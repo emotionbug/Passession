@@ -535,7 +535,6 @@ impl AgentManager {
         let owned_id = id.to_owned();
         let timeline =
             tokio::task::spawn_blocking(move || Timeline::load(&path, &owned_id)).await??;
-        let history = history || timeline.next_seq() > 1;
         snapshot["_live"] = json!(true);
         snapshot["_providerAvailable"] = json!(true);
         snapshot["lifecycle"] = json!("initializing");
@@ -552,7 +551,9 @@ impl AgentManager {
                 finalized: VecDeque::new(),
                 resolutions: HashMap::new(),
                 event_error: None,
-                staged_events: None,
+                // Resumed provider events must follow the authoritative history,
+                // including when a previous daemon saved an incomplete checkpoint.
+                staged_events: (!history).then(Vec::new),
                 staged_bytes: 0,
                 pending_replacement: false,
             }),

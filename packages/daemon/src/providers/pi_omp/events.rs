@@ -356,11 +356,15 @@ impl Mapper {
             "message_start"=>{if frame["message"]["role"]=="assistant"{self.assistant=first(&[&frame["message"]["responseId"]]).map(str::to_owned);self.stream_text.clear();self.stream_thinking.clear();}},
             "message_update"=>{
                 if frame.get("message").is_some_and(|m|!m.is_null()&&m["role"]!="assistant"){return out;}
-                let update=&frame["assistantMessageEvent"];match string(&update["type"]){
-                    "text_delta"=>out.push(self.delta(&frame["message"],false,update["delta"].as_str().unwrap_or(""))),
-                    "thinking_delta"=>out.push(self.delta(&frame["message"],true,update["delta"].as_str().unwrap_or(""))),_=>{}
+                if frame["message"]["role"]=="assistant" && frame["message"]["content"].is_array() {
+                    // Snapshots may already include deltas still queued for delivery.
+                    out.extend(self.cumulative(&frame["message"]));
+                } else {
+                    let update=&frame["assistantMessageEvent"];match string(&update["type"]){
+                        "text_delta"=>out.push(self.delta(&frame["message"],false,update["delta"].as_str().unwrap_or(""))),
+                        "thinking_delta"=>out.push(self.delta(&frame["message"],true,update["delta"].as_str().unwrap_or(""))),_=>{}
+                    }
                 }
-                if frame["message"]["role"]=="assistant"{out.extend(self.cumulative(&frame["message"]));}
             }
             "message_end"=>{
                 let message=&frame["message"];match string(&message["role"]){
@@ -596,6 +600,73 @@ mod tests {
         assert_eq!(second[0]["item"]["messageId"], id);
         let end=mapper.map(&json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}]}}));
         assert!(end.is_empty());
+    }
+
+    #[test]
+    fn cumulative_snapshots_do_not_repeat_queued_text_or_thinking_deltas() {
+        for family in ["pi", "omp"] {
+            for thinking in [false, true] {
+                let mut mapper = Mapper::new(family, family);
+                mapper.begin_turn("turn");
+                let event_type = if thinking { "thinking_delta" } else { "text_delta" };
+                let item_type = if thinking { "reasoning" } else { "assistant_message" };
+                let snapshot = |text: &str| {
+                    let block = if thinking {
+                        json!({"type":"thinking","thinking":text})
+                    } else {
+                        json!({"type":"text","text":text})
+                    };
+                    json!({"role":"assistant","responseId":"response","content":[block]})
+                };
+                let mut events = Vec::new();
+                for (delta, text) in [
+                    ("원본 ", "원본 대화"),
+                    ("대화", "원본 대화"),
+                    (" 기록", "원본 대화 기록"),
+                ] {
+                    events.extend(mapper.map(&json!({
+                        "type":"message_update",
+                        "message":snapshot(text),
+                        "assistantMessageEvent":{"type":event_type,"delta":delta}
+                    })));
+                }
+                events.extend(mapper.map(&json!({
+                    "type":"message_end",
+                    "message":snapshot("원본 대화 기록을 복구했어.")
+                })));
+                let rendered: String = events
+                    .iter()
+                    .filter(|event| event["item"]["type"] == item_type)
+                    .filter_map(|event| event["item"]["text"].as_str())
+                    .collect();
+                assert_eq!(rendered, "원본 대화 기록을 복구했어.", "{family} {item_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn snapshotless_repeated_deltas_remain_distinct_content() {
+        for family in ["pi", "omp"] {
+            let mut mapper = Mapper::new(family, family);
+            mapper.begin_turn("turn");
+            let mut events = Vec::new();
+            for _ in 0..2 {
+                events.extend(mapper.map(&json!({
+                    "type":"message_update",
+                    "assistantMessageEvent":{"type":"text_delta","delta":"하"}
+                })));
+            }
+            events.extend(mapper.map(&json!({
+                "type":"message_end",
+                "message":{"role":"assistant","content":[{"type":"text","text":"하하"}]}
+            })));
+            let rendered: String = events
+                .iter()
+                .filter(|event| event["item"]["type"] == "assistant_message")
+                .filter_map(|event| event["item"]["text"].as_str())
+                .collect();
+            assert_eq!(rendered, "하하", "{family}");
+        }
     }
 
     #[test]

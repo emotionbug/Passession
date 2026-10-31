@@ -135,9 +135,6 @@ impl AgentManager {
         select_agent_list_items(selected, &options)
     }
     async fn timeline_cell(&self, id: &str) -> Result<Arc<AgentCell>> {
-        if let Ok(cell) = self.cell(id).await {
-            return Ok(cell);
-        }
         self.ensure_loaded(id).await
     }
     pub async fn timeline(&self, id: &str, options: &Value) -> Result<Value> {

@@ -29,6 +29,8 @@
 
 ### Fixed
 
+- Fixed existing conversations appearing empty after restarting the native daemon. Provider history replaces partial checkpoints before timeline pages are served, while retaining live events received during restoration.
+- Fixed repeated Pi/OMP assistant and reasoning text when cumulative snapshots arrive ahead of queued streaming deltas. Delta-only streams still preserve intentionally repeated text.
 - Fixed empty tool-detail sheets for label-only calls such as Wait. When plain-text output is absent, show the full supplied command or wait-target label as selectable, wrapping text; retain the existing output when present.
 - Fixed the subagent list ignoring "Archive finished subagents" until it was closed. Dismissing finished provider subagents emptied the track in one step, and the open sheet or popover kept showing the old rows. The panel now closes with its track.
 - Fixed attached images flickering in the composer and sent messages. Every rebuild decoded each thumbnail again and blanked it while decoding; one decoded image is now kept per attachment.

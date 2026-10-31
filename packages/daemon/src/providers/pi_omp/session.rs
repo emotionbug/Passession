@@ -78,6 +78,7 @@ pub struct Session {
     inner: Arc<Inner>,
     capabilities: Value,
     history_events: Option<Vec<Value>>,
+    initial_history: Mutex<Option<Vec<Value>>>,
     original_persistence: Option<Value>,
 }
 impl Inner {
@@ -885,10 +886,17 @@ impl Session {
             inner,
             capabilities: catalog::capabilities(omp, supports_mcp),
             history_events: if history_only {
-                loaded.map(|h| h.events)
+                loaded.take().map(|h| h.events)
             } else {
                 None
             },
+            // This snapshot precedes runtime startup. Reading the file again after
+            // startup would replay messages also waiting in the manager's live stage.
+            initial_history: Mutex::new(if omp {
+                loaded.map(|h| h.events)
+            } else {
+                None
+            }),
             original_persistence: if history_only { persistence } else { None },
         }))
     }
@@ -1154,6 +1162,13 @@ impl AgentSession for Session {
         if let Some(events) = &self.history_events {
             for event in events {
                 sink.emit(event.clone()).await?;
+            }
+            return Ok(());
+        }
+        let initial = self.initial_history.lock().unwrap().take();
+        if let Some(events) = initial {
+            for event in events {
+                sink.emit(event).await?;
             }
             return Ok(());
         }

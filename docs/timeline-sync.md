@@ -9,6 +9,9 @@ The daemon retains projected items in memory. Each source event advances the str
 then replaces the previous tool state or merges into the current text item. Intermediate payloads
 are never retained for history or catch-up. Provider history is the durable transcript authority
 and rebuilds the projection when an agent resumes.
+Cached rows and startup notifications do not certify that replay has completed. A resumed agent's
+first history response waits for provider replay; live events received during recovery follow that
+replay instead of displacing it.
 
 The invariants are:
 
