@@ -54,12 +54,12 @@ const result = await build({
     });
   } }],
 });
-// Keep runtime-resolved Zod subpaths and optional compiler dependencies alongside the worker.
+// The compiler is optional alongside the worker, not a daemon startup dependency.
 // Preserve package layouts: esbuild locates its platform executable relative to itself.
 const { cp } = await import("node:fs/promises");
 const packages = [];
 const compilerDirectories = [];
-for (const name of ["zod", "esbuild", "typescript", `@esbuild/${process.platform}-${process.arch}`]) {
+for (const name of ["esbuild", "typescript", `@esbuild/${process.platform}-${process.arch}`]) {
   const source = path.dirname(require.resolve(`${name}/package.json`));
   compilerDirectories.push(source);
   await cp(source, path.join(output, "node_modules", name), { recursive: true });

@@ -29,7 +29,6 @@
 
 ### Fixed
 
-- Include Zod's runtime subpaths in the standalone extension worker. Extensions importing `zod/v3`, such as Kiro HTTP, now load outside the source checkout instead of failing with a missing-module error.
 - Fixed empty tool-detail sheets for label-only calls such as Wait. When plain-text output is absent, show the full supplied command or wait-target label as selectable, wrapping text; retain the existing output when present.
 - Fixed the subagent list ignoring "Archive finished subagents" until it was closed. Dismissing finished provider subagents emptied the track in one step, and the open sheet or popover kept showing the old rows. The panel now closes with its track.
 - Fixed attached images flickering in the composer and sent messages. Every rebuild decoded each thumbnail again and blanked it while decoding; one decoded image is now kept per attachment.
