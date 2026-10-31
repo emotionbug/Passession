@@ -3,15 +3,12 @@ import FlutterMacOS
 import desktop_multi_window
 
 class MainFlutterWindow: NSWindow {
-  override var canBecomeKey: Bool { false }
-  override var canBecomeMain: Bool { false }
-
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
     let windowFrame = self.frame
     self.contentViewController = flutterViewController
     self.setFrame(windowFrame, display: false)
-    self.isExcludedFromWindowsMenu = true
+    self.title = ""
     self.isRestorable = false
 
     // The plugin creates a separate engine for each secondary window.
@@ -23,7 +20,7 @@ class MainFlutterWindow: NSWindow {
     RegisterGeneratedPlugins(registry: flutterViewController)
 
     super.awakeFromNib()
-    // The initial engine is the daemon/tray coordinator, not a user window.
+    // Dart restores geometry and shows the primary user window after host setup.
     self.orderOut(nil)
   }
 }

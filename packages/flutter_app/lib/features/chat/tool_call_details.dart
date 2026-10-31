@@ -229,8 +229,12 @@ class ToolCallDetailsContent extends StatelessWidget {
           ),
         ];
       case 'plain_text':
-        if (!_present(d['text'])) return [];
-        return [_PlainTextSection(text: stringValue(d['text']), maxHeight: _maxHeight)];
+        final text = stringValue(d['text']);
+        // Some tools publish their command or wait target only as a label.
+        // The badge can abbreviate it; the opened detail must not discard it.
+        final content = text.trim().isEmpty ? stringValue(d['label']) : text;
+        if (content.trim().isEmpty) return [];
+        return [_PlainTextSection(text: content, maxHeight: _maxHeight)];
       case 'unknown':
         final input = d['input'], output = d['output'];
         final paseo = toolName == null ? null : buildPaseoToolDetailSections(toolName!, input, output);

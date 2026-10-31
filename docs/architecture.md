@@ -57,6 +57,8 @@ File operations use the selected host. Add Project browses host-side folders thr
 
 Flutter talks to the Rust `desktop-host` process through structured IPC. Desktop lifecycle tracks the daemon's process-start identity and whether this application owns its supervisor. A pre-existing daemon is not treated as a child to kill on quit. Keep-running policy and owned-stop behavior are distinct from hiding or closing a window. A supervisor restart must not create a second competing daemon.
 
+The first visible desktop window also owns process coordination; only additional windows create additional Flutter engines. Closing the first window while another remains open retains its hidden engine for daemon/tray ownership and reuses that window on the next New Window request. Destroy the primary engine only at application shutdown, after all document guards and owned-daemon cleanup have completed.
+
 Platform tray/menu/window behavior is native integration, not an Electron renderer feature. Runtime verification is platform-specific; Linux lifecycle evidence does not establish Windows or macOS execution.
 
 ## Retained and excluded surfaces

@@ -15,6 +15,7 @@ import 'package:tray_manager/tray_manager.dart' as tray;
 import 'package:window_manager/window_manager.dart';
 
 import '../../core/app_store.dart';
+import '../../core/client.dart' show ConnectionStatus;
 import '../../core/json.dart';
 import '../../core/legacy_state.dart' show originalDesktopUserDataDir;
 import 'daemon_service.dart';
@@ -22,8 +23,8 @@ import 'desktop_integrations.dart';
 import 'desktop_settings.dart';
 import 'desktop_updater.dart';
 
-/// Native desktop process coordinator. Only the first engine owns daemon/tray.
-/// Its initial engine is a hidden coordinator, never a user-facing window.
+/// The first user window also owns daemon/tray and process lifetime. Its engine
+/// survives closing that window while other windows remain open.
 class DesktopHost with WindowListener, WidgetsBindingObserver {
   DesktopHost._(this.store, this.controller, this.initialArguments);
 
@@ -40,7 +41,6 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
   final _settings = DesktopSettingsStore();
   final _errors = StreamController<Object>.broadcast();
   final _pendingErrors = <Object>[];
-  final _startupErrors = <String>[];
   final _subscriptions = <StreamSubscription<dynamic>>[];
   final _pendingRoutes = <JsonMap>[];
   final _readyWindows = <String>{};
@@ -65,7 +65,7 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
   bool _lifecycleReady = false;
   bool _routing = false;
   bool _initialized = false;
-  bool _createdUserWindow = false;
+  bool _windowReady = false;
   bool _localDaemonListening = false;
   String? _lastWindow;
   Object? _daemonFailure;
@@ -74,7 +74,6 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
   String get primaryWindowId =>
       initialArguments.text('primaryWindowId', windowId);
   bool get isPrimary => primaryWindowId == windowId;
-  bool get isCoordinator => isPrimary;
   Stream<Object> get errors => Stream.multi((sink) {
     final subscription = _errors.stream.listen(sink.add, onDone: sink.close);
     for (final error in _pendingErrors) {
@@ -96,14 +95,7 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
         : jsonMap(jsonDecode(current.arguments));
     return {
       ...args,
-      'windowId':
-          args['stateWindowId'] ??
-          (args.containsKey('primaryWindowId')
-              ? current.windowId
-              : 'coordinator'),
-      'nativeWindowId': current.windowId,
-      'isCoordinator':
-          args.text('primaryWindowId', current.windowId) == current.windowId,
+      'windowId': args.containsKey('primaryWindowId') ? current.windowId : 'main',
     };
   }
 
@@ -129,18 +121,16 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
     _support = await getApplicationSupportDirectory();
     await _support.create(recursive: true);
     _logFile = File(p.join(_support.path, 'desktop-$windowId.log'));
-    final geometryId = initialArguments.text('stateWindowId', windowId);
+    final geometryId = isPrimary ? 'main' : windowId;
     _geometryFile = File(p.join(_support.path, 'window-$geometryId.json'));
     await windowManager.ensureInitialized();
-    if (isPrimary) {
-      _logicalOpen = false;
-      await windowManager.hide();
-    }
+    if (isPrimary) await windowManager.setTitle('');
+    await windowManager.hide();
     await controller.setWindowMethodHandler(_windowCall);
     windowManager.addListener(this);
     WidgetsBinding.instance.addObserver(this);
     await windowManager.setPreventClose(true);
-    if (!isPrimary) await _restoreGeometry();
+    await _restoreGeometry();
     try {
       await integrations.initialize();
       _lifecycleReady = true;
@@ -262,11 +252,16 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
     }
     _initialized = true;
     await show();
-    if (!isPrimary) {
-      await WindowController.fromWindowId(primaryWindowId)
-          .invokeMethod('readyWindow', {'windowId': windowId});
-    }
-    _drainRoutes();
+  }
+
+  /// The shell has installed its chooser and document guards after first build.
+  void windowReady() {
+    if (_windowReady || _disposed) return;
+    _windowReady = true;
+    _run(() async {
+      await _callWindow(primaryWindowId, 'readyWindow', {'windowId': windowId});
+      _drainRoutes();
+    });
   }
 
   Future<DesktopDaemonService> _createDaemon() async {
@@ -326,12 +321,17 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
       return;
     }
     _localDaemonListening = true;
-    // The coordinator owns processes, not daemon clients or UI observations.
-    // Windows that become ready later are refreshed in `readyWindow`.
+    // Windows whose startup discovery preceded the listen address retry here.
     for (final id in List<String>.of(_readyWindows)) {
-      await WindowController.fromWindowId(id).invokeMethod('refreshLocalHost');
+      await _callWindow(id, 'refreshLocalHost');
     }
   }
+
+  // A unidirectional window channel cannot call its own registered handler.
+  Future<dynamic> _callWindow(String id, String method, [JsonMap args = const {}]) =>
+      id == windowId
+          ? _windowCall(MethodCall(method, args))
+          : WindowController.fromWindowId(id).invokeMethod(method, args);
 
   Future<dynamic> _windowCall(MethodCall call) async {
     final args = jsonMap(call.arguments);
@@ -375,16 +375,11 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
       case 'readyWindow':
         _readyWindows.add(args.text('windowId'));
         _lastWindow = args.text('windowId');
-        for (final message in _startupErrors) {
-          await WindowController.fromWindowId(_lastWindow!)
-              .invokeMethod('hostError', {'message': message});
-        }
-        _startupErrors.clear();
+        // The primary is also a user window and handles its own readiness locally.
         // Its own startup discovery may have run before the daemon published
         // its listen address.
         if (_localDaemonListening) {
-          await WindowController.fromWindowId(_lastWindow!)
-              .invokeMethod('refreshLocalHost');
+          await _callWindow(_lastWindow!, 'refreshLocalHost');
         }
         _drainRoutes();
         return true;
@@ -394,6 +389,15 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
       case 'disposeForQuit':
         await _disposeWindowResources();
         return true;
+      case 'newWindow':
+        if (!isPrimary) {
+          throw StateError('Window creation requires primary window.');
+        }
+        return (await openNew(
+          pendingOpenProjectPath: args['projectPath'] as String?,
+          serverId: args['serverId'] as String?,
+          agentId: args['agentId'] as String?,
+        )).windowId;
       case 'closeRequest':
         if (!isPrimary) {
           throw StateError('Close coordination requires primary window.');
@@ -406,8 +410,8 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
         );
         return true;
       case 'notify':
-        if (!isCoordinator) {
-          throw StateError('Notifications require the coordinator.');
+        if (!isPrimary) {
+          throw StateError('Notifications require the primary window.');
         }
         await _notifyPrimary(
           id: args.integer('id'),
@@ -471,7 +475,7 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
   Future<void> close() async {
     if (_quitting) return;
     if (isPrimary) {
-      await quit();
+      await _serialize(() => _closeWindow(windowId));
     } else {
       await WindowController.fromWindowId(primaryWindowId)
           .invokeMethod('closeRequest', {'windowId': windowId});
@@ -496,14 +500,22 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
       await _quitPrimary(reason: 'quit', force: false);
       return;
     }
-    final allowed = await window.invokeMethod<bool>('canClose') == true;
+    final allowed = await _callWindow(id, 'canClose') == true;
     if (!allowed) return;
     _readyWindows.remove(id);
-    await window.invokeMethod('finishClose');
+    if (_lastWindow == id) _lastWindow = _readyWindows.firstOrNull;
+    await _callWindow(id, 'finishClose');
   }
 
   Future<void> _finishWindowClose() async {
     _logicalOpen = false;
+    if (isPrimary) {
+      // Destroying the initial engine would also destroy daemon/tray ownership.
+      // Keep it dormant and reuse it for the next new window.
+      await _saveGeometry();
+      await controller.hide();
+      return;
+    }
     await _disposeWindowResources();
     await windowManager.setPreventClose(false);
     // destroy() terminates the entire process on Windows/macOS; never use for a child.
@@ -513,9 +525,9 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
 
   Future<void> show() async {
     if (_quitting) return;
-    if (isPrimary) {
-      await _showPreferredWindow();
-      return;
+    if (isPrimary && _windowReady) {
+      _readyWindows.add(windowId);
+      _lastWindow = windowId;
     }
     _logicalOpen = true;
     if (await windowManager.isMinimized()) await windowManager.restore();
@@ -525,9 +537,7 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
 
   Future<void> _showPreferredWindow() async {
     if (_quitting || !_initialized) return;
-    final windows = (await WindowController.getAll())
-        .where((window) => window.windowId != windowId)
-        .toList();
+    final windows = await WindowController.getAll();
     WindowController? preferred;
     for (final window in windows) {
       if (_readyWindows.contains(window.windowId)) {
@@ -539,9 +549,9 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
       }
     }
     if (preferred != null) {
-      await preferred.invokeMethod('show');
-    } else if (windows.isEmpty) {
-      await openNew();
+      await _callWindow(preferred.windowId, 'show');
+    } else {
+      await show();
     }
   }
 
@@ -551,25 +561,29 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
     String? agentId,
   }) async {
     if (_quitting) throw StateError('Application is quitting.');
-    final first = isPrimary && !_createdUserWindow;
-    final routes = first ? List<JsonMap>.of(_pendingRoutes) : const <JsonMap>[];
+    final route = <String, dynamic>{
+      'projectPath': ?pendingOpenProjectPath,
+      'serverId': ?serverId,
+      'agentId': ?agentId,
+    };
+    if (!isPrimary) {
+      final id = await _callWindow(primaryWindowId, 'newWindow', route);
+      return WindowController.fromWindowId(id as String);
+    }
+    if (!_logicalOpen) {
+      // Reserve the retained primary before yielding so simultaneous requests
+      // cannot both claim it.
+      _logicalOpen = true;
+      await show();
+      if (route.isNotEmpty) _queueRoute(route);
+      return controller;
+    }
     final window = await WindowController.create(
       WindowConfiguration(
         hiddenAtLaunch: true,
-        arguments: jsonEncode({
-          'primaryWindowId': primaryWindowId,
-          if (first) 'stateWindowId': 'main',
-          if (routes.isNotEmpty) 'routes': routes,
-          'projectPath': ?pendingOpenProjectPath,
-          'serverId': ?serverId,
-          'agentId': ?agentId,
-        }),
+        arguments: jsonEncode({'primaryWindowId': primaryWindowId, ...route}),
       ),
     );
-    if (first) {
-      _createdUserWindow = true;
-      _pendingRoutes.removeRange(0, routes.length);
-    }
     return window;
   }
 
@@ -591,14 +605,14 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
     if (!force) {
       for (final window in windows) {
         if (!_readyWindows.contains(window.windowId)) continue;
-        final allowed = await window.invokeMethod<bool>('canClose') == true;
+        final allowed = await _callWindow(window.windowId, 'canClose') == true;
         if (!allowed) throw const DesktopQuitCancelled();
       }
     }
     _quitting = true;
     for (final window in windows) {
       if (_readyWindows.contains(window.windowId)) {
-        await window.invokeMethod('beginQuit');
+        await _callWindow(window.windowId, 'beginQuit');
       }
     }
     if (_daemon != null) {
@@ -622,7 +636,7 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
     _quitPrepared = false;
     for (final window in await WindowController.getAll()) {
       if (_readyWindows.contains(window.windowId)) {
-        await window.invokeMethod('cancelQuit');
+        await _callWindow(window.windowId, 'cancelQuit');
       }
     }
   }
@@ -680,7 +694,7 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
       return;
     }
     for (final window in await WindowController.getAll()) {
-      if (_readyWindows.contains(window.windowId)) {
+      if (window.windowId != windowId && _readyWindows.contains(window.windowId)) {
         await window.invokeMethod('disposeForQuit');
         await window.invokeMethod('finishClose');
       }
@@ -752,7 +766,7 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
     JsonMap data = const {},
     String? eventKey,
   }) async {
-    if (!isCoordinator) {
+    if (!isPrimary) {
       await WindowController.fromWindowId(primaryWindowId)
           .invokeMethod('notify', {
             'id': id,
@@ -940,20 +954,20 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
     final target = parseAgentDeepLink(uri);
     if (target == null) return;
     final (:serverId, :agentId) = target;
+    if (!_initialized) {
+      _queueRoute({'serverId': serverId, 'agentId': agentId});
+      return;
+    }
     _run(() async {
-      for (final window in await WindowController.getAll()) {
-        if (window.windowId == windowId ||
-            !_readyWindows.contains(window.windowId)) {
-          continue;
-        }
-        final state = jsonMap(await window.invokeMethod('state'));
+      for (final id in List<String>.of(_readyWindows)) {
+        final state = jsonMap(await _callWindow(id, 'state'));
         if (state['serverId'] == serverId && state['agentId'] == agentId) {
-          await window.invokeMethod('show');
+          await _callWindow(id, 'show');
           return;
         }
       }
-      _queueRoute({'serverId': serverId, 'agentId': agentId});
-      await show();
+      final id = _readyWindows.contains(_lastWindow) ? _lastWindow! : windowId;
+      await _callWindow(id, 'route', {'serverId': serverId, 'agentId': agentId});
     });
   }
 
@@ -965,9 +979,17 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
   void _drainRoutes() {
     if (_routing ||
         !_initialized ||
+        !_windowReady ||
         _disposed ||
         _pendingRoutes.isEmpty ||
-        (!isPrimary && store.hosts.isEmpty)) {
+        store.hosts.isEmpty) {
+      return;
+    }
+    if (_pendingRoutes.first['projectPath'] is String &&
+        !store.hosts.any((host) =>
+            host.client.status == ConnectionStatus.connected &&
+            (_pendingRoutes.first['serverId'] == null ||
+                host.serverId == _pendingRoutes.first['serverId']))) {
       return;
     }
     _routing = true;
@@ -975,16 +997,6 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
       try {
         while (_pendingRoutes.isNotEmpty) {
           final route = _pendingRoutes.first;
-          if (isPrimary) {
-            final id = _readyWindows.contains(_lastWindow)
-                ? _lastWindow
-                : (_readyWindows.isEmpty ? null : _readyWindows.first);
-            if (id == null) return;
-            await WindowController.fromWindowId(id)
-                .invokeMethod('route', route);
-            _pendingRoutes.removeAt(0);
-            continue;
-          }
           final serverId = route['serverId'] as String?;
           if (serverId != null && store.hostFor(serverId) == null) return;
           if (route['terminalId'] is String &&
@@ -1134,16 +1146,13 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
   void _run(Future<void> Function() action) =>
       unawaited(action().catchError(_report));
   void _report(Object error, [StackTrace? stack]) {
-    if (isPrimary && !_disposed) {
-      if (!_initialized || _readyWindows.isEmpty) {
-        _startupErrors.add(error.toString());
-      } else if (_lastWindow != null && _readyWindows.contains(_lastWindow)) {
-        unawaited(
-          WindowController.fromWindowId(_lastWindow!)
-              .invokeMethod('hostError', {'message': error.toString()})
-              .catchError((Object _) => null),
-        );
-      }
+    if (isPrimary && !_disposed &&
+        _lastWindow != windowId && _readyWindows.contains(_lastWindow)) {
+      unawaited(
+        WindowController.fromWindowId(_lastWindow!)
+            .invokeMethod('hostError', {'message': error.toString()})
+            .catchError((Object _) => null),
+      );
     }
     if (!_errors.isClosed) {
       if (_errors.hasListener) {
@@ -1186,7 +1195,7 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
     _geometryTimer?.cancel();
     await _saveGeometry();
     _disposed = true;
-    if (isCoordinator) await _notificationOperations;
+    if (isPrimary) await _notificationOperations;
     store.removeListener(_drainRoutes);
     windowManager.removeListener(this);
     WidgetsBinding.instance.removeObserver(this);

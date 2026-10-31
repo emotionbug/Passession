@@ -193,6 +193,57 @@ void main() {
     expect(errors.map((e) => e.exceptionAsString()).toList(), isEmpty);
   });
 
+  for (final (size, status) in [
+    (const Size(412, 915), 'completed'),
+    (const Size(1200, 900), 'running'),
+  ]) {
+    testWidgets('label-only Wait exposes its full command in $status details', (tester) async {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      const command = 'bash running: python3 "/home/user/project with spaces/scripts/'
+          'validate_audio_latency_and_bluetooth_lifecycle.py" '
+          '--target android --variant release --output /tmp/validation-results.json\n'
+          'Waiting for the build to finish';
+      final store = AppStore();
+      try {
+        await _pump(tester, store, [
+          _tool('wait-command', 'wait', {
+            'type': 'plain_text',
+            'label': command,
+            'text': ' \n',
+          }, status: status),
+        ]);
+        await tester.tap(find.byType(ToolBadge));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 500));
+        final content = find.byType(ToolCallDetailsContent);
+        expect(find.descendant(of: content, matching: find.text(command)), findsOneWidget);
+        expect(find.descendant(of: content, matching: find.byType(SelectionArea)), findsOneWidget);
+        expect(find.descendant(of: content, matching: find.text('toolCallDetails.empty')), findsNothing);
+        expect(tester.takeException(), isNull);
+      } finally {
+        await tester.pumpWidget(const SizedBox.shrink());
+        await store.disposeAsync();
+      }
+    });
+  }
+
+  testWidgets('plain-text result takes precedence over its command label', (tester) async {
+    await tester.pumpWidget(MaterialApp(
+      theme: paseoTheme(brightness: Brightness.dark, preferences: {}),
+      home: const Scaffold(
+        body: ToolCallDetailsContent(detail: {
+          'type': 'plain_text',
+          'label': 'bash running: python3 validate.py',
+          'text': 'Validation completed\nAll audio checks passed',
+        }),
+      ),
+    ));
+    expect(find.text('Validation completed\nAll audio checks passed'), findsOneWidget);
+    expect(find.text('bash running: python3 validate.py'), findsNothing);
+  });
+
   for (final payload in _payloads) {
     final item = jsonMap(payload['item']);
     testWidgets('inline ${item['callId']} tool detail builds without errors', (tester) async {

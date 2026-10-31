@@ -42,6 +42,7 @@ class _StreamChromeState {
 
   List<JsonMap> prompts = const [];
   String? promptsEpoch;
+  List<JsonMap>? promptsTimeline;
   int promptsLatestSeq = -1, promptsRequest = 0;
   int? activePromptSeq;
   bool readingScheduled = false;
@@ -68,6 +69,7 @@ class _StreamChromeState {
     findOpen = false;
     prompts = const [];
     promptsEpoch = null;
+    promptsTimeline = null;
     promptsLatestSeq = -1;
     promptsRequest++;
     activePromptSeq = null;
@@ -157,13 +159,14 @@ class _PanelFindOperations implements ChatFindOperations {
 
   @override
   void scrollTo(int rowSeqStart) {
+    if (!state.mounted || !state._viewVisible) return;
     state._refresh(() => state.highlighted = '$rowSeqStart');
     // Like an outline jump, a find reveal leaves sticky-bottom so new rows
     // do not pull the reader back to the latest edge.
     state._detach();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final row = await state._rowContext(rowSeqStart);
-      if (row == null || !row.mounted) return;
+      if (!state.mounted || !state._viewVisible || row == null || !row.mounted) return;
       final find = state._chrome.find;
       if (find != null && chatFindScrollToMatch(row, clearance: find.matchClearance)) return;
       unawaited(Scrollable.ensureVisible(
@@ -192,7 +195,7 @@ extension _StreamChrome on _AgentPanelState {
   /// leaves the bottom detaches a sticky stream — in the inverted list
   /// nothing else moves offset 0, since growth at the newest edge keeps it.
   void _onStreamScroll() {
-    if (!scroll.hasClients) return;
+    if (!_viewVisible || !scroll.hasClients) return;
     final position = scroll.position;
     final atBottom = position.pixels - position.minScrollExtent <= 32;
     if (atBottom != _atBottom) {
@@ -224,7 +227,7 @@ extension _StreamChrome on _AgentPanelState {
   void _streamScrollEnded() {
     _userScrolling = false;
     _chrome.anchoring = false;
-    if (!scroll.hasClients) return;
+    if (!_viewVisible || !scroll.hasClients) return;
     final position = scroll.position;
     final nearBottom = position.pixels - position.minScrollExtent <= 32;
     if (nearBottom) {
@@ -242,7 +245,7 @@ extension _StreamChrome on _AgentPanelState {
   /// is a 2.2s "Couldn't load older history" toast, not a sync error.
   Future<void> _loadOlder() async {
     final c = controller;
-    if (c == null || _chrome.loadingOlder || !c.hasOlder || c.loading) return;
+    if (!_viewVisible || c == null || _chrome.loadingOlder || !c.hasOlder || c.loading) return;
     _refresh(() => _chrome.loadingOlder = true);
     try {
       await c.older();
@@ -263,11 +266,12 @@ extension _StreamChrome on _AgentPanelState {
   /// ([_readingHoldShift]), so no frame paints the pushed rows; after a
   /// frame the hold moves on to the row that is now the newest on screen.
   void _holdReadingPosition() {
-    if (_sticky || _chrome.holdScheduled) return;
+    if (!_viewVisible || _sticky || _chrome.holdScheduled) return;
     _chrome.holdScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _chrome.holdScheduled = false;
-      _chrome.hold = mounted && !_sticky && scroll.hasClients ? _readingAnchor() : null;
+      if (!mounted || !_viewVisible) return;
+      _chrome.hold = !_sticky && scroll.hasClients ? _readingAnchor() : null;
     });
   }
 
@@ -279,7 +283,7 @@ extension _StreamChrome on _AgentPanelState {
   /// in [_onStreamScroll] instead of being undone here.
   double _readingHoldShift(ScrollPosition position, double min, double max) {
     final held = _chrome.hold;
-    if (!mounted || _sticky || held == null) return 0;
+    if (!mounted || !_viewVisible || _sticky || held == null) return 0;
     final row = _streamRow(held.seq);
     if (row == null) return 0;
     final shift = (row.offset - held.offset) - (position.pixels - held.pixels);
@@ -374,7 +378,7 @@ extension _StreamChrome on _AgentPanelState {
   /// until the list scrolls near it, so page toward it (older rows lie at
   /// larger inverted offsets) a viewport at a time.
   Future<BuildContext?> _rowContext(int seq) async {
-    for (var attempt = 0; attempt < 400 && mounted; attempt++) {
+    for (var attempt = 0; attempt < 400 && mounted && _viewVisible; attempt++) {
       final built = rowKeys[seq]?.currentContext;
       if (built != null && built.mounted) return built;
       if (!scroll.hasClients) return null;
@@ -399,7 +403,7 @@ extension _StreamChrome on _AgentPanelState {
 
   // ── controller changes: sync state, catch-up, prompt index ─────────────
 
-  void _streamChanged() {
+  void _streamStateChanged() {
     final c = controller;
     if (!identical(c, _chrome.owner)) {
       _chrome.reset(c);
@@ -422,12 +426,17 @@ extension _StreamChrome on _AgentPanelState {
       _chrome.childrenRequested = true;
       unawaited(c.loadSubagents().catchError((Object _) {}));
     }
+  }
+
+  void _streamChanged() {
+    final c = controller;
+    if (c == null) return;
     _refreshPrompts();
     // onNearHistoryStart also fires without a scroll: a transcript shorter
     // than the viewport keeps paging older history in until it fills.
     if (c.hasOlder && !c.loading && !_chrome.loadingOlder) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || !scroll.hasClients) return;
+        if (!mounted || !_viewVisible || !scroll.hasClients) return;
         if (scroll.position.extentAfter <= 96) unawaited(_loadOlder());
       });
     }
@@ -448,8 +457,11 @@ extension _StreamChrome on _AgentPanelState {
         PaseoScope.of(context).preferences['chatOutlineEnabled'] == false) {
       return;
     }
+    final timeline = c.timeline;
+    if (identical(_chrome.promptsTimeline, timeline) && _chrome.promptsEpoch == c.epoch) return;
+    _chrome.promptsTimeline = timeline;
     var latest = -1;
-    for (final row in c.timeline) {
+    for (final row in timeline) {
       if (jsonMap(row['item'])['type'] == 'user_message') {
         latest = intValue(row['seqStart']) > latest ? intValue(row['seqStart']) : latest;
       }
@@ -476,11 +488,11 @@ extension _StreamChrome on _AgentPanelState {
   }
 
   void _scheduleReadingPosition() {
-    if (_chrome.readingScheduled || _chrome.prompts.length < 2) return;
+    if (!_viewVisible || _chrome.readingScheduled || _chrome.prompts.length < 2) return;
     _chrome.readingScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _chrome.readingScheduled = false;
-      if (!mounted) return;
+      if (!mounted || !_viewVisible) return;
       final viewport = _chrome.viewportKey.currentContext?.findRenderObject();
       if (viewport is! RenderBox || !viewport.attached) return;
       final top = viewport.localToGlobal(Offset.zero).dy;
@@ -523,12 +535,12 @@ extension _StreamChrome on _AgentPanelState {
       }
       row = loaded();
     }
-    if (row == null || !mounted) return;
+    if (row == null || !mounted || !_viewVisible) return;
     _detach();
     final target = row;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final revealed = await _rowContext(target);
-      if (revealed != null && revealed.mounted) {
+      if (mounted && _viewVisible && revealed != null && revealed.mounted) {
         unawaited(Scrollable.ensureVisible(
           revealed,
           duration: const Duration(milliseconds: 250),

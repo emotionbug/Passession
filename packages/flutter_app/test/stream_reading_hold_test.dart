@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:paseo_sessions/core/app_store.dart';
@@ -10,7 +11,12 @@ import 'package:paseo_sessions/core/json.dart';
 import 'package:paseo_sessions/core/scope.dart';
 import 'package:paseo_sessions/core/target.dart';
 import 'package:paseo_sessions/features/chat/agent_panel.dart';
+import 'package:paseo_sessions/features/chat/chat_drafts.dart';
+import 'package:paseo_sessions/features/chat/permission_card.dart';
+import 'package:paseo_sessions/ui/localization.dart';
+import 'package:paseo_sessions/ui/panel_activity.dart';
 import 'package:paseo_sessions/ui/theme.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 const _agentId = 'a0000000-0000-4000-8000-000000000001';
 const _target = PanelTarget(
@@ -62,11 +68,33 @@ List<JsonMap> _history() => [
   for (var i = 7; i <= 30; i++) _tool(i),
 ];
 
+class _Loaded<T> extends LocalizationsDelegate<T> {
+  const _Loaded(this.value);
+  final T value;
+  @override
+  bool isSupported(Locale locale) => true;
+  @override
+  Future<T> load(Locale locale) => SynchronousFuture(value);
+  @override
+  bool shouldReload(_Loaded<T> old) => false;
+}
+
 void main() {
   testWidgets('a detached reader is not shaken by rows arriving below it', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
     tester.view.physicalSize = const Size(424, 924);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
+    late PaseoLocalizations strings;
+    await tester.runAsync(() async {
+      strings = await PaseoLocalizations.load(const Locale('en'));
+    });
+    final visible = ValueNotifier(true);
+    addTearDown(visible.dispose);
+    final entries = _history();
+    final pendingPermissions = <JsonMap>[];
+    var promptRequests = 0;
 
     late _TestDaemon wire;
     wire = _TestDaemon((request) {
@@ -75,11 +103,20 @@ void main() {
           return {'subscriptionId': 'timeline-subscription'};
         case 'agent.provider_subagents.list.request':
           return {'subagents': []};
+        case 'agent.timeline.list_prompts.request':
+          promptRequests++;
+          return {
+            'epoch': 'epoch-1',
+            'prompts': [
+              for (final row in entries)
+                if (jsonMap(row['item'])['type'] == 'user_message')
+                  {'seq': row['seqStart'], 'preview': jsonMap(row['item'])['text']},
+            ],
+          };
         case 'fetch_agent_timeline_request':
-          final entries = _history();
           return {
             'agentId': _agentId,
-            'agent': _runningAgent,
+            'agent': {..._runningAgent, 'pendingPermissions': pendingPermissions},
             'direction': 'tail',
             'epoch': 'epoch-1',
             'window': {'minSeq': 1, 'maxSeq': entries.length, 'nextSeq': entries.length + 1},
@@ -112,8 +149,27 @@ void main() {
         PaseoScope(
           store: store,
           child: MaterialApp(
+            locale: const Locale('en'),
+            localizationsDelegates: [_Loaded<PaseoLocalizations>(strings)],
             theme: paseoTheme(brightness: Brightness.dark, preferences: const {}),
-            home: const Scaffold(body: AgentPanel(target: _target)),
+            home: Scaffold(
+              body: ValueListenableBuilder<bool>(
+                valueListenable: visible,
+                child: const AgentPanel(target: _target),
+                builder: (context, shown, child) => Offstage(
+                  offstage: !shown,
+                  child: TickerMode(
+                    enabled: shown,
+                    child: PanelActivity(
+                      visible: shown,
+                      focused: shown,
+                      appActive: shown,
+                      child: child!,
+                    ),
+                  ),
+                ),
+              ),
+            ),
           ),
         ),
       );
@@ -143,6 +199,7 @@ void main() {
       var seq = 31;
       for (var frame = 0; frame < 150; frame++) {
         if (frame < 120 && frame % 10 == 0) {
+          entries.add(_tool(seq));
           wire.emit('agent_stream', {
             'agentId': _agentId,
             'seq': seq,
@@ -167,11 +224,126 @@ void main() {
         await tester.pump(const Duration(milliseconds: 16));
       }
       expect(position.pixels, greaterThan(held + 80), reason: 'the hold undid the scroll');
+
+      final editor = tester.widget<EditableText>(find.byType(EditableText).first).controller;
+      const editing = TextEditingValue(
+        text: 'Keep this unfinished draft',
+        selection: TextSelection(baseOffset: 5, extentOffset: 9),
+      );
+      editor.value = editing;
+      await tester.pump();
+      final drafts = ChatDrafts.instance;
+      final draftKey = ChatDrafts.key('host', 'main', _agentId);
+      for (final minimized in [false, true]) {
+        final anchorTop = tester.getTopLeft(reading).dy;
+        final hiddenOffset = position.pixels;
+        final requestsBefore = promptRequests;
+        if (minimized) {
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+        } else {
+          visible.value = false;
+        }
+        await tester.pump();
+        final messageId = 'background-prompt-$minimized';
+        drafts.update(draftKey, {
+          'pending': {
+            'messageId': messageId,
+            'text': 'A submitted prompt',
+            'attachments': [],
+            'images': [],
+          },
+        });
+        final prompt = _text(seq, 'user_message', 'A submitted prompt');
+        jsonMap(prompt['item'])['clientMessageId'] = messageId;
+        entries.add(prompt);
+        wire.emit('agent_stream', {
+          'agentId': _agentId,
+          'seq': seq++,
+          'epoch': 'epoch-1',
+          'timestamp': '2026-05-01T09:00:00.000Z',
+          'event': {'type': 'timeline', 'item': prompt['item']},
+        });
+        final permission = {
+          'id': 'permission-$minimized',
+          'kind': 'tool',
+          'name': 'Bash',
+        };
+        pendingPermissions.add(permission);
+        wire.emit('agent_permission_request', {
+          'agentId': _agentId,
+          'request': permission,
+        });
+        for (var i = 0; i < 5; i++) {
+          entries.add(_tool(seq));
+          wire.emit('agent_stream', {
+            'agentId': _agentId,
+            'seq': seq,
+            'epoch': 'epoch-1',
+            'timestamp': '2026-05-01T09:00:00.000Z',
+            'event': {'type': 'timeline', 'item': jsonMap(_tool(seq)['item'])},
+          });
+          seq++;
+          await tester.pump(const Duration(milliseconds: 16));
+        }
+        expect(drafts.draft(draftKey)['pending'], isNull,
+            reason: 'hidden delivery must still acknowledge the submitted prompt');
+        expect(editor.value, editing);
+        expect(position.pixels, hiddenOffset,
+            reason: 'hidden streams must not adjust the retained reading position');
+        expect(promptRequests, requestsBefore,
+            reason: 'hidden streams must not refresh the presentation prompt index');
+
+        if (minimized) {
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+          tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+        } else {
+          visible.value = true;
+        }
+        for (var i = 0; i < 30; i++) {
+          await tester.pump(const Duration(milliseconds: 16));
+        }
+        expect(tester.getTopLeft(reading).dy, anchorTop,
+            reason: 'revealing accumulated rows must preserve the reading anchor');
+        expect(editor.value, editing);
+        expect(promptRequests, requestsBefore + 1,
+            reason: 'the outline catches up once when the stream is shown');
+      }
+
+      // All background permissions and rows become reachable on return.
+      position.jumpTo(0);
+      for (var i = 0; i < 30; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      expect(find.byType(PermissionCard), findsNWidgets(2));
+      expect(position.pixels, 0);
+      visible.value = false;
+      await tester.pump();
+      entries.add(_tool(seq));
+      wire.emit('agent_stream', {
+        'agentId': _agentId,
+        'seq': seq,
+        'epoch': 'epoch-1',
+        'timestamp': '2026-05-01T09:00:00.000Z',
+        'event': {'type': 'timeline', 'item': jsonMap(_tool(seq)['item'])},
+      });
+      await tester.pump(const Duration(milliseconds: 16));
+      visible.value = true;
+      for (var i = 0; i < 30; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      expect(position.pixels, 0, reason: 'a sticky reader still follows the newest edge on return');
+      expect(editor.value, editing);
     } finally {
+      if (tester.binding.lifecycleState == AppLifecycleState.hidden) {
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      }
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pumpWidget(const SizedBox.shrink());
       await store.disposeAsync();
       client.dispose();
       await tester.runAsync(() => wire.close());
+      debugDefaultTargetPlatformOverride = null;
     }
   });
 }
@@ -205,6 +377,7 @@ class _TestDaemon implements DaemonTransport {
           'ownedSubscriptions': true,
           'workspaceMultiplicity': true,
           'providerSubagents': true,
+          'agentTimelinePromptIndex': true,
         },
       });
       return;

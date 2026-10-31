@@ -40,7 +40,7 @@ The client deliberately excludes interactive terminal UI, embedded browser/autom
 
 ## Retained Linux desktop regression
 
-`packages/flutter_app/integration_test/desktop_lifecycle.dart` exercises the real native desktop coordinator, user engines, managed daemon and editor. `tools/native-desktop-smoke/run.py` and `bus.py` provide isolated Linux desktop/session services and collect results. Prerequisites are Linux, Xvfb, `dbus-run-session`, Python 3 with `python3-dbus` and `python3-gi`, Gdk 3 introspection, the Flutter Linux toolchain, and a complete built native runtime directory. Do not replace that runtime with a bare Cargo executable missing its assets.
+`packages/flutter_app/integration_test/desktop_lifecycle.dart` exercises the real native primary user window, additional engines, managed daemon and editor. `tools/native-desktop-smoke/run.py` and `bus.py` provide isolated Linux desktop/session services and collect results. Prerequisites are Linux, Xvfb, `dbus-run-session`, Python 3 with `python3-dbus` and `python3-gi`, Gdk 3 introspection, the Flutter Linux toolchain, and a complete built native runtime directory. Do not replace that runtime with a bare Cargo executable missing its assets.
 
 From `packages/flutter_app`, with consistent `ANDROID_HOME`/`ANDROID_SDK_ROOT` if Android tooling is also configured:
 
@@ -49,9 +49,9 @@ flutter build linux --debug --target=integration_test/desktop_lifecycle.dart
 python3 ../../tools/native-desktop-smoke/run.py --runtime /absolute/path/to/native-runtime-directory
 ```
 
-The runner uses private `HOME`/`PASEO_HOME` and the default GPU path, without a Node product runtime. It waits for actual widgets before reporting case state. Its three lifecycle cases are tray hide/activate/menu Quit, last-window close with no tray panel (a real watcher without a host), and GNOME logout while the user window is hidden. Assert managed-daemon shutdown in every case. Software-renderer runs are diagnostic evidence, not a substitute for default-GPU coverage.
+The runner uses private `HOME`/`PASEO_HOME` and the default renderer, without a Node product runtime. It waits for actual widgets before reporting case state. Check single-engine startup, cold-start project routing, primary close/Quit cancellation, hidden-primary reuse from another window, and secondary teardown without losing the primary. Its three lifecycle cases cover tray hide/activate/menu Quit, last-window close with no tray panel (a real watcher without a host), and GNOME logout while the user window is hidden. Assert managed-daemon shutdown in every case. Xvfb does not establish hardware-GPU performance; software-renderer overrides are diagnostic evidence, not a substitute for default-renderer coverage.
 
-Screenshot phase acknowledgements keep the user window alive until capture completes, preventing a race with Quit. The visual assertion compares the same window immediately before hiding and after restoration: matching pixels establish that hide/restore preserved its rendered contents, not conformity to a style golden.
+Screenshot-ready phases wait for a rasterized frame, not just a completed widget build. A compact tool-detail capture checks a long, label-only Wait command without executing it. Screenshot phase acknowledgements keep the user window alive until capture completes, preventing a race with Quit. The visual assertion compares the same window immediately before hiding and after restoration: matching pixels establish that hide/restore preserved its rendered contents, not conformity to a style golden.
 
 ### Vendored Linux multiwindow ownership
 

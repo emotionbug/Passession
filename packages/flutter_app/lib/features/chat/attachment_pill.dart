@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
@@ -140,11 +142,22 @@ class AttachmentPill extends StatefulWidget {
     }
     if (data.isNotEmpty) {
       final cached = _inline.remove(data);
-      if (cached != null) return _inline[data] = cached;
+      if (cached != null) {
+        _inline[data] = cached;
+        return cached.$1;
+      }
       try {
         final provider = MemoryImage(base64Decode(base64.normalize(data.replaceAll(RegExp(r'\s'), ''))));
-        if (_inline.length >= _inlineLimit) _inline.remove(_inline.keys.first);
-        return _inline[data] = provider;
+        // Include the retained base64 key as well as the compressed image bytes.
+        final retainedBytes = data.length * 2 + provider.bytes.lengthInBytes;
+        if (retainedBytes > _inlineByteLimit) return provider;
+        while (_inline.length >= _inlineLimit ||
+            _inlineBytes + retainedBytes > _inlineByteLimit) {
+          _inlineBytes -= _inline.remove(_inline.keys.first)!.$2;
+        }
+        _inlineBytes += retainedBytes;
+        _inline[data] = (provider, retainedBytes);
+        return provider;
       } on FormatException {
         return null;
       }
@@ -154,26 +167,17 @@ class AttachmentPill extends StatefulWidget {
     return null;
   }
 
-  /// One provider per inline payload, least recently used first out. A fresh
-  /// MemoryImage is a new image-cache key, so every rebuild of the composer
-  /// or a sent message decoded each thumbnail again and blanked it meanwhile.
-  static final Map<String, ImageProvider> _inline = {};
+  /// Reuse inline providers across mounted thumbnails and previews without
+  /// retaining unbounded payloads. Mounted thumbnails own their provider even
+  /// after eviction, including images too large for this cache.
+  static final Map<String, (MemoryImage, int)> _inline = {};
+  static int _inlineBytes = 0;
   static const _inlineLimit = 32;
+  static const _inlineByteLimit = 16 * 1024 * 1024;
 
   /// 48px square thumbnail for an inline (base64) or remote image.
-  static Widget thumbnail(BuildContext context, JsonMap image) {
-    Widget fallback() => Container(
-      width: 48,
-      height: 48,
-      color: PaseoColors.of(context).surface1,
-      child: Icon(LucideIcons.image300, size: 16,
-          color: Theme.of(context).colorScheme.onSurfaceVariant),
-    );
-    final source = provider(image);
-    if (source == null) return fallback();
-    return Image(image: source, width: 48, height: 48, fit: BoxFit.cover,
-        gaplessPlayback: true, errorBuilder: (_, _, _) => fallback());
-  }
+  static Widget thumbnail(BuildContext context, JsonMap image) =>
+      _AttachmentThumbnail(image: image);
 
   /// Title, type subtitle (null: the localized "File") and glyph for each
   /// attachment format the client sends (composer/index.tsx *AttachmentPill).
@@ -222,6 +226,94 @@ class AttachmentPill extends StatefulWidget {
 
   @override
   State<AttachmentPill> createState() => _AttachmentPillState();
+}
+
+class _AttachmentThumbnail extends StatefulWidget {
+  const _AttachmentThumbnail({required this.image});
+
+  final JsonMap image;
+
+  @override
+  State<_AttachmentThumbnail> createState() => _AttachmentThumbnailState();
+}
+
+class _AttachmentThumbnailState extends State<_AttachmentThumbnail> {
+  String? _data, _url;
+  ImageProvider? _source;
+  ImageProvider? _thumbnail;
+  int? _pixels;
+
+  @override
+  void initState() {
+    super.initState();
+    _updateSource();
+  }
+
+  @override
+  void didUpdateWidget(_AttachmentThumbnail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _updateSource();
+  }
+
+  void _updateSource() {
+    final data = stringValue(widget.image['data']);
+    final url = stringValue(widget.image['url'], stringValue(widget.image['uri']));
+    if (_data == data && _url == url) return;
+    _data = data;
+    _url = url;
+    _source = AttachmentPill.provider(widget.image);
+    _thumbnail = null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    Widget fallback() => Container(
+      width: 48,
+      height: 48,
+      color: PaseoColors.of(context).surface1,
+      child: Icon(LucideIcons.image300, size: 16,
+          color: Theme.of(context).colorScheme.onSurfaceVariant),
+    );
+    final source = _source;
+    if (source == null) return fallback();
+    final pixels = (48 * MediaQuery.devicePixelRatioOf(context)).ceil();
+    if (_thumbnail == null || _pixels != pixels) {
+      _pixels = pixels;
+      _thumbnail = _CoverThumbnailImage(source, pixels);
+    }
+    return Image(image: _thumbnail!, width: 48, height: 48, fit: BoxFit.cover,
+        gaplessPlayback: true, errorBuilder: (_, _, _) => fallback());
+  }
+}
+
+/// Decode the short edge to the physical thumbnail size. Resizing both axes
+/// distorts images; fitting inside a square undersamples the visible cover crop.
+class _CoverThumbnailImage extends ImageProvider<(Object, int)> {
+  const _CoverThumbnailImage(this.source, this.pixels);
+
+  final ImageProvider<Object> source;
+  final int pixels;
+
+  @override
+  Future<(Object, int)> obtainKey(ImageConfiguration configuration) =>
+      source.obtainKey(configuration).then((key) => (key, pixels));
+
+  @override
+  ImageStreamCompleter loadImage((Object, int) key, ImageDecoderCallback decode) {
+    final completer = source.loadImage(key.$1, (
+      ui.ImmutableBuffer buffer, {
+      ui.TargetImageSizeCallback? getTargetSize,
+    }) => decode(buffer, getTargetSize: (width, height) {
+      if (width <= height) {
+        return ui.TargetImageSize(width: width < pixels ? width : pixels);
+      }
+      return ui.TargetImageSize(height: height < pixels ? height : pixels);
+    }));
+    completer.addEphemeralErrorListener((error, stackTrace) {
+      scheduleMicrotask(() => PaintingBinding.instance.imageCache.evict(key));
+    });
+    return completer;
+  }
 }
 
 class _AttachmentPillState extends State<AttachmentPill> {

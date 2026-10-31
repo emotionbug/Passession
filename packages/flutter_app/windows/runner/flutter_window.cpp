@@ -79,9 +79,8 @@ bool FlutterWindow::OnCreate() {
       });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
-  // The initial engine is the hidden daemon/tray coordinator. DesktopHost
-  // creates every visible Sessions window through desktop_multi_window.
-  // Never show this HWND, including during single-instance activation.
+  // Dart restores geometry and shows this first user window after host setup.
+  // Single-instance activation is routed there instead of showing the HWND early.
 
   return true;
 }

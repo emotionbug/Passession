@@ -25,11 +25,9 @@ class PaseoBootstrap extends StatefulWidget {
     super.key,
     required this.store,
     required this.arguments,
-    required this.coordinator,
   });
   final AppStore store;
   final List<String> arguments;
-  final bool coordinator;
   @override
   State<PaseoBootstrap> createState() => _PaseoBootstrapState();
 }
@@ -52,38 +50,34 @@ class _PaseoBootstrapState extends State<PaseoBootstrap> {
 
   Future<void> _initialize() async {
     try {
-      if (!widget.coordinator) {
-        await ChatDrafts.instance.initialize();
-        _removeOpenHook = widget.store.registerClientOpenHook((
-          client,
-          serverId,
-        ) {
-          _delivery[client] = ChatDelivery.attach(client, serverId);
-        });
-        _removeCloseHook = widget.store.registerClientCloseHook((client) async {
-          _delivery.remove(client)?.call();
-        });
-        AudioService.initialize(widget.store);
-      }
+      await ChatDrafts.instance.initialize();
+      _removeOpenHook = widget.store.registerClientOpenHook((
+        client,
+        serverId,
+      ) {
+        _delivery[client] = ChatDelivery.attach(client, serverId);
+      });
+      _removeCloseHook = widget.store.registerClientCloseHook((client) async {
+        _delivery.remove(client)?.call();
+      });
+      AudioService.initialize(widget.store);
       await widget.store.initialize();
       if (DesktopHost.supported) {
         final host = await DesktopHost.initialize(
           widget.store,
           arguments: widget.arguments,
         );
-        if (!widget.coordinator) {
-          _desktopErrors = host.errors.listen((error) {
-            if (!mounted) return;
-            setState(() => _startupError = error);
-          });
-        }
+        _desktopErrors = host.errors.listen((error) {
+          if (!mounted) return;
+          setState(() => _startupError = error);
+        });
       } else {
         await MobileServices.initialize(widget.store);
       }
     } catch (error) {
       _startupError = error;
     } finally {
-      if (!widget.coordinator && mounted) {
+      if (mounted) {
         _activity = ClientActivity(
           widget.store,
           onError: (error) {
@@ -91,7 +85,12 @@ class _PaseoBootstrapState extends State<PaseoBootstrap> {
           },
         );
       }
-      if (mounted) setState(() => _ready = true);
+      if (mounted) {
+        setState(() => _ready = true);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) DesktopHost.instance?.windowReady();
+        });
+      }
     }
   }
 
@@ -105,18 +104,15 @@ class _PaseoBootstrapState extends State<PaseoBootstrap> {
     }
     _delivery.clear();
     unawaited(_desktopErrors?.cancel());
-    if (!widget.coordinator) {
-      unawaited(AudioService.shutdown());
-      if (!DesktopHost.supported) {
-        unawaited(MobileServices.instance.disposeAsync());
-      }
+    unawaited(AudioService.shutdown());
+    if (!DesktopHost.supported) {
+      unawaited(MobileServices.instance.disposeAsync());
     }
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (widget.coordinator) return const SizedBox.shrink();
     return PaseoApp(
       store: widget.store,
       activity: _activity,

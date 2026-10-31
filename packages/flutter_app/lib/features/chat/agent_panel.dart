@@ -112,7 +112,9 @@ class _AgentPanelState extends State<AgentPanel> {
 
   /// setState for the stream chrome extension (chrome/stream_chrome.dart).
   void _refresh([VoidCallback? change]) {
-    if (mounted) setState(change ?? () {});
+    if (!mounted) return;
+    change?.call();
+    if (_viewVisible) setState(() {});
   }
   final drafts = ChatDrafts.instance;
   final Map<int, GlobalKey> rowKeys = {};
@@ -162,6 +164,15 @@ class _AgentPanelState extends State<AgentPanel> {
   /// offstage tabs do no work for store, draft or stream changes.
   Widget? _lastBuild;
 
+  bool _streamViewDirty = true;
+  bool get _viewVisible {
+    final state = WidgetsBinding.instance.lifecycleState;
+    return PanelActivity.of(context).visible &&
+        state != AppLifecycleState.hidden &&
+        state != AppLifecycleState.paused &&
+        state != AppLifecycleState.detached;
+  }
+
   /// hooks/use-agent-attention-clear.ts for this panel's agent.
   AgentAttentionClear? _attention;
   bool _attentionFocused = false;
@@ -180,7 +191,7 @@ class _AgentPanelState extends State<AgentPanel> {
   ));
 
   void _setProviders(List<JsonMap> next) {
-    setState(() => providers = next);
+    _refresh(() => providers = next);
     _providerState.value = (config: _daemonConfig, providers: next);
   }
 
@@ -443,6 +454,8 @@ class _AgentPanelState extends State<AgentPanel> {
           state != AppLifecycleState.paused &&
           state != AppLifecycleState.detached,
     );
+    _streamViewDirty = true;
+    _refresh();
   }
 
   /// composer/index.tsx handleFocusChange → onAttentionInputFocus.
@@ -505,6 +518,7 @@ class _AgentPanelState extends State<AgentPanel> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _streamViewDirty = true;
     final next = PaseoScope.of(context).clientFor(widget.target.serverId);
     if (_client != next) {
       controller?.removeListener(_changed);
@@ -743,7 +757,7 @@ class _AgentPanelState extends State<AgentPanel> {
     } else if (_ownTextEdit) {
       return;
     }
-    setState(() {});
+    _refresh();
   }
 
   void _editorChanged() {
@@ -767,27 +781,32 @@ class _AgentPanelState extends State<AgentPanel> {
         )) {
       drafts.acknowledge(draftKey, pending);
     }
-    _holdReadingPosition();
-    _streamChanged();
+    // Delivery and attention keep running while the retained view is hidden.
+    // Presentation catches up once, from the latest state, in the next build.
+    _streamStateChanged();
+    _streamViewDirty = true;
     _syncAttention();
-    setState(() {});
-    if (_sticky) _bottom();
+    _refresh();
   }
 
   /// strategy-native.tsx sticky bottom: the inverted list's newest edge is
   /// offset 0. bottom-anchor-controller.ts evaluate: no attempt while the
   /// reader drives the list or once it detached.
-  void _bottom() => WidgetsBinding.instance.addPostFrameCallback((_) {
-    if (mounted &&
-        _sticky &&
-        !_userScrolling &&
-        scroll.hasClients &&
-        scroll.position.pixels != scroll.position.minScrollExtent) {
-      scroll.jumpTo(scroll.position.minScrollExtent);
-    }
-  });
+  void _bottom() {
+    if (!_viewVisible) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted &&
+          _viewVisible &&
+          _sticky &&
+          !_userScrolling &&
+          scroll.hasClients &&
+          scroll.position.pixels != scroll.position.minScrollExtent) {
+        scroll.jumpTo(scroll.position.minScrollExtent);
+      }
+    });
+  }
   void _showFailure(Object e) {
-    if (mounted) setState(() => error = e);
+    _refresh(() => error = e);
   }
 
   JsonMap _config() {
@@ -2033,10 +2052,15 @@ class _AgentPanelState extends State<AgentPanel> {
   /// panel is one of the non-ready views instead.
   @override
   Widget build(BuildContext context) {
-    // A hidden retained tab keeps its last frame; showing it again changes
-    // PanelActivity, which rebuilds it from current state.
-    final cached = _lastBuild;
-    if (cached != null && !PanelActivity.of(context).visible) return cached;
+    // Keep the old layout and reading anchor until this panel is shown again.
+    if (!_viewVisible) return _lastBuild ?? const SizedBox.shrink();
+    if (_streamViewDirty) {
+      _streamViewDirty = false;
+      _holdReadingPosition();
+      _streamChanged();
+      _scheduleReadingPosition();
+      if (_sticky) _bottom();
+    }
     return _lastBuild = _buildPanel(context);
   }
 

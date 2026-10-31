@@ -102,11 +102,11 @@ static void my_application_activate(GApplication* application) {
   if (use_header_bar) {
     GtkHeaderBar* header_bar = GTK_HEADER_BAR(gtk_header_bar_new());
     gtk_widget_show(GTK_WIDGET(header_bar));
-    gtk_header_bar_set_title(header_bar, "Paseo Sessions");
+    gtk_header_bar_set_title(header_bar, "");
     gtk_header_bar_set_show_close_button(header_bar, TRUE);
     gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
   } else {
-    gtk_window_set_title(window, "Paseo Sessions");
+    gtk_window_set_title(window, "");
   }
 
   gtk_window_set_default_size(window, 1280, 720);
@@ -122,8 +122,8 @@ static void my_application_activate(GApplication* application) {
   gtk_widget_show(GTK_WIDGET(view));
   gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(view));
 
-  // The initial engine is a hidden daemon/tray coordinator. Dart creates all
-  // user-visible windows through desktop_multi_window.
+  // Dart restores geometry and shows this first user window after host setup.
+  // Only additional user windows need another engine.
   gtk_widget_realize(GTK_WIDGET(view));
 
   desktop_multi_window_plugin_set_window_created_callback(

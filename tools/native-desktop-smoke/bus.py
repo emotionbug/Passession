@@ -75,7 +75,7 @@ def menu_command(label):
 
 loop = GLib.MainLoop()
 log = (proof / 'app.log').open('w')
-app = subprocess.Popen([sys.argv[1]], stdout=log, stderr=subprocess.STDOUT)
+app = subprocess.Popen([sys.argv[1], str(proof)], stdout=log, stderr=subprocess.STDOUT)
 start = time.monotonic()
 last_command = None
 failed = False
@@ -92,7 +92,7 @@ def tick():
     try:
         events_path = proof / 'events.jsonl'
         events = events_path.read_text() if events_path.exists() else ''
-        for phase in ['native-vim-delete-undo-unicode-save', 'multiwindow-close-retains-daemon', 'last-window-hidden-to-tray', 'tray-activation-restores-same-engine']:
+        for phase in ['native-vim-delete-undo-unicode-save', 'label-only-wait-command-sheet', 'primary-reuse-and-secondary-teardown', 'multiwindow-close-retains-daemon', 'last-window-hidden-to-tray', 'tray-activation-restores-same-engine']:
             if phase in events and phase not in captured:
                 root = Gdk.get_default_root_window()
                 pixels = Gdk.pixbuf_get_from_window(root, 0, 0, root.get_width(), root.get_height())

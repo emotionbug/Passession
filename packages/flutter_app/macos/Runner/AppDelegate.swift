@@ -9,7 +9,7 @@ class AppDelegate: FlutterAppDelegate {
   private var terminationPending = false
   private var terminationAllowed = false
 
-  // Only the hidden coordinator engine owns activation and process termination.
+  // The first user window's engine owns activation and process termination.
   func attachDesktopHost(to controller: FlutterViewController) {
     let channel = FlutterMethodChannel(
       name: "paseo/desktop_host_events",
@@ -45,7 +45,7 @@ class AppDelegate: FlutterAppDelegate {
   }
 
   private func activateHost(_ arguments: [String: Any] = [:]) {
-    // DesktopHost selects a user window; the coordinator must remain hidden.
+    // DesktopHost restores the preferred user window, including the primary.
     if hostReady {
       hostChannel?.invokeMethod("activate", arguments: arguments)
     } else {
