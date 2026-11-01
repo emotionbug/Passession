@@ -457,12 +457,18 @@ fn verify_package_config(sdk: &Path) -> Result<()> {
             reqwest::Url::parse(uri).is_err() && !uri.starts_with('/'),
             "Flutter package root is not portable"
         );
-        let path = base
-            .join(uri)?
+        let resolved = base.join(uri)?;
+        ensure!(
+            resolved.as_str().starts_with(root.as_str()),
+            "Flutter package root leaves the SDK before resolving filesystem aliases: {uri}"
+        );
+        let path = resolved
             .to_file_path()
             .map_err(|()| anyhow::anyhow!("Non-file package root"))?;
         ensure!(
-            path.canonicalize()?.starts_with(&canonical),
+            path.canonicalize()
+                .with_context(|| format!("Missing Flutter package root {}", path.display()))?
+                .starts_with(&canonical),
             "Flutter package escapes installed SDK"
         );
     }
@@ -489,10 +495,15 @@ fn portable_package_config(sdk: &Path) -> Result<()> {
         let path = absolute
             .to_file_path()
             .map_err(|()| anyhow::anyhow!("Non-file package rootUri"))?;
+        // Windows TEMP may use RUNNER~1 while canonicalize returns the long
+        // account name. Relativize the resolved path, not that machine-local alias.
+        let path = path.canonicalize()?;
         ensure!(
-            path.canonicalize()?.starts_with(&canonical),
+            path.starts_with(&canonical),
             "Flutter package references files outside the SDK"
         );
+        let absolute = reqwest::Url::from_directory_path(&path)
+            .map_err(|()| anyhow::anyhow!("Cannot encode canonical package root"))?;
         let relative = base
             .make_relative(&absolute)
             .context("Cannot make Flutter package reference portable")?;
@@ -1165,6 +1176,64 @@ pub fn run(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn package_roots_survive_relocation_without_source_path_aliases() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let sdk = temporary.path().join("source");
+        let package = sdk.join(".pub-cache/hosted/pub.dev/example-1.0.0");
+        fs::create_dir_all(package.join("lib"))?;
+        fs::write(package.join("lib/example.dart"), "library example;\n")?;
+        let config_path = sdk.join("packages/flutter_tools/.dart_tool/package_config.json");
+        fs::create_dir_all(config_path.parent().unwrap())?;
+
+        // A different spelling of the same directory models Windows 8.3 TEMP
+        // aliases without depending on short-name generation being enabled.
+        let alias = temporary.path().join("RUNNER~1");
+        std::os::unix::fs::symlink(&sdk, &alias)?;
+        let base = reqwest::Url::from_directory_path(config_path.parent().unwrap())
+            .map_err(|()| anyhow::anyhow!("Invalid fixture base"))?;
+        let alias_url = reqwest::Url::from_directory_path(
+            alias.join(".pub-cache/hosted/pub.dev/example-1.0.0"),
+        )
+        .map_err(|()| anyhow::anyhow!("Invalid fixture alias"))?;
+        common::write_json(
+            &config_path,
+            &serde_json::json!({
+                "configVersion": 2,
+                "packages": [{
+                    "name": "example",
+                    "rootUri": base.make_relative(&alias_url).unwrap(),
+                    "packageUri": "lib/"
+                }]
+            }),
+        )?;
+        assert!(verify_package_config(&sdk).is_err());
+        portable_package_config(&sdk)?;
+
+        let archive = temporary.path().join("sdk.tar.gz");
+        create_archive(&sdk, &archive)?;
+        fs::remove_file(&alias)?;
+        fs::remove_dir_all(&sdk)?;
+        let destination = temporary.path().join("installed");
+        fs::create_dir(&destination)?;
+        let installed = extract_archive(&archive, &destination)?;
+        verify_package_config(&installed)?;
+        let config = common::read_json(
+            &installed.join("packages/flutter_tools/.dart_tool/package_config.json"),
+        )?;
+        let base =
+            reqwest::Url::from_directory_path(installed.join("packages/flutter_tools/.dart_tool"))
+                .map_err(|()| anyhow::anyhow!("Invalid installed base"))?;
+        let library = base
+            .join(config["packages"][0]["rootUri"].as_str().unwrap())?
+            .join("lib/example.dart")?
+            .to_file_path()
+            .map_err(|()| anyhow::anyhow!("Invalid installed package root"))?;
+        assert_eq!(fs::read_to_string(library)?, "library example;\n");
+        Ok(())
+    }
 
     #[test]
     fn archives_preserve_sparse_input_as_portable_file() -> Result<()> {

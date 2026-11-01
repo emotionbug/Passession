@@ -49,6 +49,7 @@
 - Correct the pinned Flutter Windows bootstrap's Git revision command with digest-bound source bytes, so installed SDKs reuse their prebuilt tool snapshot instead of rebuilding it.
 - Flush native relay close frames when peer removal closes both notification channels, and acknowledge incoming closes before dropping the transport. Preserve replacement isolation and existing close codes instead of intermittently resetting sockets.
 - Store sparse Flutter SDK files as portable regular tar entries, keeping strict extraction checks instead of admitting special archive types.
+- Canonicalize Flutter SDK package roots before relocation, removing Windows short-path aliases that otherwise point back to the build runner after extraction.
 - Disable optional desktop JNI discovery brought in by Android-only platform implementations, avoiding an unused dependency on the build machine's JVM. Android JNI remains enabled.
 - Fixed existing conversations appearing empty after restarting the native daemon. Provider history replaces partial checkpoints before timeline pages are served, while retaining live events received during restoration.
 - Fixed repeated Pi/OMP assistant and reasoning text when cumulative snapshots arrive ahead of queued streaming deltas. Delta-only streams still preserve intentionally repeated text.

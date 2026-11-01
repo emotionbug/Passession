@@ -77,6 +77,8 @@ For Flutter 3.47.5, the pin also records one Windows bootstrap correction: upstr
 
 SDK archives encode sparse filesystem inputs as ordinary file data. Consumers continue accepting only regular files, directories and contained symlinks; GNU sparse and other special entry types are not permitted. The expanded-size limit therefore covers the full logical file data.
 
+Before making package roots relative, SDK assembly resolves filesystem aliases to canonical paths. In particular, Windows `RUNNER~1` temporary paths must not survive as references outside the archive. Validation rejects package URLs that leave the SDK even when a build-machine alias happens to resolve back into it; extracted SDKs must not depend on that machine's directory layout.
+
 Only the publish job has `contents: write`; builds and app consumers use read-only permissions. Publication validates both platform inventories and their builder revision, keeps the release draft until complete, and publishes a **non-latest prerelease**. The reserved `flutter-sdk-*` tag is not a Paseo product release, does not trigger the app release tag patterns, and must never replace the product's latest release or update feeds. Published SDK assets are immutable: do not delete, clobber, or repurpose an existing SDK tag.
 
 Publication refuses any existing reserved release or tag, including a partial draft; it neither resumes nor overwrites that identity. If publication fails after creating a draft, leave it untouched and select a new `rN` release tag in the pin before another authorized producer run. Consumers reject drafts and require the complete four-asset inventory with matching tag/builder revision.
