@@ -7,11 +7,18 @@ Agent chat delivery has two paths:
 
 The daemon retains projected items in memory. Each source event advances the stream sequence,
 then replaces the previous tool state or merges into the current text item. Intermediate payloads
-are never retained for history or catch-up. Provider history is the durable transcript authority
-and rebuilds the projection when an agent resumes.
+are never retained for history or catch-up. Provider history supplies the native transcript,
+but a successful replay call alone does not certify completeness. Providers distinguish complete
+snapshots from drained caches, bounded context or damaged/missing source records.
 Cached rows and startup notifications do not certify that replay has completed. A resumed agent's
-first history response waits for provider replay; live events received during recovery follow that
-replay instead of displacing it.
+first history response waits for replay; live events received during recovery follow it.
+
+A refresh must uniquely match every existing canonical row before replacing the projection,
+preserving client/provider message IDs and turn IDs. Ambiguous or missing matches retain the
+existing checkpoint. Agent snapshots expose `historySync.status` as `complete`, `partial`, or
+`retained`; an unverified replay can seed an empty projection without claiming completeness.
+Only an explicit rewind backed by a complete source may remove existing rows. Matching displayed
+content never settles a user-send receipt.
 
 Per-agent projection checkpoints live in `agent-timelines/{id}.sqlite3`. A retained SQLite
 connection commits the changed projected row and sequence metadata together using WAL and
@@ -134,6 +141,11 @@ temporary file and replay disk batches before the memory tail. A single oversize
 is spilled immediately; these thresholds estimate retained payload, not total allocator usage.
 The spool is not a durable event log; provider history remains authoritative after restart.
 
+The Pi/OMP stdout reader uses that spool independently of the admission stage. One delivery pump
+preserves ordinary-event FIFO, while correlated responses and host-tool call/cancel controls
+are handled at the reader rather than waiting for transcript publication. This does not move
+ordinary output ahead of an accepted steering prompt.
+
 Out-of-band commands are recognized synchronously without side effects. Their canonical prompt
 is published before execution starts in the background, without holding the admission stage or
 mutation lane until command completion. Command errors are streamed to that same cell.
@@ -145,6 +157,16 @@ and permits close/reload; a late acknowledgement cannot restore the failed owner
 Child transcripts use the same projected-page reconciliation as the main conversation. The client
 retains rendered items and sequence cursors, never a second cache of source events. Pagination
 uses the projected display anchor; live updates advance the source cursor without moving tools.
+
+Persistence uses `agent-subagents/{parentId}/index.sqlite3` for descriptors and one
+`{sha256(childId)}.sqlite3` timeline per child. Row/cursor changes use the same WAL/FULL
+commit-before-publication contract as parent timelines. Blocking storage work runs outside
+the async executor; ordinary events do not clone/rewrite sibling histories.
+
+The previous `agent-subagents/{parentId}.json` is imported once and left untouched as a migration
+backup. Native child replay uses guarded replacement, not append-to-restored-history. Existing
+children absent from an incomplete replay remain available. A changed child epoch triggers the
+existing projected-timeline resynchronization path.
 
 Clients advertising `projected_subagent_timeline` receive child streams and projected fetches.
 Updated clients require `features.projectedSubagentTimeline` for child history; older hosts show
@@ -227,33 +249,37 @@ its completion advances `seqEnd`, followed by a merged assistant message. The ap
 remaining page through the existing stream reducer. It must not append full projected text to a
 live prefix.
 
-Every path that sends a message to an agent — composer send, queued send-now, and the host
-runtime's automatic queue drain — goes through
-`dispatchComposerAgentMessage` with a submission writer. There is no second transport for the same
-product action: calling `client.sendAgentMessage` directly skips the submitted row and the pending
-footer, and permanently drops attachments because the daemon does not echo them back.
+Composer sends, queued send-now, and `ChatDelivery`'s queue drain preserve the same immutable
+message ID and behavior through `agentMessageFields`. `SentUserMessages` retains attachment
+presentation when the daemon echoes a text-only canonical user row.
 
-A submitted prompt is one `UserMessageItem` row. That row is the authoritative local presentation:
-its stable identity, text, timestamp, images, and attachments do not change when the provider
-acknowledges it. Submission lifecycle is a separate record keyed by agent, not another row shape.
-The transaction registry records two independent settlement facts: canonical acknowledgement and RPC
-settlement. Canonical acknowledgement retires optimistic activity immediately. When both facts are
-known, whichever arrives second deletes the record. A canonical acknowledgement that arrives first
-prevents a later transport error from rolling back a prompt already observed.
+A submitted prompt keeps its stable local presentation identity, text, images and attachments.
+`ChatDrafts` stores pending delivery separately from the editor generation. An authoritative
+receipt or successful legacy RPC can settle that exact send; a late error must not restore its
+text over a newer draft. Canonical row reconciliation changes presentation, not delivery evidence.
 
-The daemon's accepted response waits for the correlated run start and guarantees that the canonical
-submitted row has been recorded. It publishes the accepted turn's liveness before that row, so the
-client applies authoritative activity before canonical acknowledgement retires optimistic activity.
-Timeline render batching does not delay lifecycle application. Directory status never settles a
-submission. Overlapping sends settle independently rather than collapsing to one newest pending
-message.
+Host send admission, native provider acceptance, model consumption and canonical presentation
+are different observations. A canonical user row can record a rejected attempt and is not a
+delivery receipt. Timeline rendering or directory activity cannot settle an uncertain send.
 
-Daemons advertising `server_info.features.canonicalSubmittedPrompts` guarantee that every accepted
-human prompt carrying a client message id is recorded and streamed as a canonical `user_message` with that
-same id. This includes daemon-handled commands that do not allocate a foreground turn; their submitted
-row is recorded before handler output. The app tracks submission transactions only for hosts with this
-capability. Older hosts keep the shipped untracked optimistic-row behavior and roll that row back on RPC
-rejection.
+Hosts advertising `agentMessageReceipts` persist exact `(agentId, messageId)` receipts before
+dispatch. Clients query `agent.message_receipt.get.request`, explicitly subscribe to
+`agent.message_receipt.update`, and apply revisions monotonically. `submitted` with
+`correlation.acknowledgementPending: true` remains unconfirmed until a correlated native ACK;
+`accepted` does not prove that a model has consumed a steering instruction.
+
+Owner loss before the durable dispatch boundary is `not_delivered`; after that boundary it is
+`outcome_unknown`, unless native evidence proves acceptance or rejection. A missing receipt
+also means unknown, not safe-to-resend. No new-ID automatic retry is allowed.
+`agent.message_receipt.dismiss.request` creates a sticky exact-ID tombstone. Dismissing does not
+claim that already-dispatched work was stopped; a late ACK can improve delivery evidence but
+cannot clear dismissal or resurrect a client pending draft. Only proven non-delivery permits
+same-ID retry. Failed content is retained separately from newer editor generations.
+
+`canonicalSubmittedPrompts` still guarantees canonical presentation with the client's message
+ID, including daemon-handled commands. For older hosts without receipt support, an explicit
+successful RPC response settles the local send; a missing visible history row is never evidence
+of non-delivery. Local-only dismissal is labelled as such and does not claim remote cancellation.
 
 Turn activity has one client-side replica. Lifecycle events can attach `turnId`, and agent snapshots can
 expose `activeTurn: { turnId, startedAt } | null`. An identified terminal cannot close a different
@@ -262,7 +288,7 @@ cancellation requests, and every visible surface update the same per-agent recor
 both user-started foreground turns and autonomous provider turns;
 foreground control ownership remains a separate daemon concern. Cancellation request identity is stored
 with that record rather than in a widget, so an old request cannot clear a newer one. Submissions
-remain a separate pre-turn registry and retire on canonical acknowledgement.
+remain separate from the active provider turn and settle by exact-request delivery evidence.
 
 Canonical turns and visible responses are different boundaries. Agent-originated prompts and lifecycle
 notifications project into tool rows, so they do not create a human-message boundary. Legacy system

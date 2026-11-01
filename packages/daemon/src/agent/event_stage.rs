@@ -9,14 +9,14 @@ type Reader = serde_json::StreamDeserializer<'static, serde_json::de::IoRead<Buf
 /// Admission can await an RPC whose reply follows provider output on the same pipe.
 /// Spilling preserves FIFO without either unbounded RAM or blocking that reply.
 #[derive(Default)]
-pub(super) struct EventStage {
+pub(crate) struct EventStage {
     events: Vec<Value>,
     bytes: usize,
     spill: Option<BufWriter<File>>,
 }
 
 impl EventStage {
-    pub(super) async fn push(&mut self, event: Value) -> Result<()> {
+    pub(crate) async fn push(&mut self, event: Value) -> Result<()> {
         let bytes = event_size(&event);
         if !self.events.is_empty()
             && (self.events.len() >= MEMORY_EVENTS || self.bytes.saturating_add(bytes) > MEMORY_BYTES)
@@ -52,7 +52,7 @@ impl EventStage {
         Ok(())
     }
 
-    pub(super) async fn replay(self) -> Result<Replay> {
+    pub(crate) async fn replay(self) -> Result<Replay> {
         let disk = match self.spill {
             None => None,
             Some(mut writer) => Some(tokio::task::spawn_blocking(move || {
@@ -66,13 +66,13 @@ impl EventStage {
     }
 }
 
-pub(super) struct Replay {
+pub(crate) struct Replay {
     disk: Option<Reader>,
     tail: Vec<Value>,
 }
 
 impl Replay {
-    pub(super) async fn next_batch(&mut self) -> Result<Vec<Value>> {
+    pub(crate) async fn next_batch(&mut self) -> Result<Vec<Value>> {
         if let Some(mut reader) = self.disk.take() {
             let (reader, batch) = tokio::task::spawn_blocking(move || {
                 let mut batch = Vec::new();

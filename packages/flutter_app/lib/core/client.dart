@@ -43,6 +43,29 @@ class DaemonException implements Exception {
   String toString() => message;
 }
 
+class ChatRequestRejected implements Exception {
+  const ChatRequestRejected(this.message);
+  final String message;
+  @override
+  String toString() => message;
+}
+
+bool definitelyRejected(Object error) =>
+    error is ChatRequestRejected ||
+    (error is DaemonException && !error.outcomeUnknown);
+
+JsonMap requireSuccess(JsonMap payload) {
+  if (payload['error'] != null ||
+      payload['accepted'] == false ||
+      payload['ok'] == false ||
+      payload['success'] == false) {
+    throw ChatRequestRejected(
+      stringValue(payload['error'], 'The daemon rejected this operation'),
+    );
+  }
+  return payload;
+}
+
 /// Original `hello.rejected`: the reason keeps the daemon's wording, and only
 /// credential rejections stop automatic reconnects (`DaemonAuthenticationError`).
 class HelloRejectedException extends DaemonException {
@@ -97,6 +120,24 @@ class PaseoClient extends ChangeNotifier {
   JsonMap get serverInfo => _serverInfo;
   bool supports(String feature) =>
       (_serverInfo['features'] as Map?)?[feature] == true;
+
+  Future<JsonMap> messageReceipt(String agentId, String messageId, {bool dismiss = false}) async {
+    if (!supports('agentMessageReceipts')) {
+      throw StateError('This host cannot report or cancel message delivery.');
+    }
+    final operation = dismiss ? 'dismiss' : 'get';
+    final response = await request(
+      'agent.message_receipt.$operation.request',
+      {'agentId': agentId, 'messageId': messageId},
+      responseType: 'agent.message_receipt.$operation.response',
+    );
+    final receipt = jsonMap(response['receipt']);
+    if (receipt['agentId'] != agentId || receipt['messageId'] != messageId ||
+        receipt['revision'] is! int || (dismiss && receipt['dismissed'] != true)) {
+      throw const FormatException('Invalid message receipt identity or dismissal');
+    }
+    return receipt;
+  }
   final _events = StreamController<JsonMap>.broadcast(sync: true);
   final _binary = StreamController<Uint8List>.broadcast(sync: true);
   Stream<JsonMap> get events => _events.stream;

@@ -1,4 +1,8 @@
 use super::*;
+use super::receipts::{
+    Admission, DispatchGate, OUTCOME_UNKNOWN, QueuedAdmission, SendReceiptError, Settlement, replay,
+};
+use crate::providers::api::PromptDeliveryError;
 
 impl AgentManager {
     pub async fn send(&self, actor: &Value, id: &str, mut input: Value) -> Result<Value> {
@@ -57,6 +61,7 @@ impl AgentManager {
         let mut queue = input.clone();
         queue["recipientId"] = json!(id);
         queue["clearPendingPermissions"] = json!(true);
+        queue["receipted"] = json!(true);
         let request = receipt_request(&input, &prompt, Some(&source));
         let app = self.app.clone();
         let recipient = id.to_owned();
@@ -84,30 +89,44 @@ impl AgentManager {
             }
             .await;
             let result = match result {
-                Ok((manager, receipt)) => {
+                Ok((manager, admission)) => {
                     // Persistence and enqueue are complete. No dispatch, notification
                     // cleanup or recipient state read may delay this acknowledgement.
-                    let _ = admitted.send(Ok(()));
-                    match receipt {
-                        Some((receipt, owner)) => {
+                    match admission {
+                        QueuedAdmission::Owner(guard, receipt) => {
+                            let _ = admitted.send(Ok(()));
                             let result = receipt.dispatched(CancellationToken::new()).await;
-                            if owner {
-                                if let Err(error) = manager
-                                    .receipts()?
-                                    .finish_queued(&id, &message_id, result.is_ok())
-                                    .await
-                                {
-                                    tracing::error!(agent_id=%id,%error,"Queued message receipt completion failed");
-                                }
+                            // Dispatch settles its receipts; this reconciles only what an
+                            // early queue or dispatch failure left in flight.
+                            if let Err(error) = manager.receipts()?.finish(guard, &id, &message_id).await {
+                                tracing::error!(agent_id=%id,%error,"Queued message receipt completion failed");
                             }
                             result.map(|_| ())
                         }
-                        None => Ok(()),
+                        QueuedAdmission::Duplicate(receipt) => {
+                            let _ = admitted.send(Ok(()));
+                            receipt.dispatched(CancellationToken::new()).await.map(|_| ())
+                        }
+                        QueuedAdmission::Replay(receipt) => {
+                            let phase = receipt["phase"].as_str().unwrap_or("");
+                            if receipt["dismissed"] != true
+                                && matches!(phase, "submitted" | "accepted" | "preparing" | "queued" | "dispatching")
+                            {
+                                let _ = admitted.send(Ok(()));
+                                Ok(())
+                            } else {
+                                let error = replay(receipt).err().unwrap_or_else(|| anyhow!(OUTCOME_UNKNOWN));
+                                let message = error.to_string();
+                                let _ = admitted.send(Err(error));
+                                Err(anyhow!(message))
+                            }
+                        }
                     }
                 }
                 Err(error) => {
-                    let _ = admitted.send(Err(anyhow!(error.to_string())));
-                    Err(error)
+                    let message = error.to_string();
+                    let _ = admitted.send(Err(error));
+                    Err(anyhow!(message))
                 }
             };
             if let Some(registration) = registration {
@@ -128,7 +147,12 @@ impl AgentManager {
         admission
             .await
             .map_err(|_| anyhow!("agent_request_outcome_unknown: Agent message admission closed"))??;
-        Ok(json!({"deliveryStatus":"queued","status":status,"messageId":output_id}))
+        // Admission already succeeded; a failed read only omits the receipt.
+        let receipt = match self.receipts() {
+            Ok(receipts) => receipts.get(id, &output_id).await.unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        Ok(json!({"deliveryStatus":"queued","status":status,"messageId":output_id,"receipt":receipt}))
     }
     pub async fn send_immediate(&self, actor: &Value, id: &str, input: Value) -> Result<Value> {
         let manager = self.app()?.agents.clone();
@@ -140,6 +164,33 @@ impl AgentManager {
             .context("Agent send operation terminated")?
     }
     async fn send_immediate_owned(&self, actor: &Value, id: &str, input: Value) -> Result<Value> {
+        let prepared = input["preparedAgentMessage"] == true
+            && actor["kind"] == "system"
+            && actor["source"] == "agent-message-delivery";
+        let receipt_ids: Vec<String> = if prepared {
+            input["receiptIds"]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if receipt_ids.is_empty() {
+            return self.send_immediate_gated(actor, id, input, None).await;
+        }
+        // A queued batch already crossed its durable dispatch boundary.
+        let gate = DispatchGate::new(id, receipt_ids, false);
+        let result = self.send_immediate_gated(actor, id, input, Some(&gate)).await;
+        self.settle_dispatch(&gate, &result).await;
+        result
+    }
+    async fn send_immediate_gated(
+        &self,
+        actor: &Value,
+        id: &str,
+        input: Value,
+        gate: Option<&DispatchGate>,
+    ) -> Result<Value> {
         self.authorize(actor, id).await?;
         let prompt = build_prompt(&input)?;
         let source = if actor["kind"] == "agent" {
@@ -182,37 +233,117 @@ impl AgentManager {
             .await?
             .ok_or_else(|| anyhow!("Agent '{id}' not found"))?;
         if snapshot["archivedAt"].is_string() && !unarchive {
+            if gate.is_some() {
+                return Err(PromptDeliveryError::not_delivered("Agent is archived"));
+            }
             return Ok(json!({"disposition":"turn_started"}));
         }
-        let result = Mutex::new(None);
+        if gate.is_some() {
+            let cell = self.prepare_send(id, &run_input).await?;
+            return self.dispatch_prompt_gated(id, &cell, &run_input, gate).await;
+        }
         if let Some(message_id) = message_id
             .as_deref()
             .filter(|_| !prepared && snapshot["internal"] != true)
         {
-            self.receipts()?
-                .send(
-                    id,
-                    message_id,
-                    &request,
-                    || async { self.prepare_send(id, &run_input).await },
-                    |cell| {
-                        let run_input = &run_input;
-                        let result = &result;
-                        async move {
-                            let accepted = self.dispatch_prompt(id, &cell, run_input).await?;
-                            *result.lock().await = Some(accepted);
-                            Ok(())
-                        }
-                    },
-                )
-                .await?;
-            Ok(result.into_inner().unwrap_or(
-                json!({"disposition":"turn_started","deduplicated":true,"messageId":message_id}),
-            ))
-        } else {
-            let cell = self.prepare_send(id, &run_input).await?;
-            self.dispatch_prompt(id, &cell, &run_input).await
+            let receipts = self.receipts()?;
+            let owner = loop {
+                match receipts.admit(id, message_id, &request).await? {
+                    Admission::Run(owner) => break owner,
+                    Admission::Replay(receipt) => return replay(receipt),
+                    Admission::Wait(mut settled) => {
+                        // The live owner settles or ends; either way admit again.
+                        let _ = settled.wait_for(|done| *done).await;
+                    }
+                }
+            };
+            let gate = DispatchGate::new(id, vec![message_id.to_owned()], true);
+            let result = async {
+                let cell = self.prepare_send(id, &run_input).await?;
+                self.dispatch_prompt_gated(id, &cell, &run_input, Some(&gate)).await
+            }
+            .await;
+            let receipt = self.settle_dispatch(&gate, &result).await;
+            drop(owner);
+            return match (result, receipt) {
+                (Ok(mut value), Some(receipt)) => {
+                    value["receipt"] = receipt;
+                    Ok(value)
+                }
+                (Err(error), Some(receipt)) => {
+                    let message = error.to_string();
+                    Err(error.context(SendReceiptError { message, receipt }))
+                }
+                (result, None) => result,
+            };
         }
+        let cell = self.prepare_send(id, &run_input).await?;
+        self.dispatch_prompt(id, &cell, &run_input).await
+    }
+    /// Persist one attempt's outcome for every receipt it carried. A provider
+    /// acknowledgement that arrives later is followed by a detached owner.
+    async fn settle_dispatch(&self, gate: &DispatchGate, result: &Result<Value>) -> Option<Value> {
+        let receipts = match self.receipts() {
+            Ok(receipts) => receipts.clone(),
+            Err(error) => {
+                tracing::error!(agent_id=%gate.agent_id(),%error,"Message receipt settlement unavailable");
+                return None;
+            }
+        };
+        let acknowledgement = gate.take_acknowledgement();
+        let settlement = match result {
+            Ok(value) if value["disposition"] == "steered" => Settlement::Accepted {
+                result: Some(value.clone()),
+                correlation: gate.correlation(),
+            },
+            Ok(value) => Settlement::Submitted {
+                result: value.clone(),
+                correlation: gate.correlation(),
+                ack_pending: acknowledgement.is_some(),
+            },
+            Err(error) => Settlement::failure(error, gate.invoked()),
+        };
+        let mut first = None;
+        let mut followers = Vec::new();
+        for message_id in gate.message_ids() {
+            match receipts
+                .settle(gate.agent_id(), message_id, settlement.clone())
+                .await
+            {
+                Ok(receipt) => {
+                    first.get_or_insert(receipt);
+                }
+                Err(error) => {
+                    tracing::error!(agent_id=%gate.agent_id(),message_id,%error,"Message receipt settlement failed");
+                }
+            }
+            if acknowledgement.is_some() {
+                // Claimed after the submitted write, while the dispatch owner
+                // still holds liveness, so no reconciliation can intervene.
+                match receipts.claim(gate.agent_id(), message_id) {
+                    Ok(guard) => followers.push((message_id.clone(), guard)),
+                    Err(error) => {
+                        tracing::error!(agent_id=%gate.agent_id(),message_id,%error,"Message acknowledgement owner unavailable");
+                    }
+                }
+            }
+        }
+        if let Some(acknowledgement) = acknowledgement {
+            let agent_id = gate.agent_id().to_owned();
+            tokio::spawn(async move {
+                let settlement = Settlement::from(acknowledgement.await);
+                for (message_id, guard) in followers {
+                    if let Err(error) = receipts
+                        .settle(&agent_id, &message_id, settlement.clone())
+                        .await
+                    {
+                        tracing::error!(agent_id,message_id,%error,"Message acknowledgement settlement failed");
+                    }
+                    drop(guard);
+                }
+            });
+        }
+        first
     }
     async fn prepare_send(&self, id: &str, input: &Value) -> Result<Arc<AgentCell>> {
         let snapshot = self
@@ -245,8 +376,18 @@ impl AgentManager {
         cell: &Arc<AgentCell>,
         input: &Value,
     ) -> Result<Value> {
+        self.dispatch_prompt_gated(id, cell, input, None).await
+    }
+    /// With a gate, durable receipt phases bracket the provider prompt APIs.
+    async fn dispatch_prompt_gated(
+        &self,
+        id: &str,
+        cell: &Arc<AgentCell>,
+        input: &Value,
+        gate: Option<&DispatchGate>,
+    ) -> Result<Value> {
         let mutation = cell.mutation.lock().await;
-        let result = self.dispatch_prompt_unlocked(id, cell, input).await;
+        let result = self.dispatch_prompt_unlocked_gated(id, cell, input, gate).await;
         drop(mutation);
         if result.as_ref().is_err_and(|error| {
             error
@@ -256,7 +397,9 @@ impl AgentManager {
             self.reload(id, json!({}), false).await?;
             let replacement = self.cell(id).await?;
             let _mutation = replacement.mutation.lock().await;
-            return self.dispatch_prompt_unlocked(id, &replacement, input).await;
+            return self
+                .dispatch_prompt_unlocked_gated(id, &replacement, input, gate)
+                .await;
         }
         result
     }
@@ -265,6 +408,15 @@ impl AgentManager {
         id: &str,
         cell: &Arc<AgentCell>,
         input: &Value,
+    ) -> Result<Value> {
+        self.dispatch_prompt_unlocked_gated(id, cell, input, None).await
+    }
+    async fn dispatch_prompt_unlocked_gated(
+        &self,
+        id: &str,
+        cell: &Arc<AgentCell>,
+        input: &Value,
+        gate: Option<&DispatchGate>,
     ) -> Result<Value> {
         let session = cell
             .data
@@ -285,6 +437,11 @@ impl AgentManager {
         if input["requireIdle"] == true && is_busy(&before) {
             bail!("Agent {id} already has an active run");
         }
+        // The durable boundary follows the per-agent mutation lock, so waiting
+        // behind other work stays dismissible without any provider effect.
+        if let Some(gate) = gate {
+            self.receipts()?.begin(gate).await?;
+        }
         if let Some(mode) = text(input, "sessionMode") {
             self.change_mode(cell, session.as_ref(), mode).await?;
         }
@@ -295,6 +452,9 @@ impl AgentManager {
             let sink = cell.sink.clone();
             let cancel = cell.cancel.clone();
             let provider = session.provider().to_owned();
+            if let Some(gate) = gate {
+                gate.invoke();
+            }
             tokio::spawn(async move {
                 let result = tokio::select! {
                     biased;
@@ -320,6 +480,9 @@ impl AgentManager {
             steer_options["clearPendingPermissions"] =
                 json!(input["clearPendingPermissions"] == true);
             self.begin_event_stage(cell).await?;
+            if let Some(gate) = gate {
+                gate.invoke();
+            }
             let steered = tokio::select! {
                 biased;
                 _ = cell.cancel.cancelled() => Err(anyhow!("Agent event consumer closed")),
@@ -332,6 +495,9 @@ impl AgentManager {
             }
             let steered = steered?;
             if steered["status"] == "accepted" || steered["status"] == "steered" {
+                if let Some(gate) = gate {
+                    gate.correlate(json!({"turnId":expected,"delivery":"steer"}));
+                }
                 let submitted = self
                     .record_submitted(
                         id,
@@ -352,11 +518,19 @@ impl AgentManager {
                 text(&steered, "status"),
                 Some("unavailable" | "inactive" | "not_running")
             ) {
-                bail!("Provider did not accept steering: {steered}");
+                return Err(PromptDeliveryError::rejected(format!(
+                    "Provider did not accept steering: {steered}"
+                )));
+            }
+            // The provider reported the steer as not delivered.
+            if let Some(gate) = gate {
+                gate.revoke_invocation();
             }
             let current = cell.data.lock().await.snapshot.clone();
             if is_busy(&current) && text(&current, "activeTurnId") != expected.as_deref() {
-                bail!("Active turn changed before steering could be delivered");
+                return Err(PromptDeliveryError::not_delivered(
+                    "Active turn changed before steering could be delivered",
+                ));
             }
         }
         let busy = { is_busy(&cell.data.lock().await.snapshot) };
@@ -404,6 +578,9 @@ impl AgentManager {
             let _ = self.release_event_stage(cell).await;
             return Err(error);
         }
+        if let Some(gate) = gate {
+            gate.invoke();
+        }
         let accepted = tokio::select! {
             biased;
             _ = cell.cancel.cancelled() => Err(anyhow!("Agent event consumer closed")),
@@ -413,6 +590,12 @@ impl AgentManager {
         cell.data.lock().await.pending_replacement = false;
         match accepted {
             Ok(accepted) => {
+                if let (Some(gate), Some(turn_id)) = (gate, accepted["turnId"].as_str()) {
+                    gate.correlate(json!({"turnId":turn_id,"delivery":"start"}));
+                    if let Some(acknowledgement) = session.native_acknowledgement(turn_id) {
+                        gate.acknowledge_later(acknowledgement);
+                    }
+                }
                 let admitted = async {
                     let turn_id = required(&accepted, "turnId")?.to_owned();
                     self.update_snapshot(cell, |snapshot| {
@@ -984,10 +1167,17 @@ impl AgentManager {
                         Err(e) => return Err(e.into()),
                     }
                 }
-                self.subagent_store
-                    .lock()
-                    .map_err(|_| anyhow!("Subagent lock poisoned"))?
-                    .delete_parent(id);
+                let store = self.subagent_store.clone();
+                let parent = id.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.delete_parent(&parent);
+                    Ok::<_, anyhow::Error>(())
+                }).await??;
+                match tokio::fs::remove_dir_all(app.home.join("agent-subagents").join(id)).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
                 let _ = self
                     .events
                     .send(json!({"type":"agent_deleted","agentId":id}));
@@ -1281,7 +1471,7 @@ impl AgentManager {
                 }
                 session.rewind(target, &provider_id).await?;
                 if mode != "files" {
-                    self.hydrate_history_for(id, &cell, true, text(&input, "_initiatingSourceId"))
+                    self.hydrate_history_for(id, &cell, true, text(&input, "_initiatingSourceId"), true)
                         .await?;
                 }
                 Ok(json!({"agent":cell.data.lock().await.snapshot}))
@@ -1300,11 +1490,10 @@ impl AgentManager {
             return Ok(json!({"unarchived":false}));
         }
         if let Some(handle) = snapshot.get("persistence").filter(|v| v.is_object()) {
-            self.app()?
-                .providers
-                .get(required(&snapshot, "provider")?)?
-                .unarchive_native_session(handle)
-                .await?;
+            let factory = self.app()?.providers.get(required(&snapshot, "provider")?)?;
+            if factory.supports_native_archive() {
+                factory.unarchive_native_session(handle).await?;
+            }
         }
         snapshot["archivedAt"] = Value::Null;
         snapshot["updatedAt"] = json!(next_updated_at(&snapshot["updatedAt"]));
@@ -1376,8 +1565,10 @@ impl AgentManager {
         }
         if let Some(handle) = snapshot.get("persistence").filter(|v| v.is_object()) {
             if let Ok(factory) = self.app()?.providers.get(required(&snapshot, "provider")?) {
-                if let Err(error) = factory.archive_native_session(handle).await {
-                    tracing::warn!(agent_id=id,%error,"Failed to archive native session");
+                if factory.supports_native_archive() {
+                    if let Err(error) = factory.archive_native_session(handle).await {
+                        tracing::warn!(agent_id=id,%error,"Failed to archive native session");
+                    }
                 }
             }
         }
@@ -1519,12 +1710,93 @@ mod tests {
             manager.message_delivery.shutdown(),
         )
         .await??;
+        // Queue dispatch settled the durable receipt before shutdown drained it.
+        let phase = manager.receipts()?.get(id, "blocked-delivery").await?["phase"].clone();
+        assert!(matches!(phase.as_str(), Some("submitted" | "accepted")), "{phase}");
         cell.cancel.cancel();
         source.cancel.cancel();
         if let Some(task) = cell.task.lock().await.take() {
             task.await?;
         }
         if let Some(task) = source.task.lock().await.take() {
+            task.await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_send_dismissed_behind_running_work_never_dispatches() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = AppState::new(
+            root.path().join("home"),
+            root.path().into(),
+            std::env::current_exe()?,
+        );
+        let manager = &app.agents;
+        manager
+            .receipts
+            .get_or_init(|| async { MessageReceipts::new(app.home.clone()) })
+            .await;
+        let id = "00000000-0000-4000-8000-000000000041";
+        let cell = runtime::tests::staged_cell(&app, id).await;
+        manager.release_event_stage(&cell).await?;
+        cell.data.lock().await.snapshot["internal"] = json!(false);
+        // Another dispatch holds the agent; the new prompt waits behind it.
+        let mutation = cell.mutation.lock().await;
+        let sender = app.clone();
+        let send = tokio::spawn(async move {
+            sender
+                .agents
+                .send(
+                    &json!({"kind":"owner"}),
+                    id,
+                    json!({"text":"replace it","messageId":"blocked","activeTurnBehavior":"interrupt"}),
+                )
+                .await
+        });
+        let receipts = manager.receipts()?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while receipts.get(id, "blocked").await?["phase"] != "preparing" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        // Query and dismissal complete while the dispatch lock is still held.
+        let dismissed = tokio::time::timeout(Duration::from_secs(1), receipts.dismiss(id, "blocked"))
+            .await??;
+        assert_eq!(dismissed["dismissed"], true);
+        drop(mutation);
+        let error = tokio::time::timeout(Duration::from_secs(3), send).await??.unwrap_err();
+        assert_eq!(error.to_string(), "agent_request_dismissed");
+        let receipt = &error.downcast_ref::<SendReceiptError>().unwrap().receipt;
+        assert_eq!(receipt["phase"], "not_delivered");
+        assert_eq!(receipt["mayHaveExecuted"], false);
+        // The running turn was neither interrupted nor replaced.
+        assert_eq!(cell.data.lock().await.snapshot["activeTurnId"], "live-turn");
+        // Once idle, a fresh identity starts a turn; its retry replays the
+        // recorded result without a second provider prompt.
+        manager
+            .apply_event(
+                id,
+                &cell,
+                json!({"type":"turn_completed","provider":"mock","turnId":"live-turn"}),
+                false,
+            )
+            .await?;
+        let input = json!({"text":"start it","messageId":"start","activeTurnBehavior":"interrupt"});
+        let started = manager.send(&json!({"kind":"owner"}), id, input.clone()).await?;
+        assert_eq!(started["disposition"], "turn_started");
+        assert_eq!(started["receipt"]["phase"], "submitted");
+        assert_eq!(started["receipt"]["correlation"]["turnId"], started["turnId"]);
+        // The mock provider exposes no separate native acknowledgement.
+        assert_eq!(started["receipt"]["correlation"]["acknowledgementPending"], false);
+        let replayed = manager.send(&json!({"kind":"owner"}), id, input).await?;
+        assert_eq!(replayed["deduplicated"], true);
+        assert_eq!(replayed["turnId"], started["turnId"]);
+        assert_eq!(replayed["receipt"]["revision"], started["receipt"]["revision"]);
+        cell.cancel.cancel();
+        if let Some(task) = cell.task.lock().await.take() {
             task.await?;
         }
         Ok(())

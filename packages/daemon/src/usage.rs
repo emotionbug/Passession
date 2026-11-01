@@ -158,6 +158,7 @@ type Reports = Vec<(String, KnownReport)>;
 struct AgentReports {
     signature: Value,
     reports: Reports,
+    complete: bool,
 }
 struct CacheEntry {
     at: Instant,
@@ -182,6 +183,11 @@ struct Inner {
 #[derive(Clone)]
 pub struct UsageService {
     inner: Arc<Inner>,
+}
+
+pub struct UsageReports {
+    pub entries: Value,
+    pub unavailable_sources: Vec<String>,
 }
 impl UsageService {
     pub fn new(home: PathBuf) -> Self {
@@ -227,8 +233,7 @@ impl UsageService {
         context: &UsageContext,
         cancel: CancellationToken,
     ) -> Result<Value> {
-        self.list_reports_inner(request, context, cancel, None)
-            .await
+        Ok(self.list_reports_inner(request, context, cancel, None).await?.entries)
     }
 
     /// Streams report entries as each account finishes; sender values are bare entries.
@@ -238,7 +243,7 @@ impl UsageService {
         context: &UsageContext,
         cancel: CancellationToken,
         updates: mpsc::Sender<Value>,
-    ) -> Result<Value> {
+    ) -> Result<UsageReports> {
         self.list_reports_inner(request, context, cancel, Some(updates))
             .await
     }
@@ -249,7 +254,7 @@ impl UsageService {
         context: &UsageContext,
         cancel: CancellationToken,
         updates: Option<mpsc::Sender<Value>>,
-    ) -> Result<Value> {
+    ) -> Result<UsageReports> {
         let request = request.get("payload").unwrap_or(request);
         let agent_id = request
             .get("agentId")
@@ -309,11 +314,14 @@ impl UsageService {
                 .iter()
                 .find(|session| session.get("agentId").and_then(Value::as_str) == Some(agent_id))
                 .ok_or_else(|| anyhow!("Unknown agent: {agent_id}"))?;
+            if session["_runtimeUnavailable"] == true {
+                bail!("Agent usage state is temporarily unavailable: {agent_id}");
+            }
             if session.get("provider").and_then(Value::as_str).is_none() {
                 let mut state = self.inner.state.lock().unwrap();
                 state.by_agent.retain(|(id, _)| id != agent_id);
                 prune_cache(&mut state);
-                return Ok(json!([]));
+                return Ok(UsageReports { entries: json!([]), unavailable_sources: Vec::new() });
             }
             let signature = session_signature(session);
             let cached = {
@@ -321,7 +329,7 @@ impl UsageService {
                 state
                     .by_agent
                     .iter()
-                    .find(|(id, mapping)| id == agent_id && mapping.signature == signature)
+                    .find(|(id, mapping)| id == agent_id && mapping.signature == signature && mapping.complete)
                     .map(|(_, mapping)| mapping.reports.clone())
             };
             if let Some(cached) = cached {
@@ -352,32 +360,10 @@ impl UsageService {
                         })
                         .unwrap_or_default(),
                 };
-                let reports = tokio::select! {
-                    _ = cancel.cancelled() => bail!("Usage request cancelled"),
-                    reports = discover(&rt, &scope, &[], &sources) => reports,
-                };
-                let mut state = self.inner.state.lock().unwrap();
-                // Original publishes unless the agent was resumed under another sessionKey.
-                if state.sessions.get(agent_id).map(|current| &current[2]) != Some(&signature[2]) {
-                    return Ok(json!([]));
-                }
-                if let Some((_, mapping)) = state.by_agent.iter_mut().find(|(id, _)| id == agent_id)
-                {
-                    *mapping = AgentReports {
-                        signature,
-                        reports: reports.clone(),
-                    };
-                } else {
-                    state.by_agent.push((
-                        agent_id.to_owned(),
-                        AgentReports {
-                            signature,
-                            reports: reports.clone(),
-                        },
-                    ));
-                }
-                prune_cache(&mut state);
-                reports
+                return self.discover_and_fetch(
+                    &rt, &scope, &sources, Some((agent_id, &signature)),
+                    force, &cancel, updates.as_ref(),
+                ).await;
             }
         } else if let Some(ids) = report_ids {
             let known = merged_reports(&self.inner.state.lock().unwrap());
@@ -387,21 +373,27 @@ impl UsageService {
                 .filter_map(|id| known.iter().find(|(known_id, _)| *known_id == id).cloned())
                 .collect()
         } else {
-            let previous = self.inner.state.lock().unwrap().defaults.clone();
+            // Each source discovers and fetches independently. A slow credential
+            // store or plugin must not hold already-discovered accounts behind it.
             let scope = UsageScope {
                 provider: None,
                 model: None,
                 env: context.env.clone(),
             };
-            let defaults = tokio::select! {
-                _ = cancel.cancelled() => bail!("Usage request cancelled"),
-                defaults = discover(&rt,&scope,&previous,&sources) => defaults,
-            };
-            let mut state = self.inner.state.lock().unwrap();
-            state.defaults = defaults;
-            prune_cache(&mut state);
-            merged_reports(&state)
+            return self.discover_and_fetch(
+                &rt, &scope, &sources, None, force, &cancel, updates.as_ref(),
+            ).await;
         };
+        Ok(UsageReports {
+            entries: self.fetch_reports(reports, force, &rt, &cancel, updates.as_ref()).await?,
+            unavailable_sources: Vec::new(),
+        })
+    }
+
+    async fn fetch_reports(
+        &self, reports: Reports, force: bool, rt: &UsageRuntime,
+        cancel: &CancellationToken, updates: Option<&mpsc::Sender<Value>>,
+    ) -> Result<Value> {
         let mut pending = FuturesUnordered::new();
         for (index, (id, known)) in reports.into_iter().enumerate() {
             let rt = rt.clone();
@@ -427,6 +419,89 @@ impl UsageService {
         Ok(Value::Array(
             entries.into_iter().map(|(_, entry)| entry).collect(),
         ))
+    }
+
+    async fn discover_and_fetch(
+        &self, rt: &UsageRuntime, scope: &UsageScope, sources: &[Source],
+        agent: Option<(&str, &Value)>, force: bool, cancel: &CancellationToken,
+        updates: Option<&mpsc::Sender<Value>>,
+    ) -> Result<UsageReports> {
+        let mut pending = FuturesUnordered::new();
+        for (index, source) in sources.iter().enumerate() {
+            pending.push(async move {
+                let previous = {
+                    let state = self.inner.state.lock().unwrap();
+                    let reports = match agent {
+                        Some((id, signature)) => state.by_agent.iter()
+                            .find(|(key, mapping)| key == id && &mapping.signature == signature)
+                            .map(|(_, mapping)| mapping.reports.as_slice()).unwrap_or(&[]),
+                        None => state.defaults.as_slice(),
+                    };
+                    reports.iter().filter(|(_, known)| known.source == *source)
+                        .cloned().collect::<Reports>()
+                };
+                let (discovered, failed) = tokio::select! {
+                    _ = cancel.cancelled() => bail!("Usage request cancelled"),
+                    result = discover_source(rt, scope, &previous, source) => result,
+                };
+                let reports = {
+                    let mut state = self.inner.state.lock().unwrap();
+                    if let Some((id, signature)) = agent {
+                        if state.sessions.get(id) != Some(signature) {
+                            bail!("Agent usage session changed during discovery");
+                        }
+                        let position = match state.by_agent.iter().position(|(key, _)| key == id) {
+                            Some(position) => position,
+                            None => {
+                                state.by_agent.push((id.to_owned(), AgentReports {
+                                    signature: signature.clone(), reports: Vec::new(), complete: false,
+                                }));
+                                state.by_agent.len() - 1
+                            }
+                        };
+                        let mapping = &mut state.by_agent[position].1;
+                        if &mapping.signature != signature {
+                            mapping.signature = signature.clone();
+                            mapping.reports.clear();
+                        }
+                        mapping.complete = false;
+                        mapping.reports.retain(|(_, known)| known.source != *source);
+                        mapping.reports.extend(discovered);
+                        mapping.reports.iter().filter(|(_, known)| known.source == *source)
+                            .cloned().collect()
+                    } else {
+                        state.defaults.retain(|(_, known)| known.source != *source);
+                        state.defaults.extend(discovered);
+                        merged_reports(&state).into_iter()
+                            .filter(|(_, known)| known.source == *source).collect()
+                    }
+                };
+                let entries = self.fetch_reports(reports, force, rt, cancel, updates).await?;
+                Ok::<_, anyhow::Error>((index, entries, failed.then(|| source.id().to_owned())))
+            });
+        }
+        let mut completed = Vec::new();
+        let mut unavailable_sources = Vec::new();
+        while let Some(result) = pending.next().await {
+            let (index, entries, failed) = result?;
+            completed.push((index, entries));
+            if let Some(id) = failed { unavailable_sources.push(id); }
+        }
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            if let Some((id, signature)) = agent {
+                if let Some((_, mapping)) = state.by_agent.iter_mut()
+                    .find(|(key, mapping)| key == id && &mapping.signature == signature) {
+                    mapping.complete = unavailable_sources.is_empty();
+                }
+            }
+            prune_cache(&mut state);
+        }
+        completed.sort_by_key(|(index, _)| *index);
+        let entries = completed.into_iter().flat_map(|(_, entries)| {
+            match entries { Value::Array(entries) => entries, _ => unreachable!() }
+        }).collect::<Vec<_>>();
+        Ok(UsageReports { entries: Value::Array(entries), unavailable_sources })
     }
 
     async fn fetch_id(
@@ -630,14 +705,17 @@ fn prune_cache(state: &mut State) {
     state.cache.retain(|key, _| active.contains(key));
     state.successful.retain(|key, _| active.contains(key));
 }
-async fn discover(
+async fn discover_source(
     rt: &UsageRuntime,
     scope: &UsageScope,
     previous: &[(String, KnownReport)],
-    sources: &[Source],
-) -> Reports {
-    let results = futures_util::future::join_all(sources.iter().map(|source| async move {
-        match source.discover(rt, scope).await.and_then(validate_accounts) {
+    source: &Source,
+) -> (Reports, bool) {
+        // Use the same source-operation deadline as fetch, not a global barrier.
+        let discovered = tokio::time::timeout(Duration::from_secs(20), source.discover(rt, scope))
+            .await.map_err(|_| anyhow!("Usage discovery timed out"))
+            .and_then(|result| result).and_then(validate_accounts);
+        match discovered {
             Ok(accounts) => {
                 let mut reports: Reports = Vec::new();
                 for account in accounts {
@@ -668,21 +746,18 @@ async fn discover(
                         ));
                     }
                 }
-                reports
+                (reports, false)
             }
             Err(_) => {
                 // Never include store contents, token-bearing request URLs, or raw errors in logs.
                 tracing::warn!(source_id = source.id(), "Usage source discovery failed");
-                previous
+                (previous
                     .iter()
                     .filter(|(_, known)| known.source == *source)
                     .cloned()
-                    .collect()
+                    .collect(), true)
             }
         }
-    }))
-    .await;
-    results.into_iter().flatten().collect()
 }
 fn validate_accounts(accounts: Vec<UsageAccount>) -> Result<Vec<UsageAccount>> {
     for account in &accounts {

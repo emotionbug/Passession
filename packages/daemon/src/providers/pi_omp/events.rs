@@ -106,7 +106,6 @@ impl Mapper {
         self.suppress_next_start = true;
         self.event("turn_started")
     }
-    #[cfg(test)]
     pub fn active_turn_id(&self) -> Option<&str> {
         self.turn.as_deref()
     }

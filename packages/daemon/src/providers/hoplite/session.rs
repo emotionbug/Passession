@@ -740,11 +740,11 @@ impl AgentSession for HopliteSession {
     async fn steer_active_turn(&self, _prompt: Value, _options: Value) -> Result<Value> {
         Ok(json!({"status":"unavailable"}))
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
         for event in self.history() {
             sink.emit(event).await?;
         }
-        Ok(())
+        Ok(crate::providers::api::HistoryCoverage::Unverified)
     }
     async fn runtime_info(&self) -> Result<Value> {
         Ok(self.inner.runtime())

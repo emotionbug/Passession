@@ -3,6 +3,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+#[path = "subagent_storage.rs"]
+mod persistence;
+
 #[derive(Default)]
 struct Buffer {
     entries: Vec<Value>,
@@ -135,6 +138,7 @@ impl StreamCoalescer {
 pub struct SubagentStore {
     descriptors: Vec<Value>,
     timelines: HashMap<(String, String), Timeline>,
+    catalogs: HashMap<String, rusqlite::Connection>,
 }
 impl SubagentStore {
     pub fn apply(&mut self, parent_id: &str, provider: &str, event: &Value) -> Result<Value> {
@@ -268,6 +272,7 @@ impl SubagentStore {
             .collect();
         self.descriptors.retain(|d| d["parentAgentId"] != parent_id);
         self.timelines.retain(|(parent, _), _| parent != parent_id);
+        self.catalogs.remove(parent_id);
         ids.into_iter()
             .map(|id| json!({"type":"remove","parentAgentId":parent_id,"subagentId":id}))
             .collect()

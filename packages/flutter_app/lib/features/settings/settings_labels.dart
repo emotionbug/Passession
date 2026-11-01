@@ -27,15 +27,8 @@ String settingsLabel(BuildContext context, String label) {
     'Schedules': 'sidebar.sections.schedules',
     'Refresh': 'usage.refresh',
     'system': 'settings.general.language.options.system',
-    'ar': 'settings.general.language.options.ar',
     'en': 'settings.general.language.options.en',
-    'es': 'settings.general.language.options.es',
-    'fr': 'settings.general.language.options.fr',
-    'ja': 'settings.general.language.options.ja',
     'ko': 'settings.general.language.options.ko',
-    'pt-BR': 'settings.general.language.options.ptBR',
-    'ru': 'settings.general.language.options.ru',
-    'zh-CN': 'settings.general.language.options.zhCN',
   };
   final key = keys[label];
   if (key == null) return label;

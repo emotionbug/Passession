@@ -6,6 +6,370 @@
       "properties": {
         "type": {
           "type": "string",
+          "const": "agent.message_receipt.get.response"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string"
+            },
+            "agentId": {
+              "type": "string"
+            },
+            "messageId": {
+              "type": "string"
+            },
+            "receipt": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "agentId": {
+                      "type": "string"
+                    },
+                    "messageId": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "phase": {
+                      "type": "string",
+                      "enum": [
+                        "preparing",
+                        "queued",
+                        "dispatching",
+                        "submitted",
+                        "accepted",
+                        "rejected",
+                        "not_delivered",
+                        "outcome_unknown",
+                        "missing"
+                      ]
+                    },
+                    "dismissed": {
+                      "type": "boolean"
+                    },
+                    "mayHaveExecuted": {
+                      "type": "boolean"
+                    },
+                    "canRetry": {
+                      "type": "boolean"
+                    },
+                    "fingerprint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "result": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "updatedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "correlation": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "agentId",
+                    "messageId",
+                    "revision",
+                    "phase",
+                    "dismissed",
+                    "mayHaveExecuted",
+                    "canRetry",
+                    "fingerprint",
+                    "result",
+                    "error",
+                    "updatedAt",
+                    "correlation"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "requestId",
+            "agentId",
+            "messageId",
+            "receipt",
+            "error"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "agent.message_receipt.dismiss.response"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string"
+            },
+            "agentId": {
+              "type": "string"
+            },
+            "messageId": {
+              "type": "string"
+            },
+            "receipt": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "agentId": {
+                      "type": "string"
+                    },
+                    "messageId": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "phase": {
+                      "type": "string",
+                      "enum": [
+                        "preparing",
+                        "queued",
+                        "dispatching",
+                        "submitted",
+                        "accepted",
+                        "rejected",
+                        "not_delivered",
+                        "outcome_unknown",
+                        "missing"
+                      ]
+                    },
+                    "dismissed": {
+                      "type": "boolean"
+                    },
+                    "mayHaveExecuted": {
+                      "type": "boolean"
+                    },
+                    "canRetry": {
+                      "type": "boolean"
+                    },
+                    "fingerprint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "result": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "updatedAt": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "correlation": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "agentId",
+                    "messageId",
+                    "revision",
+                    "phase",
+                    "dismissed",
+                    "mayHaveExecuted",
+                    "canRetry",
+                    "fingerprint",
+                    "result",
+                    "error",
+                    "updatedAt",
+                    "correlation"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "requestId",
+            "agentId",
+            "messageId",
+            "receipt",
+            "error"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "agent.message_receipt.update"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "subscriptionId": {
+              "type": "string"
+            },
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "agentId": {
+                  "type": "string"
+                },
+                "messageId": {
+                  "type": "string"
+                },
+                "revision": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "phase": {
+                  "type": "string",
+                  "enum": [
+                    "preparing",
+                    "queued",
+                    "dispatching",
+                    "submitted",
+                    "accepted",
+                    "rejected",
+                    "not_delivered",
+                    "outcome_unknown",
+                    "missing"
+                  ]
+                },
+                "dismissed": {
+                  "type": "boolean"
+                },
+                "mayHaveExecuted": {
+                  "type": "boolean"
+                },
+                "canRetry": {
+                  "type": "boolean"
+                },
+                "fingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "result": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updatedAt": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "correlation": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "agentId",
+                "messageId",
+                "revision",
+                "phase",
+                "dismissed",
+                "mayHaveExecuted",
+                "canRetry",
+                "fingerprint",
+                "result",
+                "error",
+                "updatedAt",
+                "correlation"
+              ]
+            }
+          },
+          "required": [
+            "receipt"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
           "const": "hosts.list.response"
         },
         "payload": {
@@ -49778,6 +50142,88 @@
             "deliveryStatus": {
               "type": "string",
               "const": "queued"
+            },
+            "receipt": {
+              "type": "object",
+              "properties": {
+                "agentId": {
+                  "type": "string"
+                },
+                "messageId": {
+                  "type": "string"
+                },
+                "revision": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "phase": {
+                  "type": "string",
+                  "enum": [
+                    "preparing",
+                    "queued",
+                    "dispatching",
+                    "submitted",
+                    "accepted",
+                    "rejected",
+                    "not_delivered",
+                    "outcome_unknown",
+                    "missing"
+                  ]
+                },
+                "dismissed": {
+                  "type": "boolean"
+                },
+                "mayHaveExecuted": {
+                  "type": "boolean"
+                },
+                "canRetry": {
+                  "type": "boolean"
+                },
+                "fingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "result": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updatedAt": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "correlation": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "agentId",
+                "messageId",
+                "revision",
+                "phase",
+                "dismissed",
+                "mayHaveExecuted",
+                "canRetry",
+                "fingerprint",
+                "result",
+                "error",
+                "updatedAt",
+                "correlation"
+              ]
             },
             "error": {
               "type": [

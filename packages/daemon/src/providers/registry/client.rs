@@ -133,6 +133,9 @@ impl AgentProvider for Client {
     fn capabilities(&self) -> &Value {
         self.inner.capabilities()
     }
+    fn supports_native_archive(&self) -> bool {
+        self.inner.supports_native_archive()
+    }
     fn resolve_create_config(&self, input: &Value) -> Option<Result<Value>> {
         self.inner.resolve_create_config(input)
     }

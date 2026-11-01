@@ -11,29 +11,6 @@ import 'creation_recovery.dart';
 
 List<JsonMap> maps(Object? value) => jsonList(value).map(jsonMap).toList();
 
-class ChatRequestRejected implements Exception {
-  const ChatRequestRejected(this.message);
-  final String message;
-  @override
-  String toString() => message;
-}
-
-bool definitelyRejected(Object error) =>
-    error is ChatRequestRejected ||
-    (error is DaemonException && !error.outcomeUnknown);
-
-JsonMap requireSuccess(JsonMap payload) {
-  if (payload['error'] != null ||
-      payload['accepted'] == false ||
-      payload['ok'] == false ||
-      payload['success'] == false) {
-    throw ChatRequestRejected(
-      stringValue(payload['error'], 'The daemon rejected this operation'),
-    );
-  }
-  return payload;
-}
-
 /// timeline-fetch-policy.ts TIMELINE_FETCH_PAGE_SIZE: projected items per page.
 const timelineFetchPageSize = 40;
 

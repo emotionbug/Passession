@@ -85,6 +85,38 @@ impl EventSink {
     }
 }
 
+/// Definite prompt delivery evidence raised synchronously by a provider or the
+/// manager. `rejected` means the provider explicitly refused the prompt; false
+/// means it was proven never to reach the provider. Ambiguous failures must not
+/// use this type.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct PromptDeliveryError {
+    pub rejected: bool,
+    pub message: String,
+}
+impl PromptDeliveryError {
+    pub fn not_delivered(message: impl Into<String>) -> anyhow::Error {
+        Self { rejected: false, message: message.into() }.into()
+    }
+    pub fn rejected(message: impl Into<String>) -> anyhow::Error {
+        Self { rejected: true, message: message.into() }.into()
+    }
+}
+
+/// A native acknowledgement correlated to one provider prompt request.
+#[derive(Clone, Debug)]
+pub enum PromptAck {
+    /// Native evidence, for example the provider request ID.
+    Accepted(Value),
+    Rejected(String),
+    /// The request was proven never written to the provider.
+    NotDelivered(String),
+    /// The request may have reached the provider without an acknowledgement.
+    Unknown(String),
+}
+pub type PromptAckFuture = futures_util::future::BoxFuture<'static, PromptAck>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RewindTarget {
     Conversation,
@@ -98,6 +130,14 @@ pub struct ImportedSession {
     pub persistence: Value,
     pub timeline: Vec<Value>,
     pub provider_subagent_events: Vec<Value>,
+}
+
+/// A successful replay may still be a drained cache or bounded context window.
+/// Only a complete source snapshot can authorize explicit history truncation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HistoryCoverage {
+    Complete,
+    Unverified,
 }
 
 /// Values retain the existing agent-sdk-types.ts shapes, including opaque native
@@ -116,7 +156,7 @@ pub trait AgentSession: Send + Sync {
 
     async fn start_turn(&self, prompt: Value, options: Value) -> Result<Value>;
     async fn steer_active_turn(&self, prompt: Value, options: Value) -> Result<Value>;
-    async fn stream_history(&self, sink: EventSink) -> Result<()>;
+    async fn stream_history(&self, sink: EventSink) -> Result<HistoryCoverage>;
     async fn runtime_info(&self) -> Result<Value>;
     async fn available_modes(&self) -> Result<Vec<Value>>;
     async fn current_mode(&self) -> Result<Option<String>>;
@@ -142,12 +182,21 @@ pub trait AgentSession: Send + Sync {
     ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
         None
     }
+    /// Some providers return a turn ID before their native prompt request is
+    /// acknowledged. They return that turn's correlated acknowledgement here,
+    /// once; None means no separate native acknowledgement is observable.
+    fn native_acknowledgement(&self, _turn_id: &str) -> Option<PromptAckFuture> {
+        None
+    }
 }
 
 #[async_trait]
 pub trait AgentProvider: Send + Sync {
     fn id(&self) -> &str;
     fn capabilities(&self) -> &Value;
+    /// Whether the provider has paired native archive/restore operations.
+    /// Paseo's own archive metadata remains supported for every provider.
+    fn supports_native_archive(&self) -> bool { false }
     /// None delegates to the registry's generic creation policy, matching the
     /// original optional provider hook rather than overriding it with defaults.
     fn resolve_create_config(&self, _input: &Value) -> Option<Result<Value>> {

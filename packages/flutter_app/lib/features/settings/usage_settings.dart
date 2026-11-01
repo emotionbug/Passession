@@ -223,11 +223,14 @@ class HostUsageReports extends ChangeNotifier {
       onReport?.call(report);
     });
     try {
-      await settingsRequest(client, 'usage.list_reports.request', {
+      final result = await settingsRequest(client, 'usage.list_reports.request', {
         'requestId': requestId,
         'forceRefresh': force,
         'reportIds': ?reportIds,
       }, responseType: 'usage.list_reports.response');
+      if (result['complete'] == false) {
+        throw StateError('Some usage sources or sessions are unavailable. Received reports remain visible.');
+      }
       return reports;
     } finally {
       await subscription.cancel();

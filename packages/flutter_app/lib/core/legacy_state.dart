@@ -676,7 +676,10 @@ JsonMap _missing(JsonMap existing, JsonMap imported) => {
 };
 
 const _themes = {'light', 'dark', 'auto', 'zinc', 'midnight', 'claude', 'ghostty', 'pureBlack', 'plugin'};
-const _languages = {'system', 'ar', 'en', 'es', 'fr', 'ja', 'ko', 'pt-BR', 'ru', 'zh-CN'};
+/// Language values the original app's settings schema accepted. Imports keep
+/// them literally; values without a catalog now resolve to English at runtime
+/// (`paseoLanguagePreference`), so the import never rewrites user settings.
+const _legacyLanguages = {'system', 'ar', 'en', 'es', 'fr', 'ja', 'ko', 'pt-BR', 'ru', 'zh-CN'};
 
 /// Original parseClampedFontSize: finite number or nonblank numeric string, floored and clamped.
 int? _clamped(dynamic value, int min, int max) {
@@ -721,7 +724,7 @@ void _normalizeSettings(JsonMap settings, {required bool legacyKey, required boo
     if (settings.containsKey(key) && !allowed.contains(settings[key])) settings[key] = fallback;
   }
   choice('theme', _themes, 'auto');
-  choice('language', _languages, 'system');
+  choice('language', _legacyLanguages, 'system');
   choice('sendBehavior', const {'interrupt', 'steer', 'queue'}, 'steer');
   for (final key in ['uiFontFamily', 'monoFontFamily']) {
     if (settings.containsKey(key)) settings[key] = _fontFamily(settings[key]) ?? '';

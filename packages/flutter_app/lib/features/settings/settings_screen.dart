@@ -1076,13 +1076,14 @@ class _ProjectsList extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = PaseoColors.of(context);
+    final projectError = host.listErrors['project'] ?? host.error;
     if (host.projects.isEmpty) {
       // Original centered state: 24px padding around a large muted spinner
       // or the muted base empty text.
       return Padding(
         padding: const EdgeInsets.all(24),
         child: Center(
-          child: host.loading
+          child: host.loading || host.loadingLists.contains('project')
               ? SizedBox.square(
                   dimension: 36,
                   child: CircularProgressIndicator(
@@ -1091,7 +1092,7 @@ class _ProjectsList extends StatelessWidget {
                   ),
                 )
               : Text(
-                  tr(context, 'sidebar.project.empty.title'),
+                  projectError?.toString() ?? tr(context, 'sidebar.project.empty.title'),
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: colors.muted,
                   ),
@@ -1104,7 +1105,7 @@ class _ProjectsList extends StatelessWidget {
       children: [
         // Original `HostErrorsBanner`: bordered 8px-radius box, 12px padding,
         // 12px above the card, red-300 small text.
-        if (host.error != null)
+        if (projectError != null)
           Container(
             margin: const EdgeInsets.only(bottom: 12),
             padding: const EdgeInsets.all(12),
@@ -1115,7 +1116,7 @@ class _ProjectsList extends StatelessWidget {
             child: Text(
               tr(context, 'settings.projectList.hostLoadFailed', args: {
                 'hostName': host.label,
-                'message': host.error.toString(),
+                'message': projectError.toString(),
               }),
               style: theme.textTheme.bodySmall?.copyWith(
                 color: paseoFieldErrorColor,

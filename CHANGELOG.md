@@ -36,6 +36,14 @@
 
 ### Fixed
 
+- Keep request admission/ACK uncertainty distinct from live agent activity and connection freshness; preserve new composer edits across late responses and offer explicit, durable dismissal of unresolved sends.
+- Load project, workspace and agent lists independently, retaining successful/previous data and preserving event order across partial failures. Stream usage discoveries per source and retain received reports when another source or session is unavailable.
+- Store provider-subagent changes in per-child SQLite timelines and a parent descriptor index instead of cloning and rewriting the full parent JSON checkpoint for every event. Legacy checkpoints remain migration backups.
+- Require explicit replay coverage and unambiguous preservation of existing rows/identities before replacing canonical history. Retain canonical data for missing, torn, drained or ambiguous snapshots; only a complete source can authorize an explicit rewind. Replaying child history no longer appends a second copy.
+- Keep Pi/OMP RPC acknowledgements and host-tool calls/cancellation independent of transcript-consumer backlog. Ordinary events retain FIFO ordering in the existing bounded-memory private spool; spool failures terminate the affected provider instead of silently dropping output.
+- Bound admission to a stalled client output queue, including small-frame saturation. Read-only agent/usage snapshots do not wait for a busy live mutation lock and explicitly identify unavailable live state.
+- Announce worker-initiated shutdown to the independent supervisor so restarts receive the same bounded teardown as service stops. Archive and restore use paired native provider capabilities; Paseo-managed OMP archives remain restorable without changing session identity.
+- Add exact-message delivery receipts, conservative orphan reconciliation and sticky dismissal tombstones. Retain uncertain sends without automatic retransmission; separate failed content from later composer edits and recover pending requests by exact receipt identity.
 - Serve basic daemon status from cached provider observations instead of waiting for external model discovery. Mark cached results explicitly and report unknown availability as `null`, without extending the CLI's status timeout.
 - Separate queued-message admission from provider dispatch, return live duplicate receipts promptly, and reject full queues before creating a durable pending receipt. Preserve uncertain outcomes after interrupted delivery.
 - Finish Pi/OMP host-tool responses after draining accepted progress in order, without waiting for retained progress senders; cancellation also releases blocked progress forwarding.

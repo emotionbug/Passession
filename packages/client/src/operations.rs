@@ -169,6 +169,8 @@ operations! {
     fetch_provider_subagent_timeline => ("agent.provider_subagents.timeline.get.request", "agent.provider_subagents.timeline.get.response"),
     build_agent_fork_context => ("agent.fork_context.request", "agent.fork_context.response"),
     send_agent_message => ("send_agent_message_request", "send_agent_message_response"),
+    get_agent_message_receipt => ("agent.message_receipt.get.request", "agent.message_receipt.get.response"),
+    dismiss_agent_message_receipt => ("agent.message_receipt.dismiss.request", "agent.message_receipt.dismiss.response"),
     rewind_agent => ("agent.rewind.request", "agent.rewind.response"),
     cancel_agent => ("cancel_agent_request", "cancel_agent_response"),
     set_agent_mode => ("set_agent_mode_request", "set_agent_mode_response"),

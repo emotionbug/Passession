@@ -1,4 +1,6 @@
 use super::*;
+use crate::providers::api::PromptDeliveryError;
+use std::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Default)]
@@ -46,95 +48,266 @@ async fn run(
     }
 }
 
+async fn owned(receipts: &MessageReceipts, message_id: &str, request: &Value) -> Result<LiveGuard> {
+    match receipts.admit("agent", message_id, request).await? {
+        Admission::Run(owner) => Ok(owner),
+        _ => bail!("Expected send owner"),
+    }
+}
+async fn replayed(receipts: &MessageReceipts, message_id: &str, request: &Value) -> Result<Value> {
+    match receipts.admit("agent", message_id, request).await? {
+        Admission::Replay(receipt) => Ok(receipt),
+        _ => bail!("Expected receipt replay"),
+    }
+}
+fn send_key(message_id: &str) -> Result<String> {
+    digest(&json!(["send", "agent", message_id]))
+}
+
 #[tokio::test]
-async fn send_serializes_retries_and_reconstruction() -> Result<()> {
+async fn completed_and_rejected_sends_replay_without_dispatch() -> Result<()> {
     let home = tempfile::tempdir()?;
     let receipts = MessageReceipts::new(home.path().to_owned());
-    let sends = AtomicUsize::new(0);
-    let request = json!({"text":"hello"});
-    let delivery = || async {
-        sends.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    };
-    let (first, second) = tokio::join!(
-        receipts.send(
+    let request = json!({"prompt":"hello","activeTurnBehavior":"interrupt"});
+    let owner = owned(&receipts, "message", &request).await?;
+    assert!(receipts.begin_dispatch("agent", "message").await?);
+    let result = json!({"disposition":"turn_started","turnId":"turn-1"});
+    receipts
+        .settle(
             "agent",
             "message",
-            &request,
-            || async { Ok(()) },
-            |_| delivery()
-        ),
-        receipts.send(
-            "agent",
-            "message",
-            &request,
-            || async { Ok(()) },
-            |_| delivery()
-        )
-    );
-    first?;
-    second?;
-    MessageReceipts::new(home.path().to_owned())
-        .send(
-            "agent",
-            "message",
-            &request,
-            || async { bail!("Completed replay must not prepare") },
-            |_: ()| delivery(),
+            Settlement::Submitted { result: result.clone(), correlation: json!({"turnId":"turn-1"}), ack_pending: false },
         )
         .await?;
-    assert_eq!(sends.load(Ordering::SeqCst), 1);
-    let conflict = receipts
-        .send(
-            "agent",
-            "message",
-            &json!({"text":"changed"}),
-            || async { Ok(()) },
-            |_| delivery(),
-        )
+    drop(owner);
+    let restarted = MessageReceipts::new(home.path().to_owned());
+    let receipt = replayed(&restarted, "message", &request).await?;
+    assert_eq!(receipt["phase"], "submitted");
+    assert_eq!(receipt["correlation"]["acknowledgementPending"], false);
+    let replay_result = replay(receipt)?;
+    assert_eq!(replay_result["turnId"], "turn-1");
+    assert_eq!(replay_result["deduplicated"], true);
+    let conflict = restarted
+        .admit("agent", "message", &json!({"prompt":"changed"}))
         .await
-        .unwrap_err();
+        .err()
+        .unwrap();
     assert_eq!(conflict.to_string(), "agent_request_key_conflict");
+    assert_eq!(
+        conflict.downcast_ref::<SendReceiptError>().unwrap().receipt["phase"],
+        "submitted"
+    );
+
+    let owner = owned(&receipts, "rejected", &request).await?;
+    assert!(receipts.begin_dispatch("agent", "rejected").await?);
+    let refused = PromptDeliveryError::rejected("Provider did not accept steering");
+    receipts
+        .settle("agent", "rejected", Settlement::failure(&refused, true))
+        .await?;
+    drop(owner);
+    let receipt = replayed(&restarted, "rejected", &request).await?;
+    assert_eq!(receipt["phase"], "rejected");
+    assert_eq!(receipt["mayHaveExecuted"], false);
+    assert_eq!(receipt["canRetry"], false);
+    assert_eq!(
+        replay(receipt).unwrap_err().to_string(),
+        "Provider did not accept steering"
+    );
     Ok(())
 }
+
 #[tokio::test]
-async fn pending_send_is_not_replayed_but_preparation_can_retry() -> Result<()> {
+async fn live_duplicate_waits_while_queries_and_dismissal_do_not() -> Result<()> {
     let home = tempfile::tempdir()?;
     let receipts = MessageReceipts::new(home.path().to_owned());
-    let request = json!({});
-    let prepare_error = receipts
-        .send(
+    let request = json!({"prompt":"hello"});
+    let owner = owned(&receipts, "message", &request).await?;
+    let Admission::Wait(mut settled) = receipts.admit("agent", "message", &request).await? else {
+        panic!("a live duplicate must join its owner");
+    };
+    // The owner holds no receipt lock while it prepares or dispatches.
+    let receipt = tokio::time::timeout(Duration::from_secs(1), receipts.get("agent", "message")).await??;
+    assert_eq!(receipt["phase"], "preparing");
+    assert_eq!(receipt["mayHaveExecuted"], false);
+    assert!(receipts.begin_dispatch("agent", "message").await?);
+    let dismissed =
+        tokio::time::timeout(Duration::from_secs(1), receipts.dismiss("agent", "message")).await??;
+    assert_eq!(dismissed["phase"], "dispatching");
+    assert_eq!(dismissed["dismissed"], true);
+    assert_eq!(dismissed["mayHaveExecuted"], true);
+    receipts
+        .settle(
             "agent",
             "message",
-            &request,
-            || async { bail!("load failed") },
-            |_: ()| async { Ok(()) },
+            Settlement::Accepted { result: Some(json!({"disposition":"steered"})), correlation: json!({}) },
         )
-        .await
-        .unwrap_err();
-    assert_eq!(prepare_error.to_string(), "load failed");
-    let delivery_error = receipts
-        .send(
+        .await?;
+    tokio::time::timeout(Duration::from_secs(1), settled.wait_for(|done| *done)).await??;
+    drop(owner);
+    let receipt = replayed(&receipts, "message", &request).await?;
+    assert_eq!(receipt["phase"], "accepted");
+    assert_eq!(receipt["dismissed"], true);
+    assert_eq!(replay(receipt).unwrap_err().to_string(), DISMISSED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dismissal_is_sticky_through_late_acknowledgement_and_unknown_ids() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let receipts = MessageReceipts::new(home.path().to_owned());
+    let request = json!({"prompt":"hello"});
+    // Before the boundary, dismissal proves the prompt never dispatches.
+    let owner = owned(&receipts, "early", &request).await?;
+    receipts.dismiss("agent", "early").await?;
+    let gate = DispatchGate::new("agent", vec!["early".to_owned()], true);
+    let error = receipts.begin(&gate).await.unwrap_err();
+    receipts
+        .settle("agent", "early", Settlement::failure(&error, gate.invoked()))
+        .await?;
+    drop(owner);
+    let early = receipts.get("agent", "early").await?;
+    assert_eq!(early["phase"], "not_delivered");
+    assert_eq!(early["error"], DISMISSED);
+    assert_eq!(early["mayHaveExecuted"], false);
+    assert_eq!(early["canRetry"], false);
+    assert_eq!(
+        replay(replayed(&receipts, "early", &request).await?).unwrap_err().to_string(),
+        DISMISSED
+    );
+
+    // After submission, a late native ACK improves evidence but cannot revive it.
+    let owner = owned(&receipts, "late", &request).await?;
+    assert!(receipts.begin_dispatch("agent", "late").await?);
+    receipts
+        .settle(
             "agent",
-            "message",
-            &request,
-            || async { Ok(()) },
-            |_| async { bail!("connection lost") },
+            "late",
+            Settlement::Submitted { result: json!({"disposition":"turn_started","turnId":"t"}), correlation: json!({"turnId":"t"}), ack_pending: true },
         )
-        .await
-        .unwrap_err();
-    assert_eq!(delivery_error.to_string(), "connection lost");
-    let replay_error = MessageReceipts::new(home.path().to_owned())
-        .send(
+        .await?;
+    let follower = receipts.claim("agent", "late")?;
+    drop(owner);
+    let pending = receipts.dismiss("agent", "late").await?;
+    assert_eq!(pending["phase"], "submitted");
+    assert_eq!(pending["correlation"]["acknowledgementPending"], true);
+    receipts
+        .settle(
             "agent",
-            "message",
-            &request,
-            || async { Ok(()) },
-            |_| async { panic!("must not deliver pending receipt") },
+            "late",
+            crate::providers::api::PromptAck::Accepted(json!({"nativeRequestId":"req_7"})).into(),
         )
-        .await
-        .unwrap_err();
-    assert_eq!(replay_error.to_string(), "agent_request_outcome_unknown");
+        .await?;
+    drop(follower);
+    let late = replayed(&receipts, "late", &request).await?;
+    assert_eq!(late["phase"], "accepted");
+    assert_eq!(late["dismissed"], true);
+    assert_eq!(late["correlation"]["acknowledgement"]["nativeRequestId"], "req_7");
+    assert_eq!(replay(late).unwrap_err().to_string(), DISMISSED);
+
+    // A request the host never saw can be tombstoned before a retry arrives.
+    let tombstone = receipts.dismiss("agent", "never-seen").await?;
+    assert_eq!(tombstone["phase"], "missing");
+    assert_eq!(tombstone["dismissed"], true);
+    assert_eq!(tombstone["revision"], 1);
+    assert_eq!(
+        replay(replayed(&receipts, "never-seen", &request).await?).unwrap_err().to_string(),
+        DISMISSED
+    );
+    // The same request under a new message ID is a distinct, valid send.
+    owned(&receipts, "new-id", &request).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphaned_phases_reconcile_conservatively_after_restart() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let receipts = MessageReceipts::new(home.path().to_owned());
+    let request = json!({"prompt":"hello"});
+    let _preparing = owned(&receipts, "preparing", &request).await?;
+    let _dispatching = owned(&receipts, "dispatching", &request).await?;
+    assert!(receipts.begin_dispatch("agent", "dispatching").await?);
+    let _acknowledging = owned(&receipts, "acknowledging", &request).await?;
+    assert!(receipts.begin_dispatch("agent", "acknowledging").await?);
+    receipts
+        .settle(
+            "agent",
+            "acknowledging",
+            Settlement::Submitted { result: json!({"disposition":"turn_started"}), correlation: json!({}), ack_pending: true },
+        )
+        .await?;
+    let restarted = MessageReceipts::new(home.path().to_owned());
+    let preparing = restarted.get("agent", "preparing").await?;
+    assert_eq!(preparing["phase"], "not_delivered");
+    assert_eq!(preparing["canRetry"], true);
+    owned(&restarted, "preparing", &request).await?;
+    for id in ["dispatching", "acknowledging"] {
+        let unknown = restarted.get("agent", id).await?;
+        assert_eq!(unknown["phase"], "outcome_unknown", "{id}");
+        assert_eq!(unknown["mayHaveExecuted"], true, "{id}");
+        assert_eq!(unknown["canRetry"], false, "{id}");
+        assert_eq!(
+            replay(replayed(&restarted, id, &request).await?).unwrap_err().to_string(),
+            OUTCOME_UNKNOWN
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_receipts_keep_their_meaning_and_accept_tombstones() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let directory = home.path().join("agent-requests");
+    tokio::fs::create_dir_all(&directory).await?;
+    let request = json!({"prompt":"hello"});
+    let fingerprint = digest(&request)?;
+    for (id, state) in [("legacy-pending", "pending"), ("legacy-completed", "completed")] {
+        tokio::fs::write(
+            directory.join(format!("{}.json", send_key(id)?)),
+            serde_json::to_vec(&json!({"fingerprint":fingerprint,"agentId":"agent","state":state}))?,
+        )
+        .await?;
+    }
+    let receipts = MessageReceipts::new(home.path().to_owned());
+    let pending = receipts.get("agent", "legacy-pending").await?;
+    assert_eq!(pending["phase"], "outcome_unknown");
+    assert_eq!(pending["revision"], 1);
+    assert_eq!(pending["mayHaveExecuted"], true);
+    assert_eq!(pending["canRetry"], false);
+    assert_eq!(
+        replay(replayed(&receipts, "legacy-pending", &request).await?).unwrap_err().to_string(),
+        OUTCOME_UNKNOWN
+    );
+    let completed = replay(replayed(&receipts, "legacy-completed", &request).await?)?;
+    assert_eq!(completed["deduplicated"], true);
+    let dismissed = receipts.dismiss("agent", "legacy-pending").await?;
+    assert_eq!(dismissed["revision"], 2);
+    assert_eq!(dismissed["phase"], "outcome_unknown");
+    let stored: Value = serde_json::from_slice(
+        &tokio::fs::read(directory.join(format!("{}.json", send_key("legacy-pending")?))).await?,
+    )?;
+    // Rollback daemons read only fingerprint/agentId/state and must not dispatch.
+    assert_eq!(stored["state"], "pending");
+    assert_eq!(stored["fingerprint"], fingerprint.as_str());
+
+    // Parent-applied tombstone for a removed legacy receipt whose messageId is unknown.
+    tokio::fs::write(
+        directory.join(format!("{}.json", send_key("removed")?)),
+        serde_json::to_vec(&json!({
+            "version":2,"fingerprint":fingerprint,"agentId":"agent","messageId":null,
+            "state":"pending","phase":"outcome_unknown","revision":2,"dismissed":true,
+            "result":null,"error":"agent_request_outcome_unknown","updatedAt":null,
+            "correlation":{"legacy":true,"tombstone":"restored-after-removal"},"ackPending":false
+        }))?,
+    )
+    .await?;
+    let tombstone = receipts.get("agent", "removed").await?;
+    assert_eq!(tombstone["dismissed"], true);
+    assert_eq!(tombstone["phase"], "outcome_unknown");
+    assert_eq!(tombstone["messageId"], "removed");
+    assert_eq!(
+        replay(replayed(&receipts, "removed", &request).await?).unwrap_err().to_string(),
+        DISMISSED
+    );
     Ok(())
 }
 #[tokio::test]

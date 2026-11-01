@@ -1220,12 +1220,12 @@ impl AgentSession for AcpSession {
             self.provider()
         )
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
         let history = std::mem::take(&mut self.inner.state.lock().unwrap().history);
         for event in history {
             sink.emit(event).await?;
         }
-        Ok(())
+        Ok(crate::providers::api::HistoryCoverage::Unverified)
     }
     async fn runtime_info(&self) -> Result<Value> {
         Ok(self.inner.runtime())

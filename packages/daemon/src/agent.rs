@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 mod actions;
 pub(crate) mod creation;
 mod date_parse;
-mod event_stage;
+pub(crate) mod event_stage;
 mod generation;
 mod listing;
 pub mod notifications;
@@ -177,7 +177,7 @@ pub struct AgentManager {
     pub message_delivery: AgentMessageDelivery,
     agents: RwLock<HashMap<String, Arc<AgentCell>>>,
     lifecycle: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    subagent_store: StdMutex<SubagentStore>,
+    subagent_store: Arc<StdMutex<SubagentStore>>,
     events: broadcast::Sender<Value>,
     closing: AtomicBool,
 }
@@ -196,7 +196,7 @@ impl AgentManager {
             directory_sync: crate::directory_sync::DirectorySyncService::new(),
             agents: RwLock::new(HashMap::new()),
             lifecycle: Mutex::new(HashMap::new()),
-            subagent_store: StdMutex::new(SubagentStore::default()),
+            subagent_store: Arc::new(StdMutex::new(SubagentStore::default())),
             events,
             closing: AtomicBool::new(false),
         }
@@ -230,9 +230,14 @@ impl AgentManager {
                 Ok::<_, anyhow::Error>(store)
             })
             .await?;
-        self.receipts
+        let fresh = self.receipts.get().is_none();
+        let receipts = self
+            .receipts
             .get_or_init(|| async { MessageReceipts::new(home.clone()) })
             .await;
+        if fresh {
+            wire::forward_receipt_updates(self.app.clone(), receipts.subscribe_events());
+        }
         self.creations
             .get_or_init(|| async { CreationReceipts::new(home.clone()) })
             .await;
@@ -255,16 +260,13 @@ impl AgentManager {
             let Some(id) = text(&record, "id") else {
                 continue;
             };
-            if let Some(bytes) =
-                storage::read_optional(&home.join("agent-subagents").join(format!("{id}.json")))
-                    .await?
-            {
-                let checkpoint: Value = serde_json::from_slice(&bytes)?;
-                self.subagent_store
-                    .lock()
-                    .map_err(|_| anyhow!("Subagent lock poisoned"))?
-                    .restore_parent(&checkpoint)?;
-            }
+            let store = self.subagent_store.clone();
+            let root = home.join("agent-subagents");
+            let id = id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
+                    .load_parent(&root, &id, false)
+            }).await??;
         }
         Ok(())
     }
@@ -368,17 +370,21 @@ impl AgentManager {
     }
     pub async fn agent_snapshot(&self, id: &str) -> Result<Option<Value>> {
         let cell = { self.agents.read().await.get(id).cloned() };
+        let mut unavailable = false;
         if let Some(cell) = cell {
-            let data = cell.data.lock().await;
-            if data.ready {
-                return Ok(Some(data.snapshot.clone()));
+            match cell.data.try_lock() {
+                Ok(data) if data.ready => return Ok(Some(data.snapshot.clone())),
+                Ok(_) => unavailable = true,
+                Err(_) => unavailable = true,
             }
         }
-        Ok(self
-            .storage()?
-            .get(id)
-            .await?
-            .map(|record| self.stored_snapshot(record)))
+        Ok(self.storage()?.get(id).await?.map(|record| {
+            let mut snapshot = self.stored_snapshot(record);
+            if unavailable {
+                snapshot["snapshotAvailability"] = json!("last_persisted");
+            }
+            snapshot
+        }))
     }
     fn stored_snapshot(&self, mut record: Value) -> Value {
         let available = self.app.upgrade().is_some_and(|app| {
@@ -423,12 +429,42 @@ impl AgentManager {
             .map(|(id, cell)| (id.clone(), cell.clone()))
             .collect::<Vec<_>>();
         for (id, cell) in cells {
-            let data = cell.data.lock().await;
-            if data.ready {
-                all.insert(id, data.snapshot.clone());
+            match cell.data.try_lock() {
+                Ok(data) if data.ready => { all.insert(id, data.snapshot.clone()); }
+                _ => {
+                    if let Some(snapshot) = all.get_mut(&id) {
+                        snapshot["snapshotAvailability"] = json!("last_persisted");
+                    }
+                }
             }
         }
         Ok(all.into_values().collect())
+    }
+    /// Usage discovery is a read-only observation, never a waiter for provider
+    /// mutation/commit locks. Preserve unavailable identities rather than
+    /// interpreting them as absent sessions.
+    pub async fn usage_session_snapshots(&self) -> Result<Vec<Value>> {
+        let snapshots = self.list_snapshots().await?;
+        let mut result = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            let id = required(&snapshot, "id")?;
+            let cell = { self.agents.read().await.get(id).cloned() };
+            let (session, unavailable) = match cell {
+                Some(cell) => match cell.data.try_lock() {
+                    Ok(data) => (if data.owner_ended { None } else { data.session.clone() }, !data.ready),
+                    Err(_) => (None, true),
+                },
+                None => (None, false),
+            };
+            let mut usage = session.and_then(|session| session.usage_session())
+                .unwrap_or_else(|| json!({}));
+            usage["agentId"] = json!(id);
+            if unavailable {
+                usage["_runtimeUnavailable"] = json!(true);
+            }
+            result.push(usage);
+        }
+        Ok(result)
     }
     pub async fn cwd(&self, id: &str) -> Result<PathBuf> {
         let snapshot = self
@@ -826,8 +862,12 @@ impl AgentManager {
         }
         self.storage()?.upsert(record).await
     }
-    async fn commit_snapshot(&self, cell: &Arc<AgentCell>, mut snapshot: Value) -> Result<()> {
+    async fn commit_snapshot(&self, cell: &Arc<AgentCell>, snapshot: Value) -> Result<()> {
         let _commit = cell.commit.lock().await;
+        self.commit_snapshot_locked(cell, snapshot).await
+    }
+    /// Caller owns cell.commit; never hold cell.data across persistence.
+    async fn commit_snapshot_locked(&self, cell: &Arc<AgentCell>, mut snapshot: Value) -> Result<()> {
         if snapshot["lifecycle"] != "closed" {
             let data = cell.data.lock().await;
             if let Some(error) = data.event_error.as_deref() {

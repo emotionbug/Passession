@@ -964,13 +964,38 @@ class _SessionSidebarState extends State<SessionSidebar> {
         ),
       );
       if (!hostCollapsed) {
-        if (host.loading) {
+        if (host.loading || host.loadingLists.isNotEmpty) {
           rows.add(
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 12),
               child: LinearProgressIndicator(minHeight: 2),
             ),
           );
+        }
+        if (host.loadingLists.isNotEmpty) {
+          rows.add(Padding(
+            padding: const EdgeInsets.fromLTRB(32, 4, 8, 4),
+            child: Text(tr(context, 'sidebar.refresh.loading', args: {
+              'lists': host.loadingLists
+                  .map((kind) => tr(context, 'sidebar.refresh.$kind')).join(', '),
+            }), style: theme.textTheme.bodySmall),
+          ));
+        }
+        for (final failure in host.listErrors.entries) {
+          rows.add(Padding(
+            padding: const EdgeInsets.fromLTRB(32, 4, 8, 4),
+            child: Text(tr(context, 'sidebar.refresh.failed', args: {
+              'list': tr(context, 'sidebar.refresh.${failure.key}'),
+              'error': failure.value.toString(),
+            }), style: theme.textTheme.bodySmall!.copyWith(color: theme.colorScheme.error)),
+          ));
+        }
+        if (host.listErrors.isNotEmpty) {
+          rows.add(TextButton(
+            onPressed: _busy || host.loadingLists.isNotEmpty ? null :
+                () => _run(() => store.refreshHost(host.serverId)),
+            child: Text(tr(context, 'common.actions.retry')),
+          ));
         }
         if (host.error != null) {
           rows.add(
@@ -1015,7 +1040,9 @@ class _SessionSidebarState extends State<SessionSidebar> {
           );
         }
         rows.addAll(projectRows);
-        if (projects.isEmpty && !host.loading && _query.isEmpty) {
+        if (projects.isEmpty && !host.loading &&
+            !host.loadingLists.contains('project') &&
+            !host.listErrors.containsKey('project') && _query.isEmpty) {
           rows.add(
             Padding(
               padding: const EdgeInsets.only(left: 24, right: 8),

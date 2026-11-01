@@ -136,6 +136,16 @@ pub fn publish_worker_ready(listen: &str, server_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The independent supervisor owns the teardown deadline, including restarts.
+pub fn publish_worker_stopping(restart: bool) -> Result<()> {
+    let token = std::env::var("PASEO_NATIVE_TOKEN").context("Missing supervisor channel token")?;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &json!({"type":"paseo:stopping","token":token,"restart":restart}))?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
 pub async fn run_internal(command: &str, args: &[String]) -> Result<i32> {
     if args.len() != 2 || args[0] != "--home" {
         bail!("Internal daemon entry requires --home PATH");
@@ -293,7 +303,7 @@ async fn drain<R: AsyncRead + Unpin>(
             let mut lifecycle = false;
             if let Some((sender, token)) = &events {
                 if let Ok(value) = serde_json::from_slice::<Value>(line) {
-                    if value["type"] == "paseo:ready"
+                    if matches!(value["type"].as_str(), Some("paseo:ready" | "paseo:stopping"))
                         && value["token"].as_str() == Some(token.as_str())
                     {
                         lifecycle = true;
@@ -388,11 +398,19 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
             let output=tokio::spawn(drain(child.stdout.take().context("Missing worker stdout")?,log.clone(),Some((send,token.clone())),false));
             let errors=tokio::spawn(drain(child.stderr.take().context("Missing worker stderr")?,log.clone(),None,true));
             let mut heartbeat=tokio::time::interval(Duration::from_secs(1));let mut last_refresh=tokio::time::Instant::now();let mut ready=false;let mut stopping=false;let mut deadline=None;let mut events_open=true;let mut control_open=true;
+            let mut worker_shutdown = None;
             let status=loop{
                 tokio::select!{
                     status=child.wait()=>break status?,
-                    event=events.recv(),if !ready&&events_open=>{
+                    event=events.recv(),if events_open=>{
                         if let Some(event)=event{
+                            if event["type"] == "paseo:stopping" {
+                                worker_shutdown = Some(event["restart"] == true);
+                                deadline.get_or_insert(tokio::time::Instant::now()+Duration::from_secs(10));
+                                control_open = false;
+                                continue;
+                            }
+                            if ready { continue; }
                             let listen=event["listen"].as_str().filter(|s|!s.is_empty()).context("Invalid readiness listen")?;
                             let server_id=event["serverId"].as_str().filter(|s|!s.is_empty()).context("Invalid readiness server identity")?;
                             if let Err(error)=crate::daemon_admin::updater::finish_restart(home,&executable,Some((event["version"].as_str().unwrap_or(""),event["sourceSha"].as_str().unwrap_or("")))).await{
@@ -404,13 +422,17 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
                             ready=true;
                         }else{events_open=false;}
                     },
-                    _=stop.cancelled(),if !stopping=>{stopping=true;deadline=Some(tokio::time::Instant::now()+Duration::from_secs(10));let bytes=format!("{}\n",json!({"type":"paseo:graceful-shutdown","token":token}));let _=input.write_all(bytes.as_bytes()).await;},
+                    _=stop.cancelled(),if !stopping=>{stopping=true;deadline=Some(tokio::time::Instant::now()+Duration::from_secs(10));let bytes=format!("{}\n",json!({"type":"paseo:graceful-shutdown","token":token}));let _=tokio::time::timeout(Duration::from_secs(1),input.write_all(bytes.as_bytes())).await;},
                     _=heartbeat.tick()=>{
                         if deadline.is_some_and(|deadline|tokio::time::Instant::now()>=deadline){force_worker(&mut child,&worker).await?;}
                         if last_refresh.elapsed()>=Duration::from_secs(30){if let Err(error)=lock.refresh(){tracing::error!(%error,"Supervisor PID lock ownership lost");stop.cancel();}last_refresh=tokio::time::Instant::now();}
                         if !stopping&&control_open{
                             let bytes=format!("{}\n",json!({"type":"paseo:supervisor-heartbeat","token":token}));
-                            if let Err(error)=input.write_all(bytes.as_bytes()).await{tracing::debug!(%error,"Worker control channel closed");control_open=false;}
+                            if !matches!(tokio::time::timeout(Duration::from_secs(1),input.write_all(bytes.as_bytes())).await,Ok(Ok(()))){
+                                tracing::warn!("Worker control channel unavailable");
+                                control_open=false;
+                                deadline.get_or_insert(tokio::time::Instant::now()+Duration::from_secs(10));
+                            }
                         }
                     }
                 }
@@ -421,6 +443,8 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
             for mut task in [output,errors]{if tokio::time::timeout(Duration::from_secs(2),&mut task).await.is_err(){task.abort();}}
             log.write(format!("{}\n",json!({"level":"info","time":chrono::Utc::now().to_rfc3339(),"pid":std::process::id(),"name":"DaemonRunner","msg":"Worker exited","code":status.code()})).as_bytes()).await;
             if stopping||stop.is_cancelled(){return Ok(0)}
+            if worker_shutdown == Some(true) { continue; }
+            if worker_shutdown == Some(false) { return Ok(status.code().unwrap_or(1)); }
             if !ready{
                 #[cfg(windows)]
                 if crate::daemon_admin::updater::launch_recovery_helper(home,&executable,&options,&lock.instance).await?{return Ok(0)}

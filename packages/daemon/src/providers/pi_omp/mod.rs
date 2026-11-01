@@ -1,4 +1,5 @@
 mod catalog;
+mod event_queue;
 mod events;
 mod history;
 mod host_tools;

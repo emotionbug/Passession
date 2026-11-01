@@ -74,6 +74,7 @@ pub(crate) fn snapshot_payload(agent: &Value) -> Value {
         "lastError",
         "internal",
         "providerUnavailable",
+        "snapshotAvailability",
     ] {
         if let Some(value) = agent.get(key).filter(|v| !v.is_null() && **v != false) {
             out[key] = value.clone();

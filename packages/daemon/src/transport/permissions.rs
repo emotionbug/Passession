@@ -127,6 +127,8 @@ pub fn inbound(operation: &str) -> Option<&'static [&'static str]> {
         | "cancel_agent_request"
         | "create_agent_request"
         | "agent.create.request"
+        | "agent.message_receipt.get.request"
+        | "agent.message_receipt.dismiss.request"
         | "send_agent_message_request" => Some(&["workspace.write", "hub.execute"]),
         "agent.fork_context.request"
         | "agent.provider_subagents.list.request"
@@ -285,6 +287,9 @@ pub fn outbound(operation: &str) -> Option<&'static [&'static str]> {
         "agent.create.response"
         | "agent.create.update"
         | "agent.config.apply.response"
+        | "agent.message_receipt.get.response"
+        | "agent.message_receipt.dismiss.response"
+        | "agent.message_receipt.update"
         | "agent_permission_resolved"
         | "cancel_agent_response"
         | "send_agent_message_response" => Some(&["workspace.write", "hub.execute"]),

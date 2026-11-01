@@ -15,6 +15,8 @@ use super::permissions;
 
 pub const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 100 * 1024 * 1024;
+const WRITE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_PRIMING_FRAMES: usize = 4096;
 
 #[derive(Debug)]
 pub enum OutboundFrame {
@@ -363,7 +365,15 @@ impl RequestContext {
         tokio::select! { biased;
             _ = self.source.cancel.cancelled() => bail!("Physical source is closed"),
             _ = owner_cancel.cancelled() => bail!("Delivery owner is closed"),
-            result = self.source.sender.send(item) => result.map_err(|_| anyhow!("Physical source writer closed")),
+            result = tokio::time::timeout(WRITE_ADMISSION_TIMEOUT, self.source.sender.send(item)) => match result {
+                Ok(result) => result.map_err(|_| anyhow!("Physical source writer closed")),
+                Err(_) => {
+                    // A slow socket must not retain an agent commit/barrier or
+                    // block delivery to other clients. Reconnect resumes cursors.
+                    self.detach();
+                    bail!("Physical source frame queue stalled");
+                }
+            },
         }
     }
     /// Register before taking a domain snapshot; updates buffer until activate().
@@ -807,6 +817,12 @@ impl OwnedSubscription {
         let frame = self.context.reserve(frame)?;
         let mut d = self.state.delivery.lock().await;
         if d.priming {
+            if d.pending.len() >= MAX_PRIMING_FRAMES {
+                d.pending.clear();
+                d.bytes = 0;
+                self.context.detach();
+                bail!("Physical source priming frame limit exceeded");
+            }
             d.bytes += frame.bytes;
             d.pending.push_back(frame);
             Ok(())
@@ -989,6 +1005,7 @@ pub const SESSION_EVENTS: &[&str] = &[
     "activity_log",
     "hub.execution.agent.update",
     "hub.execution.agent.stream",
+    "agent.message_receipt.update",
 ];
 pub(crate) fn event_category(message: &Value) -> Option<String> {
     let kind = message["type"].as_str()?;
@@ -1014,6 +1031,8 @@ fn legacy_wants_event(event: &str, capabilities: &Value) -> bool {
             !has_capability(capabilities, "explicit_event_subscriptions")
         }
         "agent.provider_subagents.update" => has_capability(capabilities, "provider_subagents"),
+        // Opt-in only: legacy clients do not understand receipt updates.
+        "agent.message_receipt.update" => false,
         _ => true,
     }
 }

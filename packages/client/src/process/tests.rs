@@ -230,6 +230,73 @@ mod unix {
     }
 
     #[tokio::test]
+    async fn deadline_while_waiting_for_stdin_does_not_send_or_kill_other_work() {
+        let (process, stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
+        let guard = process.stdin.lock().await;
+        let error = process.write_json_with_deadline(
+            &serde_json::json!({"cancelled": true}),
+            Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+            &CancellationToken::new(),
+        ).await.unwrap_err();
+        let error = error.downcast_ref::<WriteError>().unwrap();
+        assert!(!error.attempted);
+        assert_eq!(error.written, 0);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::TimedOut);
+        drop(guard);
+        process.write_json(&serde_json::json!({"surviving": 1})).await.unwrap();
+        process.close_stdin().await.unwrap();
+        let mut output = String::new();
+        BufReader::new(stdout).read_to_string(&mut output).await.unwrap();
+        assert_eq!(output, "{\"surviving\":1}\n");
+        assert_eq!(process.wait().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_stdin_is_known_not_written() {
+        let (process, stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
+        let guard = process.stdin.lock().await;
+        let cancel = CancellationToken::new();
+        let value = serde_json::json!({"cancelled": true});
+        let write = process.write_json_with_deadline(&value, None, &cancel);
+        tokio::pin!(write);
+        tokio::select! {
+            biased;
+            result = &mut write => panic!("write must wait for the lock: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        cancel.cancel();
+        let error = write.await.unwrap_err();
+        let error = error.downcast_ref::<WriteError>().unwrap();
+        assert!(!error.attempted);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::Interrupted);
+        drop(guard);
+        process.write_bytes(b"new work\n").await.unwrap();
+        process.close_stdin().await.unwrap();
+        let mut output = String::new();
+        BufReader::new(stdout).read_to_string(&mut output).await.unwrap();
+        assert_eq!(output, "new work\n");
+        assert_eq!(process.wait().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn deadline_during_partial_json_write_preserves_ambiguity_and_closes_stream() {
+        let (process, _stdout) = ManagedProcess::spawn(shell("sleep 30")).await.unwrap();
+        let value = serde_json::json!({"payload": "x".repeat(8 * 1024 * 1024)});
+        let error = process.write_json_with_deadline(
+            &value,
+            Some(tokio::time::Instant::now() + Duration::from_millis(300)),
+            &CancellationToken::new(),
+        ).await.unwrap_err();
+        let error = error.downcast_ref::<WriteError>().unwrap();
+        assert!(error.attempted);
+        assert!(error.written > 0 && error.written < error.total);
+        assert_eq!(error.source.kind(), std::io::ErrorKind::TimedOut);
+        tokio::time::timeout(Duration::from_secs(3), process.wait()).await.unwrap().unwrap();
+        let next = process.write_bytes(b"next\n").await.unwrap_err();
+        assert!(!next.downcast_ref::<WriteError>().unwrap().attempted);
+    }
+
+    #[tokio::test]
     async fn native_exit_status_does_not_confuse_exit_code_with_signal() {
         let (normal, _stdout) = ManagedProcess::spawn(shell("exit 143")).await.unwrap();
         let status = normal.wait_status().await.unwrap();

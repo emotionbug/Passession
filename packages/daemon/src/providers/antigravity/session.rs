@@ -187,7 +187,7 @@ impl AgentSession for Session {
     async fn steer_active_turn(&self, _prompt: Value, _options: Value) -> Result<Value> {
         Ok(json!({"status":"unavailable"}))
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
         let events = self
             .snapshot
             .lock()
@@ -197,7 +197,7 @@ impl AgentSession for Session {
         for event in events {
             sink.emit(event).await?;
         }
-        Ok(())
+        Ok(crate::providers::api::HistoryCoverage::Unverified)
     }
     async fn runtime_info(&self) -> Result<Value> {
         Ok(self.info())

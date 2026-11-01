@@ -326,6 +326,8 @@ class _AgentPanelState extends State<AgentPanel> {
 
   /// composer/index.tsx sendError: the last failed send, red text above the input.
   String? sendError;
+  String? _activeSendId;
+  bool _checkingDelivery = false;
   int commandGeneration = 0;
 
   /// input/state.ts resolveActiveSendBehavior over the live app setting:
@@ -746,6 +748,7 @@ class _AgentPanelState extends State<AgentPanel> {
   void _draftChanged() {
     if (!mounted) return;
     if (initialized) _syncForgeAutoAttach();
+    sendError = draft['sendError'] as String?;
     final text = stringValue(draft['text']);
     if (editor.text != text) {
       _syncingEditor = true;
@@ -773,14 +776,6 @@ class _AgentPanelState extends State<AgentPanel> {
 
   void _changed() {
     if (!mounted) return;
-    final pending = jsonMap(draft['pending']);
-    if (pending.isNotEmpty &&
-        controller!.timeline.any(
-          (row) =>
-              jsonMap(row['item'])['clientMessageId'] == pending['messageId'],
-        )) {
-      drafts.acknowledge(draftKey, pending);
-    }
     // Delivery and attention keep running while the retained view is hidden.
     // Presentation catches up once, from the latest state, in the next build.
     _streamStateChanged();
@@ -1141,12 +1136,17 @@ class _AgentPanelState extends State<AgentPanel> {
             jsonList(draft['images']).isEmpty)) {
       return;
     }
-    if (retry == null && jsonMap(draft['pending']).isNotEmpty) {
+    if (retry == null && (jsonMap(draft['pending']).isNotEmpty ||
+        jsonMap(draft['failedMessage']).isNotEmpty)) {
       _showFailure(
         StateError(
-          'Resolve the unacknowledged send before sending another message.',
+          tr(context, 'composer.delivery.blocked'),
         ),
       );
+      return;
+    }
+    if (retry != null && !isDraft && client.supports('agentMessageReceipts') &&
+        !receiptCanRetry(jsonMap(jsonMap(draft['receipts'])[retry['messageId']]))) {
       return;
     }
     if (isDraft) {
@@ -1192,13 +1192,16 @@ class _AgentPanelState extends State<AgentPanel> {
     }
     setState(() {
       sending = true;
+      _activeSendId = stringValue(message['messageId']);
       error = null;
       sendError = null;
     });
-    // submit.ts: the composer clears at once, so the submitted row and the
-    // composer agree; a failure puts the message back.
+    // Submitted content stays with its exact request, separate from later edits.
     drafts.update(draftKey, {
       'pending': message,
+      'sendError': null,
+      'sendErrorMessageId': null,
+      if (retry != null) 'failedMessage': null,
       if (retry == null) ...{
         'text': '',
         'attachments': <JsonMap>[],
@@ -1211,25 +1214,24 @@ class _AgentPanelState extends State<AgentPanel> {
         await _create(message);
       } else {
         await _send(message);
-        drafts.acknowledge(draftKey, message);
+        if (!client.supports('agentMessageReceipts')) drafts.acknowledge(draftKey, message);
       }
       _sticky = true;
       _bottom();
     } catch (e) {
-      drafts.update(draftKey, {
-        if (definitelyRejected(e)) ...{
-          'pending': null,
-          if (isDraft) ...{'creationKey': null, 'creationRequest': null},
-        },
-        if (retry == null) ...{
-          'text': message['text'],
-          'attachments': List.of(jsonList(message['attachments'])),
-          'images': List.of(jsonList(message['images'])),
-        },
-      });
-      if (mounted) setState(() => sendError = _sendErrorMessage(e));
+      if (e is DaemonException && e.payload?['receipt'] is Map) {
+        drafts.applyReceipt(draftKey, jsonMap(e.payload!['receipt']));
+      }
+      final failed = drafts.failSend(draftKey, message, _sendErrorMessage(e),
+          rejected: definitelyRejected(e));
+      if (isDraft && failed && definitelyRejected(e)) {
+        drafts.update(draftKey, {'creationKey': null, 'creationRequest': null});
+      }
+      if (mounted && failed) setState(() => sendError = _sendErrorMessage(e));
     } finally {
-      if (mounted) setState(() => sending = false);
+      if (mounted && _activeSendId == message['messageId']) {
+        setState(() { sending = false; _activeSendId = null; });
+      }
     }
   }
 
@@ -1243,14 +1245,116 @@ class _AgentPanelState extends State<AgentPanel> {
   /// the agent's attention (onAttentionPromptSend).
   Future<void> _send(JsonMap message) async {
     SentUserMessages.remember(stringValue(widget.target.id), message);
-    requireSuccess(
+    final response = requireSuccess(
       await client.request(
         'send_agent_message_request',
         agentMessageFields(stringValue(widget.target.id), message),
         responseType: 'send_agent_message_response',
       ),
     );
+    if (client.supports('agentMessageReceipts')) {
+      final receipt = jsonMap(response['receipt']);
+      if (receipt.isNotEmpty) {
+        drafts.applyReceipt(draftKey, receipt);
+      } else {
+        await ChatDelivery.check(client, draftKey, stringValue(message['messageId']));
+      }
+    }
     if (mounted) _attention?.clearOnPromptSend();
+  }
+
+  Future<void> _checkDelivery(JsonMap message, {bool dismiss = false}) async {
+    if (_checkingDelivery) return;
+    final id = stringValue(message['messageId']);
+    final remote = !isDraft && client.supports('agentMessageReceipts');
+    if (dismiss && !await confirmAction(context,
+      title: tr(context, 'composer.delivery.stopWaitingTitle'),
+      message: tr(context, remote
+          ? 'composer.delivery.stopWaitingMessage'
+          : 'composer.delivery.stopWaitingLegacyMessage'),
+      confirmLabel: tr(context, 'composer.delivery.stopWaiting'),
+    )) return;
+    if (!mounted) return;
+    setState(() => _checkingDelivery = true);
+    try {
+      if (remote) {
+        await ChatDelivery.check(client, draftKey, id, dismiss: dismiss);
+        if (dismiss && !drafts.isDismissed(draftKey, id)) {
+          throw StateError('The host has not confirmed dismissal.');
+        }
+      } else if (dismiss) {
+        drafts.dismiss(draftKey, id);
+        await drafts.flush();
+      }
+      if (mounted && dismiss && _activeSendId == id) {
+        setState(() { _activeSendId = null; sending = false; });
+      }
+    } catch (e) {
+      if (mounted) _showFailure(e);
+    } finally {
+      if (mounted) setState(() => _checkingDelivery = false);
+    }
+  }
+
+  Widget _deliveryPending(JsonMap message) {
+    final remote = !isDraft && client.supports('agentMessageReceipts');
+    final receipt = jsonMap(jsonMap(draft['receipts'])[message['messageId']]);
+    final phase = stringValue(receipt['phase']);
+    final statusKey = client.status != ConnectionStatus.connected ? 'offline' :
+        !remote ? 'legacyUnknown' :
+        phase == 'dispatching' ? 'dispatching' :
+        phase == 'submitted' ? 'awaitingAck' :
+        ['preparing', 'queued'].contains(phase) ||
+            (sending && _activeSendId == message['messageId']) ? 'preparing' : 'unknown';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(tr(context, 'composer.delivery.$statusKey'),
+            style: Theme.of(context).textTheme.bodySmall),
+        Wrap(spacing: 8, children: [
+          if (remote)
+            TextButton(
+              onPressed: _checkingDelivery ? null : () => _checkDelivery(message),
+              child: Text(tr(context, 'composer.delivery.checkAgain')),
+            ),
+          if (remote ? receiptCanRetry(receipt) : !sending)
+            TextButton(
+              onPressed: sending || _checkingDelivery ? null : () =>
+                  maps(draft['queue']).any((item) => item['messageId'] == message['messageId'])
+                      ? _queueNow(message)
+                      : _submit(retry: message),
+              child: Text(tr(context, 'composer.delivery.retrySame')),
+            ),
+          if (!isDraft)
+            TextButton(
+              onPressed: _checkingDelivery ? null : () => _checkDelivery(message, dismiss: true),
+              child: Text(tr(context, 'composer.delivery.stopWaiting')),
+            ),
+        ]),
+      ],
+    );
+  }
+
+  Widget _failedDelivery(JsonMap message) {
+    final canRestore = editor.text.isEmpty && jsonList(draft['attachments']).isEmpty &&
+        jsonList(draft['images']).isEmpty;
+    final receipt = jsonMap(jsonMap(draft['receipts'])[message['messageId']]);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      SelectableText(tr(context, 'composer.delivery.notSent',
+          args: {'preview': stringValue(message['text'])})),
+      Wrap(spacing: 8, children: [
+        TextButton(onPressed: !canRestore || sending ? null : () => drafts.update(draftKey, {
+          'text': message['text'], 'attachments': message['attachments'], 'images': message['images'],
+          'failedMessage': null, 'sendError': null, 'sendErrorMessageId': null,
+        }), child: Text(tr(context, 'composer.delivery.restore'))),
+        if (receiptCanRetry(receipt))
+          TextButton(onPressed: sending ? null : () => _submit(retry: message),
+              child: Text(tr(context, 'composer.delivery.retrySame'))),
+        TextButton(onPressed: sending ? null : () => drafts.update(draftKey, {
+          'failedMessage': null, 'sendError': null, 'sendErrorMessageId': null,
+        }), child: Text(tr(context, 'composer.delivery.discard'))),
+      ]),
+    ]);
   }
 
   Future<void> _create(JsonMap message) async {
@@ -1373,13 +1477,24 @@ class _AgentPanelState extends State<AgentPanel> {
 
   Future<void> _queueNow(JsonMap message) async {
     if (sending) return;
-    setState(() => sending = true);
+    if (drafts.isDismissed(draftKey, stringValue(message['messageId']))) return;
+    if (message['deliveryAttempted'] == true ||
+        ['sending', 'unacknowledged', 'rejected'].contains(message['state'])) {
+      if (client.supports('agentMessageReceipts')) {
+        await _checkDelivery(message);
+        if (!mounted || !receiptCanRetry(
+            jsonMap(jsonMap(draft['receipts'])[message['messageId']]))) return;
+      }
+    }
+    if (!mounted || sending ||
+        drafts.isDismissed(draftKey, stringValue(message['messageId']))) return;
+    setState(() { sending = true; _activeSendId = stringValue(message['messageId']); });
     final queued = maps(draft['queue']);
     final queuedIndex = queued.indexWhere(
       (q) => q['messageId'] == message['messageId'],
     );
     if (queuedIndex < 0 || queued[queuedIndex]['state'] == 'sending') {
-      setState(() => sending = false);
+      setState(() { sending = false; _activeSendId = null; });
       return;
     }
     // index.tsx handleSendQueuedNow reuses submitMessage: steer with the
@@ -1393,26 +1508,40 @@ class _AgentPanelState extends State<AgentPanel> {
     try {
       await drafts.flush();
       await _send(message);
-      drafts.update(draftKey, {
-        'queue': maps(draft['queue'])
-          ..removeWhere((q) => q['messageId'] == message['messageId']),
-      });
+      if (!client.supports('agentMessageReceipts')) {
+        drafts.update(draftKey, {
+          'queue': maps(draft['queue'])
+            ..removeWhere((q) => q['messageId'] == message['messageId']),
+        });
+      } else {
+        final current = maps(draft['queue']);
+        final index = current.indexWhere((q) => q['messageId'] == message['messageId']);
+        if (index >= 0 && current[index]['state'] == 'sending') {
+          current[index] = {...current[index], 'state': 'unacknowledged'};
+          drafts.update(draftKey, {'queue': current});
+        }
+      }
     } catch (e) {
+      if (e is DaemonException) drafts.applyReceipt(draftKey, jsonMap(e.payload?['receipt']));
       final current = maps(draft['queue']);
       final index = current.indexWhere(
         (q) => q['messageId'] == message['messageId'],
       );
       if (index >= 0) {
         current[index] = {
-          ...message,
-          'state': definitelyRejected(e) ? 'rejected' : 'unacknowledged',
-          'error': '$e',
+          ...current[index],
+          'state': current[index]['state'] == 'rejected' || definitelyRejected(e)
+              ? 'rejected' : 'unacknowledged',
+          'error': current[index]['state'] == 'rejected'
+              ? current[index]['error'] ?? '$e' : '$e',
         };
       }
       drafts.update(draftKey, {'queue': current});
-      if (mounted) setState(() => sendError = _sendErrorMessage(e));
+      if (mounted && index >= 0) setState(() => sendError = _sendErrorMessage(e));
     } finally {
-      if (mounted) setState(() => sending = false);
+      if (mounted && _activeSendId == message['messageId']) {
+        setState(() { sending = false; _activeSendId = null; });
+      }
     }
   }
 
@@ -1435,18 +1564,13 @@ class _AgentPanelState extends State<AgentPanel> {
   }
 
   Future<void> _removeQueued(JsonMap message) async {
-    if (message['state'] == 'unacknowledged' &&
-        !await confirmAction(
-          context,
-          title: 'Remove unacknowledged message?',
-          message: 'The daemon may already have received it. Removing it here does not cancel the remote turn.',
-        )) {
+    if (message['deliveryAttempted'] == true ||
+        ['sending', 'unacknowledged', 'rejected'].contains(message['state'])) {
+      await _checkDelivery(message, dismiss: true);
       return;
     }
-    drafts.update(draftKey, {
-      'queue': maps(draft['queue'])
-        ..removeWhere((q) => q['messageId'] == message['messageId']),
-    });
+    drafts.dismiss(draftKey, stringValue(message['messageId']));
+    await drafts.flush();
   }
 
   /// composer/index.tsx runClientSlashCommand: no confirmation; the draft is
@@ -2479,6 +2603,12 @@ class _AgentPanelState extends State<AgentPanel> {
     final List<Widget> children;
     if (entry == null) {
       final active = jsonMap(c.agent['activeTurn']);
+      final live = client.status == ConnectionStatus.connected &&
+          c.agent['snapshotAvailability'] != 'last_persisted' &&
+          c.agent['_live'] != false;
+      final pendingDelivery = jsonMap(draft['pending']).isNotEmpty ||
+          maps(draft['queue']).any((item) =>
+              ['sending', 'unacknowledged'].contains(item['state']));
       final start = DateTime.tryParse(stringValue(
         active['startedAt'],
         stringValue(c.turns[stringValue(active['turnId'])]?['startedAt']),
@@ -2486,11 +2616,16 @@ class _AgentPanelState extends State<AgentPanel> {
       children = [
         Transform.translate(
           offset: const Offset(-2, 0),
-          child: _WorkingDots(color: colors.onSurface),
+          child: live ? _WorkingDots(color: colors.onSurface)
+              : Icon(Icons.sync_problem, color: colors.onSurfaceVariant, size: 18),
         ),
         if (!isSubagent)
           AssistantForkMenuButton(onFork: (target) => _fork(null, target)),
-        if (start != null) _ElapsedLabel(start: start, running: true),
+        if (live && start != null) _ElapsedLabel(start: start, running: true),
+        if (!live || pendingDelivery)
+          Flexible(child: Text(tr(context, live
+              ? 'composer.delivery.agentRunning' : 'composer.delivery.stateUnavailable'),
+              style: Theme.of(context).textTheme.bodySmall)),
       ];
     } else {
       // turn-boundary.ts: forking pins the turn's cursor (hosts with
@@ -2833,20 +2968,11 @@ class _AgentPanelState extends State<AgentPanel> {
                       TextButton(onPressed: _reviewLegacyAttachments, child: const Text('Review')),
                     ],
                   ),
-                if (pending.isNotEmpty && !sending)
-                  Row(
-                    spacing: 8,
-                    children: [
-                      Expanded(
-                        child: Text('Send is awaiting acknowledgement. Draft retained.',
-                            style: small),
-                      ),
-                      TextButton(
-                        onPressed: sending ? null : () => _submit(retry: pending),
-                        child: const Text('Retry same message'),
-                      ),
-                    ],
-                  ),
+                if (pending.isNotEmpty) _deliveryPending(pending),
+                if (jsonMap(draft['failedMessage']).isNotEmpty)
+                  _failedDelivery(jsonMap(draft['failedMessage'])),
+                for (final queued in queue.where((item) => item['state'] == 'unacknowledged'))
+                  _deliveryPending(queued),
                 OverlayPortal(
                   controller: _autocompletePortal,
                   overlayChildBuilder: _autocompleteOverlay,
@@ -3296,7 +3422,9 @@ class _AgentPanelState extends State<AgentPanel> {
     final canPressLoading = loading && running;
     final queues = behavior == 'queue' && running;
     final disabled = !canPressLoading &&
-        (loading || !initialized || jsonList(draft['unresolvedLegacyAttachments']).isNotEmpty);
+        (loading || !initialized || client.status != ConnectionStatus.connected ||
+         jsonMap(draft['pending']).isNotEmpty || jsonMap(draft['failedMessage']).isNotEmpty ||
+         jsonList(draft['unresolvedLegacyAttachments']).isNotEmpty);
     return Padding(
       padding: const EdgeInsets.only(left: 4),
       child: ComposerSendButton(

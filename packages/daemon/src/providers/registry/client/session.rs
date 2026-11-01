@@ -50,7 +50,7 @@ impl AgentSession for Session {
     async fn steer_active_turn(&self, prompt: Value, options: Value) -> Result<Value> {
         self.inner.steer_active_turn(prompt, options).await
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
         events::stream_history(self.inner.as_ref(), &self.provider, sink).await
     }
     async fn runtime_info(&self) -> Result<Value> {
@@ -102,5 +102,11 @@ impl AgentSession for Session {
         prompt: &Value,
     ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
         self.inner.clone().prepare_out_of_band(prompt)
+    }
+    fn native_acknowledgement(
+        &self,
+        turn_id: &str,
+    ) -> Option<crate::providers::api::PromptAckFuture> {
+        self.inner.native_acknowledgement(turn_id)
     }
 }

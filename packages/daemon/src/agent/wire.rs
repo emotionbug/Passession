@@ -12,6 +12,42 @@ mod projection;
 pub(crate) use observation::legacy_attention_eligible;
 pub(crate) use projection::{project_legacy_event, serialize_stream_event, snapshot_payload};
 
+/// Deliver durable receipt updates to event subscribers that may act on the
+/// receipt's agent. Clients refetch after reconnecting, so a lagged stream is
+/// logged and skipped rather than replayed.
+pub(super) fn forward_receipt_updates(
+    app: std::sync::Weak<crate::state::AppState>,
+    mut events: tokio::sync::broadcast::Receiver<Value>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    tokio::spawn(async move {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "Message receipt updates lagged");
+                    continue;
+                }
+                Err(RecvError::Closed) => break,
+            };
+            let Some(app) = app.upgrade() else {
+                break;
+            };
+            let agent_id = text(&event["payload"]["receipt"], "agentId").to_owned();
+            for source in app
+                .transport
+                .event_sources(super::receipts::RECEIPT_UPDATE)
+            {
+                if app.agents.authorize(source.principal(), &agent_id).await.is_err() {
+                    continue;
+                }
+                if let Err(error) = source.emit_event(event.clone()).await {
+                    tracing::debug!(%error, "Message receipt update delivery ended");
+                }
+            }
+        }
+    });
+}
 pub(super) async fn handle(
     manager: &AgentManager,
     context: &RequestContext,
@@ -59,6 +95,43 @@ pub(super) async fn handle(
             let mut payload = action_payload(message, &target, result);
             payload.as_object_mut().unwrap().remove("notice");
             reply(context, "send_agent_message_response", payload).await?;
+        }
+        "agent.message_receipt.get.request" | "agent.message_receipt.dismiss.request" => {
+            // Exact identity only: no agent prefix/title resolution. Authority
+            // is the same per-agent scope that may send to this agent.
+            let message_id = text(message, "messageId");
+            let dismiss = kind == "agent.message_receipt.dismiss.request";
+            let result = async {
+                if id.is_empty() || message_id.is_empty() {
+                    bail!("agentId and messageId are required");
+                }
+                manager.authorize(context.principal(), id).await?;
+                let receipts = manager.receipts()?;
+                if dismiss {
+                    receipts.dismiss(id, message_id).await
+                } else {
+                    receipts.get(id, message_id).await
+                }
+            }
+            .await;
+            let payload = match result {
+                Ok(receipt) => {
+                    json!({"agentId":id,"messageId":message_id,"receipt":receipt,"error":null})
+                }
+                Err(error) => {
+                    json!({"agentId":id,"messageId":message_id,"receipt":null,"error":error.to_string()})
+                }
+            };
+            reply(
+                context,
+                if dismiss {
+                    "agent.message_receipt.dismiss.response"
+                } else {
+                    "agent.message_receipt.get.response"
+                },
+                correlated(message, payload),
+            )
+            .await?;
         }
         "wait_for_finish_request" => {
             let resolved = resolve(manager, id).await;
@@ -335,14 +408,20 @@ fn action_payload(message: &Value, id: &str, result: Result<Value>) -> Value {
     let mut payload = match result {
         Ok(value) => {
             let mut payload = json!({"accepted":true,"error":null});
-            for key in ["accepted", "error", "notice", "deliveryStatus"] {
+            for key in ["accepted", "error", "notice", "deliveryStatus", "receipt"] {
                 if let Some(field) = value.get(key) {
                     payload[key] = field.clone();
                 }
             }
             payload
         }
-        Err(error) => json!({"accepted":false,"error":error.to_string()}),
+        Err(error) => {
+            let mut payload = json!({"accepted":false,"error":error.to_string()});
+            if let Some(failure) = error.downcast_ref::<super::receipts::SendReceiptError>() {
+                payload["receipt"] = failure.receipt.clone();
+            }
+            payload
+        }
     };
     payload["agentId"] = json!(id);
     correlated(message, payload)

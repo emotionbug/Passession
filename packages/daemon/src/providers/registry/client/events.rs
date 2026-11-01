@@ -88,15 +88,15 @@ pub(super) async fn stream_history(
     inner: &dyn AgentSession,
     provider: &str,
     destination: EventSink,
-) -> Result<()> {
+) -> Result<crate::providers::api::HistoryCoverage> {
     let cancel = destination.cancellation().child_token();
     let _cancel_on_exit = cancel.clone().drop_guard();
     let (sink, mut receiver) = EventSink::channel(256, cancel);
     // Join the producer and consumer in this future: success means the complete
     // history has reached its owner, including the final buffered events.
-    tokio::try_join!(
+    let (coverage, _) = tokio::try_join!(
         inner.stream_history(sink),
         forward(provider, &destination, &mut receiver)
     )?;
-    Ok(())
+    Ok(coverage)
 }

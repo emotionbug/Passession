@@ -606,11 +606,11 @@ impl AgentSession for PluginSession {
             json!({"status":if result["type"] == "steer" && result["turnId"] == options["expectedTurnId"] {"accepted"} else {"unavailable"}}),
         )
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
         for event in self.history() {
             sink.emit(event).await?;
         }
-        Ok(())
+        Ok(crate::providers::api::HistoryCoverage::Unverified)
     }
     async fn runtime_info(&self) -> Result<Value> {
         Ok(self.core.runtime_info(&self.core.state.lock().unwrap()))

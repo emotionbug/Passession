@@ -26,6 +26,7 @@ pub struct ReplayHistory {
     pub subagents: Vec<ReplaySubagent>,
     pub workflows: Vec<Value>,
     pub workflow_entries_by_run_id: BTreeMap<String, Vec<Value>>,
+    pub complete: bool,
 }
 
 pub fn config_dir(env: &BTreeMap<String, String>) -> Result<PathBuf> {
@@ -135,7 +136,7 @@ async fn directory_entries(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
     Ok(entries)
 }
 
-async fn visit_records(path: &Path, mut visit: impl FnMut(Value)) -> Result<()> {
+async fn visit_records(path: &Path, mut visit: impl FnMut(Value)) -> Result<bool> {
     let file = fs::File::open(path)
         .await
         .with_context(|| format!("Cannot read Claude transcript {}", path.display()))?;
@@ -146,13 +147,16 @@ async fn visit_records(path: &Path, mut visit: impl FnMut(Value)) -> Result<()> 
     // Read the opened inode's initial extent, not newly appended messages.
     let mut reader = BufReader::with_capacity(64 * 1024, file.take(metadata.len()));
     let mut line = Vec::new();
+    let mut complete = true;
     while reader.read_until(b'\n', &mut line).await? != 0 {
         if let Ok(entry @ Value::Object(_)) = serde_json::from_slice::<Value>(&line) {
             visit(entry);
+        } else if !line.iter().all(u8::is_ascii_whitespace) {
+            complete = false;
         }
         line.clear();
     }
-    Ok(())
+    Ok(complete)
 }
 
 async fn optional_json(path: &Path) -> Option<Value> {
@@ -234,7 +238,7 @@ pub async fn read_history(path: &Path) -> Result<ReplayHistory> {
     let mut history = ReplayHistory::default();
     let mut indices: HashMap<String, usize> = HashMap::new();
     for file in sidechain_files {
-        visit_records(&file, |entry| {
+        let complete = visit_records(&file, |entry| {
             if entry.get("isSidechain") != Some(&Value::Bool(true)) {
                 if file == path {
                     history.parent_entries.push(entry);
@@ -256,6 +260,7 @@ pub async fn read_history(path: &Path) -> Result<ReplayHistory> {
             history.subagents[index].entries.push(entry);
         })
         .await?;
+        if file == path { history.complete = complete; }
     }
     for (run_id, files) in workflow_files {
         let mut entries = Vec::new();
@@ -652,7 +657,7 @@ pub async fn renamed_title(
             Ok(None)
         }
         Err(error) => Err(error),
-        Ok(()) => Ok(title),
+        Ok(_) => Ok(title),
     }
 }
 

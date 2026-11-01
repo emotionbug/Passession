@@ -6,17 +6,33 @@ import 'package:intl/intl.dart';
 
 import '../core/json.dart';
 
-const supportedPaseoLocales = [
-  Locale('en'),
-  Locale('ar'),
-  Locale('es'),
-  Locale('fr'),
-  Locale('ja'),
-  Locale('ko'),
-  Locale('pt', 'BR'),
-  Locale('ru'),
-  Locale('zh', 'CN'),
-];
+/// English first: Flutter's locale resolution falls back to the first entry.
+const supportedPaseoLocales = [Locale('en'), Locale('ko')];
+
+/// Values shown by the language setting.
+const paseoLanguageOptions = ['system', 'en', 'ko'];
+
+/// Canonical language setting for a stored `language` value: `system`, `en`
+/// or `ko`. Region/script variants (`ko-KR`, `en_US`) keep their language;
+/// any other tag, including catalogs that were removed, resolves to English.
+/// The stored value itself is never rewritten here.
+String paseoLanguagePreference(Object? stored) {
+  if (stored is! String) return 'system';
+  final value = stored.trim();
+  if (value.isEmpty || value == 'system' || value == 'auto') return 'system';
+  return value.split(RegExp('[-_]')).first.toLowerCase() == 'ko' ? 'ko' : 'en';
+}
+
+/// Explicit app locale for a stored `language` value; null follows the device.
+Locale? paseoLocaleFor(Object? stored) =>
+    switch (paseoLanguagePreference(stored)) {
+      'system' => null,
+      final tag => Locale(tag),
+    };
+
+/// Catalog for a resolved locale; anything but Korean uses English.
+String paseoCatalogTag(Locale locale) =>
+    locale.languageCode.toLowerCase() == 'ko' ? 'ko' : 'en';
 
 String tr(
   BuildContext context,
@@ -44,11 +60,7 @@ class PaseoLocalizations {
   );
 
   static Future<PaseoLocalizations> load(Locale locale) async {
-    final tag = switch (locale.languageCode) {
-      'pt' => 'pt-BR',
-      'zh' => 'zh-CN',
-      _ => locale.languageCode,
-    };
+    final tag = paseoCatalogTag(locale);
     final catalogs = await Future.wait([_load(tag), _load('en')]);
     return PaseoLocalizations(locale, catalogs[0], catalogs[1]);
   }

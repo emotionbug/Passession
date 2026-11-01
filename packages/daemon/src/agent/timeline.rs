@@ -10,6 +10,8 @@ pub use stream::{StreamCoalescer, SubagentStore};
 mod search;
 #[path = "timeline_storage.rs"]
 mod storage;
+#[path = "timeline_history.rs"]
+mod history;
 
 pub(super) fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)

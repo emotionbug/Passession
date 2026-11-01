@@ -66,6 +66,26 @@ accepted a prompt before the daemon recorded success, so automatic resubmission 
 work. Inspect the agent before choosing a new message ID. Receipts contain identity and request
 hashes, never prompts, environment values, or credentials.
 
+With `server_info.features.agentMessageReceipts`, each `(agentId, messageId)` has a durable receipt
+with a monotonic `revision` and a `phase`: `preparing`, `queued`, `dispatching` (the durable
+boundary written before any provider prompt effect), `submitted` (the provider call returned;
+`correlation.acknowledgementPending` says whether a correlated native acknowledgement is still
+awaited), `accepted` (provider acceptance evidence), `rejected`, `not_delivered`,
+`outcome_unknown`, or `missing` (no record, which is not proof of non-delivery). `send_agent_message_response`
+keeps `accepted` as host admission and adds `receipt` when the identity has one. A retry replays a
+submitted or accepted result and a rejection without dispatching; only `canRetry: true`
+(`not_delivered`, not dismissed) runs the identity again. After a restart, an in-flight receipt
+without its owner becomes `not_delivered` before the dispatch boundary and `outcome_unknown` after it.
+
+`agent.message_receipt.get.request` reads one receipt. `agent.message_receipt.dismiss.request`
+writes a sticky tombstone: that exact request never dispatches again, even if it was never seen.
+It stops the prompt only when its owner had not crossed the dispatch boundary
+(`phase: not_delivered`, `error: agent_request_dismissed`); otherwise `mayHaveExecuted` stays true
+and dismissal is not proof that work stopped. A later native acknowledgement can still improve the
+phase but never clears `dismissed`. Durable changes are published as `agent.message_receipt.update`
+to sessions subscribed to that event and authorized for the agent. The same text under a new
+message ID is a separate request.
+
 Before messaging an archived workspace, call `workspace.recovery.inspect.request`, then
 `workspace.recovery.restore.request` and await success. The native message handler unarchives the
 agent and loads its persisted provider session. `activeTurnBehavior: "steer"` uses the provider's

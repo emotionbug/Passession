@@ -128,6 +128,26 @@
     }
   },
   "composer": {
+    "delivery": {
+      "blocked": "이전 메시지의 전송 상태를 정리한 뒤 새 메시지를 보내세요.",
+      "preparing": "메시지 접수를 확인하고 있습니다.",
+      "dispatching": "프로바이더에 메시지를 전달하고 있습니다.",
+      "awaitingAck": "호스트가 메시지를 전달했으며 프로바이더의 수신 확인을 기다리고 있습니다.",
+      "unknown": "전달 여부가 확인되지 않았습니다. 이미 실행 중인 에이전트 작업과는 별개입니다.",
+      "legacyUnknown": "이 호스트는 정확한 전송 결과 조회를 지원하지 않아 전달 여부를 확인할 수 없습니다.",
+      "offline": "호스트 연결이 끊겼습니다. 재연결 후 전송 상태를 확인하며 자동 재전송하지 않습니다.",
+      "checkAgain": "상태 확인",
+      "retrySame": "같은 메시지 재시도",
+      "stopWaiting": "대기 종료",
+      "stopWaitingTitle": "이 메시지의 대기를 종료할까요?",
+      "stopWaitingMessage": "이 메시지의 재시도를 막고 대기 표시를 없앱니다. 프로바이더가 이미 수락한 작업은 계속 실행될 수 있습니다.",
+      "stopWaitingLegacyMessage": "이 기기의 대기 표시만 지웁니다. 이 호스트에는 취소를 기록할 수 없으며 이미 전달된 작업은 계속 실행될 수 있습니다.",
+      "notSent": "수락되지 않은 메시지:\n{{preview}}",
+      "restore": "빈 입력창으로 복원",
+      "discard": "실패한 초안 버리기",
+      "agentRunning": "에이전트 실행 중 · 전송 대기와 별개",
+      "stateUnavailable": "실시간 실행 상태 확인 불가"
+    },
     "placeholders": {
       "desktop": "에이전트에게 메시지를 보내거나 @files 태그, /commands, /skills를 사용하세요",
       "mobile": "메시지, @files, /commands",
@@ -1063,6 +1083,13 @@
     }
   },
   "sidebar": {
+    "refresh": {
+      "project": "프로젝트",
+      "workspace": "워크스페이스",
+      "agent": "세션",
+      "loading": "{{lists}} 불러오는 중…",
+      "failed": "{{list}}: {{error}}"
+    },
     "statusGroupAccessibility": "{{label}} 그룹",
     "statusBucket": {
       "needsInput": "입력 필요",
@@ -2165,15 +2192,8 @@
         "description": "앱 언어",
         "options": {
           "system": "시스템",
-          "ar": "العربية",
           "en": "English",
-          "es": "Español",
-          "fr": "Français",
-          "ja": "일본어",
-          "ko": "한국어",
-          "ptBR": "브라질 포르투갈어",
-          "ru": "Русский",
-          "zhCN": "简体中文"
+          "ko": "한국어"
         }
       }
     },

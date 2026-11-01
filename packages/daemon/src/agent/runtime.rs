@@ -504,7 +504,7 @@ impl AgentManager {
         cell: &Arc<AgentCell>,
         force: bool,
     ) -> Result<()> {
-        self.hydrate_history_for(id, cell, force, None).await
+        self.hydrate_history_for(id, cell, force, None, false).await
     }
     pub(super) async fn hydrate_history_for(
         &self,
@@ -512,6 +512,7 @@ impl AgentManager {
         cell: &Arc<AgentCell>,
         force: bool,
         initiating_source: Option<&str>,
+        allow_removal: bool,
     ) -> Result<()> {
         let session = {
             let data = cell.data.lock().await;
@@ -531,13 +532,16 @@ impl AgentManager {
             events
         };
         let (result, events) = tokio::join!(session.stream_history(sink), collect);
-        result?;
+        let coverage = result?;
         self.drain_events(cell).await?;
         let _commit = cell.commit.lock().await;
         let timeline = cell.timeline.clone();
         let path = self.timeline_path(id)?;
         let id_owned = id.to_owned();
-        let (epoch, subagent_events) = tokio::task::spawn_blocking(move || {
+        let store = self.subagent_store.clone();
+        let snapshot = cell.data.lock().await.snapshot.clone();
+        let root = (snapshot["internal"] != true).then(|| self.app().map(|app| app.home.join("agent-subagents"))).transpose()?;
+        let (epoch, subagent_outputs) = tokio::task::spawn_blocking(move || {
             let mut current = timeline
                 .lock()
                 .map_err(|_| anyhow!("Timeline lock poisoned"))?;
@@ -552,23 +556,45 @@ impl AgentManager {
                     subagent_events.push(event);
                 }
             }
-            replacement.persist(&path, &id_owned)?;
-            let epoch = replacement.epoch().to_owned();
-            *current = replacement;
-            Ok::<_, anyhow::Error>((epoch, subagent_events))
+            let epoch = if replacement.reconcile_history(&current, coverage, allow_removal) {
+                replacement.persist(&path, &id_owned)?;
+                let epoch = replacement.epoch().to_owned();
+                *current = replacement;
+                Some(epoch)
+            } else {
+                tracing::warn!(agent_id=%id_owned, "Retaining canonical timeline: replay lacks complete identity coverage");
+                None
+            };
+            drop(current);
+            let outputs = if subagent_events.is_empty() { Vec::new() } else {
+                store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
+                    .replay_history(root.as_deref(), &id_owned, subagent_events)?
+            };
+            Ok::<_, anyhow::Error>((epoch, outputs))
         })
         .await??;
-        for event in subagent_events {
-            self.apply_subagent_event(id, cell, &event).await?;
+        for output in subagent_outputs {
+            self.publish_subagent_output(id, cell, &snapshot, output).await?;
         }
+        let mut snapshot = cell.data.lock().await.snapshot.clone();
+        snapshot["historySync"] = json!({
+            "status": if epoch.is_none() { "retained" }
+                else if coverage == crate::providers::api::HistoryCoverage::Complete { "complete" } else { "partial" },
+            "canonicalPreserved": epoch.is_none(),
+        });
+        self.commit_snapshot_locked(cell, snapshot).await?;
         drop(_commit);
         self.release_event_stage(cell).await?;
         cell.data.lock().await.history_primed = true;
-        let mut event = json!({"type":"timeline_replacement","agentId":id,"epoch":epoch});
-        if let Some(source) = initiating_source {
-            event["initiatingSourceId"] = json!(source);
+        if let Some(epoch) = epoch {
+            let mut event = json!({"type":"timeline_replacement","agentId":id,"epoch":epoch});
+            if let Some(source) = initiating_source {
+                event["initiatingSourceId"] = json!(source);
+            }
+            let _ = self.events.send(event);
+        } else if allow_removal {
+            bail!("Provider rewind completed, but its history snapshot could not be safely reconciled; previous canonical history was preserved");
         }
-        let _ = self.events.send(event);
         Ok(())
     }
     pub(super) fn timeline_path(&self, id: &str) -> Result<PathBuf> {
@@ -929,13 +955,6 @@ impl AgentManager {
                             item["messageId"] = json!(message_id);
                         }
                     }
-                    if from_history {
-                        // History replay rows keep only their source timestamp.
-                        options = match event.get("timestamp").filter(|value| value.is_string()) {
-                            Some(timestamp) => json!({"timestamp":timestamp}),
-                            None => json!({}),
-                        };
-                    }
                     let row = self
                         .append_to_cell(id, cell, item.clone(), &options)
                         .await?;
@@ -992,31 +1011,24 @@ impl AgentManager {
         cell: &Arc<AgentCell>,
         event: &Value,
     ) -> Result<()> {
-        let checkpoint = self
-            .subagent_store
-            .lock()
-            .map_err(|_| anyhow!("Subagent lock poisoned"))?
-            .checkpoint(id);
-        let mut candidate = SubagentStore::default();
-        candidate.restore_parent(&checkpoint)?;
-        let output = candidate.apply(id, required(event, "provider")?, &event["event"])?;
-        let next = candidate.checkpoint(id);
         let snapshot = cell.data.lock().await.snapshot.clone();
-        if snapshot["internal"] != true {
-            storage::atomic_json(
-                &self
-                    .app()?
-                    .home
-                    .join("agent-subagents")
-                    .join(format!("{id}.json")),
-                &next,
-            )
-            .await?;
-        }
-        self.subagent_store
-            .lock()
-            .map_err(|_| anyhow!("Subagent lock poisoned"))?
-            .restore_parent(&next)?;
+        let store = self.subagent_store.clone();
+        let root = (snapshot["internal"] != true).then(|| self.app().map(|app| app.home.join("agent-subagents"))).transpose()?;
+        let parent = id.to_owned();
+        let event = event.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?;
+            let provider = required(&event, "provider")?;
+            match root {
+                Some(root) => store.apply_persisted(&root, &parent, provider, &event["event"]),
+                None => store.apply(&parent, provider, &event["event"]),
+            }
+        }).await??;
+        self.publish_subagent_output(id, cell, &snapshot, output).await
+    }
+    async fn publish_subagent_output(
+        &self, id: &str, cell: &Arc<AgentCell>, snapshot: &Value, output: Value,
+    ) -> Result<()> {
         if cell.data.lock().await.ready {
             let _ = self
                 .events
@@ -1122,11 +1134,11 @@ impl AgentManager {
                 let _ = task.await;
             }
         }
-        let children = self
-            .subagent_store
-            .lock()
-            .map_err(|_| anyhow!("Subagent lock poisoned"))?
-            .list(id);
+        let store = self.subagent_store.clone();
+        let parent = id.to_owned();
+        let children = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>(store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.list(&parent))
+        }).await??;
         {
             let _commit = cell.commit.lock().await;
             for child in children

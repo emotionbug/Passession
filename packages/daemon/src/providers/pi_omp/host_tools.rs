@@ -132,6 +132,9 @@ impl Router {
             closed: AtomicBool::new(false),
             cancel,
         });
+        // Controls are dispatched by the stdout reader, independently of the
+        // ordered transcript consumer. A weak reference avoids a runtime cycle.
+        router.runtime.set_host_tools(Arc::downgrade(&router));
         if !native.is_empty() || servers.as_object().is_some_and(|s| !s.is_empty()) {
             if let Err(error) = router
                 .runtime

@@ -470,6 +470,7 @@ impl AgentProvider for CodexProvider {
             Err(e) => Ok(format!("Codex unavailable: {e}")),
         }
     }
+    fn supports_native_archive(&self) -> bool { true }
     async fn archive_native_session(&self, persistence: &Value) -> Result<()> {
         self.archive(persistence, false).await
     }

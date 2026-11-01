@@ -229,14 +229,41 @@ impl ManagedProcess {
         self.write_bytes(&frame).await
     }
 
+    /// Use one caller-owned deadline for lock admission, the complete frame and
+    /// flushing. A timeout before I/O leaves the process usable; cancellation
+    /// after I/O starts retains the partial-frame termination guard.
+    pub async fn write_json_with_deadline(
+        &self,
+        value: &serde_json::Value,
+        deadline: Option<Instant>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let mut frame = serde_json::to_vec(value).context("serializing subprocess JSON frame")?;
+        frame.push(b'\n');
+        self.write_bytes_controlled(&frame, deadline, Some(cancel)).await
+    }
+
     /// Writes all bytes asynchronously. If this future is dropped during I/O,
     /// stdin is closed and the tree is terminated: a partial protocol frame may
     /// not be followed by another request. Cancellation while waiting for the
     /// write lock does not alter the process because no I/O has been attempted.
     pub async fn write_bytes(&self, bytes: &[u8]) -> Result<()> {
+        self.write_bytes_controlled(bytes, None, None).await
+    }
+
+    async fn write_bytes_controlled(
+        &self,
+        bytes: &[u8],
+        deadline: Option<Instant>,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<()> {
+        let stopped = write_stopped(&self.control.stopping, cancel, deadline);
+        tokio::pin!(stopped);
         let mut stdin = tokio::select! {
             biased;
-            _ = self.control.stopping.cancelled() => return Err(not_written(bytes.len())),
+            source = &mut stopped => return Err(WriteError {
+                attempted: false, written: 0, total: bytes.len(), source,
+            }.into()),
             stdin = self.stdin.lock() => stdin,
         };
         if stdin.is_none() || self.control.stopping.is_cancelled() {
@@ -255,9 +282,7 @@ impl ManagedProcess {
         while written < bytes.len() {
             let result = tokio::select! {
                 biased;
-                _ = self.control.stopping.cancelled() => {
-                    Err(io::Error::new(io::ErrorKind::Interrupted, "subprocess is terminating"))
-                }
+                source = &mut stopped => Err(source),
                 result = std::future::poll_fn(|cx| {
                     attempt.io_attempted = true;
                     std::pin::Pin::new(attempt.stdin.as_mut().expect("open stdin")).poll_write(cx, &bytes[written..])
@@ -279,7 +304,8 @@ impl ManagedProcess {
                 Ok(count) => written += count,
                 Err(error)
                     if error.kind() == io::ErrorKind::Interrupted
-                        && !self.control.stopping.is_cancelled() =>
+                        && !self.control.stopping.is_cancelled()
+                        && !cancel.is_some_and(CancellationToken::is_cancelled) =>
                 {
                     continue;
                 }
@@ -299,7 +325,7 @@ impl ManagedProcess {
         // different protocol request after this one was incorrectly acknowledged.
         let flushed = tokio::select! {
             biased;
-            _ = self.control.stopping.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "subprocess is terminating")),
+            source = &mut stopped => Err(source),
             result = attempt.stdin.as_mut().expect("open stdin").flush() => result,
         };
         if let Err(source) = flushed {
@@ -435,6 +461,29 @@ fn not_written(total: usize) -> anyhow::Error {
         source: io::Error::new(io::ErrorKind::BrokenPipe, "subprocess stdin is closed"),
     }
     .into()
+}
+
+async fn write_stopped(
+    stopping: &CancellationToken,
+    cancel: Option<&CancellationToken>,
+    deadline: Option<Instant>,
+) -> io::Error {
+    tokio::select! {
+        biased;
+        _ = stopping.cancelled() => io::Error::new(io::ErrorKind::Interrupted, "subprocess is terminating"),
+        _ = async {
+            match cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => io::Error::new(io::ErrorKind::Interrupted, "subprocess write cancelled"),
+        _ = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        } => io::Error::new(io::ErrorKind::TimedOut, "subprocess write deadline exceeded"),
+    }
 }
 
 fn configure(command: &mut Command, spec: &CommandSpec) {

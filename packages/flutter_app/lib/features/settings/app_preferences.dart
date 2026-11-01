@@ -166,16 +166,6 @@ const syntaxThemeOptions = <(String, String)>[
   ('solarized', 'Solarized'),
 ];
 
-const _languages = [
-  'system', 'ar', 'en', 'es', 'fr', 'ja', 'ko', 'pt-BR', 'ru', 'zh-CN',
-];
-
-String _languageKey(String value) => switch (value) {
-  'pt-BR' => 'ptBR',
-  'zh-CN' => 'zhCN',
-  _ => value,
-};
-
 String _normalizedTheme(Object? value) {
   final theme = switch (value) {
     'dark-zinc' => 'zinc',
@@ -262,7 +252,7 @@ class _AppPreferenceSettingsState extends State<AppPreferenceSettings> {
   );
 
   List<Widget> general() {
-    final language = value('language', 'system').toString();
+    final language = paseoLanguagePreference(value('language', 'system'));
     final send = value('sendBehavior', 'steer').toString();
     final openInSidePane = jsonMap(value('openInSidePane', {}));
     final destinations = [
@@ -276,13 +266,10 @@ class _AppPreferenceSettingsState extends State<AppPreferenceSettings> {
           SettingsSelectRow<String>(
             label: t('settings.general.language.label'),
             hint: t('settings.general.language.description'),
-            value: _languages.contains(language) ? language : 'system',
+            value: language,
             options: [
-              for (final option in _languages)
-                (
-                  option,
-                  t('settings.general.language.options.${_languageKey(option)}'),
-                ),
+              for (final option in paseoLanguageOptions)
+                (option, t('settings.general.language.options.$option')),
             ],
             menuWidth: 300,
             onChanged: saving ? null : (v) => save('language', v),

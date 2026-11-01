@@ -1,11 +1,11 @@
-use paseo_client::process::{CommandSpec, ManagedProcess};
+use paseo_client::process::{CommandSpec, ManagedProcess, WriteError};
 use anyhow::{Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -14,6 +14,7 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::{mpsc, oneshot, watch},
 };
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const MAX_REASSEMBLED: usize = 64 * 1024 * 1024;
@@ -123,6 +124,36 @@ impl std::fmt::Display for CommandError {
     }
 }
 impl std::error::Error for CommandError {}
+
+/// Transport failure evidence, not a provider acceptance/rejection. Once stdin
+/// I/O starts, retrying a mutation can execute it twice even if no ACK arrived.
+#[derive(Debug, thiserror::Error)]
+#[error("JSONL request {request_id} failed (may_have_been_sent={may_have_been_sent}): {source}")]
+pub struct RequestError {
+    pub request_id: String,
+    pub may_have_been_sent: bool,
+    #[source]
+    pub source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+struct PendingRequest<'a> {
+    pending: &'a Mutex<HashMap<String, oneshot::Sender<Reply>>>,
+    id: &'a str,
+}
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(self.id);
+    }
+}
+
+fn request_failure(id: &str, source: anyhow::Error, may_have_been_sent: bool) -> anyhow::Error {
+    if source.is::<CommandError>() {
+        // An explicit native response is different from a lost transport ACK.
+        source
+    } else {
+        RequestError { request_id: id.to_owned(), may_have_been_sent, source: source.into() }.into()
+    }
+}
 type Reply = Result<Value>;
 pub struct Transport {
     pub process: Arc<ManagedProcess>,
@@ -133,6 +164,7 @@ pub struct Transport {
     ready: watch::Sender<Option<Value>>,
     cancel: CancellationToken,
     timeout: Duration,
+    host_tools: Mutex<Weak<super::host_tools::Router>>,
 }
 impl Transport {
     pub async fn spawn(
@@ -144,7 +176,6 @@ impl Transport {
             bail!("JSONL provider startup cancelled");
         }
         let (process, stdout) = ManagedProcess::spawn(spec).await?;
-        let (events, receiver) = mpsc::channel(512);
         let (ready, _) = watch::channel(None);
         let transport = Arc::new(Self {
             process,
@@ -155,7 +186,9 @@ impl Transport {
             ready,
             cancel,
             timeout,
+            host_tools: Mutex::new(Weak::new()),
         });
+        let (events, receiver) = super::event_queue::channel(&transport, transport.cancel.clone());
         let reader = transport.clone();
         let exit_events = events.clone();
         tokio::spawn(async move {
@@ -209,6 +242,10 @@ impl Transport {
                             };
                             let _ = reply.send(result);
                         } else {
+                            let router = reader.host_tools.lock().unwrap().upgrade();
+                            if router.is_some_and(|router| router.handle(&frame)) {
+                                continue;
+                            }
                             tokio::select! { _ = reader.cancel.cancelled() => break, result = events.send(frame) => if result.is_err() { break; } }
                         }
                     }
@@ -237,6 +274,16 @@ impl Transport {
                 .await;
         });
         Ok((transport, receiver))
+    }
+    pub(super) fn set_host_tools(&self, router: Weak<super::host_tools::Router>) {
+        *self.host_tools.lock().unwrap() = router;
+    }
+    pub(super) fn event_queue_failed(&self, message: &str) {
+        if self.closed.swap(true, Ordering::AcqRel) { return; }
+        tracing::error!(%message, "Provider output spool failed");
+        self.fail(message);
+        let process = self.process.clone();
+        tokio::spawn(async move { let _ = process.terminate(Duration::from_secs(2)).await; });
     }
     fn fail(&self, error: &str) {
         for (_, reply) in self.pending.lock().unwrap().drain() {
@@ -280,32 +327,43 @@ impl Transport {
         mut command: Value,
         timeout: Option<Duration>,
     ) -> Result<(String, Value)> {
+        let started = Instant::now();
         let id = format!("req_{}", self.sequence.fetch_add(1, Ordering::Relaxed));
+        let deadline = timeout.map(|timeout| started.checked_add(timeout)
+            .ok_or_else(|| request_failure(&id, anyhow!("JSONL request deadline exceeds clock range"), false)))
+            .transpose()?;
         command["id"] = json!(id);
         let (sender, receiver) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
             if self.closed.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire) {
-                bail!("JSONL provider process is closed");
+                return Err(request_failure(&id, anyhow!("JSONL provider process is closed"), false));
             }
             // Exit drains this same map after setting exited; never install a
             // waiter behind that drain.
             pending.insert(id.clone(), sender);
         }
-        if let Err(error) = self.send(&command).await {
-            self.pending.lock().unwrap().remove(&id);
-            return Err(error);
-        }
-        let receive = async {
-            receiver
-                .await
-                .map_err(|_| anyhow!("JSONL request channel closed"))?
-        };
-        let result = tokio::select! {
-            _ = self.cancel.cancelled() => Err(anyhow!("JSONL request cancelled")),
-            result = async { match timeout { Some(timeout) => tokio::time::timeout(timeout, receive).await.map_err(|_| anyhow!("JSONL request timed out phase={}\n{}", command["type"], self.process.stderr_tail()))?, None => receive.await } } => result,
-        };
-        self.pending.lock().unwrap().remove(&id);
+        let pending = PendingRequest { pending: &self.pending, id: &id };
+        let result = async {
+            self.send_with_deadline(&command, deadline).await.map_err(|error| {
+                let attempted = error.downcast_ref::<WriteError>()
+                    .is_none_or(|error| error.attempted);
+                request_failure(&id, error, attempted)
+            })?;
+            let result = tokio::select! {
+                biased;
+                result = receiver => result.unwrap_or_else(|_| Err(anyhow!("JSONL request channel closed"))),
+                _ = self.cancel.cancelled() => Err(anyhow!("JSONL request cancelled")),
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => Err(anyhow!("JSONL request timed out phase={}\n{}", command["type"], self.process.stderr_tail())),
+            };
+            result.map_err(|error| request_failure(&id, error, true))
+        }.await;
+        drop(pending);
         result.map(|value| (id, value))
     }
     pub async fn stop_work(&self, command: Value) -> Result<()> {
@@ -320,18 +378,28 @@ impl Transport {
         }
     }
     pub async fn send(&self, value: &Value) -> Result<()> {
+        self.send_with_deadline(value, None).await
+    }
+    async fn send_with_deadline(&self, value: &Value, deadline: Option<Instant>) -> Result<()> {
         if self.closed.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire) {
-            bail!("JSONL process is closed");
+            return Err(WriteError {
+                attempted: false, written: 0, total: 0,
+                source: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "JSONL process is closed"),
+            }.into());
         }
-        match self.process.write_json(value).await {
+        match self.process.write_json_with_deadline(value, deadline, &self.cancel).await {
             Ok(()) => Ok(()),
+            Err(error) if error.downcast_ref::<WriteError>().is_some_and(|error| !error.attempted) => {
+                // Waiting for another writer is not an attempted mutation and
+                // cannot justify killing that writer's healthy process.
+                Err(error)
+            }
             Err(error) => {
                 self.closed.store(true, Ordering::Release);
                 self.fail(&error.to_string());
                 self.cancel.cancel();
-                if self.process.terminate(Duration::from_secs(2)).await.is_ok() {
-                    self.exited.store(true, Ordering::Release);
-                }
+                // The partial-write guard and process supervisor own cleanup;
+                // waiting here would extend the caller's absolute RPC deadline.
                 Err(error)
             }
         }
@@ -407,5 +475,79 @@ mod tests {
             decoder.decode(frames.last().unwrap()).unwrap(),
             Some(expected)
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod request_tests {
+    use super::*;
+
+    async fn fixture(script: &str) -> (Arc<Transport>, mpsc::Receiver<Value>) {
+        Transport::spawn(CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: None, env: Default::default(), clear_env: false,
+        }, Duration::from_secs(2), CancellationToken::new()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_deadline_includes_blocked_stdin_and_cleans_waiter() {
+        let (transport, _events) = fixture("sleep 30").await;
+        let command = json!({"type":"prompt", "text":"x".repeat(2 * 1024 * 1024)});
+        let error = tokio::time::timeout(Duration::from_secs(3),
+            transport.request_with_timeout(command, Some(Duration::from_millis(300))))
+            .await.expect("the deadline must include a full stdin pipe").unwrap_err();
+        let error = error.downcast_ref::<RequestError>().unwrap();
+        assert!(error.may_have_been_sent);
+        assert_eq!(error.request_id, "req_1");
+        assert_eq!(error.source.downcast_ref::<WriteError>().unwrap().source.kind(),
+            std::io::ErrorKind::TimedOut);
+        assert!(transport.pending.lock().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(3), transport.process.wait())
+            .await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_request_removes_waiter_without_breaking_next_native_reply() {
+        let (transport, mut events) = fixture(
+            "IFS= read -r first; printf '{\"type\":\"input_seen\"}\\n'; \
+             IFS= read -r second; printf '{\"type\":\"response\",\"id\":\"req_2\",\"success\":true,\"data\":{\"value\":42}}\\n'; \
+             cat >/dev/null"
+        ).await;
+        let owner = transport.clone();
+        let request = tokio::spawn(async move {
+            owner.request_with_timeout(json!({"type":"prompt"}), None).await
+        });
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await.unwrap().unwrap()["type"], "input_seen");
+        assert_eq!(transport.pending.lock().unwrap().len(), 1);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(transport.pending.lock().unwrap().is_empty());
+        assert_eq!(transport.request(json!({"type":"get_state"})).await.unwrap(),
+            json!({"value":42}));
+        transport.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_rejection_is_distinct_from_transport_outcome_unknown() {
+        let (transport, _events) = fixture(
+            "IFS= read -r first; printf '{\"type\":\"response\",\"id\":\"req_1\",\"success\":false,\"error\":\"denied\"}\\n'; cat >/dev/null"
+        ).await;
+        let error = transport.request(json!({"type":"prompt"})).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<CommandError>().unwrap().0, "denied");
+        assert!(error.downcast_ref::<RequestError>().is_none());
+        transport.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_before_io_is_not_delivery_ambiguity() {
+        let (transport, _events) = fixture("sleep 30").await;
+        transport.cancel.cancel();
+        let error = transport.request(json!({"type":"prompt"})).await.unwrap_err();
+        assert!(!error.downcast_ref::<RequestError>().unwrap().may_have_been_sent);
+        assert!(transport.pending.lock().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(3), transport.process.wait())
+            .await.unwrap().unwrap();
     }
 }

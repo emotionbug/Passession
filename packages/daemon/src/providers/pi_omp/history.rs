@@ -31,6 +31,8 @@ pub struct History {
     pub messages: Vec<Value>,
     /// Stream envelopes retain replay timestamps, unlike initial timeline items.
     pub events: Vec<Value>,
+    /// False for a torn/invalid record, missing branch/ancestor, or missing file.
+    pub complete: bool,
 }
 
 fn nonempty(value: &Value) -> Option<&str> {
@@ -563,17 +565,30 @@ pub fn import_persistence(provider: &str, handle: &str, cwd: &str, stored_config
 }
 
 pub async fn active_entries(path: &Path, active_entry_id: Option<&str>) -> Result<Vec<Value>> {
+    Ok(active_entries_with_coverage(path, active_entry_id).await?.0)
+}
+
+async fn active_entries_with_coverage(path: &Path, active_entry_id: Option<&str>) -> Result<(Vec<Value>, bool)> {
     let content = fs::read(path).await?;
-    let entries: Vec<_> = String::from_utf8_lossy(&content)
-        .lines()
-        .filter_map(record)
-        .filter(|e| e["id"].is_string())
-        .collect();
+    let text = String::from_utf8_lossy(&content);
+    let mut complete = matches!(text, std::borrow::Cow::Borrowed(_));
+    let mut entries = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        match record(line) {
+            Some(entry) if entry["id"].is_string() => entries.push(entry),
+            Some(_) => complete = false,
+            None => complete = false,
+        }
+    }
     let by_id: HashMap<_, _> = entries
         .iter()
         .enumerate()
         .filter_map(|(i, e)| e["id"].as_str().map(|id| (id, i)))
         .collect();
+    complete &= by_id.len() == entries.len();
+    if let Some(id) = active_entry_id.filter(|id| !id.is_empty()) {
+        if !by_id.contains_key(id) { return Ok((Vec::new(), false)); }
+    }
     let parents: HashSet<_> = entries
         .iter()
         .filter_map(|e| e["parentId"].as_str())
@@ -594,16 +609,21 @@ pub async fn active_entries(path: &Path, active_entry_id: Option<&str>) -> Resul
         let entry = &entries[index];
         let id = entry["id"].as_str().unwrap_or("");
         if id.is_empty() || !seen.insert(id) {
+            complete = false;
             break;
         }
         chain.push(entry.clone());
-        current = entry["parentId"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .and_then(|p| by_id.get(p).copied());
+        current = match entry["parentId"].as_str().filter(|id| !id.is_empty()) {
+            Some(parent) => {
+                let next = by_id.get(parent).copied();
+                complete &= next.is_some();
+                next
+            }
+            None => None,
+        };
     }
     chain.reverse();
-    Ok(chain)
+    Ok((chain, complete))
 }
 
 fn fallback_message(role: &str, value: &Value) -> Value {
@@ -770,12 +790,13 @@ async fn load_inner(
         subagent_events: Vec::new(),
         messages: Vec::new(),
         events: Vec::new(),
+        complete: false,
     };
     if !visited.insert(path.to_owned()) {
         return Ok(history);
     }
-    let entries = match active_entries(path, active_entry_id).await {
-        Ok(entries) => entries,
+    let (entries, complete) = match active_entries_with_coverage(path, active_entry_id).await {
+        Ok(result) => result,
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -785,6 +806,7 @@ async fn load_inner(
         }
         Err(error) => return Err(error),
     };
+    history.complete = complete && history.descriptor.is_object();
     if history.descriptor.is_object() {
         history.descriptor["activeBranchEntryId"] = entries
             .last()
@@ -889,6 +911,7 @@ async fn load_inner(
                 if event["type"] == "timeline" {
                     let mut body =
                         json!({"type":"timeline","id":transcript.id,"item":event["item"]});
+                    body["historyComplete"] = json!(child.complete);
                     if let Some(timestamp) = event.get("timestamp") {
                         body["timestamp"] = timestamp.clone();
                     }

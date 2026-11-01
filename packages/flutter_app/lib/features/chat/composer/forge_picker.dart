@@ -8,7 +8,7 @@ import '../../../core/json.dart';
 import '../../../ui/common.dart';
 import '../../../ui/localization.dart';
 import '../../../ui/theme.dart';
-import '../chat_controller.dart' show maps, requireSuccess;
+import '../chat_controller.dart' show maps;
 import '../../git/git_controller.dart' show checkoutPayload;
 import 'attachment_files.dart' show usesLegacyForge;
 

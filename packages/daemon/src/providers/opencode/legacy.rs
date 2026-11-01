@@ -1379,7 +1379,7 @@ impl AgentSession for LegacySession {
         }
         Ok(json!({"status":"accepted"}))
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
         let this = &self.inner;
         this.reconnect_if_needed().await?;
         let info = this
@@ -1389,15 +1389,14 @@ impl AgentSession for LegacySession {
                 &this.cwd,
                 None,
             )
-            .await
-            .unwrap_or(Value::Null);
+            .await?;
         let messages = this.messages(&this.id, &this.cwd, &info).await?;
         for message in messages {
             for e in history_message(&message) {
                 sink.emit(tagged(e, self.provider(), None)).await?;
             }
         }
-        Ok(())
+        Ok(crate::providers::api::HistoryCoverage::Complete)
     }
     async fn runtime_info(&self) -> Result<Value> {
         Ok(runtime_info(

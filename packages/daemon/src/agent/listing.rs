@@ -259,11 +259,11 @@ impl AgentManager {
         if !snapshot["archivedAt"].is_string() {
             self.ensure_loaded(id).await?;
         }
-        Ok(self
-            .subagent_store
-            .lock()
-            .map_err(|_| anyhow!("Subagent lock poisoned"))?
-            .list(id))
+        let store = self.subagent_store.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            Ok(store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.list(&id))
+        }).await?
     }
     pub async fn subagent_timeline(
         &self,
@@ -272,15 +272,18 @@ impl AgentManager {
         options: &Value,
     ) -> Result<Value> {
         self.subagents(parent).await?;
-        let store = self
-            .subagent_store
-            .lock()
-            .map_err(|_| anyhow!("Subagent lock poisoned"))?;
-        let mut page = store.fetch_timeline(parent, id, options)?;
-        if let Some(descriptor) = store.get(parent, id) {
-            page["provider"] = descriptor["provider"].clone();
-        }
-        Ok(page)
+        let store = self.subagent_store.clone();
+        let parent = parent.to_owned();
+        let id = id.to_owned();
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?;
+            let mut page = store.fetch_timeline(&parent, &id, &options)?;
+            if let Some(descriptor) = store.get(&parent, &id) {
+                page["provider"] = descriptor["provider"].clone();
+            }
+            Ok(page)
+        }).await?
     }
     pub async fn list_provider_subagent_activity(&self) -> Result<Vec<Value>> {
         let public: HashSet<String> = self
@@ -290,15 +293,13 @@ impl AgentManager {
             .filter(|snapshot| snapshot["internal"] != true)
             .filter_map(|s| text(s, "id").map(str::to_owned))
             .collect();
-        Ok(self
-            .subagent_store
-            .lock()
-            .map_err(|_| anyhow!("Subagent lock poisoned"))?
-            .list_all()
-            .iter()
-            .filter(|s| text(s, "parentAgentId").is_some_and(|id| public.contains(id)))
-            .cloned()
-            .collect())
+        let store = self.subagent_store.clone();
+        tokio::task::spawn_blocking(move || {
+            Ok(store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
+                .list_all().iter()
+                .filter(|s| text(s, "parentAgentId").is_some_and(|id| public.contains(id)))
+                .cloned().collect())
+        }).await?
     }
     pub async fn workspace_last_user_message_times(&self) -> Result<BTreeMap<String, String>> {
         let mut times = BTreeMap::new();

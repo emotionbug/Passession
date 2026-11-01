@@ -345,7 +345,8 @@
               "status.plugin_settings_changed",
               "activity_log",
               "hub.execution.agent.update",
-              "hub.execution.agent.stream"
+              "hub.execution.agent.stream",
+              "agent.message_receipt.update"
             ]
           }
         },
@@ -10717,6 +10718,58 @@
         "type",
         "requestId",
         "id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "agent.message_receipt.get.request"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "agentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "messageId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "agentId",
+        "messageId"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "agent.message_receipt.dismiss.request"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "agentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "messageId": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "agentId",
+        "messageId"
       ]
     }
   ]

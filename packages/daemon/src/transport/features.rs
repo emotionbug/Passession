@@ -9,6 +9,7 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
         "usageSources",
         "ownedSubscriptions",
         "agentRequestReceipts",
+        "agentMessageReceipts",
         "workspaceRequestReceipts",
         "creationLifecycle",
         "hubAgentRpc",

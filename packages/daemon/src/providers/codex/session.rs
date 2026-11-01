@@ -30,6 +30,7 @@ pub(super) struct State {
     pub pending: HashMap<String, PendingPermission>,
     pub usage: Option<Value>,
     pub history: Vec<Value>,
+    pub history_coverage: crate::providers::api::HistoryCoverage,
     pub async_questions: permissions::AsyncQuestions,
     pub features: Arc<[Value]>,
     pub text: HashMap<String, String>,
@@ -406,6 +407,7 @@ impl CodexSession {
                 features: initial_features,
                 usage: None,
                 history,
+                history_coverage: crate::providers::api::HistoryCoverage::Complete,
                 text: HashMap::new(),
                 outputs: HashMap::new(),
                 completed: HashSet::new(),
@@ -579,6 +581,7 @@ impl CodexSession {
                     })
                     .collect();
                 state.history = history;
+                state.history_coverage = crate::providers::api::HistoryCoverage::Complete;
             }
             Ok(())
         }
@@ -855,8 +858,10 @@ async fn load_history(
     let root = client
         .request("thread/read", json!({"threadId":id,"includeTurns":true}))
         .await?;
-    if !root["thread"].is_object() {
-        bail!("Codex thread/read returned no thread")
+    if !root["thread"]["turns"].is_array()
+        || root["thread"]["turns"].as_array().is_some_and(|turns| turns.iter().any(|turn| !turn["items"].is_array()))
+    {
+        bail!("Codex thread/read returned an incomplete thread")
     }
     let mut materialize = |data: &str, mime: Option<&str>| {
         crate::providers::prompt::materialize_image(data, mime)
@@ -1073,12 +1078,17 @@ impl AgentSession for CodexSession {
         }
         Ok(json!({"status":"accepted"}))
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
-        let history = std::mem::take(&mut self.state.lock().unwrap().history);
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
+        let (history, coverage) = {
+            let mut state = self.state.lock().unwrap();
+            let history = std::mem::take(&mut state.history);
+            let coverage = std::mem::replace(&mut state.history_coverage, crate::providers::api::HistoryCoverage::Unverified);
+            (history, coverage)
+        };
         for e in history {
             sink.emit(e).await?;
         }
-        Ok(())
+        Ok(coverage)
     }
     async fn runtime_info(&self) -> Result<Value> {
         let interactive = self.state.lock().unwrap().interactive;
@@ -1449,6 +1459,7 @@ impl AgentSession for CodexSession {
                 .collect();
             let removed = s.async_questions.retain(&retained);
             s.history = history;
+            s.history_coverage = crate::providers::api::HistoryCoverage::Complete;
             removed
         };
         for request_id in removed {

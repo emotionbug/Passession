@@ -170,21 +170,7 @@ impl AppState {
     }
 
     async fn usage_context(&self) -> Result<UsageContext> {
-        let snapshots = self.agents.list_snapshots().await?;
-        let mut sessions = Vec::with_capacity(snapshots.len());
-        for snapshot in snapshots {
-            let id = snapshot
-                .get("id")
-                .or_else(|| snapshot.get("agentId"))
-                .and_then(Value::as_str)
-                .context("Agent snapshot has no identity")?;
-            let session = self.agents.session(id).await?;
-            let mut usage = session
-                .and_then(|session| session.usage_session())
-                .unwrap_or_else(|| json!({}));
-            usage["agentId"] = json!(id);
-            sessions.push(usage);
-        }
+        let sessions = self.agents.usage_session_snapshots().await?;
         Ok(UsageContext {
             env: self.config.environment(),
             user_home: Some(self.user_home.clone()),
@@ -218,8 +204,13 @@ impl AppState {
             }
             return Ok(true);
         }
+        let mut unavailable_agents = Vec::new();
+        let mut unavailable_sources = Vec::new();
         let result:Result<()>=async {
             let usage_context=self.usage_context().await?;
+            unavailable_agents=usage_context.sessions.iter()
+                .filter(|session| session["_runtimeUnavailable"] == true)
+                .map(|session| session["agentId"].clone()).collect();
             let (sender,mut receiver)=mpsc::channel(32);
             let result={
                 let fetch=self.usage.list_reports_streaming(message,&usage_context,context.cancellation(),sender);
@@ -230,10 +221,14 @@ impl AppState {
                 }}
             };
             while let Ok(report)=receiver.try_recv(){context.send(json!({"type":"usage.list_reports.update","payload":{"requestId":request,"report":report}})).await?;}
-            result?;
+            unavailable_sources = result?.unavailable_sources;
             Ok(())
         }.await;
-        context.send(json!({"type":"usage.list_reports.response","payload":{"requestId":request,"error":result.err().map(|error|error.to_string())}})).await?;
+        let error = result.err().map(|error| error.to_string());
+        context.send(json!({"type":"usage.list_reports.response","payload":{
+            "requestId":request,"complete":error.is_none() && unavailable_agents.is_empty() && unavailable_sources.is_empty(),
+            "error":error,"unavailableAgentIds":unavailable_agents,"unavailableSourceIds":unavailable_sources
+        }})).await?;
         Ok(true)
     }
 
@@ -308,6 +303,11 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
     }.await;
     signal.abort();
     let _ = signal.await;
+    if let Err(error) = crate::daemon_control::publish_worker_stopping(
+        app.shutdown_kind.load(Ordering::Acquire) == 2,
+    ) {
+        tracing::error!(%error, "Failed to announce worker shutdown");
+    }
     let shutdown = app.shutdown().await;
     if let Some(error) = app.failure.lock().unwrap().take() {
         return Err(error);

@@ -11,7 +11,6 @@ import '../../../ui/common.dart';
 import '../../../ui/localization.dart';
 import '../../../ui/theme.dart';
 import '../../settings/usage_settings.dart' show UsageCard;
-import '../chat_controller.dart' show requireSuccess;
 
 /// context-window-meter.utils.ts formatTokenCount.
 String formatTokenCount(num value) {
@@ -285,17 +284,31 @@ class _AgentUsageSectionState extends State<AgentUsageSection> {
       refreshing.add(reportId);
       refreshFailed.remove(reportId);
     });
+    final own = 'flutter-agent-usage-refresh-${DateTime.now().microsecondsSinceEpoch}';
+    JsonMap? fresh;
+    final updates = widget.client.events.listen((event) {
+      if (event['type'] != 'usage.list_reports.update' || !mounted) return;
+      final payload = jsonMap(event['payload']);
+      if (payload['requestId'] != own) return;
+      final report = jsonMap(payload['report']);
+      if (report['id'] != reportId) return;
+      fresh = report;
+      setState(() => _upsert(report));
+    });
     try {
       final result = requireSuccess(await widget.client.request(
         'usage.list_reports.request',
         {
-          'requestId': 'flutter-agent-usage-refresh-${DateTime.now().microsecondsSinceEpoch}',
+          'requestId': own,
           'agentId': widget.agentId,
           'forceRefresh': true,
         },
         responseType: 'usage.list_reports.response',
       ));
-      final fresh = jsonList(result['reports'])
+      if (result['complete'] == false) {
+        throw StateError('Some usage data is unavailable; retaining previous reports.');
+      }
+      fresh ??= jsonList(result['reports'])
           .map(jsonMap)
           .where((report) => report['id'] == reportId)
           .firstOrNull;
@@ -304,11 +317,12 @@ class _AgentUsageSectionState extends State<AgentUsageSection> {
         // model.ts replaceReport: a vanished report is dropped.
         reports = fresh == null
             ? reports.where((report) => report['id'] != reportId).toList()
-            : [for (final report in reports) report['id'] == reportId ? fresh : report];
+            : [for (final report in reports) report['id'] == reportId ? fresh! : report];
       });
     } catch (_) {
       if (mounted) setState(() => refreshFailed.add(reportId));
     } finally {
+      await updates.cancel();
       if (mounted) setState(() => refreshing.remove(reportId));
     }
   }
@@ -332,11 +346,14 @@ class _AgentUsageSectionState extends State<AgentUsageSection> {
 
   Future<void> _load() async {
     final own = requestId = 'flutter-agent-usage-${DateTime.now().microsecondsSinceEpoch}';
+    final received = <Object?, JsonMap>{};
     subscription = widget.client.events.listen((event) {
       if (event['type'] != 'usage.list_reports.update' || !mounted) return;
       final payload = jsonMap(event['payload']);
       if (payload['requestId'] != own) return;
-      setState(() => _upsert(jsonMap(payload['report'])));
+      final report = jsonMap(payload['report']);
+      received[report['id']] = report;
+      setState(() => _upsert(report));
     });
     try {
       final result = requireSuccess(await widget.client.request(
@@ -345,8 +362,13 @@ class _AgentUsageSectionState extends State<AgentUsageSection> {
         responseType: 'usage.list_reports.response',
       ));
       if (!mounted || own != requestId) return;
+      if (result['complete'] == false) {
+        throw StateError('Some usage data is unavailable; received reports remain visible.');
+      }
       // model.ts settleReports: keep shown order, drop missing, append new.
-      final finished = jsonList(result['reports']).map(jsonMap).toList();
+      final finished = result['reports'] is List
+          ? jsonList(result['reports']).map(jsonMap).toList()
+          : received.values.toList();
       final byId = {for (final report in finished) report['id']: report};
       final settledList = <JsonMap>[];
       for (final shown in reports) {
@@ -364,6 +386,9 @@ class _AgentUsageSectionState extends State<AgentUsageSection> {
       });
     } catch (e) {
       if (mounted && own == requestId) setState(() => error = e);
+    } finally {
+      await subscription?.cancel();
+      subscription = null;
     }
   }
 

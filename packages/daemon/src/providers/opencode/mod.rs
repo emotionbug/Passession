@@ -752,6 +752,7 @@ impl AgentProvider for OpenCodeProvider {
         ))
     }
 
+    fn supports_native_archive(&self) -> bool { true }
     async fn archive_native_session(&self, persistence: &Value) -> Result<()> {
         self.set_archived(persistence, chrono::Utc::now().timestamp_millis())
             .await

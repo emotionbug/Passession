@@ -1,5 +1,15 @@
-use super::{catalog, events::Mapper, history, host_tools::Router, launch, transport::Transport};
-use crate::providers::api::{AgentSession, EventSink, LaunchContext, ProviderSpec, RewindTarget};
+use super::{
+    catalog,
+    events::Mapper,
+    history,
+    host_tools::Router,
+    launch,
+    transport::{CommandError, RequestError, Transport},
+};
+use crate::providers::api::{
+    AgentSession, EventSink, HistoryCoverage, LaunchContext, PromptAck, PromptAckFuture, PromptDeliveryError,
+    ProviderSpec, RewindTarget,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -15,7 +25,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +51,8 @@ struct State {
     settling: bool,
     bridged_tools: Value,
     followed_children: HashSet<String>,
+    /// The current prompt's native acknowledgement, taken once by the manager.
+    acknowledgement: Option<(String, watch::Receiver<Option<PromptAck>>)>,
 }
 struct Inner {
     spec: ProviderSpec,
@@ -77,8 +89,8 @@ impl Drop for CompactionGuard<'_> {
 pub struct Session {
     inner: Arc<Inner>,
     capabilities: Value,
-    history_events: Option<Vec<Value>>,
-    initial_history: Mutex<Option<Vec<Value>>>,
+    history_events: Option<(Vec<Value>, bool)>,
+    initial_history: Mutex<Option<(Vec<Value>, bool)>>,
     original_persistence: Option<Value>,
 }
 impl Inner {
@@ -128,26 +140,42 @@ impl Inner {
         }
         Ok(())
     }
+    /// The nominal idle deadline bounds the refresh RPC itself, and every state
+    /// change re-checks this runtime generation and turn after each await.
     async fn settle(self: Arc<Self>, frame: Value, generation: u64, turn: Option<String>) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        let owned = |inner: &Self, state: &State| {
+            !inner.closed.load(Ordering::Acquire)
+                && inner.generation.load(Ordering::Acquire) == generation
+                && !state.dead
+                && state.active == turn
+        };
         loop {
-            if self.closed.load(Ordering::Acquire)
-                || self.generation.load(Ordering::Acquire) != generation
-                || self.state.lock().unwrap().dead
-                || self.state.lock().unwrap().active != turn
-            {
+            if !owned(self.as_ref(), &*self.state.lock().unwrap()) {
                 return;
             }
-            if tokio::time::Instant::now() >= deadline {
-                self.state.lock().unwrap().mapper.end_turn();
+            let refreshed = tokio::select! {
+                _ = self.context.cancel.cancelled() => return,
+                result = tokio::time::timeout_at(deadline, self.refresh()) => result.ok(),
+            };
+            if tokio::time::Instant::now() >= deadline && refreshed.is_none() {
+                {
+                    let mut state = self.state.lock().unwrap();
+                    if !owned(self.as_ref(), &*state) {
+                        return;
+                    }
+                    if state.mapper.active_turn_id() == turn.as_deref() {
+                        state.mapper.end_turn();
+                    }
+                }
                 let _=self.accept_events(vec![json!({"type":"turn_failed","provider":self.spec.id,"turnId":turn,"error":"OMP provider idle deadline exceeded"})]).await;
                 return;
             }
-            if let Ok(state) = self.refresh().await {
+            if let Some(Ok(state)) = refreshed {
                 if state["isStreaming"] != true && state["isCompacting"] != true {
                     let events = {
                         let mut state = self.state.lock().unwrap();
-                        if state.active != turn {
+                        if !owned(self.as_ref(), &*state) {
                             return;
                         }
                         state.settling = false;
@@ -158,7 +186,7 @@ impl Inner {
                     return;
                 }
             }
-            tokio::select! {_ = self.context.cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
+            tokio::select! {_ = self.context.cancel.cancelled()=>return,_=tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)))=>{}}
         }
     }
     fn no_turn(self: &Arc<Self>, mut frame: Value, delay: Duration) {
@@ -818,6 +846,7 @@ impl Session {
                 settling: false,
                 bridged_tools,
                 followed_children: HashSet::new(),
+                acknowledgement: None,
             }),
             spec,
             context,
@@ -899,41 +928,41 @@ impl Session {
             inner,
             capabilities: catalog::capabilities(omp, supports_mcp),
             history_events: if history_only {
-                loaded.take().map(|h| h.events)
+                loaded.take().map(|h| (h.events, h.complete))
             } else {
                 None
             },
             // This snapshot precedes runtime startup. Reading the file again after
             // startup would replay messages also waiting in the manager's live stage.
-            initial_history: Mutex::new(if omp {
-                loaded.map(|h| h.events)
-            } else {
-                None
-            }),
+            initial_history: Mutex::new(loaded.map(|h| (h.events, h.complete))),
             original_persistence: if history_only { persistence } else { None },
         }))
     }
     async fn prompt(&self, prompt: Value, options: Value, behavior: Option<&str>) -> Result<Value> {
+        // Every refusal before the native request is spawned is proven undelivered.
         if self.history_events.is_some() {
-            bail!("OMP history session cannot start a turn");
+            return Err(PromptDeliveryError::not_delivered("OMP history session cannot start a turn"));
         }
         let _gate = self.inner.operation.lock().await;
         if self.inner.closed.load(Ordering::Acquire) {
-            bail!("Provider session is closed");
+            return Err(PromptDeliveryError::not_delivered("Provider session is closed"));
         }
         if self.inner.state.lock().unwrap().active.is_some() {
-            bail!("A provider turn is already active");
+            return Err(PromptDeliveryError::not_delivered("A provider turn is already active"));
         }
         if self.inner.state.lock().unwrap().dead {
-            bail!("Provider session has ended");
+            return Err(PromptDeliveryError::not_delivered("Provider session has ended"));
         }
         let model = self.inner.state.lock().unwrap().native["model"].clone();
-        let mut command = super::prompt::convert(&prompt, &model)?;
+        let mut command = super::prompt::convert(&prompt, &model)
+            .map_err(|error| PromptDeliveryError::not_delivered(error.to_string()))?;
         command["type"] = json!("prompt");
         if let Some(behavior) = behavior {
             command["streamingBehavior"] = json!(behavior);
         }
         let turn = uuid::Uuid::new_v4().to_string();
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        let (acknowledged, acknowledgement) = watch::channel(None);
         {
             let mut state = self.inner.state.lock().unwrap();
             state.active = Some(turn.clone());
@@ -944,6 +973,7 @@ impl Session {
             state.turn_has_user = false;
             state.live = true;
             state.settling = false;
+            state.acknowledgement = Some((turn.clone(), acknowledgement));
             state.mapper.begin_turn(&turn);
             state.mapper.queue_client_message(
                 command["message"].as_str().unwrap_or(""),
@@ -964,18 +994,41 @@ impl Session {
             launch::timeout(&inner.spec, &state.config)
         };
         tokio::spawn(async move {
-            let outcome = async {
-                inner
-                    .runtime()?
-                    .request_with_timeout(command, Some(request_timeout))
-                    .await
-            }
-            .await;
+            // A late result may only change state still owned by this exact
+            // turn and runtime generation; a newer turn must never be ended.
+            let owns = |state: &State| {
+                !state.dead
+                    && state.active.as_deref() == Some(turn.as_str())
+                    && inner.generation.load(Ordering::Acquire) == generation
+            };
+            let outcome = match inner.runtime() {
+                Ok(runtime) => runtime.request_with_timeout(command, Some(request_timeout)).await,
+                Err(error) => Err(RequestError {
+                    request_id: String::new(),
+                    may_have_been_sent: false,
+                    source: error.into(),
+                }
+                .into()),
+            };
+            acknowledged.send_replace(Some(match &outcome {
+                Ok((id, ack)) => PromptAck::Accepted(
+                    json!({"nativeRequestId":id,"agentInvoked":ack.get("agentInvoked").cloned().unwrap_or(Value::Null)}),
+                ),
+                Err(error) if error.is::<CommandError>() => PromptAck::Rejected(error.to_string()),
+                Err(error)
+                    if error
+                        .downcast_ref::<RequestError>()
+                        .is_some_and(|error| !error.may_have_been_sent) =>
+                {
+                    PromptAck::NotDelivered(error.to_string())
+                }
+                Err(error) => PromptAck::Unknown(error.to_string()),
+            }));
             match outcome {
                 Ok((id, ack)) => {
                     let correlated = {
                         let mut state = inner.state.lock().unwrap();
-                        if state.dead || state.active.as_deref() != Some(&turn) {
+                        if !owns(&*state) {
                             return;
                         }
                         state.prompt_id = Some(id.clone());
@@ -999,6 +1052,7 @@ impl Session {
                             if native["isStreaming"] != true
                                 && native["isCompacting"] != true
                                 && native["queuedMessageCount"].as_u64().unwrap_or(0) == 0
+                                && owns(&*inner.state.lock().unwrap())
                             {
                                 inner.no_turn(
                                     json!({"type":"prompt_result","agentInvoked":false}),
@@ -1009,8 +1063,18 @@ impl Session {
                     }
                 }
                 Err(error) => {
+                    if !owns(&*inner.state.lock().unwrap()) {
+                        return;
+                    }
                     let _=inner.accept_events(vec![json!({"type":if error.to_string().to_lowercase().contains("abort"){"turn_canceled"}else{"turn_failed"},"provider":inner.spec.id,"turnId":turn,"error":error.to_string(),"reason":error.to_string()})]).await;
-                    inner.state.lock().unwrap().mapper.end_turn();
+                    // accept_events released this turn; a newer prompt may have
+                    // begun its mapper turn during that await.
+                    let mut state = inner.state.lock().unwrap();
+                    if inner.generation.load(Ordering::Acquire) == generation
+                        && state.mapper.active_turn_id() == Some(turn.as_str())
+                    {
+                        state.mapper.end_turn();
+                    }
                 }
             }
         });
@@ -1082,6 +1146,23 @@ impl AgentSession for Session {
     async fn start_turn(&self, prompt: Value, options: Value) -> Result<Value> {
         self.prompt(prompt, options, None).await
     }
+    fn native_acknowledgement(&self, turn_id: &str) -> Option<PromptAckFuture> {
+        let mut receiver = {
+            let mut state = self.inner.state.lock().unwrap();
+            if state.acknowledgement.as_ref()?.0 != turn_id {
+                return None;
+            }
+            state.acknowledgement.take()?.1
+        };
+        Some(Box::pin(async move {
+            match receiver.wait_for(Option::is_some).await {
+                Ok(ack) => ack.clone().expect("acknowledgement is present"),
+                Err(_) => PromptAck::Unknown(
+                    "OMP prompt acknowledgement owner ended without a result".to_owned(),
+                ),
+            }
+        }))
+    }
     async fn steer_active_turn(&self, prompt: Value, options: Value) -> Result<Value> {
         let expected = options["expectedTurnId"].as_str();
         if self.inner.closed.load(Ordering::Acquire)
@@ -1099,6 +1180,10 @@ impl AgentSession for Session {
         }
         command["type"] = json!("steer");
         let omp = self.inner.spec.family == "omp";
+        let runtime = self
+            .inner
+            .runtime()
+            .map_err(|error| PromptDeliveryError::not_delivered(error.to_string()))?;
         if omp {
             self.inner
                 .state
@@ -1110,7 +1195,7 @@ impl AgentSession for Session {
                     options["clientMessageId"].as_str(),
                 );
         }
-        if let Err(error) = self.inner.runtime()?.request(command.clone()).await {
+        if let Err(error) = runtime.request(command.clone()).await {
             if omp {
                 self.inner
                     .state
@@ -1137,6 +1222,12 @@ impl AgentSession for Session {
             {
                 return Ok(json!({"status":"unavailable"}));
             }
+            if error
+                .downcast_ref::<RequestError>()
+                .is_some_and(|error| !error.may_have_been_sent)
+            {
+                return Err(PromptDeliveryError::not_delivered(error.to_string()));
+            }
             return Err(error);
         }
         if self.inner.state.lock().unwrap().active.as_deref() != expected {
@@ -1162,21 +1253,22 @@ impl AgentSession for Session {
         }
         Ok(json!({"status":"accepted"}))
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
-        if let Some(events) = &self.history_events {
+    async fn stream_history(&self, sink: EventSink) -> Result<HistoryCoverage> {
+        if let Some((events, complete)) = &self.history_events {
             for event in events {
                 sink.emit(event.clone()).await?;
             }
-            return Ok(());
+            return Ok(if *complete { HistoryCoverage::Complete } else { HistoryCoverage::Unverified });
         }
         let initial = self.initial_history.lock().unwrap().take();
-        if let Some(events) = initial {
+        if let Some((events, complete)) = initial {
             for event in events {
                 sink.emit(event).await?;
             }
-            return Ok(());
+            return Ok(if complete { HistoryCoverage::Complete } else { HistoryCoverage::Unverified });
         }
         if self.inner.spec.family == "omp" {
+            let mut coverage = HistoryCoverage::Unverified;
             let (path, branch, metadata, phases) = {
                 let state = self.inner.state.lock().unwrap();
                 (
@@ -1195,6 +1287,7 @@ impl AgentSession for Session {
                     &metadata,
                 )
                 .await?;
+                if history.complete { coverage = HistoryCoverage::Complete; }
                 for event in history.events {
                     sink.emit(event).await?;
                 }
@@ -1205,7 +1298,7 @@ impl AgentSession for Session {
                 sink.emit(json!({"type":"timeline","provider":self.provider(),"item":todo}))
                     .await?;
             }
-            return Ok(());
+            return Ok(coverage);
         }
         self.inner
             .extension("paseo_capture_entries", json!({}))
@@ -1247,7 +1340,7 @@ impl AgentSession for Session {
                 .await?;
             }
         }
-        Ok(())
+        Ok(HistoryCoverage::Unverified)
     }
     async fn runtime_info(&self) -> Result<Value> {
         if self.history_events.is_none() {

@@ -89,9 +89,12 @@ class HostState {
   List<JsonMap> agents = [];
   bool loading = false;
   Object? error;
+  final Map<String, Object> listErrors = {};
+  Iterable<String> get loadingLists => _hydrating;
   DateTime? cachedAt;
   bool get live =>
-      client.status == ConnectionStatus.connected && !loading && error == null;
+      client.status == ConnectionStatus.connected && !loading &&
+      error == null && _hydrating.isEmpty && listErrors.isEmpty;
   bool get cached =>
       !live &&
       (projects.isNotEmpty || workspaces.isNotEmpty || agents.isNotEmpty);
@@ -101,7 +104,7 @@ class HostState {
   ConnectionStatus? _lastStatus;
   Future<void>? _refresh;
   Timer? _resync;
-  bool _hydrating = false;
+  final Set<String> _hydrating = {};
   final List<JsonMap> _queuedEvents = [];
   final Map<String, String> _generations = {};
   final Map<String, int> _sequences = {};
@@ -925,8 +928,11 @@ class AppStore extends ChangeNotifier {
         }
       }
       await _releaseObservations(host);
-      host._hydrating = true;
+      host.listErrors.clear();
+      host._hydrating.addAll(['project', 'workspace', 'agent']);
       host._queuedEvents.clear();
+      final client = host.client;
+      bool current() => !_disposed && hosts.contains(host) && identical(host.client, client);
       // Explicit-event clients receive these broadcasts only while an owned
       // feed is installed. Establish it before baselines so updates during
       // pagination are buffered by _event instead of falling into a gap.
@@ -954,62 +960,56 @@ class AppStore extends ChangeNotifier {
         onEvent: (event) => _observationLifecycle(host, event),
       );
       host._observations.add(eventFeed);
-      // Install project baseline first. Agent rows retain their own placement overlays.
-      final projectSnapshot = await host.client.request(
-        'project.list.request',
-        {},
-        responseType: 'project.list.response',
-      );
-      host.projects = jsonList(projectSnapshot['projects'])
-          .map(jsonMap)
-          .toList();
-      _cursor(host, 'project', projectSnapshot);
-      final workspaceObservation = await host.client.observe(
-        type: 'fetch_workspaces_request',
-        fields: {
-          'subscribe': {},
-          'page': {'limit': 200},
-          if (_backgroundSupported(host)) 'includeBackground': true,
-        },
-        responseType: 'fetch_workspaces_response',
-        onEvent: (event) => _observationLifecycle(host, event),
-      );
-      host._observations.add(workspaceObservation);
-      final workspaceSnapshot = workspaceObservation.snapshot;
-      host.workspaces = await _allPages(
-        host,
-        'fetch_workspaces_request',
-        'fetch_workspaces_response',
-        workspaceSnapshot,
-      );
-      _cursor(host, 'workspace', workspaceSnapshot);
-      final agentObservation = await host.client.observe(
-        type: 'fetch_agents_request',
-        fields: {
-          'subscribe': {},
-          'page': {'limit': 200},
-          if (_backgroundSupported(host)) 'includeBackground': true,
-        },
-        responseType: 'fetch_agents_response',
-        onEvent: (event) => _observationLifecycle(host, event),
-      );
-      host._observations.add(agentObservation);
-      final agentSnapshot = agentObservation.snapshot;
-      host.agents = (await _allPages(
-        host,
-        'fetch_agents_request',
-        'fetch_agents_response',
-        agentSnapshot,
-      )).map(_agentRow).toList();
-      _cursor(host, 'agent', agentSnapshot);
-      host._hydrating = false;
-      for (final event in List<JsonMap>.of(host._queuedEvents)) {
-        _event(host, event);
-      }
-      host._queuedEvents.clear();
-      host.cachedAt = DateTime.now();
-      _resolveImportedTargetDirectories(host);
-      await _saveReplica(host);
+      host.loading = false;
+      _notify();
+      await Future.wait([
+        _hydrateDirectory(host, 'project', () async {
+          final snapshot = requireSuccess(await client.request(
+            'project.list.request', {}, responseType: 'project.list.response'));
+          if (!current()) return;
+          host.projects = jsonList(snapshot['projects']).map(jsonMap).toList();
+          _cursor(host, 'project', snapshot);
+        }),
+        _hydrateDirectory(host, 'workspace', () async {
+          final observation = await client.observe(
+            type: 'fetch_workspaces_request',
+            fields: {
+              'subscribe': {}, 'page': {'limit': 200},
+              if (_backgroundSupported(host)) 'includeBackground': true,
+            },
+            responseType: 'fetch_workspaces_response',
+            onEvent: (event) => _observationLifecycle(host, event),
+          );
+          if (!current()) { await observation.close(); return; }
+          host._observations.add(observation);
+          final snapshot = requireSuccess(observation.snapshot);
+          final rows = await _allPages(host, 'fetch_workspaces_request',
+              'fetch_workspaces_response', snapshot);
+          if (!current()) return;
+          host.workspaces = rows;
+          _cursor(host, 'workspace', snapshot);
+        }),
+        _hydrateDirectory(host, 'agent', () async {
+          final observation = await client.observe(
+            type: 'fetch_agents_request',
+            fields: {
+              'subscribe': {}, 'page': {'limit': 200},
+              if (_backgroundSupported(host)) 'includeBackground': true,
+            },
+            responseType: 'fetch_agents_response',
+            onEvent: (event) => _observationLifecycle(host, event),
+          );
+          if (!current()) { await observation.close(); return; }
+          host._observations.add(observation);
+          final snapshot = requireSuccess(observation.snapshot);
+          final rows = await _allPages(host, 'fetch_agents_request',
+              'fetch_agents_response', snapshot);
+          if (!current()) return;
+          host.agents = rows.map(_agentRow).toList();
+          _cursor(host, 'agent', snapshot);
+        }),
+      ]);
+      if (!current()) return;
       for (final target in tabs.where((t) => t.serverId == host.serverId)) {
         unawaited(_markChildTabOpen(target));
       }
@@ -1029,9 +1029,38 @@ class AppStore extends ChangeNotifier {
     } catch (error) {
       host.error = error;
     } finally {
-      host._hydrating = false;
+      host._hydrating.clear();
+      _drainDirectoryEvents(host);
       host.loading = false;
       _notify();
+    }
+  }
+
+  Future<void> _hydrateDirectory(
+    HostState host, String kind, Future<void> Function() load,
+  ) async {
+    try {
+      await load();
+      host.cachedAt = DateTime.now();
+    } catch (error) {
+      // Retain the last complete list. Other baselines publish independently.
+      host.listErrors[kind] = error;
+    } finally {
+      host._hydrating.remove(kind);
+      _drainDirectoryEvents(host);
+      if (!_disposed && hosts.contains(host)) {
+        _resolveImportedTargetDirectories(host);
+        _scheduleSave();
+        _notify();
+      }
+    }
+  }
+
+  void _drainDirectoryEvents(HostState host) {
+    final queued = List<JsonMap>.of(host._queuedEvents);
+    host._queuedEvents.clear();
+    for (final event in queued) {
+      _event(host, event);
     }
   }
 
@@ -1065,6 +1094,8 @@ class AppStore extends ChangeNotifier {
     String response,
     JsonMap snapshot,
   ) async {
+    requireSuccess(snapshot);
+    final client = host.client;
     final rows = jsonList(snapshot['entries']).map(jsonMap).toList();
     var page = jsonMap(snapshot['pageInfo']);
     final seen = <String>{};
@@ -1073,10 +1104,13 @@ class AppStore extends ChangeNotifier {
       if (cursor.isEmpty || !seen.add(cursor)) {
         throw StateError('Host returned an invalid directory cursor.');
       }
-      final next = await host.client.request(request, {
+      final next = requireSuccess(await client.request(request, {
         'page': {'limit': 200, 'cursor': cursor},
         if (_backgroundSupported(host)) 'includeBackground': true,
-      }, responseType: response);
+      }, responseType: response));
+      if (!identical(client, host.client)) {
+        throw StateError('Host connection changed during directory pagination.');
+      }
       rows.addAll(jsonList(next['entries']).map(jsonMap));
       page = jsonMap(next['pageInfo']);
     }
@@ -1117,15 +1151,30 @@ class AppStore extends ChangeNotifier {
     }.contains(type)) {
       return;
     }
-    if (host._hydrating) {
-      host._queuedEvents.add(event);
-      return;
-    }
     final kind = type.startsWith('agent')
         ? 'agent'
         : type.startsWith('project')
         ? 'project'
         : 'workspace';
+    // Workspace removals can also update project placement. Keep that joint
+    // update behind both baselines without blocking unrelated agent events.
+    final affectsProject = type == 'workspace_update' &&
+        (payload['emptyProject'] is Map || payload['removedProjectId'] != null);
+    final hasEarlier = host._queuedEvents.any((queued) {
+      final queuedType = stringValue(queued['type']);
+      final queuedKind = queuedType.startsWith('agent') ? 'agent'
+          : queuedType.startsWith('project') ? 'project' : 'workspace';
+      final queuedPayload = jsonMap(queued['payload']);
+      final queuedAffectsProject = queuedType == 'workspace_update' &&
+          (queuedPayload['emptyProject'] is Map || queuedPayload['removedProjectId'] != null);
+      return queuedKind == kind || (kind == 'project' && queuedAffectsProject) ||
+          (affectsProject && queuedKind == 'project');
+    });
+    if (hasEarlier || host._hydrating.contains(kind) ||
+        (affectsProject && host._hydrating.contains('project'))) {
+      host._queuedEvents.add(event);
+      return;
+    }
     final generation = payload['generation'];
     final seq = intValue(payload['seq']);
     if (generation is String &&

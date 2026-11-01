@@ -195,10 +195,7 @@ class _PaseoAppState extends State<PaseoApp> {
     _themeKey = themeKey;
     _language = language;
     _mode = preferences.themeMode;
-    final parts = language.split('-');
-    _locale = language == 'system' || language == 'auto'
-        ? null
-        : Locale(parts.first, parts.length > 1 ? parts[1] : null);
+    _locale = paseoLocaleFor(language);
     if (updateThemes) {
       _light = paseoTheme(brightness: Brightness.light, preferences: values);
       _dark = paseoTheme(brightness: Brightness.dark, preferences: values);

@@ -5,7 +5,6 @@ import 'package:flutter/foundation.dart';
 
 import '../../core/client.dart';
 import '../../core/json.dart';
-import 'chat_controller.dart';
 
 /// client/src/creation/index.ts CreationClient for one creation intent keyed
 /// by its `idempotencyKey`. Creation has no request deadline (`timeout: 0`),

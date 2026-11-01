@@ -50,7 +50,7 @@ class ChatDrafts extends ChangeNotifier {
                 ? {
                     ...queued,
                     'state': 'unacknowledged',
-                    'error': 'The app closed before this send was acknowledged. Retry the same message to recover.',
+                    'error': 'Delivery is unconfirmed. Check the exact message status before retrying.',
                   }
                 : queued;
           }).toList();
@@ -285,7 +285,11 @@ class ChatDrafts extends ChangeNotifier {
 
   void update(String key, JsonMap fields) {
     _dirtyDrafts.add(key);
-    draft(key).addAll(fields);
+    final current = draft(key);
+    if (['text', 'attachments', 'images'].any(fields.containsKey)) {
+      current['editorGeneration'] = (current['editorGeneration'] as int? ?? 0) + 1;
+    }
+    current.addAll(fields);
     _save();
   }
 
@@ -334,19 +338,109 @@ class ChatDrafts extends ChangeNotifier {
     update(draftKey, {'attachments': current});
   }
 
+  bool ownsPending(String key, JsonMap submitted) =>
+      jsonMap(draft(key)['pending'])['messageId'] == submitted['messageId'] &&
+      !isDismissed(key, stringValue(submitted['messageId']));
+
+  bool isDismissed(String key, String id) =>
+      jsonList(draft(key)['dismissedMessageIds']).contains(id);
+
   void acknowledge(String key, JsonMap submitted) {
     final current = draft(key);
-    // A response must not erase edits made while the request was in flight.
-    // The submitted text is the trimmed composer text (submit.ts).
-    if (stringValue(current['text']).trim() == submitted['text']) current['text'] = '';
-    for (final field in ['attachments', 'images']) {
-      final sent = jsonList(submitted[field]).map(jsonEncode).toSet();
-      current[field] = jsonList(current[field])
-          .where((a) => !sent.contains(jsonEncode(a)))
-          .toList();
+    final id = stringValue(submitted['messageId']);
+    if (isDismissed(key, id)) return;
+    final pending = jsonMap(current['pending']);
+    if (pending.isNotEmpty && pending['messageId'] != id) return;
+    // Equality of content is not ownership: identical retyping is a new edit.
+    if (submitted['editorGeneration'] != null &&
+        current['editorGeneration'] == submitted['editorGeneration']) {
+      current['text'] = '';
+      current['attachments'] = <JsonMap>[];
+      current['images'] = <JsonMap>[];
+      current['editorGeneration'] = (current['editorGeneration'] as int? ?? 0) + 1;
     }
-    current.remove('pending');
+    if (pending['messageId'] == id) current.remove('pending');
+    if (current['sendErrorMessageId'] == id) {
+      current.remove('sendError');
+      current.remove('sendErrorMessageId');
+    }
     _save();
+  }
+
+  /// A local tombstone also guards legacy hosts, but never claims remote cancel.
+  void dismiss(String key, String id) {
+    final current = draft(key);
+    current['dismissedMessageIds'] = {
+      ...jsonList(current['dismissedMessageIds']).whereType<String>(), id,
+    }.toList();
+    if (jsonMap(current['pending'])['messageId'] == id) {
+      current.remove('pending');
+    }
+    current['queue'] = jsonList(current['queue']).map(jsonMap).toList()
+      ..removeWhere((item) => item['messageId'] == id);
+    if (current['sendErrorMessageId'] == id) {
+      current.remove('sendError');
+      current.remove('sendErrorMessageId');
+    }
+    _save();
+  }
+
+  /// Monotonic exact-ID delivery evidence. A canonical user row is not a receipt.
+  bool applyReceipt(String key, JsonMap receipt) {
+    final identity = jsonList(jsonDecode(key));
+    final id = stringValue(receipt['messageId']);
+    if (id.isEmpty || identity[2] != receipt['agentId'] ||
+        receipt['revision'] is! int) return false;
+    final current = draft(key);
+    final receipts = {...jsonMap(current['receipts'])};
+    final previous = jsonMap(receipts[id]);
+    if ((previous['revision'] as int? ?? -1) >= (receipt['revision'] as int)) return false;
+    final sticky = isDismissed(key, id) || previous['dismissed'] == true;
+    receipts[id] = {...receipt, if (sticky) 'dismissed': true};
+    current['receipts'] = receipts;
+    if (sticky || receipt['dismissed'] == true) {
+      dismiss(key, id);
+      return true;
+    }
+    if (receiptResolved(receipt)) {
+      final pending = jsonMap(current['pending']);
+      if (pending['messageId'] == id) acknowledge(key, pending);
+      current['queue'] = jsonList(current['queue']).map(jsonMap).toList()
+        ..removeWhere((item) => item['messageId'] == id);
+    } else if (receipt['phase'] == 'rejected' || receipt['phase'] == 'not_delivered') {
+      final pending = jsonMap(current['pending']);
+      if (pending['messageId'] == id) {
+        current['failedMessage'] = pending;
+        current.remove('pending');
+        current['sendError'] = receipt['error'];
+        current['sendErrorMessageId'] = id;
+      }
+      final queue = jsonList(current['queue']).map(jsonMap).toList();
+      for (var i = 0; i < queue.length; i++) {
+        if (queue[i]['messageId'] == id) {
+          queue[i] = {...queue[i], 'state': 'rejected', 'error': receipt['error']};
+        }
+      }
+      current['queue'] = queue;
+    }
+    _save();
+    return true;
+  }
+
+  bool failSend(String key, JsonMap submitted, Object error, {bool rejected = false}) {
+    if (!ownsPending(key, submitted)) return false;
+    final current = draft(key);
+    final receipt = jsonMap(jsonMap(current['receipts'])[submitted['messageId']]);
+    if (receiptResolved(receipt) || receipt['dismissed'] == true) return false;
+    current['sendError'] = '$error';
+    current['sendErrorMessageId'] = submitted['messageId'];
+    if (rejected && receipt.isEmpty) {
+      current['failedMessage'] = submitted;
+      current.remove('pending');
+    }
+    // Keep failed content separate; never write over newer editor generations.
+    _save();
+    return true;
   }
 
   /// The message a submit sends: the composer text trimmed (submit.ts /
@@ -355,6 +449,7 @@ class ChatDrafts extends ChangeNotifier {
     final d = draft(key);
     return {
       'messageId': const Uuid().v4(),
+      'editorGeneration': d['editorGeneration'] as int? ?? 0,
       'text': stringValue(d['text']).trim(),
       'attachments': List.of(jsonList(d['attachments'])),
       'images': List.of(jsonList(d['images'])),
@@ -444,6 +539,15 @@ class ChatDrafts extends ChangeNotifier {
         });
   }
 }
+
+bool receiptResolved(JsonMap receipt) =>
+    receipt['phase'] == 'accepted' ||
+    (receipt['phase'] == 'submitted' &&
+        jsonMap(receipt['correlation'])['acknowledgementPending'] == false);
+
+bool receiptCanRetry(JsonMap receipt) =>
+    receipt['phase'] == 'not_delivered' &&
+    receipt['canRetry'] == true && receipt['dismissed'] != true;
 
 JsonMap wireAttachment(JsonMap attachment) {
   if (attachment['kind'] != 'workspace_file') return attachment;

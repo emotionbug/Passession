@@ -181,9 +181,9 @@ impl AgentSession for V2Session {
     async fn steer_active_turn(&self, prompt: Value, options: Value) -> Result<Value> {
         self.call(Operation::Steer(prompt, options)).await
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
         self.call(Operation::History(sink)).await?;
-        Ok(())
+        Ok(crate::providers::api::HistoryCoverage::Complete)
     }
     async fn runtime_info(&self) -> Result<Value> {
         self.call(Operation::RuntimeInfo).await

@@ -105,6 +105,8 @@ impl ClaudeProvider {
             bail!("Cannot resume: persistence handle has no sessionId");
         }
         let mut history_events = Vec::new();
+        let mut history_coverage = if native_id.is_none() { crate::providers::api::HistoryCoverage::Complete }
+            else { crate::providers::api::HistoryCoverage::Unverified };
         let mut anchors = Vec::new();
         if let Some(id) = &native_id {
             let loaded = async {
@@ -118,6 +120,7 @@ impl ClaudeProvider {
                         remember_anchor(&mut anchors, entry);
                     }
                     history_events = projection::project_history(&self.spec.id, &history);
+                    if history.complete { history_coverage = crate::providers::api::HistoryCoverage::Complete; }
                 }
                 Err(error) => {
                     tracing::warn!(error=%error,"Claude persisted history could not be loaded; retaining native resume handle")
@@ -132,7 +135,7 @@ impl ClaudeProvider {
             context,
             sink,
             capabilities: capabilities(),
-            history_events: Mutex::new(history_events),
+            history_events: Mutex::new((history_events, history_coverage)),
             env,
             persist: options["persistSession"].as_bool(),
             usage_key: uuid::Uuid::new_v4().to_string(),
@@ -379,6 +382,7 @@ impl AgentProvider for ClaudeProvider {
             .history_events
             .lock()
             .unwrap()
+            .0
             .iter()
             .filter(|v| v["type"] == "timeline")
             .map(|v| json!({"item":v["item"],"timestamp":v["timestamp"]}))
@@ -387,6 +391,7 @@ impl AgentProvider for ClaudeProvider {
             .history_events
             .lock()
             .unwrap()
+            .0
             .iter()
             .filter(|v| v["type"] == "provider_subagent")
             .cloned()
@@ -494,7 +499,7 @@ struct ClaudeSession {
     context: LaunchContext,
     sink: EventSink,
     capabilities: Value,
-    history_events: Mutex<Vec<Value>>,
+    history_events: Mutex<(Vec<Value>, crate::providers::api::HistoryCoverage)>,
     env: BTreeMap<String, String>,
     persist: Option<bool>,
     usage_key: String,
@@ -989,12 +994,13 @@ impl AgentSession for ClaudeSession {
         Ok(json!({"status":"accepted"}))
     }
 
-    async fn stream_history(&self, sink: EventSink) -> Result<()> {
-        let events = std::mem::take(&mut *self.history_events.lock().unwrap());
+    async fn stream_history(&self, sink: EventSink) -> Result<crate::providers::api::HistoryCoverage> {
+        let (events, coverage) = std::mem::replace(&mut *self.history_events.lock().unwrap(),
+            (Vec::new(), crate::providers::api::HistoryCoverage::Unverified));
         for event in events {
             sink.emit(event).await?;
         }
-        Ok(())
+        Ok(coverage)
     }
     async fn runtime_info(&self) -> Result<Value> {
         let state = self.state.lock().unwrap();
@@ -1315,12 +1321,15 @@ impl AgentSession for ClaudeSession {
             if let Some(old) = old {
                 old.close().await?;
             }
-            self.history_events.lock().unwrap().clear();
+            *self.history_events.lock().unwrap() = (Vec::new(),
+                if fresh { crate::providers::api::HistoryCoverage::Complete } else { crate::providers::api::HistoryCoverage::Unverified });
             if !fresh {
                 let path = storage::transcript_path(&cwd, &next, &self.env).await?;
                 let history = storage::read_history(&path).await?;
-                *self.history_events.lock().unwrap() =
-                    projection::project_history(&self.spec.id, &history);
+                *self.history_events.lock().unwrap() = (
+                    projection::project_history(&self.spec.id, &history),
+                    if history.complete { crate::providers::api::HistoryCoverage::Complete } else { crate::providers::api::HistoryCoverage::Unverified },
+                );
                 let mut state = self.state.lock().unwrap();
                 for entry in history.parent_entries {
                     remember_anchor(&mut state.anchors, &entry);

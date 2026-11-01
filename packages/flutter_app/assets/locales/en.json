@@ -128,6 +128,26 @@
     }
   },
   "composer": {
+    "delivery": {
+      "blocked": "Resolve the previous send before sending another message.",
+      "preparing": "Message admission is being checked.",
+      "dispatching": "Sending the message to the provider.",
+      "awaitingAck": "The host submitted this message; provider acknowledgement is pending.",
+      "unknown": "Delivery is unconfirmed. This is separate from any agent work already running.",
+      "legacyUnknown": "This host cannot report an exact delivery receipt. Delivery remains unconfirmed.",
+      "offline": "Host disconnected. Reconnect to check this message; it will not be resent automatically.",
+      "checkAgain": "Check status",
+      "retrySame": "Retry same message",
+      "stopWaiting": "Stop waiting",
+      "stopWaitingTitle": "Stop waiting for this message?",
+      "stopWaitingMessage": "This prevents retries of this message and removes its pending state. Work already accepted by the provider may continue.",
+      "stopWaitingLegacyMessage": "This clears the pending message only on this device. This host cannot record a cancellation; work already delivered may continue.",
+      "notSent": "Message was not accepted:\n{{preview}}",
+      "restore": "Restore to empty composer",
+      "discard": "Discard failed draft",
+      "agentRunning": "Agent running · separate from pending delivery",
+      "stateUnavailable": "Live agent state unavailable"
+    },
     "placeholders": {
       "desktop": "Message the agent, tag @files, or use /commands and /skills",
       "mobile": "Message, @files, /commands",
@@ -1057,6 +1077,13 @@
     }
   },
   "sidebar": {
+    "refresh": {
+      "project": "Projects",
+      "workspace": "Workspaces",
+      "agent": "Sessions",
+      "loading": "Loading {{lists}}…",
+      "failed": "{{list}}: {{error}}"
+    },
     "statusGroupAccessibility": "{{label}} group",
     "statusBucket": {
       "needsInput": "Needs input",
@@ -2147,15 +2174,8 @@
         "description": "App language",
         "options": {
           "system": "System",
-          "ar": "Arabic",
           "en": "English",
-          "es": "Spanish",
-          "fr": "French",
-          "ja": "Japanese",
-          "ko": "Korean",
-          "ptBR": "Brazilian Portuguese",
-          "ru": "Russian",
-          "zhCN": "Simplified Chinese"
+          "ko": "Korean"
         }
       }
     },
