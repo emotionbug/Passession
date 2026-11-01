@@ -60,18 +60,35 @@ fn has_dynamic_segment(file: &Path) -> Result<bool> {
     Ok(false)
 }
 
+fn system_library_package<'a>(source: &Path, ownership: &'a str) -> Result<&'a str> {
+    let canonical = fs::canonicalize(source)?;
+    let mut package = None;
+    for line in ownership.lines() {
+        let Some((owner, path)) = line.split_once(": ") else {
+            continue;
+        };
+        let path = Path::new(path);
+        if path != source && fs::canonicalize(path).ok().as_deref() != Some(canonical.as_path()) {
+            continue;
+        }
+        let candidate = owner.split(':').next().unwrap_or(owner);
+        ensure!(
+            package.is_none_or(|previous| previous == candidate),
+            "Multiple packages own redistributed library {}",
+            source.display()
+        );
+        package = Some(candidate);
+    }
+    package.context("Cannot identify the redistributed system library's actual owner")
+}
+
 fn system_notice(source: &Path, destination: &Path) -> Result<()> {
     let name = source
         .file_name()
         .context("System dependency has no filename")?
         .to_string_lossy();
     let ownership = capture(command("dpkg-query")?.args(["-S", &format!("*/{name}")]))?;
-    let package = ownership
-        .lines()
-        .next()
-        .and_then(|line| line.split_once(": "))
-        .map(|(owner, _)| owner.split(':').next().unwrap_or(owner))
-        .context("Cannot identify redistributed system library owner")?;
+    let package = system_library_package(source, &ownership)?;
     let copyright = Path::new("/usr/share/doc").join(package).join("copyright");
     ensure!(
         copyright.is_file(),
@@ -239,6 +256,34 @@ pub fn appimage(appdir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn notices_follow_actual_library_ownership_not_a_shared_basename() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let system = directory.path().join("system");
+        let other = directory.path().join("other");
+        fs::create_dir(&system)?;
+        fs::create_dir(&other)?;
+        let source = system.join("libfixture.so.1");
+        let unrelated = other.join("libfixture.so.1");
+        fs::write(&source, "system")?;
+        fs::write(&unrelated, "other")?;
+        let ownership = format!(
+            "other-app: {}\nlibfixture1:amd64: {}\n",
+            unrelated.display(), source.display()
+        );
+        assert_eq!(system_library_package(&source, &ownership)?, "libfixture1");
+        let alias = directory.path().join("usr-merged");
+        std::os::unix::fs::symlink(&system, &alias)?;
+        assert_eq!(
+            system_library_package(&alias.join("libfixture.so.1"), &ownership)?,
+            "libfixture1"
+        );
+        assert!(system_library_package(&source, &format!("other-app: {}\n", unrelated.display())).is_err());
+        assert!(system_library_package(&source, &format!("{ownership}conflicting: {}\n", source.display())).is_err());
+        Ok(())
+    }
 
     #[test]
     fn dynamic_detection_uses_program_header_offsets_and_stride() -> Result<()> {

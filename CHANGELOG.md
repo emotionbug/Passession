@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Resolve redistributed Linux library notices from the package owning the actual file (including merged-`usr` aliases), not the first package containing an unrelated library with the same basename.
+
 ## 0.13.2
 
 ### Added
