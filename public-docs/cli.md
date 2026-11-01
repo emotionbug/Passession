@@ -409,6 +409,50 @@ paseo daemon stop --home ~/paseo-test
 
 The root aliases `start`, `status`, `restart`, `reload`, and `pair` use the same commands as `daemon`. Root `run` and `stop` remain agent operations.
 
+### Durable updates
+
+```bash
+paseo daemon update --home ~/paseo-test --from /path/to/complete-runtime \
+  --resume-agent <agent-id> --continuation-file continuation.txt
+paseo daemon update status <operation-id> --home ~/paseo-test --json
+paseo daemon update wait <operation-id> --home ~/paseo-test
+```
+
+`update` returns an `operationId` once the operation is durably admitted and handed to an executor outside the daemon; the replacement continues if this command, its connection, or the calling agent ends. Pass `--operation-id <uuid>` to fix the identity before submitting: repeating the same ID and input returns the existing operation, while the same ID with a different target or continuation is rejected. Without `--from` it installs the latest official release. `--from` takes a complete prepared runtime from this computer (not a bare executable); a local build may keep the same version number with a different digest and is never labeled an official release.
+
+`--resume-agent` and `--continuation-file` name one existing agent and the message it receives after the update commits. The file is read before submission, so later changes to it have no effect. `--idle-timeout <duration>` (default `5m`) bounds the wait for other running turns; when it expires the current daemon stays and the operation ends busy. `--force-running` interrupts those turns instead. While the update drains the daemon, new messages and agent creation are refused; stopping agents, closing items, and answering permissions still work. Connected apps that support it show a maintenance notice for that period.
+
+`status` reads the operation record (`native-update-operation.json` in the home) and works while the daemon is down. A record left by the previous updater (`native-update.json`) is neither converted nor modified, and it blocks new updates. `wait` only observes; interrupting it never cancels the update. The `phase` `committed`, `rolled_back` or `failed` is the update result and `wait` exits 0 only for `committed`. `continuation.state` (`pending`, `accepted`, `not_delivered`, `unknown`, `failed`) is reported separately: an unconfirmed resume does not undo a committed update, and a later `status` can show an `unknown` resume as `accepted` once its message receipt proves delivery, without sending it again.
+
+`--from` and `--continuation-file` require a local `--home`. With `--host`, `update` installs only an official release through a daemon that advertises `durableDaemonUpdates`, and `status`/`wait` query it remotely; a lost acknowledgement is retried with the same operation ID.
+
+To prepare an existing local build without claiming official release provenance:
+
+```bash
+cargo xtask build-daemon --release
+cargo xtask stage-runtime /absolute/path/to/runtime --profile release --kind standalone-local
+```
+
+The runtime contains the executable, its libraries, skills, notices and matching build
+provenance. Admission pins the input bytes; changing a directory or archive after admission
+requires a new operation ID. Symlinked inputs, incomplete packages and insufficient space
+are rejected before the running daemon is stopped.
+
+Managed replacement currently supports a verified systemd user service or a detached
+standalone daemon. Foreground, desktop-owned and unrecognized launch owners are refused
+instead of silently starting an unmanaged replacement. On first migration, Paseo saves the
+original service configuration and installs an ExecStart-only drop-in pointing at a fixed
+launcher. Later updates select immutable runtimes without rewriting the service path.
+Migrating a daemon without drain support requires explicit `--force-running`.
+
+The installation store lives outside `PASEO_HOME`, located by `native-installation.json`.
+Active/previous runtime selection is separate from the operation journal. If a trial cannot
+become ready, the launch owner restores the known-good runtime; a later launcher invocation
+also recovers an interrupted, uncommitted activation. Readiness checks the actual supervisor
+and worker images, their process identities, the authenticated server identity and the launch
+owner—not merely an open port. Runtime cleanup retains current, previous, trial and live
+operation/process references. It does not copy or restore the user's chat/receipt database.
+
 ### Foreground deployments and migration
 
 Use environment overrides with the foreground deployment command:

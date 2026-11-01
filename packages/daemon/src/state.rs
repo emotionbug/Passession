@@ -1,5 +1,6 @@
 use crate::{
-    agent, automation, config, daemon_admin, files, git, mcp, plugins, projects,
+    agent, automation, config, daemon_admin, daemon_control::WorkerExit, files, git, mcp, plugins,
+    projects,
     providers::registry::ProviderRegistry,
     terminals,
     transport::{self, RequestContext},
@@ -25,6 +26,10 @@ const FILES: u32 = 16;
 const GIT: u32 = 32;
 const TERMINALS: u32 = 64;
 const PLUGINS: u32 = 256;
+
+const EXIT_STOP: u8 = 1;
+const EXIT_RESTART: u8 = 2;
+const EXIT_FAILURE: u8 = 3;
 
 pub struct AppState {
     pub home: PathBuf,
@@ -120,13 +125,7 @@ impl AppState {
     }
 
     pub fn request_shutdown(&self, restart: bool) {
-        let _ = self.shutdown_kind.compare_exchange(
-            0,
-            if restart { 2 } else { 1 },
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.cancel.cancel();
+        self.request_exit(if restart { EXIT_RESTART } else { EXIT_STOP });
     }
 
     pub(crate) fn request_failure(&self, error: anyhow::Error) {
@@ -135,7 +134,25 @@ impl AppState {
             *failure = Some(error);
         }
         drop(failure);
-        self.request_shutdown(false);
+        self.request_exit(EXIT_FAILURE);
+    }
+
+    /// The first intent wins, so teardown failures never rewrite an explicit stop/restart.
+    fn request_exit(&self, kind: u8) {
+        let _ = self.shutdown_kind.compare_exchange(0, kind, Ordering::AcqRel, Ordering::Acquire);
+        self.cancel.cancel();
+    }
+
+    /// Fixes the exit intent: any exit not explicitly requested by now (startup
+    /// errors included) is a failure, keeping supervisor crash restart and
+    /// uncommitted-update rollback available.
+    fn settle_exit(&self) -> WorkerExit {
+        self.request_exit(EXIT_FAILURE);
+        match self.shutdown_kind.load(Ordering::Acquire) {
+            EXIT_STOP => WorkerExit::Stop,
+            EXIT_RESTART => WorkerExit::Restart,
+            _ => WorkerExit::Failure,
+        }
     }
 
     pub async fn dispatch(&self, context: &RequestContext, message: &Value) -> Result<()> {
@@ -148,6 +165,7 @@ impl AppState {
             self.agents.handle(context, message).await?;
             return Ok(());
         }
+        let _update_admission = crate::daemon_admin::update_operation::wire_admission(self, message)?;
         if self.transport.handle(context, message).await?
             || self.daemon_admin.handle(context, message).await?
             || self.config.handle(context, message).await?
@@ -303,9 +321,8 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
     }.await;
     signal.abort();
     let _ = signal.await;
-    if let Err(error) = crate::daemon_control::publish_worker_stopping(
-        app.shutdown_kind.load(Ordering::Acquire) == 2,
-    ) {
+    let exit = app.settle_exit();
+    if let Err(error) = crate::daemon_control::publish_worker_stopping(exit) {
         tracing::error!(%error, "Failed to announce worker shutdown");
     }
     let shutdown = app.shutdown().await;
@@ -314,9 +331,56 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
     }
     result?;
     shutdown?;
-    Ok(if app.shutdown_kind.load(Ordering::Acquire) == 2 {
-        75
-    } else {
-        0
-    })
+    match exit {
+        WorkerExit::Stop => Ok(0),
+        WorkerExit::Restart => Ok(75),
+        WorkerExit::Failure => bail!("Daemon stopped without a shutdown request"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> (tempfile::TempDir, Arc<AppState>) {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::new(
+            root.path().join("home"),
+            root.path().into(),
+            std::env::current_exe().unwrap(),
+        );
+        (root, app)
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_intent_survives_later_failures() {
+        let (_root, stopped) = app();
+        stopped.request_shutdown(false);
+        stopped.request_failure(anyhow::anyhow!("teardown failed"));
+        assert!(stopped.cancel.is_cancelled());
+        assert_eq!(stopped.settle_exit(), WorkerExit::Stop);
+        assert!(stopped.failure.lock().unwrap().is_some());
+
+        let (_root, restarted) = app();
+        restarted.request_shutdown(true);
+        restarted.request_failure(anyhow::anyhow!("teardown failed"));
+        assert_eq!(restarted.settle_exit(), WorkerExit::Restart);
+    }
+
+    #[tokio::test]
+    async fn fatal_and_unrequested_exits_are_failures_not_stops() {
+        let (_root, failed) = app();
+        failed.request_failure(anyhow::anyhow!("listener stopped"));
+        assert!(failed.cancel.is_cancelled());
+        failed.request_shutdown(false);
+        assert_eq!(failed.settle_exit(), WorkerExit::Failure);
+
+        // Initialization errors return without any shutdown request.
+        let (_root, startup) = app();
+        assert!(!startup.cancel.is_cancelled());
+        assert_eq!(startup.settle_exit(), WorkerExit::Failure);
+        assert!(startup.cancel.is_cancelled());
+        startup.request_shutdown(true);
+        assert_eq!(startup.settle_exit(), WorkerExit::Failure);
+    }
 }

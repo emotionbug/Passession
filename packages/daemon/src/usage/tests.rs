@@ -47,6 +47,7 @@ fn global_merge_preserves_each_sessions_fallback_and_cache_identity() {
         AgentReports {
             signature: json!(["codex", null, "launch"]),
             reports: vec![("codex:account".into(), session.clone())],
+            complete: true,
         },
     ));
     let merged = merged_reports(&state);

@@ -6,6 +6,16 @@ pub fn capabilities(omp: bool, mcp: bool) -> Value {
     }
     result
 }
+/// A destructive conversation rewind is only offered when canonical history can
+/// replay its result from a persisted native session file. History-only and
+/// unpersisted (`--no-session`) sessions cannot, so they do not advertise it.
+pub fn session_capabilities(omp: bool, mcp: bool, replayable: bool) -> Value {
+    let mut result = capabilities(omp, mcp);
+    if !replayable {
+        result["supportsRewindConversation"] = json!(false);
+    }
+    result
+}
 pub fn modes(omp: bool) -> Vec<Value> {
     if !omp {
         return vec![];

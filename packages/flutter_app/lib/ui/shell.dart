@@ -392,7 +392,7 @@ class _PaseoShellState extends State<PaseoShell>
       case 'workspace.tab.target.files':
         _openWorkspacePanel('files', explorer: true);
       case 'workspace.tab.close.current':
-        // Original `handleCloseTabById`: an agent tab closes through the agent policy.
+        // Closing a view must not change the session's lifecycle.
         if (target != null) await _closeWorkspaceTab(target);
       // Original `handleWorkspaceCurrentTabCloseAction`: bulk closes around the active tab.
       case 'workspace.tab.close-left':
@@ -1621,17 +1621,11 @@ class _PaseoShellState extends State<PaseoShell>
     }
   }
 
-  /// Original `handleCloseAgentTab` (`resolveCloseAgentTabPolicy`): closing a root agent's
-  /// tab archives the agent — confirming first while it runs unless [confirmRunning] is
-  /// off (bulk closes confirm once for all) — while a subagent's tab only leaves this
-  /// client's layout. Any other tab simply closes.
-  Future<void> _closeWorkspaceTab(PanelTarget tab, {bool confirmRunning = true}) async {
-    final open = store.targetFor(tab.key) != null;
-    if (tab.kind != 'agent') {
-      if (open) await store.closeTab(tab.key);
-      return;
-    }
-    final agent = _agentFor(tab);
+  /// Tab dismissal is client-local navigation, never session archive or stop.
+  Future<bool> _closeWorkspaceTab(PanelTarget tab) async {
+    if (store.targetFor(tab.key) == null) return true;
+    final agent = tab.kind == 'agent' ? _agentFor(tab) : null;
+    if (!await store.closeTab(tab.key)) return false;
     if (agent != null && _parentAgentId(agent).isNotEmpty) {
       final host = store.hostFor(tab.serverId);
       if (host != null) {
@@ -1640,30 +1634,8 @@ class _PaseoShellState extends State<PaseoShell>
           'labels': {'paseo.open-agent-tab.${await host.client.getClientId()}': 'false'},
         }, 'update_agent_response');
       }
-      if (open) await store.closeTab(tab.key);
-      return;
     }
-    if (confirmRunning &&
-        agent?.text('status') == 'running' &&
-        !await confirmAction(
-          context,
-          title: tr(context, 'workspace.tabs.confirmations.archiveRunningAgentTitle'),
-          message: tr(context, 'workspace.tabs.confirmations.archiveRunningAgentMessage'),
-          confirmLabel: tr(context, 'workspace.tabs.confirmations.archive'),
-          destructive: true,
-        )) {
-      return;
-    }
-    if (open && !await store.closeTab(tab.key)) return;
-    // Original: `void archiveAgent(...).catch(() => {})` — the tab is already gone and
-    // an archive failure (e.g. timeout) settles in the background without a toast.
-    unawaited(
-      navigationRequest(store, tab.serverId, 'archive_agent_request', {
-        'agentId': tab.id,
-      }, 'agent_archived')
-          .then((_) => store.refreshHost(tab.serverId))
-          .catchError((Object _) {}),
-    );
+    return true;
   }
 
   /// Original `handleClosePane`: a pane that cannot be dismissed (the last one) is left
@@ -1696,35 +1668,23 @@ class _PaseoShellState extends State<PaseoShell>
     );
   }
 
-  /// Original `handleBulkCloseTabs`: one destructive confirmation titled [titleKey] that
-  /// says what closing [tabs] does (`buildBulkCloseConfirmationMessage`: archive N agents,
-  /// close N tabs), then each tab closes as [_closeWorkspaceTab] does. Nothing to close
-  /// counts as closed; a declined confirmation does not.
+  /// Bulk dismissal follows the same layout-only policy as a single tab.
+  /// A rejected close guard stops the batch and prevents its pane from closing.
   Future<bool> _closeWorkspaceTabs(List<PanelTarget> tabs, String titleKey) async {
     if (tabs.isEmpty) return true;
-    var agents = 0;
-    for (final tab in tabs) {
-      final agent = tab.kind == 'agent' ? _agentFor(tab) : null;
-      if (tab.kind == 'agent' && (agent == null || _parentAgentId(agent).isEmpty)) agents++;
-    }
-    final others = tabs.length - agents;
-    final message = agents > 0 && others > 0
-        ? tr(context, 'workspace.tabs.confirmations.bulk.agentsAndTabs',
-            args: {'agents': agents, 'tabs': others})
-        : others > 0
-        ? tr(context, 'workspace.tabs.confirmations.bulk.tabs', args: {'tabs': others})
-        : tr(context, 'workspace.tabs.confirmations.bulk.agents', args: {'agents': agents});
+    final message = tr(context, 'workspace.tabs.confirmations.bulk.tabs',
+        args: {'tabs': tabs.length});
     if (!await confirmAction(
       context,
       title: tr(context, titleKey),
       message: message,
       confirmLabel: tr(context, 'workspace.tabs.confirmations.close'),
-      destructive: true,
+      destructive: false,
     )) {
       return false;
     }
     for (final tab in tabs) {
-      await _closeWorkspaceTab(tab, confirmRunning: false);
+      if (!await _closeWorkspaceTab(tab)) return false;
     }
     return true;
   }
@@ -1732,7 +1692,7 @@ class _PaseoShellState extends State<PaseoShell>
   /// Original mobile tab menu (`MobileTabTrailingAccessory` over
   /// `buildWorkspaceTabMenuEntries`, surface "mobile"): a sheet titled with the tab kind
   /// that stacks over the switcher. Fork, usage, subagent detach and archive live on the
-  /// conversation itself (turn footer, context meter, subagent pills, closing the tab).
+  /// conversation itself (turn footer, context meter, subagent pills, archive action).
   Future<void> _workspaceTabMenu(
     PanelTarget tab,
     PanelTarget workspace,

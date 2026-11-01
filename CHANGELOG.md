@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.13.2
+
+### Added
+
+- Added durable daemon updates for complete local standalone runtimes and official releases. A fixed launcher and independent update executor preserve the launch owner, verify the new running image and server identity, and recover the known-good runtime when activation fails. Submit, status and wait share one operation ID; closing the requesting connection does not cancel the update.
+- Separate a committed runtime update from continuation delivery. Only the explicitly selected original session is resumed with a durable message ID; uncertain acknowledgements are retained for later receipt reconciliation without automatic duplicate sends. Runtime rollback never restores old chat data over newer records.
+- Show maintenance notices while updates drain new work. Retain the operation in the client across reconnects and distinguish committed, rolled-back, failed and unconfirmed-continuation results.
+
+### Fixed
+
+- Closing an agent tab now only dismisses the view, including running root agents. Session execution, history and archive state remain intact; cancelled close guards retain the tab and its subagent open-tab label.
+- Preserve Pi/OMP terminal delivery and queued transcript events after transport write cancellation. A terminated event stream ends its session owner instead of leaving a dead transport reusable.
+- Distinguish explicit worker stop/restart intent from fatal initialization or listener errors, keeping supervisor crash recovery and update rollback reachable.
+- Isolate unreadable provider-subagent catalogs and timelines without preventing unrelated daemon startup or replacing original records with empty data. Lazily page child history and bound resident histories/catalog connections.
+- Keep read-only stale snapshot markers out of authoritative mutation/resume state and persisted records. Internal agents no longer disappear from authoritative lookup during lock contention.
+- Preserve directory resync requests received during refresh, and prevent continuous generation-mismatch events from postponing refresh indefinitely.
+- Verify persisted Pi history against the live leaf before a destructive rewind; refuse unsupported or unverifiable rewinds before changing provider context.
+- Preserve activity timestamps when loading or reconciling history. Complete provider history can retain daemon-authored notifications while recovering missing conversation rows and preserving existing message identities.
+
 ## 0.13.1 - 2026-11-01
 
 ### Added

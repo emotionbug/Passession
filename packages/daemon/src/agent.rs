@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 mod actions;
+pub(crate) mod admission;
 pub(crate) mod creation;
 mod date_parse;
 pub(crate) mod event_stage;
@@ -175,6 +176,7 @@ pub struct AgentManager {
     pub directory_sync: crate::directory_sync::DirectorySyncService,
     pub notifications: FinishSubscriptions,
     pub message_delivery: AgentMessageDelivery,
+    pub(crate) update_admission: Arc<admission::WorkAdmission>,
     agents: RwLock<HashMap<String, Arc<AgentCell>>>,
     lifecycle: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     subagent_store: Arc<StdMutex<SubagentStore>>,
@@ -188,6 +190,7 @@ impl AgentManager {
         Self {
             notifications: FinishSubscriptions::new(app.clone()),
             message_delivery: AgentMessageDelivery::new(app.clone()),
+            update_admission: Arc::new(admission::WorkAdmission::default()),
             app,
             storage: OnceCell::new(),
             receipts: OnceCell::new(),
@@ -241,32 +244,24 @@ impl AgentManager {
         self.creations
             .get_or_init(|| async { CreationReceipts::new(home.clone()) })
             .await;
-        self.restore_persisted_state(&home).await?;
+        self.restore_persisted_state().await?;
+        crate::daemon_admin::update_operation::initialize_admission(&self.app()?).await?;
         self.notifications.initialize().await
     }
-    async fn restore_persisted_state(&self, home: &Path) -> Result<()> {
-        for record in self.storage()?.list().await? {
-            let record = if matches!(text(&record, "lastStatus"), Some("running" | "initializing")) {
-                let mut record = record;
+    // Catalogs are read per parent on demand; unrelated corruption cannot abort startup.
+    async fn restore_persisted_state(&self) -> Result<()> {
+        for mut record in self.storage()?.list().await? {
+            let interrupted = matches!(text(&record, "lastStatus"), Some("running" | "initializing"));
+            let transient = object(&mut record).remove("snapshotAvailability").is_some();
+            if interrupted {
                 record["lastStatus"] = json!("closed");
                 record["lastTurnOutcome"] = json!("turn_canceled");
-                // Recovery is not new user activity. Keep the persisted timestamps,
-                // attention, provider handle and history intact.
+            }
+            if interrupted || transient {
+                // Recovery is not new user activity. Keep timestamps, attention,
+                // provider identity and history intact while discarding view-only state.
                 self.storage()?.upsert(record.clone()).await?;
-                record
-            } else {
-                record
-            };
-            let Some(id) = text(&record, "id") else {
-                continue;
-            };
-            let store = self.subagent_store.clone();
-            let root = home.join("agent-subagents");
-            let id = id.to_owned();
-            tokio::task::spawn_blocking(move || {
-                store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
-                    .load_parent(&root, &id, false)
-            }).await??;
+            }
         }
         Ok(())
     }
@@ -368,7 +363,18 @@ impl AgentManager {
             None => None,
         })
     }
+    /// Authoritative state for ownership checks and mutations, including internal
+    /// agents which have no persisted fallback. Never substitute a read-only view.
     pub async fn agent_snapshot(&self, id: &str) -> Result<Option<Value>> {
+        let cell = { self.agents.read().await.get(id).cloned() };
+        if let Some(cell) = cell {
+            return Ok(Some(cell.data.lock().await.snapshot.clone()));
+        }
+        Ok(self.storage()?.get(id).await?.map(|record| self.stored_snapshot(record)))
+    }
+    /// Nonblocking observation only. Callers must not persist or authorize from
+    /// a snapshot marked as last_persisted.
+    pub async fn observe_agent_snapshot(&self, id: &str) -> Result<Option<Value>> {
         let cell = { self.agents.read().await.get(id).cloned() };
         let mut unavailable = false;
         if let Some(cell) = cell {
@@ -378,7 +384,11 @@ impl AgentManager {
                 Err(_) => unavailable = true,
             }
         }
-        Ok(self.storage()?.get(id).await?.map(|record| {
+        let record = self.storage()?.get(id).await?;
+        if unavailable && record.is_none() {
+            bail!("Agent '{id}' snapshot is temporarily unavailable");
+        }
+        Ok(record.map(|record| {
             let mut snapshot = self.stored_snapshot(record);
             if unavailable {
                 snapshot["snapshotAvailability"] = json!("last_persisted");
@@ -387,6 +397,7 @@ impl AgentManager {
         }))
     }
     fn stored_snapshot(&self, mut record: Value) -> Value {
+        object(&mut record).remove("snapshotAvailability");
         let available = self.app.upgrade().is_some_and(|app| {
             text(&record, "provider").is_some_and(|id| app.providers.spec(id).is_some())
         });
@@ -601,6 +612,7 @@ impl AgentManager {
         let owned_id = id.to_owned();
         let timeline =
             tokio::task::spawn_blocking(move || Timeline::load(&path, &owned_id)).await??;
+        object(&mut snapshot).remove("snapshotAvailability");
         snapshot["_live"] = json!(true);
         snapshot["_providerAvailable"] = json!(true);
         snapshot["lifecycle"] = json!("initializing");
@@ -808,7 +820,22 @@ impl AgentManager {
             }
         }
     }
-    async fn persist_snapshot(&self, snapshot: &Value) -> Result<()> {
+    /// Non-activity writes preserve both durable activity stamps and the live
+    /// snapshot, even when an older record uses different values for the two.
+    async fn persist_snapshot(&self, snapshot: &mut Value, record_activity: bool) -> Result<()> {
+        object(snapshot).remove("snapshotAvailability");
+        if record_activity {
+            snapshot["lastActivityAt"] = snapshot["updatedAt"].clone();
+        } else if snapshot["internal"] != true {
+            if let Some(previous) = self.storage()?.get(required(snapshot, "id")?).await? {
+                for field in ["updatedAt", "lastActivityAt"] {
+                    match previous.get(field) {
+                        Some(value) => { snapshot[field] = value.clone(); }
+                        None => { object(snapshot).remove(field); }
+                    }
+                }
+            }
+        }
         if snapshot["internal"] == true {
             return Ok(());
         }
@@ -820,6 +847,7 @@ impl AgentManager {
             "_live",
             "_providerAvailable",
             "_historyOnly",
+            "snapshotAvailability",
             "status",
             "lifecycle",
             "session",
@@ -847,7 +875,6 @@ impl AgentManager {
             record["attentionReason"] = Value::Null;
             record["attentionTimestamp"] = Value::Null;
         }
-        record["lastActivityAt"] = snapshot["updatedAt"].clone();
         if let Some(config) = record.get_mut("config") {
             object(config).remove("daemonAppendSystemPrompt");
             strip_config_internal_servers(config);
@@ -862,12 +889,12 @@ impl AgentManager {
         }
         self.storage()?.upsert(record).await
     }
-    async fn commit_snapshot(&self, cell: &Arc<AgentCell>, snapshot: Value) -> Result<()> {
+    async fn commit_snapshot(&self, cell: &Arc<AgentCell>, snapshot: Value, touch_activity: bool) -> Result<()> {
         let _commit = cell.commit.lock().await;
-        self.commit_snapshot_locked(cell, snapshot).await
+        self.commit_snapshot_locked(cell, snapshot, touch_activity).await
     }
     /// Caller owns cell.commit; never hold cell.data across persistence.
-    async fn commit_snapshot_locked(&self, cell: &Arc<AgentCell>, mut snapshot: Value) -> Result<()> {
+    async fn commit_snapshot_locked(&self, cell: &Arc<AgentCell>, mut snapshot: Value, touch_activity: bool) -> Result<()> {
         if snapshot["lifecycle"] != "closed" {
             let data = cell.data.lock().await;
             if let Some(error) = data.event_error.as_deref() {
@@ -877,11 +904,13 @@ impl AgentManager {
                 bail!("Agent provider session has ended");
             }
         }
-        snapshot["updatedAt"] = json!(next_updated_at(&snapshot["updatedAt"]));
+        if touch_activity {
+            snapshot["updatedAt"] = json!(next_updated_at(&snapshot["updatedAt"]));
+        }
         snapshot["status"] = snapshot["lifecycle"].clone();
         let ready = cell.data.lock().await.ready;
         if ready {
-            self.persist_snapshot(&snapshot).await?;
+            self.persist_snapshot(&mut snapshot, touch_activity).await?;
         }
         {
             let mut data = cell.data.lock().await;
@@ -907,6 +936,97 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn authoritative_reads_wait_for_live_state_not_persisted_observations() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(home) }).await;
+        let id = "00000000-0000-4000-8000-000000000041";
+        let stored = json!({
+            "id":id,"provider":"mock","cwd":root.path(),"config":{},"internal":false,
+            "createdAt":"2026-01-01T00:00:00.000Z",
+            "lastStatus":"idle","updatedAt":"2026-01-01T00:00:00.000Z",
+            "owner":{"kind":"daemon","daemonId":"daemon","executionId":"old"}
+        });
+        manager.storage().unwrap().upsert(stored.clone()).await.unwrap();
+        let (cell, _receiver) = manager.make_cell(id, stored, true).await.unwrap();
+        let mut data = cell.data.lock().await;
+        data.ready = true;
+        data.snapshot["owner"]["executionId"] = json!("current");
+        let read = manager.agent_snapshot(id);
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        let observed = manager.observe_agent_snapshot(id).await.unwrap().unwrap();
+        assert_eq!(observed["snapshotAvailability"], "last_persisted");
+        assert_eq!(observed["owner"]["executionId"], "old");
+        drop(data);
+        let authoritative = read.await.unwrap().unwrap();
+        assert_eq!(authoritative["owner"]["executionId"], "current");
+        assert!(authoritative.get("snapshotAvailability").is_none());
+        assert!(manager.authorize(&json!({"kind":"daemon","daemonId":"daemon","executionId":"old"}), id).await.is_err());
+        manager.authorize(&json!({"kind":"daemon","daemonId":"daemon","executionId":"current"}), id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn contended_internal_agent_is_not_misreported_as_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(home) }).await;
+        let id = "00000000-0000-4000-8000-000000000042";
+        let snapshot = json!({"id":id,"provider":"mock","internal":true,"config":{},"cwd":root.path()});
+        let (cell, _receiver) = manager.make_cell(id, snapshot, true).await.unwrap();
+        let mut data = cell.data.lock().await;
+        data.ready = true;
+        data.snapshot["lifecycle"] = json!("running");
+        let read = manager.agent_snapshot(id);
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        assert!(manager.observe_agent_snapshot(id).await.is_err());
+        drop(data);
+        let snapshot = read.await.unwrap().unwrap();
+        assert_eq!(snapshot["id"], id);
+        assert_eq!(snapshot["lifecycle"], "running");
+        assert!(manager.storage().unwrap().get(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn transient_snapshot_markers_are_removed_without_touching_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(home.clone()) }).await;
+        let id = "00000000-0000-4000-8000-000000000043";
+        let original = json!({
+            "id":id,"provider":"mock","cwd":root.path(),"config":{},"lastStatus":"idle",
+            "createdAt":"2026-01-01T00:00:00.000Z",
+            "updatedAt":"2026-01-02T00:00:00.000Z","lastActivityAt":"2026-01-01T00:00:00.000Z",
+            "snapshotAvailability":"last_persisted"
+        });
+        manager.storage().unwrap().upsert(original.clone()).await.unwrap();
+        manager.restore_persisted_state().await.unwrap();
+        let record = manager.storage().unwrap().get(id).await.unwrap().unwrap();
+        assert!(record.get("snapshotAvailability").is_none());
+        assert_eq!(record["updatedAt"], original["updatedAt"]);
+        assert_eq!(record["lastActivityAt"], original["lastActivityAt"]);
+        let (cell, _receiver) = manager.make_cell(id, original.clone(), true).await.unwrap();
+        assert!(cell.data.lock().await.snapshot.get("snapshotAvailability").is_none());
+        let mut snapshot = cell.data.lock().await.snapshot.clone();
+        snapshot["snapshotAvailability"] = json!("last_persisted");
+        snapshot["historySync"] = json!({"status":"complete"});
+        manager.persist_snapshot(&mut snapshot, false).await.unwrap();
+        assert!(snapshot.get("snapshotAvailability").is_none());
+        let reopened = AgentStorage::new(home).get(id).await.unwrap().unwrap();
+        assert!(reopened.get("snapshotAvailability").is_none());
+        assert_eq!(reopened["historySync"]["status"], "complete");
+        assert_eq!(reopened["updatedAt"], original["updatedAt"]);
+        assert_eq!(reopened["lastActivityAt"], original["lastActivityAt"]);
+    }
+
+    #[tokio::test]
     async fn restart_closes_interrupted_records_without_rewriting_user_data() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
@@ -929,7 +1049,7 @@ mod tests {
         let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
         let manager = &app.agents;
         manager.storage.get_or_init(|| async { AgentStorage::new(home.clone()) }).await;
-        manager.restore_persisted_state(&home).await.unwrap();
+        manager.restore_persisted_state().await.unwrap();
         let reopened = AgentStorage::new(home.clone());
         for mut expected in originals {
             let id = expected["id"].as_str().unwrap().to_owned();
@@ -946,8 +1066,40 @@ mod tests {
             assert!(snapshot["activeForegroundTurnId"].is_null());
         }
         assert!(manager.agents.read().await.is_empty());
-        manager.restore_persisted_state(&home).await.unwrap();
+        manager.restore_persisted_state().await.unwrap();
         assert_eq!(reopened.list().await.unwrap(), manager.storage().unwrap().list().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unavailable_subagent_catalog_is_reported_and_scoped_to_its_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let storage = AgentStorage::new(home.clone());
+        let subagents = home.join("agent-subagents");
+        let mut store = SubagentStore::default();
+        for id in ["healthy", "corrupt"] {
+            storage.upsert(json!({
+                "id":id,"provider":"omp","cwd":root.path(),"config":{"model":"test/model"},
+                "lastStatus":"closed","createdAt":"2026-10-24T00:00:00.000Z","updatedAt":"2026-10-31T00:00:00.000Z",
+                "archivedAt":"2026-10-31T00:00:00.000Z"
+            })).await.unwrap();
+            store.apply_persisted(&subagents, id, "omp",
+                &json!({"type":"upsert","id":"child","timestamp":"2026-10-31T00:00:00.000Z"})).unwrap();
+        }
+        drop(store);
+        let catalog = subagents.join("corrupt").join("index.sqlite3");
+        std::fs::write(&catalog, b"not a sqlite database").unwrap();
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(home.clone()) }).await;
+        manager.restore_persisted_state().await.unwrap();
+        let (activity, unavailable) = manager.list_provider_subagent_activity().await.unwrap();
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0]["parentAgentId"], "healthy");
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].parent, "corrupt");
+        assert_eq!(unavailable[0].child, None);
+        assert_eq!(std::fs::read(&catalog).unwrap(), b"not a sqlite database");
     }
 
     #[test]

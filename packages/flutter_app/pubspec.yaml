@@ -1,7 +1,7 @@
 name: paseo_sessions
 description: Native Paseo Sessions client for desktop and mobile.
 publish_to: "none"
-version: 0.13.1+13001
+version: 0.13.2+13002
 
 environment:
   sdk: ^3.13.4

@@ -68,6 +68,7 @@ impl AgentManager {
         mut receipt: Option<&mut CreationGuard>,
         cancel: Option<&CancellationToken>,
     ) -> Result<Value> {
+        let _update_admission = self.update_admission.enter()?;
         let app = self.app()?;
         let is_mcp = input["kind"] == "mcp";
         let public = input

@@ -170,7 +170,7 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13001' }}
+          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13002' }}
       # Without mobile signing credentials, artifacts are explicitly labelled
       # debug-signed APK / unsigned iOS .app, never presented as store submissions.
       - name: Package native desktop installers

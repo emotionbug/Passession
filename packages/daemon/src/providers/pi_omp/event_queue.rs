@@ -55,7 +55,12 @@ impl Sender {
 /// Only the delivery pump waits for the event consumer. The stdout reader can
 /// continue resolving ACKs and host controls while ordinary events spill in FIFO
 /// order using the same bounded-memory spool as admission staging.
-pub(super) fn channel(runtime: &Arc<Transport>, cancel: CancellationToken) -> (Sender, mpsc::Receiver<Value>) {
+///
+/// Delivery has its own lifetime: transport cancellation stops the process but
+/// never abandons accepted frames. The pump ends only after every writer (the
+/// stdout reader and the exit waiter, whose process_exit is terminal) is gone
+/// and the spool is drained, or after the consumer closes.
+pub(super) fn channel(runtime: &Arc<Transport>) -> (Sender, mpsc::Receiver<Value>) {
     let shared = Arc::new(Shared {
         state: Mutex::new(State::default()), changed: Notify::new(),
         writers: AtomicUsize::new(1), consumer_gone: CancellationToken::new(),
@@ -66,11 +71,7 @@ pub(super) fn channel(runtime: &Arc<Transport>, cancel: CancellationToken) -> (S
     let delivery = shared.clone();
     tokio::spawn(async move {
         let _consumer = delivery.consumer_gone.clone().drop_guard();
-        let result = tokio::select! {
-            _ = cancel.cancelled() => Ok(()),
-            result = pump(&delivery, &output) => result,
-        };
-        if let Err(error) = result {
+        if let Err(error) = pump(&delivery, &output).await {
             let message = format!("Provider event delivery failed: {error}");
             if let Some(runtime) = delivery.runtime.upgrade() { runtime.event_queue_failed(&message); }
             // A terminal delivery error is not silently converted into an empty

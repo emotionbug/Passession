@@ -1054,10 +1054,12 @@ impl TransportService {
             .upgrade()
             .ok_or_else(|| anyhow!("Daemon is shutting down"))?;
         let hoplite = app.providers.definition("hoplite").is_some();
-        drop(app);
-        Ok(
-            json!({"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":identity["serverId"],"hostname":identity["label"],"version":env!("CARGO_PKG_VERSION"),"sourceId":context.actor_source_id(),"permissions":context.permissions(),"desktopManaged":config["desktopManaged"].as_bool().unwrap_or(false),"features":features::features(&config,hoplite),"capabilities":{}}}),
-        )
+        let maintenance = app.agents.update_admission.operation()?;
+        let mut message = json!({"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":identity["serverId"],"hostname":identity["label"],"version":env!("CARGO_PKG_VERSION"),"sourceId":context.actor_source_id(),"permissions":context.permissions(),"desktopManaged":config["desktopManaged"].as_bool().unwrap_or(false),"features":features::features(&config,hoplite),"capabilities":{}}});
+        if let Some(operation_id) = maintenance {
+            message["payload"]["daemonUpdate"] = json!({"operationId":operation_id,"active":true});
+        }
+        Ok(message)
     }
     async fn status_payload(&self, request: &Value) -> Result<Value> {
         let app = self
@@ -1072,7 +1074,7 @@ impl TransportService {
         let config = self.config_snapshot();
         let relay = relay_config(&config);
         Ok(
-            json!({"requestId":request_id(request),"serverId":self.identity()["serverId"],"version":env!("CARGO_PKG_VERSION"),"pid":std::process::id(),"nodePath":app.executable,"startedAt":pid.and_then(|p|p.get("startedAt").cloned()),"listen":self.listen_string(),"relay":relay,"providers":providers,"providersCached":true}),
+            json!({"requestId":request_id(request),"serverId":self.identity()["serverId"],"version":env!("CARGO_PKG_VERSION"),"sourceSha":option_env!("PASEO_BUILD_SOURCE_SHA").unwrap_or(""),"pid":std::process::id(),"nodePath":app.executable,"startedAt":pid.and_then(|p|p.get("startedAt").cloned()),"listen":self.listen_string(),"relay":relay,"providers":providers,"providersCached":true}),
         )
     }
     pub fn listen_string(&self) -> Option<String> {

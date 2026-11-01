@@ -1,6 +1,7 @@
 //! Native lifecycle ownership. paseo.pid is shared with older Node supervisors.
 mod identity;
 mod lock;
+pub(crate) mod managed;
 mod supervisor;
 #[cfg(test)]
 mod tests;
@@ -8,7 +9,10 @@ mod tests;
 mod windows;
 #[cfg(windows)]
 pub(crate) use identity::start_identity as read_process_start_identity;
-pub use supervisor::{WorkerGuard, attach_worker, publish_worker_ready, publish_worker_stopping, run_internal};
+pub use supervisor::{
+    WorkerExit, WorkerGuard, attach_worker, publish_worker_ready, publish_worker_stopping,
+    run_internal,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};

@@ -564,7 +564,8 @@
                       "activity_log",
                       "hub.execution.agent.update",
                       "hub.execution.agent.stream",
-                      "agent.message_receipt.update"
+                      "agent.message_receipt.update",
+                      "daemon.update.maintenance"
                     ]
                   }
                 },
@@ -2760,6 +2761,19 @@
                 },
                 "messageId": {
                   "type": "string"
+                },
+                "unarchive": {
+                  "type": "boolean"
+                },
+                "expectedPersistence": {
+                  "type": "object",
+                  "properties": {
+                    "provider": { "type": "string" },
+                    "sessionId": { "type": "string" },
+                    "nativeHandle": {}
+                  },
+                  "required": ["provider", "sessionId", "nativeHandle"],
+                  "additionalProperties": false
                 },
                 "activeTurnBehavior": {
                   "type": "string",
@@ -5444,6 +5458,95 @@
                   "const": "daemon.update.request"
                 },
                 "requestId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "requestId"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "daemon.update.submit.request"
+                },
+                "requestId": {
+                  "type": "string"
+                },
+                "operationId": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string",
+                  "const": "release"
+                },
+                "idleTimeoutMs": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "forceRunning": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "type",
+                "requestId",
+                "operationId"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "daemon.update.status.request"
+                },
+                "requestId": {
+                  "type": "string"
+                },
+                "operationId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "requestId",
+                "operationId"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "daemon.update.drain.request"
+                },
+                "requestId": {
+                  "type": "string"
+                },
+                "operationId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "requestId"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "daemon.update.drain.release.request"
+                },
+                "requestId": {
+                  "type": "string"
+                },
+                "operationId": {
                   "type": "string"
                 }
               },

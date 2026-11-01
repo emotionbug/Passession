@@ -136,23 +136,128 @@ pub fn publish_worker_ready(listen: &str, server_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The independent supervisor owns the teardown deadline, including restarts.
-pub fn publish_worker_stopping(restart: bool) -> Result<()> {
+/// Why a worker is shutting down. Only `Stop` ends supervision; `Failure` keeps
+/// crash restart and uncommitted-update rollback available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerExit {
+    Stop,
+    Restart,
+    Failure,
+}
+
+impl WorkerExit {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Failure => "failure",
+        }
+    }
+
+    /// Announcements without a known `reason` come from workers that only sent `restart`.
+    pub(super) fn from_stopping(event: &Value) -> Self {
+        match event["reason"].as_str() {
+            Some("stop") => Self::Stop,
+            Some("restart") => Self::Restart,
+            Some("failure") => Self::Failure,
+            _ if event["restart"] == true => Self::Restart,
+            _ => Self::Stop,
+        }
+    }
+}
+
+pub(super) fn stopping_message(token: &str, exit: WorkerExit) -> Value {
+    // `restart` remains for supervisors that predate `reason`.
+    json!({"type":"paseo:stopping","token":token,"restart":exit == WorkerExit::Restart,"reason":exit.reason()})
+}
+
+/// The independent supervisor owns the teardown deadline, including restarts and failures.
+pub fn publish_worker_stopping(exit: WorkerExit) -> Result<()> {
     let token = std::env::var("PASEO_NATIVE_TOKEN").context("Missing supervisor channel token")?;
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &json!({"type":"paseo:stopping","token":token,"restart":restart}))?;
+    serde_json::to_writer(&mut stdout, &stopping_message(&token, exit))?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ExitAction {
+    Exit(i32),
+    Restart,
+    /// Never-ready worker: exit 1 to the launch owner, whose fixed launcher and
+    /// update executor restore the known-good runtime (never a stop request).
+    Recover,
+}
+
+/// Post-exit policy. Only an explicit worker stop ends supervision before the
+/// not-ready rollback and ready-worker crash restart branches.
+pub(super) fn exit_action(
+    supervisor_stopping: bool,
+    announced: Option<WorkerExit>,
+    ready: bool,
+    code: Option<i32>,
+    terminated: bool,
+) -> ExitAction {
+    if supervisor_stopping {
+        return ExitAction::Exit(0);
+    }
+    match announced {
+        Some(WorkerExit::Restart) => return ExitAction::Restart,
+        Some(WorkerExit::Stop) => return ExitAction::Exit(code.unwrap_or(1)),
+        Some(WorkerExit::Failure) | None => {}
+    }
+    if !ready {
+        return ExitAction::Recover;
+    }
+    if announced == Some(WorkerExit::Failure) || code == Some(75) {
+        return ExitAction::Restart;
+    }
+    if code == Some(0) {
+        return ExitAction::Exit(0);
+    }
+    if terminated {
+        return ExitAction::Exit(1);
+    }
+    // Source supervisor restarts a crashed worker only after it reached readiness.
+    ExitAction::Restart
+}
+
 pub async fn run_internal(command: &str, args: &[String]) -> Result<i32> {
-    if args.len() != 2 || args[0] != "--home" {
+    if command == "__managed-probe" {
+        if !args.is_empty() {
+            bail!("Internal probe takes no arguments");
+        }
+        println!("{}", super::managed::probe_report());
+        return Ok(0);
+    }
+    if args.len() < 2 || args[0] != "--home" {
         bail!("Internal daemon entry requires --home PATH");
     }
     let home = PathBuf::from(&args[1]);
     if !home.is_absolute() {
         bail!("Internal daemon home must be absolute")
+    }
+    let rest = &args[2..];
+    let managed = match (command, rest) {
+        ("__launcher", []) => Some(super::managed::run_launcher(&home, false).await),
+        ("__launcher", [flag]) if flag == "--standalone" => {
+            Some(super::managed::run_launcher(&home, true).await)
+        }
+        ("__update-executor", [flag, operation]) if flag == "--operation" => {
+            Some(super::managed::run_executor(&home, operation).await)
+        }
+        ("__launcher" | "__update-executor", _) => bail!("Invalid managed entry arguments"),
+        _ => None,
+    };
+    if let Some(result) = managed {
+        if let Err(error) = &result {
+            DurableLog::new(&home).write(format!("{}\n",json!({"level":"error","time":chrono::Utc::now().to_rfc3339(),"pid":std::process::id(),"name":command,"msg":format!("{error:#}")})).as_bytes()).await;
+        }
+        return result;
+    }
+    if !rest.is_empty() {
+        bail!("Internal daemon entry requires --home PATH");
     }
     let options: Value = serde_json::from_str(
         &std::env::var("PASEO_NATIVE_OPTIONS").unwrap_or_else(|_| "{}".into()),
@@ -161,15 +266,6 @@ pub async fn run_internal(command: &str, args: &[String]) -> Result<i32> {
         "__worker" => {
             worker_identity(&home)?;
             crate::state::run_daemon(home, options).await
-        }
-        #[cfg(windows)]
-        "__update" => {
-            let result = crate::daemon_admin::updater::run_update_helper(&home).await;
-            if let Err(error) = &result {
-                let log = DurableLog::new(&home);
-                log.write(format!("{}\n",json!({"level":"error","time":chrono::Utc::now().to_rfc3339(),"name":"NativeUpdater","msg":error.to_string()})).as_bytes()).await;
-            }
-            result
         }
         "__supervisor" => {
             let result = run_supervisor(&home, options).await;
@@ -347,8 +443,6 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
     let mut lock =
         tokio::task::spawn_blocking(move || lock::PidLock::acquire(&owned_home, desktop)).await??;
     let executable = std::env::current_exe()?.canonicalize()?;
-    #[cfg(windows)]
-    crate::daemon_admin::updater::cleanup_update_helper(home).await?;
     let log = Arc::new(DurableLog::new(home));
     let stop = CancellationToken::new();
     let signal_stop = stop.clone();
@@ -373,8 +467,6 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
     let result=async {
         loop{
             if stop.is_cancelled(){return Ok(0)}
-            #[cfg(windows)]
-            if crate::daemon_admin::updater::launch_deferred_update(home,&executable,&options,&lock.instance).await?{return Ok(0)}
             let token=uuid::Uuid::new_v4().to_string();
             let mut command=Command::new(&executable);
             command.arg("__worker").arg("--home").arg(home).env("PASEO_NATIVE_OPTIONS",serde_json::to_string(&options)?).env("PASEO_NATIVE_SUPERVISOR",serde_json::to_string(&lock.instance)?).env("PASEO_NATIVE_TOKEN",&token).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -384,12 +476,7 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
             #[cfg(windows)] command.creation_flags(0x08000000);
             let mut child=match command.spawn(){
                 Ok(child)=>child,
-                Err(error)=>{
-                    #[cfg(windows)]
-                    if crate::daemon_admin::updater::launch_recovery_helper(home,&executable,&options,&lock.instance).await?{return Ok(0)}
-                    if crate::daemon_admin::updater::finish_restart(home,&executable,None).await?{continue}
-                    return Err(error).context("Failed to launch native daemon worker")
-                }
+                Err(error)=>return Err(error).context("Failed to launch native daemon worker"),
             };
             #[cfg(windows)] let _job=super::windows::WorkerJob::assign(child.id().context("Worker has no PID")?)?;
             let mut worker=lock.instance.clone();worker.pid=child.id().context("Worker has no PID")?;worker.process_start_identity=identity::start_identity(worker.pid)?;
@@ -405,7 +492,8 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
                     event=events.recv(),if events_open=>{
                         if let Some(event)=event{
                             if event["type"] == "paseo:stopping" {
-                                worker_shutdown = Some(event["restart"] == true);
+                                // Any announcement, failures included, arms the 10s teardown deadline.
+                                worker_shutdown.get_or_insert(WorkerExit::from_stopping(&event));
                                 deadline.get_or_insert(tokio::time::Instant::now()+Duration::from_secs(10));
                                 control_open = false;
                                 continue;
@@ -413,11 +501,8 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
                             if ready { continue; }
                             let listen=event["listen"].as_str().filter(|s|!s.is_empty()).context("Invalid readiness listen")?;
                             let server_id=event["serverId"].as_str().filter(|s|!s.is_empty()).context("Invalid readiness server identity")?;
-                            if let Err(error)=crate::daemon_admin::updater::finish_restart(home,&executable,Some((event["version"].as_str().unwrap_or(""),event["sourceSha"].as_str().unwrap_or("")))).await{
-                                tracing::error!(%error,"Updated worker readiness rejected");
-                                force_worker(&mut child,&worker).await?;
-                                break child.wait().await?;
-                            }
+                            // Update readiness (image, version, source, server) is verified by
+                            // the independent update executor through the launch owner.
                             lock.publish(Some(listen.into()),Some(server_id.into()))?;
                             ready=true;
                         }else{events_open=false;}
@@ -442,19 +527,15 @@ async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
             #[cfg(windows)] drop(_job);
             for mut task in [output,errors]{if tokio::time::timeout(Duration::from_secs(2),&mut task).await.is_err(){task.abort();}}
             log.write(format!("{}\n",json!({"level":"info","time":chrono::Utc::now().to_rfc3339(),"pid":std::process::id(),"name":"DaemonRunner","msg":"Worker exited","code":status.code()})).as_bytes()).await;
-            if stopping||stop.is_cancelled(){return Ok(0)}
-            if worker_shutdown == Some(true) { continue; }
-            if worker_shutdown == Some(false) { return Ok(status.code().unwrap_or(1)); }
-            if !ready{
-                #[cfg(windows)]
-                if crate::daemon_admin::updater::launch_recovery_helper(home,&executable,&options,&lock.instance).await?{return Ok(0)}
-                if crate::daemon_admin::updater::finish_restart(home,&executable,None).await?{continue}
-                return Ok(1)
+            #[cfg(unix)] let terminated={use std::os::unix::process::ExitStatusExt;status.signal()==Some(libc::SIGTERM)};
+            #[cfg(not(unix))] let terminated=false;
+            match exit_action(stopping||stop.is_cancelled(),worker_shutdown,ready,status.code(),terminated){
+                ExitAction::Exit(code)=>return Ok(code),
+                ExitAction::Restart=>continue,
+                // Runtime rollback belongs to the update executor and the fixed
+                // launcher's bootstrap recovery, not to this (possibly trial) image.
+                ExitAction::Recover=>return Ok(1),
             }
-            if status.code()==Some(75){continue}
-            if status.success(){return Ok(0)}
-            #[cfg(unix)] {use std::os::unix::process::ExitStatusExt;if status.signal()==Some(libc::SIGTERM){return Ok(1)}}
-            // Source supervisor restarts a crashed worker only after it reached readiness.
         }
     }.await;
     signals.abort();

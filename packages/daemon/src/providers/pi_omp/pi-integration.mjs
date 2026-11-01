@@ -15,13 +15,19 @@ const entry = (e) => ({ id: e.id, parentId: e.parentId ?? null, text: text(e.mes
 const entries = (values) =>
   values.filter((e) => e.type === "message" && e.message?.role === "user").map(entry);
 function capture(ctx, reason, requestId) {
+  const manager = ctx.sessionManager;
+  const call = (name) => (typeof manager[name] === "function" ? manager[name]() : undefined);
   ctx.ui.notify(
     "PASEO_ENTRY_CAPTURE " +
       JSON.stringify({
         reason,
         requestId,
-        treeEntries: entries(ctx.sessionManager.getEntries()),
-        contextEntries: entries(ctx.sessionManager.buildContextEntries()),
+        treeEntries: entries(manager.getEntries()),
+        contextEntries: entries(manager.buildContextEntries()),
+        // Paseo trusts the native session file only when it ends at this live leaf.
+        persisted: call("isPersisted"),
+        sessionFile: call("getSessionFile"),
+        leafId: call("getLeafId"),
       }),
     "info",
   );

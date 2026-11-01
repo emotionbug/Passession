@@ -12,6 +12,7 @@ import '../../ui/controls.dart';
 import '../../ui/localization.dart';
 import '../../ui/theme.dart';
 import '../chat/provider_icon.dart';
+import 'daemon_update.dart';
 import 'settings_forms.dart';
 import 'settings_host_widgets.dart';
 import 'profile_settings.dart';
@@ -1252,9 +1253,11 @@ class _RestartDaemonCardState extends State<RestartDaemonCard>
 }
 
 /// Original `UpdateDaemonCard`: shown only for a version mismatch on a
-/// self-updating or desktop-managed daemon (or after an update completes);
-/// an outline sm Update button (ArrowUpToLine) carrying the progress phase,
-/// then a success or error inline alert.
+/// self-updating or desktop-managed daemon (or while an update is observed or
+/// reported); an outline sm Update button (ArrowUpToLine) carrying the progress
+/// phase, then a success or error inline alert. A daemon advertising
+/// `durableDaemonUpdates` gets a durable operation: its ID is persisted before
+/// submission and observed by status until committed/rolled back/failed.
 class UpdateDaemonCard extends StatefulWidget {
   const UpdateDaemonCard({super.key, required this.host});
   final HostState host;
@@ -1265,19 +1268,117 @@ class UpdateDaemonCard extends StatefulWidget {
 class _UpdateDaemonCardState extends State<UpdateDaemonCard>
     with _HostClientListener<UpdateDaemonCard> {
   static const _appVersion = String.fromEnvironment('PASEO_VERSION');
+  static const _operations = DaemonUpdateOperationStore();
 
   /// `idle`, `updating`, `complete` or `failed`.
   String state = 'idle';
   String phase = '', workerVersion = '', failureTitle = '', failureMessage = '';
+
+  /// Whether the shown result is a durable operation's, and its committed-result note.
+  String completeNote = '';
+  bool durable = false;
   StreamSubscription<JsonMap>? progress;
 
   @override
   PaseoClient get hostClient => widget.host.client;
 
   @override
+  void initState() {
+    super.initState();
+    unawaited(_resume());
+  }
+
+  @override
   void dispose() {
     progress?.cancel();
     super.dispose();
+  }
+
+  /// Resumes observing an operation this app submitted before a reconnect,
+  /// rebuilt view or restart. It never submits a new update.
+  Future<void> _resume() async {
+    final serverId = widget.host.serverId;
+    if (serverId.isEmpty) return;
+    final id = await _operations.read(serverId);
+    if (id == null || !mounted || state != 'idle') return;
+    await _durableUpdate(serverId, id, resumed: true);
+  }
+
+  /// Reads the host's current client on every call, refusing another daemon.
+  DaemonUpdateRequest _request(String serverId) => (type, fields, responseType) async {
+    final client = widget.host.client;
+    final response = await client.request(
+      type,
+      fields,
+      responseType: responseType,
+      timeout: const Duration(seconds: 30),
+    );
+    if (stringValue(client.serverInfo['serverId'], serverId) != serverId) {
+      throw StateError('Daemon identity changed');
+    }
+    return response;
+  };
+
+  Future<void> _durableUpdate(String serverId, String id, {required bool resumed}) async {
+    String t(String key, [Map<String, Object?> args = const {}]) =>
+        tr(context, 'settings.host.daemon.update.$key', args: args);
+    setState(() {
+      state = 'updating';
+      durable = true;
+      phase = t('phaseStarting');
+    });
+    final request = _request(serverId);
+    try {
+      if (!resumed) {
+        // Persisted before sending: an unacknowledged submit stays observable.
+        await _operations.write(serverId, id);
+        await submitDaemonUpdate(request, id);
+      }
+      final operation = await observeDaemonUpdate(
+        request,
+        id,
+        onUpdate: (operation) {
+          if (mounted) setState(() => phase = t(daemonUpdatePhaseKey(operation['phase'])));
+        },
+      );
+      // An unsettled session resume stays inspectable: reopening re-reads status
+      // (a late receipt-proven acceptance shows up there) and never resubmits.
+      if (!retainDaemonUpdateOperation(operation)) await _operations.clear(serverId);
+      if (!mounted) return;
+      final error = stringValue(operation['error']);
+      switch (daemonUpdateOutcome(operation)) {
+        case DaemonUpdateOutcome.committed:
+          final resume = unconfirmedContinuation(operation);
+          final requested = operation['continuation'] is Map;
+          setState(() {
+            state = 'complete';
+            workerVersion = stringValue(jsonMap(operation['candidate'])['version']);
+            completeNote = !requested
+                ? t('committedMessage')
+                : resume == null
+                ? t('continuationAccepted')
+                : retainDaemonUpdateOperation(operation)
+                ? t('continuationRetained', {'state': resume})
+                : t('continuationUnconfirmed', {'state': resume});
+          });
+        case DaemonUpdateOutcome.rolledBack:
+          fail(t('rolledBackTitle'), t('rolledBackMessage', {'id': id, 'error': error}));
+        case DaemonUpdateOutcome.failed || DaemonUpdateOutcome.running:
+          fail(t('requestFailedTitle'), t('operationFailedMessage', {'id': id, 'error': error}));
+      }
+    } on DaemonUpdateStillRunning {
+      if (mounted) fail(t('stillRunningTitle'), t('stillRunningMessage', {'id': id}));
+    } catch (e) {
+      // An unknown outcome keeps the persisted ID; a definitive rejection leaves nothing to observe.
+      final unknown = isDaemonUpdateReconnectFailure(e);
+      if (!unknown) await _operations.clear(serverId);
+      if (!mounted) return;
+      if (unknown) {
+        fail(t('stillRunningTitle'), t('stillRunningMessage', {'id': id}));
+      } else {
+        fail(t('requestFailedTitle'), t('requestFailedMessage', {'error': errorMessage(e)}));
+      }
+    }
   }
 
   static String? _normalize(Object? version) {
@@ -1307,6 +1408,10 @@ class _UpdateDaemonCardState extends State<UpdateDaemonCard>
       confirmLabel: t('confirm'),
     );
     if (!confirmed || !mounted) return;
+    if (supportsDurableDaemonUpdates(client.serverInfo)) {
+      await _durableUpdate(serverId, newDaemonUpdateOperationId(), resumed: false);
+      return;
+    }
     final phases = {
       'starting': t('phaseStarting'),
       'downloading': t('phaseDownloading'),
@@ -1315,6 +1420,7 @@ class _UpdateDaemonCardState extends State<UpdateDaemonCard>
     };
     setState(() {
       state = 'updating';
+      durable = false;
       phase = phases['starting']!;
     });
     final requestId = 'settings_daemon_update_${serverId}_${DateTime.now().microsecondsSinceEpoch}';
@@ -1382,7 +1488,7 @@ class _UpdateDaemonCardState extends State<UpdateDaemonCard>
     final selfUpdate = jsonMap(info['features'])['daemonSelfUpdate'] == true;
     final app = _normalize(_appVersion), daemon = _normalize(info['version']);
     final mismatch = app != null && daemon != null && app != daemon;
-    if (!(mismatch && (selfUpdate || desktopManaged)) && state != 'complete') {
+    if (!(mismatch && (selfUpdate || desktopManaged)) && state == 'idle') {
       return const SizedBox.shrink();
     }
     final updating = state == 'updating';
@@ -1411,12 +1517,20 @@ class _UpdateDaemonCardState extends State<UpdateDaemonCard>
               if (state == 'complete')
                 SettingsInlineAlert(
                   success: true,
-                  title: tr(
-                    context,
-                    'desktop.daemon.lifecycle.workerUpdated',
-                    args: {'version': workerVersion},
-                  ),
-                  description: tr(context, 'desktop.daemon.lifecycle.supervisorRefresh'),
+                  title: durable
+                      ? tr(
+                          context,
+                          'settings.host.daemon.update.committedTitle',
+                          args: {'version': workerVersion},
+                        )
+                      : tr(
+                          context,
+                          'desktop.daemon.lifecycle.workerUpdated',
+                          args: {'version': workerVersion},
+                        ),
+                  description: durable
+                      ? completeNote
+                      : tr(context, 'desktop.daemon.lifecycle.supervisorRefresh'),
                 ),
               if (state == 'failed')
                 Padding(

@@ -589,3 +589,31 @@ fn failed_empty_replacement_retries_before_incremental_append() {
     assert_eq!(recovered.rows().len(), 2);
     assert_eq!(recovered.items()[1]["text"], "buffered committed");
 }
+
+#[test]
+fn history_recovery_preserves_notices_without_guessing_user_message_identity() {
+    use crate::providers::api::HistoryCoverage;
+    let mut previous = Timeline::new();
+    previous.append(json!({"type":"notification","level":"info","message":"daemon notice"}), &options());
+    previous.append(json!({"type":"user_message","text":"same text","messageId":"client-id","clientMessageId":"client-id"}), &options());
+    previous.enrich_submitted_user_message("client-id", "native-id").unwrap();
+    let before = previous.fetch(&json!({"limit":0}));
+    let mut uncorrelated = Timeline::new();
+    uncorrelated.append(json!({"type":"user_message","text":"same text","messageId":"different-id"}), &options());
+    assert!(!uncorrelated.reconcile_history(&previous, HistoryCoverage::Complete, false));
+    let mut replacement = Timeline::new();
+    replacement.append(json!({"type":"user_message","text":"older","messageId":"older-id"}), &options());
+    replacement.append(json!({"type":"user_message","text":"same text","messageId":"native-id"}), &options());
+    assert!(!replacement.reconcile_history(&previous, HistoryCoverage::Unverified, false));
+    assert_eq!(previous.fetch(&json!({"limit":0})), before);
+    assert!(replacement.reconcile_history(&previous, HistoryCoverage::Complete, false));
+    let rows = replacement.rows();
+    assert_eq!(rows[0]["item"]["messageId"], "older-id");
+    assert_eq!(rows[1]["item"], previous.rows()[0]["item"]);
+    assert_eq!(rows[2]["item"]["messageId"], "client-id");
+    assert_eq!(rows[2]["providerMessageId"], "native-id");
+    assert!(rows.windows(2).all(|pair| pair[0]["seqEnd"].as_i64() < pair[1]["seqStart"].as_i64()));
+    let last_seq = rows.last().unwrap()["seqEnd"].as_i64().unwrap();
+    let appended = replacement.append(json!({"type":"assistant_message","text":"next"}), &options());
+    assert_eq!(appended["seq"].as_i64(), Some(last_seq + 1));
+}

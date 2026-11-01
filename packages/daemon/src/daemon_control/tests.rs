@@ -166,3 +166,106 @@ fn configured_log_path_is_used_for_startup_diagnostics() {
         home.path().join("logs/worker.log")
     );
 }
+
+#[test]
+fn stopping_announcement_carries_intent_and_stays_legacy_compatible() {
+    use supervisor::{WorkerExit, stopping_message};
+    for (exit, restart) in [
+        (WorkerExit::Stop, false),
+        (WorkerExit::Restart, true),
+        (WorkerExit::Failure, false),
+    ] {
+        let message = stopping_message("token", exit);
+        assert_eq!(message["type"], "paseo:stopping");
+        assert_eq!(message["token"], "token");
+        // Older supervisors read only `restart`.
+        assert_eq!(message["restart"], restart);
+        assert_eq!(WorkerExit::from_stopping(&message), exit);
+    }
+    assert_eq!(
+        WorkerExit::from_stopping(&json!({"restart":true})),
+        WorkerExit::Restart
+    );
+    assert_eq!(
+        WorkerExit::from_stopping(&json!({"restart":false})),
+        WorkerExit::Stop
+    );
+}
+
+#[test]
+fn explicit_worker_stop_ends_supervision_without_recovery() {
+    use supervisor::{ExitAction, WorkerExit, exit_action};
+    let stop = Some(WorkerExit::Stop);
+    assert_eq!(exit_action(false, stop, true, Some(0), false), ExitAction::Exit(0));
+    assert_eq!(exit_action(false, stop, true, Some(1), false), ExitAction::Exit(1));
+    assert_eq!(exit_action(false, stop, false, None, true), ExitAction::Exit(1));
+    // Supervisor-initiated stop wins over any worker announcement.
+    for announced in [stop, Some(WorkerExit::Restart), Some(WorkerExit::Failure), None] {
+        for ready in [false, true] {
+            assert_eq!(
+                exit_action(true, announced, ready, Some(1), false),
+                ExitAction::Exit(0)
+            );
+        }
+    }
+}
+
+#[test]
+fn initialization_failure_takes_update_rollback_path() {
+    use supervisor::{ExitAction, WorkerExit, exit_action};
+    for announced in [Some(WorkerExit::Failure), None] {
+        for (code, terminated) in [(Some(1), false), (Some(0), false), (None, true)] {
+            assert_eq!(
+                exit_action(false, announced, false, code, terminated),
+                ExitAction::Recover
+            );
+        }
+    }
+    // A requested update restart relaunches without rollback.
+    for ready in [false, true] {
+        assert_eq!(
+            exit_action(false, Some(WorkerExit::Restart), ready, Some(75), false),
+            ExitAction::Restart
+        );
+    }
+}
+
+#[test]
+fn ready_worker_fatal_error_restarts_instead_of_stopping() {
+    use supervisor::{ExitAction, WorkerExit, exit_action};
+    let failure = Some(WorkerExit::Failure);
+    for (code, terminated) in [(Some(1), false), (None, false), (None, true), (Some(0), false)] {
+        assert_eq!(
+            exit_action(false, failure, true, code, terminated),
+            ExitAction::Restart
+        );
+    }
+    // Unannounced ready exits keep the prior crash policy.
+    assert_eq!(exit_action(false, None, true, Some(1), false), ExitAction::Restart);
+    assert_eq!(exit_action(false, None, true, Some(75), false), ExitAction::Restart);
+    assert_eq!(exit_action(false, None, true, Some(0), false), ExitAction::Exit(0));
+    assert_eq!(exit_action(false, None, true, None, true), ExitAction::Exit(1));
+}
+
+#[tokio::test]
+async fn managed_entries_reject_unknown_arguments_before_any_effect() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().to_string_lossy().into_owned();
+    let home = home.as_str();
+    for (command, args) in [
+        ("__launcher", vec!["--home", home, "--bogus"]),
+        ("__update-executor", vec!["--home", home]),
+        ("__update-executor", vec!["--home", home, "--operation"]),
+        ("__managed-probe", vec!["--home", home]),
+        ("__supervisor", vec!["--home", home, "--standalone"]),
+    ] {
+        let args: Vec<String> = args.into_iter().map(String::from).collect();
+        assert!(run_internal(command, &args).await.is_err(), "{command} {args:?}");
+    }
+    assert!(!directory.path().join("native-installation.json").exists());
+    assert!(!directory.path().join("paseo.pid").exists());
+    assert_eq!(
+        managed::probe_report()["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+}

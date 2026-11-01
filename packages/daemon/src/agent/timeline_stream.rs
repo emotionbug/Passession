@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 #[path = "subagent_storage.rs"]
 mod persistence;
+pub use persistence::SubagentStorageUnavailable;
 
 #[derive(Default)]
 struct Buffer {
@@ -134,11 +135,17 @@ impl StreamCoalescer {
     }
 }
 
+/// Descriptors of loaded parents and hydrated child timelines. Persisted
+/// (cataloged) children hydrate lazily and are evicted under bounded residency;
+/// memory-only parents keep every timeline, as they have no other copy.
 #[derive(Default)]
 pub struct SubagentStore {
     descriptors: Vec<Value>,
     timelines: HashMap<(String, String), Timeline>,
-    catalogs: HashMap<String, rusqlite::Connection>,
+    catalogs: HashMap<String, persistence::Catalog>,
+    /// Parents whose catalog could not be indexed, with the recorded reason.
+    unavailable: HashMap<String, String>,
+    residency: persistence::Residency,
 }
 impl SubagentStore {
     pub fn apply(&mut self, parent_id: &str, provider: &str, event: &Value) -> Result<Value> {
@@ -167,36 +174,45 @@ impl SubagentStore {
             }
             Some("upsert") => {
                 self.timelines.entry(key).or_default();
-                let previous = index.map(|i| &self.descriptors[i]);
-                let timestamp = event["timestamp"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(now);
-                let mut descriptor = json!({"id":id,"parentAgentId":parent_id,"provider":provider,
-                    "status":event.get("status").filter(|status|!status.is_null()).or_else(||previous.and_then(|p|p.get("status")).filter(|status|!status.is_null())).cloned().unwrap_or(json!("running")),
-                    "createdAt":previous.and_then(|p|p.get("createdAt")).cloned().unwrap_or(json!(timestamp)),"updatedAt":timestamp});
-                for field in [
-                    "title",
-                    "description",
-                    "toolCallId",
-                    "cwd",
-                    "subtitle",
-                    "parentSubagentId",
-                ] {
-                    descriptor[field] = event
-                        .get(field)
-                        .or_else(|| previous.and_then(|p| p.get(field)))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                }
-                if let Some(index) = index {
-                    self.descriptors[index] = descriptor.clone();
-                } else {
-                    self.descriptors.push(descriptor.clone());
-                }
+                let descriptor = self.descriptor(parent_id, provider, id, event);
+                self.store_descriptor(descriptor.clone());
                 Ok(json!({"type":"upsert","subagent":descriptor}))
             }
             _ => bail!("Unknown provider subagent event"),
+        }
+    }
+    /// Merge an upsert into the previous descriptor without touching storage.
+    fn descriptor(&self, parent_id: &str, provider: &str, id: &str, event: &Value) -> Value {
+        let previous = self.get(parent_id, id);
+        let timestamp = event["timestamp"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(now);
+        let mut descriptor = json!({"id":id,"parentAgentId":parent_id,"provider":provider,
+            "status":event.get("status").filter(|status|!status.is_null()).or_else(||previous.and_then(|p|p.get("status")).filter(|status|!status.is_null())).cloned().unwrap_or(json!("running")),
+            "createdAt":previous.and_then(|p|p.get("createdAt")).cloned().unwrap_or(json!(timestamp)),"updatedAt":timestamp});
+        for field in [
+            "title",
+            "description",
+            "toolCallId",
+            "cwd",
+            "subtitle",
+            "parentSubagentId",
+        ] {
+            descriptor[field] = event
+                .get(field)
+                .or_else(|| previous.and_then(|p| p.get(field)))
+                .cloned()
+                .unwrap_or(Value::Null);
+        }
+        descriptor
+    }
+    fn store_descriptor(&mut self, descriptor: Value) {
+        match self.descriptors.iter().position(|d| {
+            d["parentAgentId"] == descriptor["parentAgentId"] && d["id"] == descriptor["id"]
+        }) {
+            Some(index) => self.descriptors[index] = descriptor,
+            None => self.descriptors.push(descriptor),
         }
     }
     pub fn list(&self, parent_id: &str) -> Vec<Value> {
@@ -208,9 +224,6 @@ impl SubagentStore {
             .collect();
         result.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
         result
-    }
-    pub fn list_all(&self) -> &[Value] {
-        &self.descriptors
     }
     pub fn get(&self, parent_id: &str, id: &str) -> Option<&Value> {
         self.descriptors
@@ -273,6 +286,8 @@ impl SubagentStore {
         self.descriptors.retain(|d| d["parentAgentId"] != parent_id);
         self.timelines.retain(|(parent, _), _| parent != parent_id);
         self.catalogs.remove(parent_id);
+        self.unavailable.remove(parent_id);
+        self.residency.forget_parent(parent_id);
         ids.into_iter()
             .map(|id| json!({"type":"remove","parentAgentId":parent_id,"subagentId":id}))
             .collect()

@@ -226,7 +226,7 @@ impl AgentManager {
         if self.closing.load(Ordering::Acquire) || cell.cancel.is_cancelled() {
             bail!("Agent manager is shutting down");
         }
-        self.persist_snapshot(&snapshot).await?;
+        self.persist_snapshot(&mut snapshot, !restoring).await?;
         {
             let mut data = cell.data.lock().await;
             data.ready = true;
@@ -582,7 +582,7 @@ impl AgentManager {
                 else if coverage == crate::providers::api::HistoryCoverage::Complete { "complete" } else { "partial" },
             "canonicalPreserved": epoch.is_none(),
         });
-        self.commit_snapshot_locked(cell, snapshot).await?;
+        self.commit_snapshot_locked(cell, snapshot, false).await?;
         drop(_commit);
         self.release_event_stage(cell).await?;
         cell.data.lock().await.history_primed = true;
@@ -983,7 +983,7 @@ impl AgentManager {
         }
         snapshot["status"] = snapshot["lifecycle"].clone();
         if ready {
-            self.persist_snapshot(&snapshot).await?;
+            self.persist_snapshot(&mut snapshot, !from_history).await?;
         }
         cell.data.lock().await.snapshot = snapshot.clone();
         if ready && !from_history {
@@ -1136,9 +1136,25 @@ impl AgentManager {
         }
         let store = self.subagent_store.clone();
         let parent = id.to_owned();
-        let children = tokio::task::spawn_blocking(move || {
-            Ok::<_, anyhow::Error>(store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.list(&parent))
-        }).await??;
+        let internal = cell.data.lock().await.snapshot["internal"] == true;
+        let root = (!internal).then(|| self.app().map(|app| app.home.join("agent-subagents"))).transpose()?;
+        let listed = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?;
+            match root {
+                Some(root) => store.list_persisted(&root, &parent),
+                None => Ok((store.list(&parent), Vec::new())),
+            }
+        }).await?;
+        let (children, unreadable) = match listed {
+            Err(error) if error.downcast_ref::<timeline::SubagentStorageUnavailable>().is_some() => {
+                tracing::warn!(agent_id = id, %error, "Running subagents not marked canceled: storage unavailable");
+                (Vec::new(), Vec::new())
+            }
+            listed => listed?,
+        };
+        for error in unreadable {
+            tracing::warn!(agent_id = id, %error, "Subagent not marked canceled: descriptor unreadable");
+        }
         {
             let _commit = cell.commit.lock().await;
             for child in children
@@ -1147,9 +1163,18 @@ impl AgentManager {
             {
                 self.apply_subagent_event(id,cell,&json!({"provider":child["provider"],"event":{"type":"upsert","id":child["id"],"status":"canceled"}})).await?;
             }
+            if !internal {
+                let store = self.subagent_store.clone();
+                let parent = id.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.release_parent(&parent);
+                    Ok::<_, anyhow::Error>(())
+                }).await??;
+            }
         }
         let mut snapshot = cell.data.lock().await.snapshot.clone();
-        if is_busy(&snapshot) || snapshot["activeForegroundTurnId"].is_string() {
+        let interrupted = is_busy(&snapshot) || snapshot["activeForegroundTurnId"].is_string();
+        if interrupted {
             snapshot["lastTurnOutcome"] = json!("turn_canceled");
         }
         snapshot["lifecycle"] = json!("closed");
@@ -1159,7 +1184,8 @@ impl AgentManager {
         snapshot["activeTurn"] = Value::Null;
         snapshot["pendingPermissions"] = json!([]);
         snapshot["_live"] = json!(false);
-        self.commit_snapshot(cell, snapshot.clone()).await?;
+        // Releasing an idle/history-only view is not user or provider activity.
+        self.commit_snapshot(cell, snapshot.clone(), interrupted).await?;
         if snapshot["internal"] != true {
             let _ = self
                 .app()?
@@ -1698,23 +1724,83 @@ pub(super) mod tests {
             assert_ne!(next, cursor);
             cursor = next;
         }
-        assert_eq!(entries.len(), 7);
+        assert_eq!(entries.iter().filter(|row| row["item"]["type"] == "notification"
+            && row["item"]["message"] == "previous startup").count(), 1);
         assert_eq!(entries[0]["item"]["messageId"], "user-old");
         assert_eq!(entries[0]["timestamp"], "2026-10-24T00:00:01.000Z");
         assert_eq!(entries[1]["item"]["messageId"], "answer-old");
-        assert_eq!(entries[2]["item"]["messageId"], "user-recent");
-        assert_eq!(entries[3]["item"]["messageId"], "answer-recent");
+        let message_ids: Vec<_> = entries.iter()
+            .filter_map(|row| row["item"]["messageId"].as_str()).collect();
+        assert_eq!(message_ids, ["user-old", "answer-old", "user-recent", "answer-recent", "user-live", "answer-live"]);
         assert!(entries.windows(2).all(|rows| rows[0]["seqEnd"].as_i64() < rows[1]["seqStart"].as_i64()));
         manager.hydrate_history(id, &cell, false).await.unwrap();
         let unchanged = timeline_request(manager, id, json!({"direction":"tail","limit":2})).await;
         assert_eq!(unchanged["epoch"], tail["epoch"]);
         assert_eq!(unchanged["window"], tail["window"]);
         let recovered = Timeline::load(&manager.timeline_path(id).unwrap(), id).unwrap();
-        assert_eq!(recovered.rows().len(), 7);
+        assert_eq!(recovered.items(), entries.iter().map(|row| row["item"].clone()).collect::<Vec<_>>());
+        assert_eq!(recovered.epoch(), tail["epoch"].as_str().unwrap());
+        assert_eq!(recovered.fetch(&json!({"limit":0}))["window"], tail["window"]);
         assert_eq!(tokio::fs::read(&original).await.unwrap(), original_bytes.as_bytes());
         session.close().await.unwrap();
         cell.cancel.cancel();
         cell.task.lock().await.take().unwrap().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn archived_history_reopen_refresh_and_close_preserve_activity_stamps() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let transcript = root.path().join("history.jsonl");
+        let lines = [
+            json!({"type":"session","version":3,"id":"native-history","cwd":root.path(),"timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"message","id":"question","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"old question"}}),
+            json!({"type":"message","id":"answer","parentId":"question","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"old answer"}]}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        tokio::fs::write(&transcript, &lines).await.unwrap();
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(home.clone()) }).await;
+        let id = "00000000-0000-4000-8000-000000000044";
+        let persistence = json!({"provider":"omp","sessionId":"native-history","nativeHandle":transcript,"metadata":{"cwd":root.path()}});
+        let original = json!({
+            "id":id,"provider":"omp","cwd":root.path(),"config":{},"internal":false,
+            "persistence":persistence,"lastStatus":"closed","requiresAttention":false,
+            "createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-03T00:00:00.000Z",
+            "lastActivityAt":"2026-01-01T00:00:02.000Z","archivedAt":"2026-01-03T00:00:00.000Z",
+            "_historyOnly":true
+        });
+        manager.storage().unwrap().upsert(original.clone()).await.unwrap();
+        let provider = JsonlProvider::new(ProviderSpec {
+            id:"omp".into(),family:"omp".into(),command:Vec::new(),env:BTreeMap::new(),
+            options:json!({}),defaults:json!({}),runtime_settings:json!({}),configured_models:Vec::new(),
+        });
+        let (cell, receiver) = manager.make_cell(id, original.clone(), false).await.unwrap();
+        *cell.task.lock().await = Some(manager.start_events(id, &cell, receiver));
+        let session = provider.resume_session(
+            persistence.clone(),json!({"cwd":root.path()}),
+            LaunchContext {
+                agent_id:id.into(),home:home.clone(),executable:app.executable.clone(),
+                env:BTreeMap::new(),mcp_servers:json!({}),tool_catalog:json!([]),
+                tool_manifest:json!([]),tool_executor:None,cancel:cell.cancel.child_token(),
+            },
+            json!({"purpose":"history"}),cell.sink.clone(),
+        ).await.unwrap();
+        let restored = manager.register_session(id, &cell, session, Some(persistence), true).await.unwrap();
+        assert_eq!(restored["updatedAt"], original["updatedAt"]);
+        assert_eq!(restored["lastActivityAt"], original["lastActivityAt"]);
+        manager.hydrate_history(id, &cell, true).await.unwrap();
+        assert_eq!(cell.timeline.lock().unwrap().rows()[1]["item"]["text"], "old answer");
+        let refreshed = manager.agent_snapshot(id).await.unwrap().unwrap();
+        assert_eq!(refreshed["updatedAt"], original["updatedAt"]);
+        assert_eq!(refreshed["lastActivityAt"], original["lastActivityAt"]);
+        assert_eq!(refreshed["historySync"]["status"], "complete");
+        manager.close_cell(id, &cell).await.unwrap();
+        let closed = AgentStorage::new(home).get(id).await.unwrap().unwrap();
+        assert_eq!(closed["updatedAt"], original["updatedAt"]);
+        assert_eq!(closed["lastActivityAt"], original["lastActivityAt"]);
+        assert_eq!(closed["archivedAt"], original["archivedAt"]);
+        assert_eq!(tokio::fs::read_to_string(transcript).await.unwrap(), lines);
     }
 
     #[test]

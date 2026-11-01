@@ -5,7 +5,7 @@ use std::path::Path;
 
 #[path = "timeline_stream.rs"]
 mod stream;
-pub use stream::{StreamCoalescer, SubagentStore};
+pub use stream::{StreamCoalescer, SubagentStorageUnavailable, SubagentStore};
 #[path = "timeline_search.rs"]
 mod search;
 #[path = "timeline_storage.rs"]

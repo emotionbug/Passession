@@ -1,6 +1,6 @@
 use super::Timeline;
 use crate::providers::api::HistoryCoverage;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 fn keys(row: &Value) -> Vec<String> {
@@ -33,9 +33,9 @@ fn keys(row: &Value) -> Vec<String> {
 }
 
 impl Timeline {
-    /// Non-destructive refresh requires every existing row to survive with a
-    /// unique match. Unknown/torn replay can never authorize a rewind. Ambiguous
-    /// matches preserve the entire old timeline instead of guessing associations.
+    /// Non-destructive refresh requires unique, ordered matches for conversation
+    /// rows. Complete provider history may omit daemon notifications: retain those
+    /// beside the next matched row rather than dropping them or refusing recovery.
     pub(in crate::agent) fn reconcile_history(
         &mut self, previous: &Self, coverage: HistoryCoverage, allow_removal: bool,
     ) -> bool {
@@ -52,6 +52,8 @@ impl Timeline {
         let mut used = HashSet::new();
         let mut matches = Vec::new();
         let mut previous_index = None;
+        let mut pending_notices = Vec::new();
+        let mut retained_notices = Vec::new();
         for (old_index, row) in previous.rows.iter().enumerate() {
             let resolved: HashSet<_> = keys(row).iter()
                 .filter_map(|key| candidates.get(key).copied().flatten()).collect();
@@ -61,11 +63,18 @@ impl Timeline {
             }
             if let Some(index) = matched { previous_index = Some(index); }
             match matched.filter(|index| used.insert(*index)) {
-                Some(index) => matches.push((old_index, index)),
+                Some(index) => {
+                    retained_notices.extend(pending_notices.drain(..).map(|old| (index, old)));
+                    matches.push((old_index, index));
+                }
                 None if allow_removal => {}
+                None if coverage == HistoryCoverage::Complete && row["item"]["type"] == "notification" => {
+                    pending_notices.push(old_index);
+                }
                 None => return false,
             }
         }
+        retained_notices.extend(pending_notices.into_iter().map(|old| (self.rows.len(), old)));
         for (old_index, index) in matches {
             let old = &previous.rows[old_index];
             let row = &mut self.rows[index];
@@ -82,7 +91,41 @@ impl Timeline {
         self.identities.clear();
         self.submitted.clear();
         self.min_seq = 0;
-        for row in rows { self.append_row(row); }
+        let mut notices = retained_notices.into_iter().peekable();
+        let mut shift = 0i64;
+        for (index, mut row) in rows.into_iter().enumerate() {
+            while notices.peek().is_some_and(|(before, _)| *before == index) {
+                let (_, old) = notices.next().unwrap();
+                let mut notice = previous.rows[old].clone();
+                notice["seq"] = json!(super::num(&row, "seqStart") + shift);
+                for key in ["seqStart", "seqEnd", "sourceSeqRanges", "collapsed"] {
+                    notice.as_object_mut().unwrap().remove(key);
+                }
+                self.append_row(notice);
+                shift += 1;
+            }
+            if shift != 0 {
+                for key in ["seq", "seqStart", "seqEnd"] {
+                    row[key] = json!(super::num(&row, key) + shift);
+                }
+                for range in row["sourceSeqRanges"].as_array_mut().unwrap() {
+                    for key in ["startSeq", "endSeq"] {
+                        range[key] = json!(super::num(range, key) + shift);
+                    }
+                }
+            }
+            self.append_row(row);
+        }
+        for (_, old) in notices {
+            let mut notice = previous.rows[old].clone();
+            notice["seq"] = json!(self.next_seq + shift);
+            for key in ["seqStart", "seqEnd", "sourceSeqRanges", "collapsed"] {
+                notice.as_object_mut().unwrap().remove(key);
+            }
+            self.append_row(notice);
+            shift += 1;
+        }
+        self.next_seq += shift;
         true
     }
 }

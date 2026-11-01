@@ -309,7 +309,7 @@ pub fn cache() -> Result<PathBuf> {
 pub fn build_number(target: &str) -> Result<u64> {
     let value = env::var("PASEO_BUILD_NUMBER")
         .or_else(|_| env::var("ANDROID_VERSION_CODE"))
-        .unwrap_or_else(|_| "13001".into());
+        .unwrap_or_else(|_| "13002".into());
     ensure!(
         !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
         "PASEO_BUILD_NUMBER must be numeric"

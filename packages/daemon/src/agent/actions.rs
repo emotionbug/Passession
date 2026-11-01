@@ -82,7 +82,10 @@ impl AgentManager {
                         &message_id,
                         &request,
                         || manager.message_delivery.try_reserve(),
-                        |permit| async { manager.message_delivery.enqueue_reserved(queue, permit).await },
+                        |permit| async {
+                            let _work = manager.update_admission.enter()?;
+                            manager.message_delivery.enqueue_reserved(queue, permit).await
+                        },
                     )
                     .await?;
                 Ok::<_, anyhow::Error>((manager, admission))
@@ -217,7 +220,6 @@ impl AgentManager {
             .or_else(|| text(&input, "clientMessageId"))
             .map(str::to_owned);
         let request = receipt_request(&input, &prompt, source.as_ref());
-        let unarchive = input["unarchive"] != false;
         let mut run_input = input;
         let (prompt, client_id) = if prepared {
             (prompt, message_id.clone())
@@ -232,12 +234,6 @@ impl AgentManager {
             .agent_snapshot(id)
             .await?
             .ok_or_else(|| anyhow!("Agent '{id}' not found"))?;
-        if snapshot["archivedAt"].is_string() && !unarchive {
-            if gate.is_some() {
-                return Err(PromptDeliveryError::not_delivered("Agent is archived"));
-            }
-            return Ok(json!({"disposition":"turn_started"}));
-        }
         if gate.is_some() {
             let cell = self.prepare_send(id, &run_input).await?;
             return self.dispatch_prompt_gated(id, &cell, &run_input, gate).await;
@@ -350,6 +346,7 @@ impl AgentManager {
             .agent_snapshot(id)
             .await?
             .ok_or_else(|| anyhow!("Agent '{id}' not found"))?;
+        validate_send_identity(&snapshot, input)?;
         if snapshot["archivedAt"].is_string() {
             self.unarchive(id, &json!({})).await?;
         }
@@ -418,6 +415,7 @@ impl AgentManager {
         input: &Value,
         gate: Option<&DispatchGate>,
     ) -> Result<Value> {
+        let work = self.update_admission.enter()?;
         let session = cell
             .data
             .lock()
@@ -434,6 +432,7 @@ impl AgentManager {
         }
         let client_id = text(&options, "clientMessageId").map(str::to_owned);
         let before = cell.data.lock().await.snapshot.clone();
+        validate_send_identity(&before, input)?;
         if input["requireIdle"] == true && is_busy(&before) {
             bail!("Agent {id} already has an active run");
         }
@@ -456,6 +455,7 @@ impl AgentManager {
                 gate.invoke();
             }
             tokio::spawn(async move {
+                let _work = work;
                 let result = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
@@ -755,7 +755,7 @@ impl AgentManager {
             };
             let ready = cell.data.lock().await.ready;
             if ready {
-                self.persist_snapshot(&snapshot).await?;
+                self.persist_snapshot(&mut snapshot, touch).await?;
             }
             cell.data.lock().await.snapshot = snapshot.clone();
             let _ = self
@@ -1098,6 +1098,11 @@ impl AgentManager {
                 .await?
             ));
         }
+        let _admission = if matches!(action, "cancel" | "close") {
+            None
+        } else {
+            Some(self.update_admission.enter()?)
+        };
         if action == "resume" && input["handle"].is_object() {
             return self.resume_handle(actor, id, &input).await;
         }
@@ -1304,7 +1309,7 @@ impl AgentManager {
                     snapshot["attention"]["attentionTimestamp"] = snapshot["updatedAt"].clone();
                 }
             }
-            self.persist_snapshot(&snapshot).await?;
+            self.persist_snapshot(&mut snapshot, touch).await?;
             let _ = self
                 .events
                 .send(json!({"type":"agent_state","agent":snapshot}));
@@ -1463,6 +1468,15 @@ impl AgentManager {
                         .to_owned(),
                     None => requested.to_owned(),
                 };
+                // Refusing a session capability must not cancel its current turn.
+                let capability = match target {
+                    RewindTarget::Conversation => "supportsRewindConversation",
+                    RewindTarget::Files => "supportsRewindFiles",
+                    RewindTarget::Both => "supportsRewindBoth",
+                };
+                if session.capabilities()[capability] != true {
+                    bail!("Agent {id} does not support {mode} rewind for this session");
+                }
                 let settled = self.interrupt_cell(id, &cell).await?;
                 if settled["status"] == "refused" {
                     bail!(
@@ -1509,7 +1523,7 @@ impl AgentManager {
                 }
             }
         }
-        self.persist_snapshot(&snapshot).await?;
+        self.persist_snapshot(&mut snapshot, true).await?;
         if let Ok(cell) = self.cell(id).await {
             cell.data.lock().await.snapshot = snapshot.clone();
             if snapshot["_historyOnly"] == true {
@@ -1558,7 +1572,7 @@ impl AgentManager {
                 snapshot["lifecycle"] = json!("idle");
                 snapshot["status"] = json!("idle");
             }
-            self.persist_snapshot(&snapshot).await?;
+            self.persist_snapshot(&mut snapshot, false).await?;
             let _ = self
                 .events
                 .send(json!({"type":"agent_state","agent":snapshot}));
@@ -1650,12 +1664,53 @@ fn receipt_request(input: &Value, prompt: &Value, source: Option<&Value>) -> Val
     if let Some(mode) = input.get("sessionMode") {
         request["sessionMode"] = mode.clone();
     }
+    if input["unarchive"] == false {
+        request["unarchive"] = json!(false);
+    }
+    if let Some(expected) = input.get("expectedPersistence") {
+        request["expectedPersistence"] = expected.clone();
+    }
     request
+}
+
+fn validate_send_identity(snapshot: &Value, input: &Value) -> Result<()> {
+    if input["unarchive"] == false && snapshot["archivedAt"].is_string() {
+        return Err(PromptDeliveryError::not_delivered("Agent is archived"));
+    }
+    if let Some(expected) = input.get("expectedPersistence") {
+        let actual = json!({"provider":snapshot["provider"],"sessionId":snapshot["persistence"]["sessionId"],
+            "nativeHandle":snapshot["persistence"]["nativeHandle"]});
+        if expected != &actual {
+            return Err(PromptDeliveryError::not_delivered("Original provider session identity changed"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_identity_refuses_archived_and_replaced_provider_sessions() {
+        let mut snapshot = json!({"provider":"omp","archivedAt":null,
+            "persistence":{"sessionId":"native-one","nativeHandle":"/original.jsonl"}});
+        let request = json!({"unarchive":false,"expectedPersistence":{
+            "provider":"omp","sessionId":"native-one","nativeHandle":"/original.jsonl"}});
+        validate_send_identity(&snapshot, &request).unwrap();
+        snapshot["archivedAt"] = json!("2026-01-01T00:00:00Z");
+        let error = validate_send_identity(&snapshot, &request).unwrap_err();
+        assert!(!error.downcast_ref::<PromptDeliveryError>().unwrap().rejected);
+        snapshot["archivedAt"] = Value::Null;
+        for field in ["sessionId", "nativeHandle"] {
+            let mut changed = snapshot.clone();
+            changed["persistence"][field] = json!("replacement");
+            let error = validate_send_identity(&changed, &request).unwrap_err();
+            assert!(!error.downcast_ref::<PromptDeliveryError>().unwrap().rejected);
+        }
+        snapshot["provider"] = json!("pi");
+        assert!(validate_send_identity(&snapshot, &request).is_err());
+    }
 
     #[tokio::test]
     async fn queued_send_and_retry_return_while_recipient_delivery_is_blocked() -> Result<()> {
@@ -1733,6 +1788,7 @@ mod tests {
             std::env::current_exe()?,
         );
         let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(app.home.clone()) }).await;
         manager
             .receipts
             .get_or_init(|| async { MessageReceipts::new(app.home.clone()) })
@@ -1740,7 +1796,12 @@ mod tests {
         let id = "00000000-0000-4000-8000-000000000041";
         let cell = runtime::tests::staged_cell(&app, id).await;
         manager.release_event_stage(&cell).await?;
-        cell.data.lock().await.snapshot["internal"] = json!(false);
+        {
+            let mut data = cell.data.lock().await;
+            data.snapshot["internal"] = json!(false);
+            data.snapshot["createdAt"] = json!(now());
+            data.snapshot["cwd"] = json!(root.path());
+        }
         // Another dispatch holds the agent; the new prompt waits behind it.
         let mutation = cell.mutation.lock().await;
         let sender = app.clone();

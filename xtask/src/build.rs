@@ -1,4 +1,4 @@
-use crate::{assets, common::*, libraries, notices};
+use crate::{assets, common::*, libraries, notices, signing};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -10,6 +10,27 @@ use std::{
 
 fn valid_source(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Local operator builds packaged as complete standalone runtimes. They carry
+/// their own local provenance and are never labeled as an official release.
+pub const STANDALONE_LOCAL: &str = "standalone-local";
+
+fn native_release_env() -> bool {
+    env::var("PASEO_NATIVE_RELEASE").as_deref() == Ok("1")
+}
+
+/// A standalone-local runtime must come from a local build: no release flag,
+/// channel or repository identity may be claimed or carried over.
+fn ensure_local_identity(identity: &Value) -> Result<()> {
+    ensure!(
+        identity["release"] == false
+            && identity["channel"].is_null()
+            && identity["repository"].is_null()
+            && matches!(identity["sourceDirty"], Value::Bool(_) | Value::Null),
+        "standalone-local packages only local builds (release=false, no channel/repository); package official releases with --kind standalone-archive"
+    );
+    Ok(())
 }
 
 pub fn release_identity() -> Result<Value> {
@@ -137,6 +158,12 @@ fn build_native(profile: &str, container: bool) -> Result<()> {
     } else {
         json!({"version":version()?,"platform":platform()?,"arch":arch()?,"sourceSha":source,"channel":null,"repository":null})
     };
+    // Containers build from an exported tree whose working-copy state is unknown.
+    identity["sourceDirty"] = if container {
+        Value::Null
+    } else {
+        json!(!capture(command("git")?.args(["status", "--porcelain"]))?.is_empty())
+    };
     ensure!(
         identity["sourceSha"] == source,
         "PASEO_BUILD_SOURCE_SHA must identify the checked-out release source"
@@ -233,10 +260,21 @@ pub fn read_native_build(profile: &str, require_release: bool) -> Result<NativeB
 
 pub fn bundle_runtime(destination: &Path, profile: &str, kind: &str) -> Result<()> {
     ensure!(
-        matches!(kind, "desktop-bundled" | "standalone-archive" | "container"),
+        matches!(
+            kind,
+            "desktop-bundled" | "standalone-archive" | STANDALONE_LOCAL | "container"
+        ),
         "Unknown native installation kind: {kind}"
     );
+    ensure!(
+        kind != STANDALONE_LOCAL || !native_release_env(),
+        "standalone-local packages a local build; unset PASEO_NATIVE_RELEASE or use --kind standalone-archive"
+    );
+    // Packages the existing build output only; this never rebuilds the daemon.
     let build = read_native_build(profile, kind == "standalone-archive")?;
+    if kind == STANDALONE_LOCAL {
+        ensure_local_identity(&build.identity)?;
+    }
     let destination = absolute(destination)?;
     // Never erase source build output or a workspace in response to a mistyped destination.
     let parent = destination
@@ -308,8 +346,23 @@ pub fn validate_runtime(runtime: &Path, kind: &str, profile: &str) -> Result<Val
         "Staged runtime identity/hash/profile mismatch: {}",
         runtime.display()
     );
+    let marker = read_json(&runtime.join("paseo-runtime.json"))?;
+    ensure!(
+        marker["installationKind"] == kind
+            && ["version", "sourceSha", "platform", "arch", "release"]
+                .iter()
+                .all(|key| marker[key] == identity[key]),
+        "Runtime marker does not match bundle provenance: {}",
+        runtime.display()
+    );
     assert_architecture(&runtime.join(executable()))?;
-    if env::var("PASEO_NATIVE_RELEASE").as_deref() == Ok("1") || kind == "standalone-archive" {
+    if kind == STANDALONE_LOCAL {
+        ensure!(
+            !native_release_env(),
+            "standalone-local runtimes are not release packages; unset PASEO_NATIVE_RELEASE"
+        );
+        ensure_local_identity(&identity)?;
+    } else if native_release_env() || kind == "standalone-archive" {
         let expected = release_identity()?;
         ensure!(
             identity["release"] == true
@@ -325,6 +378,21 @@ pub fn validate_runtime(runtime: &Path, kind: &str, profile: &str) -> Result<Val
     Ok(identity)
 }
 
+/// Platform completion shared by official standalone archives and
+/// standalone-local runtimes: CRT payload, code signature and final hash.
+pub fn finish_standalone_runtime(runtime: &Path, stage: &Path) -> Result<()> {
+    match platform()? {
+        "macos" => signing::sign_mac(runtime, stage, false)?,
+        "windows" => {
+            signing::windows_runtime(runtime, true)?;
+            signing::sign_windows(&[runtime.join(executable())], stage)?;
+            refresh_runtime_hash(runtime)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn refresh_runtime_hash(runtime: &Path) -> Result<()> {
     let path = runtime.join("bundle-provenance.json");
     let mut identity = read_json(&path)?;
@@ -335,10 +403,10 @@ pub fn refresh_runtime_hash(runtime: &Path) -> Result<()> {
 pub fn stage_command(args: &[String]) -> Result<()> {
     let Some((destination, options)) = args.split_first() else {
         bail!(
-            "Usage: cargo xtask stage-runtime DESTINATION [--profile debug|release] [--kind desktop-bundled|standalone-archive|container]"
+            "Usage: cargo xtask stage-runtime DESTINATION [--profile debug|release] [--kind desktop-bundled|standalone-archive|standalone-local|container]"
         );
     };
-    let mut profile = if env::var("PASEO_NATIVE_RELEASE").as_deref() == Ok("1") {
+    let mut profile = if native_release_env() {
         "release"
     } else {
         "debug"
@@ -356,7 +424,19 @@ pub fn stage_command(args: &[String]) -> Result<()> {
         chunks.remainder().is_empty(),
         "stage-runtime option requires a value"
     );
-    bundle_runtime(Path::new(destination), profile, kind)
+    bundle_runtime(Path::new(destination), profile, kind)?;
+    if kind == STANDALONE_LOCAL {
+        // Complete it exactly like the official standalone archive payload, so
+        // `paseo daemon update --from DESTINATION` receives a full runtime.
+        let runtime = absolute(destination)?;
+        let stage = tempfile::Builder::new()
+            .prefix("paseo-local-runtime-")
+            .tempdir()?;
+        finish_standalone_runtime(&runtime, stage.path())?;
+        validate_runtime(&runtime, kind, profile)?;
+        println!("{}", runtime.display());
+    }
+    Ok(())
 }
 
 pub fn container_runtime(args: &[String]) -> Result<()> {
@@ -747,6 +827,24 @@ mod tests {
         assert!(!valid_source("main"));
         assert!(!valid_source(&"g".repeat(40)));
         assert!(!valid_source(&"a".repeat(39)));
+    }
+    #[test]
+    fn standalone_local_accepts_only_local_build_provenance() {
+        let local = json!({"release":false,"channel":null,"repository":null,"sourceDirty":true});
+        assert!(ensure_local_identity(&local).is_ok());
+        let mut legacy = local.clone();
+        legacy.as_object_mut().unwrap().remove("sourceDirty");
+        assert!(ensure_local_identity(&legacy).is_ok());
+        for (key, value) in [
+            ("release", json!(true)),
+            ("channel", json!("stable")),
+            ("repository", json!("emotionbug/paseo")),
+            ("sourceDirty", json!("unknown")),
+        ] {
+            let mut claimed = local.clone();
+            claimed[key] = value;
+            assert!(ensure_local_identity(&claimed).is_err(), "{key}");
+        }
     }
     #[test]
     fn credentials_restore_existing_and_remove_temporary_files() {

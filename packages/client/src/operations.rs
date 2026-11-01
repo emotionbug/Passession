@@ -184,6 +184,8 @@ operations! {
     set_workspace_label => ("workspace.label.assignment.set.request", "workspace.label.assignment.set.response"),
     schedule_update => ("schedule/update", "schedule/update/response"),
     update_daemon => ("daemon.update.request", "daemon.update.response"),
+    submit_daemon_update => ("daemon.update.submit.request", "daemon.update.submit.response"),
+    get_daemon_update_status => ("daemon.update.status.request", "daemon.update.status.response"),
     reload_daemon_config => ("daemon.config.reload.request", "daemon.config.reload.response"),
     collect_diagnostics => ("diagnostics.request", "diagnostics.response"),
     list_provider_usage => ("provider.usage.list.request", "provider.usage.list.response"),

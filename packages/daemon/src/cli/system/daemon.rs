@@ -1,14 +1,18 @@
 use super::{duration, error, pretty, set_path};
-use crate::cli::{Context, flag, option, output::Output, positional, string, switch};
+use crate::cli::{Context, flag, option, output::Output, parse_duration, positional, string, switch};
 use crate::{
     client::ConnectOptions,
+    daemon_admin::{
+        self as admin,
+        update_operation::{self, ResumeRequest, SubmitRequest, UpdateSource},
+    },
     daemon_control::{self as control, DaemonInstance, StartOptions, StopOptions},
 };
 use paseo_client::{ClientError, DaemonClient, DaemonTarget};
 use anyhow::{Context as _, Result, bail, ensure};
 use clap::{ArgMatches, Command};
 use serde_json::{Value, json};
-use std::{path::Path, time::Duration};
+use std::{path::{Path, PathBuf}, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 const REMOVED_FLAGS: &[(&str, &str, bool)] = &[
@@ -52,6 +56,19 @@ pub fn command() -> Command {
             Command::new("restart").arg(option("timeout", "timeout")),
         ))
         .subcommand(Command::new("reload"))
+        .subcommand(
+            Command::new("update")
+                .about("Replace the daemon runtime as a durable operation; status and wait only observe it")
+                .after_help("Submit: paseo daemon update [--from <complete-runtime>] [--operation-id <uuid>] [--resume-agent <agent-id> --continuation-file <file>] [--idle-timeout <duration>] [--force-running]\nObserve: paseo daemon update status <operation-id>\n         paseo daemon update wait <operation-id>\n--from and --continuation-file read files on this computer and require a local --home. Without --from the latest official release is installed.")
+                .arg(positional("action", false).value_parser(["status", "wait"]))
+                .arg(positional("operation", false))
+                .arg(option("from", "from"))
+                .arg(option("operation-id", "operation-id"))
+                .arg(option("resume-agent", "resume-agent").requires("continuation-file"))
+                .arg(option("continuation-file", "continuation-file").requires("resume-agent"))
+                .arg(option("idle-timeout", "idle-timeout"))
+                .arg(switch("force-running", "force-running")),
+        )
         .subcommand(Command::new("pair").arg(switch("relay", "relay")))
         .subcommand(Command::new("set-password"))
         .subcommand(
@@ -194,21 +211,14 @@ pub async fn execute(path: &[&str], m: &ArgMatches, ctx: &Context) -> Result<Out
             );
             Ok(Output::new(data).id("action").human(human))
         }
+        ["update"] => update(m, ctx).await,
         ["reload"] => {
             let client = ctx.connect().await?;
             let result = reload(&client).await;
             client.close().await;
             let payload = result?;
             let mut data = json!({"appliedPaths":payload["appliedPaths"],"restartRequiredPaths":payload["restartRequiredPaths"],"overrideControlledPaths":payload["overrideControlledPaths"]});
-            let selector = match &ctx.target {
-                DaemonTarget::Instance { home } => {
-                    format!("--home {}", serde_json::to_string(home)?)
-                }
-                DaemonTarget::Endpoint { .. } => format!(
-                    "--host {}",
-                    serde_json::to_string(&ctx.target.description())?
-                ),
-            };
+            let selector = target_selector(&ctx.target)?;
             let restart = format!("paseo daemon restart {selector}");
             data["restartCommand"] = json!(restart);
             let mut human = "Configuration reloaded.".to_owned();
@@ -296,6 +306,380 @@ async fn reload(client: &DaemonClient) -> Result<Value> {
             Duration::from_secs(30),
         )
         .await
+}
+fn target_selector(target: &DaemonTarget) -> Result<String> {
+    Ok(match target {
+        DaemonTarget::Instance { home } => format!("--home {}", serde_json::to_string(home)?),
+        DaemonTarget::Endpoint { .. } => format!(
+            "--host {}",
+            serde_json::to_string(&target.description())?
+        ),
+    })
+}
+
+const UPDATE_SUBMIT_OPTIONS: &[&str] = &[
+    "from",
+    "operation-id",
+    "resume-agent",
+    "continuation-file",
+    "idle-timeout",
+];
+const MAX_CONTINUATION_BYTES: u64 = 256 * 1024;
+const REMOTE_UPDATE_FEATURE: &str = "durableDaemonUpdates";
+/// How long a remote submit keeps retrying the same operation ID after its outcome became unknown.
+const REMOTE_SUBMIT_RETRY: Duration = Duration::from_secs(120);
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `daemon update` submits to the shared durable engine; `status` and `wait` only
+/// observe it. Local homes use the operation journal directly, so status works while
+/// the daemon is down and ending this process never cancels an admitted operation.
+async fn update(m: &ArgMatches, ctx: &Context) -> Result<Output> {
+    if let Some(action) = string(m, "action") {
+        let submit_option = UPDATE_SUBMIT_OPTIONS
+            .iter()
+            .copied()
+            .find(|key| string(m, key).is_some())
+            .or_else(|| flag(m, "force-running").then_some("force-running"));
+        if let Some(key) = submit_option {
+            return Err(error(
+                "UPDATE_OPTION_CONFLICT",
+                format!(
+                    "--{key} configures a new update; paseo daemon update {action} only observes an existing operation."
+                ),
+            ));
+        }
+        let raw = string(m, "operation").ok_or_else(|| {
+            error(
+                "OPERATION_ID_REQUIRED",
+                format!("Usage: paseo daemon update {action} <operation-id>"),
+            )
+        })?;
+        let id = admin::update_operation_id(raw)?;
+        let operation = match (action, &ctx.target) {
+            ("status", DaemonTarget::Instance { home }) => update_operation::status(home, &id).await?,
+            ("status", DaemonTarget::Endpoint { .. }) => remote_status(ctx, &id).await?,
+            (_, DaemonTarget::Instance { home }) => {
+                match update_operation::wait(home, &id, &ctx.cancel).await {
+                    Err(_) if ctx.cancel.is_cancelled() => {
+                        return Err(error(
+                            "UPDATE_OBSERVER_CANCELLED",
+                            format!("Stopped observing update operation {id}; the update itself continues."),
+                        ));
+                    }
+                    observed => observed?,
+                }
+            }
+            (_, DaemonTarget::Endpoint { .. }) => remote_wait(ctx, &id).await?,
+        };
+        let code = if action == "wait" {
+            wait_exit_code(&operation)
+        } else {
+            0
+        };
+        let human = update_text(&operation);
+        return Ok(Output::new(operation)
+            .id("operationId")
+            .exit(code)
+            .human(human));
+    }
+    // The identity exists before anything is sent, so a lost acknowledgement is
+    // retried with the same ID instead of starting a second replacement.
+    let operation_id = match string(m, "operation-id") {
+        Some(raw) => admin::update_operation_id(raw)?,
+        None => uuid::Uuid::new_v4().hyphenated().to_string(),
+    };
+    let idle = match string(m, "idle-timeout") {
+        Some(raw) => {
+            parse_duration(raw).map_err(|e| error("INVALID_IDLE_TIMEOUT", e.to_string()))?
+        }
+        None => admin::DEFAULT_UPDATE_IDLE_TIMEOUT,
+    };
+    let idle_timeout_ms = admin::update_idle_timeout_ms(idle)?;
+    let force_running = flag(m, "force-running");
+    let submitted = match &ctx.target {
+        DaemonTarget::Endpoint { .. } => {
+            if let Some(key) = ["from", "resume-agent", "continuation-file"]
+                .into_iter()
+                .find(|key| string(m, key).is_some())
+            {
+                return Err(error(
+                    "LOCAL_HOME_REQUIRED",
+                    format!(
+                        "--{key} requires a local --home: runtimes and continuations are read from files on this computer. --host can only install official releases."
+                    ),
+                ));
+            }
+            remote_submit(ctx, &operation_id, idle_timeout_ms, force_running).await
+        }
+        DaemonTarget::Instance { home } => {
+            let source = match string(m, "from") {
+                // Keep the supplied leaf intact until admission rejects symlinks
+                // and pins its bytes. Canonicalizing here would hide a symlink.
+                Some(raw) => UpdateSource::Local(if Path::new(raw).is_absolute() {
+                    PathBuf::from(raw)
+                } else {
+                    std::env::current_dir()?.join(raw)
+                }),
+                None => UpdateSource::Release,
+            };
+            let resume = match (string(m, "resume-agent"), string(m, "continuation-file")) {
+                (Some(agent), Some(file)) => Some(ResumeRequest {
+                    agent_id: resume_agent_id(agent)?,
+                    text: continuation_text(Path::new(file)).await?,
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(error(
+                        "CONTINUATION_INCOMPLETE",
+                        "--resume-agent and --continuation-file must be given together.",
+                    ));
+                }
+            };
+            let executor = std::env::current_exe()
+                .context("Cannot locate this paseo executable for the update executor handoff")?;
+            let request = SubmitRequest {
+                operation_id: operation_id.clone(),
+                source,
+                resume,
+                idle_timeout_ms,
+                force_running,
+            };
+            update_operation::submit(home, &executor, request).await
+        }
+    };
+    let operation = submitted.map_err(|failure| unconfirmed(&operation_id, failure))?;
+    let selector = target_selector(&ctx.target)?;
+    let human = format!(
+        "{}\nObserve: paseo daemon update wait {operation_id} {selector}\nStatus:  paseo daemon update status {operation_id} {selector}",
+        update_text(&operation)
+    );
+    Ok(Output::new(operation).id("operationId").human(human))
+}
+fn resume_agent_id(raw: &str) -> Result<String> {
+    let id = raw.trim();
+    ensure!(
+        !id.is_empty() && id.len() <= 256 && !id.chars().any(|c| c.is_whitespace() || c.is_control()),
+        error("INVALID_RESUME_AGENT", "--resume-agent must name one existing Paseo agent ID.")
+    );
+    Ok(id.to_owned())
+}
+/// Frozen before submission: the operation owns this text even if the file later changes or disappears.
+async fn continuation_text(path: &Path) -> Result<String> {
+    let invalid = |reason: String| {
+        error(
+            "INVALID_CONTINUATION_FILE",
+            format!("--continuation-file {}: {reason}", path.display()),
+        )
+    };
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| invalid(e.to_string()))?;
+    if !metadata.is_file() {
+        return Err(invalid("not a regular file".into()));
+    }
+    if metadata.len() > MAX_CONTINUATION_BYTES {
+        return Err(invalid(format!("larger than {MAX_CONTINUATION_BYTES} bytes")));
+    }
+    let bytes = tokio::fs::read(path).await.map_err(|e| invalid(e.to_string()))?;
+    if bytes.len() as u64 > MAX_CONTINUATION_BYTES {
+        return Err(invalid(format!("larger than {MAX_CONTINUATION_BYTES} bytes")));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| invalid("not UTF-8 text".into()))?;
+    if text.trim().is_empty() {
+        return Err(invalid("empty".into()));
+    }
+    Ok(text)
+}
+/// The outcome of an unacknowledged submit is unknown; name the ID that makes a retry safe.
+fn unconfirmed(operation_id: &str, failure: anyhow::Error) -> anyhow::Error {
+    let code = failure
+        .downcast_ref::<ClientError>()
+        .map(|e| e.code.clone())
+        .unwrap_or_else(|| "UPDATE_SUBMIT_FAILED".into());
+    ClientError::new(
+        &code,
+        format!(
+            "{failure:#}\nOperation {operation_id}: retry with --operation-id {operation_id}, or inspect paseo daemon update status {operation_id}."
+        ),
+    )
+    .details(json!({"operationId":operation_id}))
+    .into()
+}
+async fn remote_client(ctx: &Context) -> Result<DaemonClient> {
+    let mut options = ConnectOptions::new(ctx.target.clone());
+    options.timeout = Duration::from_secs(5);
+    let client = crate::client::connect(options, ctx.cancel.child_token()).await?;
+    if client.server_info()["features"][REMOTE_UPDATE_FEATURE] != true {
+        client.close().await;
+        return Err(error(
+            "DURABLE_UPDATE_UNSUPPORTED",
+            "This daemon does not offer durable updates. Update it from its own host with paseo daemon update --home.",
+        ));
+    }
+    Ok(client)
+}
+fn operation_payload(payload: Value) -> Result<Value> {
+    payload
+        .get("operation")
+        .filter(|operation| operation.is_object())
+        .cloned()
+        .context("Daemon update response did not include the operation")
+}
+async fn pause(ctx: &Context, operation_id: &str) -> Result<()> {
+    tokio::select! {
+        _ = ctx.cancel.cancelled() => Err(error(
+            "UPDATE_OBSERVER_CANCELLED",
+            format!("Stopped observing update operation {operation_id}; the update itself continues."),
+        )),
+        _ = tokio::time::sleep(REMOTE_POLL_INTERVAL) => Ok(()),
+    }
+}
+async fn remote_submit(
+    ctx: &Context,
+    operation_id: &str,
+    idle_timeout_ms: u64,
+    force_running: bool,
+) -> Result<Value> {
+    let message = json!({"type":"daemon.update.submit.request","operationId":operation_id,"source":"release","idleTimeoutMs":idle_timeout_ms,"forceRunning":force_running});
+    let deadline = tokio::time::Instant::now() + REMOTE_SUBMIT_RETRY;
+    let mut sent = false;
+    let retry = |sent: bool, failure: &anyhow::Error| {
+        sent && reconnect_failure(failure) && tokio::time::Instant::now() < deadline
+    };
+    loop {
+        let client = match remote_client(ctx).await {
+            Ok(client) => client,
+            Err(failure) if retry(sent, &failure) => {
+                pause(ctx, operation_id).await?;
+                continue;
+            }
+            Err(failure) => return Err(failure),
+        };
+        sent = true;
+        let result = client
+            .request(message.clone(), "daemon.update.submit.response", REMOTE_REQUEST_TIMEOUT)
+            .await;
+        client.close().await;
+        match result {
+            Ok(payload) => return operation_payload(payload),
+            // Same ID + same input returns the admitted operation instead of a second update.
+            Err(failure) if retry(sent, &failure) => pause(ctx, operation_id).await?,
+            Err(failure) => return Err(failure),
+        }
+    }
+}
+async fn remote_status(ctx: &Context, operation_id: &str) -> Result<Value> {
+    Ok(remote_status_from(ctx, operation_id).await?.0)
+}
+/// The operation view and the server identity that answered for it.
+async fn remote_status_from(ctx: &Context, operation_id: &str) -> Result<(Value, Value)> {
+    let client = remote_client(ctx).await?;
+    let result = client
+        .request(
+            json!({"type":"daemon.update.status.request","operationId":operation_id}),
+            "daemon.update.status.response",
+            REMOTE_REQUEST_TIMEOUT,
+        )
+        .await;
+    let server_id = client.server_info()["serverId"].clone();
+    client.close().await;
+    Ok((operation_payload(result?)?, server_id))
+}
+/// Remote observer: survives the daemon's own restart by reconnecting, refuses a
+/// different server identity, and never sends anything that could cancel the update.
+async fn remote_wait(ctx: &Context, operation_id: &str) -> Result<Value> {
+    let mut server: Option<Value> = None;
+    loop {
+        match remote_status_from(ctx, operation_id).await {
+            Ok((operation, observed)) => {
+                match &server {
+                    Some(expected) if *expected != observed => {
+                        return Err(error(
+                            "DAEMON_REPLACED",
+                            format!(
+                                "The endpoint now answers as server {observed}, not {expected}; update operation {operation_id} cannot be observed there."
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => server = Some(observed),
+                }
+                if admin::update_terminal(&operation) {
+                    return Ok(operation);
+                }
+            }
+            Err(failure) if reconnect_failure(&failure) => {}
+            Err(failure) => return Err(failure),
+        }
+        pause(ctx, operation_id).await?;
+    }
+}
+/// `wait` succeeds only for a committed replacement; session resume is reported separately.
+fn wait_exit_code(operation: &Value) -> i32 {
+    if operation["phase"] == "committed" { 0 } else { 1 }
+}
+fn runtime_text(runtime: &Value) -> Option<String> {
+    let runtime = runtime.as_object()?;
+    let version = runtime.get("version").and_then(Value::as_str).unwrap_or("unknown");
+    let digest = runtime
+        .get("executableSha256")
+        .and_then(Value::as_str)
+        .map(|sha| format!(" sha256:{}", sha.chars().take(12).collect::<String>()))
+        .unwrap_or_default();
+    let provenance = match runtime.get("release").and_then(Value::as_bool) {
+        Some(true) => " (official release)",
+        Some(false) => " (local build)",
+        None => "",
+    };
+    Some(format!("{version}{digest}{provenance}"))
+}
+pub(crate) fn update_text(operation: &Value) -> String {
+    let id = operation["operationId"].as_str().unwrap_or("unknown");
+    let phase = operation["phase"].as_str().unwrap_or("unknown");
+    let mut lines = vec![format!("Operation: {id}"), format!("Phase: {phase}")];
+    lines.push(
+        match phase {
+            "committed" => "Update committed: the replacement daemon passed readiness and identity checks.",
+            "rolled_back" => "Update rolled back: the previous runtime was restored.",
+            "failed" => "Update failed; the original runtime, candidate and diagnostics are preserved.",
+            _ if operation["accepted"] == true => "Update accepted; its executor completes it independently of this command.",
+            _ => "Update not yet accepted.",
+        }
+        .to_owned(),
+    );
+    for (label, key) in [("Previous", "previous"), ("Candidate", "candidate")] {
+        if let Some(text) = runtime_text(&operation[key]) {
+            lines.push(format!("{label}: {text}"));
+        }
+    }
+    if let Some(error) = operation["error"].as_str().filter(|e| !e.is_empty()) {
+        lines.push(format!("Error: {error}"));
+    }
+    match &operation["rollback"] {
+        Value::Null => {}
+        Value::String(rollback) => lines.push(format!("Rollback: {rollback}")),
+        rollback => lines.push(format!("Rollback: {rollback}")),
+    }
+    if let Some(continuation) = operation["continuation"].as_object() {
+        let state = continuation.get("state").and_then(Value::as_str).unwrap_or("unknown");
+        let mut line = format!(
+            "Session resume: {state} (agent {}, message {})",
+            continuation.get("agentId").and_then(Value::as_str).unwrap_or("unknown"),
+            continuation.get("messageId").and_then(Value::as_str).unwrap_or("unknown")
+        );
+        if let Some(error) = continuation.get("error").and_then(Value::as_str) {
+            line.push_str(&format!(": {error}"));
+        }
+        lines.push(line);
+        if phase == "committed" && state != "accepted" {
+            lines.push(format!(
+                "The update is committed; the session resume is {} and does not change the update result.",
+                if state == "pending" { "still pending" } else { "not confirmed" }
+            ));
+        }
+    }
+    lines.join("\n")
 }
 pub(crate) async fn assert_instance(home: &Path, expected: &DaemonInstance) -> Result<()> {
     let current = control::read_daemon_instance(home).await?;
@@ -826,6 +1210,91 @@ mod tests {
         assert_eq!(redacted["providers"][0]["api_key"], "[redacted]");
         assert_eq!(redacted["providers"][0]["model"], "model");
         assert_eq!(config["providers"][0]["api_key"], "secret");
+    }
+    fn update_matches(args: &[&str]) -> clap::error::Result<ArgMatches> {
+        let parsed = crate::cli::build_command()
+            .try_get_matches_from(["paseo", "daemon", "update"].iter().chain(args))?;
+        let (_, daemon) = parsed.subcommand().unwrap();
+        let (name, update) = daemon.subcommand().unwrap();
+        assert_eq!(name, "update");
+        Ok(update.clone())
+    }
+    fn code(failure: &anyhow::Error) -> &str {
+        failure.downcast_ref::<ClientError>().map(|e| e.code.as_str()).unwrap_or("")
+    }
+    const ID: &str = "0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11";
+    #[test]
+    fn update_submits_without_a_subcommand_and_observes_by_operation_id() {
+        let submit = update_matches(&["--from", "/opt/runtime", "--operation-id", ID]).unwrap();
+        assert_eq!(string(&submit, "from"), Some("/opt/runtime"));
+        assert_eq!(string(&submit, "action"), None);
+        let status = update_matches(&["status", ID]).unwrap();
+        assert_eq!(string(&status, "action"), Some("status"));
+        assert_eq!(string(&status, "operation"), Some(ID));
+        assert!(update_matches(&["wait", ID]).is_ok());
+        assert!(update_matches(&["cancel", ID]).is_err());
+        // A continuation names the agent and the frozen text together.
+        assert!(update_matches(&["--resume-agent", "agent"]).is_err());
+        assert!(update_matches(&["--continuation-file", "/tmp/c.txt"]).is_err());
+    }
+    #[tokio::test]
+    async fn remote_update_rejects_local_paths_before_contacting_the_host() {
+        let ctx = Context {
+            target: DaemonTarget::Endpoint {
+                host: "203.0.113.1:6767".into(),
+            },
+            output: crate::cli::output::OutputOptions::default(),
+            cancel: CancellationToken::new(),
+        };
+        for args in [
+            vec!["--from", "/opt/runtime"],
+            vec!["--resume-agent", "agent", "--continuation-file", "/tmp/c.txt"],
+        ] {
+            let failure = update(&update_matches(&args).unwrap(), &ctx).await.err().unwrap();
+            assert_eq!(code(&failure), "LOCAL_HOME_REQUIRED", "{args:?}");
+        }
+        let failure = update(&update_matches(&["status", ID, "--from", "/opt/runtime"]).unwrap(), &ctx)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(code(&failure), "UPDATE_OPTION_CONFLICT");
+        let failure = update(&update_matches(&["--operation-id", "latest"]).unwrap(), &ctx)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(code(&failure), "INVALID_OPERATION_ID");
+    }
+    #[tokio::test]
+    async fn continuation_text_is_frozen_verbatim_and_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("continuation.txt");
+        std::fs::write(&file, "Continue the release.\n").unwrap();
+        assert_eq!(continuation_text(&file).await.unwrap(), "Continue the release.\n");
+        for content in [" \n".as_bytes().to_vec(), vec![0xff, 0xfe], vec![b'a'; MAX_CONTINUATION_BYTES as usize + 1]] {
+            std::fs::write(&file, content).unwrap();
+            assert_eq!(code(&continuation_text(&file).await.unwrap_err()), "INVALID_CONTINUATION_FILE");
+        }
+        assert_eq!(
+            code(&continuation_text(directory.path()).await.unwrap_err()),
+            "INVALID_CONTINUATION_FILE"
+        );
+    }
+    #[test]
+    fn update_report_separates_commit_from_session_resume() {
+        let committed = json!({"operationId":ID,"phase":"committed","terminal":true,"accepted":true,"candidate":{"version":"1.2.0","executableSha256":"abcdef0123456789","release":false},"continuation":{"state":"unknown","agentId":"agent","messageId":"message"}});
+        assert_eq!(wait_exit_code(&committed), 0);
+        let text = update_text(&committed);
+        assert!(text.contains("Update committed"), "{text}");
+        assert!(text.contains("1.2.0 sha256:abcdef012345 (local build)"), "{text}");
+        assert!(text.contains("Session resume: unknown (agent agent, message message)"), "{text}");
+        assert!(text.contains("does not change the update result"), "{text}");
+        let accepted = json!({"operationId":ID,"phase":"draining","terminal":false,"accepted":true});
+        assert!(!update_text(&accepted).contains("committed"));
+        for phase in ["rolled_back", "failed"] {
+            let ended = json!({"operationId":ID,"phase":phase,"terminal":true,"accepted":true,"error":"readiness failed"});
+            assert_eq!(wait_exit_code(&ended), 1);
+            assert!(update_text(&ended).contains("Error: readiness failed"));
+        }
     }
 }
 

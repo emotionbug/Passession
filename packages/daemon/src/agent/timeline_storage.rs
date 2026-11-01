@@ -1,7 +1,7 @@
 use super::Timeline;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 const UPSERT_ROW: &str = "INSERT INTO timeline_rows(position, row_json) VALUES (?1, ?2) \
     ON CONFLICT(position) DO UPDATE SET row_json = excluded.row_json";
 const UPDATE_METADATA: &str = "UPDATE timeline_metadata SET epoch = ?1, next_seq = ?2, min_seq = ?3 WHERE id = 1";
+const READ_METADATA: &str = "SELECT version, agent_id, epoch, next_seq, min_seq FROM timeline_metadata WHERE id = 1";
+/// Everything `Timeline::fetch` selection reads from a row, without its item.
+const ROW_PAGE_METADATA: &str = "SELECT position, json_extract(row_json, '$.seqStart'), \
+    json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges') \
+    FROM timeline_rows ORDER BY position";
 
 #[derive(Debug)]
 pub(super) struct Store {
@@ -119,13 +124,40 @@ fn load_legacy(path: &Path, agent_id: &str) -> Result<Option<Timeline>> {
 /// `path` names the SQLite database. An absent database imports its sibling JSON
 /// checkpoint once; that source is retained as a backup, never written again.
 pub(super) fn load(path: &Path, agent_id: &str) -> Result<Timeline> {
+    load_measured(path, agent_id).map(|(timeline, _)| timeline)
+}
+
+/// Serialized JSON length of a row: the stored size, without allocating it.
+pub(super) fn encoded_bytes(row: &Value) -> u64 {
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, row).expect("JSON value serializes");
+    count.0
+}
+
+fn valid_row(row: &Value) -> bool {
+    row["seq"].as_i64().is_some_and(|seq| seq > 0) && row["item"].is_object() && row["timestamp"].is_string()
+}
+
+/// `load`, plus the stored JSON bytes of the hydrated rows.
+pub(super) fn load_measured(path: &Path, agent_id: &str) -> Result<(Timeline, u64)> {
     if !path.try_exists()? {
         let Some(mut timeline) = load_legacy(&path.with_extension("json"), agent_id)? else {
-            return Ok(Timeline::new());
+            return Ok((Timeline::new(), 0));
         };
         timeline.storage = Some(create(path, agent_id, &timeline)?);
         timeline.storage_dirty = false;
-        return Ok(timeline);
+        let bytes = timeline.rows.iter().map(encoded_bytes).sum();
+        return Ok((timeline, bytes));
     }
     let mut store = Store::open(path, agent_id)?;
     let transaction = store.connection.transaction()?;
@@ -138,6 +170,7 @@ pub(super) fn load(path: &Path, agent_id: &str) -> Result<Timeline> {
     timeline.epoch = epoch;
     timeline.next_seq = next_seq;
     timeline.min_seq = min_seq;
+    let mut bytes = 0;
     {
         let mut statement = transaction.prepare("SELECT position, row_json FROM timeline_rows ORDER BY position")?;
         let mut rows = statement.query([])?;
@@ -145,8 +178,9 @@ pub(super) fn load(path: &Path, agent_id: &str) -> Result<Timeline> {
             let index = timeline.rows.len();
             ensure!(row.get::<_, i64>(0)? == index as i64, "Invalid timeline row position");
             let encoded: String = row.get(1)?;
+            bytes += encoded.len() as u64;
             let row: Value = serde_json::from_str(&encoded)?;
-            ensure!(row["seq"].as_i64().is_some_and(|seq| seq > 0) && row["item"].is_object() && row["timestamp"].is_string(), "Invalid timeline row");
+            ensure!(valid_row(&row), "Invalid timeline row");
             if let Some(id) = super::identity(&row["item"]) {
                 timeline.identities.insert(id, index);
             }
@@ -160,7 +194,60 @@ pub(super) fn load(path: &Path, agent_id: &str) -> Result<Timeline> {
     }
     transaction.commit()?;
     timeline.storage = Some(store);
-    Ok(timeline)
+    Ok((timeline, bytes))
+}
+
+/// One page of a stored timeline without hydrating it. `Timeline::fetch` first
+/// selects over metadata-only rows (`seqStart`, `seqEnd`, `sourceSeqRanges`:
+/// all that page selection reads), then runs again with only the selected rows'
+/// stored JSON in place, so epochs, cursors, gaps, limits and source ranges
+/// behave exactly as for a hydrated timeline. Transient memory is one small
+/// metadata stub per row plus the selected rows; `limit: 0` explicitly selects
+/// the whole history. Only reads; never alters the database.
+pub(super) fn fetch_page(path: &Path, agent_id: &str, options: &Value) -> Result<Value> {
+    ensure!(path.try_exists()?, "Timeline database missing: {}", path.display());
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let transaction = connection.transaction()?;
+    let (version, stored_agent, epoch, next_seq, min_seq): (i64, String, String, i64, i64) =
+        transaction.query_row(READ_METADATA, [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?;
+    ensure!(version == 1, "Unsupported timeline database version");
+    ensure!(stored_agent == agent_id, "Timeline checkpoint agent mismatch");
+    let mut timeline = Timeline::new();
+    timeline.epoch = epoch;
+    timeline.next_seq = next_seq;
+    timeline.min_seq = min_seq;
+    {
+        let mut statement = transaction.prepare(ROW_PAGE_METADATA)?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let index = timeline.rows.len();
+            ensure!(row.get::<_, i64>(0)? == index as i64, "Invalid timeline row position");
+            let (Some(start), Some(end), Some(ranges)) =
+                (row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?)
+            else {
+                bail!("Invalid timeline row metadata");
+            };
+            let ranges: Value = serde_json::from_str(&ranges)?;
+            ensure!(ranges.is_array(), "Invalid timeline row metadata");
+            timeline.rows.push(json!({"seqStart":start,"seqEnd":end,"sourceSeqRanges":ranges,"position":index}));
+        }
+    }
+    let selected: Vec<usize> = timeline.fetch(options)["rows"].as_array().expect("page rows").iter()
+        .map(|stub| stub["position"].as_u64().expect("stub position") as usize)
+        .collect();
+    {
+        let mut statement = transaction.prepare("SELECT row_json FROM timeline_rows WHERE position = ?1")?;
+        for index in selected {
+            let encoded: String = statement.query_row([index as i64], |row| row.get(0))?;
+            let row: Value = serde_json::from_str(&encoded)?;
+            ensure!(valid_row(&row), "Invalid timeline row");
+            timeline.rows[index] = row;
+        }
+    }
+    transaction.commit()?;
+    Ok(timeline.fetch(options))
 }
 
 /// Full-history hydration/replacement is one transaction. Keep the connection

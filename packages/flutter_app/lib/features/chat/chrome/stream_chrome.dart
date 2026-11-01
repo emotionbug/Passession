@@ -1073,8 +1073,23 @@ extension _StreamChrome on _AgentPanelState {
         duration: const Duration(milliseconds: 2200),
       );
     }
-    if (c == null || isDraft || controller?.agent['archivedAt'] != null) return null;
+    // A durable daemon update pauses new messages and agent creation on this
+    // host, so draft panels show it too; it outranks "reconnecting" because
+    // the replacement itself drops the connection.
+    final maintenance = PaseoScope.of(context).hosts
+        .where((candidate) => candidate.serverId == widget.target.serverId)
+        .firstOrNull
+        ?.maintenanceOperationId;
     final spinner = ChromeSpinner(size: 18, color: Theme.of(context).colorScheme.onSurface);
+    if (maintenance != null && !_chrome.dismissedToasts.contains('maintenance:$maintenance')) {
+      return PanelToastData(
+        id: 'maintenance:$maintenance',
+        message: tr(context, 'agentPanel.states.daemonMaintenance'),
+        icon: spinner,
+        duration: null,
+      );
+    }
+    if (c == null || isDraft || controller?.agent['archivedAt'] != null) return null;
     if (!_connected) {
       return PanelToastData(
         id: 'reconnecting',

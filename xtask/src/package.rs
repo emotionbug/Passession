@@ -360,15 +360,7 @@ pub fn daemon(args: &[String]) -> Result<()> {
         .tempdir()?;
     let runtime = stage.path().join("runtime");
     build::bundle_runtime(&runtime, "release", "standalone-archive")?;
-    match platform()? {
-        "macos" => signing::sign_mac(&runtime, stage.path(), false)?,
-        "windows" => {
-            signing::windows_runtime(&runtime, true)?;
-            signing::sign_windows(&[runtime.join(executable())], stage.path())?;
-            build::refresh_runtime_hash(&runtime)?;
-        }
-        _ => {}
-    }
+    build::finish_standalone_runtime(&runtime, stage.path())?;
     build::validate_runtime(&runtime, "standalone-archive", "release")?;
     let format = if platform()? == "windows" {
         "zip"

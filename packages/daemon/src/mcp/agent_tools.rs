@@ -290,7 +290,7 @@ pub(crate) async fn execute(
                     "guidance":if notifying { format!("Queued for delivery after two quiet seconds. {PROMPT_NOTIFICATION}") } else { "Queued for delivery after two quiet seconds; provider dispatch has not occurred.".to_owned() }
                 })
             } else {
-                let snapshot = app.agents.agent_snapshot(&id).await?;
+                let snapshot = app.agents.observe_agent_snapshot(&id).await?;
                 let status = snapshot
                     .as_ref()
                     .and_then(|value| value.get("status"))
@@ -303,7 +303,7 @@ pub(crate) async fn execute(
             let id = string(&input, "agentId")?;
             let snapshot = app
                 .agents
-                .agent_snapshot(id)
+                .observe_agent_snapshot(id)
                 .await?
                 .ok_or_else(|| anyhow!("Agent {id} not found"))?;
             json!({"status":snapshot["status"],"snapshot":snapshot})
@@ -400,7 +400,7 @@ pub(crate) async fn execute(
                 .agents
                 .activity_summary(id, input.get("limit").and_then(Value::as_f64))
                 .await?;
-            let snapshot = app.agents.agent_snapshot(id).await?;
+            let snapshot = app.agents.observe_agent_snapshot(id).await?;
             summary["agentId"] = json!(id);
             summary["currentModeId"] = snapshot
                 .as_ref()

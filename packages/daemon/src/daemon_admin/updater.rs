@@ -1,9 +1,9 @@
-//! Updates only owned standalone runtime archives, never npm or a desktop bundle.
+//! Updates only owned standalone runtimes, never npm or a desktop bundle.
 //! The release hash covers the executable, libraries, skills and plugin runtime together.
+//! `preparation` stages complete local or official runtimes for the update engine.
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha512};
 use std::{
@@ -15,17 +15,14 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
-#[cfg(windows)]
-#[path = "updater_windows.rs"]
-mod windows;
-#[cfg(windows)]
-pub(crate) use windows::{
-    cleanup_update_helper, launch_deferred_update, launch_recovery_helper, run_update_helper,
+mod preparation;
+pub use preparation::{
+    input_digest, inspect_runtime, prepare_local_pinned, prepare_release, verify_runtime,
 };
+
 const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 8 * 1024 * 1024 * 1024;
 const MARKER: &str = "paseo-runtime.json";
-const RECORD: &str = "native-update.json";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
     pub version: String,
@@ -40,33 +37,8 @@ pub struct Release {
     url: Url,
     manifest_digest: String,
 }
-pub struct Prepared {
-    pub release: Release,
-    directory: tempfile::TempDir,
-    staged: PathBuf,
-    target: PathBuf,
-    original_digest: String,
-    new_digest: String,
-    _lease: File,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Transaction {
-    target: PathBuf,
-    staged: PathBuf,
-    backup: PathBuf,
-    directory: PathBuf,
-    original_digest: String,
-    new_digest: String,
-    version: String,
-    source_sha: String,
-    #[serde(default)]
-    committed: bool,
-    #[serde(default)]
-    deferred: bool,
-}
 
-fn platform() -> Result<(&'static str, &'static str)> {
+pub(crate) fn platform() -> Result<(&'static str, &'static str)> {
     let platform = match std::env::consts::OS {
         "linux" => "linux",
         "macos" => "macos",
@@ -80,9 +52,12 @@ fn platform() -> Result<(&'static str, &'static str)> {
     };
     Ok((platform, arch))
 }
+/// The only repository whose releases are official for this distribution.
+/// Local builds deliberately compile without release identity, yet may still
+/// install a genuine newer official release verified against this root.
+const OFFICIAL_REPOSITORY: &str = "emotionbug/paseo";
 fn repository() -> Result<&'static str> {
-    let repository = option_env!("PASEO_UPDATE_REPOSITORY")
-        .context("This build has no configured native update repository")?;
+    let repository = option_env!("PASEO_UPDATE_REPOSITORY").unwrap_or(OFFICIAL_REPOSITORY);
     let parts = repository.split('/').collect::<Vec<_>>();
     if parts.len() != 2
         || parts.iter().any(|s| {
@@ -376,7 +351,7 @@ async fn verify_source_commit(
     }
     bail!("Release annotated-tag chain exceeds the provenance bound")
 }
-fn executable_name(platform: &str) -> &'static str {
+pub(crate) fn executable_name(platform: &str) -> &'static str {
     if platform == "windows" {
         "paseo.exe"
     } else {
@@ -413,7 +388,7 @@ pub(super) fn validate_marker(
     };
     Ok(())
 }
-fn lease(root: &Path) -> Result<File> {
+pub(crate) fn lease(root: &Path) -> Result<File> {
     let parent = root
         .parent()
         .context("Runtime installation has no parent")?;
@@ -439,60 +414,12 @@ fn lease(root: &Path) -> Result<File> {
         .context("Another process is updating this native installation")?;
     Ok(file)
 }
-pub async fn prepare(executable: &Path, desktop_managed: bool) -> Result<Prepared> {
-    if desktop_managed
-        || executable
-            .components()
-            .any(|c| c.as_os_str().to_string_lossy().ends_with(".app"))
-    {
-        bail!("This daemon is managed by Paseo Desktop. Update Paseo Desktop on the host.")
-    }
-    if option_env!("PASEO_NATIVE_RELEASE") != Some("1") {
-        bail!(
-            "This build has no native release provenance. Install a packaged standalone native release."
-        )
-    }
-    let source = option_env!("PASEO_BUILD_SOURCE_SHA")
-        .context("This build has no native source provenance")?;
-    let executable = executable.canonicalize()?;
-    let target = executable
-        .parent()
-        .context("Executable has no runtime root")?
-        .to_owned();
-    let (platform, arch) = platform()?;
-    if executable.file_name() != Some(std::ffi::OsStr::new(executable_name(platform))) {
-        bail!("Installed executable is not the standalone native runtime entry")
-    }
-    let marker = read_marker(&target)?;
-    if marker["installationKind"] == "desktop-bundled" {
-        bail!("This daemon is managed by Paseo Desktop. Update Paseo Desktop on the host.")
-    }
-    validate_marker(&marker, env!("CARGO_PKG_VERSION"), source, platform, arch)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(&target)?;
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
-            bail!("Runtime root has unsafe ownership or permissions")
-        }
-    }
-    let lease = lease(&target)?;
-    let client = http()?;
-    let release = discover(&client).await?;
-    if semver::Version::parse(&release.version)?
-        <= semver::Version::parse(env!("CARGO_PKG_VERSION"))?
-    {
-        bail!("No newer native daemon release is available")
-    }
-    let directory = tempfile::Builder::new()
-        .prefix(".paseo-update-")
-        .tempdir_in(target.parent().context("Runtime root has no parent")?)?;
-    let archive = directory.path().join(&release.name);
-    let staged = directory.path().join("runtime");
+/// Download one discovered release archive, durably, bound to its manifest size and SHA512.
+async fn download(client: &reqwest::Client, release: &Release, archive: &Path) -> Result<()> {
     let mut file = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&archive)
+        .open(archive)
         .await?;
     let response = client
         .get(release.url.clone())
@@ -521,38 +448,7 @@ pub async fn prepare(executable: &Path, desktop_managed: bool) -> Result<Prepare
     if size != release.size || STANDARD.encode(hash.finalize()) != release.digest {
         bail!("Downloaded update failed SHA512/size verification")
     }
-    let (archive_path, staged_path, format) =
-        (archive.clone(), staged.clone(), release.format.clone());
-    tokio::task::spawn_blocking(move || extract(&archive_path, &staged_path, &format)).await??;
-    validate_marker(
-        &read_marker(&staged)?,
-        &release.version,
-        &release.source_sha,
-        &release.platform,
-        &release.arch,
-    )?;
-    for name in ["lib", "skills"] {
-        if !staged.join(name).is_dir() {
-            bail!("Native runtime archive is missing {name}/")
-        }
-    }
-    let new_executable = staged.join(executable_name(platform));
-    validate_binary(&new_executable).await?;
-    validate_signature(&executable, &new_executable).await?;
-    let (original_digest, new_digest) = tokio::try_join!(
-        tree_digest_async(target.clone()),
-        tree_digest_async(staged.clone())
-    )?;
-    tokio::fs::remove_file(archive).await?;
-    Ok(Prepared {
-        release,
-        directory,
-        staged,
-        target,
-        original_digest,
-        new_digest,
-        _lease: lease,
-    })
+    Ok(())
 }
 
 fn safe_member(path: &Path) -> Result<PathBuf> {
@@ -695,7 +591,13 @@ pub(super) fn extract(archive: &Path, root: &Path, format: &str) -> Result<()> {
 async fn tree_digest_async(root: PathBuf) -> Result<String> {
     tokio::task::spawn_blocking(move || tree_digest(&root)).await?
 }
-fn tree_digest(root: &Path) -> Result<String> {
+pub(crate) fn tree_digest(root: &Path) -> Result<String> {
+    digest_tree(root, false)
+}
+/// With `normalized`, Unix modes are hashed as staging assigns them
+/// (directories and executable files 0755, other files 0644), so a source
+/// directory digest equals the digest of its sealed staged copy.
+fn digest_tree(root: &Path, normalized: bool) -> Result<String> {
     if fs::symlink_metadata(root)?.file_type().is_symlink() {
         bail!("Runtime root cannot be a symlink")
     }
@@ -728,8 +630,18 @@ fn tree_digest(root: &Path) -> Result<String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            hash.update((metadata.permissions().mode() & 0o777).to_le_bytes());
+            let mode = metadata.permissions().mode() & 0o777;
+            let mode = if !normalized {
+                mode
+            } else if metadata.is_dir() || mode & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
+            hash.update(mode.to_le_bytes());
         }
+        #[cfg(not(unix))]
+        let _ = normalized;
         if metadata.is_file() {
             hash.update(metadata.len().to_le_bytes());
             let mut file = File::open(entry.path())?;
@@ -744,185 +656,8 @@ fn tree_digest(root: &Path) -> Result<String> {
     }
     Ok(STANDARD.encode(hash.finalize()))
 }
-async fn verify_tree(path: &Path, expected: &str) -> Result<()> {
-    if tree_digest_async(path.to_owned()).await? != expected {
-        bail!("Native runtime files changed: {}", path.display())
-    };
-    Ok(())
-}
-async fn write_record(
-    home: &Path,
-    transaction: &Transaction,
-    replace_existing: bool,
-) -> Result<()> {
-    let (home, bytes) = (home.to_owned(), serde_json::to_vec(transaction)?);
-    tokio::task::spawn_blocking(move || {
-        let mut file = tempfile::NamedTempFile::new_in(&home)?;
-        file.write_all(&bytes)?;
-        file.as_file().sync_all()?;
-        if replace_existing {
-            file.persist(home.join(RECORD)).map_err(|e| e.error)?;
-        } else {
-            file.persist_noclobber(home.join(RECORD))
-                .map_err(|e| e.error)?;
-        }
-        #[cfg(unix)]
-        File::open(home)?.sync_all()?;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await?
-}
 
-pub async fn install(home: &Path, prepared: Prepared) -> Result<String> {
-    if home.canonicalize()?.starts_with(&prepared.target) {
-        bail!("Daemon home cannot be inside the replaceable runtime installation")
-    }
-    if discover(&http()?).await? != prepared.release {
-        bail!("The release changed during download. Check for updates again.")
-    }
-    verify_tree(&prepared.staged, &prepared.new_digest).await?;
-    verify_tree(&prepared.target, &prepared.original_digest).await?;
-    validate_signature(
-        &prepared
-            .target
-            .join(executable_name(&prepared.release.platform)),
-        &prepared
-            .staged
-            .join(executable_name(&prepared.release.platform)),
-    )
-    .await?;
-    let transaction = Transaction {
-        target: prepared.target,
-        staged: prepared.staged,
-        backup: prepared.directory.path().join("previous"),
-        directory: prepared.directory.path().to_owned(),
-        original_digest: prepared.original_digest,
-        new_digest: prepared.new_digest,
-        version: prepared.release.version,
-        source_sha: prepared.release.source_sha,
-        committed: false,
-        deferred: cfg!(windows),
-    };
-    write_record(home, &transaction, false).await?;
-    let _directory = prepared.directory.keep();
-    if transaction.deferred {
-        return Ok(transaction.version);
-    }
-    if let Err(error) = replace(&transaction).await {
-        let recovery = rollback(&transaction).await;
-        if recovery.is_ok() {
-            cleanup(home, &transaction).await?;
-        }
-        return match recovery {
-            Ok(()) => Err(error),
-            Err(recovery) => Err(error.context(format!(
-                "Update recovery failed: {recovery}; retained {}",
-                home.join(RECORD).display()
-            ))),
-        };
-    }
-    Ok(transaction.version)
-}
-async fn replace(t: &Transaction) -> Result<()> {
-    tokio::fs::rename(&t.target, &t.backup)
-        .await
-        .context("Cannot preserve installed runtime")?;
-    tokio::fs::rename(&t.staged, &t.target)
-        .await
-        .context("Cannot install verified runtime")?;
-    sync_parent(&t.target).await
-}
-async fn sync_parent(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let parent = path.parent().context("Missing parent")?.to_owned();
-        tokio::task::spawn_blocking(move || File::open(parent)?.sync_all()).await??;
-    }
-    Ok(())
-}
-fn validate_transaction(t: &Transaction, executable: &Path) -> Result<()> {
-    let root = executable.parent().context("Missing runtime root")?;
-    if t.target != root
-        || t.directory.parent() != root.parent()
-        || !t
-            .directory
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with(".paseo-update-"))
-        || t.backup != t.directory.join("previous")
-        || t.staged != t.directory.join("runtime")
-        || fs::symlink_metadata(&t.directory)?.file_type().is_symlink()
-    {
-        bail!("Invalid native update recovery paths")
-    };
-    Ok(())
-}
-async fn rollback(t: &Transaction) -> Result<()> {
-    if !tokio::fs::try_exists(&t.backup).await? {
-        return verify_tree(&t.target, &t.original_digest).await;
-    }
-    verify_tree(&t.backup, &t.original_digest).await?;
-    if tokio::fs::try_exists(&t.target).await? {
-        verify_tree(&t.target, &t.new_digest).await?;
-        tokio::fs::rename(&t.target, &t.staged).await?;
-    }
-    tokio::fs::rename(&t.backup, &t.target).await?;
-    sync_parent(&t.target).await
-}
-async fn cleanup(home: &Path, t: &Transaction) -> Result<()> {
-    tokio::fs::remove_file(home.join(RECORD)).await?;
-    tokio::fs::remove_dir_all(&t.directory).await?;
-    Ok(())
-}
-/// The supervisor retains the original executable pathname across root replacement.
-/// Readiness is accepted only for the exact version/source admitted by the manifest.
-pub async fn finish_restart(
-    home: &Path,
-    executable: &Path,
-    ready: Option<(&str, &str)>,
-) -> Result<bool> {
-    let path = home.join(RECORD);
-    let metadata = match tokio::fs::symlink_metadata(&path).await {
-        Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
-        bail!("Invalid native update recovery record")
-    }
-    let mut t: Transaction = serde_json::from_slice(&tokio::fs::read(path).await?)?;
-    validate_transaction(&t, executable)?;
-    let _lease = lease(&t.target)?;
-    if let Some((version, source)) = ready {
-        if version != t.version || source != t.source_sha {
-            bail!("Updated worker provenance does not match the admitted release")
-        }
-        verify_tree(&t.target, &t.new_digest).await?;
-        if !t.committed {
-            t.committed = true;
-            write_record(home, &t, true).await?;
-        }
-        // Windows can keep the old supervisor image mapped. Retain its recovery
-        // directory until the next supervisor can remove the backup safely.
-        match tokio::fs::remove_dir_all(&t.backup).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Ok(false);
-            }
-            Err(e) => return Err(e.into()),
-        }
-        cleanup(home, &t).await?;
-        return Ok(false);
-    }
-    if t.committed {
-        return Ok(false);
-    }
-    rollback(&t).await?;
-    cleanup(home, &t).await?;
-    Ok(true)
-}
-
-pub(super) async fn validate_binary(path: &Path) -> Result<()> {
+pub(crate) async fn validate_binary(path: &Path) -> Result<()> {
     let (platform, arch) = platform()?;
     let mut file = tokio::fs::File::open(path).await?;
     let mut header = [0u8; 64];
@@ -995,7 +730,32 @@ async fn native_command(program: &Path, args: &[String]) -> Result<String> {
         String::from_utf8_lossy(&output.stderr)
     ))
 }
-async fn validate_signature(old: &Path, new: &Path) -> Result<()> {
+#[cfg(windows)]
+fn powershell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
+#[cfg(windows)]
+async fn powershell(script: &str) -> Result<String> {
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let root = std::env::var_os("SystemRoot")
+        .context("SystemRoot is unavailable for Authenticode validation")?;
+    native_command(
+        &PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+        &[
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-EncodedCommand".into(),
+            STANDARD.encode(bytes),
+        ],
+    )
+    .await
+}
+/// Official releases must keep the installed publisher identity.
+pub(crate) async fn validate_signature(old: &Path, new: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let code = Path::new("/usr/bin/codesign");
@@ -1033,75 +793,41 @@ async fn validate_signature(old: &Path, new: &Path) -> Result<()> {
         }
     }
     #[cfg(windows)]
-    {
-        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "''"));
-        let script = format!(
-            "$ErrorActionPreference='Stop';$old=Get-AuthenticodeSignature -LiteralPath {};$new=Get-AuthenticodeSignature -LiteralPath {};if($new.Status -ne 'Valid' -and $new.Status -ne 'NotSigned'){{throw 'Invalid update Authenticode signature'}};if($old.Status -eq 'Valid'){{if($new.Status -ne 'Valid' -or $old.SignerCertificate.Subject -ne $new.SignerCertificate.Subject){{throw 'Update publisher mismatch'}}}}elseif($old.Status -ne 'NotSigned'){{throw 'Installed Authenticode signature is invalid'}}",
-            quote(old),
-            quote(new)
-        );
-        let bytes = script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>();
-        let root = std::env::var_os("SystemRoot")
-            .context("SystemRoot is unavailable for Authenticode validation")?;
-        native_command(
-            &PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe"),
-            &[
-                "-NoLogo".into(),
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-EncodedCommand".into(),
-                STANDARD.encode(bytes),
-            ],
-        )
-        .await?;
-    }
+    powershell(&format!(
+        "$ErrorActionPreference='Stop';$old=Get-AuthenticodeSignature -LiteralPath {};$new=Get-AuthenticodeSignature -LiteralPath {};if($new.Status -ne 'Valid' -and $new.Status -ne 'NotSigned'){{throw 'Invalid update Authenticode signature'}};if($old.Status -eq 'Valid'){{if($new.Status -ne 'Valid' -or $old.SignerCertificate.Subject -ne $new.SignerCertificate.Subject){{throw 'Update publisher mismatch'}}}}elseif($old.Status -ne 'NotSigned'){{throw 'Installed Authenticode signature is invalid'}}",
+        powershell_quote(old),
+        powershell_quote(new)
+    ))
+    .await?;
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (old, new);
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-    #[tokio::test]
-    async fn rollback_restores_entire_runtime_and_refuses_changed_replacement() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("installed");
-        let staging = temp.path().join(".paseo-update-test");
-        fs::create_dir(&root).unwrap();
-        fs::create_dir(&staging).unwrap();
-        fs::write(root.join("paseo"), b"old executable").unwrap();
-        fs::create_dir(root.join("skills")).unwrap();
-        fs::write(root.join("skills/rule"), b"old skill").unwrap();
-        let staged = staging.join("runtime");
-        fs::create_dir(&staged).unwrap();
-        fs::write(staged.join("paseo"), b"new executable").unwrap();
-        fs::create_dir(staged.join("skills")).unwrap();
-        fs::write(staged.join("skills/rule"), b"new skill").unwrap();
-        let t = Transaction {
-            original_digest: tree_digest(&root).unwrap(),
-            new_digest: tree_digest(&staged).unwrap(),
-            target: root.clone(),
-            staged,
-            backup: staging.join("previous"),
-            directory: staging,
-            version: "2.0.0".into(),
-            source_sha: "a".repeat(40),
-            committed: false,
-            deferred: false,
-        };
-        replace(&t).await.unwrap();
-        fs::write(root.join("skills/rule"), b"unexpected change").unwrap();
-        assert!(rollback(&t).await.is_err());
-        assert!(t.backup.exists());
-        fs::write(root.join("skills/rule"), b"new skill").unwrap();
-        rollback(&t).await.unwrap();
-        assert_eq!(fs::read(root.join("paseo")).unwrap(), b"old executable");
-        assert_eq!(fs::read(root.join("skills/rule")).unwrap(), b"old skill");
-    }
+/// An explicit local build is authorized by the local operator rather than a
+/// publisher, so publisher continuity is not inherited; only the candidate's
+/// own signature must be intact (macOS: valid, ad-hoc accepted, as applied by
+/// `stage-runtime --kind standalone-local`; Windows: valid or unsigned).
+async fn validate_local_signature(executable: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    native_command(
+        Path::new("/usr/bin/codesign"),
+        &[
+            "--verify".into(),
+            "--strict".into(),
+            executable.display().to_string(),
+        ],
+    )
+    .await?;
+    #[cfg(windows)]
+    powershell(&format!(
+        "$ErrorActionPreference='Stop';$s=Get-AuthenticodeSignature -LiteralPath {};if($s.Status -ne 'Valid' -and $s.Status -ne 'NotSigned'){{throw 'Invalid local runtime Authenticode signature'}}",
+        powershell_quote(executable)
+    ))
+    .await?;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = executable;
+    Ok(())
 }
+

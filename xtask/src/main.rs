@@ -51,7 +51,7 @@ fn dispatch() -> Result<()> {
 
 fn help() -> Result<()> {
     println!(
-        "Paseo native build and release tooling\n\n  build-daemon [--release]\n  build-relay [--release]\n  build-flutter [linux|macos|windows|android|ios] [--debug] [--run [--device ID]] [--arch universal|arm64]\n  package-desktop [linux|macos|windows]\n  package-daemon\n  stage-runtime DESTINATION [--profile debug|release] [--kind desktop-bundled|standalone-archive|container]\n  container-runtime DESTINATION\n  appimage-tools\n  release <plan|record|verify|stamp|publish|notes|version|fdroid|...>\n  dev ...\n  flutter <analyze|test|...>\n  maintenance <acp-catalog|codex-titles|...>"
+        "Paseo native build and release tooling\n\n  build-daemon [--release]\n  build-relay [--release]\n  build-flutter [linux|macos|windows|android|ios] [--debug] [--run [--device ID]] [--arch universal|arm64]\n  package-desktop [linux|macos|windows]\n  package-daemon\n  stage-runtime DESTINATION [--profile debug|release] [--kind desktop-bundled|standalone-archive|standalone-local|container]\n      standalone-local packages the existing local build (no rebuild, release=false) for `paseo daemon update --from`\n  container-runtime DESTINATION\n  appimage-tools\n  release <plan|record|verify|stamp|publish|notes|version|fdroid|...>\n  dev ...\n  flutter <analyze|test|...>\n  maintenance <acp-catalog|codex-titles|...>"
     );
     println!("  relay-cloudflare <build|deploy>");
     println!("  flutter-sdk <build|publish|install>");

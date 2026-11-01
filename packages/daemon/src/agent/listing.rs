@@ -248,7 +248,9 @@ impl AgentManager {
             &json!({"rows":timeline.rows(),"agentTitle":snapshot["title"],"cwd":snapshot["cwd"],"boundaryMessageId":options["boundaryMessageId"],"cursorBoundary":options.get("boundaryCursor").filter(|v|!v.is_null()).map(|cursor|json!({"cursor":cursor,"timelineEpoch":timeline.epoch()}))}),
         )
     }
-    pub async fn subagents(&self, id: &str) -> Result<Vec<Value>> {
+    /// Validates a public parent (resuming a non-archived one, as listing always
+    /// did) and returns the persisted subagent storage root.
+    async fn subagent_root(&self, id: &str) -> Result<PathBuf> {
         let snapshot = self
             .agent_snapshot(id)
             .await?
@@ -259,33 +261,51 @@ impl AgentManager {
         if !snapshot["archivedAt"].is_string() {
             self.ensure_loaded(id).await?;
         }
+        Ok(self.app()?.home.join("agent-subagents"))
+    }
+    /// A listing that would omit an unreadable child is an error, never a
+    /// shorter success; the child's stored row is left as found.
+    pub async fn subagents(&self, id: &str) -> Result<Vec<Value>> {
+        let root = self.subagent_root(id).await?;
         let store = self.subagent_store.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            Ok(store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.list(&id))
+            let (subagents, unavailable) = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
+                .list_persisted(&root, &id)?;
+            match unavailable.into_iter().next() {
+                Some(error) => Err(error.into()),
+                None => Ok(subagents),
+            }
         }).await?
     }
+    /// Pages one child without listing (or hydrating) its siblings.
     pub async fn subagent_timeline(
         &self,
         parent: &str,
         id: &str,
         options: &Value,
     ) -> Result<Value> {
-        self.subagents(parent).await?;
+        let root = self.subagent_root(parent).await?;
         let store = self.subagent_store.clone();
         let parent = parent.to_owned();
         let id = id.to_owned();
         let options = options.clone();
         tokio::task::spawn_blocking(move || {
-            let store = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?;
-            let mut page = store.fetch_timeline(&parent, &id, &options)?;
+            let mut store = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?;
+            let mut page = store.fetch_persisted(&root, &parent, &id, &options)?;
             if let Some(descriptor) = store.get(&parent, &id) {
                 page["provider"] = descriptor["provider"].clone();
             }
             Ok(page)
         }).await?
     }
-    pub async fn list_provider_subagent_activity(&self) -> Result<Vec<Value>> {
+    /// Descriptors of every public parent's subagents, plus each parent catalog
+    /// or child descriptor that could not be read. A non-empty second list
+    /// means the first is incomplete; callers must surface that, not treat the
+    /// missing parents as having no subagents.
+    pub async fn list_provider_subagent_activity(
+        &self,
+    ) -> Result<(Vec<Value>, Vec<timeline::SubagentStorageUnavailable>)> {
         let public: HashSet<String> = self
             .list_snapshots()
             .await?
@@ -294,11 +314,10 @@ impl AgentManager {
             .filter_map(|s| text(s, "id").map(str::to_owned))
             .collect();
         let store = self.subagent_store.clone();
+        let root = self.app()?.home.join("agent-subagents");
         tokio::task::spawn_blocking(move || {
             Ok(store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
-                .list_all().iter()
-                .filter(|s| text(s, "parentAgentId").is_some_and(|id| public.contains(id)))
-                .cloned().collect())
+                .list_persisted_parents(&root, public.iter().map(String::as_str)))
         }).await?
     }
     pub async fn workspace_last_user_message_times(&self) -> Result<BTreeMap<String, String>> {

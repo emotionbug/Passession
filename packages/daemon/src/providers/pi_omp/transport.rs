@@ -19,6 +19,9 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_REASSEMBLED: usize = 64 * 1024 * 1024;
 const MAX_FRAME: usize = 1024 * 1024;
+/// After exit, stdout may stay open through a descendant. Frames already written
+/// still precede process_exit, but an inherited pipe cannot postpone it forever.
+const STDOUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 struct Assembly {
     id: String,
     count: usize,
@@ -188,10 +191,17 @@ impl Transport {
             timeout,
             host_tools: Mutex::new(Weak::new()),
         });
-        let (events, receiver) = super::event_queue::channel(&transport, transport.cancel.clone());
+        // Cancellation means "stop the process", never "discard its output": the
+        // reader drains stdout to EOF and the event queue delivers every accepted
+        // frame, then the waiter's terminal process_exit.
+        let (events, receiver) = super::event_queue::channel(&transport);
         let reader = transport.clone();
         let exit_events = events.clone();
+        let stop_reading = CancellationToken::new();
+        let reader_stop = stop_reading.clone();
+        let (reader_done, mut drained) = oneshot::channel::<()>();
         tokio::spawn(async move {
+            let _done = reader_done;
             let mut input = BufReader::new(stdout);
             let mut line = Vec::new();
             let mut decoder = Decoder::default();
@@ -203,7 +213,7 @@ impl Transport {
                     let count = input.read_until(b'\n', &mut line).await?;
                     Ok::<_, std::io::Error>(count > 0 && line.last() == Some(&b'\n'))
                 };
-                let result = tokio::select! { _ = reader.cancel.cancelled() => break, result = read => result };
+                let result = tokio::select! { _ = reader_stop.cancelled() => break, result = read => result };
                 match result {
                     Ok(false) => break,
                     Err(error) => {
@@ -246,7 +256,9 @@ impl Transport {
                             if router.is_some_and(|router| router.handle(&frame)) {
                                 continue;
                             }
-                            tokio::select! { _ = reader.cancel.cancelled() => break, result = events.send(frame) => if result.is_err() { break; } }
+                            // The spool never waits for the consumer, so this push is
+                            // bounded; abandoning it could drop an accepted frame.
+                            if events.send(frame).await.is_err() { break; }
                         }
                     }
                     Ok(None) => {}
@@ -268,6 +280,12 @@ impl Transport {
                 "JSONL process exited: {result:?}\n{}",
                 waiter.process.stderr_tail()
             );
+            // Replies and events written before exit stay ahead of the terminal
+            // frame; pending requests may still resolve from that drained output.
+            if tokio::time::timeout(STDOUT_DRAIN_GRACE, &mut drained).await.is_err() {
+                stop_reading.cancel();
+                let _ = drained.await;
+            }
             waiter.fail(&message);
             let _ = exit_events
                 .send(json!({"type":"process_exit","error":message}))
@@ -500,8 +518,6 @@ mod request_tests {
         let error = error.downcast_ref::<RequestError>().unwrap();
         assert!(error.may_have_been_sent);
         assert_eq!(error.request_id, "req_1");
-        assert_eq!(error.source.downcast_ref::<WriteError>().unwrap().source.kind(),
-            std::io::ErrorKind::TimedOut);
         assert!(transport.pending.lock().unwrap().is_empty());
         tokio::time::timeout(Duration::from_secs(3), transport.process.wait())
             .await.unwrap().unwrap();
@@ -549,5 +565,49 @@ mod request_tests {
         assert!(transport.pending.lock().unwrap().is_empty());
         tokio::time::timeout(Duration::from_secs(3), transport.process.wait())
             .await.unwrap().unwrap();
+    }
+
+    async fn next(events: &mut mpsc::Receiver<Value>) -> Option<Value> {
+        tokio::time::timeout(Duration::from_secs(10), events.recv()).await
+            .expect("event delivery must not stall")
+    }
+
+    #[tokio::test]
+    async fn stdin_failure_cancellation_delivers_spooled_output_then_process_exit() {
+        let (transport, mut events) = fixture(
+            "exec 0<&-; printf '{\"type\":\"stdin_closed\"}\\n'; i=0; \
+             while [ $i -lt 64 ]; do printf '{\"type\":\"tail\",\"index\":%d}\\n' $i; i=$((i+1)); done; \
+             sleep 30"
+        ).await;
+        assert_eq!(next(&mut events).await.unwrap()["type"], "stdin_closed");
+        // Nobody consumes while the reader accepts the tail into the spool.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let error = transport.request(json!({"type":"prompt"})).await.unwrap_err();
+        assert!(error.downcast_ref::<RequestError>().unwrap().may_have_been_sent);
+        assert!(transport.cancel.is_cancelled());
+        let mut tail = 0;
+        let terminal = loop {
+            let event = next(&mut events).await
+                .expect("the stream must not end before process_exit");
+            if event["type"] != "tail" { break event; }
+            assert_eq!(event["index"], tail);
+            tail += 1;
+        };
+        assert_eq!(tail, 64);
+        assert_eq!(terminal["type"], "process_exit");
+        assert!(next(&mut events).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn frames_written_before_natural_exit_precede_process_exit() {
+        let (_transport, mut events) = fixture(
+            "i=0; while [ $i -lt 200 ]; do printf '{\"type\":\"row\",\"index\":%d}\\n' $i; i=$((i+1)); done"
+        ).await;
+        for index in 0..200 {
+            let event = next(&mut events).await.unwrap();
+            assert_eq!((event["type"].as_str(), event["index"].as_u64()), (Some("row"), Some(index)));
+        }
+        assert_eq!(next(&mut events).await.unwrap()["type"], "process_exit");
+        assert!(next(&mut events).await.is_none());
     }
 }

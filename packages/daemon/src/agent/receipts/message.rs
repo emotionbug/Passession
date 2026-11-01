@@ -350,6 +350,28 @@ impl MessageReceipts {
             }),
         }
     }
+
+    /// Observe an exact durable receipt from a process that does not own sends.
+    /// Unlike `get`, this never reconciles or changes another worker's live RPC.
+    pub(crate) async fn observe_persisted(
+        home: &std::path::Path,
+        agent_id: &str,
+        message_id: &str,
+    ) -> Result<Value> {
+        let path = home.join("agent-requests").join(format!("{}.json", identity(agent_id, message_id)?));
+        let record = match read_optional(&path).await? {
+            Some(bytes) => Some(parse(&bytes, &path)?),
+            None => None,
+        };
+        if let Some(record) = &record {
+            if record.agent_id != agent_id
+                || record.message_id.as_deref().is_some_and(|id| id != message_id)
+            {
+                bail!("Message receipt identity mismatch");
+            }
+        }
+        Ok(project(agent_id, message_id, record.as_ref()))
+    }
     /// Receipt updates, published only after the durable write.
     pub fn subscribe_events(&self) -> broadcast::Receiver<Value> {
         self.inner.events.subscribe()

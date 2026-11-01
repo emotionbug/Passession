@@ -75,6 +75,8 @@ pub(super) async fn handle(
                         "sourceAgentServerId",
                         "activeTurnBehavior",
                         "sessionMode",
+                        "unarchive",
+                        "expectedPersistence",
                     ] {
                         if let Some(value) = message.get(field) {
                             input[field] = value.clone();
@@ -460,7 +462,7 @@ async fn resolve(manager: &AgentManager, identifier: &str) -> Result<Option<Stri
     if id.is_empty() {
         bail!("Agent identifier cannot be empty");
     }
-    if manager.agent_snapshot(id).await?.is_some() {
+    if manager.observe_agent_snapshot(id).await?.is_some() {
         return Ok(Some(id.to_owned()));
     }
     let agents = manager.list_snapshots().await?;

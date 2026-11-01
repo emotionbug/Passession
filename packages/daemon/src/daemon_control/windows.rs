@@ -7,9 +7,9 @@ use windows_sys::Win32::{
             TH32CS_SNAPPROCESS,
         },
         JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
         },
         Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
     },
@@ -50,7 +50,10 @@ impl WorkerJob {
         }
         let owned = Self(job);
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Only a child that explicitly requests CREATE_BREAKAWAY_FROM_JOB (the
+        // copied update executor) leaves; ordinary descendants stay contained.
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         if unsafe {
             SetInformationJobObject(
                 job,

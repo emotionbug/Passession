@@ -1006,6 +1006,7 @@ pub const SESSION_EVENTS: &[&str] = &[
     "hub.execution.agent.update",
     "hub.execution.agent.stream",
     "agent.message_receipt.update",
+    "daemon.update.maintenance",
 ];
 pub(crate) fn event_category(message: &Value) -> Option<String> {
     let kind = message["type"].as_str()?;
@@ -1031,8 +1032,8 @@ fn legacy_wants_event(event: &str, capabilities: &Value) -> bool {
             !has_capability(capabilities, "explicit_event_subscriptions")
         }
         "agent.provider_subagents.update" => has_capability(capabilities, "provider_subagents"),
-        // Opt-in only: legacy clients do not understand receipt updates.
-        "agent.message_receipt.update" => false,
+        // Opt-in only: legacy clients do not understand receipt or maintenance updates.
+        "agent.message_receipt.update" | "daemon.update.maintenance" => false,
         _ => true,
     }
 }

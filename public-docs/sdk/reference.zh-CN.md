@@ -89,7 +89,7 @@ SSH 使用本机 `ssh` 可执行文件、非交互批量认证及指向远端回
 
 Provider 方法：`list_available_providers`、`get_providers_snapshot`、`refresh_providers_snapshot`、`list_provider_models`、`list_provider_modes`、`list_provider_features`、`get_provider_diagnostic`、`list_provider_usage`、`list_usage_reports`。压缩快照和草稿配置见 [Provider](providers.zh-CN.md)。
 
-配置方法为 `get_daemon_config`、`patch_daemon_config`、`read_project_config`、`write_project_config`；`get_daemon_status` 和能力检查后的 `daemon_status(timeout)` 读取状态。诊断输出不得泄露秘密。`restart`、`shutdown`、`update_daemon`、`reload_daemon_config` 等管理操作影响所选正在运行的 daemon，必须有操作员明确意图。
+配置方法为 `get_daemon_config`、`patch_daemon_config`、`read_project_config`、`write_project_config`；`get_daemon_status` 和能力检查后的 `daemon_status(timeout)` 读取状态。诊断输出不得泄露秘密。`restart`、`shutdown`、`update_daemon`、`reload_daemon_config` 等管理操作影响所选正在运行的 daemon，必须有操作员明确意图。`features.durableDaemonUpdates` 为 true 时，`submit_daemon_update`（调用方生成 UUID `operationId`，仅限官方发布版）返回已持久接受的 `operation`，`get_daemon_update_status` 按 `operationId` 读取。确认丢失后用同一 `operationId` 重新提交会返回同一操作；断开连接不会取消它。`phase` 为 `committed`、`rolled_back` 或 `failed` 才是更新结果，`continuation.state` 单独报告请求的会话恢复。旧版 `update_daemon` 使用同一引擎，仅在操作 committed 时报告 `success: true`。这类 daemon 还接受在 `session.events.set_subscription` 中订阅 `daemon.update.maintenance` 事件（旧 daemon 会拒绝未知事件名，因此仅在声明该能力时订阅）。其 payload `{operationId, active}` 表示更新何时暂停新消息和新建 Agent；`server_info.daemonUpdate`（`{operationId, active: true}`）在每次连接时携带当前暂停状态，否则不存在。仅当 `active: false` 指向你正在显示的操作时才清除提示。
 
 连接主机使用 `list_hosts`、`add_host`、`update_host`、`remove_host`、`open_host_route`、`open_host_link`。把注册 ID 用作 `DaemonTarget::Endpoint` 即可使用管理路由。管理 daemon 和目标 daemon 都必须支持所需能力。路由不隐含管理其他 daemon 的授权。底层路由元数据/帧编解码位于 `paseo_protocol::{routing,binary_frames}`。
 

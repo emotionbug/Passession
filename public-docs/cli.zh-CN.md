@@ -400,6 +400,23 @@ paseo daemon stop --home ~/paseo-test
 
 根级别名 `start`、`status`、`restart`、`reload` 和 `pair` 与 `daemon` 下的命令相同。根级的 `run` 和 `stop` 仍然是 Agent 操作。
 
+### 持久更新 {#durable-updates}
+
+```bash
+paseo daemon update --home ~/paseo-test --from /path/to/complete-runtime \
+  --resume-agent <agent-id> --continuation-file continuation.txt
+paseo daemon update status <operation-id> --home ~/paseo-test --json
+paseo daemon update wait <operation-id> --home ~/paseo-test
+```
+
+操作被持久接受并移交给 daemon 之外的执行器后，`update` 返回 `operationId`；即使此命令、其连接或调用的 Agent 结束，替换也会继续。用 `--operation-id <uuid>` 可在提交前固定标识：同一 ID 和同一输入重复提交会返回现有操作，同一 ID 但目标或续接内容不同则被拒绝。不带 `--from` 时安装最新官方发布版。`--from` 接受本机上完整的已准备运行时（不是单独的可执行文件）；本地构建可以在版本号相同的情况下具有不同摘要，且永远不会被标为官方发布版。
+
+`--resume-agent` 与 `--continuation-file` 指定一个现有 Agent 以及更新提交后它收到的消息。文件在提交前读取，之后修改不会生效。`--idle-timeout <duration>`（默认 `5m`）限定等待其他运行中轮次的时间；超时后保留当前 daemon，操作以忙碌结果结束。`--force-running` 则会中断这些轮次。更新排空 daemon 期间会拒绝新消息和新建 Agent；停止 Agent、关闭项目和回应权限请求仍然可用。支持该功能的已连接应用会在此期间显示维护提示。
+
+`status` 读取主目录中的操作记录（`native-update-operation.json`），daemon 停止时也可用。旧版更新器留下的记录（`native-update.json`）既不会被转换也不会被修改，并会阻止新的更新。`wait` 只做观察；中断它不会取消更新。`phase` 为 `committed`、`rolled_back` 或 `failed` 才是更新结果，`wait` 仅在 `committed` 时以 0 退出。`continuation.state`（`pending`、`accepted`、`not_delivered`、`unknown`、`failed`）单独报告：未确认的会话恢复不会撤销已提交的更新；消息回执证明送达后，之后的 `status` 可能把 `unknown` 显示为 `accepted`，且不会再次发送。
+
+`--from` 和 `--continuation-file` 需要本地 `--home`。使用 `--host` 时，`update` 只能通过声明 `durableDaemonUpdates` 的 daemon 安装官方发布版，`status`/`wait` 远程查询；确认丢失时会用同一操作 ID 重试。
+
 ### 前台部署与迁移 {#foreground-deployments-and-migration}
 
 在前台部署命令中使用环境变量覆盖：

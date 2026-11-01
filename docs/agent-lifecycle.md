@@ -69,9 +69,9 @@ Parent archive detaches a subagent instead of archiving it when either condition
 All other children archive with the parent. After the workspace layout hydrates, the client marks
 every managed subagent present in its tabs with `paseo.open-agent-tab.<client-id>=true` through the
 generic agent metadata update. This includes background and restored tabs; navigation does not own
-the marker. Closing a tab sets that client's label to `false`. Any `true` client label keeps the child
-open. Detach clears the parent and every open-tab label. The surviving child therefore becomes a
-normal root agent immediately, and closing its still-open tab archives it.
+the marker. A successful tab close sets that client's label to `false`; a cancelled close keeps
+the tab and its label. Any `true` client label keeps the child open. Detach clears the parent and
+every open-tab label. The surviving child becomes a root agent; closing its tab still only dismisses the view.
 
 Runtime ownership is resolved from explicit workspace ID and caller context, never from `cwd`. Workspace creation is a separate operation with `local | worktree` isolation; agent creation reuses that workspace unless a new workspace is explicitly requested.
 
@@ -220,11 +220,17 @@ These are two distinct concepts that used to be conflated:
 | **Tab** (workspace layout) | Per-client | User opens/closes a view   |
 | **Archive** (lifecycle)    | Global     | Explicit lifecycle gesture |
 
-Closing a tab on a **root agent** still archives — the tab is the agent's home, so closing it means "I'm done with this agent." A confirm dialog protects against archiving a running agent by accident.
+Closing any agent tab is **layout-only**, including a running root agent. It does not stop,
+archive, delete or detach the session. Single, bulk and pane-close actions use the same rule,
+and existing unsaved-document/draft close guards can still refuse the close.
 
-Closing a tab on a **subagent** (any agent with `parentAgentId`) is **layout-only**. The app clears the current client's open-tab label before removing the tab. Another client's open tab remains protected. The agent stays unarchived and stays in its parent's track, so a later parent archive cascades to it when no client still has it open. The user can re-open the tab from the track at any time. Single and bulk tab close apply the same policy.
+For a subagent, the app clears the current client's open-tab label after the tab closes.
+Another client's label remains protected. The agent stays in its parent's track and can be
+reopened there; a root agent can be reopened from the session list with the same identity and history.
+Archive remains a separate, explicit lifecycle action.
 
-The asymmetry is intentional: a subagent's persistent relationship lives in the parent's track. Same-workspace subagents are not auto-opened as tabs; the user opens one from that track when needed. A cross-workspace subagent is also auto-opened as a tab in its own workspace so opening that workspace does not appear empty. It remains in the parent's track until it is actually detached.
+Same-workspace subagents are not auto-opened as tabs. Cross-workspace subagents are also
+opened as tabs in their own workspace, while remaining in the parent's track until detached.
 
 ## Workspace activity
 
@@ -297,15 +303,12 @@ To keep the agent alive but remove it from the parent's track, use **detach**. T
 
 ## Why this shape
 
-The decision was to **decouple "close tab" from "archive" only for subagents**, rather than universally:
+Closing a view must not destroy or hide its underlying conversation:
 
-- **Closing a tab on a root agent still archives** — preserves the existing UX users are trained on
-- **Closing a tab on a subagent is layout-only** — fixes the lossy "click to read, close to dismiss view, lose the row" flow
-- **Archive button on track rows** — gives subagents an explicit lifecycle gesture in their home surface
-- **Detach button on track rows** — lets a subagent continue independently without killing its work
-- **Cascade archive on parent** — keeps subagents from leaking when the parent is archived
-
-We considered universal decoupling (no tab close ever archives, archive is always explicit) but rejected it: it changes a behavior root-agent users rely on.
+- **Close tab** dismisses that client's view without changing session execution or archive state.
+- **Archive** explicitly changes lifecycle state and can cascade to eligible children.
+- **Detach** removes a child's parent relationship without stopping its work.
+- **Close guards** protect unsaved documents and drafts before layout changes or open-tab label cleanup.
 
 ## Limitations
 
@@ -315,7 +318,7 @@ A parent that spawns many subagents will see the panel's list grow; the pill onl
 
 ### Cross-client tab dismissal
 
-Closing a subagent's tab on one client doesn't affect other clients' layouts. This is the expected behavior of decoupled tabs and is consistent with how layouts have always worked. Archive remains the global gesture for cross-client cleanup.
+Closing an agent tab on one client does not affect other clients' layouts. Archive remains the global gesture for cross-client cleanup.
 
 ## Storage
 
@@ -324,6 +327,16 @@ $PASEO_HOME/agents/{cwd-with-dashes}/{agent-id}.json
 ```
 
 `{cwd-with-dashes}` is derived from the agent's filesystem `cwd`. It is not the workspace id; agent storage stays cwd-keyed while workspace identity is the opaque workspace id.
+
+Provider-owned child descriptors are loaded per parent on demand. Child timeline reads fetch
+only the requested page; writes/replay use a bounded cache of at most 16 histories and 32 MiB
+of serialized row JSON, with at most eight parent catalog connections. Closing a parent releases
+its cached histories/connections without deleting the stored records. These are cache bounds,
+not a process RSS bound; an individual replay can temporarily hold its old and new histories.
+
+A missing/corrupt catalog or child database is unavailable only within that record's scope.
+The original bytes are preserved, no empty replacement is created, and cross-parent activity
+results explicitly report unreadable entries rather than claiming a complete view.
 
 Each agent is a single JSON file. Fields relevant to this doc:
 

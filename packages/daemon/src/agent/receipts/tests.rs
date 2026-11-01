@@ -65,6 +65,31 @@ fn send_key(message_id: &str) -> Result<String> {
 }
 
 #[tokio::test]
+async fn external_receipt_observer_preserves_live_owner_and_sees_late_ack() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let receipts = MessageReceipts::new(home.path().to_owned());
+    let request = json!({"prompt":"continue"});
+    let owner = owned(&receipts, "resume", &request).await?;
+    assert!(receipts.begin_dispatch("agent", "resume").await?);
+    let before = receipts.get("agent", "resume").await?;
+    let observed = MessageReceipts::observe_persisted(home.path(), "agent", "resume").await?;
+    assert_eq!(observed["phase"], "dispatching");
+    assert_eq!(observed["revision"], before["revision"]);
+    assert_eq!(receipts.get("agent", "resume").await?, before);
+    receipts.settle("agent", "resume", Settlement::Accepted {
+        result: Some(json!({"disposition":"steered"})),
+        correlation: json!({"nativeMessageId":"native-resume"}),
+    }).await?;
+    drop(owner);
+    let accepted = MessageReceipts::observe_persisted(home.path(), "agent", "resume").await?;
+    assert_eq!(accepted["phase"], "accepted");
+    assert_eq!(accepted["correlation"]["nativeMessageId"], "native-resume");
+    assert_eq!(replayed(&receipts, "resume", &request).await?["phase"], "accepted");
+    assert_eq!(MessageReceipts::observe_persisted(home.path(), "agent", "absent").await?["phase"], "missing");
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_and_rejected_sends_replay_without_dispatch() -> Result<()> {
     let home = tempfile::tempdir()?;
     let receipts = MessageReceipts::new(home.path().to_owned());

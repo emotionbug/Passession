@@ -234,7 +234,7 @@ pub async fn run() -> Result<i32> {
 pub async fn run_args(mut args: Vec<String>) -> Result<i32> {
     if matches!(
         args.first().map(String::as_str),
-        Some("__supervisor" | "__worker" | "__update")
+        Some("__supervisor" | "__worker" | "__launcher" | "__update-executor" | "__managed-probe")
     ) {
         return crate::daemon_control::run_internal(&args[0], &args[1..]).await;
     }

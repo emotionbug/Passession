@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
 import 'client.dart';
+import 'daemon_maintenance.dart';
 import 'host_config.dart';
 import 'json.dart';
 import 'legacy_state.dart';
@@ -92,6 +93,10 @@ class HostState {
   final Map<String, Object> listErrors = {};
   Iterable<String> get loadingLists => _hydrating;
   DateTime? cachedAt;
+  /// Durable daemon update currently pausing new work on this host, from
+  /// `server_info.daemonUpdate` and `daemon.update.maintenance`; kept while the
+  /// connection drops during the replacement and settled by the next server_info.
+  String? maintenanceOperationId;
   bool get live =>
       client.status == ConnectionStatus.connected && !loading &&
       error == null && _hydrating.isEmpty && listErrors.isEmpty;
@@ -103,6 +108,15 @@ class HostState {
   VoidCallback? _statusListener;
   ConnectionStatus? _lastStatus;
   Future<void>? _refresh;
+  /// The client the running [_refresh] attempt hydrates.
+  PaseoClient? _refreshClient;
+  /// The client a resync was requested for while [_refresh] was running; that
+  /// refresh hydrates again once its current attempt completes.
+  PaseoClient? _resyncFor;
+  /// The client `_detach` last released; a resync is never serviced on it.
+  PaseoClient? _detachedClient;
+  /// Refresh attempts started; each directory observation keeps its own.
+  int _refreshEpoch = 0;
   Timer? _resync;
   final Set<String> _hydrating = {};
   final List<JsonMap> _queuedEvents = [];
@@ -118,13 +132,21 @@ class AppStore extends ChangeNotifier {
     this.connectHosts = true,
     this.discoverLocalHosts = true,
     this.legacyStateReader = readLegacyState,
+    this.connector,
+    this.clientId,
   });
   final LegacyStateReader legacyStateReader;
   final String windowId;
   final bool connectHosts;
   final bool discoverLocalHosts;
+  /// Opens host daemon transports; the platform connector when absent.
+  final DaemonConnector? connector;
+  /// An explicit identity for isolated clients; otherwise PaseoClient persists one.
+  final String? clientId;
   PaseoClient _newClient(HostConfig config) => PaseoClient(
     host: config,
+    connector: connector,
+    clientId: clientId,
     capabilities: const {
       'all_providers': true,
       'provider_subagents': true,
@@ -678,6 +700,7 @@ class AppStore extends ChangeNotifier {
   void _attach(HostState host) {
     if (!connectHosts) return;
     host._lastStatus = host.client.status;
+    _syncMaintenance(host, host.client.serverInfo);
     host._events = host.client.events.listen(
       (event) => _event(host, event),
       onError: (Object error) {
@@ -697,9 +720,9 @@ class AppStore extends ChangeNotifier {
         }
       }
       if (host.client.status == ConnectionStatus.connected &&
-          prior != ConnectionStatus.connected &&
-          host._refresh == null) {
-        unawaited(refreshHost(host.serverId));
+          prior != ConnectionStatus.connected) {
+        _syncMaintenance(host, host.client.serverInfo);
+        if (host._refresh == null) unawaited(refreshHost(host.serverId));
       }
       _notify();
     };
@@ -760,6 +783,8 @@ class AppStore extends ChangeNotifier {
 
   Future<void> _detach(HostState host) async {
     host._resync?.cancel();
+    host._resync = null;
+    host._detachedClient = host.client;
     if (host._statusListener != null) {
       host.client.removeListener(host._statusListener!);
     }
@@ -842,9 +867,42 @@ class AppStore extends ChangeNotifier {
   Future<void> refreshHost(String serverId) {
     final host = hostFor(serverId);
     if (host == null || _disposed || !connectHosts) return Future.value();
-    return host._refresh ??= _refreshHost(host).whenComplete(() {
+    final running = host._refresh;
+    if (running != null) {
+      // That attempt hydrates a client since replaced: hydrate the current
+      // one once it settles instead of handing back a refresh of the old one.
+      if (!identical(host._refreshClient, host.client)) {
+        host._resyncFor = host.client;
+      }
+      return running;
+    }
+    return host._refresh = _refreshUntilCurrent(host);
+  }
+
+  /// Runs refresh attempts until no resync was requested for the host's
+  /// current client during the last one. A request that arrives mid-attempt
+  /// (a mismatched generation, a restored feed, a replaced client) may
+  /// postdate that attempt's baselines, so it is serviced by another attempt
+  /// rather than dropped or merged into the one already running.
+  Future<void> _refreshUntilCurrent(HostState host) async {
+    try {
+      do {
+        host._resyncFor = null;
+        // An attempt starting now covers every earlier debounced request.
+        host._resync?.cancel();
+        host._resync = null;
+        host._refreshEpoch++;
+        host._refreshClient = host.client;
+        await _refreshHost(host);
+      } while (!_disposed &&
+          hosts.contains(host) &&
+          identical(host._resyncFor, host.client) &&
+          !identical(host.client, host._detachedClient));
+    } finally {
       host._refresh = null;
-    });
+      host._refreshClient = null;
+      host._resyncFor = null;
+    }
   }
 
   Future<void> _refreshHost(HostState host) async {
@@ -869,6 +927,7 @@ class AppStore extends ChangeNotifier {
         );
         await _detach(host);
         host.client = routed;
+        host._refreshClient = routed;
         _attach(host);
       }
       if (host.client.status != ConnectionStatus.connected) {
@@ -932,6 +991,7 @@ class AppStore extends ChangeNotifier {
       host._hydrating.addAll(['project', 'workspace', 'agent']);
       host._queuedEvents.clear();
       final client = host.client;
+      final epoch = host._refreshEpoch;
       bool current() => !_disposed && hosts.contains(host) && identical(host.client, client);
       // Explicit-event clients receive these broadcasts only while an owned
       // feed is installed. Establish it before baselines so updates during
@@ -953,11 +1013,13 @@ class AppStore extends ChangeNotifier {
             'workspace_setup_progress',
             'activity_log',
             'status.daemon_config_changed',
+            if (host.client.supports(daemonUpdateMaintenanceFeature))
+              daemonUpdateMaintenanceEvent,
           ],
           'notifications': true,
         },
         responseType: 'session.events.set_subscription.response',
-        onEvent: (event) => _observationLifecycle(host, event),
+        onEvent: (event) => _observationLifecycle(host, event, epoch),
       );
       host._observations.add(eventFeed);
       host.loading = false;
@@ -978,7 +1040,7 @@ class AppStore extends ChangeNotifier {
               if (_backgroundSupported(host)) 'includeBackground': true,
             },
             responseType: 'fetch_workspaces_response',
-            onEvent: (event) => _observationLifecycle(host, event),
+            onEvent: (event) => _observationLifecycle(host, event, epoch),
           );
           if (!current()) { await observation.close(); return; }
           host._observations.add(observation);
@@ -997,7 +1059,7 @@ class AppStore extends ChangeNotifier {
               if (_backgroundSupported(host)) 'includeBackground': true,
             },
             responseType: 'fetch_agents_response',
-            onEvent: (event) => _observationLifecycle(host, event),
+            onEvent: (event) => _observationLifecycle(host, event, epoch),
           );
           if (!current()) { await observation.close(); return; }
           host._observations.add(observation);
@@ -1018,7 +1080,7 @@ class AppStore extends ChangeNotifier {
           type: 'hosts.list.request',
           fields: {'observe': true},
           responseType: 'hosts.list.response',
-          onEvent: (event) => _observationLifecycle(host, event),
+          onEvent: (event) => _observationLifecycle(host, event, epoch),
         );
         host._observations.add(observation);
         unawaited(
@@ -1064,13 +1126,16 @@ class AppStore extends ChangeNotifier {
     }
   }
 
-  void _observationLifecycle(HostState host, JsonMap event) {
+  /// [epoch] is the refresh attempt that installed the observation.
+  void _observationLifecycle(HostState host, JsonMap event, int epoch) {
     if (_disposed || !hosts.contains(host)) return;
     // Actual wire updates are processed once through client.events. Restored
     // feeds have no replay history: refresh projects/workspaces/agents (and
     // their script state) rather than treating restored membership as a sync.
+    // A feed restored after a later attempt began is covered by that attempt;
+    // one restored while its own attempt still runs needs another.
     if (event['type'] == 'subscription.restored') {
-      if (host._refresh == null) _scheduleResync(host);
+      if (epoch == host._refreshEpoch) _scheduleResync(host);
     } else if (event['type'] == 'subscription.error') {
       host.error =
           jsonMap(event['payload'])['error'] ?? 'Host observation failed.';
@@ -1086,6 +1151,15 @@ class AppStore extends ChangeNotifier {
   bool _hostsSupported(HostState host) {
     return jsonMap(host.client.serverInfo['features'])['connectedHosts'] ==
         true;
+  }
+
+  /// server_info is a full snapshot: an absent `daemonUpdate` ends the pause.
+  void _syncMaintenance(HostState host, JsonMap info) {
+    if (info.isEmpty) return;
+    final next = daemonMaintenanceFromServerInfo(info);
+    if (next == host.maintenanceOperationId) return;
+    host.maintenanceOperationId = next;
+    _notify();
   }
 
   Future<List<JsonMap>> _allPages(
@@ -1140,6 +1214,18 @@ class AppStore extends ChangeNotifier {
     final payload = jsonMap(event['payload']);
     if (type == 'hosts.changed') {
       unawaited(_discoverRoutes(host, jsonMap(payload['directory'])));
+      return;
+    }
+    if (type == daemonUpdateMaintenanceEvent) {
+      final next = applyDaemonMaintenanceEvent(host.maintenanceOperationId, payload);
+      if (next != host.maintenanceOperationId) {
+        host.maintenanceOperationId = next;
+        _notify();
+      }
+      return;
+    }
+    if (type == 'status' && payload['status'] == 'server_info') {
+      _syncMaintenance(host, payload);
       return;
     }
     if (!const {
@@ -1274,12 +1360,20 @@ class AppStore extends ChangeNotifier {
     return true;
   }
 
+  /// Requests rehydration of the host's current client. A running refresh
+  /// keeps the request and hydrates again once its current attempt completes.
+  /// Otherwise one refresh starts 150ms after the first request; later
+  /// requests join that timer instead of postponing it, so a continuous
+  /// stream of mismatches still refreshes.
   void _scheduleResync(HostState host) {
-    host._resync?.cancel();
-    host._resync = Timer(
-      const Duration(milliseconds: 150),
-      () => unawaited(refreshHost(host.serverId)),
-    );
+    if (host._refresh != null) {
+      host._resyncFor = host.client;
+      return;
+    }
+    host._resync ??= Timer(const Duration(milliseconds: 150), () {
+      host._resync = null;
+      unawaited(refreshHost(host.serverId));
+    });
   }
 
   Future<void> _discoverRoutes(HostState origin, JsonMap directory) async {

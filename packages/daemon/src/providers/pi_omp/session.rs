@@ -53,6 +53,9 @@ struct State {
     followed_children: HashSet<String>,
     /// The current prompt's native acknowledgement, taken once by the manager.
     acknowledgement: Option<(String, watch::Receiver<Option<PromptAck>>)>,
+    /// Pi's persisted session file and live leaf from the latest entry capture.
+    /// None when the runtime did not prove both (unpersisted or older Pi).
+    native_leaf: Option<(String, Value)>,
 }
 struct Inner {
     spec: ProviderSpec,
@@ -407,6 +410,11 @@ impl Inner {
                                 .as_array()
                                 .cloned()
                                 .unwrap_or_default();
+                            let leaf = value.get("leafId").filter(|leaf| leaf.is_string() || leaf.is_null());
+                            state.native_leaf = (value["persisted"] == true)
+                                .then(|| value["sessionFile"].as_str().map(str::to_owned))
+                                .flatten()
+                                .zip(leaf.cloned());
                         }
                         if let Some(id) = value["requestId"].as_str() {
                             if let Some(reply) = state.extension_results.remove(id) {
@@ -546,16 +554,37 @@ impl Inner {
             }
         });
     }
+    /// Consumes one runtime generation until its terminal frame. A failed frame
+    /// must not stop the loop: the process_exit after a transport failure is what
+    /// marks this session dead and reports the ended owner to the manager.
     fn attach(self: &Arc<Self>, mut receiver: mpsc::Receiver<Value>, generation: u64) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
+            let mut terminal = false;
+            let mut failed = false;
             while let Some(frame) = receiver.recv().await {
                 let Some(inner) = weak.upgrade() else {
-                    break;
+                    return;
                 };
+                terminal |= frame["type"] == "process_exit";
                 if let Err(error) = inner.frame(frame, generation).await {
-                    tracing::warn!(%error,"Provider event delivery failed");
-                    break;
+                    if failed {
+                        tracing::debug!(%error, "Provider event delivery failed");
+                    } else {
+                        tracing::warn!(%error, "Provider event delivery failed");
+                    }
+                    failed = true;
+                }
+            }
+            // The queue always ends with process_exit; an end without one (a
+            // lost delivery task) still ends this generation instead of leaving
+            // a live-looking session with no runtime output.
+            if !terminal {
+                if let Some(inner) = weak.upgrade() {
+                    let frame = json!({"type":"process_exit","error":"Provider event stream ended without a process exit"});
+                    if let Err(error) = inner.frame(frame, generation).await {
+                        tracing::warn!(%error, "Provider stream end delivery failed");
+                    }
                 }
             }
         });
@@ -590,6 +619,29 @@ impl Inner {
         .await;
         self.state.lock().unwrap().extension_results.remove(&id);
         result
+    }
+    /// Captures live Pi entries, then returns the native session file's history
+    /// only when it provably reconstructs the live conversation.
+    async fn pi_file_history(&self) -> Result<Option<history::History>> {
+        self.extension("paseo_capture_entries", json!({})).await?;
+        let (persistent, captured) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.config["internal"] != true && state.config["persistSession"] != false,
+                state.native_leaf.clone(),
+            )
+        };
+        let Some((path, leaf)) = captured.filter(|_| persistent) else {
+            return Ok(None);
+        };
+        match history::verified_pi_live(&self.spec.id, Path::new(&path), &leaf).await {
+            Ok(history) => Ok(history),
+            Err(error) => {
+                // Unverified, not fatal: callers fall back or refuse to mutate.
+                tracing::warn!(%error, "Pi native session file could not verify live history");
+                Ok(None)
+            }
+        }
     }
     async fn restart(self: &Arc<Self>, mode: &str) -> Result<()> {
         let (mut config, path, previous_id) = {
@@ -847,6 +899,7 @@ impl Session {
                 bridged_tools,
                 followed_children: HashSet::new(),
                 acknowledgement: None,
+                native_leaf: None,
             }),
             spec,
             context,
@@ -926,7 +979,11 @@ impl Session {
         }
         Ok(Arc::new(Self {
             inner,
-            capabilities: catalog::capabilities(omp, supports_mcp),
+            capabilities: catalog::session_capabilities(
+                omp,
+                supports_mcp,
+                !history_only && config["internal"] != true && config["persistSession"] != false,
+            ),
             history_events: if history_only {
                 loaded.take().map(|h| (h.events, h.complete))
             } else {
@@ -937,6 +994,11 @@ impl Session {
             initial_history: Mutex::new(loaded.map(|h| (h.events, h.complete))),
             original_persistence: if history_only { persistence } else { None },
         }))
+    }
+    /// Whether a native rewind result can be replayed from a persisted file.
+    fn rewindable(&self) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        self.capabilities["supportsRewindConversation"] == true && state.native["sessionFile"].is_string()
     }
     async fn prompt(&self, prompt: Value, options: Value, behavior: Option<&str>) -> Result<Value> {
         // Every refusal before the native request is spawned is proven undelivered.
@@ -1300,9 +1362,14 @@ impl AgentSession for Session {
             }
             return Ok(coverage);
         }
-        self.inner
-            .extension("paseo_capture_entries", json!({}))
-            .await?;
+        // Only the leaf-verified native file is complete. The context-window
+        // replay below may be compacted or drained, so it stays unverified.
+        if let Some(history) = self.inner.pi_file_history().await? {
+            for event in history.events {
+                sink.emit(event).await?;
+            }
+            return Ok(HistoryCoverage::Complete);
+        }
         let response = self
             .inner
             .runtime()?
@@ -1538,11 +1605,23 @@ impl AgentSession for Session {
         }
         let _gate = self.inner.operation.lock().await;
         let id = id.trim();
-        if self.inner.state.lock().unwrap().active.is_some() {
-            bail!("Cannot rewind conversation while a turn is active");
+        {
+            let state = self.inner.state.lock().unwrap();
+            if state.active.is_some() {
+                bail!("Cannot rewind conversation while a turn is active");
+            }
+            if state.dead || self.history_events.is_some() {
+                bail!("Cannot rewind conversation without a live provider session");
+            }
         }
         if id.trim().is_empty() {
             bail!("Rewind requires a user message id");
+        }
+        // The manager replaces canonical history from stream_history after this
+        // returns. A native mutation whose result cannot be replayed completely
+        // would strand the provider ahead of canonical history, so refuse first.
+        if !self.rewindable() {
+            bail!("Conversation rewind requires a persisted native session file; the conversation was not changed");
         }
         if self.inner.spec.family == "omp" {
             let result = self
@@ -1558,9 +1637,11 @@ impl AgentSession for Session {
             }
             self.inner.state.lock().unwrap().branch = Some(id.into());
         } else {
-            self.inner
-                .extension("paseo_capture_entries", json!({}))
-                .await?;
+            if self.inner.pi_file_history().await?.is_none() {
+                bail!(
+                    "Pi rewind requires a persisted, complete native session file whose leaf matches the live session; the conversation was not changed"
+                );
+            }
             if !self
                 .inner
                 .state

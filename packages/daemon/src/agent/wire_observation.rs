@@ -84,7 +84,7 @@ pub(super) async fn handle(
                                 owner.emit(json!({"type":"agent.timeline.replacement","payload":{"agentId":id,"epoch":event["epoch"]}})).await?;
                             } else {
                                 let timeline = app.agents.timeline(id,&json!({"direction":"tail","limit":0})).await?;
-                                let snapshot = app.agents.agent_snapshot(id).await?;
+                                let snapshot = app.agents.observe_agent_snapshot(id).await?;
                                 if let Some(rows) = timeline["rows"].as_array() {
                                     for row in rows {
                                         if supports_item(owner.context(),&row["item"]) {
@@ -148,7 +148,7 @@ pub(super) async fn handle(
                         }
                     } else {
                         let agent = manager
-                            .agent_snapshot(id)
+                            .observe_agent_snapshot(id)
                             .await?
                             .as_ref()
                             .map(snapshot_payload);

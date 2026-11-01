@@ -575,6 +575,10 @@ async fn active_entries_with_coverage(path: &Path, active_entry_id: Option<&str>
     let mut entries = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         match record(line) {
+            // OMP's title preamble is file metadata, not a session-tree entry.
+            Some(entry) if entry["type"] == "title" && entry["title"].is_string()
+                && entry.get("id").is_none() && entry.get("parentId").is_none()
+                && entry.get("message").is_none() => {}
             Some(entry) if entry["id"].is_string() => entries.push(entry),
             Some(_) => complete = false,
             None => complete = false,
@@ -763,6 +767,18 @@ pub async fn load_live(
         metadata.get("bridgedTools"),
     )
     .await
+}
+
+/// Pi appends every entry to an existing session file synchronously and resumes
+/// it with the file's last entry as the leaf. A complete file ending at the live
+/// runtime's leaf is therefore an authoritative replay of the live conversation,
+/// including after a tree rewind. Stale, newer, torn or missing files are not.
+pub async fn verified_pi_live(provider: &str, path: &Path, live_leaf: &Value) -> Result<Option<History>> {
+    if !live_leaf.is_string() {
+        return Ok(None);
+    }
+    let history = load_live("pi", provider, path, None, &Value::Null).await?;
+    Ok((history.complete && history.descriptor["activeBranchEntryId"] == *live_leaf).then_some(history))
 }
 
 fn push_event(history: &mut History, event: Value) {
@@ -1261,5 +1277,58 @@ fn normalize_comparison_path(value: &str, windows: bool) -> String {
         if root.is_empty() { ".".into() } else { root }
     } else {
         format!("{root}{}", parts.join("/"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(value: &str) -> Value {
+        json!([{"type":"text","text":value}])
+    }
+
+    /// A Pi file after `paseo_tree` rewound to u2: navigateTree moved the leaf
+    /// to a1, then the extension appended the paseo_rewind marker there.
+    fn rewound_session() -> String {
+        [
+            json!({"type":"session","id":"session","cwd":"/work","timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":text("first")}}),
+            json!({"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":text("one")}}),
+            json!({"type":"message","id":"u2","parentId":"a1","message":{"role":"user","content":text("second")}}),
+            json!({"type":"message","id":"a2","parentId":"u2","message":{"role":"assistant","content":text("two")}}),
+            json!({"type":"custom","id":"r1","parentId":"a1","customType":"paseo_rewind","data":{"targetId":"u2"}}),
+        ]
+        .iter()
+        .map(|entry| format!("{entry}\n"))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn pi_file_ending_at_live_leaf_replays_rewound_branch_completely() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        fs::write(&path, rewound_session()).await.unwrap();
+        let history = verified_pi_live("pi", &path, &json!("r1")).await.unwrap()
+            .expect("a complete file ending at the live leaf is authoritative");
+        let texts: Vec<_> = history.timeline.iter().filter_map(|item| item["text"].as_str()).collect();
+        assert_eq!(texts, ["first", "one"]);
+        assert_eq!(history.timeline[0]["messageId"], "u1");
+    }
+
+    #[tokio::test]
+    async fn pi_file_not_proven_at_live_leaf_is_not_authoritative() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        // Unflushed or older Pi: no file, or no live leaf evidence.
+        assert!(verified_pi_live("pi", &path, &json!("r1")).await.unwrap().is_none());
+        fs::write(&path, rewound_session()).await.unwrap();
+        // The live runtime is behind or ahead of the file, or reported no leaf.
+        for leaf in [json!("a2"), json!("a1"), json!("later"), Value::Null] {
+            assert!(verified_pi_live("pi", &path, &leaf).await.unwrap().is_none(), "{leaf}");
+        }
+        // A torn append can hide entries even when the last valid entry matches.
+        fs::write(&path, rewound_session() + "{\"type\":\"message\",\"id\":\"u3\"").await.unwrap();
+        assert!(verified_pi_live("pi", &path, &json!("r1")).await.unwrap().is_none());
     }
 }

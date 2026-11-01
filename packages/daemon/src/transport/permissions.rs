@@ -49,6 +49,7 @@ pub fn inbound(operation: &str) -> Option<&'static [&'static str]> {
         "hosts.list.request"
         | "agent.skills.get_status.request"
         | "daemon.get_status.request"
+        | "daemon.update.status.request"
         | "diagnostics.request"
         | "get_daemon_config_request"
         | "list_available_providers_request"
@@ -190,7 +191,10 @@ pub fn inbound(operation: &str) -> Option<&'static [&'static str]> {
         | "agent.skills.save_selection.request"
         | "agent.skills.uninstall.request"
         | "daemon.config.reload.request"
+        | "daemon.update.drain.release.request"
+        | "daemon.update.drain.request"
         | "daemon.update.request"
+        | "daemon.update.submit.request"
         | "plugin.catalog.get.request"
         | "plugin.directory.inspect.request"
         | "plugin.directory.install.request"
@@ -259,6 +263,7 @@ pub fn outbound(operation: &str) -> Option<&'static [&'static str]> {
         | "hosts.changed"
         | "agent.skills.get_status.response"
         | "daemon.get_status.response"
+        | "daemon.update.status.response"
         | "diagnostics.response"
         | "get_daemon_config_response"
         | "list_available_providers_response"
@@ -423,8 +428,11 @@ pub fn outbound(operation: &str) -> Option<&'static [&'static str]> {
         | "agent.skills.save_selection.response"
         | "agent.skills.uninstall.response"
         | "daemon.config.reload.response"
+        | "daemon.update.drain.release.response"
+        | "daemon.update.drain.response"
         | "daemon.update.progress"
         | "daemon.update.response"
+        | "daemon.update.submit.response"
         | "plugin.catalog.get.response"
         | "plugin.directory.inspect.response"
         | "plugin.directory.install.response"
@@ -456,7 +464,8 @@ pub fn outbound(operation: &str) -> Option<&'static [&'static str]> {
         | "fetch_workspaces_response"
         | "workspace.recovery.inspect.response"
         | "workspace_update" => Some(&["workspace.read", "hub.execute"]),
-        "session.events.set_subscription.response" => {
+        // Every UI that can read workspaces or daemon status must see a paused-admission notice.
+        "session.events.set_subscription.response" | "daemon.update.maintenance" => {
             Some(&["workspace.read", "daemon.read", "hub.execute"])
         }
         "archive_workspace_response"

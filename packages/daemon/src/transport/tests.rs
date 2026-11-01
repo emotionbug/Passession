@@ -642,3 +642,51 @@ async fn event_source_selection_requires_demand_authority_and_liveness() {
     source.detach();
     assert!(!transport.has_event_demand("providers_snapshot_update"));
 }
+
+#[tokio::test]
+async fn update_maintenance_reaches_subscribed_ui_but_never_legacy_or_unsubscribed_clients() {
+    const OPERATION: &str = "0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11";
+    let transport = TransportService::new(Weak::new());
+    let (ui, mut ui_output) = make_source("ui", true);
+    let (older, mut older_output) = make_source("older-modern", true);
+    let (legacy, mut legacy_output) = make_source("legacy", false);
+    transport.sessions.lock().unwrap().sessions.insert(
+        "owner".into(),
+        Session {
+            id: ui.session_id().into(),
+            permissions: ui.source.permissions.clone(),
+            sources: [&ui, &older, &legacy]
+                .into_iter()
+                .map(|source| (source.source_id().into(), Arc::downgrade(&source.source)))
+                .collect(),
+            retained_until: None,
+            ephemeral: false,
+            permission_ceiling: None,
+        },
+    );
+    // The host feed a current Flutter client installs through the real request path.
+    let feed = ui.for_request(json!({"type":"session.events.set_subscription.request","requestId":"feed","events":["status.server_info","daemon.update.maintenance"],"notifications":true}));
+    assert!(transport.handle(&feed, feed.request().unwrap()).await.unwrap());
+    assert_eq!(
+        json_frame(&ui_output.recv().await.unwrap())["message"]["type"],
+        "session.events.set_subscription.response"
+    );
+    for active in [true, false] {
+        transport
+            .publish_event(json!({"type":"daemon.update.maintenance","payload":{"operationId":OPERATION,"active":active}}))
+            .await
+            .unwrap();
+        let event = json_frame(&ui_output.recv().await.unwrap());
+        assert_eq!(event["message"]["type"], "daemon.update.maintenance");
+        assert_eq!(event["message"]["payload"]["operationId"], OPERATION);
+        assert_eq!(event["message"]["payload"]["active"], active);
+    }
+    // Clients that never asked for it (older apps, legacy protocol) are not sent an unknown type.
+    assert!(older_output.try_recv().is_err());
+    assert!(legacy_output.try_recv().is_err());
+    let notice = json!({"type":"daemon.update.maintenance","payload":{}});
+    for permission in ["workspace.read", "daemon.read", "hub.execute"] {
+        assert!(permissions::allows_outbound(&notice, |p| p == permission), "{permission}");
+    }
+    assert!(!permissions::allows_outbound(&notice, |p| p == "tunnel.manage"));
+}

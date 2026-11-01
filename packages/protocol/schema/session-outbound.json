@@ -264,6 +264,37 @@
       "properties": {
         "type": {
           "type": "string",
+          "const": "daemon.update.maintenance"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "subscriptionId": {
+              "type": "string"
+            },
+            "operationId": {
+              "type": "string"
+            },
+            "active": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "operationId",
+            "active"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
           "const": "agent.message_receipt.update"
         },
         "payload": {
@@ -69568,6 +69599,270 @@
       "properties": {
         "type": {
           "type": "string",
+          "const": "daemon.update.submit.response"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "object",
+              "properties": {
+                "schemaVersion": {
+                  "type": "integer"
+                },
+                "operationId": {
+                  "type": "string"
+                },
+                "phase": {
+                  "type": "string",
+                  "enum": [
+                    "admitted",
+                    "preparing",
+                    "staged",
+                    "draining",
+                    "activating",
+                    "verifying",
+                    "committed",
+                    "rolling_back",
+                    "rolled_back",
+                    "failed"
+                  ]
+                },
+                "terminal": {
+                  "type": "boolean"
+                },
+                "accepted": {
+                  "type": "boolean"
+                },
+                "serverId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "continuation": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "pending",
+                        "accepted",
+                        "not_delivered",
+                        "unknown",
+                        "failed"
+                      ]
+                    },
+                    "agentId": {
+                      "type": "string"
+                    },
+                    "messageId": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "state"
+                  ]
+                }
+              },
+              "required": [
+                "operationId",
+                "phase",
+                "terminal",
+                "accepted"
+              ]
+            }
+          },
+          "required": [
+            "requestId",
+            "operation"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "daemon.update.status.response"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "object",
+              "properties": {
+                "schemaVersion": {
+                  "type": "integer"
+                },
+                "operationId": {
+                  "type": "string"
+                },
+                "phase": {
+                  "type": "string",
+                  "enum": [
+                    "admitted",
+                    "preparing",
+                    "staged",
+                    "draining",
+                    "activating",
+                    "verifying",
+                    "committed",
+                    "rolling_back",
+                    "rolled_back",
+                    "failed"
+                  ]
+                },
+                "terminal": {
+                  "type": "boolean"
+                },
+                "accepted": {
+                  "type": "boolean"
+                },
+                "serverId": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "continuation": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "pending",
+                        "accepted",
+                        "not_delivered",
+                        "unknown",
+                        "failed"
+                      ]
+                    },
+                    "agentId": {
+                      "type": "string"
+                    },
+                    "messageId": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "state"
+                  ]
+                }
+              },
+              "required": [
+                "operationId",
+                "phase",
+                "terminal",
+                "accepted"
+              ]
+            }
+          },
+          "required": [
+            "requestId",
+            "operation"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "daemon.update.drain.response"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "requestId"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "daemon.update.drain.release.response"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "requestId"
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
           "const": "daemon.update.progress"
         },
         "payload": {
@@ -69583,6 +69878,15 @@
                 "downloading",
                 "installing",
                 "complete"
+              ]
+            },
+            "operationId": {
+              "type": "string"
+            },
+            "operationPhase": {
+              "type": [
+                "string",
+                "null"
               ]
             }
           },
@@ -69626,6 +69930,18 @@
               ]
             },
             "newVersion": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "operationId": {
+              "type": "string"
+            },
+            "accepted": {
+              "type": "boolean"
+            },
+            "operationPhase": {
               "type": [
                 "string",
                 "null"

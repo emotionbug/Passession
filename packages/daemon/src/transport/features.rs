@@ -26,6 +26,7 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
         "forgeCheckDetails",
         "forgeSearch",
         "daemonConfigReload",
+        "durableDaemonUpdates",
         "pushTokenRevocation",
         "plugins",
         "pluginManagement",

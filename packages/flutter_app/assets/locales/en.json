@@ -273,6 +273,7 @@
       "failedToLoad": "Failed to load agent",
       "reconnecting": "Reconnecting to host",
       "updating": "Updating messages",
+      "daemonMaintenance": "Host daemon is updating. New messages and agents are paused until it finishes; you can still stop agents, close items, and answer permission requests.",
       "timelineSyncFailed": "Couldn't refresh agent history.",
       "timelineSyncRetrying": "Retrying…",
       "archivingTitle": "Archiving agent...",
@@ -669,7 +670,6 @@
       "confirmations": {
         "close": "Close",
         "cancel": "Cancel",
-        "archive": "Archive",
         "unsavedTitle": "Unsaved changes",
         "unsavedMessage": "This tab has changes that have not been saved. Closing it will discard the draft.",
         "closeWithoutSaving": "Close without saving",
@@ -677,8 +677,6 @@
         "bulkUnsaved": "{{count}} tab(s) have unsaved changes. Closing will discard those drafts.",
         "closeTerminalTitle": "Close terminal?",
         "closeTerminalMessage": "Any running process in this terminal will be stopped immediately.",
-        "archiveRunningAgentTitle": "Archive running agent?",
-        "archiveRunningAgentMessage": "This agent is still running. Archiving it will stop the agent and close the tab.",
         "closeTabsLeftTitle": "Close tabs to the left?",
         "closeTabsRightTitle": "Close tabs to the right?",
         "closeOtherTabsTitle": "Close other tabs?",
@@ -686,10 +684,8 @@
           "all": "This will archive {{agents}} agent(s), close {{terminals}} terminal(s), and close {{tabs}} tab(s). Any running process in a closed terminal will be stopped immediately.",
           "agentsAndTerminals": "This will archive {{agents}} agent(s) and close {{terminals}} terminal(s). Any running process in a closed terminal will be stopped immediately.",
           "terminalsAndTabs": "This will close {{terminals}} terminal(s) and close {{tabs}} tab(s). Any running process in a closed terminal will be stopped immediately.",
-          "agentsAndTabs": "This will archive {{agents}} agent(s) and close {{tabs}} tab(s).",
           "terminals": "This will close {{terminals}} terminal(s). Any running process in a closed terminal will be stopped immediately.",
-          "tabs": "This will close {{tabs}} tab(s).",
-          "agents": "This will archive {{agents}} agent(s)."
+          "tabs": "This will close {{tabs}} tab(s). Sessions will not be archived or stopped."
         }
       }
     },
@@ -2599,7 +2595,21 @@
           "offlineMessage": "This host is offline. Wait until it is back online before updating.",
           "requestFailedTitle": "Update failed",
           "requestFailedMessage": "Failed to update the daemon: {{error}}",
-          "dialogFailedMessage": "Unable to open the update confirmation dialog."
+          "dialogFailedMessage": "Unable to open the update confirmation dialog.",
+          "phaseDraining": "Waiting for running agents...",
+          "phaseActivating": "Restarting daemon...",
+          "phaseVerifying": "Verifying new daemon...",
+          "phaseRollingBack": "Restoring previous daemon...",
+          "committedTitle": "Daemon updated to {{version}}",
+          "committedMessage": "The new daemon passed its readiness and identity checks.",
+          "continuationUnconfirmed": "The update is committed. The requested session resume is {{state}}.",
+          "continuationRetained": "The update is committed. The requested session resume is {{state}}; reopen this page to check it again. The update is not resubmitted.",
+          "continuationAccepted": "The update is committed and the requested session resumed.",
+          "rolledBackTitle": "Update rolled back",
+          "rolledBackMessage": "The previous daemon was restored (operation {{id}}). {{error}}",
+          "operationFailedMessage": "Update operation {{id}} failed; recovery data was kept on the host. {{error}}",
+          "stillRunningTitle": "Update still in progress",
+          "stillRunningMessage": "Update operation {{id}} has not finished yet. It continues on the host; reopen this page to keep watching."
         },
         "dangerZone": "Danger zone",
         "remove": {

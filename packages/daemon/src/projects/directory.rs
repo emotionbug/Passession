@@ -293,6 +293,7 @@ struct Contributions {
     bucket: Bucket,
     agents: Vec<usize>,
     activity: Vec<(Bucket, String)>,
+    subagents_unavailable: Vec<Value>,
 }
 
 fn resolve_entered_at(
@@ -355,7 +356,7 @@ async fn build_entries_ref(
     workspaces: &[Value],
     projects: &[Value],
 ) -> Result<Vec<Value>> {
-    let (agents, message_times, provider_activity) = tokio::try_join!(
+    let (agents, message_times, (provider_activity, unavailable_subagents)) = tokio::try_join!(
         app.agents.list_snapshots(),
         app.agents.workspace_last_user_message_times(),
         app.agents.list_provider_subagent_activity()
@@ -419,6 +420,7 @@ async fn build_entries_ref(
             bucket: Bucket::Done,
             agents: Vec::new(),
             activity: Vec::new(),
+            subagents_unavailable: Vec::new(),
         };
         for terminal in app.terminals.list(Some(id), None).await {
             // Ownership is the workspace id, never its shared checkout directory.
@@ -476,6 +478,21 @@ async fn build_entries_ref(
             }
         }
     }
+    for unavailable in &unavailable_subagents {
+        let Some(parent) = active_agents.get(unavailable.parent.as_str()) else {
+            continue;
+        };
+        let Some(root) = workspace_root_agent(parent, &active_agents) else {
+            continue;
+        };
+        if let Some(contribution) = contributions.get_mut(text(root, "workspaceId")) {
+            contribution.subagents_unavailable.push(json!({
+                "parentAgentId": unavailable.parent,
+                "subagentId": unavailable.child,
+                "error": unavailable.to_string(),
+            }));
+        }
+    }
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut state = app
         .projects
@@ -504,6 +521,9 @@ async fn build_entries_ref(
         entry["status"] = json!(contribution.bucket.name());
         entry["statusEnteredAt"] = json!(at);
         entry["archivingAt"] = archiving;
+        if !contribution.subagents_unavailable.is_empty() {
+            entry["subagentActivityUnavailable"] = json!(contribution.subagents_unavailable);
+        }
     }
     Ok(entries)
 }

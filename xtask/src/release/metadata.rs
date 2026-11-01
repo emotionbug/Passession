@@ -264,7 +264,7 @@ pub(super) fn set_version(args: &[String]) -> Result<()> {
     Ok(())
 }
 fn build_number() -> Result<u64> {
-    let number: u64 = var("PASEO_BUILD_NUMBER", &var("ANDROID_VERSION_CODE", "13001")).parse()?;
+    let number: u64 = var("PASEO_BUILD_NUMBER", &var("ANDROID_VERSION_CODE", "13002")).parse()?;
     ensure!(
         number > 13000 && number <= 2_100_000_000,
         "Android build number must exceed legacy floor 13000 and fit Android versionCode"

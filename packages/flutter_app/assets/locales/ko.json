@@ -273,6 +273,7 @@
       "failedToLoad": "에이전트를 불러오지 못했습니다",
       "reconnecting": "호스트에 다시 연결하는 중",
       "updating": "메시지 업데이트 중",
+      "daemonMaintenance": "호스트 데몬을 업데이트하는 중입니다. 완료될 때까지 새 메시지와 에이전트 생성이 중단됩니다. 에이전트 중지, 항목 닫기, 권한 요청 응답은 계속할 수 있습니다.",
       "timelineSyncFailed": "에이전트 기록을 새로고침할 수 없습니다.",
       "timelineSyncRetrying": "재시도 중…",
       "archivingTitle": "에이전트 보관 중...",
@@ -672,7 +673,6 @@
       "confirmations": {
         "close": "닫기",
         "cancel": "취소",
-        "archive": "보관",
         "unsavedTitle": "저장되지 않은 변경사항",
         "unsavedMessage": "이 탭에는 저장되지 않은 변경사항이 있습니다. 닫으면 초안이 삭제됩니다.",
         "closeWithoutSaving": "저장하지 않고 닫기",
@@ -680,8 +680,6 @@
         "bulkUnsaved": "{{count}} 탭에 저장되지 않은 변경 사항이 있습니다. 종료하면 해당 초안이 삭제됩니다.",
         "closeTerminalTitle": "터미널을 닫을까요?",
         "closeTerminalMessage": "이 터미널에서 실행 중인 프로세스가 즉시 중지됩니다.",
-        "archiveRunningAgentTitle": "실행 중인 에이전트를 보관할까요?",
-        "archiveRunningAgentMessage": "이 에이전트는 아직 실행 중입니다. 보관하면 에이전트가 중지되고 탭이 닫힙니다.",
         "closeTabsLeftTitle": "왼쪽 탭을 닫을까요?",
         "closeTabsRightTitle": "오른쪽 탭을 닫을까요?",
         "closeOtherTabsTitle": "다른 탭을 닫을까요?",
@@ -689,10 +687,8 @@
           "all": "에이전트 {{agents}}개를 보관하고, 터미널 {{terminals}}개를 닫고, 탭 {{tabs}}개를 닫습니다. 닫히는 터미널에서 실행 중인 프로세스는 즉시 중지됩니다.",
           "agentsAndTerminals": "에이전트 {{agents}}개를 보관하고 터미널 {{terminals}}개를 닫습니다. 닫히는 터미널에서 실행 중인 프로세스는 즉시 중지됩니다.",
           "terminalsAndTabs": "터미널 {{terminals}}개를 닫고 탭 {{tabs}}개를 닫습니다. 닫히는 터미널에서 실행 중인 프로세스는 즉시 중지됩니다.",
-          "agentsAndTabs": "에이전트 {{agents}}개를 보관하고 탭 {{tabs}}개를 닫습니다.",
           "terminals": "터미널 {{terminals}}개를 닫습니다. 닫히는 터미널에서 실행 중인 프로세스는 즉시 중지됩니다.",
-          "tabs": "탭 {{tabs}}개를 닫습니다.",
-          "agents": "에이전트 {{agents}}개를 보관합니다."
+          "tabs": "탭 {{tabs}}개를 닫습니다. 세션은 보관되거나 중지되지 않습니다."
         }
       }
     },
@@ -2617,7 +2613,21 @@
           "offlineMessage": "이 호스트는 오프라인 상태입니다. 업데이트하기 전에 다시 온라인 상태가 될 때까지 기다리십시오.",
           "requestFailedTitle": "업데이트 실패",
           "requestFailedMessage": "데몬 업데이트 실패: {{error}}",
-          "dialogFailedMessage": "업데이트 확인 대화 상자를 열 수 없습니다."
+          "dialogFailedMessage": "업데이트 확인 대화 상자를 열 수 없습니다.",
+          "phaseDraining": "실행 중인 에이전트를 기다리는 중...",
+          "phaseActivating": "데몬 재시작 중...",
+          "phaseVerifying": "새 데몬 확인 중...",
+          "phaseRollingBack": "이전 데몬 복원 중...",
+          "committedTitle": "데몬이 {{version}}(으)로 업데이트됨",
+          "committedMessage": "새 데몬이 준비 상태와 식별 정보 확인을 통과했습니다.",
+          "continuationUnconfirmed": "업데이트는 완료되었습니다. 요청한 세션 재개 상태: {{state}}.",
+          "continuationRetained": "업데이트는 완료되었습니다. 요청한 세션 재개 상태: {{state}}. 이 페이지를 다시 열면 다시 확인하며, 업데이트를 다시 제출하지 않습니다.",
+          "continuationAccepted": "업데이트가 완료되었고 요청한 세션이 재개되었습니다.",
+          "rolledBackTitle": "업데이트 롤백됨",
+          "rolledBackMessage": "이전 데몬을 복원했습니다(작업 {{id}}). {{error}}",
+          "operationFailedMessage": "업데이트 작업 {{id}}이(가) 실패했습니다. 복구 자료는 호스트에 보존되었습니다. {{error}}",
+          "stillRunningTitle": "업데이트 진행 중",
+          "stillRunningMessage": "업데이트 작업 {{id}}이(가) 아직 끝나지 않았습니다. 호스트에서 계속 진행되며, 이 페이지를 다시 열면 계속 확인합니다."
         },
         "dangerZone": "위험 구역",
         "remove": {

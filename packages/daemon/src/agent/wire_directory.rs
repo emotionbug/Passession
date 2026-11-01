@@ -89,7 +89,7 @@ pub(super) async fn handle(
                 let Some(id) = resolve(manager, text(request, "agentId")).await? else {
                     return Ok(json!({"agent":null,"project":null,"error":null}));
                 };
-                let Some(agent) = manager.agent_snapshot(&id).await? else {
+                let Some(agent) = manager.observe_agent_snapshot(&id).await? else {
                     return Ok(json!({"agent":null,"project":null,"error":null}));
                 };
                 if !provider_visible(context, text(&agent, "provider")) {
