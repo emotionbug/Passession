@@ -127,6 +127,11 @@ impl AgentManager {
     }
     pub(super) async fn discard_failed_registration(&self, id: &str, cell: &Arc<AgentCell>) {
         let _mutation = cell.mutation.lock().await;
+        {
+            let mut data = cell.data.lock().await;
+            data.owner_ended = true;
+            cell.owner_ended.cancel();
+        }
         cell.cancel.cancel();
         let session = cell.data.lock().await.session.take();
         if let Some(session) = session {
@@ -179,6 +184,9 @@ impl AgentManager {
             self.hydrate_history(id, cell, false).await?;
         }
         let _commit = cell.commit.lock().await;
+        if cell.data.lock().await.owner_ended {
+            bail!("Agent provider session ended during registration");
+        }
         let mut snapshot = cell.data.lock().await.snapshot.clone();
         snapshot["capabilities"] = capabilities;
         snapshot["features"] = json!(session.features().as_ref());
@@ -241,6 +249,8 @@ impl AgentManager {
             let data = cell.data.lock().await;
             if data.ready
                 && data.history_primed
+                && data.session.is_some()
+                && !data.owner_ended
                 && data.event_error.is_none()
                 && !force_history
                 && overrides.as_object().is_none_or(|o| o.is_empty())
@@ -479,7 +489,7 @@ impl AgentManager {
         if let Ok(cell) = self.cell(id).await {
             let ready = {
                 let data = cell.data.lock().await;
-                data.ready && data.history_primed && data.session.is_some() && data.event_error.is_none()
+                data.ready && data.history_primed && data.session.is_some() && !data.owner_ended && data.event_error.is_none()
             };
             if ready {
                 return Ok(cell);
@@ -614,10 +624,22 @@ impl AgentManager {
             self.apply_subagent_event(id, cell, &event).await?;
             return Ok(());
         }
-        let mut snapshot = cell.data.lock().await.snapshot.clone();
-        let ready = cell.data.lock().await.ready;
+        let (mut snapshot, ready, owner_ended) = {
+            let data = cell.data.lock().await;
+            (data.snapshot.clone(), data.ready, data.owner_ended)
+        };
         let previous_lifecycle = snapshot["lifecycle"].as_str().map(str::to_owned);
         let kind = required(&event, "type")?.to_owned();
+        let session_ended = !from_history && kind == "turn_failed" && event["sessionEnded"] == true;
+        if owner_ended && (matches!(kind.as_str(), "turn_started" | "turn_completed" | "turn_canceled")
+            || (kind == "turn_failed" && snapshot["lifecycle"] == "closed")) {
+            return Ok(());
+        }
+        if session_ended {
+            // Process exit terminates the session, not just the provider turn that
+            // happened to be current when the process watcher observed it.
+            event["turnId"] = snapshot["activeTurnId"].clone();
+        }
         let mut turn = text(&event, "turnId").map(str::to_owned);
         if turn.is_none()
             && !from_history
@@ -648,7 +670,7 @@ impl AgentManager {
         } else {
             false
         };
-        if stale
+        if stale && !session_ended
             && matches!(
                 kind.as_str(),
                 "turn_started" | "turn_completed" | "turn_failed" | "turn_canceled"
@@ -687,11 +709,18 @@ impl AgentManager {
                 }
             }
             "turn_completed" | "turn_canceled" | "turn_failed" => {
-                if stale {
+                if stale && !session_ended {
                     dispatch = false;
                 } else if !from_history {
                     let replacing = {
                         let mut data = cell.data.lock().await;
+                        if session_ended {
+                            data.owner_ended = true;
+                            data.session = None;
+                            data.pending_replacement = false;
+                            snapshot["_live"] = json!(false);
+                            cell.owner_ended.cancel();
+                        }
                         if let Some(turn) = &turn {
                             if !data.finalized.contains(turn) {
                                 data.finalized.push_back(turn.clone());
@@ -1065,6 +1094,13 @@ impl AgentManager {
     }
     pub(super) async fn close_cell(&self, id: &str, cell: &Arc<AgentCell>) -> Result<()> {
         let _mutation = cell.mutation.lock().await;
+        if cell.data.lock().await.event_error.is_some() {
+            // Failed-owner cleanup may still be running or may retain a process
+            // whose close failed. Join it before deciding who must be closed.
+            if let Some(task) = cell.task.lock().await.take() {
+                let _ = task.await;
+            }
+        }
         let session = cell.data.lock().await.session.clone();
         let mut event_error = if let Some(session) = session {
             session.close().await?;
@@ -1073,6 +1109,8 @@ impl AgentManager {
             } else {
                 self.drain_events(cell).await.err()
             }
+        } else if cell.data.lock().await.owner_ended && !cell.cancel.is_cancelled() {
+            self.drain_events(cell).await.err()
         } else {
             None
         };
@@ -1099,6 +1137,9 @@ impl AgentManager {
             }
         }
         let mut snapshot = cell.data.lock().await.snapshot.clone();
+        if is_busy(&snapshot) || snapshot["activeForegroundTurnId"].is_string() {
+            snapshot["lastTurnOutcome"] = json!("turn_canceled");
+        }
         snapshot["lifecycle"] = json!("closed");
         snapshot["status"] = json!("closed");
         snapshot["activeTurnId"] = Value::Null;
@@ -1107,7 +1148,6 @@ impl AgentManager {
         snapshot["pendingPermissions"] = json!([]);
         snapshot["_live"] = json!(false);
         self.commit_snapshot(cell, snapshot.clone()).await?;
-        cell.data.lock().await.session = None;
         if snapshot["internal"] != true {
             let _ = self
                 .app()?
@@ -1249,21 +1289,39 @@ pub(super) fn transition_attention(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::providers::api::{AgentProvider, LaunchContext, ProviderSpec};
     use crate::providers::pi_omp::JsonlProvider;
     use crate::transport::{OutboundFrame, RequestContext};
 
-    async fn staged_cell(app: &Arc<AppState>, id: &str) -> Arc<AgentCell> {
+    pub(in crate::agent) async fn staged_cell(app: &Arc<AppState>, id: &str) -> Arc<AgentCell> {
         let manager = &app.agents;
         let snapshot = json!({
             "id":id,"provider":"mock","internal":true,
             "config":{},"updatedAt":now(),"requiresAttention":false
         });
         let (cell, receiver) = manager.make_cell(id, snapshot, true).await.unwrap();
+        let session = crate::providers::development::DevelopmentProvider::new("mock").unwrap()
+            .create_session(
+                json!({}),
+                LaunchContext {
+                    agent_id: id.into(),
+                    home: app.home.clone(),
+                    executable: app.executable.clone(),
+                    env: BTreeMap::new(),
+                    mcp_servers: json!({}),
+                    tool_catalog: json!([]),
+                    tool_manifest: json!([]),
+                    tool_executor: None,
+                    cancel: cell.cancel.child_token(),
+                },
+                json!({}),
+                cell.sink.clone(),
+            ).await.unwrap();
         {
             let mut data = cell.data.lock().await;
+            data.session = Some(session);
             data.ready = true;
             data.snapshot["lifecycle"] = json!("running");
             data.snapshot["status"] = json!("running");
@@ -1333,6 +1391,9 @@ mod tests {
         assert_eq!(snapshot["lifecycle"], "error");
         assert_eq!(snapshot["lastTurnOutcome"], "turn_failed");
         assert_eq!(snapshot["activeTurnId"], Value::Null);
+        assert_eq!(snapshot["_live"], false);
+        assert!(cell.data.lock().await.session.is_none());
+        assert!(cell.owner_ended.is_cancelled());
         assert!(cell.barriers.lock().await.is_empty());
         assert!(manager.update_snapshot(&cell, |snapshot| {
             snapshot["lifecycle"] = json!("running");
@@ -1343,6 +1404,108 @@ mod tests {
         assert_eq!(cell.data.lock().await.snapshot["activeTurnId"], Value::Null);
         manager.close_cell(id, &cell).await.unwrap();
         assert!(manager.cell(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_exit_clears_ownership_preserves_fifo_and_rejects_late_ack() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(home.clone()) }).await;
+        let id = "00000000-0000-4000-8000-000000000004";
+        let cell = staged_cell(&app, id).await;
+        {
+            let mut data = cell.data.lock().await;
+            data.snapshot["internal"] = json!(false);
+            data.snapshot["cwd"] = json!(root.path());
+            data.snapshot["createdAt"] = json!(now());
+            data.snapshot["pendingPermissions"] = json!([{"id":"permission"}]);
+            data.pending_replacement = true;
+        }
+        cell.sink.emit(json!({
+            "type":"timeline","provider":"mock","turnId":"live-turn",
+            "item":{"type":"assistant_message","text":"last output","messageId":"last"}
+        })).await.unwrap();
+        cell.sink.emit(json!({
+            "type":"turn_failed","provider":"mock","turnId":"live-turn",
+            "sessionEnded":true,"error":"Provider process exited"
+        })).await.unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert!(manager.session(id).await.unwrap().is_some());
+        manager.record_submitted(id, &cell, &json!("submitted prompt"), Some("client"), Some("live-turn"), false).await.unwrap();
+        manager.release_event_stage(&cell).await.unwrap();
+        let snapshot = manager.agent_snapshot(id).await.unwrap().unwrap();
+        assert_eq!(snapshot["lifecycle"], "error");
+        assert_eq!(snapshot["lastTurnOutcome"], "turn_failed");
+        assert_eq!(snapshot["_live"], false);
+        assert!(snapshot["activeTurn"].is_null());
+        assert!(snapshot["activeTurnId"].is_null());
+        assert!(snapshot["activeForegroundTurnId"].is_null());
+        assert_eq!(snapshot["pendingPermissions"], json!([]));
+        assert!(manager.session(id).await.unwrap().is_none());
+        assert!(!manager.has_in_flight_run(id).await.unwrap());
+        assert!(cell.owner_ended.is_cancelled());
+        assert!(!cell.data.lock().await.pending_replacement);
+        assert!(cell.barriers.lock().await.is_empty());
+        {
+            let timeline = cell.timeline.lock().unwrap();
+            let rows = timeline.rows();
+            assert_eq!(rows[0]["item"]["text"], "submitted prompt");
+            assert_eq!(rows[1]["item"]["text"], "last output");
+            assert_eq!(rows[2]["item"]["text"], "[System Error] Provider process exited");
+        }
+        assert!(manager.update_snapshot(&cell, |snapshot| {
+            snapshot["lifecycle"] = json!("running");
+            snapshot["activeTurnId"] = json!("late-ack");
+            Ok(())
+        }).await.is_err());
+        cell.sink.emit(json!({"type":"turn_completed","provider":"mock","turnId":"live-turn"})).await.unwrap();
+        cell.sink.emit(json!({"type":"turn_started","provider":"mock","turnId":"late-start"})).await.unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        let stored = AgentStorage::new(home).get(id).await.unwrap().unwrap();
+        assert_eq!(stored["lastStatus"], "error");
+        assert_eq!(stored["lastTurnOutcome"], "turn_failed");
+        assert_eq!(manager.agent_snapshot(id).await.unwrap().unwrap()["lifecycle"], "error");
+        manager.close_cell(id, &cell).await.unwrap();
+        assert!(manager.cell(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unexpected_event_consumer_end_settles_active_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::new(root.path().join("home"), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000005";
+        let cell = staged_cell(&app, id).await;
+        manager.release_event_stage(&cell).await.unwrap();
+        cell.cancel.cancel();
+        cell.task.lock().await.take().unwrap().await.unwrap();
+        let snapshot = manager.agent_snapshot(id).await.unwrap().unwrap();
+        assert_eq!(snapshot["lifecycle"], "error");
+        assert_eq!(snapshot["_live"], false);
+        assert!(snapshot["activeTurnId"].is_null());
+        assert!(manager.session(id).await.unwrap().is_none());
+        assert!(cell.owner_ended.is_cancelled());
+        manager.close_cell(id, &cell).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_without_terminal_event_records_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::new(root.path().join("home"), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000006";
+        let cell = staged_cell(&app, id).await;
+        manager.release_event_stage(&cell).await.unwrap();
+        manager.close_cell(id, &cell).await.unwrap();
+        let data = cell.data.lock().await;
+        assert_eq!(data.snapshot["lifecycle"], "closed");
+        assert_eq!(data.snapshot["lastTurnOutcome"], "turn_canceled");
+        assert_eq!(data.snapshot["_live"], false);
+        assert!(data.snapshot["activeTurnId"].is_null());
+        assert!(data.session.is_none());
+        assert!(cell.owner_ended.is_cancelled());
     }
 
     async fn timeline_request(manager: &AgentManager, id: &str, options: Value) -> Value {

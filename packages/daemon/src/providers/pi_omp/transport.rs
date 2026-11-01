@@ -175,9 +175,6 @@ impl Transport {
                     Ok(false) => break,
                     Err(error) => {
                         reader.fail(&error.to_string());
-                        let _ = events
-                            .send(json!({"type":"process_exit","error":error.to_string()}))
-                            .await;
                         let _ = reader.process.terminate(Duration::from_secs(2)).await;
                         break;
                     }
@@ -283,13 +280,18 @@ impl Transport {
         mut command: Value,
         timeout: Option<Duration>,
     ) -> Result<(String, Value)> {
-        if self.closed.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire) {
-            bail!("JSONL provider process is closed");
-        }
         let id = format!("req_{}", self.sequence.fetch_add(1, Ordering::Relaxed));
         command["id"] = json!(id);
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id.clone(), sender);
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire) {
+                bail!("JSONL provider process is closed");
+            }
+            // Exit drains this same map after setting exited; never install a
+            // waiter behind that drain.
+            pending.insert(id.clone(), sender);
+        }
         if let Err(error) = self.send(&command).await {
             self.pending.lock().unwrap().remove(&id);
             return Err(error);
@@ -318,7 +320,7 @@ impl Transport {
         }
     }
     pub async fn send(&self, value: &Value) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.exited.load(Ordering::Acquire) {
             bail!("JSONL process is closed");
         }
         match self.process.write_json(value).await {

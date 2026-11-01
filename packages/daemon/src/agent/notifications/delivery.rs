@@ -70,7 +70,29 @@ impl AgentMessageDelivery {
             }),
         }
     }
-    pub async fn enqueue(&self, mut input: Value) -> Result<MessageReceipt> {
+    pub(crate) fn try_reserve(&self) -> Result<OwnedSemaphorePermit> {
+        self.inner.capacity.clone().try_acquire_owned().map_err(|error| {
+            match error {
+                tokio::sync::TryAcquireError::Closed => anyhow!("Agent message delivery is closed"),
+                tokio::sync::TryAcquireError::NoPermits => anyhow!("Agent message delivery queue is full"),
+            }
+        })
+    }
+    pub async fn enqueue(&self, input: Value) -> Result<MessageReceipt> {
+        let permit = self
+            .inner
+            .capacity
+            .clone()
+            .acquire_owned()
+            .await
+            .context("Agent message delivery is closed")?;
+        self.enqueue_reserved(input, permit).await
+    }
+    pub(crate) async fn enqueue_reserved(
+        &self,
+        mut input: Value,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<MessageReceipt> {
         let recipient_id = input["recipientId"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -86,13 +108,6 @@ impl AgentMessageDelivery {
             .take();
         let (prompt, _) = prepare_agent_message(prompt, Some(&input["source"]), Some(&id))?;
         input["prompt"] = prompt;
-        let permit = self
-            .inner
-            .capacity
-            .clone()
-            .acquire_owned()
-            .await
-            .context("Agent message delivery is closed")?;
         let (complete, result) = watch::channel(None);
         let receipt = MessageReceipt {
             message_id: id.clone(),
@@ -361,5 +376,133 @@ mod tests {
             receipt.dispatched(CancellationToken::new()).await.unwrap(),
             "steered"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_admission_and_duplicate_do_not_wait_for_dispatch() -> Result<()> {
+        use crate::agent::receipts::MessageReceipts;
+        let home = tempfile::tempdir()?;
+        let receipts = MessageReceipts::new(home.path().to_owned());
+        let request = json!({"prompt":"hello"});
+        let (complete, result) = watch::channel(None);
+        let pending = MessageReceipt { message_id: "message".into(), result };
+        let (accepted, owner) = tokio::time::timeout(
+            Duration::from_secs(1),
+            receipts.enqueue("agent", "message", &request, || Ok(()), |_| async { Ok(pending) }),
+        )
+        .await??
+        .unwrap();
+        assert!(owner);
+        // The pending receipt is already durable, but cannot be replayed by a
+        // reconstructed daemon without proof of dispatch.
+        let restarted = MessageReceipts::new(home.path().to_owned());
+        let error = restarted
+            .enqueue("agent", "message", &request, || Ok(()), |_| async {
+                panic!("restart must not enqueue an uncertain message")
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "agent_request_outcome_unknown");
+        let (duplicate, owner) = tokio::time::timeout(
+            Duration::from_secs(1),
+            receipts.enqueue("agent", "message", &request, || Ok(()), |_| async {
+                panic!("live duplicate must not enqueue twice")
+            }),
+        )
+        .await??
+        .unwrap();
+        assert!(!owner);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(accepted.dispatched(cancel).await.is_err());
+        drop(accepted);
+        complete.send_replace(Some(Ok(json!({"disposition":"steered"}))));
+        duplicate.dispatched(CancellationToken::new()).await?;
+        receipts.finish_queued("agent", "message", true).await?;
+        assert!(
+            restarted
+                .enqueue("agent", "message", &request, || Ok(()), |_| async {
+                    panic!("completed receipt must not enqueue again")
+                })
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_dispatch_owner_releases_waiter_and_preserves_unknown_outcome() -> Result<()> {
+        use crate::agent::receipts::MessageReceipts;
+        let home = tempfile::tempdir()?;
+        let receipts = MessageReceipts::new(home.path().to_owned());
+        let (complete, result) = watch::channel(None);
+        let request = json!({"prompt":"hello"});
+        let (receipt, owner) = receipts
+            .enqueue("agent", "message", &request, || Ok(()), |_| async {
+                Ok(MessageReceipt { message_id: "message".into(), result })
+            })
+            .await?
+            .unwrap();
+        assert!(owner);
+        drop(complete);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                receipt.dispatched(CancellationToken::new()),
+            )
+            .await?
+            .is_err()
+        );
+        receipts.finish_queued("agent", "message", false).await?;
+        let error = receipts
+            .enqueue("agent", "message", &request, || Ok(()), |_| async {
+                panic!("failed dispatch must not be retried implicitly")
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "agent_request_outcome_unknown");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_or_closed_queue_rejects_before_durable_admission() -> Result<()> {
+        use crate::agent::receipts::MessageReceipts;
+        let home = tempfile::tempdir()?;
+        let receipts = MessageReceipts::new(home.path().to_owned());
+        let queue = AgentMessageDelivery::new(Weak::new());
+        let request = json!({"recipientId":"agent","messageId":"message","prompt":"hello","source":{"kind":"agent-message","agentId":"sender"}});
+        let full = queue.inner.capacity.clone().acquire_many_owned(QUEUE_CAPACITY as u32).await?;
+        let error = receipts
+            .enqueue("agent", "message", &request, || queue.try_reserve(), |permit| {
+                queue.enqueue_reserved(request.clone(), permit)
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "Agent message delivery queue is full");
+        drop(full);
+        queue.shutdown().await?;
+        let error = receipts
+            .enqueue("agent", "message", &request, || queue.try_reserve(), |permit| {
+                queue.enqueue_reserved(request.clone(), permit)
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "Agent message delivery is closed");
+        let queue = AgentMessageDelivery::new(Weak::new());
+        let (receipt, owner) = receipts
+            .enqueue("agent", "message", &request, || queue.try_reserve(), |permit| {
+                queue.enqueue_reserved(request.clone(), permit)
+            })
+            .await?
+            .unwrap();
+        assert!(owner, "failed reservation must leave the message retryable");
+        queue.shutdown().await?;
+        assert!(receipt.dispatched(CancellationToken::new()).await.is_err());
+        receipts.finish_queued("agent", "message", false).await?;
+        Ok(())
     }
 }

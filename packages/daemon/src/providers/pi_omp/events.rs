@@ -406,7 +406,7 @@ impl Mapper {
                 }
                 if e["type"]!="turn_completed"{out.extend(self.cancel_work());}self.end_turn();out.push(e);
             }
-            "process_exit"=>{if self.turn.is_some(){let mut e=self.event("turn_failed");e["error"]=json!(frame["error"].as_str().unwrap_or("Provider process exited"));out.extend(self.cancel_work());self.end_turn();out.push(e);}},
+            "process_exit"=>{let mut e=self.event("turn_failed");e["sessionEnded"]=json!(true);e["error"]=json!(frame["error"].as_str().unwrap_or("Provider process exited"));out.extend(self.cancel_work());self.end_turn();out.push(e);},
             _=>{}
         }
         out
@@ -586,6 +586,25 @@ fn terminal_error(family: &str, message: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_exit_reports_session_end_during_and_between_turns() {
+        for family in ["pi", "omp"] {
+            let mut mapper = Mapper::new(family, family);
+            for active in [false, true] {
+                if active {
+                    mapper.begin_turn("turn");
+                }
+                let events = mapper.map(&json!({"type":"process_exit","error":"terminated"}));
+                let terminal = events.last().unwrap();
+                assert_eq!(terminal["type"], "turn_failed");
+                assert_eq!(terminal["sessionEnded"], true);
+                assert_eq!(terminal["error"], "terminated");
+                assert_eq!(terminal["turnId"], if active { json!("turn") } else { Value::Null });
+                assert!(mapper.turn.is_none());
+            }
+        }
+    }
 
     #[test]
     fn streams_missing_snapshots_and_reconciles_terminal_content() {

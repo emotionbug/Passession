@@ -18,6 +18,13 @@ impl AgentManager {
             } else {
                 None
             };
+        // Capture advisory status before admission. Once accepted, the queued
+        // response must not wait on recipient delivery or its runtime locks.
+        let status = self
+            .agent_snapshot(id)
+            .await?
+            .ok_or_else(|| anyhow!("Agent '{id}' not found"))?["status"]
+            .clone();
         let prompt = build_prompt(&input)?;
         let message_id = text(&input, "messageId")
             .or_else(|| text(&input, "clientMessageId"))
@@ -57,44 +64,61 @@ impl AgentManager {
         let (admitted, admission) = oneshot::channel();
         tokio::spawn(async move {
             let id = recipient;
-            let Some(state) = app.upgrade() else {
-                let _ = admitted.send(Err(anyhow!("Agent manager is shutting down")));
-                return Ok::<_, anyhow::Error>(());
-            };
-            let manager = state.agents.clone();
-            drop(state);
-            let admitted = Mutex::new(Some(admitted));
-            let result = manager
-                .receipts()?
-                .send(
-                    &id,
-                    &message_id,
-                    &request,
-                    || async { Ok(()) },
-                    |_| async {
-                        let receipt = manager.message_delivery.enqueue(queue).await?;
-                        if let Some(sender) = admitted.lock().await.take() {
-                            let _ = sender.send(Ok(()));
-                        }
-                        receipt.dispatched(CancellationToken::new()).await?;
-                        Ok(())
-                    },
-                )
-                .await;
-            if let Some(registration) = registration {
-                if result.is_ok() {
-                    registration.accept().await?;
-                } else {
-                    registration.reject().await?;
-                }
+            let result = async {
+                let state = app
+                    .upgrade()
+                    .ok_or_else(|| anyhow!("Agent manager is shutting down"))?;
+                let manager = state.agents.clone();
+                drop(state);
+                let admission = manager
+                    .receipts()?
+                    .enqueue(
+                        &id,
+                        &message_id,
+                        &request,
+                        || manager.message_delivery.try_reserve(),
+                        |permit| async { manager.message_delivery.enqueue_reserved(queue, permit).await },
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>((manager, admission))
             }
-            if let Some(sender) = admitted.lock().await.take() {
-                let _ = sender.send(
-                    result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| anyhow!(error.to_string())),
-                );
+            .await;
+            let result = match result {
+                Ok((manager, receipt)) => {
+                    // Persistence and enqueue are complete. No dispatch, notification
+                    // cleanup or recipient state read may delay this acknowledgement.
+                    let _ = admitted.send(Ok(()));
+                    match receipt {
+                        Some((receipt, owner)) => {
+                            let result = receipt.dispatched(CancellationToken::new()).await;
+                            if owner {
+                                if let Err(error) = manager
+                                    .receipts()?
+                                    .finish_queued(&id, &message_id, result.is_ok())
+                                    .await
+                                {
+                                    tracing::error!(agent_id=%id,%error,"Queued message receipt completion failed");
+                                }
+                            }
+                            result.map(|_| ())
+                        }
+                        None => Ok(()),
+                    }
+                }
+                Err(error) => {
+                    let _ = admitted.send(Err(anyhow!(error.to_string())));
+                    Err(error)
+                }
+            };
+            if let Some(registration) = registration {
+                let resolved = if result.is_ok() {
+                    registration.accept().await
+                } else {
+                    registration.reject().await
+                };
+                if let Err(error) = resolved {
+                    tracing::error!(agent_id=%id,%error,"Queued message notification decision failed");
+                }
             }
             if let Err(error) = result {
                 tracing::error!(agent_id=%id,%error,"Queued agent message dispatch failed");
@@ -103,11 +127,7 @@ impl AgentManager {
         });
         admission
             .await
-            .map_err(|_| anyhow!("Agent message admission closed"))??;
-        let status = match self.agents.read().await.get(id).cloned() {
-            Some(cell) => cell.data.lock().await.snapshot["status"].clone(),
-            None => json!("idle"),
-        };
+            .map_err(|_| anyhow!("agent_request_outcome_unknown: Agent message admission closed"))??;
         Ok(json!({"deliveryStatus":"queued","status":status,"messageId":output_id}))
     }
     pub async fn send_immediate(&self, actor: &Value, id: &str, input: Value) -> Result<Value> {
@@ -303,6 +323,7 @@ impl AgentManager {
             let steered = tokio::select! {
                 biased;
                 _ = cell.cancel.cancelled() => Err(anyhow!("Agent event consumer closed")),
+                _ = cell.owner_ended.cancelled() => Err(anyhow!("Agent session owner ended")),
                 result = session.steer_active_turn(prompt.clone(), steer_options) => result,
             };
             if let Err(error) = steered {
@@ -386,6 +407,7 @@ impl AgentManager {
         let accepted = tokio::select! {
             biased;
             _ = cell.cancel.cancelled() => Err(anyhow!("Agent event consumer closed")),
+            _ = cell.owner_ended.cancelled() => Err(anyhow!("Agent session owner ended")),
             result = session.start_turn(prompt.clone(), options) => result,
         };
         cell.data.lock().await.pending_replacement = false;
@@ -428,13 +450,13 @@ impl AgentManager {
                 Ok(json!({"disposition":"turn_started","turnId":turn_id}))
             }
             Err(error) => {
-                self.release_event_stage(cell).await?;
                 if error
                     .downcast_ref::<crate::plugins::StaleProviderSessionError>()
                     .is_some()
                 {
                     // startPendingForegroundTurn: a stale session is reopened and retried by the
                     // caller, so the failed start is neither recorded nor surfaced as attention.
+                    self.release_event_stage(cell).await?;
                     self.write_snapshot(cell, true, false, |snapshot| {
                         snapshot["lifecycle"] = json!("idle");
                         snapshot["activeForegroundTurnId"] = Value::Null;
@@ -447,8 +469,12 @@ impl AgentManager {
                 }
                 // A terminal rejection belongs after the submitted prompt even though no
                 // provider turn exists.
-                self.record_submitted(id, cell, prompt, client_id.as_deref(), None, true)
-                    .await?;
+                let submitted = self
+                    .record_submitted(id, cell, prompt, client_id.as_deref(), None, true)
+                    .await;
+                let released = self.release_event_stage(cell).await;
+                submitted?;
+                released?;
                 self.apply_event(
                     id,
                     cell,
@@ -523,15 +549,18 @@ impl AgentManager {
     {
         let (snapshot, attention) = {
             let _commit = cell.commit.lock().await;
-            let mut snapshot = {
+            let (mut snapshot, owner_ended) = {
                 let data = cell.data.lock().await;
                 if let Some(error) = &data.event_error {
                     bail!("Agent event persistence failed: {error}");
                 }
-                data.snapshot.clone()
+                (data.snapshot.clone(), data.owner_ended)
             };
             let previous = snapshot["lifecycle"].as_str().map(str::to_owned);
             update(&mut snapshot)?;
+            if owner_ended && is_busy(&snapshot) {
+                bail!("Agent session owner ended");
+            }
             if touch {
                 snapshot["updatedAt"] = json!(next_updated_at(&snapshot["updatedAt"]));
             }
@@ -1431,4 +1460,73 @@ fn receipt_request(input: &Value, prompt: &Value, source: Option<&Value>) -> Val
         request["sessionMode"] = mode.clone();
     }
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_send_and_retry_return_while_recipient_delivery_is_blocked() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = AppState::new(
+            root.path().join("home"),
+            root.path().into(),
+            std::env::current_exe()?,
+        );
+        let manager = &app.agents;
+        manager
+            .receipts
+            .get_or_init(|| async { MessageReceipts::new(app.home.clone()) })
+            .await;
+        let id = "00000000-0000-4000-8000-000000000031";
+        let caller = "00000000-0000-4000-8000-000000000032";
+        let cell = runtime::tests::staged_cell(&app, id).await;
+        let source = runtime::tests::staged_cell(&app, caller).await;
+        manager.release_event_stage(&cell).await?;
+        manager.release_event_stage(&source).await?;
+        let mutation = cell.mutation.lock().await;
+        let input = json!({
+            "prompt":"queued prompt","messageId":"blocked-delivery",
+            "notifyOnFinish":false,"activeTurnBehavior":"steer"
+        });
+        let actor = json!({"kind":"agent","agentId":caller});
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                manager.send(&actor, id, input.clone()),
+            )
+            .await??;
+            assert_eq!(result["deliveryStatus"], "queued");
+            assert_eq!(result["messageId"], "blocked-delivery");
+            assert_eq!(result["status"], "running");
+        }
+        // The caller's canceled wait must leave both admission and delivery owned.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(manager.message_delivery.wait_for_dispatch(id, cancel).await.is_err());
+        manager
+            .apply_event(
+                id,
+                &cell,
+                json!({"type":"turn_completed","provider":"mock","turnId":"live-turn"}),
+                false,
+            )
+            .await?;
+        drop(mutation);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            manager.message_delivery.shutdown(),
+        )
+        .await??;
+        cell.cancel.cancel();
+        source.cancel.cancel();
+        if let Some(task) = cell.task.lock().await.take() {
+            task.await?;
+        }
+        if let Some(task) = source.task.lock().await.take() {
+            task.await?;
+        }
+        Ok(())
+    }
 }

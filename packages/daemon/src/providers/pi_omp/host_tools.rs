@@ -16,7 +16,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 struct BridgedTool {
@@ -199,18 +199,18 @@ impl Router {
         args: Value,
         cancel: CancellationToken,
     ) {
-        let (updates, mut receive) = mpsc::channel(32);
+        let (updates, receive) = mpsc::channel(32);
+        let (finished, completion) = oneshot::channel();
         let update_runtime = self.runtime.clone();
         let update_id = id.clone();
         let update_cancel = cancel.clone();
         let update_task = tokio::spawn(async move {
-            loop {
-                let update = tokio::select! {_ = update_cancel.cancelled()=>break,value=receive.recv()=>value};
-                let Some(update) = update else {
-                    break;
-                };
-                match map_result(update){Ok(result)=>{if update_runtime.send(&json!({"type":"host_tool_update","id":update_id,"partialResult":result})).await.is_err(){break;}},Err(error)=>tracing::warn!(%error,"Invalid native tool update")}
-            }
+            forward_updates(receive, completion, update_cancel, |result| {
+                let runtime = &update_runtime;
+                let frame = json!({"type":"host_tool_update","id":update_id,"partialResult":result});
+                async move { runtime.send(&frame).await }
+            })
+            .await
         });
         let result = if let Some(tool) = self.tools.get(&name) {
             drop(updates);
@@ -227,7 +227,10 @@ impl Router {
                 json!({"content":[{"type":"text","text":format!("Unknown host tool: {name}")}],"isError":true}),
             )
         };
-        let _ = update_task.await;
+        let _ = finished.send(());
+        if let Err(error) = update_task.await {
+            tracing::warn!(%error,"OMP host tool progress forwarding failed");
+        }
         if !cancel.is_cancelled() && !self.closed.load(Ordering::Acquire) {
             let result=result.and_then(map_result).unwrap_or_else(|error|json!({"content":[{"type":"text","text":error.to_string()}],"details":{},"isError":true}));
             let mut frame = json!({"type":"host_tool_result","id":id,"result":result});
@@ -252,6 +255,53 @@ impl Router {
             if let Err(error) = client.close().await {
                 tracing::debug!(%error,"OMP MCP cleanup failed");
             }
+        }
+    }
+}
+
+async fn forward_updates<F, FF>(
+    mut receive: mpsc::Receiver<Value>,
+    mut completion: oneshot::Receiver<()>,
+    cancel: CancellationToken,
+    mut send: F,
+) where
+    F: FnMut(Value) -> FF,
+    FF: Future<Output = Result<()>>,
+{
+    let mut completed = false;
+    loop {
+        let update = if completed {
+            // Only already accepted progress belongs before the final result.
+            // recv() after close can still wait on a retained sender permit.
+            receive.try_recv().ok()
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = &mut completion => {
+                    receive.close();
+                    completed = true;
+                    continue;
+                }
+                update = receive.recv() => update,
+            }
+        };
+        let Some(update) = update else { break };
+        let result = match map_result(update) {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(%error,"Invalid native tool update");
+                continue;
+            }
+        };
+        let sent = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            result = send(result) => result,
+        };
+        if let Err(error) = sent {
+            tracing::warn!(%error,"OMP host tool progress delivery failed");
+            break;
         }
     }
 }
@@ -318,4 +368,146 @@ fn bridge_name(server: &str, tool: &str) -> String {
         clean(tool, 25),
         &hash[..12]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    struct RetainedProgress {
+        sender: Mutex<Option<mpsc::Sender<Value>>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl NativeToolExecutor for RetainedProgress {
+        async fn execute_streaming(
+            &self,
+            _: &str,
+            _: Value,
+            _: CancellationToken,
+            updates: Option<mpsc::Sender<Value>>,
+        ) -> Result<Value> {
+            let updates = updates.unwrap();
+            for index in 0..3 {
+                updates.send(json!({"content":[{"type":"text","text":index.to_string()}]})).await?;
+            }
+            *self.sender.lock().unwrap() = Some(updates);
+            Ok(json!({"content":[{"type":"text","text":"done"}]}))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn router_emits_final_result_after_progress_with_retained_sender() -> Result<()> {
+        let cancel = CancellationToken::new();
+        let _cleanup = cancel.clone().drop_guard();
+        let (runtime, mut events) = Transport::spawn(
+            paseo_client::process::CommandSpec {
+                program: "cat".into(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                clear_env: false,
+            },
+            Duration::from_secs(1),
+            cancel.clone(),
+        ).await?;
+        let executor = Arc::new(RetainedProgress { sender: Mutex::new(None) });
+        let router = Arc::new(Router {
+            runtime: runtime.clone(),
+            executor: Some(executor.clone()),
+            tools: HashMap::new(),
+            clients: Vec::new(),
+            pending: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            cancel,
+        });
+        assert!(router.handle(&json!({
+            "type":"host_tool_call","id":"call","toolCallId":"native-call",
+            "toolName":"retained","arguments":{}
+        })));
+        for index in 0..3 {
+            let frame = tokio::time::timeout(Duration::from_secs(1), events.recv()).await?.unwrap();
+            assert_eq!(frame["type"], "host_tool_update");
+            assert_eq!(frame["partialResult"]["content"][0]["text"], index.to_string());
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(1), events.recv()).await?.unwrap();
+        assert_eq!(frame["type"], "host_tool_result");
+        assert_eq!(frame["result"]["content"][0]["text"], "done");
+        assert!(executor.sender.lock().unwrap().as_ref().unwrap().is_closed());
+        let canceled = router.cancel.child_token();
+        canceled.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            router.clone().call("canceled".into(), "retained".into(), json!({}), canceled),
+        ).await?;
+        runtime.send(&json!({"type":"after_cancellation"})).await?;
+        let frame = tokio::time::timeout(Duration::from_secs(1), events.recv()).await?.unwrap();
+        assert_eq!(frame["type"], "after_cancellation", "canceled calls must not emit a final result");
+        router.close().await;
+        runtime.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completed_tool_drains_fifo_without_waiting_for_retained_progress_sender() {
+        let (updates, receive) = mpsc::channel(32);
+        let retained = updates.clone();
+        let permit = retained.clone().reserve_owned().await.unwrap();
+        let (finished, completion) = oneshot::channel();
+        for index in 0..3 {
+            updates
+                .send(json!({"content":[{"type":"text","text":index.to_string()}]}))
+                .await
+                .unwrap();
+        }
+        finished.send(()).unwrap();
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let forwarded = frames.clone();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            forward_updates(receive, completion, CancellationToken::new(), |frame| {
+                forwarded.lock().unwrap().push(frame);
+                async { Ok(()) }
+            }),
+        )
+        .await
+        .expect("executor completion, not sender lifetime, ends progress");
+        frames.lock().unwrap().push(json!({"final":true}));
+        assert_eq!(
+            *frames.lock().unwrap(),
+            vec![
+                json!({"content":[{"type":"text","text":"0"}]}),
+                json!({"content":[{"type":"text","text":"1"}]}),
+                json!({"content":[{"type":"text","text":"2"}]}),
+                json!({"final":true}),
+            ]
+        );
+        assert!(updates.is_closed());
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn cancellation_unblocks_progress_delivery_with_retained_sender() {
+        let (updates, receive) = mpsc::channel(32);
+        let (_finished, completion) = oneshot::channel();
+        updates
+            .send(json!({"content":[{"type":"text","text":"progress"}]}))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let canceled = cancel.clone();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            forward_updates(receive, completion, cancel, move |_| {
+                canceled.cancel();
+                std::future::pending::<Result<()>>()
+            }),
+        )
+        .await
+        .expect("cancellation must interrupt a blocked progress write");
+        assert!(updates.is_closed());
+    }
 }

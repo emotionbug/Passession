@@ -1,4 +1,5 @@
 use super::storage::{KeyLocks, atomic_json, read_optional, sync_directory};
+use super::notifications::MessageReceipt;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -14,12 +15,14 @@ use crate::json::fingerprint as digest;
 pub struct MessageReceipts {
     directory: PathBuf,
     operations: KeyLocks,
+    queued: StdMutex<HashMap<String, MessageReceipt>>,
 }
 impl MessageReceipts {
     pub fn new(home: PathBuf) -> Self {
         Self {
             directory: home.join("agent-requests"),
             operations: KeyLocks::default(),
+            queued: StdMutex::new(HashMap::new()),
         }
     }
     /// Local preparation happens before the pending receipt. Once delivery starts,
@@ -57,6 +60,72 @@ impl MessageReceipts {
         send(prepared).await?;
         receipt["state"] = json!("completed");
         atomic_json(&path, &receipt).await
+    }
+    /// A queued receipt is durable before enqueue, but only dispatch completion
+    /// makes it replayable after restart. Live duplicates share its dispatch owner
+    /// without waiting for that owner to deliver to the provider.
+    pub async fn enqueue<T, P, F, FF>(
+        &self,
+        agent_id: &str,
+        message_id: &str,
+        request: &Value,
+        prepare: P,
+        enqueue: F,
+    ) -> Result<Option<(MessageReceipt, bool)>>
+    where
+        P: FnOnce() -> Result<T>,
+        F: FnOnce(T) -> FF,
+        FF: Future<Output = Result<MessageReceipt>>,
+    {
+        let key = digest(&json!(["send", agent_id, message_id]))?;
+        let _guard = self.operations.lock(&key).await;
+        let path = self.directory.join(format!("{key}.json"));
+        let fingerprint = digest(request)?;
+        if let Some(existing) = read_send_receipt(&path).await? {
+            if existing["fingerprint"].as_str() != Some(&fingerprint) {
+                bail!("agent_request_key_conflict");
+            }
+            if existing["state"] == "completed" {
+                return Ok(None);
+            }
+            return self
+                .queued
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .map(|receipt| Some((receipt, false)))
+                .context("agent_request_outcome_unknown");
+        }
+        let prepared = prepare()?;
+        atomic_json(
+            &path,
+            &json!({"fingerprint":fingerprint,"agentId":agent_id,"state":"pending"}),
+        )
+        .await?;
+        let receipt = enqueue(prepared).await?;
+        self.queued.lock().unwrap().insert(key, receipt.clone());
+        Ok(Some((receipt, true)))
+    }
+
+    pub async fn finish_queued(
+        &self,
+        agent_id: &str,
+        message_id: &str,
+        dispatched: bool,
+    ) -> Result<()> {
+        let key = digest(&json!(["send", agent_id, message_id]))?;
+        let _guard = self.operations.lock(&key).await;
+        self.queued.lock().unwrap().remove(&key);
+        if dispatched {
+            let path = self.directory.join(format!("{key}.json"));
+            let mut receipt = read_send_receipt(&path)
+                .await?
+                .context("Queued message receipt disappeared")?;
+            receipt["state"] = json!("completed");
+            atomic_json(&path, &receipt).await?;
+        }
+        Ok(())
     }
 }
 async fn read_send_receipt(path: &Path) -> Result<Option<Value>> {

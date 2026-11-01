@@ -148,6 +148,7 @@ struct AgentData {
     finalized: VecDeque<String>,
     resolutions: HashMap<String, Value>,
     event_error: Option<String>,
+    owner_ended: bool,
     /// agent-manager.ts pendingReplacement: a replacing prompt holds the agent busy
     /// while the interrupted turn settles.
     pending_replacement: bool,
@@ -158,6 +159,7 @@ struct AgentCell {
     commit: Mutex<()>,
     timeline: Arc<StdMutex<Timeline>>,
     cancel: CancellationToken,
+    owner_ended: CancellationToken,
     sink: EventSink,
     stage: Mutex<Option<EventStage>>,
     barriers: Mutex<HashMap<String, oneshot::Sender<()>>>,
@@ -234,7 +236,22 @@ impl AgentManager {
         self.creations
             .get_or_init(|| async { CreationReceipts::new(home.clone()) })
             .await;
+        self.restore_persisted_state(&home).await?;
+        self.notifications.initialize().await
+    }
+    async fn restore_persisted_state(&self, home: &Path) -> Result<()> {
         for record in self.storage()?.list().await? {
+            let record = if matches!(text(&record, "lastStatus"), Some("running" | "initializing")) {
+                let mut record = record;
+                record["lastStatus"] = json!("closed");
+                record["lastTurnOutcome"] = json!("turn_canceled");
+                // Recovery is not new user activity. Keep the persisted timestamps,
+                // attention, provider handle and history intact.
+                self.storage()?.upsert(record.clone()).await?;
+                record
+            } else {
+                record
+            };
             let Some(id) = text(&record, "id") else {
                 continue;
             };
@@ -249,7 +266,7 @@ impl AgentManager {
                     .restore_parent(&checkpoint)?;
             }
         }
-        self.notifications.initialize().await
+        Ok(())
     }
     pub async fn handle(
         &self,
@@ -309,11 +326,17 @@ impl AgentManager {
     }
     pub async fn has_in_flight_run(&self, id: &str) -> Result<bool> {
         let cell = self.cell(id).await?;
-        let data = cell.data.lock().await;
-        Ok(data.session.is_some()
-            && (is_busy(&data.snapshot)
-                || data.snapshot["activeForegroundTurnId"].is_string()
-                || cell.stage.lock().await.is_some()))
+        let has_session = {
+            let data = cell.data.lock().await;
+            if data.session.is_none() || data.owner_ended {
+                return Ok(false);
+            }
+            if is_busy(&data.snapshot) || data.snapshot["activeForegroundTurnId"].is_string() {
+                return Ok(true);
+            }
+            data.session.is_some()
+        };
+        Ok(has_session && cell.stage.lock().await.is_some())
     }
     async fn lane(&self, id: &str) -> Arc<Mutex<()>> {
         let mut lanes = self.lifecycle.lock().await;
@@ -334,13 +357,18 @@ impl AgentManager {
             .ok_or_else(|| anyhow!("Unknown agent '{id}'"))
     }
     pub async fn session(&self, id: &str) -> Result<Option<Arc<dyn AgentSession>>> {
-        Ok(match self.agents.read().await.get(id).cloned() {
-            Some(cell) => cell.data.lock().await.session.clone(),
+        let cell = { self.agents.read().await.get(id).cloned() };
+        Ok(match cell {
+            Some(cell) => {
+                let data = cell.data.lock().await;
+                if data.owner_ended { None } else { data.session.clone() }
+            }
             None => None,
         })
     }
     pub async fn agent_snapshot(&self, id: &str) -> Result<Option<Value>> {
-        if let Some(cell) = self.agents.read().await.get(id).cloned() {
+        let cell = { self.agents.read().await.get(id).cloned() };
+        if let Some(cell) = cell {
             let data = cell.data.lock().await;
             if data.ready {
                 return Ok(Some(data.snapshot.clone()));
@@ -367,6 +395,8 @@ impl AgentManager {
         record["availableModes"] = json!([]);
         record["pendingPermissions"] = json!([]);
         record["activeTurn"] = Value::Null;
+        record["activeTurnId"] = Value::Null;
+        record["activeForegroundTurnId"] = Value::Null;
         record["attention"] = json!({"requiresAttention":record["requiresAttention"]==true,"attentionReason":record["attentionReason"],"attentionTimestamp":record["attentionTimestamp"]});
         if record.get("capabilities").is_none() {
             record["capabilities"] = json!({"supportsStreaming":false,"supportsSessionPersistence":true,"supportsDynamicModes":false,"supportsMcpServers":false,"supportsReasoningStream":false,"supportsToolInvocations":true,"supportsRewindConversation":false,"supportsRewindFiles":false,"supportsRewindBoth":false});
@@ -528,7 +558,6 @@ impl AgentManager {
         mut snapshot: Value,
         history: bool,
     ) -> Result<(Arc<AgentCell>, mpsc::Receiver<Value>)> {
-        let app = self.app()?;
         // Drain final provider events after daemon cancellation, before committing closed state.
         let cancel = CancellationToken::new();
         let (sink, receiver) = EventSink::channel(256, cancel.clone());
@@ -554,12 +583,14 @@ impl AgentManager {
                 finalized: VecDeque::new(),
                 resolutions: HashMap::new(),
                 event_error: None,
+                owner_ended: false,
                 pending_replacement: false,
             }),
             mutation: Mutex::new(()),
             commit: Mutex::new(()),
             timeline: Arc::new(StdMutex::new(timeline)),
             cancel,
+            owner_ended: CancellationToken::new(),
             sink,
             // Replay history before live events, even when the saved checkpoint is partial.
             stage: Mutex::new((!history).then(EventStage::default)),
@@ -642,6 +673,15 @@ impl AgentManager {
                     break;
                 }
                 if closing {
+                    let unexpected = {
+                        let data = current.data.lock().await;
+                        data.ready && !data.owner_ended && data.snapshot["lifecycle"] != "closed"
+                    };
+                    if unexpected {
+                        manager.fail_event_owner(
+                            &id, &current, &anyhow!("Agent event consumer closed unexpectedly"),
+                        ).await;
+                    }
                     break;
                 }
             }
@@ -690,14 +730,17 @@ impl AgentManager {
             let _commit = cell.commit.lock().await;
             let mut data = cell.data.lock().await;
             data.event_error = Some(message.clone());
+            data.owner_ended = true;
+            data.snapshot["_live"] = json!(false);
             data.pending_replacement = false;
             if let Some(turn) = text(&data.snapshot, "activeTurnId").map(str::to_owned) {
                 // A failed terminal commit may already have entered deduplication.
                 data.finalized.retain(|finalized| finalized != &turn);
             }
-            (data.snapshot["provider"].clone(), data.session.clone())
+            (data.snapshot["provider"].clone(), data.session.take())
         };
         cell.cancel.cancel();
+        cell.owner_ended.cancel();
         cell.barriers.lock().await.clear();
         if let Err(report_error) = self.apply_event(
             id, cell, json!({"type":"turn_failed","provider":provider,"error":message}), false,
@@ -723,6 +766,9 @@ impl AgentManager {
         if let Some(session) = session {
             if let Err(close_error) = session.close().await {
                 tracing::error!(agent_id=%id,error=%close_error,"Failed to close failed event owner session");
+                // The event consumer has ended, but failed process cleanup still
+                // belongs to this cell and must block replacement until retried.
+                cell.data.lock().await.session = Some(session);
             }
         }
     }
@@ -783,8 +829,12 @@ impl AgentManager {
     async fn commit_snapshot(&self, cell: &Arc<AgentCell>, mut snapshot: Value) -> Result<()> {
         let _commit = cell.commit.lock().await;
         if snapshot["lifecycle"] != "closed" {
-            if let Some(error) = cell.data.lock().await.event_error.as_deref() {
+            let data = cell.data.lock().await;
+            if let Some(error) = data.event_error.as_deref() {
                 bail!("Agent event persistence failed: {error}");
+            }
+            if data.owner_ended && is_busy(&snapshot) {
+                bail!("Agent provider session has ended");
             }
         }
         snapshot["updatedAt"] = json!(next_updated_at(&snapshot["updatedAt"]));
@@ -793,7 +843,16 @@ impl AgentManager {
         if ready {
             self.persist_snapshot(&snapshot).await?;
         }
-        cell.data.lock().await.snapshot = snapshot.clone();
+        {
+            let mut data = cell.data.lock().await;
+            if snapshot["lifecycle"] == "closed" {
+                data.owner_ended = true;
+                data.pending_replacement = false;
+                data.session = None;
+                cell.owner_ended.cancel();
+            }
+            data.snapshot = snapshot.clone();
+        }
         if ready {
             let _ = self
                 .events
@@ -806,6 +865,50 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restart_closes_interrupted_records_without_rewriting_user_data() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let storage = AgentStorage::new(home.clone());
+        let mut originals = Vec::new();
+        for status in ["running", "initializing", "idle", "error", "closed"] {
+            let record = json!({
+                "id":format!("restart-{status}"),"provider":"omp","cwd":root.path(),
+                "config":{"model":"test/model"},"lastStatus":status,
+                "createdAt":"2026-10-24T00:00:00.000Z","updatedAt":"2026-10-31T00:00:00.000Z",
+                "lastActivityAt":"2026-10-31T00:00:01.000Z","lastTurnOutcome":"turn_completed",
+                "title":"Keep this title","labels":{"custom":"value"},"workspaceId":"workspace",
+                "requiresAttention":true,"attentionReason":"finished",
+                "attentionTimestamp":"2026-10-31T00:00:01.000Z",
+                "persistence":{"provider":"omp","sessionId":"native","nativeHandle":"private.jsonl"}
+            });
+            storage.upsert(record.clone()).await.unwrap();
+            originals.push(record);
+        }
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(home.clone()) }).await;
+        manager.restore_persisted_state(&home).await.unwrap();
+        let reopened = AgentStorage::new(home.clone());
+        for mut expected in originals {
+            let id = expected["id"].as_str().unwrap().to_owned();
+            if matches!(expected["lastStatus"].as_str(), Some("running" | "initializing")) {
+                expected["lastStatus"] = json!("closed");
+                expected["lastTurnOutcome"] = json!("turn_canceled");
+            }
+            assert_eq!(reopened.get(&id).await.unwrap().unwrap(), expected);
+            let snapshot = manager.agent_snapshot(&id).await.unwrap().unwrap();
+            assert!(!is_busy(&snapshot));
+            assert_eq!(snapshot["_live"], false);
+            assert!(snapshot["activeTurn"].is_null());
+            assert!(snapshot["activeTurnId"].is_null());
+            assert!(snapshot["activeForegroundTurnId"].is_null());
+        }
+        assert!(manager.agents.read().await.is_empty());
+        manager.restore_persisted_state(&home).await.unwrap();
+        assert_eq!(reopened.list().await.unwrap(), manager.storage().unwrap().list().await.unwrap());
+    }
 
     #[test]
     fn internal_runtime_server_is_stripped_from_config_servers() {

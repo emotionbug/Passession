@@ -12,6 +12,11 @@ initializing → idle → running → idle (or error → closed)
 
 Each live agent in `AgentManager` carries a `lastStatus` of `initializing`, `idle`, `running`, or `error`. `closed` is the persisted, resumable state for an agent record that has no live provider runtime. State transitions persist to disk and stream to subscribed clients via WebSocket.
 
+Before restoring finish watches or opening ingress, bootstrap persists any stored `running` or
+`initializing` record as `closed` with a `turn_canceled` outcome. A previous daemon's provider owner
+cannot survive as a live owner in the new manager. Recovery preserves provider handles, history,
+attention and activity timestamps; it does not resume work or create new user activity.
+
 ## Runtime residency
 
 An unarchived agent may be `closed` without being deleted or archived. Closing releases its provider
@@ -31,11 +36,10 @@ action such as archive, replacement, reload, workspace teardown, or daemon shutd
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and
 workflows all live in the CLI process, and the completion notification that would have woken the
-agent never arrives. A runtime that dies mid-turn is reported by whatever is draining its stream, but
-between turns nothing is watching, so the agent sits at `idle` looking healthy while its background
-work is gone. Report that exit as a turn failure so the agent lands in `error` with a timeline entry.
-Claude and OMP report exits between turns. OMP relaunches from its session file on the next prompt;
-the unfinished turn is lost.
+agent never arrives. Report that exit as a turn failure, including between turns, so the agent lands
+in `error` with a timeline entry. Pi and OMP also release the ended session's ownership: active turns
+and permissions are cleared, and a late acknowledgement cannot restore `running`. The next prompt
+resumes the durable session through the manager; the unfinished turn is lost.
 
 ### Cancellation
 
@@ -77,12 +81,25 @@ Users can also detach an existing subagent from the subagents track. Detach is d
 
 `notifyOnFinish` defaults to `true` for agent-scoped creation and prompt follow-ups because most delegated work needs to report back to the creating agent. Set it to `false` for explicit reporting or no completion callback.
 
-Agent-originated messages and automatic notifications share a recipient-daemon delivery module. A queued receipt acknowledges admission before provider dispatch, allowing a child to report and finish in the same two-second quiet window. Human prompts dispatch directly. Conflicting explicit interruption or session-mode choices retain separate ordered dispatches.
+Agent-originated messages and automatic notifications share a recipient-daemon delivery module.
+A queued receipt waits only for durable pending-receipt storage and enqueue, not provider dispatch
+or a second status read; its recipient status is advisory, captured before admission. This lets a
+child report and finish in the same two-second quiet window. Human prompts dispatch directly.
+Conflicting explicit interruption or session-mode choices retain separate ordered dispatches.
+Message sends reserve capacity without waiting before writing the pending receipt, so a full or
+closed queue rejects admission without leaving an ambiguous receipt. Automatic notifications keep
+their existing queue backpressure.
 
-The pending message window is in memory. Clean shutdown flushes it before closing agents; an abrupt
-crash can lose queued prompts. A durable send receipt remains pending until actual dispatch
-acknowledgment, so a lost window never becomes a completed receipt. Completion waits cover queued
-admission within their original timeout and cancellation scope.
+The pending message window is in memory. Identical retries of a live admitted message return the
+same queued receipt immediately. Clean shutdown flushes the window before closing agents; an abrupt
+crash can lose queued prompts. A durable send receipt becomes completed only after dispatch
+acknowledgment. A pending receipt without that live admission remains `outcome_unknown` after restart
+or dispatch failure, preventing blind duplicate dispatch. Completion waits cover queued admission
+within their original timeout and cancellation scope.
+
+OMP host-tool completion closes progress intake and drains already accepted progress in FIFO order
+before sending the final result. Retained progress sender or permit lifetimes cannot delay that final
+reply after the executor has finished.
 
 Finish notification intent has a separate daemon-owned lifetime. The finish-subscriptions module
 persists caller, child, host, and ownership policy through an injectable store; its JSON adapter uses
@@ -91,7 +108,7 @@ acknowledgment promises a notification. A pending replacement retains its predec
 accepts; rejected dispatch removes only the candidate. Recovery coalesces registrations for the same
 caller, child, and host into one watch.
 
-Bootstrap restores these watches after repairing stale running records to `closed` and before opening
+Bootstrap restores these watches after lifecycle recovery and before opening
 ingress. Reading a closed child's result does not load its provider. A finish notification reports that
 the child's run has settled; the parent decides whether its task is complete. Recovery never resumes
 child work. Archived or deleted parents suppress delivery; parent-owned creation watches also stop

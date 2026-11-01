@@ -112,7 +112,7 @@ impl Inner {
                 Some("turn_completed" | "turn_failed" | "turn_canceled")
             ) {
                 let mut state = self.state.lock().unwrap();
-                if event["turnId"]
+                if event["sessionEnded"] != true && event["turnId"]
                     .as_str()
                     .is_some_and(|id| state.active.as_deref() != Some(id))
                 {
@@ -133,6 +133,7 @@ impl Inner {
         loop {
             if self.closed.load(Ordering::Acquire)
                 || self.generation.load(Ordering::Acquire) != generation
+                || self.state.lock().unwrap().dead
                 || self.state.lock().unwrap().active != turn
             {
                 return;
@@ -336,7 +337,18 @@ impl Inner {
             }
         }
         if frame["type"] == "process_exit" {
-            self.state.lock().unwrap().dead = true;
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.dead {
+                    return Ok(());
+                }
+                state.dead = true;
+                state.native["isStreaming"] = json!(false);
+                state.native["isCompacting"] = json!(false);
+                for (_, reply) in state.extension_results.drain() {
+                    let _ = reply.send(Err(anyhow!("Provider process exited")));
+                }
+            }
             let router = self.host_tools.lock().unwrap().take();
             if let Some(router) = router {
                 tokio::spawn(async move {
@@ -453,6 +465,7 @@ impl Inner {
                     return;
                 };
                 if inner.closed.load(Ordering::Acquire)
+                    || inner.state.lock().unwrap().dead
                     || inner.generation.load(Ordering::Acquire) != generation
                     || offset >= MAX_BYTES
                     || items >= 200
@@ -867,7 +880,7 @@ impl Session {
                     let Some(inner) = weak.upgrade() else {
                         break;
                     };
-                    if inner.closed.load(Ordering::Acquire) {
+                    if inner.closed.load(Ordering::Acquire) || inner.state.lock().unwrap().dead {
                         break;
                     }
                     let events = inner.state.lock().unwrap().mapper.poll();
@@ -911,17 +924,8 @@ impl Session {
         if self.inner.state.lock().unwrap().active.is_some() {
             bail!("A provider turn is already active");
         }
-        let dead = self.inner.state.lock().unwrap().dead;
-        if dead && self.inner.spec.family == "omp" {
-            let mode = self
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .mode
-                .clone()
-                .unwrap_or_else(|| "full".into());
-            self.inner.restart(&mode).await?;
+        if self.inner.state.lock().unwrap().dead {
+            bail!("Provider session has ended");
         }
         let model = self.inner.state.lock().unwrap().native["model"].clone();
         let mut command = super::prompt::convert(&prompt, &model)?;
@@ -971,7 +975,7 @@ impl Session {
                 Ok((id, ack)) => {
                     let correlated = {
                         let mut state = inner.state.lock().unwrap();
-                        if state.active.as_deref() != Some(&turn) {
+                        if state.dead || state.active.as_deref() != Some(&turn) {
                             return;
                         }
                         state.prompt_id = Some(id.clone());
