@@ -64,6 +64,8 @@ cargo xtask package-desktop
 
 Only run the desktop target matching the host OS. iOS requires macOS. `cargo xtask build-flutter ios` without export/provisioning configuration emits an explicitly unsigned device app archive, not an installable IPA. Android output without a release key is marked debug-signed. Build descriptors and client artifacts live under `artifacts/flutter/`; see [release](release.md) before producing distribution artifacts.
 
+Linux and Windows app CMake configurations disable optional JNI discovery. JNI arrives transitively through Android `path_provider`/`shared_preferences` implementations; native desktop implementations do not use it. This prevents an installed development JDK from silently adding `libdartjni` and a JVM runtime dependency to desktop bundles. Android JNI configuration and dependencies are unchanged.
+
 ## Source ownership
 
 - Rust: `packages/daemon/src`; CLI commands in `cli/`, providers in `providers/`, process ownership in `daemon_control/`, desktop IPC in `desktop_host/`.

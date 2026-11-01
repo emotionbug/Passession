@@ -534,6 +534,8 @@ fn create_archive(sdk: &Path, destination: &Path) -> Result<()> {
         let encoder = GzEncoder::new(file.as_file_mut(), Compression::default());
         let mut archive = tar::Builder::new(encoder);
         archive.follow_symlinks(false);
+        // Keep sparse inputs portable; the extractor rejects special tar types.
+        archive.sparse(false);
         for entry in walkdir::WalkDir::new(sdk).sort_by_file_name() {
             let entry = entry?;
             let relative = entry.path().strip_prefix(sdk)?;
@@ -1163,6 +1165,32 @@ pub fn run(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archives_preserve_sparse_input_as_portable_file() -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+
+        let temporary = tempfile::tempdir()?;
+        let sdk = temporary.path().join("source");
+        fs::create_dir_all(sdk.join("bin/cache"))?;
+        let mut sparse = File::create(sdk.join("bin/cache/sparse-data"))?;
+        sparse.write_all(b"begin")?;
+        sparse.seek(SeekFrom::Start(1024 * 1024))?;
+        sparse.write_all(b"end")?;
+        drop(sparse);
+
+        let archive = temporary.path().join("sdk.tar.gz");
+        create_archive(&sdk, &archive)?;
+        let destination = temporary.path().join("installed");
+        fs::create_dir(&destination)?;
+        let installed = extract_archive(&archive, &destination)?;
+        let data = fs::read(installed.join("bin/cache/sparse-data"))?;
+        assert_eq!(data.len(), 1024 * 1024 + 3);
+        assert_eq!(&data[..5], b"begin");
+        assert!(data[5..1024 * 1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&data[1024 * 1024..], b"end");
+        Ok(())
+    }
 
     #[test]
     fn archive_paths_and_links_stay_inside_sdk() {

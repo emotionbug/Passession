@@ -53,6 +53,10 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 add_subdirectory("runner")
 
 
+# JNI is used only by Android path_provider/shared_preferences implementations.
+# Do not link a developer-machine JVM into native desktop packages.
+set(CMAKE_DISABLE_FIND_PACKAGE_JNI TRUE)
+
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
 include(flutter/generated_plugins.cmake)
