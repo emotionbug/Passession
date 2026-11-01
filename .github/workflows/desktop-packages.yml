@@ -2,31 +2,10 @@ name: Native Desktop Packages
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-  pull_request:
-    paths:
-      - "packages/flutter_app/**"
-      - "packages/flutter_audio/**"
-      - "packages/flutter_desktop_host/**"
-      - "packages/daemon/**"
-      - "skills/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "packages/protocol/**"
-      - "packages/plugin/**"
-      - "plugins/**"
-      - "xtask/**"
-      - ".cargo/**"
-      - ".github/actions/setup-flutter/**"
-      - ".github/flutter-sdk.json"
-      - ".github/workflows/flutter-sdk.yml"
-      - ".github/workflows/desktop-packages.yml"
 
 concurrency:
   group: desktop-packages-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

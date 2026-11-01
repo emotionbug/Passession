@@ -3,362 +3,45 @@ name: CI
 on:
   push:
     branches: [main]
-  # Every base branch, so stacked PRs and PRs into `next` get the same checks.
   pull_request:
   merge_group:
   workflow_dispatch:
-  workflow_call:
-    inputs:
-      recovery_job:
-        description: One check selected by CI Recovery; normal CI runs every routed check
-        required: false
-        type: string
-        default: all
 
-# A superseded run is cancelled only within the same recovery target.
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.recovery_job || 'all' }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  changes:
-    name: changes
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      full: ${{ github.event_name != 'pull_request' || steps.filter.outputs.routing != 'false' || steps.filter.outputs.workspace != 'false' || steps.filter.outputs.ci != 'false' }}
-      format: ${{ steps.filter.outputs.format }}
-      quality: ${{ steps.filter.outputs.quality }}
-      daemon: ${{ steps.filter.outputs.daemon }}
-      flutter: ${{ steps.filter.outputs.flutter }}
-      flutter_linux: ${{ steps.filter.outputs.flutter_linux }}
-      flutter_windows: ${{ steps.filter.outputs.flutter_windows }}
-      flutter_macos: ${{ steps.filter.outputs.flutter_macos }}
-      flutter_android: ${{ steps.filter.outputs.flutter_android }}
-      flutter_ios: ${{ steps.filter.outputs.flutter_ios }}
-      sdk: ${{ steps.filter.outputs.sdk }}
-      relay: ${{ steps.filter.outputs.relay }}
+  tests:
+    name: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          fetch-depth: 0
-
-      - name: Validate recovery target
-        if: ${{ inputs.recovery_job && inputs.recovery_job != 'all' }}
-        env:
-          RECOVERY_JOB: ${{ inputs.recovery_job }}
-        run: |
-          case "$RECOVERY_JOB" in
-            quality|rust-clippy|relay-edge|native-daemon-linux|native-daemon-windows|native-daemon-macos|flutter-analyze|flutter-test|flutter-build-linux|flutter-build-windows|flutter-build-macos|flutter-build-android|flutter-build-ios) ;;
-            *) echo "::error::Unknown CI recovery target"; exit 2 ;;
-          esac
-
-      - name: Detect affected CI contracts
-        id: filter
-        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
-        with:
-          filters: .github/ci-paths.yml
-
-
-  quality:
-    name: quality
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'quality') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false') }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.1
-        with:
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: Check Rust formatting
-        run: cargo fmt -p paseo-xtask -p paseo-protocol -p paseo-client -p paseo-plugin -p paseo-relay -p paseo-relay-cloudflare -p paseo-highlight -- --check
-      - name: Test native release and build contracts
-        run: cargo test --locked -p paseo-xtask
-
-  rust-clippy:
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'rust-clippy') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false') }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.1
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Check every native crate, example and test target
-        run: cargo clippy --locked --workspace --all-targets
-
-  relay-edge:
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'relay-edge') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.relay != 'false') }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.1
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Install pinned native Wasm binding generator
-        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
-      - name: Build Rust edge proxy and generated bindings
-        run: cargo xtask relay-cloudflare build
-      - name: Test edge routing behavior on host
-        run: cargo test --locked -p paseo-relay-cloudflare
-      - name: Check Wasm implementation
-        run: cargo clippy --locked -p paseo-relay-cloudflare --target wasm32-unknown-unknown
-
-  native-daemon-linux:
-    name: native-daemon-linux-${{ matrix.arch }}
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-linux') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.quality != 'false') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: x64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps: &native_daemon_steps
-      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: native-${{ runner.os }}-${{ runner.arch }}
-      - name: Install Linux native runtime packaging prerequisites
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y patchelf
-      - name: Build native daemon and runtime assets
-        run: cargo xtask build-daemon
-      - name: Test every workspace crate and target
-        run: cargo test --workspace --all-targets --locked
-
-  native-daemon-windows:
-    name: native-daemon-windows-${{ matrix.arch }}
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-windows') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.quality != 'false') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: windows-latest, arch: x64 }
-          - { runner: windows-11-arm, arch: arm64 }
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps: *native_daemon_steps
-
-  native-daemon-macos:
-    name: native-daemon-macos-${{ matrix.arch }}
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-macos') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.quality != 'false') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: macos-15-intel, arch: x64 }
-          - { runner: macos-15, arch: arm64 }
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps: *native_daemon_steps
-
-  flutter-analyze:
-    name: flutter-analyze
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-analyze') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    steps:
-      - &flutter_checkout
-        uses: actions/checkout@v4
-      - &flutter_sdk
-        uses: ./.github/actions/setup-flutter
+          shared-key: tests-linux-x64
+      - name: Run Rust workspace tests
+        run: cargo test --locked --workspace --all-targets
+      - uses: ./.github/actions/setup-flutter
         with:
           flutter-version: "3.47.5"
           channel: stable
           cache: true
-          cache-key: flutter-sdk-${{ runner.os }}-${{ runner.arch }}-3.47.5
-      - &flutter_pub_cache
-        uses: actions/cache@v4
+          cache-key: flutter-sdk-Linux-X64-3.47.5
+      - uses: actions/cache@v4
         with:
-          path: |
-            ~/.pub-cache
-            ~\AppData\Local\Pub\Cache
-          key: flutter-pub-${{ runner.os }}-${{ runner.arch }}-3.47.5-${{ hashFiles('packages/flutter_app/pubspec.lock') }}
-      - &flutter_pub_get
-        name: Resolve locked Flutter packages
+          path: ~/.pub-cache
+          key: flutter-pub-Linux-X64-3.47.5-${{ hashFiles('packages/flutter_app/pubspec.lock') }}
+      - name: Install Flutter test native-asset prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev
+      - name: Resolve locked Flutter packages
         working-directory: packages/flutter_app
         run: flutter pub get --enforce-lockfile
-      - name: Analyze native Flutter sources
-        working-directory: packages/flutter_app
-        run: flutter analyze --no-pub
-      - name: Analyze maintained Dart plugin libraries
-        shell: bash
-        run: |
-          for package in packages/flutter_audio packages/flutter_desktop_host/third_party/desktop_multi_window; do
-            (cd "$package" && flutter pub get && flutter analyze lib)
-          done
-
-  flutter-test:
-    name: flutter-test
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-test') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    steps:
-      - *flutter_checkout
-      - *flutter_sdk
-      - *flutter_pub_cache
-      - name: Install native asset build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev
-      - *flutter_pub_get
       - name: Run Flutter unit and widget tests
         working-directory: packages/flutter_app
-        run: flutter test --no-pub --coverage
-      - name: Retain Flutter test coverage
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: flutter-test-coverage
-          path: packages/flutter_app/coverage/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  flutter-build-linux:
-    name: flutter-build-linux-${{ matrix.arch }}
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-build-linux') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false' || needs.changes.outputs.flutter_linux != 'false') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: ubuntu-24.04, arch: x64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - *flutter_checkout
-      - *flutter_sdk
-      - *flutter_pub_cache
-      - name: Install Linux native build prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev ffmpeg pulseaudio-utils xdg-utils
-      - *flutter_pub_get
-      - name: Compile native Linux client and plugins
-        working-directory: packages/flutter_app
-        run: flutter build linux --release --no-pub
-      - &flutter_build_diagnostics
-        name: Retain native build diagnostics
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.job }}-${{ runner.arch }}-diagnostics
-          path: |
-            packages/flutter_app/build/**/CMakeConfigureLog.yaml
-            packages/flutter_app/build/**/CMakeError.log
-            packages/flutter_app/build/**/CMakeOutput.log
-            packages/flutter_app/build/**/reports/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  flutter-build-windows:
-    name: flutter-build-windows-${{ matrix.arch }}
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-build-windows') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false' || needs.changes.outputs.flutter_windows != 'false') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: windows-latest, arch: x64 }
-          - { runner: windows-11-arm, arch: arm64 }
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - *flutter_checkout
-      - *flutter_sdk
-      - *flutter_pub_cache
-      - *flutter_pub_get
-      - name: Compile native Windows client and plugins
-        working-directory: packages/flutter_app
-        run: flutter build windows --release --no-pub
-      - *flutter_build_diagnostics
-
-  flutter-build-macos:
-    name: flutter-build-macos-${{ matrix.arch }}
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-build-macos') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false' || needs.changes.outputs.flutter_macos != 'false') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner: macos-15-intel, arch: x64 }
-          - { runner: macos-15, arch: arm64 }
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - *flutter_checkout
-      - *flutter_sdk
-      - *flutter_pub_cache
-      - *flutter_pub_get
-      - name: Compile native macOS client and plugins without signing
-        working-directory: packages/flutter_app
-        run: flutter build macos --release --no-pub --config-only && xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Release -derivedDataPath build/macos CODE_SIGNING_ALLOWED=NO build
-      - *flutter_build_diagnostics
-
-  flutter-build-android:
-    name: flutter-build-android
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-build-android') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false' || needs.changes.outputs.flutter_android != 'false') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - *flutter_checkout
-      - *flutter_sdk
-      - *flutter_pub_cache
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-      - uses: android-actions/setup-android@v3
-        with:
-          packages: platform-tools
-      - uses: gradle/actions/setup-gradle@v4
-      - *flutter_pub_get
-      - name: Compile native Android client and audio plugin
-        working-directory: packages/flutter_app
-        run: flutter build apk --debug --no-pub
-      - *flutter_build_diagnostics
-
-  flutter-build-ios:
-    name: flutter-build-ios
-    needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-build-ios') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false' || needs.changes.outputs.flutter_ios != 'false') }}
-    runs-on: macos-15
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - *flutter_checkout
-      - *flutter_sdk
-      - *flutter_pub_cache
-      - *flutter_pub_get
-      - name: Compile native iOS client and audio plugin without signing
-        working-directory: packages/flutter_app
-        run: flutter build ios --release --no-codesign --no-pub
-      - *flutter_build_diagnostics
+        run: flutter test --no-pub

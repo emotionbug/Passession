@@ -22,6 +22,7 @@
 - Kept large Changes views summary-first with lazy patch loading in the native client.
 - Preserved timeline pagination and reconnect/history behavior in the native runtime.
 - Preserved all eight native release targets and complete artifacts for 30-day, publication-only and single-architecture recovery. GitHub release publication, provenance and update-feed generation now use Rust tooling instead of npm scripts.
+- Run default CI tests once on a single Ubuntu x64 runner, without platform matrices or duplicate quality/build lanes. Packaging, Docker, releases, SDK assembly and release-note synchronization are manual-only; commit and tag pushes no longer start them.
 - Restored the original app's look across the native client. This covers the sidebar tree and footer, the conversation header, tool and Thinking rows, the composer and model controls, permission cards, settings list/detail, file and diff panes, Git/PR panels and host dialogs. It also restores the original palettes, independent UI/content/code font sizes and Lucide icons.
 - Reduced the frames drawn while agents run (21 to 10 per second in a real desktop profile). The status ring, tool shimmer, working dots and elapsed time now step together on one shared clock that pauses in hidden tabs, and each repaints only itself. The clock runs at 10Hz in a focused window, 4Hz behind other windows, and stops while the window is minimized or the app is in the background. Streamed text is revealed at 30Hz in a focused window and shown whole elsewhere.
 - Decode attachment thumbnails at their physical display size while retaining original images for sending and enlargement. Bound the inline image cache by bytes as well as count, without making mounted thumbnails flicker when cache entries are evicted.
@@ -40,7 +41,7 @@
 - Removed the obsolete Node worker/validator build chain. Updated CI's Android SDK installation, macOS runners and Linux native-asset prerequisites; fixed Windows file identity on stable Rust and the Windows Flutter coroutine compiler mode.
 - Derive the native CI package channel from the release planner. Changelog synchronization skips an unpublished version unless draft creation is explicitly requested; GitHub lookup failures still fail the job.
 - Keep Cargo notice metadata locked while honoring Cargo's network policy, so clean container builds can resolve workspace crates that were not downloaded by the daemon build.
-- Build pinned Linux and Windows ARM64 Flutter SDKs in a dedicated repository workflow and publish immutable, non-latest SDK assets. ARM64 app CI installs the verified artifacts rather than rebuilding Flutter tools, and rejects emulated x64 Dart.
+- Build pinned Linux and Windows ARM64 Flutter SDKs in a dedicated manual workflow and publish immutable, non-latest SDK assets. Explicit ARM64 app builds install the verified artifacts rather than rebuilding Flutter tools, and reject emulated x64 Dart.
 - Make packaged JSON metadata readable by installed-product users instead of inheriting private temporary-file permissions.
 - Resolve Linux bundled libraries after relocating the entire payload's RPATHs, so Flutter plugins use the packaged engine rather than an absolute build-tree copy.
 - Preserve authentic revision-pinned objc2 license declarations on macOS and frozen attribution bytes on Windows checkouts.

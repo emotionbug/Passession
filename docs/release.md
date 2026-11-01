@@ -1,6 +1,6 @@
 # Release
 
-The checkout version is **0.13.1**. Build automation does not publish a release unless its publication path is explicitly selected.
+The checkout version is **0.13.1**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
 
 ## Distribution requirements
 
@@ -57,19 +57,19 @@ Optional Firebase configuration must match `sh.paseo.sessions`: `GOOGLE_SERVICES
 
 ## Workflow definitions and publication controls
 
-`.github/workflows/desktop-release.yml` is the **Native Release** workflow despite its retained filename. It builds Flutter/Rust targets, preserves complete per-target artifacts, validates recovery provenance, and publishes only through its publication path. Its matrix definition is not evidence that those targets have run.
+`.github/workflows/desktop-release.yml` is the manual-only **Native Release** workflow despite its retained filename. It builds Flutter/Rust targets, preserves complete per-target artifacts, validates recovery provenance, and publishes only through its publication path. Its matrix is for explicitly requested artifacts, not default CI or per-platform test repetition.
 
 The complete release matrix has **eight targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android universal and iOS arm64. Each target's artifacts are retained for **30 days**. macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android explicitly provisions platform-tools. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
 
-Manual inputs include `tag`, `mode` (`build` or `publish-only`), `recovery_run_id`, `platform`, `checkout_ref`, `publish`, and `rollout_hours`. **`publish` defaults to true**; explicitly select false for an authorized non-publishing build. Tag pushes also select publication. Do not push tags or dispatch a publishing workflow as a build test.
+Manual inputs include `tag`, `mode` (`build` or `publish-only`), `recovery_run_id`, `platform`, `checkout_ref`, `publish`, and `rollout_hours`. **`publish` defaults to true**; explicitly select false for an authorized non-publishing build. Tag pushes do not trigger the workflow. Do not dispatch a publishing workflow as a build test.
 
 `publish-only` consumes preserved artifacts from an exact prior completed canonical workflow run. Recovery requires a complete, unique, unexpired target inventory; one-architecture macOS recovery must not silently replace the other architecture. `cargo xtask release recovery`, `record`, `verify`, `manifests` and `publish` own recovery, artifact hashes, integrity, update feeds and publication. The publication repository is `emotionbug/paseo`; any manual `gh` command must name it explicitly with `--repo emotionbug/paseo`. Desktop rollout defaults to 36 hours; a rollout change is a publication-side operation requiring authorization, not a local check.
 
-`.github/workflows/docker.yml` and `desktop-packages.yml` cover their respective native packaging/deployment definitions. Native Desktop Packages also supports manual dispatch, allowing packaging checks to be grouped after initial SDK publication without changing normal push/PR triggers. These workflows do not establish a completed release or remove the distribution requirements above.
+`.github/workflows/docker.yml`, `desktop-packages.yml`, and `release-notes-sync.yml` are also manual-only, alongside SDK assembly, relay deployment and rollout. Docker publication requires `publish=true` and an explicit matching source version, including when the selected ref is a tag. These workflows do not establish a completed release or remove the distribution requirements above.
 
 ### Reusable Linux and Windows ARM64 Flutter SDKs
 
-Before ARM64 app CI or a native release can succeed, publish the SDK pinned by `.github/flutter-sdk.json` through the manually dispatched **Flutter ARM64 SDK** workflow (`.github/workflows/flutter-sdk.yml`). Dispatch it only after the SDK tooling and pin are present at the approved workflow revision. It assembles both SDKs on native `ubuntu-24.04-arm` and `windows-11-arm` runners using `cargo xtask flutter-sdk build`, then publishes the complete pair with `cargo xtask flutter-sdk publish`. This bootstraps pinned official Flutter source and downloads official native Dart/engine artifacts; it is **not an engine build or a separately maintained Flutter repository**.
+Before explicitly requested Linux/Windows ARM64 app builds can succeed, publish the SDK pinned by `.github/flutter-sdk.json` through the manually dispatched **Flutter ARM64 SDK** workflow (`.github/workflows/flutter-sdk.yml`). Normal Ubuntu x64 tests do not require it. Dispatch only after the SDK tooling and pin are present at the approved workflow revision. It assembles both SDKs on native `ubuntu-24.04-arm` and `windows-11-arm` runners using `cargo xtask flutter-sdk build`, then publishes the complete pair with `cargo xtask flutter-sdk publish`. This bootstraps pinned official Flutter source and downloads official native Dart/engine artifacts; it is **not an engine build or a separately maintained Flutter repository**.
 
 The pin is the single source of SDK artifact identity: Flutter version/channel, official source repository and exact source/engine revisions, destination repository, and reserved release tag. The initial tag is `flutter-sdk-3.47.5-r1` in `emotionbug/paseo`. Each platform produces `paseo-flutter-sdk-<version>-<linux|windows>-arm64.tar.gz` and a matching JSON identity/checksum manifest in `artifacts/flutter-sdk/`. Intermediate workflow artifacts expire after **7 days**; the reserved GitHub release assets are the durable consumer source.
 
@@ -79,13 +79,13 @@ SDK archives encode sparse filesystem inputs as ordinary file data. Consumers co
 
 Before making package roots relative, SDK assembly resolves filesystem aliases to canonical paths. In particular, Windows `RUNNER~1` temporary paths must not survive as references outside the archive. Validation rejects package URLs that leave the SDK even when a build-machine alias happens to resolve back into it; extracted SDKs must not depend on that machine's directory layout.
 
-Only the publish job has `contents: write`; builds and app consumers use read-only permissions. Publication validates both platform inventories and their builder revision, keeps the release draft until complete, and publishes a **non-latest prerelease**. The reserved `flutter-sdk-*` tag is not a Paseo product release, does not trigger the app release tag patterns, and must never replace the product's latest release or update feeds. Published SDK assets are immutable: do not delete, clobber, or repurpose an existing SDK tag.
+Only the publish job has `contents: write`; builds and app consumers use read-only permissions. Publication validates both platform inventories and their builder revision, keeps the release draft until complete, and publishes a **non-latest prerelease**. The reserved `flutter-sdk-*` tag is not a Paseo product release and must never replace the product's latest release or update feeds. Published SDK assets are immutable: do not delete, clobber, or repurpose an existing SDK tag.
 
 Publication refuses any existing reserved release or tag, including a partial draft; it neither resumes nor overwrites that identity. If publication fails after creating a draft, leave it untouched and select a new `rN` release tag in the pin before another authorized producer run. Consumers reject drafts and require the complete four-asset inventory with matching tag/builder revision.
 
 The shared setup action downloads the exact reserved SDK assets with `cargo xtask flutter-sdk install --version <version> --channel <channel>`. It checks the requested version/channel against the pin, verifies archive identity/size/hash before safe extraction, and checks Flutter identity and native Dart ABI before exporting the SDK. Its optional cache stores downloaded archives/manifests, not an unvalidated executable SDK; restored bytes are checked again. A missing SDK release is an actionable prerequisite failure: run the dedicated SDK workflow, rather than bootstrapping Flutter inside an app job or substituting x64 Dart. Non-ARM64 Linux/Windows and Apple hosts continue using the existing archived SDK setup.
 
-For an upgrade, update `.github/flutter-sdk.json` with the reviewed official version/channel/source/engine identity and a **new reserved release tag**; increment the `rN` suffix for a same-version SDK assembly change. Update the requested Flutter version/channel in `ci.yml`, `desktop-packages.yml`, and `desktop-release.yml` together when those change. After approval, dispatch the SDK producer at that revision and retain its run evidence before rerunning dependent app CI/release jobs. Do not reuse old assets under a new identity. SDK assembly/ABI validation alone is not proof of application execution on either platform.
+For an upgrade, update `.github/flutter-sdk.json` with the reviewed official version/channel/source/engine identity and a **new reserved release tag**; increment the `rN` suffix for a same-version SDK assembly change. Update the requested Flutter version/channel in `ci.yml`, `desktop-packages.yml`, and `desktop-release.yml` together when those change. After approval, dispatch the SDK producer at that revision and retain its run evidence before starting dependent ARM64 builds. Do not reuse old assets under a new identity. SDK assembly/ABI validation alone is not proof of application execution on either platform.
 
 ## Authorization and verification
 
@@ -110,12 +110,11 @@ release. This applies to both beta and stable releases.
   the changelog. Retarget remaining PRs based on `next` to `main` and delete the integrated
   `next`. Create it fresh when needed again.
 
-**Setup still needed:** PR checks run for every base branch, but CI and Docker
-push runs target only `main`, and GitHub permits only squash merges. Enable
-required-check protection for `next`, CI on its pushes, and merge commits for the
-integration PR. Handle PR
-base changes (`edited` events) so retargeting runs checks against the new base;
-GitHub's default PR events do not cover this. Deployment triggers stay unchanged.
+PR tests run for every base branch; automatic push tests target only `main`.
+Required-check protection and merge strategy are repository settings, not
+guarantees made by these workflow files. Retargeted or non-`main` changes can
+run the single CI workflow manually. Packaging and deployment remain
+manual-only on every branch.
 
 ### Hotfix from a release tag
 

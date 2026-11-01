@@ -13,7 +13,7 @@ cargo xtask flutter test test/<file>_test.dart
 cargo xtask flutter analyze
 ```
 
-Use bounded package/test filters locally; do not run the complete workspace or Flutter suite on the development host. CI owns `cargo test --workspace --locked`, the full Flutter suite and platform matrices.
+Use bounded package/test filters locally; do not run the complete workspace or Flutter suite on the development host. Default CI runs Rust and Flutter tests sequentially on one Ubuntu x64 runner, without a platform matrix.
 
 Rust tests are colocated with the daemon, SDKs, relay and `xtask` modules, with protocol integration tests under each crate's `tests/`. Flutter tests live in `packages/flutter_app/test`; actual app integration runs must use the Flutter client, not a browser rendering of the old UI. Native plugin checks must exercise executable IPC. Packaging/tooling tests validate artifact contracts, not the actual behavior of every target OS.
 
@@ -77,8 +77,9 @@ The local Linux cutover pass intentionally omitted broad tests, lint, benchmarks
 - Native Desktop Packages run `41299629861` completed the Linux app/daemon build, installer packaging, standalone daemon packaging and artifact-manifest generation on `b0e4b594e`. This packaging result does not establish execution on another OS.
 - SDK run `41299629918` built both ARM64 archives but failed cross-host publication validation. Inspection of its digest-matched Windows archive found 101 of 102 package roots pointing through the build runner's `RUNNER~1` alias outside the extracted SDK (`ev_26b586b6347053d7faff037631a796b2902dd0c7f87a452778d9fb66bbcef1a1`). The repair canonicalizes package paths before making relative URLs and rejects references that leave the SDK lexically, without weakening extraction or source-identity checks.
 - The package-root repair passed all 56 `paseo-xtask` tests. Its relocation regression archives an alias-based SDK, deletes the original SDK and alias, then resolves and reads the package library from the extracted archive.
+- The grouped CI-policy smoke parsed all eight remaining workflows, found exactly one automatic Ubuntu test job, and exercised the real Docker setup script with the native version CLI. Branch and tag refs both kept publication disabled unless explicitly requested (`ev_13f2d6ea70f40fcfae64ab799c5fb594dc91773ca0563be34e43c0cf0c4797b3`). No image was published. SDK run `41302020865` was cancelled before publication when the user requested test-only default CI; it is not a published SDK result.
 
-Runtime smoke observations remain narrow; passing native tests does not establish cross-platform, performance or release certification. The local toolchain lacked the Wasm target and binding generator; edge-target compilation belongs to its configured CI lane.
+Runtime smoke observations remain narrow; passing native tests does not establish cross-platform, performance or release certification. The local toolchain lacked the Wasm target and binding generator; edge-target compilation requires an explicitly requested build, not the default test workflow.
 
 ## Recorded 0.13.0 native-client migration evidence
 
@@ -122,11 +123,13 @@ At the time of this record there was **no actual Windows, macOS, Android-device,
 
 ## CI definitions versus execution
 
-`.github/workflows/ci.yml` defines native-daemon Linux, Windows and macOS lanes, each on x64 and arm64, plus Flutter lanes. Native-daemon jobs run `cargo xtask build-daemon` and `cargo test --workspace --all-targets --locked`. Quality checks use Cargo formatting, scoped xtask tests and workspace Clippy; the Rust Cloudflare relay has a separate Wasm build/check lane. Retired TypeScript server/integration/CLI jobs are not the product runtime acceptance path. `.github/ci-paths.yml` and CI Recovery route the native jobs. The historical evidence above predates the full Rust tooling/SDK/plugin cutover and is not verification of this checkout.
+`.github/workflows/ci.yml` has one `tests` job on `ubuntu-24.04`. Pushes to `main`, pull requests, merge queues and manual dispatch run `cargo test --locked --workspace --all-targets`, then `flutter test --no-pub` after locked package resolution. Rust and Flutter share that runner; there are no per-platform test jobs, separate lint/build jobs, coverage uploads, release binaries or installers in default CI. A newer run cancels the superseded run for the same ref.
 
-Linux/Windows ARM64 Flutter jobs consume the reserved SDK release defined by `.github/flutter-sdk.json`; they never assemble the SDK as part of an app check. Pin changes route Flutter checks, and shared setup/SDK workflow changes route normal CI checks. The manually dispatched **Flutter ARM64 SDK** workflow assembles and validates both native SDKs separately; its seven-day intermediate artifacts and durable non-latest prerelease assets are SDK evidence, not app runtime evidence. See [release prerequisites](release.md#reusable-linux-and-windows-arm64-flutter-sdks) before interpreting a missing SDK asset as an application regression.
+Native packaging, Docker, release publication, SDK assembly, relay deployment, rollout and release-note workflows are **manual-only**. Pushing a commit or tag does not launch them. The old path-routing file and CI Recovery workflow are removed; rerun the single CI job when needed.
 
-A matrix entry proves intended routing only. Report its actual run ID, platform, revision, result and logs before calling that platform verified. The same rule applies to release/build workflows: an installer filename or generated manifest does not establish successful execution, signing, publication, or legal distribution readiness.
+Explicitly requested Linux/Windows ARM64 builds consume the reserved SDK release defined by `.github/flutter-sdk.json`; normal Ubuntu x64 tests do not depend on that release. See [release prerequisites](release.md#reusable-linux-and-windows-arm64-flutter-sdks) before starting an ARM64 packaging run.
+
+A workflow definition is not execution evidence. Report the actual run ID, platform, revision and result; a Linux test pass does not establish Windows/macOS/mobile execution, signing, publication or distribution readiness.
 
 ## Failure and security expectations
 

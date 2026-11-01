@@ -101,7 +101,7 @@ The Rust `paseo-client` SDK lives in `packages/client`. Shared wire types and re
 
 Read [architecture](docs/architecture.md), [development](docs/development.md), [testing](docs/testing.md), and [release](docs/release.md) before changing runtime boundaries.
 
-Linux has actual native daemon/client and desktop-host lifecycle execution coverage. Cross-platform CI definitions are not evidence that Windows, macOS, Android, or iOS have been executed in this migration. The current evidence and outstanding checks are recorded in [testing](docs/testing.md).
+Linux has actual native daemon/client and desktop-host lifecycle execution coverage. Default CI runs tests in one Linux environment; manually available cross-platform build definitions are not evidence that Windows, macOS, Android, or iOS have been executed in this migration. The current evidence and outstanding checks are recorded in [testing](docs/testing.md).
 
 ## License and distribution
 

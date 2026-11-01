@@ -1,16 +1,6 @@
 name: Native Release
 
 on:
-  push:
-    tags:
-      - "v*"
-      - "desktop-v*"
-      - "desktop-macos-v*"
-      - "desktop-linux-v*"
-      - "desktop-windows-v*"
-      - "android-v*"
-      - "app-v*"
-      - "!app-v*-beta.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -54,9 +44,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-  CHECKOUT_REF: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.checkout_ref || github.event.inputs.tag) || github.ref_name }}
-  SHOULD_PUBLISH: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish != 'false' }}
+  SOURCE_TAG: ${{ inputs.tag }}
+  CHECKOUT_REF: ${{ inputs.checkout_ref || inputs.tag }}
+  SHOULD_PUBLISH: ${{ inputs.publish != 'false' }}
   RECOVERY_MODE: ${{ github.event.inputs.mode || 'build' }}
   RECOVERY_RUN_ID: ${{ github.event.inputs.recovery_run_id || '' }}
   ROLLOUT_HOURS: ${{ github.event.inputs.rollout_hours || '36' }}
