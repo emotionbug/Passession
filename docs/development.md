@@ -31,6 +31,13 @@ For direct Rust iteration, `cargo build --locked -p paseo-daemon --bin paseo` co
 
 `cargo xtask build-daemon --release` produces an optimized local native runtime, not a published release identity. Default Flutter release builds use optimized Rust; debug development builds use the debug profile. `PASEO_NATIVE_RELEASE=1` is a separate, validated publication-provenance choice; see [release](release.md).
 
+`paseo daemon status` reports daemon liveness without running external provider/model discovery.
+Its `providers` list is a cached observation (`providersCached: true`); `available` is `null`
+until availability is known, with catalog `status` and `fetchedAt` retaining context.
+The CLI's 1500ms status RPC deadline is unchanged. Use the existing
+`list_available_providers_request`, `provider_diagnostic_request` or catalog refresh for
+fresh provider diagnostics instead of treating basic status as a fresh provider probe.
+
 ## Isolated state and endpoints
 
 The ordinary native runtime defaults to `~/.paseo` and port `6767`. Development launchers use `<checkout>/.dev/paseo-home` and `127.0.0.1:6768`; they must not disturb an installed daemon or application.

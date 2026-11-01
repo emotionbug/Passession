@@ -1010,7 +1010,18 @@ fn publish(pin: &Pin) -> Result<()> {
         upload.arg(directory.join(name));
     }
     common::run(&mut upload)?;
-    let remote = release(pin)?;
+    // The tag is not created until publication; REST lookup by tag cannot find
+    // this draft. Resolve its immutable release ID through gh's draft-aware view.
+    let release_id: u64 = gh(&[
+        "release", "view", &pin.release_tag, "--repo", REPOSITORY,
+        "--json", "databaseId", "--jq", ".databaseId",
+    ])?
+    .trim()
+    .parse()
+    .context("Invalid SDK draft release ID")?;
+    let remote: Value = serde_json::from_str(&gh(&[
+        "api", &format!("repos/{REPOSITORY}/releases/{release_id}"),
+    ])?)?;
     ensure!(
         validate_release(&remote, pin, true)? == sha,
         "Draft release target mismatch"

@@ -36,6 +36,11 @@
 
 ### Fixed
 
+- Serve basic daemon status from cached provider observations instead of waiting for external model discovery. Mark cached results explicitly and report unknown availability as `null`, without extending the CLI's status timeout.
+- Separate queued-message admission from provider dispatch, return live duplicate receipts promptly, and reject full queues before creating a durable pending receipt. Preserve uncertain outcomes after interrupted delivery.
+- Finish Pi/OMP host-tool responses after draining accepted progress in order, without waiting for retained progress senders; cancellation also releases blocked progress forwarding.
+- Reconcile interrupted records on startup and clear ended provider/event-owner state, active turns and waiters. Preserve conversation identities and reject late acknowledgements that would restore stale running state.
+- Resolve newly created Flutter SDK drafts by release ID before verification; unpublished tags cannot be queried through GitHub's published-release-by-tag endpoint.
 - Removed whole-history JSON checkpoint rewrites from streamed agent updates. Persist changed timeline items and cursors transactionally in SQLite, retaining legacy JSON checkpoints as migration backups and preserving commit-before-publication ordering.
 - Preserve pending-turn event ordering without terminating high-volume sessions: spill bounded memory chunks to a private FIFO spool, run recognized out-of-band commands outside turn admission, and make genuine event-storage failures clear running state and permit close/reload.
 - Removed the obsolete Node worker/validator build chain. Updated CI's Android SDK installation, macOS runners and Linux native-asset prerequisites; fixed Windows file identity on stable Rust and the Windows Flutter coroutine compiler mode.
