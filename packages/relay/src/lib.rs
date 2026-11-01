@@ -440,29 +440,46 @@ impl Relay {
             })
         });
         let (mut sink, mut stream) = socket.split();
-        loop {
+        let closure = loop {
             tokio::select! {
-                changed = connection.close.changed() => {
-                    let closure = if changed.is_ok() { *connection.close.borrow() } else { None };
-                    if let Some(close) = closure {
-                        let _ = tokio::time::timeout(self.0.config.write_timeout, sink.send(Message::Close(Some(CloseFrame { code: close.code, reason: close.reason.into() })))).await;
-                    }
-                    break;
+                _ = connection.close.changed() => {
+                    break *connection.close.borrow();
                 }
                 message = stream.next() => match message {
                     Some(Ok(Message::Text(text))) => self.receive(&connection.key, connection.id, Message::Text(text)),
                     Some(Ok(Message::Binary(bytes))) => self.receive(&connection.key, connection.id, Message::Binary(bytes)),
                     Some(Ok(Message::Ping(bytes))) => {
-                        if !matches!(tokio::time::timeout(self.0.config.write_timeout, sink.send(Message::Pong(bytes))).await, Ok(Ok(()))) { break; }
+                        if !matches!(tokio::time::timeout(self.0.config.write_timeout, sink.send(Message::Pong(bytes))).await, Ok(Ok(()))) { break None; }
                     }
                     Some(Ok(Message::Pong(_))) => {}
-                    _ => break,
+                    Some(Ok(Message::Close(_))) => {
+                        // Tungstenite queues the close reply while reading it.
+                        // Flush that reply before dropping the transport.
+                        let _ = tokio::time::timeout(self.0.config.write_timeout, sink.flush()).await;
+                        break None;
+                    }
+                    _ => break None,
                 },
                 frame = connection.rx.recv() => {
-                    let Some(frame) = frame else { break; };
-                    if !matches!(tokio::time::timeout(self.0.config.write_timeout, sink.send(frame.frame.message)).await, Ok(Ok(()))) { break; }
+                    let Some(frame) = frame else {
+                        // Removing a peer drops both senders. The empty queue
+                        // can win select before the close notification, but
+                        // stop() has already stored the promised close frame.
+                        break *connection.close.borrow();
+                    };
+                    if !matches!(tokio::time::timeout(self.0.config.write_timeout, sink.send(frame.frame.message)).await, Ok(Ok(()))) { break None; }
                 }
             }
+        };
+        if let Some(close) = closure {
+            let _ = tokio::time::timeout(
+                self.0.config.write_timeout,
+                sink.send(Message::Close(Some(CloseFrame {
+                    code: close.code,
+                    reason: close.reason.into(),
+                }))),
+            )
+            .await;
         }
         if let Some(task) = nudge_task {
             task.abort();

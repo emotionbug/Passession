@@ -10,7 +10,10 @@ use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{Message, protocol::CloseFrame},
+};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 struct Server {
@@ -281,6 +284,31 @@ async fn legacy_replacement_and_version_isolation() {
     drop(client);
     drop(v2);
     server.empty().await;
+}
+
+#[tokio::test]
+async fn peer_close_is_acknowledged_before_transport_shutdown() {
+    let server = Server::start(Config::default()).await;
+    for query in [
+        "role=client&serverId=s",
+        "v=2&role=client&serverId=s&connectionId=a",
+    ] {
+        let mut client = server.socket(query).await;
+        let close = Message::Close(Some(CloseFrame {
+            code: 1000.into(),
+            reason: "finished".into(),
+        }));
+        client.send(close.clone()).await.unwrap();
+        assert_eq!(receive(&mut client).await, close);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), client.next())
+                .await
+                .expect("closed transport deadline")
+                .is_none(),
+            "the acknowledged close must end without a protocol error"
+        );
+        server.empty().await;
+    }
 }
 
 #[tokio::test]

@@ -18,6 +18,7 @@
 mod highlighter;
 mod languages;
 mod themes;
+mod vue;
 
 pub use arborium::advanced::CompiledGrammar as Parser;
 pub use highlighter::{

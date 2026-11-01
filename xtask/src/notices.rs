@@ -674,6 +674,15 @@ mod tests {
     }
 
     #[test]
+    fn abi_attribution_rejects_checkout_line_ending_changes() {
+        let (directory, inventory) = abi_fixture();
+        let path = directory.path().join("legacy-plugin.mjs");
+        let source = fs::read_to_string(&path).unwrap();
+        fs::write(path, source.replace('\n', "\r\n")).unwrap();
+        assert!(validate_embedded_inventory(directory.path(), &inventory).is_err());
+    }
+
+    #[test]
     fn supported_hosts_are_explicit() {
         for os in ["linux", "macos", "windows"] {
             for arch in ["x86_64", "aarch64"] {
@@ -750,6 +759,14 @@ mod tests {
             date_notice(&format!("{DATE_HEADER}\nfn main() {{}}")).unwrap(),
             DATE_HEADER
         );
+        assert!(date_notice(&DATE_HEADER.replace('\n', "\r\n")).is_err());
+        let source = text(
+            &root()
+                .unwrap()
+                .join("packages/daemon/src/agent/date_parse.rs"),
+        )
+        .unwrap();
+        assert_eq!(date_notice(&source).unwrap(), DATE_HEADER);
         assert!(
             date_notice(&DATE_HEADER.replace(
                 "// * Neither the name of Google Inc. nor the names of its contributors may be\n",

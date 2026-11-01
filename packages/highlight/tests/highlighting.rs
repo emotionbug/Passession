@@ -269,6 +269,74 @@ const title: string = "hé🦀";
 }
 
 #[test]
+fn jsx_and_tsx_keep_element_names_distinct_from_expression_identifiers() {
+    let source = r#"const view = <section aria-label="hé🦀"><Widget title="same" /><span>{value < limit ? "same" : "same"}</span></section>;"#;
+    for filename in ["jsx", "tsx"] {
+        assert_eq!(
+            reconstruct(&highlight_code(source, filename).unwrap()),
+            source
+        );
+        for name in ["section", "Widget", "span"] {
+            for (start, _) in source.match_indices(name) {
+                assert_style_at(source, filename, start..start + name.len(), Style::Tag);
+            }
+        }
+        assert_style(source, filename, "aria-label", Style::Attribute);
+        assert_style(source, filename, "title", Style::Attribute);
+        assert_style(source, filename, "value", Style::Variable);
+        assert_style(source, filename, "limit", Style::Variable);
+        let comparison = source.find("< limit").unwrap();
+        assert_style_at(
+            source,
+            filename,
+            comparison..comparison + 1,
+            Style::Operator,
+        );
+        for (start, text) in source.match_indices("same") {
+            assert_style_at(source, filename, start..start + text.len(), Style::String);
+        }
+    }
+}
+
+#[test]
+fn vue_delimiters_inside_literals_do_not_relocate_repeated_content() {
+    let source = r#"<script setup lang="ts">const label: string = 'é🦀}}same';</script>
+<template><p>{{ 'é🦀}}same' }} {{ 'é🦀}}same' }}
+{{ '<em>é🦀}}same</em>' }} {{ 'left {{ right' }}
+{{ "escaped\"}}same" }} {{{nested: {value: 'same'}}}}
+{{ `é🦀}} ${`nested ${"same"}`} same` }}
+{{ /[}}]/.test(label) ? 'same' : 'same' }}
+{{ label /* }} */ + 'same' }}</p><strong>after</strong></template>
+<style>.same { color: red; }</style>"#;
+    assert_eq!(reconstruct(&highlight_code(source, "vue").unwrap()), source);
+    for (start, text) in source.match_indices("é🦀}}same") {
+        assert_style_at(source, "vue", start..start + text.len(), Style::String);
+    }
+    for (start, text) in source.match_indices("'same'") {
+        assert_style_at(source, "vue", start..start + text.len(), Style::String);
+    }
+    assert_style(source, "vue", "}}same", Style::String);
+    assert_style(source, "vue", "left {{ right", Style::String);
+    assert_style(source, "vue", "/* }} */", Style::Comment);
+    assert_style(source, "vue", "strong", Style::Tag);
+    assert_style(source, "vue", "color", Style::Property);
+    let selector = source.rfind(".same").unwrap() + 1;
+    assert_style_at(source, "vue", selector..selector + 4, Style::Class);
+
+    let mut highlighter = Highlighter::new().unwrap();
+    let spans = highlighter.highlight_spans(source, Language::Vue).unwrap();
+    let mut offset = 0;
+    for span in spans {
+        assert_eq!(span.range.start, offset);
+        assert!(span.range.end > span.range.start);
+        assert!(source.is_char_boundary(span.range.start));
+        assert!(source.is_char_boundary(span.range.end));
+        offset = span.range.end;
+    }
+    assert_eq!(offset, source.len());
+}
+
+#[test]
 fn markdown_fences_and_inline_links_are_parsed_in_their_own_languages() {
     let source = "# Example\n\nA [link](https://example.com).\n\n```typescript\nconst café: number = 42;\n```\n";
     assert_style(source, "md", "Example", Style::Heading);

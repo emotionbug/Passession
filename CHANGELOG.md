@@ -43,6 +43,11 @@
 - Build pinned Linux and Windows ARM64 Flutter SDKs in a dedicated repository workflow and publish immutable, non-latest SDK assets. ARM64 app CI installs the verified artifacts rather than rebuilding Flutter tools, and rejects emulated x64 Dart.
 - Make packaged JSON metadata readable by installed-product users instead of inheriting private temporary-file permissions.
 - Resolve Linux bundled libraries after relocating the entire payload's RPATHs, so Flutter plugins use the packaged engine rather than an absolute build-tree copy.
+- Preserve authentic revision-pinned objc2 license declarations on macOS and frozen attribution bytes on Windows checkouts.
+- Fix native JSX/TSX tag and comparison classification and Vue interpolation boundaries inside strings, templates, comments and regular expressions, retaining Unicode byte offsets and repeated text.
+- Keep native Windows ARM64 audio enabled by maintaining the upstream SoLoud 5.2.2 sources with an explicit MSVC `_alloca` declaration.
+- Correct the pinned Flutter Windows bootstrap's Git revision command with digest-bound source bytes, so installed SDKs reuse their prebuilt tool snapshot instead of rebuilding it.
+- Flush native relay close frames when peer removal closes both notification channels, and acknowledge incoming closes before dropping the transport. Preserve replacement isolation and existing close codes instead of intermittently resetting sockets.
 - Fixed existing conversations appearing empty after restarting the native daemon. Provider history replaces partial checkpoints before timeline pages are served, while retaining live events received during restoration.
 - Fixed repeated Pi/OMP assistant and reasoning text when cumulative snapshots arrive ahead of queued streaming deltas. Delta-only streams still preserve intentionally repeated text.
 - Fixed empty tool-detail sheets for label-only calls such as Wait. When plain-text output is absent, show the full supplied command or wait-target label as selectable, wrapping text; retain the existing output when present.

@@ -1,0 +1,5 @@
+# Attribution validates these source bytes exactly; Windows checkouts must not
+# rewrite reviewed ABI digests or the complete V8 DateParser notice to CRLF.
+/packages/daemon/src/providers/opencode/assets/legacy-plugin.mjs text eol=lf
+/packages/daemon/src/providers/opencode/assets/v2-plugin.mjs text eol=lf
+/packages/daemon/src/agent/date_parse.rs text eol=lf

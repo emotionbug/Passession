@@ -8,6 +8,8 @@ Native packages exclude speech recognition, voice conversation and TTS, includin
 
 Rust tooling in `xtask/src/notices.rs` generates Cargo and bundled-asset attributions. Preserve those notices with the exact packaged artifacts and review the licenses of remaining bundled dependencies and platform runtimes. Generated attributions are not a compliance certification or a corresponding-source offer.
 
+The revision-pinned objc2 supplements preserve the authors' complete upstream `LICENSE.md`, including its Apple SDK caveat. That file is a licensing declaration linking standard terms, not a fabricated replacement license. Frozen OpenCode ABI bytes and the V8 notice use explicit LF checkout attributes so Windows cannot silently change their validated content.
+
 ## Release contents
 
 | Target                        | Native artifact scope                                                                         |
@@ -67,9 +69,11 @@ Manual inputs include `tag`, `mode` (`build` or `publish-only`), `recovery_run_i
 
 ### Reusable Linux and Windows ARM64 Flutter SDKs
 
-Before ARM64 app CI or a native release can succeed, publish the SDK pinned by `.github/flutter-sdk.json` through the manually dispatched **Flutter ARM64 SDK** workflow (`.github/workflows/flutter-sdk.yml`). Dispatch it only after the SDK tooling and pin are present at the approved workflow revision. It assembles both SDKs on native `ubuntu-24.04-arm` and `windows-11-arm` runners using `cargo xtask flutter-sdk build`, then publishes the complete pair with `cargo xtask flutter-sdk publish`. This bootstraps pinned official Flutter source and downloads official native Dart/engine artifacts; it is **not an engine build or a Flutter fork**.
+Before ARM64 app CI or a native release can succeed, publish the SDK pinned by `.github/flutter-sdk.json` through the manually dispatched **Flutter ARM64 SDK** workflow (`.github/workflows/flutter-sdk.yml`). Dispatch it only after the SDK tooling and pin are present at the approved workflow revision. It assembles both SDKs on native `ubuntu-24.04-arm` and `windows-11-arm` runners using `cargo xtask flutter-sdk build`, then publishes the complete pair with `cargo xtask flutter-sdk publish`. This bootstraps pinned official Flutter source and downloads official native Dart/engine artifacts; it is **not an engine build or a separately maintained Flutter repository**.
 
 The pin is the single source of SDK artifact identity: Flutter version/channel, official source repository and exact source/engine revisions, destination repository, and reserved release tag. The initial tag is `flutter-sdk-3.47.5-r1` in `emotionbug/paseo`. Each platform produces `paseo-flutter-sdk-<version>-<linux|windows>-arm64.tar.gz` and a matching JSON identity/checksum manifest in `artifacts/flutter-sdk/`. Intermediate workflow artifacts expire after **7 days**; the reserved GitHub release assets are the durable consumer source.
+
+For Flutter 3.47.5, the pin also records one Windows bootstrap correction: upstream `bin/internal/shared.bat` invokes literal `$git` when reading the revision. The producer changes that command to `git`, verifying both original and corrected SHA-256 values with the upstream-required CRLF checkout bytes. Published SDK validation permits only that exact declared change; other tracked-source changes still fail. This does not modify the engine. A future version with the upstream fix can set `windowsBootstrapPatch` to `null`.
 
 Only the publish job has `contents: write`; builds and app consumers use read-only permissions. Publication validates both platform inventories and their builder revision, keeps the release draft until complete, and publishes a **non-latest prerelease**. The reserved `flutter-sdk-*` tag is not a Paseo product release, does not trigger the app release tag patterns, and must never replace the product's latest release or update feeds. Published SDK assets are immutable: do not delete, clobber, or repurpose an existing SDK tag.
 

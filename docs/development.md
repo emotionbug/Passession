@@ -70,6 +70,7 @@ Only run the desktop target matching the host OS. iOS requires macOS. `cargo xta
 - Dart: `packages/flutter_app/lib`; protocol and state in `core/`, features under `features/`, native desktop/mobile integration under `platform/`.
 - Native build, packaging and release: `xtask/src`; platform project integration: `packages/flutter_desktop_host`.
 - Rust SDKs: `packages/client`, `packages/protocol`, `packages/plugin`, `packages/highlight`; relay: `packages/relay`.
+- Maintained audio dependency: `packages/flutter_audio/third_party/flutter_soloud` retains upstream 5.2.2 runtime/build sources and licenses. Its MSVC-only `<malloc.h>` include fixes ARM64 `_alloca` declarations without disabling audio or changing architecture. Archive identity, retained files and the patch are recorded in `UPSTREAM.json`; normal development and CI use the same path dependency.
 
 Use Flutter tooling for frame/layout profiling and Rust instrumentation for daemon work. Browser/CDP and React profilers do not profile the native client. A development mock provider can test controlled UI states but is not evidence of real provider interoperability.
 

@@ -156,7 +156,7 @@ async fn native_provider_enforces_permission_and_serves_real_file_settings_and_h
 fn executable_validation_reports_registered_contract_and_rejects_incompatible_manifests() {
     let directory = tempfile::tempdir().unwrap();
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_paseo-workspace-inspector"));
-    let filename = executable.file_name().unwrap();
+    let filename = executable.file_name().unwrap().to_str().unwrap();
     let local = directory.path().join(filename);
     std::fs::copy(executable, &local).unwrap();
     let manifest = json!({"id":"workspace-inspector","name":"Workspace Inspector","runtime":"native","requirements":{"paseo":">=0.13.1"},"server":{"executable":filename,"args":[]}});

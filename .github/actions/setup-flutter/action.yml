@@ -26,7 +26,7 @@ runs:
         cache-key: ${{ inputs.cache-key }}
     - name: Set up SDK installer toolchain
       if: ${{ runner.arch == 'ARM64' && (runner.os == 'Linux' || runner.os == 'Windows') }}
-      uses: dtolnay/rust-toolchain@1.93.1
+      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
       with:
         toolchain: ${{ runner.os == 'Windows' && '1.93.1-aarch64-pc-windows-msvc' || '1.93.1-aarch64-unknown-linux-gnu' }}
     - name: Cache verified ARM64 SDK downloads

@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     env,
@@ -17,6 +18,15 @@ const REPOSITORY: &str = "emotionbug/paseo";
 const SOURCE: &str = "https://github.com/flutter/flutter.git";
 const MAX_ARCHIVE: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 20 * 1024 * 1024 * 1024;
+const WINDOWS_BOOTSTRAP: &str = "bin/internal/shared.bat";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BootstrapPatch {
+    path: String,
+    upstream_sha256: String,
+    patched_sha256: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -29,6 +39,7 @@ struct Pin {
     engine_revision: String,
     release_repository: String,
     release_tag: String,
+    windows_bootstrap_patch: Option<BootstrapPatch>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -77,6 +88,15 @@ fn pin() -> Result<Pin> {
         hex_identity(&pin.source_revision, 40) && hex_identity(&pin.engine_revision, 40),
         "SDK source/engine revisions must be full lowercase SHAs"
     );
+    if let Some(patch) = &pin.windows_bootstrap_patch {
+        ensure!(
+            patch.path == WINDOWS_BOOTSTRAP
+                && hex_identity(&patch.upstream_sha256, 64)
+                && hex_identity(&patch.patched_sha256, 64)
+                && patch.upstream_sha256 != patch.patched_sha256,
+            "Invalid pinned Windows bootstrap correction"
+        );
+    }
     let prefix = format!("flutter-sdk-{}-r", pin.version);
     let revision = pin
         .release_tag
@@ -89,6 +109,26 @@ fn pin() -> Result<Pin> {
         "Invalid SDK artifact revision"
     );
     Ok(pin)
+}
+
+fn corrected_windows_bootstrap(source: &str, patch: &BootstrapPatch) -> Result<String> {
+    ensure!(
+        hex::encode(Sha256::digest(source.as_bytes())) == patch.upstream_sha256,
+        "Windows bootstrap source differs from the reviewed upstream bytes"
+    );
+    // The pinned batch script invokes literal `$git`, unlike the POSIX launcher.
+    // Fix its revision lookup so normal launches can reuse the built snapshot.
+    let before = "PUSHD %FLUTTER_ROOT% ^& $git rev-parse HEAD";
+    ensure!(
+        source.matches(before).count() == 1,
+        "Windows bootstrap correction no longer applies"
+    );
+    let corrected = source.replacen(before, "PUSHD %FLUTTER_ROOT% ^& git rev-parse HEAD", 1);
+    ensure!(
+        hex::encode(Sha256::digest(corrected.as_bytes())) == patch.patched_sha256,
+        "Windows bootstrap correction differs from its pinned digest"
+    );
+    Ok(corrected)
 }
 
 fn native_platform() -> Result<&'static str> {
@@ -299,7 +339,8 @@ fn verify_sdk(sdk: &Path, pin: &Pin, platform: &str) -> Result<()> {
         common::capture(git(sdk).args(["remote", "get-url", "origin"]))? == SOURCE,
         "SDK source remote mismatch"
     );
-    common::run(git(sdk).args([
+    let mut diff = git(sdk);
+    diff.args([
         "-c",
         "core.filemode=false",
         "diff",
@@ -307,8 +348,21 @@ fn verify_sdk(sdk: &Path, pin: &Pin, platform: &str) -> Result<()> {
         "--quiet",
         "HEAD",
         "--",
-    ]))
-    .context("SDK tracked source differs from the pinned commit")?;
+        ".",
+    ]);
+    if let Some(patch) = pin
+        .windows_bootstrap_patch
+        .as_ref()
+        .filter(|_| platform == "windows")
+    {
+        ensure!(
+            common::sha256_file(&sdk.join(&patch.path))? == patch.patched_sha256,
+            "SDK Windows bootstrap differs from the reviewed correction"
+        );
+        diff.arg(format!(":(exclude){}", patch.path));
+    }
+    common::run(&mut diff)
+        .context("SDK tracked source differs from the pinned commit and declared correction")?;
     let expected_stamp = format!("{}:", pin.source_revision);
     let stamp = read_text(&sdk.join("bin/cache/flutter_tools.stamp"))?;
     ensure!(
@@ -541,6 +595,17 @@ fn build(pin: &Pin) -> Result<()> {
     // No credential helper, extraheader, runner path or inherited include is
     // retained. Flutter still has its version tag, objects, branch and origin.
     fs::write(sdk.join(".git/config"), git_config(platform))?;
+    if let Some(patch) = pin
+        .windows_bootstrap_patch
+        .as_ref()
+        .filter(|_| platform == "windows")
+    {
+        let path = sdk.join(&patch.path);
+        fs::write(
+            &path,
+            corrected_windows_bootstrap(&fs::read_to_string(&path)?, patch)?,
+        )?;
+    }
     common::run(
         sdk_command(&flutter_path(&sdk, platform), &sdk, &home).args(["--version", "--machine"]),
     )?;

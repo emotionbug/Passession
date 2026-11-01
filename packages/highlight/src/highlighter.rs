@@ -77,6 +77,45 @@ fn register(
 fn store() -> Result<Arc<arborium::GrammarStore>, Error> {
     static STORE: LazyLock<Result<Arc<arborium::GrammarStore>, String>> = LazyLock::new(|| {
         let store = Arc::new(arborium::GrammarStore::new());
+        for (name, language, highlights, injections, locals) in [
+            (
+                "javascript",
+                arborium::lang_javascript::language(),
+                arborium::lang_javascript::HIGHLIGHTS_QUERY,
+                arborium::lang_javascript::INJECTIONS_QUERY,
+                arborium::lang_javascript::LOCALS_QUERY,
+            ),
+            (
+                "tsx",
+                arborium::lang_tsx::language(),
+                &arborium::lang_tsx::HIGHLIGHTS_QUERY,
+                arborium::lang_tsx::INJECTIONS_QUERY,
+                arborium::lang_tsx::LOCALS_QUERY,
+            ),
+        ] {
+            register(
+                &store,
+                name,
+                language.into(),
+                &format!("{highlights}\n{}", include_str!("jsx.scm")),
+                injections,
+                locals,
+            )?;
+        }
+        // Preserve interpolation openers even when Vue's raw-text scanner
+        // recovers through an embedded JavaScript string as malformed HTML.
+        register(
+            &store,
+            "vue",
+            arborium::lang_vue::language().into(),
+            &format!(
+                "{}\n{}",
+                &*arborium::lang_vue::HIGHLIGHTS_QUERY,
+                "\"{{\" @paseo.interpolation",
+            ),
+            arborium::lang_vue::INJECTIONS_QUERY,
+            arborium::lang_vue::LOCALS_QUERY,
+        )?;
         register(
             &store,
             "astro",
@@ -183,7 +222,11 @@ impl Highlighter {
         if code.len() > u32::MAX as usize {
             return Err(Error::InputTooLarge);
         }
-        let spans = self.inner.highlight_spans(language.grammar_name(), code)?;
+        let spans = if language == Language::Vue {
+            crate::vue::highlight(&mut self.inner, code)?
+        } else {
+            self.inner.highlight_spans(language.grammar_name(), code)?
+        };
         flatten(code, spans)
     }
 

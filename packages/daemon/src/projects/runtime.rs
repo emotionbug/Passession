@@ -1206,6 +1206,29 @@ mod tests {
 
     #[tokio::test]
     async fn port_probe_reservations_rollback_refresh_and_release() -> Result<()> {
+        // Concurrent PTY tests fork before closing inherited descriptors. CLOEXEC
+        // does not stop a child retaining a probe socket until then, so dropping
+        // our listener need not make its port immediately reusable. Run this
+        // close-and-rebind fixture in a process that does not spawn other tests.
+        const CHILD: &str = "PASEO_PORT_PROBE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "projects::runtime::tests::port_probe_reservations_rollback_refresh_and_release",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "isolated port fixture failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return Ok(());
+        }
         let temp = tempfile::tempdir()?;
         // This test repeatedly releases one port. Do not draw it from the
         // ephemeral pool used by concurrent network tests and outgoing sockets.
