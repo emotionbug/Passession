@@ -13,6 +13,15 @@ Cached rows and startup notifications do not certify that replay has completed. 
 first history response waits for provider replay; live events received during recovery follow that
 replay instead of displacing it.
 
+Per-agent projection checkpoints live in `agent-timelines/{id}.sqlite3`. A retained SQLite
+connection commits the changed projected row and sequence metadata together using WAL and
+`synchronous=FULL` before publishing the event. Failed commits restore the in-memory projection;
+full provider replay replaces the checkpoint in one transaction.
+
+An absent database imports the previous `{id}.json` checkpoint once. That JSON file remains
+untouched as a migration backup; subsequent writes use only SQLite. Neither checkpoint format
+replaces provider history as the transcript authority.
+
 The invariants are:
 
 > A continuously subscribed client applies every committed row in order. Opening or resuming an

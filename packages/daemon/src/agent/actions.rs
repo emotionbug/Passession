@@ -927,6 +927,9 @@ impl AgentManager {
                 let app = self.app()?;
                 for path in [
                     self.timeline_path(id)?,
+                    app.home.join("agent-timelines").join(format!("{id}.sqlite3-wal")),
+                    app.home.join("agent-timelines").join(format!("{id}.sqlite3-shm")),
+                    app.home.join("agent-timelines").join(format!("{id}.json")),
                     app.home.join("agent-subagents").join(format!("{id}.json")),
                 ] {
                     match tokio::fs::remove_file(path).await {

@@ -15,6 +15,10 @@ Live events provide immediacy; authoritative history and sequence/cursor reconci
 
 Bound memory and update work. Avoid rereading/rebuilding the complete retained history for every delta, eagerly materializing offscreen content, or sending per-token filesystem writes without the owner's ordering guarantees. Measure provider arrival, daemon processing, network delivery, Dart state work and Flutter frames separately.
 
+Parent timeline commits update only the affected projected row and cursor metadata in SQLite,
+not the complete retained history. The owner retains its connection and prepared statements.
+Publication still follows durable commit; this does not change Flutter's text-reveal timing.
+
 ## Evidence
 
 Use repeatable input for an isolated performance comparison and a real provider for interoperability. Report first visible output, sustained cadence, long-gap behavior, CPU/memory and retained-history size, not one average that hides stalls. A controlled development provider is useful for timing but must not be called a real-provider test.

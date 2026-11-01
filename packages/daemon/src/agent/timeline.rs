@@ -189,7 +189,7 @@ pub fn project_rows(rows: &[Value]) -> Vec<Value> {
     output
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Timeline {
     epoch: String,
     rows: Vec<Value>,
@@ -197,6 +197,8 @@ pub struct Timeline {
     submitted: HashMap<String, usize>,
     next_seq: i64,
     min_seq: i64,
+    storage: Option<storage::Store>,
+    storage_dirty: bool,
 }
 impl Default for Timeline {
     fn default() -> Self {
@@ -212,6 +214,8 @@ impl Timeline {
             submitted: HashMap::new(),
             next_seq: 1,
             min_seq: 0,
+            storage: None,
+            storage_dirty: false,
         }
     }
     pub fn seed(options: &Value) -> Result<Self> {
@@ -278,6 +282,7 @@ impl Timeline {
     }
     pub fn enrich_submitted_user_message(&mut self, id: &str, provider_id: &str) -> Option<Value> {
         let row = &mut self.rows[*self.submitted.get(id)?];
+        self.storage_dirty = true;
         row["providerMessageId"] = json!(provider_id);
         Some(row.clone())
     }
@@ -291,6 +296,10 @@ impl Timeline {
         storage::enrich(self, path, agent_id, message_id, provider_id)
     }
     pub fn append(&mut self, item: Value, options: &Value) -> Value {
+        self.storage_dirty = true;
+        self.append_indexed(item, options).0
+    }
+    fn append_indexed(&mut self, item: Value, options: &Value) -> (Value, usize) {
         let item = limit_item_content(item);
         let mut row = json!({"seq":self.next_seq,"timestamp":options["timestamp"].as_str().map(str::to_owned).unwrap_or_else(now),"item":item});
         for field in ["turnId", "providerMessageId"] {
@@ -299,10 +308,10 @@ impl Timeline {
             }
         }
         self.next_seq += 1;
-        self.append_row(row.clone());
-        row
+        let index = self.append_row(row.clone());
+        (row, index)
     }
-    fn append_row(&mut self, row: Value) {
+    fn append_row(&mut self, row: Value) -> usize {
         let entry = canonical(row);
         if self.min_seq == 0 {
             self.min_seq = num(&entry, "seqStart");
@@ -310,7 +319,7 @@ impl Timeline {
         if let Some(id) = identity(&entry["item"]) {
             if let Some(&index) = self.identities.get(&id) {
                 if merge_identity(&mut self.rows[index], &entry) {
-                    return;
+                    return index;
                 }
             }
             self.identities.insert(id, self.rows.len());
@@ -320,7 +329,7 @@ impl Timeline {
             .last_mut()
             .is_some_and(|previous| merge_text(previous, &entry))
         {
-            return;
+            return self.rows.len() - 1;
         }
         if kind(&entry["item"]) == "user_message" {
             if let Some(id) = entry["item"]["clientMessageId"]
@@ -331,6 +340,7 @@ impl Timeline {
             }
         }
         self.rows.push(entry);
+        self.rows.len() - 1
     }
     pub fn fetch(&self, options: &Value) -> Value {
         let direction = options["direction"].as_str().unwrap_or("tail");
@@ -458,7 +468,7 @@ impl Timeline {
     pub fn load(path: &Path, agent_id: &str) -> Result<Self> {
         storage::load(path, agent_id)
     }
-    pub fn persist(&self, path: &Path, agent_id: &str) -> Result<()> {
+    pub fn persist(&mut self, path: &Path, agent_id: &str) -> Result<()> {
         storage::persist(self, path, agent_id)
     }
     pub fn append_persisted(

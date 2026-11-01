@@ -531,7 +531,7 @@ impl AgentManager {
         // Drain final provider events after daemon cancellation, before committing closed state.
         let cancel = CancellationToken::new();
         let (sink, receiver) = EventSink::channel(256, cancel.clone());
-        let path = app.home.join("agent-timelines").join(format!("{id}.json"));
+        let path = self.timeline_path(id)?;
         let owned_id = id.to_owned();
         let timeline =
             tokio::task::spawn_blocking(move || Timeline::load(&path, &owned_id)).await??;

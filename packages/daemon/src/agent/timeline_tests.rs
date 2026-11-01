@@ -117,7 +117,7 @@ fn tool_identity_does_not_merge_across_turns() {
 #[test]
 fn checkpoint_recovery_retains_cursor_ranges_and_user_enrichment() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("timeline.json");
+    let path = dir.path().join("timeline.sqlite3");
     let mut timeline = interleaved();
     timeline.append_persisted(&path,"agent",json!({"type":"user_message","text":"accepted","clientMessageId":"client","opaque":null}),&options()).unwrap();
     let recovered = Timeline::load(&path, "agent").unwrap();
@@ -139,7 +139,7 @@ fn checkpoint_recovery_retains_cursor_ranges_and_user_enrichment() {
 #[test]
 fn corrupt_checkpoint_is_not_silently_empty() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("timeline.json");
+    let path = dir.path().join("timeline.sqlite3");
     std::fs::write(&path, "{broken").unwrap();
     assert!(Timeline::load(&path, "agent").is_err());
     assert!(
@@ -345,7 +345,7 @@ fn search_paging_retains_every_location() {
 #[test]
 fn provider_message_identity_is_durable_without_new_sequence() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("timeline.json");
+    let path = directory.path().join("timeline.sqlite3");
     let mut timeline = Timeline::new();
     timeline.append_persisted(&path,"agent",json!({"type":"user_message","text":"hello","clientMessageId":"client","messageId":"client"}),&options()).unwrap();
     let epoch = timeline.epoch().to_owned();
@@ -401,4 +401,191 @@ fn provider_subagent_checkpoint_recovers_nulls_and_timeline_epoch() {
             .unwrap(),
         store.fetch_timeline("parent", "child", &json!({})).unwrap()
     );
+}
+
+#[test]
+fn legacy_checkpoint_migrates_once_without_losing_backup_or_cursors() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let legacy = path.with_extension("json");
+    let mut original = interleaved();
+    original.append(
+        json!({"type":"user_message","text":"accepted","clientMessageId":"client","opaque":null}),
+        &options(),
+    );
+    original.enrich_submitted_user_message("client", "provider");
+    let bytes = serde_json::to_vec(&json!({
+        "version":1, "agentId":"agent", "epoch":original.epoch(),
+        "nextSeq":original.next_seq(), "rows":original.rows()
+    })).unwrap();
+    std::fs::write(&legacy, &bytes).unwrap();
+    let mut migrated = Timeline::load(&path, "agent").unwrap();
+    assert_eq!(migrated.fetch(&json!({"limit":0})), original.fetch(&json!({"limit":0})));
+    assert_eq!(migrated.submitted_user_message("client").unwrap()["providerMessageId"], "provider");
+    assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+    migrated.append_persisted(&path, "agent", json!({"type":"assistant_message","text":"new"}), &options()).unwrap();
+    let expected = migrated.fetch(&json!({"limit":0}));
+    drop(migrated);
+    // Even a subsequently damaged backup must not override the committed database.
+    std::fs::write(&legacy, b"{broken").unwrap();
+    assert_eq!(Timeline::load(&path, "agent").unwrap().fetch(&json!({"limit":0})), expected);
+}
+
+#[test]
+fn failed_legacy_migration_preserves_source_and_can_be_retried() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let legacy = path.with_extension("json");
+    let bytes = br#"{"version":1,"agentId":"agent","epoch":"saved","nextSeq":0,"rows":[]}"#;
+    std::fs::write(&legacy, bytes).unwrap();
+    assert!(Timeline::load(&path, "agent").is_err());
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
+    let valid = br#"{"version":1,"agentId":"agent","epoch":"saved","nextSeq":8,"rows":[]}"#;
+    std::fs::write(&legacy, valid).unwrap();
+    assert!(Timeline::load(&path, "wrong-agent").is_err());
+    assert!(!path.exists());
+    let recovered = Timeline::load(&path, "agent").unwrap();
+    assert_eq!(recovered.epoch(), "saved");
+    assert_eq!(recovered.next_seq(), 8);
+    assert_eq!(std::fs::read(&legacy).unwrap(), valid);
+}
+
+#[test]
+fn incremental_commits_write_only_changed_projection_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut timeline = interleaved();
+    timeline.persist(&path, "agent").unwrap();
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database.execute_batch(
+        "CREATE TABLE row_writes(position INTEGER);
+         CREATE TRIGGER record_row_insert AFTER INSERT ON timeline_rows
+         BEGIN INSERT INTO row_writes VALUES (new.position); END;
+         CREATE TRIGGER record_row_update AFTER UPDATE ON timeline_rows
+         BEGIN INSERT INTO row_writes VALUES (new.position); END;"
+    ).unwrap();
+    timeline.append_persisted(&path, "agent", tool("failed"), &options()).unwrap();
+    timeline.append_persisted(&path, "agent", json!({"type":"assistant_message","text":"a"}), &options()).unwrap();
+    timeline.append_persisted(&path, "agent", json!({"type":"assistant_message","text":"b"}), &options()).unwrap();
+    timeline.append_persisted(&path, "agent", json!({"type":"user_message","text":"hello","clientMessageId":"client"}), &options()).unwrap();
+    let next_seq = timeline.next_seq();
+    timeline.enrich_submitted_persisted(&path, "agent", "client", "provider").unwrap();
+    assert_eq!(timeline.next_seq(), next_seq);
+    let mut statement = database.prepare("SELECT position FROM row_writes ORDER BY rowid").unwrap();
+    let positions: Vec<i64> = statement.query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(positions, vec![0, 2, 2, 3, 3]);
+    assert_eq!(timeline.items()[2]["text"], "ab");
+    let expected = timeline.fetch(&json!({"limit":0}));
+    drop(timeline);
+    assert_eq!(Timeline::load(&path, "agent").unwrap().fetch(&json!({"limit":0})), expected);
+}
+
+#[test]
+fn failed_sqlite_commit_rolls_back_rows_metadata_and_memory() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut timeline = interleaved();
+    timeline.append(json!({"type":"user_message","text":"hello","clientMessageId":"client"}), &options());
+    timeline.append(json!({"type":"assistant_message","text":"start"}), &options());
+    timeline.persist(&path, "agent").unwrap();
+    let before = timeline.fetch(&json!({"limit":0}));
+    let database = rusqlite::Connection::open(&path).unwrap();
+    // The row statement has already succeeded when this trigger aborts metadata.
+    database.execute_batch(
+        "CREATE TRIGGER fail_metadata BEFORE UPDATE ON timeline_metadata
+         BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END;"
+    ).unwrap();
+    for item in [
+        json!({"type":"assistant_message","text":"uncommitted"}),
+        tool("failed"),
+        json!({"type":"user_message","text":"uncommitted","clientMessageId":"new-client"}),
+    ] {
+        assert!(timeline.append_persisted(&path, "agent", item, &options()).is_err());
+        assert_eq!(timeline.fetch(&json!({"limit":0})), before);
+        assert_eq!(Timeline::load(&path, "agent").unwrap().fetch(&json!({"limit":0})), before);
+    }
+    assert!(timeline.submitted_user_message("new-client").is_none());
+    assert!(timeline.enrich_submitted_persisted(&path, "agent", "client", "uncommitted").is_err());
+    assert_eq!(timeline.fetch(&json!({"limit":0})), before);
+    database.execute_batch("DROP TRIGGER fail_metadata").unwrap();
+    timeline.append_persisted(&path, "agent", tool("completed"), &options()).unwrap();
+    timeline.enrich_submitted_persisted(&path, "agent", "client", "committed").unwrap();
+    let expected = timeline.fetch(&json!({"limit":0}));
+    drop(timeline);
+    let recovered = Timeline::load(&path, "agent").unwrap();
+    assert_eq!(recovered.fetch(&json!({"limit":0})), expected);
+    assert_eq!(recovered.submitted_user_message("client").unwrap()["providerMessageId"], "committed");
+}
+
+#[test]
+fn full_history_replacement_is_atomic_with_an_existing_connection() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut current = interleaved();
+    current.persist(&path, "agent").unwrap();
+    let before = current.fetch(&json!({"limit":0}));
+    let old_epoch = current.epoch().to_owned();
+    let mut replacement = Timeline::new();
+    replacement.append(json!({"type":"user_message","text":"full native history","clientMessageId":"native"}), &options());
+    replacement.append(json!({"type":"assistant_message","text":"restored response"}), &options());
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database.execute_batch(
+        "CREATE TRIGGER fail_replacement BEFORE UPDATE ON timeline_metadata
+         BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END;"
+    ).unwrap();
+    assert!(replacement.persist(&path, "agent").is_err());
+    assert_eq!(current.fetch(&json!({"limit":0})), before);
+    assert_eq!(Timeline::load(&path, "agent").unwrap().fetch(&json!({"limit":0})), before);
+    database.execute_batch("DROP TRIGGER fail_replacement").unwrap();
+    replacement.persist(&path, "agent").unwrap();
+    current = replacement;
+    assert_ne!(current.epoch(), old_epoch);
+    current.append_persisted(&path, "agent", json!({"type":"assistant_message","text":" continued"}), &options()).unwrap();
+    current.enrich_submitted_persisted(&path, "agent", "native", "provider").unwrap();
+    let expected = current.fetch(&json!({"limit":0}));
+    drop(current);
+    let recovered = Timeline::load(&path, "agent").unwrap();
+    assert_eq!(recovered.fetch(&json!({"limit":0})), expected);
+    assert_eq!(recovered.rows().len(), 2);
+    assert_eq!(recovered.items()[1]["text"], "restored response continued");
+    assert_eq!(recovered.fetch(&json!({"cursor":{"epoch":old_epoch,"seq":1}}))["reset"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_checkpoint_and_live_sidecars_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut timeline = Timeline::new();
+    timeline.append_persisted(&path, "agent", json!({"type":"user_message","text":"private"}), &options()).unwrap();
+    for name in ["timeline.sqlite3", "timeline.sqlite3-wal", "timeline.sqlite3-shm"] {
+        let mode = std::fs::metadata(directory.path().join(name)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{name}");
+    }
+}
+
+#[test]
+fn failed_empty_replacement_retries_before_incremental_append() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut original = interleaved();
+    original.persist(&path, "agent").unwrap();
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database.execute_batch(
+        "CREATE TRIGGER fail_replacement BEFORE UPDATE ON timeline_metadata
+         BEGIN SELECT RAISE(ABORT, 'injected empty replacement failure'); END;"
+    ).unwrap();
+    let mut replacement = Timeline::new();
+    assert!(replacement.persist(&path, "agent").is_err());
+    assert_eq!(Timeline::load(&path, "agent").unwrap().rows(), original.rows());
+    database.execute_batch("DROP TRIGGER fail_replacement").unwrap();
+    replacement.append_persisted(&path, "agent", json!({"type":"user_message","text":"new history"}), &options()).unwrap();
+    replacement.append(json!({"type":"assistant_message","text":"buffered"}), &options());
+    replacement.append_persisted(&path, "agent", json!({"type":"assistant_message","text":" committed"}), &options()).unwrap();
+    let recovered = Timeline::load(&path, "agent").unwrap();
+    assert_eq!(recovered.fetch(&json!({"limit":0})), replacement.fetch(&json!({"limit":0})));
+    assert_eq!(recovered.rows().len(), 2);
+    assert_eq!(recovered.items()[1]["text"], "buffered committed");
 }

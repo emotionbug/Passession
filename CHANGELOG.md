@@ -29,6 +29,7 @@
 
 ### Fixed
 
+- Removed whole-history JSON checkpoint rewrites from streamed agent updates. Persist changed timeline items and cursors transactionally in SQLite, retaining legacy JSON checkpoints as migration backups and preserving commit-before-publication ordering.
 - Fixed existing conversations appearing empty after restarting the native daemon. Provider history replaces partial checkpoints before timeline pages are served, while retaining live events received during restoration.
 - Fixed repeated Pi/OMP assistant and reasoning text when cumulative snapshots arrive ahead of queued streaming deltas. Delta-only streams still preserve intentionally repeated text.
 - Fixed empty tool-detail sheets for label-only calls such as Wait. When plain-text output is absent, show the full supplied command or wait-target label as selectable, wrapping text; retain the existing output when present.

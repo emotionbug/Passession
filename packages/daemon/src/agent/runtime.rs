@@ -565,7 +565,7 @@ impl AgentManager {
             .app()?
             .home
             .join("agent-timelines")
-            .join(format!("{id}.json")))
+            .join(format!("{id}.sqlite3")))
     }
     pub(super) async fn append_to_cell(
         &self,
