@@ -106,10 +106,10 @@ pub(super) fn notes(args: &[String]) -> Result<()> {
     let release = match remote::lookup(&tag)? {
         Some(r) => r,
         None => {
-            ensure!(
-                opts.contains_key("--create-if-missing"),
-                "Release missing; pass --create-if-missing to create a draft"
-            );
+            if !opts.contains_key("--create-if-missing") {
+                eprintln!("Release {tag} does not exist; skipping notes synchronization.");
+                return Ok(());
+            }
             let mut args = vec![
                 "release",
                 "create",

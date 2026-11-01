@@ -18,6 +18,7 @@ on:
       - "plugins/**"
       - "xtask/**"
       - ".cargo/**"
+      - ".github/actions/setup-flutter/**"
       - ".github/workflows/desktop-packages.yml"
 
 concurrency:
@@ -44,7 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-packages-linux-x64
-      - uses: subosito/flutter-action@v2
+      - uses: ./.github/actions/setup-flutter
         with:
           flutter-version: "3.47.5"
           channel: stable
@@ -53,6 +54,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev dpkg-dev ffmpeg pulseaudio-utils xdg-utils patchelf
+      - name: Resolve native package channel
+        shell: bash
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "paseo-daemon") | .version')"
+          plan="$(SOURCE_TAG="v${version}" cargo xtask release plan)"
+          while IFS='=' read -r key value; do
+            if [ "$key" = "channel" ]; then
+              printf 'PASEO_RELEASE_CHANNEL=%s\n' "$value" >> "$GITHUB_ENV"
+            fi
+          done <<< "$plan"
       - name: Provision pinned AppImage tools
         run: cargo xtask appimage-tools
         env:

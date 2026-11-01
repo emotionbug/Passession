@@ -128,7 +128,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}
-      - uses: subosito/flutter-action@v2
+      - uses: ./.github/actions/setup-flutter
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
