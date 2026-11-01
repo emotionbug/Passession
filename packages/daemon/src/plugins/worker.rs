@@ -1,8 +1,8 @@
 use crate::{
-    process::{CommandSpec, ManagedProcess},
     state::AppState,
     transport::OutboundFrame,
 };
+use paseo_client::process::{CommandSpec, ManagedProcess};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -41,24 +41,16 @@ impl PluginWorker {
         env: BTreeMap<String, String>,
     ) -> Result<Arc<Self>> {
         let state = app.upgrade().context("Daemon is shutting down")?;
-        let executable = state.executable.clone();
         let transport = state.transport.clone();
         drop(state);
-        let asset = env
-            .get("PASEO_PLUGIN_WORKER")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                executable
-                    .parent()
-                    .unwrap_or(Path::new("."))
-                    .join("plugin-worker/worker.mjs")
-            });
-        let asset = tokio::fs::canonicalize(&asset).await.with_context(|| format!("JavaScript extension {id} requires the optional plugin-worker asset at {} (set PASEO_PLUGIN_WORKER)",asset.display()))?;
-        let node = env
-            .get("PASEO_PLUGIN_NODE")
-            .cloned()
-            .unwrap_or_else(|| "node".into());
-        let (process, stdout) = ManagedProcess::spawn(CommandSpec { program: node.clone(), args: vec![asset.to_string_lossy().into_owned()], cwd: Some(directory.to_owned()), env, clear_env: true }).await.with_context(|| format!("JavaScript extension {id} requires externally installed Node.js 20+; set PASEO_PLUGIN_NODE to its executable ({node})"))?;
+        let entry = super::manifest::native_entry(directory).await?;
+        let (process, stdout) = ManagedProcess::spawn(CommandSpec {
+            program: entry.executable.to_string_lossy().into_owned(),
+            args: entry.args,
+            cwd: Some(directory.to_owned()),
+            env,
+            clear_env: true,
+        }).await.with_context(|| format!("Could not launch native plugin {id}"))?;
         let worker = Arc::new(Self {
             id: id.to_owned(),
             process,
@@ -134,7 +126,10 @@ impl PluginWorker {
                 }
             }
         });
-        worker.send(json!({"type":"initialize","pluginId":id,"bundle":"","appVersion":env!("CARGO_PKG_VERSION"),"pluginDirectory":directory,"settingsDirectory":settings})).await?;
+        if let Err(error) = worker.send(json!({"type":"initialize","pluginId":id,"appVersion":env!("CARGO_PKG_VERSION"),"pluginDirectory":directory,"settingsDirectory":settings})).await {
+            let _ = worker.shutdown().await;
+            return Err(error);
+        }
         match tokio::time::timeout(REQUEST_TIMEOUT, ready_rx).await {
             Ok(Ok(Ok(_))) => Ok(worker),
             result => {
@@ -271,32 +266,30 @@ impl Drop for PendingRequestGuard<'_> {
 
 pub async fn validate(
     directory: &Path,
-    executable: &Path,
     env: BTreeMap<String, String>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let asset = env
-        .get("PASEO_PLUGIN_WORKER")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            executable
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("plugin-worker/worker.mjs")
-        });
-    let asset = tokio::fs::canonicalize(&asset).await.with_context(|| format!("JavaScript extension compilation requires optional plugin-worker asset at {} (set PASEO_PLUGIN_WORKER)",asset.display()))?;
-    let node = env
-        .get("PASEO_PLUGIN_NODE")
-        .cloned()
-        .unwrap_or_else(|| "node".into());
-    let result = crate::process::run(CommandSpec {
-        program: node, args: vec![asset.to_string_lossy().into_owned(), "--validate".into(), directory.to_string_lossy().into_owned(), env!("CARGO_PKG_VERSION").into()],
+    let entry = super::manifest::native_entry(directory).await?;
+    let mut args = entry.args;
+    args.extend(["--validate".into(), directory.to_string_lossy().into_owned(), env!("CARGO_PKG_VERSION").into()]);
+    let result = paseo_client::process::run(CommandSpec {
+        program: entry.executable.to_string_lossy().into_owned(),
+        args,
         cwd: Some(directory.to_owned()), env, clear_env: true,
-    }, 1024*1024, Duration::from_secs(120), cancel).await.context("Plugin compilation requires externally installed Node.js 20+ (PASEO_PLUGIN_NODE) and optional esbuild/TypeScript worker dependencies")?;
+    }, 1024 * 1024, Duration::from_secs(120), cancel).await.context("Native plugin validation failed")?;
     if result.status != 0 {
-        bail!("Plugin compilation failed: {}", result.stderr);
+        bail!("Native plugin validation failed: {}", result.stderr);
     }
+    validate_report(&result.stdout, &entry.manifest)?;
     Ok(())
+}
+
+fn validate_report(stdout: &[u8], manifest: &Value) -> Result<()> {
+    let report: Value = serde_json::from_slice(stdout).context("Native plugin --validate must return one JSON validation report")?;
+    if report["valid"] != true || report["plugin"]["id"] != manifest["id"] {
+        bail!("Native plugin validation report must confirm valid:true and the manifest plugin.id");
+    }
+    validate_ready(&report)
 }
 
 async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
@@ -386,6 +379,24 @@ impl LogCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_validation_authenticates_manifest_and_registration_metadata() {
+        let manifest = json!({"id":"example"});
+        let report = json!({"valid":true,"plugin":{"id":"example"},"methods":["greet"],"providers":[{"id":"example.provider","label":"Example"}],"usageSources":[],"hooks":{"before":[],"events":[]}});
+        assert!(validate_report(&serde_json::to_vec(&report).unwrap(), &manifest).is_ok());
+        for invalid in [
+            json!({"valid":true}),
+            json!({"valid":false,"plugin":{"id":"example"},"methods":[],"providers":[]}),
+            json!({"valid":true,"plugin":{"id":"different"},"methods":[],"providers":[]}),
+            json!({"valid":true,"plugin":{"id":"example"},"methods":[1],"providers":[]}),
+            json!({"valid":true,"plugin":{"id":"example"},"methods":[],"providers":[{"id":"bad"}]}),
+            json!({"valid":true,"plugin":{"id":"example"},"methods":[],"providers":[],"hooks":{"before":"not an array","events":[]}}),
+        ] {
+            assert!(validate_report(&serde_json::to_vec(&invalid).unwrap(), &manifest).is_err());
+        }
+        assert!(validate_report(b"", &manifest).is_err());
+        assert!(validate_report(b"{}\n{}", &manifest).is_err());
+    }
     #[test]
     fn log_capture_preserves_utf8_across_chunks_and_flush_activity_order() {
         let mut capture = LogCapture::default();

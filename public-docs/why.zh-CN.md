@@ -24,8 +24,6 @@ Paseo 是面向 Agent 开发的原生环境：运行编程 Agent、编辑源码�
 
 Paseo 运行你已经在用的编程 Agent，沿用你的订阅、凭据、配置、技能和 MCP 服务器。你的 Agent 使用你机器上的文件和工具。参见[支持的 Provider](/docs/supported-providers)。
 
-Agent 可以通过[文字转语音](/docs/voice)对你说话，默认在本地运行，也可以在设置中选择云端 Provider。原生客户端不采集麦克风输入。
-
 ## 在另一台设备上继续 {#continue-from-another-device}
 
 daemon 持有正在运行的 Agent 和工作区。原生桌面/移动客户端与 Rust CLI 连接同一个环境。现有 ID、历史、配置和主机侧文件保持不变。
@@ -34,8 +32,8 @@ daemon 持有正在运行的 Agent 和工作区。原生桌面/移动客户端�
 
 ## 自动化并扩展你的工作流 {#automate-and-extend-your-workflow}
 
-为 Agent 提供 [Paseo 工具](/docs/orchestration)，让它们创建 worktree、启动其他 Agent、发送提示词并收集结果。使用 [CLI](/docs/cli) 或 [TypeScript SDK](/docs/sdk) 自动化 Agent 和工作区操作。
+为 Agent 提供 [Paseo 工具](orchestration.zh-CN.md)，让它们创建 worktree、启动其他 Agent、发送提示词并收集结果。使用 [CLI](cli.zh-CN.md) 或 [Rust SDK](sdk/index.zh-CN.md) 自动化 Agent 和工作区操作。
 
-[后端扩展](/docs/plugins)通过可选的外部 Node worker 添加 Provider、RPC、生命周期行为和用量集成。内置集成使用 Rust，不支持可执行 React UI 插件。默认安装运行时不包含 Node、Electron 或 Chromium。[Hub](/docs/hub)将外部事件连接到你机器上的 Agent。
+[后端插件](plugins/index.zh-CN.md)通过原生可执行文件与 Rust SDK 添加 Provider、RPC、生命周期行为和用量集成。内置集成使用 Rust，不支持可执行 React UI 插件。Paseo 运行时与构建工具不需要 Node、Electron 或 Chromium。[Hub](hub/index.zh-CN.md)将外部事件连接到你机器上的 Agent。
 
-Paseo 源码采用 Apache-2.0，没有遥测和跟踪，也不要求 Paseo 账号。依赖项遵循各自许可证。生成的声明不能解决原生语音库的源码和许可证分发义务；分发二进制文件前请阅读仓库 `docs/release.md`。模型权重按需下载，不随运行时捆绑。
+Paseo 源码采用 Apache-2.0，没有遥测和跟踪，也不要求 Paseo 账号。依赖项遵循各自许可证。请保留生成的第三方声明，分发二进制文件前阅读仓库 `docs/release.md`。

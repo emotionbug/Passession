@@ -147,13 +147,7 @@ impl AgentManager {
         let requested = requested_cwd.as_deref();
         let mut cwd = if is_mcp {
             if let Some(parent) = parent.as_ref() {
-                if let Some(locked) =
-                    text(&input["callerContext"], "lockedCwd").filter(|s| !s.trim().is_empty())
-                {
-                    expand_path(locked.trim(), &app.user_home)?
-                } else if input["callerContext"]["allowCustomCwd"] == false
-                    || requested.is_none_or(|s| s.trim().is_empty())
-                {
+                if requested.is_none_or(|s| s.trim().is_empty()) {
                     PathBuf::from(required(parent, "cwd")?)
                 } else {
                     resolve_from(
@@ -169,12 +163,6 @@ impl AgentManager {
             expand_path(requested.context("Agent cwd is required")?, &app.user_home)?
         };
         let mut labels = Map::new();
-        if is_mcp {
-            merge_object(
-                &mut labels,
-                input["callerContext"].get("childAgentDefaultLabels"),
-            );
-        }
         merge_object(&mut labels, input.get("labels"));
         if input["detached"] == true {
             labels.remove("paseo.parent-agent-id");

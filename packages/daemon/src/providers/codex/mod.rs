@@ -9,10 +9,8 @@ mod tests;
 mod transport;
 
 use crate::providers::registry::catalog::refresh_activity;
-use crate::{
-    process::{self, CommandSpec},
-    providers::api::*,
-};
+use paseo_client::process::{self, CommandSpec};
+use crate::{ providers::api::*, };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};

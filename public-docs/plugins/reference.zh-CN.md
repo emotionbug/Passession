@@ -1,234 +1,158 @@
 ---
 title: 插件参考
-description: 后端扩展入口、SDK 契约、来源、准备命令和原生 CLI。
+description: 原生可执行文件清单、Rust SDK 契约、IPC 和来源管理。
 nav: 参考
 ---
 
 # 插件参考 {#plugin-reference}
 
-先阅读[快速上手](/docs/plugins)或[迁移指南](/docs/plugins/migration)。本页描述 **0.13.0 源码检出中尚未发布的原生迁移**。
+先阅读[快速上手](index.zh-CN.md)和[迁移指南](migration.zh-CN.md)。本文描述 **0.13.1 源码检出**，不表示已经发布或部署。
 
 ## 运行时边界 {#runtime-boundary}
 
-daemon、CLI 和内置功能由 Rust 实现。可选第三方 JavaScript 扩展在私有后端 worker 中运行，需要主机**另行安装 Node.js 20+**。在 daemon 环境中用 `PASEO_PLUGIN_NODE` 选择可执行文件，默认使用 `node`。必须提供可选生成 worker 资源，也可用 `PASEO_PLUGIN_WORKER` 指定位置。获取 npm 来源或执行 npm 准备命令还需要 npm；重新加载已安装文件需要 Node，不需要 npm。
+daemon 和内置功能由 Rust 实现。第三方插件是由 daemon 启动的原生可执行文件，通过有界 JSONL stdin/stdout 通信；没有动态库 ABI、JavaScript worker 或解释器回退。Flutter 渲染受支持的协议数据，不执行插件 UI。插件、校验和构建命令都是无沙箱的 daemon 用户代码。
 
-Flutter 负责 Linux/macOS/Windows/Android/iOS 界面，不执行 React、React Native 插件代码或客户端包，也不加载插件界面、面板、时间线渲染器、主题或 Composer 回调。移动端只远程连接。托管候选包校验与激活要求实际存在的 `index.server.ts` 或 `index.server.tsx` 文件；同名目录和仅客户端插件会明确被拒绝，而不是作为空插件报告就绪。历史 SDK 导出不代表原生 UI 兼容性。
-
-| 归属                        | 源码                                        |
-| --------------------------- | ------------------------------------------- |
-| Rust 管理、CLI、worker 桥接 | `packages/daemon/src`                       |
-| 私有可选后端 worker         | `packages/daemon/plugin-worker/src`         |
-| 公共扩展 SDK                | `packages/plugin`（`@getpaseo/plugin`）     |
-| TypeScript 客户端 SDK       | `packages/client`（`@getpaseo/client`）     |
-| 共享协议                    | `packages/protocol`（`@getpaseo/protocol`） |
-
-仓库构建使用 Node.js 24、`npm ci`、`npm run build:daemon`；监视命令是 `npm run dev:daemon`。构建工具需要 Node，不代表产品捆绑 Node 或 daemon 由 JavaScript 实现。
+权威实现：[SDK](../../packages/plugin/src/lib.rs)、[设置](../../packages/plugin/src/settings.rs)、[Provider trait](../../packages/plugin/src/provider.rs)、[daemon 桥接](../../packages/plugin/src/daemon.rs)、[宿主清单](../../packages/daemon/src/plugins/manifest.rs)和 [CLI](../../packages/daemon/src/cli/catalog/plugins.rs)。SDK 未发布时使用本地路径或明确固定修订的 Git 依赖。
 
 ## 项目文件 {#project-files}
 
-`paseo plugin init /absolute/path/to/plugin` 创建纯后端项目，包含 `paseo-plugin.json`、`package.json`、`tsconfig.json`、`OVERVIEW.md`、`index.server.ts`、`server/greeting.ts` 和 `shared/greeting.ts`，但不安装依赖。在项目内运行 `npm install` 安装编写工具。
+`paseo plugin init <directory> --sdk-path <checkout>/packages/plugin` 在空目录中生成 Rust 可执行项目、清单和作者文档，不自动构建。该选项写入绝对 SDK 路径依赖；未指定时使用 Git 依赖。激活前必须编译可执行文件。
 
-### 版本要求 {#requirements}
-
-声明 manifest ID 和明确兼容的 Paseo semver 范围：
+### 要求和运行时入口 {#runtime-entries}
 
 ```json
 {
   "id": "review-tools",
-  "requirements": { "paseo": ">=0.13.0" }
+  "name": "Review tools",
+  "description": "Reviews local changes",
+  "runtime": "native",
+  "requirements": { "paseo": ">=0.13.1" },
+  "server": { "executable": "target/release/paseo-plugin-server", "args": [] },
+  "build": [["cargo", "build", "--release", "--target-dir", "target"]]
 }
 ```
 
-脚手架使用源码检出的版本号。范围用于运行时兼容检查，不证明原生迁移已发布，也不恢复旧 UI API。省略 `requirements.paseo` 历史上表示 `<0.8.0`，当前运行时会拒绝；空范围、无效范围和未知要求键也会被拒绝。不要声明超出实际支持版本的范围。
+Windows 使用 `.exe`。插件 ID 以小写字母开头，只含小写字母、数字或连字符。`server.args` 必须存在，可以为空；参数直接传递，不拼接 shell 字符串。可执行文件必须是规范化相对路径，解析符号链接后仍在插件目录内，并为常规 ELF/Mach-O/PE 原生文件。绝对路径、路径穿越、脚本和解释器包装器被拒绝；Unix 文件必须有执行权限。有效文件头不保证架构与主机匹配。
 
-### 运行时入口 {#runtime-entries}
+只声明实际支持的 Paseo semver 范围。省略 `requirements.paseo` 意味着历史默认值 `<0.8.0`，不是任意版本兼容。空/无效范围和未知要求键会失败。仅改变版本范围不能移植插件。
 
-`index.server.ts`（也接受 `.tsx`）默认导出接收 `PluginServerContext` 的贡献函数。支持 `handle`、`registerSettings`、`registerProvider`、`registerUsageSource`、`on` 和 `before`。Node 操作、凭据、进程传输及主机资源放在 `server/`；运行时无关契约放在 `shared/`。后端不要导入 `client/`。
+### 校验和就绪 {#validation-and-readiness}
 
-### 运行时模块 {#runtime-modules}
+宿主在 `server.args` 后追加 `--validate <插件绝对目录> <daemon版本>`。程序必须成功退出，并打印不超过 1 MiB 的单个 JSON 对象：
 
-从 SDK 根入口导入 `defineRpc`、`defineSettings`、schema 和普通类型。从 `@getpaseo/plugin/server` 导入服务端 context 和生命周期类型，从 `/server/provider` 导入 Provider 契约，从 `/server/acp` 导入 ACP 适配器，从 `/server/usage` 导入用量契约和辅助函数。worker 提供这些 SDK 模块和 Zod。宿主提供的库和仅用于类型的依赖放在 `devDependencies`；其他运行时库声明为依赖或打包。后端不支持 React 和客户端 SDK 入口；共享模块不能导入特定运行时模块或类型。
+```json
+{"valid":true,"plugin":{"id":"review-tools"},"methods":[],"hooks":{"events":[],"before":[]},"providers":[],"usageSources":[]}
+```
 
-## 入口与清理 {#entry-point-and-cleanup}
+`Plugin::run()` 实现此模式，读取清单并返回已注册元数据，不调用处理函数。但程序启动和注册代码仍会执行，所以校验**不是安全检查不可信代码的方式**。
 
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
+正常启动收到 `initialize`，包含 `pluginId`、`pluginDirectory`、`appVersion`，使用设置时还包含 `settingsDirectory`。程序返回相同的注册字段，以 `type: "ready"` 取代 `valid`/`plugin`。应在 `run()` 前完成所有注册。RPC/钩子/用量请求返回匹配 `requestId` 的结果或错误；Provider 连接另有接受通知和事件。帧上限为 16 MiB，输出有背压。stdout 仅用于 IPC；诊断使用 `Context::log(...).await` 或 stderr。
 
-export default function contribute(server: PluginServerContext) {
-  server.on("agent.turn_ended", (event) => {
-    console.log(event.agent.id, event.outcome);
-  });
-  return () => {};
+## 入口和清理 {#entry-point-and-cleanup}
+
+以下完整 `src/main.rs` 使用脚手架依赖：
+
+```rust
+use paseo_plugin::{Plugin, Result, ensure};
+use serde_json::{Value, json};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut plugin = Plugin::new();
+    plugin.rpc("greeting.create", |input, _context| async move {
+        let name = input["name"].as_str().unwrap_or("");
+        ensure!(!name.is_empty(), "name must be a nonempty string");
+        Ok(json!({"message": format!("Hello, {name}!")}))
+    })?;
+    plugin.on("agent.turn_ended", |event, context| async move {
+        context.log(format!("Turn ended: {} ({})", event["agent"]["id"], event["outcome"])).await?;
+        Ok(Value::Null)
+    })?;
+    plugin.run().await
 }
 ```
 
-入口必须返回同步或异步清理函数；没有需要释放的资源时返回 `() => {}`。返回其他值的入口会被 worker 拒绝。释放创建的定时器、文件监视器、套接字、SDK 订阅和子进程。重新加载、停用、移除及 daemon 关闭会结束 worker 和注册。钩子不依赖应用连接。
+回调接收 `serde_json::Value` 和 `Context`，异步返回 `Result<Value>`。**输入和输出需要作者自行校验**，可使用 Serde、领域检查或显式 schema 校验器。`Plugin::rpc` 校验注册名称和重复项，不自动校验应用载荷。注册不会生成按钮或界面；消费者通过 daemon 协议调用插件 RPC。
+
+`Plugin::cleanup` 用于释放自己拥有的资源，回调接收 null 和 context，等待任务结束并关闭套接字/进程/订阅后返回 `Ok(Value::Null)`。`Context::cancellation` 表示请求取消或关闭。重新加载、禁用、移除和 daemon 退出会结束进程与注册。清理有截止时间；不要依赖崩溃或强制终止后仍会调用清理。没有客户端连接时钩子也会运行。
 
 ## 生命周期钩子 {#lifecycle-hooks}
 
-| 注册                            | 回调                               | 结果                                              |
-| ------------------------------- | ---------------------------------- | ------------------------------------------------- |
-| `server.on(name, callback)`     | `(event, { paseo, signal })`       | `void` 或 promise                                 |
-| `server.before(name, callback)` | `({ request }, { paseo, signal })` | 修改后的请求，或 `undefined` 保持原请求；支持异步 |
+| 注册 | 输入和结果 |
+| --- | --- |
+| `plugin.on(name, callback)` | 接收事件 JSON，处理后返回 null；按注册顺序执行，错误会记日志但不跳过后续处理函数。 |
+| `plugin.before(name, callback)` | 接收 `{"request": ...}`；返回 null 保留请求，或返回完整的变更后请求。 |
 
-事件包括 `agent.created`、`agent.closed`、`agent.turn_started`、`agent.turn_ended`、`agent.permission_requested`、`agent.permission_resolved`、`agent.archived`、`workspace.created` 和 `workspace.archived`。公开后台 Agent 使用相同生命周期，私有一次性辅助 Agent 不在范围内。归档通知不证明运行时或工作树清理已结束。
+事件包括 `agent.created`、`agent.closed`、`agent.turn_started`、`agent.turn_ended`、`agent.permission_requested`、`agent.permission_resolved`、`agent.archived`、`workspace.created`、`workspace.archived`。公开后台 Agent 参与，私有临时辅助 Agent 不参与。归档通知不证明清理已完成。轮次结束包含 `agent`、`turnId`、`outcome`（`completed`、`failed`、`canceled`）；不要依赖已废弃且为空的 `timeline`。
 
-`agent.turn_ended` 包含 `agent`、`turnId` 和 `outcome`（`completed`、`failed` 或 `canceled`）。已弃用的 `timeline` 始终为空；应按需读取有界尾部：
-
-```ts
-server.on("agent.turn_ended", async (event, { paseo, signal }) => {
-  if (signal.aborted) return;
-  const agent = paseo.agents.ref(event.agent.id);
-  const history = await agent.timeline.refetch({ direction: "tail", limit: 20 });
-  console.log("Fetched turn history", event.agent.id, history);
-});
-```
-
-生产插件不要记录私人历史，除非这是明确披露的预期行为。遵守取消信号，在清理时释放订阅。
-
-| 前置钩子             | 可编辑请求                                   |
-| -------------------- | -------------------------------------------- |
-| `agent.create`       | 除 `cwd` 外的公开 Agent 配置和启动覆盖 `env` |
-| `agent.session_open` | 仅 `env`                                     |
-| `workspace.create`   | 显式工作区创建请求                           |
-
-每次打开会话时注入环境覆盖：
-
-```ts
-server.before("agent.session_open", ({ request }) => ({
-  ...request,
-  env: { ...request.env, COMPANY_ENV: "development" },
-}));
-```
-
-`env` 是启动覆盖，不是 daemon 继承的完整环境。会话打开包括创建、恢复、刷新和导入，也可能用于交互或历史读取。用普通 SDK 权限方法回答请求；权限请求不一定是 shell 命令，也不表示轮次结束。
+前置钩子：`agent.create` 可变更除 `cwd` 外的公开配置以及启动 `env`；`agent.session_open` 仅可变更 `env`；`workspace.create` 变更显式工作区创建请求。保留无关字段与前序变更。`env` 是启动覆盖值，不是完整继承环境。会话打开包括创建、恢复、刷新、导入和历史读取。遵守取消；不要把每个权限请求都当成 shell 命令，也不要把权限解决当成轮次结束。
 
 ## 已连接主机和 Paseo SDK {#connected-hosts}
 
-处理函数收到 `{ paseo }`，生命周期回调收到 `{ paseo, signal }`，使用的是 `@getpaseo/client`，不是独立的旧 server SDK。普通 Agent、工作区、Provider 和配置操作优先使用该 API，不必创建重复 RPC。
-
-`context.paseo.hosts` 描述所选 daemon 保存的主机连接。身份属于具体 daemon 连接，路径和工作区 ID 不能视为跨主机通用。见 [SDK 参考](/docs/sdk/reference)。此后端 API 不提供旧应用 React hook，也不能注入原生界面。
-
-## 添加插件专属后端行为 {#add-plugin-specific-backend-behavior}
-
-RPC 用于供应商 API、daemon 本地资源或应留在 daemon 上的凭据。在 `shared/greeting.ts` 中定义：
-
-```ts
-import { defineRpc } from "@getpaseo/plugin";
-import { z } from "zod";
-
-export const greeting = defineRpc({
-  name: "greeting.create",
-  input: z.object({ name: z.string() }),
-  output: z.object({ message: z.string() }),
-});
-```
-
-在 `index.server.ts` 中注册：
-
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { greeting } from "./shared/greeting";
-
-export default function contribute(server: PluginServerContext) {
-  server.handle(greeting, ({ name }) => ({ message: `Hello, ${name}` }));
-  return () => {};
-}
-```
-
-契约校验输入和输出；SDK 根入口的 `RpcInput`、`RpcOutput` 可推导类型。注册只创建后端行为，不创建界面或自动添加原生按钮。消费者需要使用 daemon 插件 RPC 协议；不要把 `useRpc` 或 React 客户端入口作为原生集成方案。
+`context.daemon.client().await?` 返回 `Arc<paseo_client::DaemonClient>`。惰性连接通过插件 IPC 桥接文本和二进制帧，不需要额外令牌或网络连接。宿主关闭使缓存会话失效，下次调用会重新打开逻辑会话。普通 Agent、工作区、权限、Provider 和配置操作使用 [Rust 客户端 SDK](../sdk/reference.zh-CN.md)。需要历史时读取有界片段，不要默认记录私密对话。主机 ID、路径和工作区 ID 属于各 daemon 连接，不能跨主机混用。
 
 ## 持久化设置 {#settings-screens}
 
-后端设置 API 保留，可执行设置界面不受支持。在 `shared/` 定义文档：
+通过 `plugin.settings(...)` 注册 `SettingsDefinition::new(id, positive_version, validator)`。校验器接收 JSON 并返回包含默认值的规范化 JSON；`{}` 必须得到默认文档。可选 `.migrate(|values, from_version| async move { ... })` 在校验前转换旧数据。完整例子见[文件检查设置](../../plugin-examples/workspace-inspector/src/lib.rs)。
 
-```ts
-import { defineSettings } from "@getpaseo/plugin";
-import { z } from "zod";
+返回的可克隆 `Settings` 提供 `read().await`、`write(revision, values).await`、`reset(revision).await`、`subscribe()`（Tokio broadcast receiver）。ID 符合 `[a-z][a-z0-9_-]*`。存储以主机为范围，保留 `{version, values}` 格式；schema 版本与不透明写入 revision 不同。
 
-export const preferences = defineSettings({
-  id: "review",
-  scope: "host",
-  version: 1,
-  schema: z.object({ enabled: z.boolean().default(true) }),
-});
-```
+- 读取返回 `status: "ready"`、`values`、`revision`，或 `status: "invalid"`、`error`、`revision`。无效数据保留至明确修复/重置。
+- 写入/重置必须携带读取 revision；过期写入返回 `conflict`，成功返回 `saved`，无效数据返回 `invalid`。失败写入不通知订阅者。
+- 订阅返回状态；出现 lag 错误时重新读取。订阅者失败不会回滚已保存写入。
+- 自动注册 `settings.<id>.read`、`.write`、`.reset` RPC，变更时发出 `settings.changed`。
 
-通过 `server.registerSettings(preferences)` 注册。句柄提供 `read()`、`subscribe(listener)`，后者返回清理函数。读取结果为带 `values` 和不透明 `revision` 的 `ready`，或带 `error`、`revision` 的 `invalid`；无效的保存数据会保留。
-
-`id` 匹配 `[a-z][a-z0-9_-]*`，在安装项内唯一。`scope` 是 `host`，由该 daemon 的授权客户端共享，不跨主机同步。`version` 是正整数 schema 版本，不是写入修订号。提供默认值使 `{}` 能解析成完整文档。可选 `migrate(values, fromVersion)` 支持异步，结果必须通过当前 schema。无效写入和版本冲突不会通知订阅者；监听器失败不会撤销已提交写入。
+这些是数据 API，不是可执行设置界面。
 
 ## Provider {#providers}
 
-用 `server.registerProvider()` 注册 `@getpaseo/plugin/server/provider` 的 `ProviderRegistration`，或使用 `/server/acp` 的 `runAcpProvider()`。连接通过 `send()` 接受输入、`onEvent()` 发布事件、`close()` 释放资源。`send()` 表示接受，不表示轮次完成。
+实现 `paseo_plugin::provider::{Provider, Connection}` 并调用 `plugin.provider(...)`。`Provider::connect` 接收请求 JSON、`Events` 和 `Context`，返回 `Arc<dyn Connection>`。仅协商宿主提供的版本/能力。`Connection::send` 表示接受输入，不表示轮次完成。使用 `Events::emit` 发送符合协议的 JSON；`close` 必须停止任务/进程并解决待处理权限。可选状态/目录缓存能力必须与元数据一致。完整会话、权限、配置、持久化和时间线契约见 [Provider 指南](providers.zh-CN.md)。
 
-消息、结构化命令和引导使用 `session.prompt`。在用户时间线条目重复 `clientMessageId`，发出一个对应的 `session.prompt_result`。通过协议返回模型、模式、思考选项、能力、配置、权限、持久化和时间线数据。Provider 创建的子会话使用 `parentSessionId`。刷新会用当前配置和持久化信息关闭并重新打开会话。
+`Metadata::icon_path` 是插件目录内的 SVG 相对文件路径，不是内联 SVG 或 URL。`UsageSource::icon` 则是**内联 SVG 文本**，二者不同。宿主把 SVG 限制为 64 KiB，拒绝脚本、foreignObject、样式、事件处理属性和外部引用等主动内容。展示页 PNG 另见[分发契约](publishing.zh-CN.md#icons-and-screenshots)。
 
-开关/选择配置描述符及标准时间线条目是原生客户端渲染的数据，不是可执行插件 UI。私有选项放在 `ProviderSessionConfig.providerOptions` 并校验。宿主工具通过 MCP 服务器传入。见 [Provider 选项](/docs/sdk/provider-options)及完整的[直接/ACP Provider 指南](/docs/plugins/providers)。
-
-### SVG 规则 {#svg-rules}
-
-`ProviderRegistration.icon` 是相对插件目录的文件路径，不是内联 SVG 或 URL。解析后必须是目录内的普通文件，包括符号链接的最终目标。用量来源图标采用相同规则。SVG 必须以 `<svg>` 文档开始，最大 64 KiB；禁止 script、`foreignObject`、style 元素、事件处理属性、JavaScript URL 及非片段 `href`。展示页 PNG 图标使用单独的[发布契约](/docs/plugins/publishing#icons-and-screenshots)。
+ACP Agent 应注册 [`paseo_plugin::acp::AcpProvider`](../../packages/plugin/src/acp/mod.rs)，不必自行重建 Provider 协议。`AcpProvider::command(id, label, argv)` 与 `::connector(id, label, factory)` 返回 `Result<AcpProvider>`；`.options(AcpOptions)`、`.transformer(impl AcpTransformer)`、`.description(...)`、`.icon_path(...)` builder 返回 Provider。连接器异步返回全新、自有的 `AcpStream`，并接收取消 token。`AcpTransformer` 提供有序目录发现/配置，以及通知/工具快照变换；`AcpContext::config` 提供 `ConfigAccess::read`/`set`。生命周期和能力边界见 [ACP 指南](providers.zh-CN.md#adapt-an-acp-agent)。这是旧 ACP 辅助功能的原生实现，不是 JavaScript 源码兼容层。
 
 ## 用量来源 {#usage-sources}
 
-通过 `server.registerUsageSource()` 注册，从 `@getpaseo/plugin/server/usage` 导入契约和辅助函数。来源包含 `id`、`label`、可选图标路径、输入 Zod schema、`discover(scope)` 和 `fetch(input)`。
+`UsageSource::new(id, label, discover, fetch)` 通过 `plugin.usage_source(...)` 注册。两个异步回调都接收 JSON 和 `Context`；访问文件或服务前自行校验 scope/input，没有自动 Zod/schema 解析器。
 
-- `discover` 返回账户：稳定的 `key`、可选 `label` 和 `harness`，以及标识凭据存储的 JSON `input`，不要包含凭据。
-- scope 是全局或会话级（`provider`、可选 `model`、启动 `env`）。会话发现只解析该会话账户；无关 Provider 或没有登录时返回 `[]`，不要回退扫描其他 Agent 或默认存储。
-- `fetch` 返回带窗口及可选余额/详情的 `available`、带类型化问题的 `unavailable`，或带消息的 `error`。输入需按 schema 校验。
-- 账户 key 使用 1–128 个 `[A-Za-z0-9._-]` 字符，不使用原始凭据或邮箱。敏感稳定身份可用 `hashAccountKey()`，优先选择令牌轮换后仍稳定的身份。
-- 获取时重新读取存储，不兑换刷新令牌，不重写其他 CLI 的凭据文件。
-- `unavailable(problem)` 必须带 `expired`（`expiresAt`、可选 `refreshedBy`）、`rejected`（`status`、可选 `refreshedBy`）或 `no_quota`（`detail`）。`refreshedBy` 是 CLI 名称，不是给用户的指令。
-- 周期名称来自 Provider 数据，不从响应顺序或重置倒计时猜测。`windowFromReportedDuration()` 接收报告的秒数或 `null` 和中性未知名称/身份；`windowFromUsedPct()` 可用于 Provider 命名的周期。窗口 ID 应在重排和重置后保持稳定。
+公开 [`paseo_plugin::usage` 模块](../../packages/plugin/src/usage.rs) 提供 Serde 类型 `Scope`、`Account`、`Report`、`Problem`、`Window`、`Balance`、`Detail`、`Unit`、`Tone`。用 `serde_json::from_value` 解析输入，`serde_json::to_value` 序列化类型化输出。辅助函数包括 `hash_account_key`、`used_pct_of`、`tone_from_used_pct`、`balance_tone_from_remaining`、`window_from_used_pct`、`window_from_reported_duration`。时长函数依次接收报告秒数、可选稳定范围 ID/标签、明确的未知 ID/标签/短标签、已用百分比和重置时间；不能把重置倒计时当成周期时长。
 
-内置用量来源由 Rust 实现，不属于此可选 worker。后端注册不会创建自定义原生用量面板。
+- 发现接收全局或会话范围，返回稳定 `key`、可选 `label`/`harness` 和标识凭据存储的 JSON `input`，**不能包含凭据**。会话范围含 `provider`、可选 `model` 和启动 `env`；只返回此会话账号，无关或未登录时返回 `[]`，不回退扫描其他 Agent 的存储。
+- 获取返回带窗口及可选余额/详情的 `available`、带类型化问题的 `unavailable`，或带消息的 `error`。重新读取凭据，不兑换刷新令牌，不改写其他 CLI 的存储。
+- 账号键使用 `[A-Za-z0-9._-]` 中的 1–128 个字符。敏感身份应哈希处理；身份应跨令牌轮换稳定，不能直接使用邮箱或令牌。
+- 不可用原因区分 `expired`（`expiresAt`、可选 `refreshedBy`）、`rejected`（`status`、可选 `refreshedBy`）与 `no_quota`（`detail`）。`refreshedBy` 是 CLI 名，不是给用户的指令。
+- 窗口名来自报告时长或供应商名称，不是返回顺序或重置倒计时；ID 在重置/重排后保持稳定。
+
+内置用量集成已经由 Rust 执行，不需要额外可执行文件或自定义原生面板。
 
 ## 插件来源 {#plugin-sources}
 
-向 `paseo plugin install` 传入来源（也接受 `add`）：
+| 来源 | 选择器 |
+| --- | --- |
+| 主机目录 | `/srv/paseo/plugins/review` 或 `./review` |
+| GitHub/Git | `github:acme/paseo-review`、`git:acme/paseo-review`、`git:https://git.example/acme/review.git` |
+| Cargo crate | `cargo:paseo-review@1.2.0`（精确 semver），或 `cargo:paseo-review`（最新稳定且未撤回版本） |
+| 发行归档 | `release:https://releases.example/review-1.2.0.zip` 加 `--version 1.2.0 --sha256 <digest> --format zip` |
+| 注册表 | `owner/slug` 或 `registry.example/owner/slug` |
 
-| 来源        | 示例                                                                           |
-| ----------- | ------------------------------------------------------------------------------ |
-| 注册表      | `owner/slug` 或 `registry.example/owner/slug`                                  |
-| 主机目录    | `/srv/paseo/plugins/review` 或 `./review`                                      |
-| GitHub      | `github:acme/paseo-review` 或 `git:acme/paseo-review`                          |
-| Git URL/SCP | `git:https://git.example/acme/review.git` 或 `git@git.example:acme/review.git` |
-| npm         | `npm:@acme/paseo-review@1.2.0`                                                 |
-| 来源子目录  | `github:acme/monorepo:plugins/review`                                          |
+表中名称/URL 仅演示语法，不代表已有发布插件。裸 `owner/slug` 是注册表 ID，不是本地路径或 GitHub 简写。本地相对路径加 `./` 或 `../`。使用 `--host` 时提供 daemon 上的绝对路径，不上传文件。`--path` 选择来源内的子目录；Git 也接受 `github:acme/monorepo:plugins/review`。`--ref` 选择 Git 分支/标签/提交。安装 Cargo 版本使用 `@exact-semver`，不是 `--version`。
 
-裸 `owner/slug` 是注册表 ID，不是本地目录或 GitHub 简写。本地相对路径用 `./` 或 `../`。绝对路径、`~`、Windows 驱动器路径和 UNC 路径标识目录。CLI 在本地解析相对路径和 `~`；使用 `--host` 时应提供 daemon 主机上的绝对路径，不会上传文件。`file://` 选择 Git 获取，不是目录安装。
+发行 URL 要求无内嵌凭据的 HTTPS、明确版本和 64 位小写十六进制 SHA-256。`--format` 为 `tar.gz` 或 `zip`，可从已识别的 URL 后缀推断。下载有大小限制，校验和通过后才安全解包。来源获取不是沙箱：后续准备与校验仍执行受信任代码。
 
-npm 支持 `@` 后的确切版本、tag 或 semver 范围，默认 `latest`。含 shell 操作符的范围要加引号。不接受 tarball URL、npm 别名或 npm `file:` 规范。无 scope 的包同时指定版本和子目录时，用明确的 `npm:` 避免与 SCP 混淆。
+默认注册表为 `https://plugins.paseo.sh`，`PASEO_PLUGIN_REGISTRY` 可替换默认值。私有授权配置为 `pluginRegistries: {"host":{"authorization":"Bearer token"}}`，凭据不转发到产物主机或重定向。已有安装保留来源/注册表身份。注册表必须提供原生 Git/Cargo/发行记录；本检出不能证明公共注册表已经迁移或发布原生插件。npm 来源和旧 JavaScript 记录不会执行，参见[迁移](migration.zh-CN.md)。
 
-子目录必须位于来源内：不含空段、`.` 或 `..`，单独的 `.` 表示根目录。URL 端口和 SCP 分隔符仍属于来源。跨主机优先使用 `/`。`--ref` 选择首次安装的 Git 分支、标签或提交，默认获取 HEAD；也接受 `--path` 指定相对来源的插件目录。
-
-默认注册表是 `https://plugins.paseo.sh`。`PASEO_PLUGIN_REGISTRY` 可选择其他默认 URL，含路径前缀。daemon 配置 `pluginRegistries: { "host": { "authorization": "Bearer token" } }` 提供私有注册表凭据，修改启动设置后重启。凭据不会发送给制品主机或重定向目标。已有安装保留记录的注册表和来源；注册表记录决定审查过的修订和插件路径。
-
-npm 在 daemon 主机上运行，使用该用户的注册表/认证配置。获取过程把候选包和生产依赖安装到托管存储；安装锁记录实际解析结果。npm 作者还应在需要时提供[发布锁](/docs/plugins/publishing#2-lock-installed-dependencies)。Git 获取需要主机上的 Git 和访问权限。
-
-`--id` 覆盖 manifest 安装 ID；重复 ID 被拒绝。移除目录安装保留源码；移除托管 npm/Git 安装会删除托管文件。安装授权代码、依赖及准备命令以 daemon 用户权限无沙盒运行。
+`--id` 覆盖安装身份，重复 ID 会失败。移除目录安装保留用户源码；移除托管安装只删除其托管文件，不删除任意外部目录。
 
 ## 准备命令 {#preparation-commands}
 
-普通 TypeScript 扩展不需要单独构建，由 worker 编译。只有必须安装依赖或生成源码/资源时才声明 manifest `build`：
-
-```json
-{
-  "id": "review-tools",
-  "requirements": { "paseo": ">=0.13.0" },
-  "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]]
-}
-```
-
-每项是非空 argv 数组，在暂存插件目录直接执行，不隐式调用 shell，不从锁文件推断命令。安装和更新在校验、激活前执行准备。失败候选会被丢弃；更新保留旧安装。即使获取时禁止 npm 生命周期脚本，显式声明的命令仍是受信任的可执行代码。锁定安装依赖树并披露额外设置，见[发布指南](/docs/plugins/publishing#plugins-with-a-build-step)。
+清单 `build` 是非空 argv 数组的数组（见上例），在暂存插件目录直接执行，不隐式使用 shell。命令可下载依赖或运行 Cargo 构建脚本，权限为 daemon 用户。安装/更新先准备并校验候选，再激活；失败保留此前托管安装。不从锁文件推断命令。可复现分发应提交 `Cargo.lock` 并使用 `cargo build --locked --release --target-dir target`；初始脚手架命令有意不要求尚未生成的锁文件。本地目录重新加载前应先构建。
 
 ## CLI 参考 {#cli-reference}
 
-```bash
-paseo plugin init /absolute/path/to/plugin
+```sh
+paseo plugin init /absolute/path/to/plugin --sdk-path /absolute/path/to/paseo/packages/plugin
 paseo plugin install /absolute/path/to/plugin
-paseo plugin install npm:@acme/paseo-review@1.2.0 --id review
 paseo plugin ls review
 paseo plugin logs review
 paseo plugin update review --check
@@ -243,24 +167,10 @@ paseo plugin enable review
 paseo plugin remove review
 ```
 
-远程管理把全局 `--host <url>` 放在命令前。`ls` 读取安装身份/修订，不查询远程。普通原生 CLI 更新显示提案并要求 `--yes`，没有交互式批准提示。`--check` 始终只预览。显式 `--version`（npm）或 `--ref`（Git）授权单个插件目标，不能彼此组合或与 `--all` 组合。
+把 `review` 换成实际安装 ID。`install` 也可写作 `add`。普通更新先预览并要求 `--yes`；`--check` 永不应用。显式 `--version` 选择 Cargo 版本，`--ref` 选择 Git；显式选择授权单个目标，不能配合 `--all`。发行更新要求 `--url <HTTPS URL> --version <version> --sha256 <digest> [--format zip|tar.gz]`，且 URL origin 与已安装来源一致，没有隐式最新发行发现。
 
-直接 npm 更新考虑较新的 `latest`，直接 Git 更新考虑默认 HEAD，不受首次选择器约束。显式 npm 目标允许降级。注册表安装使用已审查固定版本。目录安装跳过更新，应修改后重新加载。批量结果独立；提案变化或不可用时失败，不静默换成其他内容。
-
-根配置 `pluginsEnabled` 和安装项自身启用标记共同控制执行。修改根配置后用 `paseo reload --json`；安装项通过插件命令管理。安装/重新加载前在插件项目中执行类型检查，加载编译不是类型检查。
+直接 Git 更新跟随默认 HEAD，Cargo 选择稳定未撤回版本，注册表跟随审查固定版本。目录安装跳过。提案绑定不可变产物身份/校验和，发生变化就失败，不会静默替换内容。批量结果彼此独立。`ls` 只读取已安装元数据，不查询远端。
 
 ## 调试后端输出 {#debug-backend-output}
 
-使用普通 `console.log`/`console.error`。`paseo plugin logs <id>` 返回近期快照，包含时间戳、流、序号和消息，不是实时跟随。日志包括加载/编译失败和 worker 输出；不要记录凭据或访问令牌。`running` 不证明 Provider 行为正确或原生 UI 贡献可用。
-
-## 加载失败 {#load-failures}
-
-| 症状                 | 处理                                                                                                              |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| worker/Node 不可用   | 安装外部 Node 20+，检查 daemon 环境、`PASEO_PLUGIN_NODE`，并提供可选 worker 资源。                                |
-| 旧入口或缺少入口     | 提供实现受支持后端行为的真实 `index.server.ts` 或 `index.server.tsx` 文件；仅客户端包和入口路径上的目录会被拒绝。 |
-| 后端导入客户端代码   | 移除依赖本身，只保留后端逻辑，不要仅隐藏编译错误。                                                                |
-| RPC 拒绝             | 检查输入/输出 Zod schema 和处理函数错误。                                                                         |
-| 改动未生效           | 类型检查、重新加载，然后查看状态和日志。                                                                          |
-| 重新加载/worker 失败 | 修复报告的源码或运行时错误再加载，不要假设旧 worker 仍在运行。                                                    |
-| 旧插件界面不存在     | 这是原生边界，不应向应用安装 React 或浏览器。                                                                     |
+`paseo plugin logs <id>` 返回近期快照，不是实时跟随。使用 stderr 或 `Context::log`；任意 stdout 文本会破坏 IPC。不要记录秘密。二进制缺失、架构不符、无执行权限、版本不兼容、元数据错误或运行失败都是实际加载错误：修复原因，必要时重新构建再加载。旧运行时需要原生移植，不是配置解释器。`running` 不证明 Provider 正确或 UI 兼容。

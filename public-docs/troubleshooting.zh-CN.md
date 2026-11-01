@@ -67,7 +67,7 @@ paseo --host <host:port> provider diagnostic <provider> --json
 
 请查看受影响 daemon 的 Provider 诊断，不要假定 Flutter 应用会导入交互式 shell 配置。`paseo daemon run` 使用终端启动环境；托管的 `paseo daemon start` 会有意移除 daemon 设置覆盖项，应将这些设置写入 `config.json`。
 
-确保 Provider 二进制文件位于 daemon 启动时的 `PATH` 中，或配置绝对路径 `command`。修改启动环境后停止并重新启动 supervisor；只重启 worker 会保留原环境。可选 JavaScript 后端插件需要外部 Node 20+（`PASEO_PLUGIN_NODE`），并无内置 Node 运行时。
+确保 Provider 二进制文件位于 daemon 启动时的 `PATH` 中，或配置绝对路径 `command`。修改启动环境后停止并重新启动 supervisor；只重启 worker 会保留原环境。原生插件可执行文件必须匹配 daemon 主机的操作系统和架构，并位于插件目录内。JavaScript/TypeScript 插件需要移植，不能通过设置 Node 运行时启用。
 
 ## 查看日志 {#reading-the-logs}
 

@@ -32,6 +32,6 @@ No telemetry, no tracking, no account required. The app talks only to daemons yo
 
 <b>You need a daemon to connect to</b>
 
-This app is not useful on its own. Install the Paseo daemon on the computer where your code and agent CLIs live, then pair this app with it from Settings. The desktop app bundles the daemon, or you can run it from npm, Docker, or Nix.
+This app is not useful on its own. Install the Paseo daemon on the computer where your code and agent CLIs live, then pair this app with it from Settings. The desktop app bundles the daemon, or you can run it from npm or Docker.
 
 Setup instructions: https://paseo.sh

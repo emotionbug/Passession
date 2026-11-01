@@ -1,7 +1,7 @@
 use crate::{
     agent, automation, config, daemon_admin, files, git, mcp, plugins, projects,
     providers::registry::ProviderRegistry,
-    speech, terminals,
+    terminals,
     transport::{self, RequestContext},
     usage::{UsageContext, UsageService},
 };
@@ -24,7 +24,6 @@ const AUTOMATION: u32 = 8;
 const FILES: u32 = 16;
 const GIT: u32 = 32;
 const TERMINALS: u32 = 64;
-const SPEECH: u32 = 128;
 const PLUGINS: u32 = 256;
 
 pub struct AppState {
@@ -41,7 +40,6 @@ pub struct AppState {
     pub terminals: Arc<terminals::TerminalService>,
     pub automation: Arc<automation::AutomationService>,
     pub mcp: Arc<mcp::McpService>,
-    pub speech: Arc<speech::SpeechService>,
     pub transport: Arc<transport::TransportService>,
     pub plugins: Arc<plugins::PluginService>,
     pub daemon_admin: Arc<daemon_admin::DaemonAdminService>,
@@ -64,7 +62,6 @@ impl AppState {
             terminals: Arc::new(terminals::TerminalService::new(weak.clone())),
             automation: Arc::new(automation::AutomationService::new(weak.clone())),
             mcp: Arc::new(mcp::McpService::new(weak.clone())),
-            speech: Arc::new(speech::SpeechService::new(weak.clone())),
             transport: Arc::new(transport::TransportService::new(weak.clone())),
             plugins: Arc::new(plugins::PluginService::new(weak.clone())),
             daemon_admin: Arc::new(daemon_admin::DaemonAdminService::new(weak.clone())),
@@ -105,8 +102,6 @@ impl AppState {
         self.providers.initialize().await?;
         self.starting(AGENTS)?;
         self.agents.initialize().await?;
-        self.starting(SPEECH)?;
-        self.speech.initialize().await?;
         // Extension startup may call domain APIs through its prepared in-process channel.
         self.starting(PLUGINS)?;
         self.plugins.initialize().await?;
@@ -164,7 +159,6 @@ impl AppState {
             || self.files.handle(context, message).await?
             || self.terminals.handle(context, message).await?
             || self.automation.handle(context, message).await?
-            || self.speech.handle(context, message).await?
             || self.agents.handle(context, message).await?
         {
             return Ok(());
@@ -253,7 +247,6 @@ impl AppState {
         }
         stop!(TRANSPORT, "transport", self.transport.shutdown());
         stop!(AUTOMATION, "automation", self.automation.shutdown());
-        stop!(SPEECH, "speech", self.speech.shutdown());
         stop!(AGENTS, "agents", self.agents.shutdown());
         stop!(PROVIDERS, "providers", self.providers.shutdown());
         stop!(PLUGINS, "plugins", self.plugins.shutdown());

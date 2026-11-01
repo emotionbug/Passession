@@ -1,5 +1,5 @@
 use super::storage;
-use crate::relay_crypto::KeyPair;
+use paseo_protocol::crypto::KeyPair;
 use anyhow::{Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;

@@ -1,14 +1,9 @@
-# Direct provider example
+# Direct provider migration notes
 
-This plugin implements `ProviderRegistration` directly in `index.server.ts` and `server/`. It
-demonstrates connection negotiation, catalog and session listing, session creation, prompt and
-command disposition, settings, persistence and replay, archive actions, and an ordinary child
-session.
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-The provider also emits versioned `provider-result` plugin timeline items for its root and child
-sessions. The native client shows those rows as formatted JSON. `index.client.tsx` registers a React
-Native renderer for them; the native client does not run it, so that file only exercises the SDK's
-client types. Emit standard timeline items for output users need to read.
+The former example demonstrated catalog, settings, session creation, commands, persistence/replay and children through a JavaScript provider. A native port implements `Provider`/`Connection`, emits complete standard timeline snapshots, correlates prompt results and handles real permissions/cancellation. Advertise optional persistence/configuration/steering only after implementing them. Host tools arrive through `config.mcpServers`; custom React timeline renderers are not a native presentation API.
 
-The provider receives Paseo host tools through `config.mcpServers`; it does not receive a second
-callback tool API.
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
+
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

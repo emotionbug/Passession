@@ -56,16 +56,6 @@ impl McpService {
             .upgrade()
             .ok_or_else(|| anyhow!("MCP service is shut down"))
     }
-    pub async fn caller_context(&self, agent_id: &str) -> Option<Value> {
-        if let Some(app) = self.app.upgrade() {
-            if app.speech.is_active_for_agent(agent_id).await {
-                return Some(
-                    json!({"childAgentDefaultLabels":{},"allowCustomCwd":false,"enableVoiceTools":true}),
-                );
-            }
-        }
-        None
-    }
     pub async fn revoke_agent(&self, agent_id: &str) {
         self.grants.write().await.retain(|_, grant| {
             if grant.agent_id == agent_id {
@@ -189,24 +179,10 @@ impl McpService {
         policy: Option<&Value>,
         manifest: bool,
     ) -> Result<Vec<Value>> {
-        let context = if let Some(id) = caller {
-            self.caller_context(id).await
-        } else {
-            None
-        };
-        let voice = context
-            .as_ref()
-            .is_some_and(|v| v["enableVoiceTools"] == true || v["voiceOnly"] == true);
-        let mut tools = Vec::new();
-        if voice {
-            tools.push(json!({"name":"speak","title":"Speak","description":"Speak text to the user via daemon-managed voice output. Blocks until playback completes.","inputSchema":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":4000,"x-trim":true}},"required":["text"],"additionalProperties":true}}));
-        }
-        if !context.as_ref().is_some_and(|v| v["voiceOnly"] == true) {
-            tools.push(json!({"name":"list_hosts","title":"List hosts","description":"Discover this host and registered destination hosts for fleet tools.","inputSchema":{"type":"object","properties":{},"additionalProperties":true}}));
-            tools.extend(workspace_tools::definitions(caller.is_some() || manifest));
-            tools.extend(agent_tools::definitions(caller.is_some() || manifest));
-            tools.extend(schedule_tools::definitions(caller.is_some() || manifest));
-        }
+        let mut tools = vec![json!({"name":"list_hosts","title":"List hosts","description":"Discover this host and registered destination hosts for fleet tools.","inputSchema":{"type":"object","properties":{},"additionalProperties":true}})];
+        tools.extend(workspace_tools::definitions(caller.is_some() || manifest));
+        tools.extend(agent_tools::definitions(caller.is_some() || manifest));
+        tools.extend(schedule_tools::definitions(caller.is_some() || manifest));
         for tool in &mut tools {
             if HOST_TOOLS.contains(&tool["name"].as_str().unwrap_or("")) {
                 tool["inputSchema"]["properties"]["serverId"] = json!({"type":"string","minLength":1,"description":"Destination server ID from list_hosts; omit for this host."});
@@ -306,14 +282,7 @@ async fn execute_local(
     cancel: CancellationToken,
     updates: Option<mpsc::Sender<Value>>,
 ) -> Result<Value> {
-    if name == "speak" {
-        let id = caller
-            .ok_or_else(|| input_error("speak is only available to agent-scoped tool sessions"))?;
-        app.speech
-            .speak(id, input["text"].as_str().unwrap_or(""), cancel)
-            .await?;
-        Ok(json!({"content":[],"structuredContent":{"ok":true}}))
-    } else if name.contains("schedule") || name.ends_with("heartbeat") {
+    if name.contains("schedule") || name.ends_with("heartbeat") {
         schedule_tools::execute(app, caller, name, input).await
     } else if matches!(
         name,

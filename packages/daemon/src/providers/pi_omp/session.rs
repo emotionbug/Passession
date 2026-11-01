@@ -1483,125 +1483,136 @@ impl AgentSession for Session {
         self.inner.state.lock().unwrap().mapper.end_turn();
         Ok(())
     }
-    async fn try_out_of_band(&self, prompt: &Value) -> Result<bool> {
-        let Some(text) = prompt.as_str().and_then(|s| s.trim().strip_prefix('/')) else {
-            return Ok(false);
-        };
+    fn prepare_out_of_band(
+        self: Arc<Self>,
+        prompt: &Value,
+    ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
+        let text = prompt.as_str()?.trim().strip_prefix('/')?;
+        enum Command { Compact, AutoCompact, Handoff, Prompt(&'static str) }
         let (name, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
         let name = name.to_lowercase();
         let args = args.trim();
-        match name.as_str() {
-            "compact" => {
-                if self.inner.manual_compaction.swap(true, Ordering::AcqRel) {
-                    bail!("A compact command is already running");
-                }
-                let _guard = CompactionGuard {
-                    running: &self.inner.manual_compaction,
-                    started: &self.inner.compaction_started,
-                };
-                self.inner
-                    .compaction_started
-                    .store(false, Ordering::Release);
-                let omp = self.inner.spec.family == "omp";
-                if omp {
-                    self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":"loading","trigger":"manual"}})).await?;
-                }
-                let mut command = json!({"type":"compact"});
-                if !args.is_empty() {
-                    command["customInstructions"] = json!(args);
-                }
-                let result = self
-                    .inner
-                    .runtime()?
-                    .request_with_timeout(command, None)
-                    .await;
-                if omp
-                    || (result.is_err()
-                        && self.inner.compaction_started.swap(false, Ordering::AcqRel))
-                {
-                    self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":"completed","trigger":"manual"}})).await?;
-                }
-                if let Err(error) = result {
-                    self.inner
-                        .out_of_band_message(format!("[Error] Failed to compact context: {error}"))
-                        .await?;
-                } else if omp {
-                    self.inner.poll_usage(None).await;
-                }
-            }
-            "autocompact" => {
-                let enabled = match args.to_lowercase().as_str() {
-                    "on" | "true" | "enable" | "enabled" => true,
-                    "off" | "false" | "disable" | "disabled" => false,
-                    "" | "toggle" => {
-                        let state = self.inner.refresh().await?;
-                        let Some(enabled) = state["autoCompactionEnabled"].as_bool() else {
-                            self.inner.out_of_band_message("[Error] Auto-compaction state is unavailable. Use /autocompact on or /autocompact off.".into()).await?;
-                            return Ok(true);
-                        };
-                        !enabled
+        let command = match name.as_str() {
+            "compact" => Command::Compact,
+            "autocompact" => Command::AutoCompact,
+            "handoff" if self.inner.spec.family == "omp" => Command::Handoff,
+            "steer" | "follow-up" if self.inner.spec.family == "omp" && !args.is_empty() =>
+                Command::Prompt(if name == "steer" { "steer" } else { "followUp" }),
+            _ => return None,
+        };
+        let args = args.to_owned();
+        Some(Box::pin(async move {
+            match command {
+                Command::Compact => {
+                    if self.inner.manual_compaction.swap(true, Ordering::AcqRel) {
+                        bail!("A compact command is already running");
                     }
-                    _ => {
+                    let _guard = CompactionGuard {
+                        running: &self.inner.manual_compaction,
+                        started: &self.inner.compaction_started,
+                    };
+                    self.inner
+                        .compaction_started
+                        .store(false, Ordering::Release);
+                    let omp = self.inner.spec.family == "omp";
+                    if omp {
+                        self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":"loading","trigger":"manual"}})).await?;
+                    }
+                    let mut command = json!({"type":"compact"});
+                    if !args.is_empty() {
+                        command["customInstructions"] = json!(args);
+                    }
+                    let result = self
+                        .inner
+                        .runtime()?
+                        .request_with_timeout(command, None)
+                        .await;
+                    if omp
+                        || (result.is_err()
+                            && self.inner.compaction_started.swap(false, Ordering::AcqRel))
+                    {
+                        self.inner.emit(json!({"type":"timeline","provider":self.provider(),"item":{"type":"compaction","status":"completed","trigger":"manual"}})).await?;
+                    }
+                    if let Err(error) = result {
                         self.inner
-                            .out_of_band_message(
-                                "[Error] Usage: /autocompact [on|off|toggle]".into(),
+                            .out_of_band_message(format!("[Error] Failed to compact context: {error}"))
+                            .await?;
+                    } else if omp {
+                        self.inner.poll_usage(None).await;
+                    }
+                }
+                Command::AutoCompact => {
+                    let enabled = match args.to_lowercase().as_str() {
+                        "on" | "true" | "enable" | "enabled" => true,
+                        "off" | "false" | "disable" | "disabled" => false,
+                        "" | "toggle" => {
+                            let state = self.inner.refresh().await?;
+                            let Some(enabled) = state["autoCompactionEnabled"].as_bool() else {
+                                self.inner.out_of_band_message("[Error] Auto-compaction state is unavailable. Use /autocompact on or /autocompact off.".into()).await?;
+                                return Ok(());
+                            };
+                            !enabled
+                        }
+                        _ => {
+                            self.inner
+                                .out_of_band_message(
+                                    "[Error] Usage: /autocompact [on|off|toggle]".into(),
+                                )
+                                .await?;
+                            return Ok(());
+                        }
+                    };
+                    match self
+                        .inner
+                        .runtime()?
+                        .request(json!({"type":"set_auto_compaction","enabled":enabled}))
+                        .await
+                    {
+                        Ok(_) => {
+                            self.inner.state.lock().unwrap().native["autoCompactionEnabled"] =
+                                json!(enabled);
+                            self.inner
+                                .out_of_band_message(format!(
+                                    "Auto-compaction {}.",
+                                    if enabled { "enabled" } else { "disabled" }
+                                ))
+                                .await?;
+                        }
+                        Err(error) => {
+                            self.inner
+                                .out_of_band_message(format!(
+                                    "[Error] Failed to set auto-compaction: {error}"
+                                ))
+                                .await?
+                        }
+                    }
+                }
+                Command::Handoff => {
+                    self.inner.state.lock().unwrap().live = true;
+                    let mut command = json!({"type":"handoff"});
+                    if !args.is_empty() {
+                        command["customInstructions"] = json!(args);
+                    }
+                    if let Err(error) = self.inner.runtime()?.request(command).await {
+                        self.inner
+                            .out_of_band_message(format!("[Error] Failed to hand off turn: {error}"))
+                            .await?;
+                    }
+                }
+                Command::Prompt(behavior) => {
+                    if self.inner.state.lock().unwrap().active.is_none() {
+                        self.prompt(json!(args), json!({}), Some(behavior)).await?;
+                    } else {
+                        self.inner
+                            .runtime()?
+                            .request(
+                                json!({"type":"prompt","message":args,"streamingBehavior":behavior}),
                             )
                             .await?;
-                        return Ok(true);
-                    }
-                };
-                match self
-                    .inner
-                    .runtime()?
-                    .request(json!({"type":"set_auto_compaction","enabled":enabled}))
-                    .await
-                {
-                    Ok(_) => {
-                        self.inner.state.lock().unwrap().native["autoCompactionEnabled"] =
-                            json!(enabled);
-                        self.inner
-                            .out_of_band_message(format!(
-                                "Auto-compaction {}.",
-                                if enabled { "enabled" } else { "disabled" }
-                            ))
-                            .await?;
-                    }
-                    Err(error) => {
-                        self.inner
-                            .out_of_band_message(format!(
-                                "[Error] Failed to set auto-compaction: {error}"
-                            ))
-                            .await?
                     }
                 }
             }
-            "handoff" if self.inner.spec.family == "omp" => {
-                self.inner.state.lock().unwrap().live = true;
-                let mut command = json!({"type":"handoff"});
-                if !args.is_empty() {
-                    command["customInstructions"] = json!(args);
-                }
-                if let Err(error) = self.inner.runtime()?.request(command).await {
-                    self.inner
-                        .out_of_band_message(format!("[Error] Failed to hand off turn: {error}"))
-                        .await?;
-                }
-            }
-            "steer" | "follow-up" if self.inner.spec.family == "omp" && !args.is_empty() => {
-                let behavior = if name == "steer" { "steer" } else { "followUp" };
-                if self.inner.state.lock().unwrap().active.is_none() {
-                    self.prompt(json!(args), json!({}), Some(behavior)).await?;
-                } else {
-                    self.inner
-                        .runtime()?
-                        .request(
-                            json!({"type":"prompt","message":args,"streamingBehavior":behavior}),
-                        )
-                        .await?;
-                }
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
+            Ok(())
+        }))
     }
 }

@@ -1,152 +1,88 @@
----
-title: Workspaces with the SDK
-description: Open directories as Paseo workspaces, place agents in them, follow changes, and archive them.
-nav: Workspaces
-order: 53
-category: TypeScript SDK
----
-
 # Workspaces with the SDK
 
-Use a workspace when an integration needs durable ownership for agents, script/setup PTYs, and files related to one task. The Flutter client has no embedded browser or interactive terminal UI; task logs are read-only.
+[中文](workspaces.zh-CN.md) · [Setup](quickstart.md)
+
+Workspaces provide durable ownership for agents, script/setup PTYs and files. The SDK can control retained daemon terminals; the Flutter app presents read-only task logs, not an embedded interactive terminal. All paths below belong to the daemon host.
 
 ## Open a directory
 
-```ts
-const workspace = await client.workspaces.open("/Users/me/dev/storefront");
-
-console.log(workspace.id);
-console.log(workspace.directory);
-```
-
-`open()` creates the project when needed and reuses the active workspace for that exact directory. Use it when the directory is the identity you care about.
+`client.open_project(json!({"cwd": directory})).await?` opens a project directory and reuses the active workspace for that exact directory. Inspect its response payload rather than assuming a local workspace handle. This is different from `create_workspace`, which requests a fresh workspace.
 
 ## Create a fresh workspace
 
-`create()` always creates a new workspace, even when another workspace already uses the directory:
+```rust
+use anyhow::Result;
+use paseo_client::{DaemonClient, RequestOptions};
+use serde_json::{Value, json};
 
-```ts
-const workspace = await client.workspaces.create({
-  source: {
-    kind: "directory",
-    path: "/Users/me/dev/storefront",
-  },
-  title: "Checkout issue 42",
-});
-```
-
-Create a Paseo-owned worktree when concurrent work needs an isolated checkout:
-
-```ts
-const workspace = await client.workspaces.create({
-  source: {
-    kind: "worktree",
-    cwd: "/Users/me/dev/storefront",
-    action: "branch-off",
-    refName: "main",
-    branchName: "fix/checkout-42",
-  },
-  title: "Checkout issue 42",
-});
-```
-
-Pass `agent` to create the workspace and its first agent in one call. See the
-[combined background workspace example](./agents.md#run-work-in-a-background-workspace).
-Set visibility on the workspace options; `agent.background` is rejected.
-
-You can pass `projectId` in either source when you already have one. Most integrations should omit it; the daemon finds or creates the project from the directory.
-
-Pass `background: true` to hide a workspace from default discovery. Its agents and terminals
-remain durable, with ordinary history, lifecycle hooks, archive, and exact-ID access. The app's
-sidebar offers **Show background** without dropping replicated state.
-
-`background` is creation-only. Omission defaults to false; when `callerAgentId` identifies an agent
-creating a new workspace, omission inherits its workspace's value. Explicit false or true overrides
-inheritance. Agent creation with `workspaceId` rejects explicit background creation intent; configure
-visibility when creating the workspace. SDK/RPC implicit agent creation also accepts `background`
-as workspace creation intent, never as an agent property.
-
-Creation and inclusive discovery require `features.backgroundWorkspaces`; the client rejects an
-unsupported host with an update-host message.
-
-## Start an agent in a workspace
-
-Create through the workspace handle:
-
-```ts
-const agent = await workspace.agents.create({
-  config: {
-    provider: "claude/claude-sonnet-5",
-  },
-  prompt: "Map the checkout flow before changing anything.",
-});
-```
-
-The handle supplies both the workspace identity and its actual directory. This avoids mismatched placement arguments.
-
-For a one-off agent, you can skip the workspace call:
-
-```ts
-const agent = await client.agents.create({
-  config: {
-    provider: "claude/claude-sonnet-5",
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Map the checkout flow before changing anything.",
-});
-```
-
-The daemon still creates a project and a fresh workspace. Read `agent.workspaceId` when you need the generated workspace ID.
-
-## Start a terminal in a workspace
-
-```ts
-const terminal = await workspace.terminals.create({ name: "Development" });
-terminal.write("echo ready");
-terminal.sendKeys(["Enter"]);
-
-const { lines } = await terminal.capture();
-const { entries } = await workspace.terminals.list();
-await terminal.kill();
-```
-
-Two workspaces may share a directory. The workspace handle supplies the ID that keeps their terminals separate. To use an ID you already have, call `client.workspaces.ref(workspaceId).terminals.create()`.
-
-See the [terminal API reference](/docs/sdk/reference#clientterminals) for command arguments, working-directory overrides, input, and capture options.
-
-## List workspaces
-
-```ts
-let cursor: string | undefined;
-
-do {
-  const page = await client.workspaces.list({
-    filter: { query: "storefront" },
-    page: { limit: 50, cursor },
-  });
-
-  for (const workspace of page.entries) {
-    console.log(workspace.id, workspace.name, workspace.status);
-  }
-
-  cursor = page.pageInfo.nextCursor ?? undefined;
-} while (cursor);
-```
-
-Background workspaces are left out unless `filter.includeBackground` is true. Use
-`client.workspaces.list({ filter: { includeBackground: true } })` or
-`client.agents.list({ filter: { includeBackground: true } })`. Workspace descriptors carry
-`background`; agents derive visibility from their workspace and have no separate setting.
-
-## Refresh and archive a handle
-
-```ts
-const workspace = client.workspaces.ref(savedWorkspaceId);
-const snapshot = await workspace.refresh();
-
-if (snapshot) {
-  await workspace.archive();
+async fn create_work(client: &DaemonClient, cwd: &str, model: &str) -> Result<Value> {
+    client.create_workspace(json!({
+        "source": {"kind": "directory", "path": cwd},
+        "title": "Checkout review",
+        "background": true,
+        "agent": {
+            "config": {"provider": "codex", "model": model, "cwd": cwd},
+            "initialPrompt": "Map the checkout flow before changing anything."
+        }
+    }), RequestOptions::default()).await
 }
 ```
 
-Workspace archive is separate from agent archive. Archive each resource according to the lifecycle your integration owns.
+The returned payload contains `workspace`, optional `agent`, and setup/creation metadata. Persist their IDs. For an isolated checkout replace `source` with `{"kind":"worktree","cwd":cwd,"action":"branch-off","refName":"main","branchName":"fix/checkout-42"}`. Directory and worktree sources may include `projectId`; otherwise the daemon resolves the project. Worktree creation determines the actual directory: use the returned workspace's directory for subsequent operations, not the source repository path.
+
+`background` belongs on the workspace. Omission defaults to false, or inherits the caller's workspace visibility when `callerAgentId` is supplied. Explicit true/false overrides inheritance. It is creation-only; adding an agent to an existing workspace does not change visibility. Nested `agent.background` is rejected. Implicit workspace creation through `create_agent` can use top-level `background` only when not specifying an existing `workspaceId`.
+
+Check `client.require_feature("backgroundWorkspaces", "Update the host for background workspaces")?` before requesting background creation or inclusive discovery. Do not silently downgrade to visible work.
+
+## Start an agent in a workspace
+
+Call `create_agent` with `workspaceId` and `config: {provider, model, cwd}` using the workspace's actual directory. Without `workspaceId`, agent creation creates a fresh workspace/project as needed. Unlike a local handle, the raw JSON API does not fill placement fields for you.
+
+## Start a terminal in a workspace
+
+```rust
+use anyhow::{Context, Result};
+use paseo_client::DaemonClient;
+use serde_json::json;
+
+async fn run_log(client: &DaemonClient, workspace_id: &str, cwd: &str) -> Result<()> {
+    let created = client.create_terminal(json!({
+        "workspaceId": workspace_id, "cwd": cwd, "name": "Repository status",
+        "command": "git", "args": ["status", "--short"],
+        "size": {"rows": 24, "cols": 100}
+    })).await?;
+    let id = created["terminal"]["id"].as_str().context("missing terminal ID")?;
+    let capture = client.capture_terminal(json!({"terminalId": id, "stripAnsi": true})).await;
+    let cleanup = client.kill_terminal(json!({"terminalId": id})).await;
+    println!("{}", capture?);
+    cleanup?;
+    Ok(())
+}
+```
+
+Capture is a point-in-time snapshot, not a wait for process exit. To wait for exit/output use `Arc<DaemonClient>::observe_terminal`, receive `TerminalEvent`, and release its subscription; see [reference](reference.md#terminals-and-files). Always pass `workspaceId` to distinguish workspaces sharing a directory. `list_terminals` accepts the same placement context. Input is available through `TerminalStream::input`; command arguments are separate from the executable. Never interpolate untrusted text into shell commands.
+
+## List workspaces
+
+```rust
+use anyhow::Result;
+use paseo_client::{CursorPages, DaemonClient, RequestOptions};
+use serde_json::json;
+
+async fn list_work(client: &DaemonClient) -> Result<()> {
+    let mut pages = CursorPages::workspaces(json!({
+        "filter": {"query": "storefront", "includeBackground": true},
+        "page": {"limit": 50}
+    }));
+    while let Some(page) = pages.next(client, RequestOptions::default()).await? {
+        println!("{}", page["entries"]);
+    }
+    Ok(())
+}
+```
+
+Background workspaces are hidden unless `filter.includeBackground` is true. `fetch_workspaces` returns one payload; `CursorPages::workspaces` walks all pages and returns each page object. Cursors are opaque.
+
+## Refresh and archive a handle
+
+There is no Rust handle to refresh. Fetch current workspace data with `fetch_workspaces`, or hold an [owned workspace observation](events.md). Archive explicitly with `archive_workspace(json!({"workspaceId": id})).await?`. Workspace archive is distinct from agent archive. Inspect recovery with `inspect_workspace_recovery` and use `restore_workspace` only when your integration intends to restore it. Archive only resources you own.

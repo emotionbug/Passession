@@ -15,6 +15,6 @@ Keep these distinctions clear:
 - A script running a web project's tests is a host-side process. Paseo can run the script and display read-only logs without embedding a browser.
 - External automation tools may install browser binaries and use their own profiles. That is an opt-in project/tool dependency, not part of Paseo's default installed runtime.
 - A remote service URL must be reachable from the machine running the browser. `localhost` on your phone is not the daemon host.
-- Browser tests of a project or the documentation website are not tests of the native Flutter client.
+- Browser tests of your project are not tests of the native Flutter client. The unused documentation website is removed; these guides remain repository Markdown.
 
-See [external browser workflow](/docs/browser), [workspace scripts](/docs/worktrees#scripts-and-services), and [connectivity](/docs/connectivity).
+See [external browser workflow](browser.md), [workspace scripts](worktrees.md#scripts-and-services), and [connectivity](connectivity.md).

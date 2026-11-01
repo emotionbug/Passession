@@ -1,139 +1,85 @@
----
-title: SDK 事件
-description: 订阅 Agent 状态、时间线、工作区和 Provider 的更新，无需维护第二套状态模型。
-nav: 事件
----
+# SDK 事件
 
-# SDK 事件 {#sdk-events}
+[English](events.md) · [环境配置](quickstart.zh-CN.md)
 
-使用一个由你持有的订阅来获取快照并跟踪它的变化。在支持的 daemon 上，建立连接、普通读取和本地目录监听器都不会启动观察。每次观察都会获得一个由服务器签发的新 ID，即使它的过滤条件与另一次观察相同。
+建立连接或调用 `subscribe()` 只附加传输监听器，不会请求 daemon 观察。将已连接客户端包装为 `Arc::new(client)`，再通过持有式观察方法获取服务器快照和订阅 ID。支持该功能的 daemon 为独立观察分配独立服务器 ID。
 
-## 跟踪一个 Agent 的状态 {#follow-one-agents-status}
+## 跟踪 Agent 状态
 
-```ts
-const directory = await client.agents.list({
-  filter: { includeArchived: false },
-  subscribe: {},
-});
+```rust
+use anyhow::Result;
+use paseo_client::{DaemonClient, RequestOptions};
+use serde_json::json;
+use std::sync::Arc;
 
-directory.subscription.subscribe({
-  snapshot({ entries }) {
-    const entry = entries.find(({ agent }) => agent.id === agentId);
-    console.log(entry?.agent.status);
-  },
-  update(message) {
-    if (message.type !== "agent_update") return;
-    const update = message.payload;
-    if (update.kind === "upsert" && update.agent.id === agentId) {
-      console.log(update.agent.status);
-    } else if (update.kind === "remove" && update.agentId === agentId) {
-      console.log("Agent removed from this directory");
-    }
-  },
-});
-
-// When this view closes:
-await directory.subscription.release();
-```
-
-`list({ subscribe: {} })` 返回快照、`subscriptionId` 和 `subscription`。省略 `subscribe` 时只返回快照。不要自己提供订阅 ID。订阅会先投递快照再投递更新，重连后会获得新的 ID 和快照。释放订阅不会影响其他观察和底层的 Agent。
-
-`client.agents.subscribe()` 和 Agent 句柄上的 `subscribe()` 会为该 API 实例持有的观察添加本地监听器。它们不会请求数据。当多个带过滤条件的视图需要各自的更新时，请使用返回的订阅上的回调。
-
-## 跟踪时间线事件 {#follow-timeline-events}
-
-```ts
-const unsubscribe = agent.timeline.subscribe((update) => {
-  const { event } = update;
-  if (event.type === "subscription_restored") {
-    // Live delivery has resumed. Choose whether to fetch missed history.
-    console.log("Reconnected; events may have been missed");
-    return;
-  }
-  if (event.type === "error") {
-    console.error("Timeline observation stopped:", event.error);
-    return;
-  }
-  if (event.type === "replacement") {
-    // Previously fetched history belongs to an old epoch. Fetch the page your UI needs.
-    void agent.timeline.refetch().then((page) => console.log(page.entries));
-    return;
-  }
-  if (event.type === "timeline" && event.item.type === "assistant_message") {
-    process.stdout.write(event.item.text);
-  }
-
-  if (event.type === "turn_completed") {
-    console.log("\nTurn completed");
-  }
-});
-```
-
-在开始需要观察其事件的工作之前，先 await `unsubscribe.ready`。它会等待初始的实时订阅建立（在只支持广播的主机上则是本地监听器挂载完成）；初始历史是一次单独的[读取](#fetch-timeline-history)。调用 `unsubscribe()` 释放需求，或在清理时 await `unsubscribe.release()`。
-
-重连后，同一个句柄会在后续实时更新之前收到 `{ agentId, subscriptionId, event: { type: "subscription_restored" } }`。这是 SDK 在成员关系确认后（在只支持广播的主机上是本地挂载后）发出的本地通知。订阅会获得一个新的 ID。不会自动获取历史，错过的事件也不会重放。
-
-请为你的使用方选择恢复方式：继续接收实时事件、请求最近一页，或者用你保存的位置调用 `timeline.refetch({ direction: "after", cursor: { epoch, seq } })`。读取进行期间，实时投递会继续；请按 epoch 和序号缓冲这些事件，或与返回的页面进行对账。需要时，根据 `hasNewer` 和 `endCursor` 继续读取后面的页面。实时的 `replacement` 会使之前的 epoch 失效。显式的历史读取失败时，只会让那次读取 reject，实时订阅仍然有效。
-
-订阅建立失败时会投递 `{ agentId, event: { type: "error", error } }` 并释放该观察。准备好重试时，请建立新的订阅。释放订阅会停止它的回调，并阻止重连后的恢复。
-
-助手消息可能分段到达。需要完整消息时请拼接它们的文本；如果只需要最终回复，请使用 `run()` 并读取 `lastMessage`。
-
-一轮的完成由 `turn_completed`、`turn_failed` 或 `turn_canceled` 表示。不要根据 `agent_update` 转为 `idle` 来推断一轮已经完成。
-
-## 获取时间线历史 {#fetch-timeline-history}
-
-```ts
-const page = await agent.timeline.refetch({
-  direction: "before",
-  limit: 100,
-  projection: "projected",
-});
-
-for (const entry of page.entries) {
-  console.log(entry.seqStart, entry.seqEnd, entry.item.type);
+async fn watch(client: &Arc<DaemonClient>) -> Result<()> {
+    let mut observation = client.observe_agents(json!({
+        "filter": {"includeArchived": false}, "page": {"limit": 50}
+    }), RequestOptions::default()).await?;
+    println!("initial: {}", observation.snapshot);
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                event = observation.recv() => println!("update: {}", event?),
+                signal = tokio::signal::ctrl_c() => { signal?; break; }
+            }
+        }
+        Ok(())
+    }.await;
+    let released = observation.release().await;
+    result?;
+    released
 }
 ```
 
-使用结果中的 `startCursor`、`endCursor`、`hasOlder` 和 `hasNewer` 翻页，不要自己计算偏移量。
+初始 payload 位于 `observation.snapshot`；之后 `recv()` 返回完整 session 消息，包含 `type` 和通常存在的 `payload`。按自己的 Agent ID 筛选条目/事件。RPC payload 与事件封装形状不同。有限缓冲接收器可能落后；错误不是空更新。继续前应刷新快照并修复缺失历史。显式 `release` 等待服务器清理；丢弃观察只会在运行时仍存在时尝试异步清理。
 
-## 跟踪工作区更新 {#follow-workspace-updates}
+## 跟踪时间线事件
 
-```ts
-const directory = await client.workspaces.list({ subscribe: {} });
-directory.subscription.subscribe({
-  snapshot({ entries }) {
-    console.log(entries);
-  },
-  update(message) {
-    if (message.type === "workspace_update") console.log(message.payload);
-  },
-});
+`client.observe_timeline(&[agent_id.to_owned()], RequestOptions::default()).await?` 返回持有式观察。根据 `type` 和 payload 处理 `agent_stream` 及时间线相关消息。流增量不一定是完整消息。保留条目/轮次身份；替换事件应替换原条目而不是重复追加，缓存失效时重新读取。辅助函数位于 `paseo_protocol::timeline`，客户端不会代管展示缓存。
 
-// When this view closes:
-await directory.subscription.release();
+## 获取时间线历史
+
+```rust
+use anyhow::Result;
+use paseo_client::{CursorPages, DaemonClient, RequestOptions};
+
+async fn history(client: &DaemonClient, agent_id: &str) -> Result<()> {
+    let mut pages = CursorPages::timeline(agent_id, "before", 100)?;
+    while let Some(page) = pages.next(client, RequestOptions::default()).await? {
+        println!("{}", page);
+    }
+    Ok(())
+}
 ```
 
-## 跟踪 Provider 目录的变化 {#follow-provider-catalog-changes}
+`CursorPages::timeline` 支持 `before` 和 `after`；以页面顺序和不透明的起止游标为准。单页调用使用 `fetch_agent_timeline`，传入 `agentId`、`direction`、`limit` 及可选 `cursor`/`projection`。`fetch_agent_history` 与 `CursorPages::history(fields)` 使用独立历史端点，不能与时间线分页互换。历史读取是显式操作，订阅不会自动重放。
 
-```ts
-const unsubscribe = client.providers.subscribe((update) => {
-  const ready = update.entries.filter((entry) => entry.status === "ready");
-  console.log(
-    "Ready providers:",
-    ready.map((entry) => entry.provider),
-  );
-});
-console.log(await client.providers.snapshot());
+## 跟踪工作区更新
 
-// When this view closes:
-unsubscribe();
+在 `Arc<DaemonClient>` 上调用 `observe_workspaces(json!({"filter": {"includeBackground": true}}), options)`。视图关闭时释放返回的观察。普通 `fetch_workspaces` 读取不会创建观察，除非显式要求订阅。
+
+## 跟踪 Provider 目录变化
+
+使用 `observe_events(json!({"events": ["providers_snapshot_update", "agent_permission_request", "agent_permission_resolved"]}), options)` 订阅，然后获取工作目录的 Provider 快照并消费更新。事件名称是协议值，不是 Rust 回调。权限请求 ID 来自 daemon 事件，不是新生成的请求 ID：
+
+```rust
+use anyhow::Result;
+use paseo_client::DaemonClient;
+use serde_json::json;
+
+async fn deny(client: &DaemonClient, agent_id: &str, permission_request_id: &str) -> Result<()> {
+    client.respond_to_permission(json!({
+        "agentId": agent_id, "requestId": permission_request_id,
+        "response": {"behavior": "deny", "message": "Not approved by the operator"}
+    })).await
+}
 ```
 
-Provider 和项目的 `subscribe()` 调用会请求各自的更新，并在取消订阅时释放该需求。对于初始的项目缓存，请在 await `client.projects.list()` 期间缓冲更新，拿到快照后再应用它们。
+只有操作员或应用明确策略授权该精确请求后才能发送 allow 响应。收到权限请求本身不代表获准执行。
 
-当应用不再需要连接时，调用 `client.close()`。
+## 重连与旧版 daemon
 
-## 旧版 daemon {#older-daemons}
+`DaemonClient` 不会自动重连。`ReconnectingClient::connect` 管理重连；`connection(&cancel).await?` 获取当前 `Arc<DaemonClient>`。其 `observe(request, response, fields, options)` 返回 `RestoringSubscription`；`recv().await` 返回 `Option<Result<SubscriptionEvent>>`。重连或落后后，`SubscriptionEvent::Snapshot { payload, restored: true }` 替换基线，需要自行补齐历史。`SubscriptionEvent::Update` 是实时事件。调用 `ReconnectingClient::close(&mut self)` 前释放恢复式订阅。
 
-同样的方法会使用现有的连接和旧的投递行为。旧版的目录订阅共享一个服务器槽位：之后带过滤条件的观察会替换该槽位的过滤条件。句柄有本地 ID 和各自的回调，但独立的服务器端过滤需要更新后的 daemon。释放句柄会解除它的回调；旧版 daemon 可能会继续发送广播。
+重连不会盲目重放修改操作。持有式观察方法检查 daemon 的 `ownedSubscriptions` 能力，并要求服务器返回 `subscriptionId`。不支持的主机会得到明确的升级提示，不会隐式回退到旧版共享过滤器。原始 RPC 与向后可读的协议消息仍可使用，但不能使未公布的观察功能变得可用。使用持有式观察前请升级主机。

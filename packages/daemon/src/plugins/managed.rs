@@ -1,5 +1,5 @@
 use super::manifest;
-use crate::process::{CommandSpec, ManagedProcess};
+use paseo_client::process::{CommandSpec, ManagedProcess};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use std::{
@@ -15,10 +15,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod cargo;
 mod git;
-mod npm;
 mod reference;
 mod registry;
+mod release;
 use reference::{absolute, plugin_path, string};
 
 pub struct Candidate {
@@ -129,6 +130,9 @@ impl ManagedSources {
 
     fn locate(&self, id: &str, configured: &Path, record: &Value) -> Result<Location> {
         manifest::validate_id(id)?;
+        if record["kind"] == "npm" {
+            bail!("Plugin {id} has a retired npm/JavaScript source record. Its source record and settings have been preserved. To migrate without deleting settings, disable this plugin, obtain and build a native Rust release in a separate directory, then change this existing plugin ID's directory path in configuration and explicitly enable it. Do not remove the plugin to migrate: removal deletes its settings. The legacy source record remains read-only; automatic managed updates require a native source installation.");
+        }
         let plugin_root = absolute(&self.root.join(id))?;
         let configured = absolute(configured)?;
         let relative = configured.strip_prefix(&plugin_root).with_context(|| {
@@ -167,23 +171,24 @@ impl ManagedSources {
                 version_root.join("checkout"),
                 json!({"kind":"git","remote":reference::redact(string(record,"remote")?),"pluginPath":join_path(&parts[2..])}),
             )
-        } else {
-            if parts.get(1) != Some(&"node_modules") || parts.get(2).is_none() {
-                bail!("Invalid npm installation directory: {id}");
-            }
-            let package_parts = if parts[2].starts_with('@') { 2 } else { 1 };
-            if parts.len() < 2 + package_parts {
-                bail!("Invalid npm package directory: {id}");
-            }
-            let package = parts[2..2 + package_parts].join("/");
-            let (name, _) = npm::parse(&package)?;
-            if name != package {
-                bail!("Invalid npm package directory: {id}");
+        } else if record["kind"] == "cargo" {
+            if parts.get(1) != Some(&"crate") {
+                bail!("Invalid Cargo installation directory: {id}");
             }
             (
-                version_root.join("node_modules").join(&package),
-                json!({"kind":"npm","packageName":package,"pluginPath":join_path(&parts[2 + package_parts..])}),
+                version_root.join("crate"),
+                json!({"kind":"cargo","crateName":string(record,"crateName")?,"pluginPath":join_path(&parts[2..])}),
             )
+        } else if record["kind"] == "release" {
+            if parts.get(1) != Some(&"release") {
+                bail!("Invalid release installation directory: {id}");
+            }
+            (
+                version_root.join("release"),
+                json!({"kind":"release","origin":string(record,"origin")?,"pluginPath":join_path(&parts[2..])}),
+            )
+        } else {
+            bail!("Unsupported managed plugin source");
         };
         if let Some(registry) = record.get("registry") {
             identity["registry"] = registry.clone();
@@ -198,19 +203,7 @@ impl ManagedSources {
     async fn revision(&self, location: &Location, configured: &Path) -> Result<String> {
         containment(&self.root, &location.version_root).await?;
         containment(&location.version_root, configured).await?;
-        if location.identity["kind"] == "npm" {
-            Ok(string(
-                &npm::artifact(
-                    &location.version_root,
-                    string(&location.identity, "packageName")?,
-                )
-                .await?,
-                "version",
-            )?
-            .to_owned())
-        } else {
-            git::rev_parse(&location.source_root, "HEAD", &self.env).await
-        }
+        git::rev_parse(&location.source_root, "HEAD", &self.env).await
     }
 
     pub async fn describe(&self, id: &str, configured: &Path) -> Result<Value> {
@@ -218,9 +211,26 @@ impl ManagedSources {
             return Ok(json!({"identity":{"kind":"directory","path":absolute(configured)?}}));
         };
         let location = self.locate(id, configured, &record)?;
-        let revision = self.revision(&location, configured).await;
         let mut result = json!({"identity":location.identity});
-        if let Ok(revision) = revision {
+        if matches!(location.identity["kind"].as_str(), Some("cargo" | "release")) {
+            let artifact = async {
+                containment(&self.root, &location.version_root).await?;
+                containment(&location.version_root, configured).await?;
+                if location.identity["kind"] == "cargo" {
+                    cargo::artifact(&location.version_root, string(&location.identity, "crateName")?).await
+                } else {
+                    let artifact = release::artifact(&location.version_root).await?;
+                    if release::origin(string(&artifact, "url")?)? != string(&location.identity, "origin")? {
+                        bail!("Release acquisition source does not match its record");
+                    }
+                    Ok(artifact)
+                }
+            }.await;
+            if let Ok(artifact) = artifact {
+                result["currentRevision"] = artifact[if artifact["kind"] == "cargo" { "version" } else { "sha256" }].clone();
+                result["artifact"] = artifact;
+            }
+        } else if let Ok(revision) = self.revision(&location, configured).await {
             result["currentRevision"] = json!(revision);
         }
         Ok(result)
@@ -228,6 +238,12 @@ impl ManagedSources {
 
     pub async fn prepare_install(&self, input: &Value) -> Result<Candidate> {
         let source = string(input, "source")?;
+        if source.starts_with("npm:") || source.starts_with('@') {
+            bail!("npm/JavaScript plugins are no longer supported. Install a native Rust plugin from cargo:, release:, Git, or a local directory.");
+        }
+        if !source.starts_with("release:") && ["version", "sha256", "format"].iter().any(|key| input.get(*key).is_some()) {
+            bail!("Install version, sha256 and format fields are only valid for release: sources; use cargo:crate@version for Cargo");
+        }
         let options = self.options()?;
         if let Some(identity) = reference::registry(
             source,
@@ -339,10 +355,16 @@ impl ManagedSources {
         let root = self.staging().await?;
         let mut cleanup = StagingCleanup(Some(root.clone()));
         let result = async {
-            let (source_root, record) = if npm::is_source(source) {
-                if requested.is_some() { bail!("Plugin --ref is only valid for Git sources; use npm:package@version for npm"); }
-                let package = npm::acquire(source, &root, target.as_ref(), &self.env).await?;
-                (root.join("node_modules").join(package), json!({"kind":"npm"}))
+            let (source_root, record, target) = if source.starts_with("cargo:") {
+                if requested.is_some() { bail!("Plugin --ref is only valid for Git sources; use cargo:crate@version for Cargo"); }
+                let (name, artifact) = cargo::acquire(source, &root, target.as_ref()).await?;
+                (root.join("crate"), json!({"kind":"cargo","crateName":name}), Some(artifact))
+            } else if let Some(url) = source.strip_prefix("release:") {
+                if requested.is_some() { bail!("Plugin --ref is only valid for Git sources"); }
+                let artifact = release::target(input, url)?;
+                if target.as_ref().is_some_and(|target| *target != artifact) { bail!("Release target changed since review"); }
+                release::acquire(&root, &artifact).await?;
+                (root.join("release"), json!({"kind":"release","origin":release::origin(url)?}), Some(artifact))
             } else {
                 let remote = git::normalize(source)?;
                 let checkout = root.join("checkout");
@@ -350,7 +372,7 @@ impl ManagedSources {
                 let commit = git::requested(&checkout, requested, &self.env).await?;
                 if target.as_ref().is_some_and(|target| target["kind"] != "git" || target["commit"] != commit) { bail!("Git target changed since review"); }
                 git::checkout(&checkout, &commit, &self.env).await?;
-                (checkout, json!({"kind":"git","remote":remote}))
+                (checkout, json!({"kind":"git","remote":remote}), target)
             };
             let directory = source_root.join(&path);
             containment(&source_root, &directory).await?;
@@ -436,41 +458,44 @@ impl ManagedSources {
             let resolved = registry::resolve(registry_identity, &self.options()?, false).await?;
             registry::assert_identity(identity, &resolved.artifact)?;
             resolved.target
-        } else if identity["kind"] == "npm" {
-            let selector = selection
-                .map(|s| string(s, "version"))
-                .transpose()?
-                .unwrap_or("latest");
-            npm::resolve(
-                string(identity, "packageName")?,
-                selector,
-                &self.root,
-                &self.env,
-            )
-            .await?
+        } else if identity["kind"] == "cargo" {
+            let requested = selection.map(|s| string(s, "version")).transpose()?;
+            cargo::resolve(string(identity, "crateName")?, requested).await?
+        } else if identity["kind"] == "release" {
+            if let Some(selection) = selection {
+                let target = release::target(selection, string(selection, "url")?)?;
+                if release::origin(string(&target, "url")?)? != string(identity, "origin")? {
+                    bail!("Release source origin changed; reinstall to approve the new source");
+                }
+                target
+            } else {
+                release::artifact(&location.version_root).await?
+            }
         } else {
             let requested = selection.map(|s| string(s, "ref")).transpose()?;
             json!({"kind":"git","commit":git::remote_commit(self,string(&record,"remote")?,requested).await?})
         };
         let target_revision = string(
             &target,
-            if target["kind"] == "npm" {
+            if target["kind"] == "cargo" {
                 "version"
+            } else if target["kind"] == "release" {
+                "sha256"
             } else {
                 "commit"
             },
         )?;
-        let outcome = if identity["kind"] == "npm" && identity.get("registry").is_none() {
+        let outcome = if identity["kind"] == "cargo" && identity.get("registry").is_none() {
             let ordering = semver::Version::parse(target_revision)?
                 .cmp_precedence(&semver::Version::parse(revision)?);
-            if ordering.is_eq() {
+            if ordering.is_eq() && current["artifact"] == target {
                 "current"
             } else if ordering.is_lt() && selection.is_none() {
                 "installed-newer"
             } else {
                 "update"
             }
-        } else if target_revision == revision {
+        } else if target_revision == revision && (identity["kind"] == "git" || current["artifact"] == target) {
             "current"
         } else {
             "update"
@@ -478,6 +503,9 @@ impl ManagedSources {
         let mut result = json!({"id":id,"outcome":outcome,"current":current,"target":target,"links":reference::links(&current,&target)});
         if outcome == "update" {
             result["proposal"] = json!({"id":id,"expected":{"identity":identity,"installationRoot":location.version_root,"revision":revision},"target":target});
+            if let Some(artifact) = current.get("artifact") {
+                result["proposal"]["expected"]["artifact"] = artifact.clone();
+            }
         }
         Ok(result)
     }
@@ -494,6 +522,7 @@ impl ManagedSources {
             || current.get("currentRevision").is_none()
             || current["currentRevision"] != proposal["expected"]["revision"]
             || json!(location.version_root) != proposal["expected"]["installationRoot"]
+            || current.get("artifact") != proposal["expected"].get("artifact")
         {
             bail!("Plugin {id} changed since review; check again");
         }
@@ -501,6 +530,10 @@ impl ManagedSources {
             bail!("Update target does not match the installed source");
         }
         validate_target(&proposal["target"])?;
+        if current["identity"]["kind"] == "release"
+            && release::origin(string(&proposal["target"], "url")?)? != string(&current["identity"], "origin")? {
+            bail!("Release source origin changed; reinstall to approve the new source");
+        }
         Ok(())
     }
 
@@ -525,8 +558,13 @@ impl ManagedSources {
         }
         let input = if identity["kind"] == "git" {
             json!({"source":format!("git:{}",string(&record,"remote")?),"ref":target["commit"],"pluginPath":identity["pluginPath"]})
+        } else if identity["kind"] == "cargo" {
+            json!({"source":format!("cargo:{}@{}",string(&identity,"crateName")?,string(target,"version")?),"pluginPath":identity["pluginPath"]})
         } else {
-            json!({"source":format!("npm:{}@{}",string(&identity,"packageName")?,string(target,"version")?),"pluginPath":identity["pluginPath"]})
+            let mut input = target.clone();
+            input["source"] = json!(format!("release:{}",string(target,"url")?));
+            input["pluginPath"] = identity["pluginPath"].clone();
+            input
         };
         self.acquire(&input, Some(target.clone())).await
     }
@@ -542,27 +580,37 @@ impl ManagedSources {
             return Ok(());
         }
         let location = self.locate(id, &candidate.directory, &candidate.record)?;
-        let revision = self.revision(&location, &candidate.directory).await?;
+        containment(&self.root, &location.version_root).await?;
+        containment(&location.version_root, &candidate.directory).await?;
+        let artifact = match location.identity["kind"].as_str() {
+            Some("cargo") => Some(cargo::artifact(
+                &location.version_root,
+                string(&location.identity, "crateName")?,
+            ).await?),
+            Some("release") => {
+                let artifact = release::artifact(&location.version_root).await?;
+                if release::origin(string(&artifact, "url")?)? != string(&location.identity, "origin")? {
+                    bail!("Release acquisition source does not match its record");
+                }
+                Some(artifact)
+            }
+            _ => None,
+        };
+        let revision = if artifact.is_none() {
+            Some(git::rev_parse(&location.source_root, "HEAD", &self.env).await?)
+        } else {
+            None
+        };
         if let Some(target) = target.or(candidate.target.as_ref()) {
             validate_target(target)?;
             if target["kind"] != location.identity["kind"] {
                 bail!("Update target does not match the installed source");
             }
-            if target["kind"] == "git" && target["commit"] != revision {
+            if target["kind"] == "git" && target["commit"].as_str() != revision.as_deref() {
                 bail!("Preparation changed the reviewed Git commit");
             }
-            if target["kind"] == "npm" {
-                let artifact = npm::artifact(
-                    &location.version_root,
-                    string(&location.identity, "packageName")?,
-                )
-                .await?;
-                if ["version", "integrity", "resolved"]
-                    .iter()
-                    .any(|key| artifact[*key] != target[*key])
-                {
-                    bail!("Preparation changed the reviewed npm artifact");
-                }
+            if artifact.as_ref().is_some_and(|artifact| artifact != target) {
+                bail!("Preparation changed the reviewed native artifact");
             }
         }
         Ok(())
@@ -638,7 +686,7 @@ impl ManagedSources {
         let preview = self.preview(id, configured, None).await?;
         let installation = &preview["current"];
         let is_git = installation["identity"]["kind"] == "git";
-        let mut status = json!({"id":id,"source":if is_git {"git"} else {"directory"},"path":configured,"installation":installation});
+        let mut status = json!({"id":id,"source":installation["identity"]["kind"],"path":configured,"installation":installation,"updateAvailable":preview["outcome"] == "update"});
         if is_git {
             status["remote"] = installation["identity"]["remote"].clone();
             if let Some(commit) = installation.get("currentRevision") {
@@ -817,7 +865,22 @@ fn normalize_record(record: &Value) -> Result<Value> {
         .unwrap_or("git");
     let mut normalized = match kind {
         "git" => json!({"kind":"git","remote":string(record,"remote")?}),
-        "npm" => json!({"kind":"npm"}),
+        // Keep legacy metadata intact so migration cannot erase acquisition history.
+        "npm" => record.clone(),
+        "cargo" => {
+            let name = string(record, "crateName")?;
+            if cargo::parse(&format!("cargo:{name}"))?.0 != name {
+                bail!("Invalid managed Cargo crate name");
+            }
+            json!({"kind":"cargo","crateName":name})
+        }
+        "release" => {
+            let origin = string(record, "origin")?;
+            if release::origin(origin)? != origin {
+                bail!("Invalid release source origin");
+            }
+            json!({"kind":"release","origin":origin})
+        }
         _ => bail!("Invalid managed plugin source kind"),
     };
     if let Some(registry) = record.get("registry") {
@@ -827,7 +890,9 @@ fn normalize_record(record: &Value) -> Result<Value> {
         }
         let url = string(registry, "url")?;
         url::Url::parse(url)?;
-        normalized["registry"] = json!({"id":id,"url":url});
+        if kind != "npm" {
+            normalized["registry"] = json!({"id":id,"url":url});
+        }
     }
     Ok(normalized)
 }
@@ -839,11 +904,8 @@ fn validate_target(target: &Value) -> Result<()> {
                 bail!("Invalid Git target commit");
             }
         }
-        "npm" => {
-            semver::Version::parse(string(target, "version")?)?;
-            url::Url::parse(string(target, "resolved")?)?;
-            string(target, "integrity")?;
-        }
+        "cargo" => cargo::validate(target)?,
+        "release" => release::validate(target)?,
         _ => bail!("Invalid plugin update target"),
     }
     Ok(())
@@ -933,7 +995,7 @@ async fn command(
     cwd: &Path,
     env: BTreeMap<String, String>,
 ) -> Result<String> {
-    let result = crate::process::run(
+    let result = paseo_client::process::run(
         CommandSpec {
             program: program.to_owned(),
             args,

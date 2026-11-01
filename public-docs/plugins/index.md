@@ -1,6 +1,6 @@
 ---
 title: Plugin quickstart
-description: Build, install, share, and update a trusted backend extension.
+description: Build and manage a trusted native backend extension with Rust.
 nav: Quickstart
 order: 44
 category: Plugins
@@ -8,104 +8,89 @@ category: Plugins
 
 # Plugin quickstart
 
-An optional JavaScript plugin extends one Paseo daemon with RPC handlers, lifecycle hooks, settings persistence, usage sources, or a coding-agent provider. Built-in behavior is implemented in Rust. Third-party JavaScript runs in a separate backend worker using **externally installed Node.js 20+** on the daemon host, not in the Flutter app.
+A Paseo plugin is a **standalone native executable** on the daemon host. The Rust `paseo-plugin` SDK supplies bounded newline-JSON IPC, RPC handlers, lifecycle hooks, settings, provider connections, usage sources and the daemon-client bridge. It is not a Rust dynamic library and does not run inside Flutter.
 
-These instructions describe the native cutover in the **0.13.0 checkout, not a published native release**. The Flutter clients for Linux, macOS, Windows, Android, and iOS do not execute React plugins. Screens, panels, themes, sidebar components, composer callbacks, and custom timeline renderers from the former JavaScript client are not supported native extension points. Mobile clients connect remotely; they do not run the daemon or plugin worker.
+This guide describes the **0.13.1 source checkout, not a published release**. There is no JavaScript worker, embedded compiler or Node fallback. Existing JavaScript plugins need an [explicit port](migration.md). Flutter does not execute plugin screens, React components, panels, themes or timeline renderers; mobile connects remotely and does not host plugins.
 
 ## Prepare the daemon host
 
-Install Node.js 20+ separately if you need JavaScript extensions. Make `node` available to the daemon or set `PASEO_PLUGIN_NODE` to its executable in the daemon environment. npm is also needed to acquire npm sources or run npm preparation commands; selecting `PASEO_PLUGIN_NODE` does not install npm. The optional worker asset must be present beside the native runtime's generated assets, or selected with `PASEO_PLUGIN_WORKER`.
+Use Rust 1.93 or newer (edition 2024) to build source plugins. Git sources also require Git. Prebuilt native plugins need the correct operating system, architecture and runtime libraries, not a Rust compiler merely to execute them. Build the checkout daemon with `cargo xtask build-daemon`; use an isolated development daemon, never an existing production installation for experiments.
 
-For a repository build, use the repository's **Node.js 24** build environment, `npm ci`, and `npm run build:daemon`. This builds the Rust debug executable and adjacent assets. `npm run dev:daemon` is the watch command. Do not use the removed `dev:server` command or install a legacy JavaScript daemon to obtain plugins.
+Plugins and their preparation commands are **trusted, unsandboxed code**, with the daemon user's file, process, network and credential access. Validation itself runs the executable. Review the source, dependencies, artifacts and updates before installing.
 
 ## Create a plugin
 
-On the daemon machine:
+Use a local SDK checkout until the desired SDK revision is actually available remotely:
 
-```bash
-paseo plugin init /absolute/path/to/workspace-plugin
+```sh
+paseo plugin init /absolute/path/to/workspace-plugin --sdk-path /absolute/path/to/paseo/packages/plugin
 cd /absolute/path/to/workspace-plugin
-npm install
+cargo build --release --target-dir target
+./target/release/paseo-plugin-server --validate . 0.13.1
 ```
 
-The Rust CLI creates a backend-only TypeScript project without running the package manager:
+On Windows the scaffold selects `target/release/paseo-plugin-server.exe`; invoke `.\target\release\paseo-plugin-server.exe`. When moving a project between operating systems, update `server.executable` accordingly.
 
-```text
-workspace-plugin/
-  paseo-plugin.json
-  package.json
-  tsconfig.json
-  OVERVIEW.md
-  index.server.ts
-  server/greeting.ts
-  shared/greeting.ts
-```
+The scaffold creates `Cargo.toml`, `src/main.rs`, `paseo-plugin.json`, `README.md`, `OVERVIEW.md` and `.gitignore`. It registers the `greeting.create` RPC: input `{"name":"World"}` returns `{"message":"Hello, World!"}`. It does not download dependencies or compile at creation time. Without `--sdk-path`, its SDK dependency points to the Paseo Git repository; pin a revision containing the required crate before distribution, rather than assuming crates.io publication.
 
-The scaffold registers a greeting RPC. `npm install` installs authoring dependencies; the worker supplies the plugin SDK and Zod at runtime. Keep daemon-local operations in `server/` and plain data and contracts in `shared/`. Do not add a client entry to make a native interface.
-
-For a simple observable backend contribution, replace `index.server.ts` with:
-
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-
-export default function contribute(server: PluginServerContext) {
-  server.on("agent.turn_ended", (event) => {
-    console.log("Turn ended", event.agent.id, event.outcome);
-  });
-  return () => {};
-}
-```
-
-This hook runs while the plugin is enabled, including when no app is connected. See the [reference](/docs/plugins/reference) for RPC, settings, lifecycle, usage, and SDK contracts, or [build a provider](/docs/plugins/providers) to connect an agent directly or through ACP.
+The manifest uses `runtime: "native"`, a contained `server.executable`, and `server.args: []`. The scaffold declares a Cargo preparation command. See the [reference](reference.md) for the complete contract.
 
 ## Install and try it
 
-Plugins are trusted, unsandboxed code. Backend code and preparation commands run with the daemon user's access to files, processes, credentials, and the network. Trust the source, dependencies, and updates before installing.
+On a selected **test daemon**:
 
-```bash
-npm run typecheck
+```sh
 paseo plugin install /absolute/path/to/workspace-plugin
 paseo plugin ls workspace-plugin
 paseo plugin logs workspace-plugin
 ```
 
-The daemon-wide `pluginsEnabled` setting and the installation's own enabled state must both allow execution. After changing the root setting in `config.json`, use `paseo reload --json`; use plugin commands to change installations. `paseo plugin enable workspace-plugin` enables that installation, not the root switch.
+Both the daemon-wide `pluginsEnabled` setting and the installation's enabled flag must allow execution. After changing the root setting in `config.json`, use `paseo reload --json`; `paseo plugin enable workspace-plugin` changes only that installation. A `running` status means activation succeeded, not that every RPC/provider path works or that an old plugin UI is supported.
 
-Complete an agent turn on the selected daemon to exercise the hook, then inspect its logs. No plugin screen or sidebar item is expected. `running` is backend activation status, not evidence that an old client contribution works.
+For a remote daemon, put `--host <url>` before the management command and use an absolute plugin path **on that host**. The CLI does not upload your local files. `plugin init` creates files locally.
 
-With a remote daemon, put `--host <url>` before the command and use an absolute path that exists **on that host**. The CLI does not upload local plugin files.
+## Run the repository example
+
+From the repository root on Linux/macOS:
+
+```sh
+cargo build -p paseo-workspace-inspector --target-dir plugin-examples/workspace-inspector/target
+./plugin-examples/workspace-inspector/target/debug/paseo-workspace-inspector --validate plugin-examples/workspace-inspector 0.13.1
+paseo plugin install ./plugin-examples/workspace-inspector
+paseo plugin ls workspace-inspector
+paseo plugin logs workspace-inspector
+```
+
+On Windows, append `.exe` to the example manifest's `server.executable` and invoke `.\plugin-examples\workspace-inspector\target\debug\paseo-workspace-inspector.exe` with the same validation arguments.
+
+The [example implementation](../../plugin-examples/workspace-inspector/src/lib.rs) is a real local-file inspector, not an AI service:
+
+- `file.inspect` accepts `{"cwd":"/absolute/workspace","path":"README.md"}` and returns bounded UTF-8 file statistics and a preview. Direct RPC reads are explicitly requested by the caller and do not create a provider permission prompt.
+- `lifecycle.counts` reports the current process's observed `agent.created` events.
+- `inspection` settings persist `maxBytes` (default 65536, range 1–1048576). The session-open hook adds `PASEO_INSPECT_MAX_BYTES` to launch overrides.
+- Select provider `workspace-inspector` and model `local-file`, then send a relative file path or its `inspect` command. Approve or deny the read request. The example rejects traversal, symlinks, oversized and non-UTF-8 files; it is not a sandbox against malicious concurrent filesystem changes.
+- Persistence, steering, configuration changes, images and output schemas are not advertised by this example.
 
 ## Edit and reload
 
-```bash
-npm run typecheck
+Rebuild into the path named by the manifest before reloading:
+
+```sh
+cargo build --release --target-dir target
 paseo plugin reload workspace-plugin
 paseo plugin ls workspace-plugin
 paseo plugin logs workspace-plugin
 ```
 
-Loading compiles the backend but does not replace author-side TypeScript checking. Release timers, watchers, sockets, subscriptions, and child processes from your entry's returned cleanup function. Reload restarts the worker; inspect errors before assuming the new code is running.
+These commands are for the scaffold directory; use the example's debug build command for `workspace-inspector`. Reload starts a new executable; it does not compile Rust on demand. Register cleanup for owned tasks, processes, subscriptions, files and sockets, and honor cancellation.
 
 ## Install and update shared plugins
 
-```bash
-paseo plugin install npm:@acme/paseo-review@1.2.0
-paseo plugin install github:acme/paseo-review
-paseo plugin install github:acme/monorepo:plugins/review
-paseo plugin update paseo-review --check
-paseo plugin update paseo-review --yes
+Directory, Git, Cargo crate, checksum-pinned HTTPS release archive and compatible registry sources are supported. The source and update flags are documented in the [reference](reference.md#plugin-sources); distribution and trust requirements are in [publishing](publishing.md).
+
+```sh
+paseo plugin update workspace-plugin --check
+paseo plugin update workspace-plugin --yes
 ```
 
-Use the plugin's installed ID, which need not equal its npm name. The native CLI displays a proposal and requires `--yes` for an ordinary update; it does not offer an interactive approval prompt. `--check` never applies the update. Explicit `--version` or `--ref` selects and authorizes a target for one plugin. Directory sources are edited in place and reloaded, not updated from a remote.
-
-`npm` is needed for acquisition, not subsequent loading; **Node remains required for backend execution**. Source selectors, registry pins, preparation commands, and update rules are documented in the [reference](/docs/plugins/reference#plugin-sources). Use [publishing](/docs/plugins/publishing) to share a plugin and [migration](/docs/plugins/migration) to remove obsolete client contributions.
-
-## Source ownership
-
-- `packages/daemon/src`: Rust daemon, CLI, plugin management, and worker bridge.
-- `packages/daemon/plugin-worker/src`: extracted private JavaScript backend worker.
-- `packages/plugin`: public `@getpaseo/plugin` author SDK.
-- `packages/client`: `@getpaseo/client` TypeScript SDK used by backend handlers.
-- `packages/protocol`: shared protocol contracts.
-
-The private worker is not an application SDK or an executable UI host. Existing SDK client exports and historical examples do not imply native UI support.
+Directory sources are edited and reloaded, not remotely updated. Ordinary managed updates require `--yes`; `--check` only previews. No installation, publication or deployment is performed by reading these instructions.

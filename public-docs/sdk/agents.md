@@ -1,217 +1,105 @@
----
-title: Agents with the SDK
-description: Create, run, find, reuse, parent, and archive coding agents from TypeScript.
-nav: Agents
-order: 52
-category: TypeScript SDK
----
-
 # Agents with the SDK
 
-An agent handle keeps a stable agent ID and exposes the turn lifecycle without exposing daemon RPCs.
+[中文](agents.zh-CN.md) · [Setup](quickstart.md)
+
+Examples are async functions to call with a connected `DaemonClient` using the quickstart dependencies. JSON field names are the wire names, not Rust struct fields. The SDK does not create local agent handles or cache agent properties for you.
 
 ## Run an initial prompt
 
-```ts
-const agent = await client.agents.create({
-  config: {
-    provider: "claude/claude-sonnet-5",
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Review the checkout flow and propose one focused fix.",
-  labels: { source: "checkout-review" },
-});
-
-const result = await agent.waitForFinish();
-console.log(result.status, result.lastMessage);
-```
-
-`waitForFinish()` returns one of four statuses:
-
-| Status       | Meaning                                                           |
-| ------------ | ----------------------------------------------------------------- |
-| `idle`       | The turn completed and the agent can accept another prompt.       |
-| `permission` | The agent needs a person to answer a permission request in Paseo. |
-| `error`      | The provider ended the turn with an error.                        |
-| `timeout`    | The wait deadline elapsed; the agent may still be running.        |
-
-A timeout does not cancel the agent.
+Call `create_agent(fields, RequestOptions)` with `config: {provider, model, cwd}` and `initialPrompt`. Omit the prompt to create an idle session. The response payload contains `agent`; persist its `id` and `workspaceId`. `config.title`, top-level `labels`, `env`, `attachments`, `images`, and `outputSchema` are supported wire fields.
 
 ## Keep a session alive for follow-ups
 
-Create an idle session when prompts arrive later:
+```rust
+use anyhow::{Context, Result};
+use paseo_client::{DaemonClient, RequestOptions};
+use serde_json::{Value, json};
+use std::time::Duration;
 
-```ts
-const reviewer = await client.agents.create({
-  config: {
-    provider: "codex/gpt-5.5",
-  },
-  cwd: "/Users/me/dev/storefront",
-  title: "Checkout reviewer",
-});
-
-const first = await reviewer.run("Review the current diff.");
-
-if (first.status === "idle") {
-  const second = await reviewer.run("Now focus on failure recovery.");
-  console.log(second.lastMessage);
+async fn review(client: &DaemonClient, cwd: &str, model: &str) -> Result<Value> {
+    let created = client.create_agent(json!({
+        "config": {"provider": "codex", "model": model, "cwd": cwd,
+                   "title": "Checkout reviewer"},
+        "labels": {"my-app-role": "reviewer"}
+    }), RequestOptions::default()).await?;
+    let id = created["agent"]["id"].as_str().context("missing agent ID")?;
+    client.send_agent_message(json!({
+        "agentId": id, "text": "Review the current diff."
+    })).await?;
+    client.wait_for_finish(id, RequestOptions {
+        timeout: Duration::from_secs(300), ..RequestOptions::default()
+    }).await
 }
 ```
 
-Use `send()` for fire-and-forget delivery. Use `run()` when the caller needs the outcome of that turn.
+`send_agent_message` waits for delivery acknowledgement, not turn completion. `wait_for_finish` then waits for the current turn. Inspect `status` (`idle`, `permission`, `error`, or `timeout`), `lastMessage`, and `error`: agent/provider turn failures remain in the outcome payload, while transport/RPC failures return `Err`. A timeout never cancels the agent. Use `cancel_agent(json!({"agentId": id}))` explicitly to stop it. Set `activeTurnBehavior` to `steer` or `interrupt` on a message when sending during an active turn; do not assume concurrent sends create independent turns.
 
 ## Find agents by label
 
-Set `labels` at creation, then filter on them. The daemon does the matching:
+```rust
+use anyhow::Result;
+use paseo_client::DaemonClient;
+use serde_json::json;
 
-```ts
-const page = await client.agents.list({
-  filter: { labels: { "issue-provider": "my-tracker" } },
-});
-
-for (const { agent } of page.entries) {
-  console.log(agent.id, agent.title, agent.status);
+async fn inspect(client: &DaemonClient, id: &str) -> Result<()> {
+    let state = client.fetch_agent(json!({"agentId": id})).await?;
+    println!("{}", state);
+    let matches = client.fetch_all_agents(json!({
+        "filter": {"labels": {"my-app-role": "reviewer"}, "includeArchived": false},
+        "page": {"limit": 50}
+    })).await?;
+    println!("{} matching agents", matches.len());
+    let commands = client.list_commands(json!({"agentId": id})).await?;
+    println!("{}", commands["commands"]);
+    Ok(())
 }
 ```
+
+`fetch_all_agents` walks cursor pages. Use `CursorPages::agents` instead for bounded-memory processing. Labels are application metadata; namespace them when sharing a daemon. Include background work with `filter.includeBackground: true`.
 
 ## Continue an agent by ID
 
-```ts
-const agent = client.agents.ref("agent_01H8X...");
-
-const result = await agent.run("Now write the fix.");
-console.log(result.lastMessage);
-```
-
-`ref()` does not contact the daemon. Call `refresh()` first when you need to know whether the agent still exists; it returns `null` if it does not.
+Call `fetch_agent` before sending to an old ID if you need fresh existence/state information; a missing resource is not an empty local handle. Then call `send_agent_message` and `wait_for_finish` with that ID. `resume_agent` and `import_agent` are separate provider-session operations; fetching an ID does not implicitly invoke them.
 
 ## Create a subagent
 
-Create a child through its workspace. The handle owns placement, so the caller does not repeat its directory:
-
-```ts
-if (!parent.workspaceId) throw new Error("Parent has no workspace");
-
-const workspace = client.workspaces.ref(parent.workspaceId);
-const child = await workspace.agents.create({
-  config: {
-    provider: "codex/gpt-5.5",
-  },
-  parent,
-  title: "Implement checkout fix",
-  prompt: "Implement the accepted checkout plan and run focused tests.",
-});
-```
-
-`parent` establishes parentage. Archiving a parent cascade-archives its children. Call `detach()` first when a child should continue independently.
+Pass `callerAgentId` and `workspaceId` to `create_agent`; `config.cwd` must match that workspace's actual directory. Read the parent's current snapshot rather than guessing placement. Archiving a parent cascade-archives its children. Use `detach_agent(json!({"agentId": child_id}))` before archiving the parent if the child must remain independent.
 
 ## Run work in a background workspace
 
-Create a background workspace and its first agent in one call. Put `background` on the
-workspace options and the agent's configuration under `agent`:
-
-```ts
-const cwd = "/Users/me/dev/storefront";
-const workspace = await client.workspaces.create({
-  source: { kind: "directory", path: cwd },
-  background: true,
-  agent: {
-    cwd,
-    config: { provider: "codex/gpt-5.5" },
-    prompt: "Review the checkout flow.",
-  },
-});
-```
-
-The call returns a workspace handle and starts its first agent with the supplied prompt.
-
-Background agents keep their history and survive daemon restarts. Default discovery hides them;
-use `client.agents.list({ filter: { includeBackground: true } })` to include them.
-Exact-ID handles work normally. See [workspace creation](./workspaces.md#create-a-fresh-workspace)
-for defaults and caller inheritance.
+Use `create_workspace` with top-level `background: true`, `source`, and optional `agent: {config, initialPrompt}`; see [workspace creation](workspaces.md#create-a-fresh-workspace). Do not put background visibility inside the nested agent. Agents retain normal lifecycle and history. Default lists hide background workspaces; include them explicitly. An exact agent ID remains usable.
 
 ## Request structured output
 
-```ts
-const schema = {
-  type: "object",
-  properties: {
-    summary: { type: "string" },
-    risk: { type: "string", enum: ["low", "medium", "high"] },
-  },
-  required: ["summary", "risk"],
-  additionalProperties: false,
-};
+```rust
+use anyhow::Result;
+use paseo_client::{DaemonClient, RequestOptions};
+use serde_json::{Value, json};
 
-const agent = await client.agents.create({
-  config: {
-    provider: "codex/gpt-5.5",
-  },
-  cwd: "/Users/me/dev/storefront",
-  outputSchema: schema,
-  prompt: "Assess the release risk of the current diff.",
-});
-
-const result = await agent.waitForFinish();
-if (result.status !== "idle" || !result.lastMessage) {
-  throw new Error(result.error ?? "Agent returned no structured output");
+async fn assess(client: &DaemonClient, cwd: &str, model: &str) -> Result<Value> {
+    client.create_agent(json!({
+        "config": {"provider": "codex", "model": model, "cwd": cwd},
+        "outputSchema": {
+            "type": "object",
+            "properties": {"summary": {"type": "string"},
+                           "risk": {"type": "string", "enum": ["low", "medium", "high"]}},
+            "required": ["summary", "risk"], "additionalProperties": false
+        },
+        "initialPrompt": "Assess the release risk of the current diff."
+    }), RequestOptions::default()).await
 }
-
-const assessment = JSON.parse(result.lastMessage) as {
-  summary: string;
-  risk: "low" | "medium" | "high";
-};
 ```
 
-Validate the parsed value in your application before using it as trusted input.
+After waiting successfully for that agent, parse `lastMessage` with `serde_json::from_str::<Value>`. Check status, presence, schema and application constraints before trusting the result. A provider that cannot fulfill structured output must not be treated as having validated it for your application.
 
 ## Read the current state of an agent
 
-```ts
-const agent = client.agents.ref("agent_01H8X...");
-await agent.refresh();
-
-if (agent.pendingPermissions?.length) {
-  console.log(`Waiting on ${agent.pendingPermissions.length} permission request(s)`);
-}
-console.log(agent.lastUsage?.totalCostUsd, agent.runtimeInfo?.sessionId);
-```
-
-The handle exposes `status`, `capabilities`, `availableModes`, `pendingPermissions`, `activeTurn`, `lastUsage`, `lastError`, `features`, `runtimeInfo`, `archivedAt`, `workspaceId`, and `cwd` as properties. All of them read the last snapshot the handle observed and never fetch.
-
-A handle from `ref()` has observed nothing, so every one of them is `null` until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Use `current()` when you need the whole snapshot or need to distinguish those states.
-
-`subscribe()` is a local listener. An owned agent-directory observation supplies its updates:
-
-```ts
-const unsubscribe = agent.subscribe(() => {
-  if (agent.status === "error") console.error(agent.lastError);
-});
-const directory = await client.agents.list({ subscribe: {} });
-
-// When this view closes:
-unsubscribe();
-await directory.subscription.release();
-```
+`fetch_agent` returns a fresh snapshot. Agent fields include `status`, `capabilities`, `availableModes`, `pendingPermissions`, `activeTurn`, `lastUsage`, `lastError`, `features`, `runtimeInfo`, `archivedAt`, `workspaceId` and `cwd`. Fields can be absent or null. Rust JSON indexing returns null for missing fields; use `get`/`as_*` and report malformed required fields instead of silently substituting defaults. For ongoing updates use an [owned observation](events.md).
 
 ## List the commands a session loaded
 
-```ts
-const { commands, error } = await agent.commands();
-if (error) throw new Error(error);
-
-const skills = commands.filter((command) => command.kind === "skill");
-```
-
-The answer comes from the running session, not from a directory scan, so it includes commands and skills built into the provider that never appear on disk. `kind` is the provider's own classification and is optional; treat a missing `kind` as unclassified rather than assuming `"command"`.
-
-A provider that cannot produce a list reports that in `error` and returns an empty `commands` array. The call does not reject.
+`list_commands` reads the running provider session, including built-in commands/skills not on disk. `kind` is optional; missing does not mean `command`. An unsupported provider can return an error, exposed as `ClientError` with the response payload in `details`.
 
 ## Archive or detach
 
-```ts
-await agent.archive(); // Soft-deletes the agent and closes its runtime.
-await child.detach(); // Keeps the child alive but removes its parent relationship.
-```
-
-Closing the SDK connection does not archive agents. Archive temporary agents explicitly, preferably in `finally`.
+`archive_agent(json!({"agentId": id}))` soft-deletes the agent and closes its runtime. `detach_agent` removes parentage without archiving. `delete_agent` is a distinct destructive operation. Closing the SDK connection archives nothing. Clean up only resources your integration owns, including failure paths; see [recipes](recipes.md).

@@ -7,17 +7,15 @@ Test observable behavior at the boundary that owns it. Rust unit tests, Dart/wid
 From the repository root:
 
 ```sh
-npm run test:daemon        # cargo test --workspace --locked
-npm run typecheck:daemon   # cargo check --workspace --all-targets --locked
-npm run test:flutter      # Flutter tests through the repository SDK wrapper
-npm run typecheck:flutter # Flutter analyze through the same wrapper
-npm run test:node          # retained SDK/extension/tooling workspace tests
-npm run typecheck:node     # retained TypeScript workspaces
+cargo check --locked -p <changed-crate> --all-targets
+cargo test --locked -p <changed-crate> --lib <test-name-filter>
+cargo xtask flutter test test/<file>_test.dart
+cargo xtask flutter analyze
 ```
 
-The root `test` and `typecheck` commands include the native daemon as well as Flutter and retained Node tooling. Node tests do not exercise a Node product daemon: the runtime is Rust. `cargo test --workspace --locked` and `cargo check --workspace --all-targets --locked` can also be run directly.
+Use bounded package/test filters locally; do not run the complete workspace or Flutter suite on the development host. CI owns `cargo test --workspace --locked`, the full Flutter suite and platform matrices.
 
-Rust tests are colocated in `packages/daemon/src` and its test modules. Flutter tests live in `packages/flutter_app/test`; actual app integration runs must use the Flutter client, not a browser rendering of the old UI. Optional worker and SDK checks belong to their retained TypeScript workspaces. Packaging/tooling tests under `scripts/` validate artifact contracts, not the actual behavior of every target OS.
+Rust tests are colocated with the daemon, SDKs, relay and `xtask` modules, with protocol integration tests under each crate's `tests/`. Flutter tests live in `packages/flutter_app/test`; actual app integration runs must use the Flutter client, not a browser rendering of the old UI. Native plugin checks must exercise executable IPC. Packaging/tooling tests validate artifact contracts, not the actual behavior of every target OS.
 
 Do not run all heavy suites concurrently. Select a bounded relevant check during an explicitly authorized verification pass. Preserve errors and failing output; do not suppress a real service failure or silently relabel a mock as end-to-end.
 
@@ -34,7 +32,6 @@ Use a disposable `PASEO_HOME`, checkout, endpoint, and model cache where applica
 - Exercise schedules, MCP, connected-host forwarding, profiles, and native CLI operations at their real protocol boundaries.
 - Exercise desktop start/idempotence, worker restart, supervisor ownership, owned shutdown, keep-running policy, and preservation of an unowned daemon. A direct Rust unit test is not a Dart-to-desktop-host IPC test.
 - Exercise native tray/menu behavior on the actual desktop, and bundled Neovim editing as a real process. Compilation alone does not prove either.
-- Exercise speech model installation, native library loading, VAD, synthesis, resampling, and recognition separately from microphone capture and cloud-provider tests.
 
 The client deliberately excludes interactive terminal UI, embedded browser/automation, web, and executable React UI plugins. Do not keep obsolete Electron/Metro/browser smoke commands as the acceptance path for the native product.
 
@@ -57,9 +54,23 @@ Screenshot-ready phases wait for a rasterized frame, not just a completed widget
 
 The project vendors `desktop_multi_window` **0.3.1+paseo.1**, retaining its license and upstream macOS/Windows implementations. The Linux patch gives each Flutter engine a private `GdkDisplay`/`EGLDisplay`, scopes GL bindings during creation, unbinds EGL before GTK's before-paint phase, and keeps the display alive until engine teardown finishes. Flutter 3.47 terminates an engine's EGL display during teardown; sharing that display across live engines invalidated another window's rendering resources. A captured failure reached GTK's next-frame `gdk_gl_context_make_current` and libGLX `BadAccess` after deferred EGL teardown. The regression must cover closing and restoring actual windows, not merely engine construction or a mocked channel response.
 
-## Recorded migration evidence
+## Recorded 0.13.1 Rust cutover smoke
 
-The following is **local Linux evidence for this cutover**, not a release certification or a statement about another OS:
+The local Linux cutover pass intentionally omitted broad tests, lint, benchmarks and app reinstallation at the user's request. Observed boundaries:
+
+- `cargo build --locked --offline --workspace --all-targets -j 2` completed, including native SDK, plugin example and regression-test compilation. Tests were not executed. The daemon retained one pre-existing unused-variable warning.
+- A disposable native daemon started with only `git` exposed on its private `PATH`, with no Node executable. The native CLI connected through the extracted Rust client SDK and returned the empty agent list with exit code 0 (`ev_e8eca15be4e1f8edf07970e71c0d95e2317cbfd405d8acf7fba5c0884ffc9118`).
+- A native highlighting consumer recognized a Rust keyword while preserving Korean source text (`ev_4740030ce0921dbdf7ea70b18b55c5696e22c645b94cc7921fe65f3091805ea0`).
+- Two real WebSocket peers exchanged opaque binary frames in both directions through the native relay (`ev_1d239eea94c3178796bd3617a3c24bdfbdaa50db9c0dc7f96beac0063a3eead0`).
+- With plugins explicitly enabled in that disposable daemon, a Rust SDK consumer installed the native workspace-inspector executable and invoked `file.inspect` through the real plugin host. The result preserved Korean preview text and reported 21 bytes, two lines and three words, without Node on the private `PATH` (`ev_066acc9e74494cd06c9a37ecdff15ca09c979e6cf613e7e3dae66745214aa7a9`).
+- The native release planner emitted all eight targets without publishing (`ev_de840adeffb7b887037083628babdc9cf853d298f4bf29ef7dcbf1564f92a753`). This smoke found and corrected the TOML document parser before the successful run.
+- The native `paseo-xtask build-daemon` entrypoint completed runtime-asset, provenance and third-party-notice packaging. Its strict inventory check caught a duplicate attribution entry; the inventory was corrected without weakening validation.
+
+These are narrow runtime observations, not full-suite, cross-platform, performance or release-certification claims. The local toolchain lacked the Wasm target and binding generator; edge-target compilation belongs to its configured CI lane.
+
+## Recorded 0.13.0 native-client migration evidence
+
+The following is **historical local Linux evidence for the 0.13.0 native-client migration**, not verification of the subsequent Rust SDK/toolchain cutover, a release certification or a statement about another OS:
 
 | Boundary                                | Observed result                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -71,7 +82,6 @@ The following is **local Linux evidence for this cutover**, not a release certif
 | Native runtime assets and CLI           | Normal-entry Linux release build via `node scripts/build-flutter.mjs linux` passed with a bundled native runtime and no publication identity. Packaged executable hash matched provenance; `PATH=/nonexistent` version execution returned `paseo 0.13.0`. Reserved/Unicode CLI deep-link IDs and spaced project paths passed a separate launcher-boundary check                                                                                                                              |
 | Normal-entry Linux release UI           | Actual release `paseo_sessions`, with no test Dart entry or runtime override, passed in private Xvfb/D-Bus and private homes using `/usr/bin:/bin` with Node absent. The supervisor executable resolved to bundled `runtime/paseo`; daemon status was reachable, desktop-managed and v0.13.0. Reviewed production screenshot showed the full Sessions shell and This computer Live without an error banner. Native tray Quit Paseo exited the app with status 0 and stopped its owned daemon |
 | Flutter static/unit checks              | Final Flutter analyze reported no issues; the complete Flutter test run passed 15 tests                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Native speech                           | Production Sherpa 1.12.28 loader/FFI; Silero VAD rejected all 31 digital-silence windows and accepted 48 synthesized-speech windows; transactional Kokoro/Parakeet model download/install; TTS produced 44,404 samples at 24 kHz; production PCM resampler and Parakeet recognized exactly `Hello, this is a speech test.`                                                                                                                                                                   |
 | Android compilation and payload         | Final Linux-hosted ARM64 release-mode wrapper build passed with Flutter 3.47.5, compile SDK 37.0 and AGP 9.1.1. ZIP enumeration verified only `arm64-v8a` native libraries, including `libapp.so` and `libflutter.so`; `apksigner verify` passed with Android Debug signing. The corrected APK is 37,410,467 bytes (37.4 MB decimal). No installation, device execution or publication is claimed                                                                                            |
 | Native editor                           | Actual packaged Neovim delete, undo, Korean insertion and `:w` passed                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Native desktop lifecycle                | Latest retained debug integration build and portable default-GPU regression passed all three cases after the GLES `eglBindAPI` correction, with actual `PaseoShell` readiness and no renderer overrides. Earlier phase-acknowledged captures matched the same window's pixels before hide and after restoration. Earlier software-renderer and Skia-GPU runs also passed                                                                                                                     |
@@ -88,20 +98,19 @@ Recorded local proof locations include:
 - `/tmp/paseo-native-desktop-proof-gp71uas4`: default-GPU portable regression, three of three lifecycle cases passed; `bus.jsonl` records `restored-pixels-match-before-hide` from phase-acknowledged captures of the same window.
 - `/tmp/paseo-native-desktop-proof-yrr4uyir`: latest retained integration build and all three default-GPU lifecycle scenarios passed after the GLES `eglBindAPI` correction.
 - `/tmp/paseo-native-desktop-proof-3hw3cdv6/results.json`: all three software-renderer lifecycle cases, including real no-panel behavior.
-- `/tmp/paseo-native-speech-proof-XQQw9g/result.json` and `native-speech.wav`: native speech inference.
 - `artifacts/flutter/Paseo-Sessions-Flutter-0.13.0-android-arm64-debug-signed.apk`: verified ARM64-only native payload, SHA-256 `11a5c8ddca90e1dfa46e57474086dcf81099a10b2995a1864dc068df2f3d47b9`; verified Android Debug certificate SHA-256 `fac61745dc0903786fb9ede62a962b399f7348f0bb6f899b8332667591033b9c`.
 
-These are temporary local investigation artifacts, not published downloadable release evidence. Each proves the recorded run, not unexecuted later edits. The speech models were temporary downloads, not packaged weights.
+These are temporary local investigation artifacts, not published downloadable release evidence. Each proves the recorded run, not unexecuted later edits.
 
 Residual upstream GTK 3 signal-disconnect cleanup warnings and Flutter implicit-view/messenger teardown warnings were observed. They were not suppressed; none of the three recorded lifecycle flows crashed. Passing these flows does not establish warning-free teardown.
 
 The empty-`PATH` check covers the native CLI's version command only. A full GTK UI still needs system helpers: removing every command from `PATH` prevented the system glycin PNG loader from finding `bwrap`. For a Node-absent UI check, preserve required system paths and verify that Node is absent there; do not treat the deliberately broken system-helper environment as an application packaging failure.
 
-At the time of this record there was **no actual Windows, macOS, Android-device, iOS or Wayland execution**. Android ARM64 compilation passed, but no production signing, installation or mobile runtime test is claimed. Provider fixtures do not establish paid live LLM execution. Microphone hardware and live cloud-speech services were not tested by the native inference run. No release was published, and the user's existing app, daemon and OMP were not installed over or restarted. Do not convert an unexecuted check into a passing claim.
+At the time of this record there was **no actual Windows, macOS, Android-device, iOS or Wayland execution**. Android ARM64 compilation passed, but no production signing, installation or mobile runtime test is claimed. Provider fixtures do not establish paid live LLM execution. No release was published, and the user's existing app, daemon and OMP were not installed over or restarted. Do not convert an unexecuted check into a passing claim.
 
 ## CI definitions versus execution
 
-`.github/workflows/ci.yml` defines native-daemon Linux, Windows and macOS lanes and Flutter lanes. Native-daemon jobs build the native executable/optional worker and run `cargo test --workspace --locked`. Retired TypeScript server/integration/CLI jobs are not the product runtime acceptance path. `.github/ci-paths.yml` and CI Recovery route the retained jobs.
+`.github/workflows/ci.yml` defines native-daemon Linux, Windows and macOS lanes, each on x64 and arm64, plus Flutter lanes. Native-daemon jobs run `cargo xtask build-daemon` and `cargo test --workspace --all-targets --locked`. Quality checks use Cargo formatting, scoped xtask tests and workspace Clippy; the Rust Cloudflare relay has a separate Wasm build/check lane. Retired TypeScript server/integration/CLI jobs are not the product runtime acceptance path. `.github/ci-paths.yml` and CI Recovery route the native jobs. The historical evidence above predates the full Rust tooling/SDK/plugin cutover and is not verification of this checkout.
 
 A matrix entry proves intended routing only. Report its actual run ID, platform, revision, result and logs before calling that platform verified. The same rule applies to release/build workflows: an installer filename or generated manifest does not establish successful execution, signing, publication, or legal distribution readiness.
 

@@ -66,7 +66,7 @@ $PASEO_HOME/
 │       └── {recordId}.json              # Helper processes owned by Paseo; reconciled on daemon bootstrap
 ├── plugins/
 │   ├── sources.json                      # Managed kind and Git acquisition remote
-│   └── {pluginId}/{uuid}/                # Git checkout or npm package/lockfile/dependency tree
+│   └── {pluginId}/{uuid}/                # Managed native Git/Cargo source or release archive
 └── push-tokens.json                     # Expo push notification tokens
 ```
 
@@ -85,7 +85,7 @@ Each agent is stored as a separate JSON file, grouped by project directory.
 | `id`                 | `string`                                 | UUID, primary key                                                                                                                                                                                                                                                                                                                                                                   |
 | `provider`           | `string`                                 | Agent provider (`"claude"`, `"codex"`, `"opencode"`, etc.)                                                                                                                                                                                                                                                                                                                          |
 | `cwd`                | `string`                                 | Working directory the agent operates in                                                                                                                                                                                                                                                                                                                                             |
-| `workspaceId`        | `string?`                                | Owning workspace id — the single source of ownership. Every agent is stamped with one at create time; legacy cwd-only records are backfilled once by `migrations/backfill-workspace-id.migration.ts` (the only place a cwd→id mapping exists). Runtime code never infers ownership or status from cwd: status is computed per `workspaceId`, and same-cwd siblings are independent. |
+| `workspaceId`        | `string?`                                | Owning workspace id — the single source of ownership. Every agent is stamped with one at create time; legacy cwd-only records are backfilled by `packages/daemon/src/projects/bootstrap.rs`. Runtime code never infers ownership or status from cwd: status is computed per `workspaceId`, and same-cwd siblings are independent. |
 | `createdAt`          | `string` (ISO 8601)                      | Creation timestamp                                                                                                                                                                                                                                                                                                                                                                  |
 | `updatedAt`          | `string` (ISO 8601)                      | Last update timestamp                                                                                                                                                                                                                                                                                                                                                               |
 | `lastActivityAt`     | `string?` (ISO 8601)                     | Last activity timestamp                                                                                                                                                                                                                                                                                                                                                             |
@@ -220,22 +220,13 @@ snapshot so a mixed edit can apply its live subset and still name the paths that
       portScript?: string    // executable that receives service/workspace context and prints one TCP port
     }
   },
-  providers: {
-    openai: {
-      apiKey?: string,
-      baseUrl?: string,
-      stt?: { apiKey?: string, baseUrl?: string },
-      tts?: { apiKey?: string, baseUrl?: string }
-    },
-    local: { modelsDir: string }
-  },
   agents: {
     skills?: {
       selection?: { mode: "all" } | { mode: "custom", skills: string[] }
     },
-    // ProviderOverrideSchema; legacy entries with `command: { mode, ... }` are migrated to the
-    // current shape on load via `migrateProviderSettings`. Custom provider IDs must declare
-    // `extends` (one of the built-ins or `"acp"`) and `label`. See `provider-launch-config.ts`.
+    // Legacy provider command shapes are normalized by the Rust configuration owner.
+    // Custom provider IDs must declare `extends` (one of the built-ins or `"acp"`)
+    // and `label`. See `packages/daemon/src/config`.
     providers: Record<providerId, ProviderOverride>,
     metadataGeneration: {
       providers: [{ provider, model?, thinkingOptionId? }]
@@ -243,10 +234,6 @@ snapshot so a mixed edit can apply its live subset and still name the paths that
   },
   pluginsEnabled: boolean,
   plugins: Record<pluginId, { source: "directory", path: string, enabled?: boolean }>,
-  features: {
-    dictation: { enabled, stt: { provider, model, language, confidenceThreshold } },
-    voiceMode: { enabled, llm, stt: { provider, model, language }, turnDetection, tts: { provider, model, voice, speakerId, speed } }
-  },
   log: {
     level, format,
     console: { level, format },
@@ -260,7 +247,7 @@ All fields are optional with sensible defaults.
 Managed plugins appear as directory sources in `config.json`; it owns the active path and enabled
 state. `plugins/sources.json` is written atomically and stores only managed kind and the Git acquisition
 remote. Installed revision, package/subdirectory identity and ownership root come from retained
-artifacts and the fixed managed layout; [managed source ownership](plugins.md#managed-source-ownership)
+artifacts and the fixed managed layout; [native source acquisition](../public-docs/plugins/publishing.md)
 explains their authority. An update prepares a new directory before replacing the active path and
 removing the previous version. Old record fields are accepted at the store boundary and ignored;
 there is no startup migration or persistent update policy.
@@ -353,42 +340,9 @@ Environment variables override `config.json`:
 after changing `config.json`. Environment changes require a daemon restart; the launch environment
 remains authoritative during reload.
 
-Local speech model ids are intentionally narrow: STT uses `parakeet-tdt-0.6b-v2-int8`, TTS uses `kokoro-en-v0_19`, and turn detection uses the bundled Silero VAD model.
+### Removed speech settings
 
-Set these to select OpenAI instead of local speech:
-
-| Env var                        | Applies to                      |
-| ------------------------------ | ------------------------------- |
-| `PASEO_VOICE_STT_PROVIDER`     | Voice mode STT provider         |
-| `PASEO_DICTATION_STT_PROVIDER` | Composer dictation STT provider |
-| `PASEO_VOICE_TTS_PROVIDER`     | Voice mode TTS provider         |
-
-OpenAI speech can be configured under `providers.openai`. STT and TTS resolve independently, so they can point at different endpoints:
-
-```json
-{
-  "providers": {
-    "openai": {
-      "stt": {
-        "apiKey": "sk-...",
-        "baseUrl": "https://stt.example.com/v1"
-      },
-      "tts": {
-        "apiKey": "sk-...",
-        "baseUrl": "https://api.openai.com/v1"
-      }
-    }
-  }
-}
-```
-
-`providers.openai.stt` is used for both composer dictation and voice mode speech-to-text; `providers.openai.tts` is used for voice mode text-to-speech. The equivalent env vars are `OPENAI_STT_API_KEY`/`OPENAI_STT_BASE_URL` and `OPENAI_TTS_API_KEY`/`OPENAI_TTS_BASE_URL`. Each feature falls back to `providers.openai.apiKey`/`providers.openai.baseUrl`, then `OPENAI_API_KEY`/`OPENAI_BASE_URL`, when its own fields are unset. These settings apply only to Paseo OpenAI speech features, not to Codex or other OpenAI-backed tools.
-
-Paseo uses these paths under the configured OpenAI base URL:
-
-- dictation STT: `/v1/audio/transcriptions`
-- voice mode STT: `/v1/audio/transcriptions`
-- voice mode TTS: `/v1/audio/speech`
+Legacy top-level `providers` speech settings and `features.dictation`/`features.voiceMode` are discarded during configuration normalization. Agent provider settings under `agents.providers` remain independent and are preserved.
 
 ---
 
@@ -509,8 +463,7 @@ Array of workspace records. A workspace is a specific working directory within a
 **Path:** `$PASEO_HOME/projects/workspace-labels.json`
 
 The catalog is shared by every workspace on one host. A definition contains a display name and one
-of the ten identity colour names (`WORKSPACE_LABEL_COLORS` in
-`packages/protocol/src/workspace-labels.ts`); trimmed, collapsed, case-insensitive name identity is
+of the ten identity colour names in the shared wire contract; trimmed, collapsed, case-insensitive name identity is
 unique within that file. Definitions have no portable ID or principal owner and remain after their
 last assignment. Editing a label takes a new name, a new colour, or both in one commit, so the two
 fields cannot land half-applied. Workspaces store label names, so a rename and a delete rewrite

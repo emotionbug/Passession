@@ -6,7 +6,7 @@ nav: CLI 参考
 
 # CLI 参考 {#cli-reference}
 
-Rust Paseo CLI 用于从终端管理 Agent 和 daemon。0.13.0 原生迁移尚未发布，请按[更新](/docs/updates)从检出构建原生运行时，不要安装旧 npm CLI 包。保留可执行文件旁生成的资源。
+Rust Paseo CLI 用于从终端管理 Agent 和 daemon。本文面向尚未发布的 0.13.1 源码检出；请按[更新](updates.zh-CN.md)构建原生运行时，不要安装旧 npm CLI 包。保留可执行文件旁生成的资源。
 
 直接运行 `paseo` 打开 CLI 聊天。显式设置使用 `paseo onboard`，托管运行使用 `paseo daemon start` 和 `paseo daemon status`。默认主目录仍为 `~/.paseo`。
 
@@ -243,20 +243,20 @@ Paseo 默认选择目录为当前目录的工作区。传入 `--cwd <path>` 选�
 
 ## 插件 {#plugins}
 
-> **信任你添加的每一个插件**。`paseo plugin add` 和 `paseo plugin install` 的含义是“我信任这个代码库”。后端插件代码和 Git 准备命令以 daemon 用户权限运行，没有沙盒。可选 JavaScript 后端插件需要外部 Node 20+（`PASEO_PLUGIN_NODE`）；内置集成运行在 Rust 中。Flutter 客户端不支持可执行 React UI 贡献。依赖和未来更新也是信任决定的一部分。使用全局 `--host` 时，命令在远程 daemon 主机上运行。
+> **信任你添加的每一个插件。** 原生插件程序、校验和声明的准备命令以 daemon 用户权限运行，没有沙箱，可以访问文件、进程、网络和凭据。依赖与未来更新也是信任决定的一部分。没有 JavaScript worker 或 Node 回退，Flutter 不执行插件 UI。全局 `--host` 将管理操作发给远程 daemon，目录路径必须在远程存在，不会上传本地文件。`plugin init` 在本地创建项目。
 
-在 daemon 上创建和管理受信任的插件：
+0.13.1 检出提供 Rust 脚手架，不表示 SDK 已发布。使用 Rust 1.93+；所需原生 SDK 修订实际可从远端获取之前使用本地路径：
 
-```bash
-paseo plugin init ./plugin
+```sh
+paseo plugin init ./plugin --id my-plugin --sdk-path /absolute/path/to/paseo/packages/plugin
+cargo build --manifest-path ./plugin/Cargo.toml --release --target-dir ./plugin/target
+./plugin/target/release/paseo-plugin-server --validate ./plugin 0.13.1
 paseo plugin install ./plugin
-paseo plugin add owner/slug
-paseo plugin add git:owner/repository
-paseo plugin add https://gitlab.com/group/repository.git --ref main
-paseo plugin add git:owner/monorepo:plugins/review
-paseo plugin ls [id]
-paseo plugin update my-plugin
-paseo plugin update --all
+paseo plugin ls my-plugin
+paseo plugin update my-plugin --check
+paseo plugin update my-plugin --yes
+paseo plugin update --all --check
+paseo plugin update --all --yes
 paseo plugin reload my-plugin
 paseo plugin logs my-plugin
 paseo plugin disable my-plugin
@@ -264,11 +264,28 @@ paseo plugin enable my-plugin
 paseo plugin remove my-plugin
 ```
 
-`paseo plugin reload <id>` 报告重新加载本身的结果：在 daemon 停止并启动插件期间，无论耗时多久，它都会等待，并且会排在 daemon 的其他插件工作之后。取消命令或丢失连接不会停止 daemon 的工作，也没有任何列表或日志条目能确定被取消的重新加载做了什么——这些中间状态见[插件参考](/docs/plugins/reference)。再次运行重新加载才能得到结果：它会等待尚未完成的那一次，然后再停止并启动插件一次。
+Windows 脚手架选择 `.exe`，调用 `.\plugin\target\release\paseo-plugin-server.exe`。清单必须声明 `runtime: "native"` 和 `server: {"executable":"contained/relative/binary","args":[]}`。目录安装重新加载前先构建；reload 不编译 Rust。根 `pluginsEnabled` 与安装启用状态都必须允许执行。
 
-不带前缀的 `owner/slug` 会安装经过审查的注册表展示项。GitHub 源码使用 `git:owner/repository`，本地目录使用 `./plugin`。对于 monorepo 中的插件，追加 `:<directory>`。
+以下仅演示来源语法，请替换为真实可信仓库/包/产物：
 
-`paseo plugin ls [id]` 不会联系远程。`paseo plugin logs <id>` 返回插件最近的 daemon 端 stdout 和 stderr。添加 `--json` 获得结构化条目，或运行 `paseo --host <target> plugin logs <id>` 查看另一个 daemon。安装、信任、生命周期和日志保留行为见[插件参考](/docs/plugins/reference)。
+```text
+paseo plugin add owner/slug
+paseo plugin install github:owner/repository --ref v1.2.0
+paseo plugin install git:https://git.example/group/repository.git --ref v1.2.0
+paseo plugin install github:owner/monorepo --path plugins/review
+paseo plugin install cargo:paseo-review@1.2.0
+paseo plugin install release:<HTTPS-archive-URL> --version <semver> --sha256 <digest> --format <tar.gz|zip>
+```
+
+裸 `owner/slug` 是注册表条目，不是目录或 GitHub 简写。本地相对路径以 `./` 或 `../` 开头，Git 也接受 `:<directory>` 后缀。Cargo 安装版本用 `@exact-semver`；省略则选择最新稳定且未撤回版本。发行归档需要针对归档字节的 64 位小写十六进制 SHA-256 和明确版本；已识别 URL 后缀可提供 `--format`。`--path` 指定来源内受限子目录。注册表必须提供原生记录，本检出不能证明公共条目已迁移。npm/旧 JavaScript 来源被拒绝，不会执行。
+
+普通托管更新需要 `--yes`，`--check` 永不应用。显式 `--version <semver>` 选择并授权单个 Cargo 目标，Git 用 `--ref <ref>`。发行更新使用 `--url <HTTPS-archive-URL> --version <semver> --sha256 <digest> [--format tar.gz|zip]`，保持已安装来源的 URL origin，没有隐式最新发行发现。显式选择不能与 `--all` 合用。提案绑定不可变产物，变更会失败而不是替换内容。目录来源直接编辑/构建/重新加载，不远程更新。
+
+`paseo plugin reload <id>` 等待 daemon 停止/启动操作，并排在其他插件工作之后。取消 CLI 或连接中断不会取消 daemon 操作；再次 reload 会排入新的停止/启动，而非仅观察此前结果。
+
+`paseo plugin ls [id]` 读取安装元数据，不查询来源。`paseo plugin logs <id>` 返回近期 daemon 端快照，不实时跟随。原生 stdout 专用于 IPC；作者用 stderr 或 `Context::log` 记录日志。`--json` 输出结构化日志，`paseo --host <target> plugin logs <id>` 选择另一 daemon。
+
+移除会删除安装设置，不能把移除/重装当作无损迁移。重复 ID 安装被拒绝，尚无同 ID 托管来源替换功能。[迁移指南](plugins/migration.zh-CN.md)说明保留既有 ID/设置/旧收据的显式目录运行时移植。来源、生命周期、信任与 IPC 见[插件参考](plugins/reference.zh-CN.md)，可运行 Rust 示例见[快速上手](plugins/index.zh-CN.md)。
 
 ## 列出 Agent {#listing-agents}
 
@@ -393,7 +410,7 @@ PASEO_LISTEN=127.0.0.1:6799 PASEO_RELAY_ENABLED=false paseo daemon run --home ~/
 
 它会一直保持附着，直到进程管理器退出或你取消，没有就绪超时。worker 重启会保留这些启动输入。要修改它们，请停止并重新启动部署。如果主目录中已经有一个运行中的进程管理器，`run` 会返回 `already_running`，而不会接管或启动前台进程。
 
-托管 `start` 忽略继承的 daemon 设置覆盖项，包括 `PORT`、`PASEO_LISTEN`、中继和语音设置，但保留 Provider 凭据与可执行文件/运行时控制项。`start --foreground` 已移除，请使用 `daemon run`。旧 start/restart 参数如 `--port` 和 `--no-relay` 会在副作用前失败，应改用对应持久设置。`--web-ui` 已废弃，没有原生替代项。见[配置编辑](/docs/configuration#apply-changes)。
+托管 `start` 忽略继承的 daemon 设置覆盖项，包括 `PORT`、`PASEO_LISTEN` 和中继设置，但保留 Provider 凭据与可执行文件/运行时控制项。`start --foreground` 已移除，请使用 `daemon run`。旧 start/restart 参数如 `--port` 和 `--no-relay` 会在副作用前失败，应改用对应持久设置。`--web-ui` 已废弃，没有原生替代项。见[配置编辑](/docs/configuration#apply-changes)。
 
 ### 选择一个 daemon {#select-one-daemon}
 

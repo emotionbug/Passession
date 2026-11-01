@@ -1,13 +1,9 @@
-> The native Paseo client does not run client UI plugins. This example only exercises the SDK's client types; it does not add anything to the native app.
+# Inline thinking: unsupported client transformer example
 
-# Inline thinking timeline example
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-This example has no server entry, so a native Paseo daemon rejects it on install
-(`Native Paseo requires index.server.ts or index.server.tsx`). The native client does not run
-timeline transformers or renderers.
+The former example replaced reasoning rows using a client timeline transformer and React renderer. Native providers should emit standard reasoning timeline data. Flutter does not execute that transformer or renderer, and adding a native no-op backend does not port it.
 
-`index.client.tsx` registers a timeline transformer that replaces reasoning rows with a plugin item,
-and a renderer that draws that item with the component in `client/thinking.tsx`.
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
 
-From the repository root, `npm run typecheck --workspace=@getpaseo/plugin` checks this example
-against the SDK's client types.
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

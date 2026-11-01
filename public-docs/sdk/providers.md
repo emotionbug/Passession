@@ -1,114 +1,59 @@
----
-title: Providers with the SDK
-description: Select a provider and model, discover available configurations, and configure an agent session.
-nav: Providers
-order: 54
-category: TypeScript SDK
----
-
 # Providers with the SDK
 
-Every agent configuration names both the provider and model:
-
-```ts
-config: {
-  provider: "codex/gpt-5.5",
-}
-```
-
-The first `/` separates the provider from the model. Model IDs can contain additional slashes.
+[中文](providers.zh-CN.md) · [Setup](quickstart.md)
 
 ## Configure a session
 
-```ts
-const agent = await client.agents.create({
-  config: {
-    provider: "codex/gpt-5.5",
-    modeId: "full-access",
-    thinkingOptionId: "high",
-    featureValues: {
-      web_search: false,
-    },
-  },
-  cwd: process.cwd(),
-  prompt: "Implement the accepted plan and run focused tests.",
-});
-```
-
-| Field              | Meaning                                                        |
-| ------------------ | -------------------------------------------------------------- |
-| `provider`         | Required `provider/model` selection.                           |
-| `modeId`           | Provider operating or permission mode.                         |
-| `thinkingOptionId` | Provider reasoning level.                                      |
-| `featureValues`    | Values for features returned by `providers.listFeatures()`.    |
-| `options`          | Provider-native settings such as sandbox and permission rules. |
-| `systemPrompt`     | Additional system or developer instructions.                   |
-| `mcpServers`       | Session-scoped MCP servers.                                    |
-| `toolPolicy`       | Exact preapproval rules for MCP tools.                         |
-
-[Provider options](/docs/sdk/provider-options) lists the accepted sandbox and permission settings.
+Use separate fields in creation: `"config": {"provider": "codex", "model": model_id, "cwd": directory}`. Model IDs may themselves contain slashes; do not split them or combine provider/model into a convenience string. Optional configuration includes `modeId`, `thinkingOptionId`, `featureValues`, and `providerOptions`. Agent launch depends on the provider's installation, credentials and configuration on the daemon host.
 
 ## Discover installed providers and models
 
-```ts
-const snapshot = await client.providers.waitForReady({
-  cwd: process.cwd(),
-  timeoutMs: 60_000,
-});
+```rust
+use anyhow::Result;
+use paseo_client::DaemonClient;
+use serde_json::json;
 
-for (const entry of snapshot.entries) {
-  if (entry.status !== "ready") continue;
-
-  for (const model of entry.models ?? []) {
-    console.log(`${entry.provider}/${model.id}`);
-  }
+async fn discover(client: &DaemonClient, cwd: &str) -> Result<()> {
+    println!("{}", client.list_available_providers(json!({})).await?);
+    println!("{}", client.get_providers_snapshot(json!({"cwd": cwd})).await?);
+    let models = client.list_provider_models(json!({"provider": "codex", "cwd": cwd})).await?;
+    println!("models: {}", models);
+    let modes = client.list_provider_modes(json!({"provider": "codex", "cwd": cwd})).await?;
+    println!("modes: {}", modes);
+    let features = client.list_provider_features(json!({
+        "draftConfig": {"provider": "codex", "cwd": cwd}
+    })).await?;
+    println!("features: {}", features);
+    Ok(())
 }
 ```
 
-An entry finishes as `ready`, `unavailable`, or `error`. `snapshot()` returns immediately and can include `loading` entries.
+Queries use the daemon directory context, which can affect available models and authentication. `get_providers_snapshot` returns entries plus generation/hash metadata; `refresh_providers_snapshot(json!({"cwd": cwd, "providers": ["codex"]}))` explicitly refreshes a provider. A discovery response is not a promise that every provider is ready: inspect entry availability/errors. Subscribe to `providers_snapshot_update` as described in [Events](events.md) for later changes. There is no `waitForReady` facade in this API.
 
 ## Select a discovered model
 
-```ts
-const snapshot = await client.providers.waitForReady({ cwd: process.cwd() });
-const entry = snapshot.entries.find((candidate) => candidate.status === "ready");
-const model = entry?.models?.find((candidate) => candidate.isDefault) ?? entry?.models?.[0];
+Choose a model ID from the selected provider's returned `models`, then pass it unchanged to `config.model`. Do not hard-code a marketing name as a model ID or silently fall back to another provider. The snapshot can use compact/reference forms. Decode compact data explicitly:
 
-if (!entry || !model) throw new Error("No provider model is ready");
+```rust
+use anyhow::{Context, Result};
+use paseo_protocol::providers::{CompactProviderSnapshot, expand_provider_snapshot};
+use serde_json::Value;
 
-const agent = await client.agents.create({
-  config: {
-    provider: `${entry.provider}/${model.id}`,
-  },
-  cwd: process.cwd(),
-  prompt: "Summarize this repository.",
-});
+fn entries(payload: &Value) -> Result<Vec<Value>> {
+    if let Some(compact) = payload.get("compactSnapshot").filter(|v| !v.is_null()) {
+        let compact: CompactProviderSnapshot = serde_json::from_value(compact.clone())?;
+        return Ok(expand_provider_snapshot(compact)?);
+    }
+    Ok(payload["entries"].as_array().context("missing provider entries")?.clone())
+}
 ```
+
+If you send `ifNoneMatch` and receive `notModified`, keep your matching cached snapshot rather than replacing it with empty entries. Cache by daemon, directory and snapshot hash; never interpret a hash-only notification as a full catalog. The static `paseo_protocol::providers::definitions()` catalog is metadata, not a probe of installed/authenticated providers.
 
 ## Discover modes, thinking levels, and features
 
-```ts
-const models = await client.providers.listModels("codex", { cwd: process.cwd() });
-const modes = await client.providers.listModes("codex", { cwd: process.cwd() });
-
-const selectedModel = models.models[0]?.id;
-const selectedMode = modes.modes[0]?.id;
-if (!selectedModel) throw new Error("No Codex model is available");
-
-const features = await client.providers.listFeatures({
-  provider: `codex/${selectedModel}`,
-  cwd: process.cwd(),
-  modeId: selectedMode,
-});
-```
-
-Use IDs returned by the daemon. Provider installations and configured models differ between hosts.
+`list_provider_modes` returns available modes. Models can carry `thinkingOptions` and `defaultThinkingOptionId`. `list_provider_features` takes `draftConfig`, so feature choices can reflect provider, model and mode. Use advertised IDs rather than labels. For an existing agent, `set_agent_mode`, `set_agent_model`, `set_agent_thinking_option`, `set_agent_feature` and `apply_agent_config` accept protocol-shaped fields; see the [request schema](../../packages/protocol/schema/session-inbound.json). Do not assume every provider supports every setting.
 
 ## Diagnose an unavailable provider
 
-```ts
-const result = await client.providers.diagnostic("codex");
-console.error(result.diagnostic);
-```
-
-Host-level profiles, binaries, credentials, and custom providers belong in [Custom providers](/docs/custom-providers).
+`client.get_provider_diagnostic(json!({"provider": "codex"})).await?` requests diagnostic details. Use its returned state/errors to fix the external executable or authentication on the daemon host; reconnecting the SDK does not install providers. `get_daemon_config` and `patch_daemon_config` expose config-backed provider settings, profiles, environment, binaries and extra models. Review the current configuration before patching and never log credentials. Provider options and host isolation are [separate concerns](provider-options.md).

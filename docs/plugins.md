@@ -1,55 +1,73 @@
 # Backend extensions
 
-Paseo's default daemon is Rust. Built-in providers, lifecycle behavior and usage integrations execute in Rust; they do not start a Node process. **Optional JavaScript backend extensions** remain supported through a separate worker. The Flutter client does **not** execute React UI plugins.
+Paseo's daemon, built-in providers and usage integrations are Rust. Third-party backend plugins are **standalone native executables** using bounded JSONL IPC, not Rust dynamic libraries, JavaScript workers or interpreted shims. Flutter does not execute plugin UI. This describes the 0.13.1 source checkout, not a published/deployed release. Kiro remains disabled and untouched.
 
 ## Runtime and source ownership
 
-- Native extension management, persistence, hooks, settings, RPC and provider bridge: `packages/daemon/src/plugins.rs` and `plugins/`.
-- Optional JavaScript worker source: `packages/daemon/plugin-worker/src`, private workspace `@getpaseo/plugin-worker`.
-- Extension author SDK: `packages/plugin`, including `@getpaseo/plugin/server`, `/server/provider`, and `/server/usage`.
-- External daemon client SDK: `packages/client`; protocol definitions: `packages/protocol`.
-- Worker build entry: `scripts/build-plugin-worker.mjs`.
+- Management, persistence, hooks, RPC and provider bridge: [daemon plugins](../packages/daemon/src/plugins.rs) and [worker supervisor](../packages/daemon/src/plugins/worker.rs).
+- Manifest/path/native executable validation: [manifest.rs](../packages/daemon/src/plugins/manifest.rs).
+- Public author SDK: [`paseo-plugin`](../packages/plugin/src/lib.rs), with provider traits, settings, usage types/helpers and daemon-client bridge.
+- External Rust client: [packages/client](../packages/client/Cargo.toml); shared protocol: [packages/protocol](../packages/protocol/Cargo.toml).
+- Runnable native example: [workspace-inspector](../plugin-examples/workspace-inspector/src/lib.rs), crate `paseo-workspace-inspector`.
 
-The runtime package includes the worker and its compiler/SDK assets, but **does not bundle Node**. An enabled JavaScript extension requires externally installed Node 20+ on the daemon host. `PASEO_PLUGIN_NODE` selects its executable; otherwise the worker uses `node` from its environment. `PASEO_PLUGIN_WORKER` can select a worker asset; the default is `plugin-worker/worker.mjs` next to the native executable.
+Source builds use Rust 1.93+, edition 2024, and `cargo xtask build-daemon`. There is no Node/npm compiler, worker asset or runtime fallback. External agent CLIs remain separate products with their own dependencies.
 
-Node 24 is required for repository build/packaging tooling, distinct from the optional worker's external runtime requirement. A missing Node installation is a visible extension error, not a reason to replace the Rust daemon or download a hidden runtime.
+## Native executable contract
 
-## Install and manage
+`paseo-plugin.json` requires `runtime: "native"`, `server: {"executable":"relative/native/binary","args":[]}`, an ID and a compatible explicit `requirements.paseo`. The entry must be a regular ELF/Mach-O/PE binary inside the plugin directory after symlink resolution, executable on Unix. Scripts, traversal and interpreter shims are rejected. Match the host OS/architecture and Windows `.exe` suffix.
 
-The native `paseo plugin` command manages extension sources and configuration. Inspect `paseo plugin --help` for subcommands, and target the intended home/host before changing configuration.
+The host launches the binary with `server.args`; validation appends `--validate <absolute-directory> <daemon-version>`. `Plugin::run` prints one bounded validation object with `valid: true`, manifest `plugin.id`, `methods`, `providers`, `usageSources` and `hooks.events`/`hooks.before`. Normal `initialize` is followed by `ready` carrying the registration fields. Stdout belongs exclusively to bounded JSONL; diagnostics use stderr or `Context::log`.
+
+Validation executes native code and is not a sandbox. Installation, build scripts, dependencies and updates all run with daemon-user filesystem, network, credential and process privileges. Only install trusted code. Mobile clients remotely use the daemon and never run the executable themselves.
+
+## Authoring and management
+
+The CLI scaffold creates Rust source, Cargo/manifest configuration and author docs. For this unpublished SDK, use a local dependency:
 
 ```sh
-paseo plugin add /absolute/path/to/my-plugin
-paseo plugin add owner/slug
-paseo plugin ls
+paseo plugin init /absolute/path/to/native-plugin --sdk-path /absolute/path/to/paseo/packages/plugin
 ```
 
-Directory, registry and managed-source operations remain host-side. An extension source may need its own dependency preparation. Only install code you trust: backend extensions run with the daemon user's filesystem, credential and process privileges. They are not a sandbox. A client connecting to a daemon does not install Node or execute the backend extension on the phone.
+Without `--sdk-path`, the generated SDK dependency uses the Paseo Git repository; pin an available native-crate revision for distribution. Build the scaffold with `cargo build --release --target-dir target`, then invoke its `target/release/paseo-plugin-server` (`.exe` on Windows) with `--validate . 0.13.1`.
 
-Keep source identity, managed checkout ownership, installed configuration, settings and logs separate. Uninstalling one managed extension must not delete arbitrary directories supplied by the user. Registry availability is independent of this unpublished native cutover.
+Directory, Git, Cargo crate, checksum-pinned HTTPS release and compatible registry sources remain host-side. See the [source/CLI reference](../public-docs/plugins/reference.md#plugin-sources) for exact selectors, preparation, update proposal approval and artifact identities. Remote paths must exist on the selected daemon host; CLI installation does not upload local files.
+
+The root `pluginsEnabled` setting and per-installation enabled flag both gate execution. Directory reload starts a freshly built executable; it does not compile Rust. `plugin logs` returns a recent snapshot, not a live follower. Installation status is not proof of end-to-end behavior.
 
 ## Contributions retained
 
-Backend registrations include RPCs, lifecycle hooks/transforms, provider connections, usage sources, and settings data. Use the server-side SDK entry points and preserve asynchronous completion/cancellation and error propagation. Provider messages cross the native worker bridge; plugin RPC is not a substitute for the provider event/permission data path.
+- `Plugin::rpc`: async JSON handlers; authors explicitly validate application input/output.
+- `Plugin::on`/`before`: lifecycle notifications and allowed request transforms, preserving cancellation and ordering.
+- `Plugin::settings`: host-local versioned documents, migrations, revisions/conflicts and change subscriptions.
+- `Plugin::provider`: negotiated connections, separate send acceptance and events, permissions, sessions, timeline and optional persistence/configuration.
+- `Plugin::usage_source`: scoped account discovery and usage retrieval, with typed helpers under `paseo_plugin::usage`.
+- `Context::daemon.client`: lazy Rust client over IPC for ordinary daemon operations, not a second token/network configuration.
+- `Plugin::cleanup`: bounded cleanup of resources the plugin owns. The supervisor tracks and shuts down its process; crashes fail pending operations rather than reporting success.
 
-The worker protocol carries bounded requests, explicit results/errors, logs, provider events and cancellation. The native owner tracks process identity and shuts down the worker it owns. A worker crash fails pending operations rather than silently dropping events or reporting success.
-
-A backend registration can provide data to the native application where that feature already has a native surface. It does not permit JavaScript to define arbitrary Flutter widgets.
+Details and complete author examples: [reference](../public-docs/plugins/reference.md), [provider guide](../public-docs/plugins/providers.md). Direct adapters implement `Provider`/`Connection`; ACP adapters register `paseo_plugin::acp::AcpProvider` with a command or owned stream and optional `AcpTransformer` extensions. The native helper owns ACP transport/protocol mapping, sessions, permissions and cancellation instead of requiring every plugin to reimplement them. This replaces the old `runAcpProvider` functionality without retaining its JavaScript API or worker. Existing daemon ACP integrations remain native.
 
 ## Client compatibility boundary
 
-Executable React client entries are excluded: screens, workspace/file panels, sidebar component renderers, timeline renderers, composer components, arbitrary buttons and themes implemented as React code are **not loaded by Flutter**. Existing examples or public SDK symbols for those former clients are not a claim of native compatibility. Do not advertise “write the UI once and run it on every native device.”
+Protocol-defined configuration controls and standard timeline items are rendered by Flutter. Executable screens, workspace/file panels, sidebar/header components, custom timeline renderers, composer components, attachment pickers and theme code are not supported plugin surfaces. Historical examples/screenshots and former SDK exports do not imply compatibility. No empty native backend or browser fallback turns a client-only plugin into a useful native extension.
 
-Native candidate validation and activation require an actual `index.server.ts` or `index.server.tsx` file. A client-only package, or a directory named like a server entry, fails explicitly rather than activating as an empty ready plugin.
+## Explicit JavaScript migration
 
-Built-in Markdown, source editing, settings and read-only script logs are Flutter features, not a React plugin host. There is no browser/webview fallback to execute a client extension. Embedded browser automation and interactive terminal UI are also excluded.
+Legacy manifests/sources fail with an actionable migration error; old installation records/settings are not silently deleted or enabled. Port backend behavior to Rust, preserve IDs/data contracts, and remove old entries/compiler dependencies from the newly distributed plugin. `PASEO_PLUGIN_NODE`/`PASEO_PLUGIN_WORKER` do not restore execution.
+
+There is currently no atomic same-ID managed-source replacement command. Duplicate installs fail, and removal deletes settings: **do not recommend remove/reinstall as data-preserving migration**. The [migration guide](../public-docs/plugins/migration.md#5-change-acquisition-and-build-requirements) documents an explicit directory-runtime migration using the existing ID/configuration, retaining old settings and managed receipts. That does not migrate the managed source record itself, which may still report a legacy-source error.
 
 ## Developing and checking a backend extension
 
-Build the native runtime assets with `npm run build:daemon`, run an isolated daemon with `npm run dev:daemon`, and install the extension into that development instance. `npm run cli -- plugin ...` selects the checkout development home. Never use the installed user daemon as a disposable extension test host.
+Use an isolated test daemon/home, never a running production installation. From the repository root on Linux/macOS:
 
-Test actual worker initialization, registration, RPC results/errors, cancellation, restart and shutdown. For provider extensions, exercise a real turn and permission path, not just successful registration. Actual optional external-Node extension scenarios were exercised on Linux during the cutover; see [testing](testing.md) for the exact coverage boundary.
+```sh
+cargo build -p paseo-workspace-inspector --target-dir plugin-examples/workspace-inspector/target
+./plugin-examples/workspace-inspector/target/debug/paseo-workspace-inspector --validate plugin-examples/workspace-inspector 0.13.1
+paseo plugin install ./plugin-examples/workspace-inspector
+paseo plugin ls workspace-inspector
+paseo plugin logs workspace-inspector
+```
 
-## Distribution
+Windows needs the example manifest/executable `.exe` suffix. The example implements `file.inspect`, `lifecycle.counts`, `inspection.maxBytes` settings, an agent-created event, a session-open environment transform and the permission-gated `workspace-inspector`/`local-file` provider. It is not an AI service and does not advertise persistence, steering, configuration, image or output-schema support.
 
-Worker/compiler notices are generated with the native package's Cargo and speech attributions. They do not grant additional rights to third-party extension code or certify the whole distribution. See [release requirements](release.md#distribution-requirements), particularly the unresolved speech-library source and licensing obligations.
+Exercise actual initialization, validation, RPC results/errors, settings migrations/conflicts, cancellation, restart and shutdown. Provider checks need a real turn and permission allow/deny path, not only registration. Usage checks must preserve scope/credential boundaries. No tests or live execution are claimed by this document; see [testing](testing.md) for recorded coverage and [distribution](../public-docs/plugins/publishing.md) for packaging requirements.

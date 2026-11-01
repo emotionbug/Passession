@@ -1,17 +1,9 @@
-> The native Paseo client does not run client UI plugins. This example only exercises the SDK's client types; it does not add anything to the native app.
+# Modal UI: unsupported client example
 
-# Modal UI example
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-This example has no server entry, so a native Paseo daemon rejects it on install
-(`Native Paseo requires index.server.ts or index.server.tsx`). This applies to the published
-`npm:@getpaseo/plugin-example-modal-ui` package too.
+The former example demonstrated executable screens, sheets, modals, scrolling and clipboard controls in the JavaScript client. Flutter does not load those plugin components. Historical images are evidence only of the former client, not current native support.
 
-It was written for the former JavaScript client. Its screens open host modals and sheets that show
-default and custom padding, a full-width body, author-owned `ScrollView` and `FlatList` scrolling,
-horizontal tabs, and clipboard actions with a keyboard-aware input.
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
 
-The images in `screenshots/` are historical captures of the former JavaScript client on Android and
-in a browser, not current behavior.
-
-From the repository root, `npm run typecheck --workspace=@getpaseo/plugin` checks this example
-against the SDK's client types.
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

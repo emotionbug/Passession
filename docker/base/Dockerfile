@@ -1,26 +1,17 @@
 # syntax=docker/dockerfile:1
 
-# All build stages use TARGETPLATFORM: Cargo and the optional extension compiler
-# must emit the same architecture as the final image (native runner or QEMU).
-ARG NODE_IMAGE=node:24-bookworm-slim
+# Every build runs for TARGETPLATFORM (native runner or QEMU); the build and
+# runtime architecture must match. Neither stage needs Node or npm.
 ARG RUST_IMAGE=rust:1.93.1-bookworm
-FROM ${NODE_IMAGE} AS build-node
 FROM ${RUST_IMAGE} AS native-build
 
-COPY --from=build-node /usr/local/bin/node /usr/local/bin/node
-COPY --from=build-node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN set -eux; \
-    ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm; \
     apt-get update; \
-    apt-get install -y --no-install-recommends bzip2 patchelf; \
+    apt-get install -y --no-install-recommends patchelf; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /tmp/paseo-src
 COPY . .
-# Lifecycle scripts build legacy applications and are unnecessary for the
-# explicitly bundled optional extension worker. Nothing from this npm tree is
-# copied to the runtime except that worker's compiler/SDK closure.
-RUN npm ci --ignore-scripts --include=dev
 
 ARG PASEO_VERSION
 ARG PASEO_BUILD_SOURCE_SHA
@@ -29,9 +20,9 @@ ARG PASEO_UPDATE_REPOSITORY
 ARG PASEO_RELEASE_CHANNEL
 # Compile and collect notices in this same stage: COPY . . retains workspace
 # path dependencies and Cargo retains its fetched registry sources/config.
-# Only the assembled runtime (including generated notices), never Cargo/npm
-# source trees or their build tools, crosses into the final image.
-RUN node docker/base/build-runtime.mjs /opt/paseo
+# Only the assembled native runtime and generated notices, never Cargo sources
+# or build tools, cross into the final image. Plugins are installed separately.
+RUN cargo xtask container-runtime /opt/paseo
 
 FROM debian:bookworm-slim
 
@@ -55,7 +46,6 @@ RUN set -eux; \
       curl \
       git \
       gosu \
-      lbzip2 \
       openssh-client \
       procps \
       tini; \

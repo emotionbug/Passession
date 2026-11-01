@@ -26,7 +26,7 @@ Two questions to ask before you commit a schema change:
 
 If you can't answer both with yes, the change isn't done.
 
-Schemas live in `packages/protocol/src/messages.ts`. New RPC names follow [rpc-namespacing.md](rpc-namespacing.md).
+Shared wire types and validation live in the Rust `packages/protocol` crate. New RPC names follow [rpc-namespacing.md](rpc-namespacing.md).
 
 ## The feature contract: per feature, gated once
 
@@ -36,14 +36,14 @@ The app checks for the capability and either runs the feature or tells the user 
 
 - **No fallback paths.** Don't build a degraded version of the feature for old daemons. Don't fan out across legacy RPCs to simulate a capability that isn't there. The user updates or doesn't get the feature.
 - **No defensive branches spread through the feature.** Detection happens in one place, and everything downstream reads a clean shape.
-- Capability flags live in `features` on the `server_info` message (`packages/protocol/src/messages.ts`, the `server_info` schema).
+- Capability flags live in `features` on the `server_info` message; keep the Rust protocol and Dart decoding aligned.
 
 Existing functionality keeps working across versions because of the protocol contract. Gating a new feature never substitutes for that.
 
 ## Client capability ownership
 
 Each implementation advertises only the protocol behavior it actually implements: the Dart native
-client, Rust CLI/daemon client and retained TypeScript SDK have separate decoding/subscription
+client and shared Rust SDK/CLI/daemon client have separate decoding/subscription
 boundaries. Keep capabilities aligned with those implementations, not merely with accepted schemas.
 The native product does not advertise embedded browser automation. A schema accepting a message
 does not establish support for its delivery semantics.

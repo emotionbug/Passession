@@ -1,8 +1,6 @@
 use super::transport::Transport;
-use crate::{
-    process::CommandSpec,
-    providers::api::{LaunchContext, ProviderSpec},
-};
+use paseo_client::process::CommandSpec;
+use crate::{ providers::api::{LaunchContext, ProviderSpec}, };
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};

@@ -10,7 +10,7 @@ nav: 相关项目
 
 ## 插件 {#plugins}
 
-可在[插件市场](/plugins)浏览社区扩展，但需逐项检查运行时要求。原生客户端通过外部 Node worker 支持后端扩展，不执行 React UI 入口。分享后端扩展请参阅[发布插件](/docs/plugins/publishing)。扩展不在沙箱中运行，安装前应阅读说明和源码。
+仅安装目标架构和 Paseo 版本要求与主机一致的原生后端插件。Flutter 客户端不执行 React UI 入口。分享后端扩展请参阅[发布插件](plugins/publishing.zh-CN.md)。扩展不在沙箱中运行，安装前应阅读说明和源码。
 
 ## 工具与集成 {#tools-and-integrations}
 

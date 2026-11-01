@@ -68,8 +68,8 @@ and duplicate-delivery semantics. Concurrent prompts gain no turn attribution.
 
 ## Connections and recovery
 
-The Rust connector in `packages/daemon/src/hosts` owns daemon target parsing and each connection attempt, including a fresh
-SSH process. The retained TypeScript SDK has its own client connector. SSH reaches an already running daemon. The client connection lifecycle owns
+The Rust connector in `packages/client` owns daemon target parsing and each connection attempt, including a fresh
+SSH process, and is shared by the daemon and Rust SDK. SSH reaches an already running daemon. The client connection lifecycle owns
 physical reconnect and keepalive; the registry retains configuration, identity acceptance, and recovery
 status. Unreachable registrations remain saved. Identity is pinned when discovered. Self and duplicate
 registrations remain inspectable; a changed destination requires explicit identity replacement.
@@ -101,6 +101,6 @@ frame size. Awaitable output completes when the physical send completes. An over
 closes without closing siblings or the saved link. Routed sessions release resources on disconnect;
 subscription demand is rebuilt by its owning client on reconnect.
 
-See the [SDK reference](../public-docs/sdk/reference.md#clienthosts),
+See the [SDK reference](../public-docs/sdk/reference.md#providers-configuration-and-connected-hosts),
 [CLI reference](../public-docs/cli.md#connected-hosts), and
 [plugin reference](../public-docs/plugins/reference.md#connected-hosts).

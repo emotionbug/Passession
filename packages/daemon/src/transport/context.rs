@@ -945,7 +945,7 @@ fn is_reply(request: &Value, reply: &Value) -> bool {
         "terminals_changed" => req == "subscribe_terminals_request",
         "usage.list_reports.update" => req == "usage.list_reports.request",
         "daemon.update.progress" => req == "daemon.update.request",
-        "transcription_result" | "checkout_status_update" => false,
+        "checkout_status_update" => false,
         "status" => match reply["payload"]["status"].as_str() {
             Some("agent_created") => req == "create_agent_request",
             Some("agent_create_failed") => {

@@ -1,7 +1,7 @@
 use crate::{
     cli::{Context, flag, option, output::Output, positional, required, string, strings, switch},
-    client::{ClientError, DaemonClient},
 };
+use paseo_client::{ClientError, DaemonClient};
 use anyhow::{Result, anyhow, bail, ensure};
 use clap::{ArgAction, ArgMatches, Command};
 use serde_json::{Value, json};

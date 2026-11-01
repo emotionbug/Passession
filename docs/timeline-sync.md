@@ -126,6 +126,20 @@ history replay. The pending approval UI can hide that tool from presentation, bu
 must retain its position. Creating a new history card on rejection places it after the prompt that
 rejected it; changing steer-event ordering would also put new assistant output before that prompt.
 
+The daemon stages live events during start/steer admission and history hydration. This includes
+output from an already active turn: accepted steering must precede output received while its
+acknowledgement was pending. The 4,096-event and approximately 16 MiB thresholds bound each
+in-memory staging chunk, not the total accepted output. Larger queues spill to a private,
+temporary file and replay disk batches before the memory tail. A single oversized provider frame
+is spilled immediately; these thresholds estimate retained payload, not total allocator usage.
+The spool is not a durable event log; provider history remains authoritative after restart.
+
+Out-of-band commands are recognized synchronously without side effects. Their canonical prompt
+is published before execution starts in the background, without holding the admission stage or
+mutation lane until command completion. Command errors are streamed to that same cell.
+Spool or event-persistence failure ends the event owner, clears pending ownership and barriers,
+and permits close/reload; a late acknowledgement cannot restore the failed owner to running.
+
 ## Provider child history
 
 Child transcripts use the same projected-page reconciliation as the main conversation. The client
@@ -196,13 +210,13 @@ The app chooses one delivery policy from `server_info.features.selectiveAgentTim
   [agent lifecycle](agent-lifecycle.md#workspace-activity)). Visible chats get the first catch-up
   attempt; the rest follow when those attempts settle, including failures, so a failed visible chat
   does not starve background recovery. Split panes catch up together. Hidden chats update the
-  replica; on web their retained presentation stays suspended until revealed, on native it keeps
-  rendering. Revealing a chat reads the current store and preserves its local UI state.
+  replica while the native presentation keeps rendering. Revealing a chat reads the current store
+  and preserves its local UI state.
 - Legacy daemons keep globally streaming agent timelines. Visibility still triggers the existing
   authoritative catch-up, but the app does not issue selective-subscription RPCs.
 
-This policy is owned by `viewed-timeline-sync.ts`; downstream reducers do not branch on daemon
-version.
+This is a client synchronization policy; downstream presentation must not branch independently
+on daemon version. The former `viewed-timeline-sync.ts` is not a current implementation owner.
 
 ## Projected pages reconcile with live presentation
 
@@ -213,8 +227,8 @@ its completion advances `seqEnd`, followed by a merged assistant message. The ap
 remaining page through the existing stream reducer. It must not append full projected text to a
 live prefix.
 
-Every path that sends a message to an agent — composer send, dictation accept-and-send, queued
-send-now, and the host runtime's automatic queue drain — goes through
+Every path that sends a message to an agent — composer send, queued send-now, and the host
+runtime's automatic queue drain — goes through
 `dispatchComposerAgentMessage` with a submission writer. There is no second transport for the same
 product action: calling `client.sendAgentMessage` directly skips the submitted row and the pending
 footer, and permanently drops attachments because the daemon does not echo them back.
@@ -308,4 +322,4 @@ canonical assistant prefix, it stays in the head lane. No row may be returned in
 - Rust canonical timeline, persistence and forwarding: `packages/daemon/src/agent/timeline.rs`, `timeline_storage.rs`, `timeline_stream.rs`, and `transport/`
 - Dart protocol and reconciliation: `packages/flutter_app/lib/core/client.dart`
 - Flutter viewed-session/controller and timeline presentation: `packages/flutter_app/lib/features/chat/chat_controller.dart`, `agent_panel.dart`, and `timeline_item.dart`
-- External TypeScript SDK: `packages/client`
+- External Rust SDK: `packages/client`

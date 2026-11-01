@@ -17,8 +17,10 @@ pub fn defaults() -> Value {
 pub fn normalize_persisted(mut value: Value) -> Result<Value> {
     remove_at(&mut value, &["daemon"], "browserTools");
     remove_at(&mut value, &["features"], "webUi");
-    remove_at(&mut value, &["providers", "local"], "autoDownload");
-    remove_at(&mut value, &["providers", "openai"], "voice");
+    remove_at(&mut value, &["features"], "dictation");
+    remove_at(&mut value, &["features"], "voiceMode");
+    // Top-level providers configured retired speech services, not agent providers.
+    remove_at(&mut value, &[], "providers");
     if let Some(providers) = value.pointer_mut("/agents/providers") {
         migrate_providers(providers)?;
     }
@@ -90,13 +92,11 @@ enum Kind {
     Trimmed,
     Boolean,
     Number,
-    Integer,
     Positive,
     Timeout,
     Version,
     Url,
     Bcrypt,
-    SpeechProvider,
     Hosts,
     PortRange,
     Enum(&'static [&'static str]),
@@ -112,10 +112,6 @@ enum Kind {
     ServiceProxy,
     Auth,
     App,
-    SpeechProviders,
-    OpenAi,
-    SpeechEndpoint,
-    Local,
     Worktrees,
     ServicePorts,
     Agents,
@@ -129,13 +125,6 @@ enum Kind {
     Skills,
     SkillSelection,
     Features,
-    Dictation,
-    DictationStt,
-    Voice,
-    Llm,
-    Stt,
-    TurnDetection,
-    Tts,
     Log,
     ConsoleLog,
     FileLog,
@@ -176,7 +165,6 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
                 ("version", Version, false),
                 ("daemon", Daemon, false),
                 ("app", App, false),
-                ("providers", SpeechProviders, false),
                 ("pluginRegistries", Record(&Registry), false),
                 ("pluginsEnabled", Boolean, false),
                 ("plugins", Plugins, false),
@@ -242,24 +230,6 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
         ),
         Auth => (Strict, &[("password", Bcrypt, false)]),
         App => (Strict, &[("baseUrl", Text, false)]),
-        SpeechProviders => (
-            Strict,
-            &[("openai", OpenAi, false), ("local", Local, false)],
-        ),
-        OpenAi => (
-            Strict,
-            &[
-                ("apiKey", Nonempty, false),
-                ("baseUrl", Trimmed, false),
-                ("stt", SpeechEndpoint, false),
-                ("tts", SpeechEndpoint, false),
-            ],
-        ),
-        SpeechEndpoint => (
-            Strict,
-            &[("apiKey", Trimmed, false), ("baseUrl", Trimmed, false)],
-        ),
-        Local => (Strict, &[("modelsDir", Nonempty, false)]),
         Worktrees => (
             Strict,
             &[
@@ -342,56 +312,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
             ],
         ),
         SkillSelection => (Strict, &[("mode", Enum(&["all"]), true)]),
-        Features => (
-            Strict,
-            &[("dictation", Dictation, false), ("voiceMode", Voice, false)],
-        ),
-        Dictation => (
-            Strict,
-            &[("enabled", Boolean, false), ("stt", DictationStt, false)],
-        ),
-        DictationStt => (
-            Strict,
-            &[
-                ("provider", SpeechProvider, false),
-                ("model", Nonempty, false),
-                ("language", Trimmed, false),
-                ("confidenceThreshold", Number, false),
-            ],
-        ),
-        Voice => (
-            Strict,
-            &[
-                ("enabled", Boolean, false),
-                ("llm", Llm, false),
-                ("stt", Stt, false),
-                ("turnDetection", TurnDetection, false),
-                ("tts", Tts, false),
-            ],
-        ),
-        Llm => (
-            Strict,
-            &[("provider", Text, false), ("model", Nonempty, false)],
-        ),
-        Stt => (
-            Strict,
-            &[
-                ("provider", SpeechProvider, false),
-                ("model", Nonempty, false),
-                ("language", Trimmed, false),
-            ],
-        ),
-        TurnDetection => (Strict, &[("provider", SpeechProvider, false)]),
-        Tts => (
-            Strict,
-            &[
-                ("provider", SpeechProvider, false),
-                ("model", Nonempty, false),
-                ("voice", Trimmed, false),
-                ("speakerId", Integer, false),
-                ("speed", Number, false),
-            ],
-        ),
+        Features => (Strict, &[]),
         Log => (
             Strict,
             &[
@@ -680,13 +601,10 @@ fn visit(mut node: Node<'_>, kind: Kind) -> Result<()> {
         }
         _ => {
             validate_leaf(node.value(), kind)?;
-            if matches!(kind, Trimmed | SpeechProvider | PortRange) {
+            if matches!(kind, Trimmed | PortRange) {
                 if let Node::Write(Value::String(text)) = node {
                     let trimmed = js_trim(text);
-                    let lower = matches!(kind, SpeechProvider);
-                    if lower {
-                        *text = trimmed.to_lowercase();
-                    } else if trimmed.len() != text.len() {
+                    if trimmed.len() != text.len() {
                         *text = trimmed.to_owned();
                     }
                 }
@@ -700,18 +618,12 @@ fn validate_leaf(value: &Value, kind: Kind) -> Result<()> {
     use Kind::*;
     match kind {
         Any => {}
-        Text | Nonempty | Trimmed | SpeechProvider | PortRange | Url | Bcrypt | Enum(_) => {
+        Text | Nonempty | Trimmed | PortRange | Url | Bcrypt | Enum(_) => {
             let text = value.as_str().context("Expected string")?;
             match kind {
                 Nonempty if text.is_empty() => bail!("String must contain at least 1 character(s)"),
                 Trimmed if js_trim(text).is_empty() => {
                     bail!("String must contain at least 1 character(s)")
-                }
-                SpeechProvider
-                    if !js_trim(text).eq_ignore_ascii_case("openai")
-                        && !js_trim(text).eq_ignore_ascii_case("local") =>
-                {
-                    bail!("Expected openai or local")
                 }
                 Enum(values) if !values.contains(&text) => {
                     bail!("Expected one of {}", values.join(", "))
@@ -726,7 +638,7 @@ fn validate_leaf(value: &Value, kind: Kind) -> Result<()> {
         }
         Boolean if !value.is_boolean() => bail!("Expected boolean"),
         Boolean => {}
-        Number | Integer | Positive | Timeout => {
+        Number | Positive | Timeout => {
             let number = value
                 .as_f64()
                 .filter(|n| n.is_finite())
@@ -899,13 +811,11 @@ mod tests {
         let value = normalize_persisted(json!({
             "daemon": {"allowedHosts": ["localhost"], "browserTools": null},
             "features": {"webUi": "obsolete"},
-            "providers": {"local": {"autoDownload": true}, "openai": {"voice": {}, "apiKey": " secret "}}
         })).unwrap();
         assert_eq!(
             value,
             json!({
                 "daemon": {"hostnames": ["localhost"]}, "features": {},
-                "providers": {"local": {}, "openai": {"apiKey": " secret "}}
             })
         );
         assert_eq!(
@@ -980,19 +890,14 @@ mod tests {
     }
 
     #[test]
-    fn ports_speech_and_provider_refinements_match_source() {
+    fn ports_and_provider_refinements_match_source() {
         let value = normalize_persisted(json!({
             "worktrees": {"servicePorts": {"range": " 00001-65535 ", "portScript": " script "}},
-            "features": {"dictation": {"stt": {"provider": " LOCAL ", "language": "\u{feff}en "}}}
         }))
         .unwrap();
         assert_eq!(
             value["worktrees"]["servicePorts"],
             json!({"range": "00001-65535", "portScript": "script"})
-        );
-        assert_eq!(
-            value["features"]["dictation"]["stt"],
-            json!({"provider": "local", "language": "en"})
         );
         for range in ["0-1", "2-1", "1-65536", "1 -2", "000001-2"] {
             assert!(

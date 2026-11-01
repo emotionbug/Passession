@@ -2,6 +2,7 @@
 node_modules/
 
 # Build outputs
+target/
 build/
 dist/
 .next/

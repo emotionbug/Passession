@@ -1006,7 +1006,4 @@ impl AgentSession for Session {
     async fn rewind(&self, _target: RewindTarget, _message_id: &str) -> Result<()> {
         bail!("Muse does not support session rewind")
     }
-    async fn try_out_of_band(&self, _prompt: &Value) -> Result<bool> {
-        Ok(false)
-    }
 }

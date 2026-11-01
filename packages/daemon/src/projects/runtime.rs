@@ -13,7 +13,7 @@ use tokio::{io::AsyncReadExt, net::TcpListener, sync::watch};
 use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::process::{self, CommandSpec, ManagedProcess};
+use paseo_client::process::{self, CommandSpec, ManagedProcess};
 
 pub type PortPlan = BTreeMap<String, f64>;
 

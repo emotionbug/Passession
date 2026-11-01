@@ -1,195 +1,101 @@
----
-title: Provider 选项
-description: 从 SDK 创建的 Codex、Claude 和 OpenCode Agent 的沙箱、权限和网络规则。
-nav: Provider 选项
----
+# Provider 选项
 
-# Provider 选项 {#provider-options}
+[English](provider-options.md) · [环境配置](quickstart.zh-CN.md)
 
-Provider 选项是传给 Provider 的一个不透明的 `Record<string, unknown>`。如何校验和应用它由 Provider 决定。Claude、Codex 和 OpenCode 使用严格的 schema：未知或拼错的键会使 Agent 创建失败，并在错误信息中指出该键。不处理选项的 Provider 会忽略这个记录。Pi、OMP、ACP 和插件 Provider 会解释它们自己的键。
+Provider 选项是由 Provider 解释的 JSON 对象（`serde_json::Value`）。Claude、Codex、OpenCode 验证接受的键，未知或拼错的键可能导致创建失败。Pi、OMP、ACP 和原生插件 Provider 解释各自选项，不能假定所有 Provider 使用同一种策略。
 
-你可以在两个地方设置选项：
+默认值位于 `config.json` 的 `agents.providers.<id>.options`。Rust 协议形状的创建请求把单个 Agent 覆盖值放在 **`config.providerOptions`**，不是 `config.options`。Daemon 递归合并普通对象；数组、标量、null 替换基础值。只保存 Agent 自身覆盖值，默认值变更在下一次启动/恢复时生效。
 
-- **Provider 默认值**：`config.json` → `agents.providers.<id>.options`。
-- **单个 Agent**：`client.agents.create()` 中的 `config.options`。它在协议中的名称是 `providerOptions`。
+```rust
+use anyhow::Result;
+use paseo_client::{DaemonClient, RequestOptions};
+use serde_json::{Value, json};
 
-在会话启动或恢复时，daemon 会把 Agent 的选项深度合并到 Provider 默认值之上。普通对象递归合并；数组、标量和 `null` 会替换基础值。只有 Agent 自己的选项会被保存。修改 `config.json` 中的默认值会在下次启动或恢复时生效。
+async fn launch(client: &DaemonClient, provider: &str, model: &str,
+                cwd: &str, provider_options: Value) -> Result<Value> {
+    client.create_agent(json!({
+        "config": {"provider": provider, "model": model, "cwd": cwd,
+                   "providerOptions": provider_options},
+        "initialPrompt": "Review the change and report the result."
+    }), RequestOptions::default()).await
+}
+```
 
-例如，先设置一次 Codex 默认值：
+将下面的 JSON 对象传给 `launch`，例如通过 `serde_json::json!` 构造，或使用 `serde_json::from_str` 解析配置字符串。使用该 Provider 实际发现的模型 ID。再用返回的 Agent ID 调用 `wait_for_finish` 观察结果。
+
+这些选项限制的是以 daemon 用户身份运行的外部 CLI，不是主机安全边界。不可信工作应在容器或独立主机执行，参见[安全](../security.zh-CN.md)。
+
+## Codex
 
 ```json
 {
-  "agents": {
-    "providers": {
-      "codex": {
-        "options": {
-          "sandbox_mode": "read-only",
-          "approval_policy": "never",
-          "sandbox_workspace_write": { "network_access": false }
-        }
-      }
+  "approval_policy": "never",
+  "sandbox_mode": "workspace-write",
+  "sandbox_workspace_write": {
+    "writable_roots": ["/home/me/dev/storefront"],
+    "network_access": false,
+    "exclude_slash_tmp": true
+  },
+  "web_search": "disabled"
+}
+```
+
+| 选项 | 接受的值/字段 |
+| --- | --- |
+| `approval_policy` | `untrusted`、`on-request`、`never` 或 `granular` 策略对象 |
+| `sandbox_mode` | `read-only`、`workspace-write`、`danger-full-access` |
+| `sandbox_workspace_write` | `writable_roots`、`network_access`、`exclude_slash_tmp`、`exclude_tmpdir_env_var` |
+| `web_search` | `disabled`、`cached`、`indexed`、`live` |
+| `features` | `multi_agent_v2`、`network_proxy`（布尔值或代理/域名策略对象） |
+
+`approval_policy: "never"` 仅取消询问，不限制访问。必须明确配置沙箱。例如默认 `sandbox_mode: "read-only"`、`approval_policy: "never"`、`sandbox_workspace_write.network_access: false`，Agent 仅覆盖 `sandbox_mode` 为 `workspace-write` 时，后两个默认值仍保留。
+
+## Claude
+
+```json
+{
+  "disallowedTools": ["WebFetch"],
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "allowWrite": ["/home/me/dev/storefront"],
+      "denyRead": ["/home/me/.ssh", "/home/me/.aws"]
+    },
+    "network": {
+      "allowedDomains": ["crates.io", "github.com"],
+      "strictAllowlist": true
     }
   }
 }
 ```
 
-然后用 `config.options: { sandbox_mode: "workspace-write" }` 创建一个 Agent。它会得到 `workspace-write`，同时保留 `approval_policy: "never"` 和 `sandbox_workspace_write.network_access: false`。没有单独选项的 Agent 会得到上面的默认值。键是 Provider 原生的；各 Provider 接受的选项见下面各节。
+| 选项 | 含义 |
+| --- | --- |
+| `allowedTools`、`disallowedTools` | 无需询问可用的工具 / 禁止的工具 |
+| `additionalDirectories` | 额外可访问目录 |
+| `sandbox` | `enabled`、`failIfUnavailable`、`allowUnsandboxedCommands`、`excludedCommands`、`filesystem`、`network` |
+| `settings` | 包含 allow/ask/deny 规则列表的 `permissions`，以及嵌套沙箱设置 |
 
-Provider 选项不是主机边界。它们约束的是 Agent CLI，而 Agent CLI 以你的用户身份运行在你的机器上。对于不受信任的工作，请在容器或单独的机器上运行 daemon。参见[安全](/docs/security)。
+`failIfUnavailable: true` 在无法建立沙箱时拒绝启动；关闭它允许回退为无沙箱运行。文件系统设置包括 `allowWrite`、`denyWrite`、`allowRead`、`denyRead`；网络设置包括域名允许/拒绝列表、`strictAllowlist` 和代理。根据 daemon 主机与真实任务调整路径和域名。
 
-## Codex {#codex}
+## OpenCode
 
-把写入限制在一个目录内，切断网络访问，并停止审批提示，让运行可以无人值守：
-
-```ts
-import { createPaseoClient } from "@getpaseo/client";
-
-const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
-await client.connect();
-
-const agent = await client.agents.create({
-  config: {
-    provider: "codex/gpt-5.5",
-    options: {
-      approval_policy: "never",
-      sandbox_mode: "workspace-write",
-      sandbox_workspace_write: {
-        writable_roots: ["/Users/me/dev/storefront"],
-        network_access: false,
-        exclude_slash_tmp: true,
-      },
-      web_search: "disabled",
-    },
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Fix the failing checkout test.",
-});
-
-const result = await agent.waitForFinish();
-console.log(result.status, result.lastMessage);
-
-await client.close();
-```
-
-| 选项                      | 取值                                                                              |
-| ------------------------- | --------------------------------------------------------------------------------- |
-| `approval_policy`         | `untrusted`、`on-request`、`never` 或 `{ granular: { … } }`                       |
-| `sandbox_mode`            | `read-only`、`workspace-write`、`danger-full-access`                              |
-| `sandbox_workspace_write` | `writable_roots`、`network_access`、`exclude_slash_tmp`、`exclude_tmpdir_env_var` |
-| `web_search`              | `disabled`、`cached`、`indexed`、`live`                                           |
-| `features`                | `multi_agent_v2`、`network_proxy`（布尔值，或代理/域名策略对象）                  |
-
-`approval_policy: "never"` 只是去掉了提示。Agent 被允许接触什么由 `sandbox_mode` 决定。设置 `never` 而不设置沙箱模式，会让无人值守的 Agent 拥有完全访问权限。
-
-## Claude {#claude}
-
-开启 Claude 自己的沙箱，把写入限制在项目内，禁止读取凭据目录，并只允许两个域名：
-
-```ts
-import { createPaseoClient } from "@getpaseo/client";
-
-const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
-await client.connect();
-
-const agent = await client.agents.create({
-  config: {
-    provider: "claude/claude-sonnet-5",
-    options: {
-      disallowedTools: ["WebFetch"],
-      sandbox: {
-        enabled: true,
-        failIfUnavailable: true,
-        allowUnsandboxedCommands: false,
-        filesystem: {
-          allowWrite: ["/Users/me/dev/storefront"],
-          denyRead: ["/Users/me/.ssh", "/Users/me/.aws"],
-        },
-        network: {
-          allowedDomains: ["registry.npmjs.org", "github.com"],
-          strictAllowlist: true,
-        },
-      },
-    },
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Install dependencies and run the focused test.",
-});
-
-const result = await agent.waitForFinish();
-console.log(result.status, result.lastMessage);
-
-await client.close();
-```
-
-| 选项                    | 取值                                                                                                    |
-| ----------------------- | ------------------------------------------------------------------------------------------------------- |
-| `allowedTools`          | Agent 可以不经询问就使用的工具名称                                                                      |
-| `disallowedTools`       | Agent 永远不能使用的工具名称                                                                            |
-| `additionalDirectories` | Agent 可以访问的额外目录                                                                                |
-| `sandbox`               | `enabled`、`failIfUnavailable`、`allowUnsandboxedCommands`、`excludedCommands`、`filesystem`、`network` |
-| `settings`              | `permissions`（`allow`/`ask`/`deny` 规则列表）以及嵌套的 `sandbox`                                      |
-
-`failIfUnavailable: true` 会在无法建立沙箱时让 Agent 启动失败。不设置时，Claude 会在没有沙箱的情况下运行。
-
-`sandbox.filesystem` 接受 `allowWrite`、`denyWrite`、`allowRead` 和 `denyRead`。`sandbox.network` 接受 `allowedDomains`、`deniedDomains`、`strictAllowlist` 以及代理设置。
-
-## OpenCode {#opencode}
-
-允许读取和编辑，禁止任何超出项目范围的访问，并按模式控制 shell 命令：
-
-```ts
-import { createPaseoClient } from "@getpaseo/client";
-
-const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
-await client.connect();
-
-const agent = await client.agents.create({
-  config: {
-    provider: "opencode/opencode/gpt-5.5",
-    options: {
-      permission: {
-        read: "allow",
-        edit: "allow",
-        webfetch: "deny",
-        external_directory: "deny",
-        bash: {
-          "git status": "allow",
-          "git diff*": "allow",
-          "git push*": "deny",
-          "*": "ask",
-        },
-      },
-    },
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Implement the requested change and show me the diff.",
-});
-
-const result = await agent.waitForFinish();
-console.log(result.status, result.lastMessage);
-
-await client.close();
-```
-
-每项权限的取值是 `ask`、`allow` 或 `deny`。带有目标的工具（`read`、`edit`、`glob`、`grep`、`list`、`bash`、`task`、`external_directory`、`repo_clone`、`repo_overview`、`lsp`、`skill`）还接受一个模式映射，其中后面的键作为兜底。没有目标的工具（`todowrite`、`question`、`webfetch`、`websearch`、`codesearch`、`doom_loop`）只接受单个操作值。
-
-把 `permission: "deny"` 写成单个字符串，会一次性应用到所有工具。
-
-`ask` 会在 Paseo 中变成一个权限请求，请求待处理期间 `waitForFinish()` 返回 `permission`。无人值守的运行请使用 `allow` 和 `deny`。如何响应待处理的请求，请参见[事件](/docs/sdk/events)。
-
-## 模式与选项 {#modes-and-options}
-
-`modeId` 从 Provider 公布的列表中选择一个 Paseo 模式，daemon 会在应用中显示这个列表，并通过 [Provider 发现](/docs/sdk/providers)报告它。`options` 是 Provider 自己的配置。两者是独立的控制项，可以同时设置：
-
-```ts
-config: {
-  provider: "codex/gpt-5.5",
-  modeId: "full-access",
-  options: {
-    approval_policy: "never",
-    sandbox_mode: "read-only",
-  },
+```json
+{
+  "permission": {
+    "read": "allow", "edit": "allow", "webfetch": "deny",
+    "external_directory": "deny",
+    "bash": {"git status": "allow", "git diff*": "allow", "git push*": "deny", "*": "ask"}
+  }
 }
 ```
 
-两者重叠时，以 `options` 为准。上例中，即使 `full-access` 本来会授予更多权限，Codex 仍以只读方式运行。
+动作是 `ask`、`allow`、`deny`。带目标的工具（`read`、`edit`、`glob`、`grep`、`list`、`bash`、`task`、`external_directory`、`repo_clone`、`repo_overview`、`lsp`、`skill`）也接受模式映射。模式顺序及回退条目很重要。不带目标的工具（`todowrite`、`question`、`webfetch`、`websearch`、`codesearch`、`doom_loop`）使用单一动作。单独设置 `permission: "deny"` 拒绝全部操作。
+
+`ask` 会变成 Paseo 权限请求。通过持有式事件观察和 `respond_to_permission` 处理，参见[事件](events.zh-CN.md)。等待结果可能为 `permission`。不要为了无人值守而自动允许所有请求。
+
+## 模式与选项
+
+`config.modeId` 选择 [Provider 发现](providers.zh-CN.md)中的模式，`config.providerOptions` 是 Provider 原生配置，两者可同时设置。冲突时显式 Provider 选项优先。例如 `modeId: "full-access"` 加上 Codex `providerOptions: {"approval_policy":"never","sandbox_mode":"read-only"}` 仍是只读。不要仅从模式标签推断权限，应检查具体选项。

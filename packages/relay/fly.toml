@@ -1,0 +1,47 @@
+# Repository-root command (only with explicit production approval):
+# flyctl deploy --ha=false --config packages/relay/fly.toml --dockerfile packages/relay/Dockerfile
+# Run ONE machine: routing state is process-local. Before an existing-app
+# cutover, verify its machine count and scale to one in the approved operation.
+# Do not enable autoscaling or multiple regions without shared routing storage.
+# The Cloudflare Rust/WASM adapter forwards relay.paseo.sh to this app.
+# Build it with cargo xtask relay-cloudflare build; upload only with explicit
+# approval using cargo xtask relay-cloudflare deploy --confirm-upload.
+# Keep the existing custom domain, TLS and DNS unchanged.
+app = "paseo-relay-next"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "15s"
+
+[build]
+dockerfile = "packages/relay/Dockerfile"
+
+[deploy]
+strategy = "immediate"
+
+[env]
+PASEO_RELAY_LISTEN = "0.0.0.0:8080"
+RUST_LOG = "paseo_relay=info"
+
+[http_service]
+internal_port = 8080
+force_https = true
+auto_stop_machines = "off"
+auto_start_machines = true
+min_machines_running = 1
+
+[http_service.concurrency]
+type = "connections"
+hard_limit = 8192
+soft_limit = 7000
+
+[[http_service.checks]]
+interval = "15s"
+timeout = "2s"
+grace_period = "5s"
+method = "GET"
+path = "/health"
+
+[[vm]]
+cpu_kind = "shared"
+cpus = 1
+memory = "1gb"

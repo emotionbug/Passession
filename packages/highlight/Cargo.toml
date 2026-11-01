@@ -1,0 +1,19 @@
+[package]
+name = "paseo-highlight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native multi-language syntax highlighting and Paseo syntax themes"
+
+[dependencies]
+arborium = { version = "=2.18.2", default-features = false, features = [
+    "lang-javascript", "lang-typescript", "lang-tsx", "lang-c", "lang-cpp",
+    "lang-objc", "lang-json", "lang-css", "lang-scss", "lang-html",
+    "lang-svelte", "lang-vue", "lang-xml", "lang-java", "lang-python",
+    "lang-go", "lang-php", "lang-yaml", "lang-rust", "lang-swift",
+    "lang-dart", "lang-c-sharp", "lang-nix", "lang-elixir",
+    "lang-regex", "lang-jsdoc",
+] }
+tree-sitter-astro-next = "=0.1.1"
+tree-sitter-md = { version = "=0.5.4", default-features = false }

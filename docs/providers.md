@@ -2,7 +2,7 @@
 
 The product daemon and built-in provider integrations are **Rust**. Provider executables remain external tools installed and authenticated on the daemon machine. Their own runtime requirements do not imply that Paseo bundles Node.
 
-Optional JavaScript backend provider extensions remain available through `@getpaseo/plugin/server/provider` and an external-Node worker. See [plugins](plugins.md). A built-in native provider is not implemented by adding a TypeScript server class or a React component.
+Optional backend provider extensions use native executables and the Rust `paseo-plugin` SDK. See [plugins](plugins.md). Existing JavaScript extensions require porting; there is no external-Node worker fallback.
 
 ## Native ownership
 
@@ -16,7 +16,7 @@ Optional JavaScript backend provider extensions remain available through `@getpa
 
 Agent orchestration, canonical timeline persistence and client publication belong to `packages/daemon/src/agent` rather than to a UI-specific provider implementation. Usage integrations live under `packages/daemon/src/usage`.
 
-Shared TypeScript wire metadata remains under `packages/protocol`, for the retained external SDK and optional worker. Keep that contract aligned with Rust and Dart when adding a provider capability or changing serialization.
+Shared Rust wire metadata lives under `packages/protocol` for the daemon and Rust client SDK. Keep that contract aligned with Dart when adding a provider capability or changing serialization.
 
 ## Provider contract
 
@@ -38,9 +38,9 @@ Provider helpers that outlive one session belong to the daemon's managed-process
 
 ## Adding an integration
 
-1. Decide whether the integration is a native built-in or an optional backend extension. Built-ins stay Rust; external-Node plugins remain opt-in.
+1. Decide whether the integration is a native built-in or an optional native backend extension.
 2. Reuse the native provider interfaces and appropriate transport implementation. Keep protocol-specific details behind the provider boundary rather than branching throughout agent orchestration.
-3. Add the provider definition/catalog/options and preserve stable wire IDs. Update TypeScript protocol definitions and Dart presentation where the capability is client-visible.
+3. Add the provider definition/catalog/options and preserve stable wire IDs. Update Rust protocol definitions and Dart presentation where the capability is client-visible.
 4. Preserve import/resume, native session identity, permissions, model/mode discovery, cancellation, errors and persistence behavior. Do not claim unsupported features.
 5. Update usage integration only if the provider supplies real attributable data; missing data must not become a fabricated zero balance.
 6. Add behavior checks for the actual boundary and run them in an authorized verification pass.
@@ -51,6 +51,6 @@ Provider UI belongs to native Flutter features under `packages/flutter_app/lib`,
 
 Use an isolated native daemon and real provider credentials for provider end-to-end checks. Exercise a turn, permission decision, interruption, reconnect/history, import/resume and shutdown where supported. Report unavailable credentials/services explicitly. A mock provider can verify controlled states, but it cannot establish real provider interoperability.
 
-Linux scenarios exercised the real Rust adapters and daemon against controlled Claude/ACP/MCP provider-protocol boundary fixtures, plus an optional external-Node extension. They were not paid live Claude/ACP LLM executions and do not establish live account authentication, every provider mode or other operating systems. See [testing](testing.md) for recorded evidence and its authority boundaries.
+The historical Linux scenarios exercised Rust adapters and daemon against controlled Claude/ACP/MCP provider-protocol boundary fixtures, plus the now-retired external-Node extension runtime. They were not paid live Claude/ACP LLM executions and do not verify the new native plugin runtime, live account authentication, every provider mode or other operating systems. See [testing](testing.md) for recorded evidence and its authority boundaries.
 
 The separate [custom-provider configuration reference](custom-providers.md) is not changed by this migration documentation task; source implementation ownership for built-ins is the native path above.

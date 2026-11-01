@@ -8,9 +8,10 @@ pub(super) fn command() -> Command {
         .subcommand_required(true)
         .subcommands([
             Command::new("init")
-                .about("Create a typecheckable server plugin")
+                .about("Create a native Rust server plugin")
                 .arg(positional("directory", true))
-                .arg(option("id", "id")),
+                .arg(option("id", "id"))
+                .arg(option("sdk-path", "sdk-path").help("Use a local paseo-plugin SDK crate")),
             Command::new("ls")
                 .alias("status")
                 .arg(positional("id", false)),
@@ -20,14 +21,20 @@ pub(super) fn command() -> Command {
                 .arg(positional("source", true))
                 .arg(option("id", "id"))
                 .arg(option("ref", "ref"))
-                .arg(option("path", "path")),
+                .arg(option("path", "path"))
+                .arg(option("version", "version").help("Release archive version"))
+                .arg(option("sha256", "sha256").help("Release archive SHA-256 digest"))
+                .arg(option("format", "format").value_parser(["tar.gz", "zip"])),
             Command::new("update")
                 .arg(positional("id", false))
                 .arg(switch("all", "all"))
                 .arg(switch("check", "check"))
                 .arg(switch("yes", "yes"))
-                .arg(option("ref", "ref"))
-                .arg(option("version", "version")),
+                .arg(option("ref", "ref").conflicts_with_all(["version", "url", "sha256", "format"]))
+                .arg(option("version", "version").help("Cargo crate or release archive version"))
+                .arg(option("url", "url").requires_all(["version", "sha256"]))
+                .arg(option("sha256", "sha256").requires("url"))
+                .arg(option("format", "format").requires("url").value_parser(["tar.gz", "zip"])),
             Command::new("reload").arg(positional("id", true)),
             Command::new("enable").arg(positional("id", true)),
             Command::new("disable").arg(positional("id", true)),
@@ -47,10 +54,13 @@ fn identity(value: &Value) -> String {
             );
         }
     }
-    let source = if value["kind"] == "npm" {
-        format!("npm:{}", text(value, "packageName"))
-    } else {
-        format!("git:{}", text(value, "remote"))
+    let source = match value["kind"].as_str() {
+        Some("cargo") => format!("cargo:{}", text(value, "crateName")),
+        Some("release") => format!("release:{}", text(value, "origin")),
+        // Preserve the identity of installed legacy records so users can migrate them.
+        Some("npm") => format!("npm:{} (legacy; reinstall a native release)", text(value, "packageName")),
+        Some("git") => format!("git:{}", text(value, "remote")),
+        _ => return "unknown source".into(),
     };
     if value["pluginPath"] == "." {
         source
@@ -141,15 +151,9 @@ pub(super) async fn execute(
         }
         "install" | "add" => {
             eprintln!(
-                "Trusting plugin code: backend code and preparation commands run unsandboxed on the daemon host. JavaScript backend extensions require external Node.js. Dependencies and future updates are part of the codebase you trust."
+                "Trusting plugin code: native executables and preparation commands run unsandboxed on the daemon host. Cargo build scripts, dependencies, and future updates are part of the codebase you trust."
             );
-            let source = source_reference(required(m, "source")?, string(m, "path"))?;
-            let mut request = json!({"type":"plugin.source.install.request","source":source});
-            for key in ["id", "ref"] {
-                if let Some(value) = string(m, key).filter(|v| !v.is_empty()) {
-                    request[key] = json!(value);
-                }
-            }
+            let request = install_request(m)?;
             let payload = client
                 .request_cancellable(
                     request,
@@ -259,20 +263,67 @@ fn source_reference(source: &str, path: Option<&str>) -> Result<String> {
     }
     Ok(source)
 }
+fn install_request(m: &ArgMatches) -> Result<Value> {
+    let source = required(m, "source")?;
+    let release = source.starts_with("release:");
+    let path = string(m, "path");
+    let source = if release {
+        source.to_owned()
+    } else {
+        source_reference(source, path)?
+    };
+    if release {
+        if string(m, "version").is_none() || string(m, "sha256").is_none() {
+            return Err(anyhow!("Release installation requires --version and --sha256"));
+        }
+        if string(m, "ref").is_some() {
+            return Err(anyhow!("--ref applies to Git sources, not release archives"));
+        }
+    } else if ["version", "sha256", "format"].iter().any(|key| string(m, key).is_some()) {
+        return Err(anyhow!("--version, --sha256, and --format require a release: source; pin Cargo versions with cargo:<crate>@<version>"));
+    }
+    let mut request = json!({"type":"plugin.source.install.request","source":source});
+    if release {
+        if let Some(path) = path {
+            if !portable(path) {
+                return Err(anyhow!("Plugin path must be a portable path relative to the archive"));
+            }
+            request["pluginPath"] = json!(path);
+        }
+    }
+    for key in ["id", "ref", "version", "sha256", "format"] {
+        if let Some(value) = string(m, key).filter(|value| !value.is_empty()) {
+            request[key] = json!(value);
+        }
+    }
+    Ok(request)
+}
+
+fn update_target(m: &ArgMatches) -> Result<Option<Value>> {
+    if let Some(url) = string(m, "url") {
+        let mut target = json!({
+            "kind": "release",
+            "url": url,
+            "version": required(m, "version")?,
+            "sha256": required(m, "sha256")?,
+        });
+        if let Some(format) = string(m, "format") {
+            target["format"] = json!(format);
+        }
+        return Ok(Some(target));
+    }
+    Ok(string(m, "ref")
+        .map(|reference| json!({"kind":"git","ref":reference}))
+        .or_else(|| string(m, "version").map(|version| json!({"kind":"cargo","version":version}))))
+}
+
 async fn update(m: &ArgMatches, context: &Context, client: &DaemonClient) -> Result<Output> {
     let id = string(m, "id");
     let all = flag(m, "all");
     if id.is_some() == all {
         return Err(anyhow!("Choose one plugin ID or pass --all"));
     }
-    let reference = string(m, "ref");
-    let version = string(m, "version");
-    if reference.is_some() && version.is_some() {
-        return Err(anyhow!("Choose --ref or --version, not both"));
-    }
-    let target = reference
-        .map(|v| json!({"kind":"git","ref":v}))
-        .or_else(|| version.map(|v| json!({"kind":"npm","version":v})));
+    let target = update_target(m)?;
     if target.is_some() && all {
         return Err(anyhow!(
             "An explicit target requires one plugin ID, without --all"
@@ -386,10 +437,23 @@ pub(super) async fn init(m: &ArgMatches) -> Result<Output> {
         || !id.as_bytes()[0].is_ascii_lowercase()
         || !id
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
         return Err(anyhow!("Invalid plugin ID: {id}"));
     }
+    let version = env!("CARGO_PKG_VERSION");
+    let sdk = if let Some(path) = string(m, "sdk-path") {
+        let path = tokio::fs::canonicalize(path)
+            .await
+            .map_err(|error| anyhow!("Cannot resolve SDK directory {path}: {error}"))?;
+        if !tokio::fs::metadata(path.join("Cargo.toml")).await?.is_file() {
+            return Err(anyhow!("SDK directory must contain Cargo.toml"));
+        }
+        let path = path.to_str().ok_or_else(|| anyhow!("SDK path must be valid UTF-8"))?;
+        format!("{{ path = {}, version = \"={version}\" }}", serde_json::to_string(path)?)
+    } else {
+        format!("{{ git = \"https://github.com/emotionbug/paseo.git\", version = \"={version}\" }}")
+    };
     tokio::fs::create_dir_all(&directory).await?;
     if tokio::fs::read_dir(&directory)
         .await?
@@ -402,14 +466,30 @@ pub(super) async fn init(m: &ArgMatches) -> Result<Output> {
             directory.display()
         ));
     }
-    let version = env!("CARGO_PKG_VERSION");
-    let manifest = json!({"id":id,"media":[],"requirements":{"paseo":format!(">={version}")}});
-    let package = json!({"name":id,"private":true,"version":"0.0.0","files":["paseo-plugin.json","OVERVIEW.md","OVERVIEW.*.md","index.server.ts","server/","shared/"],"scripts":{"typecheck":"tsc --noEmit"},"devDependencies":{"@getpaseo/plugin":version,"typescript":"^5.9.3","zod":"^4.4.3"}});
-    let tsconfig = json!({"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","lib":["ES2023"],"strict":true,"skipLibCheck":true,"noEmit":true,"esModuleInterop":true,"allowSyntheticDefaultImports":true},"include":["**/*.ts"]});
-    let files=[("paseo-plugin.json",format!("{}\n",serde_json::to_string_pretty(&manifest)?)),("package.json",format!("{}\n",serde_json::to_string_pretty(&package)?)),("tsconfig.json",format!("{}\n",serde_json::to_string_pretty(&tsconfig)?)),("index.server.ts","import type { PluginServerContext } from \"@getpaseo/plugin/server\";\nimport { createGreeting } from \"./server/greeting\";\nimport { greetingRpc } from \"./shared/greeting\";\n\nexport default function contribute(server: PluginServerContext) {\n  server.handle(greetingRpc, createGreeting);\n  return () => {};\n}\n".into()),("shared/greeting.ts","import { defineRpc } from \"@getpaseo/plugin\";\nimport { z } from \"zod\";\n\nexport const greetingRpc = defineRpc({\n  name: \"greeting.create\",\n  input: z.object({ name: z.string() }),\n  output: z.object({ message: z.string() }),\n});\n".into()),("server/greeting.ts","import type { RpcInput } from \"@getpaseo/plugin\";\nimport { greetingRpc } from \"../shared/greeting\";\n\nexport function createGreeting({ name }: RpcInput<typeof greetingRpc>) {\n  return { message: \"Hello, \" + name + \"!\" };\n}\n".into())];
-    for name in ["server", "shared"] {
-        tokio::fs::create_dir(directory.join(name)).await?;
-    }
+    let executable = format!("target/release/paseo-plugin-server{}", std::env::consts::EXE_SUFFIX);
+    let manifest = json!({
+        "id": id,
+        "runtime": "native",
+        "server": {"executable": executable, "args": []},
+        "build": [["cargo", "build", "--release", "--target-dir", "target"]],
+        "media": [],
+        "requirements": {"paseo": format!(">={version}")}
+    });
+    let cargo = format!(
+        "[package]\nname = \"{id}\"\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"1.93\"\ninclude = [\"paseo-plugin.json\", \"OVERVIEW*.md\", \"README.md\", \"src/**\"]\n\n[[bin]]\nname = \"paseo-plugin-server\"\npath = \"src/main.rs\"\n\n[dependencies]\npaseo-plugin = {sdk}\nserde_json = \"1\"\ntokio = {{ version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }}\n\n[workspace]\n"
+    );
+    let readme = format!(
+        "# {id}\n\nA native Paseo plugin exposing the `greeting.create` RPC. Send `{{\"name\":\"World\"}}` to receive `{{\"message\":\"Hello, World!\"}}`.\n\n## Develop\n\nInstall Rust 1.93 or newer, then run these commands in this directory:\n\n```sh\ncargo build --release --target-dir target\n./{executable} --validate . {version}\npaseo plugin install .\n```\n\nOn Windows, invoke `.\\{windows_executable}` instead of `./{executable}`. Validation prints the registered contributions as JSON. Keep stdout reserved for the SDK protocol; use stderr for diagnostics.\n\nThe manifest's build command is also run during managed installation. After local edits, rebuild and run `paseo plugin reload {id}`. If moving the project between operating systems, update `server.executable` in `paseo-plugin.json` to include `.exe` on Windows and omit it elsewhere.\n\nBy default the SDK comes from the Paseo Git repository. For local SDK development, generate a new plugin with `paseo plugin init <directory> --sdk-path <paseo-checkout>/packages/plugin`; this writes an absolute path dependency instead. Local path dependencies must be replaced with a published SDK dependency before distributing the plugin.\n\nCommit Cargo.lock after the first build. Review dependency and build-script changes before installing or updating: native plugins run unsandboxed with the daemon user's privileges. Include `paseo-plugin.json`, the source, and your completed OVERVIEW.md when publishing a crate or Git repository. Cargo registry publication requires replacing Git/path SDK dependencies with the published `paseo-plugin` version.\n",
+        windows_executable = executable.replace('/', "\\")
+    );
+    let files = [
+        ("paseo-plugin.json", format!("{}\n", serde_json::to_string_pretty(&manifest)?)),
+        ("Cargo.toml", cargo),
+        ("src/main.rs", PLUGIN_MAIN.into()),
+        ("README.md", readme),
+        (".gitignore", "/target/\n".into()),
+    ];
+    tokio::fs::create_dir(directory.join("src")).await?;
     for (name, content) in files {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -428,9 +508,26 @@ pub(super) async fn init(m: &ArgMatches) -> Result<Output> {
         .columns(&[("PLUGIN", "id"), ("DIRECTORY", "directory")])
         .widths(&[20, 60]))
 }
+const PLUGIN_MAIN: &str = r#"use paseo_plugin::{Plugin, Result, anyhow};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut plugin = Plugin::new();
+    plugin.rpc("greeting.create", |input, _context| async move {
+        let name = input
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("greeting.create requires a string name"))?;
+        Ok(json!({"message": format!("Hello, {name}!")}))
+    })?;
+    plugin.run().await
+}
+"#;
+
 const OVERVIEW: &str = r#"<!--
 Use this file to describe your backend plugin for its registry listing. Keep it
-beside paseo-plugin.json at the pinned commit and in your npm package.
+beside paseo-plugin.json at the pinned commit and in your Cargo crate.
 Replace this comment with useful facts before publishing.
 
 This overview is for people choosing a plugin in Paseo, on the plugin page under
@@ -485,10 +582,117 @@ mod tests {
     #[test]
     fn managed_identity_has_explicit_source() {
         assert_eq!(
-            identity(&json!({"kind":"npm","packageName":"@scope/plugin","pluginPath":"."})),
-            "npm:@scope/plugin"
+            identity(&json!({"kind":"cargo","crateName":"review-plugin","pluginPath":"."})),
+            "cargo:review-plugin"
         );
     }
+    #[test]
+    fn native_update_selections_keep_explicit_release_pins() {
+        let cargo = command().try_get_matches_from([
+            "plugin", "update", "example", "--version", "1.2.3",
+        ]).unwrap();
+        assert_eq!(
+            update_target(cargo.subcommand_matches("update").unwrap()).unwrap(),
+            Some(json!({"kind":"cargo","version":"1.2.3"}))
+        );
+        let digest = "a".repeat(64);
+        let release = command().try_get_matches_from([
+            "plugin", "update", "example", "--url", "https://example.com/plugin.zip",
+            "--version", "1.2.3", "--sha256", &digest, "--format", "zip",
+        ]).unwrap();
+        assert_eq!(
+            update_target(release.subcommand_matches("update").unwrap()).unwrap(),
+            Some(json!({"kind":"release","url":"https://example.com/plugin.zip","version":"1.2.3","sha256":digest,"format":"zip"}))
+        );
+        assert!(command().try_get_matches_from([
+            "plugin", "update", "example", "--url", "https://example.com/plugin.zip",
+            "--version", "1.2.3",
+        ]).is_err());
+        assert!(command().try_get_matches_from([
+            "plugin", "update", "example", "--ref", "main", "--version", "1.2.3",
+        ]).is_err());
+    }
+
+    #[test]
+    fn release_install_requires_digest_and_rejects_cross_source_options() {
+        let digest = "b".repeat(64);
+        let release = command().try_get_matches_from([
+            "plugin", "install", "release:https://example.com/plugin.zip",
+            "--version", "1.2.3", "--sha256", &digest, "--format", "zip",
+        ]).unwrap();
+        let request = install_request(release.subcommand_matches("install").unwrap()).unwrap();
+        assert_eq!(request["source"], "release:https://example.com/plugin.zip");
+        assert_eq!(request["sha256"], digest);
+        assert_eq!(request["version"], "1.2.3");
+        for args in [
+            vec!["plugin", "install", "release:https://example.com/plugin.zip"],
+            vec!["plugin", "install", "cargo:example", "--version", "1.2.3"],
+        ] {
+            let matches = command().try_get_matches_from(args).unwrap();
+            assert!(install_request(matches.subcommand_matches("install").unwrap()).is_err());
+        }
+        let cargo = command().try_get_matches_from([
+            "plugin", "install", "cargo:example@1.2.3",
+        ]).unwrap();
+        assert_eq!(
+            install_request(cargo.subcommand_matches("install").unwrap()).unwrap()["source"],
+            "cargo:example@1.2.3"
+        );
+    }
+
+    #[test]
+    fn release_subpath_preserves_archive_url() {
+        let digest = "c".repeat(64);
+        let source = "release:https://example.com/plugin.zip?signature=part:one";
+        let matches = command().try_get_matches_from([
+            "plugin", "install", source, "--version", "1.2.3",
+            "--sha256", &digest, "--format", "zip", "--path", "archive/plugin",
+        ]).unwrap();
+        let request = install_request(matches.subcommand_matches("install").unwrap()).unwrap();
+        assert_eq!(request["source"], source);
+        assert_eq!(request["pluginPath"], "archive/plugin");
+        let matches = command().try_get_matches_from([
+            "plugin", "install", source, "--version", "1.2.3",
+            "--sha256", &digest, "--format", "zip", "--path", "../escape",
+        ]).unwrap();
+        assert!(install_request(matches.subcommand_matches("install").unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn generated_native_manifest_is_accepted_before_build() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("my-plugin");
+        let sdk = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin");
+        let matches = command().try_get_matches_from([
+            "plugin".to_owned(), "init".into(), directory.to_string_lossy().into_owned(),
+            "--sdk-path".into(), sdk.to_string_lossy().into_owned(),
+        ]).unwrap();
+        init(matches.subcommand_matches("init").unwrap()).await.unwrap();
+        let manifest = crate::plugins::read_plugin_manifest(&directory).await.unwrap();
+        assert_eq!(manifest["id"], "my-plugin");
+        assert_eq!(manifest["runtime"], "native");
+        assert_eq!(manifest["server"]["args"], json!([]));
+        assert_eq!(manifest["server"]["executable"],
+            format!("target/release/paseo-plugin-server{}", std::env::consts::EXE_SUFFIX));
+        assert_eq!(manifest["build"], json!([["cargo","build","--release","--target-dir","target"]]));
+        assert!(directory.join("Cargo.toml").is_file());
+        assert!(directory.join("src/main.rs").is_file());
+        assert!(!directory.join("package.json").exists());
+    }
+
+    #[tokio::test]
+    async fn initialization_rejects_unloadable_ids_without_creating_files() {
+        let root = tempfile::tempdir().unwrap();
+        for id in ["with.dot", "with_underscore"] {
+            let directory = root.path().join(id);
+            let matches = command().try_get_matches_from([
+                "plugin".to_owned(), "init".into(), directory.to_string_lossy().into_owned(),
+            ]).unwrap();
+            assert!(init(matches.subcommand_matches("init").unwrap()).await.is_err());
+            assert!(!directory.exists());
+        }
+    }
+
     #[tokio::test]
     async fn initialization_never_overwrites_existing_content() {
         let root = tempfile::tempdir().unwrap();

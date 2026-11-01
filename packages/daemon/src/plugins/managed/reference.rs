@@ -39,8 +39,13 @@ pub fn registry_id(id: &str) -> bool {
 }
 
 pub fn split(source: &str) -> (String, Option<String>) {
-    let (prefix, rest) = if let Some(rest) = source.strip_prefix("npm:") {
-        ("npm:", rest)
+    // Release URLs may contain colons in their path/query. Nested directories
+    // use the explicit pluginPath field rather than ambiguous URL suffixes.
+    if source.starts_with("release:") {
+        return (source.to_owned(), None);
+    }
+    let (prefix, rest) = if let Some(rest) = source.strip_prefix("cargo:") {
+        ("cargo:", rest)
     } else if let Some(rest) = source.strip_prefix("github:") {
         ("github:", rest)
     } else if source.starts_with("git:") && !source.starts_with("git://") {
@@ -55,7 +60,7 @@ pub fn split(source: &str) -> (String, Option<String>) {
                 .find('/')
                 .is_some_and(|start| separator >= scheme + 3 + start)
         } else {
-            prefix == "npm:" || !base.contains('@') || base.contains(':') || base.contains('/')
+            prefix == "cargo:" || !base.contains('@') || base.contains(':') || base.contains('/')
         };
         if portable(path) && scheme_ok {
             return (format!("{prefix}{base}"), Some(path.to_owned()));
@@ -139,27 +144,14 @@ pub fn redact(remote: &str) -> String {
 pub fn links(current: &Value, target: &Value) -> Vec<String> {
     let identity = &current["identity"];
     let revision = current["currentRevision"].as_str().unwrap_or_default();
-    if identity["kind"] == "npm" && target["kind"] == "npm" {
-        if url::Url::parse(target["resolved"].as_str().unwrap_or_default())
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .as_deref()
-            == Some("registry.npmjs.org")
-        {
-            return [revision, target["version"].as_str().unwrap_or_default()]
-                .iter()
-                .map(|v| {
-                    format!(
-                        "https://www.npmjs.com/package/{}/v/{}",
-                        identity["packageName"].as_str().unwrap_or_default(),
-                        percent_encoding::utf8_percent_encode(
-                            v,
-                            percent_encoding::NON_ALPHANUMERIC
-                        )
-                    )
-                })
-                .collect();
-        }
+    if identity["kind"] == "cargo" && target["kind"] == "cargo" {
+        return [revision, target["version"].as_str().unwrap_or_default()]
+            .iter()
+            .map(|version| format!("https://crates.io/crates/{}/{version}", identity["crateName"].as_str().unwrap_or_default()))
+            .collect();
+    }
+    if identity["kind"] == "release" && target["kind"] == "release" {
+        return target["url"].as_str().map(|url| vec![url.to_owned()]).unwrap_or_default();
     }
     if identity["kind"] == "git" && target["kind"] == "git" {
         let remote = identity["remote"].as_str().unwrap_or_default();

@@ -122,7 +122,7 @@ Compose 和反向代理的示例见 [Docker](/docs/docker)。
 
 Flutter 桌面客户端不包含 Electron 或 Chromium，Chromium 沙盒参数及辅助程序安装说明不适用。这并不隔离 Agent：Provider 和脚本/设置任务 PTY 拥有 daemon 用户的文件系统与凭据访问权限。客户端提供只读任务日志，不提供交互式终端 UI。
 
-内置集成在 Rust 中运行。可选 JavaScript 后端插件通过外部安装的 Node 20+ 执行受信任代码（可用 `PASEO_PLUGIN_NODE` 选择）。独立 worker 进程不是安全沙盒，只安装可信插件。原生产品不包含可执行 React UI 插件或内嵌浏览器自动化。
+内置集成在 Rust 中运行。原生后端插件以 daemon 用户权限在独立进程中执行受信任代码。进程隔离不是安全沙盒，只安装可信插件。原生产品不包含可执行 React UI 插件或内嵌浏览器自动化。
 
 ## Agent 身份验证 {#agent-authentication}
 
@@ -132,7 +132,7 @@ Paseo 封装了 Agent CLI（Claude Code、Codex、OpenCode、Muse Code），但�
 - **Codex**：使用你的 OpenAI API 密钥或 OAuth 会话
 - **OpenCode**：通过各 Provider 专用的 API 密钥配置
 
-Agent 在你的用户上下文中使用现有凭据运行。Paseo 也会读取显式配置的 Provider 凭据，包括 OpenAI 语音密钥，因此应将 `config.json`、daemon 环境和备份视为敏感状态保护。这些凭据与中继配对及 Hub 注册不同。
+Agent 在你的用户上下文中使用现有凭据运行。`config.json`、daemon 环境和备份可能包含 Provider 凭据，应作为敏感状态保护。这些凭据与中继配对及 Hub 注册不同。
 
 ## Hub 身份与凭据 {#hub-identities-and-credentials}
 

@@ -1,8 +1,6 @@
 use super::*;
-use crate::{
-    relay_crypto::{Frame, InitiatorOptions, SecureChannel, SecurityMode},
-    transport::OutboundFrame,
-};
+use crate::transport::OutboundFrame;
+use paseo_protocol::crypto::{Frame, InitiatorOptions, SecureChannel, SecurityMode};
 
 #[test]
 fn control_messages_preserve_source_normalization() {
@@ -173,9 +171,9 @@ fn malformed_protected_hello_cannot_fall_back_to_legacy() {
 #[test]
 fn wire_budget_counts_base64_and_protected_chunk_expansion() {
     let (_, server, _) = protected_pair();
-    let length = crate::relay_crypto::MAX_CHUNK_DATA_BYTES + 1;
+    let length = paseo_protocol::crypto::MAX_CHUNK_DATA_BYTES + 1;
     let text = Frame::Text("a".repeat(length));
-    let record_length = crate::relay_crypto::protected_record_byte_length(length).unwrap();
+    let record_length = paseo_protocol::crypto::protected_record_byte_length(length).unwrap();
     assert_eq!(
         server.outbound_wire_byte_length(&text).unwrap(),
         record_length.div_ceil(3) * 4

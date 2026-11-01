@@ -1,11 +1,9 @@
-# ACP provider transformer example
+# ACP provider transformer migration notes
 
-This server plugin registers an ACP command through `runAcpProvider()`. The helper owns ACP process
-and SDK details behind Paseo's callback-based provider connection.
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-`server/vendor-edit.ts` shows the intended extension seam: a focused transformer converts one
-vendor tool payload into Paseo's ordinary file-edit shape. It does not translate the whole event
-stream.
+The former example used the JavaScript `runAcpProvider` convenience helper and a vendor edit transformer. Port that behavior to `paseo_plugin::acp::AcpProvider` and `AcpTransformer`; the native SDK supplies ACP transport, session/permission mapping, cancellation and cleanup. Register it with `Plugin::provider`, using the actual installed agent command or an owned asynchronous stream. The [ACP guide](../../public-docs/plugins/providers.md#adapt-an-acp-agent) describes configuration and vendor extension hooks. Validate vendor payloads and leave unrelated/malformed values unchanged. This directory itself has not been ported; do not launch its old worker or substitute a placeholder agent command.
 
-Replace the placeholder `example-acp --stdio` command with an installed ACP agent before enabling
-the plugin.
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
+
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

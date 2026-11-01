@@ -10,7 +10,7 @@ category: Getting started
 
 The native container runs the Rust daemon and CLI for servers and development hosts. Connect with a remote Flutter desktop/mobile client or the CLI; it does not serve a web product client or include Node, Electron, Chromium, or embedded browser automation.
 
-The 0.13.0 native migration checkout is unpublished. Published `latest` images are not evidence of this runtime. Build a local image from this checkout:
+This guide describes the 0.13.1 source checkout, not a publication announcement. Published `latest` images are not evidence of this runtime. Build a local image from this checkout:
 
 ```bash
 docker build -f docker/base/Dockerfile -t paseo-native:local .
@@ -71,7 +71,7 @@ docker compose up -d
 
 Use the existing [`docker/Dockerfile.agents.example`](https://github.com/getpaseo/paseo/blob/main/docker/Dockerfile.agents.example) as a starting point, setting its base image to your local native image. Install each provider using its supported distribution and include any runtime it requires. The base runtime has no `node` or `npm`, so an npm-based provider installation requires explicitly adding those tools to your child image first.
 
-Optional JavaScript backend plugins likewise require an externally installed Node 20+ runtime, selected with `PASEO_PLUGIN_NODE` when needed. This is not required by built-in Rust integrations. Repository builds use Node 24.
+Backend plugins use native executables built with the Rust `paseo-plugin` SDK for the container's target architecture. Existing JavaScript/TypeScript plugins need porting. Paseo's repository build and plugin runtime do not require Node.
 
 Use the resulting child image in Compose.
 

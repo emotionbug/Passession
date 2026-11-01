@@ -23,8 +23,7 @@ pub fn commands() -> Vec<Command> {
             .arg(switch("no-relay", "no-relay"))
             .arg(switch("no-mcp", "no-mcp"))
             .arg(option("hostnames", "hostnames").alias("allowed-hosts"))
-            .arg(option("timeout", "timeout"))
-            .arg(option("voice", "voice").value_parser(["ask", "enable", "disable"])),
+            .arg(option("timeout", "timeout")),
     ]
 }
 pub async fn execute(
@@ -43,7 +42,7 @@ pub async fn execute(
     Ok(Some(result))
 }
 pub(crate) fn error(code: &str, message: impl Into<String>) -> anyhow::Error {
-    crate::client::ClientError::new(code, message).into()
+    paseo_client::ClientError::new(code, message).into()
 }
 pub(crate) fn duration(
     matches: &ArgMatches,

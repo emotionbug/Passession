@@ -46,7 +46,7 @@ pub async fn resolve(identity: &Value, options: &Value, install: bool) -> Result
     if install {
         request = request.header("X-Paseo-Install", "1");
     }
-    let mut response = request.send().await.map_err(|_| anyhow::anyhow!("Could not reach plugin registry {url}. {}", if install { format!("Plugin {id} was not installed. Retry or use an explicit npm: or github: source.") } else { format!("Could not check updates for {id}. Retry later.") }))?;
+    let mut response = request.send().await.map_err(|_| anyhow::anyhow!("Could not reach plugin registry {url}. {}", if install { format!("Plugin {id} was not installed. Retry or use an explicit cargo:, release:, or github: source.") } else { format!("Could not check updates for {id}. Retry later.") }))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         bail!(
             "Plugin {id} was not found in registry {host}. {}",
@@ -73,6 +73,10 @@ pub async fn resolve(identity: &Value, options: &Value, install: bool) -> Result
         bytes.extend_from_slice(&chunk);
     }
     let document: Value = serde_json::from_slice(&bytes).context("Invalid registry JSON")?;
+    resolve_document(id, &document)
+}
+
+pub(super) fn resolve_document(id: &str, document: &Value) -> Result<Resolved> {
     if document["id"] != id {
         bail!("Registry returned a different plugin ID");
     }
@@ -81,32 +85,35 @@ pub async fn resolve(identity: &Value, options: &Value, install: bool) -> Result
         .context("Registry artifact is missing")?
         .clone();
     let (input, target) = match string(&artifact, "kind")? {
-        "npm" => {
-            let name = string(&artifact, "package")?;
+        "cargo" => {
+            let name = string(&artifact, "crate")?;
             let version = string(&artifact, "version")?;
-            let (parsed, _) = super::npm::parse(name)?;
-            if parsed != name {
-                bail!("Invalid registry npm package");
+            let source = format!("cargo:{name}@{version}");
+            let (parsed, _) = super::cargo::parse(&source)?;
+            if parsed != name { bail!("Invalid registry Cargo crate"); }
+            let target = json!({"kind":"cargo","version":version,"checksum":string(&artifact,"checksum")?,"resolved":string(&artifact,"resolved")?});
+            super::cargo::validate(&target)?;
+            if target["resolved"] != super::cargo::download_url(name, version) {
+                bail!("Registry Cargo artifact URL does not match its crate and version");
             }
-            semver::Version::parse(version).context("Invalid registry npm version")?;
-            let resolved = string(&artifact, "resolved")?;
-            url::Url::parse(resolved)?;
-            let integrity = string(&artifact, "integrity")?;
-            let digest = integrity
-                .strip_prefix("sha512-")
-                .context("Registry npm integrity requires sha512")?;
-            if digest.is_empty()
-                || !digest
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
-            {
-                bail!("Invalid registry npm integrity");
+            let mut input = json!({"source":source});
+            if let Some(path) = artifact.get("pluginPath") {
+                plugin_path(Some(path.as_str().context("Invalid registry pluginPath")?))?;
+                input["pluginPath"] = path.clone();
             }
-            (
-                json!({"source":format!("npm:{name}@{version}")}),
-                json!({"kind":"npm","version":version,"resolved":resolved,"integrity":integrity}),
-            )
+            (input, target)
         }
+        "release" => {
+            let target = super::release::target(&artifact, string(&artifact, "url")?)?;
+            let mut input = target.clone();
+            input["source"] = json!(format!("release:{}",string(&target,"url")?));
+            if let Some(path) = artifact.get("pluginPath") {
+                plugin_path(Some(path.as_str().context("Invalid registry pluginPath")?))?;
+                input["pluginPath"] = path.clone();
+            }
+            (input, target)
+        }
+        "npm" => bail!("This registry entry still targets npm/JavaScript. Ask its publisher for a native Rust Cargo, Git, or release artifact; no plugin was installed."),
         "git" => {
             let remote = string(&artifact, "remote")?;
             let commit = string(&artifact, "commit")?;
@@ -137,8 +144,12 @@ pub async fn resolve(identity: &Value, options: &Value, install: bool) -> Result
 }
 
 pub fn assert_identity(identity: &Value, artifact: &Value) -> Result<()> {
-    let matches = if identity["kind"] == "npm" && artifact["kind"] == "npm" {
-        identity["packageName"] == artifact["package"] && identity["pluginPath"] == "."
+    let matches = if identity["kind"] == "cargo" && artifact["kind"] == "cargo" {
+        identity["crateName"] == artifact["crate"]
+            && identity["pluginPath"].as_str() == Some(artifact["pluginPath"].as_str().unwrap_or("."))
+    } else if identity["kind"] == "release" && artifact["kind"] == "release" {
+        identity["origin"].as_str() == Some(super::release::origin(string(artifact, "url")?)?.as_str())
+            && identity["pluginPath"].as_str() == Some(artifact["pluginPath"].as_str().unwrap_or("."))
     } else if identity["kind"] == "git" && artifact["kind"] == "git" {
         identity["remote"].as_str()
             == Some(super::reference::redact(string(artifact, "remote")?).as_str())

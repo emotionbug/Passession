@@ -12,7 +12,7 @@ import '../../core/client.dart';
 import '../../core/json.dart';
 
 /// Original session-context `BufferedAudioChunk`.
-typedef AudioOutputChunk = ({int chunkIndex, String audio, String format, String id});
+typedef AudioOutputChunk = ({int chunkIndex, String audio, String format});
 
 /// Original `buildAudioPlaybackSource` MIME rule: daemon formats are bare
 /// names; `pcm` is 24 kHz PCM16.
@@ -24,7 +24,9 @@ String audioOutputMimeType(String format) => switch (format) {
 
 /// Original `buildAudioPlaybackSource`: the group's chunks in index order,
 /// concatenated into one source typed by the first chunk's format.
-({Uint8List bytes, String mimeType}) buildAudioPlaybackSource(List<AudioOutputChunk> chunks) {
+({Uint8List bytes, String mimeType}) buildAudioPlaybackSource(
+  List<AudioOutputChunk> chunks,
+) {
   final ordered = [...chunks]..sort((a, b) => a.chunkIndex - b.chunkIndex);
   final builder = BytesBuilder(copy: false);
   for (final chunk in ordered) {
@@ -38,7 +40,10 @@ String audioOutputMimeType(String format) => switch (format) {
 
 /// Original `audio/pcm` `parsePcmSampleRate`.
 int? parsePcmSampleRate(String mimeType) {
-  final match = RegExp(r'rate=(\d+)', caseSensitive: false).firstMatch(mimeType);
+  final match = RegExp(
+    r'rate=(\d+)',
+    caseSensitive: false,
+  ).firstMatch(mimeType);
   final rate = match == null ? null : int.tryParse(match.group(1)!);
   return rate != null && rate > 0 ? rate : null;
 }
@@ -92,7 +97,9 @@ class AudioService extends ChangeNotifier {
     _removeOpenHook?.call();
     _removeCloseHook?.call();
     _audioEvents ??= _engine.events.listen(_onAudioEvent);
-    _removeOpenHook = store.registerClientOpenHook((client, _) => forClient(client));
+    _removeOpenHook = store.registerClientOpenHook(
+      (client, _) => forClient(client),
+    );
     _removeCloseHook = store.registerClientCloseHook((client) async {
       await _services[client]?.close();
     });
@@ -125,16 +132,14 @@ class AudioService extends ChangeNotifier {
 
   /// The platform took the audio session away: nothing queued may resume.
   static void _onAudioEvent(AudioEngineEvent event) {
-    if ((event.type == 'audioFocus' || event.type == 'interruption') && event.state == 'blocked') {
+    if ((event.type == 'audioFocus' || event.type == 'interruption') &&
+        event.state == 'blocked') {
       unawaited(_engine.cancelPlayback().catchError((Object _) {}));
     }
   }
 
-  /// Original `audio_output` handler: chunks buffer per group until the final
-  /// one (`isLastChunk` defaults to true), then the group plays as one source
-  /// and every chunk id is confirmed, whether or not playback succeeded.
-  /// Voice-mode audio belongs to the voice runtime this client excludes, so it
-  /// is confirmed without playing (the original's no-voice-runtime branch).
+  /// Chunks buffer per group until the final one (`isLastChunk` defaults to
+  /// true), then the group plays as one source.
   void _onMessage(JsonMap message) {
     if (_disposed || message['type'] != 'audio_output') return;
     final payload = jsonMap(message['payload']);
@@ -145,37 +150,36 @@ class AudioService extends ChangeNotifier {
       chunkIndex: intValue(payload['chunkIndex']),
       audio: stringValue(payload['audio']),
       format: stringValue(payload['format']),
-      id: id,
     ));
     if (payload['isLastChunk'] == false) return;
-    unawaited(_playGroup(groupId, [...chunks], voiceMode: payload['isVoiceMode'] == true));
+    unawaited(_playGroup(groupId, [...chunks]));
   }
 
-  Future<void> _playGroup(String groupId, List<AudioOutputChunk> chunks, {required bool voiceMode}) async {
+  Future<void> _playGroup(String groupId, List<AudioOutputChunk> chunks) async {
     try {
-      if (!voiceMode) {
-        final source = buildAudioPlaybackSource(chunks);
-        await playAudio(source.bytes, mimeType: source.mimeType);
-      }
+      final source = buildAudioPlaybackSource(chunks);
+      await playAudio(source.bytes, mimeType: source.mimeType);
     } catch (failure) {
       _failure(failure);
     } finally {
       _buffers.remove(groupId);
-      if (!_disposed && client.status == ConnectionStatus.connected) {
-        for (final chunk in chunks) {
-          client.send('audio_played', {'id': chunk.id});
-        }
-      }
     }
   }
 
   /// Plays one source after everything already queued; completes when it has
   /// finished playing. PCM is resampled to the engine's 16 kHz (original
   /// `playPcm16`, 24 kHz when the type names no rate).
-  static Future<void> playAudio(Uint8List bytes, {required String mimeType}) async {
+  static Future<void> playAudio(
+    Uint8List bytes, {
+    required String mimeType,
+  }) async {
     final id = const Uuid().v4();
     if (mimeType.toLowerCase().startsWith('audio/pcm')) {
-      final pcm = resamplePcm16(bytes, parsePcmSampleRate(mimeType) ?? 24000, 16000);
+      final pcm = resamplePcm16(
+        bytes,
+        parsePcmSampleRate(mimeType) ?? 24000,
+        16000,
+      );
       await _engine.enqueuePlayback(id: id, pcm16: pcm, sampleRate: 16000);
     } else {
       await _engine.playEncoded(id: id, bytes: bytes, mimeType: mimeType);

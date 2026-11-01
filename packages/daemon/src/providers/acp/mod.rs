@@ -5,13 +5,11 @@ mod terminal;
 mod tests;
 
 use crate::providers::registry::catalog::refresh_activity;
-use crate::{
-    process::CommandSpec,
-    providers::api::{
-        AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
-        RewindTarget,
-    },
-};
+use paseo_client::process::CommandSpec;
+use crate::{ providers::api::{
+    AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
+    RewindTarget,
+}, };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use mapping::*;
@@ -1533,9 +1531,6 @@ impl AgentSession for AcpSession {
     }
     async fn rewind(&self, _target: RewindTarget, _message_id: &str) -> Result<()> {
         bail!("{} ACP adapter does not support rewind", self.provider())
-    }
-    async fn try_out_of_band(&self, _prompt: &Value) -> Result<bool> {
-        Ok(false)
     }
 }
 

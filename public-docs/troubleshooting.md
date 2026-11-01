@@ -69,7 +69,7 @@ An OS launcher, service manager, container, or remote host can supply a differen
 
 Use the affected daemon's provider diagnostic rather than assuming the Flutter app imports your interactive shell configuration. Start a foreground instance with `paseo daemon run` to use your terminal's launch environment. Managed `paseo daemon start` intentionally removes daemon-setting overrides; save those settings in `config.json`.
 
-Ensure provider binaries are on the daemon's launch `PATH`, or configure an absolute provider `command`. If you change the launch environment, stop and relaunch the owning supervisor; a worker restart retains its original environment. Optional JavaScript backend plugins need external Node 20+ (`PASEO_PLUGIN_NODE`), not a bundled Node runtime.
+Ensure provider binaries are on the daemon's launch `PATH`, or configure an absolute provider `command`. If you change the launch environment, stop and relaunch the owning supervisor; a worker restart retains its original environment. Native plugin executables must match the daemon host's OS and architecture and stay within their plugin directory. JavaScript/TypeScript plugins need porting, not a Node runtime setting.
 
 ## Reading the logs
 

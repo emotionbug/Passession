@@ -1,270 +1,152 @@
----
-title: SDK API reference
-description: Public configuration, methods, handles, results, defaults, and lifecycle behavior for @getpaseo/client.
-nav: API reference
-order: 58
-category: TypeScript SDK
----
-
 # SDK API reference
 
-Import every supported runtime value and TypeScript type from `@getpaseo/client`.
+[中文](reference.zh-CN.md) · [Dependency and Tokio setup](quickstart.md)
 
-## `createPaseoClient(config)`
+The Rust public roots are `paseo_client`, `paseo_protocol`, and `paseo_highlight`. See [client source](../../packages/client/src/lib.rs), [operation mappings](../../packages/client/src/operations.rs), and [subscription types](../../packages/client/src/subscriptions.rs). JSON operation arguments and response payloads are `serde_json::Value`, preserving provider/plugin extension fields. There are no implicit agent/workspace facade objects.
 
-Creates a client without opening the connection.
+## Connection and authentication
 
-Required configuration:
+```rust
+use anyhow::Result;
+use paseo_client::{ConnectOptions, DaemonClient, DaemonTarget};
+use tokio_util::sync::CancellationToken;
 
-| Field | Type     | Meaning                                     |
-| ----- | -------- | ------------------------------------------- |
-| `url` | `string` | Daemon WebSocket endpoint, including `/ws`. |
-
-Common optional configuration:
-
-| Field                   | Type          | Default        | Meaning                                          |
-| ----------------------- | ------------- | -------------- | ------------------------------------------------ |
-| `clientId`              | `string`      | Generated      | Stable identifier for logs and subscriptions.    |
-| `password`              | `string`      | Unset          | Daemon password.                                 |
-| `authHeader`            | `string`      | Unset          | Complete authorization-header value for a proxy. |
-| `connectTimeoutMs`      | `number`      | Client default | Connection deadline.                             |
-| `reconnect.enabled`     | `boolean`     | Client default | Reconnect after an unexpected disconnect.        |
-| `reconnect.baseDelayMs` | `number`      | Client default | Initial reconnect delay.                         |
-| `reconnect.maxDelayMs`  | `number`      | Client default | Maximum reconnect delay.                         |
-| `logger`                | `PaseoLogger` | Unset          | Debug, info, warning, and error sink.            |
-
-Relay E2EE clients can also pass `e2ee.enabled` and `e2ee.daemonPublicKeyB64`. `appVersion`, `runtimeGeneration`, and runtime-metrics options exist for Paseo client surfaces; ordinary integrations can omit them.
-
-## Client lifecycle
-
-| Method                 | Result            | Behavior                                                                  |
-| ---------------------- | ----------------- | ------------------------------------------------------------------------- |
-| `connect()`            | `Promise<void>`   | Resolves after the daemon sends its server information.                   |
-| `close()`              | `Promise<void>`   | Closes the connection and disposes this client.                           |
-| `ensureConnected()`    | `void`            | Throws unless the client is connected.                                    |
-| `getConnectionState()` | `ConnectionState` | Returns `idle`, `connecting`, `connected`, `disconnected`, or `disposed`. |
-
-Create a new client after `close()`.
-
-## `client.agents`
-
-| Method               | Result                 | Behavior                                                                                                     |
-| -------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `list(options?)`     | `PaseoAgentListResult` | Lists a page of agents. `scope`, `filter`, `sort`, `page`, and `subscribe` match the daemon directory query. |
-| `create(options)`    | `PaseoAgentHandle`     | Creates an agent and a fresh workspace for `cwd`. Requires `config`.                                         |
-| `ref(agentOrId)`     | `PaseoAgentHandle`     | Creates a local handle without fetching.                                                                     |
-| `subscribe(handler)` | Unsubscribe function   | Local listener for this API instance. Requires an owned `list({ subscribe: {} })` observation.               |
-
-`list({ subscribe: {} })` also returns a `subscriptionId` and an owned `subscription`. Its `subscribe({ snapshot, update, error? })` callbacks receive the snapshot before scoped wire updates; `release()` ends that observation. Capable daemons assign the ID and keep observations independent. Older daemons use local IDs and their established shared delivery behavior. Plain lists create no observation. The same contract applies to workspace lists. See [events](./events.md).
-
-Creation options include `config`, `cwd`, `parent`, `title`, `prompt`, `env`, `outputSchema`, `images`, `attachments`, `git`, `worktree`, `autoArchive`, `background`, and `labels`.
-
-`parent` accepts a host-local agent ID, an `AgentAddress` (`{ serverId, agentId }`), or an agent handle. A handle’s `address` keeps its host identity after disconnect. When creating through `hosts.client(serverId)`, pass the parent handle or complete address; the SDK carries parent metadata to the destination.
-
-`background` is workspace creation intent. It cannot accompany an existing `workspaceId`.
-See [background workspaces](./workspaces.md) for caller inheritance and inclusive discovery.
-
-`config` accepts:
-
-| Field              | Type                      | Meaning                                                                                           |
-| ------------------ | ------------------------- | ------------------------------------------------------------------------------------------------- |
-| `provider`         | `string`                  | Required `provider/model` selection.                                                              |
-| `modeId`           | `string`                  | Provider operating or permission mode.                                                            |
-| `thinkingOptionId` | `string`                  | Provider reasoning level.                                                                         |
-| `featureValues`    | `Record<string, unknown>` | Values for features discovered through `providers.listFeatures`.                                  |
-| `options`          | JSON object               | Provider-native settings, strictly validated. See [Provider options](/docs/sdk/provider-options). |
-| `systemPrompt`     | `string`                  | Additional system or developer instructions.                                                      |
-| `mcpServers`       | MCP server map            | Session-scoped MCP servers.                                                                       |
-| `toolPolicy`       | MCP tool policy           | Exact preapproval rules for MCP tools.                                                            |
-
-### Agent handle
-
-| Member                         | Result                            | Behavior                                                                                                |
-| ------------------------------ | --------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `id`                           | `string`                          | Stable daemon agent ID.                                                                                 |
-| `address`                      | `AgentAddress`                    | Complete `{ serverId, agentId }` identity; requires a connected host to establish it.                   |
-| `workspaceId`                  | `string \| null`                  | Current workspace placement.                                                                            |
-| `cwd`                          | `string \| null`                  | Current working directory.                                                                              |
-| `status`                       | Agent status or `null`            | Current lifecycle status.                                                                               |
-| `capabilities`                 | Capability flags or `null`        | What the provider session supports.                                                                     |
-| `availableModes`               | Agent modes or `null`             | Modes the session can switch to.                                                                        |
-| `pendingPermissions`           | Permission requests or `null`     | Requests waiting on an answer.                                                                          |
-| `activeTurn`                   | Active turn or `null`             | The turn in flight, with `turnId` and `startedAt`.                                                      |
-| `lastUsage`                    | Usage or `null`                   | Token counts, cost, and context-window use from the last turn.                                          |
-| `lastError`                    | `string \| null`                  | Last error the daemon recorded for the agent.                                                           |
-| `features`                     | Agent features or `null`          | Provider feature toggles and selects with their current values.                                         |
-| `runtimeInfo`                  | Runtime info or `null`            | Live provider, session ID, model, thinking option, and mode.                                            |
-| `archivedAt`                   | `string \| null`                  | Archive timestamp; `null` while the agent is active.                                                    |
-| `current()`                    | `PaseoAgent \| null`              | Current detailed value observed by this handle; never fetches.                                          |
-| `refresh(requestId?)`          | `PaseoAgentRefetchResult \| null` | Fetches the current agent and project placement.                                                        |
-| `send(text, options?)`         | `Promise<void>`                   | Resolves when the daemon accepts the prompt.                                                            |
-| `respondToPermission(options)` | `Promise<void>`                   | Answers a pending permission by `requestId` with an allow or deny `response`.                           |
-| `run(text, options?)`          | `PaseoAgentRunResult`             | Sends a prompt and waits for that turn. `timeoutMs` controls the wait; it defaults to 10 minutes.       |
-| `waitForFinish(timeoutMs?)`    | `PaseoAgentRunResult`             | Waits for the active turn, including an initial prompt. Default timeout: 10 minutes.                    |
-| `commands(options?)`           | `PaseoAgentCommandsResult`        | Asks the live session for its slash commands and skills, including built-in ones. Options: `requestId`. |
-| `subscribe(handler)`           | Unsubscribe function              | Filters agent-directory updates to this ID and refreshes the handle properties.                         |
-| `archive()`                    | `{ archivedAt }`                  | Soft-deletes the agent and closes its runtime.                                                          |
-| `detach()`                     | `Promise<void>`                   | Removes the parent relationship without stopping the agent.                                             |
-
-`workspaceId` through `archivedAt` mirror the last snapshot the handle observed. A handle from `ref()` reads `null` for all of them until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Call `current()` when you need the whole snapshot or need to distinguish those states.
-
-`PaseoAgentRunResult` contains `status`, `final`, `error`, and `lastMessage`. `final` refreshes the handle when present.
-
-`PaseoAgentCommandsResult` contains `agentId`, `commands`, and `error`. Each command has `name`, `description`, `argumentHint`, and an optional `kind` of `"command"` or `"skill"`. A provider that cannot answer reports it in `error` rather than rejecting; providers that expose no command list at all return an empty array.
-
-### Timeline handle
-
-`agent.timeline.refetch(options?)` fetches a page. Options are `direction`, `cursor`, `limit`, `projection`, and `requestId`.
-
-`agent.timeline.subscribe(handler)` establishes network demand for this agent and restores it after reconnect. Its unsubscribe function releases that demand; await `unsubscribe.ready` for initial daemon acknowledgement before starting work. Delivery is live-only. Reconnect emits a local `subscription_restored` event; request missed history explicitly with `refetch()`. A live replacement invalidates the previous epoch. See the callback shapes, paging and failure behavior in [timeline events](./events.md#follow-timeline-events).
-
-## `client.projects`
-
-| Method               | Result                   | Behavior                                                                                       |
-| -------------------- | ------------------------ | ---------------------------------------------------------------------------------------------- |
-| `list(options?)`     | `PaseoProjectListResult` | Lists every registered project, including projects with no active workspaces.                  |
-| `subscribe(handler)` | Unsubscribe function     | Requests future project updates; unsubscribe releases demand. `list()` supplies initial state. |
-
-See [events](./events.md#follow-provider-catalog-changes) for explicit event observation and cleanup.
-
-## `client.workspaces`
-
-| Method                   | Result                        | Behavior                                                                                                                 |
-| ------------------------ | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `list(options?)`         | `PaseoWorkspaceListResult`    | Lists, filters, pages, or subscribes to the workspace directory.                                                         |
-| `open(cwd)`              | `PaseoWorkspaceHandle`        | Reuses the active workspace for a directory or creates one.                                                              |
-| `create(options)`        | `PaseoWorkspaceHandle`        | Always creates a fresh directory-backed or Paseo-worktree workspace. `background: true` hides it from default discovery. |
-| `ref(workspaceOrId)`     | `PaseoWorkspaceHandle`        | Creates a local handle.                                                                                                  |
-| `archive(workspaceOrId)` | `PaseoWorkspaceArchiveResult` | Archives without first creating a handle.                                                                                |
-| `subscribe(handler)`     | Unsubscribe function          | Local listener for this API instance. Requires an owned `list({ subscribe: {} })` observation.                           |
-
-`create({ source, agent, background })` creates a workspace and its initial agent together.
-`agent` accepts agent creation options except `worktree`, `git`, `onEvent`, `idempotencyKey`,
-and `requestId`. Set `background` on the workspace options; `agent.background` is rejected.
-See the [combined creation example](./agents.md#run-work-in-a-background-workspace).
-
-A workspace handle exposes `id`, `projectId`, `directory`, `name`, `status`, `current()`, `refresh()`, `setTitle(title)`, `archive()`, and `subscribe()`. Pass `null` to `setTitle` to restore the derived workspace name. Use `workspace.agents.create(options)` to create an agent without repeating the workspace ID or directory.
-
-## `client.terminals`
-
-Terminal operations control retained daemon-side PTYs for script/setup automation, not an interactive terminal UI in Flutter. The native client presents read-only logs. These APIs require a host that supports workspace terminals; an older host receives no terminal request and the SDK throws an update-host error.
-
-| Method              | Result                             | Behavior                                                                           |
-| ------------------- | ---------------------------------- | ---------------------------------------------------------------------------------- |
-| `create(options)`   | `Promise<PaseoTerminalHandle>`     | Creates a terminal owned by the required `workspaceId`.                            |
-| `list(options?)`    | `Promise<PaseoTerminalListResult>` | Returns `{ entries, requestId }`. Omit filters to list all terminals on this host. |
-| `ref(terminalOrId)` | `PaseoTerminalHandle`              | Creates a local handle without fetching or attaching a terminal stream.            |
-
-Creation options:
-
-| Field             | Meaning                                                                                                                  |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `workspaceId`     | Required active workspace ID. Unknown and archived IDs fail.                                                             |
-| `cwd`             | Optional absolute process working directory. Defaults to the workspace directory; changing it does not change ownership. |
-| `name`            | Optional terminal name.                                                                                                  |
-| `command`, `args` | Optional executable and argument array. Omit them to start the default shell.                                            |
-| `size`            | Optional initial viewport: `{ rows, cols }`.                                                                             |
-| `requestId`       | Optional request correlation ID.                                                                                         |
-
-List options are `workspaceId`, `cwd`, and `requestId`. `workspaceId` selects ownership, including terminals started outside the workspace directory. When it is present, `cwd` does not restrict the results. Without an ID, `cwd` filters by workspace root directory. Each entry contains `id`, `workspaceId`, `cwd`, and `name`; `cwd` is the terminal's actual starting directory.
-
-Terminal handles expose:
-
-| Method              | Result                                | Behavior                                                                                         |
-| ------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `current()`         | `PaseoTerminal \| null`               | Last snapshot from creation, `ref(snapshot)`, or refresh. A handle made from an ID starts empty. |
-| `refresh(options?)` | `Promise<PaseoTerminal \| null>`      | Fetches the terminal snapshot, or `null` when it no longer exists. Accepts `requestId`.          |
-| `write(data)`       | `number`                              | Sends literal text without interpreting key names. Returns the input's UTF-16 length.            |
-| `sendKeys(keys)`    | `number`                              | Expands key tokens and sends the combined input. Returns its UTF-16 length.                      |
-| `capture(options?)` | `Promise<PaseoTerminalCaptureResult>` | Returns `{ terminalId, lines, totalLines, requestId }`.                                          |
-| `kill(requestId?)`  | `Promise<void>`                       | Waits for terminal teardown. Killing an already-removed terminal succeeds.                       |
-
-`sendKeys()` recognizes `Enter`, `Tab`, `Escape`, `Space`, `BSpace`, `C-c`, `C-d`, `C-z`, `C-l`, `C-a`, and `C-e`. Other strings pass through literally. Input methods send without waiting for command execution or acknowledging that the terminal consumed the input.
-
-Capture accepts optional `start`, `end`, `stripAnsi`, and `requestId`. Line bounds are zero-based and inclusive across scrollback and the viewport. Negative bounds count from the end; omitted bounds capture all lines. `stripAnsi` defaults to `true`. A missing terminal returns empty lines.
-
-Use `workspace.terminals.create(options?)` and `workspace.terminals.list(options?)` to supply the workspace ID from a handle. Creation accepts the same options except `workspaceId`; listing accepts only `requestId`. Backend plugins can access the handler's `paseo` context. Executable React UI plugins and their `usePaseo()` hook are not supported in the Flutter product client.
-
-## `client.providers`
-
-| Method                           | Result                        | Behavior                                                                                                                                                 |
-| -------------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `waitForReady(options?)`         | `PaseoProviderSnapshotResult` | Waits until no provider is loading. Default timeout: 60 seconds. Rejects with an update-host error when the daemon cannot correlate workspace snapshots. |
-| `snapshot(options?)`             | `PaseoProviderSnapshotResult` | Returns the current catalog immediately.                                                                                                                 |
-| `refresh(options?)`              | Acknowledgement               | Forces catalog refresh for all or selected providers.                                                                                                    |
-| `listAvailable()`                | Availability result           | Reports installed provider availability.                                                                                                                 |
-| `listModels(provider, options?)` | Models result                 | Discovers models for one provider and directory.                                                                                                         |
-| `listModes(provider, options?)`  | Modes result                  | Discovers permission or operating modes.                                                                                                                 |
-| `listFeatures(draftConfig)`      | Features result               | Discovers features for the current draft provider configuration.                                                                                         |
-| `diagnostic(provider)`           | Diagnostic result             | Returns human-readable setup diagnostics.                                                                                                                |
-| `listUsage(options?)`            | `PaseoProviderUsageResult`    | Returns normalized subscription windows, balances, and provider details. Rejects with an update-host error when unsupported. Options: `requestId`.       |
-| `subscribe(handler)`             | Unsubscribe function          | Requests future catalog updates; unsubscribe releases demand.                                                                                            |
-
-## `client.config`
-
-`config.get(requestId?)` returns the daemon's mutable configuration.
-
-`config.patch(patch, requestId?)` validates, persists, and returns an updated configuration. Use this administrative surface for host configuration, not per-agent choices. A patch affects every client and future agent using that daemon.
-
-## `client.hosts`
-
-Manage hosts connected to the selected daemon. Both the managing daemon and destination must support connected hosts.
-
-```ts
-const directory = await client.hosts.list();
-const registration = await client.hosts.add({
-  connection: "ssh://deploy@build-box",
-  label: "Build box",
-  metadata: { team: "infra" },
-  sourceKey: "build-box",
-});
-await client.hosts.update(registration.registrationId, { enabled: false });
-await client.hosts.remove(registration.registrationId);
-```
-
-`list()` returns `{ self: { serverId, label }, hosts }`. Each host includes its registration and server
-IDs, label, authenticated source, string metadata, enabled state, connection status, safe target
-description, last-online/retry timestamps, and an actionable error. Credentials are never returned.
-A valid but unreachable connection is saved and retried. Invalid syntax fails without saving.
-
-`update(registrationId, patch)` accepts `label`, `metadata`, `enabled`, `connection`, and
-`replaceIdentity`. Metadata replaces the whole map. Replacing a connection preserves the expected
-server ID unless `replaceIdentity: true` explicitly accepts a new destination.
-
-`observe()` returns an owned subscription. Await `ready`, subscribe for snapshots and `hosts.changed`
-updates, then call `release()`. Observations restore a current snapshot after reconnect.
-
-```ts
-const remote = await client.hosts.client("srv_build_box");
-try {
-  const workspaces = await remote.workspaces.list();
-  const providers = await remote.providers.listAvailable();
-  await remote.agents.ref("agent_on_build_box").send("Continue the investigation");
-} finally {
-  await remote.dispose();
+async fn connect_remote() -> Result<DaemonClient> {
+    let host = std::env::var("PASEO_HOST")?;
+    let mut options = ConnectOptions::new(DaemonTarget::Endpoint { host });
+    options.password = std::env::var("PASEO_PASSWORD").ok();
+    DaemonClient::connect(options, CancellationToken::new()).await
 }
 ```
 
-`client(serverId)` returns a caller-owned `PaseoApi` bound to that destination through the selected
-daemon. The ordinary APIs keep their signatures. Paths and IDs belong to the destination. Selecting
-the local server ID returns a local scope. Routing supports one hop.
+`DaemonTarget::Instance { home: PathBuf }` discovers a local daemon. `DaemonTarget::Endpoint { host: String }` accepts:
 
-Disposing one scope releases its observations without closing siblings or deleting the saved host.
-Origin disposal cascades. Observations recover through the ordinary client lifecycle. While connecting,
-new requests use the existing bounded send queue; disconnected requests fail. Connection loss clears
-old waiters and queued sends. Ordinary non-recoverable requests are not replayed; existing
-acknowledged/idempotent creation recovery retains its request identity. A submitted request whose response
-is lost rejects with `DaemonConnectionError` (`code: "DAEMON_CONNECTION_LOST"`), optional
-`outcome: "unknown"` and known `serverId`. Inspect before retrying a mutation.
+| Target | Example / meaning |
+| --- | --- |
+| Direct WebSocket | `wss://daemon.example/ws` or loopback `ws://127.0.0.1:6767/ws` |
+| Host/port | `127.0.0.1:6767`, `tcp://127.0.0.1:6767` |
+| Unix socket | `unix:///absolute/path/to/daemon.sock` |
+| Windows pipe | `pipe://` followed by an actual named-pipe path |
+| SSH | `ssh://user@host:22?daemonPort=6767` |
+| Relay | Daemon-generated `relay://` URL or pairing URL carrying `#connect=` / `#offer=` |
+| Registered host | `hst_…` or `srv_…`, resolved through the local managing daemon |
 
-Registration and host acquisition failures expose a stable `code`: `host_unknown`, `host_disabled`, `host_offline`,
-`permission_denied`, `unsupported_capability`, `authentication_failed`, `server_id_mismatch`,
-`self_host`, or `duplicate_host`. Ordinary RPC permission codes, including `access_denied`, pass through
-unchanged. Multiplexing is a transport; consumers use the same client/API operations and lifecycle.
-Discovery does not grant execution authority.
+Use daemon-generated pairing material unchanged; do not invent a public key. Relay URLs carry the daemon key pin. For encrypted direct connections set `ConnectOptions.server_public_key`. `minimum_security: paseo_client::crypto::SecurityMode::Protected` requires protected encrypted records; it does not enable TLS or replace a key pin/password. `wss` authenticates the TLS endpoint. Never send a daemon password over untrusted plaintext `ws`.
 
+`ConnectOptions::new(target)` defaults to a 15-second connection timeout, `client_type: "cli"`, and `SecurityMode::Legacy`. Optional `password` overrides URL authentication; otherwise `PASEO_PASSWORD` can supply it. `local_credential` is an explicit local credential. Automatic local credentials are used only for the exact endpoint published by the selected local daemon, never arbitrary remote targets. `home` chooses identity/discovery storage for an explicit endpoint; `client_id` overrides the normally persisted SDK identity. Keep passwords, credential files, pairing URLs and keys out of logs.
+
+SSH uses the local `ssh` executable, noninteractive batch authentication and `-W` forwarding to remote loopback. Configure keys/agent and trusted host keys beforehand. It does not start a remote daemon. The `password` option is daemon authentication, not an SSH login password. SSH configuration and host verification remain the SSH client's responsibility.
+
+## Client lifecycle
+
+| Public API | Result / behavior |
+| --- | --- |
+| `DaemonClient::connect(options, cancel).await` | Connected `Result<DaemonClient>`; performs handshake/authentication. |
+| `server_info()` | Current JSON server capabilities/metadata snapshot. |
+| `require_feature(key, message)` | Reject unsupported capabilities explicitly. |
+| `subscribe()`, `subscribe_binary()` | Local bounded receivers; do not create server observations. |
+| `send(message).await`, `send_binary(bytes).await` | Send session JSON or a binary frame without RPC result handling. |
+| `request(message, response_type, timeout).await` | Correlated RPC; generates a request ID if absent. |
+| `rpc(request_type, response_type, fields, options).await` | Correlated JSON operation with explicit timeout/cancellation. |
+| `flush().await` | Wait for outbound transport flush. |
+| `cancellation()` | Connection lifetime cancellation token. |
+| `close().await` | Cancel and join owned tasks; no agent/workspace archival. |
+
+`RequestOptions { timeout, cancel }` defaults to 30 seconds and a fresh cancellation token. A zero request timeout disables its deadline. `request_cancellable` accepts a token directly. A submitted mutation may still complete after timeout, cancellation or disconnect. Never assume dropping a future rolls it back.
+
+## Agents and workspaces
+
+`create_agent(fields, options)` / `create_workspace(fields, options)` require keyed creation lifecycle support and preserve/allocate `idempotencyKey`. They return payloads containing resources rather than handles. Keep explicit keys for recoverable workflows. Ordinary named operation methods take one JSON `fields` argument and use default request options. `update_agent(agent_id, patch)` is an exception with a separate ID argument.
+
+| Area | Methods |
+| --- | --- |
+| Agent queries | `fetch_agent`, `fetch_agents`, `fetch_all_agents`, `fetch_agent_history`, `fetch_agent_timeline`, `list_commands` |
+| Turns | `send_agent_message`, `wait_for_finish(agent_id, options)`, `cancel_agent`, `rewind_agent` |
+| Configuration | `update_agent`, `set_agent_mode`, `set_agent_model`, `set_agent_feature`, `set_agent_thinking_option`, `apply_agent_config` |
+| Lifecycle | `resume_agent`, `import_agent`, `refresh_agent`, `archive_agent`, `detach_agent`, `delete_agent` |
+| Subagents | `list_provider_subagents`, `fetch_provider_subagent_timeline`, `build_agent_fork_context` |
+| Projects | `open_project`, `add_project`, `list_projects`, `rename_project`, `set_project_icon`, `remove_project` |
+| Workspaces | `fetch_workspaces`, `archive_workspace`, `set_workspace_title`, `set_workspace_pinned`, `inspect_workspace_recovery`, `restore_workspace` |
+| Setup/scripts | `fetch_workspace_setup_status`, `run_workspace_setup`, `list_workspace_scripts`, `start_workspace_script_with_status`, `stop_workspace_script` |
+| Labels | `list_workspace_labels`, `set_workspace_label`, `update_workspace_label`, `delete_workspace_label` |
+
+Use [Agents](agents.md), [Workspaces](workspaces.md), and the [complete request schema](../../packages/protocol/schema/session-inbound.json) for argument shapes. `CursorPages::{agents,workspaces,history}` and fallible `CursorPages::timeline` provide `next(&client, options).await -> Result<Option<Value>>`; repeated cursors are errors. They do not collect all pages unless you do so.
+
+## Events and recovery
+
+Owned observations require `Arc<DaemonClient>`: `observe_agents`, `observe_workspaces`, `observe_events`, `observe_timeline`, `observe_terminals`, `observe_terminal`. An `OwnedSubscription` exposes `snapshot`, `subscription_id`, `recv().await` and `release().await`. Current owned observation methods require `ownedSubscriptions`; they do not emulate old shared-filter subscriptions. Event bodies remain full session messages.
+
+`ReconnectingClient` restores explicitly owned observations, not arbitrary mutations. `connection(&cancel)` returns the current `Arc<DaemonClient>`. `RestoringSubscription` reports `SubscriptionEvent::{Snapshot,Update}`; restored snapshots invalidate old baselines and require history reconciliation. `recover_creation(kind, key, fields, options)` explicitly reconciles an uncertain creation with its original key. See [Events](events.md) and [Recipes](recipes.md).
+
+## Terminals and files
+
+`create_terminal`, `list_terminals`, `rename_terminal`, `capture_terminal`, `kill_terminal` manage daemon PTYs. Include workspace identity and actual directory. `observe_terminal(id, restore, options)` returns `TerminalStream`; `recv` yields `TerminalEvent::{Frame,Exit}`, `input` sends bytes, and `resize` takes `paseo_protocol::binary_frames::TerminalResize`. Release `stream.subscription` explicitly. These APIs do not add an interactive terminal UI to Flutter.
+
+`read_file(cwd, path, max_bytes, options)` returns `DownloadedFile { metadata, bytes }` with a byte ceiling. `upload_file(file_name, mime, modified_at, bytes, options)` uses bounded binary frames. `list_directory`, `write_file`, `create_file_entry`, `rename_file_entry`, `duplicate_file_entry`, `delete_file_entry` expose file operations; check their exact schema before destructive calls. Upload cancellation does not promise rollback or automatic retry.
+
+## Providers, configuration, and connected hosts
+
+Provider methods: `list_available_providers`, `get_providers_snapshot`, `refresh_providers_snapshot`, `list_provider_models`, `list_provider_modes`, `list_provider_features`, `get_provider_diagnostic`, `list_provider_usage`, `list_usage_reports`. See [Providers](providers.md) for compact snapshots and draft configuration.
+
+Configuration methods are `get_daemon_config`, `patch_daemon_config`, `read_project_config`, `write_project_config`; `get_daemon_status` and feature-gated `daemon_status(timeout)` read daemon status. Do not expose secrets in diagnostic output. Management methods such as `restart`, `shutdown`, `update_daemon` and `reload_daemon_config` affect the selected running daemon and require explicit operator intent.
+
+Connected hosts use `list_hosts`, `add_host`, `update_host`, `remove_host`, `open_host_route`, `open_host_link`. Select a registered ID as `DaemonTarget::Endpoint` to use its managed route. Both managing and destination daemons must support the requested host capabilities. Routing is not implicit permission to manage an unrelated daemon. Low-level route metadata/frame codecs are in `paseo_protocol::{routing,binary_frames}`.
+
+The operations module also exposes checkout/forge, schedules, plugins, usage and browser-host registration RPCs. These preserve the wire contract; they are not separate local runtime implementations. `rpc` supports an explicit request/response pair when a named convenience method is unnecessary.
+
+<a id="errors-and-cleanup"></a>
 ## Errors and cleanup
 
-Connection, validation, rejection, and timeout failures reject their promise. Turn outcomes are returned through `PaseoAgentRunResult.status` because permission and provider errors are expected agent states.
+```rust
+use anyhow::Result;
+use paseo_client::{ClientError, DaemonClient};
+use serde_json::json;
 
-Always close the client in `finally`. Closing a client removes its local listeners and network connection; it does not stop agents or archive workspaces.
+async fn inspect_errors(client: &DaemonClient, id: &str) -> Result<()> {
+    match client.fetch_agent(json!({"agentId": id})).await {
+        Ok(payload) => println!("{}", payload),
+        Err(error) => {
+            if let Some(failure) = error.downcast_ref::<ClientError>() {
+                eprintln!("daemon code: {}", failure.code);
+                // Inspect failure.details deliberately; it may contain private data.
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+```
+
+Methods return `anyhow::Result`; not every error is `ClientError`. That type provides `code`, `message`, and optional JSON `details`. Known transport/request codes include `DAEMON_UNREACHABLE`, `DAEMON_CONNECTION_LOST`, `DAEMON_REQUEST_TIMEOUT`, `DAEMON_REQUEST_CANCELLED`, and `DAEMON_RPC_ERROR`; target selection also reports ambiguity/invalid/local-only errors. Daemon rejection payloads can contain more specific codes.
+
+RPC payloads with a string `error`, `accepted: false`, or `success: false` are generally surfaced as errors, with the original payload in `ClientError.details`. `wait_for_finish_response` is deliberately different: its string `error` describes the agent's turn outcome and remains in the returned payload. Always inspect outcome `status` and `error` even when the Rust result is `Ok`; `permission`/`timeout` is not completion. Actual transport/RPC failures still return `Err`. Cleanup must release subscriptions and close the client on failures. Archive only resources you own; closing transport never substitutes for archival.
+
+## Protocol APIs
+
+`paseo_protocol::wire::{Direction,SessionMessage,Envelope,parse_envelope,encode_envelope,validate_session}` validates native JSON schemas. `Inbound` means **to the daemon**, `Outbound` means **from the daemon**. `SessionMessage::parse` validates without stripping unknown extension fields; `new` and ordinary deserialization are not full schema validation. Protocol crypto handles transport encryption, not application password authorization. See [protocol validation](../../docs/protocol-validation.md) for authoritative schema ownership and examples.
+
+## Syntax highlighting
+
+Add `paseo-highlight = { path = "../paseo/packages/highlight" }` to the quickstart application's dependencies. Native grammars require a platform C compiler in addition to Rust/Cargo. A standalone synchronous example:
+
+```rust
+use paseo_highlight::{ColorScheme, SyntaxThemeId, highlight_code, resolve_syntax_colors};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let source = "fn main() { println!(\"hello\"); }";
+    let colors = resolve_syntax_colors(SyntaxThemeId::Github, ColorScheme::Dark);
+    for line in highlight_code(source, "example.rs")? {
+        for token in line {
+            let color = token.style.map(|role| colors.color(role));
+            println!("{:?}: {:?}", color, token.text);
+        }
+    }
+    Ok(())
+}
+```
+
+`highlight_code`/`highlight_line` borrow token text from the input. Reuse `Highlighter::new()` and its methods for repeated work. `get_language_for_file`, `is_language_supported`, `get_supported_extensions`, and `get_parser_for_file` expose language lookup; unknown suffixes are plain text, supported-parser failures are errors. `StyledRange` uses UTF-8 byte offsets; `byte_to_utf16` and `utf16_to_byte` adapt other consumers. Highlight complete documents when cross-line syntax matters.
+
+`highlight_code_in_steps(code, filename, HighlightStepsOptions)` launches a native worker. Its `HighlightSteps` supports blocking iteration or nonblocking `poll_next`. `HighlightStep::Preview` is provisional; final `Lines { first_line, lines }` replaces those positions, and `Finished` marks completion. This is bounded incremental delivery, not an edit-delta parser. Dropping the handle cancels delivery, though an active native parse may finish.
+
+`SyntaxThemeId` covers Github, Catppuccin, Dracula, TokyoNight, One, Nord, Gruvbox and Solarized. `resolve_syntax_colors` selects light/dark palettes (Dracula uses one palette); `create_highlight_style` returns native style rules for the 20 `HighlightStyle` roles. Rendering is your responsibility; no browser editor or framework runtime is required.

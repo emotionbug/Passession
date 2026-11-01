@@ -8,7 +8,7 @@ category: Orchestration
 
 # CLI reference
 
-The Rust Paseo CLI manages agents and daemon operations from your terminal. The 0.13.0 native migration is unpublished; build the native runtime from the checkout as described in [Updates](/docs/updates), not an old npm CLI package. Keep the executable with its generated adjacent assets.
+The Rust Paseo CLI manages agents and daemon operations from your terminal. These instructions target the unpublished 0.13.1 source checkout; build the native runtime as described in [Updates](updates.md), not an old npm CLI package. Keep the executable with its generated adjacent assets.
 
 Bare `paseo` opens CLI chat. Use `paseo onboard` for explicit setup, then `paseo daemon start` and `paseo daemon status` for managed operation. The default home remains `~/.paseo`.
 
@@ -252,20 +252,20 @@ The output includes each script's lifecycle and supervised terminal ID. Services
 
 ## Plugins
 
-> **Trust every plugin you add.** `paseo plugin add` and `paseo plugin install` mean “I trust this codebase.” Backend plugin code and Git preparation commands run unsandboxed with the daemon user's access on the daemon host. Optional JavaScript backend plugins require external Node 20+ (`PASEO_PLUGIN_NODE`); built-ins run in Rust. Executable React UI contributions are not supported by the Flutter client. Dependencies and future updates are part of the trust decision. With global `--host`, commands run on the remote daemon host.
+> **Trust every plugin you add.** Native plugin executables, validation and declared preparation commands run unsandboxed with the daemon user's file, process, network and credential access. Dependencies and future updates are part of the trust decision. There is no JavaScript worker or Node fallback; Flutter does not execute plugin UI. Global `--host` targets management at the remote daemon; directory paths must exist there and are not uploaded. `plugin init` creates a project locally.
 
-Create and manage trusted plugins on a daemon:
+The 0.13.1 checkout provides a Rust scaffold, not a claim that the SDK has been published. Use Rust 1.93+ and the local SDK path until your chosen native SDK revision is actually available remotely:
 
-```bash
-paseo plugin init ./plugin
+```sh
+paseo plugin init ./plugin --id my-plugin --sdk-path /absolute/path/to/paseo/packages/plugin
+cargo build --manifest-path ./plugin/Cargo.toml --release --target-dir ./plugin/target
+./plugin/target/release/paseo-plugin-server --validate ./plugin 0.13.1
 paseo plugin install ./plugin
-paseo plugin add owner/slug
-paseo plugin add git:owner/repository
-paseo plugin add https://gitlab.com/group/repository.git --ref main
-paseo plugin add git:owner/monorepo:plugins/review
-paseo plugin ls [id]
-paseo plugin update my-plugin
-paseo plugin update --all
+paseo plugin ls my-plugin
+paseo plugin update my-plugin --check
+paseo plugin update my-plugin --yes
+paseo plugin update --all --check
+paseo plugin update --all --yes
 paseo plugin reload my-plugin
 paseo plugin logs my-plugin
 paseo plugin disable my-plugin
@@ -273,21 +273,28 @@ paseo plugin enable my-plugin
 paseo plugin remove my-plugin
 ```
 
-`paseo plugin reload <id>` reports the result of the reload itself: it waits while the daemon stops
-and starts the plugin, however long that takes, and it queues behind the daemon's other plugin work.
-Cancelling the command or losing the connection does not stop the daemon's work, and no listing or
-log entry settles what a cancelled reload did — the [Plugin reference](/docs/plugins/reference)
-covers those interim states. Running the reload again is what reports the result: it waits behind the
-outstanding one, then stops and starts the plugin once more.
+On Windows, the scaffold selects `.exe`; invoke `.\plugin\target\release\paseo-plugin-server.exe`. The manifest requires `runtime: "native"` and `server: {"executable":"contained/relative/binary","args":[]}`. Rebuild before reloading a directory installation; reload does not compile Rust. Both root `pluginsEnabled` and per-installation enablement must permit execution.
 
-Bare `owner/slug` installs a reviewed registry listing. Use `git:owner/repository` for GitHub
-source, or `./plugin` for a local directory. Append `:<directory>` for a plugin in a monorepo.
+Source syntax below is illustrative; substitute a real trusted repository/package/artifact:
 
-`paseo plugin ls [id]` does not contact the remote. `paseo plugin logs <id>` returns the
-plugin's recent daemon-side stdout and stderr. Add `--json` for structured entries, or run
-`paseo --host <target> plugin logs <id>` for another daemon. See the
-[Plugin reference](/docs/plugins/reference) for installation, trust, lifecycle, and log-retention
-behavior.
+```text
+paseo plugin add owner/slug
+paseo plugin install github:owner/repository --ref v1.2.0
+paseo plugin install git:https://git.example/group/repository.git --ref v1.2.0
+paseo plugin install github:owner/monorepo --path plugins/review
+paseo plugin install cargo:paseo-review@1.2.0
+paseo plugin install release:<HTTPS-archive-URL> --version <semver> --sha256 <digest> --format <tar.gz|zip>
+```
+
+Bare `owner/slug` is a registry listing, not a directory or GitHub shorthand. Prefix local relative paths with `./` or `../`. Git also accepts a `:<directory>` suffix. Cargo install versions use `@exact-semver`; omitting it selects the latest stable non-yanked release. Release archives require a lowercase 64-character SHA-256 over archive bytes and an explicit version; recognized URL suffixes can supply `--format`. `--path` selects a contained source subdirectory. A registry must provide native records; this checkout does not prove public listings have migrated. npm/legacy JavaScript sources are rejected, not executed.
+
+Ordinary managed updates require `--yes`, and `--check` never applies. Explicit `--version <semver>` selects and authorizes one Cargo target; `--ref <ref>` does so for Git. Release updates use `--url <HTTPS-archive-URL> --version <semver> --sha256 <digest> [--format tar.gz|zip]`, retaining the installed URL origin; there is no implicit latest-release discovery. Explicit selections cannot be combined with `--all`. Proposals bind immutable artifacts; changed proposals fail instead of substituting content. Directory sources are edited/rebuilt/reloaded, not remotely updated.
+
+`paseo plugin reload <id>` waits for the daemon's stop/start operation and queues behind other plugin work. Canceling the CLI or losing its connection does not cancel the daemon's operation; another reload queues a new stop/start rather than merely observing the previous one.
+
+`paseo plugin ls [id]` reads installed metadata without querying the source. `paseo plugin logs <id>` returns a recent daemon-side snapshot, not a live follower. Native stdout is reserved for IPC; authors log via stderr or `Context::log`. Add `--json` for structured log entries, or use `paseo --host <target> plugin logs <id>` for another daemon.
+
+Removal deletes the installation's settings; do not use remove/reinstall as a data-preserving migration. Duplicate-ID installation is rejected, and same-ID managed-source replacement is not implemented. The [migration guide](plugins/migration.md) documents an explicit directory-runtime port preserving the existing ID/settings and old receipts. See the [plugin reference](plugins/reference.md) for source, lifecycle, trust and IPC details, and [quickstart](plugins/index.md) for the runnable Rust example.
 
 ## Listing agents
 
@@ -412,7 +419,7 @@ PASEO_LISTEN=127.0.0.1:6799 PASEO_RELAY_ENABLED=false paseo daemon run --home ~/
 
 It stays attached until the supervisor exits or you cancel, without a readiness timeout. Worker restart retains these launch inputs. Stop and relaunch the deployment to change them. If the home already has a live supervisor, `run` returns `already_running` without owning or launching a foreground process.
 
-Managed `start` ignores inherited daemon-setting overrides, including `PORT`, `PASEO_LISTEN`, relay, and voice settings. It preserves provider credentials and executable/runtime controls. `start --foreground` is removed; use `daemon run`. Former start/restart configuration flags such as `--port` and `--no-relay` fail before side effects; use the corresponding persisted setting. `--web-ui` is obsolete and has no native replacement. See [configuration edits](/docs/configuration#apply-changes).
+Managed `start` ignores inherited daemon-setting overrides, including `PORT`, `PASEO_LISTEN`, and relay settings. It preserves provider credentials and executable/runtime controls. `start --foreground` is removed; use `daemon run`. Former start/restart configuration flags such as `--port` and `--no-relay` fail before side effects; use the corresponding persisted setting. `--web-ui` is obsolete and has no native replacement. See [configuration edits](/docs/configuration#apply-changes).
 
 ### Select one daemon
 

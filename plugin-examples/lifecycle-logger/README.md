@@ -1,21 +1,9 @@
-# Lifecycle logger
+# Lifecycle logger migration notes
 
-Registers every server lifecycle hook (nine events and three before hooks) and logs their data as
-JSON. It observes workspace creation and archive, agent creation, session opening, turns,
-permissions, closing, and archive. Before hooks return the request unchanged. Environment values
-are redacted; prompts and timeline content are logged.
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-Install it on a daemon where plugins are enabled:
+The former example observed nine events and three before hooks. Port notifications using `Plugin::on`, transforms using `Plugin::before`, and diagnostics using `Context::log` or stderr; stdout is reserved for JSONL IPC. Log only deliberately selected, redacted fields: prompts, history and environment values can be private. `paseo plugin logs <installed-id>` is a recent snapshot, not a live follower.
 
-```bash
-paseo plugin install /absolute/path/to/plugin-examples/lifecycle-logger
-paseo plugin logs lifecycle-logger
-```
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
 
-`paseo plugin logs` shows a recent in-memory tail of the plugin's output. Log lines are capped at
-16 KiB, so a large timeline can be truncated. The output is not copied to the daemon log, and
-removing the plugin or restarting the daemon clears it.
-
-See the [lifecycle reference](../../public-docs/plugins/reference.md#lifecycle-hooks) for callback
-shapes and delivery rules. Install it alongside [lifecycle-actions](../lifecycle-actions) on a test
-daemon to watch those callbacks run.
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

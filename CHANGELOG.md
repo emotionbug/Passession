@@ -1,13 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.13.1 - 2026-11-01
 
 ### Added
 
-- Replaced the product daemon and CLI with Rust and the client with native Flutter targets for Linux, macOS, Windows, Android and iOS. Desktop/server hosts run the daemon; mobile clients connect remotely. The native cutover is not a published release.
-- Preserved host → directory → session navigation, existing protocol/configuration/home and session persistence, Markdown/source editing, summary-first large diffs, schedules, MCP, speech, connected hosts, and script/setup PTYs with read-only client logs.
-- Kept optional JavaScript backend extensions on an externally installed Node runtime, with built-in integrations running in Rust and no Node executable in the default installed runtime.
-- Added generated Cargo, optional-worker and speech attributions. Official Sherpa 1.12.28 TTS-enabled prebuilts statically include GPL espeak-ng; notices do not establish corresponding-source/source-offer, combined-work, MPL/LGPL, CRT or Rust-toolchain obligations. These remain unresolved release-distribution requirements, not a compliance certification. Model weights are downloaded on demand, not bundled.
+- Replaced the product daemon and CLI with Rust and the client with native Flutter targets for Linux, macOS, Windows, Android and iOS. Desktop/server hosts run the daemon; mobile clients connect remotely.
+- Preserved host → directory → session navigation, existing protocol/configuration/home and session persistence, Markdown/source editing, summary-first large diffs, schedules, MCP, connected hosts, and script/setup PTYs with read-only client logs.
+- Added native Rust protocol, client, highlighting and plugin SDKs, a Rust WebSocket relay and a Rust/Wasm edge proxy. Paseo-owned SDKs, plugin execution, development, packaging and release tooling no longer require Node.js or TypeScript.
+- Native executable plugins replace JavaScript backend workers. Existing incompatible plugin records remain intact and require an explicit migration; built-in providers and usage sources remain native.
+- Added Cargo and digest-bound OpenCode ABI bundle attributions. Minimal self-contained JavaScript required by external provider APIs remains; it is not a Paseo Node build/runtime dependency. Preserve notices when distributing packages; notices are not a compliance certification.
 
 - Added a host-scoped directory browser to Add Project, including explicit selection, history, retry, and mobile-friendly remote navigation without path entry.
 - The native client imports the previous app's settings without modifying the original data: Android/iOS AsyncStorage and the desktop Chromium localStorage. Imported settings include hosts and passwords, theme, language, font sizes, keyboard overrides, sidebar order, layout and unsent drafts. On later launches it also picks up settings changed in the previous app, unless the same setting was changed in the native client; native choices win on conflict. An unreadable source is retried on the next launch instead of being marked as imported.
@@ -15,21 +16,28 @@
 ### Improved
 
 - Bounded relay connection fan-out, protected-handshake retries, WebSocket buffering, and supervisor log backpressure.
-- Reduced persisted-agent lookup allocation and isolated terminal latency benchmarks from speech and relay startup.
-- Updated retained SDK and build-tool dependencies; the installed product no longer depends on a Node daemon, Electron or Chromium.
+- Reduced persisted-agent lookup allocation and isolated terminal latency benchmarks from relay startup.
+- Replaced npm development and packaging scripts with `cargo xtask`; the installed product no longer depends on a Node daemon, Electron or Chromium.
 - Reduced Changes-pane startup latency by loading file-tree summaries without waiting for patch bodies or filesystem watcher startup, highlighting only the initial visible file batch, batching tracked-file work, and removing per-file Git processes for untracked text files.
 - Kept large Changes views summary-first with lazy patch loading in the native client.
 - Preserved timeline pagination and reconnect/history behavior in the native runtime.
-- Preserved complete desktop release artifacts before publication for 30-day, publication-only and single-architecture recovery, and made partial npm publication resumable.
+- Preserved all eight native release targets and complete artifacts for 30-day, publication-only and single-architecture recovery. GitHub release publication, provenance and update-feed generation now use Rust tooling instead of npm scripts.
 - Restored the original app's look across the native client. This covers the sidebar tree and footer, the conversation header, tool and Thinking rows, the composer and model controls, permission cards, settings list/detail, file and diff panes, Git/PR panels and host dialogs. It also restores the original palettes, independent UI/content/code font sizes and Lucide icons.
 - Reduced the frames drawn while agents run (21 to 10 per second in a real desktop profile). The status ring, tool shimmer, working dots and elapsed time now step together on one shared clock that pauses in hidden tabs, and each repaints only itself. The clock runs at 10Hz in a focused window, 4Hz behind other windows, and stops while the window is minimized or the app is in the background. Streamed text is revealed at 30Hz in a focused window and shown whole elsewhere.
 - Decode attachment thumbnails at their physical display size while retaining original images for sending and enlargement. Bound the inline image cache by bytes as well as count, without making mounted thumbnails flicker when cache entries are evicted.
 - Defer hidden conversation presentation work until the tab or window is shown, preserving incoming messages, delivery acknowledgements, permissions, drafts and reading position. Visible animation timing is unchanged.
 - Reuse the first desktop window's engine for daemon and tray coordination instead of starting a separate hidden engine. Additional windows, close-to-tray, dirty-document cancellation and external project routing remain available; a closed primary window is retained and reused while other windows are open.
 
+### Removed
+
+- Removed unused Nix configuration, website sources and their CI jobs.
+- Removed speech recognition and text-to-speech providers and packaging libraries. Generic audio playback and sound effects remain; legacy speech configuration is retired without deleting agent provider settings.
+
 ### Fixed
 
 - Removed whole-history JSON checkpoint rewrites from streamed agent updates. Persist changed timeline items and cursors transactionally in SQLite, retaining legacy JSON checkpoints as migration backups and preserving commit-before-publication ordering.
+- Preserve pending-turn event ordering without terminating high-volume sessions: spill bounded memory chunks to a private FIFO spool, run recognized out-of-band commands outside turn admission, and make genuine event-storage failures clear running state and permit close/reload.
+- Removed the obsolete Node worker/validator build chain. Updated CI's Android SDK installation, macOS runners and Linux native-asset prerequisites; fixed Windows file identity on stable Rust and the Windows Flutter coroutine compiler mode.
 - Fixed existing conversations appearing empty after restarting the native daemon. Provider history replaces partial checkpoints before timeline pages are served, while retaining live events received during restoration.
 - Fixed repeated Pi/OMP assistant and reasoning text when cumulative snapshots arrive ahead of queued streaming deltas. Delta-only streams still preserve intentionally repeated text.
 - Fixed empty tool-detail sheets for label-only calls such as Wait. When plain-text output is absent, show the full supplied command or wait-target label as selectable, wrapping text; retain the existing output when present.
@@ -45,7 +53,7 @@
 - Restored the original window's size and position on first launch, and translated the sidebar host, project and session menus, the tab menu and the Korean "Open location" settings.
 - Fixed Import sessions failing with "Malformed fetch_recent_provider_sessions_response: pageInfo": the native client required page info that the protocol never sends for recent provider sessions.
 - Fixed usage/settings headers leaving actions short of the right edge and truncating provider names despite spare space. Usage percentages, reset times and balances now use their natural width and align with the meter edge; balance reset times appear below the amount like the original.
-- Restored the top-level `paseo reload` command from the original CLI; it reloads `config.json` like `paseo daemon reload`. `paseo plugin init` scaffolds again return the cleanup function the extension worker requires, so a new plugin loads instead of failing at startup.
+- Restored the top-level `paseo reload` command from the original CLI; it reloads `config.json` like `paseo daemon reload`. `paseo plugin init` now creates a Cargo-based native executable plugin.
 - Preserved project and workspace registry files when loading invalid data instead of replacing them on the next mutation.
 - Verified daemon process-start identity before sending local signals, and retained managed-helper recovery records after termination timeouts.
 - Cancelled pending Desktop daemon starts during quit and normalized Windows checkout identity across short and canonical paths.
@@ -62,8 +70,7 @@
 - Propagated durable agent-deletion failures instead of acknowledging deletion that could reappear after restart.
 - Cleaned up mirrored terminals after worker crashes and bounded WebSocket shutdown handshakes before forced daemon exit.
 - Removed the product web client, embedded browser/automation, interactive terminal UI and executable React UI-plugin compatibility. Script/setup PTY backend support remains.
-- Removed microphone capture, dictation and voice-input controls and permissions from the native client and audio plugin; server audio playback remains.
-- Recorded actual Linux native client/daemon, provider/extension, desktop-host lifecycle and native speech inference coverage separately from unexecuted cross-platform CI definitions; see `docs/testing.md`.
+- Recorded actual Linux native client/daemon, provider/extension and desktop-host lifecycle coverage separately from unexecuted cross-platform CI definitions; see `docs/testing.md`.
 - Fixed the native client clearing attention on agents nobody opened at launch: only the focused agent clears, on focus, input focus, send or leave, and never for a pending permission. Opening an archived agent from History no longer sends a refresh that could replace its stored timeline, and its header reads "Untitled session" like the original.
 - Made the native conversation an inverted, virtualized list like the original: short chats rest on the composer, older pages load without moving the rows or stopping a fling, a detached reader keeps their place while new rows stream in, and a running agent keeps Stop while the keyboard is still composing a word. Typing and tapping no longer rebuild every open tab.
 - Fixed the native conversation shaking while a reader scrolled up during a running turn: new rows arriving below made the list jump back and forth every frame, and each arrival twitched what was on screen. The reading position is now held as part of the list's layout, so it stays put and the reader can still scroll freely.
@@ -89,6 +96,11 @@
     - Usage reports are cached for 60 s.
     - Shortcut overrides no longer reject conflicts.
     - Daemon PCM audio plays, resampled to 16 kHz.
+
+### Removed
+
+- Removed speech recognition, dictation, voice conversations, TTS, model downloads, speech runtime libraries and related MCP/SDK APIs. Generic audio playback remains. Legacy speech settings are ignored during normalization without changing agent-provider configuration.
+- Removed unused Nix packaging, the NixOS module and their dedicated CI workflow. Native application and standalone daemon packaging remain.
 
 ## 0.13.0 - 2026-10-24
 

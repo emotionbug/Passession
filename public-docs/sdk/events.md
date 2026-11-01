@@ -1,144 +1,85 @@
----
-title: SDK events
-description: Subscribe to agent status, timeline, workspace, and provider updates without maintaining a second state model.
-nav: Events
-order: 56
-category: TypeScript SDK
----
-
 # SDK events
 
-Use an owned subscription to fetch a snapshot and follow its changes. On capable daemons, connecting, plain reads, and local directory listeners do not start observation. Each observation gets a new server-issued ID, even when its filter matches another observation.
+[中文](events.zh-CN.md) · [Setup](quickstart.md)
+
+Connecting or calling `subscribe()` only attaches a transport listener; it does not request daemon-side observation. Wrap a connected client in `Arc::new(client)` and use owned observation methods to obtain a server snapshot and subscription ID. Independent observations have independent server IDs on capable daemons.
 
 ## Follow one agent's status
 
-```ts
-const directory = await client.agents.list({
-  filter: { includeArchived: false },
-  subscribe: {},
-});
+```rust
+use anyhow::Result;
+use paseo_client::{DaemonClient, RequestOptions};
+use serde_json::json;
+use std::sync::Arc;
 
-directory.subscription.subscribe({
-  snapshot({ entries }) {
-    const entry = entries.find(({ agent }) => agent.id === agentId);
-    console.log(entry?.agent.status);
-  },
-  update(message) {
-    if (message.type !== "agent_update") return;
-    const update = message.payload;
-    if (update.kind === "upsert" && update.agent.id === agentId) {
-      console.log(update.agent.status);
-    } else if (update.kind === "remove" && update.agentId === agentId) {
-      console.log("Agent removed from this directory");
-    }
-  },
-});
-
-// When this view closes:
-await directory.subscription.release();
-```
-
-`list({ subscribe: {} })` returns the snapshot, `subscriptionId`, and `subscription`. Omitting `subscribe` returns only a snapshot. Do not supply a subscription ID. The subscription delivers its snapshot before updates and receives a new ID and snapshot after reconnect. Releasing it leaves other observations and the underlying agents intact.
-
-`client.agents.subscribe()` and agent-handle `subscribe()` add local listeners to observations owned by that API instance. They do not request data. Use the returned subscription's callbacks when multiple filtered views need separate updates.
-
-## Follow timeline events
-
-```ts
-const unsubscribe = agent.timeline.subscribe((update) => {
-  const { event } = update;
-  if (event.type === "subscription_restored") {
-    // Live delivery has resumed. Choose whether to fetch missed history.
-    console.log("Reconnected; events may have been missed");
-    return;
-  }
-  if (event.type === "error") {
-    console.error("Timeline observation stopped:", event.error);
-    return;
-  }
-  if (event.type === "replacement") {
-    // Previously fetched history belongs to an old epoch. Fetch the page your UI needs.
-    void agent.timeline.refetch().then((page) => console.log(page.entries));
-    return;
-  }
-  if (event.type === "timeline" && event.item.type === "assistant_message") {
-    process.stdout.write(event.item.text);
-  }
-
-  if (event.type === "turn_completed") {
-    console.log("\nTurn completed");
-  }
-});
-```
-
-Await `unsubscribe.ready` before starting work whose events you need to observe. It waits for the initial live subscription (local listener attachment on broadcast-only hosts); initial history is a separate [read](#fetch-timeline-history). Call `unsubscribe()` to release demand, or await `unsubscribe.release()` for teardown.
-
-After reconnect, the same handle receives `{ agentId, subscriptionId, event: { type: "subscription_restored" } }` before subsequent live updates. This is a local SDK notification after membership acknowledgement (local attachment on broadcast-only hosts). The subscription gets a fresh ID. No history is fetched automatically, and missed events are not replayed.
-
-Choose recovery for your consumer: continue live, request a recent page, or call `timeline.refetch({ direction: "after", cursor: { epoch, seq } })` using your saved position. Live delivery continues while your read is pending; buffer or reconcile those events with the returned page by epoch and sequence. Follow `hasNewer` and `endCursor` to read further pages when needed. A live `replacement` invalidates the previous epoch. A failed explicit history read rejects that read and leaves the live subscription active.
-
-Subscription establishment failures deliver `{ agentId, event: { type: "error", error } }` and release the observation. Establish a new subscription when ready to retry. Releasing a subscription stops its callbacks and prevents restoration after reconnect.
-
-Assistant messages can arrive in pieces. Concatenate their text when you need a complete message, or use `run()` and read `lastMessage` when you only need the final reply.
-
-Turn completion comes from `turn_completed`, `turn_failed`, or `turn_canceled`. Do not infer turn completion from an `agent_update` transition to `idle`.
-
-## Fetch timeline history
-
-```ts
-const page = await agent.timeline.refetch({
-  direction: "before",
-  limit: 100,
-  projection: "projected",
-});
-
-for (const entry of page.entries) {
-  console.log(entry.seqStart, entry.seqEnd, entry.item.type);
+async fn watch(client: &Arc<DaemonClient>) -> Result<()> {
+    let mut observation = client.observe_agents(json!({
+        "filter": {"includeArchived": false}, "page": {"limit": 50}
+    }), RequestOptions::default()).await?;
+    println!("initial: {}", observation.snapshot);
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                event = observation.recv() => println!("update: {}", event?),
+                signal = tokio::signal::ctrl_c() => { signal?; break; }
+            }
+        }
+        Ok(())
+    }.await;
+    let released = observation.release().await;
+    result?;
+    released
 }
 ```
 
-Use `startCursor`, `endCursor`, `hasOlder`, and `hasNewer` from the result to page without inventing offsets.
+The initial payload is `observation.snapshot`; subsequent `recv()` values are whole session messages with `type` and usually `payload`. Filter entries/events for your agent ID. Do not confuse the RPC payload shape with an event envelope. Bounded receivers can lag; an error is not an empty update. Refresh your snapshot and reconcile missing history before continuing. Explicit `release` waits for server cleanup; dropping an observation only attempts asynchronous cleanup when a runtime remains available.
+
+## Follow timeline events
+
+`client.observe_timeline(&[agent_id.to_owned()], RequestOptions::default()).await?` returns an owned observation. Consume `agent_stream` and timeline-related messages according to their `type` and payload. A stream delta is not necessarily a complete message. Preserve item/turn identity, apply replacements rather than appending duplicate items, and refetch when a replacement invalidates your cache. Helpers live in `paseo_protocol::timeline`; the client does not maintain a presentation cache for you.
+
+## Fetch timeline history
+
+```rust
+use anyhow::Result;
+use paseo_client::{CursorPages, DaemonClient, RequestOptions};
+
+async fn history(client: &DaemonClient, agent_id: &str) -> Result<()> {
+    let mut pages = CursorPages::timeline(agent_id, "before", 100)?;
+    while let Some(page) = pages.next(client, RequestOptions::default()).await? {
+        println!("{}", page);
+    }
+    Ok(())
+}
+```
+
+`CursorPages::timeline` supports `before` and `after`; page order and opaque start/end cursors are authoritative. For a single page call `fetch_agent_timeline` with `agentId`, `direction`, `limit` and optional `cursor`/`projection`. `fetch_agent_history` and `CursorPages::history(fields)` address the separate history endpoint; they are not interchangeable with timeline pages. History is explicit, not automatically replayed by subscriptions.
 
 ## Follow workspace updates
 
-```ts
-const directory = await client.workspaces.list({ subscribe: {} });
-directory.subscription.subscribe({
-  snapshot({ entries }) {
-    console.log(entries);
-  },
-  update(message) {
-    if (message.type === "workspace_update") console.log(message.payload);
-  },
-});
-
-// When this view closes:
-await directory.subscription.release();
-```
+Use `observe_workspaces(json!({"filter": {"includeBackground": true}}), options)` with an `Arc<DaemonClient>`. Release the returned observation when your view closes. Ordinary `fetch_workspaces` calls do not create observations unless you explicitly request one.
 
 ## Follow provider catalog changes
 
-```ts
-const unsubscribe = client.providers.subscribe((update) => {
-  const ready = update.entries.filter((entry) => entry.status === "ready");
-  console.log(
-    "Ready providers:",
-    ready.map((entry) => entry.provider),
-  );
-});
-console.log(await client.providers.snapshot());
+Subscribe with `observe_events(json!({"events": ["providers_snapshot_update", "agent_permission_request", "agent_permission_resolved"]}), options)`. Then fetch the provider snapshot for your working directory and consume updates. Event names are protocol values, not Rust callbacks. Permission IDs come from daemon events, not generated request IDs:
 
-// When this view closes:
-unsubscribe();
+```rust
+use anyhow::Result;
+use paseo_client::DaemonClient;
+use serde_json::json;
+
+async fn deny(client: &DaemonClient, agent_id: &str, permission_request_id: &str) -> Result<()> {
+    client.respond_to_permission(json!({
+        "agentId": agent_id, "requestId": permission_request_id,
+        "response": {"behavior": "deny", "message": "Not approved by the operator"}
+    })).await
+}
 ```
 
-Provider and project `subscribe()` calls request their own updates and release that demand on unsubscribe. For an initial project cache, buffer updates while awaiting `client.projects.list()`, then apply them after the snapshot.
+Only send an allow response after the operator or your explicit application policy authorizes that exact request. Receiving a permission request does not authorize it.
 
-Call `client.close()` when the application no longer needs the connection.
+## Reconnection and older daemons
 
-## Older daemons
+`DaemonClient` does not reconnect automatically. `ReconnectingClient::connect` manages reconnects; `connection(&cancel).await?` obtains the current `Arc<DaemonClient>`. Its `observe(request, response, fields, options)` returns `RestoringSubscription`; `recv().await` yields `Option<Result<SubscriptionEvent>>`. `SubscriptionEvent::Snapshot { payload, restored: true }` replaces the baseline after reconnect or lag. Repair history gaps yourself. `SubscriptionEvent::Update` is a live event. Release restoring subscriptions before `ReconnectingClient::close(&mut self)`.
 
-The same methods use the existing connection and legacy delivery behavior. Old directory subscriptions
-share a server slot: a later filtered observation replaces that slot's filter. Handles have local IDs
-and separate callbacks, but independent server filters require an updated daemon. Releasing a handle
-detaches its callbacks; old daemons may continue sending broadcasts.
+Reconnect never blindly replays mutations. Owned observation methods check the daemon's `ownedSubscriptions` capability and require server-issued `subscriptionId` responses. Unsupported hosts receive an explicit update-host error; there is no hidden legacy shared-filter fallback. Raw RPC and backward-readable wire messages remain available, but they do not make an unadvertised observation feature available. Upgrade the host to use owned observations.

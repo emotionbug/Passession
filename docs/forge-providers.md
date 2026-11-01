@@ -1,6 +1,6 @@
 # Git forge integrations
 
-Forge operations are native daemon behavior. `packages/daemon/src/git/forge.rs` and `git/forge/` own service behavior; Flutter Git presentation is under `packages/flutter_app/lib/features/git`, with chat forge attachments under `features/chat/forge_attachments.dart`. Shared TypeScript protocol definitions remain in `packages/protocol` for external SDK consumers.
+Forge operations are native daemon behavior. `packages/daemon/src/git/forge.rs` and `git/forge/` own service behavior; Flutter Git presentation is under `packages/flutter_app/lib/features/git`, with chat forge attachments under `features/chat/forge_attachments.dart`. Shared Rust wire types live in `packages/protocol` for the daemon and external Rust SDK.
 
 Do not add a TypeScript server adapter or React client registry in a removed application tree. Keep forge-specific logic behind the current native boundary rather than branching by vendor throughout workspace orchestration.
 
@@ -22,4 +22,4 @@ Client presentation owns labels, links, status and action availability. Open ext
 
 Exercise real read and mutation boundaries with authorized test repositories/credentials. Retain errors and service-native evidence; a fixture validates decoding, not authentication or remote effects. Use isolated daemon state and bounded queries so a large repository does not cause one process/request per visible row.
 
-For native changes use the Rust/Flutter checks in [testing](testing.md); retained protocol/SDK changes use their own workspace checks. `npm run build:daemon` stages native runtime assets, and `npm run build:client` builds the external TypeScript SDK. A successful SDK build does not compile or test a Node product daemon.
+Use the scoped Rust/Flutter checks in [testing](testing.md). `cargo xtask build-daemon` stages native runtime assets; `cargo check --locked -p paseo-client` checks the Rust SDK. Exercise affected Git/forge calls against an isolated daemon rather than treating compilation as interoperability evidence.

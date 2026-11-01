@@ -10,48 +10,48 @@ category: Getting started
 
 Paseo Sessions uses Flutter on **Linux, macOS, Windows, Android and iOS**, with a **Rust daemon and CLI**. Desktop/server hosts run agents; Android and iOS connect remotely. The client includes Markdown, source editing, summary-first diffs, remote folder browsing and read-only script/setup logs, organized as host → directory → session.
 
-**This native cutover is not a published release.** Existing upstream downloads and store listings must not be assumed to contain it. Build from the migration checkout for local use. Binary redistribution remains subject to the unresolved requirements in the repository's `docs/release.md`, including source/licensing obligations for the native speech libraries.
+Use [this repository's releases](https://github.com/emotionbug/paseo/releases) for native build artifacts; upstream downloads and store listings are separate products. Source builds and redistribution requirements are documented in the repository's `docs/release.md`.
 
 ## Prerequisites
 
 Install and authenticate at least one supported provider CLI on the daemon machine. Paseo manages these tools; it does not supply your provider credentials. Git and, for relevant forge operations, an authenticated forge CLI are also needed.
 
-Source builds require Rust/Cargo and **Node 24/npm as build tooling**. Client builds also require Flutter and the target platform's native toolchain. Desktop builds require the matching OS; iOS requires macOS/Xcode. Node is not bundled in the installed default runtime. Optional JavaScript backend extensions require an external Node installation.
+Source builds require Rust/Cargo. Client builds also require Flutter and the target platform's native toolchain. Desktop builds require the matching OS; iOS requires macOS/Xcode. Paseo's build tools, SDKs and native plugin runtime do not require Node or TypeScript. External agent CLIs retain their own prerequisites.
 
 ## Desktop app
 
 From the repository root:
 
 ```sh
-npm ci
-npm run dev:desktop
+cargo fetch --locked
+cargo xtask dev app
 ```
 
-This builds/runs the native desktop client with an isolated checkout development home, `.dev/paseo-home`, on port `6768`. It does not replace an installed app or its daemon. For an optimized native build use `npm run build:flutter -- linux`, `macos`, or `windows` on the corresponding host. Packaging outputs go under `artifacts/flutter/`; a local build is not a published signed installer.
+This builds/runs the native desktop client with an isolated checkout development home, `.dev/paseo-home`, on port `6768`. It does not replace an installed app or its daemon. For an optimized native build use `cargo xtask build-flutter linux`, `macos`, or `windows` on the corresponding host. Packaging outputs go under `artifacts/flutter/`; a local build is not a published signed installer.
 
 ## Server / CLI
 
 Build the native runtime and keep its generated assets together:
 
 ```sh
-npm ci
-npm run build:daemon
+cargo fetch --locked
+cargo xtask build-daemon
 ./target/debug/paseo onboard
 ./target/debug/paseo daemon start
 ./target/debug/paseo daemon status
 ```
 
-Use `paseo.exe` on Windows and the corresponding directory when `CARGO_TARGET_DIR` is set. `npm run build:daemon:release` builds an optimized local runtime under the release target directory; optimization does not confer publication provenance.
+Use `paseo.exe` on Windows and the corresponding directory when `CARGO_TARGET_DIR` is set. `cargo xtask build-daemon --release` builds an optimized local runtime under the release target directory; optimization does not confer publication provenance.
 
-The normal daemon endpoint is `ws://127.0.0.1:6767/ws`. Configuration and durable state remain under `PASEO_HOME` (default `~/.paseo`), or the explicit CLI `--home`. `paseo onboard` performs setup; bare `paseo` opens CLI chat, not daemon installation. For an isolated development daemon use `npm run dev:daemon` instead.
+The normal daemon endpoint is `ws://127.0.0.1:6767/ws`. Configuration and durable state remain under `PASEO_HOME` (default `~/.paseo`), or the explicit CLI `--home`. `paseo onboard` performs setup; bare `paseo` opens CLI chat, not daemon installation. For an isolated development daemon use `cargo xtask dev daemon` instead.
 
-If you receive a native daemon archive from a separately authorized distribution, extract the **whole** archive, keep libraries/skills/worker assets alongside the executable, and invoke that executable. Do not install the retired Node CLI with npm or assume an old npm package supplies the Rust runtime.
+When using a native daemon archive, extract the **whole** archive, keep libraries, skills, notices and runtime metadata alongside the executable, and invoke that executable. An old npm CLI package does not supply this Rust runtime.
 
 ## Mobile clients
 
 ```sh
-npm run build:apk:arm64
-npm run build:ios
+cargo xtask build-flutter android --arch arm64
+cargo xtask build-flutter ios
 ```
 
 Android uses package `sh.paseo.sessions`. Android/iOS outputs are under `artifacts/flutter/`; without signing/provisioning they are explicitly debug-signed or unsigned, not store submissions. Add the remote daemon's reachable address and credentials in the client. A phone's loopback address is not the daemon machine.
@@ -74,8 +74,8 @@ Choose a real password. Connect a native client or CLI; there is **no bundled we
 
 ## Runtime scope
 
-There is no product web client, Electron/Chromium, embedded browser/automation, interactive terminal UI or executable React UI-plugin host. Workspace/service scripts still run in daemon-owned PTYs and provide read-only logs. Backend extensions and the external TypeScript SDK remain supported.
+There is no product web client, Electron/Chromium, embedded browser/automation, interactive terminal UI or executable React UI-plugin host. Workspace/service scripts still run in daemon-owned PTYs and provide read-only logs. Native backend plugins and the external Rust SDK remain supported.
 
-Current Linux execution evidence and unverified platform boundaries are documented in the repository's `docs/testing.md`. Cross-platform CI entries are not successful device tests. Native packages do not include speech model weights; they are downloaded on demand.
+Recorded Linux execution evidence and unverified platform boundaries are documented in the repository's `docs/testing.md`. Cross-platform CI entries are not successful device tests. Native packages exclude speech recognition, voice conversations and TTS; generic effect-sound playback remains.
 
-See [Connectivity](/docs/connectivity), [CLI reference](/docs/cli), [TypeScript SDK](/docs/sdk), and the checkout's `README.md` / `docs/development.md` for connection and development details.
+See [Connectivity](connectivity.md), [CLI reference](cli.md), [Rust SDK](sdk/index.md), and the checkout's [README](../README.md) / [development guide](../docs/development.md) for connection and development details.

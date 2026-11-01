@@ -4,8 +4,8 @@ use crate::{
         output::{Output, OutputOptions},
         parse_duration, positional, provider_model, required, string, switch,
     },
-    client::{ClientError, DaemonClient, DaemonTarget},
 };
+use paseo_client::{ClientError, DaemonClient, DaemonTarget};
 use anyhow::{Result, anyhow, bail, ensure};
 use clap::{ArgMatches, Command};
 use serde_json::{Value, json};

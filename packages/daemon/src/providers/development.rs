@@ -503,12 +503,16 @@ impl AgentSession for Session {
         }
         Ok(())
     }
-    async fn try_out_of_band(&self, prompt: &Value) -> Result<bool> {
+    fn prepare_out_of_band(
+        self: Arc<Self>,
+        prompt: &Value,
+    ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
         if prompt.as_str() != Some("/mock handled-command") {
-            return Ok(false);
+            return None;
         }
-        let _gate = self.inner.gate.lock().await;
-        self.emit_locked(json!({"type":"timeline","provider":"mock","item":{"type":"assistant_message","text":"Mock command handled"}})).await?;
-        Ok(true)
+        Some(Box::pin(async move {
+            let _gate = self.inner.gate.lock().await;
+            self.emit_locked(json!({"type":"timeline","provider":"mock","item":{"type":"assistant_message","text":"Mock command handled"}})).await
+        }))
     }
 }

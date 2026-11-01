@@ -20,11 +20,6 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.recovery_job || 'all' }}
   cancel-in-progress: true
 
-env:
-  # CI does not use the CUDA execution provider, and the onnxruntime-node
-  # postinstall download from NuGet is large enough to make npm ci flaky.
-  ONNXRUNTIME_NODE_INSTALL: skip
-
 jobs:
   changes:
     name: changes
@@ -50,17 +45,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
       - name: Validate recovery target
         if: ${{ inputs.recovery_job && inputs.recovery_job != 'all' }}
         env:
           RECOVERY_JOB: ${{ inputs.recovery_job }}
         run: |
           case "$RECOVERY_JOB" in
-            quality|typecheck|native-daemon-linux|native-daemon-windows|native-daemon-macos|flutter-analyze|flutter-test|flutter-build-linux|flutter-build-windows|flutter-build-macos|flutter-build-android|flutter-build-ios) ;;
+            quality|rust-clippy|relay-edge|native-daemon-linux|native-daemon-windows|native-daemon-macos|flutter-analyze|flutter-test|flutter-build-linux|flutter-build-windows|flutter-build-macos|flutter-build-android|flutter-build-ios) ;;
             *) echo "::error::Unknown CI recovery target"; exit 2 ;;
           esac
 
@@ -70,165 +61,107 @@ jobs:
         with:
           filters: .github/ci-paths.yml
 
-      - name: Validate CI contracts
-        run: node --test scripts/ci-workflow.test.mjs scripts/flutter-release.test.mjs scripts/native-packaging.test.mjs scripts/release-version-utils.test.mjs scripts/publish-release-packages.test.mjs scripts/sync-fdroid-changelogs.test.mjs scripts/upload-release-assets.test.mjs
 
   quality:
     name: quality
     needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'quality') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.format != 'false' || needs.changes.outputs.quality != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.sdk != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'quality') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false') }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
         with:
-          node-version: "22"
-          cache: "npm"
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Rust formatting
+        run: cargo fmt -p paseo-xtask -p paseo-protocol -p paseo-client -p paseo-plugin -p paseo-relay -p paseo-relay-cloudflare -p paseo-highlight -- --check
+      - name: Test native release and build contracts
+        run: cargo test --locked -p paseo-xtask
 
-      - name: Install dependencies
-        id: install
-        run: node scripts/npm-retry.mjs ci
-
-      # Explicit status checks keep independent domains running after a failure.
-      # A failed step still fails quality; no continue-on-error or success shim.
-      - name: Check formatting
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.format != 'false') }}
-        run: npm run format:check
-
-      - name: Lint lockfile
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-        run: npx --yes lockfile-lint --path package-lock.json --type npm --allowed-hosts npm --validate-https --validate-integrity
-
-      - name: Verify dependency signatures
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-        run: npm audit signatures
-
-      - name: Reject critical production vulnerabilities
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-        run: npm audit --omit=dev --audit-level=critical
-
-      - name: Lint
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-        run: npm run lint
-
-      - name: Test daemon launch and title synchronization
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-        run: node --test scripts/daemon-launch-contract.test.mjs
-
-      - name: Build relay
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.relay != 'false') }}
-        run: npm run build:relay
-
-      - name: Run relay tests
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.relay != 'false') }}
-        run: npm run test --workspace=@getpaseo/relay
-
-      - name: Build client dependencies
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
-        run: npm run build:relay && npm run build:client
-
-      - name: Build plugin SDK
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
-        run: npm run build:plugin
-
-      - name: Run plugin SDK tests
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
-        run: npm run test --workspace=@getpaseo/plugin
-
-      - name: Run protocol tests
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
-        run: npm run test --workspace=@getpaseo/protocol
-
-      - name: Run client tests
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
-        run: npm run test --workspace=@getpaseo/client
-
-      - name: Run highlight tests
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
-        run: npm run test --workspace=@getpaseo/highlight
-
-      - name: Typecheck client examples
-        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.full != 'false' || needs.changes.outputs.sdk != 'false') }}
-        run: npm run typecheck:examples --workspace=@getpaseo/client
-
-  typecheck:
-    name: typecheck
+  rust-clippy:
     needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'typecheck') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false') }}
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'rust-clippy') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.quality != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false') }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
         with:
-          node-version: "22"
-          cache: "npm"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check every native crate, example and test target
+        run: cargo clippy --locked --workspace --all-targets
 
-      - name: Install dependencies
-        run: node scripts/npm-retry.mjs ci
-
-      - name: Build SDK dependencies
-        run: npm run build:relay && npm run build:client && npm run build:plugin
-
-      - name: Typecheck Node packages
-        run: npm run typecheck:node
-
-      - name: Run website tests
-        run: npx vitest run packages/website/src --bail=1
-
-      - name: Install website test browsers
-        run: npx playwright install --with-deps chromium webkit
-
-      - name: Verify website mockups
-        run: npm run test:e2e --workspace=@getpaseo/website
-
-      - name: Verify public package contents
-        run: |
-          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/protocol
-          npm pack --dry-run --ignore-scripts --workspace=@getpaseo/client
+  relay-edge:
+    needs: changes
+    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'relay-edge') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.relay != 'false') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned native Wasm binding generator
+        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Build Rust edge proxy and generated bindings
+        run: cargo xtask relay-cloudflare build
+      - name: Test edge routing behavior on host
+        run: cargo test --locked -p paseo-relay-cloudflare
+      - name: Check Wasm implementation
+        run: cargo clippy --locked -p paseo-relay-cloudflare --target wasm32-unknown-unknown
 
   native-daemon-linux:
-    name: native-daemon-linux
+    name: native-daemon-linux-${{ matrix.arch }}
     needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-linux') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false') }}
-    runs-on: ubuntu-24.04
+    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-linux') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.quality != 'false') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps: &native_daemon_steps
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24.15.0"
-          cache: npm
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: native-daemon-${{ runner.os }}-${{ runner.arch }}
-      - name: Install optional plugin worker build dependencies
-        run: node scripts/npm-retry.mjs ci
+          shared-key: native-${{ runner.os }}-${{ runner.arch }}
       - name: Install Linux native runtime packaging prerequisites
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y patchelf
-      - name: Build native daemon and optional plugin worker
-        run: node scripts/build-native-daemon.mjs
-      - name: Test native backend contracts
-        run: cargo test --workspace --locked
-      - name: Run built-in plugin tests
-        run: npm run test --workspace=@getpaseo/builtin-plugins
+      - name: Build native daemon and runtime assets
+        run: cargo xtask build-daemon
+      - name: Test every workspace crate and target
+        run: cargo test --workspace --all-targets --locked
 
   native-daemon-windows:
-    name: native-daemon-windows
+    name: native-daemon-windows-${{ matrix.arch }}
     needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-windows') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false') }}
-    runs-on: windows-latest
+    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-windows') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.quality != 'false') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, arch: x64 }
+          - { runner: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps: *native_daemon_steps
 
   native-daemon-macos:
-    name: native-daemon-macos
+    name: native-daemon-macos-${{ matrix.arch }}
     needs: changes
-    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-macos') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false') }}
-    runs-on: macos-14
+    if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'native-daemon-macos') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.daemon != 'false' || needs.changes.outputs.sdk != 'false' || needs.changes.outputs.relay != 'false' || needs.changes.outputs.quality != 'false') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15-intel, arch: x64 }
+          - { runner: macos-15, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps: *native_daemon_steps
 
@@ -264,6 +197,12 @@ jobs:
       - name: Analyze native Flutter sources
         working-directory: packages/flutter_app
         run: flutter analyze --no-pub
+      - name: Analyze maintained Dart plugin libraries
+        shell: bash
+        run: |
+          for package in packages/flutter_audio packages/flutter_desktop_host/third_party/desktop_multi_window; do
+            (cd "$package" && flutter pub get && flutter analyze lib)
+          done
 
   flutter-test:
     name: flutter-test
@@ -277,6 +216,8 @@ jobs:
       - *flutter_checkout
       - *flutter_sdk
       - *flutter_pub_cache
+      - name: Install native asset build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev
       - *flutter_pub_get
       - name: Run Flutter unit and widget tests
         working-directory: packages/flutter_app
@@ -291,10 +232,16 @@ jobs:
           retention-days: 7
 
   flutter-build-linux:
-    name: flutter-build-linux
+    name: flutter-build-linux-${{ matrix.arch }}
     needs: changes
     if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-build-linux') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false' || needs.changes.outputs.flutter_linux != 'false') }}
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -305,7 +252,7 @@ jobs:
       - name: Install Linux native build prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev ffmpeg pulseaudio-utils xdg-utils
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev ffmpeg pulseaudio-utils xdg-utils
       - *flutter_pub_get
       - name: Compile native Linux client and plugins
         working-directory: packages/flutter_app
@@ -315,7 +262,7 @@ jobs:
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.job }}-diagnostics
+          name: ${{ github.job }}-${{ runner.arch }}-diagnostics
           path: |
             packages/flutter_app/build/**/CMakeConfigureLog.yaml
             packages/flutter_app/build/**/CMakeError.log
@@ -325,10 +272,16 @@ jobs:
           retention-days: 7
 
   flutter-build-windows:
-    name: flutter-build-windows
+    name: flutter-build-windows-${{ matrix.arch }}
     needs: changes
     if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-build-windows') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false' || needs.changes.outputs.flutter_windows != 'false') }}
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, arch: x64 }
+          - { runner: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -343,10 +296,16 @@ jobs:
       - *flutter_build_diagnostics
 
   flutter-build-macos:
-    name: flutter-build-macos
+    name: flutter-build-macos-${{ matrix.arch }}
     needs: changes
     if: ${{ !cancelled() && (!inputs.recovery_job || inputs.recovery_job == 'all' || inputs.recovery_job == 'flutter-build-macos') && (needs.changes.outputs.full != 'false' || needs.changes.outputs.flutter != 'false' || needs.changes.outputs.flutter_macos != 'false') }}
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15-intel, arch: x64 }
+          - { runner: macos-15, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -377,6 +336,8 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - uses: gradle/actions/setup-gradle@v4
       - *flutter_pub_get
       - name: Compile native Android client and audio plugin

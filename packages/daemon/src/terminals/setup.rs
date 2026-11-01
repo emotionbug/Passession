@@ -1,8 +1,6 @@
 use super::{CreateTerminal, scripts::config};
-use crate::{
-    process::{CommandSpec, ManagedProcess},
-    state::AppState,
-};
+use paseo_client::process::{CommandSpec, ManagedProcess};
+use crate::{ state::AppState, };
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::{

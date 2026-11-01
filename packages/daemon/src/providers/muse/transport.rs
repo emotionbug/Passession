@@ -16,10 +16,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    process::{CommandSpec, ManagedProcess},
-    providers::api::ProviderSpec,
-};
+use paseo_client::process::{CommandSpec, ManagedProcess};
+use crate::{ providers::api::ProviderSpec, };
 
 const FINGERPRINT: &str = "sha256:e0e163db6ccf00dbe68402ce55d6319b3edc33c421f31e9583b587b2de8a118f";
 

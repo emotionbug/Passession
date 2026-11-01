@@ -72,7 +72,7 @@ paseo daemon restart
 
 当你删除 `daemon.relay.enabled` 时，新的主目录会保持中继关闭。如果 daemon 启动时其配置就已经省略了这个字段，它会为了兼容而保持旧版的中继开启行为。编辑较旧的配置时，请显式设置 `daemon.relay.enabled`。
 
-监听地址、身份验证、中继端点和 TLS、worktree 分配、服务代理地址、日志、语音、凭据以及本地模型设置需要重启。重新加载会先应用同一文件中的其他有效编辑，再报告这些路径。
+监听地址、身份验证、中继端点和 TLS、worktree 分配、服务代理地址和日志设置需要重启。重新加载会先应用同一文件中的其他有效编辑，再报告这些路径。
 
 部署环境变量仍然具有最终决定权。当启动覆盖项阻止文件设置生效时，重新加载会在 `overrideControlledPaths` 中报告。主机名和 CORS 来源等列表仍会跨来源追加。要让文件值生效，请停止部署并在不带覆盖项的情况下重新启动。
 
@@ -96,11 +96,9 @@ Agent Provider，包括 Paseo 自带的一等 Provider 和你在 `agents.provide
 
 相对路径基于 `PASEO_HOME` 解析。已有的 worktree 保持原位；修改此设置只会改变 Paseo 之后创建和发现由 Paseo 管理的 worktree 的位置。
 
-## 语音 {#voice}
+## 已移除的语音设置 {#removed-speech-settings}
 
-语音通过 `features.dictation` 和 `features.voiceMode` 配置，Provider 凭据放在 `providers` 下。
-
-语音的设计理念、架构以及完整的本地和 OpenAI 设置示例，见[语音文档](/docs/voice)。
+不再支持语音识别、语音对话和 TTS。配置规范化会丢弃旧的顶层 `providers`、`features.dictation` 和 `features.voiceMode` 设置，不会移除 `agents.providers` 下的 Agent 配置。
 
 ## 原生客户端 {#native-clients}
 
@@ -224,16 +222,7 @@ URI 中的 `password=` 总是优先于环境变量，因此你可以全局设置
 - `PASEO_LOG_FILE_ROTATE_SIZE`，覆盖 `log.file.rotate.maxSize`
 - `PASEO_LOG_FILE_ROTATE_COUNT`，覆盖 `log.file.rotate.maxFiles`
 - `PASEO_LOG`、`PASEO_LOG_FORMAT`，旧版日志覆盖项（仍受支持）
-- `OPENAI_API_KEY`，覆盖 OpenAI Provider 密钥
-- `OPENAI_STT_API_KEY`、`OPENAI_STT_BASE_URL`，OpenAI 语音转文字端点（听写和语音模式 STT）
-- `OPENAI_TTS_API_KEY`、`OPENAI_TTS_BASE_URL`，OpenAI 文字转语音端点（语音模式 TTS）
-- `PASEO_VOICE_LLM_PROVIDER`，覆盖语音 LLM Provider（`claude`、`codex`、`opencode`）
-- `PASEO_DICTATION_STT_PROVIDER`、`PASEO_VOICE_STT_PROVIDER`、`PASEO_VOICE_TTS_PROVIDER`，覆盖语音 Provider 的选择（`local` 或 `openai`）
-- `PASEO_LOCAL_MODELS_DIR`，控制本地模型目录
-- `PASEO_DICTATION_LOCAL_STT_MODEL`，覆盖本地听写 STT 模型
-- `PASEO_VOICE_LOCAL_STT_MODEL`、`PASEO_VOICE_LOCAL_TTS_MODEL`，覆盖本地语音 STT/TTS 模型
-- `PASEO_DICTATION_LANGUAGE`、`PASEO_VOICE_LANGUAGE`，覆盖听写和语音 STT 的语言
-- `PASEO_VOICE_LOCAL_TTS_SPEAKER_ID`、`PASEO_VOICE_LOCAL_TTS_SPEED`，可选的本地语音 TTS 调优
+- 外部 Agent CLI 会继承 `OPENAI_API_KEY` 等 Provider 凭据；请按照对应 Provider 的文档配置。
 
 ## Schema {#schema}
 

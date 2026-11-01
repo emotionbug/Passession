@@ -16,7 +16,8 @@ pub use context::{
 };
 pub use identity::{generate_local_pairing_offer, hash_daemon_password, offline_pairing_offer};
 
-use crate::{relay_crypto::KeyPair, state::AppState};
+use crate::state::AppState;
+use paseo_protocol::crypto::KeyPair;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -110,10 +111,8 @@ impl Drop for SourceGuard<'_> {
                     return;
                 };
                 let hosts = app.transport.hosts.clone();
-                let speech = app.speech.clone();
                 drop(app);
                 hosts.detach_source(&source).await;
-                let _ = speech.detach_source(&source).await;
             });
         }
     }
@@ -234,23 +233,6 @@ impl TransportService {
                 transport.sessions.lock().unwrap().sessions.retain(|_, s| s.retained_until.is_none_or(|until| until > Instant::now()));
             } } }
         }));
-        if let Some(app) = self.app.upgrade() {
-            let mut readiness = app.speech.subscribe_readiness();
-            let weak = self.app.clone();
-            let cancel = self.cancel.clone();
-            drop(app);
-            self.tasks.lock().unwrap().push(tokio::spawn(async move {
-                loop { tokio::select! { _ = cancel.cancelled() => break, changed = readiness.changed() => {
-                    if changed.is_err() { break; }
-                    let Some(app) = weak.upgrade() else { break; }; let transport = app.transport.clone(); drop(app);
-                    for source in transport.live_sources() {
-                        if source.wants_event("status.server_info") {
-                            if let Ok(info) = transport.server_info(&source).await { let _ = source.emit_event(info).await; }
-                        }
-                    }
-                } } }
-            }));
-        }
         Ok(())
     }
     pub async fn initialize(&self) -> Result<()> {
@@ -653,7 +635,7 @@ impl TransportService {
                             match handled {
                                 Ok(true) => {},
                                 Ok(false) => { send_close(&outbound,1008,"Unowned binary frame").await; break; },
-                                Err(error) => { let code = if error.downcast_ref::<hosts::HostError>().is_some_and(|e| matches!(e.code.as_str(),"permission_denied" | "host_unknown" | "invalid_message")) { 1008 } else { 1011 }; send_close(&outbound,code,&error.to_string()).await; break; }
+                                Err(error) => { let code = if error.downcast_ref::<paseo_client::transport::HostError>().is_some_and(|e| matches!(e.code.as_str(),"permission_denied" | "host_unknown" | "invalid_message")) { 1008 } else { 1011 }; send_close(&outbound,code,&error.to_string()).await; break; }
                             }
                         }
                         OutboundFrame::Ping(bytes) => { context.queue(OutboundFrame::Pong(bytes)).await?; }
@@ -667,11 +649,6 @@ impl TransportService {
         }.await;
         context.detach();
         self.hosts.detach_source(context.source_id()).await;
-        if let Some(app) = self.app.upgrade() {
-            if let Err(error) = app.speech.detach_source(context.source_id()).await {
-                tracing::debug!(%error,"Speech source teardown failed");
-            }
-        }
         self.detach_registration(&context, &key);
         let _ = writer.await;
         source_guard.completed = true;
@@ -1077,11 +1054,9 @@ impl TransportService {
             .upgrade()
             .ok_or_else(|| anyhow!("Daemon is shutting down"))?;
         let hoplite = app.providers.definition("hoplite").is_some();
-        let speech = app.speech.clone();
         drop(app);
-        let readiness = speech.readiness().await;
         Ok(
-            json!({"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":identity["serverId"],"hostname":identity["label"],"version":env!("CARGO_PKG_VERSION"),"sourceId":context.actor_source_id(),"permissions":context.permissions(),"desktopManaged":config["desktopManaged"].as_bool().unwrap_or(false),"features":features::features(&config,hoplite),"capabilities":features::speech_capabilities(&readiness)}}),
+            json!({"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":identity["serverId"],"hostname":identity["label"],"version":env!("CARGO_PKG_VERSION"),"sourceId":context.actor_source_id(),"permissions":context.permissions(),"desktopManaged":config["desktopManaged"].as_bool().unwrap_or(false),"features":features::features(&config,hoplite),"capabilities":{}}}),
         )
     }
     async fn status_payload(&self, request: &Value) -> Result<Value> {

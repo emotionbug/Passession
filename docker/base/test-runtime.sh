@@ -40,15 +40,13 @@ docker run --rm --network none \
   ! command -v electron
   test "$(readlink -f /usr/local/bin/paseo)" = /opt/paseo/paseo
   test -x /opt/paseo/paseo
-  test -f /opt/paseo/lib/libsherpa-onnx-c-api.so
   test -d /opt/paseo/skills/paseo
-  test -f /opt/paseo/plugin-worker/worker.mjs
+  test ! -e /opt/paseo/plugin-worker
+  test ! -e /opt/paseo/node_modules
   test -s /opt/paseo/RUST-THIRD-PARTY-NOTICES.json
   test -s /opt/paseo/RUST-THIRD-PARTY-NOTICES.txt
-  test -s /opt/paseo/plugin-worker/THIRD-PARTY-NOTICES.json
-  test -s /opt/paseo/plugin-worker/THIRD-PARTY-NOTICES.txt
-  test -s /opt/paseo/lib/SPEECH-THIRD-PARTY-NOTICES.json
-  test -s /opt/paseo/lib/SPEECH-THIRD-PARTY-NOTICES.txt
+  test -s /opt/paseo/bundle-provenance.json
+  test -s /opt/paseo/LICENSE
   test -s /opt/paseo/THIRD-PARTY-NOTICES.txt
   test ! -e /etc/paseo-server-entry
   case "$(cat /opt/paseo/paseo-runtime.json)" in
@@ -73,8 +71,7 @@ test "$status" = 37
 docker create --name "$name" --network none \
   --mount "type=volume,src=$volume,dst=/home/paseo" \
   -e PASEO_LISTEN=0.0.0.0:6779 -e PASEO_PASSWORD=isolated-smoke-only \
-  -e PASEO_RELAY_ENABLED=false -e PASEO_DICTATION_ENABLED=false \
-  -e PASEO_VOICE_MODE_ENABLED=false "$image" >/dev/null
+  -e PASEO_RELAY_ENABLED=false "$image" >/dev/null
 created_container=true
 docker start "$name" >/dev/null
 healthy=false

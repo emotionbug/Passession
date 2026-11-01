@@ -6,40 +6,38 @@ Paseo is a native client/server system. **Rust owns the daemon and CLI; Flutter 
 Flutter desktop ── native desktop-host IPC ── Rust lifecycle/supervisor
        │                                         │
 Flutter mobile ── WebSocket / encrypted relay ── Rust daemon
-Rust CLI / external TypeScript SDK ───────────────┤
+Rust CLI / external Rust SDK ─────────────────────┤
                                                   ├─ provider processes
                                                   ├─ persistent state / files / Git
                                                   ├─ script and setup PTYs
                                                   ├─ MCP / schedules / connected hosts
-                                                  ├─ native or remote speech
-                                                  └─ optional external-Node backend worker
+                                                  └─ optional native plugin executables
 ```
 
-The default installed runtime includes neither Node, Electron, nor Chromium. Node 24 is build tooling. Optional JavaScript backend extensions can start a separately installed Node executable; built-in integrations do not use that worker. External provider programs retain their own installation and runtime requirements.
+Paseo's runtime, SDKs and build tools require neither Node, Electron, nor Chromium. Optional backend plugins run as native executables with bounded JSONL IPC. External provider programs retain their own installation and runtime requirements.
 
 ## Ownership
 
 | Component                   | Source                                                                                 | Responsibility                                                                            |
 | --------------------------- | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | Native executable           | `packages/daemon/src/main.rs`, `cli.rs`, `cli/`                                        | CLI dispatch, daemon commands, client operations                                          |
-| Transport                   | `transport.rs`, `transport/`, `client.rs`, `relay_crypto/` under `packages/daemon/src` | HTTP/WebSocket, authentication, relay encryption, local/remote CLI connections            |
+| Transport                   | `packages/daemon/src/transport/`, `packages/client/src`, `packages/protocol/src/crypto` | HTTP/WebSocket, authentication, relay encryption, local/remote SDK and CLI connections |
 | State and configuration     | `state.rs`, `config.rs`, `config/`                                                     | Config resolution, durable state, mutation transactions                                   |
 | Agents                      | `agent.rs`, `agent/`, `providers/`                                                     | Provider processes, permissions, lifecycle, snapshots, timeline persistence and streaming |
 | Projects and workspaces     | `projects.rs`, `projects/`, `directory_sync/`                                          | Checkout/worktree identity, acquisition, registries, directory reconciliation             |
 | Files and Git               | `files/`, `git/`                                                                       | Remote picker, reads/writes, observation, Git facts and lazy diff bodies                  |
 | Scripts                     | `terminals.rs`, `terminals/`                                                           | PTY lifecycle, setup, service scripts, replayable output                                  |
 | Automation and integrations | `automation/`, `mcp/`, `mcp_client/`, `hosts/`, `hub/`                                 | Schedules, MCP client/server, connected-host and Hub behavior                             |
-| Speech                      | `speech/`                                                                              | Model installation, native inference, remote services, streaming audio                    |
 | Desktop lifecycle           | `desktop_host.rs`, `desktop_host/`, `daemon_control/`                                  | Structured IPC, process identity, ownership, supervisor and worker lifecycle              |
 | Client                      | `packages/flutter_app/lib`                                                             | Dart transport/store, navigation, native views and platform integration                   |
-| Packaging                   | `packages/flutter_desktop_host/packaging`                                              | Native runtime assets, installers, provenance, updates, attributions                      |
+| Packaging                   | `xtask/src`, `packages/flutter_desktop_host`                                            | Native runtime assets, installers, provenance, updates, attributions                      |
 | Audio bridge                | `packages/flutter_audio`                                                               | Native audio integration                                                                  |
 
-Paths in the daemon rows are relative to `packages/daemon/src` unless otherwise shown. The TypeScript SDK (`packages/client`), protocol (`packages/protocol`), relay library (`packages/relay`), and optional extension SDK (`packages/plugin`) remain separate libraries, not the product daemon. The website remains separate build/deployment tooling.
+Paths in the daemon rows are relative to `packages/daemon/src` unless otherwise shown. The client (`paseo-client`), shared protocol (`paseo-protocol`), relay (`paseo-relay`), plugin SDK (`paseo-plugin`) and highlighting (`paseo-highlight`) are Rust workspace crates. `paseo-xtask` owns development and release commands. The unused website source is removed; Markdown documentation remains in the repository.
 
 ## Protocol and persistence
 
-The existing JSON request/response and event contracts, binary stream framing, request IDs, session IDs, provider-native session identity, and configuration formats are preserved. `packages/protocol` supplies the TypeScript schema/SDK contract; Rust and Dart implement it independently. Compatibility work must update all affected language implementations and exercise the wire boundary, not just compile one side.
+The existing JSON request/response and event contracts, binary stream framing, request IDs, session IDs, provider-native session identity, and configuration formats are preserved. `packages/protocol` supplies Rust wire types, validation and shared cryptography; Dart implements the same wire contract. Compatibility work must update both sides and exercise the wire boundary, not just compile one side.
 
 The default daemon home is `~/.paseo`. `PASEO_HOME` and CLI `--home` select another instance. State remains in that home: `config.json`, agent/session records and history, project/workspace records, schedules, plugin configuration, credentials and runtime bookkeeping. A UI cutover is not permission to delete, reset, or relocate a user's state. Checkout development defaults to `.dev/paseo-home` and `127.0.0.1:6768`, separate from the ordinary `6767` endpoint.
 
@@ -69,6 +67,6 @@ The client has no embedded browser, browser automation, web target, Chromium cap
 
 ## Runtime assets and release boundary
 
-Desktop packaging carries the native executable, speech libraries, skills, optional-worker compiler/SDK assets, and desktop editor runtime assets. It does not carry a Node executable or speech model weights. Models are downloaded on demand.
+Desktop packaging carries the native executable, skills, native runtime assets and desktop editor assets. It does not carry a Node executable, JavaScript plugin compiler or speech runtime. Speech recognition, voice conversation and TTS are excluded; generic effect-sound playback remains.
 
-Cargo, worker and speech notices are generated by `packages/flutter_desktop_host/packaging/third-party-notices.mjs`. Notices do not settle redistribution rights or corresponding-source obligations for static GPL espeak-ng inside the official Sherpa 1.12.28 TTS-enabled builds. See [release requirements](release.md#distribution-requirements).
+Cargo and bundled-asset notices are generated by the Rust tooling in `xtask/src/notices.rs`. Preserve them with the packaged artifacts. See [release requirements](release.md#distribution-requirements).

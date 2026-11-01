@@ -475,20 +475,9 @@ pub(crate) async fn resolve_scoped_cwd(
 ) -> Result<PathBuf> {
     if let Some(id) = caller {
         let agent = caller_agent(app, id).await?;
-        let context = app.mcp.caller_context(id).await;
-        if let Some(locked) = context
-            .as_ref()
-            .and_then(|value| trimmed(value, "lockedCwd"))
-        {
-            return expand_path(app, locked, None);
-        }
         let parent = Path::new(required(&agent, "cwd")?);
         let requested = requested.map(str::trim).filter(|value| !value.is_empty());
-        if context
-            .as_ref()
-            .is_some_and(|context| !flag(context, "allowCustomCwd", true))
-            || requested.is_none()
-        {
+        if requested.is_none() {
             return Ok(parent.to_path_buf());
         }
         return expand_path(app, requested.unwrap(), Some(parent));

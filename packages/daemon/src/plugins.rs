@@ -1,8 +1,9 @@
-//! Native extension lifecycle. JavaScript runs only for explicitly configured
-//! third-party backend extensions in an optional, externally supplied Node runtime.
+//! Native extension lifecycle using bounded JSON IPC with standalone executables.
 mod lifecycle;
 mod managed;
 mod manifest;
+#[cfg(test)]
+pub(crate) use manifest::read as read_plugin_manifest;
 mod operations;
 mod provider;
 #[cfg(test)]
@@ -182,7 +183,6 @@ impl PluginService {
         let manifest = manifest::read(&directory).await?;
         manifest::check_compatibility(&manifest)?;
         self.append_log(id, "stdout", "[paseo] Loading plugin");
-        manifest::require_server_entry(&directory).await?;
         let worker = PluginWorker::start(self.app.clone(), id, &directory, &settings, env).await?;
         let result = self
             .publish(id, directory, manifest, Some(worker.clone()))

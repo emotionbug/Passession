@@ -10,9 +10,7 @@ For testing rules, see [testing.md](testing.md).
 - **YAGNI** — build features and abstractions only when needed. A function called once is indirection, not abstraction.
 - **No "while I'm at it" cleanups** — make the change you came for. Drive-by edits hide in the diff.
 - **Functional and declarative** over object-oriented.
-- **`function` declarations** over arrow function assignments.
-- **`interface`** over `type` when both work.
-- **No `index.ts` barrel files** that only re-export — they create indirection and circular-dep risk. Import from the source.
+- Keep one deliberate public API per Rust crate or Dart library; do not add pass-through modules that only hide the owner.
 
 ## Shell scripts
 
@@ -25,47 +23,46 @@ For testing rules, see [testing.md](testing.md).
 - No decorative section dividers (`// ===== Helpers =====`). Use files and modules to organize, not ASCII art.
 - No hedging comments (`// might need to revisit`, `// should work for most cases`). If you're unsure, investigate.
 - No commented-out code. Git remembers.
-- No `console.log` / `debugger` left behind. No `TODO: implement` stubs — if it needs to exist, write it.
+- Remove temporary debug output and breakpoints. No `TODO: implement` stubs — if it needs to exist, write it.
 
 ## Confidence: commit to a shape
 
 - Validate at boundaries (network, IPC, user input, file I/O), trust types internally. After the parse, the value is what its type says.
-- Every `?.` and `??` past the validation boundary is unconfident code — either the boundary should resolve it, or the type should reflect reality.
-- No defensive checks for conditions the type system already rules out (`if (!agent) return` on a non-nullable parameter).
-- No `try/catch` "just in case." If you can't say what you're catching and why, don't catch.
-- Optionality is a design decision, not a migration shortcut. Distinct valid states → discriminated union. Intentionally empty → explicit `null`. Keep optionality at real boundaries.
+- Resolve optionality at the owning boundary instead of repeating fallback chains downstream.
+- No defensive checks for conditions the type system already rules out.
+- Do not catch errors "just in case." Handle a defined failure or propagate it with context.
+- Optionality is a design decision, not a migration shortcut. Represent distinct states with enums, optional data explicitly, and preserve the wire distinction between missing and null values where required.
 
 ## Types
 
-- No `any`. No `as` casts to bypass errors. No `@ts-ignore` / `@ts-expect-error`. Narrow with `if` / schema validation; let the compiler check harder, not less.
-- If a Zod schema exists, the TypeScript type is `z.infer<typeof schema>`. Never hand-write a parallel type.
-- One canonical type per concept. Layer-specific views are `Pick` / `Omit`, not duplicated fields.
-- Name multi-property object shapes — no inline `Array<{ ... }>` or `Promise<{ ... }>` in signatures, returns, or generic args.
-- Use string literal unions, not raw `string`, when the value is one of a known set. Catches typos at compile time.
-- Object parameters past the obvious-name threshold: 3+ args, any boolean arg, any optional arg → object. `(thing, true, false, true)` is unreadable at the call site.
-- Make impossible states impossible — discriminated unions over `{ isLoading; error?; data? }` bags.
+- Use Rust structs/enums and Dart model types after boundary validation; avoid untyped maps for known internal shapes.
+- Keep one canonical type per concept. Import shared protocol types instead of maintaining parallel copies.
+- Name multi-property input/output shapes rather than hiding their meaning in tuple positions or anonymous maps.
+- Use enums when a value comes from a known set; use checked conversions where truncation or invalid values matter.
+- Use a named options struct when several flags or optional arguments would make call sites ambiguous.
+- Make impossible states impossible rather than combining independent loading/error/data flags.
 
 ## Errors
 
-- Throw typed error classes that carry the fields a caller would want to read. Plain `Error("Provider X not found")` collapses structured info into a string.
-- Catch blocks branch on `instanceof` for what they can handle; rethrow the rest. No `catch (e) { return null }`.
+- Return typed Rust errors or throw typed Dart exceptions with the fields consumers need. Keep error codes and structured details at public boundaries.
+- Handle only failures the caller can resolve; propagate other errors with context. Never turn an unknown failure into an empty success value.
 - Separate user-facing copy from log/debug strings — don't make one string serve telemetry, logs, and the UI.
 - Fail explicitly. If the caller asked for X and X isn't available, throw — don't silently substitute Y.
-- Every fallible user action owns explicit pending, success, and failure UI. Console logs and unverified platform alerts do not satisfy this contract. See [testing.md](testing.md#fallible-user-actions).
+- Every fallible user action owns explicit pending, success, and failure UI. Console logs and unverified platform alerts do not satisfy this contract. See [testing.md](testing.md#failure-and-security-expectations).
 - A capability advertised to a client means the current runtime can perform the action, not merely that its RPC handler exists. If an unavailable action needs explanatory UI, send the runtime fact or reason separately and keep the server-side refusal fail-closed.
 
 ## Density
 
-- Nested ternaries are forbidden. A single ternary is fine only when both branches are a single identifier or trivial access (`x ? a : b`).
+- Avoid nested conditional expressions. Name branch decisions when a compact expression hides their meaning.
 - Boolean expressions with 2+ clauses or mixed concerns → name the conditions.
-- Object literals assemble pre-computed values; don't pack branching and lookups into property positions.
-- Operations wrapping operations (`Object.fromEntries(arr.filter(...).map(...))`, `Math.max(...xs.map(...))`) → break into named intermediates.
-- Max 3 levels of nesting (callbacks, JSX, control flow). Above that, extract.
+- Struct and object construction assemble precomputed values; do not hide state transitions in field initializers.
+- Break dense transformation chains into named intermediate concepts when they obscure ownership or error handling.
+- Keep control flow shallow. Extract a real responsibility rather than adding wrappers solely to reduce indentation.
 
 ## Structure and modules
 
 - A directory is a module, not a namespace. One intentional public surface; internal files stay internal.
-- Path is part of the name — prefer `provider/registry.ts` over `provider/provider-registry.ts`. If the filename has to do double duty, deepen the path.
+- Path is part of the name — prefer `provider/registry.rs` over `provider/provider_registry.rs`. If the filename has to do double duty, deepen the path.
 - Filenames ending in `-utils`, `-helpers`, `-manager`, `-handler`, `-controller`, `-formatter`, `-builder` are a smell — the path didn't carry enough domain.
 - Boundary returns answer the caller's question (`getActiveAgents()`), not "here's my storage" (`getAgents().filter(...)` repeated everywhere).
 - One adapter means a hypothetical seam; two adapters means a real one. Don't define a port until something actually varies across it.
@@ -84,31 +81,6 @@ For testing rules, see [testing.md](testing.md).
 ## Native runtime
 
 Rust owns daemon/CLI execution and Flutter/Dart owns the native client. Keep process/PTY/storage authority on the daemon, protocol validation at each language boundary, and UI lifecycle separate from provider lifetime. Avoid avoidable allocations and whole-history work on hot paths. Do not introduce Node, Electron, Chromium, a webview or a React UI-plugin host as a fallback.
-
-## React website
-
-These React rules apply to the retained website, not the native product client:
-
-- `useEffect` is for synchronizing with external systems (DOM, network, timers, subscriptions). Not for transforming React state. Derived state → compute in render or `useMemo`.
-- No effect cascades — chains of effects setting state that triggers more effects almost always want React Query or a reducer.
-- `useRef` is for DOM refs and non-rendering identities (timer IDs, AbortController, latest-callback caches). If the value affects what renders next, it's state — model it explicitly with `useReducer` and a discriminated union.
-- Server state goes through React Query. Manual `useState` + `useEffect` + `isLoading` + `error` for fetched data is always worse.
-- Components render and dispatch — they don't compute transitions. Two-plus interacting `useState`s → extract a reducer.
-- Never define components inside other components. Module-scope only.
-- Subscribe narrowly: select primitives from stores, pass `status` not `agent`, use `useShallow` / deep-equal when returning derived arrays/objects.
-- Collection rows do not independently subscribe to a high-frequency global store. The collection owner selects structurally shared indexes once, derives a keyed row model with `useMemo`, and passes entries to rows. This keeps retained hidden collections current without running one selector per row on every store update.
-- Equality functions prevent React renders; they do not prevent selector callbacks from running. A selector attached to a hot store must be O(1) when its relevant source references have not changed.
-- Stable references for props that cross `memo` boundaries or feed dependency arrays. Static literals at module scope `as const`; derived with `useMemo`; handlers with `useCallback` only when there's a memoized beneficiary.
-- Use stable ids for `key`, never array index for reorderable/filterable lists.
-- Context for stable values (theme, auth). Store with selectors for state that changes.
-
-### Hidden website measurements
-
-A hidden DOM surface can report zero width/height. A non-positive measurement is not a valid compact layout. This website rule does not prescribe Flutter widget retention:
-
-- Suspend geometry-derived updates while either measured dimension is non-positive. Preserve the last valid state until the surface reports positive geometry again.
-- Enforce the rule at the measurement boundary shared by every trigger. Guarding only an `onLayout` or `ResizeObserver` callback still lets effects, content changes, and imperative remeasurement publish hidden geometry.
-- Test the hide-and-reveal path through a real retained surface. Settled assertions do not catch stale geometry painted during the first returned frames.
 
 ## Naming
 

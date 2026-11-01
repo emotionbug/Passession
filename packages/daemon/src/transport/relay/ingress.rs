@@ -1,10 +1,10 @@
 use super::Socket;
 use crate::{
-    relay_crypto::{
-        Frame, HANDSHAKE_TIMEOUT, KeyPair, MAX_WIRE_BYTES, SecureChannel, SecurityMode,
-    },
     state::AppState,
     transport::{OutboundFrame, context::MAX_BUFFERED_BYTES},
+};
+use paseo_protocol::crypto::{
+    Frame, HANDSHAKE_TIMEOUT, KeyPair, MAX_WIRE_BYTES, SecureChannel, SecurityMode,
 };
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;

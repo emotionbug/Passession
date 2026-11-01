@@ -1,29 +1,72 @@
-name: Deploy Relay
+name: Deploy Native Relay
 
 on:
-  # Manual-only while relay.paseo.sh bridges traffic to the Fly deployment.
-  # A release or main push must not redeploy the temporary Cloudflare bridge.
   workflow_dispatch:
+    inputs:
+      target:
+        description: Explicit service to deploy
+        required: true
+        type: choice
+        default: fly
+        options: [fly, cloudflare]
+      confirm_edge_upload:
+        description: Replace the existing paseo-relay Worker with the Rust/WASM edge proxy
+        required: true
+        type: boolean
+        default: false
+      confirm_single_machine:
+        description: Confirm the target Fly app has exactly one machine and its public routing is approved
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-relay-production
+  cancel-in-progress: false
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-
+    if: github.repository == 'emotionbug/paseo' && inputs.target == 'fly' && vars.ENABLE_RELAY_DEPLOY == 'true' && inputs.confirm_single_machine
+    environment: relay-production
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Test native relay
+        run: cargo test --locked -p paseo-relay
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Validate explicit deployment credentials
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: test -n "$FLY_API_TOKEN" || { echo 'Configure relay-production FLY_API_TOKEN before deploying'; exit 1; }
+      # Process-local routing requires a single machine; this workflow does not
+      # scale existing production services or alter Cloudflare DNS/Worker routes.
+      - name: Deploy native Fly relay without HA duplication
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --ha=false --config packages/relay/fly.toml --dockerfile packages/relay/Dockerfile
 
-      - uses: actions/setup-node@v4
+  deploy-edge:
+    if: github.repository == 'emotionbug/paseo' && inputs.target == 'cloudflare' && vars.ENABLE_RELAY_EDGE_DEPLOY == 'true' && inputs.confirm_edge_upload
+    environment: relay-edge-production
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
         with:
-          node-version: "22"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: node scripts/npm-retry.mjs ci --workspace=@getpaseo/relay --include-workspace-root
-
-      - name: Typecheck
-        run: npm run typecheck --workspace=@getpaseo/relay
-
-      - name: Deploy worker
-        run: cd packages/relay && npx wrangler deploy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned native Wasm binding generator
+        run: cargo install wasm-bindgen-cli --version 0.2.108 --locked
+      - name: Build Rust edge proxy
+        run: cargo xtask relay-cloudflare build
+      - name: Upload existing Worker without changing routes
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 10ed39a1dbf316e30abd0c409bed40d6
+          PASEO_RELAY_UPSTREAM: https://paseo-relay-next.fly.dev
+        run: cargo xtask relay-cloudflare deploy --confirm-upload

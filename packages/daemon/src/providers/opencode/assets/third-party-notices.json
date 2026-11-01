@@ -1,0 +1,778 @@
+{
+  "schemaVersion": 1,
+  "boundary": "Retained external OpenCode CLI ABI JavaScript assets, embedded as data in the native daemon. Package names and source-module markers are observed in the digest-bound assets. Only Zod has an embedded version corroborated by the retained lock entry. Other bundled package versions are unverified: observed build-input manifest versions identify the retained attribution sources, not proven versions of the bundled code. License texts are copied verbatim from those retained package inputs; no npm, Node, or node_modules access is required to validate or stage this inventory. This inventory is not proof of original build-input equivalence.",
+  "assets": [
+    {
+      "path": "legacy-plugin.mjs",
+      "sha256": "833f3e8cadda9fd7c39941cf2ee29636358ea9ef76e5634b904a630672cab5c2",
+      "modules": [
+        {
+          "source": "../../node_modules/zod/v4/classic/external.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/index.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/util.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/core.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/errors.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/parse.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/regexes.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/checks.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/doc.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/versions.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/schemas.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/memoizer.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/index.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ar.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/az.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/be.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/bg.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/bn.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ca.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ckb.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/cs.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/da.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/de.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/el.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/en.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/eo.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/es.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/fa.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/fi.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/fr.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/fr-CA.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/gu.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/he.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/hi.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/hr.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/hu.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/hy.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/id.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/is.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/it.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ja.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ka.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/km.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/kh.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/kn.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ko.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/lt.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/mk.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ms.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ne.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/nl.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/nn.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/no.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ota.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ps.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/pl.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/pt.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/pt-BR.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ro.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ru.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/sk.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/sl.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/sv.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ta.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/tg.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/th.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/tk.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/tr.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/uk.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ua.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/ur.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/uz.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/vi.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/zh-CN.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/zh-TW.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/locales/yo.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/registries.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/compile.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/api.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/to-json-schema.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/json-schema-processors.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/json-schema-generator.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/json-schema.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/schemas.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/checks.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/errors.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/parse.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/compat.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/iso.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/from-json-schema.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/core/visit.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/deep-partial.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/in-out.js",
+          "package": "zod"
+        },
+        {
+          "source": "../../node_modules/zod/v4/classic/coerce.js",
+          "package": "zod"
+        }
+      ]
+    },
+    {
+      "path": "v2-plugin.mjs",
+      "sha256": "f69b7d297ebb1a54b84958a03a573fb77f2197d5bc69908f279fd610bed53dd6",
+      "modules": [
+        {
+          "source": "node_modules/ajv/dist/compile/codegen/code.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/codegen/scope.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/codegen/index.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/util.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/names.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/errors.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/validate/boolSchema.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/rules.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/validate/applicability.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/validate/dataType.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/validate/defaults.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/code.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/validate/keyword.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/validate/subschema.js",
+          "package": "ajv"
+        },
+        {
+          "source": "../../node_modules/fast-deep-equal/index.js",
+          "package": "fast-deep-equal"
+        },
+        {
+          "source": "../../node_modules/json-schema-traverse/index.js",
+          "package": "json-schema-traverse"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/resolve.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/validate/index.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/runtime/validation_error.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/ref_error.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/compile/index.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/refs/data.json",
+          "package": "ajv"
+        },
+        {
+          "source": "../../node_modules/fast-uri/lib/utils.js",
+          "package": "fast-uri"
+        },
+        {
+          "source": "../../node_modules/fast-uri/lib/schemes.js",
+          "package": "fast-uri"
+        },
+        {
+          "source": "../../node_modules/fast-uri/index.js",
+          "package": "fast-uri"
+        },
+        {
+          "source": "node_modules/ajv/dist/runtime/uri.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/core.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/core/id.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/core/ref.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/core/index.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/limitNumber.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/multipleOf.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/runtime/ucs2length.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/limitLength.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/pattern.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/limitProperties.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/required.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/limitItems.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/runtime/equal.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/uniqueItems.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/const.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/enum.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/validation/index.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/additionalItems.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/items.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/prefixItems.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/items2020.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/contains.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/dependencies.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/propertyNames.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/additionalProperties.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/properties.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/patternProperties.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/not.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/anyOf.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/oneOf.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/allOf.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/if.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/thenElse.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/applicator/index.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/format/format.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/format/index.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/metadata.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/draft7.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/discriminator/types.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/vocabularies/discriminator/index.js",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/refs/json-schema-draft-07.json",
+          "package": "ajv"
+        },
+        {
+          "source": "node_modules/ajv/dist/ajv.js",
+          "package": "ajv"
+        }
+      ]
+    }
+  ],
+  "packages": [
+    {
+      "name": "ajv",
+      "version": "unverified",
+      "source": "ajv-validator/ajv",
+      "license": "MIT",
+      "notices": [
+        {
+          "source": "retained build input ajv@8.20.0/LICENSE (bundle version unverified)",
+          "sha256": "a05350a88e318e4f5f2c2a1ff1e2e88daa4dd38e6e78b71cccae422bdc762cc3"
+        }
+      ],
+      "manifestEvidence": {
+        "path": "packages/server/node_modules/ajv/package.json",
+        "sha256": "1f9033ee5a6515e7d76938b7072941862d1ed228a6879cc7fe10cdeb75107989",
+        "text": "{\n  \"name\": \"ajv\",\n  \"version\": \"8.20.0\",\n  \"description\": \"Another JSON Schema Validator\",\n  \"main\": \"dist/ajv.js\",\n  \"types\": \"dist/ajv.d.ts\",\n  \"files\": [\n    \"lib/\",\n    \"dist/\",\n    \".runkit_example.js\"\n  ],\n  \"sideEffects\": false,\n  \"scripts\": {\n    \"eslint\": \"eslint \\\"lib/**/*.ts\\\" \\\"spec/**/*.*s\\\" --ignore-pattern spec/JSON-Schema-Test-Suite\",\n    \"prettier:write\": \"prettier --write \\\"./**/*.{json,yaml,js,ts}\\\"\",\n    \"prettier:check\": \"prettier --list-different \\\"./**/*.{json,yaml,js,ts}\\\"\",\n    \"test-spec\": \"cross-env TS_NODE_PROJECT=spec/tsconfig.json mocha -r ts-node/register \\\"spec/**/*.spec.{ts,js}\\\" -R dot\",\n    \"test-codegen\": \"nyc cross-env TS_NODE_PROJECT=spec/tsconfig.json mocha -r ts-node/register 'spec/codegen.spec.ts' -R spec\",\n    \"test-debug\": \"npm run test-spec -- --inspect-brk\",\n    \"test-cov\": \"nyc npm run test-spec\",\n    \"rollup\": \"rm -rf bundle && rollup -c\",\n    \"bundle\": \"rm -rf bundle && node ./scripts/bundle.js ajv ajv7 ajv7 && node ./scripts/bundle.js 2019 ajv2019 ajv2019 && node ./scripts/bundle.js 2020 ajv2020 ajv2020 && node ./scripts/bundle.js jtd ajvJTD ajvJTD\",\n    \"build\": \"rm -rf dist && tsc && cp -r lib/refs dist && rm dist/refs/json-schema-2019-09/index.ts && rm dist/refs/json-schema-2020-12/index.ts && rm dist/refs/jtd-schema.ts\",\n    \"json-tests\": \"rm -rf spec/_json/*.js && node scripts/jsontests\",\n    \"test-karma\": \"karma start\",\n    \"test-browser\": \"rm -rf .browser && npm run bundle && scripts/prepare-tests && karma start\",\n    \"test-all\": \"npm run test-cov\",\n    \"test\": \"npm run json-tests && npm run prettier:check && npm run eslint && npm link && npm link --legacy-peer-deps ajv && npm run test-cov\",\n    \"test-ci\": \"AJV_FULL_TEST=true npm test\",\n    \"prepublish\": \"npm run build\",\n    \"benchmark\": \"npm i && npm run build && npm link && cd ./benchmark && npm link --legacy-peer-deps ajv && npm i && node ./jtd\",\n    \"docs:dev\": \"./scripts/prepare-site && vuepress dev docs\",\n    \"docs:build\": \"./scripts/prepare-site && vuepress build docs\"\n  },\n  \"nyc\": {\n    \"exclude\": [\n      \"**/spec/**\",\n      \"node_modules\"\n    ],\n    \"reporter\": [\n      \"lcov\",\n      \"text-summary\"\n    ]\n  },\n  \"repository\": \"ajv-validator/ajv\",\n  \"keywords\": [\n    \"JSON\",\n    \"schema\",\n    \"validator\",\n    \"validation\",\n    \"jsonschema\",\n    \"json-schema\",\n    \"json-schema-validator\",\n    \"json-schema-validation\"\n  ],\n  \"author\": \"Evgeny Poberezkin\",\n  \"license\": \"MIT\",\n  \"bugs\": \"https://github.com/ajv-validator/ajv/issues\",\n  \"homepage\": \"https://ajv.js.org\",\n  \"runkitExampleFilename\": \".runkit_example.js\",\n  \"dependencies\": {\n    \"fast-deep-equal\": \"^3.1.3\",\n    \"fast-uri\": \"^3.0.1\",\n    \"json-schema-traverse\": \"^1.0.0\",\n    \"require-from-string\": \"^2.0.2\"\n  },\n  \"devDependencies\": {\n    \"@ajv-validator/config\": \"^0.5.0\",\n    \"@rollup/plugin-commonjs\": \"^25.0.7\",\n    \"@rollup/plugin-json\": \"^6.1.0\",\n    \"@rollup/plugin-node-resolve\": \"^15.2.3\",\n    \"@rollup/plugin-typescript\": \"^11.1.6\",\n    \"@types/chai\": \"^4.3.11\",\n    \"@types/mocha\": \"^10.0.6\",\n    \"@types/node\": \"^20.11.30\",\n    \"@types/require-from-string\": \"^1.2.3\",\n    \"@typescript-eslint/eslint-plugin\": \"^7.3.1\",\n    \"@typescript-eslint/parser\": \"^7.3.1\",\n    \"ajv-formats\": \"^3.0.1\",\n    \"browserify\": \"^17.0.0\",\n    \"chai\": \"^4.4.1\",\n    \"cross-env\": \"^7.0.3\",\n    \"dayjs\": \"^1.11.10\",\n    \"dayjs-plugin-utc\": \"^0.1.2\",\n    \"eslint\": \"^8.57.0\",\n    \"eslint-config-prettier\": \"^9.1.0\",\n    \"glob\": \"^10.3.10\",\n    \"husky\": \"^9.0.11\",\n    \"jimp\": \"^0.22.10\",\n    \"js-beautify\": \"^1.15.1\",\n    \"json-schema-test\": \"^2.0.0\",\n    \"karma\": \"^6.4.2\",\n    \"karma-chrome-launcher\": \"^3.2.0\",\n    \"karma-mocha\": \"^2.0.1\",\n    \"lint-staged\": \"^15.2.2\",\n    \"mocha\": \"^10.3.0\",\n    \"module-from-string\": \"^3.3.0\",\n    \"node-fetch\": \"^3.3.2\",\n    \"nyc\": \"^15.1.0\",\n    \"prettier\": \"3.0.3\",\n    \"re2\": \"^1.20.9\",\n    \"rollup\": \"^2.79.1\",\n    \"rollup-plugin-terser\": \"^7.0.2\",\n    \"ts-node\": \"^10.9.2\",\n    \"tsify\": \"^5.0.4\",\n    \"typescript\": \"5.3.3\",\n    \"uri-js\": \"^4.4.1\"\n  },\n  \"collective\": {\n    \"type\": \"opencollective\",\n    \"url\": \"https://opencollective.com/ajv\"\n  },\n  \"funding\": {\n    \"type\": \"github\",\n    \"url\": \"https://github.com/sponsors/epoberezkin\"\n  },\n  \"prettier\": \"@ajv-validator/config/prettierrc.json\",\n  \"husky\": {\n    \"hooks\": {\n      \"pre-commit\": \"lint-staged && npm test\"\n    }\n  },\n  \"lint-staged\": {\n    \"*.{json,yaml,js,ts}\": \"prettier --write\"\n  }\n}\n"
+      },
+      "versionAuthority": "unverified-bundle-version"
+    },
+    {
+      "name": "fast-deep-equal",
+      "version": "unverified",
+      "source": "{'type': 'git', 'url': 'git+https://github.com/epoberezkin/fast-deep-equal.git'}",
+      "license": "MIT",
+      "notices": [
+        {
+          "source": "retained build input fast-deep-equal@3.1.3/LICENSE (bundle version unverified)",
+          "sha256": "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a"
+        }
+      ],
+      "manifestEvidence": {
+        "path": "node_modules/fast-deep-equal/package.json",
+        "sha256": "a5c63940db0260739be9e2ac67f3aac268df4db5770420ee4e34e493152f97d2",
+        "text": "{\n  \"name\": \"fast-deep-equal\",\n  \"version\": \"3.1.3\",\n  \"description\": \"Fast deep equal\",\n  \"main\": \"index.js\",\n  \"scripts\": {\n    \"eslint\": \"eslint *.js benchmark/*.js spec/*.js\",\n    \"build\": \"node build\",\n    \"benchmark\": \"npm i && npm run build && cd ./benchmark && npm i && node ./\",\n    \"test-spec\": \"mocha spec/*.spec.js -R spec\",\n    \"test-cov\": \"nyc npm run test-spec\",\n    \"test-ts\": \"tsc --target ES5 --noImplicitAny index.d.ts\",\n    \"test\": \"npm run build && npm run eslint && npm run test-ts && npm run test-cov\",\n    \"prepublish\": \"npm run build\"\n  },\n  \"repository\": {\n    \"type\": \"git\",\n    \"url\": \"git+https://github.com/epoberezkin/fast-deep-equal.git\"\n  },\n  \"keywords\": [\n    \"fast\",\n    \"equal\",\n    \"deep-equal\"\n  ],\n  \"author\": \"Evgeny Poberezkin\",\n  \"license\": \"MIT\",\n  \"bugs\": {\n    \"url\": \"https://github.com/epoberezkin/fast-deep-equal/issues\"\n  },\n  \"homepage\": \"https://github.com/epoberezkin/fast-deep-equal#readme\",\n  \"devDependencies\": {\n    \"coveralls\": \"^3.1.0\",\n    \"dot\": \"^1.1.2\",\n    \"eslint\": \"^7.2.0\",\n    \"mocha\": \"^7.2.0\",\n    \"nyc\": \"^15.1.0\",\n    \"pre-commit\": \"^1.2.2\",\n    \"react\": \"^16.12.0\",\n    \"react-test-renderer\": \"^16.12.0\",\n    \"sinon\": \"^9.0.2\",\n    \"typescript\": \"^3.9.5\"\n  },\n  \"nyc\": {\n    \"exclude\": [\n      \"**/spec/**\",\n      \"node_modules\"\n    ],\n    \"reporter\": [\n      \"lcov\",\n      \"text-summary\"\n    ]\n  },\n  \"files\": [\n    \"index.js\",\n    \"index.d.ts\",\n    \"react.js\",\n    \"react.d.ts\",\n    \"es6/\"\n  ],\n  \"types\": \"index.d.ts\"\n}\n"
+      },
+      "versionAuthority": "unverified-bundle-version"
+    },
+    {
+      "name": "fast-uri",
+      "version": "unverified",
+      "source": "{'type': 'git', 'url': 'git+https://github.com/fastify/fast-uri.git'}",
+      "license": "BSD-3-Clause",
+      "notices": [
+        {
+          "source": "retained build input fast-uri@3.1.2/LICENSE (bundle version unverified)",
+          "sha256": "b010b0dfdfdb23d7396e03b82cd4621fc9bb8f95d6b0aea70b9c24e12074c786"
+        }
+      ],
+      "manifestEvidence": {
+        "path": "node_modules/fast-uri/package.json",
+        "sha256": "bf5b935d03f7fd78711858e0fd05cff61cbb50169658d8df8964a75400a3e251",
+        "text": "{\n  \"name\": \"fast-uri\",\n  \"description\": \"Dependency-free RFC 3986 URI toolbox\",\n  \"version\": \"3.1.2\",\n  \"main\": \"index.js\",\n  \"type\": \"commonjs\",\n  \"types\": \"types/index.d.ts\",\n  \"license\": \"BSD-3-Clause\",\n  \"author\": \"Vincent Le Goff <vince.legoff@gmail.com> (https://github.com/zekth)\",\n  \"contributors\": [\n    {\n      \"name\": \"Matteo Collina\",\n      \"email\": \"hello@matteocollina.com\"\n    },\n    {\n      \"name\": \"Gürgün Dayıoğlu\",\n      \"email\": \"hey@gurgun.day\",\n      \"url\": \"https://heyhey.to/G\"\n    },\n    {\n      \"name\": \"Aras Abbasi\",\n      \"email\": \"aras.abbasi@gmail.com\"\n    },\n    {\n      \"name\": \"Frazer Smith\",\n      \"email\": \"frazer.dev@icloud.com\",\n      \"url\": \"https://github.com/fdawgs\"\n    }\n  ],\n  \"repository\": {\n    \"type\": \"git\",\n    \"url\": \"git+https://github.com/fastify/fast-uri.git\"\n  },\n  \"bugs\": {\n    \"url\": \"https://github.com/fastify/fast-uri/issues\"\n  },\n  \"homepage\": \"https://github.com/fastify/fast-uri\",\n  \"funding\": [\n    {\n      \"type\": \"github\",\n      \"url\": \"https://github.com/sponsors/fastify\"\n    },\n    {\n      \"type\": \"opencollective\",\n      \"url\": \"https://opencollective.com/fastify\"\n    }\n  ],\n  \"scripts\": {\n    \"lint\": \"eslint\",\n    \"lint:fix\": \"eslint --fix\",\n    \"test\": \"npm run test:unit && npm run test:typescript\",\n    \"test:browser:chromium\": \"playwright-test ./test/* --runner tape --browser=chromium\",\n    \"test:browser:firefox\": \"playwright-test ./test/* --runner tape --browser=firefox\",\n    \"test:browser:webkit\": \"playwright-test ./test/* --runner tape --browser=webkit\",\n    \"test:browser\": \"npm run test:browser:chromium && npm run test:browser:firefox && npm run test:browser:webkit\",\n    \"test:unit\": \"tape test/**/*.js\",\n    \"test:unit:dev\": \"npm run test:unit -- --coverage-report=html\",\n    \"test:typescript\": \"tsd\"\n  },\n  \"devDependencies\": {\n    \"ajv\": \"^8.16.0\",\n    \"eslint\": \"^9.17.0\",\n    \"neostandard\": \"^0.13.0\",\n    \"playwright-test\": \"^14.1.12\",\n    \"tape\": \"^5.8.1\",\n    \"tsd\": \"^0.33.0\"\n  }\n}\n"
+      },
+      "versionAuthority": "unverified-bundle-version"
+    },
+    {
+      "name": "json-schema-traverse",
+      "version": "unverified",
+      "source": "{'type': 'git', 'url': 'git+https://github.com/epoberezkin/json-schema-traverse.git'}",
+      "license": "MIT",
+      "notices": [
+        {
+          "source": "retained build input json-schema-traverse@1.0.0/LICENSE (bundle version unverified)",
+          "sha256": "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a"
+        }
+      ],
+      "manifestEvidence": {
+        "path": "node_modules/json-schema-traverse/package.json",
+        "sha256": "156fb24af02845c190701360d06dfda35ef04282e34a734289ea9535ad9819ae",
+        "text": "{\n  \"name\": \"json-schema-traverse\",\n  \"version\": \"1.0.0\",\n  \"description\": \"Traverse JSON Schema passing each schema object to callback\",\n  \"main\": \"index.js\",\n  \"types\": \"index.d.ts\",\n  \"scripts\": {\n    \"eslint\": \"eslint index.js spec\",\n    \"test-spec\": \"mocha spec -R spec\",\n    \"test\": \"npm run eslint && nyc npm run test-spec\"\n  },\n  \"repository\": {\n    \"type\": \"git\",\n    \"url\": \"git+https://github.com/epoberezkin/json-schema-traverse.git\"\n  },\n  \"keywords\": [\n    \"JSON-Schema\",\n    \"traverse\",\n    \"iterate\"\n  ],\n  \"author\": \"Evgeny Poberezkin\",\n  \"license\": \"MIT\",\n  \"bugs\": {\n    \"url\": \"https://github.com/epoberezkin/json-schema-traverse/issues\"\n  },\n  \"homepage\": \"https://github.com/epoberezkin/json-schema-traverse#readme\",\n  \"devDependencies\": {\n    \"eslint\": \"^7.3.1\",\n    \"mocha\": \"^8.0.1\",\n    \"nyc\": \"^15.0.0\",\n    \"pre-commit\": \"^1.2.2\"\n  },\n  \"nyc\": {\n    \"exclude\": [\n      \"**/spec/**\",\n      \"node_modules\"\n    ],\n    \"reporter\": [\n      \"lcov\",\n      \"text-summary\"\n    ]\n  }\n}\n"
+      },
+      "versionAuthority": "unverified-bundle-version"
+    },
+    {
+      "name": "zod",
+      "version": "4.6.7",
+      "source": "{'type': 'git', 'url': 'git+https://github.com/colinhacks/zod.git'}",
+      "license": "MIT",
+      "notices": [
+        {
+          "source": "retained build input zod@4.6.7/LICENSE (bundle version verified)",
+          "sha256": "3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8"
+        }
+      ],
+      "manifestEvidence": {
+        "path": "node_modules/zod/package.json",
+        "sha256": "c2d190d9ee4e0bdb60332aaa2130a6a98d65ddb903fe1d29248b15de57832c45",
+        "text": "{\n  \"name\": \"zod\",\n  \"version\": \"4.6.7\",\n  \"type\": \"module\",\n  \"license\": \"MIT\",\n  \"author\": \"Colin McDonnell <zod@colinhacks.com>\",\n  \"description\": \"TypeScript-first schema declaration and validation library with static type inference\",\n  \"homepage\": \"https://zod.dev\",\n  \"llms\": \"https://zod.dev/llms.txt\",\n  \"llmsFull\": \"https://zod.dev/llms-full.txt\",\n  \"mcpServer\": \"https://mcp.inkeep.com/zod/mcp\",\n  \"funding\": \"https://github.com/sponsors/colinhacks\",\n  \"sideEffects\": [\n    \"./compile.js\",\n    \"./compile.cjs\",\n    \"./src/compile.ts\"\n  ],\n  \"files\": [\n    \"src\",\n    \"**/*.js\",\n    \"**/*.mjs\",\n    \"**/*.cjs\",\n    \"**/*.d.ts\",\n    \"**/*.d.mts\",\n    \"**/*.d.cts\",\n    \"**/package.json\"\n  ],\n  \"keywords\": [\n    \"typescript\",\n    \"schema\",\n    \"validation\",\n    \"type\",\n    \"inference\"\n  ],\n  \"main\": \"./index.cjs\",\n  \"types\": \"./index.d.cts\",\n  \"module\": \"./index.js\",\n  \"zshy\": {\n    \"exports\": {\n      \"./package.json\": \"./package.json\",\n      \".\": \"./src/index.ts\",\n      \"./mini\": \"./src/mini/index.ts\",\n      \"./compile\": \"./src/compile.ts\",\n      \"./locales\": \"./src/locales/index.ts\",\n      \"./v3\": \"./src/v3/index.ts\",\n      \"./v4\": \"./src/v4/index.ts\",\n      \"./v4-mini\": \"./src/v4-mini/index.ts\",\n      \"./v4/mini\": \"./src/v4/mini/index.ts\",\n      \"./v4/core\": \"./src/v4/core/index.ts\",\n      \"./v4/locales\": \"./src/v4/locales/index.ts\",\n      \"./v4/locales/*\": \"./src/v4/locales/*\"\n    },\n    \"conditions\": {\n      \"@zod/source\": \"src\"\n    },\n    \"sealCjsExports\": true\n  },\n  \"exports\": {\n    \"./package.json\": \"./package.json\",\n    \".\": {\n      \"@zod/source\": \"./src/index.ts\",\n      \"types\": \"./index.d.cts\",\n      \"import\": \"./index.js\",\n      \"require\": \"./index.cjs\"\n    },\n    \"./mini\": {\n      \"@zod/source\": \"./src/mini/index.ts\",\n      \"types\": \"./mini/index.d.cts\",\n      \"import\": \"./mini/index.js\",\n      \"require\": \"./mini/index.cjs\"\n    },\n    \"./compile\": {\n      \"@zod/source\": \"./src/compile.ts\",\n      \"types\": \"./compile.d.cts\",\n      \"import\": \"./compile.js\",\n      \"require\": \"./compile.cjs\"\n    },\n    \"./locales\": {\n      \"@zod/source\": \"./src/locales/index.ts\",\n      \"types\": \"./locales/index.d.cts\",\n      \"import\": \"./locales/index.js\",\n      \"require\": \"./locales/index.cjs\"\n    },\n    \"./v3\": {\n      \"@zod/source\": \"./src/v3/index.ts\",\n      \"types\": \"./v3/index.d.cts\",\n      \"import\": \"./v3/index.js\",\n      \"require\": \"./v3/index.cjs\"\n    },\n    \"./v4\": {\n      \"@zod/source\": \"./src/v4/index.ts\",\n      \"types\": \"./v4/index.d.cts\",\n      \"import\": \"./v4/index.js\",\n      \"require\": \"./v4/index.cjs\"\n    },\n    \"./v4-mini\": {\n      \"@zod/source\": \"./src/v4-mini/index.ts\",\n      \"types\": \"./v4-mini/index.d.cts\",\n      \"import\": \"./v4-mini/index.js\",\n      \"require\": \"./v4-mini/index.cjs\"\n    },\n    \"./v4/mini\": {\n      \"@zod/source\": \"./src/v4/mini/index.ts\",\n      \"types\": \"./v4/mini/index.d.cts\",\n      \"import\": \"./v4/mini/index.js\",\n      \"require\": \"./v4/mini/index.cjs\"\n    },\n    \"./v4/core\": {\n      \"@zod/source\": \"./src/v4/core/index.ts\",\n      \"types\": \"./v4/core/index.d.cts\",\n      \"import\": \"./v4/core/index.js\",\n      \"require\": \"./v4/core/index.cjs\"\n    },\n    \"./v4/locales\": {\n      \"@zod/source\": \"./src/v4/locales/index.ts\",\n      \"types\": \"./v4/locales/index.d.cts\",\n      \"import\": \"./v4/locales/index.js\",\n      \"require\": \"./v4/locales/index.cjs\"\n    },\n    \"./v4/locales/*\": {\n      \"@zod/source\": \"./src/v4/locales/*\",\n      \"types\": \"./v4/locales/*\",\n      \"import\": \"./v4/locales/*\",\n      \"require\": \"./v4/locales/*\"\n    }\n  },\n  \"repository\": {\n    \"type\": \"git\",\n    \"url\": \"git+https://github.com/colinhacks/zod.git\"\n  },\n  \"bugs\": {\n    \"url\": \"https://github.com/colinhacks/zod/issues\"\n  },\n  \"support\": {\n    \"backing\": {\n      \"npm-funding\": true\n    }\n  },\n  \"scripts\": {\n    \"clean\": \"git clean -xdf . -e node_modules\",\n    \"build\": \"nub exec --node zshy --project tsconfig.build.json\",\n    \"postbuild\": \"nub ../../scripts/write-stub-package-jsons.ts && nub exec --node biome check --write .\",\n    \"test:watch\": \"nub exec --node vitest\",\n    \"test\": \"nub exec --node vitest run\",\n    \"prepublishOnly\": \"nub ../../scripts/check-versions.ts\"\n  }\n}\n"
+      },
+      "versionAuthority": "embedded-version-and-lock",
+      "lockEvidence": {
+        "version": "4.6.7",
+        "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.7.tgz",
+        "integrity": "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==",
+        "license": "MIT",
+        "funding": {
+          "url": "https://github.com/sponsors/colinhacks"
+        }
+      },
+      "embeddedVersionEvidence": {
+        "asset": "legacy-plugin.mjs",
+        "source": "../../node_modules/zod/v4/core/versions.js",
+        "text": "var version = {\n  major: 4,\n  minor: 6,\n  patch: 7\n};"
+      }
+    }
+  ],
+  "texts": {
+    "a05350a88e318e4f5f2c2a1ff1e2e88daa4dd38e6e78b71cccae422bdc762cc3": "The MIT License (MIT)\n\nCopyright (c) 2015-2021 Evgeny Poberezkin\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n\n",
+    "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a": "MIT License\n\nCopyright (c) 2017 Evgeny Poberezkin\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n",
+    "b010b0dfdfdb23d7396e03b82cd4621fc9bb8f95d6b0aea70b9c24e12074c786": "Copyright (c) 2011-2021, Gary Court until https://github.com/garycourt/uri-js/commit/a1acf730b4bba3f1097c9f52e7d9d3aba8cdcaae\nCopyright (c) 2021-present The Fastify team <https://github.com/fastify/fastify#team>\nAll rights reserved.\n\nRedistribution and use in source and binary forms, with or without\nmodification, are permitted provided that the following conditions are met:\n    * Redistributions of source code must retain the above copyright\n      notice, this list of conditions and the following disclaimer.\n    * Redistributions in binary form must reproduce the above copyright\n      notice, this list of conditions and the following disclaimer in the\n      documentation and/or other materials provided with the distribution.\n    * The names of any contributors may not be used to endorse or promote\n      products derived from this software without specific prior written\n      permission.\n\nTHIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND\nANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED\nWARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE\nDISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS AND CONTRIBUTORS BE LIABLE FOR ANY\nDIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES\n(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;\nLOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND\nON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS\nSOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n\n                                  *   *   *\n\nThe complete list of contributors can be found at:\n- https://github.com/garycourt/uri-js/graphs/contributors",
+    "3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8": "MIT License\n\nCopyright (c) 2025 Colin McDonnell\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n"
+  }
+}

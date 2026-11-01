@@ -87,7 +87,7 @@ async fn export_conflict_prevents_all_file_writes() {
         .unwrap();
     assert_eq!(
         error
-            .downcast_ref::<crate::client::ClientError>()
+            .downcast_ref::<paseo_client::ClientError>()
             .unwrap()
             .code,
         "HUB_EXPORT_CONFLICT"

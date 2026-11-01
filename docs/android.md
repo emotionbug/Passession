@@ -4,15 +4,15 @@ The Android application is the Flutter **Paseo Sessions** client, package `sh.pa
 
 ## Build and launch
 
-Use Node 24/npm for the build wrapper, Flutter, JDK 17-compatible tooling and the Android SDK. The checked-in project is `packages/flutter_app/android`, not a generated Expo project. Minimum SDK is 24. The current dependency set requires compile SDK **37.0** (API 37, minor 0), **Android Gradle Plugin 9.1.1**, **NDK 28.2.13676358**, and JNI **CMake 3.22.1**; retain the Flutter-selected target SDK. AGP 9.1.0 with integer compile SDK 37 does not resolve the required `android-37.0` platform.
+Use Rust/Cargo for `xtask`, Flutter, JDK 17-compatible tooling and the Android SDK. The checked-in project is `packages/flutter_app/android`, not a generated Expo project. Minimum SDK is 24. The current dependency set requires compile SDK **37.0** (API 37, minor 0), **Android Gradle Plugin 9.1.1**, **NDK 28.2.13676358**, and JNI **CMake 3.22.1**; retain the Flutter-selected target SDK. AGP 9.1.0 with integer compile SDK 37 does not resolve the required `android-37.0` platform.
 
 From the repository root:
 
 ```sh
-npm ci
-npm run build:apk             # universal APK
-npm run build:apk:arm64       # arm64 APK
-npm run dev:android -- --device <device-id>
+cargo fetch --locked
+cargo xtask build-flutter android              # universal APK
+cargo xtask build-flutter android --arch arm64 # arm64 APK
+cargo xtask dev app android --device <device-id>
 ```
 
 The development wrapper uses an attached Android device/emulator selected through Flutter. If more than one supported device is attached, select its exact ID with `--device`. It runs `flutter pub get --enforce-lockfile` and uses the checked-in Dart dependency lock.
@@ -40,7 +40,7 @@ The app ID stays `sh.paseo.sessions`, separate from the upstream app. Optional F
 
 ## Version codes
 
-`packages/flutter_desktop_host/packaging/common.mjs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `13000`. Android clamps it to at least `13000`, as does the Gradle project. Set the next code against actual installed/store history before a distribution. Do not reuse the former Expo version-code formula or EAS remote counters.
+`xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `13001`. Android clamps it to at least `13000`, as does the Gradle project. Set the next code against actual installed/store history before a distribution. Do not reuse the former Expo version-code formula or EAS remote counters.
 
 The repository's `fastlane/metadata/android` store text and changelog tooling are metadata, not evidence of a Flutter F-Droid/Play release. The old Expo source-only/F-Droid flags are not an Android build mode for this project. A source-distribution/store build needs its own completed dependency, signing and policy review; no such submission is claimed here.
 
@@ -49,7 +49,7 @@ The repository's `fastlane/metadata/android` store text and changelog tooling ar
 Start an isolated daemon on the development machine:
 
 ```sh
-PASEO_LISTEN=0.0.0.0:6768 npm run dev:daemon
+PASEO_LISTEN=0.0.0.0:6768 cargo xtask dev daemon
 ```
 
 Add its host address in the client. A standard Android AVD can reach the machine at `10.0.2.2:6768`; `localhost` inside the emulator means the emulator itself. A physical phone needs a reachable LAN/VPN address or encrypted relay. Use a password for any network-reachable daemon and avoid exposing the port beyond the intended network.
@@ -60,8 +60,8 @@ An explicitly configured ADB reverse tunnel can instead forward the daemon port 
 
 The compact sidebar is host → directory → session. Back returns from an open file explorer to the session and from the session to the sidebar; leaving the app must not stop remote sessions. Directory collapse is persisted per host/path. Add Project browses folders on the selected host, not Android's local filesystem.
 
-Markdown, source editing, large summary-first diffs, schedules, settings, speech controls and read-only script/setup logs are native client surfaces. Microphone/notification permissions and behavior require actual Android testing; Linux speech inference does not prove Android capture or push delivery.
+Markdown, source editing, large summary-first diffs, schedules, settings, generic effect-sound playback and read-only script/setup logs are native client surfaces. Notification permissions and delivery require actual Android testing; desktop execution does not prove Android push delivery.
 
 ## Release boundary
 
-`build:ios` is a separate macOS/Xcode path; without export/provisioning configuration it produces an unsigned app archive. Native mobile targets do not inherit desktop daemon ownership. Review [release](release.md) for exact signing/artifact rules and unresolved distribution requirements before publishing anything.
+`cargo xtask build-flutter ios` is a separate macOS/Xcode path; without export/provisioning configuration it produces an unsigned app archive. Native mobile targets do not inherit desktop daemon ownership. Review [release](release.md) for exact signing and artifact rules before publishing.

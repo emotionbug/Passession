@@ -1,4 +1,4 @@
-use crate::process::{CommandOutput, CommandSpec};
+use paseo_client::process::{CommandOutput, CommandSpec};
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use std::{
@@ -76,7 +76,7 @@ pub async fn run(
     environment.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
     // Repository/error classification must not depend on the desktop locale.
     environment.insert("LC_ALL".into(), "C".into());
-    crate::process::run(
+    paseo_client::process::run(
         CommandSpec {
             program: "git".into(),
             args: args.to_vec(),

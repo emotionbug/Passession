@@ -124,32 +124,45 @@ pub fn open_no_follow(path: &Path) -> Result<File> {
     }
     Ok(options.open(path)?)
 }
-pub fn revision(metadata: &Metadata) -> String {
+pub fn revision(_file: &File, metadata: &Metadata) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        return format!(
+        return Ok(format!(
             "{}:{}:{}:{}",
             metadata.dev(),
             metadata.ino(),
             metadata.len(),
             i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec())
-        );
+        ));
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        return format!(
+        use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // The borrowed File keeps the handle alive; Windows initializes the
+        // information on success. Query this handle, not a potentially replaced path.
+        if unsafe { GetFileInformationByHandle(_file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let information = unsafe { information.assume_init() };
+        let index =
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+        return Ok(format!(
             "{}:{}:{}:{}",
-            metadata.volume_serial_number().unwrap_or(0),
-            metadata.file_index().unwrap_or(0),
+            information.dwVolumeSerialNumber,
+            index,
             metadata.len(),
             (i128::from(metadata.last_write_time()) - 116444736000000000) * 100
-        );
+        ));
     }
     #[cfg(not(any(unix, windows)))]
     {
-        format!(
+        Ok(format!(
             "0:0:{}:{}",
             metadata.len(),
             metadata
@@ -158,7 +171,7 @@ pub fn revision(metadata: &Metadata) -> String {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
-        )
+        ))
     }
 }
 pub fn modified(metadata: &Metadata) -> Result<String> {
@@ -241,10 +254,11 @@ pub fn open(root: &str, path: &str, home: &Path) -> Result<Opened> {
     })
 }
 pub fn version(root: &str, path: &str, home: &Path) -> Value {
-    match open(root, path, home) {
-        Ok(file) => {
-            json!({"status":"ready","cwd":expand(root,home),"path":file.scope.relative,"size":file.metadata.len(),"modifiedAt":modified(&file.metadata).unwrap_or_default(),"revision":revision(&file.metadata),"kind":file.kind,"mimeType":file.mime})
-        }
+    match open(root, path, home).and_then(|file| {
+        let revision = revision(&file.file, &file.metadata)?;
+        Ok(json!({"status":"ready","cwd":expand(root,home),"path":file.scope.relative,"size":file.metadata.len(),"modifiedAt":modified(&file.metadata).unwrap_or_default(),"revision":revision,"kind":file.kind,"mimeType":file.mime}))
+    }) {
+        Ok(version) => version,
         Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(missing) => {
             json!({"status":"missing","cwd":expand(root,home),"path":path})
         }
@@ -303,6 +317,7 @@ pub fn read(
     cancel: &CancellationToken,
 ) -> Result<Value> {
     let mut file = open(root, path, home)?;
+    let initial_revision = revision(&file.file, &file.metadata)?;
     if let Some(max) = max.filter(|m| *m > 0) {
         ensure!(file.metadata.len() <= max, "File is too large to display");
     }
@@ -317,11 +332,11 @@ pub fn read(
         bytes.extend_from_slice(&block[..n]);
     }
     ensure!(
-        revision(&file.file.metadata()?) == revision(&file.metadata),
+        revision(&file.file, &file.file.metadata()?)? == initial_revision,
         "File changed during transfer"
     );
     let (kind, mime) = classify(&extension(&file.scope.resolved), &bytes, false);
-    let mut result = json!({"path":file.scope.relative,"kind":kind,"encoding":match kind {"image"=>"base64","binary"=>"none",_=>"utf-8"},"mimeType":mime,"size":file.metadata.len(),"modifiedAt":modified(&file.metadata)?,"revision":revision(&file.metadata)});
+    let mut result = json!({"path":file.scope.relative,"kind":kind,"encoding":match kind {"image"=>"base64","binary"=>"none",_=>"utf-8"},"mimeType":mime,"size":file.metadata.len(),"modifiedAt":modified(&file.metadata)?,"revision":initial_revision});
     if kind == "image" {
         result["content"] = Value::String(base64::engine::general_purpose::STANDARD.encode(bytes));
     } else if kind == "text" {
@@ -338,6 +353,7 @@ pub fn stream_open(
     cancel: &CancellationToken,
 ) -> Result<Opened> {
     let mut file = open(root, path, home)?;
+    let initial_revision = revision(&file.file, &file.metadata)?;
     if let Some(max) = max.filter(|m| *m > 0) {
         ensure!(file.metadata.len() <= max, "File is too large to display");
     }
@@ -388,17 +404,17 @@ pub fn stream_open(
         file.file.seek(SeekFrom::Start(0))?;
     }
     ensure!(
-        revision(&file.file.metadata()?) == revision(&file.metadata),
+        revision(&file.file, &file.file.metadata()?)? == initial_revision,
         "File changed during transfer"
     );
     Ok(file)
 }
-fn matches(metadata: &Metadata, request: &Value) -> bool {
+fn matches(metadata: &Metadata, revision: &str, request: &Value) -> bool {
     if let Some(rev) = request["expectedRevision"]
         .as_str()
         .filter(|s| !s.is_empty())
     {
-        revision(metadata) == rev
+        revision == rev
     } else {
         modified(metadata).ok().as_deref() == request["expectedModifiedAt"].as_str()
     }
@@ -462,6 +478,7 @@ pub fn write(request: &Value, home: &Path, cancel: &CancellationToken) -> Value 
             Err(error) => return Err(error),
         };
         let metadata = current.metadata()?;
+        let initial_revision = revision(&current, &metadata)?;
         ensure!(metadata.is_file(), "Requested path is not a file");
         ensure!(metadata.len() <= EDIT_LIMIT, "File is too large to edit");
         if !base64 {
@@ -472,7 +489,7 @@ pub fn write(request: &Value, home: &Path, cancel: &CancellationToken) -> Value 
                 "Binary files cannot be edited"
             );
         }
-        if !matches(&metadata, request) {
+        if !matches(&metadata, &initial_revision, request) {
             return Ok(conflict());
         }
         let parent = scope.resolved.parent().ok_or_else(|| anyhow!(OUTSIDE))?;
@@ -491,23 +508,25 @@ pub fn write(request: &Value, home: &Path, cancel: &CancellationToken) -> Value 
             return Ok(conflict());
         }
         let latest = match open_no_follow(&scope.resolved) {
-            Ok(file) => file.metadata()?,
+            Ok(file) => file,
             Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(missing) => {
                 return Ok(conflict());
             }
             Err(error) => return Err(error),
         };
-        if !matches(&latest, request) || revision(&latest) != revision(&metadata) {
+        let latest_metadata = latest.metadata()?;
+        let latest_revision = revision(&latest, &latest_metadata)?;
+        if !matches(&latest_metadata, &latest_revision, request) || latest_revision != initial_revision {
             return Ok(conflict());
         }
         // Like the source daemon, this is compare/recheck + atomic rename, not an
         // OS-wide compare-and-swap lock against unrelated writers.
-        temporary
+        let written = temporary
             .persist(&scope.resolved)
             .map_err(|error| error.error)?;
-        let final_metadata = fs::metadata(&scope.resolved)?;
+        let final_metadata = written.metadata()?;
         Ok(
-            json!({"status":"written","modifiedAt":modified(&final_metadata)?,"size":final_metadata.len(),"revision":revision(&final_metadata)}),
+            json!({"status":"written","modifiedAt":modified(&final_metadata)?,"size":final_metadata.len(),"revision":revision(&written, &final_metadata)?}),
         )
     })();
     result.unwrap_or_else(|error| json!({"status":"error","error":error.to_string()}))
@@ -779,15 +798,15 @@ fn run_git(
     cwd: &Path,
     args: Vec<String>,
     cancel: &CancellationToken,
-) -> Result<crate::process::CommandOutput> {
-    let spec = crate::process::CommandSpec {
+) -> Result<paseo_client::process::CommandOutput> {
+    let spec = paseo_client::process::CommandSpec {
         program: "git".into(),
         args,
         cwd: Some(cwd.to_owned()),
         env: std::collections::BTreeMap::from([("GIT_LITERAL_PATHSPECS".into(), "0".into())]),
         clear_env: false,
     };
-    tokio::runtime::Handle::current().block_on(crate::process::run(
+    tokio::runtime::Handle::current().block_on(paseo_client::process::run(
         spec,
         20 * 1024 * 1024,
         std::time::Duration::from_secs(30),
@@ -813,6 +832,42 @@ mod tests {
         );
         assert_eq!(result["status"], "conflict");
         assert_eq!(fs::read_to_string(path).unwrap(), "external");
+    }
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replacement_with_same_size_and_time_has_a_different_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.md");
+        fs::write(&path, "old").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let original = open_no_follow(&path).unwrap();
+        let metadata = original.metadata().unwrap();
+        let initial_revision = revision(&original, &metadata).unwrap();
+
+        let mut replacement = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        replacement.write_all(b"new").unwrap();
+        replacement
+            .as_file()
+            .set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+        drop(replacement.persist(&path).unwrap());
+
+        let current = open_no_follow(&path).unwrap();
+        let current_metadata = current.metadata().unwrap();
+        assert_eq!(metadata.len(), current_metadata.len());
+        assert_eq!(metadata.modified().unwrap(), current_metadata.modified().unwrap());
+        assert_eq!(
+            revision(&original, &original.metadata().unwrap()).unwrap(),
+            initial_revision
+        );
+        assert_ne!(revision(&current, &current_metadata).unwrap(), initial_revision);
+        let result = write(
+            &json!({"cwd":cwd,"path":"file.md","content":"edit","expectedRevision":initial_revision}),
+            dir.path(),
+            &CancellationToken::new(),
+        );
+        assert_eq!(result["status"], "conflict");
+        assert_eq!(fs::read_to_string(path).unwrap(), "new");
     }
     #[test]
     fn revision_wins_and_markdown_roundtrips() {

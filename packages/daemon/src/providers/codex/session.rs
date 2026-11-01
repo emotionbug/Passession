@@ -1458,60 +1458,65 @@ impl AgentSession for CodexSession {
         }
         Ok(())
     }
-    async fn try_out_of_band(&self, prompt: &Value) -> Result<bool> {
-        let Some(text) = prompt.as_str() else {
-            return Ok(false);
-        };
+    fn prepare_out_of_band(
+        self: Arc<Self>,
+        prompt: &Value,
+    ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
+        let text = prompt.as_str()?;
         let text = text.trim();
         let (command, args) = text
             .split_once(char::is_whitespace)
             .map(|(a, b)| (a, b.trim()))
             .unwrap_or((text, ""));
         if command != "/compact" && (command != "/goal" || !self.goals) {
-            return Ok(false);
+            return None;
         }
-        let thread = self.ensure_thread().await?;
-        if command == "/compact" {
-            self.state.lock().unwrap().manual_compactions += 1;
-            if let Err(e) = self
-                .client
-                .request("thread/compact/start", json!({"threadId":thread}))
-                .await
-            {
-                let mut s = self.state.lock().unwrap();
-                s.manual_compactions = s.manual_compactions.saturating_sub(1);
-                return Err(e);
-            }
-            return Ok(true);
-        }
-        let message = match args {
-            "" => "Usage: /goal <objective>|pause|resume|clear".into(),
-            "clear" => {
-                self.client
-                    .request("thread/goal/clear", json!({"threadId":thread}))
-                    .await?;
-                "Goal cleared.".into()
-            }
-            "pause" | "resume" => {
-                self.client.request("thread/goal/set",json!({"threadId":thread,"status":if args=="pause"{"paused"}else{"active"}})).await?;
-                if args == "pause" {
-                    "Goal paused.".into()
-                } else {
-                    "Goal resumed.".into()
+        let compact = command == "/compact";
+        let args = args.to_owned();
+        Some(Box::pin(async move {
+            let thread = self.ensure_thread().await?;
+            if compact {
+                self.state.lock().unwrap().manual_compactions += 1;
+                if let Err(e) = self
+                    .client
+                    .request("thread/compact/start", json!({"threadId":thread}))
+                    .await
+                {
+                    let mut s = self.state.lock().unwrap();
+                    s.manual_compactions = s.manual_compactions.saturating_sub(1);
+                    return Err(e);
                 }
+                return Ok(());
             }
-            objective => {
-                self.client
-                    .request(
-                        "thread/goal/set",
-                        json!({"threadId":thread,"objective":objective,"status":"active"}),
-                    )
-                    .await?;
-                format!("Goal set: {objective}")
-            }
-        };
-        self.emit(json!({"type":"timeline","item":{"type":"assistant_message","text":format!("{message}\n\n")}})).await?;
-        Ok(true)
+            let message = match args.as_str() {
+                "" => "Usage: /goal <objective>|pause|resume|clear".into(),
+                "clear" => {
+                    self.client
+                        .request("thread/goal/clear", json!({"threadId":thread}))
+                        .await?;
+                    "Goal cleared.".into()
+                }
+                "pause" | "resume" => {
+                    self.client.request("thread/goal/set",json!({"threadId":thread,"status":if args=="pause"{"paused"}else{"active"}})).await?;
+                    if args == "pause" {
+                        "Goal paused.".into()
+                    } else {
+                        "Goal resumed.".into()
+                    }
+                }
+                objective => {
+                    self.client
+                        .request(
+                            "thread/goal/set",
+                            json!({"threadId":thread,"objective":objective,"status":"active"}),
+                        )
+                        .await?;
+                    format!("Goal set: {objective}")
+                }
+            };
+            self.emit(json!({"type":"timeline","item":{"type":"assistant_message","text":format!("{message}\n\n")}})).await?;
+            Ok(())
+        }))
     }
 }
 fn next_turn_notice(active: bool, setting: &str) -> Option<Value> {

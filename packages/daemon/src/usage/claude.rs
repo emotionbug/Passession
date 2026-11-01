@@ -90,8 +90,8 @@ async fn read_keychain(rt: &UsageRuntime, service: &str, account: &str) -> Optio
         vec!["find-generic-password", "-a", account, "-w", "-s", service],
         vec!["find-generic-password", "-w", "-s", service],
     ] {
-        let output = crate::process::run(
-            crate::process::CommandSpec {
+        let output = paseo_client::process::run(
+            paseo_client::process::CommandSpec {
                 program: "security".into(),
                 args: args.into_iter().map(str::to_owned).collect(),
                 cwd: None,

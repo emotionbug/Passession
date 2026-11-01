@@ -1,109 +1,94 @@
 ---
 title: 插件快速上手
-description: 构建、安装、分享和更新受信任的后端扩展。
+description: 使用 Rust 构建并管理受信任的原生后端扩展。
 nav: 快速上手
 ---
 
 # 插件快速上手 {#plugin-quickstart}
 
-可选 JavaScript 插件为一个 Paseo daemon 提供 RPC 处理函数、生命周期钩子、设置持久化、用量来源或编程 Agent Provider。内置功能由 Rust 实现。第三方 JavaScript 在独立后端 worker 中运行，使用 daemon 主机上**另行安装的 Node.js 20+**，不在 Flutter 应用中执行。
+Paseo 插件是在 daemon 主机上运行的**独立原生可执行文件**。Rust `paseo-plugin` SDK 提供有界逐行 JSON IPC、RPC、生命周期钩子、设置、Provider、用量来源及 daemon 客户端桥接。它不是 Rust 动态库，也不在 Flutter 内运行。
 
-本指南描述 **0.13.0 源码检出中的原生迁移，迁移尚未发布**。Linux、macOS、Windows、Android 和 iOS 的 Flutter 客户端不执行 React 插件。旧 JavaScript 客户端的界面、面板、主题、侧边栏组件、Composer 回调和自定义时间线渲染器都不是原生扩展点。移动端只远程连接，不运行 daemon 或插件 worker。
+本文描述 **0.13.1 源码检出，不代表版本已经发布**。不再有 JavaScript worker、内嵌编译器或 Node 回退。旧 JavaScript 插件必须[显式移植](migration.zh-CN.md)。Flutter 不执行插件界面、React 组件、面板、主题或时间线渲染器；移动端远程连接，不运行插件。
 
 ## 准备 daemon 主机 {#prepare-the-daemon-host}
 
-需要 JavaScript 扩展时，单独安装 Node.js 20+，让 daemon 可以找到 `node`，或在 daemon 环境中用 `PASEO_PLUGIN_NODE` 指定可执行文件。获取 npm 来源或执行 npm 准备命令还需要 npm；设置 `PASEO_PLUGIN_NODE` 不会安装 npm。原生运行时的生成资源中必须包含可选 worker，也可以用 `PASEO_PLUGIN_WORKER` 指定它。
+构建源码插件需要 Rust 1.93 或更新版本（edition 2024）；Git 来源还需要 Git。预编译插件需要匹配操作系统、架构和运行库，仅运行时不需要 Rust 编译器。仓库 daemon 使用 `cargo xtask build-daemon` 构建。请使用隔离的开发 daemon，不要拿现有生产安装做实验。
 
-从仓库构建时，使用仓库要求的 **Node.js 24**，执行 `npm ci` 和 `npm run build:daemon`，生成 Rust 调试可执行文件及相邻资源。监视开发命令是 `npm run dev:daemon`。不要使用已移除的 `dev:server` 或为插件安装旧 JavaScript daemon。
+插件及其准备命令都是**受信任、无沙箱的代码**，拥有 daemon 用户的文件、进程、网络和凭据权限。校验也会运行可执行文件；安装前应审查源码、依赖、产物和更新。
 
 ## 创建插件 {#create-a-plugin}
 
-在 daemon 主机上执行：
+所需 SDK 修订真正可从远端获取前，使用本地源码依赖：
 
-```bash
-paseo plugin init /absolute/path/to/workspace-plugin
+```sh
+paseo plugin init /absolute/path/to/workspace-plugin --sdk-path /absolute/path/to/paseo/packages/plugin
 cd /absolute/path/to/workspace-plugin
-npm install
+cargo build --release --target-dir target
+./target/release/paseo-plugin-server --validate . 0.13.1
 ```
 
-Rust CLI 创建纯后端 TypeScript 项目，不自动运行包管理器：
+Windows 脚手架使用 `target/release/paseo-plugin-server.exe`，调用 `.\target\release\paseo-plugin-server.exe`。跨系统移动项目时，应修改 `server.executable` 的后缀。
 
-```text
-workspace-plugin/
-  paseo-plugin.json
-  package.json
-  tsconfig.json
-  OVERVIEW.md
-  index.server.ts
-  server/greeting.ts
-  shared/greeting.ts
-```
+脚手架创建 `Cargo.toml`、`src/main.rs`、`paseo-plugin.json`、`README.md`、`OVERVIEW.md` 和 `.gitignore`。它注册 `greeting.create` RPC：输入 `{"name":"World"}` 返回 `{"message":"Hello, World!"}`。创建时不下载依赖或编译。未指定 `--sdk-path` 时，SDK 依赖指向 Paseo Git 仓库；分发前应固定包含所需 crate 的修订，不能假定已发布到 crates.io。
 
-脚手架注册问候 RPC。`npm install` 安装编写插件所需的依赖；worker 在运行时提供插件 SDK 和 Zod。主机操作放在 `server/`，普通数据和契约放在 `shared/`。不要通过添加客户端入口来创建原生界面。
-
-要观察一个简单的后端贡献，可以将 `index.server.ts` 替换为：
-
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-
-export default function contribute(server: PluginServerContext) {
-  server.on("agent.turn_ended", (event) => {
-    console.log("Turn ended", event.agent.id, event.outcome);
-  });
-  return () => {};
-}
-```
-
-启用期间，即使没有应用连接，该钩子也会运行。[参考](/docs/plugins/reference)介绍 RPC、设置、生命周期、用量和 SDK 契约；[Provider 指南](/docs/plugins/providers)介绍直接接入 Agent 或通过 ACP 适配。
+清单声明 `runtime: "native"`、插件目录内的 `server.executable` 以及 `server.args: []`。脚手架还声明 Cargo 准备命令。完整契约见[参考](reference.zh-CN.md)。
 
 ## 安装并试用 {#install-and-try-it}
 
-插件是受信任且没有沙盒的代码。后端及准备命令拥有 daemon 用户对文件、进程、凭据和网络的访问权限。安装前应信任来源、依赖及更新。
+在选定的**测试 daemon** 上：
 
-```bash
-npm run typecheck
+```sh
 paseo plugin install /absolute/path/to/workspace-plugin
 paseo plugin ls workspace-plugin
 paseo plugin logs workspace-plugin
 ```
 
-daemon 根设置 `pluginsEnabled` 和插件自身的启用状态都必须允许执行。修改 `config.json` 中的根设置后运行 `paseo reload --json`；安装项的修改使用插件命令。`paseo plugin enable workspace-plugin` 只启用该安装项，不打开根开关。
+daemon 根设置 `pluginsEnabled` 和安装条目的启用状态都必须允许执行。修改 `config.json` 的根设置后使用 `paseo reload --json`；`paseo plugin enable workspace-plugin` 仅启用该安装。`running` 只表示激活成功，不证明所有 RPC/Provider 路径正确，也不代表兼容旧插件 UI。
 
-在所选 daemon 上完成一轮 Agent 对话，再查看钩子日志。不会出现插件界面或侧边栏项。`running` 仅表示后端激活，不证明旧客户端贡献可用。
+远程管理时，把 `--host <url>` 放在管理命令之前，使用 **daemon 主机上的绝对路径**。CLI 不上传本地文件；`plugin init` 在本地创建文件。
 
-远程操作时，将 `--host <url>` 放在命令前，使用**远程主机上存在的绝对路径**。CLI 不会上传本地插件文件。
+## 运行仓库示例 {#run-the-repository-example}
+
+Linux/macOS 上从仓库根目录执行：
+
+```sh
+cargo build -p paseo-workspace-inspector --target-dir plugin-examples/workspace-inspector/target
+./plugin-examples/workspace-inspector/target/debug/paseo-workspace-inspector --validate plugin-examples/workspace-inspector 0.13.1
+paseo plugin install ./plugin-examples/workspace-inspector
+paseo plugin ls workspace-inspector
+paseo plugin logs workspace-inspector
+```
+
+Windows 上给示例清单的 `server.executable` 加 `.exe`，并以 `.\plugin-examples\workspace-inspector\target\debug\paseo-workspace-inspector.exe` 调用相同的校验参数。
+
+[示例实现](../../plugin-examples/workspace-inspector/src/lib.rs) 是真实的本地文件检查器，不是 AI 服务：
+
+- `file.inspect` 接收 `{"cwd":"/absolute/workspace","path":"README.md"}`，返回有大小限制的 UTF-8 文件统计和预览。直接 RPC 读取由调用者明确请求，不会弹出 Provider 权限请求。
+- `lifecycle.counts` 返回当前进程观察到的 `agent.created` 次数。
+- `inspection` 设置持久化 `maxBytes`（默认 65536，范围 1–1048576）。会话打开钩子向启动覆盖环境添加 `PASEO_INSPECT_MAX_BYTES`。
+- 选择 `workspace-inspector` Provider 和 `local-file` 模型，发送相对文件路径或使用 `inspect` 命令，然后批准或拒绝读取。示例拒绝路径穿越、符号链接、过大文件和非 UTF-8 数据，但不是对抗恶意并发文件系统修改的沙箱。
+- 示例不声明持久化、转向、配置变更、图片或输出 schema 能力。
 
 ## 编辑并重新加载 {#edit-and-reload}
 
-```bash
-npm run typecheck
+重新加载前，先构建到清单指定的位置：
+
+```sh
+cargo build --release --target-dir target
 paseo plugin reload workspace-plugin
 paseo plugin ls workspace-plugin
 paseo plugin logs workspace-plugin
 ```
 
-加载会编译后端，但不能替代作者执行 TypeScript 类型检查。入口返回的清理函数应释放定时器、文件监视器、套接字、订阅和子进程。重新加载会重启 worker；确认错误状态后再判断新代码是否运行。
+这些命令用于脚手架目录；`workspace-inspector` 应使用前面的 debug 构建命令。重新加载会启动新的可执行文件，不会按需编译 Rust。为任务、子进程、订阅、文件和套接字注册清理逻辑，并遵守取消通知。
 
-## 安装和更新共享插件 {#install-a-published-plugin}
+## 安装和更新共享插件 {#install-and-update-shared-plugins}
 
-```bash
-paseo plugin install npm:@acme/paseo-review@1.2.0
-paseo plugin install github:acme/paseo-review
-paseo plugin install github:acme/monorepo:plugins/review
-paseo plugin update paseo-review --check
-paseo plugin update paseo-review --yes
+支持目录、Git、Cargo crate、校验和固定的 HTTPS 发行归档，以及兼容的注册表来源。参数见[来源参考](reference.zh-CN.md#plugin-sources)，分发与信任要求见[发布指南](publishing.zh-CN.md)。
+
+```sh
+paseo plugin update workspace-plugin --check
+paseo plugin update workspace-plugin --yes
 ```
 
-使用实际安装 ID，它不一定等于 npm 包名。原生 CLI 显示更新提案，普通更新需要 `--yes`；它不会弹出交互式批准提示。`--check` 不应用更新。显式 `--version` 或 `--ref` 为单个插件选择并授权目标版本。目录来源应直接修改后重新加载。
-
-npm 用于获取包，后续加载不需要 npm；**后端执行仍需要 Node**。来源选择器、注册表固定版本、准备命令和更新规则见[参考](/docs/plugins/reference#plugin-sources)。分享插件见[发布指南](/docs/plugins/publishing)，移除旧客户端贡献见[迁移指南](/docs/plugins/migration)。
-
-## 源码归属 {#source-ownership}
-
-- `packages/daemon/src`：Rust daemon、CLI、插件管理和 worker 桥接。
-- `packages/daemon/plugin-worker/src`：提取出的私有 JavaScript 后端 worker。
-- `packages/plugin`：公共 `@getpaseo/plugin` 作者 SDK。
-- `packages/client`：后端处理函数使用的 `@getpaseo/client` TypeScript SDK。
-- `packages/protocol`：共享协议契约。
-
-私有 worker 不是应用 SDK，也不是可执行 UI 宿主。遗留 SDK 客户端导出和历史示例并不意味着支持原生 UI 插件。
+目录来源应直接编辑并重新加载，不进行远程更新。普通托管更新需要 `--yes`；`--check` 仅预览。阅读本文不会执行安装、发布或部署。

@@ -1,6 +1,6 @@
 ---
 title: Plugin reference
-description: Backend extension entries, SDK contracts, sources, preparation, and native CLI commands.
+description: Native executable manifests, Rust SDK contracts, IPC and source management.
 nav: Reference
 order: 48
 category: Plugins
@@ -8,229 +8,153 @@ category: Plugins
 
 # Plugin reference
 
-Start with the [quickstart](/docs/plugins) or [migration guide](/docs/plugins/migration). This reference describes the **unpublished native cutover in the 0.13.0 checkout**.
+See the [quickstart](index.md) and [migration guide](migration.md). This documents the **0.13.1 source checkout**, not publication or deployment.
 
 ## Runtime boundary
 
-The daemon, CLI, and built-ins are Rust. Optional third-party JavaScript extensions run in a private backend worker with externally installed **Node.js 20+**. Set `PASEO_PLUGIN_NODE` in the daemon environment to select the executable; otherwise it uses `node`. The optional generated worker asset must be available; `PASEO_PLUGIN_WORKER` can select its location. npm is separately needed for npm acquisition or preparation commands. Reloading installed files needs Node, not npm.
+The daemon and built-ins run in Rust. Third-party plugins are native executables launched by the daemon, communicating through bounded JSONL stdin/stdout; there is no dynamic-library ABI, JavaScript worker or interpreter fallback. Flutter renders supported protocol data, not executable plugin UI. Plugins, validation and build commands are unsandboxed daemon-user code.
 
-Flutter owns the Linux/macOS/Windows/Android/iOS interface. It does not execute React or React Native plugin code, client bundles, custom screens, panels, timeline renderers, themes, or composer callbacks. Mobile is remote-only. Managed candidate validation and activation require an actual `index.server.ts` or `index.server.tsx` file; directories with those names and client-only plugins are rejected, not reported as empty ready plugins. Historical SDK exports do not imply native UI compatibility.
-
-| Owner                               | Source                                     |
-| ----------------------------------- | ------------------------------------------ |
-| Rust management, CLI, worker bridge | `packages/daemon/src`                      |
-| Private optional backend worker     | `packages/daemon/plugin-worker/src`        |
-| Public extension SDK                | `packages/plugin` (`@getpaseo/plugin`)     |
-| TypeScript client SDK               | `packages/client` (`@getpaseo/client`)     |
-| Shared protocol                     | `packages/protocol` (`@getpaseo/protocol`) |
-
-Repository builds use Node.js 24, `npm ci`, and `npm run build:daemon`; the watch command is `npm run dev:daemon`. This build-tool requirement does not bundle Node into the product or turn the daemon into JavaScript.
+Sources of truth: [SDK](../../packages/plugin/src/lib.rs), [settings](../../packages/plugin/src/settings.rs), [provider traits](../../packages/plugin/src/provider.rs), [daemon bridge](../../packages/plugin/src/daemon.rs), [host manifest](../../packages/daemon/src/plugins/manifest.rs) and [CLI](../../packages/daemon/src/cli/catalog/plugins.rs). Use local path or explicitly pinned Git dependencies while the SDK is unpublished.
 
 ## Project files
 
-`paseo plugin init /absolute/path/to/plugin` creates a backend-only project with `paseo-plugin.json`, `package.json`, `tsconfig.json`, `OVERVIEW.md`, `index.server.ts`, `server/greeting.ts`, and `shared/greeting.ts`. It does not install dependencies. Run `npm install` in that project for authoring tools.
+`paseo plugin init <directory> --sdk-path <checkout>/packages/plugin` creates a Rust executable project, manifest and author documentation. It requires an empty directory, does not build it, and writes an absolute SDK path dependency. Without `--sdk-path`, it uses a Git dependency. Compile the executable before activation.
 
-### Requirements
-
-Declare a manifest ID and an explicit compatible Paseo semver range:
+### Requirements and runtime entries
 
 ```json
 {
   "id": "review-tools",
-  "requirements": { "paseo": ">=0.13.0" }
+  "name": "Review tools",
+  "description": "Reviews local changes",
+  "runtime": "native",
+  "requirements": { "paseo": ">=0.13.1" },
+  "server": { "executable": "target/release/paseo-plugin-server", "args": [] },
+  "build": [["cargo", "build", "--release", "--target-dir", "target"]]
 }
 ```
 
-The scaffold uses the checkout's version. A version range checks runtime compatibility; it is not evidence that the native migration has shipped or that former UI APIs are supported. An omitted `requirements.paseo` historically means `<0.8.0` and is rejected by current runtimes. Empty or invalid ranges and unknown requirement keys are rejected. Do not broaden the range beyond versions you support.
+Use `.exe` on Windows. The plugin ID starts with a lowercase letter and contains lowercase letters, digits or hyphens. `server.args` is required, even when empty; arguments are passed directly, without shell concatenation. The executable must be a normalized relative path to a regular native ELF/Mach-O/PE file inside the plugin directory, including after symlink resolution. Absolute paths, traversal, scripts and interpreter shims are rejected; Unix files need executable permission. A valid header does not prove host architecture compatibility.
 
-### Runtime entries
+Declare the Paseo semver range you actually support. Omitted `requirements.paseo` means the historical `<0.8.0` default, not unrestricted compatibility. Empty/invalid ranges and unknown requirement keys fail. A version change alone cannot port an old plugin.
 
-`index.server.ts` (also accepted as `.tsx`) default-exports a contribution function receiving `PluginServerContext`. Supported backend contributions are `handle`, `registerSettings`, `registerProvider`, `registerUsageSource`, `on`, and `before`. Keep Node operations, credentials, process transports, and machine-local resources under `server/`; keep runtime-neutral contracts under `shared/`. Do not import `client/` into backend code.
+### Validation and readiness
 
-### Runtime modules
+The host appends `--validate <absolute-plugin-directory> <daemon-version>` to `server.args`. The executable must exit successfully and print one JSON object, at most 1 MiB:
 
-Use the SDK root for `defineRpc`, `defineSettings`, schemas, and plain types. Import server context and lifecycle types from `@getpaseo/plugin/server`, provider contracts from `/server/provider`, ACP adapters from `/server/acp`, and usage contracts/helpers from `/server/usage`. The worker supplies these SDK modules and Zod. Keep host-provided and type-only dependencies in `devDependencies`; declare other runtime libraries as dependencies or bundle them. Backend imports of React and client SDK entry points are not supported. Shared modules cannot import runtime-specific modules or types.
+```json
+{"valid":true,"plugin":{"id":"review-tools"},"methods":[],"hooks":{"events":[],"before":[]},"providers":[],"usageSources":[]}
+```
+
+`Plugin::run()` handles this mode, reading the manifest and returning registered metadata without invoking handlers. Registration code and executable startup still run: validation is **not** a safe way to inspect untrusted code.
+
+Normal startup receives `initialize` with `pluginId`, `pluginDirectory`, `appVersion` and, for settings, `settingsDirectory`. It emits the same registration fields with `type: "ready"` instead of `valid`/`plugin`. Register all contributions before `run()`. RPC/hook/usage requests return matching `requestId` results or errors; provider connections have separate acceptance and event messages. Frames are bounded to 16 MiB and output is backpressured. Reserve stdout exclusively for IPC; use `Context::log(...).await` or stderr for diagnostics.
 
 ## Entry point and cleanup
 
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
+This complete `src/main.rs` uses the scaffold's dependencies:
 
-export default function contribute(server: PluginServerContext) {
-  server.on("agent.turn_ended", (event) => {
-    console.log(event.agent.id, event.outcome);
-  });
-  return () => {};
+```rust
+use paseo_plugin::{Plugin, Result, ensure};
+use serde_json::{Value, json};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut plugin = Plugin::new();
+    plugin.rpc("greeting.create", |input, _context| async move {
+        let name = input["name"].as_str().unwrap_or("");
+        ensure!(!name.is_empty(), "name must be a nonempty string");
+        Ok(json!({"message": format!("Hello, {name}!")}))
+    })?;
+    plugin.on("agent.turn_ended", |event, context| async move {
+        context.log(format!("Turn ended: {} ({})", event["agent"]["id"], event["outcome"])).await?;
+        Ok(Value::Null)
+    })?;
+    plugin.run().await
 }
 ```
 
-The entry must return a synchronous or asynchronous cleanup function; return `() => {}` when there is nothing to release. The worker rejects an entry that returns anything else. Release timers, watchers, sockets, SDK subscriptions, and child processes you create. Reload, disable, removal, and daemon shutdown tear down the worker and its registrations. Hooks do not require an app connection.
+Callbacks receive `serde_json::Value` and `Context`, and return an async `Result<Value>`. **Validate input and output yourself**, using Serde/domain checks or an explicit schema validator. `Plugin::rpc` validates registration names and duplicates, not arbitrary application payload schemas. Registration does not create a native button or screen; consumers use plugin RPC through the daemon protocol.
+
+Use `Plugin::cleanup` for resources you own. Its callback receives null and a context; return `Ok(Value::Null)` after joining tasks and closing sockets/processes/subscriptions. `Context::cancellation` signals request cancellation or shutdown. Reload, disable, removal and daemon shutdown end the process and registrations. Cleanup has a bounded deadline; do not depend on it running after a crash or forced termination. Hooks operate without a connected app.
 
 ## Lifecycle hooks
 
-| Registration                    | Callback                           | Result                                                    |
-| ------------------------------- | ---------------------------------- | --------------------------------------------------------- |
-| `server.on(name, callback)`     | `(event, { paseo, signal })`       | `void` or promise                                         |
-| `server.before(name, callback)` | `({ request }, { paseo, signal })` | Modified request, or `undefined` to keep it; may be async |
+| Registration | Input and result |
+| --- | --- |
+| `plugin.on(name, callback)` | Event JSON; return null after handling. Handlers run in registration order; an error is logged without skipping later handlers. |
+| `plugin.before(name, callback)` | `{"request": ...}`; return null to preserve the request, or the complete transformed request. |
 
-Events include `agent.created`, `agent.closed`, `agent.turn_started`, `agent.turn_ended`, `agent.permission_requested`, `agent.permission_resolved`, `agent.archived`, `workspace.created`, and `workspace.archived`. Public background agents use the same lifecycle; private disposable helpers are excluded. Archive notification is not proof that runtime/worktree cleanup is finished.
+Events: `agent.created`, `agent.closed`, `agent.turn_started`, `agent.turn_ended`, `agent.permission_requested`, `agent.permission_resolved`, `agent.archived`, `workspace.created`, `workspace.archived`. Public background agents participate; private disposable helpers do not. Archive notification does not prove cleanup has finished. Turn-end payloads include `agent`, `turnId` and `outcome` (`completed`, `failed`, `canceled`); do not rely on the deprecated empty `timeline` field.
 
-`agent.turn_ended` carries `agent`, `turnId`, and `outcome` (`completed`, `failed`, or `canceled`). Its deprecated `timeline` is always empty. Fetch a bounded tail instead:
-
-```ts
-server.on("agent.turn_ended", async (event, { paseo, signal }) => {
-  if (signal.aborted) return;
-  const agent = paseo.agents.ref(event.agent.id);
-  const history = await agent.timeline.refetch({ direction: "tail", limit: 20 });
-  console.log("Fetched turn history", event.agent.id, history);
-});
-```
-
-Do not log private history in a production plugin unless it is explicitly intended and disclosed. Respect the hook abort signal and release subscriptions during cleanup.
-
-| Before hook          | Editable request                                                    |
-| -------------------- | ------------------------------------------------------------------- |
-| `agent.create`       | Public agent configuration except `cwd`, and launch overrides `env` |
-| `agent.session_open` | Only `env`                                                          |
-| `workspace.create`   | Explicit workspace creation request                                 |
-
-For example, inject a launch override on every session opening:
-
-```ts
-server.before("agent.session_open", ({ request }) => ({
-  ...request,
-  env: { ...request.env, COMPANY_ENV: "development" },
-}));
-```
-
-The environment map contains launch overrides, not the daemon's inherited environment. Session opening includes create, resume, refresh, and import, and can serve interactive or history work. Use ordinary SDK permission methods to answer requests; do not treat every permission request as a shell command or a completed turn.
+Before hooks: `agent.create` can transform public configuration except `cwd`, plus launch `env`; `agent.session_open` can change only `env`; `workspace.create` transforms an explicit workspace creation request. Preserve unrelated fields and previous transforms. `env` contains launch overrides, not the whole inherited environment. Session opening includes create/resume/refresh/import and history work. Respect cancellation; do not assume every permission is a shell command or every permission resolution is a completed turn.
 
 ## Connected hosts and the Paseo SDK {#connected-hosts}
 
-Handlers receive `{ paseo }`; lifecycle callbacks receive `{ paseo, signal }`. These use the `@getpaseo/client` API, not a separate legacy server SDK. Use it for normal agent, workspace, provider, and configuration operations rather than defining duplicate plugin RPCs.
-
-`context.paseo.hosts` describes the selected daemon's saved host connections. Host identity belongs to the daemon connection; paths and workspace IDs must not be treated as globally interchangeable across hosts. See the [SDK reference](/docs/sdk/reference). This backend API does not provide the former app's React hooks or a way to inject native screens.
-
-## Add plugin-specific backend behavior
-
-Use RPC for vendor APIs, daemon-local resources, or credentials that should stay on the daemon. In `shared/greeting.ts`:
-
-```ts
-import { defineRpc } from "@getpaseo/plugin";
-import { z } from "zod";
-
-export const greeting = defineRpc({
-  name: "greeting.create",
-  input: z.object({ name: z.string() }),
-  output: z.object({ message: z.string() }),
-});
-```
-
-In `index.server.ts`:
-
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { greeting } from "./shared/greeting";
-
-export default function contribute(server: PluginServerContext) {
-  server.handle(greeting, ({ name }) => ({ message: `Hello, ${name}` }));
-  return () => {};
-}
-```
-
-Input and output are validated by the contract; `RpcInput` and `RpcOutput` from the SDK root derive its types. Registration creates backend behavior, not a UI or automatic native button. A consumer must use the daemon's plugin RPC protocol. Do not add `useRpc` or a React client entry as a native integration recipe.
+Call `context.daemon.client().await?` to obtain an `Arc<paseo_client::DaemonClient>`. This lazy connection uses the plugin IPC bridge, including text/binary frames, not an extra token or network connection. Host closure invalidates the cached session; a later call opens another logical session. Use the [Rust client SDK](../sdk/reference.md) for ordinary agent, workspace, permission, provider and configuration operations. Fetch bounded history when necessary rather than logging private conversation contents by default. Host IDs, paths and workspace IDs are scoped to their daemon connection, not globally interchangeable.
 
 ## Persisted settings {#settings-screens}
 
-The backend settings API remains supported; executable settings screens do not. Define a document in `shared/`:
+Register `SettingsDefinition::new(id, positive_version, validator)` with `plugin.settings(...)`. The validator accepts JSON and returns normalized JSON with defaults; `{}` must produce the default document. Optional `.migrate(|values, from_version| async move { ... })` converts older stored data before validation. See the complete [inspection settings implementation](../../plugin-examples/workspace-inspector/src/lib.rs).
 
-```ts
-import { defineSettings } from "@getpaseo/plugin";
-import { z } from "zod";
+The returned cloneable `Settings` exposes `read().await`, `write(revision, values).await`, `reset(revision).await` and `subscribe()` (a Tokio broadcast receiver). IDs match `[a-z][a-z0-9_-]*`. Storage is host-scoped and preserves the existing `{version, values}` envelope. Schema version differs from opaque write revision.
 
-export const preferences = defineSettings({
-  id: "review",
-  scope: "host",
-  version: 1,
-  schema: z.object({ enabled: z.boolean().default(true) }),
-});
-```
+- Read returns `status: "ready"`, `values`, `revision`, or `status: "invalid"`, `error`, `revision`. Invalid saved data is retained until explicitly repaired/reset.
+- Write/reset requires the read revision; stale writes return `conflict`. Successful writes return `saved`; invalid values return `invalid`. Failed writes do not notify subscribers.
+- Subscriptions deliver states; a lag error means re-read to synchronize. Subscriber failure does not undo a saved write.
+- RPCs `settings.<id>.read`, `.write`, `.reset` are registered automatically, with `settings.changed` notification on changes.
 
-Register it with `server.registerSettings(preferences)`. The handle exposes `read()` and `subscribe(listener)`; the latter returns cleanup. A read returns `ready` with `values` and opaque `revision`, or `invalid` with `error` and `revision`. Invalid saved data is preserved rather than silently replaced.
-
-`id` matches `[a-z][a-z0-9_-]*` and is unique within the installation. `scope` is `host`, shared by authorized clients of that daemon, not synchronized across hosts. `version` is a positive schema version, distinct from the write revision. Supply defaults so `{}` parses to a complete document. Optional `migrate(values, fromVersion)` may be async and must produce data valid under the current schema. Invalid writes and revision conflicts do not notify subscribers; listener errors do not undo committed writes.
+These are data APIs, not executable settings screens.
 
 ## Providers
 
-Call `server.registerProvider()` with `ProviderRegistration` from `@getpaseo/plugin/server/provider`, or use `runAcpProvider()` from `/server/acp`. A connection accepts input via `send()`, publishes events via `onEvent()`, and releases resources with `close()`. `send()` reports acceptance, not turn completion.
+Implement `paseo_plugin::provider::{Provider, Connection}` and register with `plugin.provider(...)`. `Provider::connect` receives request JSON, `Events` and `Context`; return `Arc<dyn Connection>`. Negotiate only offered versions/capabilities. `Connection::send` reports acceptance, not turn completion. Publish typed-by-protocol JSON through `Events::emit`; implement `close` to stop tasks/processes and resolve pending permissions. Optional status/catalog-cache capabilities must agree with metadata. Full session, permission, configuration, persistence and timeline contracts are covered in the [provider guide](providers.md).
 
-Use `session.prompt` for messages, structured commands, and steering. Repeat `clientMessageId` on the user timeline item and emit one matching `session.prompt_result`. Return model, mode, thinking, capability, configuration, permission, persistence, and timeline data through the provider protocol. Provider-created children use `parentSessionId`. Refresh closes and reopens the session with current configuration and persistence.
+`Metadata::icon_path` is a relative SVG file path contained in the plugin directory, not inline SVG or a URL. `UsageSource::icon` is **inline SVG text**, a different wire field. Host validation limits SVG to 64 KiB and rejects active content such as scripts, foreign objects, styles, event handlers and external references. Listing PNGs have a separate [distribution contract](publishing.md#icons-and-screenshots).
 
-Toggle/select configuration descriptors and standard timeline items are data rendered by the native client; they are not executable plugin UI. Keep provider-private options in `ProviderSessionConfig.providerOptions` and validate them. Host tools arrive as MCP servers. See [provider options](/docs/sdk/provider-options) and the complete [direct/ACP provider guide](/docs/plugins/providers).
-
-### SVG rules
-
-`ProviderRegistration.icon` is a file path relative to the plugin directory, not inline SVG or a URL. It must resolve to a regular file inside that directory, including after symlink resolution. Usage-source icons use the same rules. SVG must begin with an `<svg>` document and be at most 64 KiB. Scripts, `foreignObject`, style elements, event-handler attributes, JavaScript URLs, and non-fragment `href` references are rejected. Listing PNG icons have a separate [publication contract](/docs/plugins/publishing#icons-and-screenshots).
+For ACP agents, register [`paseo_plugin::acp::AcpProvider`](../../packages/plugin/src/acp/mod.rs) instead of rebuilding the provider protocol yourself. `AcpProvider::command(id, label, argv)` and `::connector(id, label, factory)` return `Result<AcpProvider>`; builders `.options(AcpOptions)`, `.transformer(impl AcpTransformer)`, `.description(...)` and `.icon_path(...)` return the provider. The connector returns a fresh owned `AcpStream` asynchronously and receives a cancellation token. `AcpTransformer` exposes ordered catalog discovery/configuration and notification/tool-snapshot transforms; `AcpContext::config` provides `ConfigAccess::read`/`set`. See the [ACP guide](providers.md#adapt-an-acp-agent) for lifecycle and capability boundaries. This is a native implementation of the former ACP helper functionality, not JavaScript source compatibility.
 
 ## Usage sources
 
-Register with `server.registerUsageSource()`. Import contracts and helpers from `@getpaseo/plugin/server/usage`. A source has `id`, `label`, optional icon path, an input Zod schema, `discover(scope)`, and `fetch(input)`.
+`UsageSource::new(id, label, discover, fetch)` registers with `plugin.usage_source(...)`. Both async callbacks receive JSON plus `Context`. Validate scope/input before accessing files or contacting a service; there is no automatic Zod/schema parser.
 
-- `discover` returns accounts with stable `key`, optional `label` and `harness`, and JSON `input` identifying a credential store, never containing credentials.
-- Scope is global or session-specific (`provider`, optional `model`, and launch `env`). Session discovery must resolve only that session's account; return `[]` for unrelated providers or absent logins. Do not scan other agents or default stores as a fallback.
-- `fetch` returns `available` with usage windows and optional balances/details, `unavailable` with a typed problem, or `error` with a message. Validate input with the source schema.
-- Account keys use 1–128 characters from `[A-Za-z0-9._-]`; never use raw credentials or email. `hashAccountKey()` handles sensitive stable identities. Prefer account identity that survives token rotation.
-- Read the store again when fetching. Do not redeem refresh tokens or rewrite another CLI's credential files.
-- `unavailable(problem)` requires `expired` (`expiresAt`, optional `refreshedBy`), `rejected` (`status`, optional `refreshedBy`), or `no_quota` (`detail`). `refreshedBy` is a CLI name, not a user-facing instruction.
-- Derive period labels from provider data, not response order or reset countdowns. `windowFromReportedDuration()` accepts reported seconds or `null` and a neutral unknown name/identity; `windowFromUsedPct()` is appropriate for provider-named periods. Keep window IDs stable across response reordering and resets.
+The public [`paseo_plugin::usage` module](../../packages/plugin/src/usage.rs) supplies Serde `Scope`, `Account`, `Report`, `Problem`, `Window`, `Balance`, `Detail`, `Unit` and `Tone` types. Deserialize callback input with `serde_json::from_value` and serialize typed output with `serde_json::to_value`. Helpers include `hash_account_key`, `used_pct_of`, `tone_from_used_pct`, `balance_tone_from_remaining`, `window_from_used_pct` and `window_from_reported_duration`. The duration helper takes reported seconds, optional stable scope ID/label, explicit unknown ID/label/short-label, used percentage and reset time; never pass a reset countdown as the period duration.
 
-Built-in usage sources belong to Rust, not this optional worker. The backend registration does not create a custom native usage panel.
+- Discovery receives global or session scope and returns accounts with stable `key`, optional `label`/`harness`, and JSON `input` identifying a credential store, **never credentials**. Session scope includes `provider`, optional `model` and launch `env`; return only the session's account, or `[]` for unrelated/missing logins. Do not scan other agents' stores as fallback.
+- Fetch returns `available` with windows and optional balances/details, `unavailable` with a typed problem, or `error` with a message. Re-read credentials; do not redeem refresh tokens or rewrite another CLI's store.
+- Account keys use 1–128 characters from `[A-Za-z0-9._-]`. Hash sensitive identities; choose identity stable across token rotation, not email/token contents.
+- Unavailable problems distinguish `expired` (`expiresAt`, optional `refreshedBy`), `rejected` (`status`, optional `refreshedBy`) and `no_quota` (`detail`). `refreshedBy` names a CLI, not a user-facing instruction.
+- Derive window names from reported duration or provider names, not response order or reset countdown. Keep window IDs stable across resets/reordering.
+
+Built-in usage integrations already run in Rust; no extra executable or custom native panel is required.
 
 ## Plugin sources
 
-Pass a source to `paseo plugin install` (`add` is also accepted):
+| Source | Selector |
+| --- | --- |
+| Host directory | `/srv/paseo/plugins/review` or `./review` |
+| GitHub/Git | `github:acme/paseo-review`, `git:acme/paseo-review`, `git:https://git.example/acme/review.git` |
+| Cargo crate | `cargo:paseo-review@1.2.0` (exact semver), or `cargo:paseo-review` (latest stable non-yanked) |
+| Release archive | `release:https://releases.example/review-1.2.0.zip` plus `--version 1.2.0 --sha256 <digest> --format zip` |
+| Registry | `owner/slug` or `registry.example/owner/slug` |
 
-| Source              | Example                                                                        |
-| ------------------- | ------------------------------------------------------------------------------ |
-| Registry            | `owner/slug` or `registry.example/owner/slug`                                  |
-| Host directory      | `/srv/paseo/plugins/review` or `./review`                                      |
-| GitHub              | `github:acme/paseo-review` or `git:acme/paseo-review`                          |
-| Git URL/SCP         | `git:https://git.example/acme/review.git` or `git@git.example:acme/review.git` |
-| npm                 | `npm:@acme/paseo-review@1.2.0`                                                 |
-| Source subdirectory | `github:acme/monorepo:plugins/review`                                          |
+Names/URLs in this table illustrate syntax, not existing published plugins. Bare `owner/slug` is a registry identity, not a local path or GitHub shorthand. Prefix relative directories with `./` or `../`. With `--host`, use an absolute path on that daemon; local files are not uploaded. `--path` selects a contained source subdirectory; Git also accepts `github:acme/monorepo:plugins/review`. `--ref` chooses a Git branch/tag/commit. Cargo versions use `@exact-semver` on install, not `--version`.
 
-Bare `owner/slug` is a registry ID, not a local directory or GitHub shorthand. Prefix local relative paths with `./` or `../`. Absolute paths, `~`, Windows drive paths, and UNC paths identify directory sources. The CLI resolves relative paths and `~` locally; with `--host`, supply an absolute path on the daemon host. Files are not uploaded. A `file://` URL selects Git acquisition, not a directory.
+Release URLs require HTTPS without embedded credentials, an explicit version and lowercase 64-character SHA-256. `--format` is `tar.gz` or `zip`; it can be inferred from recognized URL suffixes. Downloads are bounded/checksummed before safe extraction. Source acquisition is not a sandbox: preparation and validation execute trusted code afterward.
 
-npm accepts an exact version, tag, or semver range after `@`, defaulting to `latest`. Quote ranges containing shell operators. Tarball URLs, npm aliases, and npm `file:` specifications are not plugin source identifiers. Use explicit `npm:` for an unscoped package with both a version and subdirectory, avoiding ambiguity with SCP syntax.
+Default registry: `https://plugins.paseo.sh`; `PASEO_PLUGIN_REGISTRY` selects another default. Private registry authorization is configured with `pluginRegistries: {"host":{"authorization":"Bearer token"}}`; credentials are not forwarded to artifact hosts or redirects. Existing installs retain their source/registry identity. A registry must serve native Git/Cargo/release records; this checkout does not prove the public registry has migrated or published any native plugin. npm sources and legacy JavaScript records are not executed; see [migration](migration.md).
 
-A subdirectory suffix must stay inside the acquired source: no empty, `.` or `..` segments; a lone `.` selects the root. URL ports and SCP separators remain part of the source. Prefer `/` separators across hosts. `--ref` selects an initial Git branch/tag/commit; without it, acquisition uses default HEAD. `--path` is also accepted for a source-relative plugin directory.
-
-The default plugin registry is `https://plugins.paseo.sh`. `PASEO_PLUGIN_REGISTRY` selects another default, including a path prefix. Daemon config `pluginRegistries: { "host": { "authorization": "Bearer token" } }` supplies private registry authorization. Restart after changing startup settings. Registry credentials are not sent to artifact hosts or redirects. Existing installs retain their recorded registry and source. Registry records own the reviewed revision and plugin path.
-
-npm runs on the daemon host using that user's registry/auth configuration. Acquisition installs a candidate and production dependencies into managed storage; the installed lock records actual resolution. npm package authors must also ship the [publication lock](/docs/plugins/publishing#2-lock-installed-dependencies) when required. Git acquisition needs Git and access on that host.
-
-`--id` overrides the manifest's installation ID. Duplicate IDs are rejected. Removing a directory installation preserves its source; removing a managed npm/Git installation removes its managed files. Installation grants unsandboxed daemon-user access to code, dependencies, and preparation commands.
+`--id` overrides installation identity. Duplicate IDs fail. Removing a directory install preserves user-owned sources; removing a managed install removes its managed files, not arbitrary external directories.
 
 ## Preparation commands
 
-Ordinary TypeScript extensions need no separate build: the worker compiles them. Use manifest `build` only for required dependency installation or generated source/assets:
-
-```json
-{
-  "id": "review-tools",
-  "requirements": { "paseo": ">=0.13.0" },
-  "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]]
-}
-```
-
-Each command is a non-empty argv array, executed directly without an implicit shell from the staged plugin directory. Paseo does not infer commands from lockfiles. Installation and update run declared preparation before validation and activation. A failed candidate is discarded; update retains the previous installation. Declared commands remain trusted executable code even though npm lifecycle scripts are suppressed during acquisition. Keep installed dependency trees locked and disclose additional setup; see [publishing](/docs/plugins/publishing#plugins-with-a-build-step).
+Manifest `build` is an array of nonempty argv arrays (as in the manifest above). Commands run directly from the staged plugin directory, without an implicit shell. They may fetch dependencies or execute Cargo build scripts with daemon-user privileges. Installation/update prepares and validates a candidate before activation; failure retains the previous managed installation. No commands are inferred from lockfiles. For reproducible distribution commit `Cargo.lock` and use `cargo build --locked --release --target-dir target`; the generated scaffold's initial command intentionally works before a lockfile exists. Rebuild local directory sources before reload.
 
 ## CLI reference
 
-```bash
-paseo plugin init /absolute/path/to/plugin
+```sh
+paseo plugin init /absolute/path/to/plugin --sdk-path /absolute/path/to/paseo/packages/plugin
 paseo plugin install /absolute/path/to/plugin
-paseo plugin install npm:@acme/paseo-review@1.2.0 --id review
 paseo plugin ls review
 paseo plugin logs review
 paseo plugin update review --check
@@ -245,24 +169,10 @@ paseo plugin enable review
 paseo plugin remove review
 ```
 
-Put global `--host <url>` before the management command for a remote daemon. `ls` reports installed identity/revision without querying the remote source. Ordinary native CLI updates show the proposal and require `--yes`; there is no interactive approval prompt. `--check` always previews only. Explicit `--version` (npm) or `--ref` (Git) authorizes one plugin target and cannot be combined with `--all` or each other.
+Use the actual installed ID in place of `review`. `install` also accepts `add`. Ordinary updates preview and require `--yes`; `--check` never applies. Explicit `--version` selects a Cargo version; `--ref` selects Git. Explicit selections authorize one target, not `--all`. Release updates require `--url <HTTPS URL> --version <version> --sha256 <digest> [--format zip|tar.gz]` and retain the installed URL origin. They have no implicit latest-release discovery.
 
-Direct npm updates consider newer `latest` versions; direct Git updates consider default HEAD regardless of the initial selector. Explicit npm targets can downgrade. Registry installs use reviewed pins. Directory installs are skipped: edit and reload them. Each bulk result is independent. A changed or unavailable proposal fails rather than silently applying different content.
-
-The root `pluginsEnabled` config and each installation's enabled flag both gate execution. Use `paseo reload --json` after changing the root config; manage installation entries through plugin commands. Typecheck in the plugin project before installing or reloading; load-time compilation is not a typecheck.
+Direct Git updates follow default HEAD, Cargo updates choose stable non-yanked releases, and registry updates follow reviewed pins. Directory installs are skipped. Proposals bind immutable artifact identities/checksums; changed proposals fail rather than silently substituting content. Bulk results are independent. `ls` reads installed metadata without querying the remote source.
 
 ## Debug backend output
 
-Use normal `console.log`/`console.error`. `paseo plugin logs <id>` returns a recent snapshot with timestamps, stream, sequence, and message, not a live follower. Logs include load/compile failures and worker output. They can contain private data; never log credentials or access tokens. A status of `running` proves neither provider correctness nor a native UI contribution.
-
-## Load failures
-
-| Symptom                     | Action                                                                                                                                                            |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Worker/Node unavailable     | Install external Node 20+, check daemon environment and `PASEO_PLUGIN_NODE`, and supply the optional worker asset.                                                |
-| Legacy or missing entry     | Supply a real `index.server.ts` or `index.server.tsx` file implementing supported backend behavior; client-only packages and entry-path directories are rejected. |
-| Backend imports client code | Remove the dependency, not just the compiler error; keep only backend logic.                                                                                      |
-| RPC rejects                 | Check both Zod schemas and the handler error.                                                                                                                     |
-| Changes not active          | Typecheck, reload, then inspect status and logs.                                                                                                                  |
-| Reload/worker failure       | Fix the reported source/runtime error and reload; do not assume the old worker is still active.                                                                   |
-| No former plugin screen     | Expected native boundary, not a reason to install React or a browser into the app.                                                                                |
+`paseo plugin logs <id>` returns a recent snapshot, not a live follower. Use stderr or `Context::log`; arbitrary stdout corrupts IPC. Never log secrets. Missing binary, wrong architecture, absent execute permission, incompatible requirements, invalid metadata or runtime failure are real load errors: fix the cause, rebuild when appropriate and reload. A legacy runtime needs a native port, not an interpreter setting. `running` is not proof of provider correctness or UI compatibility.

@@ -62,7 +62,7 @@ The boundary can evolve. Some built-in capabilities may eventually make more sen
 
 ## Extensibility and composition
 
-Built-in integrations run in Rust. Optional JavaScript backend extensions can add providers, RPCs, lifecycle behavior, usage sources and settings data using an externally installed Node runtime. Node is also repository build tooling, but is not bundled in the default installed runtime.
+Built-in integrations run in Rust. Optional native backend executables can add providers, RPCs, lifecycle behavior, usage sources and settings data through the Rust `paseo-plugin` SDK. Paseo runtime and repository tooling do not require Node; external agent programs retain their own runtime requirements.
 
 Executable React UI-plugin compatibility, embedded browser/automation and interactive terminal UI are intentionally excluded. There is no Electron, Chromium or webview fallback for these surfaces. Script and setup PTYs remain daemon functionality; their native presentation is read-only logs.
 

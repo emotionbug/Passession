@@ -1,209 +1,101 @@
----
-title: Provider options
-description: Sandboxing, permissions, and network rules for Codex, Claude, and OpenCode agents created from the SDK.
-nav: Provider options
-order: 55
-category: TypeScript SDK
----
-
 # Provider options
 
-Provider options are an opaque `Record<string, unknown>` passed to the provider.
-The provider decides how to validate and apply it. Claude, Codex, and OpenCode
-use strict schemas: an unknown or misspelled key fails agent creation with a
-message naming the bad key. Providers without option handling ignore the record.
-Pi, OMP, ACP, and plugin providers interpret their own keys.
+[中文](provider-options.zh-CN.md) · [Setup](quickstart.md)
 
-You set options in two places:
+Provider options are a JSON object (`serde_json::Value`) interpreted by the provider. Claude, Codex and OpenCode validate their accepted keys; unknown or misspelled keys can fail creation. Pi, OMP, ACP and native plugin providers interpret their own options. Do not assume all providers implement the same policy.
 
-- **Provider defaults:** `config.json` → `agents.providers.<id>.options`.
-- **One agent:** `config.options` in `client.agents.create()`. Its wire name is
-  `providerOptions`.
+Set defaults in `config.json` at `agents.providers.<id>.options`. Per-agent values go in **`config.providerOptions`** in the Rust wire-shaped creation request, not `config.options`. The daemon recursively merges plain objects over defaults; arrays, scalars and null replace their base values. Only per-agent overrides are stored. Default changes take effect at the next launch/resume.
 
-The daemon deep-merges the agent's options over the provider defaults at session
-launch or resume. Plain objects merge recursively; arrays, scalars, and `null`
-replace the base value. Only the agent's own options are stored. Changing
-`config.json` defaults takes effect on the next launch or resume.
+```rust
+use anyhow::Result;
+use paseo_client::{DaemonClient, RequestOptions};
+use serde_json::{Value, json};
 
-For example, set Codex defaults once:
+async fn launch(client: &DaemonClient, provider: &str, model: &str,
+                cwd: &str, provider_options: Value) -> Result<Value> {
+    client.create_agent(json!({
+        "config": {"provider": provider, "model": model, "cwd": cwd,
+                   "providerOptions": provider_options},
+        "initialPrompt": "Review the change and report the result."
+    }), RequestOptions::default()).await
+}
+```
+
+Pass a JSON object below to `launch`, for example by constructing it with `serde_json::json!` or parsing a configuration string using `serde_json::from_str`. Use an actual model ID discovered for that provider. Call `wait_for_finish` with the returned agent ID to observe the outcome.
+
+Provider settings constrain an external CLI running as the daemon user. They are not a host security boundary. Run untrusted work in a container or separate machine; see [Security](../security.md).
+
+## Codex
 
 ```json
 {
-  "agents": {
-    "providers": {
-      "codex": {
-        "options": {
-          "sandbox_mode": "read-only",
-          "approval_policy": "never",
-          "sandbox_workspace_write": { "network_access": false }
-        }
-      }
+  "approval_policy": "never",
+  "sandbox_mode": "workspace-write",
+  "sandbox_workspace_write": {
+    "writable_roots": ["/home/me/dev/storefront"],
+    "network_access": false,
+    "exclude_slash_tmp": true
+  },
+  "web_search": "disabled"
+}
+```
+
+| Option | Accepted values/fields |
+| --- | --- |
+| `approval_policy` | `untrusted`, `on-request`, `never`, or a `granular` policy object |
+| `sandbox_mode` | `read-only`, `workspace-write`, `danger-full-access` |
+| `sandbox_workspace_write` | `writable_roots`, `network_access`, `exclude_slash_tmp`, `exclude_tmpdir_env_var` |
+| `web_search` | `disabled`, `cached`, `indexed`, `live` |
+| `features` | `multi_agent_v2`, `network_proxy` (boolean or proxy/domain policy object) |
+
+`approval_policy: "never"` removes prompts; it does not restrict access. Configure the sandbox deliberately. For example, defaults of `sandbox_mode: "read-only"`, `approval_policy: "never"`, and `sandbox_workspace_write.network_access: false` retain the latter two when an agent overrides only `sandbox_mode` to `workspace-write`.
+
+## Claude
+
+```json
+{
+  "disallowedTools": ["WebFetch"],
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "allowWrite": ["/home/me/dev/storefront"],
+      "denyRead": ["/home/me/.ssh", "/home/me/.aws"]
+    },
+    "network": {
+      "allowedDomains": ["crates.io", "github.com"],
+      "strictAllowlist": true
     }
   }
 }
 ```
 
-Then create one agent with `config.options: { sandbox_mode: "workspace-write" }`.
-It receives `workspace-write`, retains `approval_policy: "never"`, and retains
-`sandbox_workspace_write.network_access: false`. With no per-agent options it
-receives the defaults above. Keys are provider-native; use the sections below
-for the options each provider accepts.
+| Option | Meaning |
+| --- | --- |
+| `allowedTools`, `disallowedTools` | Tools allowed without asking / forbidden tools |
+| `additionalDirectories` | Extra accessible directories |
+| `sandbox` | `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands`, `excludedCommands`, `filesystem`, `network` |
+| `settings` | `permissions` with allow/ask/deny rule lists and nested sandbox settings |
 
-Provider options are not a host boundary. They constrain the agent CLI, which runs as your user on your machine. For untrusted work, run the daemon in a container or on a separate machine. See [Security](/docs/security).
-
-## Codex
-
-Confine writes to one directory, cut off network access, and stop approval prompts so the run is unattended:
-
-```ts
-import { createPaseoClient } from "@getpaseo/client";
-
-const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
-await client.connect();
-
-const agent = await client.agents.create({
-  config: {
-    provider: "codex/gpt-5.5",
-    options: {
-      approval_policy: "never",
-      sandbox_mode: "workspace-write",
-      sandbox_workspace_write: {
-        writable_roots: ["/Users/me/dev/storefront"],
-        network_access: false,
-        exclude_slash_tmp: true,
-      },
-      web_search: "disabled",
-    },
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Fix the failing checkout test.",
-});
-
-const result = await agent.waitForFinish();
-console.log(result.status, result.lastMessage);
-
-await client.close();
-```
-
-| Option                    | Values                                                                            |
-| ------------------------- | --------------------------------------------------------------------------------- |
-| `approval_policy`         | `untrusted`, `on-request`, `never`, or `{ granular: { … } }`                      |
-| `sandbox_mode`            | `read-only`, `workspace-write`, `danger-full-access`                              |
-| `sandbox_workspace_write` | `writable_roots`, `network_access`, `exclude_slash_tmp`, `exclude_tmpdir_env_var` |
-| `web_search`              | `disabled`, `cached`, `indexed`, `live`                                           |
-| `features`                | `multi_agent_v2`, `network_proxy` (boolean or a proxy/domain policy object)       |
-
-`approval_policy: "never"` only removes the prompts. What the agent is allowed to touch is `sandbox_mode`. Setting `never` without a sandbox mode gives an unattended agent full access.
-
-## Claude
-
-Turn on Claude's own sandbox, restrict writes to the project, deny reads of credential directories, and allow only two domains:
-
-```ts
-import { createPaseoClient } from "@getpaseo/client";
-
-const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
-await client.connect();
-
-const agent = await client.agents.create({
-  config: {
-    provider: "claude/claude-sonnet-5",
-    options: {
-      disallowedTools: ["WebFetch"],
-      sandbox: {
-        enabled: true,
-        failIfUnavailable: true,
-        allowUnsandboxedCommands: false,
-        filesystem: {
-          allowWrite: ["/Users/me/dev/storefront"],
-          denyRead: ["/Users/me/.ssh", "/Users/me/.aws"],
-        },
-        network: {
-          allowedDomains: ["registry.npmjs.org", "github.com"],
-          strictAllowlist: true,
-        },
-      },
-    },
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Install dependencies and run the focused test.",
-});
-
-const result = await agent.waitForFinish();
-console.log(result.status, result.lastMessage);
-
-await client.close();
-```
-
-| Option                  | Values                                                                                                  |
-| ----------------------- | ------------------------------------------------------------------------------------------------------- |
-| `allowedTools`          | Tool names the agent may use without asking                                                             |
-| `disallowedTools`       | Tool names the agent may never use                                                                      |
-| `additionalDirectories` | Extra directories the agent may access                                                                  |
-| `sandbox`               | `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands`, `excludedCommands`, `filesystem`, `network` |
-| `settings`              | `permissions` (`allow`/`ask`/`deny` rule lists) and a nested `sandbox`                                  |
-
-`failIfUnavailable: true` makes agent startup fail when the sandbox cannot be established. Leave it off and Claude runs unsandboxed instead.
-
-`sandbox.filesystem` takes `allowWrite`, `denyWrite`, `allowRead`, and `denyRead`. `sandbox.network` takes `allowedDomains`, `deniedDomains`, `strictAllowlist`, and proxy settings.
+`failIfUnavailable: true` rejects startup if the sandbox cannot be established; leaving it off permits an unsandboxed fallback. Filesystem settings include `allowWrite`, `denyWrite`, `allowRead`, `denyRead`. Network settings include domain allow/deny lists, `strictAllowlist` and proxies. Adapt paths/domains to the daemon host and actual task.
 
 ## OpenCode
 
-Allow reads and edits, deny anything that reaches outside the project, and gate shell commands by pattern:
-
-```ts
-import { createPaseoClient } from "@getpaseo/client";
-
-const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
-await client.connect();
-
-const agent = await client.agents.create({
-  config: {
-    provider: "opencode/opencode/gpt-5.5",
-    options: {
-      permission: {
-        read: "allow",
-        edit: "allow",
-        webfetch: "deny",
-        external_directory: "deny",
-        bash: {
-          "git status": "allow",
-          "git diff*": "allow",
-          "git push*": "deny",
-          "*": "ask",
-        },
-      },
-    },
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Implement the requested change and show me the diff.",
-});
-
-const result = await agent.waitForFinish();
-console.log(result.status, result.lastMessage);
-
-await client.close();
-```
-
-Every permission is `ask`, `allow`, or `deny`. Tools that take a target — `read`, `edit`, `glob`, `grep`, `list`, `bash`, `task`, `external_directory`, `repo_clone`, `repo_overview`, `lsp`, `skill` — also accept a pattern map, where later keys act as the fallback. Tools without a target — `todowrite`, `question`, `webfetch`, `websearch`, `codesearch`, `doom_loop` — take a bare action.
-
-`permission: "deny"` as a bare string applies to everything at once.
-
-An `ask` resolves to a permission request in Paseo, and `waitForFinish()` returns `permission` while it is pending. Use `allow` and `deny` for unattended runs. See [Events](/docs/sdk/events) for reacting to a pending request.
-
-## Modes and options
-
-`modeId` picks a Paseo mode from the provider's published list, which the daemon shows in the app and reports through [provider discovery](/docs/sdk/providers). `options` is the provider's own configuration. They are separate controls and you can set both:
-
-```ts
-config: {
-  provider: "codex/gpt-5.5",
-  modeId: "full-access",
-  options: {
-    approval_policy: "never",
-    sandbox_mode: "read-only",
-  },
+```json
+{
+  "permission": {
+    "read": "allow", "edit": "allow", "webfetch": "deny",
+    "external_directory": "deny",
+    "bash": {"git status": "allow", "git diff*": "allow", "git push*": "deny", "*": "ask"}
+  }
 }
 ```
 
-Where the two overlap, `options` wins. Above, Codex runs read-only even though `full-access` would otherwise grant more.
+Actions are `ask`, `allow`, or `deny`. Target-aware tools (`read`, `edit`, `glob`, `grep`, `list`, `bash`, `task`, `external_directory`, `repo_clone`, `repo_overview`, `lsp`, `skill`) also accept pattern maps. Pattern order matters, including fallback entries. Tools without targets (`todowrite`, `question`, `webfetch`, `websearch`, `codesearch`, `doom_loop`) use a bare action. A bare `permission: "deny"` denies everything.
+
+An `ask` becomes a Paseo permission request. Handle it with an owned event observation and `respond_to_permission`; see [Events](events.md). A waiting run can report `permission`. Do not turn every request into an automatic allow merely to make a run unattended.
+
+## Modes and options
+
+`config.modeId` selects a mode from [provider discovery](providers.md). `config.providerOptions` is native provider configuration; both can be set. Where they overlap, explicit provider options take precedence. For example, `modeId: "full-access"` with Codex `providerOptions: {"approval_policy":"never","sandbox_mode":"read-only"}` remains read-only. Review options rather than inferring permissions from a mode label alone.

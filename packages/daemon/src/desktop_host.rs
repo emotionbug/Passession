@@ -3,9 +3,9 @@ pub(crate) mod input;
 mod tests;
 
 use crate::{
-    client::{self, ClientError, DaemonTarget},
     daemon_control::{self as control, DaemonInstance, StartOptions, StopOptions},
 };
+use paseo_client::{ClientError, DaemonTarget};
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -152,7 +152,7 @@ impl Session {
             "Missing absolute runtime directory: workingDirectory"
         );
         let configured_home = std::env::var("PASEO_HOME").ok();
-        let home = client::resolve_home(
+        let home = paseo_client::resolve_home(
             args["home"]
                 .as_str()
                 .filter(|v| !v.is_empty())

@@ -16,13 +16,8 @@ on:
       - "packages/protocol/**"
       - "packages/plugin/**"
       - "plugins/**"
-      - "scripts/build-flutter.mjs"
-      - "scripts/build-native-daemon.mjs"
-      - "scripts/package-native-daemon.mjs"
-      - "scripts/package-flutter-desktop.mjs"
-      - "scripts/generate-flutter-update-manifests.mjs"
-      - "package.json"
-      - "package-lock.json"
+      - "xtask/**"
+      - ".cargo/**"
       - ".github/workflows/desktop-packages.yml"
 
 concurrency:
@@ -34,11 +29,8 @@ permissions:
   packages: read
 
 env:
-  ONNXRUNTIME_NODE_INSTALL: skip
-  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
-  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
   PASEO_NATIVE_RELEASE: "1"
-  PASEO_UPDATE_REPOSITORY: ${{ github.repository }}
+  PASEO_UPDATE_REPOSITORY: emotionbug/paseo
   PASEO_BUILD_SOURCE_SHA: ${{ github.sha }}
   SOURCE_SHA: ${{ github.sha }}
 
@@ -48,16 +40,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24.15.0"
-          cache: npm
-          registry-url: https://npm.pkg.github.com
-          scope: "@boudra"
-      - name: Install dependencies
-        run: node scripts/npm-retry.mjs ci
-        env:
-          NODE_AUTH_TOKEN: ${{ github.token }}
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
         with:
@@ -70,22 +52,19 @@ jobs:
       - name: Install native prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev dpkg-dev ffmpeg pulseaudio-utils xdg-utils patchelf
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev dpkg-dev ffmpeg pulseaudio-utils xdg-utils patchelf
       - name: Provision pinned AppImage tools
-        run: node packages/flutter_desktop_host/packaging/appimage-tools.mjs
+        run: cargo xtask appimage-tools
         env:
           GH_TOKEN: ${{ github.token }}
-      - name: Select candidate release channel
-        run: |
-          node -e "require('node:fs').appendFileSync(process.env.GITHUB_ENV, 'PASEO_RELEASE_CHANNEL=' + (require('./package.json').version.includes('-') ? 'beta' : 'stable') + '\n')"
       - name: Build native Linux app and bundled daemon
-        run: node scripts/build-flutter.mjs linux
+        run: cargo xtask build-flutter linux
       - name: Package native Linux installers
-        run: node scripts/package-flutter-desktop.mjs linux
+        run: cargo xtask package-desktop linux
       - name: Package complete standalone native daemon and separate feed
-        run: node scripts/package-native-daemon.mjs
+        run: cargo xtask package-daemon
       - name: Generate manifests from actual packaged artifacts
-        run: node scripts/generate-flutter-update-manifests.mjs
+        run: cargo xtask release manifests
       - uses: actions/upload-artifact@v4
         with:
           name: native-packages-linux-x64
@@ -96,4 +75,4 @@ jobs:
             artifacts/flutter/flutter-*.json
             artifacts/flutter/packages-*.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30

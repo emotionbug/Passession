@@ -1,5 +1,5 @@
 use super::{Context, flag, multiple, option, output::Output, positional, string, strings};
-use crate::client::{ClientError, DaemonClient};
+use paseo_client::{ClientError, DaemonClient};
 use anyhow::{Result, anyhow};
 use clap::{ArgMatches, Command};
 use serde_json::{Value, json};

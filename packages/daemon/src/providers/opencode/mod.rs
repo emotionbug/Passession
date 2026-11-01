@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use super::api::{
     AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
 };
-use crate::process::{self, CommandSpec};
+use paseo_client::process::{self, CommandSpec};
 use runtime::{Generation, Runtime, RuntimeManager};
 
 pub struct OpenCodeProvider {

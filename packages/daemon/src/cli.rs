@@ -4,7 +4,8 @@ mod hooks;
 pub mod output;
 mod services;
 pub(crate) mod system;
-use crate::client::{ConnectOptions, DaemonClient, DaemonTarget};
+use crate::client::ConnectOptions;
+use paseo_client::{DaemonClient, DaemonTarget};
 use anyhow::{Result, anyhow, bail, ensure};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use output::{Format, Output, OutputOptions};
@@ -22,12 +23,12 @@ pub struct Context {
 }
 impl Context {
     pub async fn connect(&self) -> Result<DaemonClient> {
-        DaemonClient::connect(ConnectOptions::new(self.target.clone()),self.cancel.clone()).await.map_err(|error|{
-            let code=error.downcast_ref::<crate::client::ClientError>().map(|error|error.code.as_str()).or_else(||error.downcast_ref::<crate::daemon_control::DaemonInstanceError>().map(|error|error.code.as_str())).unwrap_or("DAEMON_UNREACHABLE");
+        crate::client::connect(ConnectOptions::new(self.target.clone()),self.cancel.clone()).await.map_err(|error|{
+            let code=error.downcast_ref::<paseo_client::ClientError>().map(|error|error.code.as_str()).or_else(||error.downcast_ref::<crate::daemon_control::DaemonInstanceError>().map(|error|error.code.as_str())).unwrap_or("DAEMON_UNREACHABLE");
             let description=self.target.description();let mut message=error.to_string();if let DaemonTarget::Endpoint{host}=&self.target{message=message.replace(host,&description);}
             if !message.starts_with("Cannot connect to daemon at "){message=format!("Cannot connect to daemon at {description}: {message}");}
             let details=match code{"AUTH_REQUIRED"=>"The daemon requires a password. Set PASEO_PASSWORD and retry.".into(),"AUTH_FAILED"=>"The daemon rejected the password. Check PASEO_PASSWORD and retry.".into(),_=>match &self.target{DaemonTarget::Instance{home}=>format!("Start with: paseo daemon start --home {}",serde_json::to_string(&home.to_string_lossy()).expect("path string serializes")),DaemonTarget::Endpoint{..}=>"Check the selected endpoint and credentials. SSH transport does not install or start the daemon.".into()}};
-            crate::client::ClientError::new(code,message).details(details).into()
+            paseo_client::ClientError::new(code,message).details(details).into()
         })
     }
     pub fn local_home(&self) -> Result<PathBuf> {
@@ -124,11 +125,11 @@ pub fn provider_model(
     model: Option<&str>,
     default_provider: Option<&str>,
 ) -> Result<(String, Option<String>)> {
-    let provider=provider.map(str::trim).filter(|v|!v.is_empty()).or(default_provider).ok_or_else(||crate::client::ClientError::new("MISSING_PROVIDER","Provider is required. Set a CLI default profile in Paseo host settings, or pass --provider <provider>."))?;
+    let provider=provider.map(str::trim).filter(|v|!v.is_empty()).or(default_provider).ok_or_else(||paseo_client::ClientError::new("MISSING_PROVIDER","Provider is required. Set a CLI default profile in Paseo host settings, or pass --provider <provider>."))?;
     let model = match model {
         Some(value) => {
             if value.trim().is_empty() {
-                return Err(crate::client::ClientError::new(
+                return Err(paseo_client::ClientError::new(
                     "INVALID_MODEL",
                     "--model cannot be empty",
                 )
@@ -141,14 +142,14 @@ pub fn provider_model(
     if let Some((provider, embedded)) = provider.split_once('/') {
         let (provider, embedded) = (provider.trim(), embedded.trim());
         if provider.is_empty() || embedded.is_empty() {
-            return Err(crate::client::ClientError::new(
+            return Err(paseo_client::ClientError::new(
                 "INVALID_PROVIDER",
                 "Invalid --provider value",
             )
             .into());
         }
         if model.is_some_and(|model| model != embedded) {
-            return Err(crate::client::ClientError::new(
+            return Err(paseo_client::ClientError::new(
                 "CONFLICTING_MODEL_OPTIONS",
                 "Conflicting model values provided",
             )
@@ -252,7 +253,7 @@ pub async fn run_args(mut args: Vec<String>) -> Result<i32> {
     let known: Vec<_> = command.get_subcommands().map(|c| c.get_name()).collect();
     if let Some(first) = args.first() {
         if !first.starts_with('-') && !known.contains(&first.as_str()) {
-            let path = crate::client::resolve_home(Some(first))?;
+            let path = paseo_client::resolve_home(Some(first))?;
             if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
                 open_desktop(&[path.to_string_lossy().into_owned()]).await?;
                 return Ok(0);
@@ -288,15 +289,6 @@ pub async fn run_args(mut args: Vec<String>) -> Result<i32> {
     while let Some((name, matches)) = leaf.subcommand() {
         path.push(name);
         leaf = matches;
-    }
-    if path == ["speech"] {
-        let mut help = build_command();
-        help.build();
-        help.find_subcommand_mut("speech")
-            .expect("registered speech command")
-            .print_help()?;
-        output::stdout_chunk("\n")?;
-        return Ok(0);
     }
     if path == ["hooks"] {
         hooks::run(required(leaf, "agent")?, required(leaf, "event")?).await?;

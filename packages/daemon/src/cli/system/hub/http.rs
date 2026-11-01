@@ -145,7 +145,7 @@ impl HubHttp {
                 .await;
             let outcome = match outcome {
                 Err(e)
-                    if e.downcast_ref::<crate::client::ClientError>()
+                    if e.downcast_ref::<paseo_client::ClientError>()
                         .is_some_and(|e| e.code == "HUB_NETWORK_ERROR") =>
                 {
                     continue;

@@ -508,29 +508,19 @@ async fn invalid_negotiation_and_cross_origin_sse_endpoint_are_rejected() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn stdio_owns_process_env_cwd_out_of_order_replies_and_cancellation() {
-    // A real, deliberately tiny POSIX fixture; production never inserts a shell
-    // around a configured MCP executable. No Node/helper runtime is needed.
+    // Compile a std-only native fixture; no interpreter or libtest stdout banners.
+    let executable_home = tempfile::tempdir().unwrap();
+    let executable = executable_home.path().join(format!("mcp-fixture{}", std::env::consts::EXE_SUFFIX));
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio.rs");
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiled = tokio::process::Command::new(compiler)
+        .arg("--edition=2024").arg(&source).arg("-o").arg(&executable)
+        .output().await.unwrap();
+    assert!(compiled.status.success(), "native MCP fixture compilation failed: {}", String::from_utf8_lossy(&compiled.stderr));
     let home = tempfile::tempdir().unwrap();
-    let script = r#"
-IFS= read -r initialize || exit 1
-printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}'
-IFS= read -r initialized || exit 1
-IFS= read -r list || exit 1
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"fixture","inputSchema":{"type":"object"}}]}}'
-IFS= read -r first || exit 1
-IFS= read -r second || exit 1
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"second"}]}}'
-printf '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"%s:%s"}]}}\n' "$PWD" "$MCP_FIXTURE_ENV"
-IFS= read -r waiting || exit 1
-printf ready > waiting
-IFS= read -r cancelled || exit 1
-case "$cancelled" in *'"method":"notifications/cancelled"'*'"requestId":4'*) printf cancelled > cancelled ;; *) exit 2 ;; esac
-IFS= read -r eof
-"#;
-    let config = json!({"type":"stdio","command":"/bin/sh","args":["-c",script],"env":{"MCP_FIXTURE_ENV":"overlay"}});
+    let config = json!({"type":"stdio","command":executable,"args":[],"env":{"MCP_FIXTURE_ENV":"overlay"}});
     let client = McpConnection::connect(
         "stdio-fixture",
         &config,
@@ -573,7 +563,6 @@ IFS= read -r eof
     }
 }
 
-#[cfg(unix)]
 async fn wait_file(path: std::path::PathBuf) {
     tokio::time::timeout(Duration::from_secs(3), async {
         while !path.exists() {

@@ -1,8 +1,8 @@
 # Running the native daemon in Docker
 
-The Dockerfile builds the **Rust daemon/CLI** and stages its native runtime assets. The final image has no Node executable, Electron, Chromium, bundled web UI, or speech model weights. Connect with a native Flutter client or the CLI; the HTTP root is not an application page.
+The Dockerfile builds the **Rust daemon/CLI** and stages its native runtime assets. The final image has no Node executable, Electron, Chromium, bundled web UI, or speech runtime. Connect with a native Flutter client or the CLI; the HTTP root is not an application page.
 
-This cutover has not been published as a new container release. Do not assume an existing registry `latest` image contains this implementation. Native speech-library distribution requirements remain unresolved; see [release](release.md#distribution-requirements) before publishing an image.
+Do not assume an existing registry `latest` image contains the native implementation. Select a release by its published provenance and review [release requirements](release.md#distribution-requirements) before publishing an image.
 
 ## Build locally
 
@@ -12,7 +12,7 @@ From the repository root:
 docker build -f docker/base/Dockerfile -t paseo:local .
 ```
 
-The multi-stage build uses Node 24 only in the build stage for compiler/SDK assets and packaging, and Rust for the daemon. Build stages target the final platform so the executable, optional extension compiler and native libraries agree on architecture. The final image is Debian-based and includes shell, Git, SSH, certificates and process-management utilities.
+The multi-stage build uses Rust and `cargo xtask container-runtime` for the daemon, runtime staging and notices. Neither stage requires Node or npm. Build stages target the final platform so the executable and native libraries agree on architecture. The final image is Debian-based and includes shell, Git, SSH, certificates and process-management utilities.
 
 ## Run an isolated instance
 
@@ -35,7 +35,7 @@ The `/home/paseo` volume holds `.paseo` state plus provider credential/config di
 
 Install and authenticate the agent CLIs you need in an explicitly extended image or controlled runtime environment. The base runtime is not a bundled set of provider executables. A provider CLI may itself require Node; that is an opt-in provider dependency, not a requirement of the Rust daemon.
 
-JavaScript backend extensions similarly need an **externally supplied Node** executable. Their worker/compiler assets can be present without starting Node; built-in integrations run in Rust. Do not add Node to the default image merely to launch built-ins.
+Backend plugins use native executables and the Rust `paseo-plugin` SDK. Build or acquire plugins for the container's target architecture and install them explicitly. JavaScript/TypeScript plugins require porting; the base image has no Node worker or compiler.
 
 The daemon retains workspace setup/service PTYs. Native clients show their read-only logs; there is no interactive terminal emulator or embedded browser in the app.
 

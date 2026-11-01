@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 mod actions;
 pub(crate) mod creation;
 mod date_parse;
+mod event_stage;
 mod generation;
 mod listing;
 pub mod notifications;
@@ -30,6 +31,7 @@ mod wire;
 pub use generation::{StructuredAgentFallbackError, StructuredAgentResponseError};
 pub(crate) use generation::{compile_schema, retry_prompt, validate_response};
 pub use listing::select_agent_list_items;
+use event_stage::EventStage;
 use notifications::{AgentMessageDelivery, FinishSubscriptions};
 use receipts::{CreationReceipts, MessageReceipts};
 use storage::AgentStorage;
@@ -146,8 +148,6 @@ struct AgentData {
     finalized: VecDeque<String>,
     resolutions: HashMap<String, Value>,
     event_error: Option<String>,
-    staged_events: Option<Vec<Value>>,
-    staged_bytes: usize,
     /// agent-manager.ts pendingReplacement: a replacing prompt holds the agent busy
     /// while the interrupted turn settles.
     pending_replacement: bool,
@@ -159,6 +159,7 @@ struct AgentCell {
     timeline: Arc<StdMutex<Timeline>>,
     cancel: CancellationToken,
     sink: EventSink,
+    stage: Mutex<Option<EventStage>>,
     barriers: Mutex<HashMap<String, oneshot::Sender<()>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -312,7 +313,7 @@ impl AgentManager {
         Ok(data.session.is_some()
             && (is_busy(&data.snapshot)
                 || data.snapshot["activeForegroundTurnId"].is_string()
-                || data.staged_events.is_some()))
+                || cell.stage.lock().await.is_some()))
     }
     async fn lane(&self, id: &str) -> Arc<Mutex<()>> {
         let mut lanes = self.lifecycle.lock().await;
@@ -542,6 +543,8 @@ impl AgentManager {
         snapshot["pendingPermissions"] = json!([]);
         snapshot["availableModes"] = json!([]);
         snapshot["activeTurn"] = Value::Null;
+        snapshot["activeTurnId"] = Value::Null;
+        snapshot["activeForegroundTurnId"] = Value::Null;
         let cell = Arc::new(AgentCell {
             data: Mutex::new(AgentData {
                 snapshot,
@@ -551,10 +554,6 @@ impl AgentManager {
                 finalized: VecDeque::new(),
                 resolutions: HashMap::new(),
                 event_error: None,
-                // Resumed provider events must follow the authoritative history,
-                // including when a previous daemon saved an incomplete checkpoint.
-                staged_events: (!history).then(Vec::new),
-                staged_bytes: 0,
                 pending_replacement: false,
             }),
             mutation: Mutex::new(()),
@@ -562,6 +561,8 @@ impl AgentManager {
             timeline: Arc::new(StdMutex::new(timeline)),
             cancel,
             sink,
+            // Replay history before live events, even when the saved checkpoint is partial.
+            stage: Mutex::new((!history).then(EventStage::default)),
             barriers: Mutex::new(HashMap::new()),
             task: Mutex::new(None),
         });
@@ -620,17 +621,24 @@ impl AgentManager {
                     if let Some(event)=direct {
                         if matches!(text(&event,"type"),Some("__barrier"|"__release_stage")){
                             if event["type"]=="__release_stage" {
-                                let staged={let mut data=current.data.lock().await;data.staged_bytes=0;data.staged_events.take().unwrap_or_default()};
-                                for event in staged{manager.apply_event(&id,&current,event,false).await?;}
+                                let staged = current.stage.lock().await.take();
+                                if let Some(staged) = staged {
+                                    let mut replay = staged.replay().await?;
+                                    loop {
+                                        let batch = replay.next_batch().await?;
+                                        if batch.is_empty() { break; }
+                                        for event in batch {
+                                            manager.apply_event(&id, &current, event, false).await?;
+                                        }
+                                    }
+                                }
                             }
                             if let Some(key)=text(&event,"key"){if let Some(sender)=current.barriers.lock().await.remove(key){let _=sender.send(());}}
                         }else{manager.apply_event(&id,&current,event,false).await?;}
                     }
                     Ok::<_,anyhow::Error>(())}.await;
                 if let Err(error) = result {
-                    current.data.lock().await.event_error = Some(error.to_string());
-                    current.cancel.cancel();
-                    tracing::error!(agent_id=%id,error=%error,"Failed to persist agent provider event");
+                    manager.fail_event_owner(&id, &current, &error).await;
                     break;
                 }
                 if closing {
@@ -640,25 +648,83 @@ impl AgentManager {
         })
     }
     async fn drain_events(&self, cell: &Arc<AgentCell>) -> Result<()> {
+        self.event_barrier(cell, false).await
+    }
+    async fn begin_event_stage(&self, cell: &Arc<AgentCell>) -> Result<()> {
+        self.drain_events(cell).await?;
+        let mut stage = cell.stage.lock().await;
+        if stage.is_some() {
+            bail!("Agent already has a pending event stage");
+        }
+        *stage = Some(EventStage::default());
+        Ok(())
+    }
+    async fn release_event_stage(&self, cell: &Arc<AgentCell>) -> Result<()> {
+        self.event_barrier(cell, true).await
+    }
+    async fn event_barrier(&self, cell: &Arc<AgentCell>, release: bool) -> Result<()> {
         if let Some(error) = cell.data.lock().await.event_error.clone() {
             bail!("Agent event persistence failed: {error}");
         }
         let key = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         cell.barriers.lock().await.insert(key.clone(), sender);
-        cell.sink
-            .emit(json!({"type":"__barrier","key":key}))
-            .await?;
-        tokio::select! {result=receiver=>result.map_err(|_|anyhow!("Agent event consumer closed")),_=cell.cancel.cancelled()=>Err(anyhow!("Agent event consumer closed"))}
+        let result = async {
+            cell.sink.emit(json!({
+                "type":if release { "__release_stage" } else { "__barrier" },
+                "key":key
+            })).await?;
+            tokio::select! {
+                result = receiver => result.map_err(|_| anyhow!("Agent event consumer closed")),
+                _ = cell.cancel.cancelled() => Err(anyhow!("Agent event consumer closed")),
+            }
+        }.await;
+        cell.barriers.lock().await.remove(&key);
+        result
     }
-    async fn release_event_stage(&self, cell: &Arc<AgentCell>) -> Result<()> {
-        let key = uuid::Uuid::new_v4().to_string();
-        let (sender, receiver) = oneshot::channel();
-        cell.barriers.lock().await.insert(key.clone(), sender);
-        cell.sink
-            .emit(json!({"type":"__release_stage","key":key}))
-            .await?;
-        tokio::select! {result=receiver=>result.map_err(|_|anyhow!("Agent event consumer closed")),_=cell.cancel.cancelled()=>Err(anyhow!("Agent event consumer closed"))}
+    async fn fail_event_owner(&self, id: &str, cell: &Arc<AgentCell>, error: &anyhow::Error) {
+        let message = error.to_string();
+        tracing::error!(agent_id=%id,error=%message,"Failed to persist agent provider event");
+        cell.stage.lock().await.take();
+        let (provider, session) = {
+            let _commit = cell.commit.lock().await;
+            let mut data = cell.data.lock().await;
+            data.event_error = Some(message.clone());
+            data.pending_replacement = false;
+            if let Some(turn) = text(&data.snapshot, "activeTurnId").map(str::to_owned) {
+                // A failed terminal commit may already have entered deduplication.
+                data.finalized.retain(|finalized| finalized != &turn);
+            }
+            (data.snapshot["provider"].clone(), data.session.clone())
+        };
+        cell.cancel.cancel();
+        cell.barriers.lock().await.clear();
+        if let Err(report_error) = self.apply_event(
+            id, cell, json!({"type":"turn_failed","provider":provider,"error":message}), false,
+        ).await {
+            // The original failure may itself be a failed disk commit. Keep the
+            // in-memory state terminal even when no durable error row can be written.
+            tracing::error!(agent_id=%id,error=%report_error,"Failed to persist event owner failure");
+            let _commit = cell.commit.lock().await;
+            let mut data = cell.data.lock().await;
+            let snapshot = &mut data.snapshot;
+            snapshot["lifecycle"] = json!("error");
+            snapshot["status"] = json!("error");
+            snapshot["lastTurnOutcome"] = json!("turn_failed");
+            snapshot["lastError"] = json!(message);
+            snapshot["updatedAt"] = json!(now());
+            snapshot["activeTurnId"] = Value::Null;
+            snapshot["activeForegroundTurnId"] = Value::Null;
+            snapshot["activeTurn"] = Value::Null;
+            snapshot["pendingPermissions"] = json!([]);
+            runtime::transition_attention(None, snapshot);
+            let _ = self.events.send(json!({"type":"agent_state","agent":snapshot}));
+        }
+        if let Some(session) = session {
+            if let Err(close_error) = session.close().await {
+                tracing::error!(agent_id=%id,error=%close_error,"Failed to close failed event owner session");
+            }
+        }
     }
     async fn persist_snapshot(&self, snapshot: &Value) -> Result<()> {
         if snapshot["internal"] == true {
@@ -716,6 +782,11 @@ impl AgentManager {
     }
     async fn commit_snapshot(&self, cell: &Arc<AgentCell>, mut snapshot: Value) -> Result<()> {
         let _commit = cell.commit.lock().await;
+        if snapshot["lifecycle"] != "closed" {
+            if let Some(error) = cell.data.lock().await.event_error.as_deref() {
+                bail!("Agent event persistence failed: {error}");
+            }
+        }
         snapshot["updatedAt"] = json!(next_updated_at(&snapshot["updatedAt"]));
         snapshot["status"] = snapshot["lifecycle"].clone();
         let ready = cell.data.lock().await.ready;

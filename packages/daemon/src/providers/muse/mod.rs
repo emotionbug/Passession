@@ -7,7 +7,7 @@ mod transport;
 use super::api::{
     AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
 };
-use crate::process::{self, CommandSpec};
+use paseo_client::process::{self, CommandSpec};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};

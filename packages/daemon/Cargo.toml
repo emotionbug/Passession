@@ -22,31 +22,34 @@ axum = { version = "0.8", features = ["ws", "multipart"] }
 base64 = "0.22"
 bcrypt = "0.17"
 bytes = "1"
-bzip2 = "0.6"
-chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
-crypto_secretbox = { version = "0.1", features = ["salsa20"] }
-curve25519-dalek = "4"
 dirs = "6"
 flate2 = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
-hmac = "0.12"
 hostname = "0.4"
 http = "1"
 jsonschema = { version = "0.60.2", default-features = false }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "server", "http1", "http2", "tokio", "service"] }
+hyper-util = { version = "0.1", features = [
+  "client-legacy",
+  "server",
+  "http1",
+  "http2",
+  "tokio",
+  "service",
+] }
 icu_collator = "1.5"
 icu_casemap = "1.5"
 icu_locid = "1.5"
-libloading = "0.8"
 mime_guess = "2"
 notify = "8"
 node-semver = "2.2"
+paseo-client = { path = "../client" }
+paseo-protocol = { path = "../protocol" }
 percent-encoding = "2"
 portable-pty = "0.9"
 pulldown-cmark = "0.13"
@@ -54,7 +57,12 @@ qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
 ryu-js = "1"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "stream",
+  "gzip",
+] }
 sysinfo = "0.37"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
@@ -98,4 +106,14 @@ rustix = { version = "0.38", default-features = false, features = ["std"] }
 nix = { version = "0.30", features = ["fs", "process", "signal", "term", "user"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }

@@ -1,44 +1,49 @@
-# @getpaseo/client
+# paseo-client
 
-TypeScript SDK for building integrations on top of a Paseo daemon.
+Native asynchronous Rust SDK for an existing Paseo daemon. It provides direct/local/relay/SSH connections, authentication, correlated JSON RPCs, agent/workspace operations, owned observations, reconnection, pagination, and bounded binary file/terminal transport.
 
-```bash
-npm install @getpaseo/client
+Use Rust 1.93 or newer and edition 2024. In an application beside a checkout:
+
+```toml
+[package]
+name = "paseo-integration"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+
+[dependencies]
+paseo-client = { path = "../paseo/packages/client" }
+paseo-protocol = { path = "../paseo/packages/protocol" }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = "0.7"
 ```
 
-```ts
-import { createPaseoClient } from "@getpaseo/client";
+Adjust paths to your checkout. These dependencies do not imply registry publication. Run the application under Tokio; the [complete quickstart](../../public-docs/sdk/quickstart.md) includes an async entry point, provider/model discovery prerequisites and cleanup on error.
 
-const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
-await client.connect();
+```rust
+use anyhow::Result;
+use paseo_client::{ConnectOptions, DaemonClient, DaemonTarget};
+use tokio_util::sync::CancellationToken;
 
-const agent = await client.agents.create({
-  config: { provider: "codex/gpt-5.5" },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Review the current diff and name the riskiest change.",
-});
-
-const result = await agent.waitForFinish();
-console.log(result.lastMessage);
-
-await client.close();
+async fn connect_remote() -> Result<DaemonClient> {
+    let host = std::env::var("PASEO_HOST")?;
+    let mut options = ConnectOptions::new(DaemonTarget::Endpoint { host });
+    options.password = std::env::var("PASEO_PASSWORD").ok();
+    DaemonClient::connect(options, CancellationToken::new()).await
+}
 ```
 
-The public API is the package root. Imports under `@getpaseo/client/internal/*` are unsupported implementation details used by Paseo's own packages.
+`PASEO_HOST` may be a direct WebSocket endpoint, supported socket/pipe target, SSH target, daemon-generated relay/pairing URL, or registered host ID. `DaemonTarget::select(None, None, false)` instead selects from environment/local discovery. Authentication and encryption are separate: use TLS or a trusted encrypted transport for remote credentials, and preserve the daemon's key pin for relay/encrypted direct access. SSH needs a configured local SSH client and trusted host keys; it never starts the remote daemon.
 
-Read the [SDK documentation](https://paseo.sh/docs/sdk) for agents, workspaces, terminals, provider discovery, events, recipes, and the API reference. Runnable TypeScript patterns also live in [`examples/`](./examples/README.md).
+## API conventions
 
-## Runtime
+- Named operations accept `serde_json::Value` with wire field names and return response payloads. Agent creation uses `config.provider`, separate `config.model`, `config.cwd`, `initialPrompt` and `config.providerOptions`.
+- `create_agent`/`create_workspace` also take `RequestOptions`; save returned resource IDs. There are no cached local agent/workspace handles.
+- Use `Arc<DaemonClient>` for `observe_agents`, `observe_workspaces`, `observe_events`, and other owned observations. Consume snapshots/events and release subscriptions explicitly.
+- `ReconnectingClient` restores owned observations but never blindly replays mutations. Reconcile missing history after restored snapshots. Recover uncertain creation only with its original idempotency key.
+- Requests can fail after a mutation was submitted. `ClientError` preserves code/message/details; other failures remain ordinary `anyhow::Error`. Timeout/cancellation does not roll back remote work.
+- Call `close().await` even on errors. Closing never archives agents or workspaces.
 
-The client needs a WebSocket implementation. Modern browsers and Node.js 22 provide one globally.
-
-Use a WebSocket URL ending in `/ws`, such as `ws://127.0.0.1:6767/ws`. Pass `password` when the daemon requires authentication.
-
-The client advertises its supported protocol capabilities by default. Optional `capabilities`
-overrides extend or override that declaration; browser hosting must be supplied by the caller.
-Connecting alone does not subscribe to agent timelines or catalog events. See the
-[event guide](https://paseo.sh/docs/sdk/events) for subscription lifetimes and timeline replacements.
-
-## Stability
-
-The high-level API exported from `@getpaseo/client` is the supported SDK surface. The SDK and daemon remain protocol-compatible across versions, but newly added capabilities can require a newer daemon.
+See the [English SDK guides](../../public-docs/sdk/index.md), [中文指南](../../public-docs/sdk/index.zh-CN.md), [API reference](../../public-docs/sdk/reference.md), and [example index](examples/README.md). New capabilities can require a newer daemon; unsupported owned subscriptions are not silently emulated.

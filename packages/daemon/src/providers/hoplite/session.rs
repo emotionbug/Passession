@@ -1,11 +1,9 @@
 use super::compat;
-use crate::{
-    process::CommandSpec,
-    providers::{
-        acp::rpc::{Rpc, RpcError},
-        api::{AgentSession, EventSink, LaunchContext, ProviderSpec, RewindTarget},
-    },
-};
+use paseo_client::process::CommandSpec;
+use crate::{ providers::{
+    acp::rpc::{Rpc, RpcError},
+    api::{AgentSession, EventSink, LaunchContext, ProviderSpec, RewindTarget},
+}, };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -825,9 +823,6 @@ impl AgentSession for HopliteSession {
     }
     async fn rewind(&self, _target: RewindTarget, _message_id: &str) -> Result<()> {
         bail!("session.revert is not supported by this ACP provider")
-    }
-    async fn try_out_of_band(&self, _prompt: &Value) -> Result<bool> {
-        Ok(false)
     }
 }
 fn mcp_servers(servers: &Value) -> Vec<Value> {

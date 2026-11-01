@@ -1,43 +1,84 @@
 # Protocol Validation
 
-The retained **TypeScript SDK** validates inbound WebSocket messages with a zod-aot generated validator instead of runtime Zod on its hot path. Zod remains the authoring source for TypeScript schemas and types. The Rust daemon and Dart client implement the same wire contract natively; they do not execute this JavaScript validator.
-
-The earlier Hermes measurement motivated the SDK optimization but is not a Flutter benchmark. Native validation performance and correctness require Rust/Dart checks and actual native transport evidence.
+The native `paseo-protocol` crate owns the shared wire schemas, JSON validation, binary framing and encrypted-record codecs. There is no generated executable validator or package-install generation step. Rust consumers compile the crate with Cargo; the Flutter/Dart consumer remains a separate implementation of the same wire contract.
 
 ## Runtime Path
 
-`packages/protocol/src/validation/ws-outbound.ts` is the shipped boundary. It validates the envelope with a generated validator that checks only each session message's `type` tag, then runs the generated validator for that one message type and returns the validated data. Issue paths from the message validator, including nested union branches, are prefixed with `message`, so callers see the same issues as when one validator covered the whole envelope. It does not normalize, repair, or re-validate the generated result.
+The public boundary is [`packages/protocol/src/wire.rs`](../packages/protocol/src/wire.rs). Session schemas are compiled lazily into a discriminator-indexed catalog with the native `jsonschema` library. Envelope, terminal snapshot and daemon configuration validators use their maintained schemas. Compilation is offline; validation does not retrieve remote schemas.
 
-Keep one generated function per message type. zod-aot inlines nested schemas; a single enormous validator can cause expensive V8 compilation in external SDK consumers and optional Node workers. `packages/protocol/tests/validation/ws-outbound.test.ts` bounds generated function size. This is an SDK/tooling concern, not an Electron or mobile JavaScript runtime.
+- `validate_session(&value, Direction)` checks a session message and cross-field semantics.
+- `SessionMessage::parse(value, Direction)` validates and retains a lossless JSON object. Unknown extension fields are not stripped or normalized away.
+- `parse_envelope(bytes, Direction)` checks the wire size, parses JSON, validates the envelope and nested semantic constraints, then produces an `Envelope`.
+- `encode_envelope(&envelope, Direction)` validates the output and enforces the wire size before returning encoded bytes.
+- `validate_terminal_snapshot` and `validate_config` validate those separate documents.
+- `message_types(Direction)` exposes supported discriminator names; iterator order is not a stable catalog order.
 
-Generated validators preserve unknown keys where Zod object parsing strips them. The client dispatch path uses known `type` and payload fields, so this passthrough behavior is accepted for inbound messages. The wire format is unchanged.
+Direction is relative to the daemon: **Inbound is client → daemon; Outbound is daemon → client**. Do not validate a response against the request catalog. `SessionMessage::new` permits constructing extension messages; it is not full validation. Ordinary serde deserialization checks representation but is not a substitute for `parse` at an untrusted boundary.
 
-Provider model normalization is a parser-side compatibility shim in the client consumers that need it. Newer daemons normalize at the provider registry source.
+The direct WebSocket JSON ceiling is `MAX_WEBSOCKET_MESSAGE_BYTES` (100 MiB). Relay/encrypted frames have independent limits in `crypto`. Binary messages use `binary_frames`, not the JSON validator. Encryption authenticates transport peers/records; daemon password or local-credential authorization is a separate handshake concern.
 
-## Codegen Ownership
+## Schema Ownership
 
-The protocol package owns generation.
+Maintained, checked-in schemas are:
 
-- `packages/protocol/src/validation/ws-outbound-envelope.ts` defines the tag-only envelope schema and exposes the session message schemas that get their own validators.
-- `packages/protocol/scripts/generate-validation-aot.mjs` writes the zod-aot discovery entry and the runtime schema metadata, runs the exact-pinned compiler, and applies the small local compiler patches before generation. It also emits the `type` → validator map the boundary dispatches through.
-- `packages/protocol/scripts/watch-validation-aot.mjs` reruns generation while editing protocol sources.
-- `packages/protocol/codegen/generated/ws-outbound.compile.ts`, `packages/protocol/src/generated/validation/ws-outbound.aot.ts`, and `packages/protocol/src/generated/validation/ws-outbound-schema-metadata.ts` are generated and gitignored. The metadata module lets generated code reach schema fallback/default values.
+- [`session-inbound.json`](../packages/protocol/schema/session-inbound.json)
+- [`session-outbound.json`](../packages/protocol/schema/session-outbound.json)
+- [`ws-inbound.json`](../packages/protocol/schema/ws-inbound.json)
+- [`ws-outbound.json`](../packages/protocol/schema/ws-outbound.json)
+- [`terminal-state.json`](../packages/protocol/schema/terminal-state.json)
+- [`paseo.config.v1.json`](../packages/protocol/src/paseo.config.v1.json)
 
-Generation runs from protocol-owned lifecycle hooks: `prebuild`, `pretypecheck`, `pretest`, and `watch`. Installs do not run generation: published packages consume protocol from prebuilt `dist`, and local build/typecheck/test flows generate the source file at the point it is actually needed.
+`wire` embeds these documents with `include_str!`; update the affected session and envelope definitions together when changing a message. They are runtime authority, not temporary generated build products. Preserve existing discriminator strings, record IDs, optionality, extension fields and binary compatibility. A new message also needs real daemon/client behavior, not just a schema entry.
+
+## Example
+
+Use Rust 1.93 or newer and edition 2024. In an application beside the checkout:
+
+```toml
+[dependencies]
+paseo-protocol = { path = "../paseo/packages/protocol" }
+serde_json = "1"
+```
+
+This path dependency does not assume registry publication. The following synchronous program validates and round-trips a request without connecting to a daemon:
+
+```rust
+use paseo_protocol::wire::{Direction, SessionMessage, encode_envelope, parse_envelope};
+use serde_json::json;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let message = SessionMessage::parse(json!({
+        "type": "fetch_agent_request",
+        "requestId": "example-request",
+        "agentId": "saved-agent-id"
+    }), Direction::Inbound)?;
+    let encoded = encode_envelope(&message.into_envelope(), Direction::Inbound)?;
+    let decoded = parse_envelope(&encoded, Direction::Inbound)?;
+    println!("{decoded:?}");
+    Ok(())
+}
+```
+
+## Errors and Normalization
+
+`ProtocolError` distinguishes malformed JSON, wire limits, missing/invalid fields, unknown message types and schema failures. Schema errors carry an instance path; do not rely on the text reproducing another validator's diagnostic format. Structural validation does not repair input, inject defaults, coerce types or normalize provider models. JSON Schema `default` annotations do not mutate messages.
+
+Compatibility transformations belong in explicit consumer logic. For example, `providers::{compact_provider_snapshot,expand_provider_snapshot}` handles provider catalogs, while `timeline` and `helpers` expose specific presentation/identity helpers. Never hide malformed supported data behind a generic fallback. Preserve unknown extension data when forwarding messages.
 
 ## Regression Tests
 
-zod-aot is exact-pinned and young enough that compiler patches are treated as part of this package. `packages/protocol/tests/validation/ws-outbound.test.ts` keeps small regression tests for the patched cases:
+The native regression suite lives in [`packages/protocol/tests/boundaries.rs`](../packages/protocol/tests/boundaries.rs) and module tests, including retained wire/crypto fixtures. Integration verification should cover:
 
-- discriminated-union branch output must propagate `.default()` fields
-- current sequential item routing must accept `tool_call`-like status branches
-- generated runtime imports must keep `.js` extensions for packaged Node ESM
-- the generated WebSocket envelope accepts a minimal valid message and rejects a corrupted one
+- every supported discriminator in both directions and unknown-type rejection;
+- malformed envelopes, required fields, nested unions and cross-field correlation;
+- preservation of provider/plugin extension fields without default insertion;
+- compact provider snapshot round-trips and invalid references;
+- binary boundaries, truncated input, byte order and size ceilings;
+- encrypted record interoperability, replay/sequence handling and security-mode requirements;
+- existing daemon/client wire fixtures and native client request/response paths.
+
+Suggested integration command: `cargo test -p paseo-protocol`. Run it after the source cutover is integrated, together with the relevant daemon/client tests. This document does not claim those checks or the example have been executed.
 
 ## Schema Purity
 
-Message schemas are structural declarations. Do not put `.transform()`, `.catch()`, or `.preprocess()` on WebSocket message schemas. If parsed data needs normalization, put it in an explicit consumer or post-validation pass.
-
-Use `z.discriminatedUnion()` when every branch has a shared literal tag. Plain `z.union()` is acceptable only when there is no shared literal discriminator or when a generated-code regression test proves that specific shape is miscompiled.
-
-Defaults are allowed only on primitive leaves. Do not place `.default()` on large arrays, item schemas, or big containers in inbound message schemas.
+Keep schemas structural and transport-neutral. Put cross-field invariants in an explicit semantic validator when structural JSON Schema cannot express the intended contract clearly. Keep normalization in separately named consumer functions. Validation must not load a daemon, mutate configuration, contact providers, or authenticate a remote service.

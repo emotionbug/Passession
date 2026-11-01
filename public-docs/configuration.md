@@ -74,7 +74,7 @@ Runtime-safe settings include relay enablement, MCP settings, hostnames, CORS or
 
 New homes keep relay disabled when you remove `daemon.relay.enabled`. A daemon whose config already omitted this field when it started keeps the legacy relay-enabled behavior for compatibility. Set `daemon.relay.enabled` explicitly when editing an older config.
 
-Listen addresses, authentication, relay endpoints and TLS, worktree allocation, service-proxy addresses, logging, speech, voice, credentials, and local model settings require a restart. Reload applies other valid edits in the same file before reporting those paths.
+Listen addresses, authentication, relay endpoints and TLS, worktree allocation, service-proxy addresses, and logging require a restart. Reload applies other valid edits in the same file before reporting those paths.
 
 Deployment environment variables remain authoritative. Reload reports a changed file setting under `overrideControlledPaths` when a launch override prevents it from taking effect. List settings such as hostnames and CORS origins still append across sources. Stop and relaunch the deployment without the override to make the file value authoritative.
 
@@ -98,11 +98,9 @@ New worktrees are created under `$PASEO_HOME/worktrees` by default. To place new
 
 Relative paths are resolved against `PASEO_HOME`. Existing worktrees remain where they are; changing this setting only changes where Paseo creates and discovers Paseo-managed worktrees going forward.
 
-## Voice
+## Removed speech settings
 
-Voice is configured through `features.dictation` and `features.voiceMode`, with provider credentials under `providers`.
-
-For voice philosophy, architecture, and complete local/OpenAI setup examples, see [Voice docs](/docs/voice).
+Speech recognition, voice conversations and TTS are no longer supported. Legacy top-level `providers`, `features.dictation` and `features.voiceMode` settings are discarded during configuration normalization. This does not remove agent configuration under `agents.providers`.
 
 ## Native clients
 
@@ -226,16 +224,7 @@ Set the persisted value in `config.json`:
 - `PASEO_LOG_FILE_ROTATE_SIZE`, override `log.file.rotate.maxSize`
 - `PASEO_LOG_FILE_ROTATE_COUNT`, override `log.file.rotate.maxFiles`
 - `PASEO_LOG`, `PASEO_LOG_FORMAT`, legacy log overrides (still supported)
-- `OPENAI_API_KEY`, override OpenAI provider key
-- `OPENAI_STT_API_KEY`, `OPENAI_STT_BASE_URL`, OpenAI speech-to-text endpoint (dictation + voice mode STT)
-- `OPENAI_TTS_API_KEY`, `OPENAI_TTS_BASE_URL`, OpenAI text-to-speech endpoint (voice mode TTS)
-- `PASEO_VOICE_LLM_PROVIDER`, override voice LLM provider (`claude`, `codex`, `opencode`)
-- `PASEO_DICTATION_STT_PROVIDER`, `PASEO_VOICE_STT_PROVIDER`, `PASEO_VOICE_TTS_PROVIDER`, override voice provider selection (`local` or `openai`)
-- `PASEO_LOCAL_MODELS_DIR`, control local model directory
-- `PASEO_DICTATION_LOCAL_STT_MODEL`, override local dictation STT model
-- `PASEO_VOICE_LOCAL_STT_MODEL`, `PASEO_VOICE_LOCAL_TTS_MODEL`, override local voice STT/TTS models
-- `PASEO_DICTATION_LANGUAGE`, `PASEO_VOICE_LANGUAGE`, override dictation and voice STT language
-- `PASEO_VOICE_LOCAL_TTS_SPEAKER_ID`, `PASEO_VOICE_LOCAL_TTS_SPEED`, optional local voice TTS tuning
+- Provider credentials such as `OPENAI_API_KEY` are inherited by external agent CLIs; configure them according to the provider's documentation.
 
 ## Schema
 

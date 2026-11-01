@@ -23,13 +23,13 @@ on:
         options: [build, publish-only]
         default: build
       recovery_run_id:
-        description: Exact prior Native Release run ID; required for publish-only or publishing one macOS architecture
+        description: Exact prior Native Release run ID; required for publish-only or publishing one desktop architecture
         type: string
         default: ""
       platform:
-        description: Native platform or macOS architecture to build
+        description: Native platform or individual desktop target to build
         type: choice
-        options: [all, desktop, macos, linux, windows, android, ios, macos-arm64, macos-x64]
+        options: [all, desktop, macos, linux, windows, android, ios, macos-arm64, macos-x64, linux-arm64, linux-x64, windows-arm64, windows-x64]
         default: all
       checkout_ref:
         description: Optional source ref override (must have the same package version as tag)
@@ -60,10 +60,6 @@ env:
   RECOVERY_MODE: ${{ github.event.inputs.mode || 'build' }}
   RECOVERY_RUN_ID: ${{ github.event.inputs.recovery_run_id || '' }}
   ROLLOUT_HOURS: ${{ github.event.inputs.rollout_hours || '36' }}
-  NODE_OPTIONS: --max-old-space-size=8192
-  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
-  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
-  ONNXRUNTIME_NODE_INSTALL: skip
   FLUTTER_VERSION: "3.47.5"
 
 jobs:
@@ -88,9 +84,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24.15.0"
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
       - id: source
         shell: bash
         run: |
@@ -100,25 +95,13 @@ jobs:
         env:
           INPUT_PLATFORM: ${{ github.event.inputs.platform || 'all' }}
         shell: bash
-        run: node scripts/flutter-release.mjs plan >> "$GITHUB_OUTPUT"
+        run: cargo xtask release plan >> "$GITHUB_OUTPUT"
       - name: Validate recovery workflow and complete artifact inventory
         if: env.RECOVERY_RUN_ID != ''
-        uses: actions/github-script@v7
         env:
+          GH_TOKEN: ${{ github.token }}
           RECOVERY_TARGETS: ${{ steps.plan.outputs.recovery }}
-        with:
-          script: |
-            const run_id = Number(process.env.RECOVERY_RUN_ID);
-            if (String(run_id) === process.env.GITHUB_RUN_ID) throw new Error('Recovery requires a prior run.');
-            const {data: run} = await github.rest.actions.getWorkflowRun({...context.repo, run_id});
-            if (run.path !== '.github/workflows/desktop-release.yml' || run.status !== 'completed') {
-              throw new Error('Recovery requires a completed canonical Native Release run.');
-            }
-            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {...context.repo, run_id});
-            for (const target of JSON.parse(process.env.RECOVERY_TARGETS)) {
-              const matches = artifacts.filter(a => a.name === `native-release-${target}`);
-              if (matches.length !== 1 || matches[0].expired) throw new Error(`Expected exactly one unexpired artifact for ${target}`);
-            }
+        run: cargo xtask release recovery
 
   native:
     needs: source
@@ -134,28 +117,15 @@ jobs:
       RELEASE_VERSION: ${{ needs.source.outputs.version }}
       PASEO_RELEASE_CHANNEL: ${{ needs.source.outputs.channel }}
       PASEO_NATIVE_RELEASE: "1"
-      PASEO_UPDATE_REPOSITORY: ${{ github.repository }}
+      PASEO_UPDATE_REPOSITORY: emotionbug/paseo
       PASEO_BUILD_SOURCE_SHA: ${{ needs.source.outputs.sha }}
       TARGET_ID: ${{ matrix.platform }}-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.source.outputs.sha }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24.15.0"
-          architecture: ${{ matrix.arch == 'universal' && 'x64' || matrix.arch }}
-          cache: npm
-          registry-url: https://npm.pkg.github.com
-          scope: "@boudra"
-      - name: Install locked backend build dependencies
-        run: node scripts/npm-retry.mjs ci
-        env:
-          NODE_AUTH_TOKEN: ${{ github.token }}
       - uses: dtolnay/rust-toolchain@1.93.1
-        if: matrix.desktop
       - uses: Swatinem/rust-cache@v2
-        if: matrix.desktop
         with:
           shared-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}
       - uses: subosito/flutter-action@v2
@@ -168,15 +138,15 @@ jobs:
           path: |
             ~/.pub-cache
             ~/.cache/paseo-flutter-packaging
-          key: flutter-native-${{ runner.os }}-${{ matrix.arch }}-${{ env.FLUTTER_VERSION }}-${{ hashFiles('packages/flutter_app/pubspec.lock', 'packages/flutter_desktop_host/packaging/*-runtime.mjs', 'packages/flutter_desktop_host/packaging/appimage-tools.mjs') }}
+          key: flutter-native-${{ runner.os }}-${{ matrix.arch }}-${{ env.FLUTTER_VERSION }}-${{ hashFiles('packages/flutter_app/pubspec.lock', 'xtask/src/**') }}
       - name: Install Linux native build prerequisites
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev dpkg-dev ffmpeg pulseaudio-utils xdg-utils patchelf
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev dpkg-dev ffmpeg pulseaudio-utils xdg-utils patchelf
       - name: Provision pinned AppImage tools
         if: matrix.platform == 'linux'
-        run: node packages/flutter_desktop_host/packaging/appimage-tools.mjs
+        run: cargo xtask appimage-tools
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Install NSIS
@@ -190,6 +160,8 @@ jobs:
           java-version: "17"
       - uses: android-actions/setup-android@v3
         if: matrix.platform == 'android'
+        with:
+          packages: platform-tools
       - uses: gradle/actions/setup-gradle@v4
         if: matrix.platform == 'android'
       - name: Stage optional Android release signing key
@@ -203,17 +175,17 @@ jobs:
             echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/paseo-release.keystore" >> "$GITHUB_ENV"
           fi
       - name: Build Flutter client and native Rust desktop runtime
-        run: node scripts/build-flutter.mjs ${{ matrix.platform }}
+        run: cargo xtask build-flutter ${{ matrix.platform }}
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13000' }}
+          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13001' }}
       # Without mobile signing credentials, artifacts are explicitly labelled
       # debug-signed APK / unsigned iOS .app, never presented as store submissions.
       - name: Package native desktop installers
         if: matrix.desktop
-        run: node scripts/package-flutter-desktop.mjs ${{ matrix.platform }}
+        run: cargo xtask package-desktop ${{ matrix.platform }}
         env:
           CSC_LINK: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE || '' }}
           CSC_KEY_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
@@ -224,7 +196,7 @@ jobs:
           WIN_CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_KEY_PASSWORD || '' }}
       - name: Package complete standalone native daemon
         if: matrix.desktop
-        run: node scripts/package-native-daemon.mjs
+        run: cargo xtask package-daemon
         env:
           CSC_LINK: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE || '' }}
           CSC_KEY_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
@@ -235,9 +207,9 @@ jobs:
           WIN_CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_KEY_PASSWORD || '' }}
       - name: Generate native update manifests
         if: matrix.desktop
-        run: node scripts/generate-flutter-update-manifests.mjs
+        run: cargo xtask release manifests
       - name: Record exact source, run and artifact hashes
-        run: node scripts/flutter-release.mjs record
+        run: cargo xtask release record
       - uses: actions/upload-artifact@v4
         with:
           name: native-release-${{ matrix.platform }}-${{ matrix.arch }}
@@ -254,7 +226,7 @@ jobs:
 
   publish:
     needs: [source, native]
-    if: ${{ !cancelled() && needs.source.result == 'success' && needs.source.outputs.publish == 'true' && (needs.native.result == 'success' || github.event.inputs.mode == 'publish-only') }}
+    if: ${{ !cancelled() && github.repository == 'emotionbug/paseo' && needs.source.result == 'success' && needs.source.outputs.publish == 'true' && (needs.native.result == 'success' || github.event.inputs.mode == 'publish-only') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -273,9 +245,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.source.outputs.sha }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24.15.0"
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
       - name: Download current build artifacts
         if: github.event.inputs.mode != 'publish-only'
         uses: actions/download-artifact@v4
@@ -287,23 +258,12 @@ jobs:
         if: env.RECOVERY_RUN_ID != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          while IFS= read -r target; do
-            gh run download "$RECOVERY_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "native-release-$target" --dir artifacts/flutter
-          done < <(node -e 'for (const target of JSON.parse(process.env.RECOVERY_TARGETS)) console.log(target)')
+        run: cargo xtask release recovery --download
       - name: Validate all source and artifact provenance before any release mutation
-        run: node scripts/flutter-release.mjs validate
-      - name: Regenerate native manifests at rollout start
-        shell: bash
-        run: |
-          if compgen -G 'artifacts/flutter/packages-*.json' >/dev/null; then
-            node scripts/generate-flutter-update-manifests.mjs
-          fi
+        run: cargo xtask release verify
       - name: Publish native release assets and finalize complete desktop rollout
         env:
           GH_TOKEN: ${{ github.token }}
           CREATE_RELEASE: ${{ needs.source.outputs.create_release }}
           IS_PRERELEASE: ${{ needs.source.outputs.prerelease }}
-        run: node scripts/publish-flutter-release.mjs
+        run: cargo xtask release publish

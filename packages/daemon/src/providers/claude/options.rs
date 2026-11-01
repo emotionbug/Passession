@@ -1,8 +1,6 @@
 use super::catalog;
-use crate::{
-    process::CommandSpec,
-    providers::api::{LaunchContext, ProviderSpec},
-};
+use paseo_client::process::CommandSpec;
+use crate::{ providers::api::{LaunchContext, ProviderSpec}, };
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 use std::{

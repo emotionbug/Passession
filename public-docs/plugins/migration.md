@@ -1,6 +1,6 @@
 ---
 title: Migrate a plugin to the native backend runtime
-description: Retain backend extension behavior and remove executable client contributions for the native cutover.
+description: Port backend behavior to Rust executables without a JavaScript or UI compatibility fallback.
 nav: Migration
 order: 47
 category: Plugins
@@ -8,103 +8,99 @@ category: Plugins
 
 # Migrate a plugin to the native backend runtime
 
-This guide targets the **unpublished native migration in the 0.13.0 checkout**. It is not a claim that a new native release is available. The old 0.8 migration separated client and server entries; that historical split does not make the client half compatible with Flutter.
+This is the **0.13.1 source migration**, not a publication announcement. Existing JavaScript/TypeScript plugins are **not executable in the new runtime**. The daemon rejects legacy runtime manifests with an actionable native migration error while preserving installation records and settings. It does not load a Node worker, install an interpreter, or silently delete/enable old plugins. `PASEO_PLUGIN_NODE` and `PASEO_PLUGIN_WORKER` are not migration mechanisms.
 
-Built-ins now belong to Rust. Optional JavaScript backend plugins remain supported through a private worker with externally installed Node.js 20+. Flutter clients do not evaluate plugin JavaScript, React components, or executable UI contributions. Mobile connects to a desktop/server daemon and never hosts the worker.
+The migration is a real port, not renaming an entry or changing a version requirement. Existing Rust built-ins remain native; Kiro remains disabled and is not part of these instructions. External agent CLIs are separate products, not Paseo's plugin runtime.
 
 ## 1. Classify the plugin
 
-| Existing behavior                                                                    | Native migration                                                                                          |
-| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| RPC handlers and daemon-local vendor calls                                           | Retain in the backend worker.                                                                             |
-| Lifecycle hooks and SDK automation                                                   | Retain server registration and cleanup.                                                                   |
-| Persisted settings schemas and migrations                                            | Retain backend registration; remove executable settings screens.                                          |
-| Direct or ACP provider                                                               | Retain backend protocol implementation; emit standard timeline/configuration data.                        |
-| Usage discovery and fetching                                                         | Retain backend usage-source registration.                                                                 |
-| Screens, sidebar/header items, panels, file renderers                                | Remove executable client contributions; no native plugin equivalent is promised.                          |
-| React timeline renderers or transformers                                             | Remove; represent provider output with standard protocol item types.                                      |
-| Client commands, composer pills, attachment pickers, themes, browser/audio callbacks | Remove client registrations and imports. Backend data or operations may remain when independently useful. |
-| Client-only plugin                                                                   | Not a supported native extension; do not label an empty backend entry a migration.                        |
+| Old behavior | Native implementation |
+| --- | --- |
+| RPC/vendor calls | `Plugin::rpc` with explicit JSON validation and real Rust I/O. |
+| Lifecycle events/transforms | `Plugin::on`/`before`, cancellation and owned-resource cleanup. |
+| Settings schemas/migrations | `SettingsDefinition`, `Plugin::settings`, compatible stored envelopes and revisions. |
+| Direct provider | `Provider`/`Connection`, real session events, permissions and cleanup. |
+| ACP adapter | `paseo_plugin::acp::AcpProvider` with a command or owned stream; port vendor extensions to `AcpTransformer`. This replaces `runAcpProvider` behavior, not its JavaScript source API. |
+| Usage discovery/fetch | `UsageSource`, explicit input validation and account/credential boundaries. |
+| Screens, panels, sidebar/header components, attachment pickers, themes | No executable Flutter plugin equivalent. Remove obsolete UI registrations. |
+| React timeline transforms/renderers | Emit standard protocol items; do not require extension code to read important output. |
+| Client-only plugin | Not a supported native plugin; do not claim that an empty native backend is a migration. |
 
-Do not move a React component into `server/`, bundle a browser, or load a client bundle from the worker. Native Markdown/source editing and other built-in interfaces are product features, not executable extension slots.
+Native Markdown/source views and configuration descriptors are product features/data contracts, not arbitrary extension UI slots. There is no browser/webview fallback for old client code.
 
-## 2. Retain an explicit backend entry
+## 2. Build a native executable
 
-Use this layout:
+Use `paseo plugin init <new-empty-directory> --sdk-path <checkout>/packages/plugin` as a starting point, then port the actual behavior. The project contains `Cargo.toml`, `src/main.rs`, `paseo-plugin.json` and author docs. Use Rust 1.93+, edition 2024, and the real `paseo-plugin` crate; do not add a dependency on an unpublished registry version.
 
-```text
-paseo-plugin.json
-package.json
-tsconfig.json
-index.server.ts
-server/
-shared/
-```
-
-`index.server.ts` default-exports a function receiving `PluginServerContext`. Keep host operations and credentials in `server/`; keep plain values and Zod contracts in `shared/`. Remove the old mixed `index.ts` after moving its supported behavior. Remove `index.client.tsx`, client modules, and UI-only dependencies from the native-targeted package rather than leaving an unsupported entry alongside it.
-
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-
-export default function contribute(server: PluginServerContext) {
-  server.on("agent.turn_ended", (event) => {
-    console.log(event.agent.id, event.outcome);
-  });
-  return () => {};
+```json
+{
+  "id": "review-tools",
+  "runtime": "native",
+  "requirements": { "paseo": ">=0.13.1" },
+  "server": { "executable": "target/release/paseo-plugin-server", "args": [] },
+  "build": [["cargo", "build", "--release", "--target-dir", "target"]]
 }
 ```
 
-For older mixed APIs, replace daemon handler registration with `server.handle(contract, handler)`. Register hooks with `server.on`/`server.before`, settings with `server.registerSettings`, providers with `server.registerProvider`, and usage sources with `server.registerUsageSource`. There is no replacement registration for an executable client surface.
+Match the executable to your Cargo binary target and use `.exe` on Windows. It must remain inside the plugin directory and be an actual native binary, not a script that invokes the old entry. Commands are argv arrays, not shell fragments. `Plugin::run` supplies `--validate` and normal initialize/ready IPC. See the [reference](reference.md#validation-and-readiness).
 
-Keep real cleanup for timers, subscriptions, sockets, watchers, and child processes. The worker may stop when the plugin is reloaded, disabled, removed, or the daemon shuts down. Agent hooks operate even when no app is connected.
+Port I/O and dependencies to Rust, then remove obsolete runtime entries, package-manager manifests, compiler configuration and UI-only modules from the **new distributed plugin**. Do not delete the user's old installation or stored settings as part of a source port. Pin an available SDK Git revision or use the local path while developing.
 
-## 3. Correct imports and SDK ownership
+## 3. Port SDK calls explicitly
 
-| Need                                                   | Import/source                                      |
-| ------------------------------------------------------ | -------------------------------------------------- |
-| `defineRpc`, `defineSettings`, plain types and schemas | `@getpaseo/plugin`                                 |
-| Server context, lifecycle and process helpers          | `@getpaseo/plugin/server`                          |
-| Provider contracts                                     | `@getpaseo/plugin/server/provider`                 |
-| ACP adapter                                            | `@getpaseo/plugin/server/acp`                      |
-| Usage contracts/helpers                                | `@getpaseo/plugin/server/usage`                    |
-| TypeScript daemon API                                  | `@getpaseo/client`, owned by `packages/client`     |
-| Shared protocol types                                  | `@getpaseo/protocol`, owned by `packages/protocol` |
+| Former concept | Native API/source |
+| --- | --- |
+| Server contribution entry | Construct `Plugin`, register before `run().await`. |
+| `handle`/`defineRpc` schemas | `Plugin::rpc`; validate `Value` input/output with Serde/domain checks. No automatic Zod equivalent. |
+| `on`/`before` callbacks | Async `(Value, Context) -> Result<Value>`; before input is `{request: ...}`, null preserves it. |
+| Returned cleanup callback | `Plugin::cleanup`; observe `Context::cancellation`. |
+| `defineSettings`/`registerSettings` | `SettingsDefinition::new(...).migrate(...)`, `Plugin::settings`. |
+| Server-side Paseo client | `context.daemon.client().await?` gives `Arc<paseo_client::DaemonClient>`. |
+| Provider registration | `paseo_plugin::provider::{Provider, Connection, Events, Metadata}`. |
+| Usage registration | `UsageSource::new`, `Plugin::usage_source`; `paseo_plugin::usage` helpers/types. |
+| JavaScript process helpers | Real Rust process ownership and platform-specific cleanup, not compatibility shims. |
 
-The extension SDK is `packages/plugin`. The private worker is `packages/daemon/plugin-worker/src`; native management and CLI code are in `packages/daemon/src`. Do not import from removed server/app/desktop/CLI trees or copy the private worker into a public plugin.
+Author SDK: [packages/plugin](../../packages/plugin/src/lib.rs); host: [daemon plugins](../../packages/daemon/src/plugins.rs); client: [Rust SDK reference](../sdk/reference.md). No old SDK export implies UI support.
 
-Remove `/client`, `/client/ui`, React, React Native, and UI hook imports from the migrated runtime. Historical compatibility aliases or dates in old SDK documentation do not extend support to Flutter. Keep genuine Node libraries and type-only dependencies as needed; this is a backend-only cutover, not a ban on JavaScript.
+## 4. Preserve data and behavior
 
-## 4. Preserve data contracts, not custom rendering
+Keep installation IDs, RPC names, payload meaning and settings IDs stable where compatibility is intended. Settings keep host-local `{version, values}` envelopes, opaque revisions, defaults, migration validation, conflict detection and invalid-data retention. Test migration against actual old stored data without overwriting it on parse errors. Settings APIs do not create native settings screens.
 
-Keep RPC input/output Zod schemas and server handlers. RPC registration does not generate a native button or panel; consumers use the daemon's plugin RPC protocol. Use the SDK supplied to handlers and lifecycle hooks for ordinary Paseo operations.
+Before hooks return the **whole transformed request** or null. Preserve prior transforms and unrelated fields. `agent.session_open` changes only launch environment overrides; do not use it to bypass daemon policy. Hook event payloads/cancellation and cleanup matter as much as successful registration.
 
-Keep `defineSettings` schemas, defaults, versioned migrations, and `registerSettings` read/subscription behavior. Removing the former React settings screen does not require deleting stored values or inventing a new persistence format.
+Providers must preserve capability negotiation, prompt receipts, permission decisions, cancellation, timeline identity, optional persistence/replay and child-session restoration. Never claim unsupported optional behavior. Standard user/assistant text, reasoning, tools, todos, errors, notifications and compaction render without custom plugin code. See [provider guidance](providers.md).
 
-For providers, preserve capability negotiation, prompt receipts, permissions, persistence, cancellation, and replay. Emit standard user/assistant text, reasoning, tool, todo, error, notification, and compaction items. Do not require a custom React renderer for an essential result. Provider toggle/select configuration is protocol data rendered by the native client, not executable plugin UI. See [provider migration details](/docs/plugins/providers).
+Usage callbacks must discover only the scoped account, avoid secrets in identifiers/input/logs, and not refresh or rewrite another CLI's credentials. The daemon-client bridge replaces ad hoc duplicate RPCs for ordinary host operations. Access to that bridge is trusted daemon access, not a security sandbox.
 
-## 5. Prepare the actual daemon host
+## 5. Change acquisition and build requirements
 
-Install Node.js 20+ separately and expose `node` to the daemon or configure `PASEO_PLUGIN_NODE`. Supply the optional worker asset, using `PASEO_PLUGIN_WORKER` when necessary. npm is required separately for npm acquisition or declared npm preparation; Git acquisition needs Git. These tools and permissions belong to the daemon host, including when the user connects remotely.
+Use directory, Git, Cargo or checksum-pinned HTTPS release sources. Old npm sources cannot execute or update through npm. **Do not use remove/reinstall to preserve settings:** removal deletes the installation's settings directory, and duplicate-ID installation is rejected. There is currently no atomic same-ID managed-source replacement command.
 
-For a source checkout, use Node.js 24, `npm ci`, and `npm run build:daemon` to create the Rust debug executable and adjacent assets. `npm run dev:daemon` is the watch command; `dev:server` is removed. `build:daemon:release` produces optimized local assets, not release provenance.
+For an explicit non-destructive **directory runtime migration**:
 
-## 6. Update package and publication metadata
+1. Disable the old installation with `paseo plugin disable <id>`.
+2. Separately obtain/build a trusted native port and run its `--validate <directory> <daemon-version>`.
+3. Back up the selected daemon configuration/settings. Edit only the existing `plugins[<id>]` configuration entry to `{"source":"directory","path":"/absolute/path/to/native-plugin","enabled":false}`, preserving the installation ID and every other configuration entry.
+4. Apply the configuration with `paseo reload --json`, then deliberately enable/reload the same ID and inspect status/logs.
 
-Update `package.json`'s `files` list to include the manifest, server entry, `server/`, `shared/`, imported assets, and listing files. Remove client entries and client-only assets. Keep host-provided libraries and type-only dependencies in `devDependencies`; lock installed runtime dependency trees as described in [publishing](/docs/plugins/publishing).
+This keeps `plugin-settings/<id>` and old managed receipts/files. It does **not** migrate the old managed source record; source-management commands can continue to report the legacy-source migration error. A managed receipt/source replacement workflow is a separate missing capability, not something to hide by deleting records. Use a test copy first and keep backups before migrating real data.
 
-Declare an explicit `requirements.paseo` range for versions you support. The native checkout currently reports `0.13.0`; changing the range alone cannot distinguish or migrate an old UI plugin. Describe backend-only support and external Node requirements in your README and listing, and do not present the unpublished cutover as a released version. Preserve historical release descriptions as historical rather than silently rewriting them.
+Git/Cargo source plugins need the host Rust toolchain and declared build dependencies. Prebuilt plugins need only compatible host runtime dependencies. Build the repository daemon with `cargo xtask build-daemon`; no Node build step is required. Use a separate test daemon/home, not the user's production daemon. Remote installation paths exist on the daemon host and are not uploaded by the CLI.
 
-## 7. Exercise the migrated behavior
+Distribute the manifest, actual native executable or reproducible source/build inputs, assets and notices. Pin dependencies, commit Cargo locks for `--locked` source builds, and document supported OS/architecture. See [distribution](publishing.md). A broad `requirements.paseo` range cannot convert an old plugin into a native one.
 
-On a suitable test daemon, after the source changes:
+## 6. Exercise the migrated behavior
 
-```bash
-npm run typecheck
-paseo plugin reload <plugin-id>
-paseo plugin ls <plugin-id>
-paseo plugin logs <plugin-id>
+For a scaffold-shaped project, on an isolated test host:
+
+```sh
+cargo build --release --target-dir target
+./target/release/paseo-plugin-server --validate . 0.13.1
+paseo plugin install /absolute/path/to/native-plugin
+paseo plugin ls <installed-id>
+paseo plugin logs <installed-id>
 ```
 
-For a new installation, use `paseo plugin install /absolute/path/to/plugin` first. The daemon-wide `pluginsEnabled` and installation's enabled state must both permit loading. Exercise every retained RPC, hook, provider, settings migration, and usage source; confirm cleanup while work is active. `running` alone does not establish behavior or native UI compatibility. Test on the host platforms you claim to support; a CI definition or historical JavaScript-client test is not evidence of an actual native run.
+Use the actual executable name and `.exe` on Windows. After edits, rebuild and `paseo plugin reload <installed-id>`. Both root `pluginsEnabled` and installation enablement must allow execution. Exercise every retained RPC, hook, setting/migration, usage source and real provider turn/permission path, including cleanup while active. `running` and successful validation are not behavioral coverage. No publication, deployment or test execution is claimed here.
 
-No UI compatibility shim is part of this migration. If the only useful behavior was a client surface, the plugin cannot currently provide that feature to Flutter; state that limitation rather than publishing a no-op backend.
+The repository's maintained runnable example is [workspace-inspector](index.md#run-the-repository-example), not the old JavaScript example directories. Former client-only examples cannot be made useful by adding a no-op backend; state the unsupported feature plainly.

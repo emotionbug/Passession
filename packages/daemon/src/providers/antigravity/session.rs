@@ -17,10 +17,8 @@ use super::{
     catalog,
     wire::{self, Error, Frame, Status, Turn},
 };
-use crate::{
-    process::ManagedProcess,
-    providers::{api::*, prompt},
-};
+use paseo_client::process::ManagedProcess;
+use crate::{ providers::{api::*, prompt}, };
 
 type Reply = oneshot::Sender<Result<Value>>;
 enum Command {
@@ -260,9 +258,6 @@ impl AgentSession for Session {
     }
     async fn rewind(&self, _target: RewindTarget, _message_id: &str) -> Result<()> {
         Err(anyhow!("Antigravity does not support session.revert"))
-    }
-    async fn try_out_of_band(&self, _prompt: &Value) -> Result<bool> {
-        Ok(false)
     }
 }
 

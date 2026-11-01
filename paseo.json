@@ -1,23 +1,23 @@
 {
   "worktree": {
-    "setup": ["npm ci", "node ./scripts/seed-worktree-dev-state.mjs", "npm run build:daemon"]
+    "setup": ["cargo xtask maintenance seed-dev-state", "cargo xtask build-daemon"]
   },
   "scripts": {
     "daemon": {
       "type": "service",
-      "command": "PASEO_DEV_MANAGED_HOME=1 PASEO_DEV_ROOT=\"${PASEO_WORKTREE_PATH:-$PWD}\" PASEO_HOME=\"${PASEO_WORKTREE_PATH:-$PWD}/.dev/paseo-home\" PASEO_LISTEN=0.0.0.0:${PASEO_PORT:-6768} npm run dev"
+      "command": "cargo xtask dev daemon --watch"
     },
     "desktop": {
-      "command": "npm run dev:desktop"
+      "command": "cargo xtask dev app"
     },
     "ios": {
-      "command": "npm run dev:ios"
+      "command": "cargo xtask dev app ios"
     },
     "android": {
-      "command": "npm run dev:android"
+      "command": "cargo xtask dev app android"
     },
     "typecheck": {
-      "command": "npm run typecheck"
+      "command": "cargo xtask flutter analyze"
     }
   }
 }

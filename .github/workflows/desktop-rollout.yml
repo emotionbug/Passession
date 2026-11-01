@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing canonical release tag to re-stamp (vX.Y.Z or vX.Y.Z-beta.N)
+        description: Existing canonical release tag (vX.Y.Z or vX.Y.Z-beta.N)
         required: true
         type: string
       rollout_hours:
-        description: Total ramp duration since the original release date; 0 admits everyone
+        description: Total ramp duration since original release date; 0 admits everyone
         required: true
         type: string
 
@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   stamp:
+    if: github.repository == 'emotionbug/paseo'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -27,36 +28,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24.15.0"
-      - name: Resolve canonical release identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/emit-release-env.mjs --source-tag "$SOURCE_TAG" >> "$GITHUB_ENV"
-          node --input-type=module -e 'import {getReleaseInfoFromSourceTag} from "./scripts/release-version-utils.mjs"; const p=getReleaseInfoFromSourceTag(process.env.SOURCE_TAG); if(p.releaseTag!==process.env.SOURCE_TAG) throw Error("Use the canonical v-prefixed release tag"); const n=Number(process.env.NEW_HOURS); if(!process.env.NEW_HOURS.trim() || !Number.isFinite(n) || n<0) throw Error("rollout_hours must be nonnegative");'
-      # Standalone daemon feeds are separate and have no desktop rollout policy.
-      - name: Download six Flutter desktop manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          channel=stable
-          [[ "$IS_BETA" != true ]] || channel=beta
-          mkdir release-manifests
-          for platform in linux macos windows; do
-            for arch in x64 arm64; do
-              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "flutter-$channel-$platform-$arch.json" --dir release-manifests
-            done
-          done
-      - name: Validate identity and preserve original release dates
-        shell: bash
-        run: |
-          node --input-type=module -e 'import fs from "node:fs"; for(const f of fs.readdirSync("release-manifests")) {const m=JSON.parse(fs.readFileSync(`release-manifests/${f}`)); if(m.version!==process.env.RELEASE_VERSION || f!==`flutter-${process.env.IS_BETA==="true"?"beta":"stable"}-${m.platform}-${m.arch}.json`) throw Error(`Manifest identity mismatch: ${f}`); console.log(`${f}: rolloutHours=${m.rolloutHours} releaseDate=${m.releaseDate}`);}'
-          node scripts/stamp-flutter-rollout.mjs "$NEW_HOURS" release-manifests/*.json
-      - name: Upload native rollout manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release upload "$RELEASE_TAG" release-manifests/*.json --clobber --repo "$GITHUB_REPOSITORY"
-          printf 'Native desktop rollout for %s updated to %s hours; original release dates retained.\n' "$RELEASE_TAG" "$NEW_HOURS" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate all six feeds and stamp without restarting original ramps
+        run: cargo xtask release rollout

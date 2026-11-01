@@ -1,17 +1,9 @@
-> The native Paseo client does not run client UI plugins. The settings screen in `client/` only
-> exercises the SDK's client types; the native app has no plugin settings screen.
+# Settings migration notes
 
-# Settings example
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-The backend part works on a native daemon: `index.server.ts` registers the `display` settings
-document from `shared/preferences.ts` with `server.registerSettings()`. That adds the
-`settings.display.read`, `settings.display.write`, and `settings.display.reset` RPCs. Values are
-stored on the daemon host and shared by every client of that host. Every field has a default, so a
-read returns complete values before anything is saved.
+The former example registered a host-scoped `display` document and a React settings screen. The native data equivalent is `SettingsDefinition` plus `Plugin::settings`, automatically registering `settings.<id>.read`, `.write` and `.reset`. Preserve document ID, `{version, values}` storage, defaults, migrations and opaque revisions so conflicts do not overwrite another writer. Invalid saved data stays intact. Flutter does not execute the former settings screen.
 
-Install it with `paseo plugin install /absolute/path/to/plugin-examples/settings`.
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
 
-`client/display-settings.tsx` was written for the former JavaScript client. Its title editor keeps
-the revision it started from, so another client's save produces a conflict instead of being
-overwritten. The images in `screenshots/` are historical captures of that client on Android,
-Electron, and the web, not current behavior.
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

@@ -5,15 +5,11 @@ routing:
   - ".github/ci-paths.yml"
 
 workspace:
-  - ".mise.toml"
-  - ".tool-versions"
-  - "package.json"
-  - "package-lock.json"
-  - "patches/**"
-  - "scripts/**"
-  - "tsconfig.json"
-  - "tsconfig.base.json"
-  - "vitest.config.ts"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+  - ".cargo/**"
+  - "xtask/**"
 
 ci:
   - ".github/actions/**"
@@ -21,14 +17,16 @@ ci:
   - ".github/workflows/ci-recovery.yml"
 
 format:
-  - ".agents/**/*.{cjs,css,html,js,json,jsonc,jsx,md,mjs,ts,tsx,yaml,yml}"
-  - ".github/**/*.{cjs,css,html,js,json,jsonc,jsx,md,mjs,ts,tsx,yaml,yml}"
-  - "**/*.{cjs,css,html,js,json,jsonc,jsx,md,mjs,ts,tsx,yaml,yml}"
+  - "**/*.rs"
+  - "**/Cargo.toml"
+  - "rustfmt.toml"
 
 quality:
-  - "*.{cjs,js,json,jsx,mjs,ts,tsx}"
-  - "!(packages)/**/*.{cjs,js,json,jsx,mjs,ts,tsx}"
-  - "packages/!(flutter_app|flutter_audio|flutter_desktop_host)/**/*.{cjs,js,json,jsx,mjs,ts,tsx}"
+  - "**/*.rs"
+  - "**/Cargo.toml"
+  - "Cargo.lock"
+  - ".cargo/**"
+  - "xtask/**"
 
 daemon:
   - "Cargo.toml"
@@ -50,6 +48,8 @@ sdk:
 
 relay:
   - "packages/relay/**"
+  - "packages/relay-cloudflare/**"
+  - "xtask/src/relay_cloudflare.rs"
 
 # Shared Dart, assets and package resolutions affect every native build.
 # Platform implementation changes compile on their owning host only.
@@ -61,18 +61,23 @@ flutter:
   - "packages/flutter_desktop_host/integrations/pubspec.yaml"
   - "packages/flutter_desktop_host/integrations/lib/**"
   - "packages/flutter_desktop_host/updater/**"
+  - "packages/flutter_desktop_host/third_party/desktop_multi_window/lib/**"
+  - "packages/flutter_desktop_host/third_party/desktop_multi_window/pubspec.yaml"
 
 flutter_linux:
   - "packages/flutter_app/linux/**"
   - "packages/flutter_desktop_host/integrations/linux/**"
+  - "packages/flutter_desktop_host/third_party/desktop_multi_window/linux/**"
 
 flutter_windows:
   - "packages/flutter_app/windows/**"
   - "packages/flutter_desktop_host/integrations/windows/**"
+  - "packages/flutter_desktop_host/third_party/desktop_multi_window/windows/**"
 
 flutter_macos:
   - "packages/flutter_app/macos/**"
   - "packages/flutter_desktop_host/integrations/macos/**"
+  - "packages/flutter_desktop_host/third_party/desktop_multi_window/macos/**"
 
 flutter_android:
   - "packages/flutter_app/android/**"

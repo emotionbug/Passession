@@ -1,108 +1,104 @@
 ---
 title: 将插件迁移到原生后端运行时
-description: 为原生迁移保留后端扩展行为，移除可执行客户端贡献。
+description: 把后端行为移植为 Rust 可执行文件，不保留 JavaScript 或 UI 兼容回退。
 nav: 迁移
 ---
 
 # 将插件迁移到原生后端运行时 {#migrate-a-plugin-to-the-native-backend-runtime}
 
-本指南针对 **0.13.0 源码检出中尚未发布的原生迁移**，不表示新的原生发行版已经可用。历史上的 0.8 迁移将客户端与服务端入口分离，但这个分离不让客户端部分兼容 Flutter。
+本文是 **0.13.1 源码迁移说明**，不是发布公告。旧 JavaScript/TypeScript 插件**不能在新运行时执行**。daemon 会拒绝旧运行时清单并给出原生迁移错误，同时保留安装记录和设置；不会启动 Node worker、安装解释器或静默删除/启用旧插件。`PASEO_PLUGIN_NODE`、`PASEO_PLUGIN_WORKER` 不是迁移机制。
 
-内置功能现在由 Rust 实现。可选 JavaScript 后端插件继续通过私有 worker 运行，需要单独安装 Node.js 20+。Flutter 不执行插件 JavaScript、React 组件或可执行 UI 贡献。移动端连接桌面/服务器 daemon，不运行 worker。
+迁移需要真实移植，不是重命名入口或修改版本范围。已有 Rust 内置功能保持原生；Kiro 保持禁用，不属于本指南操作。外部 Agent CLI 是独立产品，不是 Paseo 插件运行时。
 
 ## 1. 对插件分类 {#1-classify-the-plugin}
 
-| 现有行为                                                     | 原生迁移                                                 |
-| ------------------------------------------------------------ | -------------------------------------------------------- |
-| RPC 处理函数和 daemon 本地供应商调用                         | 保留在后端 worker。                                      |
-| 生命周期钩子和 SDK 自动化                                    | 保留服务端注册及清理。                                   |
-| 持久化设置 schema 和迁移                                     | 保留后端注册，移除可执行设置界面。                       |
-| 直接或 ACP Provider                                          | 保留后端协议实现，输出标准时间线/配置数据。              |
-| 用量发现和获取                                               | 保留后端用量来源注册。                                   |
-| 界面、侧边栏/标题栏项、面板、文件渲染器                      | 移除可执行客户端贡献，不承诺存在原生插件等价物。         |
-| React 时间线渲染器或转换器                                   | 移除；Provider 输出改用标准协议条目。                    |
-| 客户端命令、Composer 标签、附件选择器、主题、浏览器/音频回调 | 移除客户端注册和导入；独立有用的后端数据与操作可以保留。 |
-| 仅客户端插件                                                 | 不属于受支持的原生扩展；不要把空后端入口称为迁移。       |
+| 旧功能 | 原生实现 |
+| --- | --- |
+| RPC/供应商调用 | `Plugin::rpc`，显式 JSON 校验和真实 Rust I/O。 |
+| 生命周期事件/变换 | `Plugin::on`/`before`、取消和资源清理。 |
+| 设置 schema/迁移 | `SettingsDefinition`、`Plugin::settings`，兼容存储格式和 revision。 |
+| 直接 Provider | `Provider`/`Connection`、真实会话事件、权限和清理。 |
+| ACP 适配器 | `paseo_plugin::acp::AcpProvider` 接受命令或自有流，供应商扩展移植到 `AcpTransformer`。它替代 `runAcpProvider` 的功能，不兼容 JavaScript 源码 API。 |
+| 用量发现/获取 | `UsageSource`、显式输入校验及账号/凭据边界。 |
+| 界面、面板、侧边栏/标题组件、附件选择器、主题 | 没有可执行 Flutter 插件对应项，移除旧 UI 注册。 |
+| React 时间线变换/渲染器 | 输出标准协议条目，重要输出不能依赖扩展代码。 |
+| 仅客户端插件 | 不是支持的原生插件，不能把空后端称作迁移。 |
 
-不要把 React 组件移进 `server/`、捆绑浏览器或让 worker 加载客户端包。原生 Markdown/源码编辑等内置界面是产品功能，不是可执行扩展槽。
+原生 Markdown/源码查看和配置描述符是产品功能/数据契约，不是任意 UI 扩展插槽。没有浏览器/webview 回退执行旧客户端代码。
 
-## 2. 保留显式后端入口 {#2-retain-an-explicit-backend-entry}
+## 2. 构建原生可执行文件 {#2-build-a-native-executable}
 
-使用以下结构：
+以 `paseo plugin init <new-empty-directory> --sdk-path <checkout>/packages/plugin` 为起点，随后移植实际行为。项目包括 `Cargo.toml`、`src/main.rs`、`paseo-plugin.json` 和作者文档。使用 Rust 1.93+、edition 2024 和真实 `paseo-plugin` crate，不要依赖未发布注册表版本。
 
-```text
-paseo-plugin.json
-package.json
-tsconfig.json
-index.server.ts
-server/
-shared/
-```
-
-`index.server.ts` 默认导出接收 `PluginServerContext` 的函数。主机操作和凭据放在 `server/`，普通值与 Zod 契约放在 `shared/`。移动受支持行为后删除旧混合 `index.ts`。从面向原生的包中移除 `index.client.tsx`、客户端模块及纯 UI 依赖，不要把不受支持的入口留在旁边。
-
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-
-export default function contribute(server: PluginServerContext) {
-  server.on("agent.turn_ended", (event) => {
-    console.log(event.agent.id, event.outcome);
-  });
-  return () => {};
+```json
+{
+  "id": "review-tools",
+  "runtime": "native",
+  "requirements": { "paseo": ">=0.13.1" },
+  "server": { "executable": "target/release/paseo-plugin-server", "args": [] },
+  "build": [["cargo", "build", "--release", "--target-dir", "target"]]
 }
 ```
 
-旧混合 API 的 daemon 处理函数改为 `server.handle(contract, handler)`。钩子用 `server.on`/`server.before`，设置用 `server.registerSettings`，Provider 用 `server.registerProvider`，用量来源用 `server.registerUsageSource`。可执行客户端界面没有替代注册。
+路径应匹配 Cargo 二进制目标，Windows 使用 `.exe`。文件必须留在插件目录内且为真实原生程序，不能是调用旧入口的脚本。命令是 argv 数组，不是 shell 片段。`Plugin::run` 提供 `--validate` 和正常 initialize/ready IPC，见[参考](reference.zh-CN.md#validation-and-readiness)。
 
-保留定时器、订阅、套接字、文件监视器和子进程的真实清理逻辑。重新加载、停用、移除或 daemon 关闭时 worker 会停止。没有应用连接时 Agent 钩子仍可运行。
+把 I/O 和依赖移植到 Rust，再从**新分发插件**移除旧入口、包管理器清单、编译器配置和纯 UI 模块。源码移植不应删除用户旧安装或设置。开发中使用本地路径，或固定可获取的 SDK Git 修订。
 
-## 3. 修正导入和 SDK 归属 {#3-correct-imports-and-sdk-ownership}
+## 3. 显式移植 SDK 调用 {#3-port-sdk-calls-explicitly}
 
-| 需要                                             | 导入/源码                                      |
-| ------------------------------------------------ | ---------------------------------------------- |
-| `defineRpc`、`defineSettings`、普通类型和 schema | `@getpaseo/plugin`                             |
-| 服务端 context、生命周期和进程辅助函数           | `@getpaseo/plugin/server`                      |
-| Provider 契约                                    | `@getpaseo/plugin/server/provider`             |
-| ACP 适配器                                       | `@getpaseo/plugin/server/acp`                  |
-| 用量契约/辅助函数                                | `@getpaseo/plugin/server/usage`                |
-| TypeScript daemon API                            | `@getpaseo/client`，位于 `packages/client`     |
-| 共享协议类型                                     | `@getpaseo/protocol`，位于 `packages/protocol` |
+| 旧概念 | 原生 API/来源 |
+| --- | --- |
+| 服务端贡献入口 | 创建 `Plugin`，在 `run().await` 前完成注册。 |
+| `handle`/`defineRpc` schema | `Plugin::rpc`；用 Serde/领域检查校验 `Value` 输入/输出，没有自动 Zod 对应。 |
+| `on`/`before` | 异步 `(Value, Context) -> Result<Value>`；before 输入为 `{request: ...}`，null 保留请求。 |
+| 返回清理回调 | `Plugin::cleanup`，观察 `Context::cancellation`。 |
+| `defineSettings`/`registerSettings` | `SettingsDefinition::new(...).migrate(...)`、`Plugin::settings`。 |
+| 服务端 Paseo 客户端 | `context.daemon.client().await?` 返回 `Arc<paseo_client::DaemonClient>`。 |
+| Provider 注册 | `paseo_plugin::provider::{Provider, Connection, Events, Metadata}`。 |
+| 用量注册 | `UsageSource::new`、`Plugin::usage_source`、`paseo_plugin::usage` 类型/函数。 |
+| JavaScript 进程辅助函数 | 真实 Rust 进程所有权和平台清理，不是兼容包装。 |
 
-扩展 SDK 位于 `packages/plugin`。私有 worker 位于 `packages/daemon/plugin-worker/src`，原生管理和 CLI 位于 `packages/daemon/src`。不要从已移除的 server/app/desktop/CLI 目录导入，也不要把私有 worker 复制为公共插件。
+作者 SDK：[packages/plugin](../../packages/plugin/src/lib.rs)；宿主：[daemon 插件](../../packages/daemon/src/plugins.rs)；客户端：[Rust SDK 参考](../sdk/reference.zh-CN.md)。旧 SDK 导出不能证明支持 UI。
 
-从迁移后的运行时移除 `/client`、`/client/ui`、React、React Native 和 UI hook 导入。旧 SDK 文档中的兼容别名或日期不延伸到 Flutter。保留真正需要的 Node 库和类型依赖；这是纯后端迁移，不是禁止 JavaScript。
+## 4. 保留数据与行为 {#4-preserve-data-and-behavior}
 
-## 4. 保留数据契约而非自定义渲染 {#4-preserve-data-contracts}
+需要兼容时保持安装 ID、RPC 名、载荷含义和设置 ID。设置保留主机本地 `{version, values}` 格式、不透明 revision、默认值、迁移校验、冲突检测和无效数据保留。对真实旧数据测试迁移，解析失败不能覆盖数据。设置 API 不生成原生设置界面。
 
-保留 RPC 输入/输出 Zod schema 和服务端处理函数。RPC 注册不生成原生按钮或面板，消费者使用 daemon 插件 RPC 协议。普通 Paseo 操作用处理函数和生命周期钩子获得的 SDK。
+前置钩子返回**完整变更后请求**或 null，保留先前变换与无关字段。`agent.session_open` 仅改变启动环境覆盖，不绕过 daemon 策略。事件载荷、取消与清理和注册成功一样重要。
 
-保留 `defineSettings` schema、默认值、版本迁移及 `registerSettings` 的读取/订阅行为。移除旧 React 设置界面不意味着删除保存值或创造新存储格式。
+Provider 保留能力协商、提示回执、权限决定、取消、时间线身份、可选持久化/重放和子会话恢复；未实现能力不能宣传。标准用户/助手文本、推理、工具、待办、错误、通知和压缩无需自定义代码即可展示。见 [Provider 指南](providers.zh-CN.md)。
 
-Provider 保留能力协商、提示词回执、权限、持久化、取消和重放。输出标准用户/助手文本、推理、工具、待办、错误、通知和压缩条目；关键结果不能依赖自定义 React 渲染器。开关/选择配置是原生客户端渲染的协议数据，不是可执行插件 UI。见 [Provider 指南](/docs/plugins/providers)。
+用量只发现指定范围账号，标识/input/日志不能包含秘密，不刷新或改写其他 CLI 凭据。普通宿主操作使用 daemon 客户端桥接，不再自行重复实现 RPC。桥接是可信 daemon 访问，不是安全沙箱。
 
-## 5. 准备实际 daemon 主机 {#5-prepare-the-daemon-host}
+## 5. 更换获取和构建要求 {#5-change-acquisition-and-build-requirements}
 
-单独安装 Node.js 20+，让 daemon 找到 `node`，或配置 `PASEO_PLUGIN_NODE`。提供可选 worker 资源，必要时用 `PASEO_PLUGIN_WORKER` 指定。npm 获取及声明的 npm 准备步骤需要另行提供 npm；Git 获取需要 Git。即使用户远程连接，这些工具和权限也属于 daemon 主机。
+使用目录、Git、Cargo 或校验和固定的 HTTPS 发行来源。旧 npm 来源不能通过 npm 执行/更新。**不能用移除/重装来保留设置**：移除会删除该安装的设置目录，重复 ID 安装也会被拒绝。目前没有原子化同 ID 托管来源替换命令。
 
-源码构建使用 Node.js 24、`npm ci` 和 `npm run build:daemon`，生成 Rust 调试可执行文件及相邻资源。监视命令是 `npm run dev:daemon`，`dev:server` 已移除。`build:daemon:release` 生成优化的本地资源，不赋予发行来源证明。
+明确执行无损的**目录运行时迁移**：
 
-## 6. 更新包和发布元数据 {#6-update-package-and-publication-metadata}
+1. 用 `paseo plugin disable <id>` 禁用旧安装。
+2. 另行获取/构建可信原生移植，并执行 `--validate <directory> <daemon-version>`。
+3. 备份选定 daemon 配置/设置。只把既有 `plugins[<id>]` 配置条目改为 `{"source":"directory","path":"/absolute/path/to/native-plugin","enabled":false}`，保留安装 ID 和全部其他配置条目。
+4. 用 `paseo reload --json` 应用配置，再明确启用/重新加载同 ID，并查看状态/日志。
 
-修改 `package.json` 的 `files`，包含 manifest、服务端入口、`server/`、`shared/`、被导入资源和展示页文件。移除客户端入口和仅客户端资源。宿主提供库和类型依赖留在 `devDependencies`；按[发布指南](/docs/plugins/publishing)锁定运行时依赖树。
+这样保留 `plugin-settings/<id>` 和旧托管收据/文件，但**不迁移旧托管来源记录**；来源管理命令可能继续报告旧来源迁移错误。托管收据/来源替换流程是单独缺少的能力，不能通过删除记录来掩盖。先在测试副本上操作，真实数据迁移前保留备份。
 
-声明实际支持版本的 `requirements.paseo`。原生检出当前报告 `0.13.0`；只改范围无法区分或迁移旧 UI 插件。在 README 和展示页说明纯后端支持及外部 Node 要求，不要把未发布的迁移称为已发布版本。历史发行描述应保持历史性质，不要静默改写。
+Git/Cargo 源码插件需要主机 Rust 工具链和声明构建依赖；预编译插件只需兼容运行依赖。仓库 daemon 用 `cargo xtask build-daemon` 构建，无需 Node 构建步骤。使用独立测试 daemon/home，不操作用户生产 daemon。远程安装路径必须在 daemon 主机存在，CLI 不上传文件。
 
-## 7. 运行迁移后的行为 {#7-exercise-the-migrated-behavior}
+分发清单、真实原生程序或可复现源码/构建输入、资源和声明。固定依赖，`--locked` 构建提交 Cargo 锁，说明 OS/架构。见[分发指南](publishing.zh-CN.md)。放宽 `requirements.paseo` 不能把旧插件变成原生插件。
 
-源码修改后，在合适的测试 daemon 上执行：
+## 6. 实际覆盖迁移后的行为 {#6-exercise-the-migrated-behavior}
 
-```bash
-npm run typecheck
-paseo plugin reload <plugin-id>
-paseo plugin ls <plugin-id>
-paseo plugin logs <plugin-id>
+对于脚手架布局，在隔离测试主机上：
+
+```sh
+cargo build --release --target-dir target
+./target/release/paseo-plugin-server --validate . 0.13.1
+paseo plugin install /absolute/path/to/native-plugin
+paseo plugin ls <installed-id>
+paseo plugin logs <installed-id>
 ```
 
-新安装先执行 `paseo plugin install /absolute/path/to/plugin`。daemon 根设置 `pluginsEnabled` 和安装项启用状态都必须允许加载。运行每个保留的 RPC、钩子、Provider、设置迁移和用量来源，并确认活跃工作期间的清理。仅 `running` 不能证明行为或原生 UI 兼容性。在声称支持的平台上实际测试；CI 定义或旧 JavaScript 客户端测试不是原生实际运行证据。
+使用实际可执行文件名，Windows 加 `.exe`。修改后重新构建并执行 `paseo plugin reload <installed-id>`。根 `pluginsEnabled` 和安装启用状态都应允许执行。覆盖每个保留 RPC、钩子、设置/迁移、用量和真实 Provider 轮次/权限路径，包括活动时清理。`running` 和校验通过不代表行为覆盖。本文不声称已发布、部署或执行测试。
 
-此迁移不包含 UI 兼容层。如果插件唯一有用行为是客户端界面，目前就不能把该功能提供给 Flutter；应说明限制，而不是发布无操作后端。
+仓库维护的可运行示例是 [workspace-inspector](index.zh-CN.md#run-the-repository-example)，不是旧 JavaScript 示例目录。纯客户端示例不能靠无操作后端变得有用，应明确说明不支持的功能。

@@ -734,9 +734,6 @@ impl AgentSession for PluginSession {
         self.core.connection.complete(json!({"type":"session.revert","sessionId":self.core.id,"token":token,"scope":scope}),&self.core.cancel).await?;
         Ok(())
     }
-    async fn try_out_of_band(&self, _prompt: &Value) -> Result<bool> {
-        Ok(false)
-    }
 }
 impl Drop for PluginSession {
     fn drop(&mut self) {

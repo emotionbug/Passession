@@ -3,10 +3,8 @@ mod ingress;
 #[cfg(test)]
 mod tests;
 
-use crate::{
-    relay_crypto::{KeyPair, MAX_WIRE_BYTES},
-    state::AppState,
-};
+use crate::state::AppState;
+use paseo_protocol::crypto::{KeyPair, MAX_WIRE_BYTES};
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};

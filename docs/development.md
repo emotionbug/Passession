@@ -2,33 +2,32 @@
 
 ## Toolchains
 
-- Rust and Cargo for `packages/daemon` (the daemon and `paseo` CLI).
+- Rust and Cargo for the daemon/CLI, client/protocol/plugin/highlighting SDKs, relay and `xtask` tooling. `Cargo.toml` specifies the minimum Rust version.
 - Flutter/Dart for `packages/flutter_app`; set `FLUTTER_BIN` or `FLUTTER_ROOT`, or put Flutter on `PATH`. Packaging also searches `$XDG_CACHE_HOME/paseo-flutter-sdk` (default `~/.cache/paseo-flutter-sdk`).
-- Node **24** and npm for workspace dependencies, build orchestration, the optional extension compiler, SDKs, and website. Node is not the installed daemon runtime.
+- Node, npm and a TypeScript compiler are not Paseo build prerequisites. Separately installed agent CLIs retain their own runtime requirements.
 - Linux desktop: Flutter's Linux toolchain and native GTK/build dependencies. macOS/iOS: macOS, Xcode and the Flutter Apple toolchain. Windows: Flutter's Windows/Visual Studio C++ toolchain. Android: JDK and Android SDK as required by the checked-in Flutter Android project.
 
-Install repository dependencies with `npm ci`. The Flutter wrapper runs `flutter pub get --enforce-lockfile`. Desktop builds require their target host; the native packaging scripts reject `CARGO_BUILD_TARGET` cross-compilation.
+Fetch Rust dependencies with `cargo fetch --locked`. Flutter wrappers run `flutter pub get --enforce-lockfile`. Desktop builds require their target host; native packaging rejects `CARGO_BUILD_TARGET` cross-compilation.
 
 ## Development commands
 
 Run commands from the repository root:
 
 ```sh
-npm run build:daemon       # Cargo binary plus native runtime assets
-npm run dev:daemon         # rebuild/watch and run the Rust daemon
-npm run dev:app            # build/run the native desktop Flutter client
-npm run dev:desktop        # the same desktop client entry point
-npm run dev:android -- --device <device-id>
-npm run dev:ios -- --device <device-id>
-npm run cli -- ls          # native CLI against checkout development home
-npm run dev:website        # separate website, not a product web client
+cargo xtask build-daemon                # Cargo binary plus native runtime assets
+cargo xtask dev daemon                  # run the isolated Rust daemon
+cargo xtask dev daemon --watch          # rebuild/restart that dev process on source changes
+cargo xtask dev app                     # build/run the native desktop Flutter client
+cargo xtask dev app android --device <device-id>
+cargo xtask dev app ios --device <device-id>
+cargo xtask dev cli ls                  # native CLI against the checkout dev home
 ```
 
-`npm run dev` starts the development daemon. There is no Metro server, Expo prebuild, Electron renderer, Chromium debugging port, or web client build.
+`cargo xtask dev daemon` starts the development daemon. There is no website build, Metro server, Expo prebuild, Electron renderer, Chromium debugging port, or web client build.
 
-For direct Rust iteration, `cargo build --locked -p paseo-daemon --bin paseo` compiles the executable. Use `npm run build:daemon` when the run also needs staged speech libraries, skills, optional-extension compiler assets, or packaging provenance. Cargo-only compilation is not a complete distributable runtime.
+For direct Rust iteration, `cargo build --locked -p paseo-daemon --bin paseo` compiles the executable. Use `cargo xtask build-daemon` when the run also needs staged skills, native runtime assets or packaging provenance. Cargo-only compilation is not a complete distributable runtime.
 
-`npm run build:daemon:release` produces an optimized local native runtime, not a published release identity. Default Flutter release builds use optimized Rust; debug development builds use the debug profile. `PASEO_NATIVE_RELEASE=1` is a separate, validated publication-provenance choice; see [release](release.md).
+`cargo xtask build-daemon --release` produces an optimized local native runtime, not a published release identity. Default Flutter release builds use optimized Rust; debug development builds use the debug profile. `PASEO_NATIVE_RELEASE=1` is a separate, validated publication-provenance choice; see [release](release.md).
 
 ## Isolated state and endpoints
 
@@ -42,7 +41,6 @@ The daemon development wrapper honors:
 - `PASEO_SERVICE_DAEMON_PORT`: service port, defaulting the listen address to `0.0.0.0:<port>` when supplied.
 - `PASEO_DEV_SEED_HOME`: copy durable agent/project JSON and configuration into an empty development home, not process IDs, sockets, or logs.
 - `PASEO_DEV_RESET_HOME=1`: destructive reset of that development destination before seeding; use only with an explicitly disposable target.
-- `PASEO_LOCAL_MODELS_DIR`: speech model cache override. The development wrapper defaults to `~/.paseo/models/local-speech`; set a temporary directory for isolated model-download tests.
 
 The Flutter `--run` wrapper fixes its development home to this checkout's `.dev/paseo-home` and defaults its listen endpoint to `127.0.0.1:6768`. Do not assume a custom daemon `PASEO_HOME` automatically changes the app wrapper's managed home. To use another host instance, add it as an explicit client connection.
 
@@ -53,23 +51,23 @@ A mobile emulator's `localhost` is not the development machine. On an Android AV
 ## Native builds
 
 ```sh
-npm run build:flutter -- linux
-npm run build:flutter -- macos
-npm run build:flutter -- windows
-npm run build:apk
-npm run build:apk:arm64
-npm run build:ios
-npm run package:flutter:desktop
+cargo xtask build-flutter linux
+cargo xtask build-flutter macos
+cargo xtask build-flutter windows
+cargo xtask build-flutter android
+cargo xtask build-flutter android --arch arm64
+cargo xtask build-flutter ios
+cargo xtask package-desktop
 ```
 
-Only run the desktop target matching the host OS. iOS requires macOS. `build:ios` without export/provisioning configuration emits an explicitly unsigned device app archive, not an installable IPA. Android output without a release key is marked debug-signed. Build descriptors and client artifacts live under `artifacts/flutter/`; see [release](release.md) before producing distribution artifacts.
+Only run the desktop target matching the host OS. iOS requires macOS. `cargo xtask build-flutter ios` without export/provisioning configuration emits an explicitly unsigned device app archive, not an installable IPA. Android output without a release key is marked debug-signed. Build descriptors and client artifacts live under `artifacts/flutter/`; see [release](release.md) before producing distribution artifacts.
 
 ## Source ownership
 
 - Rust: `packages/daemon/src`; CLI commands in `cli/`, providers in `providers/`, process ownership in `daemon_control/`, desktop IPC in `desktop_host/`.
 - Dart: `packages/flutter_app/lib`; protocol and state in `core/`, features under `features/`, native desktop/mobile integration under `platform/`.
-- Native packaging: `packages/flutter_desktop_host/packaging` and `scripts/build-native-daemon.mjs` / `scripts/build-flutter.mjs`.
-- External TypeScript SDK: `packages/client`; wire definitions: `packages/protocol`; optional extension author SDK: `packages/plugin`.
+- Native build, packaging and release: `xtask/src`; platform project integration: `packages/flutter_desktop_host`.
+- Rust SDKs: `packages/client`, `packages/protocol`, `packages/plugin`, `packages/highlight`; relay: `packages/relay`.
 
 Use Flutter tooling for frame/layout profiling and Rust instrumentation for daemon work. Browser/CDP and React profilers do not profile the native client. A development mock provider can test controlled UI states but is not evidence of real provider interoperability.
 

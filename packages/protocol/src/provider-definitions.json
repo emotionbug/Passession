@@ -42,12 +42,7 @@
           "colorTier": "dangerous",
           "isUnattended": true
         }
-      ],
-      "voice": {
-        "enabled": true,
-        "defaultModeId": "default",
-        "defaultModel": "haiku"
-      }
+      ]
     },
     {
       "id": "codex",
@@ -77,12 +72,7 @@
           "colorTier": "dangerous",
           "isUnattended": true
         }
-      ],
-      "voice": {
-        "enabled": true,
-        "defaultModeId": "auto",
-        "defaultModel": "gpt-5.4-mini"
-      }
+      ]
     },
     {
       "id": "copilot",
@@ -134,11 +124,7 @@
           "icon": "ShieldEllipsis",
           "colorTier": "planning"
         }
-      ],
-      "voice": {
-        "enabled": true,
-        "defaultModeId": "build"
-      }
+      ]
     },
     {
       "id": "pi",

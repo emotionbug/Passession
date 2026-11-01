@@ -28,7 +28,7 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use self::http::HttpTransport;
-use crate::process::{CommandSpec, ManagedProcess};
+use paseo_client::process::{CommandSpec, ManagedProcess};
 
 const SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);

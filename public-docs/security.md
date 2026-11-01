@@ -125,7 +125,7 @@ See [Docker](/docs/docker) for Compose and reverse proxy examples.
 
 The Flutter desktop client does not bundle Electron or Chromium. Chromium sandbox switches and helper-installation instructions do not apply. This does not sandbox agents: providers and script/setup PTYs run with the daemon user's filesystem and credential access. The client exposes read-only task logs, not an interactive terminal UI.
 
-Built-in integrations run in Rust. Optional JavaScript backend plugins execute trusted code using externally installed Node 20+ (`PASEO_PLUGIN_NODE` may select it). Do not treat the separate worker process as a security sandbox; install only plugins you trust. Executable React UI plugins and embedded browser automation are not part of the native product.
+Built-in integrations run in Rust. Native backend plugins execute trusted code in separate processes with the daemon user's privileges. Process isolation is not a security sandbox; install only plugins you trust. Executable React UI plugins and embedded browser automation are not part of the native product.
 
 ## Agent authentication
 
@@ -135,7 +135,7 @@ Paseo wraps agent CLIs (Claude Code, Codex, OpenCode, Muse Code) but does not ma
 - **Codex**, uses your OpenAI API key or OAuth session
 - **OpenCode**, configured via provider-specific API keys
 
-Agents run in your user context with their existing credentials. Paseo can also read explicitly configured provider credentials, including OpenAI speech keys, so protect `config.json`, the daemon environment, and backups as sensitive state. These credentials are distinct from relay pairing and Hub enrollment.
+Agents run in your user context with their existing credentials. Protect `config.json`, the daemon environment, and backups as sensitive state because they may contain provider credentials. These credentials are distinct from relay pairing and Hub enrollment.
 
 ## Hub identities and credentials
 

@@ -4,7 +4,7 @@ use super::{
     output::{Format, Output},
     positional, string, switch,
 };
-use crate::client::DaemonClient;
+use paseo_client::DaemonClient;
 use anyhow::{Result, anyhow};
 use clap::{ArgMatches, Command};
 use serde_json::{Value, json};
@@ -53,7 +53,6 @@ pub fn commands() -> Vec<Command> {
                     .arg(positional("id", true))
                     .arg(switch("refresh", "refresh")),
             ]),
-        Command::new("speech").about("Speech commands"),
         plugins::command(),
     ]
 }

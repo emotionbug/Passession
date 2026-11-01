@@ -133,9 +133,15 @@ pub trait AgentSession: Send + Sync {
     async fn set_thinking_option(&self, option: Option<&str>) -> Result<Option<Value>>;
     async fn set_feature(&self, feature: &str, value: Value) -> Result<()>;
     async fn rewind(&self, target: RewindTarget, message_id: &str) -> Result<()>;
-    /// False means this prompt is not an out-of-band command, not that a
-    /// recognized command failed. A recognized failure must be returned.
-    async fn try_out_of_band(&self, prompt: &Value) -> Result<bool>;
+    /// Recognize without requests or events. The manager publishes the accepted
+    /// prompt before polling this owned operation outside its admission barrier.
+    /// Execution failures become command-error stream events, not rejected sends.
+    fn prepare_out_of_band(
+        self: Arc<Self>,
+        _prompt: &Value,
+    ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
+        None
+    }
 }
 
 #[async_trait]

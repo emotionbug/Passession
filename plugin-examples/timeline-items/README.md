@@ -1,17 +1,9 @@
-> The native Paseo client does not run client UI plugins. This example only exercises the SDK's client types; it does not add anything to the native app.
+# Pi tasks: unsupported client transformer example
 
-# Pi tasks timeline plugin example
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-This example has no server entry, so a native Paseo daemon rejects it on install
-(`Native Paseo requires index.server.ts or index.server.tsx`). The native client does not run
-timeline transformers or renderers.
+The former example converted Pi task results into custom timeline items and rendered them with React. Flutter does not execute plugin timeline transforms/renderers. A native backend should validate tool payloads, preserve unrelated or malformed output and emit standard todo/tool snapshots with stable IDs. This directory is not an installable native task renderer.
 
-The transformer in `shared/pi-tasks.ts` recognizes Pi `todo` tool calls from both
-`@juicesharp/rpiv-todo` and Pi's `examples/extensions/todo.ts`, and replaces the tool-call entry
-with a versioned `pi-task-list` item. The rpiv shape preserves `pending`, `in_progress`, and
-`completed`; deleted tombstones are omitted. Pi's example shape maps `done` to `completed` or
-`pending`. Malformed results and unrelated tool calls return `undefined`, which keeps the original
-entry. `client/pi-tasks.tsx` is the React Native renderer for the item.
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
 
-`pi-tasks.test.ts` tests the transformer. From the repository root,
-`npm run typecheck --workspace=@getpaseo/plugin` checks this example against the SDK's client types.
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

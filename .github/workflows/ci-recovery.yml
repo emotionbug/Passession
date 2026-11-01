@@ -11,7 +11,8 @@ on:
         default: quality
         options:
           - quality
-          - typecheck
+          - rust-clippy
+          - relay-edge
           - native-daemon-linux
           - native-daemon-windows
           - native-daemon-macos

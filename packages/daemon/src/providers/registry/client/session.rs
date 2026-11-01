@@ -97,7 +97,10 @@ impl AgentSession for Session {
     async fn rewind(&self, target: RewindTarget, message_id: &str) -> Result<()> {
         self.inner.rewind(target, message_id).await
     }
-    async fn try_out_of_band(&self, prompt: &Value) -> Result<bool> {
-        self.inner.try_out_of_band(prompt).await
+    fn prepare_out_of_band(
+        self: std::sync::Arc<Self>,
+        prompt: &Value,
+    ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
+        self.inner.clone().prepare_out_of_band(prompt)
     }
 }

@@ -6,19 +6,18 @@ Paseo is an environment for running, monitoring and controlling your local AI co
 
 ## Repository map
 
-Rust and Flutter own the product. An npm workspace holds the TypeScript SDKs, relay, extension worker, tooling and website.
+Rust and Flutter own the product. Cargo also owns the SDKs, relay, native plugin runtime, and build/release tooling. The unused website is retired.
 
 - `packages/daemon` — Rust daemon and `paseo` CLI: agent lifecycle, WebSocket API, MCP server, providers, desktop host IPC
-- `packages/daemon/plugin-worker` — External-Node worker for optional JavaScript backend extensions
 - `packages/flutter_app` — Native client for Linux, macOS, Windows, Android and iOS
 - `packages/flutter_audio` — Native audio plugin for the Flutter client
 - `packages/flutter_desktop_host` — Desktop packaging, desktop integrations plugin, updater, vendored `desktop_multi_window`
-- `packages/protocol` — Wire schemas and types (TypeScript)
-- `packages/client` — External TypeScript SDK (`@getpaseo/client`)
-- `packages/plugin` — Backend extension author SDK (`@getpaseo/plugin`)
-- `packages/relay` — E2E encrypted relay for remote access
-- `packages/highlight` — Syntax highlighting package (`@getpaseo/highlight`)
-- `packages/website` — Marketing site (paseo.sh)
+- `packages/protocol` — Shared Rust wire types, validation and relay cryptography (`paseo-protocol`)
+- `packages/client` — Rust client SDK (`paseo-client`)
+- `packages/plugin` — Native backend plugin SDK (`paseo-plugin`)
+- `packages/relay` — E2E encrypted relay for remote access (`paseo-relay`)
+- `packages/highlight` — Rust syntax highlighting library (`paseo-highlight`)
+- `xtask` — Cargo development, build, packaging and release commands
 - `plugins/` — First-party backend extensions (usage sources, providers); `plugin-examples/` — SDK examples
 
 The native client is a port of the original React Native/Expo and Electron app at commit `c3bac24ccc2df8dcc67d807c805db0efa0817dff`. Behavior, copy and geometry follow that app; Dart doc comments name the original file a widget ports. Read it with `git show c3bac24:packages/app/src/<path>`.
@@ -37,7 +36,7 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | [docs/timeline-sync.md](docs/timeline-sync.md)                       | Live stream vs authoritative history, gap recovery, resume, projected pages vs live presentation                  |
 | [docs/data-model.md](docs/data-model.md)                             | File-based JSON persistence: agents, config, schedules, project/workspace registries, Flutter client stores       |
 | [docs/glossary.md](docs/glossary.md)                                 | Authoritative terminology — UI label wins, no synonyms                                                            |
-| [docs/coding-standards.md](docs/coding-standards.md)                 | Commit to a shape, types, errors, density, module structure, native runtime and website rules                     |
+| [docs/coding-standards.md](docs/coding-standards.md)                 | Commit to a shape, types, errors, density, module structure and native runtime rules                              |
 | [docs/design.md](docs/design.md)                                     | Native design — theme ownership, reuse, hierarchy, density, states, what's forbidden                              |
 | [docs/forms.md](docs/forms.md)                                       | Native forms — settings, schedule, host and creation widgets, state and load gating                               |
 | [docs/hover.md](docs/hover.md)                                       | Hover and input affordances — shared hit regions for rows and their actions                                       |
@@ -55,15 +54,14 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | [docs/providers.md](docs/providers.md)                               | Adding a native agent provider end-to-end                                                                         |
 | [docs/forge-providers.md](docs/forge-providers.md)                   | Adding a git forge: native daemon boundary, Flutter Git presentation                                              |
 | [docs/custom-providers.md](docs/custom-providers.md)                 | Custom provider config: Z.AI, Alibaba/Qwen, ACP agents, profiles, custom binaries                                 |
-| [docs/plugins.md](docs/plugins.md)                                   | Backend extensions — Rust built-ins, the optional JavaScript worker, manifests and RPCs                           |
+| [docs/plugins.md](docs/plugins.md)                                   | Backend extensions — Rust built-ins, native plugin executables, manifests and RPCs                               |
 | [docs/hub.md](docs/hub.md)                                           | Paseo Hub — opt-in connection, authority, session grants, revocation                                              |
-| [docs/website-i18n.md](docs/website-i18n.md)                         | Website languages: locale URLs, translated Markdown pairs, `{#id}` anchors, Chinese style                         |
 | [docs/service-proxy.md](docs/service-proxy.md)                       | Service proxy: exposing workspace scripts at public URLs, DNS setup, reverse proxy config                         |
 | [docs/relay-endpoint-security.md](docs/relay-endpoint-security.md)   | Relay E2EE modes: Noise NK mapping, record framing, negotiation, the `requireProtectedSecurity` flag, close codes |
 | [docs/development.md](docs/development.md)                           | Toolchains, dev commands, isolated state and endpoints, native builds, source ownership                           |
 | [docs/rpc-namespacing.md](docs/rpc-namespacing.md)                   | WebSocket RPC naming convention — dotted namespaces and `.request`/`.response` pairs                              |
 | [docs/protocol-compatibility.md](docs/protocol-compatibility.md)     | Why app/daemon versions drift, protocol vs feature contract, capability gating, COMPAT tagging                    |
-| [docs/protocol-validation.md](docs/protocol-validation.md)           | TypeScript SDK inbound validation (zod-aot), schema-purity rules, native validation boundary                      |
+| [docs/protocol-validation.md](docs/protocol-validation.md)           | Rust wire validation, forward-compatible decoding and native validation boundaries                              |
 | [docs/connected-hosts.md](docs/connected-hosts.md)                   | Daemon-owned host registrations, routed SDK scopes, identity and authority boundaries                             |
 | [docs/permissions.md](docs/permissions.md)                           | Semantic daemon permissions, principals, credentials, pairing invitations, and Hub authority                      |
 | [docs/terminal-activity.md](docs/terminal-activity.md)               | Workspace setup and service scripts as daemon-owned PTYs with read-only client logs                               |
@@ -108,19 +106,18 @@ Do not:
 ## Quick start
 
 ```bash
-npm run dev                          # Start the Rust dev daemon
-npm run dev:app                      # Run the desktop Flutter client against the dev daemon
-npm run dev:android -- --device <id> # Run the Android client on a device
-npm run cli -- ls -a -g              # List all agents
-npm run cli -- daemon status         # Check daemon status
-npm run typecheck                    # cargo check, TypeScript workspaces, flutter analyze
-npm run lint                         # oxlint (JS/TS)
-npm run format                       # oxfmt (JS/TS/JSON/Markdown/YAML/CSS)
+cargo xtask dev daemon                 # Start the isolated Rust dev daemon
+cargo xtask dev app                    # Run the desktop Flutter client
+cargo xtask dev app android --device <id>
+cargo xtask dev cli ls -a -g            # List agents in the dev home
+cargo xtask dev cli daemon status
+cargo check --locked --workspace --all-targets
+cargo xtask flutter analyze
 ```
 
-Repo dev commands use checkout-local state. `PASEO_HOME` resolves to `.dev/paseo-home`, the dev daemon listens on `127.0.0.1:6768`, and `npm run cli -- ...` targets that same dev home. The installed daemon and app keep using `~/.paseo` on port `6767`.
+Repo dev commands use checkout-local state. `PASEO_HOME` resolves to `.dev/paseo-home`, the dev daemon listens on `127.0.0.1:6768`, and `cargo xtask dev cli ...` targets that same dev home. The installed daemon and app keep using `~/.paseo` on port `6767`.
 
-When Mo requests an APK, use `npm run build:apk:arm64` for an ARM64 build: it writes the APK to `artifacts/flutter/` (debug-signed without a release key) without starting a device; `npm run build:apk` builds a universal APK.
+When Mo requests an APK, use `cargo xtask build-flutter android --arch arm64`: it writes the APK to `artifacts/flutter/` (debug-signed without a release key) without starting a device. Omit `--arch arm64` for a universal APK.
 
 See [docs/development.md](docs/development.md) for toolchains, isolated state, native builds and source ownership.
 
@@ -137,21 +134,17 @@ and updating `next`, integrating it after a release, and releasing a hotfix from
 - **NEVER assume a timeout means the service needs restarting** — timeouts can be transient.
 - **NEVER add auth checks to tests** — agent providers handle their own auth.
 - **Before changing navigation, startup routing, remembered workspace restore, or active workspace selection, read [docs/expo-router.md](docs/expo-router.md).**
-- **NEVER run the full test suites locally.** `cargo test`, `flutter test` and the Node suites are heavy and will freeze the machine, especially if multiple agents run them in parallel. Rules:
-  - Run only the tests for what you changed: `cargo test --locked -p paseo-daemon --lib <test-name-filter>`, `npm run test:flutter -- test/<file>_test.dart`, or `npx vitest run <file> --bail=1` in a TypeScript workspace.
-  - Never run `npm run test` or a whole suite unless explicitly asked, and never run two heavy suites at once.
-  - If you must run a broad suite, pipe output to a file and read it afterward: `npm run test:flutter > /tmp/test-output.txt 2>&1` then read the file.
+- **NEVER run the full test suites locally.** Rust and Flutter suites are heavy and will freeze the machine, especially if multiple agents run them in parallel. Rules:
+  - Run only the tests for what you changed: `cargo test --locked -p <crate> --lib <test-name-filter>` or `cargo xtask flutter test test/<file>_test.dart`.
+  - Never run a whole suite unless explicitly asked, and never run two heavy suites at once.
+  - Keep long check output in a captured log rather than flooding the conversation.
   - Never re-run a test suite that another agent already ran and reported green — trust the result.
   - For full suite verification, push to CI and check GitHub Actions instead.
-- Add tests to existing suites and reuse their npm scripts and CI jobs instead of creating feature-specific ones.
-- **Always run typecheck and lint for what you changed.** Rust: `npm run typecheck:daemon`. Dart: `npm run typecheck:flutter`. TypeScript: `npm run typecheck:node` and `npm run lint`.
-- **Build workspace packages before diagnosing cross-package TypeScript type errors.** The TypeScript workspaces consume generated declarations from each other. If typecheck fails in a package that depends on another workspace, run `npm run build:client` to rebuild protocol and client declarations first. Do not patch inferred callback parameters or add local duplicate types just to silence stale declaration errors.
-- **Run `npm run format` before committing.** `oxfmt` formats JS/TS/JSON/Markdown/YAML/CSS. Do not manually fix formatting — let the formatter handle it. Rust and Dart have no repository formatter; match the surrounding file.
-- **Always use npm scripts for linting and formatting.** Do not run tools directly with `npx oxfmt`, `npx oxlint`, or package-local binaries. For targeted checks, pass file paths through the npm script:
-  - `npm run lint -- packages/client/src/daemon-client.ts`
-  - `npm run format:files -- AGENTS.md packages/client/src/daemon-client.ts`
+- Add behavioral tests to existing Rust and Flutter suites and reuse their CI jobs instead of creating feature-specific ones.
+- **Check and lint the changed surface.** Rust: `cargo check --locked -p <crate> --all-targets` and scoped Clippy. Dart: `cargo xtask flutter analyze`.
+- Match surrounding Rust/Dart formatting; do not mass-reformat unrelated legacy files. No npm formatter or TypeScript build step is required.
 - **The protocol stays backward-compatible. Features don't have to.** Read [docs/protocol-compatibility.md](docs/protocol-compatibility.md) before touching the wire protocol in `packages/protocol` or the daemon's message handling. The short version:
-  - **Protocol contract (always):** an old client parses messages from a new daemon, and a new daemon parses messages from an old client. New fields are optional; never narrow, never remove, never require. Wire schemas stay pure — no `.transform()`, `.catch()`, or `.preprocess()`.
+  - **Protocol contract (always):** an old client parses messages from a new daemon, and a new daemon parses messages from an old client. New fields are optional; never narrow, never remove, never require. Validation must not silently transform messages or substitute defaults for malformed input.
   - **Feature contract (per-feature):** gate the capability once on `server_info.features.*`, then run the feature or tell the user to update the host. No fallback paths, no defensive branches.
   - **Every shim is tagged.** `// COMPAT(name): added in vX, remove after <date>` at the site that has to be deleted. `rg "COMPAT\("` is the cleanup backlog; untagged back-compat is permanent by accident.
   - **New RPCs use dotted namespaces with direction suffixes.** Follow [docs/rpc-namespacing.md](docs/rpc-namespacing.md): `domain.provider.operation.request` pairs with `domain.provider.operation.response`. Existing flat RPC names will migrate over time; don't add new ones.
@@ -169,7 +162,7 @@ The Flutter client targets Linux, macOS and Windows desktops and Android and iOS
 
 - **Keep the original's platform branches.** The original app's native (iOS/Android) behavior maps to Android and iOS; its web and Electron behavior maps to the desktop targets. A branch that differs from the original is a bug, not a simplification.
 - **Don't use the platform as a proxy for layout.** A narrow desktop window is compact; use `isCompactLayout`, not `defaultTargetPlatform`.
-- **The native client excludes** the interactive terminal UI (daemon PTYs and read-only script/setup logs stay), the web client, embedded browser and Electron, executable React UI plugins, and microphone dictation and voice input (audio output stays). Don't reintroduce them.
+- **The native product excludes** the interactive terminal UI (daemon PTYs and read-only script/setup logs stay), the web client, embedded browser and Electron, executable React UI plugins, speech recognition, voice conversation and TTS. Generic effect-sound playback stays. Don't reintroduce the excluded features.
 
 ## Debugging
 

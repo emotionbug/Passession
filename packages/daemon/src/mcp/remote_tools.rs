@@ -7,8 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     state::AppState,
-    transport::hosts::{HostClient, HostError},
+    transport::hosts::HostClient,
 };
+use paseo_client::transport::HostError;
 
 pub(super) fn server_identity(app: &AppState) -> Result<String> {
     app.transport
@@ -64,19 +65,6 @@ pub(super) async fn execute(
     };
     let mut prompt_submitted = false;
     let operation = async {
-        if let Some(caller) = caller {
-            if app
-                .mcp
-                .caller_context(caller)
-                .await
-                .as_ref()
-                .and_then(|context| context.get("lockedCwd"))
-                .and_then(Value::as_str)
-                .is_some_and(|cwd| !cwd.is_empty())
-            {
-                bail!("This caller is restricted to its local working directory");
-            }
-        }
         let client = app.transport.hosts.tool_client(destination, cancel).await?;
         let operation = {
             let request = execute_remote(

@@ -9,7 +9,7 @@ use super::api::{
     AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
     RewindTarget,
 };
-use crate::process::{CommandSpec, run};
+use paseo_client::process::{CommandSpec, run};
 use crate::providers::registry::catalog::refresh_activity;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -1331,9 +1331,6 @@ impl AgentSession for ClaudeSession {
                 .await?;
         }
         Ok(())
-    }
-    async fn try_out_of_band(&self, _prompt: &Value) -> Result<bool> {
-        Ok(false)
     }
 }
 

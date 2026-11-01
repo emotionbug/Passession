@@ -6,10 +6,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::wire::{Error, diagnostic};
-use crate::{
-    process::{self, CommandSpec},
-    providers::api::ProviderSpec,
-};
+use paseo_client::process::{self, CommandSpec};
+use crate::{ providers::api::ProviderSpec, };
 
 pub fn modes() -> Vec<Value> {
     vec![

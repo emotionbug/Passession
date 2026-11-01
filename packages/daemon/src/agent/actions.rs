@@ -269,21 +269,28 @@ impl AgentManager {
             self.change_mode(cell, session.as_ref(), mode).await?;
         }
         let command = notifications::agent_message_command(&prompt).map(Value::String);
-        self.drain_events(cell).await?;
-        cell.data.lock().await.staged_events = Some(Vec::new());
-        let out_of_band = session
-            .try_out_of_band(command.as_ref().unwrap_or(&prompt))
-            .await;
-        let submitted = if matches!(out_of_band, Ok(true)) {
-            self.record_submitted(id, cell, prompt, client_id.as_deref(), None, false)
-                .await
-        } else {
-            Ok(())
-        };
-        let released = self.release_event_stage(cell).await;
-        submitted?;
-        released?;
-        if out_of_band? {
+        if let Some(run) = session.clone().prepare_out_of_band(command.as_ref().unwrap_or(&prompt)) {
+            self.drain_events(cell).await?;
+            self.record_submitted(id, cell, prompt, client_id.as_deref(), None, false).await?;
+            let sink = cell.sink.clone();
+            let cancel = cell.cancel.clone();
+            let provider = session.provider().to_owned();
+            tokio::spawn(async move {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    result = run => result,
+                };
+                if let Err(error) = result {
+                    let event = json!({"type":"timeline","provider":provider,"item":{
+                        "type":"assistant_message",
+                        "text":format!("[System Error] Out-of-band command failed: {error}")
+                    }});
+                    if let Err(report_error) = sink.emit(event).await {
+                        tracing::error!(error=%error,report_error=%report_error,"Failed to report out-of-band command failure");
+                    }
+                }
+            });
             return Ok(json!({"disposition":"out_of_band"}));
         }
         if is_busy(&before) && input["activeTurnBehavior"] == "steer" {
@@ -292,11 +299,12 @@ impl AgentManager {
             steer_options["expectedTurnId"] = json!(expected);
             steer_options["clearPendingPermissions"] =
                 json!(input["clearPendingPermissions"] == true);
-            self.drain_events(cell).await?;
-            cell.data.lock().await.staged_events = Some(Vec::new());
-            let steered = session
-                .steer_active_turn(prompt.clone(), steer_options)
-                .await;
+            self.begin_event_stage(cell).await?;
+            let steered = tokio::select! {
+                biased;
+                _ = cell.cancel.cancelled() => Err(anyhow!("Agent event consumer closed")),
+                result = session.steer_active_turn(prompt.clone(), steer_options) => result,
+            };
             if let Err(error) = steered {
                 self.release_event_stage(cell).await?;
                 return Err(error);
@@ -357,11 +365,10 @@ impl AgentManager {
             }
             replaced?;
         }
-        if let Err(error) = self.drain_events(cell).await {
+        if let Err(error) = self.begin_event_stage(cell).await {
             cell.data.lock().await.pending_replacement = false;
             return Err(error);
         }
-        cell.data.lock().await.staged_events = Some(Vec::new());
         let pending_id = uuid::Uuid::new_v4().to_string();
         let preparing = self
             .update_snapshot(cell, |snapshot| {
@@ -376,7 +383,11 @@ impl AgentManager {
             let _ = self.release_event_stage(cell).await;
             return Err(error);
         }
-        let accepted = session.start_turn(prompt.clone(), options).await;
+        let accepted = tokio::select! {
+            biased;
+            _ = cell.cancel.cancelled() => Err(anyhow!("Agent event consumer closed")),
+            result = session.start_turn(prompt.clone(), options) => result,
+        };
         cell.data.lock().await.pending_replacement = false;
         match accepted {
             Ok(accepted) => {
@@ -451,7 +462,7 @@ impl AgentManager {
     }
     /// agent-manager.ts recordSubmittedPrompt: human attempts stay in history on
     /// rejection; delivery notices require acceptance.
-    async fn record_submitted(
+    pub(super) async fn record_submitted(
         &self,
         id: &str,
         cell: &Arc<AgentCell>,
@@ -512,7 +523,13 @@ impl AgentManager {
     {
         let (snapshot, attention) = {
             let _commit = cell.commit.lock().await;
-            let mut snapshot = cell.data.lock().await.snapshot.clone();
+            let mut snapshot = {
+                let data = cell.data.lock().await;
+                if let Some(error) = &data.event_error {
+                    bail!("Agent event persistence failed: {error}");
+                }
+                data.snapshot.clone()
+            };
             let previous = snapshot["lifecycle"].as_str().map(str::to_owned);
             update(&mut snapshot)?;
             if touch {

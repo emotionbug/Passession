@@ -1646,9 +1646,6 @@ impl AgentSession for LegacySession {
             .await?;
         Ok(())
     }
-    async fn try_out_of_band(&self, _prompt: &Value) -> Result<bool> {
-        Ok(false)
-    }
 }
 impl Drop for Inner {
     fn drop(&mut self) {

@@ -11,8 +11,8 @@ The bar is four questions:
 
 Every pull request needs evidence for the questions its change touches. Pull requests without evidence get closed.
 
-For plugin changes, verify the [backend extension boundary](plugins.md#runtime-and-source-ownership).
-Exercise the Rust owner and optional external-Node worker; Flutter does not load React client plugins.
+For plugin changes, verify the [native executable boundary](plugins.md#native-executable-contract).
+Exercise the Rust host and native plugin executable; Flutter does not load React client plugins.
 
 ## Evidence
 
@@ -71,7 +71,7 @@ Tests are evidence only when they exercise the real thing.
 
 - A bug fix needs a regression test that fails on the old code for the reported reason.
 - A feature needs tests that go through the same interface a user or a caller uses.
-- Native client flows need actual Flutter execution. Website Playwright checks cover the separate website, not the product client.
+- Native client flows need actual Flutter execution. Browser checks of a user's project do not cover the product client; the unused website is removed.
 - Agent provider work needs manual verification against the real provider by someone who can tell that it worked. A fixture and a mock prove the fixture parses, nothing more.
 
 Tests that mock away the behavior, assert on internals, or pass against the broken code claim coverage that isn't there.

@@ -183,7 +183,7 @@ impl Store {
     }
 }
 pub(super) fn home() -> Result<PathBuf> {
-    crate::client::resolve_home(std::env::var("PASEO_HOME").ok().as_deref())
+    paseo_client::resolve_home(std::env::var("PASEO_HOME").ok().as_deref())
 }
 #[cfg(test)]
 mod tests {

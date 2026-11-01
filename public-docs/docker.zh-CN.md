@@ -8,7 +8,7 @@ nav: Docker
 
 原生容器为服务器和开发主机运行 Rust daemon 与 CLI。请使用远程 Flutter 桌面/移动客户端或 CLI 连接；它不提供 Web 产品客户端，也不包含 Node、Electron、Chromium 或内嵌浏览器自动化。
 
-0.13.0 原生迁移检出尚未发布，已发布的 `latest` 镜像不能证明包含此运行时。请从当前检出构建本地镜像：
+本文描述 0.13.1 源码检出，不代表版本已经发布。已发布的 `latest` 镜像不能证明包含此运行时。请从当前检出构建本地镜像：
 
 ```bash
 docker build -f docker/base/Dockerfile -t paseo-native:local .
@@ -69,7 +69,7 @@ docker compose up -d
 
 可参考现有的 [`docker/Dockerfile.agents.example`](https://github.com/getpaseo/paseo/blob/main/docker/Dockerfile.agents.example)，将基础镜像改为本地原生镜像。按照各 Provider 支持的分发方式安装，并提供其所需运行时。基础镜像没有 `node` 或 `npm`；使用 npm 安装 Provider 前，需要在子镜像中显式添加这些工具。
 
-可选 JavaScript 后端插件同样需要外部安装的 Node 20+，必要时用 `PASEO_PLUGIN_NODE` 指定。内置 Rust 集成不需要它。仓库构建使用 Node 24。
+后端插件使用 Rust `paseo-plugin` SDK 构建的原生可执行文件，目标架构须与容器一致。原有 JavaScript/TypeScript 插件需要移植。Paseo 仓库构建和插件运行时不需要 Node。
 
 然后在 Compose 中使用构建出的子镜像。
 

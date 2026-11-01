@@ -48,6 +48,43 @@ fn removed_frontend_settings_do_not_survive_normalization() {
 }
 
 #[test]
+fn retired_service_settings_migrate_without_changing_agent_providers() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.json");
+    let providers = json!({"claude":{"env":{"OPENAI_API_KEY":"agent-key"},"enabled":false}});
+    let legacy = json!({
+        "providers": {
+            "openai": {"apiKey":"retired-key","stt":{"model":"retired-model"}},
+            "local": {"modelsDir":"/retired-models"}
+        },
+        "features": {
+            "dictation": {"enabled":true,"stt":{"provider":"retired-provider"}},
+            "voiceMode": {"enabled":true,"tts":{"speed":"retired-value"}}
+        },
+        "agents": {"providers":providers}
+    });
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let persisted = storage::read(home.path(), false, false).unwrap();
+    assert!(persisted.get("providers").is_none());
+    assert_eq!(persisted["features"], json!({}));
+    assert_eq!(persisted["agents"]["providers"], providers);
+    let environment = std::collections::BTreeMap::from([
+        ("PASEO_DICTATION_STT_PROVIDER".to_owned(), "retired-provider".to_owned()),
+        ("PASEO_VOICE_LOCAL_TTS_SPEED".to_owned(), "retired-value".to_owned()),
+        ("OPENAI_API_KEY".to_owned(), "retired-key".to_owned()),
+    ]);
+    let resolved =
+        super::resolve::resolve(home.path(), home.path(), &persisted, &environment).unwrap();
+    assert_eq!(resolved["providerOverrides"], providers);
+    assert!(resolved.get("speech").is_none());
+    assert!(resolved.get("openai").is_none());
+    assert!(resolved.get("voiceLlmProvider").is_none());
+    assert_eq!(resolved["configReload"]["env"], json!({}));
+    storage::save(home.path(), &persisted).unwrap();
+    assert_eq!(storage::read(home.path(), false, false).unwrap(), persisted);
+}
+
+#[test]
 fn reload_diff_distinguishes_missing_and_explicit_null() {
     let mut paths = Vec::new();
     transactions::diff(
@@ -176,6 +213,9 @@ fn editable_configuration_paths_stop_at_dynamic_boundaries() {
         "agents.skills.selection.mode",
         "daemon.browserTools",
         "features.webUi",
+        "providers",
+        "features.dictation",
+        "features.voiceMode",
     ] {
         assert!(super::validate_persisted_path(path).is_err(), "{path}");
     }

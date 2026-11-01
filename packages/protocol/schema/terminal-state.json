@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "rows": {
+      "type": "number"
+    },
+    "cols": {
+      "type": "number"
+    },
+    "grid": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "char": {
+              "type": "string"
+            },
+            "fg": {
+              "type": "number"
+            },
+            "bg": {
+              "type": "number"
+            },
+            "fgMode": {
+              "type": "number"
+            },
+            "bgMode": {
+              "type": "number"
+            },
+            "bold": {
+              "type": "boolean"
+            },
+            "italic": {
+              "type": "boolean"
+            },
+            "underline": {
+              "type": "boolean"
+            },
+            "dim": {
+              "type": "boolean"
+            },
+            "inverse": {
+              "type": "boolean"
+            },
+            "strikethrough": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "char"
+          ]
+        }
+      }
+    },
+    "scrollback": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "char": {
+              "type": "string"
+            },
+            "fg": {
+              "type": "number"
+            },
+            "bg": {
+              "type": "number"
+            },
+            "fgMode": {
+              "type": "number"
+            },
+            "bgMode": {
+              "type": "number"
+            },
+            "bold": {
+              "type": "boolean"
+            },
+            "italic": {
+              "type": "boolean"
+            },
+            "underline": {
+              "type": "boolean"
+            },
+            "dim": {
+              "type": "boolean"
+            },
+            "inverse": {
+              "type": "boolean"
+            },
+            "strikethrough": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "char"
+          ]
+        }
+      }
+    },
+    "cursor": {
+      "type": "object",
+      "properties": {
+        "row": {
+          "type": "number"
+        },
+        "col": {
+          "type": "number"
+        },
+        "hidden": {
+          "type": "boolean"
+        },
+        "style": {
+          "type": "string",
+          "enum": [
+            "block",
+            "underline",
+            "bar"
+          ]
+        },
+        "blink": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "col"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "gridWrapped": {
+      "type": "array",
+      "items": {
+        "type": "boolean"
+      }
+    },
+    "scrollbackWrapped": {
+      "type": "array",
+      "items": {
+        "type": "boolean"
+      }
+    }
+  },
+  "required": [
+    "rows",
+    "cols",
+    "grid",
+    "scrollback",
+    "cursor"
+  ]
+}

@@ -1,92 +1,83 @@
----
-title: SDK quickstart
-description: Connect to a Paseo daemon, run one coding agent, and read its reply.
-nav: Quickstart
-order: 51
-category: TypeScript SDK
----
-
 # SDK quickstart
 
-```bash
-npm install @getpaseo/client
+[中文](quickstart.zh-CN.md) · [SDK overview](index.md)
+
+Use Rust 1.93 or newer. Create an application beside your Paseo checkout and use these path dependencies; adjust paths to your checkout. These instructions do not assume a published crate or release.
+
+```toml
+[package]
+name = "paseo-integration"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+
+[dependencies]
+paseo-client = { path = "../paseo/packages/client" }
+paseo-protocol = { path = "../paseo/packages/protocol" }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = "0.7"
 ```
-
-The external SDK requires Node.js 22 or newer. This is a requirement for your JavaScript/TypeScript integration, not the Rust daemon or Flutter client. Repository builds use Node 24.
-
-Build the unpublished native runtime from the checkout as described in [Updates](/docs/updates), then use `paseo onboard` for explicit setup and `paseo daemon start` to start it. Bare `paseo` opens chat; the SDK npm package does not install a daemon.
 
 ## Connect
 
-```ts
-import { createPaseoClient } from "@getpaseo/client";
-
-const client = createPaseoClient({ url: "ws://127.0.0.1:6767/ws" });
-await client.connect();
-```
-
-`connect()` resolves once the daemon has identified itself. If the daemon has a password, pass it:
-
-```ts
-const client = createPaseoClient({
-  url: "wss://devbox.example.com/ws",
-  password: "my-secret",
-});
-```
+Start or select your own development daemon using the [repository instructions](../../README.md). Connecting never starts a daemon. `DaemonTarget::select(None, None, false)` reads `PASEO_HOST` or `PASEO_HOME`, otherwise uses the default local home. Setting both environment variables is ambiguous; select one explicitly. Local discovery reads the daemon's published endpoint and uses its matching local credential. For a remote endpoint, set `PASEO_HOST` and supply the daemon password when required.
 
 ## Create an agent
 
-```ts
-const agent = await client.agents.create({
-  config: { provider: "codex/gpt-5.5" },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Review the current diff and name the riskiest change.",
-});
-```
+Save the following as `src/main.rs`. Install/authenticate the external provider on the daemon host, discover a Codex model using [Providers](providers.md), and set `PASEO_MODEL` to that model's ID. Working directories are paths on the daemon host; replace `current_dir()` for remote use.
 
-`config.provider` is always `provider/model`. [Providers](/docs/sdk/providers) lists what the daemon has available and how to discover it at runtime.
+```rust
+use anyhow::{Context, Result};
+use paseo_client::{ConnectOptions, DaemonClient, DaemonTarget, RequestOptions};
+use serde_json::json;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
-`cwd` is the directory the agent works in. Paseo creates the workspace behind it. [Workspaces](/docs/sdk/workspaces) covers reusing one instead.
+#[tokio::main]
+async fn main() -> Result<()> {
+    let target = DaemonTarget::select(None, None, false)?;
+    let mut options = ConnectOptions::new(target);
+    options.password = std::env::var("PASEO_PASSWORD").ok();
+    let client = DaemonClient::connect(options, CancellationToken::new()).await?;
 
-`create()` resolves as soon as the session exists. The prompt is still running.
-
-## Wait for the reply
-
-```ts
-const result = await agent.waitForFinish();
-
-if (result.status === "idle") {
-  console.log(result.lastMessage);
+    let result: Result<()> = async {
+        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        let model = std::env::var("PASEO_MODEL")
+            .context("set PASEO_MODEL to a model ID discovered for codex")?;
+        let created = client.create_agent(json!({
+            "config": {"provider": "codex", "model": model, "cwd": cwd},
+            "initialPrompt": "Review the current diff and identify its greatest risk."
+        }), RequestOptions::default()).await?;
+        let id = created["agent"]["id"].as_str().context("missing agent ID")?;
+        let outcome = client.wait_for_finish(id, RequestOptions {
+            timeout: Duration::from_secs(300),
+            ..RequestOptions::default()
+        }).await?;
+        println!("{}: {}", outcome["status"], outcome["lastMessage"]);
+        Ok(())
+    }.await;
+    client.close().await;
+    result
 }
 ```
 
-`waitForFinish()` waits up to 10 minutes by default; pass milliseconds to change it. It returns one of four statuses:
+## Wait for the reply
 
-| Status       | Meaning                                                           |
-| ------------ | ----------------------------------------------------------------- |
-| `idle`       | The turn finished and the agent can take another prompt.          |
-| `permission` | The agent needs a person to answer a permission request in Paseo. |
-| `error`      | The provider ended the turn with an error.                        |
-| `timeout`    | The deadline elapsed. The agent is still running.                 |
+Creation uses wire-shaped JSON: `config.provider` is the provider ID, `config.model` is the separate model ID, `config.cwd` is the directory, and `initialPrompt` starts the first turn. The return value is the response payload, not an agent handle. Keep `agent.id` for future calls.
+
+`wait_for_finish` returns a payload with `status`, `lastMessage`, `final`, and `error`, or an error for transport/RPC failures. Agent/provider turn failures remain outcomes in the returned payload: inspect `status` and `error` even when the Rust result is `Ok`. A request deadline or cancellation stops waiting, not the agent; see [error handling](reference.md#errors-and-cleanup).
 
 ## Disconnect
 
-```ts
-await client.close();
-```
+Always call `client.close().await` after your work, including on error as above. Dropping a client cancels its transport, but explicit close waits for tasks to finish. Neither action archives an agent. Explicitly archive temporary resources you own.
 
-The agent keeps running on the daemon and stays visible in Paseo. A later program reaches it again by ID:
-
-```ts
-const agent = client.agents.ref("agent_01H8X...");
-await agent.refresh();
-await agent.run("Now write the fix.");
-```
+Run your application with `cargo run`; this may create real provider work and incur usage. Examples are source examples, not a claim that a live daemon/provider run has been verified.
 
 ## Next
 
-- [Agents](/docs/sdk/agents), follow-up prompts, finding existing agents, archiving.
-- [Providers](/docs/sdk/providers), discovering models and modes from the daemon.
-- [Provider options](/docs/sdk/provider-options), sandboxing and provider-native settings.
-- [Workspaces](/docs/sdk/workspaces), reusing a workspace or creating a worktree.
-- [Events](/docs/sdk/events), streaming updates instead of waiting.
+- [Agents](agents.md): follow-ups, labels, parentage, structured output.
+- [Workspaces](workspaces.md): placement, background work and terminals.
+- [Events](events.md): owned subscriptions and history repair.
+- [Reference](reference.md): authentication, relay, SSH and protocol APIs.

@@ -126,6 +126,7 @@ impl PluginService {
                 .context("Plugin manifest missing id")?,
         );
         self.require_available_id(id)?;
+        self.validate_candidate(&directory).await?;
         self.patch_source(
             id,
             Some(json!({"source":"directory","path":directory,"enabled":true})),
@@ -165,6 +166,7 @@ impl PluginService {
             self.require_available_id(&id)?;
             let manifest = manifest::read(&candidate.directory).await?;
             manifest::check_compatibility(&manifest)?;
+            self.validate_candidate(&candidate.directory).await?;
             self.patch_source(
                 &id,
                 Some(json!({"source":"directory","path":candidate.directory,"enabled":true})),
@@ -441,12 +443,10 @@ impl PluginService {
         Ok(result)
     }
     async fn validate_candidate(&self, directory: &Path) -> Result<()> {
-        manifest::require_server_entry(directory).await?;
         let app = self.app.upgrade().context("Daemon is shutting down")?;
         let env = app.config.environment();
-        let executable = app.executable.clone();
         drop(app);
-        worker::validate(directory, &executable, env, self.stopping.clone()).await
+        worker::validate(directory, env, self.stopping.clone()).await
     }
 }
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {

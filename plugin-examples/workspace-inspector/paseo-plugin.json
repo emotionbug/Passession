@@ -1,0 +1,8 @@
+{
+  "id": "workspace-inspector",
+  "name": "Workspace Inspector",
+  "description": "Permission-gated local text-file statistics, settings and lifecycle integration without an AI service.",
+  "runtime": "native",
+  "requirements": { "paseo": ">=0.13.1" },
+  "server": { "executable": "target/debug/paseo-workspace-inspector", "args": [] }
+}

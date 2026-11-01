@@ -1,138 +1,88 @@
----
-title: 在 SDK 中使用工作区
-description: 把目录打开为 Paseo 工作区，在其中放置 Agent，跟踪改动并归档。
-nav: 工作区
----
+# 在 SDK 中使用工作区
 
-# 在 SDK 中使用工作区 {#workspaces-with-the-sdk}
+[English](workspaces.md) · [环境配置](quickstart.zh-CN.md)
 
-当集成需要为任务相关的 Agent、脚本/设置任务 PTY 和文件提供持久归属时，请使用工作区。Flutter 客户端没有内嵌浏览器或交互式终端 UI；任务日志为只读。
+工作区为 Agent、脚本/初始化 PTY 和文件提供持久归属。SDK 可以控制 daemon 保留的终端；Flutter 应用显示只读任务日志，不包含交互式终端。以下路径均属于 daemon 主机。
 
-## 打开目录 {#open-a-directory}
+## 打开目录
 
-```ts
-const workspace = await client.workspaces.open("/Users/me/dev/storefront");
+`client.open_project(json!({"cwd": directory})).await?` 打开项目目录并复用该精确目录的活动工作区。检查响应 payload，不要假定存在本地工作区句柄。它与请求新工作区的 `create_workspace` 不同。
 
-console.log(workspace.id);
-console.log(workspace.directory);
-```
+## 创建新工作区
 
-`open()` 会在需要时创建项目，并复用该目录对应的当前工作区。当目录本身就是你关心的身份标识时使用它。
+```rust
+use anyhow::Result;
+use paseo_client::{DaemonClient, RequestOptions};
+use serde_json::{Value, json};
 
-## 创建新的工作区 {#create-a-fresh-workspace}
-
-`create()` 总是创建新的工作区，即使已有其他工作区在使用该目录：
-
-```ts
-const workspace = await client.workspaces.create({
-  source: {
-    kind: "directory",
-    path: "/Users/me/dev/storefront",
-  },
-  title: "Checkout issue 42",
-});
-```
-
-当并行工作需要隔离的检出时，创建一个由 Paseo 管理的 worktree：
-
-```ts
-const workspace = await client.workspaces.create({
-  source: {
-    kind: "worktree",
-    cwd: "/Users/me/dev/storefront",
-    action: "branch-off",
-    refName: "main",
-    branchName: "fix/checkout-42",
-  },
-  title: "Checkout issue 42",
-});
-```
-
-传入 `agent` 可以在一次调用中同时创建工作区及其第一个 Agent。参见[后台工作区组合示例](./agents.md#run-work-in-a-background-workspace)。可见性在工作区选项中设置；`agent.background` 会被拒绝。
-
-如果你已经有 `projectId`，可以在任一种来源中传入它。大多数集成应该省略它；daemon 会根据目录查找或创建项目。
-
-传入 `background: true` 可以让工作区不出现在默认的发现结果中。它的 Agent 和终端仍然是持久的，有正常的历史记录、生命周期钩子、归档和精确 ID 访问。应用侧边栏提供 **显示后台工作区**，不会丢弃已同步的状态。
-
-`background` 只能在创建时设置。省略时默认为 false；当 `callerAgentId` 指明是某个 Agent 在创建新工作区时，省略则继承该 Agent 所在工作区的值。显式的 false 或 true 会覆盖继承。带 `workspaceId` 创建 Agent 时会拒绝显式的后台创建意图；请在创建工作区时配置可见性。SDK/RPC 的隐式 Agent 创建也接受 `background`，但它表示工作区的创建意图，而不是 Agent 的属性。
-
-创建和包含后台工作区的发现都需要 `features.backgroundWorkspaces`；对于不支持的主机，客户端会拒绝并提示更新主机。
-
-## 在工作区中启动 Agent {#start-an-agent-in-a-workspace}
-
-通过工作区句柄创建：
-
-```ts
-const agent = await workspace.agents.create({
-  config: {
-    provider: "claude/claude-sonnet-5",
-  },
-  prompt: "Map the checkout flow before changing anything.",
-});
-```
-
-句柄同时提供工作区身份和它的实际目录，避免位置参数不匹配。
-
-对于一次性的 Agent，可以跳过工作区调用：
-
-```ts
-const agent = await client.agents.create({
-  config: {
-    provider: "claude/claude-sonnet-5",
-  },
-  cwd: "/Users/me/dev/storefront",
-  prompt: "Map the checkout flow before changing anything.",
-});
-```
-
-daemon 仍然会创建一个项目和一个新的工作区。需要生成的工作区 ID 时，读取 `agent.workspaceId`。
-
-## 在工作区中启动终端 {#start-a-terminal-in-a-workspace}
-
-```ts
-const terminal = await workspace.terminals.create({ name: "Development" });
-terminal.write("echo ready");
-terminal.sendKeys(["Enter"]);
-
-const { lines } = await terminal.capture();
-const { entries } = await workspace.terminals.list();
-await terminal.kill();
-```
-
-两个工作区可以共享同一个目录。工作区句柄提供的 ID 让它们的终端相互独立。要使用你已有的 ID，请调用 `client.workspaces.ref(workspaceId).terminals.create()`。
-
-命令参数、工作目录覆盖、输入和捕获选项见[终端 API 参考](/docs/sdk/reference#clientterminals)。
-
-## 列出工作区 {#list-workspaces}
-
-```ts
-let cursor: string | undefined;
-
-do {
-  const page = await client.workspaces.list({
-    filter: { query: "storefront" },
-    page: { limit: 50, cursor },
-  });
-
-  for (const workspace of page.entries) {
-    console.log(workspace.id, workspace.name, workspace.status);
-  }
-
-  cursor = page.pageInfo.nextCursor ?? undefined;
-} while (cursor);
-```
-
-除非 `filter.includeBackground` 为 true，否则后台工作区不会被列出。使用 `client.workspaces.list({ filter: { includeBackground: true } })` 或 `client.agents.list({ filter: { includeBackground: true } })`。工作区描述符带有 `background`；Agent 的可见性来自它所在的工作区，没有单独的设置。
-
-## 刷新和归档句柄 {#refresh-and-archive-a-handle}
-
-```ts
-const workspace = client.workspaces.ref(savedWorkspaceId);
-const snapshot = await workspace.refresh();
-
-if (snapshot) {
-  await workspace.archive();
+async fn create_work(client: &DaemonClient, cwd: &str, model: &str) -> Result<Value> {
+    client.create_workspace(json!({
+        "source": {"kind": "directory", "path": cwd},
+        "title": "Checkout review",
+        "background": true,
+        "agent": {
+            "config": {"provider": "codex", "model": model, "cwd": cwd},
+            "initialPrompt": "Map the checkout flow before changing anything."
+        }
+    }), RequestOptions::default()).await
 }
 ```
 
-工作区归档与 Agent 归档是分开的。请按照你的集成所负责的生命周期分别归档每个资源。
+响应包含 `workspace`、可选 `agent` 和初始化/创建元数据，请保存 ID。若需要隔离检出，将 `source` 替换为 `{"kind":"worktree","cwd":cwd,"action":"branch-off","refName":"main","branchName":"fix/checkout-42"}`。目录和 worktree 来源均可携带 `projectId`，否则由 daemon 解析项目。Worktree 创建会确定实际目录；后续操作应使用返回的工作区目录，而非源仓库路径。
+
+`background` 属于工作区。省略时默认 false；提供 `callerAgentId` 时继承调用者工作区可见性。显式 true/false 覆盖继承。它仅用于创建；向已有工作区添加 Agent 不会改变可见性。嵌套的 `agent.background` 会被拒绝。通过 `create_agent` 隐式创建工作区时，只能在未指定已有 `workspaceId` 时使用顶层 `background`。
+
+请求后台创建或包含后台资源的发现前，调用 `client.require_feature("backgroundWorkspaces", "Update the host for background workspaces")?`。不要静默降级为可见工作。
+
+## 在工作区启动 Agent
+
+调用 `create_agent`，提供 `workspaceId` 和 `config: {provider, model, cwd}`，其中目录必须是工作区实际目录。不提供 `workspaceId` 时，创建 Agent 会按需建立项目和新工作区。原始 JSON API 不会像本地句柄那样代填位置字段。
+
+## 在工作区启动终端
+
+```rust
+use anyhow::{Context, Result};
+use paseo_client::DaemonClient;
+use serde_json::json;
+
+async fn run_log(client: &DaemonClient, workspace_id: &str, cwd: &str) -> Result<()> {
+    let created = client.create_terminal(json!({
+        "workspaceId": workspace_id, "cwd": cwd, "name": "Repository status",
+        "command": "git", "args": ["status", "--short"],
+        "size": {"rows": 24, "cols": 100}
+    })).await?;
+    let id = created["terminal"]["id"].as_str().context("missing terminal ID")?;
+    let capture = client.capture_terminal(json!({"terminalId": id, "stripAnsi": true})).await;
+    let cleanup = client.kill_terminal(json!({"terminalId": id})).await;
+    println!("{}", capture?);
+    cleanup?;
+    Ok(())
+}
+```
+
+Capture 是某一时刻的快照，不会等待进程退出。需要等待输出/退出时，使用 `Arc<DaemonClient>::observe_terminal` 接收 `TerminalEvent`，并释放其订阅；参见[参考](reference.zh-CN.md#terminals-and-files)。始终传入 `workspaceId`，以区分共享目录的工作区。`list_terminals` 接受相同位置上下文。通过 `TerminalStream::input` 写入输入；可执行文件与参数分开传递，切勿将不可信文本拼接进 shell 命令。
+
+## 列出工作区
+
+```rust
+use anyhow::Result;
+use paseo_client::{CursorPages, DaemonClient, RequestOptions};
+use serde_json::json;
+
+async fn list_work(client: &DaemonClient) -> Result<()> {
+    let mut pages = CursorPages::workspaces(json!({
+        "filter": {"query": "storefront", "includeBackground": true},
+        "page": {"limit": 50}
+    }));
+    while let Some(page) = pages.next(client, RequestOptions::default()).await? {
+        println!("{}", page["entries"]);
+    }
+    Ok(())
+}
+```
+
+除非 `filter.includeBackground` 为 true，否则不显示后台工作区。`fetch_workspaces` 返回单次 payload；`CursorPages::workspaces` 遍历所有页面并返回每页对象。游标是不透明值。
+
+## 刷新与归档
+
+Rust 不提供需刷新的本地句柄。使用 `fetch_workspaces` 读取最新数据，或持有[工作区观察](events.zh-CN.md)。使用 `archive_workspace(json!({"workspaceId": id})).await?` 显式归档。工作区归档不同于 Agent 归档。通过 `inspect_workspace_recovery` 检查恢复状态；仅当应用确实要恢复时调用 `restore_workspace`。只归档自己拥有的资源。

@@ -6,4 +6,4 @@ For client screenshots, launch the real Flutter application against an isolated 
 
 Use [testing](testing.md) for native smoke boundaries and [mobile testing](mobile-testing.md) for device-specific interaction. Linux evidence includes reviewed native host-tree, Markdown, large-diff and compact-sidebar captures. No equivalent Windows/macOS/iOS execution is implied.
 
-External links open outside Paseo. There is no browser-profile persistence, guest WebContents ownership, CDP screenshot path, embedded automation toolset or fallback webview to test in the native product. Website browser tests remain website tests and must not be reported as application coverage.
+External links open outside Paseo. There is no browser-profile persistence, guest WebContents ownership, CDP screenshot path, embedded automation toolset or fallback webview to test in the native product. The unused website is removed; browser tests of a user's project must not be reported as application coverage.

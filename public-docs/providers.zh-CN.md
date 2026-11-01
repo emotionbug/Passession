@@ -16,7 +16,7 @@ Provider 是 Paseo 与某个外部 Agent CLI 之间的约定：如何启动它�
 
 ## 两个层级 {#two-tiers}
 
-- **原生支持**：Paseo 为主流 Agent（Claude Code、Codex、OpenCode、Pi、[Antigravity](/docs/supported-providers#antigravity)、[Muse Code](/docs/muse-code)）内置了适配器。安装底层 CLI 后会被自动发现，并在适用时提供模式元数据和语音支持。
+- **原生支持**：Paseo 为主流 Agent（Claude Code、Codex、OpenCode、Pi、[Antigravity](/docs/supported-providers#antigravity)、[Muse Code](/docs/muse-code)）内置了适配器。安装底层 CLI 后会被自动发现，并在适用时提供模式元数据。
 - **ACP 目录**：任何使用 [Agent Client Protocol](https://agentclientprotocol.com) 的 Agent 都可以通过通用适配器获得支持。Paseo 提供一个精选目录，支持一键安装（Cursor、Gemini、GitHub Copilot、Hermes、Kimi、Qwen Code 等 25 个以上），你也可以自行添加任何其他 ACP Agent。
 
 无论哪种方式，**底层 CLI 都由你安装**，Paseo 负责运行它。

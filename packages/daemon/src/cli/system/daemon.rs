@@ -1,9 +1,10 @@
 use super::{duration, error, pretty, set_path};
 use crate::cli::{Context, flag, option, output::Output, positional, string, switch};
 use crate::{
-    client::{ClientError, ConnectOptions, DaemonClient, DaemonTarget},
+    client::ConnectOptions,
     daemon_control::{self as control, DaemonInstance, StartOptions, StopOptions},
 };
+use paseo_client::{ClientError, DaemonClient, DaemonTarget};
 use anyhow::{Context as _, Result, bail, ensure};
 use clap::{ArgMatches, Command};
 use serde_json::{Value, json};
@@ -333,7 +334,7 @@ pub(crate) async fn observe_status(
     let mut options = ConnectOptions::new(target.clone());
     options.instance = instance.clone();
     options.timeout = Duration::from_millis(1500);
-    let client = match DaemonClient::connect(options, cancel.child_token()).await {
+    let client = match crate::client::connect(options, cancel.child_token()).await {
         Ok(client) => client,
         Err(failure) => {
             if matches!(target, DaemonTarget::Endpoint { .. }) {
@@ -454,7 +455,7 @@ pub(crate) async fn restart_confirmed(
         let mut options = ConnectOptions::new(target.clone());
         options.instance = instance.clone();
         options.timeout = timeout;
-        DaemonClient::connect(options, cancel.child_token())
+        crate::client::connect(options, cancel.child_token())
     };
     let client = connect(remaining()).await?;
     let previous = async {
@@ -625,7 +626,7 @@ pub async fn pairing(
     }
     let mut options = ConnectOptions::new(target.clone());
     options.timeout = Duration::from_millis(1500);
-    let client = DaemonClient::connect(options, cancel.child_token()).await?;
+    let client = crate::client::connect(options, cancel.child_token()).await?;
     let result = async {
         client.require_feature(
             "daemonStatusRpc",
@@ -743,34 +744,6 @@ pub async fn onboard(m: &ArgMatches, ctx: &Context) -> Result<Output> {
         )?;
     }
     crate::config::save_persisted(&home, &config).await?;
-    let saved_voice = config
-        .pointer("/features/voiceMode/enabled")
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            config
-                .pointer("/features/dictation/enabled")
-                .and_then(Value::as_bool)
-        });
-    let voice = match string(m, "voice").unwrap_or("ask") {
-        "enable" => true,
-        "disable" => false,
-        _ => match saved_voice {
-            Some(voice) => voice,
-            None if super::prompts::interactive() => {
-                super::prompts::confirm(
-                    "Enable voice features? (downloads local STT/TTS models in background)",
-                    false,
-                    &ctx.cancel,
-                )
-                .await?
-            }
-            None => false,
-        },
-    };
-    for path in ["features.voiceMode.enabled", "features.dictation.enabled"] {
-        set_path(&mut config, path, Some(json!(voice)))?;
-    }
-    crate::config::save_persisted(&home, &config).await?;
     if existing.is_some() {
         let client = ctx.connect().await?;
         let result = reload(&client).await;
@@ -802,7 +775,7 @@ pub async fn onboard(m: &ArgMatches, ctx: &Context) -> Result<Output> {
         }
     }
     pretty(
-        json!({"home":home,"pid":ready.pid,"listen":ready.listen,"voiceEnabled":voice,"pairing":offer,"logPath":control::daemon_log_path(&home)}),
+        json!({"home":home,"pid":ready.pid,"listen":ready.listen,"pairing":offer,"logPath":control::daemon_log_path(&home)}),
     )
 }
 

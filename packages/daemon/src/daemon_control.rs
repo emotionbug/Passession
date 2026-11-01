@@ -490,13 +490,13 @@ pub async fn stop_daemon_instance(
     let verified = identity::verified(&instance)?;
     if instance.listen.is_some() && (!verified || cfg!(windows)) {
         let mut connect =
-            crate::client::ConnectOptions::new(crate::client::DaemonTarget::Instance {
+            crate::client::ConnectOptions::new(paseo_client::DaemonTarget::Instance {
                 home: home.to_owned(),
             });
         connect.instance = Some(instance.clone());
         connect.timeout = options.timeout.min(Duration::from_secs(5));
         let rpc = async {
-            let client = crate::client::DaemonClient::connect(connect, cancel.clone()).await?;
+            let client = crate::client::connect(connect, cancel.clone()).await?;
             let result = client
                 .shutdown(options.timeout.min(Duration::from_secs(5)))
                 .await;
@@ -582,21 +582,14 @@ pub async fn stop_daemon_instance(
 
 const MANAGED_SETTING_KEYS: &[&str] = &[
     "MCP_DEBUG",
-    "OPENAI_STT_BASE_URL",
-    "OPENAI_TTS_BASE_URL",
     "PASEO_ALLOWED_HOSTS",
     "PASEO_APP_BASE_URL",
     "PASEO_CORS_ORIGINS",
-    "PASEO_DICTATION_ENABLED",
-    "PASEO_DICTATION_LANGUAGE",
-    "PASEO_DICTATION_LOCAL_STT_MODEL",
-    "PASEO_DICTATION_STT_PROVIDER",
     "PASEO_GIT_CONCURRENCY",
     "PASEO_GIT_MAX_PROCESSES_PER_SECOND",
     "PASEO_GIT_MAX_PROCESS_CONCURRENCY",
     "PASEO_HOSTNAMES",
     "PASEO_LISTEN",
-    "PASEO_LOCAL_MODELS_DIR",
     "PASEO_LOG",
     "PASEO_LOG_CONSOLE_FORMAT",
     "PASEO_LOG_CONSOLE_LEVEL",
@@ -619,21 +612,7 @@ const MANAGED_SETTING_KEYS: &[&str] = &[
     "PASEO_SERVICE_PROXY_LISTEN",
     "PASEO_SERVICE_PROXY_PUBLIC_BASE_URL",
     "PASEO_TRUSTED_PROXIES",
-    "PASEO_VOICE_LANGUAGE",
-    "PASEO_VOICE_LLM_PROVIDER",
-    "PASEO_VOICE_LOCAL_STT_MODEL",
-    "PASEO_VOICE_LOCAL_TTS_MODEL",
-    "PASEO_VOICE_LOCAL_TTS_SPEAKER_ID",
-    "PASEO_VOICE_LOCAL_TTS_SPEED",
-    "PASEO_VOICE_MODE_ENABLED",
-    "PASEO_VOICE_STT_PROVIDER",
-    "PASEO_VOICE_TTS_PROVIDER",
-    "PASEO_VOICE_TURN_DETECTION_PROVIDER",
     "PASEO_WEB_UI_DIST_DIR",
     "PASEO_WEB_UI_ENABLED",
     "PORT",
-    "STT_CONFIDENCE_THRESHOLD",
-    "STT_MODEL",
-    "TTS_MODEL",
-    "TTS_VOICE",
 ];

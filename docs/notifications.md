@@ -16,4 +16,4 @@ Android/iOS credentials are optional and must match the Sessions application ide
 
 ## Verification
 
-Exercise permission denial/grant, foreground delivery, background delivery, terminated-app launch, duplicate taps, reconnect, stale targets and Back on the actual OS/device. Linux native client and server-side speech tests do not establish Android/iOS notification behavior. See [mobile testing](mobile-testing.md), [Android](android.md), and [testing](testing.md).
+Exercise permission denial/grant, foreground delivery, background delivery, terminated-app launch, duplicate taps, reconnect, stale targets and Back on the actual OS/device. Linux native client tests do not establish Android/iOS notification behavior. See [mobile testing](mobile-testing.md), [Android](android.md), and [testing](testing.md).

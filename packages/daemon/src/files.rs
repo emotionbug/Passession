@@ -254,7 +254,7 @@ impl FileService {
                 tokio::task::spawn_blocking(move || fs::stream_open(&c, &p, &home, max, &cancel))
                     .await??;
             let id = fs::field(request, "requestId")?;
-            let revision = fs::revision(&opened.metadata);
+            let revision = fs::revision(&opened.file, &opened.metadata)?;
             let size = opened.metadata.len();
             let metadata = serde_json::to_vec(
                 &json!({"mime":opened.mime,"size":size,"encoding":if opened.kind=="text"{"utf-8"}else{"binary"},"modifiedAt":fs::modified(&opened.metadata)?,"revision":revision}),
@@ -275,16 +275,22 @@ impl FileService {
                     .send_binary(transfer::encode_frame(0x11, id, &chunk[..count])?)
                     .await?;
             }
-            ensure!(
-                fs::revision(&file.metadata().await?) == revision,
-                "File changed during transfer"
-            );
-            // Atomic replacement leaves the old handle readable. Reject it too,
-            // rather than finishing a transfer whose advertised path changed.
-            ensure!(
-                fs::revision(&tokio::fs::metadata(&opened.scope.resolved).await?) == revision,
-                "File changed during transfer"
-            );
+            let file = file.into_std().await;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                ensure!(
+                    fs::revision(&file, &file.metadata()?)? == revision,
+                    "File changed during transfer"
+                );
+                // Atomic replacement leaves the old handle readable. Reopen the
+                // advertised path so its identity is checked, not the old handle twice.
+                let current = fs::open_no_follow(&opened.scope.resolved)?;
+                ensure!(
+                    fs::revision(&current, &current.metadata()?)? == revision,
+                    "File changed during transfer"
+                );
+                Ok(())
+            })
+            .await??;
             context
                 .send_binary(transfer::encode_frame(0x12, id, &[])?)
                 .await?;

@@ -1,36 +1,9 @@
-# Lifecycle actions
+# Lifecycle actions migration notes
 
-Small callbacks using the existing SDK:
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-- Send `Try again.` when the latest output contains `out of credits`.
-- Decline a shell request matching `rm -rf`; approve exactly `git status`; leave other requests alone.
-- Inject `PASEO_HOOK_CREATE_EXAMPLE=created` on creation and `PASEO_HOOK_OPEN_EXAMPLE=opened` on each session opening.
-- Change requested Codex agents to Claude Haiku before creation.
-- Create a worktree when a directory creation request is titled `Isolated lifecycle example`.
+The former example automated follow-up prompts, permission choices, launch environments, provider selection and worktree creation. A native port uses `Plugin::on`, `Plugin::before` and `context.daemon.client().await?`. Preserve cancellation and request fields. Permission requests are structured operations, not universally shell commands: a regex is not a complete shell safety policy. Follow-up automation needs deliberate bounds to avoid repeated prompts or repeated side effects. Do not silently enable broad automation when migrating an installation.
 
-This is a demonstration plugin: installing it enables all these behaviors on its host. Install it
-alongside `lifecycle-logger` on a test daemon with plugins enabled:
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
 
-```bash
-paseo plugin install /absolute/path/to/plugin-examples/lifecycle-actions
-paseo plugin install /absolute/path/to/plugin-examples/lifecycle-logger
-paseo plugin logs lifecycle-logger
-```
-
-Outside the Paseo repository, `server/inspect.ts` needs `@getpaseo/protocol` installed for its
-type imports. Add it to your plugin development dependencies at the same version as
-`@getpaseo/plugin` before installing this example.
-
-Copy the callbacks you need into your own plugin. The follow-up example sends a new message; it does
-not replay attachments or undo previous tool effects. If the provider keeps returning the matching
-phrase, it keeps sending follow-ups. Add limits or delay in your plugin when your workflow needs them.
-The command regex illustrates a policy; it does not parse shell syntax or cover every deletion command.
-
-`server/inspect.ts` joins provider text chunks and excludes earlier turns and the current user prompt
-from the phrase match. The failing-first regression test records the split text observed with a real
-Claude agent.
-
-See [agent configuration](../agent-configuration) for a focused example that injects MCP servers and
-changes Codex sandbox and approval options while preserving other settings.
-
-See the [lifecycle reference](../../public-docs/plugins/reference.md#lifecycle-hooks) for the API.
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

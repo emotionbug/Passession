@@ -1,6 +1,6 @@
 ---
 title: Build a provider plugin
-description: Add a coding agent to Paseo directly or adapt an ACP agent.
+description: Connect a real agent through the native Rust provider protocol.
 nav: Provider plugins
 order: 46
 category: Plugins
@@ -8,412 +8,134 @@ category: Plugins
 
 # Build a provider plugin
 
-Start with the [plugin quickstart](/docs/plugins) if you have not built a Paseo plugin before.
+Start with the [quickstart](index.md). This guide targets the unpublished **0.13.1 source checkout**. Providers run in native executables on the daemon host; Flutter renders protocol data, never plugin React components. Existing first-party native providers remain built-in. Kiro remains disabled; developing a plugin does not enable it.
 
-A provider plugin connects a coding agent to Paseo without adding it to Paseo core. [Publish the plugin](/docs/plugins/publishing) on npm or in a Git repository so users can
-install it with `paseo plugin install`.
-
-This guide targets the unpublished native cutover in the 0.13.0 checkout. Built-in providers
-are Rust; this author API is for optional third-party JavaScript backends. They run in
-`packages/daemon/plugin-worker/src` with externally installed Node.js 20+ on the daemon host
-(`PASEO_PLUGIN_NODE` selects the executable). The public SDK remains `packages/plugin`.
-Flutter renders protocol data but never executes plugin React components. Mobile connects remotely
-and does not run the provider worker. See the quickstart for worker assets and host preparation.
-
-Choose one implementation path:
-
-| Agent                                                             | Path                                                                         |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| It already implements ACP                                         | Register it with `runAcpProvider()` and add only narrow vendor transformers. |
-| It has a TypeScript SDK, JSON-RPC API, or custom process protocol | Implement `ProviderRegistration` directly.                                   |
-
-The backend parts of
-[`provider-direct`](https://github.com/getpaseo/paseo/tree/main/plugin-examples/provider-direct)
-illustrate sessions, settings, prompts, persistence, and child sessions. Any historical client
-renderer in an example is outside the native contract; do not include it in a native-targeted plugin.
-[`provider-acp-transformer`](https://github.com/getpaseo/paseo/tree/main/plugin-examples/provider-acp-transformer)
-illustrates a Zod-validated vendor edit transformer. Replace `example-acp --stdio` with an installed
-ACP agent before loading it. Renderer-only examples are not supported native extensions.
+The complete runnable example is [workspace-inspector](../../plugin-examples/workspace-inspector/src/lib.rs), crate `paseo-workspace-inspector`. It implements permission-gated local UTF-8 file statistics, not an AI/model service. The [quickstart commands](index.md#run-the-repository-example) build, validate and install it. It deliberately does not advertise persistence, steering, configuration changes, images or output schemas. Use its real registration/connection/session flow as a starting point, not a claim that it supports every optional protocol feature.
 
 ## Register a direct provider
 
-Add a server entry:
+Implement the public [provider traits](../../packages/plugin/src/provider.rs):
 
-```ts
-// index.server.ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { createProvider } from "./server/provider";
+- `Provider::metadata(&self) -> Metadata`: use `Metadata::new(id, label)` and set applicable description, `icon_path`, command and optional capability flags.
+- `Provider::connect(&self, request: Value, events: Events, context: Context) -> Result<Arc<dyn Connection>>`: use `#[paseo_plugin::async_trait]` on the implementation. Negotiate a version and capability subset from `request.versions`/`request.capabilities`.
+- `Connection::version() -> u64` and `capabilities() -> Vec<String>` report the negotiated result. The runtime rejects values not offered by the host.
+- `Connection::send(input: Value) -> Result<()>` accepts input. Results and session changes are emitted through `events.emit(event).await`, not returned from `send`.
+- `Connection::close() -> Result<()>` stops owned sessions, producer tasks and child processes and resolves pending permissions. `Events::cancellation()` signals connection closure and interrupts blocked publishers.
 
-export default function contribute(server: PluginServerContext) {
-  server.registerProvider(createProvider());
-  return () => {};
-}
-```
-
-`createProvider()` returns one `ProviderRegistration`:
-
-```ts
-import {
-  negotiateProviderCapabilities,
-  type ProviderRegistration,
-} from "@getpaseo/plugin/server/provider";
-
-const supported = ["prompt.message"] as const;
-
-export function createProvider(): ProviderRegistration {
-  return {
-    id: "my-agent",
-    label: "My agent",
-    icon: "icon.svg",
-    async connect(request) {
-      const capabilities = negotiateProviderCapabilities(request.capabilities, supported);
-      return createConnection(capabilities);
-    },
-  };
-}
-```
-
-The connection has three operations:
-
-- `send(input)` accepts work and returns. Results are events, not return values.
-- `onEvent(listener)` publishes session state and complete timeline snapshots.
-- `close()` stops every session and releases processes, subscriptions, and pending work.
-
-Keep the native SDK, process, and stream inside the connection implementation. Convert its output
-to `ProviderEvent` objects before publishing it.
+Register with `plugin.provider(implementation)?` before `plugin.run().await`. Optional `Provider::status` and `catalog_cache_key` must agree with `Metadata::has_status` and `has_catalog_cache_key`. Keep metadata deterministic so validation and readiness describe the same contributions. JSON payloads retain host wire shapes; validate them rather than relying on Rust `Value` to enforce a schema.
 
 ## Launch the provider CLI
 
-Use `spawnProcess` and `execCommand` from `@getpaseo/plugin/server` for process transports
-and CLI probes. Both handle Windows `.cmd`/`.bat` launchers and quote shell arguments.
-Raw Node `spawn` and `execFile` reject those launchers on Windows.
+An external agent CLI is a separate product. Use Rust process APIs such as `tokio::process::Command` with discrete arguments, working directory and the supplied `request.launch` command, argument prefix and environment. Pass the resolved environment explicitly; do not accidentally inherit unrelated credentials or assume launch overrides are the complete environment. Do not wrap your Paseo plugin in an interpreter script: `server.executable` must remain a native binary.
 
-The daemon supplies `request.launch` with the resolved command, argument prefix, and complete
-environment. Pass that environment explicitly; the helpers do not apply daemon environment policy.
-Keep the process lifecycle and protocol deadlines inside your provider. End stdin for graceful
-shutdown; use `terminateProcess(child)` for a forced stop. It kills the process tree on Windows,
-including the CLI behind a command-script launcher. Bound your final wait for closed streams.
-
-```ts
-import { spawnProcess, execCommand } from "@getpaseo/plugin/server";
-
-const child = spawnProcess(launch.command, [...launch.args, "serve"], {
-  env: launch.env,
-  cwd,
-  stdio: "pipe",
-});
-const { stdout } = await execCommand(launch.command, [...launch.args, "--version"], {
-  env: launch.env,
-  timeout: 5000,
-});
-```
+For a direct `Provider`/`Connection` implementation, own platform-specific launch handling, process-tree cleanup and bounded waits; the old JavaScript `spawnProcess`/`execCommand`/`terminateProcess` functions are not Rust APIs. Close stdin for graceful shutdown, then terminate owned processes when necessary; do not kill unrelated processes. For an ACP agent, use the [native ACP adapter](#adapt-an-acp-agent), which owns its transport and session lifecycle. Disclose required external software and obtain user approval before downloading/installing it.
 
 ## Return models, modes, and thinking options
 
-Paseo requests the catalog before creating a session. Return the choices needed by the agent form:
+A `catalog` input includes `requestId`. Emit a `catalog` event with the same ID and a `catalog` object. Models/modes contain stable IDs and labels; optional thinking options and defaults must use the current host protocol. Return empty categories when unsupported, not fictional choices. The example's real response is:
 
-```ts
-if (input.type === "catalog") {
-  emit({
-    type: "catalog",
-    requestId: input.requestId,
-    catalog: {
-      models: [
-        { id: "agent-large", label: "Agent Large" },
-        { id: "agent-small", label: "Agent Small" },
-      ],
-      modes: [
-        { id: "build", label: "Build" },
-        { id: "plan", label: "Plan" },
-      ],
-      thinkingOptions: [
-        { id: "standard", label: "Standard" },
-        { id: "extended", label: "Extended" },
-      ],
-      defaultModel: "agent-large",
-      defaultMode: "build",
-      defaultThinkingOption: "standard",
-    },
-  });
-}
+```json
+{"type":"catalog","requestId":"request-1","catalog":{"models":[{"id":"local-file","label":"Local text files"}],"modes":[],"defaultModel":"local-file"}}
 ```
 
-Return an empty array for a category the agent does not expose. The selected `model`, `mode`, and
-`thinkingOption` arrive in the session configuration.
-
-The catalog describes choices available before a session exists. Session-specific controls come
-later through `session.config`.
+Catalog choices exist before a session. Session-specific configuration arrives later through `session.config`. For full shapes, use the [host provider bridge](../../packages/daemon/src/plugins/provider.rs) and the [SDK provider-options guide](../sdk/provider-options.md).
 
 ## Open a session
 
-`session.open` contains the complete launch configuration: working directory, environment, system
-prompt, MCP servers, tool policy, model, mode, settings, opaque provider options, and persistence
-preference.
+`session.open` carries `sessionId`, `requestId`, launch configuration, optional persistence and history mode. `config` includes working directory, model/mode/thinking, environment, system prompt, MCP servers, tool policy and opaque provider options. Validate provider-private options; keep user-facing settings separate. Read persisted plugin settings through `Settings::read`, and subscribe if you cache them.
 
-For persisted host-scoped plugin settings, use the handle returned by `server.registerSettings()`.
-Read it in catalog and session callbacks, and subscribe when the provider keeps in-memory
-configuration. See [settings](./reference.md#settings-screens) for the `read()` and `subscribe()`
-contract.
-
-Create the native session with the selected catalog values, then publish its effective state:
-
-```ts
-const nativeSession = await sdk.createSession({
-  cwd: input.config.cwd,
-  model: input.config.model,
-  mode: input.config.mode,
-  thinking: input.config.thinkingOption,
-  systemPrompt: input.config.systemPrompt,
-  env: input.config.env,
-  mcpServers: input.config.mcpServers,
-});
-
-emit({
-  type: "session.opened",
-  requestId: input.requestId,
-  sessionId: input.sessionId,
-  capabilities: ["prompt.message"],
-  restoration: "core",
-  cwd: input.config.cwd,
-});
-emit({
-  type: "session.config",
-  sessionId: input.sessionId,
-  config: {
-    model: nativeSession.model,
-    mode: nativeSession.mode,
-    thinkingOption: nativeSession.thinking,
-    models,
-    modes,
-    thinkingOptions,
-    settings: [],
-  },
-});
-emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
-```
-
-`session.config` contains the committed values. Publish what the native agent selected after
-normalization, not a copy of the request.
+Create/resume the actual underlying session, then emit `session.opened` with the matching IDs, effective `cwd`, supported capabilities and restoration policy. Publish effective `session.config` where applicable, then `session.ready`. Report committed values after normalization, not simply a copy of the request. Host tools arrive through `config.mcpServers`, not a second callback tool API.
 
 ## Complete the first prompt
 
-Start with message prompts. Advertise `prompt.message`, pass the content to the native agent, and
-publish the resulting lifecycle:
+All prompts use `session.prompt`, including messages and structured commands. Each `prompt.clientMessageId` needs exactly one matching `session.prompt_result`:
 
-```ts
-const turnId = crypto.randomUUID();
+1. Publish a standard `user_message` timeline snapshot with that `clientMessageId`, so the host can reconcile optimistic text.
+2. Publish `session.prompt_result` with `result: {"type":"turn","turnId":"..."}` for a new turn, or the protocol's non-turn completion/failure result when appropriate.
+3. Emit `session.turn` with `state: "started"`.
+4. Emit complete `timeline.item` snapshots with stable item IDs as actual output changes.
+5. Emit exactly one terminal `session.turn`: `completed`, `failed` or `canceled`.
 
-emit({
-  type: "timeline.item",
-  sessionId,
-  item: {
-    type: "user_message",
-    id: `user:${turnId}`,
-    text,
-    clientMessageId: prompt.clientMessageId,
-  },
-});
-emit({
-  type: "session.prompt_result",
-  sessionId,
-  clientMessageId: prompt.clientMessageId,
-  result: { type: "turn", turnId },
-});
-emit({ type: "session.turn", sessionId, turnId, state: "started" });
+`send()` returning successfully acknowledges acceptance only. Do not report completion before the agent finishes or swallow a failed operation. Keep request IDs, client-message IDs, session IDs and turn IDs distinct.
 
-// Publish complete snapshots as native output changes.
-emit({
-  type: "timeline.item",
-  sessionId,
-  item: { type: "assistant_message", id: `assistant:${turnId}`, text: completeText },
-});
+## Permissions and cancellation
 
-emit({ type: "session.turn", sessionId, turnId, state: "completed" });
-```
+Emit `session.permission` with the session ID and a request containing a stable permission ID, descriptive name/detail, kind and the actual allowed actions. For example, the inspector offers `allow`/`deny` for a specific workspace-relative file. Handle the matching incoming `session.permission` response by validating the permission ID and chosen behavior before executing the read. Emit `session.permission_resolved` and the resulting turn outcome; a denied action must not run.
 
-Publish exactly one `session.prompt_result` for each `clientMessageId`. Copy `clientMessageId` onto
-the user timeline item so Paseo replaces its optimistic message. Every started turn needs one
-terminal `completed`, `failed`, or `canceled` event.
-
-At this point the provider is usable: users can select a model, open a session, send a message, and
-see the response.
+Permissions are structured operations, not universally shell strings. Preserve question/approval choices from the underlying agent; never manufacture approval or silently select a permissive default. Session cancellation must stop active work and settle pending permissions. Closing/reloading a plugin while approval is outstanding must not leave a detached action running.
 
 ## Add session-specific composer controls
 
-Add `session.configure` only when the native agent has settings users should change after opening a
-session. Publish them in `session.config` as toggle or select controls:
+Advertise supported configuration behavior and emit `session.config` with standard toggle/select descriptors when the actual agent supports them. User changes arrive as `session.configure`; apply them, emit committed configuration, then `request.completed`. Do not acknowledge a change you did not apply. Controls may change with the selected model.
 
-```ts
-emit({
-  type: "session.config",
-  sessionId,
-  config: {
-    model: "agent-large",
-    models: [{ id: "agent-large", label: "Agent Large" }],
-    modes: [],
-    thinkingOptions: [],
-    settings: [
-      {
-        type: "toggle",
-        id: "fast",
-        label: "Fast mode",
-        value: nativeSession.fast,
-      },
-      {
-        type: "select",
-        id: "approval",
-        label: "Approvals",
-        value: nativeSession.approval,
-        options: [
-          { label: "Ask", value: "ask" },
-          { label: "Auto accept", value: "auto" },
-        ],
-      },
-    ],
-  },
-});
-```
-
-Paseo renders these controls in the composer. A user change arrives as `session.configure`; apply it
-and publish the committed `session.config` before `request.completed`. The provider may change the
-available controls at runtime, including after a model change.
-
-`settings` are user-facing controls. `providerOptions` is opaque JSON supplied at session creation
-for provider-specific configuration that Paseo does not render. A provider-specific token budget
-belongs in one of those two places; it is not a dedicated prompt field.
+`providerOptions` is opaque JSON passed at session creation, not an automatically rendered settings panel. A provider-specific token budget belongs in actual provider options or a supported configuration descriptor, not an invented prompt field. Standard configuration data is not an executable Flutter extension.
 
 ## Add persistence and replay
 
-Advertise `session.persistence` when a native session can be reopened. Open a new native session
-when `session.open.persistence` is absent. Resume the identified native session when it is present.
-Return an opaque persistence value in `session.opened` or `session.persistence`; Paseo stores it
-without inspecting it.
+Advertise `session.persistence` only when the underlying session can actually resume. Without `session.open.persistence`, open a new session; with it, restore that session. Return opaque persistence via `session.opened` or `session.persistence`; Paseo stores it without interpreting it.
 
-When `history` is `"replay"`, publish the native session's existing `timeline.item` snapshots before
-`session.ready`. Use `history: "skip"` to open without replaying old rows.
-
-Paseo refreshes an agent by closing its current provider session and opening it again with current
-configuration and persistence. Re-read credentials, environment, global configuration, and MCP
-servers during `session.open`. There is no separate reload operation.
-
-Use `restoration: "core"` when Paseo can reopen a session from persistence. A provider-owned child
-uses `restoration: "parent"`; emit it as another `session.opened` event with `parentSessionId` and
-recreate it while restoring the parent.
+For `history: "replay"`, publish prior complete timeline items before `session.ready`; `history: "skip"` avoids replay. Refresh closes and reopens with current configuration/persistence, so re-read credentials, environment and MCP servers on open. A normal restorable session uses `restoration: "core"`; provider-owned children use `restoration: "parent"` and `parentSessionId`, and must be recreated while restoring their parent. Do not advertise persistence for a transient in-memory map.
 
 ## Add commands and steering
 
-All user input arrives through `session.prompt`:
-
-- `input.type: "message"` carries text, images, and attachments;
-- `input.type: "command"` carries a selected command and its arguments;
-- `delivery: "steer"` asks you to add input to the active turn;
-- `delivery: "auto"` lets you start a turn or complete a command without one.
-
-Publish `session.commands` to add structured commands to the composer. A command can start a normal
-turn or finish as a side effect with a `completed` prompt result.
-
-Advertise only capabilities you implement. If steering is unsupported, omit `prompt.steer`; Paseo
-can replace the active turn instead.
+Message input contains structured text/images/attachments; command input contains name and arguments. Advertise only supported content and capabilities. `session.commands` publishes actual commands. `delivery: "steer"` asks to add input to an active turn; if unsupported, omit `prompt.steer` and reject unsupported inputs rather than pretending they were steered. `delivery: "auto"` may start a turn or complete a command without one. Preserve the prompt-result correlation in both paths.
 
 ## Publish timeline items
 
-Publish complete snapshots through `timeline.item`. Reuse an item `id` when updating streamed text,
-a running tool, or a todo list. Paseo derives the live delta and keeps the normal timeline.
+Use complete `timeline.item` snapshots and reuse IDs for updated streamed text, tools or todos. Standard types cover user/assistant messages, reasoning, tools, todos, errors, notifications and compaction. Native clients render these data shapes without loading plugin code. Historical custom plugin payloads and React renderers are not a presentation API; essential output must remain understandable through standard items.
 
-Standard item types cover user and assistant messages, reasoning, tools, todos, errors,
-notifications, and compaction. Represent essential provider output with these protocol types so
-the native client can render it without executing extension code.
-
-For example, publish a review result as ordinary assistant text:
-
-```ts
-emit({
-  type: "timeline.item",
-  sessionId,
-  item: {
-    type: "assistant_message",
-    id: "review-42",
-    text: "Review verdict: ship. All checks passed.",
-  },
-});
+```json
+{"type":"timeline.item","sessionId":"session-1","item":{"type":"assistant_message","id":"inspection-1","text":"README.md: 42 lines"}}
 ```
 
-Use the precise item shape from `@getpaseo/plugin/server/provider` for your SDK version.
-Historical `type: "plugin"` payloads and custom React renderers are not a native presentation API.
-Do not register `index.client.tsx` or a timeline transformer to make them visible. Protocol
-configuration descriptors and timeline data are backend contributions; native rendering belongs
-to Flutter.
+This illustrates a wire shape, not evidence that a file has actually been inspected.
 
 ## Adapt an ACP agent
 
-Use the ACP shim when the agent already speaks ACP:
+Use [`paseo_plugin::acp`](../../packages/plugin/src/acp/mod.rs), the native replacement for the former `runAcpProvider` functionality. It implements `Provider`/`Connection` for you: register it before `plugin.run().await`. Existing first-party ACP integration remains native as well; plugins do not import daemon-private modules or retain a JavaScript worker.
 
-```ts
-import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { runAcpProvider } from "@getpaseo/plugin/server/acp";
+```rust
+use paseo_plugin::{Plugin, Result, acp::{AcpOptions, AcpProvider}};
 
-export default function contribute(server: PluginServerContext) {
-  server.registerProvider(
-    runAcpProvider({
-      id: "vendor-agent",
-      label: "Vendor agent",
-      icon: "icon.svg",
-      command: ["vendor-agent", "acp"],
-    }),
-  );
-  return () => {};
+fn register_acp(plugin: &mut Plugin, command: Vec<String>) -> Result<()> {
+    let provider = AcpProvider::command("my-acp", "My ACP agent", command)?
+        .options(AcpOptions {
+            wait_for_initial_commands: true,
+            ..AcpOptions::default()
+        });
+    plugin.provider(provider)?;
+    Ok(())
 }
 ```
 
-The shim owns the ACP process, capability mapping, session lifecycle, prompts, permissions, and
-timeline conversion. Do not copy that machinery into the plugin.
+Pass the actual installed agent's executable and discrete arguments as `command`; this function does not install software or supply an agent. The plugin's own manifest still points to its native binary. Register deterministic metadata during `--validate` too; probing/connecting the agent happens through the provider connection, not registration.
 
-Use `transformers` only for vendor differences ACP cannot describe. Validate vendor payloads with
-Zod and leave malformed or unrelated values unchanged:
+The command adapter honors a host-supplied launch descriptor's executable, argv and complete environment; otherwise it uses the registered command and inherited environment. Session `config.env` values overlay that environment. Stdout is reserved for ACP JSON-RPC; stderr is drained into plugin logs. On Unix, shutdown sends `SIGTERM` to the owned direct child PID, waits up to one second, then uses `SIGKILL` and reaps it if needed; this is not process-group termination. On Windows, shutdown invokes `taskkill.exe /PID <owned PID> /T /F` to target the child and its process tree, with a five-second helper deadline, then reaps the direct child. Helper failures are logged and fall back to forcibly terminating/reaping the direct child; descendant cleanup is not guaranteed when the helper fails.
 
-```ts
-import type { AcpTransformer } from "@getpaseo/plugin/server/acp";
-import { z } from "zod";
+For a custom byte transport, `AcpProvider::connector(id, label, factory)?` accepts an asynchronous factory taking a cancellation token and returning a fresh owned `AcpStream`. Construct it with `AcpStream::new(reader, writer)` where both halves implement Tokio `AsyncRead`/`AsyncWrite` respectively, plus `Unpin + Send + 'static`. The stream exposes its `cancellation` token and optional `task: Option<tokio::task::JoinHandle<()>>`; attach a connector task only when the stream owns its lifetime, and make it observe cancellation. Closing cancels the stream and joins the owned task, with bounded shutdown and task abortion on timeout. Do not block a Tokio runtime thread or assume task abortion cleans up independently spawned processes.
 
-const editSchema = z.object({
-  path: z.string(),
-  before: z.string(),
-  after: z.string(),
-});
+The factory is called separately for capability probing, catalog discovery and sessions; do not share an active session stream or return borrowed resources. A custom connector owns any transport-specific process/network cleanup that the command adapter would otherwise provide.
 
-export const vendorEdits: AcpTransformer = {
-  toolCall(toolCall) {
-    if (toolCall.name !== "vendor_file_edit") return toolCall;
-    const input = editSchema.safeParse(toolCall.input);
-    if (!input.success) return toolCall;
-    return {
-      ...toolCall,
-      kind: "edit",
-      input: {
-        filePath: input.data.path,
-        oldString: input.data.before,
-        newString: input.data.after,
-      },
-    };
-  },
-};
-```
+The adapter negotiates provider protocol 1. It supports text/command prompts, configuration and permissions; image input, session listing and persistence are enabled only when the ACP agent advertises the corresponding capabilities and the host offers them. It rejects steering and structured-output schemas rather than pretending to support them. `AcpOptions::default()` uses a 10-second startup timeout, global catalog discovery (`workspace_only_catalog: false`), and no initial-command wait. When enabled, `wait_for_initial_commands` waits up to `initial_commands_timeout` (default 1 second). Prompt duration itself is not capped by the startup timeout.
+
+Interrupt sends ACP `session/cancel` and resolves outstanding permission requests as cancelled; the agent must settle its active prompt. The 2-second default `cancellation_timeout` bounds the wait when a new prompt replaces an active one, not every standalone interrupt. If that previous turn does not settle, the adapter closes its transport instead of starting overlapping work.
+
+The ACP client advertises `clientCapabilities: {}` and handles only `session/request_permission` from the agent. It does not expose client filesystem or terminal services. Permissions cover the agent's reported requests, not every OS operation: the agent and plugin remain trusted native processes with the daemon user's access.
+
+### Vendor transformers
+
+Attach ordered extensions with `.transformer(implementation)` and implement `AcpTransformer` using `#[paseo_plugin::async_trait]`:
+
+- `discover(catalog, AcpContext) -> Result<Value>` transforms the discovered catalog.
+- `configure(&ConfigChange, AcpContext) -> Result<bool>` handles model/mode/thinking or `{id, value}` setting changes. Return `true` only after applying the change; `false` leaves it for another transformer or the adapter's normal mapping.
+- `notification(method, params, session_id) -> Result<Vec<VendorUpdate>>` handles vendor notifications. Updates can carry commands, configuration, timeline items or notices.
+- `tool_call(snapshot, session_id) -> Result<Value>` transforms a complete tool snapshot (`id`, optional `name`, `title`, optional `kind`, `status`, `input`, `output`, `locations`).
+- `AcpContext` provides the adapter's `session_id` and `config`; `ConfigAccess::read().await` reads current options and `set(id, value).await` applies an option.
+
+Notification/tool transforms are synchronous so wire updates precede the following JSON-RPC response; perform asynchronous configuration through the async hooks instead. Validate vendor payloads and leave unrelated/malformed data unchanged. Preserve ordinary tool/edit semantics rather than replacing the event stream with a custom renderer. The historical `provider-acp-transformer` directory is not an installable native plugin; its JavaScript API needs an explicit port to these hooks.
 
 ## Test and publish
 
-Test the provider against the real agent, not only mocked frames:
+On an isolated test daemon, exercise the actual external agent or local-file example: registration and catalog, session creation, real prompt, permissions/denial, cancellation, optional steering/persistence/replay, and cleanup while work is active. Verify standard data renders on the native clients/platforms you claim to support. Compilation, validation metadata and `running` status alone do not prove this behavior.
 
-1. install the plugin as a directory source;
-2. confirm its SVG, models, modes, and settings appear;
-3. create a session and complete a real prompt;
-4. exercise permissions, steering, cancellation, persistence, and replay when supported;
-5. confirm standard timeline items render in the actual native desktop and mobile clients you support;
-6. reload and remove the plugin while a session is active and confirm the session terminates.
-
-Follow [Publish a plugin](/docs/plugins/publishing) to distribute the provider through npm or Git.
-Keep agent compatibility and releases in the plugin project.
-Describe only platforms you have actually exercised. CI definitions and historical JavaScript-client
-tests do not establish native execution, and this checkout's migration is not a published release.
-
-See the [plugin reference](/docs/plugins/reference#providers) for the exact runtime and SVG
-rules.
+Follow [distribution](publishing.md) for Git, Cargo and checksum-pinned release sources. No tests, installation or publication are implied by this guide. Document any unimplemented optional capability explicitly and do not advertise it.

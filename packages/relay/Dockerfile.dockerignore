@@ -1,0 +1,20 @@
+# A relay build must not upload local state, credentials, Flutter installations,
+# artifacts or reference Node dependencies to a remote Docker builder.
+**
+!Cargo.toml
+!Cargo.lock
+!packages/
+!packages/**/
+!packages/**/Cargo.toml
+!packages/**/*.rs
+!packages/protocol/schema/**
+!packages/protocol/src/paseo.config.v1.json
+!packages/protocol/src/provider-definitions.json
+!xtask/
+!xtask/**/
+!xtask/Cargo.toml
+!xtask/**/*.rs
+!plugin-examples/
+!plugin-examples/**/
+!plugin-examples/**/Cargo.toml
+!plugin-examples/**/*.rs

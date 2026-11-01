@@ -249,15 +249,14 @@ pub fn stdout_chunk(text: &str) -> Result<()> {
     }
 }
 pub fn error(error: &anyhow::Error, options: &OutputOptions) -> Result<()> {
-    let code = if let Some(error) = error.downcast_ref::<crate::client::ClientError>() {
+    let code = if let Some(error) = error.downcast_ref::<paseo_client::ClientError>() {
         error.code.as_str()
     } else if let Some(error) = error.downcast_ref::<crate::daemon_control::DaemonInstanceError>() {
         error.code.as_str()
     } else {
         "UNKNOWN_ERROR"
     };
-    let details = error
-        .downcast_ref::<crate::client::ClientError>()
+    let details = error.downcast_ref::<paseo_client::ClientError>()
         .and_then(|error| error.details.as_ref());
     let mut value = json!({"error":{"code":code,"message":error.to_string()}});
     if let Some(details) = details {

@@ -558,10 +558,6 @@ async fn resolve_create(
         ),
         None => None,
     };
-    let context = match caller {
-        Some(id) => app.mcp.caller_context(id).await,
-        None => None,
-    };
     let parent_workspace = parent
         .as_ref()
         .and_then(|value| value.get("workspaceId"))
@@ -641,17 +637,6 @@ async fn resolve_create(
             } else {
                 std::path::PathBuf::from(string(&workspace, "cwd")?)
             };
-            if context
-                .as_ref()
-                .and_then(|value| value.get("lockedCwd"))
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                let locked = super::workspace_tools::resolve_scoped_cwd(app, caller, None).await?;
-                if !cwd.starts_with(&locked) {
-                    bail!("Workspace {id} is outside the allowed cwd");
-                }
-            }
             (Some(json!(cwd)), id.to_owned())
         }
         "create" => {
@@ -712,9 +697,6 @@ async fn resolve_create(
             .as_object_mut()
             .ok_or_else(|| anyhow!("labels must be an object"))?
             .insert("paseo.parent-server-id".to_owned(), json!(server_id));
-    }
-    if let Some(context) = context {
-        object.insert("callerContext".to_owned(), context);
     }
     if let Some(options) = inherited {
         object.insert("config".to_owned(), json!({"providerOptions":options}));

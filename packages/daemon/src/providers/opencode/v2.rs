@@ -242,7 +242,4 @@ impl AgentSession for V2Session {
         self.call(Operation::Rewind(message_id.to_owned())).await?;
         Ok(())
     }
-    async fn try_out_of_band(&self, _prompt: &Value) -> Result<bool> {
-        Ok(false)
-    }
 }

@@ -1,4 +1,4 @@
-use crate::process::{CommandSpec, ManagedProcess};
+use paseo_client::process::{CommandSpec, ManagedProcess};
 use anyhow::{Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};

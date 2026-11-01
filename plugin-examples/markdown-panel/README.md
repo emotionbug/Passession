@@ -1,15 +1,9 @@
-> The native Paseo client does not run client UI plugins. This example only exercises the SDK's client types; it does not add anything to the native app.
+# Markdown panel: unsupported client example
 
-# Markdown file panel example
+This is a historical JavaScript plugin example, **not an installable native plugin** in the 0.13.1 source checkout. The runtime requires a native executable and does not compile or run the old entries. No Node fallback or executable Flutter UI compatibility is provided.
 
-The server entry is empty, so installing this directory on a native daemon loads a plugin that does
-nothing. The native client does not run file panels; it has its own Markdown view.
+The former example registered a client-side Markdown editor and conflict UI. Flutter owns its built-in Markdown/source views and does not execute this panel. A historical empty server entry is not a supported native plugin, and no compiler or webview fallback is supplied.
 
-`index.client.tsx` registers a file panel for `.md` and `.markdown` files. The panel in `client/`
-is a CodeMirror editor that reads the file with `readText`, saves with `writeText` 500 ms after the
-last edit, reports unsaved edits with `tab.setModified`, and offers **Reload** and **Overwrite**
-when the file changes on disk or a write rejects with `PluginFileConflictError`. DOM integration
-lives in `client/web.ts`.
+Use the maintained Rust [workspace-inspector example and exact commands](../../public-docs/plugins/index.md#run-the-repository-example), crate `paseo-workspace-inspector`, for a real native plugin. Its source is [here](../workspace-inspector/src/lib.rs); it demonstrates bounded local-file RPC, settings, lifecycle hooks and permission-gated provider sessions, not every historical example feature.
 
-The editor dependencies are in `package.json`. Run `npm install` in this directory before
-typechecking it from the repository root with `npm run typecheck --workspace=@getpaseo/plugin`.
+See the [native SDK reference](../../public-docs/plugins/reference.md), [provider contract](../../public-docs/plugins/providers.md) and [explicit migration guide](../../public-docs/plugins/migration.md). Preserve existing installation data; do not remove/reinstall merely to suppress a legacy-runtime error, because removal deletes settings. These notes do not claim publication, deployment or test execution.

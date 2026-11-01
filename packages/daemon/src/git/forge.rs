@@ -1,5 +1,5 @@
 //! Native forge adapters. Commands remain injectable; no daemon/transport state is retained.
-use crate::process::{CommandOutput, CommandSpec};
+use paseo_client::process::{CommandOutput, CommandSpec};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -75,7 +75,7 @@ impl ForgeIo for NativeForgeIo {
             return crate::git::command::run(cwd, &spec.args, &spec.env, cancel, limit, timeout)
                 .await;
         }
-        crate::process::run(spec, limit, timeout, cancel).await
+        paseo_client::process::run(spec, limit, timeout, cancel).await
     }
     async fn http(
         &self,

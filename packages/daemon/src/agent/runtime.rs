@@ -241,6 +241,7 @@ impl AgentManager {
             let data = cell.data.lock().await;
             if data.ready
                 && data.history_primed
+                && data.event_error.is_none()
                 && !force_history
                 && overrides.as_object().is_none_or(|o| o.is_empty())
             {
@@ -478,7 +479,7 @@ impl AgentManager {
         if let Ok(cell) = self.cell(id).await {
             let ready = {
                 let data = cell.data.lock().await;
-                data.ready && data.history_primed && data.session.is_some()
+                data.ready && data.history_primed && data.session.is_some() && data.event_error.is_none()
             };
             if ready {
                 return Ok(cell);
@@ -602,19 +603,9 @@ impl AgentManager {
             event["item"] = timeline::limit_item_content(event["item"].take());
         }
         if !from_history {
-            let mut data = cell.data.lock().await;
-            if data.staged_events.is_some() {
-                let bytes = event_size(&event);
-                if data
-                    .staged_events
-                    .as_ref()
-                    .is_some_and(|events| events.len() >= 4096)
-                    || data.staged_bytes.saturating_add(bytes) > 16 * 1024 * 1024
-                {
-                    bail!("Provider exceeded bounded pending-turn event buffer");
-                }
-                data.staged_bytes += bytes;
-                data.staged_events.as_mut().unwrap().push(event);
+            let mut stage = cell.stage.lock().await;
+            if let Some(stage) = stage.as_mut() {
+                stage.push(event).await?;
                 return Ok(());
             }
         }
@@ -1051,30 +1042,6 @@ impl AgentManager {
         if let Some((name, payload)) = hook_stream(&snapshot, &event) {
             let _ = app.plugins.emit(name, payload).await;
         }
-        if event["type"] == "permission_requested"
-            && app.speech.is_active_for_agent(id).await
-            && crate::speech::is_voice_permission_allowed(&event["request"])
-        {
-            let session = cell.data.lock().await.session.clone();
-            let sink = cell.sink.clone();
-            let id = id.to_owned();
-            let request_id = required(&event["request"], "id")?.to_owned();
-            if let Some(session) = session {
-                tokio::spawn(async move {
-                    match session
-                        .respond_to_permission(&request_id, json!({"behavior":"allow"}))
-                        .await
-                    {
-                        Ok(_) => {
-                            let _=sink.emit(json!({"type":"permission_resolved","provider":session.provider(),"requestId":request_id,"resolution":{"behavior":"allow"}})).await;
-                        }
-                        Err(error) => {
-                            tracing::warn!(agent_id=%id,%error,"Failed to auto-allow voice permission")
-                        }
-                    }
-                });
-            }
-        }
         if let Some(serialized) =
             serialize_stream_event(&event).filter(|_| event["type"] != "attention_required")
         {
@@ -1099,12 +1066,24 @@ impl AgentManager {
     pub(super) async fn close_cell(&self, id: &str, cell: &Arc<AgentCell>) -> Result<()> {
         let _mutation = cell.mutation.lock().await;
         let session = cell.data.lock().await.session.clone();
-        let event_error = if let Some(session) = session {
+        let mut event_error = if let Some(session) = session {
             session.close().await?;
-            self.drain_events(cell).await.err()
+            if cell.data.lock().await.event_error.is_some() {
+                None
+            } else {
+                self.drain_events(cell).await.err()
+            }
         } else {
             None
         };
+        if cell.data.lock().await.event_error.is_some() {
+            // Join the failed owner before committing closed, so its terminal
+            // update cannot race this close or a subsequent session reload.
+            event_error = None;
+            if let Some(task) = cell.task.lock().await.take() {
+                let _ = task.await;
+            }
+        }
         let children = self
             .subagent_store
             .lock()
@@ -1218,17 +1197,6 @@ fn hook_stream(snapshot: &Value, event: &Value) -> Option<(&'static str, Value)>
     })
 }
 
-fn event_size(value: &Value) -> usize {
-    match value {
-        Value::String(value) => value.len(),
-        Value::Array(values) => values.iter().map(event_size).sum(),
-        Value::Object(values) => values
-            .iter()
-            .map(|(key, value)| key.len() + event_size(value))
-            .sum(),
-        _ => 16,
-    }
-}
 
 /// agent-manager.ts SYSTEM_ERROR_PREFIX.
 const SYSTEM_ERROR_PREFIX: &str = "[System Error]";
@@ -1286,6 +1254,96 @@ mod tests {
     use crate::providers::api::{AgentProvider, LaunchContext, ProviderSpec};
     use crate::providers::pi_omp::JsonlProvider;
     use crate::transport::{OutboundFrame, RequestContext};
+
+    async fn staged_cell(app: &Arc<AppState>, id: &str) -> Arc<AgentCell> {
+        let manager = &app.agents;
+        let snapshot = json!({
+            "id":id,"provider":"mock","internal":true,
+            "config":{},"updatedAt":now(),"requiresAttention":false
+        });
+        let (cell, receiver) = manager.make_cell(id, snapshot, true).await.unwrap();
+        {
+            let mut data = cell.data.lock().await;
+            data.ready = true;
+            data.snapshot["lifecycle"] = json!("running");
+            data.snapshot["status"] = json!("running");
+            data.snapshot["activeTurnId"] = json!("live-turn");
+            data.snapshot["activeForegroundTurnId"] = json!("live-turn");
+            data.snapshot["activeTurn"] = json!({"turnId":"live-turn"});
+        }
+        *cell.task.lock().await = Some(manager.start_events(id, &cell, receiver));
+        manager.begin_event_stage(&cell).await.unwrap();
+        cell
+    }
+
+    #[tokio::test]
+    async fn pending_stage_spills_without_overtaking_the_accepted_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::new(root.path().join("home"), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000002";
+        let cell = staged_cell(&app, id).await;
+        // A delayed acknowledgement must neither drop output nor expose it before the prompt.
+        for tokens in 0..4100 {
+            cell.sink.emit(json!({
+                "type":"usage_updated","provider":"mock","turnId":"live-turn",
+                "usage":{"outputTokens":tokens}
+            })).await.unwrap();
+        }
+        cell.sink.emit(json!({
+            "type":"timeline","provider":"mock","turnId":"next-turn",
+            "item":{"type":"assistant_message","text":"pending response","messageId":"pending"}
+        })).await.unwrap();
+        cell.sink.emit(json!({
+            "type":"timeline","provider":"mock","turnId":"live-turn",
+            "item":{"type":"assistant_message","text":"completed response","messageId":"live"}
+        })).await.unwrap();
+        cell.sink.emit(json!({"type":"turn_completed","provider":"mock","turnId":"live-turn"})).await.unwrap();
+        manager.drain_events(&cell).await.unwrap();
+        assert_eq!(cell.data.lock().await.snapshot["lifecycle"], "running");
+        assert!(cell.timeline.lock().unwrap().rows().is_empty());
+        manager.record_submitted(id, &cell, &json!("steered prompt"), Some("client"), Some("live-turn"), false).await.unwrap();
+        manager.release_event_stage(&cell).await.unwrap();
+        let snapshot = cell.data.lock().await.snapshot.clone();
+        assert_eq!(snapshot["lastUsage"]["outputTokens"], 4099);
+        assert_eq!(snapshot["lifecycle"], "idle");
+        assert_eq!(snapshot["activeTurnId"], Value::Null);
+        let timeline = cell.timeline.lock().unwrap();
+        let rows = timeline.rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["item"]["text"], "steered prompt");
+        assert_eq!(rows[1]["item"]["messageId"], "pending");
+        assert_eq!(rows[2]["item"]["messageId"], "live");
+        drop(timeline);
+        cell.cancel.cancel();
+        cell.task.lock().await.take().unwrap().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_stage_failure_ends_running_state_and_allows_close() {
+        let root = tempfile::tempdir().unwrap();
+        let app = AppState::new(root.path().join("home"), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000003";
+        let cell = staged_cell(&app, id).await;
+        cell.sink.emit(json!({})).await.unwrap();
+        assert!(manager.release_event_stage(&cell).await.is_err());
+        cell.task.lock().await.take().unwrap().await.unwrap();
+        let snapshot = cell.data.lock().await.snapshot.clone();
+        assert_eq!(snapshot["lifecycle"], "error");
+        assert_eq!(snapshot["lastTurnOutcome"], "turn_failed");
+        assert_eq!(snapshot["activeTurnId"], Value::Null);
+        assert!(cell.barriers.lock().await.is_empty());
+        assert!(manager.update_snapshot(&cell, |snapshot| {
+            snapshot["lifecycle"] = json!("running");
+            snapshot["activeTurnId"] = json!("late-acceptance");
+            Ok(())
+        }).await.is_err());
+        assert_eq!(cell.data.lock().await.snapshot["lifecycle"], "error");
+        assert_eq!(cell.data.lock().await.snapshot["activeTurnId"], Value::Null);
+        manager.close_cell(id, &cell).await.unwrap();
+        assert!(manager.cell(id).await.is_err());
+    }
 
     async fn timeline_request(manager: &AgentManager, id: &str, options: Value) -> Value {
         let (source, mut output) = RequestContext::attach(

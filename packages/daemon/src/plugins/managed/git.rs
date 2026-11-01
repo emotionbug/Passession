@@ -140,8 +140,8 @@ pub async fn requested(
     ] {
         // A missing candidate is not a fallback for a failed process launch or transport.
         let (env_git, _) = environment(env, None);
-        let result = crate::process::run(
-            crate::process::CommandSpec {
+        let result = paseo_client::process::run(
+            paseo_client::process::CommandSpec {
                 program: "git".into(),
                 args: vec![
                     "show-ref".into(),

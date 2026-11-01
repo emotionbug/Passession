@@ -12,7 +12,7 @@ These projects are related to Paseo and built by the community.
 
 ## Plugins
 
-Browse the [plugin registry](/plugins) for community extensions, checking each one's runtime requirements. The native client supports backend extensions through an external-Node worker, not executable React UI entries. To share a backend extension, follow [Publish a plugin](/docs/plugins/publishing).
+Install only native backend plugins whose target architecture and Paseo version requirements match your host. The Flutter client does not execute React UI entries. To share a backend extension, follow [Publish a plugin](plugins/publishing.md).
 Extensions run unsandboxed; read their listing and source before installing.
 
 ## Tools and integrations

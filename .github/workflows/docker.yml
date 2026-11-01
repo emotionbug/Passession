@@ -20,7 +20,7 @@ on:
           - "false"
           - "true"
       publish_latest:
-        description: "Also publish ghcr.io/getpaseo/paseo:latest. Ignored for prereleases."
+        description: "Also publish ghcr.io/emotionbug/paseo:latest. Ignored for prereleases."
         required: false
         default: "false"
         type: choice
@@ -49,6 +49,8 @@ jobs:
       native_release: ${{ steps.values.outputs.native_release }}
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
 
       - id: values
         env:
@@ -62,7 +64,7 @@ jobs:
 
           owner="$(printf '%s' "${REPO_OWNER}" | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/${owner}/paseo"
-          package_version="$(node -p "require('./package.json').version")"
+          package_version="$(cargo xtask release version --print)"
           install_version="${INPUT_PASEO_VERSION:-${package_version}}"
           publish=false
           publish_latest=false
@@ -92,6 +94,13 @@ jobs:
             if [[ "${INPUT_PUBLISH_LATEST:-false}" == "true" && "${prerelease}" != "true" ]]; then
               publish_latest=true
             fi
+          fi
+          if [[ "$install_version" != "$package_version" ]]; then
+            echo "::error::Requested Docker version differs from Cargo workspace source."
+            exit 1
+          fi
+          if [[ "$GITHUB_REPOSITORY" != "emotionbug/paseo" ]]; then
+            publish=false
           fi
           release_channel=stable
           if [[ "${prerelease}" == "true" ]]; then release_channel=beta; fi
@@ -147,7 +156,7 @@ jobs:
             PASEO_VERSION=${{ needs.setup.outputs.install_version }}
             PASEO_BUILD_SOURCE_SHA=${{ github.sha }}
             PASEO_NATIVE_RELEASE=${{ needs.setup.outputs.native_release }}
-            PASEO_UPDATE_REPOSITORY=${{ github.repository }}
+            PASEO_UPDATE_REPOSITORY=emotionbug/paseo
             PASEO_RELEASE_CHANNEL=${{ needs.setup.outputs.release_channel }}
           tags: ${{ needs.setup.outputs.check_tag }}
           push: false
@@ -163,7 +172,7 @@ jobs:
 
   publish:
     needs: [setup, build]
-    if: needs.setup.outputs.publish == 'true'
+    if: github.repository == 'emotionbug/paseo' && needs.setup.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -190,7 +199,7 @@ jobs:
             PASEO_VERSION=${{ needs.setup.outputs.install_version }}
             PASEO_BUILD_SOURCE_SHA=${{ github.sha }}
             PASEO_NATIVE_RELEASE=${{ needs.setup.outputs.native_release }}
-            PASEO_UPDATE_REPOSITORY=${{ github.repository }}
+            PASEO_UPDATE_REPOSITORY=emotionbug/paseo
             PASEO_RELEASE_CHANNEL=${{ needs.setup.outputs.release_channel }}
           tags: ${{ needs.setup.outputs.publish_tags }}
           push: true

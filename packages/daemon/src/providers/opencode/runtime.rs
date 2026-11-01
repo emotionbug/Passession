@@ -23,10 +23,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::bridge::Bridge;
 use crate::providers::registry::catalog::refresh_activity;
-use crate::{
-    process::{self, CommandSpec, ManagedProcess},
-    providers::api::{LaunchContext, ProviderSpec},
-};
+use paseo_client::process::{self, CommandSpec, ManagedProcess};
+use crate::{ providers::api::{LaunchContext, ProviderSpec}, };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);

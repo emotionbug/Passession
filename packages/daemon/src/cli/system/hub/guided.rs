@@ -182,8 +182,7 @@ pub(super) async fn run(ctx: &Context) -> Result<Output> {
     let result = run_inner(ctx).await;
     match result {
         Err(error)
-            if error
-                .downcast_ref::<crate::client::ClientError>()
+            if error.downcast_ref::<paseo_client::ClientError>()
                 .is_some_and(|e| e.code == "PROMPT_CANCELLED") =>
         {
             eprintln!("{error}");
@@ -246,7 +245,7 @@ async fn run_inner(ctx: &Context) -> Result<Output> {
     eprintln!("Logged in to {origin}");
     let daemon_id = ensure_connection(&origin, &http, &store, ctx).await?;
     let key = store.resolve_key(&origin, None)?;
-    let resources=http.get(&origin,"/api/v1/configuration-resources",&key).await.map_err(|e|if e.downcast_ref::<crate::client::ClientError>().is_some_and(|e|matches!(e.code.as_str(),"HUB_NOT_FOUND"|"HUB_INVALID_RESPONSE")){error("HUB_UPDATE_REQUIRED","This Hub needs an update before guided setup can use organization triggers. Update Hub and try again.")}else{e})?;
+    let resources=http.get(&origin,"/api/v1/configuration-resources",&key).await.map_err(|e|if e.downcast_ref::<paseo_client::ClientError>().is_some_and(|e|matches!(e.code.as_str(),"HUB_NOT_FOUND"|"HUB_INVALID_RESPONSE")){error("HUB_UPDATE_REQUIRED","This Hub needs an update before guided setup can use organization triggers. Update Hub and try again.")}else{e})?;
     let cwd = std::env::current_dir()?;
     let remote = command_value("git", &["remote", "get-url", "origin"], Some(&cwd)).await;
     let repository = remote.as_deref().and_then(github_repository);

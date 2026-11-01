@@ -1,26 +1,12 @@
 # Release
 
-The checkout version is **0.13.0**. The Rust daemon/CLI and five-platform Flutter client cutover has **not been published**. Build automation and generated notices do not authorize publication or establish that a release is legally distributable.
+The checkout version is **0.13.1**. Build automation does not publish a release unless its publication path is explicitly selected.
 
 ## Distribution requirements
 
-**Unresolved release-distribution requirement:** the official **Sherpa 1.12.28 TTS-enabled prebuilts statically include GPL espeak-ng**. Paseo packaging now generates Cargo, optional-worker, and speech attributions using `packages/flutter_desktop_host/packaging/third-party-notices.mjs`. Including these notices does **not** establish:
+Native packages exclude speech recognition, voice conversation and TTS, including Sherpa, the speech ONNX runtime and espeak-ng. Generic effect-sound playback remains.
 
-- complete corresponding source or a valid source offer;
-- the applicable GPL combined-work scope and license compatibility;
-- satisfaction of MPL/LGPL conditions;
-- rights or required notices for proprietary CRT redistribution;
-- complete Rust-toolchain runtime/dependency obligations.
-
-Paseo's source license has not changed and local TTS has not been removed. This document is neither a compliance certification nor an offer to provide source. Distribution review remains required before publishing binary assets or container images.
-
-Investigation evidence is recorded locally in `/tmp/paseo-source-closure-feasibility.json`. It identifies a technically feasible **separate source artifact** alongside binary assets, without installing source into the application or changing its runtime. No such complete artifact has been assembled, rebuilt, published, or offered by this migration.
-
-The unresolved technical requirement is a complete mapping from **each shipped binary digest and architecture** to exact source trees, transitive sources/submodules/FetchContent inputs, patches, generated-source recipes, and build/packaging modifications. Top-level repository links or source tarballs alone do not establish that closure. Upstream release tags and temporally adjacent build runs do not prove that their inputs produced the selected binary bytes. The evidence records distinct Eigen inputs in Sherpa and ONNX Runtime, modified/generated Sherpa version information, ONNX workflow modifications, and missing authoritative per-binary source binding.
-
-A controlled source build using the same pinned source archive and recorded recipes, or authoritative matching upstream binary/source records, is needed to establish that mapping. Qualified release review must separately resolve licensing, combined-work, installation-information, CRT and toolchain conditions; source delivery alone does not decide those questions. An eventual source location must actually be downloadable and tied to the release before it can be represented as available. This is a release gate, not a promise of future compliance.
-
-Native packages carry speech libraries, **not speech model weights**. Models are downloaded on demand and must not be described as bundled. Model distribution/licensing is a separate consideration from the native libraries.
+Rust tooling in `xtask/src/notices.rs` generates Cargo and bundled-asset attributions. Preserve those notices with the exact packaged artifacts and review the licenses of remaining bundled dependencies and platform runtimes. Generated attributions are not a compliance certification or a corresponding-source offer.
 
 ## Release contents
 
@@ -29,29 +15,29 @@ Native packages carry speech libraries, **not speech model weights**. Models are
 | Linux, macOS, Windows desktop | Flutter application, Rust daemon/CLI, native desktop integration and runtime assets           |
 | Android                       | Flutter remote client APK; no daemon                                                          |
 | iOS                           | Flutter remote client; no daemon; unsigned app archive unless provisioning/export is supplied |
-| Standalone daemon             | Rust executable with libraries, skills, optional-worker assets, notices and provenance        |
+| Standalone daemon             | Rust executable with libraries, skills, notices and provenance                                |
 | Container                     | Native daemon and runtime assets; no browser UI or Node executable in the default image       |
-| npm                           | Retained SDK/protocol/extension libraries, not installation of a Node product daemon or CLI   |
+| Rust libraries                | Client, protocol, plugin and highlighting crates; source/package availability is separate from binary releases |
 
-No Electron, Chromium, web client, embedded automation, or interactive terminal UI is shipped. Script/setup PTY support stays in the daemon and the client presents read-only logs. Optional JavaScript backend extensions require external Node; their shipped compiler/SDK closure is not a Node runtime.
+No Electron, Chromium, web client, embedded automation, or interactive terminal UI is shipped. Script/setup PTY support stays in the daemon and the client presents read-only logs. Backend plugins use native executables; no Node worker or JavaScript compiler is packaged.
 
 ## Local build versus distribution identity
 
-Use Node 24 for packaging, Rust/Cargo, Flutter, and each target's native toolchain. Build desktop artifacts on the matching OS; build iOS on macOS with Xcode.
+Use Rust/Cargo, Flutter, and each target's native toolchain. Build desktop artifacts on the matching OS; build iOS on macOS with Xcode. Build and release commands run through `cargo xtask`, without Node or npm.
 
 ```sh
-npm ci
-npm run build:daemon           # debug binary and runtime assets
-npm run build:daemon:release   # optimized local Rust build, not publication
-npm run build:flutter -- linux # matching host only; optimized desktop runtime
-npm run package:flutter:desktop
-npm run build:apk:arm64
-npm run build:ios
+cargo fetch --locked
+cargo xtask build-daemon                # debug binary and runtime assets
+cargo xtask build-daemon --release      # optimized local build, not publication
+cargo xtask build-flutter linux         # matching host only
+cargo xtask package-desktop
+cargo xtask build-flutter android --arch arm64
+cargo xtask build-flutter ios
 ```
 
 The default Flutter release build uses optimized Rust; a debug development build uses the debug profile. Optimization is independent of publication: `--release` alone must not turn a local binary into an updater-enabled official build.
 
-Published provenance is explicitly selected by `PASEO_NATIVE_RELEASE=1` together with the optimized build and validated `PASEO_UPDATE_REPOSITORY`, `PASEO_RELEASE_CHANNEL`, and `PASEO_BUILD_SOURCE_SHA`. The source SHA must identify the checked-out source. Standalone `npm run package:daemon` requires that release identity; it is not a way to relabel an arbitrary local executable.
+Published provenance is explicitly selected by `PASEO_NATIVE_RELEASE=1` together with the optimized build and validated `PASEO_UPDATE_REPOSITORY`, `PASEO_RELEASE_CHANNEL`, and `PASEO_BUILD_SOURCE_SHA`. The source SHA must identify the checked-out source. Standalone `cargo xtask package-daemon` requires that release identity; it is not a way to relabel an arbitrary local executable.
 
 Client artifacts and build descriptors live in `artifacts/flutter/`. Standalone daemon archives are `Paseo-Daemon-<version>-<platform>-<arch>.tar.gz` (ZIP on Windows), with a channel/platform/architecture manifest. Native runtime metadata includes `paseo-runtime.json`, `bundle-provenance.json`, and desktop-specific `desktop-runtime.json` when applicable. Preserve assets together; copying only the executable omits runtime libraries and skills.
 
@@ -59,7 +45,7 @@ Bundle provenance records the executable digest **after relocation**, because ru
 
 ## Signing and mobile build numbers
 
-`packages/flutter_desktop_host/packaging/common.mjs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `13000`. Android enforces a minimum of `13000`. Confirm the next build number against the actual store history; do not infer store acceptance from a local version string.
+`xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `13001`. Android enforces a minimum of `13000`. Confirm the next build number against the actual store history; do not infer store acceptance from a local version string.
 
 Android release signing uses `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`, or the checked-in project's local signing properties. Without a release key, output is explicitly named **debug-signed**, not store-ready. Credentials are not part of this fork. The Android application ID is `sh.paseo.sessions`.
 
@@ -71,17 +57,19 @@ Optional Firebase configuration must match `sh.paseo.sessions`: `GOOGLE_SERVICES
 
 `.github/workflows/desktop-release.yml` is the **Native Release** workflow despite its retained filename. It builds Flutter/Rust targets, preserves complete per-target artifacts, validates recovery provenance, and publishes only through its publication path. Its matrix definition is not evidence that those targets have run.
 
+The complete release matrix has **eight targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android universal and iOS arm64. Each target's artifacts are retained for **30 days**. macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android explicitly provisions platform-tools. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
+
 Manual inputs include `tag`, `mode` (`build` or `publish-only`), `recovery_run_id`, `platform`, `checkout_ref`, `publish`, and `rollout_hours`. **`publish` defaults to true**; explicitly select false for an authorized non-publishing build. Tag pushes also select publication. Do not push tags or dispatch a publishing workflow as a build test.
 
-`publish-only` consumes preserved artifacts from an exact prior completed canonical workflow run. Recovery requires a complete, unique, unexpired target inventory; one-architecture macOS recovery must not silently replace the other architecture. The publication scripts and update-manifest generator own final artifact integrity and source identity. Desktop rollout defaults to 36 hours; a rollout change is a publication-side operation requiring authorization, not a local check.
+`publish-only` consumes preserved artifacts from an exact prior completed canonical workflow run. Recovery requires a complete, unique, unexpired target inventory; one-architecture macOS recovery must not silently replace the other architecture. `cargo xtask release recovery`, `record`, `verify`, `manifests` and `publish` own recovery, artifact hashes, integrity, update feeds and publication. The publication repository is `emotionbug/paseo`; any manual `gh` command must name it explicitly with `--repo emotionbug/paseo`. Desktop rollout defaults to 36 hours; a rollout change is a publication-side operation requiring authorization, not a local check.
 
-`.github/workflows/docker.yml`, `desktop-packages.yml`, and `nix.yml` cover their respective native packaging/deployment definitions. They do not establish a completed release or remove the distribution requirements above.
+`.github/workflows/docker.yml` and `desktop-packages.yml` cover their respective native packaging/deployment definitions. They do not establish a completed release or remove the distribution requirements above.
 
 ## Authorization and verification
 
-A release requires an explicit approved source revision, version/channel decision, publication target and authorization. Keep preparation separate from publication. Commands named `release:publish`, `release:push`, `release:patch`, `release:minor`, `release:major`, their beta variants, and promotion commands have external effects; they are not verification shortcuts.
+A release requires an explicit approved source revision, version/channel decision, publication target and authorization. Keep preparation separate from publication. Native release publishing commands, tag pushes and publishing workflow dispatches have external effects; they are not verification shortcuts.
 
-Before a release decision, gather actual Rust/Flutter/SDK checks, target-platform execution, packaging/signing/install/update evidence, and distribution review for the exact revision and binary inventory. `npm run release:check` is a repository check command; it is not a compliance audit, proof of signing, or permission to publish.
+Before a release decision, gather actual Rust/Flutter/SDK checks, target-platform execution, packaging/signing/install/update evidence, and distribution review for the exact revision and binary inventory. Integrity verification is not a compliance audit, proof of signing, or permission to publish.
 
 Current actual Linux evidence and explicit missing platform checks are in [testing](testing.md). Android ARM64 release-mode compilation passed with debug signing, not production credentials; no Android device execution or Windows/macOS/iOS execution is claimed. Consult the testing record for desktop tray/editor follow-up results rather than treating a build as runtime proof. No release was published, installed, committed, pushed, or offered by the documentation update.
 
@@ -100,7 +88,7 @@ release. This applies to both beta and stable releases.
   the changelog. Retarget remaining PRs based on `next` to `main` and delete the integrated
   `next`. Create it fresh when needed again.
 
-**Setup still needed:** PR checks run for every base branch, but CI, Docker, and Nix
+**Setup still needed:** PR checks run for every base branch, but CI and Docker
 push runs target only `main`, and GitHub permits only squash merges. Enable
 required-check protection for `next`, CI on its pushes, and merge commits for the
 integration PR. Handle PR

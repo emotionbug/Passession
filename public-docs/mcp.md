@@ -66,7 +66,7 @@ Omitting `paseoTools` enables the complete catalog. Set `enabled` to `false` to 
 or list exact tool IDs in `disabledTools` to remove selected tools. Custom profiles do not inherit
 this policy from `extends`; configure each custom provider ID separately.
 
-The voice-only `speak` tool is separate from this policy. The native runtime has no embedded browser automation tools or browser host.
+The native runtime has no embedded browser automation tools or browser host.
 
 This setting limits the catalog presented to an agent. It is not a security boundary for an agent
 that can access the host through a shell.
@@ -192,9 +192,3 @@ Omit absent optional settings. If no profile fits, use provider discovery to cho
 | -------------------------- | ------------------------------------------------- |
 | `list_pending_permissions` | Return pending permission requests across agents. |
 | `respond_to_permission`    | Approve or deny a pending permission request.     |
-
-### Voice
-
-| Tool    | Function                                                                                  |
-| ------- | ----------------------------------------------------------------------------------------- |
-| `speak` | Speak text through daemon-managed voice output. Available only in voice-enabled sessions. |

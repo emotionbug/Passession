@@ -102,26 +102,3 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
     }
     Value::Object(result)
 }
-
-pub fn speech_capabilities(readiness: &Value) -> Value {
-    let state = |key: &str| {
-        let item = &readiness[key];
-        let reason = if item["available"] == true {
-            String::new()
-        } else if readiness["voiceFeature"]["reasonCode"] == "model_download_in_progress" {
-            let base = readiness["voiceFeature"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .trim();
-            if base.contains("Try again in a few minutes") {
-                base.to_owned()
-            } else {
-                format!("{base} Try again in a few minutes.")
-            }
-        } else {
-            item["message"].as_str().unwrap_or("").to_owned()
-        };
-        json!({"enabled":item["enabled"],"reason":reason})
-    };
-    json!({"voice":{"dictation":state("dictation"),"voice":state("realtimeVoice")}})
-}

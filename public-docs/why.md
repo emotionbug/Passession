@@ -26,8 +26,6 @@ Configure [workspace scripts](/docs/worktrees#scripts-and-services) to start dev
 
 Paseo runs the coding agents you already use, with your subscriptions, credentials, configuration, skills, and MCP servers. Your agents work with the files and tools on your machine. See [supported providers](/docs/supported-providers).
 
-Agents can speak to you through [text-to-speech](/docs/voice) that runs locally by default, with cloud providers available in settings. The native clients do not capture microphone input.
-
 ## Continue from another device
 
 The daemon owns running agents and workspaces. Native desktop/mobile clients and the Rust CLI connect to the same environment. Existing IDs, history, configuration and host-side files are preserved.
@@ -36,8 +34,8 @@ Use Paseo on your laptop or connect to another machine. Android and iOS provide 
 
 ## Automate and extend your workflow
 
-Give agents [Paseo tools](/docs/orchestration) to create worktrees, launch other agents, send prompts, and collect results. Use the [CLI](/docs/cli) or [TypeScript SDK](/docs/sdk) to automate agent and workspace operations.
+Give agents [Paseo tools](orchestration.md) to create worktrees, launch other agents, send prompts, and collect results. Use the [CLI](cli.md) or [Rust SDK](sdk/index.md) to automate agent and workspace operations.
 
-[Backend extensions](/docs/plugins) add providers, RPCs, lifecycle behavior and usage integrations through an optional external-Node worker. Built-ins run in Rust; executable React UI plugins are not supported. The default installed runtime includes neither Node, Electron nor Chromium. [Hub](/docs/hub) connects external events to agents running on your machines.
+[Backend plugins](plugins/index.md) add providers, RPCs, lifecycle behavior and usage integrations through native executables and the Rust SDK. Built-ins run in Rust; executable React UI plugins are not supported. Paseo runtime/build tools require no Node, Electron or Chromium. [Hub](hub/index.md) connects external events to agents running on your machines.
 
-Paseo source is Apache-2.0, with no telemetry, tracking or required Paseo account. Dependency licenses remain their own. Generated notices do not resolve the native speech libraries' source/licensing distribution requirements; consult the checkout's `docs/release.md` before distributing binaries. Model weights are downloaded on demand, not bundled.
+Paseo source is Apache-2.0, with no telemetry, tracking or required Paseo account. Dependency licenses remain their own. Preserve generated third-party notices and consult the checkout's `docs/release.md` before distributing binaries.

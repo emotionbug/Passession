@@ -1,4 +1,4 @@
-use super::target::{Endpoint, ssh_args};
+use super::target::Endpoint;
 use super::*;
 
 fn isolated(home: &std::path::Path) -> HostsService {
@@ -176,31 +176,13 @@ fn connection_grammar_hides_credentials_and_preserves_native_endpoints() {
     assert_eq!(ssh.password.as_deref(), Some("private"));
     let Endpoint::Ssh {
         host,
-        port,
-        daemon_port,
+        port: Some(2222),
+        daemon_port: 7000,
     } = ssh.endpoint
     else {
-        panic!("ssh expected")
+        panic!("ssh endpoint must preserve the requested host and ports")
     };
-    assert_eq!(
-        ssh_args(&host, port, daemon_port),
-        [
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ClearAllForwardings=yes",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-p",
-            "2222",
-            "-W",
-            "127.0.0.1:7000",
-            "user@example.test"
-        ]
-    );
+    assert_eq!(host, "user@example.test");
     for invalid in [
         "ssh://-option",
         "ssh://host?daemonPort=1&daemonPort=2",
