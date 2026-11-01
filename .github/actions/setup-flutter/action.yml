@@ -1,5 +1,5 @@
 name: Set up native Flutter SDK
-description: Use release archives where available and pinned source bootstrap for Linux and Windows ARM64.
+description: Install archived SDKs or verified reusable Linux and Windows ARM64 SDK release assets.
 inputs:
   flutter-version:
     description: Exact Flutter version
@@ -24,64 +24,34 @@ runs:
         channel: ${{ inputs.channel }}
         cache: ${{ inputs.cache }}
         cache-key: ${{ inputs.cache-key }}
-    - name: Validate pinned ARM64 SDK version
+    - name: Set up SDK installer toolchain
       if: ${{ runner.arch == 'ARM64' && (runner.os == 'Linux' || runner.os == 'Windows') }}
-      shell: bash
-      env:
-        SDK_VERSION: ${{ inputs.flutter-version }}
-        SDK_CHANNEL: ${{ inputs.channel }}
-      run: |
-        if [[ "$SDK_VERSION" != "3.47.5" || "$SDK_CHANNEL" != "stable" ]]; then
-          echo "Update the pinned ARM64 Flutter source revision when changing the SDK version." >&2
-          exit 1
-        fi
-    - name: Check out pinned Flutter source
-      if: ${{ runner.arch == 'ARM64' && (runner.os == 'Linux' || runner.os == 'Windows') }}
-      uses: actions/checkout@v6
+      uses: dtolnay/rust-toolchain@1.93.1
       with:
-        repository: flutter/flutter
-        ref: "3.47.5"
-        path: .paseo-flutter-sdk
-        fetch-depth: 1
-        persist-credentials: false
-    - name: Verify immutable Flutter source revision
-      if: ${{ runner.arch == 'ARM64' && (runner.os == 'Linux' || runner.os == 'Windows') }}
-      shell: bash
-      run: |
-        revision="$(git -C "$GITHUB_WORKSPACE/.paseo-flutter-sdk" rev-parse HEAD)"
-        if [ "$revision" != "6a19cca56475dbfba1478ee68d7bd0c2ef891da1" ]; then
-          echo "Flutter source tag no longer matches the pinned revision." >&2
-          exit 1
-        fi
-    - name: Cache native SDK bootstrap
+        toolchain: ${{ runner.os == 'Windows' && '1.93.1-aarch64-pc-windows-msvc' || '1.93.1-aarch64-unknown-linux-gnu' }}
+    - name: Cache verified ARM64 SDK downloads
       if: ${{ inputs.cache == 'true' && runner.arch == 'ARM64' && (runner.os == 'Linux' || runner.os == 'Windows') }}
       uses: actions/cache@v4
       with:
-        path: .paseo-flutter-sdk/bin/cache
-        key: flutter-source-${{ runner.os }}-${{ runner.arch }}-6a19cca56475dbfba1478ee68d7bd0c2ef891da1
-    - name: Bootstrap native Linux ARM64 SDK
+        path: ${{ runner.temp }}/paseo-flutter-sdk/downloads
+        key: ${{ inputs.cache-key || 'flutter-sdk' }}-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/flutter-sdk.json') }}
+    - name: Install published Linux ARM64 SDK
       if: ${{ runner.arch == 'ARM64' && runner.os == 'Linux' }}
       shell: bash
-      run: |
-        sdk="$GITHUB_WORKSPACE/.paseo-flutter-sdk"
-        "$sdk/bin/flutter" --version
-        dart_version="$("$sdk/bin/dart" --version 2>&1)"
-        case "$dart_version" in
-          *'"linux_arm64"'*) ;;
-          *) printf 'Expected native Linux ARM64 Dart, got: %s\n' "$dart_version" >&2; exit 1 ;;
-        esac
-        printf '%s/bin\n' "$sdk" >> "$GITHUB_PATH"
-        printf 'FLUTTER_ROOT=%s\n' "$sdk" >> "$GITHUB_ENV"
-    - name: Bootstrap native Windows ARM64 SDK
+      env:
+        RUSTUP_TOOLCHAIN: 1.93.1-aarch64-unknown-linux-gnu
+        FLUTTER_SDK_VERSION: ${{ inputs.flutter-version }}
+        FLUTTER_SDK_CHANNEL: ${{ inputs.channel }}
+        GH_TOKEN: ${{ github.token }}
+      run: cargo xtask flutter-sdk install --version "$FLUTTER_SDK_VERSION" --channel "$FLUTTER_SDK_CHANNEL"
+    - name: Install published Windows ARM64 SDK
       if: ${{ runner.arch == 'ARM64' && runner.os == 'Windows' }}
       shell: pwsh
+      env:
+        RUSTUP_TOOLCHAIN: 1.93.1-aarch64-pc-windows-msvc
+        FLUTTER_SDK_VERSION: ${{ inputs.flutter-version }}
+        FLUTTER_SDK_CHANNEL: ${{ inputs.channel }}
+        GH_TOKEN: ${{ github.token }}
       run: |
-        $sdk = Join-Path $env:GITHUB_WORKSPACE '.paseo-flutter-sdk'
-        & "$sdk/bin/flutter.bat" --version
-        if ($LASTEXITCODE -ne 0) { throw 'Native Flutter SDK bootstrap failed' }
-        $dartVersion = (& "$sdk/bin/dart.bat" --version 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0 -or $dartVersion -notmatch '"windows_arm64"') {
-          throw "Expected native Windows ARM64 Dart, got: $dartVersion"
-        }
-        "$sdk/bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        "FLUTTER_ROOT=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        cargo xtask flutter-sdk install --version "$env:FLUTTER_SDK_VERSION" --channel "$env:FLUTTER_SDK_CHANNEL"
+        if ($LASTEXITCODE -ne 0) { throw 'Published native Flutter SDK installation failed' }

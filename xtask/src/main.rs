@@ -2,6 +2,7 @@ mod assets;
 mod build;
 mod common;
 mod dev;
+mod flutter_sdk;
 mod libraries;
 mod notices;
 mod package;
@@ -41,6 +42,7 @@ fn dispatch() -> Result<()> {
         }
         "release" => release::run(args),
         "relay-cloudflare" => relay_cloudflare::run(args),
+        "flutter-sdk" => flutter_sdk::run(args),
         "dev" | "flutter" | "maintenance" => dev::run(command, args),
         "help" | "--help" | "-h" => help(),
         other => bail!("Unknown xtask command {other:?}; run cargo xtask --help"),
@@ -52,6 +54,7 @@ fn help() -> Result<()> {
         "Paseo native build and release tooling\n\n  build-daemon [--release]\n  build-relay [--release]\n  build-flutter [linux|macos|windows|android|ios] [--debug] [--run [--device ID]] [--arch universal|arm64]\n  package-desktop [linux|macos|windows]\n  package-daemon\n  stage-runtime DESTINATION [--profile debug|release] [--kind desktop-bundled|standalone-archive|container]\n  container-runtime DESTINATION\n  appimage-tools\n  release <plan|record|verify|stamp|publish|notes|version|fdroid|...>\n  dev ...\n  flutter <analyze|test|...>\n  maintenance <acp-catalog|codex-titles|...>"
     );
     println!("  relay-cloudflare <build|deploy>");
+    println!("  flutter-sdk <build|publish|install>");
     Ok(())
 }
 

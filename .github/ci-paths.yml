@@ -15,6 +15,7 @@ ci:
   - ".github/actions/**"
   - ".github/workflows/ci.yml"
   - ".github/workflows/ci-recovery.yml"
+  - ".github/workflows/flutter-sdk.yml"
 
 format:
   - "**/*.rs"
@@ -54,6 +55,7 @@ relay:
 # Shared Dart, assets and package resolutions affect every native build.
 # Platform implementation changes compile on their owning host only.
 flutter:
+  - ".github/flutter-sdk.json"
   - "packages/flutter_app/!(linux|windows|macos|android|ios)/**"
   - "packages/flutter_app/*"
   - "packages/flutter_audio/lib/**"

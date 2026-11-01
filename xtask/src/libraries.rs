@@ -4,7 +4,7 @@ use regex::Regex;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     fs,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -31,6 +31,35 @@ fn is_elf(file: &Path) -> Result<bool> {
     Ok(input.read(&mut header)? == 4 && header == *b"\x7fELF")
 }
 
+fn has_dynamic_segment(file: &Path) -> Result<bool> {
+    let mut input = fs::File::open(file)?;
+    let mut header = [0; 64];
+    input.read_exact(&mut header)?;
+    ensure!(
+        header[4] == 2 && header[5] == 1,
+        "Expected a 64-bit little-endian ELF"
+    );
+    let offset = u64::from_le_bytes(header[32..40].try_into()?);
+    let stride = u16::from_le_bytes(header[54..56].try_into()?) as u64;
+    let count = u16::from_le_bytes(header[56..58].try_into()?);
+    ensure!(
+        count == 0 || stride >= 56,
+        "Invalid ELF program header size"
+    );
+    for index in 0..count {
+        let position = offset
+            .checked_add(u64::from(index) * stride)
+            .context("ELF program header offset overflow")?;
+        input.seek(SeekFrom::Start(position))?;
+        let mut kind = [0; 4];
+        input.read_exact(&mut kind)?;
+        if u32::from_le_bytes(kind) == 2 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn system_notice(source: &Path, destination: &Path) -> Result<()> {
     let name = source
         .file_name()
@@ -55,28 +84,67 @@ fn system_notice(source: &Path, destination: &Path) -> Result<()> {
     )
 }
 
+fn relocate_elf(file: &Path, destination: &Path) -> Result<bool> {
+    if !is_elf(file)? {
+        return Ok(false);
+    }
+    assert_architecture(file)?;
+    if !has_dynamic_segment(file)? {
+        return Ok(false);
+    }
+    let old = capture(command("patchelf")?.arg("--print-rpath").arg(file))?;
+    let mut paths: Vec<String> = old
+        .split(':')
+        .filter(|value| *value == "$ORIGIN" || value.starts_with("$ORIGIN/"))
+        .map(str::to_owned)
+        .collect();
+    if !paths.iter().any(|path| path == "$ORIGIN") {
+        paths.push("$ORIGIN".to_owned());
+    }
+    let relative = relative(file.parent().context("ELF has no directory")?, destination)?;
+    let local = if relative.is_empty() {
+        "$ORIGIN".to_owned()
+    } else {
+        format!("$ORIGIN/{relative}")
+    };
+    if !paths.contains(&local) {
+        paths.push(local);
+    }
+    let relocated = paths.join(":");
+    if relocated != old {
+        run(command("patchelf")?
+            .arg("--set-rpath")
+            .arg(relocated)
+            .arg(file))?;
+    }
+    Ok(true)
+}
+
 /// Collect the complete non-host ELF closure and patch every ELF's own RPATH.
 /// The daemon remains independently runnable, without an AppRun environment.
 fn bundle(root: &Path, destination: &Path, notices: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     fs::create_dir_all(notices)?;
+    let root = fs::canonicalize(root)?;
+    let destination = fs::canonicalize(destination)?;
     let host = Regex::new(
         r"^(ld-linux|lib(c|m|pthread|dl|rt|resolv|nss_[^.]+|anl|util)\.so|lib(GL|GLX|EGL|GLdispatch|drm|gbm)[-.])",
     )?;
     let mut queue = VecDeque::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    // Relocate the whole payload before resolving transitive dependencies.
+    // Otherwise a plugin's old absolute RPATH can select the build-tree engine.
+    for entry in WalkDir::new(&root).follow_links(false) {
         let entry = entry?;
-        if entry.file_type().is_file() {
+        if entry.file_type().is_file() && relocate_elf(entry.path(), &destination)? {
             queue.push_back(entry.into_path());
         }
     }
     let mut visited = HashSet::new();
     let mut copies = BTreeMap::<PathBuf, PathBuf>::new();
     while let Some(file) = queue.pop_front() {
-        if !visited.insert(fs::canonicalize(&file)?) || !is_elf(&file)? {
+        if !visited.insert(fs::canonicalize(&file)?) {
             continue;
         }
-        assert_architecture(&file)?;
         let output = Command::new("ldd")
             .arg(&file)
             .env("LC_ALL", "C")
@@ -109,7 +177,9 @@ fn bundle(root: &Path, destination: &Path, notices: &Path) -> Result<()> {
             };
             let source = Path::new(source);
             let basename = source.file_name().context("Invalid ldd library path")?;
-            if source.starts_with(root) || host.is_match(&basename.to_string_lossy()) {
+            if fs::canonicalize(source)?.starts_with(&root)
+                || host.is_match(&basename.to_string_lossy())
+            {
                 continue;
             }
             let target = destination.join(basename);
@@ -128,28 +198,11 @@ fn bundle(root: &Path, destination: &Path, notices: &Path) -> Result<()> {
                 );
                 copy_tree(source, &target)?;
                 copies.insert(target.clone(), source.to_path_buf());
-                queue.push_back(target);
+                if relocate_elf(&target, &destination)? {
+                    queue.push_back(target);
+                }
             }
         }
-        let old = capture(command("patchelf")?.arg("--print-rpath").arg(&file))?;
-        let mut paths: Vec<String> = old
-            .split(':')
-            .filter(|value| *value == "$ORIGIN" || value.starts_with("$ORIGIN/"))
-            .map(str::to_owned)
-            .collect();
-        let relative = relative(file.parent().context("ELF has no directory")?, destination)?;
-        let local = if relative.is_empty() {
-            "$ORIGIN".to_owned()
-        } else {
-            format!("$ORIGIN/{relative}")
-        };
-        if !paths.contains(&local) {
-            paths.push(local);
-        }
-        run(command("patchelf")?
-            .arg("--set-rpath")
-            .arg(paths.join(":"))
-            .arg(&file))?;
     }
     for source in copies.values() {
         system_notice(source, notices)?;
@@ -186,6 +239,29 @@ pub fn appimage(appdir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_detection_uses_program_header_offsets_and_stride() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("fixture");
+        let mut bytes = vec![0_u8; 240];
+        bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        bytes[32..40].copy_from_slice(&128_u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[128..132].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[184..188].copy_from_slice(&2_u32.to_le_bytes());
+        fs::write(&path, &bytes)?;
+        assert!(has_dynamic_segment(&path)?);
+        bytes[184..188].copy_from_slice(&1_u32.to_le_bytes());
+        fs::write(&path, &bytes)?;
+        assert!(!has_dynamic_segment(&path)?);
+        bytes[54..56].copy_from_slice(&4_u16.to_le_bytes());
+        fs::write(&path, &bytes)?;
+        assert!(has_dynamic_segment(&path).is_err());
+        Ok(())
+    }
+
     #[test]
     fn library_paths_are_relocatable_at_each_runtime_depth() {
         assert_eq!(

@@ -1,6 +1,7 @@
 name: Native Desktop Packages
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -19,6 +20,8 @@ on:
       - "xtask/**"
       - ".cargo/**"
       - ".github/actions/setup-flutter/**"
+      - ".github/flutter-sdk.json"
+      - ".github/workflows/flutter-sdk.yml"
       - ".github/workflows/desktop-packages.yml"
 
 concurrency:

@@ -1,0 +1,75 @@
+name: Flutter ARM64 SDK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-sdk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Assemble SDK (${{ matrix.platform }}-arm64)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux, runner: ubuntu-24.04-arm, toolchain: 1.93.1-aarch64-unknown-linux-gnu }
+          - { platform: windows, runner: windows-11-arm, toolchain: 1.93.1-aarch64-pc-windows-msvc }
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: flutter-sdk-${{ matrix.platform }}-arm64
+      - name: Assemble pinned official Flutter SDK and verify native Dart
+        run: cargo xtask flutter-sdk build
+      - name: Retain SDK archive and identity manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-sdk-${{ matrix.platform }}-arm64
+          path: artifacts/flutter-sdk/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish immutable SDK assets (not a product release)
+    needs: build
+    if: github.repository == 'emotionbug/paseo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: flutter-sdk-publish
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: flutter-sdk-*-arm64
+          path: artifacts/flutter-sdk
+          merge-multiple: true
+      - name: Validate both SDKs and publish reserved non-latest prerelease
+        run: cargo xtask flutter-sdk publish
+        env:
+          GH_TOKEN: ${{ github.token }}

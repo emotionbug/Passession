@@ -38,6 +38,8 @@ pub fn write_json(path: &Path, value: &Value) -> Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
     serde_json::to_writer_pretty(&mut temporary, value)?;
     temporary.write_all(b"\n")?;
+    // Build metadata ships with packages and must be readable by their users.
+    chmod(temporary.path(), 0o644)?;
     temporary
         .persist(path)
         .map_err(|error| error.error)
@@ -403,10 +405,25 @@ pub fn absolute(path: impl AsRef<Path>) -> Result<PathBuf> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::{
         io::{BufRead, BufReader},
         os::unix::process::{CommandExt, ExitStatusExt},
     };
+
+    #[test]
+    fn published_json_remains_readable_after_replacement() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("paseo-runtime.json");
+        write_json(&path, &json!({"version": 1}))?;
+        chmod(&path, 0o600)?;
+        write_json(&path, &json!({"version": 2}))?;
+        assert_eq!(read_json(&path)?, json!({"version": 2}));
+        assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o644);
+        Ok(())
+    }
 
     #[test]
     fn cancellation_reaps_a_process_ignoring_termination() -> Result<()> {

@@ -40,7 +40,9 @@
 - Removed the obsolete Node worker/validator build chain. Updated CI's Android SDK installation, macOS runners and Linux native-asset prerequisites; fixed Windows file identity on stable Rust and the Windows Flutter coroutine compiler mode.
 - Derive the native CI package channel from the release planner. Changelog synchronization skips an unpublished version unless draft creation is explicitly requested; GitHub lookup failures still fail the job.
 - Keep Cargo notice metadata locked while honoring Cargo's network policy, so clean container builds can resolve workspace crates that were not downloaded by the daemon build.
-- Bootstrap Linux and Windows ARM64 Flutter SDKs from the pinned upstream source when release archives are unavailable, and reject an emulated x64 Dart SDK instead of silently building the wrong architecture.
+- Build pinned Linux and Windows ARM64 Flutter SDKs in a dedicated repository workflow and publish immutable, non-latest SDK assets. ARM64 app CI installs the verified artifacts rather than rebuilding Flutter tools, and rejects emulated x64 Dart.
+- Make packaged JSON metadata readable by installed-product users instead of inheriting private temporary-file permissions.
+- Resolve Linux bundled libraries after relocating the entire payload's RPATHs, so Flutter plugins use the packaged engine rather than an absolute build-tree copy.
 - Fixed existing conversations appearing empty after restarting the native daemon. Provider history replaces partial checkpoints before timeline pages are served, while retaining live events received during restoration.
 - Fixed repeated Pi/OMP assistant and reasoning text when cumulative snapshots arrive ahead of queued streaming deltas. Delta-only streams still preserve intentionally repeated text.
 - Fixed empty tool-detail sheets for label-only calls such as Wait. When plain-text output is absent, show the full supplied command or wait-target label as selectable, wrapping text; retain the existing output when present.

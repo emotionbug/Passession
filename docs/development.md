@@ -9,6 +9,8 @@
 
 Fetch Rust dependencies with `cargo fetch --locked`. Flutter wrappers run `flutter pub get --enforce-lockfile`. Desktop builds require their target host; native packaging rejects `CARGO_BUILD_TARGET` cross-compilation.
 
+CI provisions Linux/Windows ARM64 Flutter from a reusable, pinned SDK release in this repository, not from a source bootstrap in each app build. `.github/flutter-sdk.json` defines its identity; the shared setup action rejects a mismatched requested version/channel or non-native Dart ABI. The dedicated SDK workflow must publish both platforms before dependent app jobs run; see [SDK prerequisites and upgrades](release.md#reusable-linux-and-windows-arm64-flutter-sdks). This uses official Flutter source and native Dart/engine artifacts, with no engine fork. Other hosts retain archived SDK setup.
+
 ## Development commands
 
 Run commands from the repository root:
