@@ -256,6 +256,24 @@ impl CatalogService {
             .collect())
     }
 
+    /// A status read must not start discovery or wait for provider processes.
+    pub(crate) fn cached_availability(&self) -> Vec<Value> {
+        let cache = self.inner.cache.lock().unwrap();
+        match cache.targets.get(GLOBAL) {
+            Some(target) => target
+                .snapshot
+                .records
+                .iter()
+                .map(|record| state::availability(&record.entry))
+                .collect(),
+            None => cache
+                .order
+                .iter()
+                .map(|id| state::availability(&cache.providers[id].initial.entry))
+                .collect(),
+        }
+    }
+
     pub(crate) async fn handle(&self, context: &RequestContext, message: &Value) -> Result<bool> {
         // Work shared across sources continues; replies/events are still fenced by
         // the exact request/subscription owner and its current permission grant.

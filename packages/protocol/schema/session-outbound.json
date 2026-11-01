@@ -49873,6 +49873,9 @@
                 }
               ]
             },
+            "providersCached": {
+              "type": "boolean"
+            },
             "providers": {
               "type": "array",
               "items": {
@@ -49882,7 +49885,16 @@
                     "type": "string"
                   },
                   "available": {
+                    "type": ["boolean", "null"]
+                  },
+                  "status": {
+                    "enum": ["loading", "ready", "unavailable", "error"]
+                  },
+                  "enabled": {
                     "type": "boolean"
+                  },
+                  "fetchedAt": {
+                    "type": ["string", "null"]
                   },
                   "error": {
                     "type": [

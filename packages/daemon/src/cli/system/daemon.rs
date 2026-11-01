@@ -372,6 +372,7 @@ pub(crate) async fn observe_status(
                     ("workerPid", "pid"),
                     ("daemonExecutable", "nodePath"),
                     ("providers", "providers"),
+                    ("providersCached", "providersCached"),
                     ("relay", "relay"),
                 ] {
                     if let Some(value) = status.get(source) {

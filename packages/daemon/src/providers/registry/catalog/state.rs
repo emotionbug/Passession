@@ -223,6 +223,22 @@ pub(super) fn initial(entry: &ProviderEntry) -> Arc<SnapshotRecord> {
     identify(value)
 }
 
+pub(super) fn availability(entry: &Value) -> Value {
+    let available = match (entry["enabled"].as_bool(), entry["status"].as_str()) {
+        (Some(true), Some("ready")) => Some(true),
+        (Some(true), Some("unavailable")) => Some(false),
+        _ => None,
+    };
+    json!({
+        "provider": entry["provider"],
+        "available": available,
+        "status": entry["status"],
+        "enabled": entry["enabled"],
+        "error": entry["error"],
+        "fetchedAt": entry["fetchedAt"],
+    })
+}
+
 pub(super) fn same_records(
     previous: &[Arc<SnapshotRecord>],
     current: &[Arc<SnapshotRecord>],

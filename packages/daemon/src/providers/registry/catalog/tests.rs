@@ -12,6 +12,24 @@ fn waiting() -> watch::Receiver<bool> {
 }
 
 #[test]
+fn cached_status_does_not_invent_provider_availability() {
+    for (enabled, status, expected) in [
+        (true, "loading", None),
+        (true, "error", None),
+        (false, "unavailable", None),
+        (true, "ready", Some(true)),
+        (true, "unavailable", Some(false)),
+    ] {
+        let cached = super::state::availability(&json!({
+            "provider": "antigravity",
+            "enabled": enabled,
+            "status": status,
+        }));
+        assert_eq!(cached["available"], json!(expected), "{enabled}/{status}");
+    }
+}
+
+#[test]
 fn refresh_intent_survives_key_lookup_supersession() {
     let first = Binding::superseding(1, None, true, waiting());
     let second = Binding::superseding(2, Some(&first), false, waiting());

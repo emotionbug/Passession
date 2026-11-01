@@ -1064,23 +1064,7 @@ impl TransportService {
             .app
             .upgrade()
             .ok_or_else(|| anyhow!("Daemon is shutting down"))?;
-        let providers = futures_util::future::join_all(app.providers.ids().into_iter().map(|id| {
-            let registry = &app.providers;
-            let cancel = self.cancel.child_token();
-            async move {
-                let available = match registry.get(&id) {
-                    Ok(provider) => provider.is_available(json!({}), cancel).await,
-                    Err(error) => Err(error),
-                };
-                match available {
-                    Ok(available) => json!({"provider":id,"available":available,"error":null}),
-                    Err(error) => {
-                        json!({"provider":id,"available":false,"error":error.to_string()})
-                    }
-                }
-            }
-        }))
-        .await;
+        let providers = app.providers.catalogs.cached_availability();
         let pid = match tokio::fs::read(app.home.join("paseo.pid")).await {
             Ok(bytes) => serde_json::from_slice::<Value>(&bytes).ok(),
             Err(_) => None,
@@ -1088,7 +1072,7 @@ impl TransportService {
         let config = self.config_snapshot();
         let relay = relay_config(&config);
         Ok(
-            json!({"requestId":request_id(request),"serverId":self.identity()["serverId"],"version":env!("CARGO_PKG_VERSION"),"pid":std::process::id(),"nodePath":app.executable,"startedAt":pid.and_then(|p|p.get("startedAt").cloned()),"listen":self.listen_string(),"relay":relay,"providers":providers}),
+            json!({"requestId":request_id(request),"serverId":self.identity()["serverId"],"version":env!("CARGO_PKG_VERSION"),"pid":std::process::id(),"nodePath":app.executable,"startedAt":pid.and_then(|p|p.get("startedAt").cloned()),"listen":self.listen_string(),"relay":relay,"providers":providers,"providersCached":true}),
         )
     }
     pub fn listen_string(&self) -> Option<String> {
