@@ -5,6 +5,7 @@
 ### Fixed
 
 - Resolve redistributed Linux library notices from the package owning the actual file (including merged-`usr` aliases), not the first package containing an unrelated library with the same basename.
+- Restore the exact revision-pinned macOS Cargo license text, including its omitted blank line. Manual release builds can pin a corrected notice-data commit without changing the published application source tag or weakening notice validation.
 
 ## 0.13.2
 
