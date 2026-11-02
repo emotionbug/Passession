@@ -65,6 +65,8 @@ struct Inner {
     assets: Mutex<Option<launch::Assets>>,
     host_tools: Mutex<Option<Arc<Router>>>,
     sink: EventSink,
+    /// Live rows of a child whose in-stream replay is being decided.
+    holds: crate::providers::api::ChildRowHold,
     closed: AtomicBool,
     generation: AtomicU64,
     operation: tokio::sync::Mutex<()>,
@@ -115,7 +117,7 @@ impl Inner {
         Ok(state)
     }
     async fn emit(&self, event: Value) -> Result<()> {
-        self.sink.emit(event).await
+        self.holds.emit(&self.sink, event).await
     }
     async fn out_of_band_message(&self, text: String) -> Result<()> {
         self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"assistant_message","text":text}})).await
@@ -451,7 +453,7 @@ impl Inner {
             self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"compaction","status":if started{"loading"}else{"completed"},"trigger":if frame["reason"]=="manual"{"manual"}else{"auto"}}})).await?;
             return Ok(());
         }
-        let (events, responses, children) = {
+        let (mut events, responses, children) = {
             let mut state = self.state.lock().unwrap();
             let events = state.mapper.map(&frame);
             (
@@ -464,6 +466,7 @@ impl Inner {
             self.runtime()?.send(&response).await?;
         }
         for child in children {
+            events.extend(history::pi_child_source(&self.spec.id, &child));
             self.follow_child(child, generation);
         }
         let completed = events
@@ -490,8 +493,9 @@ impl Inner {
         }
         let (id, file) = (id.to_owned(), file.to_owned());
         let weak = Arc::downgrade(self);
+        // Identified as the opened child's file replay identifies the same records.
+        let mut mapper = Mapper::new("pi", &self.spec.id).native_ids();
         tokio::spawn(async move {
-            let mut mapper = Mapper::new("pi", "pi");
             let mut offset = 0u64;
             let mut pending = Vec::<u8>::new();
             let mut items = 0usize;
@@ -806,6 +810,32 @@ async fn initialized_state(
     Ok(state)
 }
 impl Session {
+    /// Whether this is `parent`'s session with a runtime that can still publish
+    /// live child rows (an OMP `subagent_event` or a followed Pi child file).
+    pub(super) fn publishes_for(&self, parent: &str) -> bool {
+        if self.inner.closed.load(Ordering::Acquire) || self.inner.runtime.lock().unwrap().is_none() {
+            return false;
+        }
+        let state = self.inner.state.lock().unwrap();
+        !state.dead && state.native["sessionFile"].as_str() == Some(parent)
+    }
+    /// The child's file replay, published in this session's live stream behind
+    /// every child row already published. Live child rows (OMP `subagent_event`
+    /// messages, the Pi child-file tail) and the replay map the same records
+    /// with the same native identity, so a held row equal to a snapshot row is
+    /// that record again and is dropped once the snapshot is applied.
+    pub(super) async fn replay_child(
+        &self,
+        request: &crate::providers::api::SubagentHistoryRequest,
+        read: impl Future<Output = Result<(Vec<Value>, HistoryCoverage)>>,
+    ) -> Result<crate::providers::api::SubagentHistory> {
+        self.inner
+            .holds
+            .publish_replay(request, &self.inner.spec.id, &self.inner.sink, read, |item, snapshot| {
+                snapshot.contains(item)
+            })
+            .await
+    }
     pub async fn open(
         spec: ProviderSpec,
         config: Value,
@@ -813,6 +843,7 @@ impl Session {
         persistence: Option<Value>,
         options: Value,
         sink: EventSink,
+        probes: &launch::CommandProbes,
     ) -> Result<Arc<Self>> {
         launch::validate_options(&spec.family, &config["providerOptions"])?;
         context.cancel = context.cancel.child_token();
@@ -842,7 +873,7 @@ impl Session {
             bail!("OMP history session file is unavailable");
         }
         let assets = if !omp && !history_only {
-            Some(launch::pi_assets(&spec, &config, &context).await?)
+            Some(launch::pi_assets(&spec, &config, &context, probes).await?)
         } else {
             None
         };
@@ -907,6 +938,7 @@ impl Session {
             assets: Mutex::new(assets),
             host_tools: Mutex::new(None),
             sink,
+            holds: Default::default(),
             closed: AtomicBool::new(false),
             generation: AtomicU64::new(1),
             operation: tokio::sync::Mutex::new(()),
@@ -1390,21 +1422,9 @@ impl AgentSession for Session {
                 sink.emit(event).await?;
             }
         }
-        let mut remaining = 16 * 1024 * 1024;
         for child in mapper.drain_child_sessions() {
-            let (Some(id), Some(path)) = (child["id"].as_str(), child["file"].as_str()) else {
-                continue;
-            };
-            if remaining == 0 {
-                break;
-            }
-            let budget = remaining.min(2 * 1024 * 1024);
-            remaining -= budget;
-            for event in history::pi_child_history(id, Path::new(path), budget).await {
-                sink.emit(
-                    json!({"type":"provider_subagent","provider":self.provider(),"event":event}),
-                )
-                .await?;
+            if let Some(event) = history::pi_child_source(self.provider(), &child) {
+                sink.emit(event).await?;
             }
         }
         Ok(HistoryCoverage::Unverified)

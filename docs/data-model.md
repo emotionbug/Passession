@@ -67,7 +67,7 @@ $PASEO_HOME/
 ├── plugins/
 │   ├── sources.json                      # Managed kind and Git acquisition remote
 │   └── {pluginId}/{uuid}/                # Managed native Git/Cargo source or release archive
-└── push-tokens.json                     # Expo push notification tokens
+└── push-tokens.json                     # Expo push subscription leases
 ```
 
 The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
@@ -85,7 +85,7 @@ Each agent is stored as a separate JSON file, grouped by project directory.
 | `id`                 | `string`                                 | UUID, primary key                                                                                                                                                                                                                                                                                                                                                                   |
 | `provider`           | `string`                                 | Agent provider (`"claude"`, `"codex"`, `"opencode"`, etc.)                                                                                                                                                                                                                                                                                                                          |
 | `cwd`                | `string`                                 | Working directory the agent operates in                                                                                                                                                                                                                                                                                                                                             |
-| `workspaceId`        | `string?`                                | Owning workspace id — the single source of ownership. Every agent is stamped with one at create time; legacy cwd-only records are backfilled by `packages/daemon/src/projects/bootstrap.rs`. Runtime code never infers ownership or status from cwd: status is computed per `workspaceId`, and same-cwd siblings are independent. |
+| `workspaceId`        | `string?`                                | Owning workspace id — the single source of ownership. Every agent is stamped with one at create time. Runtime code never infers ownership or status from cwd: status is computed per `workspaceId`, and same-cwd siblings are independent.                                                                                                                                         |
 | `createdAt`          | `string` (ISO 8601)                      | Creation timestamp                                                                                                                                                                                                                                                                                                                                                                  |
 | `updatedAt`          | `string` (ISO 8601)                      | Last update timestamp                                                                                                                                                                                                                                                                                                                                                               |
 | `lastActivityAt`     | `string?` (ISO 8601)                     | Last activity timestamp                                                                                                                                                                                                                                                                                                                                                             |
@@ -456,7 +456,7 @@ Array of workspace records. A workspace is a specific working directory within a
 | `pinnedAt`                     | `string \| null` (ISO 8601)                                  | Pinned-to-top-of-sidebar timestamp; null means "not pinned"                                                                                                                                   |
 | `untrustedSource`              | `{ kind: "change_request", forge, number, headRepository }?` | Provenance captured when a cross-repository change request creates the workspace. Missing means repository automation is allowed; explicit setup removes the field.                           |
 
-> **Opaque-ID invariant:** `workspaceId` is opaque identity, never a filesystem path. Filesystem and git operations take `cwd`/`workspaceDirectory` only — never the id. A compatibility-only first-materialization bootstrap still groups pre-registry agent records by path and Git remote so existing installs retain their legacy records. That grouping never runs against a live registry, and its keys are not runtime project or workspace identity.
+> **Opaque-ID invariant:** `workspaceId` is opaque identity, never a filesystem path. Filesystem and git operations take `cwd`/`workspaceDirectory` only — never the id. The daemon never materializes registries or workspace ownership from agent records at startup.
 
 ### Workspace label catalog
 
@@ -494,11 +494,11 @@ than treating it as valid.
 
 ```json
 {
-  "tokens": ["ExponentPushToken[...]", ...]
+  "subscriptions": [{ "token": "ExponentPushToken[...]", "expiresAt": "2026-11-03T00:00:00.000Z" }]
 }
 ```
 
-Simple set of Expo push notification tokens. Loaded with permissive parsing (filters non-string entries). Persisted with atomic temp-file rename.
+Expo push subscription leases. A live client heartbeat renews its token's `expiresAt`; expired leases receive no notifications. Entries without a token or an RFC 3339 `expiresAt` are skipped, and a repeated token keeps its last expiry. Written atomically with mode `0600`.
 
 ---
 
@@ -523,8 +523,8 @@ The native client stores state beneath the platform application-support director
 - `state.json` contains versioned preferences, saved hosts, route suppression and layout. Unknown preference keys are retained. A newer unsupported state version is not overwritten.
 - `state.lock` serializes updates. Writes merge changes against the latest state so another client window's unrelated preference/host edits are not lost.
 - `replica-<base64url-server-id>.json` stores a host's project/workspace/agent snapshot and cache timestamp. It is scoped to the saved server identity and reconciled with the live daemon.
-- Drafts are retained in preferences with explicit host/workspace/target keys. Layout restoration excludes removed browser and executable plugin targets.
+- Drafts are retained in preferences with explicit host/workspace/target keys. Layout restoration drops removed browser, executable plugin and interactive terminal tabs; other saved layout is restored as written.
 
 Directory identity includes `(serverId, cwd)`; equal paths on two hosts must not merge. Workspace-owned state remains scoped to workspace identity, not parsed from a pathname. Closing a tab changes layout, not the daemon's archive state.
 
-The Flutter client does not use the retired browser IndexedDB, React Native AsyncStorage or Expo SQLite replica implementation. Cached client state is not the authoritative session history; the daemon remains the authority. Treat cached prompts, paths, credentials and tool output as sensitive data and do not infer encryption at rest from encrypted transport.
+The Flutter client does not read or import the retired app's browser IndexedDB, React Native AsyncStorage, Electron localStorage or desktop settings. Cached client state is not the authoritative session history; the daemon remains the authority. Treat cached prompts, paths, credentials and tool output as sensitive data and do not infer encryption at rest from encrypted transport.

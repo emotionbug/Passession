@@ -10,7 +10,6 @@ use std::{
 use tokio::sync::{Mutex, OnceCell};
 
 mod acquisition;
-mod bootstrap;
 pub mod directory;
 mod naming;
 mod project_config;
@@ -57,7 +56,6 @@ impl ProjectService {
     }
     pub async fn start_observations(&self) -> Result<()> {
         let app = self.app()?;
-        bootstrap::bootstrap(&app).await?;
         for workspace in self.list_workspaces().await? {
             if workspace["archivedAt"].is_null() {
                 let cwd = Path::new(text(&workspace, "cwd")?);

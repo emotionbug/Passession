@@ -1265,6 +1265,7 @@ fn validate_hello(hello: &Value) -> std::result::Result<(), &'static str> {
         "provider_snapshot_references",
         "timeline_replacement_invalidation",
         "timeline_notifications",
+        "saved_history_reads",
     ] {
         if hello["capabilities"]
             .get(capability)

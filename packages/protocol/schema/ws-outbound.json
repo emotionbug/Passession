@@ -30699,6 +30699,13 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "historySource": {
+                      "type": "string",
+                      "enum": [
+                        "live",
+                        "saved"
+                      ]
                     }
                   },
                   "required": [

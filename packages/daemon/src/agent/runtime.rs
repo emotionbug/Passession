@@ -16,6 +16,21 @@ impl AgentManager {
         }
         Ok(config)
     }
+    async fn session_environment(
+        &self,
+        id: &str,
+        config: &Value,
+        workspace: Option<&Value>,
+        reason: &str,
+        purpose: &str,
+        env: BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>> {
+        let app = self.app()?;
+        let request = json!({"agentId":id,"workspaceId":workspace.cloned().unwrap_or(Value::Null),"provider":config["provider"],"cwd":config["cwd"],"reason":reason,"purpose":purpose,"env":env});
+        let transformed = app.plugins.before("agent.session_open", request).await?;
+        serde_json::from_value::<BTreeMap<String, String>>(transformed["env"].clone())
+            .context("Invalid plugin session environment")
+    }
     async fn open_context(
         &self,
         id: &str,
@@ -25,12 +40,63 @@ impl AgentManager {
         purpose: &str,
         env: BTreeMap<String, String>,
     ) -> Result<crate::providers::api::LaunchContext> {
+        let env = self
+            .session_environment(id, config, workspace, reason, purpose, env)
+            .await?;
+        self.app()?.mcp.launch_context(id, config, env).await
+    }
+    /// A provider history read beside (or without) the agent's own session. It
+    /// holds no MCP grant: issuing one would revoke the live session's grant.
+    pub(super) async fn history_context(
+        &self,
+        id: &str,
+        config: &Value,
+        workspace: Option<&Value>,
+    ) -> Result<crate::providers::api::LaunchContext> {
         let app = self.app()?;
-        let request = json!({"agentId":id,"workspaceId":workspace.cloned().unwrap_or(Value::Null),"provider":config["provider"],"cwd":config["cwd"],"reason":reason,"purpose":purpose,"env":env});
-        let transformed = app.plugins.before("agent.session_open", request).await?;
-        let env = serde_json::from_value::<BTreeMap<String, String>>(transformed["env"].clone())
-            .context("Invalid plugin session environment")?;
-        app.mcp.launch_context(id, config, env).await
+        let mut env = app.config.environment();
+        if let Some(workspace) = workspace.and_then(Value::as_str) {
+            env.extend(app.projects.teardown_environment(workspace).await?);
+        }
+        env.insert("PASEO_AGENT_ID".into(), id.into());
+        env.insert("PASEO_AGENT_CWD".into(), required(config, "cwd")?.into());
+        let env = self
+            .session_environment(id, config, workspace, "resume", "history", env)
+            .await?;
+        Ok(crate::providers::api::LaunchContext {
+            agent_id: id.into(),
+            home: app.home.clone(),
+            executable: app.executable.clone(),
+            env,
+            mcp_servers: json!({}),
+            tool_catalog: json!([]),
+            tool_manifest: json!([]),
+            tool_executor: None,
+            cancel: app.cancel.child_token(),
+        })
+    }
+    /// The stored launch configuration: provider handle metadata, then the
+    /// record's config and last mode, then caller overrides.
+    pub(super) fn stored_launch_config(
+        record: &Value,
+        handle: Option<&Value>,
+        provider: &str,
+        overrides: &Value,
+    ) -> Value {
+        let mut config = handle
+            .and_then(|h| h.get("metadata"))
+            .cloned()
+            .unwrap_or(json!({}));
+        merge(&mut config, &record["config"]);
+        if let Some(mode) = record.get("lastModeId").filter(|v| !v.is_null()) {
+            config["modeId"] = mode.clone();
+        }
+        merge(&mut config, overrides);
+        config["provider"] = json!(provider);
+        if config.get("cwd").is_none() {
+            config["cwd"] = record["cwd"].clone();
+        }
+        config
     }
     pub(super) async fn create_session(
         &self,
@@ -247,11 +313,7 @@ impl AgentManager {
         let _lane = lane.lock().await;
         if let Ok(cell) = self.cell(id).await {
             let data = cell.data.lock().await;
-            if data.ready
-                && data.history_primed
-                && data.session.is_some()
-                && !data.owner_ended
-                && data.event_error.is_none()
+            if data.serves_runtime()
                 && !force_history
                 && overrides.as_object().is_none_or(|o| o.is_empty())
             {
@@ -282,6 +344,9 @@ impl AgentManager {
         if self.closing.load(Ordering::Acquire) {
             bail!("Agent manager is shutting down");
         }
+        // Child reads in flight finish (and apply) before a parent session can
+        // start publishing live child rows; new child reads wait for this.
+        let _starting = self.child_read_gate(id).await.write_owned().await;
         let mut record = self
             .agent_snapshot(id)
             .await?
@@ -309,20 +374,7 @@ impl AgentManager {
             .or_else(|| text(&record, "provider"))
             .ok_or_else(|| anyhow!("Agent has no provider"))?
             .to_owned();
-        let mut config = handle
-            .as_ref()
-            .and_then(|h| h.get("metadata"))
-            .cloned()
-            .unwrap_or(json!({}));
-        merge(&mut config, &record["config"]);
-        if let Some(mode) = record.get("lastModeId").filter(|v| !v.is_null()) {
-            config["modeId"] = mode.clone();
-        }
-        merge(&mut config, &overrides);
-        config["provider"] = json!(provider);
-        if config.get("cwd").is_none() {
-            config["cwd"] = record["cwd"].clone();
-        }
+        let config = Self::stored_launch_config(&record, handle.as_ref(), &provider, &overrides);
         let history = record.get("archivedAt").is_some_and(|v| !v.is_null());
         let config = self.normalize_config_for(config, true, history).await?;
         record["config"] = config.clone();
@@ -361,14 +413,15 @@ impl AgentManager {
                 .await?;
             let launch = self.launch_config(config)?;
             let session = if let Some(handle) = handle.as_ref() {
+                let options = {
+                    let timeline = cell
+                        .timeline
+                        .lock()
+                        .map_err(|_| anyhow!("Timeline lock poisoned"))?;
+                    resume_options(history, &timeline)
+                };
                 factory
-                    .resume_session(
-                        handle.clone(),
-                        launch,
-                        context,
-                        json!({"purpose":if history{"history"}else{"interactive"}}),
-                        cell.sink.clone(),
-                    )
+                    .resume_session(handle.clone(), launch, context, options, cell.sink.clone())
                     .await?
             } else {
                 let mut options = json!({"labels":record_labels,"workspaceId":workspace});
@@ -391,8 +444,14 @@ impl AgentManager {
             Ok(cell.data.lock().await.snapshot.clone())
         }
         .await;
-        if result.is_err() {
-            self.discard_failed_registration(id, &cell).await;
+        match &result {
+            Ok(_) => {
+                // A live owner supersedes a recorded background failure.
+                if self.preparations.clear_failure(id) {
+                    self.publish_preparation(id).await;
+                }
+            }
+            Err(_) => self.discard_failed_registration(id, &cell).await,
         }
         result
     }
@@ -487,11 +546,7 @@ impl AgentManager {
     }
     pub(super) async fn ensure_loaded(&self, id: &str) -> Result<Arc<AgentCell>> {
         if let Ok(cell) = self.cell(id).await {
-            let ready = {
-                let data = cell.data.lock().await;
-                data.ready && data.history_primed && data.session.is_some() && !data.owner_ended && data.event_error.is_none()
-            };
-            if ready {
+            if cell.data.lock().await.serves_runtime() {
                 return Ok(cell);
             }
         }
@@ -568,7 +623,7 @@ impl AgentManager {
             drop(current);
             let outputs = if subagent_events.is_empty() { Vec::new() } else {
                 store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
-                    .replay_history(root.as_deref(), &id_owned, subagent_events)?
+                    .replay_history(root.as_deref(), &id_owned, subagent_events, false)?
             };
             Ok::<_, anyhow::Error>((epoch, outputs))
         })
@@ -646,6 +701,12 @@ impl AgentManager {
             }
         }
         let _commit = cell.commit.lock().await;
+        if event["type"] == "provider_subagent" && event["event"]["type"] == "replay" {
+            // Applied in the parent's event order; the outcome goes to the
+            // provider and the reader. A failed replay never ends the parent's owner.
+            self.apply_published_replay(id, &event).await;
+            return Ok(());
+        }
         if event["type"] == "provider_subagent" {
             self.apply_subagent_event(id, cell, &event).await?;
             return Ok(());
@@ -1030,26 +1091,37 @@ impl AgentManager {
         &self, id: &str, cell: &Arc<AgentCell>, snapshot: &Value, output: Value,
     ) -> Result<()> {
         if cell.data.lock().await.ready {
-            let _ = self
-                .events
-                .send(json!({"type":"provider_subagent","event":output}));
-            if snapshot["internal"] != true {
-                let payload = match text(&output, "type") {
-                    Some("upsert") => json!({"kind":"upsert","subagent":output["subagent"]}),
-                    Some("timeline") => {
-                        json!({"kind":"timeline","parentAgentId":id,"subagentId":output["subagentId"],"provider":output["provider"],"item":output["row"]["item"],"timestamp":output["row"]["timestamp"],"seq":output["row"]["seq"],"epoch":output["epoch"]})
-                    }
-                    _ => {
-                        json!({"kind":"remove","parentAgentId":id,"subagentId":output["subagentId"]})
-                    }
-                };
-                self.app()?
-                    .transport
-                    .publish_event(
-                        json!({"type":"agent.provider_subagents.update","payload":payload}),
-                    )
-                    .await?;
-            }
+            self.emit_subagent_output(id, snapshot["internal"] == true, output).await?;
+        }
+        Ok(())
+    }
+    /// Publishes one stored child change. Lazy child-body reads use this
+    /// without a parent runtime; descriptors leave without their `source` and
+    /// with the child's current native-refresh state.
+    pub(super) async fn emit_subagent_output(&self, id: &str, internal: bool, mut output: Value) -> Result<()> {
+        if let Some(descriptor) = output.get_mut("subagent") {
+            *descriptor = timeline::public_subagent(descriptor.take());
+            self.overlay_subagent_refresh(descriptor);
+        }
+        let _ = self
+            .events
+            .send(json!({"type":"provider_subagent","event":output}));
+        if !internal {
+            let payload = match text(&output, "type") {
+                Some("upsert") => json!({"kind":"upsert","subagent":output["subagent"]}),
+                Some("timeline") => {
+                    json!({"kind":"timeline","parentAgentId":id,"subagentId":output["subagentId"],"provider":output["provider"],"item":output["row"]["item"],"timestamp":output["row"]["timestamp"],"seq":output["row"]["seq"],"epoch":output["epoch"]})
+                }
+                _ => {
+                    json!({"kind":"remove","parentAgentId":id,"subagentId":output["subagentId"]})
+                }
+            };
+            self.app()?
+                .transport
+                .publish_event(
+                    json!({"type":"agent.provider_subagents.update","payload":payload}),
+                )
+                .await?;
         }
         Ok(())
     }
@@ -1209,6 +1281,9 @@ impl AgentManager {
         self.notifications.shutdown().await?;
         self.message_delivery.shutdown().await?;
         self.closing.store(true, Ordering::Release);
+        // Owned background reads end with the manager; their waiters see cancellation.
+        self.preparations.abort_all();
+        self.subagent_reads.abort_all();
         let agents = self
             .agents
             .read()
@@ -1228,6 +1303,22 @@ impl AgentManager {
             Ok(())
         }
     }
+}
+/// `resume_session` options. `subagentCardLogs` carries each stored
+/// sub-agent card's recorded log by call ID, and `subagentCardEntries` the
+/// recorded identities of that log's entries, so a provider keeps the log
+/// across replay and continues live child output exactly once without
+/// reading child bodies.
+pub(super) fn resume_options(history: bool, timeline: &Timeline) -> Value {
+    let mut options = json!({"purpose":if history { "history" } else { "interactive" }});
+    let (logs, entries) = timeline.subagent_card_logs();
+    if !logs.is_empty() {
+        options["subagentCardLogs"] = Value::Object(logs);
+    }
+    if !entries.is_empty() {
+        options["subagentCardEntries"] = Value::Object(entries);
+    }
+    options
 }
 pub(super) fn hook_agent(snapshot: &Value) -> Value {
     json!({"id":snapshot["id"],"workspaceId":snapshot["workspaceId"],"parentAgentId":snapshot["labels"]["paseo.parent-agent-id"],"provider":snapshot["provider"],"cwd":snapshot["cwd"],"title":snapshot["title"]})

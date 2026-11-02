@@ -378,77 +378,17 @@ fn provider_message_identity_is_durable_without_new_sequence() {
 }
 
 #[test]
-fn provider_subagent_checkpoint_recovers_nulls_and_timeline_epoch() {
-    let mut store = SubagentStore::default();
-    store
-        .apply(
-            "parent",
-            "codex",
-            &json!({"type":"upsert","id":"child","title":null,"status":"running"}),
-        )
-        .unwrap();
-    store.apply("parent","codex",&json!({"type":"timeline","id":"child","item":{"type":"assistant_message","text":"hello"}})).unwrap();
-    let checkpoint = store.checkpoint("parent");
-    let mut recovered = SubagentStore::default();
-    recovered.restore_parent(&checkpoint).unwrap();
-    assert_eq!(
-        recovered.get("parent", "child").unwrap()["title"],
-        Value::Null
-    );
-    assert_eq!(
-        recovered
-            .fetch_timeline("parent", "child", &json!({}))
-            .unwrap(),
-        store.fetch_timeline("parent", "child", &json!({})).unwrap()
-    );
-}
-
-#[test]
-fn legacy_checkpoint_migrates_once_without_losing_backup_or_cursors() {
+fn absent_database_is_empty_and_ignores_retired_json_checkpoints() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("timeline.sqlite3");
-    let legacy = path.with_extension("json");
-    let mut original = interleaved();
-    original.append(
-        json!({"type":"user_message","text":"accepted","clientMessageId":"client","opaque":null}),
-        &options(),
-    );
-    original.enrich_submitted_user_message("client", "provider");
-    let bytes = serde_json::to_vec(&json!({
-        "version":1, "agentId":"agent", "epoch":original.epoch(),
-        "nextSeq":original.next_seq(), "rows":original.rows()
-    })).unwrap();
-    std::fs::write(&legacy, &bytes).unwrap();
-    let mut migrated = Timeline::load(&path, "agent").unwrap();
-    assert_eq!(migrated.fetch(&json!({"limit":0})), original.fetch(&json!({"limit":0})));
-    assert_eq!(migrated.submitted_user_message("client").unwrap()["providerMessageId"], "provider");
-    assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
-    migrated.append_persisted(&path, "agent", json!({"type":"assistant_message","text":"new"}), &options()).unwrap();
-    let expected = migrated.fetch(&json!({"limit":0}));
-    drop(migrated);
-    // Even a subsequently damaged backup must not override the committed database.
-    std::fs::write(&legacy, b"{broken").unwrap();
-    assert_eq!(Timeline::load(&path, "agent").unwrap().fetch(&json!({"limit":0})), expected);
-}
-
-#[test]
-fn failed_legacy_migration_preserves_source_and_can_be_retried() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("timeline.sqlite3");
-    let legacy = path.with_extension("json");
-    let bytes = br#"{"version":1,"agentId":"agent","epoch":"saved","nextSeq":0,"rows":[]}"#;
-    std::fs::write(&legacy, bytes).unwrap();
-    assert!(Timeline::load(&path, "agent").is_err());
+    let retired = path.with_extension("json");
+    let bytes = br#"{"version":1,"agentId":"agent","epoch":"saved","nextSeq":8,"rows":[]}"#;
+    std::fs::write(&retired, bytes).unwrap();
+    let loaded = Timeline::load(&path, "agent").unwrap();
+    assert_eq!(loaded.next_seq(), Timeline::new().next_seq());
+    assert_ne!(loaded.epoch(), "saved");
     assert!(!path.exists());
-    assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
-    let valid = br#"{"version":1,"agentId":"agent","epoch":"saved","nextSeq":8,"rows":[]}"#;
-    std::fs::write(&legacy, valid).unwrap();
-    assert!(Timeline::load(&path, "wrong-agent").is_err());
-    assert!(!path.exists());
-    let recovered = Timeline::load(&path, "agent").unwrap();
-    assert_eq!(recovered.epoch(), "saved");
-    assert_eq!(recovered.next_seq(), 8);
-    assert_eq!(std::fs::read(&legacy).unwrap(), valid);
+    assert_eq!(std::fs::read(&retired).unwrap(), bytes);
 }
 
 #[test]

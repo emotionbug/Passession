@@ -802,12 +802,6 @@ impl CreationHooks for AgentManager {
             )
         }
     }
-    async fn read_agent(&self, id: &str) -> Result<Option<Value>> {
-        Ok(self
-            .agent_snapshot(id)
-            .await?
-            .map(|agent| snapshot_payload(&agent)))
-    }
     async fn validate_completed(&self, snapshot: &Value) -> Result<()> {
         if let Some(id) = text(snapshot, "agentId") {
             if !self.exists("agent", id).await? {

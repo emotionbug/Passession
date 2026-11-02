@@ -2,11 +2,11 @@ import '../../../core/json.dart';
 import '../chat_controller.dart' show maps;
 
 /// create-agent-preferences: the remembered new-agent selection, stored in
-/// the app preferences under this key (legacy imports land here too).
+/// the app preferences under this key.
 const formPreferencesKey = 'createAgentPreferences';
 
-/// preferences.ts parseFormPreferences: the current shape, or the legacy one
-/// whose per-provider `thinkingOptionId` belongs to that provider's model.
+/// preferences.ts parseFormPreferences: the remembered provider and its
+/// per-provider model, mode, per-model thinking and feature values.
 JsonMap parseFormPreferences(Object? value) {
   if (value is! Map) return {};
   final source = jsonMap(value);
@@ -17,7 +17,6 @@ JsonMap parseFormPreferences(Object? value) {
     final thinking = <String, dynamic>{
       for (final row in jsonMap(prefs['thinkingByModel']).entries)
         if (row.value is String) row.key: row.value,
-      if (model != null && prefs['thinkingOptionId'] is String) model: prefs['thinkingOptionId'],
     };
     providers[entry.key] = <String, dynamic>{
       'model': ?model,

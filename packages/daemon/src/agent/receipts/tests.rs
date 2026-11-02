@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Default)]
 struct Hooks {
-    agent: StdMutex<Option<Value>>,
     exists: AtomicBool,
     validations: AtomicUsize,
     reject_completed: AtomicBool,
@@ -14,9 +13,6 @@ struct Hooks {
 impl CreationHooks for Hooks {
     async fn exists(&self, _: &str, _: &str) -> Result<bool> {
         Ok(self.exists.load(Ordering::SeqCst))
-    }
-    async fn read_agent(&self, _: &str) -> Result<Option<Value>> {
-        Ok(self.agent.lock().unwrap().clone())
     }
     async fn validate_completed(&self, _: &Value) -> Result<()> {
         self.validations.fetch_add(1, Ordering::SeqCst);
@@ -279,60 +275,38 @@ async fn orphaned_phases_reconcile_conservatively_after_restart() -> Result<()> 
 }
 
 #[tokio::test]
-async fn legacy_receipts_keep_their_meaning_and_accept_tombstones() -> Result<()> {
+async fn stored_receipts_replay_and_versionless_records_are_errors() -> Result<()> {
     let home = tempfile::tempdir()?;
     let directory = home.path().join("agent-requests");
     tokio::fs::create_dir_all(&directory).await?;
     let request = json!({"prompt":"hello"});
     let fingerprint = digest(&request)?;
-    for (id, state) in [("legacy-pending", "pending"), ("legacy-completed", "completed")] {
+    // Receipts written by earlier native daemons also carry a `state` field.
+    for (id, phase, dismissed) in [("submitted", "submitted", false), ("dismissed", "outcome_unknown", true)] {
         tokio::fs::write(
             directory.join(format!("{}.json", send_key(id)?)),
-            serde_json::to_vec(&json!({"fingerprint":fingerprint,"agentId":"agent","state":state}))?,
+            serde_json::to_vec(&json!({
+                "version":2,"fingerprint":fingerprint,"agentId":"agent","messageId":id,
+                "state":"pending","phase":phase,"revision":2,"dismissed":dismissed,
+                "result":null,"error":null,"updatedAt":null,"correlation":null,"ackPending":false
+            }))?,
         )
         .await?;
     }
     let receipts = MessageReceipts::new(home.path().to_owned());
-    let pending = receipts.get("agent", "legacy-pending").await?;
-    assert_eq!(pending["phase"], "outcome_unknown");
-    assert_eq!(pending["revision"], 1);
-    assert_eq!(pending["mayHaveExecuted"], true);
-    assert_eq!(pending["canRetry"], false);
+    let submitted = replay(replayed(&receipts, "submitted", &request).await?)?;
+    assert_eq!(submitted["deduplicated"], true);
+    assert_eq!(submitted["receipt"]["revision"], 2);
     assert_eq!(
-        replay(replayed(&receipts, "legacy-pending", &request).await?).unwrap_err().to_string(),
-        OUTCOME_UNKNOWN
-    );
-    let completed = replay(replayed(&receipts, "legacy-completed", &request).await?)?;
-    assert_eq!(completed["deduplicated"], true);
-    let dismissed = receipts.dismiss("agent", "legacy-pending").await?;
-    assert_eq!(dismissed["revision"], 2);
-    assert_eq!(dismissed["phase"], "outcome_unknown");
-    let stored: Value = serde_json::from_slice(
-        &tokio::fs::read(directory.join(format!("{}.json", send_key("legacy-pending")?))).await?,
-    )?;
-    // Rollback daemons read only fingerprint/agentId/state and must not dispatch.
-    assert_eq!(stored["state"], "pending");
-    assert_eq!(stored["fingerprint"], fingerprint.as_str());
-
-    // Parent-applied tombstone for a removed legacy receipt whose messageId is unknown.
-    tokio::fs::write(
-        directory.join(format!("{}.json", send_key("removed")?)),
-        serde_json::to_vec(&json!({
-            "version":2,"fingerprint":fingerprint,"agentId":"agent","messageId":null,
-            "state":"pending","phase":"outcome_unknown","revision":2,"dismissed":true,
-            "result":null,"error":"agent_request_outcome_unknown","updatedAt":null,
-            "correlation":{"legacy":true,"tombstone":"restored-after-removal"},"ackPending":false
-        }))?,
-    )
-    .await?;
-    let tombstone = receipts.get("agent", "removed").await?;
-    assert_eq!(tombstone["dismissed"], true);
-    assert_eq!(tombstone["phase"], "outcome_unknown");
-    assert_eq!(tombstone["messageId"], "removed");
-    assert_eq!(
-        replay(replayed(&receipts, "removed", &request).await?).unwrap_err().to_string(),
+        replay(replayed(&receipts, "dismissed", &request).await?).unwrap_err().to_string(),
         DISMISSED
     );
+
+    let versionless = directory.join(format!("{}.json", send_key("versionless")?));
+    let bytes = serde_json::to_vec(&json!({"fingerprint":fingerprint,"agentId":"agent","state":"completed"}))?;
+    tokio::fs::write(&versionless, &bytes).await?;
+    assert!(receipts.get("agent", "versionless").await.is_err());
+    assert_eq!(tokio::fs::read(&versionless).await?, bytes);
     Ok(())
 }
 #[tokio::test]
@@ -504,60 +478,6 @@ async fn ready_agent_without_prompt_can_complete_after_restart() -> Result<()> {
             .await
             .is_err()
     );
-    Ok(())
-}
-#[tokio::test]
-async fn imports_legacy_completed_or_pending_with_resource_without_reexecution() -> Result<()> {
-    for state in ["pending", "completed"] {
-        let home = tempfile::tempdir()?;
-        let input = input("agent");
-        let mut request = input.request.clone();
-        request["type"] = json!("create_agent_request");
-        let receipt =
-            json!({"fingerprint":digest(&request)?,"state":state,"agentId":"legacy-agent"});
-        atomic_json(
-            &home
-                .path()
-                .join("agent-requests")
-                .join(format!("{}.json", digest(&json!(["create", input.key]))?)),
-            &receipt,
-        )
-        .await?;
-        let hooks = Hooks::default();
-        *hooks.agent.lock().unwrap() =
-            Some(json!({"id":"legacy-agent","workspaceId":"legacy-workspace"}));
-        let receipts = CreationReceipts::new(home.path().to_owned());
-        let CreationAdmission::Replay(snapshot) = receipts.begin(&input, &hooks).await? else {
-            panic!("legacy resource must be imported");
-        };
-        assert_eq!(snapshot["phase"], "completed");
-        assert_eq!(snapshot["agentId"], "legacy-agent");
-        assert_eq!(snapshot["workspaceId"], "legacy-workspace");
-    }
-    Ok(())
-}
-#[tokio::test]
-async fn pending_legacy_without_resource_never_executes() -> Result<()> {
-    let home = tempfile::tempdir()?;
-    let input = input("agent");
-    let mut request = input.request.clone();
-    request["type"] = json!("create_agent_request");
-    let path = home
-        .path()
-        .join("agent-requests")
-        .join(format!("{}.json", digest(&json!(["create", input.key]))?));
-    atomic_json(
-        &path,
-        &json!({"fingerprint":digest(&request)?,"state":"pending","agentId":"missing"}),
-    )
-    .await?;
-    let CreationAdmission::Replay(snapshot) = CreationReceipts::new(home.path().to_owned())
-        .begin(&input, &Hooks::default())
-        .await?
-    else {
-        panic!("pending legacy receipt must not run");
-    };
-    assert_eq!(snapshot["outcomeUnknown"], true);
     Ok(())
 }
 #[tokio::test]

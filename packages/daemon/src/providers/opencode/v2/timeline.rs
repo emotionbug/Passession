@@ -68,11 +68,13 @@ impl Timeline {
             bail!("OpenCode changed previously emitted message content");
         }
         let suffix = stream[previous.len()..].to_owned();
-        self.content.insert(key, stream.clone());
+        self.content.insert(key.clone(), stream.clone());
         let item = if kind == "text" {
             json!({"type":"assistant_message","text":suffix,"messageId":data["assistantMessageID"]})
         } else {
-            json!({"type":"reasoning","text":suffix})
+            // OpenCode reasoning parts carry no id; message id and ordinal are the
+            // native identity both this stream and message replay derive.
+            json!({"type":"reasoning","text":suffix,"messageId":key})
         };
         Ok(Some(event(item, &timestamp(&Value::Null))))
     }
@@ -152,11 +154,11 @@ impl Timeline {
                                 bail!("OpenCode changed previously emitted message content");
                             }
                             let suffix = text[previous.len()..].to_owned();
-                            self.content.insert(key, text.to_owned());
+                            self.content.insert(key.clone(), text.to_owned());
                             let item = if kind == "text" {
                                 json!({"type":"assistant_message","text":suffix,"messageId":id})
                             } else {
-                                json!({"type":"reasoning","text":suffix})
+                                json!({"type":"reasoning","text":suffix,"messageId":key})
                             };
                             events.push(event(item, &time));
                         } else if kind == "tool" {

@@ -3,7 +3,10 @@ use super::{
     projection::{Projection, Questions},
     transport::{Connection, command_id},
 };
-use crate::providers::api::{AgentSession, EventSink, LaunchContext, ProviderSpec, RewindTarget};
+use crate::providers::api::{
+    AgentSession, EventSink, HistoryCoverage, LaunchContext, ProviderSpec, ReplayOutcome,
+    RewindTarget, SubagentReplay,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -46,17 +49,26 @@ struct State {
 enum Action {
     Correlate(String, String, oneshot::Sender<()>),
     Answer(String, Value, oneshot::Sender<Result<bool>>),
+    ReplayChild(String, Marker, SubagentReplay, oneshot::Sender<Result<()>>),
+    SettleReplay(String, bool),
     Activity,
     Close(oneshot::Sender<Result<()>>),
 }
 
+/// Builds the in-stream replay marker for an opened child's snapshot.
+pub(super) type Marker = Box<dyn FnOnce(Vec<Value>, HistoryCoverage) -> Value + Send>;
+
 impl Session {
+    /// `register` makes the session findable for opened-child replays. It runs
+    /// after every fallible step and before the actor starts, so the session is
+    /// registered before it can publish any child row.
     pub(super) async fn open(
         spec: &ProviderSpec,
         persistence: Option<Value>,
         config: Value,
         context: LaunchContext,
         sink: EventSink,
+        register: impl FnOnce(&Arc<Self>) + Send,
     ) -> Result<Arc<Self>> {
         let cwd = config["cwd"]
             .as_str()
@@ -90,6 +102,7 @@ impl Session {
             host.clone(),
             rx,
             cwd,
+            register,
         )
         .await;
         if result.is_err() {
@@ -107,6 +120,7 @@ impl Session {
         host: Arc<Connection>,
         rx: mpsc::UnboundedReceiver<Value>,
         cwd: String,
+        register: impl FnOnce(&Arc<Self>) + Send,
     ) -> Result<Arc<Self>> {
         let mut mcp = serde_json::Map::new();
         let mut servers = config
@@ -232,6 +246,9 @@ impl Session {
                     .await?;
             }
         }
+        // Children named by resumed history are recovered descriptors; their
+        // bodies are read when opened. Everything after this is the live stream.
+        projection.go_live();
         if response["pendingRequests"].as_array().is_some_and(|v| {
             v.iter()
                 .any(|p| p["kind"] == "approval" || p["kind"] == "userInput")
@@ -256,6 +273,7 @@ impl Session {
         session.refresh_catalog().await?;
         session.refresh_commands().await?;
         session.publish_config(false).await?;
+        register(&session);
         let actor = session.clone();
         tokio::spawn(async move {
             actor.run(rx, actions, projection, questions).await;
@@ -276,6 +294,63 @@ impl Session {
     pub(super) fn matches_env(&self, env: &BTreeMap<String, String>) -> bool {
         !self.state.lock().unwrap().closed
             && super::usage_account_key(&self.env) == super::usage_account_key(env)
+    }
+    /// Whether this open session serves the native parent `native`.
+    pub(super) fn serves(&self, native: &str) -> bool {
+        let state = self.state.lock().unwrap();
+        self.native == native && !state.closed && state.failure.is_none()
+    }
+    /// Publishes an opened child's replay on this session's live stream, in order
+    /// with its rows. The session snapshots the child, emits `marker`, and holds
+    /// that child's later rows until the daemon reports `replay`'s outcome. The
+    /// actor owns the whole transaction, so a dropped caller cannot strand it.
+    /// Never resumes or prompts the parent.
+    pub(super) async fn replay_child(
+        &self,
+        id: &str,
+        marker: Marker,
+        replay: SubagentReplay,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.actions
+            .send(Action::ReplayChild(id.into(), marker, replay, tx))
+            .map_err(|_| anyhow!("Muse session is closed"))?;
+        rx.await.map_err(|_| anyhow!("Muse session is closed"))?
+    }
+    async fn publish_replay(
+        &self,
+        id: &str,
+        marker: Marker,
+        replay: SubagentReplay,
+        projection: &mut Projection,
+    ) -> Result<()> {
+        let snapshot = projection.replay_child(id).await?;
+        let collected = snapshot.collected;
+        // The marker is not parent history: replaying the parent must not reapply it.
+        let published = tokio::select! {
+            result=self.sink.emit(marker(snapshot.events, snapshot.coverage))=>result,
+            _=self.stop.cancelled()=>Err(anyhow!("Muse session is closed")),
+        };
+        if collected {
+            let actions = self.actions.clone();
+            let id = id.to_owned();
+            if published.is_ok() {
+                let stop = self.stop.clone();
+                // `None` (reader gone, parent closed) keeps the previous view and
+                // releases the pause; a closed session completes its children itself.
+                tokio::spawn(async move {
+                    let outcome = tokio::select! {
+                        outcome=replay.outcome()=>outcome,
+                        _=stop.cancelled()=>return,
+                    };
+                    let applied = outcome == Some(ReplayOutcome::Applied);
+                    let _ = actions.send(Action::SettleReplay(id, applied));
+                });
+            } else {
+                let _ = actions.send(Action::SettleReplay(id, false));
+            }
+        }
+        published
     }
     pub(super) async fn read_usage(&self) -> Result<Value> {
         super::validate_usage(self.host.request("usage/read", json!({})).await?)
@@ -471,16 +546,21 @@ impl Session {
                 action=actions.recv()=>match action {
                     Some(Action::Correlate(command,client,reply))=>{projection.correlate(command,client);let _=reply.send(());Ok(())},
                     Some(Action::Answer(id,response,reply))=>{let result=questions.answer(&id,&response).await;self.state.lock().unwrap().questions=questions.pending();let _=reply.send(result);Ok(())},
+                    Some(Action::ReplayChild(id,marker,replay,reply))=>{let _=reply.send(self.publish_replay(&id,marker,replay,&mut projection).await);Ok(())},
+                    // The daemon applied or retained the replay; the child resumes against that state.
+                    Some(Action::SettleReplay(id,applied))=>match projection.settle_replay(&id,applied).await {Ok(events)=>self.publish(events,true).await,Err(e)=>Err(e)},
                     Some(Action::Activity)=>Ok(()),
                     Some(Action::Close(reply))=>{
                         let mut result=Ok(());
                         while let Ok(event)=rx.try_recv(){if event["method"]!="$error" {if let Err(error)=self.notify(event,&mut projection,&mut questions).await{result=Err(error);break;}}}
-                        if result.is_ok(){result=self.publish(projection.close_children(),true).await;}
+                        if result.is_ok(){result=match projection.close_children().await {Ok(events)=>self.publish(events,true).await,Err(e)=>Err(e)};}
                         let _=reply.send(result);break;
                     },
                     None=>break,
                 },
                 event=rx.recv()=>match event {Some(event)=>self.notify(event,&mut projection,&mut questions).await,None=>Err(anyhow!("Muse MSP notification stream closed"))},
+                // Watchdog for the parent's view and the children this run
+                // collects; unopened recovered children are never polled.
                 _=tokio::time::sleep(Duration::from_secs(120)),if self.active().is_some()=>{
                     let cursor=self.state.lock().unwrap().cursor.clone();
                     let result=self.backfill(cursor,&mut projection,&mut questions).await;
@@ -492,7 +572,9 @@ impl Session {
                 break;
             }
         }
-        let _ = self.publish(projection.close_children(), false).await;
+        if let Ok(events) = projection.close_children().await {
+            let _ = self.publish(events, false).await;
+        }
         self.stop.cancel();
         self.ended.notify_waiters();
         let _ = self.host.close().await;

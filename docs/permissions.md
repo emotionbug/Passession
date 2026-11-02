@@ -60,4 +60,4 @@ The Hub authenticates as a service principal. Its locally selected grants decide
 
 Hub user and role identifiers remain opaque external subjects. The Hub may create and revoke linked daemon principals when granted `access.manage`; the daemon does not interpret accounts, organizations, or roles.
 
-Hub enrollment and permission updates exchange these semantic permissions directly. Legacy persisted Hub relationships that contain `hub.execution.*` migrate once to `hub.execute` when the daemon loads them; new relationships never persist or emit transport scopes as authority.
+Hub enrollment and permission updates exchange these semantic permissions directly. Relationships never persist or emit transport scopes as authority; a stored relationship record without semantic permissions is quarantined at load and grants nothing.

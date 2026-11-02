@@ -81,10 +81,7 @@ impl PushNotifications {
             }
             None => json!({}),
         };
-        let (leases, migrated) = load_leases(&parsed, Utc::now().timestamp_millis());
-        if migrated {
-            persist(&path, &leases).await?;
-        }
+        let leases = load_leases(&parsed);
         self.inner
             .http
             .get_or_try_init(|| async {
@@ -304,7 +301,7 @@ fn put_lease(leases: &mut Vec<Lease>, token: String, expires_at: i64) {
         leases.push(Lease { token, expires_at });
     }
 }
-fn load_leases(value: &Value, now: i64) -> (Vec<Lease>, bool) {
+fn load_leases(value: &Value) -> Vec<Lease> {
     let mut leases = Vec::new();
     for value in value["subscriptions"].as_array().into_iter().flatten() {
         if let (Some(token), Some(expiry)) = (
@@ -319,20 +316,7 @@ fn load_leases(value: &Value, now: i64) -> (Vec<Lease>, bool) {
             put_lease(&mut leases, token.to_owned(), expiry.timestamp_millis());
         }
     }
-    let mut migrated = false;
-    for token in value["tokens"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        migrated = true;
-        let token = token.trim();
-        if !token.is_empty() {
-            put_lease(&mut leases, token.to_owned(), now + LEASE_MS);
-        }
-    }
-    (leases, migrated)
+    leases
 }
 async fn persist(path: &Path, leases: &[Lease]) -> Result<()> {
     let subscriptions = leases.iter().map(|lease| json!({"token":lease.token,"expiresAt":DateTime::<Utc>::from_timestamp_millis(lease.expires_at).expect("Lease timestamp in range").to_rfc3339_opts(SecondsFormat::Millis, true)})).collect::<Vec<_>>();
@@ -409,24 +393,21 @@ mod tests {
         assert!(service.inner.sources.lock().unwrap().is_empty());
     }
     #[test]
-    fn legacy_tokens_migrate_with_a_finite_lease_and_stable_deduplication() {
-        let now = 1_700_000_000_000;
-        let (leases, migrated) = load_leases(
-            &json!({"subscriptions":[{"token":"a","expiresAt":"2020-01-01T00:00:00Z"}],"tokens":[" a ","b","",null]}),
-            now,
-        );
-        assert!(migrated);
+    fn subscriptions_load_deduplicated_and_retired_token_arrays_grant_no_lease() {
+        let leases = load_leases(&json!({
+            "subscriptions":[
+                {"token":" a ","expiresAt":"2020-01-01T00:00:00Z"},
+                {"token":"a","expiresAt":"2021-01-01T00:00:00Z"},
+                {"token":"","expiresAt":"2021-01-01T00:00:00Z"},
+                {"token":"no-expiry"}
+            ],
+            "tokens":["b"]
+        }));
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].token, "a");
         assert_eq!(
-            leases
-                .iter()
-                .map(|lease| lease.token.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "b"]
-        );
-        assert!(
-            leases
-                .iter()
-                .all(|lease| lease.expires_at == now + LEASE_MS)
+            leases[0].expires_at,
+            DateTime::parse_from_rfc3339("2021-01-01T00:00:00Z").unwrap().timestamp_millis()
         );
     }
     #[tokio::test]
@@ -439,8 +420,7 @@ mod tests {
         }];
         persist(&path, &leases).await.unwrap();
         let parsed: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        let (loaded, migrated) = load_leases(&parsed, 1_800_000_000_000);
-        assert!(!migrated);
+        let loaded = load_leases(&parsed);
         assert_eq!(loaded[0].expires_at, leases[0].expires_at);
         #[cfg(unix)]
         {

@@ -14,6 +14,9 @@ pub struct Projection {
     turn: Option<String>,
     autonomous: bool,
     replaying: bool,
+    /// An opened sidechain's replay names its assistant rows by API message ID,
+    /// as the live stream that may still be publishing them does.
+    live_identity: bool,
     session: Option<String>,
     model: Option<String>,
     lanes: HashMap<String, Lane>,
@@ -91,6 +94,7 @@ impl Projection {
             turn: None,
             autonomous: false,
             replaying: false,
+            live_identity: false,
             session: None,
             model: None,
             lanes: HashMap::new(),
@@ -2263,12 +2267,109 @@ pub fn project_history(provider: &str, history: &super::storage::ReplayHistory) 
     Projection::new(provider).project_history(history)
 }
 
+/// One opened file-backed agent: its rows, refreshed status and subtitle, and the
+/// agents it spawned announced by descriptor. `source` is the locator its parent
+/// replay announced. Parent rows are never part of a child replay.
+pub fn project_subagent(
+    provider: &str,
+    id: &str,
+    source: &Value,
+    child: &super::storage::ReplaySubagent,
+    others: &[super::storage::ReplaySubagent],
+    complete: bool,
+) -> Vec<Value> {
+    let mut projection = Projection::new(provider);
+    projection.replaying = true;
+    projection.live_identity = true;
+    let input = json!({"name":source["title"],"description":source["description"]});
+    let mut events = Vec::new();
+    let owner = s(source, "parent");
+    let outcome = source["failed"].as_bool();
+    let started = source.get("started").cloned().unwrap_or(Value::Null);
+    if let Some(facts) =
+        projection.replay_child(id, owner, &input, &started, child, outcome, true, &mut events)
+    {
+        projection.replay_subagents(vec![(Some(id.to_owned()), facts)], others, &mut events);
+    }
+    child_rows(events, id, complete)
+}
+
+/// One opened workflow run: its prompt, entries, result and final status.
+pub fn project_workflow(
+    provider: &str,
+    id: &str,
+    workflow: &Value,
+    entries: &[Value],
+    complete: bool,
+) -> Vec<Value> {
+    let mut projection = Projection::new(provider);
+    projection.replaying = true;
+    projection.live_identity = true;
+    let mut events = Vec::new();
+    projection.declare_workflow(id, workflow, &mut events);
+    let description = first(workflow, &["summary", "workflowName"]);
+    if let Some(text) = description {
+        let mut prompt = projection.timeline(json!({"type":"user_message","text":text}), Some(id));
+        if let Some(time) = timestamp(&workflow["startTime"]) {
+            prompt["event"]["timestamp"] = json!(time);
+        }
+        events.push(prompt);
+    }
+    let mut texts = HashSet::new();
+    for row in notification_replay_entries(entries) {
+        let mapped = projection.history_entry(&row, Some(id));
+        for event in &mapped {
+            if event["event"]["item"]["type"] == "assistant_message" {
+                if let Some(text) = s(&event["event"]["item"], "text") {
+                    texts.insert(text.trim().to_owned());
+                }
+            }
+        }
+        events.extend(mapped);
+    }
+    let mut ending = Vec::new();
+    if let Some(text) = workflow
+        .get("result")
+        .and_then(format_workflow_result)
+        .filter(|text| !texts.contains(text.trim()))
+    {
+        ending.push(projection.timeline(json!({"type":"assistant_message","text":text}), Some(id)));
+    }
+    projection.subtitle(id, &mut ending);
+    projection.set_status(id, workflow_status(workflow), &mut ending);
+    stamp(&mut ending, workflow);
+    events.extend(ending);
+    child_rows(events, id, complete)
+}
+
+/// Keeps the opened child's rows and the descriptors it produced, marking each
+/// row with the completeness of the source that was read.
+fn child_rows(mut events: Vec<Value>, id: &str, complete: bool) -> Vec<Value> {
+    events.retain(|event| event["type"] == "provider_subagent");
+    for event in &mut events {
+        if event["event"]["type"] == "timeline" && event["event"]["id"] == id {
+            event["event"]["historyComplete"] = json!(complete);
+        }
+    }
+    events
+}
+
+fn workflow_status(workflow: &Value) -> &'static str {
+    match s(workflow, "status").unwrap_or("").trim().to_lowercase().as_str() {
+        "completed" => "completed",
+        "canceled" | "cancelled" | "killed" | "stopped" => "canceled",
+        _ => "failed",
+    }
+}
+
 #[derive(Default)]
 struct ReplayFacts {
     tools: HashMap<String, Value>,
     outcomes: HashMap<String, bool>,
     links: HashMap<String, String>,
     workflows: HashMap<String, String>,
+    /// Timestamp of the record that issued each tool, for children not yet read.
+    started: HashMap<String, Value>,
 }
 impl ReplayFacts {
     fn read(entries: &[Value]) -> Self {
@@ -2281,6 +2382,7 @@ impl ReplayFacts {
                     {
                         if let Some(id) = s(block, "id") {
                             facts.tools.insert(id.to_owned(), block.clone());
+                            facts.started.insert(id.to_owned(), entry["timestamp"].clone());
                         }
                     }
                 }
@@ -2340,13 +2442,48 @@ impl ReplayFacts {
     }
 }
 impl Projection {
+    /// Inline sidechains are replayed with the transcript that contains them.
+    /// File-backed agents and workflow runs are announced by descriptor with a
+    /// `source` locator; their bodies are read only when opened.
     pub fn project_history(&mut self, history: &super::storage::ReplayHistory) -> Vec<Value> {
         self.end_turn();
         self.replaying = true;
         let mut events = Vec::new();
         let root = ReplayFacts::read(&history.parent_entries);
-        let mut resolved: Vec<(String, ReplayFacts)> = Vec::new();
-        let mut remaining: Vec<_> = history.subagents.iter().collect();
+        let workflows = root.workflows.clone();
+        self.replay_subagents(vec![(None, root)], &history.subagents, &mut events);
+        for workflow in &history.workflows {
+            let Some(run_id) = s(workflow, "runId") else {
+                continue;
+            };
+            let Some(id) = workflows.get(run_id) else {
+                continue;
+            };
+            self.declare_workflow(id, workflow, &mut events);
+            let mut ending = Vec::new();
+            self.subtitle(id, &mut ending);
+            self.set_status(id, workflow_status(workflow), &mut ending);
+            stamp(&mut ending, workflow);
+            events.extend(ending);
+        }
+        // Proven child tool owners were recorded before parent notifications are projected.
+        for row in notification_replay_entries(&history.parent_entries) {
+            if row["isSidechain"] != true {
+                events.extend(self.history_entry(&row, None));
+            }
+        }
+        self.replaying = false;
+        events
+    }
+    /// Links every agent to the tool that spawned it, shallowest first. An agent
+    /// is linkable once the owner whose tool spawned it has been replayed.
+    fn replay_subagents(
+        &mut self,
+        mut resolved: Vec<(Option<String>, ReplayFacts)>,
+        subagents: &[super::storage::ReplaySubagent],
+        events: &mut Vec<Value>,
+    ) {
+        let mut remaining: Vec<_> = subagents.iter().collect();
         remaining.sort_by_key(|child| {
             child
                 .meta
@@ -2359,96 +2496,33 @@ impl Projection {
             let mut index = 0;
             while index < remaining.len() {
                 let child = remaining[index];
-                let link = root
-                    .child_id(child)
-                    .map(|id| (None, id, &root))
-                    .or_else(|| {
-                        resolved.iter().find_map(|(owner, facts)| {
-                            facts
-                                .child_id(child)
-                                .map(|id| (Some(owner.clone()), id, facts))
-                        })
-                    });
-                let Some((owner, id, facts)) = link else {
+                let link = resolved.iter().find_map(|(owner, facts)| {
+                    let id = facts.child_id(child)?;
+                    Some((
+                        owner.clone(),
+                        facts.tools[&id]["input"].clone(),
+                        facts.started.get(&id).cloned().unwrap_or(Value::Null),
+                        facts.outcomes.get(&id).copied(),
+                        id,
+                    ))
+                });
+                let Some((owner, input, started, outcome, id)) = link else {
                     index += 1;
                     continue;
                 };
-                let tool = &facts.tools[&id];
-                let input = &tool["input"];
-                let meta = child.meta.as_ref().unwrap_or(&Value::Null);
-                let title = first(input, &["name", "subagent_type"])
-                    .or_else(|| s(meta, "agentType"))
-                    .map(str::to_owned);
-                let description = s(input, "description")
-                    .or_else(|| s(meta, "description"))
-                    .map(str::to_owned);
-                let outcome = facts.outcomes.get(&id).copied();
-                self.aliases.insert(id.clone(), id.clone());
-                self.task_ids.insert(child.agent_id.clone(), id.clone());
-                self.tasks.insert(
-                    id.clone(),
-                    Child {
-                        title: title.clone(),
-                        model: None,
-                        effort: None,
-                        tokens: None,
-                        subtitle: title.clone().unwrap_or_default(),
-                        status: "running".to_owned(),
-                        background: false,
-                        workflow: false,
-                        turn: None,
-                        last_result: None,
-                        description: description.clone(),
-                        parent: owner.clone(),
-                        ..Child::default()
-                    },
-                );
-                let mut declaration =
-                    json!({"type":"upsert","id":id,"toolCallId":id,"status":"running"});
-                if let Some(title) = title {
-                    declaration["title"] = json!(title);
+                let body = child.file.is_none();
+                if let Some(facts) = self.replay_child(
+                    &id,
+                    owner.as_deref(),
+                    &input,
+                    &started,
+                    child,
+                    outcome,
+                    body,
+                    events,
+                ) {
+                    resolved.push((Some(id), facts));
                 }
-                if let Some(description) = description {
-                    declaration["description"] = json!(description);
-                }
-                if let Some(owner) = owner {
-                    declaration["parentSubagentId"] = json!(owner);
-                }
-                if let Some(time) = child
-                    .entries
-                    .first()
-                    .and_then(|e| timestamp(&e["timestamp"]))
-                {
-                    declaration["timestamp"] = json!(time);
-                }
-                events.push(self.child_event(declaration));
-                let mut terminal = None;
-                for row in notification_replay_entries(&child.entries) {
-                    if row["type"] == "assistant" {
-                        terminal = if row["message"]["stop_reason"] == "end_turn" {
-                            Some("completed")
-                        } else {
-                            None
-                        };
-                        if let Some(tokens) = usage_total(&row["message"]["usage"]) {
-                            self.tasks.get_mut(&id).expect("declared child").tokens = Some(tokens);
-                        }
-                    }
-                    events.extend(self.history_entry(&row, Some(&id)));
-                }
-                let mut ending = Vec::new();
-                self.subtitle(&id, &mut ending);
-                if let Some(status) = outcome
-                    .map(|failed| if failed { "failed" } else { "completed" })
-                    .or(terminal)
-                {
-                    self.set_status(&id, status, &mut ending);
-                }
-                if let Some(row) = child.entries.last() {
-                    stamp(&mut ending, row);
-                }
-                events.extend(ending);
-                resolved.push((id, ReplayFacts::read(&child.entries)));
                 remaining.remove(index);
                 progress = true;
             }
@@ -2456,95 +2530,142 @@ impl Projection {
                 break;
             }
         }
-        for workflow in &history.workflows {
-            let Some(run_id) = s(workflow, "runId") else {
-                continue;
-            };
-            let Some(id) = root.workflows.get(run_id) else {
-                continue;
-            };
-            let description = first(workflow, &["summary", "workflowName"]);
-            self.aliases.insert(id.clone(), id.clone());
-            self.task_ids.insert(run_id.to_owned(), id.clone());
-            self.tasks.insert(
-                id.clone(),
-                Child {
-                    title: Some("Workflow".to_owned()),
-                    model: s(workflow, "defaultModel").map(str::to_owned),
-                    effort: None,
-                    tokens: number(workflow, "totalTokens"),
-                    subtitle: String::new(),
-                    status: "running".to_owned(),
-                    background: false,
-                    workflow: true,
-                    turn: None,
-                    last_result: None,
-                    description: description.map(str::to_owned),
-                    ..Child::default()
-                },
-            );
-            let mut declaration = json!({"type":"upsert","id":id,"toolCallId":id,"title":"Workflow","status":"running"});
-            if let Some(text) = description {
-                declaration["description"] = json!(text);
+    }
+    /// Declares one linked agent and, when its body is in hand, replays its rows.
+    /// Returns the facts of a replayed body so its own children can be linked.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_child(
+        &mut self,
+        id: &str,
+        owner: Option<&str>,
+        input: &Value,
+        started: &Value,
+        child: &super::storage::ReplaySubagent,
+        outcome: Option<bool>,
+        body: bool,
+        events: &mut Vec<Value>,
+    ) -> Option<ReplayFacts> {
+        let meta = child.meta.as_ref().unwrap_or(&Value::Null);
+        let title = first(input, &["name", "subagent_type"])
+            .or_else(|| s(meta, "agentType"))
+            .map(str::to_owned);
+        let description = s(input, "description")
+            .or_else(|| s(meta, "description"))
+            .map(str::to_owned);
+        self.aliases.insert(id.to_owned(), id.to_owned());
+        self.task_ids.insert(child.agent_id.clone(), id.to_owned());
+        self.tasks.insert(
+            id.to_owned(),
+            Child {
+                title: title.clone(),
+                model: None,
+                effort: None,
+                tokens: None,
+                subtitle: title.clone().unwrap_or_default(),
+                status: "running".to_owned(),
+                background: false,
+                workflow: false,
+                turn: None,
+                last_result: None,
+                description: description.clone(),
+                parent: owner.map(str::to_owned),
+                ..Child::default()
+            },
+        );
+        // An unread body cannot prove the agent is still running; a stored
+        // status stays until its outcome or body says otherwise.
+        let mut declaration = json!({"type":"upsert","id":id,"toolCallId":id});
+        if body || outcome.is_some() {
+            declaration["status"] = json!("running");
+        }
+        if let Some(title) = &title {
+            declaration["title"] = json!(title);
+        }
+        if let Some(description) = &description {
+            declaration["description"] = json!(description);
+        }
+        if let Some(owner) = owner {
+            declaration["parentSubagentId"] = json!(owner);
+        }
+        if let Some(time) = child
+            .entries
+            .first()
+            .and_then(|e| timestamp(&e["timestamp"]))
+            .or_else(|| timestamp(started))
+        {
+            declaration["timestamp"] = json!(time);
+        }
+        if child.file.is_some() {
+            declaration["source"] = json!({"agentId":child.agent_id,"title":title,
+                "description":description,"parent":owner,"failed":outcome,"started":started});
+        }
+        events.push(self.child_event(declaration));
+        if !body {
+            if let Some(failed) = outcome {
+                let status = if failed { "failed" } else { "completed" };
+                self.set_status(id, status, events);
             }
-            if let Some(time) = timestamp(&workflow["startTime"]) {
-                declaration["timestamp"] = json!(time);
-            }
-            events.push(self.child_event(declaration));
-            if let Some(text) = description {
-                let mut prompt =
-                    self.timeline(json!({"type":"user_message","text":text}), Some(id));
-                if let Some(time) = timestamp(&workflow["startTime"]) {
-                    prompt["event"]["timestamp"] = json!(time);
+            return None;
+        }
+        let mut terminal = None;
+        for row in notification_replay_entries(&child.entries) {
+            if row["type"] == "assistant" {
+                terminal = if row["message"]["stop_reason"] == "end_turn" {
+                    Some("completed")
+                } else {
+                    None
+                };
+                if let Some(tokens) = usage_total(&row["message"]["usage"]) {
+                    self.tasks.get_mut(id).expect("declared child").tokens = Some(tokens);
                 }
-                events.push(prompt);
             }
-            let mut texts = HashSet::new();
-            if let Some(rows) = history.workflow_entries_by_run_id.get(run_id) {
-                for row in notification_replay_entries(rows) {
-                    let mapped = self.history_entry(&row, Some(id));
-                    for event in &mapped {
-                        if event["event"]["item"]["type"] == "assistant_message" {
-                            if let Some(text) = s(&event["event"]["item"], "text") {
-                                texts.insert(text.trim().to_owned());
-                            }
-                        }
-                    }
-                    events.extend(mapped);
-                }
-            }
-            let mut ending = Vec::new();
-            if let Some(text) = workflow
-                .get("result")
-                .and_then(format_workflow_result)
-                .filter(|text| !texts.contains(text.trim()))
-            {
-                ending
-                    .push(self.timeline(json!({"type":"assistant_message","text":text}), Some(id)));
-            }
-            self.subtitle(id, &mut ending);
-            let status = match s(workflow, "status")
-                .unwrap_or("")
-                .trim()
-                .to_lowercase()
-                .as_str()
-            {
-                "completed" => "completed",
-                "canceled" | "cancelled" | "killed" | "stopped" => "canceled",
-                _ => "failed",
-            };
+            events.extend(self.history_entry(&row, Some(id)));
+        }
+        let mut ending = Vec::new();
+        self.subtitle(id, &mut ending);
+        if let Some(status) = outcome
+            .map(|failed| if failed { "failed" } else { "completed" })
+            .or(terminal)
+        {
             self.set_status(id, status, &mut ending);
-            stamp(&mut ending, workflow);
-            events.extend(ending);
         }
-        // Proven child tool owners were recorded before parent notifications are projected.
-        for row in notification_replay_entries(&history.parent_entries) {
-            if row["isSidechain"] != true {
-                events.extend(self.history_entry(&row, None));
-            }
+        if let Some(row) = child.entries.last() {
+            stamp(&mut ending, row);
         }
-        self.replaying = false;
-        events
+        events.extend(ending);
+        Some(ReplayFacts::read(&child.entries))
+    }
+    fn declare_workflow(&mut self, id: &str, workflow: &Value, events: &mut Vec<Value>) {
+        let run_id = s(workflow, "runId").unwrap_or_default();
+        let description = first(workflow, &["summary", "workflowName"]);
+        self.aliases.insert(id.to_owned(), id.to_owned());
+        self.task_ids.insert(run_id.to_owned(), id.to_owned());
+        self.tasks.insert(
+            id.to_owned(),
+            Child {
+                title: Some("Workflow".to_owned()),
+                model: s(workflow, "defaultModel").map(str::to_owned),
+                effort: None,
+                tokens: number(workflow, "totalTokens"),
+                subtitle: String::new(),
+                status: "running".to_owned(),
+                background: false,
+                workflow: true,
+                turn: None,
+                last_result: None,
+                description: description.map(str::to_owned),
+                ..Child::default()
+            },
+        );
+        let mut declaration = json!({"type":"upsert","id":id,"toolCallId":id,"title":"Workflow",
+            "status":"running","source":{"workflowRunId":run_id}});
+        if let Some(text) = description {
+            declaration["description"] = json!(text);
+        }
+        if let Some(time) = timestamp(&workflow["startTime"]) {
+            declaration["timestamp"] = json!(time);
+        }
+        events.push(self.child_event(declaration));
     }
     fn history_entry(&mut self, row: &Value, owner: Option<&str>) -> Vec<Value> {
         if row["isCompactSummary"] == true {
@@ -2581,14 +2702,16 @@ impl Projection {
             frame["parent_tool_use_id"] = json!(owner);
         }
         if row["type"] == "assistant" {
-            if let Some(id) = s(row, "uuid") {
-                frame["message_id"] = json!(id);
+            if !self.live_identity {
+                if let Some(id) = s(row, "uuid") {
+                    frame["message_id"] = json!(id);
+                }
+                // History UUIDs are independent rows, not consecutive partial snapshots.
+                self.lanes
+                    .entry(owner.unwrap_or("").to_owned())
+                    .or_default()
+                    .active = None;
             }
-            // History UUIDs are independent rows, not consecutive partial snapshots.
-            self.lanes
-                .entry(owner.unwrap_or("").to_owned())
-                .or_default()
-                .active = None;
         }
         let mut events = self.project(&frame);
         events.retain(|e| matches!(s(e, "type"), Some("timeline" | "provider_subagent")));

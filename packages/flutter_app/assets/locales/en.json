@@ -146,7 +146,8 @@
       "restore": "Restore to empty composer",
       "discard": "Discard failed draft",
       "agentRunning": "Agent running · separate from pending delivery",
-      "stateUnavailable": "Live agent state unavailable"
+      "stateUnavailable": "Live agent state unavailable",
+      "agentNotReady": "The agent isn't ready yet. Your message is kept in the composer."
     },
     "placeholders": {
       "desktop": "Message the agent, tag @files, or use /commands and /skills",
@@ -276,6 +277,10 @@
       "daemonMaintenance": "Host daemon is updating. New messages and agents are paused until it finishes; you can still stop agents, close items, and answer permission requests.",
       "timelineSyncFailed": "Couldn't refresh agent history.",
       "timelineSyncRetrying": "Retrying…",
+      "preparingAgent": "Starting agent. Saved messages stay readable; sending waits until it's ready.",
+      "preparationFailed": "Couldn't start the agent. Saved messages stay readable.",
+      "subagentRefreshing": "Refreshing this subagent's transcript. Saved messages stay readable.",
+      "subagentRefreshFailed": "Couldn't refresh this subagent's transcript. Saved messages stay readable.",
       "archivingTitle": "Archiving agent...",
       "archivingSubtitle": "Please wait while we archive this agent."
     },

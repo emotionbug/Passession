@@ -11,23 +11,28 @@ are never retained for history or catch-up. Provider history supplies the native
 but a successful replay call alone does not certify completeness. Providers distinguish complete
 snapshots from drained caches, bounded context or damaged/missing source records.
 Cached rows and startup notifications do not certify that replay has completed. A resumed agent's
-first history response waits for replay; live events received during recovery follow it.
+first authoritative history response waits for replay; live events received during recovery follow
+it. Clients that opt into saved reads get the checkpoint first, labelled as such (see
+[Saved history and execution readiness](#saved-history-and-execution-readiness)).
 
 A refresh must uniquely match every existing canonical row before replacing the projection,
 preserving client/provider message IDs and turn IDs. Ambiguous or missing matches retain the
 existing checkpoint. Agent snapshots expose `historySync.status` as `complete`, `partial`, or
 `retained`; an unverified replay can seed an empty projection without claiming completeness.
-Only an explicit rewind backed by a complete source may remove existing rows. Matching displayed
-content never settles a user-send receipt.
+Only an explicit rewind backed by a complete source may remove existing rows; a complete native
+replay of a finished child has the same authority over that child. Matching displayed content never
+settles a user-send receipt.
+
+Non-authoritative refreshes also require each matched row's non-empty `item.text` to remain a
+prefix of the incoming text. Matching identities alone cannot authorize shortening or rewriting
+live text; a stale snapshot retains the canonical projection.
 
 Per-agent projection checkpoints live in `agent-timelines/{id}.sqlite3`. A retained SQLite
 connection commits the changed projected row and sequence metadata together using WAL and
 `synchronous=FULL` before publishing the event. Failed commits restore the in-memory projection;
-full provider replay replaces the checkpoint in one transaction.
-
-An absent database imports the previous `{id}.json` checkpoint once. That JSON file remains
-untouched as a migration backup; subsequent writes use only SQLite. Neither checkpoint format
-replaces provider history as the transcript authority.
+full provider replay replaces the checkpoint in one transaction. The checkpoint never replaces
+provider history as the transcript authority. `{id}.json` checkpoints from earlier releases are not
+read.
 
 The invariants are:
 
@@ -39,6 +44,44 @@ Tool output is bounded before it enters either delivery path. Canonical shell to
 to 64 KiB, and the same bounded item is used for runtime timeline rows and live stream events.
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
+
+## Saved history and execution readiness
+
+Reading a conversation and running it are separate. A cold provider start plus full history replay
+takes seconds (several for large Codex threads), and a provider can fail outright; neither may delay
+or hide what the daemon already saved.
+
+Clients advertising the `saved_history_reads` capability get `fetch_agent_timeline_request` answered
+without waiting for the provider. The response carries `historySource`: `live` when a ready,
+history-synchronized runtime served it, `saved` when it came from the checkpoint or a runtime still
+replaying. A `saved` page has ordinary epochs and cursors but certifies nothing about currency.
+Connected-host routes forward the origin client's hello capabilities, so a routed app session gets
+saved reads from the destination daemon. The CLI, MCP fleet tools and SDK do not advertise the
+capability: they return transcript entries without readiness metadata to callers (models, scripts)
+that treat them as current, so they keep the blocking authoritative read.
+
+A saved read starts one owned background preparation per agent: provider start and history replay.
+Concurrent reads join it. Agent snapshots carry `preparation: {status: "preparing"}` or
+`{status: "failed", error}` while it runs or after it failed, and `agent_update` announces the start
+and the outcome. The field is an observation: it is never persisted and never authorizes anything.
+Sends, permissions, mode changes and every other mutation still wait for a live owner and never act
+on a saved snapshot. The next saved read retries a failed preparation; a live owner established
+any other way clears the failure. Daemon shutdown cancels outstanding preparation.
+
+An agent without a checkpoint has nothing saved to show, so that read waits for preparation and
+returns its error rather than an empty conversation. An unreadable checkpoint is an error response
+and starts nothing. Timeline search and the prompt index read the same projection without starting a
+provider.
+
+After a `saved` page, the client refreshes `after` its end cursor once per readiness transition.
+Replay normally changes the epoch, so that refresh resets to the new tail through the stale-cursor
+path. Once a saved page lands the chat stays readable: no overlay or full-screen error replaces it.
+Send, Enter, send-now, queue drain and agent controls require a live snapshot (no `preparation`, not
+`last_persisted`) observed since the latest preparation started; a later `last_persisted`
+observation does not revoke that. While `preparation` is present the client shows the provider
+error with Retry inline (Retry is an ordinary resume fetch) and treats the snapshot's pending
+permissions and running turn as absent. A `last_persisted` snapshot neither grants nor revokes
+permissions or turns.
 
 ## Presence is not delivery
 
@@ -163,10 +206,65 @@ Persistence uses `agent-subagents/{parentId}/index.sqlite3` for descriptors and 
 commit-before-publication contract as parent timelines. Blocking storage work runs outside
 the async executor; ordinary events do not clone/rewrite sibling histories.
 
-The previous `agent-subagents/{parentId}.json` is imported once and left untouched as a migration
-backup. Native child replay uses guarded replacement, not append-to-restored-history. Existing
+Parent cards that summarize child work keep their recorded log across resume without reading any
+child: `resume_session` options carry `subagentCardLogs` (call ID → stored card log). A replayed card
+replaces the stored row by call ID, so the provider must emit the seeded log in it and append live
+child output after it once.
+
+The descriptor list and child pages never start the parent. Parent replay and live events announce
+children with descriptors carrying a provider-owned `source` locator, which stays inside the daemon.
+Opening a child reads that child alone: a child with stored rows answers from storage, and its native
+body is fetched through the parent's provider (`AgentProvider::stream_subagent_history`) in the
+background. Only a complete replay that replaced the stored rows (or a provider without a separate
+body) is reused, and only for a finished child; a running child, an unverified replay, or a replay
+that could not account for the stored rows is read again on the next open. A
+child with no stored rows waits for that fetch, and a failed fetch
+is an error response. With stored rows, the page and the child's descriptor (list responses and
+`agent.provider_subagents.update` upserts, published when the refresh starts and settles) carry
+`nativeRefresh: {status: "refreshing"}` or `{status: "failed", error}`; the rows stay visible and
+the next `timeline.get` for that child, including the pane's Retry, retries. The client shows the
+state only for the open child. The fetch replays only rows for the opened child; rows for other
+children are discarded. A complete replay of a child already recorded as finished is authoritative
+and replaces its stored rows. Anything else is a guarded replacement: a running child can have live
+rows its native history does not contain yet, however well-formed that history is.
+
+Codex includes unfinished turns when reading a cold child with no attached live stream, but leaves
+them to that stream when it exists; either unfinished snapshot is unverified.
+
+A provider whose live session publishes rows for that child cannot hand the replay back through the
+hook: rows published between its snapshot and the daemon's apply would be overwritten or
+duplicated, and comparing text or timestamps cannot recover the order. It runs a per-child
+two-phase replay instead (`SubagentHistoryRequest::replay`):
+
+1. Under its own live-event ordering it reads the snapshot and publishes `replay.marker(...)` on
+   the parent's live sink, then returns `SubagentHistory::Published`. Rows published before the
+   marker are covered by it; nothing can fall between.
+2. It holds that child's later live updates and awaits `replay.outcome()`. The parent's event
+   consumer applies the marker in order and reports `Applied` or `Retained`.
+3. `Applied`: the provider rebases its live position onto the snapshot. `Retained` (or `None`, when
+   the parent closed first): it keeps its previous position, which still matches the stored rows.
+   Held updates are then computed against that position and published after the marker.
+
+Only that child's rows wait, and only until its own marker is applied. The provider must keep
+serving the parent session meanwhile (await the outcome in a separate task, never in the session's
+event loop): a marker behind a held event stage (the parent's own history replay or a turn
+admission) applies only once that stage releases, and releasing it can need the same session.
+For the same reason, and so a parent session cannot start between a provider's live/cold decision
+and the application of a cold (`Replayed`) result, child reads share a per-parent gate that starting
+or replaying the parent takes exclusively: a child read waits for a parent already starting, and a
+parent start waits for child reads in flight. Child reads never start the parent. Providers register
+a live session before it can publish any child row, so "no live session" means no live rows. When a
+read ends without its marker being applied (error, cancellation, shutdown), the outcome resolves
+`None` and a marker arriving later is ignored, so stored rows and the provider's position never
+diverge.
+
+A provider without a live session for the parent returns rows through the hook (`Replayed`); no live
+rows exist then. Providers without a separately
+readable child body answer from rows collected from the parent's stream. The read holds no MCP
+grant: issuing one for the parent's agent ID would revoke the live session's grant. Existing
 children absent from an incomplete replay remain available. A changed child epoch triggers the
-existing projected-timeline resynchronization path.
+existing projected-timeline resynchronization path; an open child refetches its tail once per newly
+announced epoch, and inactive children never fetch.
 
 Clients advertising `projected_subagent_timeline` receive child streams and projected fetches.
 Updated clients require `features.projectedSubagentTimeline` for child history; older hosts show
@@ -346,6 +444,7 @@ canonical assistant prefix, it stays in the head lane. No row may be returned in
 ## Relevant code
 
 - Rust canonical timeline, persistence and forwarding: `packages/daemon/src/agent/timeline.rs`, `timeline_storage.rs`, `timeline_stream.rs`, and `transport/`
+- Rust saved reads, background preparation and lazy child bodies: `packages/daemon/src/agent/history_read.rs`
 - Dart protocol and reconciliation: `packages/flutter_app/lib/core/client.dart`
 - Flutter viewed-session/controller and timeline presentation: `packages/flutter_app/lib/features/chat/chat_controller.dart`, `agent_panel.dart`, and `timeline_item.dart`
 - External Rust SDK: `packages/client`

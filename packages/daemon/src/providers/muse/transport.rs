@@ -550,6 +550,20 @@ impl Connection {
     }
 }
 
+/// The MSP request surface projections read through, so the child-history
+/// boundary can be exercised against a recorded host.
+#[async_trait::async_trait]
+pub trait Host: Send + Sync {
+    async fn request(&self, method: &str, params: Value) -> Result<Value>;
+}
+
+#[async_trait::async_trait]
+impl Host for Connection {
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        Connection::request(self, method, params).await
+    }
+}
+
 impl Drop for Connection {
     fn drop(&mut self) {
         self.inner.begin_close();

@@ -52,8 +52,10 @@ pub(super) async fn handle(
                                     break;
                                 };
                                 for id in &ids {
-                                    match app.agents.timeline(id,&json!({"direction":"tail","limit":1})).await {
-                                        Ok(page) => pending.push_back(json!({"type":"timeline_replacement","agentId":id,"epoch":page["epoch"]})),
+                                    // Recovery reports the current epoch; it never starts a provider.
+                                    match app.agents.timeline_epoch(id).await {
+                                        Ok(Some(epoch)) => pending.push_back(json!({"type":"timeline_replacement","agentId":id,"epoch":epoch})),
+                                        Ok(None) => {}
                                         Err(_) => {let _ = owner.release().await; return;}
                                     }
                                 }
@@ -134,6 +136,8 @@ pub(super) async fn handle(
                         &options,
                     )
                     .await
+            } else if supports(context, "saved_history_reads") {
+                manager.saved_timeline(id, &options).await
             } else {
                 manager.timeline(id, &options).await
             };
@@ -315,6 +319,7 @@ fn project_page(context: &RequestContext, timeline: Value, subagent: bool) -> Va
         "hasOlder",
         "hasNewer",
         "provider",
+        "historySource",
     ] {
         if let Some(value) = timeline.get(key) {
             out[key] = value.clone();

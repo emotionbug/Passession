@@ -52,6 +52,8 @@ pub struct RuntimeManager {
     selected: AtomicU8,
     state: Arc<Mutex<ManagerState>>,
     cancel: CancellationToken,
+    /// Live parent sessions an opened child's replay is serialized with.
+    pub(super) families: super::family::Families,
 }
 
 impl RuntimeManager {
@@ -61,6 +63,7 @@ impl RuntimeManager {
             selected: AtomicU8::new(0),
             state: Arc::new(Mutex::new(ManagerState::default())),
             cancel: CancellationToken::new(),
+            families: Default::default(),
         }
     }
 
@@ -362,7 +365,8 @@ impl Drop for RuntimeManager {
 pub struct Runtime {
     pub generation: Generation,
     pub environment: BTreeMap<String, String>,
-    process: Arc<ManagedProcess>,
+    /// None only for the test loopback runtime, whose server is in-process.
+    process: Option<Arc<ManagedProcess>>,
     client: Client,
     base_url: String,
     password: Option<String>,
@@ -497,7 +501,7 @@ impl Runtime {
         let runtime = Arc::new(Self {
             generation,
             environment,
-            process,
+            process: Some(process),
             client,
             base_url,
             username,
@@ -541,9 +545,32 @@ impl Runtime {
     pub async fn stop(&self) -> Result<()> {
         self.exited.cancel();
         let bridge = self.bridge.shutdown().await;
-        let process = self.process.terminate(SHUTDOWN_GRACE).await;
+        let process = match &self.process {
+            Some(process) => process.terminate(SHUTDOWN_GRACE).await,
+            None => Ok(()),
+        };
         bridge?;
         process
+    }
+
+    /// A runtime whose OpenCode server is an in-process loopback fixture.
+    #[cfg(test)]
+    pub async fn loopback(
+        generation: Generation,
+        base_url: String,
+        home: &std::path::Path,
+    ) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            generation,
+            environment: BTreeMap::new(),
+            process: None,
+            client: Client::builder().no_proxy().build()?,
+            base_url,
+            password: None,
+            username: "opencode".to_owned(),
+            exited: CancellationToken::new(),
+            bridge: Bridge::start(home, generation, Value::Null).await?,
+        }))
     }
 
     fn builder(
@@ -620,7 +647,9 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         self.exited.cancel();
         self.bridge.close();
-        let process = self.process.clone();
+        let Some(process) = self.process.clone() else {
+            return;
+        };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Err(error) = process.terminate(SHUTDOWN_GRACE).await {

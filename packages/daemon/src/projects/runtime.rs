@@ -1048,19 +1048,6 @@ pub async fn rebind_worktree_change_request_hint(
     Ok(true)
 }
 
-pub async fn pin_worktree_branch_identity_if_missing(root: &Path, branch: &str) -> Result<bool> {
-    let Some(mut metadata) = read_worktree_metadata(root).await? else {
-        return Ok(false);
-    };
-    if metadata.get("changeRequestLookupTarget").is_some() {
-        return Ok(false);
-    }
-    metadata["changeRequestLookupTarget"] =
-        create_worktree_change_request_hint(&json!({"headRef":branch,"localBranchName":branch}))?;
-    write_metadata_file(root, &metadata).await?;
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

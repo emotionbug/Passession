@@ -368,7 +368,7 @@ fn follow(
             let result: Result<()> = async {
                 let (id, entry, matches) = if event["type"] == "agent_deleted" {
                     (text(&event, "agentId").to_owned(), None, false)
-                } else if event["type"] == "agent_state" {
+                } else if event["type"] == "agent_state" || event["type"] == "agent_preparation" {
                     let agent = snapshot_payload(&event["agent"]);
                     let id = text(&agent, "id").to_owned();
                     if stamps

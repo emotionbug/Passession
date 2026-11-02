@@ -102,6 +102,10 @@ class ChatDelivery {
       _apply(jsonMap(payload['receipt']));
     }
     if (event['type'] == 'agent_permission_resolved' ||
+        // A provider that finished preparing can take its held queue.
+        (event['type'] == 'agent_update' &&
+            payload['agent'] is Map &&
+            jsonMap(payload['agent'])['preparation'] == null) ||
         (event['type'] == 'agent_stream' &&
             [
               'turn_completed',
@@ -196,8 +200,11 @@ class ChatDelivery {
       if (agent.isEmpty) {
         throw StateError('The queued session no longer exists.');
       }
+      // A preparing, failed or busy-observed provider is not idle evidence.
       if (agent['status'] != 'idle' ||
           agent['activeTurn'] != null ||
+          agent['preparation'] != null ||
+          agent['snapshotAvailability'] == 'last_persisted' ||
           jsonList(agent['pendingPermissions']).isNotEmpty ||
           agent['archivedAt'] != null) {
         return;

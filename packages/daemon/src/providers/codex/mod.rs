@@ -1,6 +1,7 @@
 mod commands;
 mod events;
 mod input;
+mod metadata;
 mod permissions;
 mod projection;
 mod session;
@@ -28,6 +29,7 @@ pub struct CodexProvider {
     spec: ProviderSpec,
     caps: Value,
     sessions: Mutex<Vec<Weak<CodexSession>>>,
+    discovery: metadata::MetadataCache,
 }
 pub(super) fn capabilities() -> Value {
     json!({"supportsStreaming":true,"supportsSessionPersistence":true,"supportsSessionListing":true,"supportsDynamicModes":false,"supportsMcpServers":true,"supportsReasoningStream":true,"supportsToolInvocations":true,"supportsRewindConversation":true,"supportsRewindFiles":false,"supportsRewindBoth":false})
@@ -129,69 +131,13 @@ pub(super) fn custom_config(spec: &ProviderSpec) -> Option<Value> {
     }
     Some(json!({"model_provider":spec.id,"model_providers":{(spec.id.clone()):provider}}))
 }
-pub(super) async fn metadata(
-    client: &Transport,
-    cwd: Value,
-) -> Result<(Vec<Value>, Value, Vec<Value>, Option<Vec<Value>>)> {
-    let model_reply =
-        refresh_activity("model/list", client.request("model/list", json!({}))).await?;
-    let models = model_reply["data"]
-        .as_array()
-        .ok_or_else(|| anyhow!("Codex model/list returned no model array"))?
-        .clone();
-    let config = refresh_activity("config/read", async {
-        let mut config = client
-            .request("config/read", json!({"cwd":cwd}))
-            .await
-            .unwrap_or_else(|_| json!({}))["config"]
-            .clone();
-        if !config.is_object() {
-            config = json!({});
-        }
-        if let Ok(saved) = client.request("getUserSavedConfig", json!({})).await {
-            for (source, dest) in [
-                ("model", "model"),
-                ("modelReasoningEffort", "model_reasoning_effort"),
-            ] {
-                if saved["config"][source]
-                    .as_str()
-                    .is_some_and(|s| !s.trim().is_empty())
-                {
-                    config[dest] = saved["config"][source].clone();
-                }
-            }
-        }
-        Ok(config)
-    })
-    .await?;
-    let collaboration = client
-        .request("collaborationMode/list", json!({}))
-        .await
-        .ok()
-        .and_then(|v| v["data"].as_array().cloned())
-        .unwrap_or_default();
-    let skills = client
-        .request("skills/list", json!({"cwds":[cwd]}))
-        .await
-        .ok()
-        .map(|v| {
-            v["data"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .flat_map(|v| v["skills"].as_array().into_iter().flatten())
-                .filter(|s| s["enabled"] != false && s["name"].is_string() && s["path"].is_string())
-                .cloned()
-                .collect()
-        });
-    Ok((models, config, collaboration, skills))
-}
 impl CodexProvider {
     pub fn new(spec: ProviderSpec) -> Self {
         Self {
             spec,
             caps: capabilities(),
             sessions: Mutex::new(Vec::new()),
+            discovery: metadata::MetadataCache::default(),
         }
     }
     async fn client(&self, cancel: CancellationToken) -> Result<Arc<Transport>> {
@@ -229,6 +175,28 @@ impl CodexProvider {
         }
         Ok(client)
     }
+    /// Draft and catalog reads share discovery with each other; a cache miss
+    /// starts its own short-lived app-server.
+    async fn discover(
+        &self,
+        cwd: &Value,
+        cancel: CancellationToken,
+    ) -> Result<Arc<metadata::Discovery>> {
+        self.discovery
+            .discover(&self.spec, &["app-server"], &BTreeMap::new(), cwd, &cancel, || async {
+                let c = self.client(cancel.clone()).await?;
+                let result = tokio::select! {
+                    biased;
+                    _=cancel.cancelled()=>Err(anyhow!("Codex metadata discovery canceled")),
+                    result=metadata::fetch(&c,cwd)=>result,
+                };
+                let close = c.close().await;
+                let result = result?;
+                close?;
+                Ok(result)
+            })
+            .await
+    }
     async fn open(
         &self,
         config: Value,
@@ -244,6 +212,7 @@ impl CodexProvider {
             options,
             persistence,
             sink,
+            &self.discovery,
         )
         .await?;
         self.sessions.lock().unwrap().push(Arc::downgrade(&session));
@@ -325,6 +294,21 @@ impl AgentProvider for CodexProvider {
         )
         .await
     }
+    async fn stream_subagent_history(
+        &self,
+        request: SubagentHistoryRequest,
+        context: LaunchContext,
+        sink: EventSink,
+    ) -> Result<SubagentHistory> {
+        let sessions: Vec<_> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        session::stream_subagent_history(&self.spec, &sessions, request, context, sink).await
+    }
     async fn catalog_cache_key(
         &self,
         _options: Value,
@@ -333,20 +317,9 @@ impl AgentProvider for CodexProvider {
         Ok(Some("host".to_owned()))
     }
     async fn fetch_catalog(&self, _options: Value, cancel: CancellationToken) -> Result<Value> {
-        let (version_result, metadata_result) = tokio::join!(
-            refresh_activity("version", probe(&self.spec, cancel.clone())),
-            async {
-                let c = self.client(cancel.clone()).await?;
-                let result = tokio::select! {
-                    biased;
-                    _=cancel.cancelled()=>Err(anyhow!("Codex catalog refresh canceled")),
-                    result=metadata(&c,Value::Null)=>result,
-                };
-                let close = c.close().await;
-                let result = result?;
-                close?;
-                Ok::<_, anyhow::Error>(result)
-            }
+        let (version_result, discovery) = tokio::join!(
+            refresh_activity("version", self.discovery.probe(&self.spec, cancel.clone())),
+            self.discover(&Value::Null, cancel.clone())
         );
         if cancel.is_cancelled() {
             bail!("Codex catalog refresh canceled");
@@ -355,7 +328,8 @@ impl AgentProvider for CodexProvider {
             .ok()
             .and_then(|v| version(&v))
             .is_some_and(|v| v >= (0, 115, 0));
-        let (models, config, _, _) = metadata_result?;
+        let discovery = discovery?;
+        let (models, config) = (&discovery.metadata.models, &discovery.metadata.resolved_config);
         let configured = models.iter().any(|m| m["id"] == config["model"]);
         let models:Vec<Value>=models.iter().map(|m|{
             let effort=config["model_reasoning_effort"].as_str().or(m["defaultReasoningEffort"].as_str());
@@ -368,20 +342,15 @@ impl AgentProvider for CodexProvider {
         )
     }
     async fn list_features(&self, config: &Value) -> Result<Vec<Value>> {
-        let c = self.client(CancellationToken::new()).await?;
-        let result = metadata(&c, config["cwd"].clone()).await;
-        let close = c.close().await;
-        let (models, _, collab, _) = result?;
-        close?;
-        Ok(session::features(config, &models, &collab))
+        let discovery = self.discover(&config["cwd"], CancellationToken::new()).await?;
+        let metadata = &discovery.metadata;
+        Ok(session::features(config, &metadata.models, &metadata.collaboration))
     }
     async fn list_commands(&self, config: &Value) -> Result<Vec<Value>> {
-        let c = self.client(CancellationToken::new()).await?;
-        let result = metadata(&c, config["cwd"].clone()).await;
-        let close = c.close().await;
-        let (_, _, _, skills) = result?;
-        close?;
-        let goals = probe(&self.spec, CancellationToken::new())
+        let discovery = self.discover(&config["cwd"], CancellationToken::new()).await?;
+        let goals = self
+            .discovery
+            .probe(&self.spec, CancellationToken::new())
             .await
             .ok()
             .and_then(|v| version(&v))
@@ -389,7 +358,7 @@ impl AgentProvider for CodexProvider {
         session::command_list(
             &home(&self.spec, &BTreeMap::new()),
             config["cwd"].as_str().unwrap_or("."),
-            skills.as_deref(),
+            discovery.skills.as_deref(),
             goals,
         )
         .await
@@ -432,6 +401,7 @@ impl AgentProvider for CodexProvider {
             json!({}),
             Some(persistence.clone()),
             sink,
+            &self.discovery,
         )
         .await?;
         self.sessions.lock().unwrap().push(Arc::downgrade(&session));
@@ -457,8 +427,12 @@ impl AgentProvider for CodexProvider {
             provider_subagent_events,
         })
     }
-    async fn is_available(&self, _options: Value, cancel: CancellationToken) -> Result<bool> {
-        Ok(probe(&self.spec, cancel).await.is_ok())
+    async fn is_available(&self, options: Value, cancel: CancellationToken) -> Result<bool> {
+        // A forced catalog refresh asks availability first, before any reuse.
+        if options["force"] == true {
+            self.discovery.invalidate();
+        }
+        Ok(self.discovery.probe(&self.spec, cancel).await.is_ok())
     }
     async fn diagnostic(&self) -> Result<String> {
         match probe(&self.spec, CancellationToken::new()).await {

@@ -5,7 +5,7 @@ use std::path::Path;
 
 #[path = "timeline_stream.rs"]
 mod stream;
-pub use stream::{StreamCoalescer, SubagentStorageUnavailable, SubagentStore};
+pub use stream::{StreamCoalescer, SubagentStorageUnavailable, SubagentStore, public_subagent};
 #[path = "timeline_search.rs"]
 mod search;
 #[path = "timeline_storage.rs"]
@@ -467,8 +467,32 @@ impl Timeline {
             false,
         )
     }
+    /// Each projected sub-agent card's recorded log, and its log-entry
+    /// identities where recorded, by call ID. A resumed provider keeps these
+    /// instead of reading child transcripts.
+    pub fn subagent_card_logs(&self) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>) {
+        let mut logs = serde_json::Map::new();
+        let mut entries = serde_json::Map::new();
+        for item in self.rows.iter().map(|row| &row["item"]) {
+            if item["type"] != "tool_call" || item["detail"]["type"] != "sub_agent" {
+                continue;
+            }
+            let (Some(call), Some(log)) = (item["callId"].as_str(), item["detail"]["log"].as_str().filter(|log| !log.is_empty())) else {
+                continue;
+            };
+            logs.insert(call.to_owned(), json!(log));
+            if let Some(recorded) = item["metadata"]["subagentLog"].as_array() {
+                entries.insert(call.to_owned(), json!(recorded));
+            }
+        }
+        (logs, entries)
+    }
     pub fn load(path: &Path, agent_id: &str) -> Result<Self> {
         storage::load(path, agent_id)
+    }
+    /// One page of an existing checkpoint, read without hydrating it.
+    pub fn fetch_saved(path: &Path, agent_id: &str, options: &Value) -> Result<Value> {
+        storage::fetch_page(path, agent_id, options)
     }
     pub fn persist(&mut self, path: &Path, agent_id: &str) -> Result<()> {
         storage::persist(self, path, agent_id)

@@ -17,7 +17,6 @@ import 'package:window_manager/window_manager.dart';
 import '../../core/app_store.dart';
 import '../../core/client.dart' show ConnectionStatus;
 import '../../core/json.dart';
-import '../../core/legacy_state.dart' show originalDesktopUserDataDir;
 import 'daemon_service.dart';
 import 'desktop_integrations.dart';
 import 'desktop_settings.dart';
@@ -1026,13 +1025,11 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
   Future<void> _restoreGeometry() async {
     final file = _geometryFile!;
     try {
-      final data = await file.exists()
-          ? jsonMap(jsonDecode(await file.readAsString()))
-          : await originalWindowState(Platform.environment);
-      if (data == null) {
+      if (!await file.exists()) {
         await windowManager.center();
         return;
       }
+      final data = jsonMap(jsonDecode(await file.readAsString()));
       final size = Size(
         (data['width'] as num).toDouble(),
         (data['height'] as num).toDouble(),
@@ -1057,32 +1054,6 @@ class DesktopHost with WindowListener, WidgetsBindingObserver {
       if (data['maximized'] == true) await windowManager.maximize();
     } catch (error) {
       _report(error);
-    }
-  }
-
-  /// settings/window-state.ts coerceWindowState over the original Electron
-  /// window's `window-state.json`: the last bounds (at least 400×300, a
-  /// position only with both coordinates), used until this app saves its own.
-  static Future<JsonMap?> originalWindowState(Map<String, String> env) async {
-    final directory = originalDesktopUserDataDir(env);
-    if (directory == null) return null;
-    final file = File(p.join(directory, 'window-state.json'));
-    try {
-      if (!await file.exists()) return null;
-      final state = jsonMap(jsonMap(jsonDecode(await file.readAsString()))['state']);
-      final width = state['width'], height = state['height'];
-      if (width is! num || height is! num || !width.isFinite || !height.isFinite) return null;
-      final x = state['x'], y = state['y'];
-      return {
-        if (x is num && y is num && x.isFinite && y.isFinite) ...{'x': x.round(), 'y': y.round()},
-        'width': width.round() < 400 ? 400 : width.round(),
-        'height': height.round() < 300 ? 300 : height.round(),
-        'maximized': state['isMaximized'] == true,
-      };
-    } on FormatException {
-      return null;
-    } on FileSystemException {
-      return null;
     }
   }
 

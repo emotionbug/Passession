@@ -61,6 +61,14 @@ impl Timeline {
             if !allow_removal && matched.is_some_and(|index| previous_index.is_some_and(|previous| index <= previous)) {
                 return false;
             }
+            // A non-authoritative snapshot may lag live text even when IDs match.
+            if !allow_removal
+                && let Some(index) = matched
+                && let Some(text) = row["item"]["text"].as_str().filter(|text| !text.is_empty())
+                && !self.rows[index]["item"]["text"].as_str().is_some_and(|next| next.starts_with(text))
+            {
+                return false;
+            }
             if let Some(index) = matched { previous_index = Some(index); }
             match matched.filter(|index| used.insert(*index)) {
                 Some(index) => {

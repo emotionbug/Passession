@@ -146,7 +146,8 @@
       "restore": "빈 입력창으로 복원",
       "discard": "실패한 초안 버리기",
       "agentRunning": "에이전트 실행 중 · 전송 대기와 별개",
-      "stateUnavailable": "실시간 실행 상태 확인 불가"
+      "stateUnavailable": "실시간 실행 상태 확인 불가",
+      "agentNotReady": "에이전트가 아직 준비되지 않았습니다. 메시지는 입력창에 유지됩니다."
     },
     "placeholders": {
       "desktop": "에이전트에게 메시지를 보내거나 @files 태그, /commands, /skills를 사용하세요",
@@ -276,6 +277,10 @@
       "daemonMaintenance": "호스트 데몬을 업데이트하는 중입니다. 완료될 때까지 새 메시지와 에이전트 생성이 중단됩니다. 에이전트 중지, 항목 닫기, 권한 요청 응답은 계속할 수 있습니다.",
       "timelineSyncFailed": "에이전트 기록을 새로고침할 수 없습니다.",
       "timelineSyncRetrying": "재시도 중…",
+      "preparingAgent": "에이전트를 시작하는 중입니다. 저장된 메시지는 계속 볼 수 있으며 전송은 준비가 끝난 뒤 가능합니다.",
+      "preparationFailed": "에이전트를 시작하지 못했습니다. 저장된 메시지는 계속 볼 수 있습니다.",
+      "subagentRefreshing": "이 서브에이전트의 기록을 새로고침하는 중입니다. 저장된 메시지는 계속 볼 수 있습니다.",
+      "subagentRefreshFailed": "이 서브에이전트의 기록을 새로고침하지 못했습니다. 저장된 메시지는 계속 볼 수 있습니다.",
       "archivingTitle": "에이전트 보관 중...",
       "archivingSubtitle": "이 에이전트를 보관하는 동안 잠시 기다려 주세요."
     },

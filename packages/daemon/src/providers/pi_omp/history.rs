@@ -14,6 +14,7 @@ use tokio::{
 };
 
 use super::events::Mapper;
+use crate::providers::api::{HistoryCoverage, SubagentHistoryRequest, subagent_row};
 
 static TITLE_PREFIX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}[-:]\d{2}[-:]\d{2}").unwrap());
@@ -564,10 +565,6 @@ pub fn import_persistence(provider: &str, handle: &str, cwd: &str, stored_config
     json!({"provider":provider,"sessionId":handle,"nativeHandle":handle,"metadata":metadata})
 }
 
-pub async fn active_entries(path: &Path, active_entry_id: Option<&str>) -> Result<Vec<Value>> {
-    Ok(active_entries_with_coverage(path, active_entry_id).await?.0)
-}
-
 async fn active_entries_with_coverage(path: &Path, active_entry_id: Option<&str>) -> Result<(Vec<Value>, bool)> {
     let content = fs::read(path).await?;
     let text = String::from_utf8_lossy(&content);
@@ -736,13 +733,11 @@ pub async fn load_with_metadata(
     active_entry_id: Option<&str>,
     metadata: &Value,
 ) -> Result<History> {
-    let mut visited = HashSet::new();
     load_inner(
         family,
         provider,
         path,
         active_entry_id,
-        &mut visited,
         true,
         metadata.get("bridgedTools"),
     )
@@ -756,13 +751,11 @@ pub async fn load_live(
     active_entry_id: Option<&str>,
     metadata: &Value,
 ) -> Result<History> {
-    let mut visited = HashSet::new();
     load_inner(
         family,
         provider,
         path,
         active_entry_id,
-        &mut visited,
         false,
         metadata.get("bridgedTools"),
     )
@@ -791,26 +784,17 @@ fn push_event(history: &mut History, event: Value) {
     history.events.push(event);
 }
 
+/// Reads only `path`. The children it spawned are announced by descriptor with a
+/// `source` locator; a child transcript is read only when that child is opened.
 async fn load_inner(
     family: &str,
     provider: &str,
     path: &Path,
     active_entry_id: Option<&str>,
-    visited: &mut HashSet<PathBuf>,
     append_todo: bool,
     bridged_tools: Option<&Value>,
 ) -> Result<History> {
-    let mut history = History {
-        descriptor: describe(family, path).await?.unwrap_or(Value::Null),
-        timeline: Vec::new(),
-        subagent_events: Vec::new(),
-        messages: Vec::new(),
-        events: Vec::new(),
-        complete: false,
-    };
-    if !visited.insert(path.to_owned()) {
-        return Ok(history);
-    }
+    let descriptor = describe(family, path).await?.unwrap_or(Value::Null);
     let (entries, complete) = match active_entries_with_coverage(path, active_entry_id).await {
         Ok(result) => result,
         Err(error)
@@ -818,10 +802,48 @@ async fn load_inner(
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
         {
-            return Ok(history);
+            return Ok(empty_history(descriptor));
         }
         Err(error) => return Err(error),
     };
+    Ok(project(
+        family,
+        provider,
+        path,
+        descriptor,
+        &entries,
+        complete,
+        append_todo,
+        bridged_tools,
+        false,
+    ))
+}
+
+fn empty_history(descriptor: Value) -> History {
+    History {
+        descriptor,
+        timeline: Vec::new(),
+        subagent_events: Vec::new(),
+        messages: Vec::new(),
+        events: Vec::new(),
+        complete: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project(
+    family: &str,
+    provider: &str,
+    path: &Path,
+    descriptor: Value,
+    entries: &[Value],
+    complete: bool,
+    append_todo: bool,
+    bridged_tools: Option<&Value>,
+    // A child transcript, identified the way its live events are.
+    child: bool,
+) -> History {
+    let mut history = empty_history(descriptor);
     history.complete = complete && history.descriptor.is_object();
     if history.descriptor.is_object() {
         history.descriptor["activeBranchEntryId"] = entries
@@ -830,10 +852,13 @@ async fn load_inner(
             .unwrap_or(Value::Null);
     }
     let mut mapper = Mapper::new(family, provider);
+    if child {
+        mapper = mapper.native_ids();
+    }
     if let Some(tools) = bridged_tools {
         mapper.set_bridged_tools(tools);
     }
-    for entry in &entries {
+    for entry in entries {
         let timestamp = if family == "omp" {
             replay_timestamp(&entry["timestamp"])
         } else {
@@ -870,89 +895,24 @@ async fn load_inner(
         history.messages.push(message);
     }
     if family == "omp" {
-        let transcripts = subagent_transcripts(&history.messages, path);
-        for transcript in transcripts {
-            let child_entries = match active_entries(&transcript.path, None).await {
-                Ok(entries) => entries,
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    Vec::new()
-                }
-                Err(error) => return Err(error),
-            };
-            let model = child_entries
-                .iter()
-                .filter_map(|e| {
-                    if e["type"] == "model_change" {
-                        model_id(&e["provider"], &e["modelId"])
-                    } else if e["type"] == "message" && e["message"]["role"] == "assistant" {
-                        model_id(
-                            &e["message"]["provider"],
-                            e["message"]
-                                .get("responseModel")
-                                .filter(|v| !v.is_null())
-                                .unwrap_or(&e["message"]["model"]),
-                        )
-                    } else {
-                        None
-                    }
-                })
-                .last();
-            let title = subagent_title(&transcript.title, model.as_deref());
-            push_event(
-                &mut history,
-                transcript.upsert(
-                    provider,
-                    "running",
-                    &title,
-                    child_entries
-                        .first()
-                        .and_then(|e| replay_timestamp(&e["timestamp"])),
-                ),
-            );
-            let child = Box::pin(load_inner(
-                family,
-                provider,
-                &transcript.path,
-                None,
-                visited,
-                false,
-                None,
-            ))
-            .await?;
-            for event in child.events {
-                if event["type"] == "timeline" {
-                    let mut body =
-                        json!({"type":"timeline","id":transcript.id,"item":event["item"]});
-                    body["historyComplete"] = json!(child.complete);
-                    if let Some(timestamp) = event.get("timestamp") {
-                        body["timestamp"] = timestamp.clone();
-                    }
-                    push_event(
-                        &mut history,
-                        json!({"type":"provider_subagent","provider":provider,"event":body}),
-                    );
-                } else if event["type"] == "provider_subagent" {
-                    push_event(&mut history, event);
-                }
-            }
-            push_event(
-                &mut history,
-                transcript.upsert(
-                    provider,
-                    transcript.status,
-                    &title,
-                    child_entries
-                        .last()
-                        .and_then(|e| replay_timestamp(&e["timestamp"])),
-                ),
-            );
+        let finished: HashMap<&str, String> = entries
+            .iter()
+            .filter(|e| e["message"]["role"] == "toolResult")
+            .filter_map(|e| {
+                Some((
+                    e["message"]["toolCallId"].as_str()?,
+                    replay_timestamp(&e["timestamp"])?,
+                ))
+            })
+            .collect();
+        for transcript in subagent_transcripts(&history.messages, path) {
+            let timestamp = finished.get(transcript.tool_call.as_str()).cloned();
+            let title = subagent_title(&transcript.title, None);
+            let event = transcript.upsert(provider, transcript.status, &title, timestamp);
+            push_event(&mut history, event);
         }
         if append_todo {
-            if let Some(todo) = todo_state(&entries) {
+            if let Some(todo) = todo_state(entries) {
                 push_event(
                     &mut history,
                     json!({"type":"timeline","provider":provider,"item":todo}),
@@ -960,25 +920,168 @@ async fn load_inner(
             }
         }
     } else {
-        let mut remaining = 16 * 1024 * 1024;
         for child in mapper.drain_child_sessions() {
-            let (Some(id), Some(file)) = (child["id"].as_str(), child["file"].as_str()) else {
-                continue;
-            };
-            if remaining == 0 {
-                break;
-            }
-            let budget = remaining.min(2 * 1024 * 1024);
-            remaining -= budget;
-            for event in pi_child_history(id, Path::new(file), budget).await {
-                push_event(
-                    &mut history,
-                    json!({"type":"provider_subagent","provider":provider,"event":event}),
-                );
+            if let Some(event) = pi_child_source(provider, &child) {
+                push_event(&mut history, event);
             }
         }
     }
-    Ok(history)
+    history
+}
+
+/// Attaches the transcript file a Pi extension reported to the child's descriptor.
+pub(super) fn pi_child_source(provider: &str, child: &Value) -> Option<Value> {
+    let (Some(id), Some(file)) = (child["id"].as_str(), child["file"].as_str()) else {
+        return None;
+    };
+    Some(json!({"type":"provider_subagent","provider":provider,
+        "event":{"type":"upsert","id":id,"source":{"file":file}}}))
+}
+
+/// The opened child's rows, a title refreshed with its model, and descriptors for
+/// the children it spawned. Only that child's transcript is read. A descriptor
+/// stored before `source` existed is located again from the parent file alone.
+pub async fn child_history(
+    family: &str,
+    provider: &str,
+    request: &SubagentHistoryRequest,
+) -> Result<Vec<Value>> {
+    let source = if request.source.is_object() {
+        request.source.clone()
+    } else {
+        let parent = request.persistence["nativeHandle"]
+            .as_str()
+            .or(request.persistence["sessionId"].as_str())
+            .ok_or_else(|| anyhow!("Subagent parent has no native session file"))?;
+        let parent = load_inner(family, provider, Path::new(parent), None, false, None).await?;
+        parent
+            .subagent_events
+            .iter()
+            .map(|event| &event["event"])
+            .find(|event| event["id"] == request.child_id.as_str() && event["source"].is_object())
+            .map(|event| event["source"].clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Subagent '{}' has no transcript in its parent session",
+                    request.child_id
+                )
+            })?
+    };
+    if family == "omp" {
+        omp_child_history(provider, request, &source).await
+    } else {
+        pi_child_history(provider, request, &source).await
+    }
+}
+
+async fn omp_child_history(
+    provider: &str,
+    request: &SubagentHistoryRequest,
+    source: &Value,
+) -> Result<Vec<Value>> {
+    let path = Path::new(
+        source["path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("OMP subagent '{}' has no transcript path", request.child_id))?,
+    );
+    let (entries, complete) = active_entries_with_coverage(path, None)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "OMP subagent transcript {} is unavailable: {error:#}",
+                path.display()
+            )
+        })?;
+    let model = entries
+        .iter()
+        .filter_map(|e| {
+            if e["type"] == "model_change" {
+                model_id(&e["provider"], &e["modelId"])
+            } else if e["type"] == "message" && e["message"]["role"] == "assistant" {
+                model_id(
+                    &e["message"]["provider"],
+                    e["message"]
+                        .get("responseModel")
+                        .filter(|v| !v.is_null())
+                        .unwrap_or(&e["message"]["model"]),
+                )
+            } else {
+                None
+            }
+        })
+        .last();
+    let descriptor = describe("omp", path).await?.unwrap_or(Value::Null);
+    let child = project("omp", provider, path, descriptor, &entries, complete, false, None, true);
+    let coverage = if child.complete {
+        HistoryCoverage::Complete
+    } else {
+        HistoryCoverage::Unverified
+    };
+    let title = subagent_title(source["title"].as_str().unwrap_or(""), model.as_deref());
+    let mut events = vec![json!({"type":"provider_subagent","provider":provider,
+        "event":{"type":"upsert","id":request.child_id,"title":title}})];
+    for mut event in child.events {
+        if event["type"] == "timeline" {
+            events.push(subagent_row(
+                provider,
+                &request.child_id,
+                event["item"].take(),
+                event.get("timestamp"),
+                coverage,
+            ));
+        } else if event["type"] == "provider_subagent" {
+            if event["event"]["parentSubagentId"].is_null() {
+                event["event"]["parentSubagentId"] = json!(request.child_id);
+            }
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
+/// Complete only when every line of the file parsed and none was torn.
+async fn pi_child_history(
+    provider: &str,
+    request: &SubagentHistoryRequest,
+    source: &Value,
+) -> Result<Vec<Value>> {
+    let file = source["file"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Pi subagent '{}' has no transcript file", request.child_id))?;
+    let data = fs::read(file)
+        .await
+        .map_err(|error| anyhow!("Pi subagent transcript {file} is unavailable: {error}"))?;
+    let end = data.iter().rposition(|b| *b == b'\n').map_or(0, |last| last + 1);
+    let text = String::from_utf8_lossy(&data[..end]);
+    let mut complete = end == data.len() && matches!(text, std::borrow::Cow::Borrowed(_));
+    let mut mapper = Mapper::new("pi", provider).native_ids();
+    let mut rows = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Some(entry) = record(line) else {
+            complete = false;
+            continue;
+        };
+        if !entry["message"]["role"].is_string() {
+            continue;
+        }
+        for event in mapper.replay_message(&entry["message"], None) {
+            if event["type"] == "timeline" {
+                let timestamp = Some(&entry["timestamp"]).filter(|t| truthy(t)).cloned();
+                rows.push((limit_child_item(event["item"].clone()), timestamp));
+            }
+        }
+    }
+    let coverage = if complete {
+        HistoryCoverage::Complete
+    } else {
+        HistoryCoverage::Unverified
+    };
+    Ok(rows
+        .into_iter()
+        .map(|(item, timestamp)| {
+            subagent_row(provider, &request.child_id, item, timestamp.as_ref(), coverage)
+        })
+        .collect())
 }
 
 struct Transcript {
@@ -996,7 +1099,9 @@ impl Transcript {
         title: &str,
         timestamp: Option<String>,
     ) -> Value {
-        let mut event = json!({"type":"upsert","id":self.id,"title":title,"status":status,"toolCallId":self.tool_call});
+        let mut event = json!({"type":"upsert","id":self.id,"title":title,"status":status,
+            "toolCallId":self.tool_call,
+            "source":{"path":self.path.to_string_lossy(),"title":self.title}});
         if let Some(timestamp) = timestamp {
             event["timestamp"] = json!(timestamp);
         }
@@ -1158,49 +1263,6 @@ pub fn todo_state(entries: &[Value]) -> Option<Value> {
     )
 }
 
-pub(super) async fn pi_child_history(id: &str, path: &Path, budget: usize) -> Vec<Value> {
-    let Ok(file) = fs::File::open(path).await else {
-        return Vec::new();
-    };
-    let mut data = Vec::new();
-    if file
-        .take(budget as u64)
-        .read_to_end(&mut data)
-        .await
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(last_newline) = data.iter().rposition(|b| *b == b'\n') else {
-        return Vec::new();
-    };
-    let mut mapper = Mapper::new("pi", "pi");
-    let mut out = Vec::new();
-    for entry in String::from_utf8_lossy(&data[..last_newline])
-        .lines()
-        .filter_map(record)
-    {
-        if !entry["message"]["role"].is_string() {
-            continue;
-        }
-        for event in mapper.replay_message(&entry["message"], None) {
-            if event["type"] != "timeline" {
-                continue;
-            }
-            let mut body =
-                json!({"type":"timeline","id":id,"item":limit_child_item(event["item"].clone())});
-            if truthy(&entry["timestamp"]) {
-                body["timestamp"] = entry["timestamp"].clone();
-            }
-            out.push(body);
-            if out.len() >= 200 {
-                return out;
-            }
-        }
-    }
-    out
-}
-
 pub(super) fn limit_child_item(mut item: Value) -> Value {
     if item["type"] != "tool_call" {
         return item;
@@ -1330,5 +1392,174 @@ mod tests {
         // A torn append can hide entries even when the last valid entry matches.
         fs::write(&path, rewound_session() + "{\"type\":\"message\",\"id\":\"u3\"").await.unwrap();
         assert!(verified_pi_live("pi", &path, &json!("r1")).await.unwrap().is_none());
+    }
+
+    fn lines(entries: &[Value]) -> String {
+        entries.iter().map(|entry| format!("{entry}\n")).collect()
+    }
+
+    /// An OMP session whose `task` tool spawned `children`, each with an agent name.
+    fn omp_session(id: &str, children: &[(&str, &str)], reply: &str) -> String {
+        let results: Vec<_> =
+            children.iter().map(|(child, agent)| json!({"id":child,"agent":agent})).collect();
+        lines(&[
+            json!({"type":"session","id":id,"cwd":"/work","timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"model_change","id":"m0","parentId":null,"provider":"anthropic","modelId":"claude"}),
+            json!({"type":"message","id":"u1","parentId":"m0","timestamp":"2026-01-01T00:00:01.000Z",
+                "message":{"role":"user","content":text("delegate")}}),
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-01T00:00:02.000Z",
+                "message":{"role":"assistant","content":[{"type":"text","text":reply},
+                    {"type":"toolCall","id":"task-1","name":"task","arguments":{"agent":"worker"}}]}}),
+            json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:03.000Z",
+                "message":{"role":"toolResult","toolCallId":"task-1","toolName":"task",
+                    "content":text("done"),"details":{"results":results}}}),
+        ])
+    }
+
+    fn request(child: &str, parent: &Path, source: Value) -> SubagentHistoryRequest {
+        SubagentHistoryRequest {
+            persistence: json!({"sessionId":"parent","nativeHandle":parent}),
+            config: json!({"cwd":"/work"}),
+            child_id: child.into(),
+            source,
+            status: json!("completed"),
+            replay: crate::providers::api::SubagentReplay::new(
+                "replay".into(),
+                tokio::sync::watch::channel(None).1,
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn omp_parent_history_announces_children_without_reading_their_transcripts() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent.jsonl");
+        fs::write(&parent, omp_session("parent", &[("child-a", "reviewer"), ("child-b", "scout")], "parent text"))
+            .await.unwrap();
+        let children = directory.path().join("parent");
+        // An unreadable sibling fails any read of it: parent recovery must not touch it.
+        fs::create_dir_all(children.join("child-a.jsonl")).await.unwrap();
+        fs::create_dir_all(children.join("child-b.jsonl")).await.unwrap();
+        let history = load_live("omp", "omp", &parent, None, &Value::Null).await.unwrap();
+        assert!(history.complete);
+        assert!(history.timeline.iter().any(|item| item["text"] == "parent text"));
+        let descriptors: Vec<_> = history.subagent_events.iter().map(|e| &e["event"]).collect();
+        assert!(descriptors.iter().all(|e| e["type"] == "upsert"), "{descriptors:?}");
+        let ids: Vec<_> = descriptors.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["child-a", "child-b"]);
+        assert_eq!(descriptors[0]["title"], "reviewer");
+        assert_eq!(descriptors[0]["status"], "completed");
+        assert_eq!(descriptors[0]["toolCallId"], "task-1");
+        assert_eq!(descriptors[0]["timestamp"], "2026-01-01T00:00:03.000Z");
+        assert_eq!(descriptors[0]["source"]["path"], json!(children.join("child-a.jsonl")));
+    }
+
+    #[tokio::test]
+    async fn opened_omp_child_replays_only_its_transcript_and_announces_grandchildren() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent.jsonl");
+        fs::write(&parent, omp_session("parent", &[("child-a", "reviewer"), ("child-b", "scout")], "parent text"))
+            .await.unwrap();
+        let children = directory.path().join("parent");
+        fs::create_dir_all(children.join("child-b.jsonl")).await.unwrap();
+        fs::write(children.join("child-a.jsonl"), omp_session("child-a", &[("grand", "digger")], "child text"))
+            .await.unwrap();
+        let history = load_live("omp", "omp", &parent, None, &Value::Null).await.unwrap();
+        let source = history.subagent_events[0]["event"]["source"].clone();
+        for source in [source, Value::Null] {
+            let events = child_history("omp", "omp", &request("child-a", &parent, source)).await.unwrap();
+            assert_eq!(events[0]["event"], json!({"type":"upsert","id":"child-a","title":"reviewer · claude (anthropic)"}));
+            let rows: Vec<_> = events.iter().filter(|e| e["event"]["type"] == "timeline").collect();
+            assert!(rows.iter().any(|row| row["event"]["item"]["text"] == "child text"));
+            assert!(!rows.iter().any(|row| row["event"]["item"]["text"] == "parent text"));
+            assert!(rows.iter().all(|row| row["event"]["id"] == "child-a" && row["event"]["historyComplete"] == true));
+            let nested: Vec<_> = events.iter().filter(|e| e["event"]["type"] == "upsert").skip(1).collect();
+            assert_eq!(nested.len(), 1);
+            assert_eq!(nested[0]["event"]["id"], "grand");
+            assert_eq!(nested[0]["event"]["parentSubagentId"], "child-a");
+            assert_eq!(nested[0]["event"]["source"]["path"], json!(children.join("child-a").join("grand.jsonl")));
+        }
+        let sibling = child_history("omp", "omp", &request("child-b", &parent, Value::Null)).await;
+        assert!(sibling.unwrap_err().to_string().contains("unavailable"));
+        fs::remove_file(children.join("child-a.jsonl")).await.unwrap();
+        let missing = child_history("omp", "omp", &request("child-a", &parent, Value::Null)).await;
+        assert!(missing.unwrap_err().to_string().contains("unavailable"), "a missing body is never an empty replay");
+        let unknown = child_history("omp", "omp", &request("stranger", &parent, Value::Null)).await;
+        assert!(unknown.is_err());
+    }
+
+    #[tokio::test]
+    async fn pi_parent_attaches_child_file_and_opened_child_reads_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent.jsonl");
+        let child = directory.path().join("reviewer.jsonl");
+        let output = format!("Output file: {}", child.display());
+        fs::write(&parent, lines(&[
+            json!({"type":"session","id":"parent","cwd":"/work","timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":text("delegate")}}),
+            json!({"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[
+                {"type":"toolCall","id":"spawn","name":"subagent","arguments":{"subagent_type":"reviewer","prompt":"Review"}}]}}),
+            json!({"type":"message","id":"r1","parentId":"a1","message":{"role":"toolResult","toolCallId":"spawn",
+                "toolName":"subagent","content":text(&output),"details":{"agentId":"native-child","status":"completed"}}}),
+        ])).await.unwrap();
+        let body = lines(&[
+            json!({"type":"message","timestamp":"2026-01-01T00:00:05.000Z","message":{"role":"assistant","content":text("child text")}}),
+        ]);
+        fs::write(&child, &body).await.unwrap();
+        let history = load_live("pi", "pi", &parent, None, &Value::Null).await.unwrap();
+        assert!(history.subagent_events.iter().all(|e| e["event"]["type"] != "timeline"),
+            "parent recovery never replays the child file");
+        let source = history.subagent_events.iter().map(|e| &e["event"])
+            .find(|e| e["id"] == "spawn" && e["source"].is_object()).expect("child file attached")["source"].clone();
+        assert_eq!(source, json!({"file":child}));
+        for source in [source, Value::Null] {
+            let events = child_history("pi", "pi", &request("spawn", &parent, source)).await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event"]["item"]["text"], "child text");
+            assert_eq!(events[0]["event"]["historyComplete"], true);
+            assert_eq!(events[0]["event"]["timestamp"], "2026-01-01T00:00:05.000Z");
+        }
+        fs::write(&child, body + "{\"type\":\"message\"").await.unwrap();
+        let torn = child_history("pi", "pi", &request("spawn", &parent, json!({"file":child}))).await.unwrap();
+        assert_eq!(torn[0]["event"]["historyComplete"], false, "a torn tail is not complete");
+        fs::remove_file(&child).await.unwrap();
+        let missing = child_history("pi", "pi", &request("spawn", &parent, json!({"file":child}))).await;
+        assert!(missing.unwrap_err().to_string().contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn omp_live_child_rows_and_file_replay_share_native_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent.jsonl");
+        let path = directory.path().join("parent").join("child-a.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        let message = |text_value: &str, stamp: u64| {
+            json!({"role":"assistant","content":text(text_value),"timestamp":stamp})
+        };
+        fs::write(&path, lines(&[
+            json!({"type":"session","id":"child-a","cwd":"/work","timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"message","id":"m1","parentId":null,"message":message("earlier", 1_000)}),
+            json!({"type":"message","id":"m2","parentId":"m1","message":message("latest", 2_000)}),
+        ])).await.unwrap();
+        // The live stream began after the child's first message: its mapper never saw it.
+        let mut live = Mapper::new("omp", "omp");
+        let live_rows = live.map(&json!({"type":"subagent_event","payload":{"id":"child-a",
+            "event":{"type":"message_end","message":message("latest", 2_000)}}}));
+        let live_row = live_rows
+            .iter()
+            .find(|e| e["type"] == "provider_subagent" && e["event"]["type"] == "timeline")
+            .expect("live child row");
+        let replay = child_history(
+            "omp",
+            "omp",
+            &request("child-a", &parent, json!({"path":path,"title":"reviewer"})),
+        )
+        .await
+        .unwrap();
+        let rows: Vec<_> = replay.iter().filter(|e| e["event"]["type"] == "timeline").collect();
+        let ids: Vec<_> = rows.iter().map(|e| e["event"]["item"]["messageId"].clone()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(rows[1]["event"]["item"], live_row["event"]["item"], "the same record, read live or replayed");
     }
 }

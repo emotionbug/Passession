@@ -12,6 +12,7 @@ use crate::providers::registry::catalog::refresh_activity;
 use paseo_client::process::{self, CommandSpec};
 use crate::{ providers::api::{
     AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
+    SubagentHistory, SubagentHistoryRequest,
 }, };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -29,6 +30,7 @@ pub struct JsonlProvider {
     spec: ProviderSpec,
     capabilities: Value,
     sessions: Mutex<Vec<Weak<Session>>>,
+    command_probes: launch::CommandProbes,
 }
 impl JsonlProvider {
     pub fn new(spec: ProviderSpec) -> Self {
@@ -36,6 +38,7 @@ impl JsonlProvider {
             capabilities: catalog::capabilities(spec.family == "omp", spec.family == "omp"),
             spec,
             sessions: Mutex::new(Vec::new()),
+            command_probes: launch::CommandProbes::default(),
         }
     }
     fn environment(&self) -> BTreeMap<String, String> {
@@ -166,6 +169,7 @@ impl AgentProvider for JsonlProvider {
             None,
             options,
             sink,
+            &self.command_probes,
         )
         .await?;
         self.remember(&session);
@@ -206,6 +210,7 @@ impl AgentProvider for JsonlProvider {
             Some(persistence),
             options,
             sink,
+            &self.command_probes,
         )
         .await?;
         self.remember(&session);
@@ -365,9 +370,57 @@ impl AgentProvider for JsonlProvider {
             provider_subagent_events,
         })
     }
-    async fn is_available(&self, _options: Value, cancel: CancellationToken) -> Result<bool> {
+    /// Child transcripts are files; reading one never launches Pi/OMP. A live
+    /// parent session can still publish rows for the child, so its replay goes
+    /// in-stream through that session; a cold parent publishes nothing, so the
+    /// hook sink carries it. File completeness alone never makes it
+    /// authoritative: `settle` also requires the child recorded as finished.
+    async fn stream_subagent_history(
+        &self,
+        request: SubagentHistoryRequest,
+        _context: LaunchContext,
+        sink: EventSink,
+    ) -> Result<SubagentHistory> {
+        let read = async {
+            let events =
+                history::child_history(&self.spec.family, &self.spec.id, &request).await?;
+            let read = if events.iter().all(|event| {
+                event["event"]["type"] != "timeline" || event["event"]["historyComplete"] == true
+            }) {
+                crate::providers::api::HistoryCoverage::Complete
+            } else {
+                crate::providers::api::HistoryCoverage::Unverified
+            };
+            Ok((events, read))
+        };
+        let parent = request.persistence["nativeHandle"]
+            .as_str()
+            .or(request.persistence["sessionId"].as_str());
+        let live = parent.and_then(|parent| {
+            self.sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|session| session.publishes_for(parent))
+        });
+        if let Some(session) = live {
+            return session.replay_child(&request, read).await;
+        }
+        let (mut events, read) = read.await?;
+        let coverage = request.settle(&mut events, read);
+        for event in events {
+            sink.emit(event).await?;
+        }
+        Ok(SubagentHistory::Replayed(coverage))
+    }
+    async fn is_available(&self, options: Value, cancel: CancellationToken) -> Result<bool> {
         if cancel.is_cancelled() {
             bail!("Availability check cancelled");
+        }
+        // A forced catalog refresh asks availability first, before any reuse.
+        if options["force"] == true {
+            self.command_probes.clear();
         }
         let prefix = self.executable_prefix();
         let env = self.environment();

@@ -60,6 +60,10 @@ pub struct Mapper {
     stream_thinking: String,
     suppress_next_start: bool,
     card_updates: HashMap<String, (std::time::Instant, bool)>,
+    /// Child transcripts: messages are identified by their own timestamp, which a
+    /// live child event and the child's file record carry alike, never by a
+    /// counter that depends on where reading started.
+    native_ids: bool,
 }
 impl Mapper {
     pub fn new(family: &str, provider: &str) -> Self {
@@ -88,7 +92,25 @@ impl Mapper {
             stream_thinking: String::new(),
             card_updates: HashMap::new(),
             suppress_next_start: false,
+            native_ids: false,
         }
+    }
+    /// For child transcripts, read live or from their file.
+    pub fn native_ids(mut self) -> Self {
+        self.native_ids = true;
+        self
+    }
+    fn native_key(&self, message: &Value, kind: &str) -> Option<String> {
+        if !self.native_ids {
+            return None;
+        }
+        let stamp = &message["timestamp"];
+        let stamp = stamp
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| stamp.is_number().then(|| stamp.to_string()))?;
+        Some(format!("{kind}-{stamp}"))
     }
     pub fn begin_turn(&mut self, turn_id: &str) {
         self.turn = Some(turn_id.into());
@@ -392,7 +414,7 @@ impl Mapper {
                 }
                 if let Some(e)=mapped{out.extend(self.subagents(vec![e]));}
             },
-            "subagent_event" if self.family=="omp"=>{let p=&frame["payload"];if p["event"]["type"]=="message_end"{let id=string(&p["id"]);let child=self.child_mappers.entry(id.into()).or_insert_with(||Box::new(Mapper::new("omp",&self.provider)));for e in child.replay_message(&p["event"]["message"],None){if e["type"]=="timeline"{let mut event=json!({"type":"timeline","id":id,"item":e["item"]});if let Some(ts)=e.get("timestamp"){event["timestamp"]=ts.clone();}out.push(json!({"type":"provider_subagent","provider":self.provider,"event":event}));}}}},
+            "subagent_event" if self.family=="omp"=>{let p=&frame["payload"];if p["event"]["type"]=="message_end"{let id=string(&p["id"]);let child=self.child_mappers.entry(id.into()).or_insert_with(||Box::new(Mapper::new("omp",&self.provider).native_ids()));for e in child.replay_message(&p["event"]["message"],None){if e["type"]=="timeline"{let mut event=json!({"type":"timeline","id":id,"item":e["item"]});if let Some(ts)=e.get("timestamp"){event["timestamp"]=ts.clone();}out.push(json!({"type":"provider_subagent","provider":self.provider,"event":event}));}}}},
             "agent_end"|"agent_settled"=>{
                 if self.turn.is_none()&&!(self.family=="omp"&&self.started){return out;}
                 if self.family!="omp"&&kind=="agent_end"&&frame.get("willRetry").is_some(){self.settled=array(&frame["messages"]).to_vec();return out;}
@@ -435,15 +457,22 @@ impl Mapper {
                 let text = tools::content_text(&message["content"]);
                 if !text.is_empty() {
                     let mut item = json!({"type":"user_message","text":text});
-                    put(&mut item, "messageId", message_id);
+                    let native = self
+                        .native_key(message, "user")
+                        .map(|key| format!("{}-{key}", self.provider));
+                    put(&mut item, "messageId", native.as_deref().or(message_id));
                     out.push(self.timeline(item));
                 }
             }
             "assistant" => {
                 self.assistant_index += 1;
                 let id = first(&[&message["responseId"]])
-                    .or(message_id)
                     .map(str::to_owned)
+                    .or_else(|| {
+                        self.native_key(message, "assistant")
+                            .map(|key| format!("{}-{key}", self.provider))
+                    })
+                    .or_else(|| message_id.map(str::to_owned))
                     .unwrap_or_else(|| {
                         format!(
                             "{}-history-assistant-{}",
@@ -451,7 +480,7 @@ impl Mapper {
                         )
                     });
                 for block in array(&message["content"]) {
-                    match string(&block["type"]){"text" if block["text"].as_str().is_some_and(|s|!s.is_empty())=>out.push(self.timeline(json!({"type":"assistant_message","text":block["text"],"messageId":id}))),"thinking" if block["thinking"].as_str().is_some_and(|s|!s.is_empty())=>out.push(self.timeline(json!({"type":"reasoning","text":block["thinking"]}))),"toolCall"=>{let id=string(&block["id"]);let name=string(&block["name"]);self.tools.insert(id.into(),(name.into(),block["arguments"].clone()));out.extend(self.tool_events(id,name,&block["arguments"],"running",&Value::Null,&Value::Null,true));},_=>{}}
+                    match string(&block["type"]){"text" if block["text"].as_str().is_some_and(|s|!s.is_empty())=>out.push(self.timeline(json!({"type":"assistant_message","text":block["text"],"messageId":id}))),"thinking" if block["thinking"].as_str().is_some_and(|s|!s.is_empty())=>{let mut reasoning=json!({"type":"reasoning","text":block["thinking"]});if self.native_ids{reasoning["messageId"]=json!(&id);}out.push(self.timeline(reasoning))},"toolCall"=>{let id=string(&block["id"]);let name=string(&block["name"]);self.tools.insert(id.into(),(name.into(),block["arguments"].clone()));out.extend(self.tool_events(id,name,&block["arguments"],"running",&Value::Null,&Value::Null,true));},_=>{}}
                 }
             }
             "toolResult" => {
@@ -504,15 +533,16 @@ impl Mapper {
                     } else {
                         None
                     };
-                    if !hook && native_id.is_none() {
+                    let native = native_id
+                        .map(str::to_owned)
+                        .or_else(|| self.native_key(message, "message"));
+                    if !hook && native.is_none() {
                         self.custom_index += 1;
                     }
                     let id = format!(
                         "{}-custom-{}",
                         self.provider,
-                        native_id
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| self.custom_index.to_string())
+                        native.unwrap_or_else(|| self.custom_index.to_string())
                     );
                     if let Some(mut item) = custom_item(&self.family, message, &id) {
                         if item["type"] == "user_message" {

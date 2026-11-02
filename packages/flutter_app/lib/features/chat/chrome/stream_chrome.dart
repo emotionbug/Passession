@@ -412,6 +412,8 @@ extension _StreamChrome on _AgentPanelState {
       _userScrolling = false;
     }
     if (c == null) return;
+    // The kept draft can send now; the not-ready notice no longer applies.
+    if (_notReadyNotice && !_executionBlocked) _notReadyNotice = false;
     // use-agent-screen-state-machine.ts updateInitialSyncFailureMemory.
     if (c.synced) {
       _chrome.hydrated = true;

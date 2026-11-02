@@ -1,9 +1,16 @@
 use super::transport::Transport;
 use paseo_client::process::CommandSpec;
-use crate::{ providers::api::{LaunchContext, ProviderSpec}, };
+use crate::providers::{
+    api::{LaunchContext, ProviderSpec},
+    registry::catalog::memo::{self, Loaded, Memo},
+};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+
+/// Commands a Pi launch reports, shared across session opens of one provider
+/// instance. The MCP integration depends on which extension provides `mcp`.
+pub type CommandProbes = Memo<Arc<[Value]>>;
 
 pub struct Assets {
     pub directory: tempfile::TempDir,
@@ -203,22 +210,55 @@ pub fn validate_options(family: &str, options: &Value) -> Result<()> {
     }
     Ok(())
 }
-pub async fn pi_assets(
+fn pi_agent_dir(env: &BTreeMap<String, String>) -> PathBuf {
+    let home = env
+        .get("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
+    env.get("PI_CODING_AGENT_DIR")
+        .map(|value| value.trim())
+        .filter(|v| !v.is_empty())
+        .map(|value| {
+            if value == "~" {
+                home.clone()
+            } else if let Some(rest) = value.strip_prefix("~/") {
+                home.join(rest)
+            } else {
+                PathBuf::from(value)
+            }
+        })
+        .unwrap_or_else(|| home.join(".pi/agent"))
+}
+/// The probe launch plus the extension and settings locations Pi loads
+/// commands from, so installing or removing an extension changes the key.
+async fn probe_key(launch: &CommandSpec) -> String {
+    let agent = pi_agent_dir(&launch.env);
+    let mut watched = vec![agent.join("extensions"), agent.join("settings.json")];
+    if let Some(cwd) = &launch.cwd {
+        watched.extend([cwd.join(".pi/extensions"), cwd.join(".pi/settings.json")]);
+    }
+    let fingerprint = memo::fingerprint(&watched).await;
+    memo::key(&json!([
+        launch.program,
+        launch.args,
+        launch.cwd.as_ref().map(|cwd| cwd.to_string_lossy()),
+        memo::shared_env(&launch.env),
+        fingerprint
+    ]))
+}
+async fn extension_commands(
     spec: &ProviderSpec,
     config: &Value,
     context: &LaunchContext,
-) -> Result<Assets> {
-    let directory = tempfile::Builder::new()
-        .prefix("paseo-pi-extension-")
-        .tempdir()?;
-    let mut builtin = json!({});
-    let servers = context.mcp_servers.as_object();
-    let mut supported = false;
-    if servers.is_some_and(|s| !s.is_empty()) {
-        let probe_config = json!({"cwd":config["cwd"],"providerOptions":config["providerOptions"]});
-        let detected = async {
+    probes: &CommandProbes,
+) -> Result<Arc<[Value]>> {
+    let probe_config = json!({"cwd":config["cwd"],"providerOptions":config["providerOptions"]});
+    let launch = command(spec, &probe_config, context, None, None)?;
+    let key = probe_key(&launch).await;
+    probes
+        .get_or_load(key, &context.cancel, || async move {
             let (probe, mut events) = Transport::spawn(
-                command(spec, &probe_config, context, None, None)?,
+                launch,
                 timeout(spec, config),
                 context.cancel.child_token(),
             )
@@ -227,14 +267,32 @@ pub async fn pi_assets(
             let commands = probe.request(json!({"type":"get_commands"})).await;
             let _ = probe.close().await;
             drain.abort();
-            commands
-        }
-        .await;
-        let commands = match detected {
-            Ok(commands) => commands["commands"].as_array().cloned().unwrap_or_default(),
+            let commands = commands?["commands"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            Ok(Loaded::Complete(commands.into()))
+        })
+        .await
+}
+pub async fn pi_assets(
+    spec: &ProviderSpec,
+    config: &Value,
+    context: &LaunchContext,
+    probes: &CommandProbes,
+) -> Result<Assets> {
+    let directory = tempfile::Builder::new()
+        .prefix("paseo-pi-extension-")
+        .tempdir()?;
+    let mut builtin = json!({});
+    let servers = context.mcp_servers.as_object();
+    let mut supported = false;
+    if servers.is_some_and(|s| !s.is_empty()) {
+        let commands = match extension_commands(spec, config, context, probes).await {
+            Ok(commands) => commands,
             Err(error) => {
                 tracing::debug!(%error,"Pi MCP capability probe unavailable");
-                Vec::new()
+                Arc::from([])
             }
         };
         let adapter = commands.iter().any(|c| {
@@ -253,25 +311,7 @@ pub async fn pi_assets(
                 && c.pointer("/sourceInfo/path") == Some(&json!("builtin:mcp"))
         });
         if adapter {
-            let env = external_env(spec, context);
-            let home = env
-                .get("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default());
-            let agent = env
-                .get("PI_CODING_AGENT_DIR")
-                .map(|value| value.trim())
-                .filter(|v| !v.is_empty())
-                .map(|value| {
-                    if value == "~" {
-                        home.clone()
-                    } else if let Some(rest) = value.strip_prefix("~/") {
-                        home.join(rest)
-                    } else {
-                        PathBuf::from(value)
-                    }
-                })
-                .unwrap_or_else(|| home.join(".pi/agent"));
+            let agent = pi_agent_dir(&external_env(spec, context));
             let path = agent.join("mcp.json");
             let mut global = match tokio::fs::read(&path).await {
                 Ok(bytes) => serde_json::from_slice::<Value>(&bytes)?,
@@ -365,4 +405,53 @@ pub fn private_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     }
     options.open(path)?.write_all(bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_key;
+    use paseo_client::process::CommandSpec;
+    use std::{collections::BTreeMap, path::Path};
+
+    fn launch(cwd: &Path, agent: &str, agent_dir: &Path) -> CommandSpec {
+        CommandSpec {
+            program: "pi".into(),
+            args: vec!["--mode".into(), "rpc".into()],
+            cwd: Some(cwd.to_path_buf()),
+            env: BTreeMap::from([
+                ("PASEO_AGENT_ID".to_owned(), agent.to_owned()),
+                (
+                    "PI_CODING_AGENT_DIR".to_owned(),
+                    agent_dir.to_string_lossy().into_owned(),
+                ),
+            ]),
+            clear_env: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn command_probe_is_shared_per_workspace_until_extensions_change() {
+        let (project, other, agent_dir) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let first = probe_key(&launch(project.path(), "a", agent_dir.path())).await;
+        assert_eq!(
+            first,
+            probe_key(&launch(project.path(), "b", agent_dir.path())).await
+        );
+        assert_ne!(
+            first,
+            probe_key(&launch(other.path(), "a", agent_dir.path())).await
+        );
+        std::fs::create_dir_all(project.path().join(".pi/extensions")).unwrap();
+        let project_extension = probe_key(&launch(project.path(), "a", agent_dir.path())).await;
+        assert_ne!(first, project_extension);
+        std::fs::create_dir_all(agent_dir.path().join("extensions")).unwrap();
+        assert_ne!(
+            project_extension,
+            probe_key(&launch(project.path(), "a", agent_dir.path())).await
+        );
+    }
 }

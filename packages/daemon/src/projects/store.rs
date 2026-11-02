@@ -73,12 +73,6 @@ impl Store {
         Ok(store)
     }
 
-    pub async fn projects_exist_on_disk(&self) -> Result<bool> {
-        exists(&self.root.join("projects.json")).await
-    }
-    pub async fn workspaces_exist_on_disk(&self) -> Result<bool> {
-        exists(&self.root.join("workspaces.json")).await
-    }
     pub async fn list_projects(&self) -> Vec<Value> {
         self.state.lock().await.projects.values().cloned().collect()
     }
@@ -710,13 +704,6 @@ async fn read_json(path: &Path) -> Result<Option<Value>> {
         Err(e) => Err(e).with_context(|| format!("Reading {}", path.display())),
     }
 }
-async fn exists(path: &Path) -> Result<bool> {
-    match fs::metadata(path).await {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
 async fn read_registry(path: &Path, workspace: bool) -> Result<Map<String, Value>> {
     let mut records = Map::new();
     if let Some(value) = read_json(path).await? {
@@ -949,13 +936,6 @@ fn synchronize(state: &State, cursor: Option<&Value>) -> Value {
     json!({"labels":upserts.values().collect::<Vec<_>>(),"sync":{"mode":"changes","generation":state.generation,"headSeq":state.seq,"removals":removals.values().collect::<Vec<_>>()}})
 }
 
-pub fn derive_project_kind(checkout: &Value) -> &'static str {
-    if checkout["isGit"] == true {
-        "git"
-    } else {
-        "non_git"
-    }
-}
 pub fn derive_workspace_kind(checkout: &Value) -> &'static str {
     if checkout["isGit"] != true {
         "directory"
@@ -1287,32 +1267,6 @@ pub async fn derive_project_key(
         .map(|id| format!("host:{id}:{path}"))
         .unwrap_or(path))
 }
-pub async fn derive_project_grouping_display_name(
-    root: &str,
-    remote: Option<&str>,
-    worktree_root: Option<&str>,
-) -> String {
-    if let Some(worktree) = worktree_root.filter(|s| !s.is_empty()) {
-        if relative_inside(worktree, root)
-            .await
-            .is_some_and(|s| !s.is_empty())
-        {
-            return last_segment(root).into();
-        }
-    }
-    match remote.and_then(remote_location) {
-        Some((_, _, path)) => {
-            let segments: Vec<_> = path.split('/').filter(|s| !s.is_empty()).collect();
-            let display = segments[segments.len().saturating_sub(2)..].join("/");
-            if display.is_empty() {
-                root.into()
-            } else {
-                display
-            }
-        }
-        None => last_segment(root).into(),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1470,8 +1424,8 @@ mod tests {
             json!([{"name":"Before","color":"sky"}])
         );
         assert!(
-            !exists(
-                &dir.path()
+            !fs::try_exists(
+                dir.path()
                     .join("projects/workspace-labels.transaction.json")
             )
             .await?

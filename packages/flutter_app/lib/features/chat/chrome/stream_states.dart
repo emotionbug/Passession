@@ -185,46 +185,122 @@ class TimelineSyncErrorCallout extends StatelessWidget {
   final VoidCallback onRetry;
 
   @override
+  Widget build(BuildContext context) => _StreamCallout(
+    border: PaseoColors.of(context).danger,
+    children: [
+      Flexible(
+        child: Text(
+          tr(context, 'agentPanel.states.timelineSyncFailed'),
+          style: _base(context),
+        ),
+      ),
+      PaseoButton(
+        label: retrying
+            ? tr(context, 'agentPanel.states.timelineSyncRetrying')
+            : tr(context, 'common.actions.retry'),
+        size: PaseoControlSize.sm,
+        variant: PaseoButtonVariant.secondary,
+        onPressed: retrying ? null : onRetry,
+      ),
+    ],
+  );
+}
+
+/// The provider preparation (or, in a subagent pane, background transcript
+/// refresh) state under the stream, in the sync callout's rail: saved history
+/// stays readable above it while the work runs, and a failure shows the
+/// provider's own error with a Retry that reads "Retrying…" and disables
+/// while the retry runs.
+class AgentPreparationCallout extends StatelessWidget {
+  const AgentPreparationCallout({
+    super.key,
+    required this.failed,
+    this.error,
+    this.retrying = false,
+    this.onRetry,
+    this.subagent = false,
+  });
+  final bool failed;
+  final String? error;
+  final bool retrying;
+  final VoidCallback? onRetry;
+  final bool subagent;
+
+  @override
   Widget build(BuildContext context) {
     final colors = PaseoColors.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      child: Center(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxWidth: PaseoTypography.of(context).contentMaxWidth),
-          child: Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              color: colors.surface1,
-              border: Border.all(color: colors.danger),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              spacing: 12,
+    final detail = error?.trim() ?? '';
+    return Semantics(
+      liveRegion: true,
+      child: _StreamCallout(
+        border: failed ? colors.danger : colors.borderAccent,
+        children: [
+          if (!failed) const ChromeSpinner(size: 16),
+          Flexible(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Flexible(
-                  child: Text(
-                    tr(context, 'agentPanel.states.timelineSyncFailed'),
-                    style: _base(context),
-                  ),
+                Text(
+                  tr(context, switch ((subagent, failed)) {
+                    (false, false) => 'agentPanel.states.preparingAgent',
+                    (false, true) => 'agentPanel.states.preparationFailed',
+                    (true, false) => 'agentPanel.states.subagentRefreshing',
+                    (true, true) => 'agentPanel.states.subagentRefreshFailed',
+                  }),
+                  style: _base(context),
                 ),
-                PaseoButton(
-                  label: retrying
-                      ? tr(context, 'agentPanel.states.timelineSyncRetrying')
-                      : tr(context, 'common.actions.retry'),
-                  size: PaseoControlSize.sm,
-                  variant: PaseoButtonVariant.secondary,
-                  onPressed: retrying ? null : onRetry,
-                ),
+                if (failed && detail.isNotEmpty)
+                  SelectableText(detail, style: _base(context, color: colors.danger)),
               ],
             ),
           ),
-        ),
+          if (failed)
+            PaseoButton(
+              label: retrying
+                  ? tr(context, 'agentPanel.states.timelineSyncRetrying')
+                  : tr(context, 'common.actions.retry'),
+              size: PaseoControlSize.sm,
+              variant: PaseoButtonVariant.secondary,
+              onPressed: retrying ? null : onRetry,
+            ),
+        ],
       ),
     );
   }
+}
+
+/// The callout rail under the stream: inside contentMaxWidth (16px sides,
+/// 8px top), a centred row on surface1 with a 1px border and 16px radius
+/// (8/16 padding, 12px gap).
+class _StreamCallout extends StatelessWidget {
+  const _StreamCallout({required this.border, required this.children});
+  final Color border;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+    child: Center(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxWidth: PaseoTypography.of(context).contentMaxWidth),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          decoration: BoxDecoration(
+            color: PaseoColors.of(context).surface1,
+            border: Border.all(color: border),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            spacing: 12,
+            children: children,
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 /// components/archived-agent-callout.tsx, in place of the composer for an

@@ -12,7 +12,6 @@ import 'client.dart';
 import 'daemon_maintenance.dart';
 import 'host_config.dart';
 import 'json.dart';
-import 'legacy_state.dart';
 import 'preferences.dart';
 import 'target.dart';
 import 'transport/connection_selection.dart';
@@ -131,11 +130,9 @@ class AppStore extends ChangeNotifier {
     this.windowId = '0',
     this.connectHosts = true,
     this.discoverLocalHosts = true,
-    this.legacyStateReader = readLegacyState,
     this.connector,
     this.clientId,
   });
-  final LegacyStateReader legacyStateReader;
   final String windowId;
   final bool connectHosts;
   final bool discoverLocalHosts;
@@ -151,6 +148,7 @@ class AppStore extends ChangeNotifier {
       'all_providers': true,
       'provider_subagents': true,
       'projected_subagent_timeline': true,
+      'saved_history_reads': true,
       'timeline_replacement_invalidation': true,
       'reasoning_merge_enum': true,
       'timeline_notifications': true,
@@ -377,13 +375,9 @@ class AppStore extends ChangeNotifier {
       await _directory!.create(recursive: true);
       await _restrict(_directory!.path, directory: true);
       final file = File(p.join(_directory!.path, 'state.json'));
-      try {
-        await _importLegacyState(file);
-      } catch (error) {
-        // A failed import must not let first-launch defaults replace recoverable
-        // data. Existing Flutter state remains usable, but writes wait for retry.
-        storageError = error;
-        _storageWritable = false;
+      _retained = await _readStateFile(file);
+      if (intValue(_retained['version']) > 1) {
+        throw StateError('App state belongs to a newer Paseo version; it will not be overwritten.');
       }
       if (_retained.isNotEmpty) {
         preferences = AppPreferences(jsonMap(_retained['preferences']));
@@ -455,57 +449,6 @@ class AppStore extends ChangeNotifier {
     return jsonMap(decoded);
   }
 
-  /// The original app's snapshot (legacy_state.dart's `legacyImport` marker,
-  /// every original string as the re-sync base) is large and changes only on
-  /// import/re-sync. It lives beside state.json so routine saves, which
-  /// re-read and rewrite state.json, never carry it.
-  File _legacyImportFile() => File(p.join(_directory!.path, 'legacy-import.json'));
-
-  Future<void> _importLegacyState(File file) async {
-    final lockFile = File(p.join(_directory!.path, 'state.lock'));
-    final lock = await lockFile.open(mode: FileMode.append);
-    var locked = false;
-    try {
-      await _restrict(lockFile.path);
-      await lock.lock(FileLock.blockingExclusive);
-      locked = true;
-      final stored = await _readStateFile(file);
-      if (intValue(stored['version']) > 1) {
-        throw StateError('App state belongs to a newer Paseo version; it will not be overwritten.');
-      }
-      // Earlier builds kept the marker inside state.json; it moves out once.
-      final embedded = stored.remove('legacyImport');
-      final markerFile = _legacyImportFile();
-      final marker = embedded ??
-          (await markerFile.exists() ? jsonDecode(await markerFile.readAsString()) : null);
-      _retained = stored;
-      final current = <String, dynamic>{...stored, 'legacyImport': ?marker};
-      final resync = jsonMap(marker)['version'] == legacyImportVersion;
-      var next = current;
-      try {
-        next = mergeLegacyState(current, await legacyStateReader());
-      } catch (error) {
-        if (!resync) rethrow;
-        // Flutter state is already complete and stays writable; an unreadable
-        // original only defers the re-sync. Neither state nor base changes.
-        storageError = error;
-      }
-      // Unchanged original (same digest) and nothing to move: no write.
-      if (identical(next, current) && embedded == null) return;
-      final nextMarker = next['legacyImport'];
-      final nextState = <String, dynamic>{...next}..remove('legacyImport');
-      // State first, then base. A lost base write re-syncs against the older
-      // base next launch, where the values merged here already win as ours.
-      // Nothing is observable on a parse/read failure; next launch retries.
-      await _atomicWrite(file.path, jsonEncode(nextState));
-      if (nextMarker != null) await _atomicWrite(markerFile.path, jsonEncode(nextMarker));
-      _retained = nextState;
-    } finally {
-      if (locked) await lock.unlock();
-      await lock.close();
-    }
-  }
-
   Future<void> discoverLocalDaemon() async {
     await _discoverLocalDaemon();
     await refreshHosts();
@@ -552,8 +495,8 @@ class AppStore extends ChangeNotifier {
     bool local(HostConfig c) =>
         c.endpoint == listen || listening != null && identity(c.endpoint) == listening;
     final serverId = stringValue(state['serverId']);
-    // Imported original hosts already name this daemon (the old desktop app
-    // supplied its local credential implicitly); never add a duplicate host.
+    // A saved host may already name this daemon by endpoint or server ID;
+    // never add a duplicate host.
     final existing = hosts.where((host) =>
         host.connections.any(local) ||
         serverId.isNotEmpty &&
@@ -1111,7 +1054,6 @@ class AppStore extends ChangeNotifier {
       host._hydrating.remove(kind);
       _drainDirectoryEvents(host);
       if (!_disposed && hosts.contains(host)) {
-        _resolveImportedTargetDirectories(host);
         _scheduleSave();
         _notify();
       }
@@ -1831,20 +1773,6 @@ class AppStore extends ChangeNotifier {
     'data': t.data,
   };
 
-  void _resolveImportedTargetDirectories(HostState host) {
-    for (var index = 0; index < tabs.length; index++) {
-      final target = tabs[index];
-      if (target.serverId != host.serverId || target.cwd.isNotEmpty ||
-          target.data['legacyImported'] != true) {
-        continue;
-      }
-      final workspace = host.workspaces
-          .where((row) => row['id'] == target.workspaceId).firstOrNull;
-      final cwd = stringValue(workspace?['workspaceDirectory'],
-          stringValue(workspace?['projectRootPath']));
-      if (cwd.isNotEmpty) tabs[index] = target.copyWith(cwd: cwd);
-    }
-  }
   PanelTarget _targetFromJson(JsonMap t) => PanelTarget(
     kind: stringValue(t['kind']),
     serverId: stringValue(t['serverId']),
@@ -1855,15 +1783,11 @@ class AppStore extends ChangeNotifier {
     data: jsonMap(t['data']),
   );
   void _restoreLayout(JsonMap saved) {
-    final migratedKeys = <String, String>{};
     for (final raw in jsonList(saved['tabs'])) {
-      final old = _targetFromJson(jsonMap(raw));
-      if (old.kind == 'browser' || old.kind == 'plugin') continue;
-      if (old.kind == 'terminal' && old.id == null) continue;
-      final target = old.kind == 'terminal'
-          ? old.copyWith(kind: 'execution_log')
-          : old;
-      migratedKeys[old.key] = target.key;
+      final target = _targetFromJson(jsonMap(raw));
+      // Removed surfaces: the embedded browser, executable plugin UI and the
+      // interactive terminal.
+      if (const {'browser', 'plugin', 'terminal'}.contains(target.kind)) continue;
       if (!tabs.any((t) => t.key == target.key)) tabs.add(target);
     }
     final seen = <String>{};
@@ -1882,11 +1806,9 @@ class AppStore extends ChangeNotifier {
       }
       final keys = jsonList(node['tabs'])
           .whereType<String>()
-          .map((key) => migratedKeys[key] ?? key)
           .where((key) => targetFor(key) != null && seen.add(key))
           .toList();
-      final oldSelection = stringValue(node['selected']);
-      final selected = migratedKeys[oldSelection] ?? oldSelection;
+      final selected = stringValue(node['selected']);
       return PanelPane(
         id: stringValue(node['id'], 'main'),
         tabKeys: keys,
@@ -1899,38 +1821,11 @@ class AppStore extends ChangeNotifier {
     explorerTabKeys.addAll(
       jsonList(saved['explorerTabs'])
           .whereType<String>()
-          .map((key) => migratedKeys[key] ?? key)
           .where((key) => targetFor(key) != null && seen.add(key)),
     );
-    final oldExplorerKey = saved['selectedExplorer'] as String?;
-    selectedExplorerKey = migratedKeys[oldExplorerKey] ?? oldExplorerKey;
+    selectedExplorerKey = saved['selectedExplorer'] as String?;
     if (!explorerTabKeys.contains(selectedExplorerKey)) {
       selectedExplorerKey = explorerTabKeys.firstOrNull;
-    }
-    // Layouts saved before version 2 opened a workspace's Explorer with the Files view
-    // alone. The original Explorer starts with Files + Changes, Changes focused
-    // (workspace-layout-actions.ts createDefaultExplorerSidebarTabs), so those
-    // Flutter-created Explorers gain their missing Changes view once. Imported
-    // original layouts stay authoritative.
-    if (intValue(saved['version']) < 2) {
-      for (final key in List.of(explorerTabKeys)) {
-        final files = targetFor(key);
-        if (files == null ||
-            files.kind != 'files' ||
-            files.data['legacyImported'] == true) {
-          continue;
-        }
-        final changes = PanelTarget(
-          kind: 'changes_tree',
-          serverId: files.serverId,
-          workspaceId: files.workspaceId,
-          cwd: files.cwd,
-        );
-        if (!seen.add(changes.key)) continue;
-        if (targetFor(changes.key) == null) tabs.add(changes);
-        explorerTabKeys.insert(explorerTabKeys.indexOf(key) + 1, changes.key);
-        if (selectedExplorerKey == key) selectedExplorerKey = changes.key;
-      }
     }
     if (selectedExplorerKey case final key?) _focusExplorer(key);
     for (final target in tabs) {
@@ -1944,9 +1839,7 @@ class AppStore extends ChangeNotifier {
         1000,
       );
     }
-    // A saved Flutter width wins; otherwise the original panel-state width
-    // imported into preferences.
-    final sidebar = saved['sidebarWidth'] ?? preferences['sidebarWidth'];
+    final sidebar = saved['sidebarWidth'];
     if (sidebar is num) sidebarWidth = sidebar.toDouble().clamp(200, 600);
     sidebarVisible = saved['sidebarVisible'] != false;
     // Compact starts at the active agent, never a persisted side destination.

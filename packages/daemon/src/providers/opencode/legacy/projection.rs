@@ -160,7 +160,7 @@ pub fn history_message(message: &Value) -> Vec<Value> {
                 Some(json!({"type":"assistant_message","text":part["text"],"messageId":info["id"]}))
             }
             "reasoning" if !s(&part["text"]).is_empty() => {
-                Some(json!({"type":"reasoning","text":part["text"]}))
+                Some(json!({"type":"reasoning","text":part["text"],"messageId":part["id"]}))
             }
             "tool" if s(&part["tool"]).trim().eq_ignore_ascii_case("todowrite") => {
                 todo_data(&part["state"]["input"])
@@ -215,6 +215,10 @@ pub struct Track {
     steps: HashMap<String, Value>,
     pub tasks: HashMap<String, Value>,
     fingerprints: HashMap<String, Value>,
+    /// Parts a replayed snapshot caught mid-stream. SSE deltas carry no offset,
+    /// so their remaining deltas cannot be told apart from ones the snapshot
+    /// already holds; the final part text supplies what follows the snapshot.
+    held: HashSet<String>,
 }
 impl Track {
     pub fn reset_turn(&mut self) {
@@ -222,6 +226,7 @@ impl Track {
         self.client_id = None;
         self.steers.clear();
         self.parts.clear();
+        self.held.clear();
         self.part_types.clear();
         self.summaries.clear();
         self.compactions.clear();
@@ -251,25 +256,39 @@ impl Track {
             }
         }
     }
-    pub fn hydrate_completed(&mut self, messages: &[Value]) {
-        let mut last = None;
+    /// Continues live collection after a replayed native snapshot of this track:
+    /// rows the snapshot covers are never emitted again.
+    pub fn rebase(&mut self, messages: &[Value]) {
         for m in messages {
             let info = &m["info"];
-            if info["role"] == "assistant" && info["time"]["completed"].is_null() {
-                continue;
-            }
-            self.roles
-                .insert(s(&info["id"]).into(), s(&info["role"]).into());
+            let mid = s(&info["id"]);
+            self.roles.insert(mid.into(), s(&info["role"]).into());
             if info["role"] == "user" {
-                self.users.insert(s(&info["id"]).into());
+                self.users.insert(mid.into());
             }
-            last = Some(m);
-        }
-        if let Some(m) = last {
-            self.fingerprints
-                .insert(s(&m["info"]["id"]).into(), m["info"].clone());
-            for p in m["parts"].as_array().into_iter().flatten() {
-                self.fingerprints.insert(s(&p["id"]).into(), p.clone());
+            self.fingerprints.insert(mid.into(), info.clone());
+            let parts = m["parts"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let has_text = parts
+                .iter()
+                .any(|p| p["type"] == "text" && !s(&p["text"]).is_empty());
+            if info["role"] == "assistant" && !has_text && structured(info).is_some() {
+                self.structured.insert(mid.into());
+            }
+            for p in parts {
+                let id = s(&p["id"]);
+                let kind = s(&p["type"]);
+                self.fingerprints.insert(id.into(), p.clone());
+                self.part_types.insert(id.into(), kind.into());
+                if info["role"] == "assistant" && matches!(kind, "text" | "reasoning") {
+                    let done = !p["time"]["end"].is_null() && p["time"]["end"] != 0;
+                    self.parts
+                        .insert(id.into(), (mid.into(), s(&p["text"]).into(), done));
+                    if done {
+                        self.held.remove(id);
+                    } else {
+                        self.held.insert(id.into());
+                    }
+                }
             }
         }
     }
@@ -384,8 +403,8 @@ impl Track {
                         if previous.is_some_and(|p|p.2){return out;}
                         let emitted=previous.filter(|p|p.0==mid).map(|p|p.1.as_str()).unwrap_or("");
                         if !full.starts_with(emitted){tracing::warn!(part_id=id,message_id=mid,"OpenCode final part differs from streamed content");return out;}
-                        let suffix=full[emitted.len()..].to_owned();self.parts.insert(id.into(),(mid.into(),full.into(),true));
-                        if !suffix.is_empty(){out.push(timeline(if kind=="reasoning"{json!({"type":"reasoning","text":suffix})}else{json!({"type":"assistant_message","text":suffix,"messageId":mid})}));}
+                        let suffix=full[emitted.len()..].to_owned();self.parts.insert(id.into(),(mid.into(),full.into(),true));self.held.remove(id);
+                        if !suffix.is_empty(){out.push(timeline(if kind=="reasoning"{json!({"type":"reasoning","text":suffix,"messageId":id})}else{json!({"type":"assistant_message","text":suffix,"messageId":mid})}));}
                     }
                     "tool" if !s(&part["tool"]).trim().eq_ignore_ascii_case("todowrite") => {if let Some(mut item)=tool(part){if item["detail"]["type"]=="sub_agent"{let id=s(&item["callId"]).to_owned();if item["detail"]["childSessionId"].is_null(){if let Some(old)=self.tasks.get(&id){if !old["detail"]["childSessionId"].is_null(){item["detail"]["childSessionId"]=old["detail"]["childSessionId"].clone();}}}self.tasks.insert(id,item.clone());}out.push(timeline(item));}},
                     "compaction" if self.compactions.insert(id.into()) => out.push(timeline(json!({"type":"compaction","status":"loading","trigger":if part["auto"]==true{"auto"}else{"manual"}}))),
@@ -411,6 +430,9 @@ impl Track {
                     self.summaries.insert(mid.into());
                     return out;
                 }
+                if self.held.contains(id) {
+                    return out;
+                }
                 if !id.is_empty() {
                     let materialized = self
                         .parts
@@ -422,7 +444,7 @@ impl Track {
                     materialized.1.push_str(delta);
                 }
                 out.push(timeline(if reasoning {
-                    json!({"type":"reasoning","text":delta})
+                    json!({"type":"reasoning","text":delta,"messageId":id})
                 } else {
                     json!({"type":"assistant_message","text":delta,"messageId":mid})
                 }));
@@ -504,6 +526,8 @@ pub struct Projection {
     pub root: Track,
     pub children: HashMap<String, Child>,
     pub windows: HashMap<String, f64>,
+    /// Rebased tracks for replayed children this projection has not detected yet.
+    primed: HashMap<String, Track>,
 }
 impl Projection {
     pub fn new(id: String, cwd: String) -> Self {
@@ -513,10 +537,18 @@ impl Projection {
             root: Track::default(),
             children: HashMap::new(),
             windows: HashMap::new(),
+            primed: HashMap::new(),
         }
     }
     pub fn owns(&self, id: &str) -> bool {
         id == self.id || self.children.contains_key(id)
+    }
+    /// Continues a child's live collection after its replayed native snapshot.
+    pub fn rebase(&mut self, id: &str, messages: &[Value]) {
+        match self.children.get_mut(id) {
+            Some(child) => child.track.rebase(messages),
+            None => self.primed.entry(id.into()).or_default().rebase(messages),
+        }
     }
     pub fn directory(&self, id: &str) -> String {
         self.children
@@ -533,29 +565,11 @@ impl Projection {
         if id.is_empty() || id == self.id || !self.owns(parent) || self.children.contains_key(id) {
             return vec![];
         }
-        let mut child = Child {
-            info: info.clone(),
-            track: Track::default(),
-            presentation: json!({}),
-            last_subtitle: String::new(),
-            title_emitted: false,
-            linked: String::new(),
-            status: Value::Null,
-        };
-        let mut up = json!({"type":"upsert","id":id,"parentSubagentId":if parent==self.id{Value::Null}else{json!(parent)}});
-        for (source, dest) in [("title", "description"), ("directory", "cwd")] {
-            if let Some(t) = text(&info[source]) {
-                up[dest] = json!(t);
-            }
+        let (mut child, up) =
+            new_child(info, (parent != self.id).then_some(parent), status, &self.cwd);
+        if let Some(track) = self.primed.remove(id) {
+            child.track = track;
         }
-        if let Some(status) = status {
-            up["status"] = json!(status);
-        }
-        presentation(
-            &mut child,
-            &json!({"agent":info["agent"],"modelID":info["model"]["id"],"variant":info["model"]["variant"]}),
-            &mut up,
-        );
         self.children.insert(id.into(), child);
         let mut out = vec![subagent(up)];
         let track = if parent == self.id {
@@ -675,6 +689,41 @@ impl Projection {
         presentation(c, info, &mut up);
         (up.as_object()?.len() > 2).then(|| subagent(up))
     }
+}
+/// Opaque locator persisted with a child descriptor; the opened-child replay
+/// reads exactly this native session in this directory.
+pub fn source(info: &Value, cwd: &str) -> Value {
+    json!({"sessionId":info["id"],"directory":text(&info["directory"]).unwrap_or(cwd)})
+}
+/// The descriptor-only upsert announcing one native child session.
+pub fn descriptor(info: &Value, parent: Option<&str>, status: Option<&str>, cwd: &str) -> Value {
+    new_child(info, parent, status, cwd).1
+}
+fn new_child(info: &Value, parent: Option<&str>, status: Option<&str>, cwd: &str) -> (Child, Value) {
+    let mut child = Child {
+        info: info.clone(),
+        track: Track::default(),
+        presentation: json!({}),
+        last_subtitle: String::new(),
+        title_emitted: false,
+        linked: String::new(),
+        status: Value::Null,
+    };
+    let mut up = json!({"type":"upsert","id":info["id"],"parentSubagentId":parent,"source":source(info, cwd)});
+    for (key, dest) in [("title", "description"), ("directory", "cwd")] {
+        if let Some(t) = text(&info[key]) {
+            up[dest] = json!(t);
+        }
+    }
+    if let Some(status) = status {
+        up["status"] = json!(status);
+    }
+    presentation(
+        &mut child,
+        &json!({"agent":info["agent"],"modelID":info["model"]["id"],"variant":info["model"]["variant"]}),
+        &mut up,
+    );
+    (child, up)
 }
 fn presentation(child: &mut Child, info: &Value, up: &mut Value) {
     for (src, dst) in [

@@ -55,7 +55,7 @@ fn permissions_preserve_first_occurrence_and_acknowledgment_cardinality() {
     ));
 }
 #[tokio::test]
-async fn durable_pending_record_reuses_credential_and_migrates_legacy_grants() {
+async fn durable_pending_record_reuses_credential() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("hub-relationship.json");
     let original = pending("https://hub.example");
@@ -83,21 +83,32 @@ async fn durable_pending_record_reuses_credential_and_migrates_legacy_grants() {
             0o600
         );
     }
-    let mut legacy = serde_json::to_value(original).unwrap();
-    legacy["version"] = 1.into();
-    legacy["relationship"]
+}
+#[tokio::test]
+async fn retired_scope_records_fail_closed_without_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("hub-relationship.json");
+    let mut retired = serde_json::to_value(pending("https://hub.example")).unwrap();
+    retired["version"] = 1.into();
+    retired["relationship"]
         .as_object_mut()
         .unwrap()
         .remove("permissions");
-    legacy["relationship"]["scopes"] = json!(["hub.execution.*"]);
-    tokio::fs::write(&path, serde_json::to_vec(&legacy).unwrap())
-        .await
-        .unwrap();
-    let migrated = record::load(&path).await.unwrap().unwrap();
-    assert_eq!(migrated.relationship.permissions, vec!["hub.execute"]);
-    let disk: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-    assert_eq!(disk["version"], 2);
-    assert!(disk["relationship"].get("scopes").is_none());
+    retired["relationship"]["scopes"] = json!(["hub.execution.*"]);
+    let bytes = serde_json::to_vec(&retired).unwrap();
+    tokio::fs::write(&path, &bytes).await.unwrap();
+    assert!(record::load(&path).await.unwrap().is_none());
+    assert!(!path.exists());
+    let mut entries = tokio::fs::read_dir(directory.path()).await.unwrap();
+    let entry = entries.next_entry().await.unwrap().unwrap();
+    assert!(
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("hub-relationship.invalid-")
+    );
+    assert_eq!(tokio::fs::read(entry.path()).await.unwrap(), bytes);
+    assert!(entries.next_entry().await.unwrap().is_none());
 }
 #[tokio::test]
 async fn corrupt_authority_is_quarantined_not_deleted_or_used() {

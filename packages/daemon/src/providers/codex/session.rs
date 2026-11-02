@@ -1,5 +1,6 @@
 use super::{
     commands,
+    metadata::{Metadata, MetadataCache},
     permissions::{self, PendingPermission},
     projection,
     transport::{RpcError, SessionTransport, Transport},
@@ -16,6 +17,7 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
+#[cfg_attr(test, derive(Default))]
 pub(super) struct State {
     pub config: Value,
     pub thread: Option<String>,
@@ -40,6 +42,9 @@ pub(super) struct State {
     pub orphan_events: HashMap<String, VecDeque<Value>>,
     pub child_tools: HashMap<String, Value>,
     pub child_items: HashMap<String, Vec<(String, Value)>>,
+    /// Recorded card lines with no native item identity, by call ID; they stay
+    /// ahead of the card's item lines. Child threads are never read to rebuild them.
+    pub card_logs: HashMap<String, String>,
     pub terminal_commands: HashMap<String, String>,
     pub terminal_pending: HashMap<String, Vec<Value>>,
     pub terminal_seen: HashSet<String>,
@@ -52,15 +57,12 @@ pub(super) struct State {
     pub user_turns: Vec<(String, Option<String>)>,
     pub sandbox: Value,
 }
-struct Metadata {
-    models: Vec<Value>,
-    collaboration: Vec<Value>,
-    resolved_config: Value,
-}
 pub(super) struct CodexSession {
     pub spec: ProviderSpec,
     pub client: Arc<SessionTransport>,
     pub sink: EventSink,
+    /// Live rows of a child whose in-stream replay is being decided.
+    pub holds: ChildRowHold,
     pub state: Mutex<State>,
     self_weak: std::sync::Weak<Self>,
     reconnect_gate: AsyncMutex<()>,
@@ -247,6 +249,7 @@ impl CodexSession {
         options: Value,
         persistence: Option<Value>,
         sink: EventSink,
+        cache: &MetadataCache,
     ) -> Result<Arc<Self>> {
         if !config.is_object() {
             bail!("Codex session config must be an object");
@@ -264,7 +267,8 @@ impl CodexSession {
             .and_then(|p| p["nativeHandle"].as_str().or(p["sessionId"].as_str()))
             .map(str::to_owned);
         let history_only = options["purpose"] == "history";
-        let v = super::probe(&spec, context.cancel.clone())
+        let v = cache
+            .probe(&spec, context.cancel.clone())
             .await
             .ok()
             .and_then(|s| super::version(&s));
@@ -287,39 +291,38 @@ impl CodexSession {
                 .as_str()
                 .and_then(super::version)
                 .is_some_and(|v| v >= (0, 156, 0));
-            let (models, resolved, collaboration, skills) = if history_only {
-                (Vec::new(), json!({}), Vec::new(), None)
+            let (metadata, skills) = if history_only {
+                (Arc::new(Metadata::default()), None)
             } else {
-                super::metadata(&client, config["cwd"].clone()).await?
+                let cwd = &config["cwd"];
+                let discovery = cache
+                    .discover(&spec, &args, &context.env, cwd, &context.cancel, || {
+                        super::metadata::fetch(&client, cwd)
+                    })
+                    .await?;
+                normalize_config(
+                    &mut config,
+                    &discovery.metadata.models,
+                    &discovery.metadata.resolved_config,
+                );
+                (discovery.metadata.clone(), discovery.skills.clone())
             };
-            if !history_only {
-                normalize_config(&mut config, &models, &resolved);
-            }
             let sandbox = Value::Null;
             let history = if let Some(id) = &native {
-                load_history(&client, id, config["cwd"].as_str(), &spec.id).await?
+                load_history(client.as_ref(), id, config["cwd"].as_str(), &spec.id).await?
             } else {
                 Vec::new()
             };
-            Ok((
-                rollback,
-                models,
-                resolved,
-                collaboration,
-                skills,
-                sandbox,
-                history,
-            ))
+            Ok((rollback, metadata, skills, sandbox, history))
         }
         .await;
-        let (rollback, models, resolved_config, collaboration, skills, sandbox, history) =
-            match prepared {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = client.close().await;
-                    return Err(e);
-                }
-            };
+        let (rollback, metadata, skills, sandbox, history) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = client.close().await;
+                return Err(e);
+            }
+        };
         let mut history = history;
         let async_questions = permissions::AsyncQuestions::new(&config["asyncQuestions"]);
         for entry in &mut history {
@@ -332,7 +335,10 @@ impl CodexSession {
                 }
             }
         }
-        let initial_features: Arc<[Value]> = features(&config, &models, &collaboration).into();
+        let recorded_cards = card_logs(&options);
+        apply_card_logs(&mut history, &recorded_cards);
+        let initial_features: Arc<[Value]> =
+            features(&config, &metadata.models, &metadata.collaboration).into();
         let user_turns = history
             .iter()
             .filter(|e| e["type"] == "timeline" && e["item"]["type"] == "user_message")
@@ -382,6 +388,7 @@ impl CodexSession {
                 })
             })
             .collect();
+        let card_logs = seed_card_logs(&recorded_cards, &mut child_items);
         let codex_home = super::home(&spec, &context.env);
         let mut environment = spec.env.clone();
         environment.extend(context.env);
@@ -411,6 +418,7 @@ impl CodexSession {
                 text: HashMap::new(),
                 outputs: HashMap::new(),
                 completed: HashSet::new(),
+                card_logs,
                 children,
                 orphan_events: HashMap::new(),
                 last_plan: None,
@@ -428,12 +436,9 @@ impl CodexSession {
                 sandbox,
             }),
             gate: AsyncMutex::new(()),
+            holds: ChildRowHold::default(),
             changed: Notify::new(),
-            metadata: Mutex::new(Arc::new(Metadata {
-                models,
-                collaboration,
-                resolved_config,
-            })),
+            metadata: Mutex::new(metadata),
             skills: Mutex::new(skills),
             codex_home,
             inner,
@@ -542,15 +547,12 @@ impl CodexSession {
         self.attach_reader(transport.clone(), receiver);
         let result: Result<()> = async {
             transport.initialize().await?;
-            let (models, resolved_config, collaboration, skills) =
-                super::metadata(&transport, config["cwd"].clone()).await?;
-            let metadata = Arc::new(Metadata {
-                models,
-                resolved_config,
-                collaboration,
-            });
+            let discovery = super::metadata::fetch(&transport, &config["cwd"])
+                .await?
+                .into_value();
+            let metadata = discovery.metadata.clone();
             *self.metadata.lock().unwrap() = metadata.clone();
-            *self.skills.lock().unwrap() = skills;
+            *self.skills.lock().unwrap() = discovery.skills.clone();
             {
                 let mut state = self.state.lock().unwrap();
                 normalize_config(
@@ -563,10 +565,26 @@ impl CodexSession {
             }
             if let Some(thread) = thread {
                 let response = resume(&transport, &thread, &config, &self.inner).await?;
-                let history =
-                    load_history(&transport, &thread, config["cwd"].as_str(), &self.spec.id)
+                let mut history =
+                    load_history(transport.as_ref(), &thread, config["cwd"].as_str(), &self.spec.id)
                         .await?;
                 let mut state = self.state.lock().unwrap();
+                // Reconnect keeps child items in memory; replay shows the cards as they are.
+                let mut logs = HashMap::new();
+                for tool in state.child_tools.values() {
+                    if let (Some(call), Some(log)) =
+                        (tool["callId"].as_str(), tool["detail"]["log"].as_str())
+                    {
+                        logs.insert(
+                            call.to_owned(),
+                            CardLog {
+                                log: log.to_owned(),
+                                entries: tool["metadata"]["subagentLog"].clone(),
+                            },
+                        );
+                    }
+                }
+                apply_card_logs(&mut history, &logs);
                 state.sandbox = response["sandbox"].clone();
                 state.user_turns = history
                     .iter()
@@ -603,7 +621,7 @@ impl CodexSession {
                 event["turnId"] = json!(turn);
             }
         }
-        self.sink.emit(event).await
+        self.holds.emit(&self.sink, event).await
     }
     async fn ensure_thread(&self) -> Result<String> {
         self.ensure_connected().await?;
@@ -849,80 +867,305 @@ async fn resume(client: &Transport, id: &str, config: &Value, inner: &Value) -> 
         Err(error) => Err(error),
     }
 }
-async fn load_history(
-    client: &Transport,
-    id: &str,
-    cwd: Option<&str>,
-    provider: &str,
-) -> Result<Vec<Value>> {
-    let root = client
-        .request("thread/read", json!({"threadId":id,"includeTurns":true}))
-        .await?;
-    if !root["thread"]["turns"].is_array()
-        || root["thread"]["turns"].as_array().is_some_and(|turns| turns.iter().any(|turn| !turn["items"].is_array()))
+/// One `thread/read` with turns. Parent recovery reads only the parent thread;
+/// a child thread is read only when its pane is opened.
+#[async_trait]
+pub(super) trait ThreadReader: Send + Sync {
+    async fn read_thread(&self, id: &str) -> Result<Value>;
+}
+#[async_trait]
+impl ThreadReader for Transport {
+    async fn read_thread(&self, id: &str) -> Result<Value> {
+        self.request("thread/read", json!({"threadId":id,"includeTurns":true}))
+            .await
+    }
+}
+#[async_trait]
+impl ThreadReader for SessionTransport {
+    async fn read_thread(&self, id: &str) -> Result<Value> {
+        self.request("thread/read", json!({"threadId":id,"includeTurns":true}))
+            .await
+    }
+}
+async fn read_complete(reader: &dyn ThreadReader, id: &str) -> Result<Value> {
+    let reply = reader.read_thread(id).await?;
+    let turns = &reply["thread"]["turns"];
+    if !turns.is_array()
+        || turns.as_array().is_some_and(|turns| turns.iter().any(|turn| !turn["items"].is_array()))
     {
         bail!("Codex thread/read returned an incomplete thread")
     }
+    Ok(reply)
+}
+fn materialized(thread: &Value, cwd: Option<&str>) -> Vec<Value> {
     let mut materialize = |data: &str, mime: Option<&str>| {
         crate::providers::prompt::materialize_image(data, mime)
             .ok()
             .map(|p| p.to_string_lossy().into_owned())
     };
-    let mut history = projection::history_with_images(&root["thread"], cwd, &mut materialize);
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::from([id.to_owned()]);
-    for turn in root["thread"]["turns"].as_array().into_iter().flatten() {
+    projection::history_with_images(thread, cwd, &mut materialize)
+}
+/// Descriptor-only announcements of the threads `thread` spawned, first sighting
+/// first. Their bodies stay unread; `source` lets the opened pane read one.
+fn child_descriptors(
+    thread: &Value,
+    thread_id: &str,
+    parent: Option<&str>,
+    cwd: Option<&str>,
+    provider: &str,
+) -> Vec<Value> {
+    let mut seen = HashSet::from([thread_id.to_owned()]);
+    let mut descriptors = Vec::new();
+    for turn in thread["turns"].as_array().into_iter().flatten() {
         for item in turn["items"].as_array().into_iter().flatten() {
-            for child in projection::child_threads(item) {
-                queue.push_back((child, item.clone(), None::<String>));
+            let children = projection::child_threads(item);
+            if children.is_empty() {
+                continue;
+            }
+            let Some(tool) = projection::item(item, false, cwd) else {
+                continue;
+            };
+            for child in children {
+                if !seen.insert(child.clone()) {
+                    continue;
+                }
+                descriptors.push(json!({"type":"provider_subagent","provider":provider,"event":{
+                    "type":"upsert","id":child,
+                    "title":tool["detail"]["subAgentType"],
+                    "description":tool["detail"]["description"],
+                    "status":if tool["status"]=="canceled"{"canceled"}else{"completed"},
+                    "toolCallId":tool["callId"],"parentSubagentId":parent,
+                    "source":{"threadId":child}}}));
             }
         }
     }
-    let mut children = Vec::new();
-    while !queue.is_empty() && visited.len() < 100 {
-        let (child, item, parent) = queue.pop_front().unwrap();
-        if !visited.insert(child.clone()) {
+    descriptors
+}
+pub(super) async fn load_history(
+    reader: &dyn ThreadReader,
+    id: &str,
+    cwd: Option<&str>,
+    provider: &str,
+) -> Result<Vec<Value>> {
+    let root = read_complete(reader, id).await?;
+    let mut history = child_descriptors(&root["thread"], id, None, cwd, provider);
+    for mut event in materialized(&root["thread"], cwd) {
+        event["provider"] = json!(provider);
+        history.push(event);
+    }
+    Ok(history)
+}
+/// A sub-agent card's activity log as the daemon last recorded it. `entries`
+/// (`metadata.subagentLog`) names, in log order, the native child item behind
+/// each run of lines, so a resumed item continues in place instead of repeating.
+#[derive(Clone)]
+pub(super) struct CardLog {
+    pub log: String,
+    pub entries: Value,
+}
+/// Recorded card logs by call ID, from resume options. Child threads are not
+/// read to rebuild them.
+pub(super) fn card_logs(options: &Value) -> HashMap<String, CardLog> {
+    options["subagentCardLogs"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(call, log)| {
+            let log = log.as_str().filter(|log| !log.is_empty())?;
+            Some((
+                call.clone(),
+                CardLog {
+                    log: log.to_owned(),
+                    entries: options["subagentCardEntries"][call].clone(),
+                },
+            ))
+        })
+        .collect()
+}
+/// Parent replay maps a sub-agent card without its activity; keep the recorded
+/// log and its item identities on the card the daemon reconciles by call ID.
+pub(super) fn apply_card_logs(history: &mut [Value], logs: &HashMap<String, CardLog>) {
+    for event in history.iter_mut().filter(|event| event["type"] == "timeline") {
+        let item = &mut event["item"];
+        if item["type"] != "tool_call" || item["detail"]["type"] != "sub_agent" {
             continue;
         }
-        let Some(tool) = projection::item(&item, false, cwd) else {
+        let Some(card) = item["callId"].as_str().and_then(|call| logs.get(call)) else {
             continue;
         };
-        children.push(json!({"type":"provider_subagent","event":{
-            "type":"upsert","id":child,
-            "title":tool["detail"]["subAgentType"],
-            "description":tool["detail"]["description"],
-            "status":if tool["status"]=="canceled"{"canceled"}else{"completed"},
-            "toolCallId":tool["callId"],"parentSubagentId":parent}}));
-        match client
-            .request("thread/read", json!({"threadId":child,"includeTurns":true}))
-            .await
-        {
-            Ok(reply) => {
-                for entry in
-                    projection::history_with_images(&reply["thread"], cwd, &mut materialize)
-                {
-                    children.push(json!({"type":"provider_subagent","event":{
-                        "type":"timeline","id":child,"item":entry["item"],"timestamp":entry["timestamp"]
-                    }}));
-                }
-                for turn in reply["thread"]["turns"].as_array().into_iter().flatten() {
-                    for item in turn["items"].as_array().into_iter().flatten() {
-                        for id in projection::child_threads(item) {
-                            queue.push_back((id, item.clone(), Some(child.clone())));
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error,thread_id=%child,"Unable to read Codex subagent history")
+        if item["detail"]["log"].as_str().is_none_or(str::is_empty) {
+            item["detail"]["log"] = json!(card.log);
+            if card.entries.is_array() {
+                item["metadata"]["subagentLog"] = card.entries.clone();
             }
         }
     }
-    children.append(&mut history);
-    for event in &mut children {
-        event["provider"] = json!(provider);
+}
+/// Restores each recorded card as the child items it was built from: a recorded
+/// assistant or reasoning item becomes that item again, so its later deltas or
+/// final text continue it; any other recorded run of lines stays as written
+/// until the same native item replaces it. Lines without an identity (cards
+/// recorded before identities were kept) are returned as a fixed prefix.
+pub(super) fn seed_card_logs(
+    cards: &HashMap<String, CardLog>,
+    child_items: &mut HashMap<String, Vec<(String, Value)>>,
+) -> HashMap<String, String> {
+    let mut prefixes = HashMap::new();
+    for (call, card) in cards {
+        let lines: Vec<&str> = card.log.split('\n').collect();
+        let entries = card.entries.as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let counts: Vec<usize> = entries.iter().map(|e| e["lines"].as_u64().unwrap_or(0) as usize).collect();
+        if entries.is_empty() || counts.contains(&0) || counts.iter().sum::<usize>() != lines.len() {
+            prefixes.insert(call.clone(), card.log.clone());
+            continue;
+        }
+        let mut prefix = Vec::new();
+        let mut next = 0;
+        for (entry, count) in entries.iter().zip(counts) {
+            let text = lines[next..next + count].join("\n");
+            next += count;
+            let (Some(child), Some(key)) = (entry["child"].as_str(), entry["key"].as_str()) else {
+                prefix.push(text);
+                continue;
+            };
+            let kind = entry["kind"].as_str().unwrap_or("");
+            let label = match kind {
+                "assistant_message" => Some("[Assistant] "),
+                "reasoning" => Some("[Thought] "),
+                _ => None,
+            };
+            let item = match label.and_then(|label| text.strip_prefix(label)) {
+                Some(raw) => {
+                    let raw = format!("{raw}{}", entry["trailing"].as_str().unwrap_or(""));
+                    let mut item = json!({"type":kind,"text":raw,"recorded":true});
+                    if kind == "assistant_message" {
+                        item["messageId"] = json!(key);
+                    }
+                    item
+                }
+                None => json!({"type":"recorded","text":text,"recorded":true}),
+            };
+            child_items.entry(child.to_owned()).or_default().push((key.to_owned(), item));
+        }
+        if !prefix.is_empty() {
+            prefixes.insert(call.clone(), prefix.join("\n"));
+        }
     }
-    Ok(children)
+    prefixes
+}
+/// The opened child's rows plus descriptors for the threads it spawned.
+/// With an attached live stream, omit growing turns whose older snapshot could
+/// truncate live text. A cold read includes them because it has no other writer.
+/// Either kind of unfinished snapshot remains unverified.
+pub(super) async fn subagent_history(
+    reader: &dyn ThreadReader,
+    request: &SubagentHistoryRequest,
+    provider: &str,
+    live_stream_attached: bool,
+) -> Result<(Vec<Value>, HistoryCoverage)> {
+    let thread = request.source["threadId"]
+        .as_str()
+        .unwrap_or(&request.child_id);
+    let mut reply = read_complete(reader, thread).await?;
+    let cwd = request.config["cwd"].as_str();
+    let mut events = child_descriptors(
+        &reply["thread"],
+        thread,
+        Some(request.child_id.as_str()),
+        cwd,
+        provider,
+    );
+    let running =
+        |turn: &Value| matches!(turn["status"].as_str(), Some("inProgress" | "in_progress"));
+    let mut coverage = HistoryCoverage::Complete;
+    if let Some(turns) = reply["thread"]["turns"].as_array_mut()
+        && turns.iter().any(running)
+    {
+        coverage = HistoryCoverage::Unverified;
+        if live_stream_attached {
+            turns.retain(|turn| !running(turn));
+        }
+    }
+    for entry in materialized(&reply["thread"], cwd) {
+        events.push(subagent_row(
+            provider,
+            &request.child_id,
+            entry["item"].clone(),
+            entry.get("timestamp"),
+            coverage,
+        ));
+    }
+    Ok((events, coverage))
+}
+/// A live parent's app-server keeps publishing the child's rows, so its replay
+/// goes in-stream: the rows are held from before the read until the daemon has
+/// decided. The snapshot holds only finished turns, whose items are final, so
+/// once it is applied any held row of an item it contains (a late delta or
+/// completion still in the frame queue) is already covered and is dropped; rows
+/// of a turn still in progress continue. A cold parent has no live rows; it gets
+/// a history-only app-server for this one read. Other sessions are untouched.
+pub(super) async fn stream_subagent_history(
+    spec: &ProviderSpec,
+    sessions: &[Arc<CodexSession>],
+    request: SubagentHistoryRequest,
+    context: LaunchContext,
+    sink: EventSink,
+) -> Result<SubagentHistory> {
+    let parent = request.persistence["nativeHandle"]
+        .as_str()
+        .or(request.persistence["sessionId"].as_str());
+    let live = sessions.iter().find(|session| {
+        let state = session.state.lock().unwrap();
+        !state.closed && state.thread.as_deref() == parent && !session.client.is_closed()
+    });
+    let (mut events, read) = match live {
+        Some(session) => {
+            let read = subagent_history(session.client.as_ref(), &request, &spec.id, true);
+            return session
+                .holds
+                .publish_replay(&request, &spec.id, &session.sink, read, |item, snapshot| {
+                    let identity = |item: &Value| {
+                        item["messageId"].as_str().or(item["callId"].as_str()).map(str::to_owned)
+                    };
+                    identity(item).is_some_and(|id| {
+                        snapshot.iter().any(|row| identity(row).as_deref() == Some(id.as_str()))
+                    })
+                })
+                .await;
+        }
+        None => {
+            let (client, mut frames) = Transport::spawn(
+                super::command(spec, &["app-server"], &context.env, None)?,
+                context.cancel.clone(),
+            )
+            .await?;
+            let weak = Arc::downgrade(&client);
+            tokio::spawn(async move {
+                while let Some(frame) = frames.recv().await {
+                    let Some(client) = weak.upgrade() else { break };
+                    if frame.get("id").is_some() {
+                        let _ = client
+                            .reject(frame["id"].clone(), "No interactive session is attached")
+                            .await;
+                    }
+                }
+            });
+            let result = async {
+                client.initialize().await?;
+                subagent_history(client.as_ref(), &request, &spec.id, false).await
+            }
+            .await;
+            let closed = client.close().await;
+            let events = result?;
+            closed?;
+            events
+        }
+    };
+    let coverage = request.settle(&mut events, read);
+    for event in events {
+        sink.emit(event).await?;
+    }
+    Ok(SubagentHistory::Replayed(coverage))
 }
 #[async_trait]
 impl AgentSession for CodexSession {
@@ -1434,7 +1677,7 @@ impl AgentSession for CodexSession {
                 .into();
         }
         let history = load_history(
-            &self.client.current(),
+            self.client.current().as_ref(),
             &id,
             config["cwd"].as_str(),
             &self.spec.id,

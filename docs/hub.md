@@ -21,8 +21,8 @@ Normal authenticated daemon sessions may manage the daemon's Hub relationship an
 Hub connections have no daemon permissions by default. Connecting gives Hub machine identity and
 presence but no execution authority. The `hub.execute` permission lets workflows triggered from
 GitHub, Slack, Discord, Linear, and other integrations create workspaces and run agents. Grant it
-during interactive login or later with `paseo hub permissions grant hub.execute`. Relationships
-created before this split migrate their legacy execution scope to `hub.execute`. Hub sessions cannot
+during interactive login or later with `paseo hub permissions grant hub.execute`. A stored
+relationship from before this split grants nothing; connect the daemon again. Hub sessions cannot
 manage their own relationship or permissions.
 
 ## Session grants and agent operations

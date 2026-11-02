@@ -108,7 +108,7 @@ fn unavailable_catalog_or_child_is_scoped_and_retains_stored_bytes() {
         let mut replay = message_event(id, 1);
         replay["historyComplete"] = json!(true);
         let outputs = store.replay_history(Some(root), "broken-children",
-            vec![json!({"provider":"codex","event":replay})]).unwrap();
+            vec![json!({"provider":"codex","event":replay})], false).unwrap();
         assert!(outputs.is_empty());
     }
     // No empty replacement is created, and corrupt bytes are never rewritten.
@@ -153,6 +153,7 @@ fn child_history_hydrates_only_for_writes_under_bounded_residency_with_durable_i
     for page in &expected {
         assert_eq!(page["rows"].as_array().unwrap().len(), 5);
     }
+    drop(store);
 
     // A fresh store indexes descriptors and pages history without hydrating it.
     let mut fresh = SubagentStore::with_residency(2, u64::MAX, 1);
@@ -264,7 +265,7 @@ fn stored_pages_match_hydrated_pages_and_oversized_history_is_not_retained() {
         event["historyComplete"] = json!(true);
         json!({"provider":"codex","event":event})
     }).collect();
-    assert_eq!(bounded.replay_history(Some(root), "parent", replay).unwrap().len(), 1);
+    assert_eq!(bounded.replay_history(Some(root), "parent", replay, false).unwrap().len(), 1);
     assert!(bounded.timelines.is_empty());
     assert_eq!(bounded.residency.bytes, 0);
     assert_eq!(page(&mut bounded, root, "parent", "fresh", json!({"limit":0}))["rows"].as_array().unwrap().len(), 6);
@@ -294,14 +295,24 @@ fn replay_reconciles_against_stored_child_that_is_not_hydrated() {
 
     // A partial replay cannot shrink canonical rows that were never hydrated.
     let mut fresh = SubagentStore::default();
-    assert!(fresh.replay_history(Some(root), "parent", replay(1, false)).unwrap().is_empty());
+    assert!(fresh.replay_history(Some(root), "parent", replay(1, false), false).unwrap().is_empty());
     assert_eq!(page(&mut fresh, root, "parent", "child", json!({"limit":0})), stored);
+    // Matching identities do not authorize an older body to replace live text.
+    for (complete, text) in [
+        (false, "child"), (true, "child"),
+        (false, "different child body"), (true, "different child body"),
+    ] {
+        let mut stale = replay(3, complete);
+        stale[0]["event"]["item"]["text"] = json!(text);
+        assert!(fresh.replay_history(Some(root), "parent", stale, false).unwrap().is_empty());
+        assert_eq!(page(&mut fresh, root, "parent", "child", json!({"limit":0})), stored);
+    }
     let mut restarted = SubagentStore::default();
     assert_eq!(page(&mut restarted, root, "parent", "child", json!({"limit":0})), stored);
 
     // A complete covering replay replaces the history durably.
     let mut fresh = SubagentStore::default();
-    assert_eq!(fresh.replay_history(Some(root), "parent", replay(4, true)).unwrap().len(), 1);
+    assert_eq!(fresh.replay_history(Some(root), "parent", replay(4, true), false).unwrap().len(), 1);
     let mut restarted = SubagentStore::default();
     let replaced = page(&mut restarted, root, "parent", "child", json!({"limit":0}));
     assert_eq!(replaced["rows"].as_array().unwrap().len(), 4);

@@ -264,6 +264,16 @@ void main() {
           'timestamp': '2026-05-01T09:00:00.000Z',
           'event': {'type': 'timeline', 'item': prompt['item']},
         });
+        // A canonical echo is presentation, not delivery evidence: the
+        // host's exact-ID receipt settles the submitted prompt.
+        wire.emit('agent.message_receipt.update', {
+          'receipt': {
+            'agentId': _agentId,
+            'messageId': messageId,
+            'revision': 1,
+            'phase': 'accepted',
+          },
+        });
         final permission = {
           'id': 'permission-$minimized',
           'kind': 'tool',
@@ -378,6 +388,7 @@ class _TestDaemon implements DaemonTransport {
           'workspaceMultiplicity': true,
           'providerSubagents': true,
           'agentTimelinePromptIndex': true,
+          'agentMessageReceipts': true,
         },
       });
       return;

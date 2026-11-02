@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -22,142 +21,36 @@ void main() {
     await drafts.initialize();
   });
 
-  test('legacy active draft retains text and converts supported attachments without touching source files', () async {
-    final directory = await Directory.systemTemp.createTemp('paseo-legacy-draft-');
-    final image = File('${directory.path}/original.png');
-    final bytes = base64Decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=');
-    await image.writeAsBytes(bytes);
-    final key = ChatDrafts.key('legacy-server', 'workspace', 'legacy-agent');
+  test('a persisted draft sends its text, images and wire attachments', () async {
+    final key = ChatDrafts.key('server', 'workspace', 'agent');
     final uploaded = {
       'type': 'uploaded_file', 'id': 'upload', 'fileName': 'notes.txt',
       'mimeType': 'text/plain', 'size': 12, 'path': '/uploads/notes.txt',
     };
-    final original = {
-      'lifecycle': 'active', 'updatedAt': 100, 'version': 2,
-      'input': {
-        'text': 'Keep this unsent prompt',
-        'attachments': [
-          {'kind': 'file', 'attachment': uploaded},
-          {'kind': 'workspace_file', 'path': 'src/main.dart', 'selection': {'kind': 'line_range', 'startLine': 2, 'endLine': 4}},
-          {'kind': 'image', 'metadata': {'id': 'image', 'storageType': 'native-file', 'storageKey': image.path, 'mimeType': 'image/png', 'createdAt': 100}},
-          {'kind': 'forge_issue', 'item': {'kind': 'issue', 'forge': 'github', 'number': 7, 'title': 'Issue', 'url': 'https://example.test/issues/7', 'body': 'Context'}},
-        ],
-      },
+    final issue = {
+      'type': 'forge_issue', 'mimeType': 'application/paseo-forge-issue', 'forge': 'github',
+      'number': 7, 'title': 'Issue', 'url': 'https://example.test/issues/7', 'body': 'Context',
     };
-    try {
-      // Reading a blank draft before hydration must not hide the legacy record.
-      drafts.draft(key);
-      await drafts.hydrateLegacy(key, {
-        'drafts': {'agent:legacy-server:legacy-agent': original},
-      }, sourceKeys: ['agent:legacy-server:legacy-agent']);
-      final restored = drafts.draft(key);
-      expect(restored['text'], 'Keep this unsent prompt');
-      final message = agentMessageFields('legacy-agent', drafts.snapshot(key));
-      final attachments = jsonList(message['attachments']).map(jsonMap).toList();
-      expect(attachments.first, uploaded);
-      expect(attachments[1]['text'], contains('Lines: 2-4'));
-      expect(attachments[2]['type'], 'forge_issue');
-      expect(attachments[2]['number'], 7);
-      expect(base64Decode(jsonMap(jsonList(message['images']).single)['data'] as String), bytes);
-      expect(await image.readAsBytes(), bytes);
-      expect(jsonMap(restored['legacySource'])['record'], original);
-      final saved = jsonMap(jsonDecode((await SharedPreferences.getInstance()).getString('paseo.chat.drafts.v1')!));
-      expect(jsonList(saved['legacyImports']), contains('agent:legacy-server:legacy-agent'));
-    } finally {
-      await directory.delete(recursive: true);
-    }
-  });
-
-  test('new draft wins and inactive legacy records never become unsent prompts', () async {
-    final key = ChatDrafts.key('legacy-server', 'workspace', 'new-wins');
-    drafts.update(key, {'text': 'Edited in Flutter'});
-    await drafts.hydrateLegacy(key, {
-      'drafts': {'agent:legacy-server:new-wins': {'lifecycle': 'active', 'input': {'text': 'Old text', 'attachments': []}}},
-    }, sourceKeys: ['agent:legacy-server:new-wins']);
-    expect(drafts.draft(key)['text'], 'Edited in Flutter');
-    final inactive = ChatDrafts.key('legacy-server', 'workspace', 'sent-draft');
-    await drafts.hydrateLegacy(inactive, {
-      'drafts': {'agent:legacy-server:sent-draft': {'lifecycle': 'sent', 'input': {'text': 'Already sent', 'attachments': []}}},
-    }, sourceKeys: ['agent:legacy-server:sent-draft']);
-    expect(drafts.draft(inactive)['text'], isEmpty);
+    const image = {'data': 'iVBORw0KGgo=', 'mimeType': 'image/png'};
+    drafts.update(key, {
+      'text': '  Keep this unsent prompt  ',
+      'attachments': [
+        uploaded,
+        {'kind': 'workspace_file', 'path': 'src/main.dart', 'selection': {'kind': 'line_range', 'startLine': 2, 'endLine': 4}},
+        issue,
+      ],
+      'images': [image],
+    });
     await drafts.flush();
-  });
-
-  test('re-sync adopts a newer original draft only while the imported draft is untouched', () async {
-    JsonMap legacy(String id, String text, int updatedAt, {String lifecycle = 'active'}) => {
-      'drafts': {'agent:legacy-server:$id': {
-        'lifecycle': lifecycle, 'updatedAt': updatedAt,
-        'input': {'text': text, 'attachments': []},
-      }},
-    };
-    final untouched = ChatDrafts.key('legacy-server', 'workspace', 'resync');
-    final source = ['agent:legacy-server:resync'];
-    await drafts.hydrateLegacy(untouched, legacy('resync', 'first', 1), sourceKeys: source);
-    expect(drafts.draft(untouched)['text'], 'first');
-    // Not newer than the imported record: nothing changes.
-    await drafts.hydrateLegacy(untouched, legacy('resync', 'stale', 1), sourceKeys: source);
-    expect(drafts.draft(untouched)['text'], 'first');
-    await drafts.hydrateLegacy(untouched, legacy('resync', 'continued in original', 5), sourceKeys: source);
-    expect(drafts.draft(untouched)['text'], 'continued in original');
-    // Sent in the original afterwards: the untouched copy is cleared, not resent.
-    await drafts.hydrateLegacy(untouched, legacy('resync', '', 9, lifecycle: 'sent'), sourceKeys: source);
-    expect(drafts.draft(untouched)['text'], isEmpty);
-
-    final edited = ChatDrafts.key('legacy-server', 'workspace', 'resync-edited');
-    final editedSource = ['agent:legacy-server:resync-edited'];
-    await drafts.hydrateLegacy(edited, legacy('resync-edited', 'first', 1), sourceKeys: editedSource);
-    drafts.update(edited, {'text': 'typed in Flutter'});
-    await drafts.hydrateLegacy(edited, legacy('resync-edited', 'newer original', 5), sourceKeys: editedSource);
-    expect(drafts.draft(edited)['text'], 'typed in Flutter');
-    await drafts.flush();
-  });
-
-  test('unreadable images and excluded resources remain recoverable without losing edits', () async {
-    final directory = await Directory.systemTemp.createTemp('paseo-legacy-recover-');
-    final image = File('${directory.path}/restored.png');
-    final key = ChatDrafts.key('legacy-server', 'workspace', 'recover-images');
-    final plugin = {'kind': 'plugin_resource', 'pluginId': 'original-plugin', 'resource': {'id': 'resource'}};
-    try {
-      await drafts.hydrateLegacy(key, {
-        'drafts': {
-          'agent:legacy-server:recover-images': {
-            'lifecycle': 'active',
-            'input': {
-              'text': 'Original prompt',
-              'attachments': [
-                {'kind': 'image', 'metadata': {'storageType': 'desktop-file', 'storageKey': image.path, 'mimeType': 'image/png'}},
-                plugin,
-                {'kind': 'image', 'metadata': {'storageType': 'web-indexeddb', 'storageKey': 'browser-image'}},
-              ],
-            },
-          },
-        },
-      }, sourceKeys: ['agent:legacy-server:recover-images']);
-      expect(jsonList(drafts.draft(key)['unresolvedLegacyAttachments']), hasLength(3));
-      expect(jsonList(drafts.draft(key)['attachments']), isEmpty);
-      drafts.update(key, {'text': 'Edited after import'});
-      await image.writeAsBytes([1, 2, 3]);
-      await drafts.recoverLegacyAttachments(key);
-      final restored = drafts.draft(key);
-      expect(restored['text'], 'Edited after import');
-      expect(jsonList(restored['images']), hasLength(1));
-      expect(jsonList(restored['unresolvedLegacyAttachments']), hasLength(2));
-      expect(jsonList(restored['unresolvedLegacyAttachments']).map(jsonMap).map((row) => row['source']), contains(plugin));
-      expect(await image.exists(), isTrue);
-    } finally {
-      await directory.delete(recursive: true);
-    }
-  });
-
-  test('unsupported legacy schema is not marked imported', () async {
-    final key = ChatDrafts.key('legacy-server', 'workspace', 'unsupported');
-    await expectLater(drafts.hydrateLegacy(key, {
-      'drafts': {'agent:legacy-server:unsupported': {'lifecycle': 'active', 'input': {'text': 12}}},
-    }, sourceKeys: ['agent:legacy-server:unsupported']), throwsStateError);
-    await drafts.hydrateLegacy(key, {
-      'drafts': {'agent:legacy-server:unsupported': {'lifecycle': 'active', 'input': {'text': 'Recovered', 'attachments': []}}},
-    }, sourceKeys: ['agent:legacy-server:unsupported']);
-    expect(drafts.draft(key)['text'], 'Recovered');
+    final saved = jsonMap(jsonDecode((await SharedPreferences.getInstance()).getString('paseo.chat.drafts.v1')!));
+    expect(saved.object('drafts').object(key)['text'], '  Keep this unsent prompt  ');
+    final message = agentMessageFields('agent', drafts.snapshot(key));
+    expect(message['text'], 'Keep this unsent prompt');
+    final attachments = jsonList(message['attachments']).map(jsonMap).toList();
+    expect(attachments.first, uploaded);
+    expect(attachments[1]['text'], contains('Lines: 2-4'));
+    expect(attachments[2], issue);
+    expect(jsonList(message['images']), [image]);
   });
 
   test('an ambiguous message receipt cannot release its retry identity', () async {

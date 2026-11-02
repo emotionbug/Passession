@@ -26,11 +26,15 @@ The session API includes turn start/steering, history, runtime info, modes/model
 
 Event sinks are bounded and cancellation-aware. The agent owner persists events before outward publication. Never drop an event because a socket or extension consumer is slow, and never publish durable success before the corresponding mutation is persisted.
 
+Parent history replay announces child agents by descriptor only: an `upsert` with an opaque `source` locator. It never reads a child's separate transcript, thread or file. Read one child's body in `AgentProvider::stream_subagent_history` when the user opens it; that call works for a stored parent without resuming it and must fail, not return an empty replay, when the body is missing or unreadable. Child output the parent's own transcript or native stream already carries keeps flowing with it. See [timeline sync](timeline-sync.md#provider-child-history) for how the daemon stores and pages it.
+
 `LaunchContext` binds tools to the agent's authority and environment. Provider options are not an alternate channel for replacing that authority. Exact MCP preapproval must only be advertised when supported; broad “allow all” behavior is not a substitute for an exact tool policy.
 
 ## Catalog and configuration behavior
 
 Keep provider models, modes and configuration scoped to the effective environment and working directory. Native catalogs may be discovered asynchronously; distinguish pending discovery, unsupported discovery, and a real provider error. Configuration changes must not return a snapshot from a different identity/environment.
+
+Discovery a provider repeats while opening sessions or answering draft model/command reads goes through the provider instance's `Memo` (`packages/daemon/src/providers/registry/catalog/memo.rs`), not a process-wide cache. Key it on the launch identity the discovery actually talks to: command and arguments, environment without `PASEO_AGENT_ID`, working directory, and a fingerprint of the config, credential and skill/extension paths the native CLI reads. Return failed or degraded lookups as `Err` or `Loaded::Partial` so the next open retries, and clear the memo when `is_available` receives a forced refresh (`force: true`), because that call runs before any catalog reuse. Replacing a provider's configuration replaces its instance and therefore its memo.
 
 CLI-default profiles are host-owned. Explicit command-line provider/model arguments override the saved default; conflicting provider/model values are rejected before connection. Selecting a different provider must not carry over incompatible saved options.
 

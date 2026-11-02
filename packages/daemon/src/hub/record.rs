@@ -236,35 +236,13 @@ pub(super) async fn load(path: &Path) -> Result<Option<Record>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let parsed = (|| -> Result<(Record, bool)> {
-        let mut value: Value = serde_json::from_slice(&bytes)?;
-        let legacy = value["version"] == 1;
-        if legacy {
-            let scopes = value["relationship"]["scopes"]
-                .as_array()
-                .context("Invalid legacy Hub scopes")?;
-            ensure!(
-                scopes.iter().all(Value::is_string),
-                "Invalid legacy Hub scopes"
-            );
-            let grants = if scopes.iter().any(|v| v == "hub.execution.*") {
-                serde_json::json!(["hub.execute"])
-            } else {
-                serde_json::json!([])
-            };
-            value["version"] = 2.into();
-            value["relationship"]
-                .as_object_mut()
-                .context("Invalid Hub relationship")?
-                .remove("scopes");
-            value["relationship"]["permissions"] = grants;
-        }
-        let mut record: Record = serde_json::from_value(value)?;
+    let parsed = (|| -> Result<Record> {
+        let mut record: Record = serde_json::from_slice(&bytes)?;
         record.validate()?;
-        Ok((record, legacy))
+        Ok(record)
     })();
-    let (record, legacy) = match parsed {
-        Ok(result) => result,
+    let record = match parsed {
+        Ok(record) => record,
         Err(error) => {
             let quarantine = path.with_file_name(format!(
                 "hub-relationship.invalid-{}-{}.json",
@@ -277,9 +255,6 @@ pub(super) async fn load(path: &Path) -> Result<Option<Record>> {
             return Ok(None);
         }
     };
-    if legacy {
-        persist(path, &record).await?;
-    }
     private(path).await?;
     if record.state == "disconnecting" {
         remove(path).await?;

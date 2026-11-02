@@ -17,7 +17,7 @@ Bound memory and update work. Avoid rereading/rebuilding the complete retained h
 
 Parent and provider-child timeline commits update only the affected projected row and cursor
 metadata in SQLite, not the complete retained history. Owners retain connections and prepared
-statements. Child descriptors have a separate parent index; legacy JSON is imported once.
+statements. Child descriptors have a separate parent index.
 Child storage work runs on blocking workers, without holding an agent data guard across I/O.
 Publication still follows durable commit; this does not change Flutter's text-reveal timing.
 

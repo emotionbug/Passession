@@ -1,15 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
-import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../core/json.dart';
-import '../../core/legacy_state.dart' show legacyDraftUpdatedAt;
-import 'forge_attachments.dart';
 
 /// Durable client-owned drafts and queues. A queue is never a daemon API.
 class ChatDrafts extends ChangeNotifier {
@@ -19,8 +15,6 @@ class ChatDrafts extends ChangeNotifier {
   final Map<String, List<JsonMap>> _inbox = {};
   final Set<String> _intents = {};
   final Set<String> _dirtyDrafts = {};
-  final Set<String> _persistedDrafts = {};
-  final Set<String> _legacyImports = {};
   Future<void>? _initialization;
   Future<void> _writes = Future.value();
   Object? persistenceError;
@@ -55,7 +49,6 @@ class ChatDrafts extends ChangeNotifier {
                 : queued;
           }).toList();
           _drafts[entry.key] = value;
-          _persistedDrafts.add(entry.key);
         }
         for (final entry in jsonMap(saved['inbox']).entries) {
           final current = _inbox.putIfAbsent(entry.key, () => []);
@@ -67,7 +60,6 @@ class ChatDrafts extends ChangeNotifier {
           );
         }
         _intents.addAll(jsonList(saved['intents']).whereType<String>());
-        _legacyImports.addAll(jsonList(saved['legacyImports']).whereType<String>());
       }
     } catch (error) {
       persistenceError = error;
@@ -85,203 +77,6 @@ class ChatDrafts extends ChangeNotifier {
       'config': <String, dynamic>{},
     },
   );
-
-  /// Import the matching active legacy draft into an absent Flutter draft.
-  /// Re-sync: a newer original record (by updatedAt) for the source this
-  /// draft imported replaces it only while the draft is unchanged since that
-  /// import (a newer inactive record clears it). Flutter edits always win.
-  /// The original record and unresolved attachment references stay durable;
-  /// source files are read-only.
-  Future<void> hydrateLegacy(
-    String key,
-    JsonMap legacy, {
-    required List<String> sourceKeys,
-    bool legacyForge = false,
-  }) async {
-    await initialize();
-    final state = legacy['state'] is Map ? jsonMap(legacy['state']) : legacy;
-    final records = jsonMap(state['drafts']);
-    bool absent() => !_persistedDrafts.contains(key) && !_dirtyDrafts.contains(key);
-    String? sourceKey;
-    JsonMap record = {};
-    var resync = false;
-    for (final candidate in sourceKeys) {
-      final value = candidate == 'createModalDraft'
-          ? state['createModalDraft'] : records[candidate];
-      if (value is! Map) continue;
-      final candidateRecord = jsonMap(value);
-      if (_legacyImports.contains(candidate)) {
-        if (!_resyncable(key, candidate, candidateRecord)) continue;
-        resync = true;
-      } else if (!absent() || !_activeLegacy(candidateRecord)) {
-        continue;
-      }
-      sourceKey = candidate;
-      record = candidateRecord;
-      break;
-    }
-    if (sourceKey == null) return;
-    final input = record['input'] is Map ? jsonMap(record['input']) : record;
-    final attachments = <JsonMap>[], images = <JsonMap>[], unresolved = <JsonMap>[];
-    var text = '';
-    if (_activeLegacy(record)) {
-      if (input['text'] is! String ||
-          (input['attachments'] != null && input['attachments'] is! List)) {
-        throw StateError('The legacy draft $sourceKey has an unsupported format. Its original data has been retained.');
-      }
-      text = input['text'] as String;
-      final sources = [
-        ...jsonList(input['attachments']),
-        for (final image in jsonList(input['images']))
-          {'kind': 'image', 'metadata': image},
-      ];
-      for (final source in sources) {
-        if (source is! Map) {
-          unresolved.add({'source': source, 'reason': 'Unsupported legacy attachment format'});
-          continue;
-        }
-        final converted = await _legacyAttachment(jsonMap(source), legacyForge: legacyForge);
-        if (converted.attachment != null) attachments.add(converted.attachment!);
-        if (converted.image != null) images.add(converted.image!);
-        if (converted.error != null) unresolved.add({'source': source, 'reason': converted.error});
-      }
-    }
-    // Reading an image must not overwrite typing or another imported draft.
-    if (resync
-        ? !_resyncable(key, sourceKey, record)
-        : !absent() || _legacyImports.contains(sourceKey)) {
-      return;
-    }
-    _legacyImports.add(sourceKey);
-    final fields = <String, dynamic>{
-      'text': text,
-      'attachments': attachments,
-      'images': images,
-      'unresolvedLegacyAttachments': unresolved,
-    };
-    update(key, {
-      ...fields,
-      'legacySource': {'key': sourceKey, 'record': record, 'digest': _importedDigest(fields)},
-    });
-    await flush();
-  }
-
-  // migration.ts: a record without lifecycle is active.
-  static bool _activeLegacy(JsonMap record) =>
-      record['lifecycle'] == null || record['lifecycle'] == 'active';
-
-  /// The draft at [key] imported [sourceKey], [record] is newer than that
-  /// import, and nothing changed the draft since.
-  bool _resyncable(String key, String sourceKey, JsonMap record) {
-    final current = _drafts[key];
-    final source = jsonMap(current?['legacySource']);
-    if (current == null || source['key'] != sourceKey ||
-        !(legacyDraftUpdatedAt(record) > legacyDraftUpdatedAt(source['record']))) {
-      return false;
-    }
-    if (jsonList(current['queue']).isNotEmpty || current['pending'] != null) return false;
-    if (source['digest'] is String) return source['digest'] == _importedDigest(current);
-    // Imported before digests were recorded: the text and every converted or
-    // unresolved original attachment must still be exactly as imported.
-    final imported = jsonMap(source['record']);
-    final input = imported['input'] is Map ? jsonMap(imported['input']) : imported;
-    return current['text'] == stringValue(input['text']) &&
-        jsonList(current['attachments']).length + jsonList(current['images']).length +
-                jsonList(current['unresolvedLegacyAttachments']).length ==
-            jsonList(input['attachments']).length + jsonList(input['images']).length;
-  }
-
-  static String _importedDigest(JsonMap draft) => sha256.convert(utf8.encode(jsonEncode([
-    draft['text'],
-    jsonList(draft['attachments']),
-    jsonList(draft['images']),
-    jsonList(draft['unresolvedLegacyAttachments']),
-  ]))).toString();
-
-  Future<void> recoverLegacyAttachments(String key, {bool legacyForge = false}) async {
-    final unresolved = List.of(jsonList(draft(key)['unresolvedLegacyAttachments']));
-    for (final value in unresolved) {
-      final row = jsonMap(value);
-      if (row['source'] is! Map) continue;
-      final converted = await _legacyAttachment(jsonMap(row['source']), legacyForge: legacyForge);
-      final current = draft(key);
-      final pending = List.of(jsonList(current['unresolvedLegacyAttachments']));
-      final index = pending.indexWhere((item) => jsonEncode(item) == jsonEncode(row));
-      if (index < 0) continue;
-      if (converted.error != null) {
-        pending[index] = {...row, 'reason': converted.error};
-      } else {
-        pending.removeAt(index);
-      }
-      update(key, {
-        'unresolvedLegacyAttachments': pending,
-        if (converted.attachment != null)
-          'attachments': [...jsonList(current['attachments']), converted.attachment],
-        if (converted.image != null)
-          'images': [...jsonList(current['images']), converted.image],
-      });
-    }
-    await flush();
-  }
-
-  Future<({JsonMap? attachment, JsonMap? image, String? error})> _legacyAttachment(
-    JsonMap source, {
-    required bool legacyForge,
-  }) async {
-    switch (source['kind']) {
-      case 'file':
-        final attachment = jsonMap(source['attachment']);
-        if (attachment['type'] == 'uploaded_file') {
-          return (attachment: attachment, image: null, error: null);
-        }
-      case 'workspace_file':
-        return (attachment: source, image: null, error: null);
-      case 'forge_issue':
-      case 'forge_change_request':
-      case 'github_issue':
-      case 'github_pr':
-        return (
-          attachment: forgeAttachment(jsonMap(source['item']), legacy: legacyForge),
-          image: null,
-          error: null,
-        );
-      case 'image':
-        final metadata = jsonMap(source['metadata']);
-        if (metadata['storageType'] == 'web-indexeddb') {
-          return (attachment: null, image: null,
-            error: 'This image remains in the original browser image store. Export and attach it to recover it.');
-        }
-        final location = stringValue(metadata['storageKey'], stringValue(metadata['uri']));
-        try {
-          final uri = Uri.tryParse(location);
-          if (location.isEmpty || uri == null ||
-              (uri.hasScheme && !['file', 'data'].contains(uri.scheme))) {
-            throw StateError('Image storage location is not a local file');
-          }
-          final bytes = uri.scheme == 'data'
-              ? uri.data!.contentAsBytes()
-              : await (uri.scheme == 'file' ? File.fromUri(uri) : File(location)).readAsBytes();
-          return (
-            attachment: null,
-            image: {
-              'data': base64Encode(bytes),
-              'mimeType': stringValue(metadata['mimeType'], uri.data?.mimeType ?? 'image/png'),
-              if (metadata['fileName'] != null) 'fileName': metadata['fileName'],
-            },
-            error: null,
-          );
-        } catch (error) {
-          return (attachment: null, image: null,
-            error: 'The original image could not be read: $error. Its reference has been retained.');
-        }
-      default:
-        if (source['type'] is String && source['kind'] == null) {
-          return (attachment: source, image: null, error: null);
-        }
-    }
-    return (attachment: null, image: null,
-      error: 'This legacy ${source['kind'] ?? 'attachment'} requires its original integration. The original data has been retained.');
-  }
 
   void update(String key, JsonMap fields) {
     _dirtyDrafts.add(key);
@@ -522,7 +317,6 @@ class ChatDrafts extends ChangeNotifier {
             'drafts': _drafts,
             'inbox': _inbox,
             'intents': _intents.toList(),
-            'legacyImports': _legacyImports.toList(),
           });
           final prefs = await SharedPreferences.getInstance();
           if (!await prefs.setString('paseo.chat.drafts.v1', encoded)) {

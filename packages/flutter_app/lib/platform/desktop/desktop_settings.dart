@@ -5,7 +5,6 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../../core/json.dart';
-import '../../core/legacy_state.dart' show originalDesktopUserDataDir;
 
 /// One process-wide settings owner; secondary engines forward mutations to it.
 class DesktopSettingsStore {
@@ -28,33 +27,12 @@ class DesktopSettingsStore {
   Future<void> initialize() async {
     final support = await getApplicationSupportDirectory();
     _file = File(p.join(support.path, 'desktop-settings.json'));
-    File source = _file;
-    final legacyBase = originalDesktopUserDataDir(Platform.environment);
-    if (!await source.exists() && legacyBase != null) {
-      source = File(p.join(legacyBase, 'desktop-settings.json'));
+    if (await _file.exists()) {
+      _document = jsonMap(jsonDecode(await _file.readAsString()));
     }
-    if (await source.exists()) {
-      _document = jsonMap(jsonDecode(await source.readAsString()));
-    }
-    final stored = jsonMap(_document['settings']);
     final settings = defaults();
-    _merge(settings, stored);
-    final migrations = Map<String, dynamic>.of(
-      jsonMap(_document['migrations']),
-    );
-    // The existing Electron migration deliberately changed the old quit default.
-    if (migrations['daemonStopOnQuitDefaultApplied'] != true) {
-      final daemon = jsonMap(settings['daemon']);
-      daemon['keepRunningAfterQuit'] = false;
-      settings['daemon'] = daemon;
-    }
-    migrations['daemonStopOnQuitDefaultApplied'] = true;
-    _document = {
-      ..._document,
-      'version': 1,
-      'settings': settings,
-      'migrations': migrations,
-    };
+    _merge(settings, jsonMap(_document['settings']));
+    _document = {..._document, 'version': 1, 'settings': settings};
     await _save();
   }
 

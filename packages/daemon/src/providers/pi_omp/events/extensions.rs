@@ -314,6 +314,10 @@ impl Extensions {
         if let Some(model) = first(&[&data["resolvedModel"]]) {
             state["resolvedModel"] = json!(model);
         }
+        if let Some(file) = first(&[&payload["sessionFile"]]) {
+            let title = state["title"].clone();
+            state["source"] = json!({"path":file,"title":title});
+        }
         let mut event = state.clone();
         if let Some(model) = first(&[&state["resolvedModel"]]) {
             let model = model.trim();

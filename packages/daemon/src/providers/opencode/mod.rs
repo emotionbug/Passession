@@ -1,6 +1,10 @@
 mod bridge;
 mod catalog;
+mod family;
 mod legacy;
+#[cfg(test)]
+mod loopback;
+mod reader;
 mod runtime;
 mod v2;
 
@@ -14,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::api::{
     AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
+    SubagentHistory, SubagentHistoryRequest,
 };
 use paseo_client::process::{self, CommandSpec};
 use runtime::{Generation, Runtime, RuntimeManager};
@@ -356,6 +361,66 @@ impl AgentProvider for OpenCodeProvider {
         }
         self.attach(runtime, info, config, context, options, sink)
             .await
+    }
+
+    /// Reads one opened child straight from OpenCode's session store. No parent
+    /// session is resumed and no MCP authority is bound. A live parent publishes the
+    /// replay in its own event stream, ordered with its live child collection
+    /// (`family`); a cold parent replays into the sink through the helper already
+    /// serving that family, or a shared history-only helper.
+    async fn stream_subagent_history(
+        &self,
+        request: SubagentHistoryRequest,
+        context: LaunchContext,
+        sink: EventSink,
+    ) -> Result<SubagentHistory> {
+        let parent = native_id(&request.persistence)?.to_owned();
+        let child = request.source["sessionId"]
+            .as_str()
+            .unwrap_or(&request.child_id);
+        if child != request.child_id {
+            bail!(
+                "OpenCode child source names session {child}, not {}",
+                request.child_id
+            );
+        }
+        let directory = request.source["directory"]
+            .as_str()
+            .or_else(|| request.persistence.pointer("/metadata/cwd")?.as_str())
+            .or_else(|| request.config["cwd"].as_str())
+            .ok_or_else(|| anyhow!("OpenCode child history requires the parent working directory"))?
+            .to_owned();
+        if let Some(family) = self.runtime.families.live(&parent) {
+            family
+                .publish_replay(&self.spec.id, request, &directory, context.cancel.clone())
+                .await?;
+            return Ok(SubagentHistory::Published);
+        }
+        let child = request.child_id.as_str();
+        let runtime = match self
+            .runtime
+            .acquire_existing(child)
+            .or_else(|| self.runtime.acquire_existing(&parent))
+        {
+            Some(runtime) => runtime,
+            None => {
+                self.runtime
+                    .acquire(None, &json!({}), context.cancel.clone())
+                    .await?
+            }
+        };
+        let reader = reader::RuntimeReader::new(&runtime, context.cancel.clone());
+        let (mut events, read) = match runtime.generation {
+            Generation::Legacy => {
+                legacy::replay_child(&reader, &self.spec.id, &parent, child, &directory).await?
+            }
+            Generation::V2 => v2::replay_child(&reader, &self.spec.id, &parent, child).await?,
+        };
+        let coverage = request.settle(&mut events, read);
+        for event in events {
+            sink.emit(event).await?;
+        }
+        Ok(SubagentHistory::Replayed(coverage))
     }
 
     async fn fetch_catalog(&self, options: Value, cancel: CancellationToken) -> Result<Value> {

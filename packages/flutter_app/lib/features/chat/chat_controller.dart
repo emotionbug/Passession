@@ -26,6 +26,12 @@ Duration nextTimelineRetryDelay(Duration? previous) {
 /// viewed-timeline-sync.ts ViewedTimelineStatus.
 enum TimelineSyncStatus { ready, pending, error, retrying }
 
+/// Whether the provider can run work for this agent, separate from whether
+/// its saved conversation is readable. Hosts that serve saved history first
+/// (`saved_history_reads`) put `preparation` on the agent snapshot until the
+/// provider is ready; older hosts never send it and answer only when ready.
+enum AgentExecutionStatus { ready, preparing, failed }
+
 /// agent-snapshots.ts derivePendingPermissionKey, scoped to one agent.
 String pendingPermissionKey(JsonMap request) {
   final metadata = jsonMap(request['metadata']);
@@ -324,6 +330,21 @@ class ChatController extends ChangeNotifier {
   Object? error;
   String? notice;
 
+  /// The latest parent page came from the host's saved checkpoint
+  /// (`historySource: "saved"`): readable, but not certified current.
+  bool historySaved = false;
+
+  // The preparation callout's retry owns its in-flight state until the
+  // retried fetch settles. One `after` refresh per readiness transition
+  // replaces saved history with the provider-synced projection; a child has
+  // no replacement notification, so a new child epoch reinstalls its tail.
+  bool _preparationRetry = false, _liveRefreshDone = false;
+  // A live snapshot (no preparation, not a last-persisted observation) was
+  // applied since the provider last reported preparation.
+  bool _liveObserved = false;
+  bool _refreshPending = false;
+  String? _childResyncEpoch;
+
   OwnedObservation? _observation;
   StreamSubscription<JsonMap>? _events;
   bool _disposed = false;
@@ -353,11 +374,71 @@ class ChatController extends ChangeNotifier {
   String get agentId =>
       isSubagent ? stringValue(target.data['parentAgentId']) : target.id!;
   bool get running =>
-      agent['status'] == 'running' ||
-      agent['activeTurn'] != null ||
-      // use-agent-screen-state-machine.ts shouldUseOptimisticCreateFlowAgent:
-      // a just-created agent reads as running until its snapshot says otherwise.
-      (createHandoff && (agent.isEmpty || agent['status'] == 'idle'));
+      // A provider that is still preparing (or failed to) runs no turn,
+      // whatever the saved snapshot last recorded.
+      execution == AgentExecutionStatus.ready &&
+      (agent['status'] == 'running' ||
+          agent['activeTurn'] != null ||
+          // use-agent-screen-state-machine.ts shouldUseOptimisticCreateFlowAgent:
+          // a just-created agent reads as running until its snapshot says otherwise.
+          (createHandoff && (agent.isEmpty || agent['status'] == 'idle')));
+
+  /// Execution readiness from the agent snapshot's `preparation`. Any
+  /// reported preparation other than a failure is not ready.
+  AgentExecutionStatus get execution {
+    final preparation = agent['preparation'];
+    if (preparation is! Map) return AgentExecutionStatus.ready;
+    return preparation['status'] == 'failed'
+        ? AgentExecutionStatus.failed
+        : AgentExecutionStatus.preparing;
+  }
+
+  /// The provider's own failure message, shown verbatim (diagnostic evidence).
+  String? get preparationError => execution == AgentExecutionStatus.failed
+      ? stringValue(jsonMap(agent['preparation'])['error'])
+      : null;
+
+  bool get preparationRetrying => _preparationRetry;
+
+  /// Sends, send-now and agent controls need a live snapshot. A fresh open
+  /// before any snapshot, or one that has seen only a saved/last-persisted
+  /// observation, never authorizes execution; a later busy (last-persisted)
+  /// observation does not revoke an authorized live one. A just-created
+  /// agent is live by construction.
+  bool get executionAuthorized =>
+      execution == AgentExecutionStatus.ready && (_liveObserved || createHandoff);
+
+  /// Retry a failed provider preparation. Any parent timeline fetch restarts
+  /// it on the host; saved history stays on screen throughout.
+  void retryPreparation() {
+    if (_disposed ||
+        isSubagent ||
+        _preparationRetry ||
+        execution != AgentExecutionStatus.failed) {
+      return;
+    }
+    _preparationRetry = true;
+    _notify();
+    _requestRefresh();
+  }
+
+  /// An open child's background native-body refresh (`nativeRefresh` on its
+  /// page and descriptor upserts): `refreshing`, `failed` with the provider's
+  /// error, or empty when idle. Stored rows stay on screen either way.
+  JsonMap _childRefresh = const {};
+  bool get childRefreshing => isSubagent && _childRefresh['status'] == 'refreshing';
+  String? get childRefreshError => isSubagent && _childRefresh['status'] == 'failed'
+      ? stringValue(_childRefresh['error'])
+      : null;
+
+  /// Retry a failed child refresh: any timeline read for this child starts a
+  /// new attempt on the host.
+  void retryChildRefresh() {
+    if (_disposed || _preparationRetry || childRefreshError == null) return;
+    _preparationRetry = true;
+    _notify();
+    _requestRefresh();
+  }
 
   /// agent-panel.tsx findActiveCreateHandoff: this client just created the
   /// agent and the viewed sync still owes it a catch-up.
@@ -490,6 +571,11 @@ class ChatController extends ChangeNotifier {
       _pending = true;
       error = null;
       _manualRetry = false;
+      _preparationRetry = false;
+      // Execution authority belongs to this connection: after a reconnect
+      // only a fresh live snapshot restores it. History, drafts and live
+      // permissions stay until authoritative state replaces them.
+      _liveObserved = false;
     } else if (_observation == null) {
       // Never acknowledged (or released after a failure): subscribe again.
       _membershipNeedsRetry = false;
@@ -542,6 +628,17 @@ class ChatController extends ChangeNotifier {
     _catchUp = null;
     _catchUpRun = null;
     _gapPending = false;
+    _refreshPending = false;
+  }
+
+  /// One more resume after the running catch-up (or now): the running fetch
+  /// may have been sent before the host restarted or finished preparation.
+  void _requestRefresh() {
+    if (_catchUp == 'running') {
+      _refreshPending = true;
+      return;
+    }
+    unawaited(_startCatchUp(supersede: true));
   }
 
   /// viewed-timeline-sync.ts startCatchUp/decideCatchUp. A resume fetches
@@ -609,6 +706,10 @@ class ChatController extends ChangeNotifier {
       error = null;
       _manualRetry = false;
       _notify();
+      if (_refreshPending) {
+        _refreshPending = false;
+        scheduleMicrotask(() => unawaited(_startCatchUp(supersede: true)));
+      }
     } catch (e) {
       if (_disposed || generation != _catchUpGeneration) return;
       final delay = _catchUpDelay = nextTimelineRetryDelay(_catchUpDelay);
@@ -625,6 +726,7 @@ class ChatController extends ChangeNotifier {
 
   void _setError(Object? failure) {
     _manualRetry = false;
+    _preparationRetry = false;
     _pending = false;
     error = failure ?? StateError('Conversation synchronization failed');
     _notify();
@@ -818,6 +920,32 @@ class ChatController extends ChangeNotifier {
         break;
     }
     if (direction != 'before') synced = true;
+    if (!isSubagent && direction != 'before') {
+      // A retried preparation settles with the fetch that restarted it.
+      _preparationRetry = false;
+      historySaved = result['historySource'] == 'saved';
+      _refreshSavedWhenReady();
+    }
+    if (isSubagent && direction != 'before') {
+      _preparationRetry = false;
+      _childRefresh = jsonMap(result['nativeRefresh']);
+    }
+  }
+
+  /// Saved history is replaced through one ordinary `after` page once the
+  /// provider is ready; the host answers it from the synced projection (an
+  /// epoch change resets to its tail). Nothing is cleared before that page.
+  void _refreshSavedWhenReady() {
+    if (isSubagent ||
+        !historySaved ||
+        _liveRefreshDone ||
+        agent.isEmpty ||
+        execution != AgentExecutionStatus.ready ||
+        agent['snapshotAvailability'] == 'last_persisted') {
+      return;
+    }
+    _liveRefreshDone = true;
+    _requestRefresh();
   }
 
   /// A projected row can grow across a cursor. Replace its covered live
@@ -895,6 +1023,9 @@ class ChatController extends ChangeNotifier {
         if (child['parentAgentId'] == agentId) {
           subagents.removeWhere((s) => s['id'] == child['id']);
           subagents.add(child);
+          if (isSubagent && child['id'] == target.id) {
+            _childRefresh = jsonMap(child['nativeRefresh']);
+          }
         }
       } else if (p['parentAgentId'] == agentId && p['kind'] == 'remove') {
         subagents.removeWhere((s) => s['id'] == p['subagentId']);
@@ -936,13 +1067,25 @@ class ChatController extends ChangeNotifier {
     if (type == 'agent_status' && p['info'] is Map) {
       _setAgent(jsonMap(p['info']));
     }
+    _refreshSavedWhenReady();
     // [_project] notifies once for the whole event.
   }
 
-  /// An agent snapshot is authoritative for its activity and pending
-  /// permissions (agent-store.ts replacePendingPermissions).
+  /// A live agent snapshot is authoritative for its activity and pending
+  /// permissions (agent-store.ts replacePendingPermissions). A preparing or
+  /// failed provider has neither, and a last-persisted observation (the
+  /// runtime was busy) cannot revoke or grant what live events reported.
   void _setAgent(JsonMap value) {
     agent = value;
+    if (value['preparation'] is Map) {
+      permissions.clear();
+      // The next readiness gets its own refresh of saved history.
+      _liveRefreshDone = false;
+      _liveObserved = false;
+      return;
+    }
+    if (value['snapshotAvailability'] == 'last_persisted') return;
+    _liveObserved = true;
     final active = jsonMap(value['activeTurn']);
     if (active['turnId'] is String) {
       final id = stringValue(active['turnId']);
@@ -960,6 +1103,15 @@ class ChatController extends ChangeNotifier {
         maps(value['pendingPermissions'])
             .map((p) => MapEntry(pendingPermissionKey(p), p)),
       );
+  }
+
+  /// A background native refresh can move an open child to a new epoch
+  /// without a replacement notification: install that child's latest tail
+  /// once per announced epoch. Only the open child pane fetches.
+  void _resyncChild(String announced) {
+    if (_childResyncEpoch == announced) return;
+    _childResyncEpoch = announced;
+    unawaited(refreshTail().catchError(_reportError));
   }
 
   /// session-stream-reducers.ts processTimelineSequencingGate +
@@ -995,7 +1147,10 @@ class ChatController extends ChangeNotifier {
         startCursor ??= {'epoch': eventEpoch, 'seq': seq};
       } else if (epoch != eventEpoch) {
         // drop_epoch, except a fresh epoch's first event resets the timeline.
-        if (seq != 1) return;
+        if (seq != 1) {
+          if (isSubagent) _resyncChild(eventEpoch);
+          return;
+        }
         _generation++;
         _rows.clear();
         _fold.reset();
@@ -1099,6 +1254,11 @@ class ChatController extends ChangeNotifier {
     );
     if (_disposed) return;
     subagents = maps(result['subagents']);
+    if (isSubagent) {
+      for (final child in subagents) {
+        if (child['id'] == target.id) _childRefresh = jsonMap(child['nativeRefresh']);
+      }
+    }
     _notify();
   }
 

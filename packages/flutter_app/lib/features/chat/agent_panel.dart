@@ -345,6 +345,17 @@ class _AgentPanelState extends State<AgentPanel> {
   bool get isDraft => widget.target.kind == 'draft';
   bool get isSubagent => widget.target.kind == 'provider_subagent';
 
+  /// Saved history stays readable while the provider prepares, after it
+  /// failed to, or before any live snapshot arrived; sending and agent
+  /// controls wait for a live, ready agent.
+  bool get _executionBlocked =>
+      !isDraft && controller != null && !controller!.executionAuthorized;
+
+  /// A blocked send (Enter, Send, send-now) shows why it did not go out. It is
+  /// panel state, not the draft's [sendError], so draft notifications cannot
+  /// erase it; a ready agent or a started send clears it.
+  bool _notReadyNotice = false;
+
   /// pane-context host "sheet": the workspace sheet is for looking, so the
   /// agent shows without its composer (Open as tab brings it back).
   bool get isSheet => widget.target.data['paneHost'] == 'sheet';
@@ -588,25 +599,6 @@ class _AgentPanelState extends State<AgentPanel> {
   Future<void> _initialize() async {
     await drafts.initialize();
     if (!mounted) return;
-    final hydrationKey = draftKey;
-    try {
-      final server = widget.target.serverId;
-      final id = widget.target.id;
-      await drafts.hydrateLegacy(
-        hydrationKey,
-        jsonMap(PaseoScope.of(context).preferences['legacyDrafts']),
-        sourceKeys: isDraft
-            ? [
-                if (id != null) 'draft:$server:$id',
-                if (id == null || id == 'draft') ...['new-workspace', 'createModalDraft'],
-              ]
-            : ['agent:$server:$id'],
-        legacyForge: jsonMap(client.serverInfo['features'])['forgeAttachments'] == false,
-      );
-    } catch (e) {
-      _showFailure(e);
-    }
-    if (!mounted || hydrationKey != draftKey) return;
     if (jsonMap(draft['config']).isEmpty &&
         widget.target.data['config'] is Map) {
       drafts.update(draftKey, {
@@ -1126,8 +1118,9 @@ class _AgentPanelState extends State<AgentPanel> {
 
   Future<void> _submit({JsonMap? retry, String? overrideBehavior}) async {
     if (sending || uploading || isSubagent) return;
-    if (retry == null && jsonList(draft['unresolvedLegacyAttachments']).isNotEmpty) {
-      await _reviewLegacyAttachments();
+    if (_executionBlocked) {
+      // Nothing is sent or cleared: the draft stays for a ready agent.
+      setState(() => _notReadyNotice = true);
       return;
     }
     if (retry == null &&
@@ -1195,6 +1188,7 @@ class _AgentPanelState extends State<AgentPanel> {
       _activeSendId = stringValue(message['messageId']);
       error = null;
       sendError = null;
+      _notReadyNotice = false;
     });
     // Submitted content stays with its exact request, separate from later edits.
     drafts.update(draftKey, {
@@ -1477,6 +1471,10 @@ class _AgentPanelState extends State<AgentPanel> {
 
   Future<void> _queueNow(JsonMap message) async {
     if (sending) return;
+    if (_executionBlocked) {
+      setState(() => _notReadyNotice = true);
+      return;
+    }
     if (drafts.isDismissed(draftKey, stringValue(message['messageId']))) return;
     if (message['deliveryAttempted'] == true ||
         ['sending', 'unacknowledged', 'rejected'].contains(message['state'])) {
@@ -1582,6 +1580,7 @@ class _AgentPanelState extends State<AgentPanel> {
     drafts.update(draftKey, {'text': '', 'attachments': <JsonMap>[], 'images': <JsonMap>[]});
     setState(() {
       sendError = null;
+      _notReadyNotice = false;
       sending = true;
     });
     try {
@@ -2237,6 +2236,26 @@ class _AgentPanelState extends State<AgentPanel> {
                             retrying: status == TimelineSyncStatus.retrying,
                             onRetry: c.retrySync,
                           ),
+                        if (c != null &&
+                            !isSubagent &&
+                            !archived &&
+                            c.execution != AgentExecutionStatus.ready)
+                          AgentPreparationCallout(
+                            failed: c.execution == AgentExecutionStatus.failed,
+                            error: c.preparationError,
+                            retrying: c.preparationRetrying,
+                            onRetry: c.retryPreparation,
+                          ),
+                        if (c != null &&
+                            isSubagent &&
+                            (c.childRefreshing || c.childRefreshError != null))
+                          AgentPreparationCallout(
+                            subagent: true,
+                            failed: c.childRefreshError != null,
+                            error: c.childRefreshError,
+                            retrying: c.preparationRetrying,
+                            onRetry: c.retryChildRefresh,
+                          ),
                         if (!isSubagent && !isSheet)
                           if (archived)
                             ArchivedAgentCallout(
@@ -2815,6 +2834,18 @@ class _AgentPanelState extends State<AgentPanel> {
     ),
   );
 
+  /// Why the kept draft did not send: the agent has no live, ready runtime.
+  Widget _notReadyText(BuildContext context) => Semantics(
+    key: const ValueKey('composer-not-ready'),
+    liveRegion: true,
+    child: Text(
+      tr(context, 'composer.delivery.agentNotReady'),
+      style: Theme.of(context).textTheme.bodyMedium!.copyWith(
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
+      ),
+    ),
+  );
+
   /// composer/index.tsx ComposerContent: inputAreaContainer (16px sides and
   /// bottom, centred, contentMaxWidth) holding inputAreaContent (12px gaps):
   /// the queue track, the send error, then the message input wrapper — the
@@ -2829,9 +2860,7 @@ class _AgentPanelState extends State<AgentPanel> {
     final attachments = maps(draft['attachments']),
         images = maps(draft['images']);
     final pending = jsonMap(draft['pending']);
-    final colors = Theme.of(context).colorScheme;
     final palette = PaseoColors.of(context);
-    final small = Theme.of(context).textTheme.bodySmall!.copyWith(color: colors.onSurfaceVariant);
     final narrow = MediaQuery.sizeOf(context).width < 720;
     final top = narrow ? 8.0 : 16.0, bottom = narrow ? 8.0 : 12.0, side = narrow ? 12.0 : 16.0;
     const overhang = AttachmentPill.removableOverhang;
@@ -2955,19 +2984,7 @@ class _AgentPanelState extends State<AgentPanel> {
                     onRemove: _removeQueued,
                   ),
                 if (sendError != null) _sendErrorText(context),
-                // Client-only durability states the original never reaches.
-                if (jsonList(draft['unresolvedLegacyAttachments']).isNotEmpty)
-                  Row(
-                    spacing: 8,
-                    children: [
-                      Icon(LucideIcons.info300, size: 14, color: colors.onSurfaceVariant),
-                      Expanded(
-                        child: Text('Some original attachments need recovery before sending.',
-                            style: small),
-                      ),
-                      TextButton(onPressed: _reviewLegacyAttachments, child: const Text('Review')),
-                    ],
-                  ),
+                if (_notReadyNotice && _executionBlocked) _notReadyText(context),
                 if (pending.isNotEmpty) _deliveryPending(pending),
                 if (jsonMap(draft['failedMessage']).isNotEmpty)
                   _failedDelivery(jsonMap(draft['failedMessage'])),
@@ -3305,7 +3322,7 @@ class _AgentPanelState extends State<AgentPanel> {
     features: isDraft ? draftFeatures : maps(controller?.agent['features']),
     profiles: profiles,
     canSwitchProvider: isDraft,
-    disabled: !initialized || (isDraft && sending),
+    disabled: !initialized || (isDraft && sending) || _executionBlocked,
     onChanged: _saveConfig,
     onApplyProfile: _applyProfile,
     loadFeatures: isDraft ? _loadDraftFeatures : null,
@@ -3423,8 +3440,8 @@ class _AgentPanelState extends State<AgentPanel> {
     final queues = behavior == 'queue' && running;
     final disabled = !canPressLoading &&
         (loading || !initialized || client.status != ConnectionStatus.connected ||
-         jsonMap(draft['pending']).isNotEmpty || jsonMap(draft['failedMessage']).isNotEmpty ||
-         jsonList(draft['unresolvedLegacyAttachments']).isNotEmpty);
+         _executionBlocked ||
+         jsonMap(draft['pending']).isNotEmpty || jsonMap(draft['failedMessage']).isNotEmpty);
     return Padding(
       padding: const EdgeInsets.only(left: 4),
       child: ComposerSendButton(
@@ -3442,72 +3459,6 @@ class _AgentPanelState extends State<AgentPanel> {
         ),
         tooltip: tr(context, queues ? 'composer.input.queue' : 'composer.input.send'),
         onPressed: disabled ? null : canPressLoading ? _cancelAgent : () => _submit(),
-      ),
-    );
-  }
-
-  Future<void> _reviewLegacyAttachments() async {
-    final key = draftKey;
-    var recovering = false;
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Recover original attachments'),
-          content: SizedBox(
-            width: 600,
-            height: 360,
-            child: AnimatedBuilder(
-              animation: drafts,
-              builder: (context, _) => ListView(
-                children: [
-                  const Text('The original draft and attachment references are retained. Local files can be retried. Browser-store images or excluded plugin resources can be exported from the original app and attached manually. No source files are deleted.'),
-                  const SizedBox(height: 12),
-                  for (final value in jsonList(drafts.draft(key)['unresolvedLegacyAttachments']))
-                    ExpansionTile(
-                      title: Text(stringValue(jsonMap(value)['reason'])),
-                      children: [JsonDetails(value: jsonMap(value)['source'])],
-                    ),
-                ],
-              ),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: recovering ? null : () async {
-                setDialogState(() => recovering = true);
-                try {
-                  await drafts.recoverLegacyAttachments(
-                    key,
-                    legacyForge: jsonMap(client.serverInfo['features'])['forgeAttachments'] == false,
-                  );
-                } catch (e) {
-                  _showFailure(e);
-                } finally {
-                  if (dialogContext.mounted) setDialogState(() => recovering = false);
-                }
-              },
-              child: Text(recovering ? 'Recovering…' : 'Retry local files'),
-            ),
-            TextButton(
-              onPressed: recovering ? null : () async {
-                if (await confirmAction(
-                  context,
-                  title: 'Remove unresolved attachments from this draft?',
-                  message: 'Only the unresolved references in this composer will be removed. The original imported draft and source files remain preserved.',
-                )) {
-                  drafts.update(key, {'unresolvedLegacyAttachments': []});
-                  if (dialogContext.mounted) Navigator.pop(dialogContext);
-                }
-              },
-              child: const Text('Remove from this draft'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Close'),
-            ),
-          ],
-        ),
       ),
     );
   }

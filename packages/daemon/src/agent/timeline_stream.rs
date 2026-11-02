@@ -135,6 +135,15 @@ impl StreamCoalescer {
     }
 }
 
+/// Client-facing descriptor. `source` is the provider's opaque locator for the
+/// child's native body; it stays inside the daemon.
+pub fn public_subagent(mut descriptor: Value) -> Value {
+    if let Some(fields) = descriptor.as_object_mut() {
+        fields.remove("source");
+    }
+    descriptor
+}
+
 /// Descriptors of loaded parents and hydrated child timelines. Persisted
 /// (cataloged) children hydrate lazily and are evicted under bounded residency;
 /// memory-only parents keep every timeline, as they have no other copy.
@@ -198,6 +207,7 @@ impl SubagentStore {
             "cwd",
             "subtitle",
             "parentSubagentId",
+            "source",
         ] {
             descriptor[field] = event
                 .get(field)
@@ -236,45 +246,6 @@ impl SubagentStore {
             .get(&(parent_id.into(), id.into()))
             .with_context(|| format!("Unknown agent '{parent_id}\0{id}'"))?
             .fetch(options))
-    }
-    pub fn checkpoint(&self, parent_id: &str) -> Value {
-        let timelines=self.timelines.iter().filter(|((parent,_),_)|parent==parent_id).map(|((_,id),timeline)|json!({"id":id,"epoch":timeline.epoch(),"rows":timeline.rows(),"nextSeq":timeline.next_seq()})).collect::<Vec<_>>();
-        json!({"version":1,"parentAgentId":parent_id,"descriptors":self.list(parent_id),"timelines":timelines})
-    }
-    pub fn restore_parent(&mut self, checkpoint: &Value) -> Result<()> {
-        if checkpoint["version"] != 1 {
-            bail!("Invalid subagent checkpoint version");
-        }
-        let parent = checkpoint["parentAgentId"]
-            .as_str()
-            .context("Missing subagent checkpoint parent")?;
-        let descriptors = checkpoint["descriptors"]
-            .as_array()
-            .context("Missing subagent descriptors")?;
-        let timelines = checkpoint["timelines"]
-            .as_array()
-            .context("Missing subagent timelines")?;
-        if descriptors.iter().any(|descriptor| {
-            descriptor["parentAgentId"] != parent
-                || descriptor["id"].as_str().is_none()
-                || descriptor["provider"].as_str().is_none()
-        }) {
-            bail!("Subagent checkpoint descriptor identity mismatch");
-        }
-        let mut restored = Vec::new();
-        for timeline in timelines {
-            let id = timeline["id"]
-                .as_str()
-                .context("Missing subagent timeline id")?;
-            restored.push((
-                (parent.to_owned(), id.to_owned()),
-                Timeline::seed(timeline)?,
-            ));
-        }
-        self.delete_parent(parent);
-        self.descriptors.extend(descriptors.iter().cloned());
-        self.timelines.extend(restored);
-        Ok(())
     }
     pub fn delete_parent(&mut self, parent_id: &str) -> Vec<Value> {
         let ids: Vec<String> = self

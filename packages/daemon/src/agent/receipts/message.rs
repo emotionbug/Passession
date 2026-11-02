@@ -38,11 +38,7 @@ struct Record {
     version: u32,
     fingerprint: Option<String>,
     agent_id: String,
-    #[serde(default)]
-    message_id: Option<String>,
-    /// Rollback compatibility: older daemons replay "completed" without
-    /// dispatch and report anything else as an unknown outcome.
-    state: String,
+    message_id: String,
     phase: String,
     revision: u64,
     #[serde(default)]
@@ -65,8 +61,7 @@ impl Record {
             version: 2,
             fingerprint,
             agent_id: agent_id.to_owned(),
-            message_id: Some(message_id.to_owned()),
-            state: "pending".to_owned(),
+            message_id: message_id.to_owned(),
             phase: "missing".to_owned(),
             revision: 0,
             dismissed: false,
@@ -79,46 +74,13 @@ impl Record {
     }
 }
 
-/// A legacy receipt has only fingerprint, agentId and pending/completed state.
-/// Pending carries no delivery evidence, so it is an unknown outcome; completed
-/// meant the host dispatch returned, without separate native acknowledgement.
 fn parse(bytes: &[u8], path: &std::path::Path) -> Result<Record> {
-    let value: Value = serde_json::from_slice(bytes)?;
-    if value.get("version").is_some() {
-        let record: Record = serde_json::from_value(value)
-            .with_context(|| format!("Invalid message receipt at {}", path.display()))?;
-        if !PHASES.contains(&record.phase.as_str()) {
-            bail!("Invalid message receipt phase at {}", path.display());
-        }
-        return Ok(record);
+    let record: Record = serde_json::from_slice(bytes)
+        .with_context(|| format!("Invalid message receipt at {}", path.display()))?;
+    if !PHASES.contains(&record.phase.as_str()) {
+        bail!("Invalid message receipt phase at {}", path.display());
     }
-    let (Some(fingerprint), Some(agent_id), Some(state)) = (
-        value["fingerprint"].as_str(),
-        value["agentId"].as_str(),
-        value["state"].as_str(),
-    ) else {
-        bail!("Invalid message receipt at {}", path.display());
-    };
-    let completed = match state {
-        "completed" => true,
-        "pending" => false,
-        _ => bail!("Invalid message receipt at {}", path.display()),
-    };
-    Ok(Record {
-        version: 2,
-        fingerprint: Some(fingerprint.to_owned()),
-        agent_id: agent_id.to_owned(),
-        message_id: None,
-        state: state.to_owned(),
-        phase: if completed { "submitted" } else { "outcome_unknown" }.to_owned(),
-        revision: 1,
-        dismissed: false,
-        result: Value::Null,
-        error: (!completed).then(|| OUTCOME_UNKNOWN.to_owned()),
-        updated_at: None,
-        correlation: json!({"legacy":true}),
-        ack_pending: false,
-    })
+    Ok(record)
 }
 
 pub const PHASES: [&str; 9] = [
@@ -364,9 +326,7 @@ impl MessageReceipts {
             None => None,
         };
         if let Some(record) = &record {
-            if record.agent_id != agent_id
-                || record.message_id.as_deref().is_some_and(|id| id != message_id)
-            {
+            if record.agent_id != agent_id || record.message_id != message_id {
                 bail!("Message receipt identity mismatch");
             }
         }
@@ -644,15 +604,6 @@ impl Inner {
         record.updated_at = Some(
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         );
-        record.state = if matches!(phase, "submitted" | "accepted") {
-            "completed"
-        } else {
-            "pending"
-        }
-        .to_owned();
-        if record.message_id.is_none() {
-            record.message_id = Some(message_id.to_owned());
-        }
         atomic_json(&self.path(key), &serde_json::to_value(&*record)?).await?;
         let receipt = project(&record.agent_id, message_id, Some(record));
         let _ = self

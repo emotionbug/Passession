@@ -168,22 +168,12 @@ impl AgentManager {
         Ok(items)
     }
     pub async fn timeline_search(&self, id: &str, options: &Value) -> Result<Value> {
-        let cell = self.timeline_cell(id).await?;
-        let result = cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?
-            .search(options);
-        result
+        let options = options.clone();
+        self.read_projection(id, move |timeline| timeline.search(&options))
+            .await?
     }
     pub async fn timeline_prompts(&self, id: &str) -> Result<Value> {
-        let cell = self.timeline_cell(id).await?;
-        let result = cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?
-            .prompts();
-        Ok(result)
+        self.read_projection(id, Timeline::prompts).await
     }
     pub async fn append_timeline(&self, id: &str, item: Value) -> Result<Value> {
         let cell = self.ensure_loaded(id).await?;
@@ -248,8 +238,8 @@ impl AgentManager {
             &json!({"rows":timeline.rows(),"agentTitle":snapshot["title"],"cwd":snapshot["cwd"],"boundaryMessageId":options["boundaryMessageId"],"cursorBoundary":options.get("boundaryCursor").filter(|v|!v.is_null()).map(|cursor|json!({"cursor":cursor,"timelineEpoch":timeline.epoch()}))}),
         )
     }
-    /// Validates a public parent (resuming a non-archived one, as listing always
-    /// did) and returns the persisted subagent storage root.
+    /// Validates a public parent and returns the persisted subagent storage
+    /// root. Child descriptors and bodies are read without starting the parent.
     async fn subagent_root(&self, id: &str) -> Result<PathBuf> {
         let snapshot = self
             .agent_snapshot(id)
@@ -257,9 +247,6 @@ impl AgentManager {
             .ok_or_else(|| anyhow!("Unknown parent agent"))?;
         if snapshot["internal"] == true {
             bail!("Unknown parent agent");
-        }
-        if !snapshot["archivedAt"].is_string() {
-            self.ensure_loaded(id).await?;
         }
         Ok(self.app()?.home.join("agent-subagents"))
     }
@@ -269,14 +256,22 @@ impl AgentManager {
         let root = self.subagent_root(id).await?;
         let store = self.subagent_store.clone();
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || {
+        let listed: Vec<Value> = tokio::task::spawn_blocking(move || {
             let (subagents, unavailable) = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
                 .list_persisted(&root, &id)?;
             match unavailable.into_iter().next() {
-                Some(error) => Err(error.into()),
+                Some(error) => Err(anyhow::Error::from(error)),
                 None => Ok(subagents),
             }
-        }).await?
+        }).await??;
+        Ok(listed
+            .into_iter()
+            .map(|descriptor| {
+                let mut descriptor = timeline::public_subagent(descriptor);
+                self.overlay_subagent_refresh(&mut descriptor);
+                descriptor
+            })
+            .collect())
     }
     /// Pages one child without listing (or hydrating) its siblings.
     pub async fn subagent_timeline(
@@ -286,18 +281,7 @@ impl AgentManager {
         options: &Value,
     ) -> Result<Value> {
         let root = self.subagent_root(parent).await?;
-        let store = self.subagent_store.clone();
-        let parent = parent.to_owned();
-        let id = id.to_owned();
-        let options = options.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut store = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?;
-            let mut page = store.fetch_persisted(&root, &parent, &id, &options)?;
-            if let Some(descriptor) = store.get(&parent, &id) {
-                page["provider"] = descriptor["provider"].clone();
-            }
-            Ok(page)
-        }).await?
+        self.read_subagent(&root, parent, id, options).await
     }
     /// Descriptors of every public parent's subagents, plus each parent catalog
     /// or child descriptor that could not be read. A non-empty second list
@@ -316,8 +300,9 @@ impl AgentManager {
         let store = self.subagent_store.clone();
         let root = self.app()?.home.join("agent-subagents");
         tokio::task::spawn_blocking(move || {
-            Ok(store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
-                .list_persisted_parents(&root, public.iter().map(String::as_str)))
+            let (subagents, unavailable) = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
+                .list_persisted_parents(&root, public.iter().map(String::as_str));
+            Ok((subagents.into_iter().map(timeline::public_subagent).collect(), unavailable))
         }).await?
     }
     pub async fn workspace_last_user_message_times(&self) -> Result<BTreeMap<String, String>> {

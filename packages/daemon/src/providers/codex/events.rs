@@ -736,7 +736,14 @@ impl CodexSession {
         source_id: Option<&str>,
         delta: bool,
     ) -> Result<Vec<Value>> {
-        let mut state = self.state.lock().unwrap();
+        Self::aggregate(&mut self.state.lock().unwrap(), events, source_id, delta)
+    }
+    pub(super) fn aggregate(
+        state: &mut State,
+        events: &[Value],
+        source_id: Option<&str>,
+        delta: bool,
+    ) -> Result<Vec<Value>> {
         let mut changed = Vec::new();
         for event in events {
             if event["type"] != "provider_subagent" {
@@ -756,13 +763,19 @@ impl CodexSession {
                     .or(source_id)
                     .unwrap_or_else(|| item["type"].as_str().unwrap_or("item"))
                     .to_owned();
+                let items = state.child_items.entry(id.to_owned()).or_default();
+                // A recorded item from a previous session continues when the same
+                // native item reports again, with deltas or its full text.
+                let recorded = items
+                    .iter()
+                    .any(|(existing, item)| existing == &key && item["recorded"] == true);
                 if delta
+                    || recorded
                     || !matches!(
                         item["type"].as_str(),
                         Some("assistant_message" | "reasoning")
                     )
                 {
-                    let items = state.child_items.entry(id.to_owned()).or_default();
                     upsert_child_item(items, key, item, delta);
                 }
             } else {
@@ -797,28 +810,50 @@ impl CodexSession {
                     .map(|(id, _)| id.clone())
                     .collect();
                 siblings.sort();
-                let child_timeline: Vec<Value> = siblings
-                    .iter()
-                    .flat_map(|id| {
-                        state
-                            .child_items
-                            .get(id)
-                            .into_iter()
-                            .flatten()
-                            .map(|(_, item)| item.clone())
-                    })
-                    .collect();
-                let entries = crate::activity::curate(
-                    &child_timeline,
-                    &json!({"labelAssistantMessages":true}),
-                )?;
-                tool["detail"]["log"] = json!(
-                    entries
-                        .iter()
-                        .filter_map(|entry| entry["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
+                // Each native item renders its own lines; the card records which
+                // item produced which lines so a resumed session continues it.
+                let prefix = tool["callId"]
+                    .as_str()
+                    .and_then(|call| state.card_logs.get(call))
+                    .filter(|log| !log.is_empty());
+                let mut lines = Vec::new();
+                let mut identities = Vec::new();
+                if let Some(prefix) = prefix {
+                    identities.push(json!({"kind":"recorded","lines":prefix.split('\n').count()}));
+                    lines.push(prefix.clone());
+                }
+                for child in &siblings {
+                    for (key, item) in state.child_items.get(child).into_iter().flatten() {
+                        let text = if item["type"] == "recorded" {
+                            item["text"].as_str().unwrap_or_default().to_owned()
+                        } else {
+                            crate::activity::curate(
+                                std::slice::from_ref(item),
+                                &json!({"labelAssistantMessages":true}),
+                            )?
+                            .iter()
+                            .filter_map(|entry| entry["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                        };
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let mut identity = json!({"child":child,"key":key,"kind":item["type"],
+                            "lines":text.split('\n').count()});
+                        if matches!(item["type"].as_str(), Some("assistant_message" | "reasoning")) {
+                            let raw = item["text"].as_str().unwrap_or_default();
+                            let trailing = &raw[raw.trim_end().len()..];
+                            if !trailing.is_empty() {
+                                identity["trailing"] = json!(trailing);
+                            }
+                        }
+                        identities.push(identity);
+                        lines.push(text);
+                    }
+                }
+                tool["detail"]["log"] = json!(lines.join("\n"));
+                tool["metadata"]["subagentLog"] = json!(identities);
                 state.child_tools.insert(id.clone(), tool.clone());
                 let parent = descriptor["parentSubagentId"].as_str().map(str::to_owned);
                 if let Some(parent) = parent {

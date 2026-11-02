@@ -18,15 +18,29 @@ pub struct ReplaySubagent {
     pub agent_id: String,
     pub meta: Option<Value>,
     pub entries: Vec<Value>,
+    /// The sidechain file holding this agent's body, read only when the agent is
+    /// opened. None: the body was inline in the transcript already read.
+    pub file: Option<PathBuf>,
 }
 
 #[derive(Default)]
 pub struct ReplayHistory {
     pub parent_entries: Vec<Value>,
     pub subagents: Vec<ReplaySubagent>,
+    /// Workflow run summaries; their entry files are read only when opened.
     pub workflows: Vec<Value>,
-    pub workflow_entries_by_run_id: BTreeMap<String, Vec<Value>>,
     pub complete: bool,
+}
+
+/// Sidechain files and agent metadata beside one transcript, without their bodies.
+#[derive(Default)]
+struct SidechainIndex {
+    /// `agent-<agentId>.jsonl` files by agent ID.
+    files: Vec<(String, PathBuf)>,
+    /// Sidechain files whose name does not identify their agent.
+    unnamed: Vec<PathBuf>,
+    workflow_files: BTreeMap<String, Vec<PathBuf>>,
+    meta: HashMap<String, Value>,
 }
 
 pub fn config_dir(env: &BTreeMap<String, String>) -> Result<PathBuf> {
@@ -179,12 +193,9 @@ fn filtered_fields(value: &Value, strings: &[&str], numbers: &[&str]) -> Option<
     Some(Value::Object(result))
 }
 
-pub async fn read_history(path: &Path) -> Result<ReplayHistory> {
-    let session_directory = path.with_extension("");
-    let sidechain_directory = session_directory.join("subagents");
-    let mut sidechain_files = vec![path.to_path_buf()];
-    let mut workflow_files: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    let mut meta = HashMap::new();
+async fn sidechain_index(path: &Path) -> Result<SidechainIndex> {
+    let sidechain_directory = path.with_extension("").join("subagents");
+    let mut index = SidechainIndex::default();
     let mut directories = vec![sidechain_directory.clone()];
     while let Some(directory) = directories.pop() {
         let entries = match directory_entries(&directory).await {
@@ -209,12 +220,19 @@ pub async fn read_history(path: &Path) -> Result<ReplayHistory> {
                     .components()
                     .collect();
                 if parts.len() >= 3 && parts[0].as_os_str() == "workflows" {
-                    workflow_files
+                    index
+                        .workflow_files
                         .entry(parts[1].as_os_str().to_string_lossy().into_owned())
                         .or_default()
                         .push(file);
+                } else if let Some(agent_id) = name
+                    .strip_prefix("agent-")
+                    .and_then(|name| name.strip_suffix(".jsonl"))
+                    .filter(|id| !id.is_empty())
+                {
+                    index.files.push((agent_id.to_owned(), file));
                 } else {
-                    sidechain_files.push(file);
+                    index.unnamed.push(file);
                 }
             } else if let Some(agent_id) = name
                 .strip_prefix("agent-")
@@ -229,60 +247,180 @@ pub async fn read_history(path: &Path) -> Result<ReplayHistory> {
                     )
                 }) {
                     if value.as_object().is_some_and(|object| !object.is_empty()) {
-                        meta.insert(agent_id.to_owned(), value);
+                        index.meta.insert(agent_id.to_owned(), value);
                     }
                 }
             }
         }
     }
-    let mut history = ReplayHistory::default();
-    let mut indices: HashMap<String, usize> = HashMap::new();
-    for file in sidechain_files {
-        let complete = visit_records(&file, |entry| {
-            if entry.get("isSidechain") != Some(&Value::Bool(true)) {
-                if file == path {
-                    history.parent_entries.push(entry);
-                }
-                return;
+    Ok(index)
+}
+
+/// Groups `isSidechain` records of `file` by agent, in first-seen order.
+async fn visit_sidechains(
+    file: &Path,
+    subagents: &mut Vec<ReplaySubagent>,
+    meta: &mut HashMap<String, Value>,
+    mut parent: Option<&mut Vec<Value>>,
+) -> Result<bool> {
+    visit_records(file, |entry| {
+        if entry.get("isSidechain") != Some(&Value::Bool(true)) {
+            if let Some(parent) = parent.as_mut() {
+                parent.push(entry);
             }
-            let Some(agent_id) = entry.get("agentId").and_then(Value::as_str) else {
-                return;
-            };
-            let index = *indices.entry(agent_id.to_owned()).or_insert_with(|| {
-                let index = history.subagents.len();
-                history.subagents.push(ReplaySubagent {
+            return;
+        }
+        let Some(agent_id) = entry.get("agentId").and_then(Value::as_str) else {
+            return;
+        };
+        let index = match subagents.iter().position(|child| child.agent_id == agent_id) {
+            Some(index) => index,
+            None => {
+                subagents.push(ReplaySubagent {
                     agent_id: agent_id.to_owned(),
                     meta: meta.remove(agent_id),
                     entries: Vec::new(),
+                    file: None,
                 });
-                index
+                subagents.len() - 1
+            }
+        };
+        subagents[index].entries.push(entry);
+    })
+    .await
+}
+
+/// The parent transcript with sidechains already inline in it. File-backed agents
+/// are announced from their file name and metadata; their bodies stay unread.
+pub async fn read_history(path: &Path) -> Result<ReplayHistory> {
+    let mut index = sidechain_index(path).await?;
+    let mut history = ReplayHistory::default();
+    history.complete = visit_sidechains(
+        path,
+        &mut history.subagents,
+        &mut index.meta,
+        Some(&mut history.parent_entries),
+    )
+    .await?;
+    for file in &index.unnamed {
+        visit_sidechains(file, &mut history.subagents, &mut index.meta, None).await?;
+    }
+    for (agent_id, file) in index.files {
+        if history.subagents.iter().any(|child| child.agent_id == agent_id) {
+            // A body split between the transcript and its own file stays whole.
+            visit_sidechains(&file, &mut history.subagents, &mut index.meta, None).await?;
+        } else {
+            history.subagents.push(ReplaySubagent {
+                meta: index.meta.remove(&agent_id),
+                agent_id,
+                entries: Vec::new(),
+                file: Some(file),
             });
-            history.subagents[index].entries.push(entry);
+        }
+    }
+    history.workflows = read_workflows(path).await?;
+    Ok(history)
+}
+
+/// One opened agent's sidechain transcript, and every other file-backed agent's
+/// descriptor so the children it spawned can be linked without reading them.
+pub async fn read_subagent(
+    path: &Path,
+    agent_id: &str,
+) -> Result<(ReplaySubagent, Vec<ReplaySubagent>, bool)> {
+    let mut index = sidechain_index(path).await?;
+    let file = index
+        .files
+        .iter()
+        .find(|(id, _)| id == agent_id)
+        .map(|(_, file)| file.clone())
+        .ok_or_else(|| anyhow!("Claude subagent {agent_id} has no sidechain transcript"))?;
+    let mut entries = Vec::new();
+    let complete = visit_records(&file, |entry| {
+        if entry.get("isSidechain") == Some(&Value::Bool(true))
+            && entry.get("agentId").and_then(Value::as_str) == Some(agent_id)
+        {
+            entries.push(entry);
+        }
+    })
+    .await?;
+    let child = ReplaySubagent {
+        agent_id: agent_id.to_owned(),
+        meta: index.meta.remove(agent_id),
+        entries,
+        file: Some(file),
+    };
+    let others = index
+        .files
+        .into_iter()
+        .filter(|(id, _)| id != agent_id)
+        .map(|(id, file)| ReplaySubagent {
+            meta: index.meta.remove(&id),
+            agent_id: id,
+            entries: Vec::new(),
+            file: Some(file),
+        })
+        .collect();
+    Ok((child, others, complete))
+}
+
+/// Keeps the assistant records of messages the transcript records as finished:
+/// some record of the message carries the API's `stop_reason`, which is set only
+/// once the message stopped. Records of any other assistant message are dropped,
+/// since their text may still be growing. Returns the finished message IDs and
+/// whether anything was dropped.
+pub fn keep_finished_messages(entries: &mut Vec<Value>) -> (HashSet<String>, bool) {
+    let finished: HashSet<String> = entries
+        .iter()
+        .filter(|entry| entry["type"] == "assistant" && !entry["message"]["stop_reason"].is_null())
+        .filter_map(|entry| entry["message"]["id"].as_str().map(str::to_owned))
+        .collect();
+    let before = entries.len();
+    entries.retain(|entry| {
+        entry["type"] != "assistant"
+            || entry["message"]["id"].as_str().is_some_and(|id| finished.contains(id))
+    });
+    let dropped = entries.len() != before;
+    (finished, dropped)
+}
+
+/// One opened workflow run: its summary, its entries in timestamp order, and
+/// whether every entry file was read without a torn record.
+pub async fn read_workflow(path: &Path, run_id: &str) -> Result<(Value, Vec<Value>, bool)> {
+    let workflow = read_workflows(path)
+        .await?
+        .into_iter()
+        .find(|workflow| workflow["runId"] == run_id)
+        .ok_or_else(|| anyhow!("Claude workflow {run_id} has no run record"))?;
+    let mut entries = Vec::new();
+    let mut complete = true;
+    let files = sidechain_index(path)
+        .await?
+        .workflow_files
+        .remove(run_id)
+        .unwrap_or_default();
+    for file in files {
+        complete &= visit_records(&file, |entry| {
+            if entry.get("type").and_then(Value::as_str) != Some("user")
+                || has_tool_result(&entry)
+            {
+                entries.push(entry);
+            }
         })
         .await?;
-        if file == path { history.complete = complete; }
     }
-    for (run_id, files) in workflow_files {
-        let mut entries = Vec::new();
-        for file in files {
-            visit_records(&file, |entry| {
-                if entry.get("type").and_then(Value::as_str) != Some("user")
-                    || has_tool_result(&entry)
-                {
-                    entries.push(entry);
-                }
-            })
-            .await?;
-        }
-        entries.sort_by_key(|entry| (timestamp(entry).is_none(), timestamp(entry)));
-        history.workflow_entries_by_run_id.insert(run_id, entries);
-    }
-    let workflow_directory = session_directory.join("workflows");
+    entries.sort_by_key(|entry| (timestamp(entry).is_none(), timestamp(entry)));
+    Ok((workflow, entries, complete))
+}
+
+async fn read_workflows(path: &Path) -> Result<Vec<Value>> {
+    let workflow_directory = path.with_extension("").join("workflows");
     let entries = match directory_entries(&workflow_directory).await {
         Ok(entries) => entries,
         Err(error) if missing(&error) => Vec::new(),
         Err(error) => return Err(error.into()),
     };
+    let mut workflows = Vec::new();
     for entry in entries {
         if !entry.file_type().await?.is_file()
             || entry.path().extension().and_then(|s| s.to_str()) != Some("json")
@@ -308,11 +446,11 @@ pub async fn read_history(path: &Path) -> Result<ReplayHistory> {
                 if let Some(result) = raw.get("result") {
                     workflow["result"] = result.clone();
                 }
-                history.workflows.push(workflow);
+                workflows.push(workflow);
             }
         }
     }
-    Ok(history)
+    Ok(workflows)
 }
 
 fn timestamp(value: &Value) -> Option<i64> {
@@ -960,4 +1098,235 @@ pub async fn fork_session(
     }
     file.flush().await?;
     Ok(fork_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::projection;
+    use super::*;
+
+    fn lines(entries: &[Value]) -> String {
+        entries.iter().map(|entry| format!("{entry}\n")).collect()
+    }
+    fn task(id: &str, agent: &str, description: &str) -> Value {
+        json!({"type":"tool_use","id":id,"name":"Task",
+            "input":{"subagent_type":agent,"description":description,"prompt":description}})
+    }
+
+    /// A parent that spawned file-backed agents A (finished) and B (unread: its
+    /// file is a directory, so any read fails); A spawned C.
+    async fn family() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        fs::write(&path, lines(&[
+            json!({"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"go"}}),
+            json!({"type":"assistant","uuid":"a1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant",
+                "content":[task("toolu_1","reviewer","Review code"),task("toolu_2","scout","Scout")],"stop_reason":"tool_use"}}),
+            json!({"type":"user","uuid":"u2","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user",
+                "content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"done"}]}}),
+        ])).await.unwrap();
+        let sidechains = directory.path().join("session").join("subagents");
+        fs::create_dir_all(&sidechains).await.unwrap();
+        fs::write(sidechains.join("agent-B.jsonl"), lines(&[
+            json!({"type":"assistant","isSidechain":true,"agentId":"B","uuid":"s1","timestamp":"2026-01-01T00:00:03Z",
+                "message":{"role":"assistant","content":[{"type":"text","text":"sibling text"}],"stop_reason":"end_turn"}}),
+        ])).await.unwrap();
+        for (agent, meta) in [
+            ("A", json!({"agentType":"reviewer","toolUseId":"toolu_1"})),
+            ("B", json!({"agentType":"scout","toolUseId":"toolu_2"})),
+            ("C", json!({"agentType":"digger","toolUseId":"toolu_3","spawnDepth":2})),
+        ] {
+            fs::write(sidechains.join(format!("agent-{agent}.meta.json")), meta.to_string()).await.unwrap();
+        }
+        fs::write(sidechains.join("agent-A.jsonl"), lines(&[
+            json!({"type":"user","isSidechain":true,"agentId":"A","uuid":"c1","timestamp":"2026-01-01T00:00:03Z",
+                "message":{"role":"user","content":"Review code"}}),
+            json!({"type":"assistant","isSidechain":true,"agentId":"A","uuid":"c2","timestamp":"2026-01-01T00:00:04Z",
+                "message":{"role":"assistant","content":[{"type":"text","text":"child text"},task("toolu_3","digger","Dig")],
+                    "stop_reason":"end_turn"}}),
+        ])).await.unwrap();
+        fs::write(sidechains.join("agent-C.jsonl"), lines(&[
+            json!({"type":"assistant","isSidechain":true,"agentId":"C","uuid":"g1","timestamp":"2026-01-01T00:00:05Z",
+                "message":{"role":"assistant","content":[{"type":"text","text":"grandchild text"}],"stop_reason":"end_turn"}}),
+        ])).await.unwrap();
+        (directory, path)
+    }
+
+    fn children(events: &[Value]) -> Vec<&Value> {
+        events.iter().filter(|e| e["type"] == "provider_subagent").map(|e| &e["event"]).collect()
+    }
+
+    #[tokio::test]
+    async fn parent_history_announces_file_backed_agents_without_reading_them() {
+        let (_directory, path) = family().await;
+        let history = read_history(&path).await.unwrap();
+        assert!(history.subagents.iter().all(|child| child.entries.is_empty() && child.file.is_some()));
+        let events = projection::project_history("claude", &history);
+        let announced = children(&events);
+        assert!(announced.iter().all(|e| e["type"] == "upsert"), "{announced:?}");
+        let ids: Vec<_> = announced.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["toolu_1", "toolu_1", "toolu_2"], "declare A, A finished, declare B");
+        assert_eq!(announced[0]["source"]["agentId"], "A");
+        assert_eq!(announced[0]["title"], "reviewer");
+        assert_eq!(announced[0]["description"], "Review code");
+        assert_eq!(announced[0]["timestamp"], "2026-01-01T00:00:01.000Z", "spawn time, not read from the body");
+        assert_eq!(*announced[1], json!({"type":"upsert","id":"toolu_1","status":"completed"}));
+        assert_eq!(announced[2]["source"]["agentId"], "B");
+        // B's parent holds no result for it and its metadata has no status, so
+        // nothing short of its body is authoritative: the recorded status stays.
+        assert!(announced[2].get("status").is_none(), "{:?}", announced[2]);
+        assert!(!events.iter().any(|e| e.to_string().contains("sibling text")));
+        assert!(
+            events.iter().any(|e| e["type"] == "timeline" && e["item"]["callId"] == "toolu_1"),
+            "the parent's own Task card still replays"
+        );
+    }
+
+    #[tokio::test]
+    async fn opened_agent_replays_only_its_body_and_announces_its_children() {
+        let (_directory, path) = family().await;
+        let events = projection::project_history("claude", &read_history(&path).await.unwrap());
+        let source = children(&events)
+            .into_iter()
+            .find(|e| e["id"] == "toolu_1" && e["source"].is_object())
+            .unwrap()["source"]
+            .clone();
+        let (body, others, complete) = read_subagent(&path, "A").await.unwrap();
+        assert!(complete);
+        let opened = projection::project_subagent("claude", "toolu_1", &source, &body, &others, complete);
+        assert!(opened.iter().all(|e| e["type"] == "provider_subagent"), "no parent row is replayed");
+        let rows: Vec<_> = children(&opened).into_iter().filter(|e| e["type"] == "timeline").collect();
+        assert!(rows.iter().all(|row| row["id"] == "toolu_1" && row["historyComplete"] == true), "{rows:?}");
+        let texts: Vec<_> = rows
+            .iter()
+            .filter(|row| row["item"]["type"] == "assistant_message")
+            .map(|row| row["item"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["child text"], "exactly the opened agent's reply");
+        let tools: Vec<_> = rows
+            .iter()
+            .filter(|row| row["item"]["type"] == "tool_call")
+            .map(|row| row["item"]["callId"].as_str().unwrap())
+            .collect();
+        assert_eq!(tools, ["toolu_3"], "its own spawn card, nothing of the parent's");
+        assert!(!opened.iter().any(|e| ["go", "grandchild text", "sibling text"]
+            .iter()
+            .any(|text| e["event"]["item"]["text"] == *text)));
+        assert!(
+            children(&opened).iter().any(|e| e["type"] == "upsert" && e["id"] == "toolu_1" && e["status"] == "completed"),
+            "the body's finished turn refreshes the status"
+        );
+        let nested = children(&opened)
+            .into_iter()
+            .find(|e| e["type"] == "upsert" && e["id"] == "toolu_3" && e["source"].is_object())
+            .expect("the opened agent's own child is announced");
+        assert_eq!(nested["parentSubagentId"], "toolu_1");
+        assert_eq!(nested["source"]["agentId"], "C");
+        assert!(!children(&opened).iter().any(|e| e["id"] == "toolu_2"), "siblings stay untouched");
+        assert!(!opened.iter().chain(&events).any(|e| e.to_string().contains("sibling text")));
+        // Opening B, whose parent recorded no outcome, takes its status from its body.
+        let b = children(&events).into_iter().find(|e| e["id"] == "toolu_2").unwrap()["source"].clone();
+        let (body, others, complete) = read_subagent(&path, "B").await.unwrap();
+        let opened = projection::project_subagent("claude", "toolu_2", &b, &body, &others, complete);
+        let texts: Vec<_> = children(&opened)
+            .into_iter()
+            .filter(|e| e["type"] == "timeline" && e["item"]["type"] == "assistant_message")
+            .map(|e| e["item"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["sibling text"]);
+        assert!(children(&opened).iter().any(|e| e["id"] == "toolu_2" && e["status"] == "completed"));
+        fs::remove_file(path.with_extension("").join("subagents").join("agent-A.jsonl")).await.unwrap();
+        let missing = read_subagent(&path, "A").await;
+        assert!(missing.is_err(), "a missing body is an error, never an empty replay");
+        assert!(read_subagent(&path, "unknown").await.is_err());
+    }
+
+    #[test]
+    fn only_messages_with_a_stop_reason_are_final() {
+        let record = |uuid: &str, id: &str, stop: Value| {
+            json!({"type":"assistant","uuid":uuid,"message":{"id":id,"role":"assistant",
+                "content":[{"type":"text","text":uuid}],"stop_reason":stop}})
+        };
+        let mut entries = vec![
+            json!({"type":"user","uuid":"u1","message":{"role":"user","content":"go"}}),
+            record("r1", "m1", Value::Null),
+            record("r2", "m1", json!("tool_use")),
+            // Not last, yet nothing records it as stopped: it is not final.
+            record("r3", "m2", Value::Null),
+            json!({"type":"user","uuid":"u2","message":{"role":"user","content":"more"}}),
+            record("r4", "m3", Value::Null),
+        ];
+        let (finished, dropped) = keep_finished_messages(&mut entries);
+        assert!(dropped);
+        assert_eq!(finished, HashSet::from(["m1".to_owned()]));
+        let kept: Vec<_> = entries.iter().map(|e| e["uuid"].as_str().unwrap()).collect();
+        assert_eq!(kept, ["u1", "r1", "r2", "u2"]);
+    }
+
+    #[tokio::test]
+    async fn held_sidechain_updates_survive_an_applied_snapshot_exactly_once() {
+        use crate::providers::api::{
+            ChildRowHold, EventSink, HistoryCoverage, ReplayOutcome, SubagentHistoryRequest,
+            SubagentReplay, subagent_row,
+        };
+        let row = |item: Value| {
+            json!({"type":"provider_subagent","provider":"claude","event":{"type":"timeline","id":"toolu_1","item":item}})
+        };
+        let pending = json!({"type":"tool_call","callId":"t1","name":"Bash","status":"running","detail":{"type":"shell","command":"ls"}});
+        let completed = json!({"type":"tool_call","callId":"t1","name":"Bash","status":"completed","detail":{"type":"shell","command":"ls","output":"a"}});
+        let failed = json!({"type":"tool_call","callId":"t2","name":"Bash","status":"failed","error":{"message":"boom"}});
+        let finished_text = json!({"type":"assistant_message","text":"done.","messageId":"m1"});
+        let finished_chunk = json!({"type":"assistant_message","text":".","messageId":"m1"});
+        let streaming = json!({"type":"assistant_message","text":" more","messageId":"m2"});
+        let (sink, mut published) = EventSink::channel(64, tokio_util::sync::CancellationToken::new());
+        let hold = std::sync::Arc::new(ChildRowHold::default());
+        let (decide, decision) = tokio::sync::watch::channel(None);
+        let request = SubagentHistoryRequest {
+            persistence: json!({"sessionId":"parent"}),
+            config: json!({"cwd":"/work"}),
+            child_id: "toolu_1".into(),
+            source: Value::Null,
+            status: json!("running"),
+            replay: SubagentReplay::new("k".into(), decision),
+        };
+        let snapshot = vec![
+            subagent_row("claude", "toolu_1", pending.clone(), None, HistoryCoverage::Unverified),
+            subagent_row("claude", "toolu_1", finished_text, None, HistoryCoverage::Unverified),
+        ];
+        let (reading, read_started) = tokio::sync::oneshot::channel::<()>();
+        let (finish, read_finished) = tokio::sync::oneshot::channel::<()>();
+        let finished = HashSet::from(["m1".to_owned()]);
+        let task = {
+            let (hold, sink) = (hold.clone(), sink.clone());
+            tokio::spawn(async move {
+                let read = async move {
+                    reading.send(()).unwrap();
+                    read_finished.await.unwrap();
+                    Ok::<_, anyhow::Error>((snapshot, HistoryCoverage::Unverified))
+                };
+                hold.publish_replay(&request, "claude", &sink, read, move |item, snapshot| {
+                    super::super::covered_by_snapshot(item, snapshot, &finished)
+                })
+                .await
+            })
+        };
+        read_started.await.unwrap();
+        for item in [&pending, &completed, &failed, &finished_chunk, &streaming] {
+            hold.emit(&sink, row(item.clone())).await.unwrap();
+        }
+        finish.send(()).unwrap();
+        assert_eq!(published.recv().await.unwrap()["event"]["type"], "replay");
+        decide.send(Some(ReplayOutcome::Applied)).unwrap();
+        task.await.unwrap().unwrap();
+        let mut after = Vec::new();
+        while let Ok(event) = published.try_recv() {
+            after.push(event["event"]["item"].clone());
+        }
+        assert_eq!(
+            after,
+            [completed, failed, streaming],
+            "a newer tool status and a still-streaming message are published once; \
+             only the identical tool row and the finished message's chunk are covered"
+        );
+    }
 }

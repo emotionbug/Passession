@@ -5,7 +5,9 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::{fmt, fs::{self, File}, io::BufReader, path::{Path, PathBuf}};
+#[cfg(unix)]
+use std::fs::File;
+use std::{fmt, fs, path::{Path, PathBuf}};
 
 /// Child timelines kept hydrated after an operation. Each holds one WAL
 /// connection (database, `-wal` and `-shm` descriptors).
@@ -145,9 +147,11 @@ impl SubagentStore {
     /// Replay each child as a guarded replacement, never append the same native
     /// transcript to a restored checkpoint a second time. Stored children are
     /// hydrated first so reconciliation always sees canonical rows; an
-    /// unavailable child keeps its stored bytes and is skipped.
+    /// unavailable child keeps its stored bytes and is skipped. An
+    /// `authoritative` complete replay (an explicitly read native child body,
+    /// applied in order with live events) may also remove stored rows it lacks.
     pub fn replay_history(
-        &mut self, root: Option<&Path>, parent: &str, events: Vec<Value>,
+        &mut self, root: Option<&Path>, parent: &str, events: Vec<Value>, authoritative: bool,
     ) -> Result<Vec<Value>> {
         use crate::providers::api::HistoryCoverage;
         let mut timelines = BTreeMap::<String, (String, Timeline, bool)>::new();
@@ -187,7 +191,8 @@ impl SubagentStore {
                 None => self.timelines.contains_key(&key),
             };
             let coverage = if complete { HistoryCoverage::Complete } else { HistoryCoverage::Unverified };
-            if stored && !replacement.reconcile_history(&self.timelines[&key], coverage, false) {
+            let removal = authoritative && coverage == HistoryCoverage::Complete;
+            if stored && !replacement.reconcile_history(&self.timelines[&key], coverage, removal) {
                 tracing::warn!(parent_id=parent, subagent_id=id, "Retaining canonical subagent history: replay does not cover stored rows");
                 continue;
             }
@@ -404,50 +409,22 @@ impl SubagentStore {
         }
     }
 
-    /// The legacy checkpoint is imported once and left untouched. The catalog is
-    /// published only after every child database is durable. Only descriptors
-    /// are retained; child histories hydrate on demand.
+    /// A missing catalog is created empty only when `create` is requested.
+    /// Only descriptors are retained; child histories hydrate on demand.
     fn index_parent(&mut self, root: &Path, parent: &str, create: bool) -> Result<bool> {
         let directory = root.join(parent);
         let catalog = directory.join("index.sqlite3");
         if !catalog.try_exists()? {
-            let legacy = root.join(format!("{parent}.json"));
-            match File::open(&legacy) {
-                Ok(file) => {
-                    let checkpoint: Value = serde_json::from_reader(BufReader::new(file))?;
-                    ensure!(checkpoint["parentAgentId"] == parent, "Subagent checkpoint parent mismatch");
-                    self.restore_parent(&checkpoint)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if !create { return Ok(false); }
-                }
-                Err(error) => return Err(error.into()),
-            }
-            // Legacy descriptors may legitimately have no first timeline item.
-            for descriptor in &self.descriptors {
-                if descriptor["parentAgentId"] == parent {
-                    let id = descriptor["id"].as_str().context("Subagent descriptor missing id")?;
-                    self.timelines.entry((parent.to_owned(), id.to_owned())).or_default();
-                }
+            if !create {
+                return Ok(false);
             }
             fs::create_dir_all(&directory)?;
-            for ((owner, id), timeline) in &mut self.timelines {
-                if owner == parent {
-                    timeline.persist(&timeline_path(root, parent, id), &identity(parent, id))?;
-                }
-            }
             let file = tempfile::NamedTempFile::new_in(&directory)?;
             let mut connection = Connection::open(file.path())?;
             connection.pragma_update(None, "synchronous", "FULL")?;
             let transaction = connection.transaction()?;
             transaction.execute_batch("CREATE TABLE identity(version INTEGER NOT NULL, parent_id TEXT NOT NULL); CREATE TABLE children(id TEXT PRIMARY KEY, descriptor TEXT);")?;
             transaction.execute("INSERT INTO identity VALUES (1, ?1)", [parent])?;
-            for ((owner, id), _) in &self.timelines {
-                if owner == parent {
-                    let descriptor = self.get(parent, id).map(serde_json::to_string).transpose()?;
-                    transaction.execute("INSERT INTO children VALUES (?1, ?2)", params![id, descriptor])?;
-                }
-            }
             transaction.commit()?;
             drop(connection);
             file.as_file().sync_all()?;
@@ -484,7 +461,6 @@ impl SubagentStore {
                 }
             }
         }
-        // A legacy import hydrated every child once; keep only the index.
         self.delete_parent(parent);
         self.descriptors.extend(descriptors);
         let used = self.residency.tick();

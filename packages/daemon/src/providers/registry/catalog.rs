@@ -1,3 +1,4 @@
+pub(crate) mod memo;
 mod refresh;
 mod state;
 #[cfg(test)]

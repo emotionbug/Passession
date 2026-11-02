@@ -1,9 +1,10 @@
 use super::Timeline;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use serde_json::{Value, json};
-use std::fs::{self, File};
-use std::io::BufReader;
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 const UPSERT_ROW: &str = "INSERT INTO timeline_rows(position, row_json) VALUES (?1, ?2) \
@@ -67,8 +68,8 @@ fn write_rows(transaction: &Transaction<'_>, rows: &[Value]) -> Result<()> {
     Ok(())
 }
 
-// Build the complete initial database off to the side. Failed imports never leave
-// a database that could mask the legacy checkpoint on the next startup.
+// Build the complete initial database off to the side, so a failed creation
+// never leaves a partial database behind.
 fn create(path: &Path, agent_id: &str, timeline: &Timeline) -> Result<Store> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
@@ -104,25 +105,8 @@ fn create(path: &Path, agent_id: &str, timeline: &Timeline) -> Result<Store> {
     Store::open(path, agent_id)
 }
 
-fn load_legacy(path: &Path, agent_id: &str) -> Result<Option<Timeline>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let checkpoint: Value = serde_json::from_reader(BufReader::new(file))
-        .with_context(|| format!("Invalid timeline checkpoint {}", path.display()))?;
-    ensure!(checkpoint["version"] == 1, "Unsupported timeline checkpoint version");
-    ensure!(checkpoint["agentId"] == agent_id, "Timeline checkpoint agent mismatch");
-    ensure!(
-        checkpoint["rows"].is_array() && checkpoint["epoch"].is_string() && checkpoint["nextSeq"].as_i64().is_some(),
-        "Invalid timeline checkpoint"
-    );
-    Ok(Some(Timeline::seed(&checkpoint)?))
-}
-
-/// `path` names the SQLite database. An absent database imports its sibling JSON
-/// checkpoint once; that source is retained as a backup, never written again.
+/// `path` names the SQLite database. An absent database is an empty timeline;
+/// it is created on the first commit.
 pub(super) fn load(path: &Path, agent_id: &str) -> Result<Timeline> {
     load_measured(path, agent_id).map(|(timeline, _)| timeline)
 }
@@ -151,13 +135,7 @@ fn valid_row(row: &Value) -> bool {
 /// `load`, plus the stored JSON bytes of the hydrated rows.
 pub(super) fn load_measured(path: &Path, agent_id: &str) -> Result<(Timeline, u64)> {
     if !path.try_exists()? {
-        let Some(mut timeline) = load_legacy(&path.with_extension("json"), agent_id)? else {
-            return Ok((Timeline::new(), 0));
-        };
-        timeline.storage = Some(create(path, agent_id, &timeline)?);
-        timeline.storage_dirty = false;
-        let bytes = timeline.rows.iter().map(encoded_bytes).sum();
-        return Ok((timeline, bytes));
+        return Ok((Timeline::new(), 0));
     }
     let mut store = Store::open(path, agent_id)?;
     let transaction = store.connection.transaction()?;

@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -15,21 +15,6 @@ pub use message::{
     Admission, DISMISSED, DispatchGate, KEY_CONFLICT, LiveGuard, MessageReceipts, OUTCOME_UNKNOWN,
     QueuedAdmission, RECEIPT_UPDATE, SendReceiptError, Settlement, replay,
 };
-
-/// Legacy agent-requests reader, kept for importing pre-lifecycle creation receipts.
-async fn read_send_receipt(path: &Path) -> Result<Option<Value>> {
-    let Some(bytes) = read_optional(path).await? else {
-        return Ok(None);
-    };
-    let value: Value = serde_json::from_slice(&bytes)?;
-    if !value["fingerprint"].is_string()
-        || !value["agentId"].is_string()
-        || !matches!(value["state"].as_str(), Some("pending" | "completed"))
-    {
-        bail!("Invalid message receipt at {}", path.display());
-    }
-    Ok(Some(value))
-}
 
 #[derive(Clone, Debug)]
 pub struct CreationInput {
@@ -44,7 +29,6 @@ pub struct CreationInput {
 #[async_trait]
 pub trait CreationHooks: Send + Sync {
     async fn exists(&self, kind: &str, id: &str) -> Result<bool>;
-    async fn read_agent(&self, id: &str) -> Result<Option<Value>>;
     async fn validate_completed(&self, snapshot: &Value) -> Result<()>;
 }
 pub enum CreationAdmission {
@@ -58,7 +42,6 @@ struct Active {
 }
 struct CreationInner {
     directory: PathBuf,
-    legacy_directory: PathBuf,
     admission: Mutex<()>,
     accesses: KeyLocks,
     active: StdMutex<HashMap<String, Active>>,
@@ -74,7 +57,6 @@ impl CreationReceipts {
         Self {
             inner: Arc::new(CreationInner {
                 directory: home.join("creations"),
-                legacy_directory: home.join("agent-requests"),
                 admission: Mutex::new(()),
                 accesses: KeyLocks::default(),
                 active: StdMutex::new(HashMap::new()),
@@ -96,9 +78,6 @@ impl CreationReceipts {
         tokio::fs::create_dir_all(&self.inner.directory).await?;
         let fingerprint = digest(&input.request)?;
         let (mut record, receiver) = self.inner.read_with_active(&identity).await?;
-        if record.is_none() {
-            record = self.import_legacy(input, &fingerprint, hooks).await?;
-        }
         if record
             .as_ref()
             .is_some_and(|r| r["fingerprint"].as_str() != Some(&fingerprint))
@@ -236,58 +215,6 @@ impl CreationReceipts {
         file.write_all(identity.as_bytes()).await?;
         file.sync_all().await?;
         sync_directory(&self.inner.directory).await
-    }
-    async fn import_legacy(
-        &self,
-        input: &CreationInput,
-        fingerprint: &str,
-        hooks: &dyn CreationHooks,
-    ) -> Result<Option<Value>> {
-        if input.kind != "agent" {
-            return Ok(None);
-        }
-        let path = self
-            .inner
-            .legacy_directory
-            .join(format!("{}.json", digest(&json!(["create", input.key]))?));
-        let Some(receipt) = read_send_receipt(&path).await? else {
-            return Ok(None);
-        };
-        let mut legacy_request = json!({"type":"create_agent_request"});
-        for (key, value) in input
-            .request
-            .as_object()
-            .context("Creation request must be an object")?
-        {
-            legacy_request[key] = value.clone();
-        }
-        if receipt["fingerprint"].as_str() != Some(&digest(&legacy_request)?) {
-            bail!("agent_request_key_conflict");
-        }
-        let agent_id = receipt["agentId"].as_str().unwrap();
-        let agent = hooks.read_agent(agent_id).await?;
-        if agent.is_none() && receipt["state"] == "completed" {
-            bail!("Previously created agent no longer exists");
-        }
-        let mut imported = input.clone();
-        imported.agent_id = Some(agent_id.to_owned());
-        let mut record = initial_record(&imported, fingerprint);
-        if let Some(agent) = agent {
-            record["snapshot"]["phase"] = json!("completed");
-            if let Some(workspace_id) = agent.get("workspaceId").filter(|v| !v.is_null()) {
-                record["snapshot"]["workspaceId"] = workspace_id.clone();
-            }
-            record["snapshot"]["agent"] = agent;
-        } else {
-            record["snapshot"]["phase"] = json!("failed");
-            record["snapshot"]["error"] = json!("agent_request_outcome_unknown");
-            record["snapshot"]["failedStage"] = json!("agent");
-            record["snapshot"]["outcomeUnknown"] = json!(true);
-        }
-        self.inner
-            .write(&identity_for(&input.kind, &input.key)?, &record)
-            .await?;
-        Ok(Some(record))
     }
 }
 impl CreationInner {

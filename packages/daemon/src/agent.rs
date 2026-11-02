@@ -22,6 +22,7 @@ pub(crate) mod creation;
 mod date_parse;
 pub(crate) mod event_stage;
 mod generation;
+mod history_read;
 mod listing;
 pub mod notifications;
 pub mod receipts;
@@ -154,6 +155,16 @@ struct AgentData {
     /// while the interrupted turn settles.
     pending_replacement: bool,
 }
+impl AgentData {
+    /// A live, history-synchronized owner that may serve reads and mutations.
+    fn serves_runtime(&self) -> bool {
+        self.ready
+            && self.history_primed
+            && self.session.is_some()
+            && !self.owner_ended
+            && self.event_error.is_none()
+    }
+}
 struct AgentCell {
     data: Mutex<AgentData>,
     mutation: Mutex<()>,
@@ -180,6 +191,14 @@ pub struct AgentManager {
     agents: RwLock<HashMap<String, Arc<AgentCell>>>,
     lifecycle: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     subagent_store: Arc<StdMutex<SubagentStore>>,
+    /// Owned background provider preparation, one per parent agent.
+    preparations: history_read::Flights,
+    /// Owned native child-body reads, one per parent/child pair.
+    subagent_reads: history_read::Flights,
+    /// Child-body readers waiting for their replay to pass a live parent's events.
+    child_replays: history_read::ReplayWaiters,
+    /// Per-parent gates: child reads shared, parent start/replay exclusive.
+    child_read_gates: Mutex<HashMap<String, Weak<RwLock<()>>>>,
     events: broadcast::Sender<Value>,
     closing: AtomicBool,
 }
@@ -200,6 +219,10 @@ impl AgentManager {
             agents: RwLock::new(HashMap::new()),
             lifecycle: Mutex::new(HashMap::new()),
             subagent_store: Arc::new(StdMutex::new(SubagentStore::default())),
+            preparations: history_read::Flights::default(),
+            subagent_reads: history_read::Flights::default(),
+            child_replays: history_read::ReplayWaiters::default(),
+            child_read_gates: Mutex::new(HashMap::new()),
             events,
             closing: AtomicBool::new(false),
         }
@@ -285,42 +308,6 @@ impl AgentManager {
     ) -> Result<notifications::FinishRegistration> {
         self.notifications.register(input, pending).await
     }
-    pub async fn list_persisted_records(&self) -> Result<Vec<Value>> {
-        let home = self.app()?.home.clone();
-        self.storage
-            .get_or_try_init(|| async {
-                let store = AgentStorage::new(home);
-                store.initialize().await?;
-                Ok::<_, anyhow::Error>(store)
-            })
-            .await?
-            .list()
-            .await
-    }
-    pub async fn backfill_workspace_id(&self, id: &str, workspace_id: &str) -> Result<bool> {
-        self.list_persisted_records().await?;
-        let lane = self.lane(id).await;
-        let _lane = lane.lock().await;
-        let mut changed = false;
-        self.storage()?
-            .mutate(id, |previous| {
-                let mut record = previous
-                    .cloned()
-                    .ok_or_else(|| anyhow!("Agent not found"))?;
-                if text(&record, "workspaceId").is_none_or(str::is_empty) {
-                    record["workspaceId"] = json!(workspace_id);
-                    changed = true;
-                }
-                Ok(record)
-            })
-            .await?;
-        if changed {
-            if let Ok(cell) = self.cell(id).await {
-                cell.data.lock().await.snapshot["workspaceId"] = json!(workspace_id);
-            }
-        }
-        Ok(changed)
-    }
     pub async fn has_in_flight_run(&self, id: &str) -> Result<bool> {
         let cell = self.cell(id).await?;
         let has_session = {
@@ -379,7 +366,11 @@ impl AgentManager {
         let mut unavailable = false;
         if let Some(cell) = cell {
             match cell.data.try_lock() {
-                Ok(data) if data.ready => return Ok(Some(data.snapshot.clone())),
+                Ok(data) if data.ready => {
+                    let mut snapshot = data.snapshot.clone();
+                    self.overlay_preparation(&mut snapshot, data.serves_runtime());
+                    return Ok(Some(snapshot));
+                }
                 Ok(_) => unavailable = true,
                 Err(_) => unavailable = true,
             }
@@ -393,6 +384,7 @@ impl AgentManager {
             if unavailable {
                 snapshot["snapshotAvailability"] = json!("last_persisted");
             }
+            self.overlay_preparation(&mut snapshot, false);
             snapshot
         }))
     }
@@ -441,13 +433,20 @@ impl AgentManager {
             .collect::<Vec<_>>();
         for (id, cell) in cells {
             match cell.data.try_lock() {
-                Ok(data) if data.ready => { all.insert(id, data.snapshot.clone()); }
+                Ok(data) if data.ready => {
+                    let mut snapshot = data.snapshot.clone();
+                    self.overlay_preparation(&mut snapshot, data.serves_runtime());
+                    all.insert(id, snapshot);
+                }
                 _ => {
                     if let Some(snapshot) = all.get_mut(&id) {
                         snapshot["snapshotAvailability"] = json!("last_persisted");
                     }
                 }
             }
+        }
+        for snapshot in all.values_mut().filter(|snapshot| snapshot["_live"] == false) {
+            self.overlay_preparation(snapshot, false);
         }
         Ok(all.into_values().collect())
     }
@@ -848,6 +847,7 @@ impl AgentManager {
             "_providerAvailable",
             "_historyOnly",
             "snapshotAvailability",
+            "preparation",
             "status",
             "lifecycle",
             "session",

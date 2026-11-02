@@ -321,7 +321,7 @@ impl HostsService {
                     _=&mut deadline,if !verified=>return Err(HostError::new("host_offline","Host handshake timed out").into()),
                     frame=incoming.recv()=>{
                         let Some(InputFrame{mut frame,permit})=frame else{break};
-                        if !hello_sent {let HostFrame::Text(text)=frame else{return Err(HostError::new("invalid_message","Expected hello").into());};let mut hello:Value=serde_json::from_str(&text)?;ensure!(hello["type"]=="hello",HostError::new("invalid_message","Expected hello"));hello["clientId"]=json!(transformed);hello["routed"]=json!(true);hello["producer"]=producer.clone();hello["sessionPermissions"]=json!(permissions);hello.as_object_mut().unwrap().remove("auth");frame=HostFrame::Text(serde_json::to_string(&hello)?);hello_sent=true;}
+                        if !hello_sent {let HostFrame::Text(text)=frame else{return Err(HostError::new("invalid_message","Expected hello").into());};frame=HostFrame::Text(routed_hello(&text,&transformed,&producer,&permissions)?);hello_sent=true;}
                         else{ensure!(verified,HostError::new("host_offline","Host identity has not been verified"));}
                         send_nested(&link,&remote,frame,permit).await?;
                     },
@@ -414,7 +414,7 @@ impl HostsService {
             let mut first=true;
             let result:Result<()>=async{loop{tokio::select!{
                 _=route_task.cancel.cancelled()=>break,
-                frame=incoming.recv()=>{let Some(InputFrame{frame,permit})=frame else{break};let frame=if first{first=false;let HostFrame::Text(text)=frame else{return Err(HostError::new("permission_denied","Expected hello").into());};let mut hello:Value=serde_json::from_str(&text)?;ensure!(hello["type"]=="hello"&&hello["clientId"].is_string(),HostError::new("permission_denied","Invalid hello"));hello["clientId"]=json!(link_client_id(&identity,hello["clientId"].as_str().unwrap())?);hello["routed"]=json!(true);hello.as_object_mut().unwrap().remove("auth");HostFrame::Text(serde_json::to_string(&hello)?)}else{frame};
+                frame=incoming.recv()=>{let Some(InputFrame{frame,permit})=frame else{break};let frame=if first{first=false;let HostFrame::Text(text)=frame else{return Err(HostError::new("permission_denied","Expected hello").into());};HostFrame::Text(linked_hello(&text,&identity)?)}else{frame};
                     tokio::select!{_=route_task.cancel.cancelled()=>break,result=admission_tx.send(to_outbound(frame))=>{result.map_err(|_|anyhow!("Host channel input closed"))?;}}drop(permit);
                 },
                 frame=outgoing.recv()=>{let Some(frame)=frame else{break};let frame=match frame{OutboundFrame::Text(text)=>HostFrame::Text(text),OutboundFrame::Binary(bytes)=>HostFrame::Binary(bytes),OutboundFrame::Flush(ack)=>HostFrame::Flush(ack),OutboundFrame::Close{code,reason}=>{route_task.stop(if code==1009{"resource_limit"}else if code==1008{"permission_denied"}else{"host_offline"},&reason);break;},OutboundFrame::Ping(_)|OutboundFrame::Pong(_)=>continue};tokio::select!{_=route_task.cancel.cancelled()=>break,result=output_tx.send(frame)=>{result.map_err(|_|anyhow!("Host channel output closed"))?;}}}
@@ -593,6 +593,32 @@ async fn send_nested(
         HostFrame::Flush(ack) => HostFrame::Flush(ack),
     };
     link.sender.send_reserved(outer, permit).await
+}
+/// The origin client's hello as the destination sees it: identity, producer
+/// and permissions are the route's, credentials are dropped, and the client's
+/// own capabilities (e.g. `saved_history_reads`) pass through unchanged.
+fn routed_hello(text: &str, client_id: &str, producer: &Value, permissions: &[String]) -> Result<String> {
+    let mut hello: Value = serde_json::from_str(text)?;
+    ensure!(hello["type"] == "hello", HostError::new("invalid_message", "Expected hello"));
+    hello["clientId"] = json!(client_id);
+    hello["routed"] = json!(true);
+    hello["producer"] = producer.clone();
+    hello["sessionPermissions"] = json!(permissions);
+    hello.as_object_mut().unwrap().remove("auth");
+    Ok(serde_json::to_string(&hello)?)
+}
+/// A linked channel's hello: the link's identity, no credentials, and the
+/// client's own capabilities.
+fn linked_hello(text: &str, identity: &str) -> Result<String> {
+    let mut hello: Value = serde_json::from_str(text)?;
+    ensure!(
+        hello["type"] == "hello" && hello["clientId"].is_string(),
+        HostError::new("permission_denied", "Invalid hello")
+    );
+    hello["clientId"] = json!(link_client_id(identity, hello["clientId"].as_str().unwrap())?);
+    hello["routed"] = json!(true);
+    hello.as_object_mut().unwrap().remove("auth");
+    Ok(serde_json::to_string(&hello)?)
 }
 async fn emit_frame(owner: &OwnedSubscription, frame: HostFrame, limit: usize) -> Result<()> {
     match frame {

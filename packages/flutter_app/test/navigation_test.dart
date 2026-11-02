@@ -7,6 +7,7 @@ import 'package:paseo_sessions/core/client.dart';
 import 'package:paseo_sessions/core/host_config.dart';
 import 'package:paseo_sessions/core/scope.dart';
 import 'package:paseo_sessions/features/navigation/session_sidebar.dart';
+import 'package:paseo_sessions/features/navigation/sidebar_display_menu.dart';
 import 'package:paseo_sessions/ui/theme.dart';
 
 void main() {
@@ -73,6 +74,14 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
       await store.disposeAsync();
     }
+  });
+
+  test('stored label filters match normalized labels and the empty Unlabelled key', () {
+    final filters = sidebarLabelFilters({'labelFilters': ['', '  Bug   Fix ']});
+    expect(filters, {sidebarUnlabelledLabelKey, 'bug fix'});
+    expect(sidebarWorkspaceMatchesLabels({'labels': <String>[]}, filters), isTrue);
+    expect(sidebarWorkspaceMatchesLabels({'labels': ['bug fix']}, filters), isTrue);
+    expect(sidebarWorkspaceMatchesLabels({'labels': ['Docs']}, filters), isFalse);
   });
 }
 

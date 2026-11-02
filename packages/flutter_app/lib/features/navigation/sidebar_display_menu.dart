@@ -67,10 +67,9 @@ Set<String> resolveSidebarHostFilters(AppStore store, JsonMap prefs) {
   };
 }
 
-/// The stored label filter keys; legacy `__unlabelled__` reads as the Unlabelled key.
+/// The stored label filter keys.
 Set<String> sidebarLabelFilters(JsonMap prefs) => {
-  for (final item in prefs.array('labelFilters'))
-    item.toString() == '__unlabelled__' ? sidebarUnlabelledLabelKey : sidebarLabelKey(item.toString()),
+  for (final item in prefs.array('labelFilters')) sidebarLabelKey(item.toString()),
 };
 
 /// Original `filterWorkspacesByLabels`: any selected label matches; Unlabelled matches a

@@ -7,7 +7,6 @@ import 'package:path_provider_platform_interface/path_provider_platform_interfac
 import 'package:paseo_sessions/app.dart';
 import 'package:paseo_sessions/core/app_store.dart';
 import 'package:paseo_sessions/core/json.dart';
-import 'package:paseo_sessions/core/legacy_state.dart';
 import 'package:paseo_sessions/features/settings/app_preferences.dart';
 import 'package:paseo_sessions/features/settings/settings_forms.dart';
 import 'package:paseo_sessions/ui/localization.dart';
@@ -19,11 +18,7 @@ class _SupportDirectory extends PathProviderPlatform {
   Future<String?> getApplicationSupportPath() async => path;
 }
 
-AppStore _store() => AppStore(
-  connectHosts: false,
-  discoverLocalHosts: false,
-  legacyStateReader: () async => const LegacyStateSnapshot(values: {}, sources: []),
-);
+AppStore _store() => AppStore(connectHosts: false, discoverLocalHosts: false);
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -46,6 +41,20 @@ void main() {
       PaseoLocalizations.load(const Locale('en')),
       PaseoLocalizations.load(const Locale('ko')),
     ]));
+  }
+
+  /// `PaseoLocalizations.load` awaits catalog futures that [warmCatalogs]
+  /// completed on real time. Dart delivers an already-completed future to a new
+  /// listener through a microtask scheduled in the zone that created the
+  /// future, and fake-async pumps never drain that real queue, so the app's
+  /// Localizations would keep waiting. The first pump builds any pending locale
+  /// change, which starts the delegate load; loading a catalog on real time
+  /// then queues behind those deliveries, so once it completes they have run;
+  /// the final pump applies the loaded resources.
+  Future<void> settleLocalizations(WidgetTester tester) async {
+    await tester.pump();
+    await tester.runAsync(() => PaseoLocalizations.load(const Locale('en')));
+    await tester.pumpAndSettle();
   }
 
   Future<AppStore> reopenedWith(WidgetTester tester, Map<String, Object?> preferences) async =>
@@ -102,7 +111,7 @@ void main() {
       store: store,
       home: Scaffold(body: SingleChildScrollView(child: AppPreferenceSettings(store: store))),
     ));
-    await tester.pumpAndSettle();
+    await settleLocalizations(tester);
 
     final context = tester.element(find.byType(AppPreferenceSettings));
     expect(Localizations.localeOf(context), const Locale('en'));
@@ -129,7 +138,7 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 20));
       }
     });
-    await tester.pumpAndSettle();
+    await settleLocalizations(tester);
 
     expect(Localizations.localeOf(tester.element(find.byType(AppPreferenceSettings))), const Locale('ko'));
     row = languageRow(tester);
@@ -165,7 +174,7 @@ void main() {
         store: store!,
         home: Builder(builder: (context) => Text(tr(context, 'settings.general.language.label'))),
       ));
-      await tester.pumpAndSettle();
+      await settleLocalizations(tester);
 
       expect(Localizations.localeOf(tester.element(find.byType(Text))), expected);
       expect(find.text(expected.languageCode == 'ko' ? '언어' : 'Language'), findsOneWidget);

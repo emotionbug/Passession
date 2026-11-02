@@ -77,16 +77,26 @@ void main() {
       expect(resolved['modeId'], 'auto');
     });
 
-    test('legacy preferences keep their thinking option for the remembered model', () {
-      final preferences = parseFormPreferences({
+    test('remembered preferences round-trip through the stored shape', () {
+      final stored = mergeProviderPreferences(
+        mergeProviderPreferences({}, 'codex', mode: 'read-only'),
+        'claude',
+        model: 'opus',
+        mode: 'plan',
+        thinkingByModel: {'opus': 'low'},
+        featureValues: {'fast': true},
+      );
+      expect(parseFormPreferences(stored), {
         'provider': 'claude',
-        'serverId': 'old',
         'providerPreferences': {
-          'claude': {'model': 'opus', 'thinkingOptionId': 'low'},
+          'codex': {'mode': 'read-only'},
+          'claude': {
+            'model': 'opus',
+            'mode': 'plan',
+            'thinkingByModel': {'opus': 'low'},
+            'featureValues': {'fast': true},
+          },
         },
-      });
-      expect(jsonMap(jsonMap(preferences['providerPreferences'])['claude'])['thinkingByModel'], {
-        'opus': 'low',
       });
     });
 

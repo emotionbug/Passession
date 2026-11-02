@@ -162,6 +162,9 @@
             "timeline_notifications": {
               "type": "boolean"
             },
+            "saved_history_reads": {
+              "type": "boolean"
+            },
             "browser_host": {
               "type": "object",
               "properties": {

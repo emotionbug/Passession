@@ -5,7 +5,8 @@ mod session;
 mod transport;
 
 use super::api::{
-    AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
+    AgentProvider, AgentSession, EventSink, HistoryCoverage, ImportedSession, LaunchContext,
+    ProviderSpec, SubagentHistory, SubagentHistoryRequest,
 };
 use paseo_client::process::{self, CommandSpec};
 use anyhow::{Result, anyhow, bail};
@@ -57,11 +58,13 @@ impl MuseProvider {
         self.remember(&self.spec.env);
         let mut env = self.spec.env.clone();
         env.extend(context.env.clone());
-        let session = Session::open(&self.spec, persistence, config, context, sink).await?;
+        let session = Session::open(&self.spec, persistence, config, context, sink, |session| {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.retain(|s| s.strong_count() > 0);
+            sessions.push(Arc::downgrade(session));
+        })
+        .await?;
         self.remember(&env);
-        let mut sessions = self.sessions.lock().unwrap();
-        sessions.retain(|s| s.strong_count() > 0);
-        sessions.push(Arc::downgrade(&session));
         Ok(session)
     }
     fn remember(&self, env: &BTreeMap<String, String>) {
@@ -223,6 +226,63 @@ impl AgentProvider for MuseProvider {
                 sink,
             )
             .await?)
+    }
+    /// Pages only the opened child's native view. An open parent publishes the
+    /// replay in its own live stream, ordered with that child's live rows; a cold
+    /// parent gets a maintenance host that never resumes it.
+    async fn stream_subagent_history(
+        &self,
+        request: SubagentHistoryRequest,
+        context: LaunchContext,
+        sink: EventSink,
+    ) -> Result<SubagentHistory> {
+        let parent = decode_persistence(&request.persistence)?;
+        let parent = parent["data"]["sessionId"]
+            .as_str()
+            .expect("validated Muse session ID")
+            .to_owned();
+        let child = projection::child_session(&request.child_id, &request.source)?.to_owned();
+        let cwd = request.config["cwd"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Muse requires cwd to read a subagent"))?
+            .to_owned();
+        let live = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|session| session.serves(&parent));
+        if let Some(session) = live {
+            let outcome = request.replay.clone();
+            let provider = self.spec.id.clone();
+            // A child still recorded as running may grow, so its replay stays guarded.
+            let marker: session::Marker = Box::new(move |mut events: Vec<Value>, read: HistoryCoverage| {
+                let coverage = request.settle(&mut events, read);
+                request
+                    .replay
+                    .marker(&provider, &request.child_id, events, coverage)
+            });
+            session.replay_child(&child, marker, outcome).await?;
+            return Ok(SubagentHistory::Published);
+        }
+        let (host, _notifications) = Connection::spawn(
+            &self.spec,
+            context.env.clone(),
+            Some(cwd.as_str().into()),
+            &json!({}),
+            context.cancel.clone(),
+        )
+        .await?;
+        let result = projection::read_child(host.as_ref(), &self.spec.id, &child, &cwd).await;
+        let closed = host.close().await;
+        let mut replay = result?;
+        closed?;
+        let coverage = request.settle(&mut replay.events, replay.coverage);
+        for event in replay.events {
+            sink.emit(event).await?;
+        }
+        Ok(SubagentHistory::Replayed(coverage))
     }
     async fn fetch_catalog(&self, _options: Value, cancel: CancellationToken) -> Result<Value> {
         self.remember(&self.spec.env);
@@ -414,4 +474,85 @@ fn validate_usage(response: Value) -> Result<Value> {
         }
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider() -> MuseProvider {
+        MuseProvider::new(ProviderSpec {
+            id: "muse".into(),
+            family: "muse".into(),
+            command: vec!["paseo-test-missing-muse".into()],
+            env: BTreeMap::new(),
+            options: Value::Null,
+            defaults: json!({}),
+            runtime_settings: json!({}),
+            configured_models: vec![],
+        })
+    }
+
+    fn context() -> LaunchContext {
+        LaunchContext {
+            agent_id: "parent".into(),
+            home: std::env::temp_dir(),
+            executable: std::env::current_exe().unwrap(),
+            env: BTreeMap::new(),
+            mcp_servers: json!({}),
+            tool_catalog: json!([]),
+            tool_manifest: json!([]),
+            tool_executor: None,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn request(persistence: Value, source: Value) -> SubagentHistoryRequest {
+        SubagentHistoryRequest {
+            persistence,
+            config: json!({"cwd":std::env::temp_dir()}),
+            child_id: "child-a".into(),
+            source,
+            replay: crate::providers::api::SubagentReplay::new(
+                "k".into(),
+                tokio::sync::watch::channel(None).1,
+            ),
+            status: json!("completed"),
+        }
+    }
+
+    fn parent() -> Value {
+        let saved = json!({"version":1,"data":{"sessionId":"parent"}});
+        json!({"provider":"muse","sessionId":format!("plugin:{saved}"),
+            "metadata":{"pluginProviderPersistence":saved}})
+    }
+
+    async fn read(request: SubagentHistoryRequest) -> (Result<SubagentHistory>, Vec<Value>) {
+        let (sink, mut receiver) = EventSink::channel(16, CancellationToken::new());
+        let result = provider()
+            .stream_subagent_history(request, context(), sink)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    #[tokio::test]
+    async fn opened_child_validates_stored_handles_before_launching_muse() {
+        let (result, events) = read(request(json!({"sessionId":"not-a-plugin"}), Value::Null)).await;
+        assert!(result.is_err_and(|error| error.to_string().contains("persistence")));
+        assert!(events.is_empty());
+        let (result, events) = read(request(parent(), json!({"sessionId":"child-b"}))).await;
+        assert!(result.is_err_and(|error| error.to_string().contains("does not name session child-a")));
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_child_is_an_error_not_an_empty_replay() {
+        let (result, events) = read(request(parent(), json!({"sessionId":"child-a"}))).await;
+        assert!(result.is_err_and(|error| error.to_string().contains("paseo-test-missing-muse")));
+        assert!(events.is_empty());
+    }
 }

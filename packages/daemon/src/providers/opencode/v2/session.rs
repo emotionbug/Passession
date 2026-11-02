@@ -1,18 +1,19 @@
 use super::super::{
-    catalog,
+    catalog, family,
+    reader::RuntimeReader,
     runtime::{Runtime, RuntimeManager, read_sse},
 };
 use super::{
     Call, Operation, Snapshot, array, component, permissions, s, session_path,
-    timeline::{OUTPUT_TOOL, Timeline, timestamp},
+    timeline::{OUTPUT_TOOL, Timeline},
     usage,
 };
-use crate::providers::api::{EventSink, LaunchContext};
+use crate::providers::api::{EventSink, LaunchContext, SubagentHistoryRequest};
 use anyhow::{Result, anyhow, bail};
 use reqwest::Method;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -36,6 +37,8 @@ struct Pending {
 struct Child {
     timeline: Timeline,
     signature: String,
+    /// Last descriptor status this session announced was running.
+    running: bool,
 }
 pub(super) struct Session {
     runtime: Arc<Runtime>,
@@ -70,6 +73,15 @@ pub(super) struct Session {
     connected: bool,
     reconcile_at: Option<Instant>,
     context_limits: HashMap<String, Option<Value>>,
+    /// Live timelines rebased by a replay before their child was announced.
+    primed: HashMap<String, Timeline>,
+    /// Children whose in-stream replay awaits the daemon's outcome: their live
+    /// re-reads wait, and the snapshot to rebase onto if it is applied.
+    held: family::HeldEvents,
+    snapshots: HashMap<String, Vec<Value>>,
+    /// Replay outcomes posted back by their watchers: `(child, applied)`.
+    settle_sender: mpsc::UnboundedSender<(String, bool)>,
+    settled: mpsc::UnboundedReceiver<(String, bool)>,
 }
 impl Session {
     pub fn new(
@@ -87,6 +99,7 @@ impl Session {
         close_error: Arc<Mutex<Option<String>>>,
     ) -> Self {
         let (event_sender, events) = mpsc::channel(256);
+        let (settle_sender, settled) = mpsc::unbounded_channel();
         Self {
             runtime,
             manager,
@@ -120,6 +133,11 @@ impl Session {
             connected: false,
             reconcile_at: None,
             context_limits: HashMap::new(),
+            primed: HashMap::new(),
+            held: Default::default(),
+            snapshots: HashMap::new(),
+            settle_sender,
+            settled,
         }
     }
     fn cwd(&self) -> &str {
@@ -207,30 +225,11 @@ impl Session {
         }
         self.emit(event).await
     }
+    fn reader(&self) -> RuntimeReader<'_> {
+        RuntimeReader::new(&self.runtime, self.cancel.clone())
+    }
     async fn messages(&self, id: &str) -> Result<Vec<Value>> {
-        let mut result = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut seen = HashSet::new();
-        loop {
-            let mut query = vec![("limit".to_owned(), "100".to_owned())];
-            if let Some(cursor) = &cursor {
-                query.push(("cursor".to_owned(), cursor.clone()));
-            } else {
-                query.push(("order".to_owned(), "asc".to_owned()));
-            }
-            let page = self
-                .request(Method::GET, &session_path(id, "/message"), &query, None)
-                .await?;
-            result.extend(array(&page["data"]).iter().cloned());
-            cursor = page["cursor"]["next"].as_str().map(str::to_owned);
-            let Some(next) = &cursor else {
-                break;
-            };
-            if !seen.insert(next.clone()) {
-                bail!("OpenCode repeated a message pagination cursor");
-            }
-        }
-        Ok(result)
+        super::messages(&self.reader(), id).await
     }
     async fn configure(&mut self) -> Result<()> {
         catalog::wait_ready(&self.runtime, self.cwd(), false, self.cancel.clone()).await?;
@@ -376,6 +375,7 @@ impl Session {
                 _=self.cancel.cancelled()=>break,
                 call=calls.recv()=>{let Some(call)=call else{break;};if self.handle(call).await{break;}},
                 event=self.events.recv()=>{if let Some(event)=event{if let Err(error)=self.observe(event).await{tracing::warn!(%error,"OpenCode event reconciliation failed");self.stream_cancel.cancel();self.reconcile_at=Some(Instant::now()+Duration::from_millis(100));}}},
+                settled=self.settled.recv()=>{if let Some((child,applied))=settled{self.settle_replay(&child,applied).await;}},
                 _=tick.tick()=>{
                     if self.runtime.is_exited(){
                         if self.turn.is_some(){let _=self.fail("OpenCode helper server exited".to_owned()).await;}
@@ -586,42 +586,30 @@ impl Session {
         }
         Ok(())
     }
-    async fn reconcile_children(&mut self, parent: &str) -> Result<()> {
-        let mut parents = vec![parent.to_owned()];
-        let mut visited = HashSet::new();
-        while let Some(parent) = parents.pop() {
-            if !visited.insert(parent.clone()) {
-                continue;
-            }
-            let mut cursor: Option<String> = None;
-            let mut seen = HashSet::new();
-            loop {
-                let mut query = vec![("limit".to_owned(), "100".to_owned())];
-                if let Some(cursor) = &cursor {
-                    query.push(("cursor".to_owned(), cursor.clone()));
-                } else {
-                    query.push(("parentID".to_owned(), parent.clone()));
-                }
-                let page = self
-                    .request(Method::GET, "/api/session", &query, None)
-                    .await?;
-                for child in array(&page["data"]) {
-                    self.reconcile_child(child.clone()).await?;
-                    parents.push(s(child, "id").to_owned());
-                }
-                cursor = page["cursor"]["next"].as_str().map(str::to_owned);
-                let Some(next) = &cursor else {
-                    break;
-                };
-                if !seen.insert(next.clone()) {
-                    bail!("OpenCode repeated a child pagination cursor");
-                }
+    /// Announces every descendant of `parent` descriptor-first. Child bodies are
+    /// collected only from live child events, after an event `gap` for children
+    /// this session saw running, or when a child is opened.
+    async fn reconcile_children(&mut self, parent: &str, gap: bool) -> Result<()> {
+        let found = super::descendants(&self.reader(), parent).await?;
+        if found.is_empty() {
+            return Ok(());
+        }
+        let active = super::active_sessions(&self.reader()).await?;
+        for info in found {
+            let id = s(&info, "id");
+            let was_running = self.children.get(id).is_some_and(|child| child.running);
+            self.announce_child(&info, &active).await?;
+            if gap && was_running && !self.held.is_held(id) {
+                self.collect_body(id).await?;
             }
         }
         Ok(())
     }
-    async fn reconcile_child(&mut self, info: Value) -> Result<()> {
-        let id = s(&info, "id").to_owned();
+    async fn announce_child(&mut self, info: &Value, active: &Value) -> Result<()> {
+        let id = s(info, "id").to_owned();
+        if id.is_empty() {
+            bail!("OpenCode child session response omitted its id");
+        }
         self.reconcile_permissions(&id).await?;
         if !self.children.contains_key(&id) {
             self.runtime.bind_session(&id, &self.context)?;
@@ -629,47 +617,87 @@ impl Session {
             self.children.insert(
                 id.clone(),
                 Child {
-                    timeline: Timeline::default(),
+                    timeline: self.primed.remove(&id).unwrap_or_default(),
                     signature: String::new(),
+                    running: false,
                 },
             );
         }
-        let active = self.get("/api/session/active").await?;
-        let status = if active["data"]
-            .get(&id)
-            .is_some_and(|v| !v.is_null() && v != false)
-        {
-            "running"
-        } else {
-            match s(&info, "outcome") {
-                "failed" => "failed",
-                "interrupted" => "canceled",
-                _ => "completed",
-            }
-        };
-        let parent = if s(&info, "parentID") == self.id {
-            Value::Null
-        } else {
-            info["parentID"].clone()
-        };
-        let presentation = json!({"type":"upsert","id":id,"parentSubagentId":parent,"title":info["title"],"status":status,"cwd":info["location"]["directory"],"timestamp":timestamp(&info["time"]["updated"])});
+        let presentation = super::descriptor(info, &self.id, active);
         let signature = serde_json::to_string(&presentation)?;
-        let changed = self
-            .children
-            .get(&id)
-            .is_some_and(|child| child.signature != signature);
-        if changed {
-            self.children.get_mut(&id).unwrap().signature = signature;
+        let child = self.children.get_mut(&id).unwrap();
+        child.running = presentation["status"] == "running";
+        if child.signature != signature {
+            child.signature = signature;
             self.emit(
                 json!({"type":"provider_subagent","provider":"opencode","event":presentation}),
             )
             .await?;
         }
-        let history = self.messages(&id).await?;
+        Ok(())
+    }
+    /// Live collection for a child that produced an event: refresh its descriptor
+    /// and collect its transcript.
+    async fn collect_child(&mut self, id: &str) -> Result<()> {
+        let info = self.get(&session_path(id, "")).await?["data"].take();
+        if s(&info, "id") != id {
+            bail!("OpenCode session {id} was not found");
+        }
+        let active = super::active_sessions(&self.reader()).await?;
+        self.announce_child(&info, &active).await?;
+        self.collect_body(id).await
+    }
+    /// Publishes an opened child's replay marker in this parent's live stream and
+    /// holds that child's live re-reads until its watcher posts the outcome. The
+    /// actor keeps serving the parent and other children meanwhile.
+    async fn publish_replay(
+        &mut self,
+        provider: &str,
+        request: &SubagentHistoryRequest,
+    ) -> Result<()> {
+        let child = request.child_id.as_str();
+        let (events, read, history) =
+            super::read_child(&self.reader(), provider, &self.id, child).await?;
+        self.emit(family::marker(request, provider, events, read))
+            .await?;
+        self.held.hold(child);
+        self.snapshots.insert(child.to_owned(), history);
+        let settled = self.settle_sender.clone();
+        let child = child.to_owned();
+        family::on_outcome(request.replay.clone(), self.cancel.clone(), move |applied| async move {
+            let _ = settled.send((child, applied));
+        });
+        Ok(())
+    }
+    /// An applied snapshot becomes the child's live timeline; either way its
+    /// re-read then resumes once, against whichever state the daemon kept.
+    async fn settle_replay(&mut self, child: &str, applied: bool) {
+        self.held.release(child);
+        let Some(history) = self.snapshots.remove(child) else {
+            return;
+        };
+        if applied {
+            let timeline = match self.children.get_mut(child) {
+                Some(tracked) => &mut tracked.timeline,
+                None => self.primed.entry(child.to_owned()).or_default(),
+            };
+            if let Err(error) = timeline.messages(&history, true) {
+                tracing::warn!(%error,"OpenCode child live rebase failed");
+            }
+        }
+        if self.children.contains_key(child) {
+            if let Err(error) = self.collect_child(child).await {
+                tracing::warn!(%error,"OpenCode held child collection failed");
+            }
+        }
+    }
+    /// Emits only the transcript this child's live timeline has not emitted yet.
+    async fn collect_body(&mut self, id: &str) -> Result<()> {
+        let history = self.messages(id).await?;
         let events = self
             .children
-            .get_mut(&id)
-            .unwrap()
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("OpenCode child {id} is not tracked"))?
             .timeline
             .messages(&history, true)?;
         for event in events {
@@ -690,7 +718,7 @@ impl Session {
             )
             .await?;
             self.reconcile().await?;
-            self.reconcile_children(&self.id.clone()).await?;
+            self.reconcile_children(&self.id.clone(), true).await?;
             self.reconcile_turn().await?;
             self.connected = true;
             return Ok(());
@@ -698,13 +726,13 @@ impl Session {
         if kind == "session.created" {
             let parent = s(data, "parentID");
             if parent == self.id || self.children.contains_key(parent) {
-                self.reconcile_children(parent).await?;
+                self.reconcile_children(parent, false).await?;
             }
         }
         let event_session = s(data, "sessionID");
-        if self.children.contains_key(event_session) {
-            let info = self.get(&session_path(event_session, "")).await?;
-            self.reconcile_child(info["data"].clone()).await?;
+        // A held child's re-read waits for its replay outcome (`settle_replay`).
+        if self.children.contains_key(event_session) && !self.held.is_held(event_session) {
+            self.collect_child(event_session).await?;
         }
         if kind == "permission.replied" {
             self.resolve(
@@ -1077,6 +1105,10 @@ impl Session {
                     }
                 }
             }
+            Operation::ReplayChild(provider, request) => {
+                let published = self.publish_replay(&provider, &request).await;
+                let _ = reply.send(published.map(|()| Value::Null));
+            }
             operation => {
                 let result = self.operation(operation).await;
                 self.publish();
@@ -1244,7 +1276,10 @@ impl Session {
                 }
                 Ok(Value::Null)
             }
-            Operation::Start(..) | Operation::Interrupt | Operation::Rewind(..) => {
+            Operation::Start(..)
+            | Operation::Interrupt
+            | Operation::Rewind(..)
+            | Operation::ReplayChild(..) => {
                 unreachable!("control operation handled by actor")
             }
         }

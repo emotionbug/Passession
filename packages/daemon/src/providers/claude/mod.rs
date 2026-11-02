@@ -6,11 +6,14 @@ mod storage;
 mod transport;
 
 use super::api::{
-    AgentProvider, AgentSession, EventSink, ImportedSession, LaunchContext, ProviderSpec,
-    RewindTarget,
+    AgentProvider, AgentSession, EventSink, HistoryCoverage, ImportedSession, LaunchContext,
+    ProviderSpec, RewindTarget, SubagentHistory, SubagentHistoryRequest,
 };
 use paseo_client::process::{CommandSpec, run};
-use crate::providers::registry::catalog::refresh_activity;
+use crate::providers::registry::catalog::{
+    memo::{self, Loaded, Memo},
+    refresh_activity,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use projection::Projection;
@@ -31,10 +34,23 @@ fn merged_env(spec: &ProviderSpec, context: Option<&LaunchContext>) -> BTreeMap<
     options::provider_env(spec, context.map(|context| &context.env))
 }
 
+/// Whether a held live sidechain row is already in an applied snapshot. An
+/// assistant or reasoning row of a message the snapshot holds finished is a
+/// chunk of text the snapshot already has. Any other row, such as a tool's
+/// later status or a message still streaming, is covered only by an identical
+/// row, so a newer update with the same ID is kept.
+fn covered_by_snapshot(item: &Value, snapshot: &[Value], finished: &HashSet<String>) -> bool {
+    let text = matches!(item["type"].as_str(), Some("assistant_message" | "reasoning"));
+    (text && item["messageId"].as_str().is_some_and(|id| finished.contains(id)))
+        || snapshot.contains(item)
+}
 pub struct ClaudeProvider {
     spec: ProviderSpec,
     capabilities: Value,
     sessions: Mutex<Vec<Weak<ClaudeSession>>>,
+    /// The no-prompt initialize response lists both models and commands, so
+    /// catalog refreshes and draft command reads share one discovery.
+    initialized: Memo<Arc<Value>>,
 }
 impl ClaudeProvider {
     pub fn new(spec: ProviderSpec) -> Self {
@@ -42,6 +58,7 @@ impl ClaudeProvider {
             spec,
             capabilities: capabilities(),
             sessions: Mutex::new(Vec::new()),
+            initialized: Memo::default(),
         }
     }
 
@@ -134,6 +151,7 @@ impl ClaudeProvider {
             spec: self.spec.clone(),
             context,
             sink,
+            holds: Default::default(),
             capabilities: capabilities(),
             history_events: Mutex::new((history_events, history_coverage)),
             env,
@@ -184,38 +202,62 @@ impl ClaudeProvider {
         })
     }
 
-    async fn discover(&self, cancel: CancellationToken) -> Result<Value> {
+    async fn discover(&self, cancel: CancellationToken) -> Result<Arc<Value>> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot resolve home directory"))?;
         let launch = options::discovery_launch(&self.spec, &home)?;
-        let (transport, mut incoming) = Transport::spawn(launch.command, cancel).await?;
-        let responder = transport.clone();
-        let pump = tokio::spawn(async move {
-            while let Some(frame) = incoming.recv().await {
-                let frame = frame?;
-                if frame["type"] == "control_request" {
-                    let id = frame["request_id"]
-                        .as_str()
-                        .ok_or_else(|| anyhow!("Claude control request has no id"))?;
-                    responder
-                        .reply(
-                            id,
-                            Err(anyhow!(
-                                "Model discovery does not grant tool or hook execution"
-                            )),
-                        )
-                        .await?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        let result = transport
-            .request(launch.initialize, Duration::from_secs(5))
-            .await;
-        pump.abort();
-        let _ = pump.await;
-        let closed = transport.close().await;
-        closed?;
-        result
+        // Discovery reads only user settings and user-level commands, skills
+        // and plugins; credentials decide which models the account sees.
+        let config_dir = storage::config_dir(&launch.command.env)?;
+        let watched = [
+            "settings.json",
+            ".credentials.json",
+            "commands",
+            "skills",
+            "plugins",
+        ]
+        .map(|name| config_dir.join(name));
+        let fingerprint = memo::fingerprint(&watched).await;
+        let key = memo::key(&json!([
+            launch.command.program,
+            launch.command.args,
+            memo::shared_env(&launch.command.env),
+            launch.initialize,
+            fingerprint
+        ]));
+        let waiting = cancel.clone();
+        self.initialized
+            .get_or_load(key, &waiting, || async move {
+                let (transport, mut incoming) = Transport::spawn(launch.command, cancel).await?;
+                let responder = transport.clone();
+                let pump = tokio::spawn(async move {
+                    while let Some(frame) = incoming.recv().await {
+                        let frame = frame?;
+                        if frame["type"] == "control_request" {
+                            let id = frame["request_id"]
+                                .as_str()
+                                .ok_or_else(|| anyhow!("Claude control request has no id"))?;
+                            responder
+                                .reply(
+                                    id,
+                                    Err(anyhow!(
+                                        "Model discovery does not grant tool or hook execution"
+                                    )),
+                                )
+                                .await?;
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                });
+                let result = transport
+                    .request(launch.initialize, Duration::from_secs(5))
+                    .await;
+                pump.abort();
+                let _ = pump.await;
+                let closed = transport.close().await;
+                closed?;
+                result.map(|initialized| Loaded::Complete(Arc::new(initialized)))
+            })
+            .await
     }
 }
 
@@ -309,7 +351,7 @@ impl AgentProvider for ClaudeProvider {
                     return Err(error);
                 }
                 tracing::warn!(error=%error,"Claude model discovery failed; omitting discovery-required models");
-                Value::Null
+                Arc::new(Value::Null)
             }
         };
         let env = merged_env(&self.spec, None);
@@ -341,7 +383,7 @@ impl AgentProvider for ClaudeProvider {
     }
     async fn list_commands(&self, _config: &Value) -> Result<Vec<Value>> {
         Ok(catalog::commands(
-            &self.discover(CancellationToken::new()).await?,
+            self.discover(CancellationToken::new()).await?.as_ref(),
         ))
     }
     async fn list_importable_sessions(&self, options: Value) -> Result<Vec<Value>> {
@@ -404,9 +446,111 @@ impl AgentProvider for ClaudeProvider {
             provider_subagent_events,
         })
     }
-    async fn is_available(&self, _options: Value, cancel: CancellationToken) -> Result<bool> {
+    /// Sidechain and workflow transcripts are files beside the parent's; reading
+    /// one never launches Claude. Inline sidechains arrived with the parent.
+    async fn stream_subagent_history(
+        &self,
+        request: SubagentHistoryRequest,
+        context: LaunchContext,
+        sink: EventSink,
+    ) -> Result<SubagentHistory> {
+        let cwd = request.config["cwd"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Claude requires the original working directory"))?;
+        let session = request.persistence["sessionId"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Claude subagent parent has no sessionId"))?;
+        let path =
+            storage::transcript_path(cwd, session, &merged_env(&self.spec, Some(&context))).await?;
+        let child = request.child_id.as_str();
+        let source = if request.source.is_object() {
+            request.source.clone()
+        } else {
+            // A descriptor stored before `source`: locate it from the parent alone.
+            let announced = projection::project_history(&self.spec.id, &storage::read_history(&path).await?);
+            let mut announced = announced
+                .iter()
+                .filter(|event| event["type"] == "provider_subagent" && event["event"]["id"] == child);
+            match announced.clone().find(|event| event["event"]["source"].is_object()) {
+                Some(event) => event["event"]["source"].clone(),
+                None if announced.next().is_some() => return Ok(SubagentHistory::Collected),
+                None => bail!("Claude subagent '{child}' cannot be located from its parent transcript"),
+            }
+        };
+        let live = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|live| live.publishes_for(session));
+        let finished = matches!(request.status.as_str(), Some("completed" | "failed" | "canceled"));
+        let open_tail_is_live = live.is_some() && !finished;
+        // Messages the snapshot holds in their final form, by API message ID.
+        let final_messages = Arc::new(Mutex::new(HashSet::new()));
+        let read = async {
+            // A running sidechain's message may still be streaming: its records
+            // are final only once one carries the API `stop_reason`. Unfinished
+            // messages are left to the live stream so no snapshot row lags
+            // behind live text.
+            let keep_finished = |entries: &mut Vec<Value>, complete: &mut bool| {
+                if open_tail_is_live {
+                    let (finished, dropped) = storage::keep_finished_messages(entries);
+                    *final_messages.lock().unwrap() = finished;
+                    *complete &= !dropped;
+                }
+            };
+            let events = match (source["workflowRunId"].as_str(), source["agentId"].as_str()) {
+                (Some(run), _) => {
+                    let (workflow, mut entries, mut complete) =
+                        storage::read_workflow(&path, run).await?;
+                    keep_finished(&mut entries, &mut complete);
+                    projection::project_workflow(&self.spec.id, child, &workflow, &entries, complete)
+                }
+                (None, Some(agent)) => {
+                    let (mut body, others, mut complete) = storage::read_subagent(&path, agent).await?;
+                    keep_finished(&mut body.entries, &mut complete);
+                    projection::project_subagent(&self.spec.id, child, &source, &body, &others, complete)
+                }
+                (None, None) => {
+                    bail!("Claude subagent '{child}' has an unrecognized transcript locator")
+                }
+            };
+            let read = if events.iter().all(|event| {
+                event["event"]["type"] != "timeline" || event["event"]["historyComplete"] == true
+            }) {
+                HistoryCoverage::Complete
+            } else {
+                HistoryCoverage::Unverified
+            };
+            Ok((events, read))
+        };
+        // A live parent can still stream this sidechain, so the file replay goes
+        // in-stream behind the rows it already published, named as the live
+        // stream names them (API message ID, record uuid, tool call ID).
+        if let Some(live) = live {
+            let finals = final_messages.clone();
+            return live
+                .holds
+                .publish_replay(&request, &self.spec.id, &live.sink, read, move |item, snapshot| {
+                    covered_by_snapshot(item, snapshot, &finals.lock().unwrap())
+                })
+                .await;
+        }
+        let (mut events, read) = read.await?;
+        let coverage = request.settle(&mut events, read);
+        for event in events {
+            sink.emit(event).await?;
+        }
+        Ok(SubagentHistory::Replayed(coverage))
+    }
+    async fn is_available(&self, options: Value, cancel: CancellationToken) -> Result<bool> {
         if cancel.is_cancelled() {
             bail!("Claude availability probe canceled");
+        }
+        // A forced catalog refresh asks availability first, before any reuse.
+        if options["force"] == true {
+            self.initialized.clear();
         }
         let Some(program) = self.spec.command.first() else {
             return Ok(false);
@@ -498,6 +642,8 @@ struct ClaudeSession {
     spec: ProviderSpec,
     context: LaunchContext,
     sink: EventSink,
+    /// Live rows of a child whose in-stream replay is being decided.
+    holds: crate::providers::api::ChildRowHold,
     capabilities: Value,
     history_events: Mutex<(Vec<Value>, crate::providers::api::HistoryCoverage)>,
     env: BTreeMap<String, String>,
@@ -533,9 +679,15 @@ fn remember_anchor(anchors: &mut Vec<(String, Option<String>)>, frame: &Value) {
 impl ClaudeSession {
     async fn emit(&self, events: Vec<Value>) -> Result<()> {
         for event in events {
-            self.sink.emit(event).await?;
+            self.holds.emit(&self.sink, event).await?;
         }
         Ok(())
+    }
+    /// Whether this is the parent `session` with a live runtime that can still
+    /// stream a sidechain's rows.
+    fn publishes_for(&self, session: &str) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.closed && state.runtime.is_some() && state.native_id.as_deref() == Some(session)
     }
 
     async fn ensure_runtime(&self) -> Result<Arc<Transport>> {

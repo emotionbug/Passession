@@ -1,17 +1,26 @@
 mod projection;
 mod prompt;
 mod tools;
+#[cfg(test)]
+mod tests;
 
 use super::{
     catalog,
     runtime::{Generation, Runtime, RuntimeManager, read_sse},
 };
-use crate::providers::api::{AgentSession, EventSink, LaunchContext, ProviderSpec, RewindTarget};
+use super::{
+    family::{self, LiveFamily},
+    reader::{NativeReader, RuntimeReader},
+};
+use crate::providers::api::{
+    AgentSession, EventSink, HistoryCoverage, LaunchContext, ProviderSpec, RewindTarget,
+    SubagentHistoryRequest, subagent_row,
+};
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use projection::{
-    Projection, diagnostic, event, filter_reverted, history_message, model, s, session_id,
-    subagent, timeline,
+    Projection, descriptor, diagnostic, event, filter_reverted, history_message, model, s,
+    session_id, subagent, timeline,
 };
 pub(super) use prompt::{prompt_parts, prompt_text};
 use rand::RngCore;
@@ -103,6 +112,8 @@ struct State {
     unrelated: HashSet<String>,
     features: Arc<[Value]>,
     auto_accept: bool,
+    /// Children whose in-stream replay awaits the daemon's outcome.
+    held: family::HeldEvents,
 }
 impl State {
     fn start(&mut self) -> String {
@@ -162,6 +173,10 @@ struct Inner {
     changed: Notify,
     reconnect: tokio::sync::Mutex<()>,
     start_gate: tokio::sync::Mutex<()>,
+    /// Held while one native event is handled, by an opened child's in-stream
+    /// replay for its native read and marker, and while that child's held events
+    /// are translated after the daemon settled it (`family`).
+    live_gate: tokio::sync::Mutex<()>,
     usage_key: String,
 }
 struct LegacySession {
@@ -271,6 +286,7 @@ pub async fn attach(
             mcp_ready: false,
             modes: None,
             unrelated: HashSet::new(),
+            held: Default::default(),
         }),
         runtime: Mutex::new(Some(runtime)),
         closed: AtomicBool::new(false),
@@ -281,8 +297,15 @@ pub async fn attach(
         changed: Notify::new(),
         reconnect: tokio::sync::Mutex::new(()),
         start_gate: tokio::sync::Mutex::new(()),
+        live_gate: tokio::sync::Mutex::new(()),
         usage_key: uuid::Uuid::new_v4().to_string(),
     });
+    let family: Arc<dyn LiveFamily> = inner.clone();
+    inner
+        .manager
+        .families
+        .register(&inner.id, Arc::downgrade(&family));
+    drop(family);
     Inner::spawn_stream(&inner, stream_cancel);
     let capabilities = json!({"supportsStreaming":true,"supportsSessionPersistence":true,"supportsSessionListing":true,"supportsDynamicModes":true,"supportsMcpServers":true,"supportsReasoningStream":true,"supportsToolInvocations":true,"supportsRewindConversation":false,"supportsRewindFiles":false,"supportsRewindBoth":true});
     Ok(Arc::new(LegacySession {
@@ -427,7 +450,7 @@ impl Inner {
                         biased;
                         _ = cancel.cancelled()=>None,
                         _ = tokio::time::sleep_until(next_repair), if repair_pending=>{
-                            let repair=tokio::select!{_ = cancel.cancelled()=>break,result=this.repair_gap()=>result};
+                            let repair=tokio::select!{_ = cancel.cancelled()=>break,result=async{let _live=this.live_gate.lock().await;this.repair_gap().await}=>result};
                             repair_pending=repair.is_err();
                             next_repair=tokio::time::Instant::now()+Duration::from_secs(1);
                             continue;
@@ -440,6 +463,7 @@ impl Inner {
                     delivered = true;
                     let e = raw.get("payload").unwrap_or(&raw);
                     let handle = async {
+                        let _live = this.live_gate.lock().await;
                         if e["type"] == "server.connected" {
                             connected = true;
                             this.ready.send_replace(true);
@@ -469,6 +493,7 @@ impl Inner {
                                 !id.is_empty()
                                     && !st.projection.owns(id)
                                     && !st.unrelated.contains(id)
+                                    && !st.held.covers(id)
                             };
                             if unknown
                                 && !matches!(s(&e["type"]), "session.created" | "session.updated")
@@ -477,7 +502,7 @@ impl Inner {
                                     tracing::warn!(%error,"OpenCode child discovery failed");
                                 }
                                 let mut st = this.state();
-                                if !st.projection.owns(id) {
+                                if !st.projection.owns(id) && !st.held.covers(id) {
                                     st.unrelated.insert(id.into());
                                 }
                             }
@@ -543,6 +568,13 @@ impl Inner {
     }
     async fn consume(&self, e: &Value) -> Result<()> {
         let sid = session_id(e).to_owned();
+        if self
+            .state()
+            .held
+            .intercept(&sid, s(&e["properties"]["info"]["parentID"]), e)
+        {
+            return Ok(());
+        }
         let kind = s(&e["type"]);
         let (discard, ack) = {
             let mut st = self.state();
@@ -722,146 +754,127 @@ impl Inner {
         filter_reverted(&mut messages, info);
         Ok(messages)
     }
+    /// Announces every native descendant with descriptor-only upserts. Bodies are
+    /// read only to catch up a gap in a child that is or was running; any other
+    /// child's transcript loads when it is opened (`replay_child`).
     async fn hydrate_children(&self, recovered: bool) -> Result<()> {
-        let mut queue = VecDeque::from([(self.id.clone(), self.cwd.clone())]);
-        let mut visited = HashSet::new();
-        let mut children = vec![];
-        while let Some((id, cwd)) = queue.pop_front() {
-            if visited.len() >= 100 {
-                break;
-            }
-            if !visited.insert(id.clone()) {
+        let runtime = self.runtime()?;
+        let found = discover(
+            &RuntimeReader::new(&runtime, self.cancel.clone()),
+            &self.id,
+            &self.cwd,
+        )
+        .await?;
+        for child in found {
+            let id = s(&child.info["id"]);
+            // A session spawned beneath a held child is detected in order with that
+            // child's buffered events, so its task row still links on release.
+            let deferred = {
+                let mut st = self.state();
+                !st.projection.children.contains_key(id)
+                    && st.held.intercept(
+                        id,
+                        parent_id(&child.info),
+                        &json!({"type":"session.created","properties":{"info":child.info}}),
+                    )
+            };
+            if deferred {
+                self.manager.remember_session(id, &runtime);
                 continue;
             }
-            let values = self
-                .request(
-                    Method::GET,
-                    &format!("/session/{}/children", segment(&id)),
-                    &cwd,
-                    None,
-                )
-                .await?;
-            for info in values
-                .as_array()
-                .ok_or_else(|| anyhow!("Invalid OpenCode children response"))?
-            {
-                let child = s(&info["id"]);
-                if child.is_empty() {
-                    continue;
-                }
-                let directory = info["directory"].as_str().unwrap_or(&cwd).to_owned();
-                children.push((info.clone(), directory.clone()));
-                if queue.len() + visited.len() < 100 {
-                    queue.push_back((child.into(), directory));
-                }
-            }
-        }
-        let mut statuses = HashMap::new();
-        for (info, cwd) in children {
-            if !statuses.contains_key(&cwd) {
-                statuses.insert(
-                    cwd.clone(),
-                    self.request(Method::GET, "/session/status", &cwd, None)
-                        .await
-                        .ok(),
+            let (detected, was_running) = {
+                let mut st = self.state();
+                let was_running = st
+                    .projection
+                    .children
+                    .get(id)
+                    .is_some_and(|c| c.status["status"] == "running");
+                let detected = st.projection.detect(
+                    &child.info,
+                    Some(if child.active() { "running" } else { "completed" }),
                 );
-            }
-            let id = s(&info["id"]);
-            let snapshot = statuses.get(&cwd).and_then(Option::as_ref);
-            let kind = snapshot.map(|v| s(&v[id]["type"]));
-            let active = snapshot.is_none() || matches!(kind, Some("busy" | "retry"));
-            let detected = {
-                self.state().projection.detect(
-                    &info,
-                    if recovered {
-                        None
-                    } else {
-                        Some(if active { "running" } else { "completed" })
-                    },
-                )
+                if let (Some(up), Some(c)) =
+                    (detected.first(), st.projection.children.get_mut(id))
+                {
+                    c.status = up["event"].clone();
+                }
+                (detected, was_running)
             };
             for e in detected {
                 self.emit(e, None).await?;
             }
-            self.manager.remember_session(id, &self.runtime()?);
-            let messages = match self.messages(id, &cwd, &info).await {
-                Ok(messages) => messages,
-                Err(error) => {
-                    tracing::warn!(%error,session_id=id,"OpenCode child timeline hydration failed");
-                    Vec::new()
-                }
-            };
-            let hydrated = {
-                let st = self.state();
-                st.projection
-                    .children
-                    .get(id)
-                    .is_some_and(|c| c.info["_paseoHydrated"] == true)
-            };
-            if recovered {
-                for m in &messages {
-                    self.consume(
-                        &json!({"type":"message.updated","properties":{"info":m["info"]}}),
-                    )
-                    .await?;
-                    for p in m["parts"].as_array().into_iter().flatten() {
-                        self.consume(
-                            &json!({"type":"message.part.updated","properties":{"part":p}}),
-                        )
-                        .await?;
-                    }
-                }
-            } else if !hydrated {
-                for m in &messages {
-                    if m["info"]["role"] == "assistant" && m["info"]["time"]["completed"].is_null()
-                    {
-                        continue;
-                    }
-                    for e in history_message(m) {
-                        let mut nested = json!({"type":"timeline","id":id,"item":e["item"]});
-                        if let Some(time) = e.get("timestamp") {
-                            nested["timestamp"] = time.clone();
-                        }
-                        self.emit(subagent(nested), None).await?;
-                    }
-                }
-                let mut st = self.state();
-                if let Some(child) = st.projection.children.get_mut(id) {
-                    child.track.hydrate_completed(&messages);
-                    child.info["_paseoHydrated"] = json!(true);
-                }
-            }
-            let latest = messages
-                .iter()
-                .rev()
-                .find(|m| m["info"]["role"] == "assistant");
-            let presentation =
-                latest.and_then(|m| self.state().projection.child_presentation(id, &m["info"]));
-            if let Some(e) = presentation {
-                self.emit(e, None).await?;
-            }
-            if recovered {
-                let status = if matches!(kind, Some("busy" | "retry")) {
-                    Some("running")
-                } else if latest.is_some_and(|m| !m["info"]["error"].is_null()) {
-                    Some("failed")
-                } else if snapshot.is_some()
-                    || latest.is_some_and(|m| !m["info"]["time"]["completed"].is_null())
-                {
-                    Some("completed")
-                } else {
-                    None
-                };
-                if let Some(status) = status {
-                    self.emit(
-                        subagent(json!({"type":"upsert","id":id,"status":status})),
-                        None,
-                    )
-                    .await?;
-                }
+            self.manager.remember_session(id, &runtime);
+            if recovered && (was_running || child.active()) {
+                self.catch_up_child(&child).await?;
             }
         }
         Ok(())
+    }
+    /// Live collection after an event gap: replays the running child's native
+    /// state through its live track, which emits only what it has not emitted.
+    async fn catch_up_child(&self, child: &Discovered) -> Result<()> {
+        let id = s(&child.info["id"]);
+        let messages = match self.messages(id, &child.directory, &child.info).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!(%error,session_id=id,"OpenCode child gap recovery failed");
+                Vec::new()
+            }
+        };
+        for m in &messages {
+            self.consume(&json!({"type":"message.updated","properties":{"info":m["info"]}}))
+                .await?;
+            for p in m["parts"].as_array().into_iter().flatten() {
+                self.consume(&json!({"type":"message.part.updated","properties":{"part":p}}))
+                    .await?;
+            }
+        }
+        let latest = messages
+            .iter()
+            .rev()
+            .find(|m| m["info"]["role"] == "assistant");
+        let presentation =
+            latest.and_then(|m| self.state().projection.child_presentation(id, &m["info"]));
+        if let Some(e) = presentation {
+            self.emit(e, None).await?;
+        }
+        let status = if child.running() {
+            Some("running")
+        } else if latest.is_some_and(|m| !m["info"]["error"].is_null()) {
+            Some("failed")
+        } else if child.native_status.is_some()
+            || latest.is_some_and(|m| !m["info"]["time"]["completed"].is_null())
+        {
+            Some("completed")
+        } else {
+            None
+        };
+        if let Some(status) = status {
+            let up = json!({"type":"upsert","id":id,"status":status});
+            if let Some(c) = self.state().projection.children.get_mut(id) {
+                c.status = up.clone();
+            }
+            self.emit(subagent(up), None).await?;
+        }
+        Ok(())
+    }
+    /// Settles an opened child's in-stream replay: an applied snapshot becomes the
+    /// child's live state, then its held events are translated once, in order,
+    /// against whichever state the daemon kept.
+    async fn settle_replay(&self, child: &str, applied: bool, messages: &[Value]) {
+        let _live = self.live_gate.lock().await;
+        let held = {
+            let mut st = self.state();
+            if applied {
+                st.projection.rebase(child, messages);
+            }
+            st.held.release(child)
+        };
+        for event in held {
+            if let Err(error) = self.consume(&event).await {
+                tracing::warn!(%error,session_id=child,"OpenCode held child event failed");
+            }
+        }
     }
     async fn reconcile_permissions(&self) -> Result<()> {
         let directories = {
@@ -1167,6 +1180,234 @@ impl Inner {
 }
 fn runtime_info(provider: &str, id: &str, config: &Value) -> Value {
     json!({"provider":provider,"sessionId":id,"model":config["model"],"modeId":config["modeId"],"thinkingOptionId":config["thinkingOptionId"]})
+}
+
+#[async_trait]
+impl LiveFamily for Inner {
+    fn is_live(&self) -> bool {
+        !self.closed.load(Ordering::Acquire) && !self.cancel.is_cancelled()
+    }
+    async fn publish_replay(
+        self: Arc<Self>,
+        provider: &str,
+        request: SubagentHistoryRequest,
+        directory: &str,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let child = request.child_id.clone();
+        let messages = {
+            // The gate orders the snapshot and marker with live event handling; it
+            // is released before the outcome so the session keeps serving.
+            let _live = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => bail!("OpenCode child history read canceled"),
+                live = self.live_gate.lock() => live,
+            };
+            let runtime = self.runtime()?;
+            let (events, read, messages) = read_child(
+                &RuntimeReader::new(&runtime, cancel),
+                provider,
+                &self.id,
+                &child,
+                directory,
+            )
+            .await?;
+            self.state().held.hold(&child);
+            if let Err(error) = self
+                .sink
+                .emit(family::marker(&request, provider, events, read))
+                .await
+            {
+                self.state().held.release(&child);
+                return Err(error);
+            }
+            messages
+        };
+        let weak = Arc::downgrade(&self);
+        family::on_outcome(request.replay, self.cancel.clone(), move |applied| async move {
+            if let Some(this) = weak.upgrade() {
+                this.settle_replay(&child, applied, &messages).await;
+            }
+        });
+        Ok(())
+    }
+}
+
+/// One native descendant found by the `/children` walk, with its runner state
+/// from that directory's status snapshot (`None` when the snapshot failed).
+pub(super) struct Discovered {
+    pub info: Value,
+    pub directory: String,
+    pub native_status: Option<String>,
+}
+impl Discovered {
+    fn running(&self) -> bool {
+        matches!(self.native_status.as_deref(), Some("busy" | "retry"))
+    }
+    /// An unknown runner state counts as running so its live events are kept.
+    pub fn active(&self) -> bool {
+        self.native_status.is_none() || self.running()
+    }
+}
+
+/// Walks `/children` breadth-first from `root` (at most 100 sessions) and reads
+/// one status snapshot per directory. Never reads a session's messages.
+pub(super) async fn discover(
+    reader: &dyn NativeReader,
+    root: &str,
+    cwd: &str,
+) -> Result<Vec<Discovered>> {
+    let mut queue = VecDeque::from([(root.to_owned(), cwd.to_owned())]);
+    let mut visited = HashSet::new();
+    let mut children = vec![];
+    while let Some((id, cwd)) = queue.pop_front() {
+        if visited.len() >= 100 {
+            break;
+        }
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let values = reader
+            .get(&format!("/session/{}/children", segment(&id)), &query(&cwd))
+            .await?;
+        for info in values
+            .as_array()
+            .ok_or_else(|| anyhow!("Invalid OpenCode children response"))?
+        {
+            let child = s(&info["id"]);
+            if child.is_empty() {
+                continue;
+            }
+            let directory = info["directory"].as_str().unwrap_or(&cwd).to_owned();
+            children.push((info.clone(), directory.clone()));
+            if queue.len() + visited.len() < 100 {
+                queue.push_back((child.into(), directory));
+            }
+        }
+    }
+    let mut statuses: HashMap<String, Option<Value>> = HashMap::new();
+    let mut found = Vec::with_capacity(children.len());
+    for (info, directory) in children {
+        if !statuses.contains_key(&directory) {
+            let snapshot = reader.get("/session/status", &query(&directory)).await.ok();
+            statuses.insert(directory.clone(), snapshot);
+        }
+        let native_status = statuses[&directory]
+            .as_ref()
+            .map(|snapshot| s(&snapshot[s(&info["id"])]["type"]).to_owned());
+        found.push(Discovered {
+            info,
+            directory,
+            native_status,
+        });
+    }
+    Ok(found)
+}
+
+fn parent_id(info: &Value) -> &str {
+    info["parentID"]
+        .as_str()
+        .or_else(|| info["parentId"].as_str())
+        .unwrap_or("")
+}
+
+/// Replays one opened child: descriptor-only upserts for the sessions it spawned,
+/// then its own transcript as `provider_subagent` rows. Reads no sibling. A child
+/// with an assistant message still running replays that partial message under
+/// its native `messageId` (matching live rows) as `Unverified`. Every read
+/// completes before any row exists.
+pub(super) async fn replay_child(
+    reader: &dyn NativeReader,
+    provider: &str,
+    parent: &str,
+    child: &str,
+    directory: &str,
+) -> Result<(Vec<Value>, HistoryCoverage)> {
+    let (events, coverage, _) = read_child(reader, provider, parent, child, directory).await?;
+    Ok((events, coverage))
+}
+/// `replay_child` plus the native messages the live track rebases onto.
+async fn read_child(
+    reader: &dyn NativeReader,
+    provider: &str,
+    parent: &str,
+    child: &str,
+    directory: &str,
+) -> Result<(Vec<Value>, HistoryCoverage, Vec<Value>)> {
+    let location = query(directory);
+    let info = reader
+        .get(&format!("/session/{}", segment(child)), &location)
+        .await?;
+    if info["id"] != child {
+        bail!("OpenCode session {child} was not found");
+    }
+    let mut ancestor = parent_id(&info).to_owned();
+    let mut depth = 0;
+    while ancestor != parent {
+        depth += 1;
+        if ancestor.is_empty() || depth > 100 {
+            bail!("OpenCode session {child} is not a subagent of {parent}");
+        }
+        let next = reader
+            .get(&format!("/session/{}", segment(&ancestor)), &location)
+            .await?;
+        ancestor = parent_id(&next).to_owned();
+    }
+    let response = reader
+        .get(&format!("/session/{}/message", segment(child)), &location)
+        .await?;
+    let mut messages = response
+        .as_array()
+        .cloned()
+        .ok_or_else(|| anyhow!("OpenCode messages response is not an array"))?;
+    filter_reverted(&mut messages, &info);
+    let spawned = reader
+        .get(&format!("/session/{}/children", segment(child)), &location)
+        .await?;
+    let mut statuses: HashMap<String, Option<Value>> = HashMap::new();
+    let mut events = Vec::new();
+    for info in spawned
+        .as_array()
+        .ok_or_else(|| anyhow!("Invalid OpenCode children response"))?
+    {
+        let id = s(&info["id"]);
+        if id.is_empty() {
+            continue;
+        }
+        let cwd = info["directory"].as_str().unwrap_or(directory).to_owned();
+        if !statuses.contains_key(&cwd) {
+            let snapshot = reader.get("/session/status", &query(&cwd)).await.ok();
+            statuses.insert(cwd.clone(), snapshot);
+        }
+        let status = statuses[&cwd].as_ref().map(|snapshot| {
+            if matches!(s(&snapshot[id]["type"]), "busy" | "retry") {
+                "running"
+            } else {
+                "completed"
+            }
+        });
+        events.push(json!({"type":"provider_subagent","provider":provider,
+            "event":descriptor(info, Some(child), status, directory)}));
+    }
+    let unfinished =
+        |m: &Value| m["info"]["role"] == "assistant" && m["info"]["time"]["completed"].is_null();
+    let coverage = if messages.iter().any(unfinished) {
+        HistoryCoverage::Unverified
+    } else {
+        HistoryCoverage::Complete
+    };
+    for message in &messages {
+        for e in history_message(message) {
+            events.push(subagent_row(
+                provider,
+                child,
+                e["item"].clone(),
+                e.get("timestamp"),
+                coverage,
+            ));
+        }
+    }
+    Ok((events, coverage, messages))
 }
 
 #[async_trait]
