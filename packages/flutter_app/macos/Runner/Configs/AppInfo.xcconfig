@@ -15,3 +15,7 @@ PRODUCT_COPYRIGHT = Copyright © 2026 sh.paseo. All rights reserved.
 
 // Preserve the Sessions desktop distribution contract (plugins require at least 12).
 MACOSX_DEPLOYMENT_TARGET = 13.0
+
+// The bundled daemon and desktop FFI library are built for the native host.
+// A universal launcher could select a slice that cannot load that FFI library.
+ARCHS = $(NATIVE_ARCH_ACTUAL)

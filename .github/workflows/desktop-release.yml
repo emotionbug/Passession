@@ -29,6 +29,11 @@ on:
         description: Optional exact commit containing corrected Cargo license notices only; application source stays at the selected tag
         type: string
         default: ""
+      macos_arm64_runner:
+        description: Hosted Apple Silicon image for manual release builds
+        type: choice
+        options: [macos-26, macos-15]
+        default: macos-26
       publish:
         description: Publish artifacts to GitHub Releases
         type: choice
@@ -105,7 +110,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.source.outputs.matrix) }}
-    runs-on: ${{ matrix.runner }}
+    name: native (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.platform == 'macos' && matrix.arch == 'arm64' && inputs.macos_arm64_runner || matrix.runner }}
     env:
       SOURCE_SHA: ${{ needs.source.outputs.sha }}
       SOURCE_DATE_EPOCH: ${{ needs.source.outputs.epoch }}
@@ -138,6 +144,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}
+          cache-on-failure: true
       - uses: ./.github/actions/setup-flutter
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
@@ -184,6 +191,20 @@ jobs:
             printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/paseo-release.keystore"
             echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/paseo-release.keystore" >> "$GITHUB_ENV"
           fi
+      - name: Configure host-native macOS release architecture
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TARGET_ID" in
+            macos-x64) architecture=x86_64; excluded=arm64 ;;
+            macos-arm64) architecture=arm64; excluded=x86_64 ;;
+            *) exit 1 ;;
+          esac
+          configuration="$RUNNER_TEMP/paseo-native-architecture.xcconfig"
+          printf 'ARCHS = %s\nEXCLUDED_ARCHS = %s\nONLY_ACTIVE_ARCH = NO\n' \
+            "$architecture" "$excluded" > "$configuration"
+          echo "XCODE_XCCONFIG_FILE=$configuration" >> "$GITHUB_ENV"
       - name: Build Flutter client and native Rust desktop runtime
         run: cargo xtask build-flutter ${{ matrix.platform }}
         env:
@@ -191,6 +212,13 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13002' }}
+      - name: Inspect native macOS build output
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          bundle="packages/flutter_app/build/macos/Build/Products/Release/Paseo Sessions.app"
+          /usr/bin/lipo -info "$bundle/Contents/MacOS/Paseo Sessions"
+          "$bundle/Contents/Resources/runtime/paseo" --version
       # Without mobile signing credentials, artifacts are explicitly labelled
       # debug-signed APK / unsigned iOS .app, never presented as store submissions.
       - name: Package native desktop installers
