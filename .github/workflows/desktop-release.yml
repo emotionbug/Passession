@@ -32,7 +32,7 @@ on:
       macos_arm64_runner:
         description: Hosted Apple Silicon image for manual release builds
         type: choice
-        options: [macos-26, macos-15]
+        options: [macos-26, macos-15, macos-14]
         default: macos-26
       publish:
         description: Publish artifacts to GitHub Releases
