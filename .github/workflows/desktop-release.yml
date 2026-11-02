@@ -30,9 +30,9 @@ on:
         type: string
         default: ""
       macos_arm64_runner:
-        description: Hosted Apple Silicon image for manual release builds
+        description: Hosted Apple Silicon image with Swift 6.1 or newer for Firebase packages
         type: choice
-        options: [macos-26, macos-15, macos-14]
+        options: [macos-26, macos-15]
         default: macos-26
       publish:
         description: Publish artifacts to GitHub Releases

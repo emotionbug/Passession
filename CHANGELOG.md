@@ -7,7 +7,7 @@
 - Resolve redistributed Linux library notices from the package owning the actual file (including merged-`usr` aliases), not the first package containing an unrelated library with the same basename.
 - Restore the exact revision-pinned macOS Cargo license text, including its omitted blank line. Manual release builds can pin a corrected notice-data commit without changing the published application source tag or weakening notice validation.
 - Build the macOS launcher for the host architecture, matching its bundled native daemon and FFI library instead of producing an incompatible universal launcher. Manual release builds pin the same Xcode settings for older source tags and can select an available Apple Silicon runner.
-- Prepare SwiftPM plugin staging directories before manual Apple release builds so Flutter dependency resolution also works with macOS 14's system rsync.
+- Prepare SwiftPM plugin staging directories before manual Apple release builds rather than relying on rsync to create missing parents. Supported Apple Silicon runner choices require Swift 6.1 or newer for the pinned Firebase packages.
 
 ## 0.13.2
 
