@@ -156,6 +156,13 @@ jobs:
             ~/.pub-cache
             ~/.cache/paseo-flutter-packaging
           key: flutter-native-${{ runner.os }}-${{ matrix.arch }}-${{ env.FLUTTER_VERSION }}-${{ hashFiles('packages/flutter_app/pubspec.lock', 'xtask/src/**') }}
+      - name: Prepare SwiftPM plugin staging directories
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Flutter pub get stages both Apple platforms before a target build.
+          # Its plugin copier does not create parents required by macOS 14 rsync.
+          mkdir -p packages/flutter_app/build/{ios,macos}/SourcePackages
       - name: Install Linux native build prerequisites
         if: matrix.platform == 'linux'
         run: |
