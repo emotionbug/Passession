@@ -23,17 +23,38 @@ async fn repository() -> anyhow::Result<tempfile::TempDir> {
 #[tokio::test]
 async fn literal_discard_does_not_interpret_pathspec_magic() -> anyhow::Result<()> {
     let dir = repository().await?;
-    let special = ":(glob)*";
-    tokio::fs::write(dir.path().join(special), b"literal\n").await?;
+    // Read as a glob, `[ab].txt` would also discard the ordinary tracked `a.txt`.
+    tokio::fs::write(dir.path().join("a.txt"), b"before\n").await?;
+    git(dir.path(), &["add", "a.txt"]).await?;
+    git(dir.path(), &["commit", "-m", "ordinary glob match"]).await?;
+    // Windows file names cannot contain `:` or `*`; elsewhere also cover magic.
+    let specials: Vec<&str> = if cfg!(windows) {
+        vec!["[ab].txt"]
+    } else {
+        vec!["[ab].txt", ":(glob)*"]
+    };
+    for special in &specials {
+        tokio::fs::write(dir.path().join(special), b"literal\n").await?;
+    }
+    tokio::fs::write(dir.path().join("a.txt"), b"keep a\n").await?;
     tokio::fs::write(dir.path().join("tracked.txt"), b"keep this change\n").await?;
     mutations::discard(
         dir.path(),
-        &[special.to_owned()],
+        &specials.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
         &BTreeMap::new(),
         CancellationToken::new(),
     )
     .await?;
-    assert!(!dir.path().join(special).exists());
+    for special in &specials {
+        assert!(
+            !dir.path().join(special).exists(),
+            "{special} was not discarded"
+        );
+    }
+    assert_eq!(
+        tokio::fs::read(dir.path().join("a.txt")).await?,
+        b"keep a\n"
+    );
     assert_eq!(
         tokio::fs::read(dir.path().join("tracked.txt")).await?,
         b"keep this change\n"

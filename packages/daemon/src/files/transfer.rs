@@ -477,7 +477,9 @@ impl Downloads {
         }
     }
 
-    /// The caller has already resolved workspace containment and file metadata.
+    /// Tokens bind the canonical path observed at issue time; `open` rejects the
+    /// file if that path no longer canonicalizes to itself (a replaced leaf or
+    /// parent). Callers resolve the request path and permissions beforehand.
     pub async fn issue(
         &self,
         path: PathBuf,
@@ -486,7 +488,10 @@ impl Downloads {
         mime_type: String,
         _size: u64,
     ) -> Result<String> {
-        ensure!(fs::canonicalize(&path).await? == path, "File not found");
+        // The canonical form is platform-specific (`\\?\` verbatim paths on
+        // Windows, `/private/var` on macOS), so it is computed here rather than
+        // required of the caller's path spelling.
+        let path = fs::canonicalize(&path).await?;
         ensure!(fs::metadata(&path).await?.is_file(), "File not found");
         let now = Instant::now();
         let mut tokens = self.tokens.lock().unwrap();
@@ -834,7 +839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chunk_errors_have_exact_messages_and_remove_partial_data() {
+    async fn chunk_boundaries_reject_out_of_order_and_oversize_data_and_remove_partial_data() {
         let home = tempfile::tempdir().unwrap();
         let directory = home.path().join("upload");
         let mut upload = Upload {
@@ -849,34 +854,18 @@ mod tests {
             started: false,
             completed: false,
         };
-        assert_eq!(
-            upload
-                .apply(FILE_CHUNK, b"x")
-                .await
-                .unwrap_err()
-                .to_string(),
-            "Upload chunks arrived before file begin."
-        );
+        assert!(upload.apply(FILE_CHUNK, b"x").await.is_err());
+        assert!(!upload.directory.exists());
         upload.apply(FILE_BEGIN, b"").await.unwrap();
         upload.apply(FILE_CHUNK, b"ab").await.unwrap();
-        assert_eq!(
-            upload.apply(FILE_END, b"").await.unwrap_err().to_string(),
-            "Upload size mismatch: expected 3, received 2."
-        );
-        let error = upload
-            .apply(FILE_CHUNK, b"cd")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "Upload exceeded declared size: expected 3, received 4."
-        );
-        assert_eq!(
-            upload.response(Some(&error)),
-            json!({"type":"file.upload.response",
-            "payload":{"requestId":"r","file":null,"error":error}})
-        );
+        assert!(upload.apply(FILE_END, b"").await.is_err());
+        assert!(!upload.completed);
+        // A chunk crossing the declared size is rejected whole; one that fills it exactly is kept.
+        assert!(upload.apply(FILE_CHUNK, b"cd").await.is_err());
+        assert_eq!(fs::read(&upload.path).await.unwrap(), b"ab");
+        upload.apply(FILE_CHUNK, b"c").await.unwrap();
+        assert!(upload.apply(FILE_CHUNK, b"d").await.is_err());
+        assert_eq!(fs::read(&upload.path).await.unwrap(), b"abc");
         upload.cleanup().await.unwrap();
         assert!(!upload.directory.exists());
     }

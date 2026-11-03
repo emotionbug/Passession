@@ -52,7 +52,9 @@ The daemon supports an optional shared-secret password (set via `auth.password` 
 
 The daemon writes a new `$PASEO_HOME/local-credential` on every run with mode `0600` and removes it on shutdown. The CLI and desktop main process read it only for the daemon whose PID lock `listen` matches their connection target. A same-user process can read this credential, so the password protects against network clients and other OS users, not processes running as the daemon user. Protect `$PASEO_HOME` accordingly. Relay traffic remains end-to-end encrypted independently of password admission.
 
-Connected clients are trusted operators of the daemon user. File previews follow that authority: a preview request may read any regular file the daemon process can read, while keeping path normalization and symlink checks in the daemon file service. Workspace-relative paths remain a UI convenience, not a security boundary.
+Connected clients are trusted operators of the daemon user. File RPCs still require their existing `workspace.read` or `workspace.write` grants, but the chosen cwd is a path anchor, not a filesystem sandbox. Absolute paths, parent-relative paths and symlinks can reach locations outside it when the daemon user's OS permissions allow the operation. These grants currently apply daemon-wide; see [permissions](docs/permissions.md).
+
+The file service retains file-type and read-size checks, revision-checked atomic saves, cancellation and protections against deleting or renaming the current workspace or its ancestors. Workspace-relative paths remain a UI convenience, not a security boundary. Provider CLI sandbox settings are independent of this file-service authority.
 
 When Paseo checks out a change request from a different repository, it does not run that workspace's `paseo.json` setup, automatic terminals, named scripts, or teardown until you explicitly run setup for that workspace. The decision lasts for the workspace and does not re-prompt after new commits. Same-repository changes, ordinary branches, local workspaces, agent launches, terminals, explicit shell commands, and metadata-generation instructions are outside this gate.
 

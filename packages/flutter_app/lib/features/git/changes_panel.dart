@@ -15,6 +15,7 @@ import '../../core/target.dart';
 import '../../ui/common.dart';
 import '../../ui/controls.dart';
 import '../../ui/localization.dart';
+import '../../ui/panel_activity.dart';
 import '../../ui/theme.dart';
 import '../files/file_icons.dart';
 import '../files/pane_chrome.dart';
@@ -40,6 +41,12 @@ class _ChangesPanelState extends State<ChangesPanel> {
   CheckoutGitActions? _actions;
   ReviewDraft? _review;
   late AppStore _store;
+  bool _visible = true;
+  int _actionsRevision = 0;
+
+  /// The last build, reused while this retained view is hidden so offstage
+  /// tabs do no work for store, checkout or diff changes.
+  Widget? _lastBuild;
   final Set<String> _collapsedFolders = {};
   final Set<String> _collapsedFiles = {};
   final _document = GlobalKey<DiffDocumentState>();
@@ -98,32 +105,106 @@ class _ChangesPanelState extends State<ChangesPanel> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     _store = PaseoScope.of(context);
-    if (_git != null) {
-      // The shared whitespace preference keys the diff request.
-      if (!git.isCommit && git.ignoreWhitespace != _hideWhitespace) {
-        git.ignoreWhitespace = _hideWhitespace;
-        unawaited(git.refresh());
-      }
+    _visible = PanelActivity.of(context).visible;
+    // A removed host's tab closes with it; until then the view keeps its client.
+    final client = _store.hostFor(_serverId)?.client;
+    if (_git == null) {
+      _bind(client ?? _store.clientFor(_serverId));
       return;
     }
-    final client = _store.clientFor(_serverId);
-    _git = GitController(client, widget.target)
+    if (client != null && !identical(client, git.client)) _rebindClient(client);
+    // The shared whitespace preference keys the diff request. A working diff
+    // reloads when shown again anyway, with the current preference.
+    final whitespaceChanged =
+        !git.isCommit && git.ignoreWhitespace != _hideWhitespace;
+    if (whitespaceChanged) git.ignoreWhitespace = _hideWhitespace;
+    if (git.active != _visible) {
+      git.active = _visible;
+    } else if (whitespaceChanged) {
+      unawaited(git.refresh());
+    }
+  }
+
+  @override
+  void didUpdateWidget(ChangesPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final old = oldWidget.target, next = widget.target;
+    // Reopening a tab replaces its target under the same key (host, workspace,
+    // kind, id); another checkout directory or commit is another view.
+    if (old.cwd != next.cwd ||
+        old.data.text('sha', old.id ?? '') !=
+            next.data.text('sha', next.id ?? '')) {
+      _unbind();
+      _lastBuild = null;
+      _initialRevealed = false;
+      _commitsError = null;
+      _bind(_store.hostFor(_serverId)?.client ?? _store.clientFor(_serverId));
+    }
+  }
+
+  void _bind(PaseoClient client) {
+    final commit = widget.target.kind == 'commit_diff';
+    // A working diff reads status through the checkout's shared state, bound
+    // first, so the view and that state send one status request.
+    if (!commit) _bindCheckout(client);
+    final git = _git = GitController(client, widget.target, checkout: _checkout)
       ..ignoreWhitespace = _hideWhitespace
+      ..active = _visible
       ..addListener(_changed);
-    if (!git.isCommit) {
-      final state = CheckoutGitState.acquire(client, _serverId, _cwd)..addListener(_checkoutChanged);
-      _checkout = state;
-      _actions = CheckoutGitActions(
-        store: _store,
-        serverId: _serverId,
-        workspaceId: widget.target.workspaceId,
-        cwd: _cwd,
-        state: state,
-      );
-      CheckoutGitActionsStore.instance.addListener(_checkoutChanged);
+    if (!commit) {
+      CheckoutGitActionsStore.instance.addListener(_actionsChanged);
       _bindReview();
     }
     unawaited(git.refresh());
+  }
+
+  void _bindCheckout(PaseoClient client) {
+    final state = CheckoutGitState.acquire(client, _serverId, _cwd)
+      ..addListener(_checkoutChanged);
+    _checkout = state;
+    _actions = CheckoutGitActions(
+      store: _store,
+      serverId: _serverId,
+      workspaceId: widget.target.workspaceId,
+      cwd: _cwd,
+      state: state,
+    );
+    _actionsRevision = CheckoutGitActionsStore.instance.revision(
+      _serverId,
+      _cwd,
+    );
+  }
+
+  void _releaseCheckout() {
+    _checkout?.removeListener(_checkoutChanged);
+    _checkout?.release();
+    _checkout = null;
+    _actions = null;
+  }
+
+  /// A connection switch replaced the host's client: the view and its shared
+  /// checkout state move to it with their cached data. The replacement state
+  /// is acquired while the previous one is still held, so it starts from that
+  /// state's snapshots.
+  void _rebindClient(PaseoClient client) {
+    final previous = _checkout;
+    if (previous != null) {
+      previous.removeListener(_checkoutChanged);
+      _bindCheckout(client);
+    }
+    git.rebind(client, checkout: _checkout);
+    previous?.release();
+  }
+
+  void _unbind() {
+    _git?.removeListener(_changed);
+    _git?.dispose();
+    _git = null;
+    _releaseCheckout();
+    CheckoutGitActionsStore.instance.removeListener(_actionsChanged);
+    _review?.removeListener(_reviewChanged);
+    _review?.release();
+    _review = null;
   }
 
   void _changed() {
@@ -134,6 +215,14 @@ class _ChangesPanelState extends State<ChangesPanel> {
   }
 
   void _checkoutChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// Action statuses are global; only this checkout's rebuild the view.
+  void _actionsChanged() {
+    final revision = CheckoutGitActionsStore.instance.revision(_serverId, _cwd);
+    if (revision == _actionsRevision) return;
+    _actionsRevision = revision;
     if (mounted) setState(() {});
   }
 
@@ -248,13 +337,7 @@ class _ChangesPanelState extends State<ChangesPanel> {
 
   @override
   void dispose() {
-    _git?.removeListener(_changed);
-    _git?.dispose();
-    _checkout?.removeListener(_checkoutChanged);
-    _checkout?.release();
-    if (_actions != null) CheckoutGitActionsStore.instance.removeListener(_checkoutChanged);
-    _review?.removeListener(_reviewChanged);
-    _review?.release();
+    _unbind();
     super.dispose();
   }
 
@@ -1477,10 +1560,12 @@ class _ChangesPanelState extends State<ChangesPanel> {
   @override
   Widget build(BuildContext context) {
     if (_git == null) return const LoadingState();
+    // Keep the last layout until this retained view is shown again.
+    if (!_visible) return _lastBuild ?? const SizedBox.shrink();
     final theme = Theme.of(context);
     final isGit = git.status?.flag('isGit') == true;
     final hasStatus = git.status != null;
-    return ColoredBox(
+    return _lastBuild = ColoredBox(
       color: _presentation == _Presentation.tree
           ? PaseoColors.of(context).sidebar
           : PaseoColors.of(context).surface0,

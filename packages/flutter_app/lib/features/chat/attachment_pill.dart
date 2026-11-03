@@ -10,6 +10,7 @@ import '../../core/json.dart';
 import '../../ui/common.dart';
 import '../../ui/theme.dart';
 import '../../ui/localization.dart';
+import '../files/remote_path.dart';
 
 /// components/attachment-pill.tsx: every attachment body is 48px high inside
 /// a 6px-radius accent-bordered frame; removable pills carry a 24px close disc
@@ -189,7 +190,7 @@ class AttachmentPill extends StatefulWidget {
         // attachments/workspace-file.ts getWorkspaceFileAttachmentSubtitle.
         final selection = jsonMap(attachment['selection']);
         return (
-          path.split('/').last,
+          remoteBasename(path),
           selection['kind'] == 'line_range'
               ? '$path · ${selection['startLine']}-${selection['endLine']}'
               : path,

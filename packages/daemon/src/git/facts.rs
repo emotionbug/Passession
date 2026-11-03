@@ -96,65 +96,124 @@ pub async fn snapshot(
         return Err(anyhow!("{}", output.stderr.trim()));
     }
     let root = PathBuf::from(String::from_utf8(output.stdout)?.trim());
-    let current = current_branch(&root, env, cancel.clone()).await?;
-    let remote = optional(
-        &root,
-        &["config", "--get", "remote.origin.url"],
-        env,
-        cancel.clone(),
-    )
-    .await?;
-    let dirty = !checked(
-        &root,
-        &["status".into(), "--porcelain=v1".into(), "-z".into()],
-        env,
-        cancel.clone(),
-        READ_LIMIT,
-        READ_TIMEOUT,
-    )
-    .await?
-    .is_empty();
-    let base = operation_base(&root, None, env, cancel.clone()).await?;
-    let upstream = optional(
-        &root,
-        &["rev-parse", "--symbolic-full-name", "@{upstream}"],
-        env,
-        cancel.clone(),
-    )
-    .await?;
-    let upstream_counts = if let Some(u) = &upstream {
-        divergence(&root, "HEAD", u, env, cancel.clone()).await?
-    } else {
-        None
+    // Independent read-only facts run concurrently through the shared git
+    // scheduler; dependent comparisons start as soon as their inputs resolve.
+    // The first error wins and dropping the other futures stops their processes.
+    let comparison = async {
+        let (current, base) = tokio::try_join!(
+            current_branch(&root, env, cancel.clone()),
+            operation_base(&root, None, env, cancel.clone()),
+        )?;
+        let (ahead_behind, diff_stat) = tokio::try_join!(
+            base_divergence(
+                &root,
+                base.as_deref(),
+                current.as_deref(),
+                env,
+                cancel.clone()
+            ),
+            async {
+                // As in the former separate shortstat pass, an unavailable
+                // shortstat is reported as null, never as a snapshot error.
+                let stat = match current.as_deref() {
+                    Some(branch) if !root.as_os_str().is_empty() => {
+                        super::diff::shortstat(&root, branch, base.clone(), env, cancel.clone())
+                            .await
+                    }
+                    _ => Ok(None),
+                };
+                Ok::<_, anyhow::Error>(stat.unwrap_or_else(|error| {
+                    tracing::debug!(%error,"Checkout shortstat unavailable");
+                    None
+                }))
+            },
+        )?;
+        Ok::<_, anyhow::Error>((current, base, ahead_behind, diff_stat))
     };
-    let mut ahead_behind = Value::Null;
-    if let (Some(base), Some(branch)) = (&base, &current) {
-        if branch_name(base) != branch {
-            let comparison = if base.starts_with("refs/") {
-                Some(base.clone())
-            } else {
-                let remote = format!("refs/remotes/origin/{}", branch_name(base));
-                if exists(&root, &remote, env, cancel.clone()).await? {
-                    Some(remote)
-                } else {
-                    Some(base.clone())
-                }
-            };
-            if let Some(comparison) = comparison {
-                if let Some((ahead, behind)) =
-                    divergence(&root, "HEAD", &comparison, env, cancel.clone()).await?
-                {
-                    ahead_behind = json!({"ahead":ahead,"behind":behind});
-                }
-            }
-        }
-    }
-    let main = crate::projects::worktrees::repo_root(&root, cancel.clone()).await?;
-    let ownership = crate::projects::worktrees::ownership(home, config, &root, cancel).await?;
-    let owned = ownership["allowed"].as_bool().unwrap_or(false) && base.is_some();
+    let upstream = async {
+        let upstream = optional(
+            &root,
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"],
+            env,
+            cancel.clone(),
+        )
+        .await?;
+        let counts = match &upstream {
+            Some(u) => divergence(&root, "HEAD", u, env, cancel.clone()).await?,
+            None => None,
+        };
+        Ok::<_, anyhow::Error>((upstream, counts))
+    };
+    let dirty = async {
+        Ok::<_, anyhow::Error>(
+            !checked(
+                &root,
+                &["status".into(), "--porcelain=v1".into(), "-z".into()],
+                env,
+                cancel.clone(),
+                READ_LIMIT,
+                READ_TIMEOUT,
+            )
+            .await?
+            .is_empty(),
+        )
+    };
+    let (
+        (current, base, ahead_behind, diff_stat),
+        remote,
+        dirty,
+        (upstream, upstream_counts),
+        main,
+        placed,
+    ) = tokio::try_join!(
+        comparison,
+        optional(
+            &root,
+            &["config", "--get", "remote.origin.url"],
+            env,
+            cancel.clone(),
+        ),
+        dirty,
+        upstream,
+        crate::projects::worktrees::repo_root(&root, cancel.clone()),
+        crate::projects::worktrees::in_worktrees_root(home, config, &root),
+    )?;
+    let owned = placed && base.is_some();
     let display_base = base.as_deref().map(branch_name);
     Ok(
-        json!({"cwd":cwd,"isGit":true,"repoRoot":root,"mainRepoRoot":main,"currentBranch":current,"isDirty":dirty,"baseRef":display_base,"aheadBehind":ahead_behind,"upstreamRef":upstream,"aheadOfOrigin":upstream_counts.map(|c|c.0),"behindOfOrigin":upstream_counts.map(|c|c.1),"hasRemote":remote.is_some(),"remoteUrl":remote,"isPaseoOwnedWorktree":owned,"error":null}),
+        json!({"cwd":cwd,"isGit":true,"repoRoot":root,"mainRepoRoot":main,"currentBranch":current,"isDirty":dirty,"baseRef":display_base,"aheadBehind":ahead_behind,"upstreamRef":upstream,"aheadOfOrigin":upstream_counts.map(|c|c.0),"behindOfOrigin":upstream_counts.map(|c|c.1),"hasRemote":remote.is_some(),"remoteUrl":remote,"isPaseoOwnedWorktree":owned,"error":null,"diffStat":diff_stat.unwrap_or(Value::Null)}),
+    )
+}
+/// Ahead/behind of HEAD against the operation base, preferring its origin
+/// branch for short names; null when on the base itself or either is unknown.
+async fn base_divergence(
+    root: &Path,
+    base: Option<&str>,
+    current: Option<&str>,
+    env: &BTreeMap<String, String>,
+    cancel: CancellationToken,
+) -> Result<Value> {
+    let (Some(base), Some(branch)) = (base, current) else {
+        return Ok(Value::Null);
+    };
+    if branch_name(base) == branch {
+        return Ok(Value::Null);
+    }
+    let comparison = if base.starts_with("refs/") {
+        base.to_owned()
+    } else {
+        let remote = format!("refs/remotes/origin/{}", branch_name(base));
+        if exists(root, &remote, env, cancel.clone()).await? {
+            remote
+        } else {
+            base.to_owned()
+        }
+    };
+    Ok(
+        match divergence(root, "HEAD", &comparison, env, cancel).await? {
+            Some((ahead, behind)) => json!({"ahead":ahead,"behind":behind}),
+            None => Value::Null,
+        },
     )
 }
 /// The source's `normalizeBranchSuggestionName`: a short branch name, or None for

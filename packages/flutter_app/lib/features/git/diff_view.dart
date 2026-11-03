@@ -497,8 +497,10 @@ class DiffDocumentState extends State<DiffDocument> {
           (file.integer('additions') + file.integer('deletions') + 2).clamp(2, 400) * lineHeight;
       return SliverList(
         delegate: SliverChildBuilderDelegate(
+          // A loader requests once; a new patch revision dropped any load it
+          // started, so the revision remounts it.
           (context, _) => _PatchLoader(
-            key: ValueKey('load:$path'),
+            key: ValueKey('load:${git.patchRevision}:$path'),
             height: estimate,
             onLoad: () => git.ensurePatch(path),
           ),

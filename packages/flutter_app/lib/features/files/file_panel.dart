@@ -11,6 +11,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:yaml/yaml.dart';
 
 import '../../core/app_store.dart';
+import '../../core/client.dart';
 import '../../core/json.dart';
 import '../../core/scope.dart';
 import '../../core/target.dart';
@@ -29,7 +30,7 @@ import 'file_panel_resolve.dart';
 import 'html_preview.dart';
 import 'native_file_actions.dart';
 import 'pane_chrome.dart';
-import 'remote_directory_browser.dart';
+import 'remote_path.dart';
 import 'remote_file_service.dart';
 import 'source_controller.dart';
 import 'vim_engine.dart';
@@ -80,8 +81,15 @@ class _FilePanelState extends State<FilePanel> {
   RemoteHtmlPreview? _htmlPreview;
   bool _htmlBusy = false;
   final Map<String, Future<RemoteFileData>> _images = {};
+
+  /// The connection [_images] were read through. Reads that failed because a
+  /// switched-in connection was not up yet are read again once it is.
+  PaseoClient? _imagesClient;
   FileTransferCancellation _assetCancellation = FileTransferCancellation();
   bool _observing = false;
+
+  /// The last full build, reused while this retained tab is hidden.
+  Widget? _lastBuild;
   VimEngine? _vim;
   bool _vimStarting = false;
   Object? _vimError;
@@ -127,9 +135,13 @@ class _FilePanelState extends State<FilePanel> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    if (_session == null) _start();
-    if (_session != null) unawaited(_syncVim());
     _syncObserving();
+    if (_session == null) {
+      _start();
+    } else {
+      _syncClient();
+    }
+    unawaited(_syncVim());
   }
 
   /// Original FilePane: a hidden tab or a backgrounded app stops observing;
@@ -140,18 +152,41 @@ class _FilePanelState extends State<FilePanel> {
     _session?.setObserving(_observing);
   }
 
+  /// The file a target names (original `useFileHandle` dependencies). The tab
+  /// key omits the cwd, so one tab can be reopened with the same relative
+  /// path under another cwd: that is another file.
+  static (String, String, String) _fileOf(PanelTarget target) =>
+      (target.serverId, target.cwd, target.data.text('path', target.id ?? ''));
+
+  /// The store replaces a host's client when it switches connections. The
+  /// session moves to the new one with its buffer; transfers on the old one
+  /// stop.
+  void _syncClient() {
+    final client = PaseoScope.read(context)
+        .hostFor(widget.target.serverId)
+        ?.client;
+    if (client == null || identical(client, session.client)) return;
+    session.useClient(client);
+    _assetCancellation.cancel();
+    _assetCancellation = FileTransferCancellation();
+  }
+
   @override
   void didUpdateWidget(FilePanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.target.key != widget.target.key) {
+    if (_fileOf(oldWidget.target) != _fileOf(widget.target)) {
       _assetCancellation.cancel();
       _assetCancellation = FileTransferCancellation();
+      // A hidden tab must not keep showing the previous file's editor.
+      _lastBuild = null;
       _stopVim();
       _vimError = null;
       _removeGuard?.call();
       modifiedFileTabs.set(oldWidget.target.key, modified: false);
       _session?.removeListener(_onSession);
-      _session?.dispose();
+      // The previous file's unsaved edit is written to that file, not dropped
+      // and not carried into this one.
+      _session?.release();
       _editor.removeListener(_onEditor);
       _editor.dispose();
       _editor = SourceController(
@@ -164,7 +199,10 @@ class _FilePanelState extends State<FilePanel> {
       _htmlPreview = null;
       if (preview != null) unawaited(preview.close());
       _start();
-    } else if (oldWidget.target.data['line'] != widget.target.data['line'] ||
+      return;
+    }
+    _syncClient();
+    if (oldWidget.target.data['line'] != widget.target.data['line'] ||
         oldWidget.target.data['lineEnd'] != widget.target.data['lineEnd'] ||
         oldWidget.target.data['column'] != widget.target.data['column']) {
       // Original useTextFileView: each later line target switches to Source.
@@ -263,7 +301,14 @@ class _FilePanelState extends State<FilePanel> {
       return;
     }
     final model = _model;
-    if (_vim != null || _vimStarting || _vimError != null || model == null || !_hasText) {
+    // A hidden tab or a backgrounded app starts no Vim process; showing the
+    // tab starts it. A running engine stays, with its modes and undo history.
+    if (_vim != null ||
+        _vimStarting ||
+        _vimError != null ||
+        model == null ||
+        !_hasText ||
+        !_observing) {
       return;
     }
     _vimStarting = true;
@@ -348,9 +393,11 @@ class _FilePanelState extends State<FilePanel> {
     await engine.flush();
   }
 
+  /// The buffer the user saved; Vim input still arriving lands in it first.
   Future<void> _saveFile() async {
+    final model = _model;
     await _commitVimInput();
-    await _model?.save();
+    await model?.save();
   }
 
   Future<void> _setVim(bool enabled) async {
@@ -370,10 +417,14 @@ class _FilePanelState extends State<FilePanel> {
   /// Original `confirmDiscardModifiedTab`: a tab with unsaved changes asks
   /// before closing, holding its pending save meanwhile; closing drops it.
   Future<bool> _guardClose() async {
-    if (!mounted) return !session.modified;
+    final owner = _session;
+    if (!mounted || owner == null) return !(owner?.modified ?? false);
     await _commitVimInput();
-    if (!session.modified || !mounted) return true;
-    final resumePendingSave = session.holdWrites();
+    if (!mounted) return true;
+    // The tab moved to another file meanwhile: the question is about that one.
+    if (!identical(owner, _session)) return _guardClose();
+    if (!owner.modified) return true;
+    final resumePendingSave = owner.holdWrites();
     final confirmed = await confirmAction(
       context,
       title: tr(context, 'workspace.tabs.confirmations.unsavedTitle'),
@@ -381,16 +432,22 @@ class _FilePanelState extends State<FilePanel> {
       confirmLabel: tr(context, 'workspace.tabs.confirmations.closeWithoutSaving'),
       destructive: true,
     );
-    if (!confirmed) resumePendingSave();
-    return confirmed;
+    // A file switch during the question released the old buffer to be
+    // written; the tab now shows another file, so it stays open.
+    if (!confirmed || !identical(owner, _session)) {
+      resumePendingSave();
+      return false;
+    }
+    return true;
   }
 
   /// Original `handleReload`: replaces the buffer with the file on disk,
   /// confirming first when it has unsaved changes.
   Future<void> _reload() async {
-    await _commitVimInput();
     final model = _model;
-    if (!mounted || model == null) return;
+    if (model == null) return;
+    await _commitVimInput();
+    if (!mounted || !identical(model, _model)) return;
     if (model.modified &&
         !await confirmAction(
           context,
@@ -404,10 +461,11 @@ class _FilePanelState extends State<FilePanel> {
     await model.reload();
   }
 
-  /// Original `handleOverwrite`.
+  /// Original `handleOverwrite`: the conflicted buffer the user chose.
   Future<void> _overwrite() async {
+    final model = _model;
     await _commitVimInput();
-    await _model?.overwrite();
+    await model?.overwrite();
   }
 
   /// Original line reveal: the source view scrolls the line to the middle of the view
@@ -529,8 +587,9 @@ class _FilePanelState extends State<FilePanel> {
 
   Future<void> _replaceAll() async {
     if (!_editable || !_hasText || _find.text.isEmpty) return;
+    final owner = _session;
     await _commitVimInput();
-    if (!mounted) return;
+    if (!mounted || !identical(owner, _session)) return;
     final pattern = RegExp(
       RegExp.escape(_find.text),
       caseSensitive: _matchCase,
@@ -574,7 +633,7 @@ class _FilePanelState extends State<FilePanel> {
       [
         {
           'kind': 'workspace_file',
-          'path': remoteRelative(widget.target.cwd, session.path),
+          'path': remoteAbsolute(widget.target.cwd, session.path),
           'selection': selection,
         },
       ],
@@ -583,40 +642,42 @@ class _FilePanelState extends State<FilePanel> {
   }
 
   Future<void> _download({bool share = false, bool open = false}) async {
+    final owner = session, model = _model;
     await _commitVimInput();
-    if (!mounted) return;
+    if (!mounted || !identical(owner, _session)) return;
     await saveRemoteFile(
       context,
-      client: session.client,
-      cwd: widget.target.cwd,
-      path: session.path,
+      client: owner.client,
+      cwd: owner.cwd,
+      path: owner.path,
       share: share,
       open: open,
-      currentBytes: _model?.modified ?? false
-          ? Uint8List.fromList(utf8.encode(_model!.fileContent))
+      currentBytes: model?.modified ?? false
+          ? Uint8List.fromList(utf8.encode(model!.fileContent))
           : null,
-      mimeType: session.stat?.mimeType,
+      mimeType: owner.stat?.mimeType,
     );
   }
 
   Future<void> _openHtml() async {
     if (_htmlBusy) return;
     _htmlBusy = true;
-    final targetKey = widget.target.key;
+    final owner = session;
     try {
       await _commitVimInput();
-      if (!mounted) return;
+      if (!mounted || !identical(owner, _session)) return;
       if (_htmlPreview == null) {
         final preview = await RemoteHtmlPreview.create(
-          client: session.client,
-          cwd: widget.target.cwd,
-          path: session.path,
+          // Assets read through the host's current connection.
+          client: () => owner.client,
+          cwd: owner.cwd,
+          path: owner.path,
           content: _currentText,
           onError: (error) {
             if (mounted) showError(context, error);
           },
         );
-        if (!mounted || widget.target.key != targetKey) {
+        if (!mounted || !identical(owner, _session)) {
           await preview.close();
           return;
         }
@@ -632,6 +693,7 @@ class _FilePanelState extends State<FilePanel> {
   }
 
   Future<void> _openLocalEditor(BuildContext anchor) async {
+    final owner = session;
     try {
       final desktop = DesktopHost.instance;
       if (desktop == null) {
@@ -655,12 +717,12 @@ class _FilePanelState extends State<FilePanel> {
             PaseoMenuEntry.item(value: target, label: target.label),
         ],
       );
-      if (target == null) return;
+      if (target == null || !mounted || !identical(owner, _session)) return;
       final (line, column) = _editor.locationAt(_editor.selection.extentOffset);
       await DesktopIntegrations.instance.openEditor(
         editorId: target.id,
-        workspacePath: widget.target.cwd,
-        filePath: remoteAbsolute(widget.target.cwd, session.path),
+        workspacePath: owner.cwd,
+        filePath: remoteAbsolute(owner.cwd, owner.path),
         line: line,
         column: column,
       );
@@ -752,10 +814,16 @@ class _FilePanelState extends State<FilePanel> {
             remoteParent(remoteAbsolute(widget.target.cwd, session.path)),
             uri.path,
           );
+    final client = session.client;
+    if (!identical(client, _imagesClient) &&
+        client.status == ConnectionStatus.connected) {
+      _imagesClient = client;
+      _images.clear();
+    }
     final future = _images.putIfAbsent(
       path,
       () =>
-          RemoteFileService(session.client)
+          RemoteFileService(client)
               .read(widget.target.cwd, path, cancellation: _assetCancellation),
     );
     return FutureBuilder<RemoteFileData>(
@@ -1529,6 +1597,7 @@ class _FilePanelState extends State<FilePanel> {
 
   /// The more-actions menu of the file toolbar, anchored under its button.
   Future<void> _moreMenu(BuildContext anchor, (int, int) location) async {
+    final owner = session;
     final action = await showPaseoMenu<String>(
       anchor,
       anchor: paseoAnchorRect(anchor),
@@ -1607,7 +1676,8 @@ class _FilePanelState extends State<FilePanel> {
         ),
       ],
     );
-    if (!mounted) return;
+    // The menu was for this file; the tab may show another one by now.
+    if (!mounted || !identical(owner, _session)) return;
     switch (action) {
       case 'find':
         _openFind();
@@ -1641,7 +1711,7 @@ class _FilePanelState extends State<FilePanel> {
           title: 'Go to line:column',
           initialValue: '${location.$1}:${location.$2}',
         );
-        if (line != null && mounted) {
+        if (line != null && mounted && identical(owner, _session)) {
           final parts = line.split(':');
           _goToLocation(
             int.tryParse(parts.first) ?? 1,
@@ -1711,6 +1781,15 @@ class _FilePanelState extends State<FilePanel> {
 
   @override
   Widget build(BuildContext context) {
+    // Like AgentPanel: a hidden retained tab reuses its last tree, so store
+    // changes do not re-measure and re-lay out an offstage source editor.
+    if (!PanelActivity.of(context).visible) {
+      return _lastBuild ?? const SizedBox.shrink();
+    }
+    return _lastBuild = _buildPanel(context);
+  }
+
+  Widget _buildPanel(BuildContext context) {
     if (_session == null) return const LoadingState();
     if (session.status.status != 'ready') {
       return ColoredBox(color: PaseoColors.of(context).surface0, child: _loadState());

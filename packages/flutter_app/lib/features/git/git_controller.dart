@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import '../../core/client.dart';
 import '../../core/json.dart';
 import '../../core/target.dart';
+import 'git_actions.dart' show CheckoutGitState;
 
 String _responseTypeFor(String type) => type.endsWith('_request')
     ? type.replaceFirst(RegExp(r'_request$'), '_response')
@@ -103,15 +104,37 @@ JsonMap normalizeCheckoutDiffCompare({
 }
 
 class GitController extends ChangeNotifier {
-  GitController(this.client, this.target) {
-    mode = isCommit ? 'all' : _comparisons.resolve(target.serverId, target.workspaceId, target.cwd);
+  /// A working diff reads status through its checkout's shared [checkout]
+  /// state, on the same client, so the view and the state send one request.
+  GitController(PaseoClient client, this.target, {CheckoutGitState? checkout})
+      : _client = client,
+        _checkout = checkout {
+    assert(checkout == null || identical(checkout.client, client));
+    mode = isCommit
+        ? 'all'
+        : _comparisons.resolve(target.serverId, target.workspaceId, target.cwd);
     selectedPath = target.data.text(
       'path',
       target.kind == 'working_diff' ? target.id ?? '' : '',
     );
+    _listen();
+    if (!isCommit) _comparisons.addListener(_comparisonChanged);
+    // Original runCheckoutAction: a finished action invalidates the checkout's
+    // status and commits (diffs stay subscription-fed).
+    _invalidations = CheckoutInvalidations.stream.listen((checkout) {
+      if (checkout.$1 == target.serverId && checkout.$2 == target.cwd) {
+        if (_active) {
+          unawaited(_reloadStatus());
+        } else {
+          _missed();
+        }
+      }
+    });
+  }
+
+  void _listen() {
     _connectionStatus = client.status;
     client.addListener(_connectionChanged);
-    if (!isCommit) _comparisons.addListener(_comparisonChanged);
     _events = client.events.listen((event) {
       final p = jsonMap(event['payload']);
       if (event['type'] == 'checkout_status_update' &&
@@ -121,7 +144,13 @@ class GitController extends ChangeNotifier {
         status = p;
         notifyListeners();
         // Original applyCheckoutStatusUpdateFromEvent invalidates the commit list.
-        if (_commitsLoaded) unawaited(loadCommits().catchError((Object _) {}));
+        if (_commitsLoaded) {
+          if (_active) {
+            unawaited(loadCommits().catchError((Object _) {}));
+          } else {
+            _missed();
+          }
+        }
         // The diff is keyed by the status base ref.
         if (!isCommit && previousBase != null && previousBase != p.text('baseRef')) {
           baseRef = p.text('baseRef');
@@ -129,18 +158,124 @@ class GitController extends ChangeNotifier {
         }
       }
     });
-    // Original runCheckoutAction: a finished action invalidates the checkout's
-    // status and commits (diffs stay subscription-fed).
-    _invalidations = CheckoutInvalidations.stream.listen((checkout) {
-      if (checkout.$1 == target.serverId && checkout.$2 == target.cwd) {
-        unawaited(_reloadStatus());
-      }
-    });
   }
+
+  /// Moves this view to the host's replacement client (a connection switch)
+  /// and that client's shared [checkout] state, keeping the cached repository
+  /// state until the new client reloads it.
+  void rebind(PaseoClient next, {CheckoutGitState? checkout}) {
+    assert(checkout == null || identical(checkout.client, next));
+    if (_disposed || identical(next, _client)) return;
+    client.removeListener(_connectionChanged);
+    unawaited(_events?.cancel());
+    unawaited(_observation?.close());
+    _observation = null;
+    _client = next;
+    _checkout = checkout;
+    _generation++;
+    _connectionRevision++;
+    _abandonLoads();
+    _listen();
+    if (_active) {
+      unawaited(refresh(resume: true));
+      // The resumed diff does not reload a working diff's commit list.
+      if (_commitsLoaded && !isCommit) {
+        unawaited(loadCommits().catchError((Object _) {}));
+      }
+    } else {
+      _missed();
+    }
+  }
+
+  /// Records a checkout change this hidden view missed: it reloads when shown,
+  /// and so does a commit list it had loaded.
+  void _missed() {
+    _stale = true;
+    if (_commitsLoaded) _commitsStale = true;
+  }
+
+  /// Original `useCheckoutDiffQuery` gates its diff subscription on
+  /// `useRetainedPanelActive`: a hidden retained Changes view keeps its cached
+  /// status, files and patches, but holds no diff subscription and issues no
+  /// checkout RPCs; results still in flight when it hides are dropped. What
+  /// it missed meanwhile reloads once when it is shown again.
+  bool get active => _active;
+  set active(bool value) {
+    if (_disposed || value == _active) return;
+    _active = value;
+    if (!value) {
+      // Late results of the hidden view's loads would land on a comparison or
+      // checkout state it no longer tracks.
+      _stale = _stale || loading || !isCommit;
+      // Placeholders that requested a patch request once; an interrupted load
+      // has them remount when the view is shown.
+      if (patchLoading || loadingPatches.isNotEmpty) _patchLoadsDeferred = true;
+      _generation++;
+      unawaited(_observation?.close());
+      _observation = null;
+      _abandonLoads();
+      notifyListeners();
+      return;
+    }
+    final deferred = _patchLoadsDeferred;
+    final commits = _commitsStale;
+    _patchLoadsDeferred = false;
+    _commitsStale = false;
+    if (_stale) {
+      // The reload's new snapshot (or, for a commit, its file list) remounts
+      // the placeholders whose loads were deferred while hidden.
+      _stale = false;
+      unawaited(refresh(resume: true));
+    } else if (deferred) {
+      _patchRevision++;
+      notifyListeners();
+    }
+    // A commit view's reload includes its commit list.
+    if (commits && !isCommit) {
+      unawaited(loadCommits().catchError((Object _) {}));
+    }
+  }
+
+  void _abandonLoads() {
+    _fullRequest = null;
+    loadingPatches.clear();
+    loading = false;
+    patchLoading = false;
+  }
+
+  bool _active = true;
+
+  /// Something this view depends on changed, or a load was interrupted, while
+  /// it was hidden.
+  bool _stale = false;
+  bool _patchLoadsDeferred = false;
+
+  /// A loaded commit list missed a change while this view was hidden.
+  bool _commitsStale = false;
   WorkingDiffComparisons get _comparisons => WorkingDiffComparisons.instance;
   StreamSubscription<(String, String)>? _invalidations;
   bool _commitsLoaded = false;
-  final PaseoClient client;
+  PaseoClient _client;
+  PaseoClient get client => _client;
+  CheckoutGitState? _checkout;
+
+  /// The checkout status, joined with the shared state's read when bound to
+  /// one. Its payload carries domain failures, which this view reports as
+  /// errors like its own request does.
+  Future<JsonMap> _readStatus() async {
+    final checkout = _checkout;
+    if (checkout == null) {
+      return gitRequest(client, 'checkout_status_request', {'cwd': target.cwd});
+    }
+    final payload = await checkout.readStatus();
+    final failure = checkoutPayloadError(payload);
+    if (failure != null) throw StateError(failure);
+    if (payload['success'] == false || payload['accepted'] == false) {
+      throw StateError('The host did not accept this operation.');
+    }
+    return payload;
+  }
+
   final PanelTarget target;
   StreamSubscription<JsonMap>? _events;
   OwnedObservation? _observation;
@@ -166,6 +301,10 @@ class GitController extends ChangeNotifier {
   String? diffError;
   Object? patchError;
   int _generation = 0;
+
+  /// Bumped whenever cached patches and in-flight patch loads are invalidated;
+  /// patch placeholders are keyed by it so they request again.
+  int get patchRevision => _patchRevision;
   int _patchRevision = 0;
   int _selection = 0;
   Future<JsonMap>? _fullRequest;
@@ -194,6 +333,10 @@ class GitController extends ChangeNotifier {
     _connectionStatus = client.status;
     _connectionRevision++;
     if (_connectionStatus == ConnectionStatus.connected) {
+      if (!_active) {
+        _missed();
+        return;
+      }
       // Owned observations restore their own baseline; only the independent RPC
       // state needs reloading here. An initial offline open has no observation.
       unawaited(_observation == null ? refresh() : _reloadStatus());
@@ -217,13 +360,17 @@ class GitController extends ChangeNotifier {
     loading = true;
     notifyListeners();
     try {
-      final next = await gitRequest(client, 'checkout_status_request', {
-        'cwd': target.cwd,
-      });
+      final next = await _readStatus();
       if (_disposed || connection != _connectionRevision) return;
       if (revision == _statusRevision) status = next;
       notifyListeners();
-      if (_commitsLoaded) await loadCommits();
+      if (_commitsLoaded) {
+        if (_active) {
+          await loadCommits();
+        } else {
+          _missed();
+        }
+      }
     } catch (e) {
       if (!_disposed && connection == _connectionRevision) {
         error = e;
@@ -237,22 +384,30 @@ class GitController extends ChangeNotifier {
     }
   }
 
-  Future<void> refresh() async {
+  /// Reloads the status and resubscribes to the diff. A [resume] (shown again,
+  /// or moved to a new client) keeps the cached patches until the new
+  /// snapshot replaces them.
+  Future<void> refresh({bool resume = false}) async {
+    if (!_active) {
+      _stale = true;
+      return;
+    }
     final generation = ++_generation;
     final statusRevision = _statusRevision;
     loading = true;
     error = null;
     patchError = null;
-    patches.clear();
+    if (!resume) {
+      patches.clear();
+      patchErrors.clear();
+      _patchRevision++;
+    }
     loadingPatches.clear();
-    patchErrors.clear();
     _fullRequest = null;
     patchLoading = false;
     notifyListeners();
     try {
-      final next = await gitRequest(client, 'checkout_status_request', {
-        'cwd': target.cwd,
-      });
+      final next = await _readStatus();
       if (_disposed || generation != _generation) return;
       if (statusRevision == _statusRevision) status = next;
       final current = status!;
@@ -269,6 +424,9 @@ class GitController extends ChangeNotifier {
             {'path': selectedPath},
           ];
         }
+        // A commit's patches never change; placeholders left by interrupted
+        // loads request again.
+        if (resume) _patchRevision++;
       } else if (mode == 'all' && !client.supports('checkoutDiffAll')) {
         // COMPAT(checkoutDiffAll): hosts without All changes report an update prompt.
         await _observation?.close();
@@ -349,6 +507,10 @@ class GitController extends ChangeNotifier {
     selectedPath = path;
     patchError = null;
     final selection = ++_selection;
+    if (!_active) {
+      _patchLoadsDeferred = true;
+      return;
+    }
     if (patches.containsKey(path)) {
       patchLoading = false;
       notifyListeners();
@@ -376,6 +538,10 @@ class GitController extends ChangeNotifier {
   /// into view. Working diffs share the single full-diff request.
   Future<void> ensurePatch(String path) async {
     if (patches.containsKey(path) || loadingPatches.contains(path)) return;
+    if (!_active) {
+      _patchLoadsDeferred = true;
+      return;
+    }
     final generation = _generation;
     final revision = _patchRevision;
     loadingPatches.add(path);
@@ -476,8 +642,18 @@ class GitController extends ChangeNotifier {
 /// `invalidateCheckoutGitQueriesForClient`): `(serverId, cwd)` pairs.
 abstract final class CheckoutInvalidations {
   static final _controller = StreamController<(String, String)>.broadcast(sync: true);
+  static final Map<String, int> _revisions = {};
   static Stream<(String, String)> get stream => _controller.stream;
-  static void add(String serverId, String cwd) => _controller.add((serverId, cwd));
+
+  /// Bumped before listeners run, so a status read can tell whether it began
+  /// after the checkout's latest invalidation whichever listener asks first.
+  static int revision(String serverId, String cwd) => _revisions['$serverId::$cwd'] ?? 0;
+
+  static void add(String serverId, String cwd) {
+    final key = '$serverId::$cwd';
+    _revisions[key] = revision(serverId, cwd) + 1;
+    _controller.add((serverId, cwd));
+  }
 }
 
 class PatchUnavailable implements Exception {

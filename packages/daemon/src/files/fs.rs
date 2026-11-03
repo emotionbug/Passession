@@ -11,7 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 pub const EDIT_LIMIT: u64 = 1024 * 1024;
 pub const CHUNK: usize = 256 * 1024;
-const OUTSIDE: &str = "Access outside of workspace is not allowed";
 
 pub struct Scoped {
     pub root: PathBuf,
@@ -49,6 +48,9 @@ pub fn normalize(path: &Path) -> PathBuf {
     }
     result
 }
+/// Resolves a request path against the workspace cwd. The cwd anchors relative
+/// paths and response names; it is not a sandbox: absolute paths, `..` and
+/// symlinks may reach anywhere the daemon user's OS permissions allow.
 pub fn scoped(root: &str, relative: &str, home: &Path) -> Result<Scoped> {
     ensure!(!root.trim().is_empty(), "cwd is required");
     let root = expand(root, home);
@@ -63,29 +65,27 @@ pub fn scoped(root: &str, relative: &str, home: &Path) -> Result<Scoped> {
     } else {
         root.join(path)
     });
-    ensure!(requested.starts_with(&root), OUTSIDE);
-    let canonical_root = fs::canonicalize(&root)?;
-    // Validate the nearest existing ancestor too: a missing leaf below an escaping
-    // symlink must not become an authorized create/write target.
+    // A missing leaf resolves below its nearest existing ancestor's canonical
+    // path, so later creation keeps the same identity for observers and locks.
     let resolved = match fs::canonicalize(&requested) {
-        Ok(path) => {
-            ensure!(path.starts_with(&canonical_root), OUTSIDE);
-            path
-        }
+        Ok(path) => path,
         Err(error) if missing(&error) => {
             let mut ancestor = requested.as_path();
             loop {
-                if let Ok(path) = fs::canonicalize(ancestor) {
-                    ensure!(path.starts_with(&canonical_root), OUTSIDE);
-                    break;
+                let Some(parent) = ancestor.parent() else {
+                    return Err(error.into());
+                };
+                ancestor = parent;
+                match fs::canonicalize(ancestor) {
+                    Ok(path) => break path.join(requested.strip_prefix(ancestor)?),
+                    Err(error) if missing(&error) => {}
+                    Err(error) => return Err(error.into()),
                 }
-                ancestor = ancestor.parent().ok_or_else(|| anyhow!(OUTSIDE))?;
             }
-            requested.clone()
         }
         Err(error) => return Err(error.into()),
     };
-    let relative = relative_name(&root, &requested)?;
+    let relative = relative_name(&root, &requested);
     Ok(Scoped {
         root,
         requested,
@@ -93,12 +93,16 @@ pub fn scoped(root: &str, relative: &str, home: &Path) -> Result<Scoped> {
         relative,
     })
 }
-fn relative_name(root: &Path, path: &Path) -> Result<String> {
-    let value = path
-        .strip_prefix(root)?
-        .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/");
-    Ok(if value.is_empty() { ".".into() } else { value })
+/// Paths inside the cwd stay cwd-relative; others are returned absolute so
+/// clients can send them back unchanged.
+fn relative_name(root: &Path, path: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
+        Ok(relative) => relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
 }
 pub fn missing(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
@@ -146,7 +150,9 @@ pub fn revision(_file: &File, metadata: &Metadata) -> Result<String> {
         let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
         // The borrowed File keeps the handle alive; Windows initializes the
         // information on success. Query this handle, not a potentially replaced path.
-        if unsafe { GetFileInformationByHandle(_file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        if unsafe { GetFileInformationByHandle(_file.as_raw_handle(), information.as_mut_ptr()) }
+            == 0
+        {
             return Err(std::io::Error::last_os_error().into());
         }
         let information = unsafe { information.assume_init() };
@@ -289,10 +295,9 @@ pub fn list(root: &str, path: &str, home: &Path, cancel: &CancellationToken) -> 
         match result {
             Ok(entry) => entries.push(entry),
             Err(error)
-                if error.to_string() == OUTSIDE
-                    || error.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                        missing(e) || e.kind() == std::io::ErrorKind::PermissionDenied
-                    }) => {}
+                if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                    missing(e) || e.kind() == std::io::ErrorKind::PermissionDenied
+                }) => {}
             Err(error) => return Err(error),
         }
     }
@@ -492,14 +497,14 @@ pub fn write(request: &Value, home: &Path, cancel: &CancellationToken) -> Value 
         if !matches(&metadata, &initial_revision, request) {
             return Ok(conflict());
         }
-        let parent = scope.resolved.parent().ok_or_else(|| anyhow!(OUTSIDE))?;
+        let parent = scope
+            .resolved
+            .parent()
+            .ok_or_else(|| anyhow!("Requested path has no parent directory"))?;
         let mut temporary = tempfile::Builder::new()
             .prefix(".paseo-")
             .suffix(".tmp")
             .tempfile_in(parent)?;
-        temporary
-            .as_file()
-            .set_permissions(metadata.permissions())?;
         temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
         ensure!(!cancel.is_cancelled(), "File request cancelled");
@@ -516,14 +521,25 @@ pub fn write(request: &Value, home: &Path, cancel: &CancellationToken) -> Value 
         };
         let latest_metadata = latest.metadata()?;
         let latest_revision = revision(&latest, &latest_metadata)?;
-        if !matches(&latest_metadata, &latest_revision, request) || latest_revision != initial_revision {
+        if !matches(&latest_metadata, &latest_revision, request)
+            || latest_revision != initial_revision
+        {
             return Ok(conflict());
         }
         // Like the source daemon, this is compare/recheck + atomic rename, not an
-        // OS-wide compare-and-swap lock against unrelated writers.
-        let written = temporary
-            .persist(&scope.resolved)
-            .map_err(|error| error.error)?;
+        // OS-wide compare-and-swap lock against unrelated writers. Our own handles
+        // close first, and std's rename uses POSIX replace semantics on Windows, so
+        // an open target does not make the replace fail with ERROR_ACCESS_DENIED.
+        drop((current, latest));
+        let (written, temporary) = temporary.keep().map_err(|error| error.error)?;
+        // `keep` resets Windows attributes, so the original's are applied after it.
+        let replaced = written
+            .set_permissions(metadata.permissions())
+            .and_then(|()| fs::rename(&temporary, &scope.resolved));
+        if let Err(error) = replaced {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
         let final_metadata = written.metadata()?;
         Ok(
             json!({"status":"written","modifiedAt":modified(&final_metadata)?,"size":final_metadata.len(),"revision":revision(&written, &final_metadata)?}),
@@ -570,6 +586,20 @@ fn copy_exclusive(source: &Path, target: &Path, cancel: &CancellationToken) -> R
             copy_exclusive(&entry.path(), &target.join(entry.file_name()), cancel)?;
         }
         fs::set_permissions(target, metadata.permissions())?;
+        // Windows opens a directory handle only with backup semantics, and
+        // SetFileTime needs FILE_WRITE_ATTRIBUTES rather than read access.
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+            };
+            OpenOptions::new()
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(target)?
+        };
+        #[cfg(not(windows))]
         let file = File::open(target)?;
         file.set_times(
             std::fs::FileTimes::new()
@@ -601,8 +631,16 @@ fn copy_exclusive(source: &Path, target: &Path, cancel: &CancellationToken) -> R
     Ok(())
 }
 fn remove(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() {
+    let file_type = fs::symlink_metadata(path)?.file_type();
+    // Windows directory symlinks and junctions are removed as directory entries;
+    // no branch follows a link into its target.
+    #[cfg(windows)]
+    let directory_link = std::os::windows::fs::FileTypeExt::is_symlink_dir(&file_type);
+    #[cfg(not(windows))]
+    let directory_link = false;
+    if directory_link {
+        fs::remove_dir(path)?;
+    } else if file_type.is_dir() {
         fs::remove_dir_all(path)?;
     } else {
         fs::remove_file(path)?;
@@ -658,7 +696,7 @@ fn mutate_entry(request: &Value, home: &Path, cancel: &CancellationToken) -> Res
             }
             return Err(error.into());
         }
-        return relative_name(&parent.root, &parent.requested.join(name));
+        return Ok(relative_name(&parent.root, &parent.requested.join(name)));
     }
     let scope = scoped(root, field(request, "path")?, home)?;
     let verb = if operation == "fs.entry.delete.request" {
@@ -668,10 +706,6 @@ fn mutate_entry(request: &Value, home: &Path, cancel: &CancellationToken) -> Res
     } else {
         "duplicate"
     };
-    ensure!(
-        scope.resolved != fs::canonicalize(&scope.root)?,
-        "Cannot {verb} the workspace root"
-    );
     let metadata = fs::symlink_metadata(&scope.requested).map_err(|error| {
         if missing(&error) {
             anyhow!("File or folder no longer exists")
@@ -679,13 +713,32 @@ fn mutate_entry(request: &Value, home: &Path, cancel: &CancellationToken) -> Res
             error.into()
         }
     })?;
+    // Paths outside the cwd are allowed, but the workspace is not removed or moved
+    // through its own path or an ancestor; duplicating an ancestor only copies.
+    // A symlink entry is operated on as the link itself, so only its lexical
+    // position matters, not its target.
+    let workspace = fs::canonicalize(&scope.root)?;
+    let link = metadata.file_type().is_symlink();
+    ensure!(
+        scope.requested != scope.root && (link || scope.resolved != workspace),
+        "Cannot {verb} the workspace root"
+    );
+    ensure!(
+        verb == "duplicate"
+            || (!scope.root.starts_with(&scope.requested)
+                && (link || !workspace.starts_with(&scope.resolved))),
+        "Cannot {verb} a folder containing the workspace root"
+    );
+    let (Some(parent), Some(entry_name)) = (scope.requested.parent(), scope.requested.file_name())
+    else {
+        bail!("Cannot {verb} a filesystem root");
+    };
     if verb == "delete" {
         remove(&scope.requested)?;
         return Ok(scope.relative);
     }
-    let parent = scope.requested.parent().ok_or_else(|| anyhow!(OUTSIDE))?;
     if verb == "duplicate" {
-        let original = scope.requested.file_name().unwrap().to_string_lossy();
+        let original = entry_name.to_string_lossy();
         let extension = if metadata.is_dir() {
             None
         } else {
@@ -712,13 +765,13 @@ fn mutate_entry(request: &Value, home: &Path, cancel: &CancellationToken) -> Res
                 Err(e) => return Err(e.into()),
             }
             copy_exclusive(&scope.requested, &target, cancel)?;
-            return relative_name(&scope.root, &target);
+            return Ok(relative_name(&scope.root, &target));
         }
         unreachable!()
     }
     let name = name(field(request, "name")?)?;
     let target = parent.join(name);
-    let relative = relative_name(&scope.root, &target)?;
+    let relative = relative_name(&scope.root, &target);
     if target == scope.requested {
         return Ok(relative);
     }
@@ -741,10 +794,12 @@ fn mutate_entry(request: &Value, home: &Path, cancel: &CancellationToken) -> Res
         }
         ensure!(case_only, "\"{name}\" already exists");
     }
+    // Git runs in the shared parent with basename arguments, so tracked renames
+    // work in whichever repository owns the entry, inside or outside the cwd.
     // The native process supervisor supplies bounded pipes, cancellation and
     // process-tree teardown; this filesystem transaction runs on a blocking worker.
     let repository = run_git(
-        &scope.root,
+        parent,
         vec!["rev-parse".into(), "--is-inside-work-tree".into()],
         cancel,
     )?;
@@ -753,32 +808,30 @@ fn mutate_entry(request: &Value, home: &Path, cancel: &CancellationToken) -> Res
         "{}",
         repository.stderr
     );
-    let tracked = if repository.status == 0 {
-        let output = run_git(
-            &scope.root,
-            vec![
-                "ls-files".into(),
-                "-z".into(),
-                "--".into(),
-                format!(":(literal){}", scope.relative),
-            ],
-            cancel,
-        )?;
-        ensure!(output.status == 0, "{}", output.stderr);
-        !output.stdout.is_empty()
-    } else {
-        false
-    };
+    let source = entry_name.to_string_lossy().into_owned();
+    // A `.git` directory or bare repository reports "false" with status 0.
+    let tracked =
+        if repository.status == 0 && String::from_utf8_lossy(&repository.stdout).trim() == "true" {
+            let output = run_git(
+                parent,
+                vec![
+                    "ls-files".into(),
+                    "-z".into(),
+                    "--".into(),
+                    format!(":(literal){source}"),
+                ],
+                cancel,
+            )?;
+            ensure!(output.status == 0, "{}", output.stderr);
+            !output.stdout.is_empty()
+        } else {
+            false
+        };
     ensure!(!cancel.is_cancelled(), "File request cancelled");
     if tracked {
         let output = run_git(
-            &scope.root,
-            vec![
-                "mv".into(),
-                "--".into(),
-                scope.relative.clone(),
-                relative.clone(),
-            ],
+            parent,
+            vec!["mv".into(), "--".into(), source, name.into()],
             cancel,
         )?;
         ensure!(output.status == 0, "{}", output.stderr);
@@ -850,17 +903,26 @@ mod tests {
             .as_file()
             .set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
             .unwrap();
-        drop(replacement.persist(&path).unwrap());
+        // std's rename replaces a target that still has open handles on Windows
+        // (POSIX semantics); tempfile's MoveFileExW persist does not.
+        let replacement = replacement.into_temp_path();
+        fs::rename(&replacement, &path).unwrap();
 
         let current = open_no_follow(&path).unwrap();
         let current_metadata = current.metadata().unwrap();
         assert_eq!(metadata.len(), current_metadata.len());
-        assert_eq!(metadata.modified().unwrap(), current_metadata.modified().unwrap());
+        assert_eq!(
+            metadata.modified().unwrap(),
+            current_metadata.modified().unwrap()
+        );
         assert_eq!(
             revision(&original, &original.metadata().unwrap()).unwrap(),
             initial_revision
         );
-        assert_ne!(revision(&current, &current_metadata).unwrap(), initial_revision);
+        assert_ne!(
+            revision(&current, &current_metadata).unwrap(),
+            initial_revision
+        );
         let result = write(
             &json!({"cwd":cwd,"path":"file.md","content":"edit","expectedRevision":initial_revision}),
             dir.path(),
@@ -908,29 +970,244 @@ mod tests {
         );
         assert_eq!(result["error"], "File is too large to edit");
     }
-    #[cfg(unix)]
     #[test]
-    fn symlinks_cannot_escape_and_delete_does_not_follow() {
+    fn external_paths_roundtrip_reads_lists_and_versioned_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("secret"), "secret").unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
-        let cwd = dir.path().to_str().unwrap();
-        assert!(scoped(cwd, "escape/secret", dir.path()).is_err());
-        assert!(scoped(cwd, "escape/missing", dir.path()).is_err());
-        assert!(scoped(cwd, "../secret", dir.path()).is_err());
-        fs::write(dir.path().join("target"), "safe").unwrap();
-        std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
-        mutate(
-            &json!({"type":"fs.entry.delete.request","cwd":cwd,"path":"link"}),
+        let workspace = dir.path().join("workspace");
+        let external = dir.path().join("external");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(workspace.join("note.txt"), "workspace copy").unwrap();
+        fs::write(external.join("note.txt"), "external copy").unwrap();
+        let cwd = workspace.to_str().unwrap();
+        let absolute = external.join("note.txt");
+        let cancel = CancellationToken::new();
+        let original = read(cwd, absolute.to_str().unwrap(), dir.path(), None, &cancel).unwrap();
+        assert_eq!(original["content"], "external copy");
+        let listed = list(cwd, "../external", dir.path(), &cancel).unwrap();
+        assert_eq!(listed["path"], external.to_str().unwrap());
+        let entry_path = listed["entries"][0]["path"].as_str().unwrap();
+        assert_eq!(entry_path, absolute.to_str().unwrap());
+        assert_eq!(
+            read(cwd, entry_path, dir.path(), None, &cancel).unwrap()["content"],
+            "external copy"
+        );
+        assert_eq!(
+            read(cwd, "note.txt", dir.path(), None, &cancel).unwrap()["path"],
+            "note.txt"
+        );
+        let written = write(
+            &json!({"cwd":cwd,"path":entry_path,"content":"external edit","expectedRevision":original["revision"]}),
             dir.path(),
-            &CancellationToken::new(),
+            &cancel,
+        );
+        assert_eq!(written["status"], "written");
+        assert_eq!(fs::read_to_string(&absolute).unwrap(), "external edit");
+        assert_eq!(
+            fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            "workspace copy"
+        );
+        let stale = write(
+            &json!({"cwd":cwd,"path":entry_path,"content":"stale edit","expectedRevision":original["revision"]}),
+            dir.path(),
+            &cancel,
+        );
+        assert_eq!(stale["status"], "conflict");
+        assert_eq!(fs::read_to_string(&absolute).unwrap(), "external edit");
+    }
+
+    #[tokio::test]
+    async fn external_entries_can_be_created_renamed_duplicated_and_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let external = dir.path().join("external");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&external).unwrap();
+        tokio::task::spawn_blocking(move || {
+            let cancel = CancellationToken::new();
+            let git = |cwd: &Path, args: &[&str]| {
+                let output = run_git(cwd, args.iter().map(|s| s.to_string()).collect(), &cancel).unwrap();
+                assert_eq!(output.status, 0, "{}", output.stderr);
+                String::from_utf8(output.stdout).unwrap()
+            };
+            git(&workspace, &["init", "--quiet"]);
+            git(&external, &["init", "--quiet"]);
+            let cwd = workspace.to_str().unwrap();
+            // A tracked rename inside the cwd still goes through its repository.
+            fs::write(workspace.join("inside.txt"), "inside").unwrap();
+            git(&workspace, &["add", "--", "inside.txt"]);
+            let moved = mutate(
+                &json!({"type":"fs.entry.rename.request","cwd":cwd,"path":"inside.txt","name":"moved.txt"}),
+                dir.path(), &cancel,
+            ).unwrap();
+            assert_eq!(moved, "moved.txt");
+            assert_eq!(git(&workspace, &["ls-files", "-z"]), "moved.txt\0");
+
+            let created = mutate(
+                &json!({"type":"fs.entry.create.request","cwd":cwd,"parentPath":external,"name":"original.txt","kind":"file"}),
+                dir.path(), &cancel,
+            ).unwrap();
+            assert_eq!(created, external.join("original.txt").to_str().unwrap());
+            fs::write(external.join("original.txt"), "keep content").unwrap();
+            git(&external, &["add", "--", "original.txt"]);
+            let renamed = mutate(
+                &json!({"type":"fs.entry.rename.request","cwd":cwd,"path":created,"name":"renamed.txt"}),
+                dir.path(), &cancel,
+            ).unwrap();
+            assert_eq!(renamed, external.join("renamed.txt").to_str().unwrap());
+            assert!(!external.join("original.txt").exists());
+            // The external repository owns the tracked rename; the cwd repository is untouched.
+            assert_eq!(git(&external, &["ls-files", "-z"]), "renamed.txt\0");
+            assert_eq!(git(&workspace, &["ls-files", "-z"]), "moved.txt\0");
+            assert_eq!(read(cwd, &renamed, dir.path(), None, &cancel).unwrap()["content"], "keep content");
+            let copied = mutate(
+                &json!({"type":"fs.entry.duplicate.request","cwd":cwd,"path":"../external/renamed.txt"}),
+                dir.path(), &cancel,
+            ).unwrap();
+            assert_eq!(copied, external.join("renamed copy.txt").to_str().unwrap());
+            mutate(
+                &json!({"type":"fs.entry.delete.request","cwd":cwd,"path":renamed}),
+                dir.path(), &cancel,
+            ).unwrap();
+            assert!(!external.join("renamed.txt").exists());
+            assert_eq!(read(cwd, &copied, dir.path(), None, &cancel).unwrap()["content"], "keep content");
+        }).await.unwrap();
+    }
+    #[test]
+    fn workspace_root_is_protected_and_ancestors_can_only_be_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let workspace = outer.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("keep.txt"), "keep").unwrap();
+        let cwd = workspace.to_str().unwrap();
+        let cancel = CancellationToken::new();
+        let attempt = |kind: &str, path: &str| {
+            mutate(
+                &json!({"type":kind,"cwd":cwd,"path":path,"name":"elsewhere"}),
+                dir.path(),
+                &cancel,
+            )
+        };
+        assert!(attempt("fs.entry.delete.request", ".").is_err());
+        assert!(attempt("fs.entry.rename.request", cwd).is_err());
+        assert!(attempt("fs.entry.duplicate.request", ".").is_err());
+        assert!(attempt("fs.entry.delete.request", "..").is_err());
+        assert!(attempt("fs.entry.rename.request", outer.to_str().unwrap()).is_err());
+        assert_eq!(
+            fs::read_to_string(workspace.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!outer.join("workspace copy").exists());
+        assert!(!outer.join("elsewhere").exists() && !dir.path().join("elsewhere").exists());
+        // Duplicating an outside ancestor copies it beside itself; the original stays.
+        let copied = attempt("fs.entry.duplicate.request", "..").unwrap();
+        assert_eq!(copied, dir.path().join("outer copy").to_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("outer copy/workspace/keep.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn deleting_external_junction_keeps_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let external = dir.path().join("external");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("secret"), "secret").unwrap();
+        let junction = workspace.join("junction");
+        // Junctions need neither administrator rights nor Developer Mode.
+        let status = std::process::Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&external)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let cwd = workspace.to_str().unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            read(cwd, "junction/secret", dir.path(), None, &cancel).unwrap()["content"],
+            "secret"
+        );
+        mutate(
+            &json!({"type":"fs.entry.delete.request","cwd":cwd,"path":"junction"}),
+            dir.path(),
+            &cancel,
         )
         .unwrap();
+        assert!(fs::symlink_metadata(&junction).is_err());
         assert_eq!(
-            fs::read_to_string(dir.path().join("target")).unwrap(),
-            "safe"
+            fs::read_to_string(external.join("secret")).unwrap(),
+            "secret"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn external_symlinks_resolve_and_deleting_links_keeps_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let external = dir.path().join("external");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("secret"), "secret").unwrap();
+        std::os::unix::fs::symlink(&external, workspace.join("escape")).unwrap();
+        std::os::unix::fs::symlink("../external/secret", workspace.join("link")).unwrap();
+        std::os::unix::fs::symlink(&workspace, workspace.join("self")).unwrap();
+        let cwd = workspace.to_str().unwrap();
+        let cancel = CancellationToken::new();
+        let file = read(cwd, "escape/secret", dir.path(), None, &cancel).unwrap();
+        assert_eq!(
+            (file["path"].as_str(), file["content"].as_str()),
+            (Some("escape/secret"), Some("secret"))
+        );
+        assert_eq!(
+            read(cwd, "link", dir.path(), None, &cancel).unwrap()["content"],
+            "secret"
+        );
+        // Missing leaves below an external link resolve to the target's canonical
+        // path, the same identity the file has once it exists.
+        let missing = scoped(cwd, "escape/new.txt", dir.path()).unwrap().resolved;
+        assert_eq!(
+            missing,
+            fs::canonicalize(&external).unwrap().join("new.txt")
+        );
+        let created = mutate(
+            &json!({"type":"fs.entry.create.request","cwd":cwd,"parentPath":"escape","name":"new.txt","kind":"file"}),
+            dir.path(), &cancel,
+        ).unwrap();
+        assert_eq!(created, "escape/new.txt");
+        assert_eq!(scoped(cwd, &created, dir.path()).unwrap().resolved, missing);
+        let listed = list(cwd, ".", dir.path(), &cancel).unwrap();
+        let names: Vec<_> = listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"escape") && names.contains(&"link"));
+        for link in ["escape", "link", "self"] {
+            mutate(
+                &json!({"type":"fs.entry.delete.request","cwd":cwd,"path":link}),
+                dir.path(),
+                &cancel,
+            )
+            .unwrap();
+            assert!(fs::symlink_metadata(workspace.join(link)).is_err());
+        }
+        assert_eq!(
+            fs::read_to_string(external.join("secret")).unwrap(),
+            "secret"
+        );
+        assert!(external.join("new.txt").exists());
+        assert!(workspace.is_dir());
     }
     #[test]
     fn classification_checks_beyond_sample_and_utf8_chunk_boundaries() {

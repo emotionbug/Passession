@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
-import 'package:path/path.dart' as p;
 
 import '../../core/client.dart';
 import '../../core/json.dart';
@@ -12,26 +11,7 @@ import '../../ui/localization.dart';
 import '../../ui/theme.dart';
 import 'file_icons.dart';
 import 'pane_chrome.dart';
-
-final _windowsDrive = RegExp(r'^[A-Za-z]:');
-p.Context _remoteStyle(String path) =>
-    _windowsDrive.hasMatch(path) || path.startsWith('\\\\')
-    ? p.windows
-    : p.posix;
-String remoteBasename(String path, {String? cwd}) =>
-    _remoteStyle(cwd ?? path).basename(path);
-String remoteParent(String path) => _remoteStyle(path).dirname(path);
-String remoteAbsolute(String cwd, String path) {
-  final style = _remoteStyle(cwd);
-  return style.normalize(style.isAbsolute(path) ? path : style.join(cwd, path));
-}
-
-String remoteRelative(String cwd, String path) {
-  final style = _remoteStyle(cwd);
-  return style.isAbsolute(path)
-      ? style.relative(path, from: cwd)
-      : style.normalize(path);
-}
+import 'remote_path.dart';
 
 /// Original `isHiddenExplorerPath`: any segment other than `.`/`..` starting
 /// with a dot.
@@ -209,6 +189,7 @@ class RemoteDirectoryBrowserState extends State<RemoteDirectoryBrowser> {
   /// Original `initializeExplorer`: lists the root, then restores the
   /// persisted expanded directories.
   Future<void> _initialize() async {
+    final generation = _generation;
     final persisted = _persistedExpanded;
     setState(() {
       _expanded
@@ -216,20 +197,24 @@ class RemoteDirectoryBrowserState extends State<RemoteDirectoryBrowser> {
         ..addAll(persisted.where((path) => path != '.'));
     });
     final root = await navigate(_path);
-    if (root == null || !mounted) return;
+    if (root == null || !mounted || generation != _generation) return;
     final restored = await restoreExpandedDirectories(
       rootEntries: root,
       persisted: persisted,
       showHiddenFiles: _hidden,
-      list: _load,
+      list: _listFor(generation),
     );
-    if (!mounted) return;
-    final hiddenPersisted = _hidden ? const <String>[] : persisted.where(isHiddenExplorerPath);
-    _setExpanded(reconcileRestoredExpandedPaths(
-      persisted: persisted,
-      current: {'.', ..._expanded},
-      restored: [...restored, ...hiddenPersisted],
-    ));
+    if (!mounted || generation != _generation) return;
+    final hiddenPersisted = _hidden
+        ? const <String>[]
+        : persisted.where(isHiddenExplorerPath);
+    _setExpanded(
+      reconcileRestoredExpandedPaths(
+        persisted: persisted,
+        current: {'.', ..._expanded},
+        restored: [...restored, ...hiddenPersisted],
+      ),
+    );
   }
 
   void _setExpanded(Iterable<String> paths) {
@@ -258,7 +243,7 @@ class RemoteDirectoryBrowserState extends State<RemoteDirectoryBrowser> {
   @override
   void didUpdateWidget(RemoteDirectoryBrowser oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.client != widget.client || oldWidget.cwd != widget.cwd) {
+    if (oldWidget.cwd != widget.cwd) {
       _generation++;
       _directories.clear();
       _expanded.clear();
@@ -267,16 +252,58 @@ class RemoteDirectoryBrowserState extends State<RemoteDirectoryBrowser> {
       _errors.clear();
       _history.clear();
       _historyIndex = -1;
-      navigate(widget.initialPath);
+      _path = widget.initialPath;
+      if (widget.preferences != null) {
+        unawaited(_initialize());
+      } else {
+        navigate(widget.initialPath);
+      }
+    } else if (oldWidget.client != widget.client) {
+      // The store switched this host to another connection; the old one is
+      // closed and its pending listings fail. The tree and its expansion stay
+      // and list again on the new connection once it is up.
+      _generation++;
+      _loading.clear();
+      _inflight.clear();
+      _errors.clear();
+      _relistWhenConnected();
     } else if (oldWidget.initialPath != widget.initialPath &&
         _path != widget.initialPath) {
       navigate(widget.initialPath);
     }
   }
 
+  /// A connection the store swapped in before it connected: listing on it
+  /// would fail at once, so the tree lists again when it connects.
+  PaseoClient? _awaitingConnection;
+
+  void _relistWhenConnected() {
+    _awaitingConnection?.removeListener(_connectionChanged);
+    _awaitingConnection = null;
+    final client = widget.client;
+    if (client.status == ConnectionStatus.connected) {
+      unawaited(refresh());
+      return;
+    }
+    _awaitingConnection = client..addListener(_connectionChanged);
+  }
+
+  void _connectionChanged() {
+    if (!mounted || _awaitingConnection?.status != ConnectionStatus.connected) {
+      return;
+    }
+    _relistWhenConnected();
+  }
+
+  /// [_load] for a restore that started in [generation]: after a host or cwd
+  /// change it lists nothing, so old paths do not land in the new tree.
+  Future<List<JsonMap>?> Function(String) _listFor(int generation) =>
+      (path) => generation == _generation ? _load(path) : Future.value(null);
+
   @override
   void dispose() {
     _generation++;
+    _awaitingConnection?.removeListener(_connectionChanged);
     _pathInput.dispose();
     super.dispose();
   }
@@ -341,24 +368,35 @@ class RemoteDirectoryBrowserState extends State<RemoteDirectoryBrowser> {
     final root = _directories[_path];
     if (!willShow || root == null || widget.preferences == null) return;
     final persisted = {'.', ..._expanded};
+    final generation = _generation;
     final restored = await restoreExpandedDirectories(
       rootEntries: root,
       persisted: persisted,
       showHiddenFiles: true,
-      list: _load,
+      list: _listFor(generation),
     );
-    if (!mounted) return;
-    _setExpanded(reconcileRestoredExpandedPaths(
-      persisted: persisted,
-      current: {'.', ..._expanded},
-      restored: restored,
-    ));
+    if (!mounted || generation != _generation) return;
+    _setExpanded(
+      reconcileRestoredExpandedPaths(
+        persisted: persisted,
+        current: {'.', ..._expanded},
+        restored: restored,
+      ),
+    );
   }
 
   /// Lists [path]; concurrent requests for one path share the listing.
   /// Returns null when it failed.
-  Future<List<JsonMap>?> _load(String path) =>
-      _inflight[path] ??= _list(path).whenComplete(() => _inflight.remove(path));
+  Future<List<JsonMap>?> _load(String path) {
+    final pending = _inflight[path];
+    if (pending != null) return pending;
+    late final Future<List<JsonMap>?> listing;
+    listing = _list(path).whenComplete(() {
+      // A host or cwd change may have started a newer listing of this path.
+      if (identical(_inflight[path], listing)) _inflight.remove(path);
+    });
+    return _inflight[path] = listing;
+  }
 
   Future<List<JsonMap>?> _list(String path) async {
     final generation = _generation;

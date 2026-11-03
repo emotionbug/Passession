@@ -7,7 +7,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../core/client.dart';
-import 'remote_directory_browser.dart';
+import 'remote_path.dart';
 import 'remote_file_service.dart';
 
 /// Serves a static, script-free preview and real relative workspace assets to
@@ -20,8 +20,10 @@ class RemoteHtmlPreview {
   bool _closed = false;
   final _cancellation = FileTransferCancellation();
 
+  /// [client] is read per asset request: the host's connection can change
+  /// while the browser still shows the preview.
   static Future<RemoteHtmlPreview> create({
-    required PaseoClient client,
+    required PaseoClient Function() client,
     required String cwd,
     required String path,
     required String content,
@@ -81,7 +83,7 @@ class RemoteHtmlPreview {
               request.response.add(utf8.encode(preview._content));
             }
           } else {
-            final asset = await RemoteFileService(client)
+            final asset = await RemoteFileService(client())
                 .read(cwd, requested, cancellation: preview._cancellation);
             request.response.headers.contentType = ContentType.parse(
               asset.mime,

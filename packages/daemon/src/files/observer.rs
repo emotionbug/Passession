@@ -185,4 +185,44 @@ mod tests {
         );
         observers.shutdown();
     }
+    #[tokio::test]
+    async fn external_missing_file_keeps_its_identity_once_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let external = dir.path().join("external");
+        tokio::fs::create_dir(&workspace).await.unwrap();
+        tokio::fs::create_dir(&external).await.unwrap();
+        let cwd = workspace.to_string_lossy().into_owned();
+        let observers = Observers::new();
+        let mut early = observers
+            .subscribe(
+                cwd.clone(),
+                "../external/notes.md".into(),
+                dir.path().to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(early.receiver.borrow_and_update()["status"], "missing");
+        tokio::fs::write(external.join("notes.md"), "created")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), early.receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let ready = early.receiver.borrow_and_update().clone();
+        assert_eq!(ready["status"], "ready");
+        assert_eq!(ready["path"], external.join("notes.md").to_str().unwrap());
+        // An absolute subscriber after creation joins the same canonical target.
+        let late = observers
+            .subscribe(
+                cwd,
+                external.join("notes.md").to_string_lossy().into_owned(),
+                dir.path().to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&early._target, &late._target));
+        observers.shutdown();
+    }
 }

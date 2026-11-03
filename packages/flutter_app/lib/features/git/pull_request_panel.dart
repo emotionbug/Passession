@@ -40,6 +40,11 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
   StreamSubscription<(String, String)>? _invalidations;
   ConnectionStatus? _connectionStatus;
   bool _visible = true;
+  int _actionsRevision = 0;
+
+  /// The last build, reused while this retained pane is hidden so offstage
+  /// tabs do no work for store or checkout changes.
+  Widget? _lastBuild;
 
   // Activity (original usePrPaneData timeline query).
   String? _timelineKey;
@@ -57,7 +62,7 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
   String _pipelineIdentity = '';
   JsonMap? _pipeline;
   Object? _pipelineError;
-  bool _pipelineLoading = false;
+  bool _pipelineLoading = false, _pipelineFetching = false;
   int _pipelineGeneration = 0;
   int _pipelineRevision = -1;
   Timer? _pipelinePoll;
@@ -69,12 +74,11 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     _visible = PanelActivity.of(context).visible;
+    final store = PaseoScope.of(context);
+    // A removed host's tab closes with it; until then the pane keeps its client.
+    final client = store.hostFor(widget.target.serverId)?.client;
     if (_git == null) {
-      final client = _client = PaseoScope.of(context).clientFor(widget.target.serverId);
-      _connectionStatus = client.status;
-      client.addListener(_connectionChanged);
-      _git = CheckoutGitState.acquire(client, widget.target.serverId, widget.target.cwd)
-        ..addListener(_gitChanged);
+      _bind(client ?? store.clientFor(widget.target.serverId));
       CheckoutGitActionsStore.instance.addListener(_actionsChanged);
       // Original invalidateCheckoutGitQueries: actions (and refresh) mark the
       // activity and pipeline stale too.
@@ -83,8 +87,62 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
           _invalidateActivity();
         }
       });
+    } else if (client != null && !identical(client, _client)) {
+      // A connection switch replaced the host's client.
+      _bind(client);
     }
     _sync();
+  }
+
+  @override
+  void didUpdateWidget(PullRequestPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Reopening the tab can replace its target under the same key; another
+    // checkout directory is another change request.
+    if (oldWidget.target.cwd == widget.target.cwd) return;
+    _timeline = null;
+    _pipelineIdentity = '';
+    _pipeline = null;
+    _pipelineError = null;
+    _lastBuild = null;
+    // Bind the host's current client: a connection switch in the same frame
+    // reaches didChangeDependencies only after this update.
+    _bind(
+      PaseoScope.read(context).hostFor(widget.target.serverId)?.client ??
+          _client!,
+    );
+    _sync();
+  }
+
+  /// Binds the pane to [client] and its checkout's shared state, refetching
+  /// activity and pipeline as after a reconnect. A replacement state is
+  /// acquired while the previous one is still held, so a replaced client's
+  /// state starts from its predecessor's snapshots.
+  void _bind(PaseoClient client) {
+    final previous = _git;
+    previous?.removeListener(_gitChanged);
+    _client?.removeListener(_connectionChanged);
+    _client = client;
+    _connectionStatus = client.status;
+    client.addListener(_connectionChanged);
+    _git = CheckoutGitState.acquire(
+      client,
+      widget.target.serverId,
+      widget.target.cwd,
+    )..addListener(_gitChanged);
+    previous?.release();
+    _actionsRevision = CheckoutGitActionsStore.instance.revision(
+      widget.target.serverId,
+      widget.target.cwd,
+    );
+    // Results still in flight belong to the previous client or checkout.
+    _timelineGeneration++;
+    _timelineFetching = false;
+    _timelineKey = null;
+    _pipelineGeneration++;
+    _pipelineFetching = false;
+    _pipelineLoading = false;
+    _pipelineRevision = -1;
   }
 
   @override
@@ -100,7 +158,14 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
     super.dispose();
   }
 
+  /// Action statuses are global; only this checkout's rebuild the pane.
   void _actionsChanged() {
+    final revision = CheckoutGitActionsStore.instance.revision(
+      widget.target.serverId,
+      widget.target.cwd,
+    );
+    if (revision == _actionsRevision) return;
+    _actionsRevision = revision;
     if (mounted) setState(() {});
   }
 
@@ -115,7 +180,11 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
     final client = _client!;
     if (!mounted || _connectionStatus == client.status) return;
     _connectionStatus = client.status;
-    if (client.status == ConnectionStatus.connected) _invalidateActivity();
+    if (client.status == ConnectionStatus.connected) {
+      _invalidateActivity();
+    } else {
+      _sync();
+    }
     setState(() {});
   }
 
@@ -146,9 +215,17 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
           _unsupportedTimelines.contains(_unsupportedKey(number)),
     );
     // A disabled query keeps its data; it refetches when enabled again only
-    // if its key changed or it was invalidated meanwhile.
+    // if its key changed or it was invalidated meanwhile. A hidden or
+    // disconnected pane stops a fetch (and its retries) in flight, which then
+    // runs again once enabled.
     final key = fetch ? '$number/$owner/$name' : null;
-    if (key != null && (key != _timelineKey || git.prRevision != _timelineRevision)) {
+    if (key == null) {
+      if (_timelineFetching) {
+        _timelineGeneration++;
+        _timelineFetching = false;
+        _timelineKey = null;
+      }
+    } else if (key != _timelineKey || git.prRevision != _timelineRevision) {
       _timelineKey = key;
       _timelineRevision = git.prRevision;
       unawaited(_loadTimeline(number!, owner, name));
@@ -197,7 +274,8 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
   /// section needs `forgeProviders`; its jobs are fetched while the section is
   /// open on hosts with `forgeCheckDetails`, through the check-details RPC
   /// (pipeline id as checkRunId), polled every 15s while the pipeline is
-  /// active, and never shown for another change request.
+  /// active, and never shown for another change request. A hidden pane keeps
+  /// its jobs without fetching or polling.
   void _syncPipeline() {
     final facts = status.object('forgeSpecific');
     final pipelineId = facts['pipelineId'];
@@ -209,15 +287,27 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
       _pipeline = null;
       _pipelineError = null;
       _pipelineLoading = false;
+      _pipelineFetching = false;
       _pipelineRevision = -1;
       _pipelineGeneration++;
     }
-    final fetch = section &&
+    final fetch =
+        section &&
+        _visible &&
         _checksOpen &&
         _connected &&
         widget.target.cwd.isNotEmpty &&
         (_client?.supports('forgeCheckDetails') ?? false);
-    final live = fetch && _gitlabActiveStatuses.contains(facts.text('pipelineStatus'));
+    final live =
+        fetch && _gitlabActiveStatuses.contains(facts.text('pipelineStatus'));
+    if (!fetch && (_pipelineFetching || _pipelinePoll != null)) {
+      // An interrupted fetch, or a live pipeline's polled jobs, load again
+      // once the query is enabled.
+      _pipelineGeneration++;
+      _pipelineFetching = false;
+      _pipelineLoading = false;
+      _pipelineRevision = -1;
+    }
     if (live && _pipelinePoll == null) {
       _pipelinePoll = Timer.periodic(const Duration(seconds: 15), (_) => _fetchPipeline());
     } else if (!live) {
@@ -240,6 +330,7 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
     final pipelineId = facts['pipelineId'];
     if (pipelineId == null || _client == null) return;
     final generation = ++_pipelineGeneration;
+    _pipelineFetching = true;
     setState(() => _pipelineLoading = _pipeline == null);
     try {
       final response = await checkoutPayload(
@@ -264,6 +355,7 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
       if (mounted && generation == _pipelineGeneration) setState(() => _pipelineError = e);
     } finally {
       if (mounted && generation == _pipelineGeneration) {
+        _pipelineFetching = false;
         setState(() => _pipelineLoading = false);
       }
     }
@@ -336,6 +428,8 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
   /// number; otherwise the status error, loading, or the empty state.
   @override
   Widget build(BuildContext context) {
+    // Keep the last layout until this retained pane is shown again.
+    if (!_visible) return _lastBuild ?? const SizedBox.shrink();
     final colors = PaseoColors.of(context);
     final git = _git!;
     final pr = status;
@@ -351,7 +445,7 @@ class _PullRequestPanelState extends State<PullRequestPanel> {
     } else {
       content = const _PaneEmpty();
     }
-    return ColoredBox(color: colors.sidebar, child: content);
+    return _lastBuild = ColoredBox(color: colors.sidebar, child: content);
   }
 
   Widget _pane(JsonMap pr, int number) {

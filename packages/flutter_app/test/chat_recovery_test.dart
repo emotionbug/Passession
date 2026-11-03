@@ -7,7 +7,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:paseo_sessions/core/client.dart';
 import 'package:paseo_sessions/core/host_config.dart';
 import 'package:paseo_sessions/core/json.dart';
-import 'package:paseo_sessions/features/chat/chat_controller.dart';
 import 'package:paseo_sessions/features/chat/chat_delivery.dart';
 import 'package:paseo_sessions/features/chat/chat_drafts.dart';
 import 'package:paseo_sessions/features/chat/creation_recovery.dart';
@@ -415,12 +414,12 @@ void main() {
         }
       }
 
-      drafts.addListener(watchQueue);
+      final stopWatching = drafts.listenToDraft(key, watchQueue);
       try {
         acknowledge.complete({'accepted': true, 'error': null});
         await emptied.future.timeout(const Duration(seconds: 5));
       } finally {
-        drafts.removeListener(watchQueue);
+        stopWatching();
       }
       expect(
         drafts.draft(key)['text'],
@@ -540,6 +539,64 @@ void main() {
       'interrupt',
     );
   });
+
+  test(
+    'local creation recovery never enters daemon agent message delivery',
+    () async {
+      const serverId = 'creation-delivery-owner';
+      final creation = ChatDrafts.key(serverId, 'workspace', 'draft');
+      final agent = ChatDrafts.key(serverId, 'workspace', 'agent');
+      final agentChecked = Completer<void>();
+      final wire = _TestDaemon((request) {
+        if (request['type'] != 'agent.message_receipt.get.request') {
+          return {'subscriptionId': 'creation-receipts'};
+        }
+        if (request['agentId'] == 'agent' && !agentChecked.isCompleted) {
+          agentChecked.complete();
+        }
+        return {
+          'receipt': {
+            'agentId': request['agentId'],
+            'messageId': request['messageId'],
+            'revision': 1,
+            'phase': 'submitted',
+          },
+        };
+      }, receipts: true);
+      final client = await _connect(wire, serverId: serverId);
+      final release = ChatDelivery.attach(client, serverId);
+      final creationMessage = _message('creation-prompt');
+      try {
+        // The creation composer is scanned first; the agent check proves the
+        // same delivery scan ran and recovered an uncertain agent message.
+        drafts.update(creation, {
+          'pending': creationMessage,
+          'creationKey': 'creation-intent',
+        });
+        drafts.update(agent, {'pending': _message('agent-prompt')});
+        await agentChecked.future.timeout(const Duration(seconds: 5));
+        expect(
+          wire.requests
+              .where(
+                (request) =>
+                    request['type'] == 'agent.message_receipt.get.request',
+              )
+              .map((request) => request['agentId']),
+          ['agent'],
+        );
+        expect(
+          drafts.draft(creation)['pending'],
+          creationMessage,
+          reason: 'creation recovery retains its own pending request',
+        );
+        await drafts.flush();
+      } finally {
+        release();
+        await client.close();
+        client.dispose();
+      }
+    },
+  );
 }
 
 const JsonMap _creationFields = {
@@ -639,8 +696,9 @@ Future<PaseoClient> _connectEach(List<_TestDaemon> wires) async {
 /// Exercises production request correlation, validation, and exception creation;
 /// only the remote daemon endpoint is replaced with controlled wire responses.
 class _TestDaemon implements DaemonTransport {
-  _TestDaemon(this.respond);
+  _TestDaemon(this.respond, {this.receipts = false});
   final FutureOr<JsonMap> Function(JsonMap) respond;
+  final bool receipts;
   final requests = <JsonMap>[];
   final _messages = StreamController<Object>();
   @override
@@ -664,7 +722,11 @@ class _TestDaemon implements DaemonTransport {
       _emit('status', {
         'status': 'server_info',
         'serverId': 'test-daemon',
-        'features': {'ownedSubscriptions': true, 'workspaceMultiplicity': true},
+        'features': {
+          'ownedSubscriptions': true,
+          'workspaceMultiplicity': true,
+          'agentMessageReceipts': receipts,
+        },
       });
       return;
     }

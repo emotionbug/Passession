@@ -91,20 +91,33 @@ class FileReader<T> extends ChangeNotifier {
 /// file state — the editor buffer, the read-only text or the image bytes.
 class FileEditorSession extends ChangeNotifier {
   FileEditorSession({
-    required this.client,
+    required PaseoClient client,
     required this.cwd,
     required this.path,
     required this.editorPlatform,
     FileHost? host,
     this.associations,
-  }) : handle = FileHandle(host ?? DaemonFileHost(client, cwd: cwd, path: path)) {
+  }) : _client = client,
+       handle = FileHandle(
+         host ?? DaemonFileHost(client, cwd: cwd, path: path),
+       ) {
     handle.addListener(_onHandle);
+    _follow(client);
   }
 
-  final PaseoClient client;
+  PaseoClient _client;
   final String cwd, path;
   final bool editorPlatform;
   final FileHandle handle;
+
+  /// The host connection this file's reads, writes and observation use.
+  PaseoClient get client => _client;
+  bool _observing = false;
+
+  /// [client] while it has not connected. Until its hello the host's features
+  /// are unknown (the file host would take the legacy read-as-stat path and
+  /// fail), so observing starts when it connects.
+  PaseoClient? _connecting;
 
   /// The device's `filePanelAssociations` (`ext:`/`name:` key → panel id).
   final Map<String, dynamic> Function()? associations;
@@ -139,9 +152,55 @@ class FileEditorSession extends ChangeNotifier {
   /// Whether the open buffer has unsaved changes (the tab's `modified`).
   bool get modified => _model?.modified ?? false;
 
-  void setObserving(bool observing) => handle.setObserving(observing);
+  /// Whether the tab is on screen; observation follows it.
+  void setObserving(bool observing) {
+    _observing = observing;
+    if (observing && _connecting != null) return;
+    handle.setObserving(observing);
+  }
 
-  void retry() => handle.retry();
+  /// Observes again after a failure; before the connection is up, connects it
+  /// and observes once it is.
+  void retry() {
+    if (_connecting == null) {
+      handle.retry();
+      return;
+    }
+    unawaited(_client.connect().catchError((Object _) {}));
+  }
+
+  /// The store switched this host to another connection, possibly before it
+  /// connected. Reads and writes use it at once; the handle, its buffer,
+  /// conflict and remembered version stay. The old connection is closed, so
+  /// its subscription ends now, and an on-screen tab observes again once the
+  /// new connection is up.
+  void useClient(PaseoClient client) {
+    if (_disposed || identical(client, _client)) return;
+    _client = client;
+    final host = handle.host;
+    if (host is DaemonFileHost) host.client = client;
+    handle.setObserving(false);
+    _follow(client);
+  }
+
+  /// Observes through [client] now if it is connected, else when it connects.
+  void _follow(PaseoClient client) {
+    _connecting?.removeListener(_connectionChanged);
+    _connecting = null;
+    if (client.status == ConnectionStatus.connected) {
+      if (_observing) handle.setObserving(true);
+      return;
+    }
+    _connecting = client..addListener(_connectionChanged);
+  }
+
+  void _connectionChanged() {
+    final client = _connecting;
+    if (client == null || client.status != ConnectionStatus.connected) return;
+    _follow(client);
+    // The panel rebuilds and reads its previews again on this connection.
+    _changed();
+  }
 
   /// Holds this file's writes while the tab asks to discard them.
   void Function() holdWrites() => handle.holdWrites();
@@ -205,11 +264,27 @@ class FileEditorSession extends ChangeNotifier {
     if (!_disposed) notifyListeners();
   }
 
+  /// The tab moved to another file: a modified buffer is still written to
+  /// this file, and the handle closes once that write lands or fails.
+  void release() {
+    if (_disposed) return;
+    _disposed = true;
+    handle.removeListener(_onHandle);
+    _connecting?.removeListener(_connectionChanged);
+    _connecting = null;
+    handle.setObserving(false);
+    _unmount();
+    unawaited(handle.settled.whenComplete(handle.dispose));
+    super.dispose();
+  }
+
   @override
   void dispose() {
     if (_disposed) return;
     _disposed = true;
     handle.removeListener(_onHandle);
+    _connecting?.removeListener(_connectionChanged);
+    _connecting = null;
     _unmount();
     // Closing the tab disposes the handle, which drops held and queued writes.
     handle.dispose();

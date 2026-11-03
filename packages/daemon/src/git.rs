@@ -228,15 +228,9 @@ impl GitService {
                 .as_ref()
                 .map(|(_, v)| v["forge"].clone());
             let forge=previous.unwrap_or_else(||json!({"featuresEnabled":false,"pullRequest":null,"authState":"no_remote","error":null}));
-            let mut value = json!({"cwd":key,"git":git,"forge":forge});
+            let value = json!({"cwd":key,"git":git,"forge":forge});
+            // `facts::snapshot` already computed `diffStat` alongside the other facts.
             if value["git"]["isGit"] == true {
-                value["git"]["diffStat"] = match diff::shortstat(&key, &env, cancel.clone()).await {
-                    Ok(stat) => stat.unwrap_or(Value::Null),
-                    Err(error) => {
-                        tracing::debug!(%error,"Checkout shortstat unavailable");
-                        Value::Null
-                    }
-                };
                 self.ensure_observation(&key, &env, cancel).await?;
             }
             let published = entry.snapshot.generation.load(Ordering::Acquire) == generation;

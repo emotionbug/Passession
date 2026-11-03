@@ -12,6 +12,7 @@ import '../chat/chat_drafts.dart';
 import 'native_file_actions.dart';
 import 'pane_chrome.dart';
 import 'remote_directory_browser.dart';
+import 'remote_path.dart';
 
 class FilesPanel extends StatefulWidget {
   const FilesPanel({super.key, required this.target});
@@ -33,7 +34,14 @@ class _FilesPanelState extends State<FilesPanel> {
   @override
   void didUpdateWidget(FilesPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.target.data['path'] != oldWidget.target.data['path']) _revealTargetPath();
+    if (widget.target.data['path'] != oldWidget.target.data['path'] ||
+        widget.target.cwd != oldWidget.target.cwd) {
+      // After this frame the tree lists the target's cwd; revealing now would
+      // list the folder in the previous cwd and be dropped by its reset.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _revealTargetPath();
+      });
+    }
   }
 
   /// An assistant folder link (path-open.ts `openDirectory`) reveals its
@@ -54,16 +62,21 @@ class _FilesPanelState extends State<FilesPanel> {
   // COMPAT(fsEntryDuplicate)
   bool get _entryDuplicate => _features.flag('fsEntryDuplicate');
 
-  void _open(String path, {bool? beside}) {
+  /// Whether this panel still shows the tree listed in [cwd]. The tab can be
+  /// reopened under another cwd (an assistant link from an agent elsewhere),
+  /// where the same relative path is another file.
+  bool _showing(String cwd) => widget.target.cwd == cwd;
+
+  void _open(String cwd, String path, {bool? beside}) {
     final store = PaseoScope.of(context);
     store.open(
       PanelTarget(
         kind: 'file',
         serverId: widget.target.serverId,
         workspaceId: widget.target.workspaceId,
-        cwd: widget.target.cwd,
+        cwd: cwd,
         id: path,
-        title: remoteBasename(path, cwd: widget.target.cwd),
+        title: remoteBasename(path, cwd: cwd),
         data: {'path': path},
       ),
       beside:
@@ -90,43 +103,56 @@ class _FilesPanelState extends State<FilesPanel> {
 
   /// Original `handleNewEntry` + `handleDraftCommit`: the parent folder
   /// expands, the new entry's parent re-lists, and a new file opens.
-  Future<void> _create(String parent, String kind) => _run(() async {
-    await _browser.currentState?.expandForCreate(parent);
-    if (!mounted) return;
-    final name = (await promptText(
-      context,
-      title: tr(
-        context,
-        kind == 'directory'
-            ? 'workspace.fileActions.newFolder'
-            : 'workspace.fileActions.newFile',
-      ),
-      hint: tr(
-        context,
-        kind == 'directory'
-            ? 'workspace.fileExplorer.draft.folderPlaceholder'
-            : 'workspace.fileExplorer.draft.filePlaceholder',
-      ),
-    ))?.trim();
-    if (name == null || name.isEmpty || !mounted) return;
-    final result = await _entryRequest('create', {
-      'parentPath': parent,
-      'name': name,
-      'kind': kind,
-    }, 'workspace.fileExplorer.errors.createFailed');
-    await _browser.currentState?.reload(parent);
-    final path = result['path'];
-    if (mounted && kind == 'file' && path is String && path.isNotEmpty) _open(path);
-  });
+  Future<void> _create(String cwd, String parent, String kind) =>
+      _run(() async {
+        await _browser.currentState?.expandForCreate(parent);
+        if (!mounted || !_showing(cwd)) return;
+        final name = (await promptText(
+          context,
+          title: tr(
+            context,
+            kind == 'directory'
+                ? 'workspace.fileActions.newFolder'
+                : 'workspace.fileActions.newFile',
+          ),
+          hint: tr(
+            context,
+            kind == 'directory'
+                ? 'workspace.fileExplorer.draft.folderPlaceholder'
+                : 'workspace.fileExplorer.draft.filePlaceholder',
+          ),
+        ))?.trim();
+        if (name == null || name.isEmpty || !mounted || !_showing(cwd)) return;
+        final result = await _entryRequest(cwd, 'create', {
+          'parentPath': parent,
+          'name': name,
+          'kind': kind,
+        }, 'workspace.fileExplorer.errors.createFailed');
+        if (!mounted || !_showing(cwd)) return;
+        await _browser.currentState?.reload(parent);
+        final path = result['path'];
+        if (mounted &&
+            _showing(cwd) &&
+            kind == 'file' &&
+            path is String &&
+            path.isNotEmpty) {
+          _open(cwd, path);
+        }
+      });
 
-  /// One `fs.entry.<action>` request; an unsuccessful payload is its error or
-  /// the original fallback message.
-  Future<JsonMap> _entryRequest(String action, JsonMap fields, String failedKey) async {
+  /// One `fs.entry.<action>` request in [cwd]; an unsuccessful payload is its
+  /// error or the original fallback message.
+  Future<JsonMap> _entryRequest(
+    String cwd,
+    String action,
+    JsonMap fields,
+    String failedKey,
+  ) async {
     final failed = tr(context, failedKey);
     final result = await PaseoScope.of(context)
         .clientFor(widget.target.serverId)
         .request('fs.entry.$action.request', {
-          'cwd': widget.target.cwd,
+          'cwd': cwd,
           ...fields,
         }, responseType: 'fs.entry.$action.response');
     if (result['success'] != true) {
@@ -135,10 +161,12 @@ class _FilesPanelState extends State<FilesPanel> {
     return result;
   }
 
-  Future<void> _action(String action, JsonMap entry) async {
+  /// [entry] was listed in [cwd]; the action runs there or not at all.
+  Future<void> _action(String action, JsonMap entry, String cwd) async {
+    if (!mounted || !_showing(cwd)) return;
     final path = entry.text('path');
     if (action == 'open') {
-      _open(path, beside: true);
+      _open(cwd, path, beside: true);
       return;
     }
     if (action == 'collapse') {
@@ -149,8 +177,8 @@ class _FilesPanelState extends State<FilesPanel> {
       await Clipboard.setData(
         ClipboardData(
           text: action == 'absolute'
-              ? remoteAbsolute(widget.target.cwd, path)
-              : remoteRelative(widget.target.cwd, path),
+              ? remoteAbsolute(cwd, path)
+              : remoteRelative(cwd, path),
         ),
       );
       return;
@@ -162,7 +190,7 @@ class _FilesPanelState extends State<FilesPanel> {
         [
           {
             'kind': 'workspace_file',
-            'path': remoteRelative(widget.target.cwd, path),
+            'path': remoteAbsolute(cwd, path),
             'selection': {'kind': 'whole_file'},
           },
         ],
@@ -171,14 +199,14 @@ class _FilesPanelState extends State<FilesPanel> {
       return;
     }
     if (action == 'new_file' || action == 'new_directory') {
-      await _create(path, action == 'new_file' ? 'file' : 'directory');
+      await _create(cwd, path, action == 'new_file' ? 'file' : 'directory');
       return;
     }
     if (action == 'download' || action == 'share') {
       await saveRemoteFile(
         context,
         client: PaseoScope.of(context).clientFor(widget.target.serverId),
-        cwd: widget.target.cwd,
+        cwd: cwd,
         path: path,
         share: action == 'share',
       );
@@ -192,25 +220,29 @@ class _FilesPanelState extends State<FilesPanel> {
           title: 'Rename ${entry.text('name')}',
           initialValue: entry.text('name'),
         ))?.trim();
-        if (name == null || name.isEmpty || name == entry.text('name') || !mounted) {
+        if (name == null ||
+            name.isEmpty ||
+            name == entry.text('name') ||
+            !mounted ||
+            !_showing(cwd)) {
           return;
         }
         // Original `handleRenameCommit`: open tabs keep their old path.
-        final result = await _entryRequest(
-          'rename',
-          {'path': path, 'name': name},
-          'workspace.fileExplorer.errors.renameFailed',
-        );
+        final result = await _entryRequest(cwd, 'rename', {
+          'path': path,
+          'name': name,
+        }, 'workspace.fileExplorer.errors.renameFailed');
         final renamed = result['renamedPath'];
         if (renamed is! String || renamed.isEmpty) {
           if (mounted) throw StateError(tr(context, 'workspace.fileExplorer.errors.renameFailed'));
           return;
         }
+        if (!mounted || !_showing(cwd)) return;
         await _browser.currentState?.reload(parent);
         if (entry.text('kind') == 'directory') {
           await _browser.currentState?.renamed(path, renamed);
-        } else if (mounted) {
-          _open(renamed);
+        } else if (mounted && _showing(cwd)) {
+          _open(cwd, renamed);
         }
         return;
       }
@@ -228,23 +260,28 @@ class _FilesPanelState extends State<FilesPanel> {
               confirmLabel: tr(context, 'workspace.fileActions.confirmDelete.confirm'),
               destructive: true,
             ) ||
-            !mounted) {
+            !mounted ||
+            !_showing(cwd)) {
           return;
         }
-        await _entryRequest('delete', {'path': path}, 'workspace.fileExplorer.errors.deleteFailed');
-        await _browser.currentState?.reload(parent);
+        await _entryRequest(cwd, 'delete', {
+          'path': path,
+        }, 'workspace.fileExplorer.errors.deleteFailed');
+        if (mounted && _showing(cwd)) {
+          await _browser.currentState?.reload(parent);
+        }
         return;
       }
       if (action == 'duplicate') {
-        final result = await _entryRequest(
-          'duplicate',
-          {'path': path},
-          'workspace.fileExplorer.errors.duplicateFailed',
-        );
+        final result = await _entryRequest(cwd, 'duplicate', {
+          'path': path,
+        }, 'workspace.fileExplorer.errors.duplicateFailed');
         if (result['duplicatedPath'] is! String && mounted) {
           throw StateError(tr(context, 'workspace.fileExplorer.errors.duplicateFailed'));
         }
-        await _browser.currentState?.reload(parent);
+        if (mounted && _showing(cwd)) {
+          await _browser.currentState?.reload(parent);
+        }
       }
     });
   }
@@ -254,6 +291,7 @@ class _FilesPanelState extends State<FilesPanel> {
   /// glyphs in a 220px menu, a separator between groups.
   Future<void> _entryMenu(BuildContext rowContext, JsonMap entry, Offset? position) async {
     if (_busy) return;
+    final cwd = widget.target.cwd;
     final file = entry.text('kind') == 'file';
     final expanded = !file && (_browser.currentState?.isExpanded(entry.text('path')) ?? false);
     final colors = PaseoColors.of(context);
@@ -350,12 +388,13 @@ class _FilesPanelState extends State<FilesPanel> {
         ...group,
       ],
     ]);
-    if (action != null && mounted) await _action(action, entry);
+    if (action != null) await _action(action, entry, cwd);
   }
 
   /// Original `RootCreationContextTarget` menu: new file / new folder at the root.
   Future<void> _backgroundMenu(Offset? position) async {
     if (_busy || !_entryOps) return;
+    final cwd = widget.target.cwd;
     final colors = PaseoColors.of(context);
     final action = await _showMenu(context, position, [
       PaseoMenuEntry.item(
@@ -369,7 +408,9 @@ class _FilesPanelState extends State<FilesPanel> {
         leading: Icon(LucideIcons.folderPlus300, size: 14, color: colors.muted),
       ),
     ]);
-    if (action != null && mounted) await _create('.', action);
+    if (action != null && mounted && _showing(cwd)) {
+      await _create(cwd, '.', action);
+    }
   }
 
   /// A context menu opens at the pointer on desktop and under the row otherwise.
@@ -411,17 +452,22 @@ class _FilesPanelState extends State<FilesPanel> {
                   PaneToolbarButton(
                     tooltip: tr(context, 'workspace.fileActions.newFile'),
                     icon: LucideIcons.filePlus300,
-                    onPressed: _busy ? null : () => _create('.', 'file'),
+                    onPressed: _busy
+                        ? null
+                        : () => _create(widget.target.cwd, '.', 'file'),
                   ),
                   PaneToolbarButton(
                     tooltip: tr(context, 'workspace.fileActions.newFolder'),
                     icon: LucideIcons.folderPlus300,
-                    onPressed: _busy ? null : () => _create('.', 'directory'),
+                    onPressed: _busy
+                        ? null
+                        : () => _create(widget.target.cwd, '.', 'directory'),
                   ),
                 ],
               ],
               navigationMenu: false,
-              onFileSelected: (entry) => _open(entry.text('path')),
+              onFileSelected: (entry) =>
+                  _open(widget.target.cwd, entry.text('path')),
               onEntryMenu: _entryMenu,
               onBackgroundMenu: _backgroundMenu,
             ),

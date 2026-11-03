@@ -82,8 +82,13 @@ async fn unborn_summary_full_binary_and_whitespace() -> Result<()> {
 #[tokio::test]
 async fn root_commit_rename_and_binary_file_reads() -> Result<()> {
     let repo = Repo::new().await?;
-    let old = "old file\tname.txt";
-    let new = "new file\nname.txt";
+    // Git quotes these paths outside NUL-separated output. Windows forbids
+    // control characters in file names, so it renames spaced non-ASCII names.
+    let (old, new) = if cfg!(windows) {
+        ("old file name.txt", "new file nämé.txt")
+    } else {
+        ("old file\tname.txt", "new file\nname.txt")
+    };
     repo.write(old, b"one\ntwo\nthree\nfour\n").await?;
     repo.write("binary.dat", b"\0binary").await?;
     let root = repo.commit("root").await?;
@@ -257,32 +262,39 @@ async fn aggregate_budget_keeps_later_small_files_and_cancellation_propagates() 
     Ok(())
 }
 
+/// The checkout snapshot's `diffStat`, produced from its resolved root, branch and base.
+async fn snapshot_diff_stat(repo: &Repo) -> Result<Value> {
+    let snapshot = crate::git::facts::snapshot(
+        repo.path(),
+        repo.path(),
+        &json!({}),
+        &repo.env,
+        CancellationToken::new(),
+    )
+    .await?;
+    Ok(snapshot["diffStat"].clone())
+}
+
 #[tokio::test]
-async fn shortstat_requires_comparison_and_counts_untracked_text() -> Result<()> {
+async fn snapshot_diff_stat_requires_comparison_and_counts_untracked_text() -> Result<()> {
     let repo = Repo::new().await?;
     repo.write("tracked", b"old\n").await?;
     repo.commit("base").await?;
     repo.write("tracked", b"new\nmore\n").await?;
     repo.write("untracked", b"one\ntwo").await?;
     repo.write("binary", b"\0binary").await?;
-    assert!(
-        shortstat(repo.path(), &repo.env, CancellationToken::new())
-            .await?
-            .is_none()
-    );
+    // On the base branch with no origin counterpart there is nothing to compare.
+    assert_eq!(snapshot_diff_stat(&repo).await?, Value::Null);
     repo.git(&["update-ref", "refs/remotes/origin/main", "HEAD"])
         .await?;
+    // Tracked +2/-1 against origin/main, plus two untracked text lines; binary adds none.
     assert_eq!(
-        shortstat(repo.path(), &repo.env, CancellationToken::new()).await?,
-        Some(json!({"additions":4,"deletions":1}))
+        snapshot_diff_stat(&repo).await?,
+        json!({"additions":4,"deletions":1})
     );
     repo.commit("changes").await?;
     repo.git(&["update-ref", "refs/remotes/origin/main", "HEAD"])
         .await?;
-    assert!(
-        shortstat(repo.path(), &repo.env, CancellationToken::new())
-            .await?
-            .is_none()
-    );
+    assert_eq!(snapshot_diff_stat(&repo).await?, Value::Null);
     Ok(())
 }

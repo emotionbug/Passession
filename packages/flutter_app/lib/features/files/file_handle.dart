@@ -122,7 +122,11 @@ abstract interface class FileHost {
 /// Original `createDaemonFileSession` for one target.
 class DaemonFileHost implements FileHost {
   DaemonFileHost(this.client, {required this.cwd, required this.path});
-  final PaseoClient client;
+
+  /// The host's current connection. The store replaces a host's client when it
+  /// switches connections; the session moves this to it, since the old one is
+  /// closed and observing on it would reconnect a client nobody owns.
+  PaseoClient client;
   final String cwd, path;
 
   // COMPAT(workspaceFileEditing): the host cannot observe or write files.
@@ -172,12 +176,20 @@ class DaemonFileHost implements FileHost {
         final contents = await read();
         kind = (kind: contents.kind, mimeType: contents.mimeType);
       } catch (_) {
-        unawaited(observation.close());
+        unawaited(_release(observation));
         rethrow;
       }
     }
-    return (initial: classify(initial), unsubscribe: () => unawaited(observation.close()));
+    return (
+      initial: classify(initial),
+      unsubscribe: () => unawaited(_release(observation)),
+    );
   }
+
+  /// Releasing fails when the connection drops meanwhile; the daemon drops the
+  /// subscription with that connection, so the failure is not the tab's.
+  static Future<void> _release(OwnedObservation observation) =>
+      observation.close().catchError((Object _) {});
 
   @override
   Future<FileContents> read() async {
@@ -271,6 +283,9 @@ class FileHandle extends ChangeNotifier {
 
   /// The latest stat this handle knows, or null before the first one.
   FileVersion? get stat => _stat;
+
+  /// Completes once every write queued so far has finished or failed.
+  Future<void> get settled => _writes;
 
   void Function() watch(FileEventListener listener) {
     _watchers.add(listener);

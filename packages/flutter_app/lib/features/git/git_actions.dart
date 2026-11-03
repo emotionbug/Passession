@@ -862,23 +862,36 @@ class CheckoutGitActionsStore extends ChangeNotifier {
   final Map<String, Future<void>> _inFlight = {};
   final Map<String, Timer> _successTimers = {};
   final Set<String> _postShipArchive = {};
+  final Map<String, int> _revisions = {};
   static String _checkout(String serverId, String cwd) => '$serverId::$cwd';
 
   GitActionStatus status(String serverId, String cwd, String actionId) =>
       _status['${_checkout(serverId, cwd)}::$actionId'] ?? GitActionStatus.idle;
 
+  /// Changes whenever anything this store holds for the checkout changes, so
+  /// listeners of this global store rebuild only for their own checkout.
+  int revision(String serverId, String cwd) =>
+      _revisions[_checkout(serverId, cwd)] ?? 0;
+
+  void _changed(String checkout) {
+    _revisions[checkout] = (_revisions[checkout] ?? 0) + 1;
+    notifyListeners();
+  }
+
   bool postShipArchiveSuggested(String serverId, String cwd) =>
       _postShipArchive.contains(_checkout(serverId, cwd));
 
   void suggestPostShipArchive(String serverId, String cwd) {
-    if (_postShipArchive.add(_checkout(serverId, cwd))) notifyListeners();
+    final checkout = _checkout(serverId, cwd);
+    if (_postShipArchive.add(checkout)) _changed(checkout);
   }
 
   /// Original `invalidateCheckoutGitQueries`: status, PR status and commits of
   /// the checkout reload.
   void invalidate(String serverId, String cwd) => CheckoutInvalidations.add(serverId, cwd);
 
-  void _set(String key, GitActionStatus status) {
+  void _set(String checkout, String actionId, GitActionStatus status) {
+    final key = '$checkout::$actionId';
     final current = _status[key] ?? GitActionStatus.idle;
     if (current == status) return;
     if (status == GitActionStatus.idle) {
@@ -886,7 +899,7 @@ class CheckoutGitActionsStore extends ChangeNotifier {
     } else {
       _status[key] = status;
     }
-    notifyListeners();
+    _changed(checkout);
   }
 
   Future<void> run({
@@ -895,25 +908,26 @@ class CheckoutGitActionsStore extends ChangeNotifier {
     required String actionId,
     required Future<void> Function() body,
   }) async {
-    final key = '${_checkout(serverId, cwd)}::$actionId';
+    final checkout = _checkout(serverId, cwd);
+    final key = '$checkout::$actionId';
     final existing = _inFlight[key];
     if (existing != null) {
       await existing;
       return;
     }
     _successTimers.remove(key)?.cancel();
-    _set(key, GitActionStatus.pending);
+    _set(checkout, actionId, GitActionStatus.pending);
     final future = () async {
       try {
         await body();
         invalidate(serverId, cwd);
-        _set(key, GitActionStatus.success);
+        _set(checkout, actionId, GitActionStatus.success);
         _successTimers[key] = Timer(successDisplay, () {
           _successTimers.remove(key);
-          _set(key, GitActionStatus.idle);
+          _set(checkout, actionId, GitActionStatus.idle);
         });
       } catch (_) {
-        _set(key, GitActionStatus.idle);
+        _set(checkout, actionId, GitActionStatus.idle);
         rethrow;
       } finally {
         _inFlight.remove(key);
@@ -923,8 +937,9 @@ class CheckoutGitActionsStore extends ChangeNotifier {
     await future;
   }
 
-  /// Re-render consumers after an action-owned flag outside this store changed.
-  void touch() => notifyListeners();
+  /// Re-render the checkout's consumers after an action-owned flag outside
+  /// this store changed.
+  void touch(String serverId, String cwd) => _changed(_checkout(serverId, cwd));
 }
 
 /// Original `useCheckoutStatusQuery` + `useCheckoutPrStatusQuery` for one
@@ -932,7 +947,18 @@ class CheckoutGitActionsStore extends ChangeNotifier {
 /// `checkout_status_update` pushes (including their `prStatus`), action
 /// invalidations and reconnects. Shared per host and cwd.
 class CheckoutGitState extends ChangeNotifier {
-  CheckoutGitState._(this.client, this.serverId, this.cwd) {
+  CheckoutGitState._(
+    this.client,
+    this.serverId,
+    this.cwd,
+    CheckoutGitState? previous,
+  ) {
+    // A replaced host client starts from the previous client's snapshots.
+    if (previous != null) {
+      status = previous.status;
+      prPayload = previous.prPayload;
+      prRevision = previous.prRevision;
+    }
     _connection = client.status;
     client.addListener(_connectionChanged);
     _events = client.events.listen(_event);
@@ -943,34 +969,25 @@ class CheckoutGitState extends ChangeNotifier {
   }
 
   static final Map<String, CheckoutGitState> _shared = {};
-  static final Map<String, int> _refs = {};
+
+  /// Holders of this instance. A host's replacement client gets a new shared
+  /// state, while holders of the previous one keep it until they release it.
+  int _refs = 0;
 
   static CheckoutGitState acquire(PaseoClient client, String serverId, String cwd) {
     final key = '$serverId::$cwd';
-    final current = _shared[key];
-    if (current != null && identical(current.client, client)) {
-      _refs[key] = (_refs[key] ?? 0) + 1;
-      return current;
+    var state = _shared[key];
+    if (state == null || !identical(state.client, client)) {
+      state = _shared[key] = CheckoutGitState._(client, serverId, cwd, state);
     }
-    final state = CheckoutGitState._(client, serverId, cwd);
-    _shared[key] = state;
-    _refs[key] = 1;
+    state._refs++;
     return state;
   }
 
   void release() {
+    if (--_refs > 0) return;
     final key = '$serverId::$cwd';
-    if (!identical(_shared[key], this)) {
-      dispose();
-      return;
-    }
-    final refs = (_refs[key] ?? 1) - 1;
-    if (refs > 0) {
-      _refs[key] = refs;
-      return;
-    }
-    _refs.remove(key);
-    _shared.remove(key);
+    if (identical(_shared[key], this)) _shared.remove(key);
     dispose();
   }
 
@@ -1008,7 +1025,34 @@ class CheckoutGitState extends ChangeNotifier {
   void _connectionChanged() {
     if (_disposed || _connection == client.status) return;
     _connection = client.status;
-    if (_connection == ConnectionStatus.connected) unawaited(reload());
+    if (_connection == ConnectionStatus.connected) {
+      unawaited(reload());
+    } else {
+      // A read sent on the lost connection never serves the next one.
+      _statusRead = null;
+    }
+  }
+
+  Future<JsonMap>? _statusRead;
+  int _statusReadInvalidation = 0;
+
+  /// One `checkout_status_request` shared by every reader of this checkout on
+  /// this client (this state and the Changes views bound to it). A reader
+  /// joins the request in flight unless the checkout was invalidated, pushed
+  /// a newer status or lost its connection after it was sent; its payload or
+  /// failure reaches every joined reader.
+  Future<JsonMap> readStatus() {
+    final invalidation = CheckoutInvalidations.revision(serverId, cwd);
+    final current = _statusRead;
+    if (current != null && _statusReadInvalidation == invalidation) return current;
+    final read = checkoutPayload(client, 'checkout_status_request', {'cwd': cwd});
+    _statusRead = read;
+    _statusReadInvalidation = invalidation;
+    void settle() {
+      if (identical(_statusRead, read)) _statusRead = null;
+    }
+    unawaited(read.then<void>((_) => settle(), onError: (Object _) => settle()));
+    return read;
   }
 
   void _event(JsonMap event) {
@@ -1016,6 +1060,8 @@ class CheckoutGitState extends ChangeNotifier {
     final payload = jsonMap(event['payload']);
     if (payload.text('cwd') != cwd) return;
     _statusGeneration++;
+    // A read sent before this push would overwrite it for a later joiner.
+    _statusRead = null;
     status = {...payload}..remove('prStatus');
     statusError = null;
     statusLoading = false;
@@ -1034,7 +1080,7 @@ class CheckoutGitState extends ChangeNotifier {
     statusLoading = status == null;
     notifyListeners();
     try {
-      final next = await checkoutPayload(client, 'checkout_status_request', {'cwd': cwd});
+      final next = await readStatus();
       if (_disposed || generation != _statusGeneration) return;
       status = next;
       statusError = null;
@@ -1489,7 +1535,7 @@ class CheckoutGitActions {
     }
     final failure = tr(context, 'sidebar.workspace.toasts.archiveFailed');
     _hiding = true;
-    _actions.touch();
+    _actions.touch(serverId, cwd);
     try {
       final id = workspace.text('id');
       final response = await checkoutPayload(_client, 'archive_workspace_request', {'workspaceId': id});
@@ -1507,7 +1553,7 @@ class CheckoutGitActions {
       }
     } finally {
       _hiding = false;
-      _actions.touch();
+      _actions.touch(serverId, cwd);
     }
   }
 }
@@ -1554,11 +1600,27 @@ class WorkspaceGitActionsButton extends StatefulWidget {
 class _WorkspaceGitActionsButtonState extends State<WorkspaceGitActionsButton> {
   CheckoutGitState? _state;
   CheckoutGitActions? _binding;
+  int _actionsRevision = 0;
   bool _hovered = false, _caretHovered = false, _open = false;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    // A connection switch replaces the host's client; the shared checkout
+    // state follows it. The replacement is acquired while the previous state
+    // is still held, so it starts from that state's snapshots.
+    final client = PaseoScope.of(context).hostFor(widget.serverId)?.client;
+    final previous = _state;
+    if (client != null &&
+        previous != null &&
+        !identical(client, previous.client)) {
+      previous.removeListener(_changed);
+      CheckoutGitActionsStore.instance.removeListener(_actionsChanged);
+      _state = null;
+      _bind();
+      previous.release();
+      return;
+    }
     _bind();
   }
 
@@ -1584,7 +1646,11 @@ class _WorkspaceGitActionsButtonState extends State<WorkspaceGitActionsButton> {
       cwd: widget.cwd,
       state: state,
     );
-    CheckoutGitActionsStore.instance.addListener(_changed);
+    _actionsRevision = CheckoutGitActionsStore.instance.revision(
+      widget.serverId,
+      widget.cwd,
+    );
+    CheckoutGitActionsStore.instance.addListener(_actionsChanged);
   }
 
   void _unbind() {
@@ -1592,11 +1658,22 @@ class _WorkspaceGitActionsButtonState extends State<WorkspaceGitActionsButton> {
     _state?.release();
     _state = null;
     _binding = null;
-    CheckoutGitActionsStore.instance.removeListener(_changed);
+    CheckoutGitActionsStore.instance.removeListener(_actionsChanged);
   }
 
   void _changed() {
     if (mounted) setState(() {});
+  }
+
+  /// Action statuses are global; only this checkout's rebuild the button.
+  void _actionsChanged() {
+    final revision = CheckoutGitActionsStore.instance.revision(
+      widget.serverId,
+      widget.cwd,
+    );
+    if (revision == _actionsRevision) return;
+    _actionsRevision = revision;
+    _changed();
   }
 
   @override

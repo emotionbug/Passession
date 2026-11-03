@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../core/json.dart';
+import '../files/remote_path.dart';
 
 /// Durable client-owned drafts and queues. A queue is never a daemon API.
 class ChatDrafts extends ChangeNotifier {
@@ -17,16 +18,71 @@ class ChatDrafts extends ChangeNotifier {
   final Set<String> _dirtyDrafts = {};
   Future<void>? _initialization;
   Future<void> _writes = Future.value();
+  final _draftChanges = <String, ChangeNotifier>{};
+  final _inboxChanges = <String, ChangeNotifier>{};
+  final _deliveryChanges = <String, ChangeNotifier>{};
+  int _revision = 0, _completedRevision = 0;
+  bool _saveQueued = false;
   Object? persistenceError;
 
   static String key(String serverId, String workspaceId, String id) =>
       jsonEncode([serverId, workspaceId, id]);
   static String workspaceKey(String serverId, String workspaceId) =>
       jsonEncode([serverId, workspaceId]);
-  Iterable<String> keysForServer(String serverId) => _drafts.keys.where((key) {
+  Iterable<String> agentKeysForServer(String serverId) =>
+      _drafts.keys.where((key) => _deliveryServer(key) == serverId);
+
+  /// The server whose host delivery owns [key]. The local creation composer
+  /// has no daemon agent or message receipts, so it has no delivery owner.
+  static String? _deliveryServer(String key) {
     final identity = jsonList(jsonDecode(key));
-    return identity.isNotEmpty && identity.first == serverId;
-  });
+    if (identity.length != 3 || identity[2] == 'draft') return null;
+    return identity.first is String ? identity.first as String : null;
+  }
+
+  /// Editor changes do not wake unrelated panes or host delivery scans.
+  VoidCallback listenToDraft(String key, VoidCallback listener) =>
+      _listen(_draftChanges, key, listener);
+
+  VoidCallback listenToInbox(
+    String serverId,
+    String workspaceId,
+    VoidCallback listener,
+  ) => _listen(_inboxChanges, workspaceKey(serverId, workspaceId), listener);
+
+  VoidCallback listenToDelivery(String serverId, VoidCallback listener) =>
+      _listen(_deliveryChanges, serverId, listener);
+
+  VoidCallback _listen(
+    Map<String, ChangeNotifier> scope,
+    String key,
+    VoidCallback listener,
+  ) {
+    final notifier = scope.putIfAbsent(key, ChangeNotifier.new);
+    notifier.addListener(listener);
+    return () {
+      notifier.removeListener(listener);
+      _release(scope, key, notifier);
+    };
+  }
+
+  void _notify(Map<String, ChangeNotifier> scope, String key) {
+    final notifier = scope[key];
+    if (notifier == null) return;
+    notifier.notifyListeners();
+    // Listeners removed during their own notification are counted until it ends.
+    _release(scope, key, notifier);
+  }
+
+  void _release(
+    Map<String, ChangeNotifier> scope,
+    String key,
+    ChangeNotifier notifier,
+  ) {
+    if (!notifier.hasListeners && identical(scope[key], notifier)) {
+      scope.remove(key);
+    }
+  }
 
   Future<void> initialize() => _initialization ??= _load();
   Future<void> _load() async {
@@ -64,7 +120,12 @@ class ChatDrafts extends ChangeNotifier {
     } catch (error) {
       persistenceError = error;
     }
-    notifyListeners();
+    for (final scope in [_draftChanges, _inboxChanges, _deliveryChanges]) {
+      for (final key in scope.keys.toList()) {
+        _notify(scope, key);
+      }
+    }
+    if (persistenceError != null) notifyListeners();
   }
 
   JsonMap draft(String key) => _drafts.putIfAbsent(
@@ -79,13 +140,22 @@ class ChatDrafts extends ChangeNotifier {
   );
 
   void update(String key, JsonMap fields) {
+    // Editor edits made before stored drafts load take precedence over them.
     _dirtyDrafts.add(key);
     final current = draft(key);
     if (['text', 'attachments', 'images'].any(fields.containsKey)) {
       current['editorGeneration'] = (current['editorGeneration'] as int? ?? 0) + 1;
     }
     current.addAll(fields);
-    _save();
+    _save(
+      key: key,
+      delivery: const [
+        'queue',
+        'pending',
+        'receipts',
+        'dismissedMessageIds',
+      ].any(fields.containsKey),
+    );
   }
 
   void addAttachments(
@@ -105,6 +175,7 @@ class ChatDrafts extends ChangeNotifier {
       }
     }
     _save();
+    _notify(_inboxChanges, workspaceKey(serverId, workspaceId));
   }
 
   void addDraftAttachments(
@@ -159,7 +230,7 @@ class ChatDrafts extends ChangeNotifier {
       current.remove('sendError');
       current.remove('sendErrorMessageId');
     }
-    _save();
+    _save(key: key, delivery: true);
   }
 
   /// A local tombstone also guards legacy hosts, but never claims remote cancel.
@@ -177,7 +248,7 @@ class ChatDrafts extends ChangeNotifier {
       current.remove('sendError');
       current.remove('sendErrorMessageId');
     }
-    _save();
+    _save(key: key, delivery: true);
   }
 
   /// Monotonic exact-ID delivery evidence. A canonical user row is not a receipt.
@@ -218,7 +289,7 @@ class ChatDrafts extends ChangeNotifier {
       }
       current['queue'] = queue;
     }
-    _save();
+    _save(key: key, delivery: true);
     return true;
   }
 
@@ -234,7 +305,7 @@ class ChatDrafts extends ChangeNotifier {
       current.remove('pending');
     }
     // Keep failed content separate; never write over newer editor generations.
-    _save();
+    _save(key: key, delivery: true);
     return true;
   }
 
@@ -302,35 +373,59 @@ class ChatDrafts extends ChangeNotifier {
   }
 
   Future<void> flush() async {
-    await _writes;
+    final boundary = _revision;
+    while (_completedRevision < boundary) {
+      await _writes;
+    }
     if (persistenceError != null) {
       throw StateError('Draft persistence failed: $persistenceError');
     }
   }
 
-  void _save() {
+  void _save({String? key, bool delivery = false}) {
+    _revision++;
+    _queueSave();
+    if (key == null) return;
+    _notify(_draftChanges, key);
+    final server = delivery ? _deliveryServer(key) : null;
+    if (server != null) _notify(_deliveryChanges, server);
+  }
+
+  void _queueSave() {
+    if (_saveQueued) return;
+    _saveQueued = true;
+    _writes = _writes.then((_) => _persist());
+  }
+
+  Future<void> _persist() async {
+    var revision = _revision;
+    try {
+      await initialize();
+      final prefs = await SharedPreferences.getInstance();
+      revision = _revision;
+      final encoded = jsonEncode({
+        'drafts': _drafts,
+        'inbox': _inbox,
+        'intents': _intents.toList(),
+      });
+      if (!await prefs.setString('paseo.chat.drafts.v1', encoded)) {
+        throw StateError('Could not save conversation drafts');
+      }
+      _persistenceChanged(null);
+    } catch (error) {
+      _persistenceChanged(error);
+    } finally {
+      _completedRevision = revision;
+      _saveQueued = false;
+      if (_revision != revision) _queueSave();
+    }
+  }
+
+  void _persistenceChanged(Object? error) {
+    if (identical(persistenceError, error)) return;
+    persistenceError = error;
+    // Global listeners observe only durability failures and recovery.
     notifyListeners();
-    _writes = _writes
-        .then((_) async {
-          await initialize();
-          final encoded = jsonEncode({
-            'drafts': _drafts,
-            'inbox': _inbox,
-            'intents': _intents.toList(),
-          });
-          final prefs = await SharedPreferences.getInstance();
-          if (!await prefs.setString('paseo.chat.drafts.v1', encoded)) {
-            throw StateError('Could not save conversation drafts');
-          }
-          if (persistenceError != null) {
-            persistenceError = null;
-            notifyListeners();
-          }
-        })
-        .catchError((Object error) {
-          persistenceError = error;
-          notifyListeners();
-        });
   }
 }
 
@@ -353,7 +448,7 @@ JsonMap wireAttachment(JsonMap attachment) {
   return {
     'type': 'text',
     'mimeType': 'text/plain',
-    'title': path.split('/').last,
+    'title': remoteBasename(path),
     'text': 'Workspace file: $path$lines',
   };
 }

@@ -7,7 +7,7 @@ import '../../ui/common.dart';
 import '../../ui/theme.dart';
 import 'file_icons.dart';
 import 'file_panel.dart';
-import 'remote_directory_browser.dart';
+import 'remote_path.dart';
 
 /// Reveals a `file` [target] the way the original workspace-layout-store
 /// `openTab` does for an implicit open (workspace-tabs/open-beside.ts

@@ -116,6 +116,72 @@ pub async fn normalize_path(path: &Path) -> Result<PathBuf> {
         }
     }
 }
+/// A path as a Git argument. `normalize_path` identities are Windows `\\?\`
+/// verbatim paths, which Git for Windows rewrites to `//?/C:/…` and then fails
+/// to open. The equivalent plain drive or UNC spelling is used when every name
+/// means the same without the prefix; otherwise, and off Windows, the path is
+/// passed unchanged. Only the argument changes, never the stored identity.
+fn git_path(path: &Path) -> Result<std::borrow::Cow<'_, str>> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow!("Worktree path is not UTF-8"))?;
+    #[cfg(windows)]
+    let text = plain_windows_path(text);
+    #[cfg(not(windows))]
+    let text = std::borrow::Cow::Borrowed(text);
+    Ok(text)
+}
+#[cfg(windows)]
+fn plain_windows_path(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let plain_names = |names: &str| names.split('\\').filter(|n| !n.is_empty()).all(plain_name);
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        let mut parts = rest.splitn(3, '\\');
+        let (Some(server), Some(share)) = (parts.next(), parts.next()) else {
+            return Cow::Borrowed(text);
+        };
+        if server.is_empty() || share.is_empty() || !plain_names(parts.next().unwrap_or("")) {
+            return Cow::Borrowed(text);
+        }
+        let mut unc = String::with_capacity(rest.len() + 2);
+        unc.push_str(r"\\");
+        unc.push_str(rest);
+        return Cow::Owned(unc);
+    }
+    match text.strip_prefix(r"\\?\") {
+        // `X:\…` only: a bare `X:` would become drive-relative.
+        Some(rest)
+            if rest.len() >= 3
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+                && &rest.as_bytes()[1..3] == b":\\"
+                && plain_names(&rest[3..]) =>
+        {
+            Cow::Borrowed(rest)
+        }
+        _ => Cow::Borrowed(text),
+    }
+}
+/// Whether Win32 path parsing keeps this name as-is: no trailing dot/space, no
+/// reserved characters and no DOS device stem.
+#[cfg(windows)]
+fn plain_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        || stem.get(..3).is_some_and(|prefix| {
+            (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+                && matches!(
+                    &stem[3..],
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+        });
+    !device
+        && !name.ends_with(['.', ' '])
+        && !name
+            .chars()
+            .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+}
 pub fn base_root(home: &Path, config: &Value) -> Result<PathBuf> {
     let Some(root) = text(config, "worktreesRoot") else {
         return lexical(&home.join("worktrees"));
@@ -197,18 +263,29 @@ pub async fn ownership(
     if cancel.is_cancelled() {
         bail!("Worktree operation cancelled");
     }
-    if let Ok(relative) = resolved.strip_prefix(&base) {
-        let mut parts = relative.components();
-        if let (Some(Component::Normal(hash)), Some(Component::Normal(slug))) =
-            (parts.next(), parts.next())
-        {
-            let root = base.join(hash);
-            result["allowed"] = json!(true);
-            result["worktreePath"] = json!(root.join(slug));
-            result["worktreeRoot"] = json!(root);
-        }
+    if let Some((root, slug)) = placement(&resolved, &base) {
+        result["allowed"] = json!(true);
+        result["worktreePath"] = json!(root.join(slug));
+        result["worktreeRoot"] = json!(root);
     }
     Ok(result)
+}
+/// `ownership(..)["allowed"]` without its repository lookup: whether `cwd`
+/// lies at `<worktrees root>/<project hash>/<slug>`. No git process runs.
+pub async fn in_worktrees_root(home: &Path, config: &Value, cwd: &Path) -> Result<bool> {
+    let resolved = normalize_path(cwd).await?;
+    let base = normalize_path(&base_root(home, config)?).await?;
+    Ok(placement(&resolved, &base).is_some())
+}
+/// The `<base>/<hash>` root and slug of a path inside the worktrees root.
+fn placement<'a>(resolved: &'a Path, base: &Path) -> Option<(PathBuf, &'a std::ffi::OsStr)> {
+    let mut parts = resolved.strip_prefix(base).ok()?.components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(hash)), Some(Component::Normal(slug))) => {
+            Some((base.join(hash), slug))
+        }
+        _ => None,
+    }
 }
 
 fn parse_worktrees(bytes: &[u8]) -> Result<Vec<Value>> {
@@ -551,9 +628,11 @@ async fn refresh_base(cwd: &Path, base: &str, cancel: &CancellationToken) -> Res
     // `refreshRemoteTrackingBaseRef` is best effort: any failure, including listing
     // remotes, branches from the cached ref.
     let remotes = git(cwd, &["remote"], cancel).await.unwrap_or_default();
-    if let Some(remote) = remotes.lines().map(str::trim).find(|name| {
-        !name.is_empty() && base.starts_with(&format!("refs/remotes/{name}/"))
-    }) {
+    if let Some(remote) = remotes
+        .lines()
+        .map(str::trim)
+        .find(|name| !name.is_empty() && base.starts_with(&format!("refs/remotes/{name}/")))
+    {
         let branch = &base["refs/remotes/".len() + remote.len() + 1..];
         let args = vec![
             "fetch".into(),
@@ -1036,13 +1115,11 @@ async fn create_with_identity(
             return Err(error);
         }
     };
-    let path_string = path
-        .to_str()
-        .ok_or_else(|| anyhow!("Worktree path is not UTF-8"))?;
+    let path_arg = git_path(&path)?;
     let mut added = false;
     let mut config_changes = Vec::new();
     let result: Result<Value> = async {
-        git(cwd, &["worktree", "add", path_string, &plan.branch], &cancel).await?;
+        git(cwd, &["worktree", "add", &path_arg, &plan.branch], &cancel).await?;
         added = true;
         configure_remotes(cwd, source, &plan.branch, &mut config_changes, &cancel).await?;
         super::runtime::write_worktree_metadata(&path, &plan.metadata).await?;
@@ -1069,10 +1146,22 @@ async fn create_with_identity(
                         // Remove it only if Git registered this precise path and branch; otherwise an
                         // empty-directory removal is the only safe cleanup.
                         let entries = all_worktrees(cwd, &CancellationToken::new()).await?;
-                        let registered = entries.iter().any(|entry| {
-                            text(entry, "path") == Some(path_string)
-                                && text(entry, "branchName") == Some(plan.branch.as_str())
-                        });
+                        let mut registered = false;
+                        for entry in &entries {
+                            if text(entry, "branchName") != Some(plan.branch.as_str()) {
+                                continue;
+                            }
+                            // Git lists its own spelling (`C:/…` on Windows): compare identities.
+                            if let Some(listed) = text(entry, "path") {
+                                if normalize_path(Path::new(listed))
+                                    .await
+                                    .is_ok_and(|p| p == path)
+                                {
+                                    registered = true;
+                                    break;
+                                }
+                            }
+                        }
                         if registered {
                             remove_disk(home, config, cwd, &path, CancellationToken::new()).await?;
                         } else {
@@ -1351,12 +1440,10 @@ async fn remove_disk(
     if cancel.is_cancelled() {
         bail!("Worktree operation cancelled");
     }
-    let target_text = target
-        .to_str()
-        .ok_or_else(|| anyhow!("Worktree path is not UTF-8"))?;
+    let target_arg = git_path(&target)?;
     let _ = git(
         repo,
-        &["worktree", "remove", target_text, "--force"],
+        &["worktree", "remove", &target_arg, "--force"],
         &cancel,
     )
     .await;
@@ -1603,7 +1690,10 @@ mod tests {
         for _ in 0..32 {
             let id = create_name_id();
             let (adjective, noun) = id.split_once('-').unwrap();
-            assert!(adjectives.contains(&adjective) && nouns.contains(&noun), "{id}");
+            assert!(
+                adjectives.contains(&adjective) && nouns.contains(&noun),
+                "{id}"
+            );
             assert_eq!(slugify(&id).unwrap(), id);
             assert!(validate_slug(&id).is_ok());
         }

@@ -12,7 +12,7 @@ import '../../core/json.dart';
 import '../../ui/common.dart';
 import '../../ui/controls.dart';
 import '../../ui/theme.dart';
-import 'remote_directory_browser.dart';
+import 'remote_path.dart';
 import 'remote_file_service.dart';
 
 Future<File> _temporaryFile(String name) async {

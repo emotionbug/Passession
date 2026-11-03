@@ -582,24 +582,19 @@ pub async fn commit_file(
     Ok(Some(value))
 }
 
-/// Snapshot shortstat uses the comparison branch, not an all-diff inventory:
-/// an untracked-only checkout with no comparison ref has no shortstat.
-pub async fn shortstat(
+/// The checkout snapshot's `diffStat` for its already resolved worktree root,
+/// current branch and operation base. It uses the comparison branch, not an
+/// all-diff inventory: an untracked-only checkout with no comparison ref has
+/// no shortstat.
+pub(crate) async fn shortstat(
     cwd: &Path,
+    branch: &str,
+    base: Option<String>,
     env: &BTreeMap<String, String>,
     cancel: CancellationToken,
 ) -> Result<Option<Value>> {
     let env = readonly(env);
-    let cwd = match root(cwd, &env, &cancel).await {
-        Ok(cwd) => cwd,
-        Err(error) if cancel.is_cancelled() => return Err(error),
-        Err(_) => return Ok(None),
-    };
-    let Some(branch) = super::facts::current_branch(&cwd, &env, cancel.clone()).await? else {
-        return Ok(None);
-    };
-    let base = command::operation_base(&cwd, None, &env, cancel.clone()).await?;
-    let comparison = if let Some(base) = base.filter(|base| base != &branch) {
+    let comparison = if let Some(base) = base.filter(|base| base != branch) {
         if base.starts_with("refs/heads/") || base.starts_with("refs/remotes/") {
             if !command::exists(&cwd, &base, &env, cancel.clone()).await? {
                 return Ok(None);

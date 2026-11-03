@@ -117,6 +117,7 @@ class _AgentPanelState extends State<AgentPanel> {
     if (_viewVisible) setState(() {});
   }
   final drafts = ChatDrafts.instance;
+  VoidCallback? _removeDraftListener, _removeInboxListener;
   final Map<int, GlobalKey> rowKeys = {};
 
   /// Each row's widget with the inputs it was built from: a rebuild that
@@ -155,10 +156,9 @@ class _AgentPanelState extends State<AgentPanel> {
   /// and its fling) nothing scrolls it programmatically.
   bool _userScrolling = false;
 
-  /// Set while a keystroke publishes its own text to [drafts]: every panel's
-  /// draft listener skips that rebuild, since only the editor's own
-  /// listeners (send control, line count) depend on the text.
-  static bool _ownTextEdit = false;
+  /// Text edits update their own send/line-count controls without rebuilding
+  /// the originating panel; another view of this draft still synchronizes.
+  bool _ownTextEdit = false;
 
   /// The last full build, reused while this retained panel is hidden so
   /// offstage tabs do no work for store, draft or stream changes.
@@ -448,7 +448,9 @@ class _AgentPanelState extends State<AgentPanel> {
   @override
   void initState() {
     super.initState();
+    // Store-wide notifications carry only durability failures and recovery.
     drafts.addListener(_draftChanged);
+    _listenToDraft();
     editor.addListener(_editorChanged);
     focus.onKeyEvent = _composerKey;
     focus.addListener(_inputFocusChanged);
@@ -456,6 +458,19 @@ class _AgentPanelState extends State<AgentPanel> {
     fullscreenFocus.addListener(_inputFocusChanged);
     scroll.addListener(_onStreamScroll);
     _appLifecycle = AppLifecycleListener(onStateChange: _appLifecycleChanged);
+  }
+
+  void _listenToDraft() {
+    _removeDraftListener?.call();
+    _removeInboxListener?.call();
+    _removeDraftListener = drafts.listenToDraft(draftKey, _draftChanged);
+    _removeInboxListener = drafts.listenToInbox(
+      widget.target.serverId,
+      widget.target.workspaceId,
+      () {
+        if (mounted && initialized) _takeAttachments();
+      },
+    );
   }
 
   /// viewed-timeline-sync.ts setActive (app-visibility.ts getIsAppVisible):
@@ -588,6 +603,7 @@ class _AgentPanelState extends State<AgentPanel> {
         unawaited(controller!.start());
       }
       initialized = false;
+      _listenToDraft();
       unawaited(_initialize());
       _syncAttention();
     } else if (old.target.data['attachmentIntentId'] !=
@@ -2959,43 +2975,55 @@ class _AgentPanelState extends State<AgentPanel> {
         ],
       ),
     );
-    return DropTarget(
-      // useFileDrop is disabled while a submit or upload is in flight.
-      onDragDone: (details) async {
-        if (sending || uploading) return;
-        await _attachFiles(details.files, drop: true);
-      },
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-        child: Center(
-          child: ConstrainedBox(
-            constraints: BoxConstraints(maxWidth: PaseoTypography.of(context).contentMaxWidth),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              spacing: 12,
-              children: [
-                if (queue.isNotEmpty)
-                  ComposerQueueTrack(
-                    queue: queue,
-                    sending: sending,
-                    onEdit: _editQueued,
-                    onSendNow: _queueNow,
-                    onRemove: _removeQueued,
+    // Native drops bypass Offstage; hidden panels also reuse cached widget trees.
+    // Observe visibility below that cache to unregister the drop listener.
+    return Builder(
+      builder: (context) => DropTarget(
+        enable: PanelActivity.of(context).visible && !sending && !uploading,
+        onDragDone: (details) async {
+          if (sending || uploading) return;
+          await _attachFiles(details.files, drop: true);
+        },
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: PaseoTypography.of(context).contentMaxWidth,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                spacing: 12,
+                children: [
+                  if (queue.isNotEmpty)
+                    ComposerQueueTrack(
+                      queue: queue,
+                      sending: sending,
+                      onEdit: _editQueued,
+                      onSendNow: _queueNow,
+                      onRemove: _removeQueued,
+                    ),
+                  if (sendError != null) _sendErrorText(context),
+                  if (_notReadyNotice && _executionBlocked)
+                    _notReadyText(context),
+                  if (pending.isNotEmpty) _deliveryPending(pending),
+                  if (jsonMap(draft['failedMessage']).isNotEmpty)
+                    _failedDelivery(jsonMap(draft['failedMessage'])),
+                  for (final queued in queue.where(
+                    (item) => item['state'] == 'unacknowledged',
+                  ))
+                    _deliveryPending(queued),
+                  OverlayPortal(
+                    controller: _autocompletePortal,
+                    overlayChildBuilder: _autocompleteOverlay,
+                    child: CompositedTransformTarget(
+                      link: _composerLink,
+                      child: wrapper,
+                    ),
                   ),
-                if (sendError != null) _sendErrorText(context),
-                if (_notReadyNotice && _executionBlocked) _notReadyText(context),
-                if (pending.isNotEmpty) _deliveryPending(pending),
-                if (jsonMap(draft['failedMessage']).isNotEmpty)
-                  _failedDelivery(jsonMap(draft['failedMessage'])),
-                for (final queued in queue.where((item) => item['state'] == 'unacknowledged'))
-                  _deliveryPending(queued),
-                OverlayPortal(
-                  controller: _autocompletePortal,
-                  overlayChildBuilder: _autocompleteOverlay,
-                  child: CompositedTransformTarget(link: _composerLink, child: wrapper),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -3474,6 +3502,8 @@ class _AgentPanelState extends State<AgentPanel> {
     autocomplete.dispose();
     _forgeAutoAttach.dispose();
     drafts.removeListener(_draftChanged);
+    _removeDraftListener?.call();
+    _removeInboxListener?.call();
     editor.removeListener(_editorChanged);
     focus.removeListener(_inputFocusChanged);
     fullscreenFocus.removeListener(_inputFocusChanged);

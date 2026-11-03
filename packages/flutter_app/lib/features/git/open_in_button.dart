@@ -143,6 +143,20 @@ class _WorkspaceOpenInButtonState extends State<WorkspaceOpenInButton> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    // A connection switch replaces the host's client; the shared checkout
+    // state follows it. The replacement is acquired while the previous state
+    // is still held, so it starts from that state's snapshots.
+    final client = PaseoScope.of(context).hostFor(widget.serverId)?.client;
+    final previous = _state;
+    if (client != null &&
+        previous != null &&
+        !identical(client, previous.client)) {
+      previous.removeListener(_changed);
+      _state = CheckoutGitState.acquire(client, widget.serverId, widget.cwd)
+        ..addListener(_changed);
+      previous.release();
+      return;
+    }
     _bind();
   }
 

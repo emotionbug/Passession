@@ -13,7 +13,7 @@ class ChatDelivery {
   ChatDelivery._(this.client, this.serverId) {
     _subscription = client.events.listen(_event);
     client.addListener(_schedule);
-    drafts.addListener(_schedule);
+    _removeDraftListener = drafts.listenToDelivery(serverId, _schedule);
     drafts.initialize().then((_) => _schedule());
   }
   static final Map<PaseoClient, ChatDelivery> _owners = {};
@@ -34,6 +34,7 @@ class ChatDelivery {
   final String serverId;
   final drafts = ChatDrafts.instance;
   late final StreamSubscription<JsonMap> _subscription;
+  late final VoidCallback _removeDraftListener;
   final Set<String> _busy = {};
   final Map<String, OwnedObservation> _observations = {};
   final Set<String> _queried = {};
@@ -54,7 +55,7 @@ class ChatDelivery {
 
   void _apply(JsonMap receipt) {
     if (receipt.isEmpty) return;
-    for (final key in drafts.keysForServer(serverId).toList()) {
+    for (final key in drafts.agentKeysForServer(serverId).toList()) {
       final identity = jsonList(jsonDecode(key));
       if (identity[2] == receipt['agentId']) drafts.applyReceipt(key, receipt);
     }
@@ -131,7 +132,7 @@ class ChatDelivery {
     scheduleMicrotask(() {
       _scheduled = false;
       if (_disposed) return;
-      for (final key in drafts.keysForServer(serverId)) {
+      for (final key in drafts.agentKeysForServer(serverId)) {
         if (client.supports('agentMessageReceipts')) {
           if (_receiptObservation == null && !_subscribing) {
             unawaited(_subscribeReceipts());
@@ -268,7 +269,7 @@ class ChatDelivery {
 
   void _dispose() {
     _disposed = true;
-    drafts.removeListener(_schedule);
+    _removeDraftListener();
     client.removeListener(_schedule);
     _subscription.cancel();
     _receiptObservation?.close();

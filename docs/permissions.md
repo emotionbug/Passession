@@ -31,6 +31,12 @@ A pairing invitation is neither. It is an expiring, single-use exchange that cre
 
 Agents and terminals use workspace authority. Both can execute code and mutate the workspace, so separate write permissions would claim an isolation boundary the daemon cannot enforce.
 
+File RPCs use `cwd` as the base for relative paths, not as a filesystem sandbox.
+Authenticated principals with `workspace.read` or `workspace.write` can use the corresponding
+file operations with absolute paths, `..`, and symlink targets outside that directory,
+subject to the daemon process's operating-system permissions. Provider CLI sandboxes are
+independent of these daemon file permissions.
+
 Connected-host management uses `tunnel.manage`; source-owned connection and metadata replacement
 requires the producer or `access.manage`. Routed operations retain both caller and link authority,
 see [Connected hosts](connected-hosts.md#ownership-and-authority).
@@ -52,7 +58,7 @@ type Grant = {
 
 A delegating principal can grant only authority it already possesses. A session may attenuate its principal's grants but cannot widen them.
 
-Workspace-scoped grants require every resource-bearing operation and outbound observation to enforce the same workspace boundary. File preview currently accepts any daemon-readable regular file, so it must gain resource enforcement before workspace-specific access ships.
+Workspace-scoped grants require every resource-bearing operation and outbound observation to enforce the same workspace boundary. File operations currently accept paths outside `cwd`, so they must gain resource enforcement before workspace-specific access ships.
 
 ## Hub
 
