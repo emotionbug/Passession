@@ -49,6 +49,64 @@ endfunction()
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 add_subdirectory(${FLUTTER_MANAGED_DIR})
 
+# firebase_core serves only Android/iOS push (MobileServices.supported), but
+# Flutter registers its Windows plugin for every Windows target. The Firebase
+# C++ SDK has no Windows ARM64 libraries, so an ARM64 runner cannot link it.
+# For windows-arm64 only, build from configure-time copies of Flutter's
+# generated plugin files without firebase_core; Flutter keeps regenerating the
+# originals, which x64 builds use unchanged.
+set(PASEO_PLUGIN_REGISTRANT_SOURCE
+  "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc")
+set(PASEO_GENERATED_PLUGINS_CMAKE "${FLUTTER_MANAGED_DIR}/generated_plugins.cmake")
+if(FLUTTER_TARGET_PLATFORM STREQUAL "windows-arm64")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${PASEO_PLUGIN_REGISTRANT_SOURCE}" "${PASEO_GENERATED_PLUGINS_CMAKE}")
+  # Each expected generated entry must be present and leave no other
+  # firebase_core reference, so a generator change fails instead of linking.
+  function(paseo_remove_generated VAR PATTERN REPLACEMENT)
+    string(REGEX REPLACE "${PATTERN}" "${REPLACEMENT}" FILTERED "${${VAR}}")
+    if("${FILTERED}" STREQUAL "${${VAR}}")
+      message(FATAL_ERROR "Flutter's generated plugin files changed; cannot "
+        "exclude firebase_core from the windows-arm64 runner (${PATTERN}).")
+    endif()
+    set(${VAR} "${FILTERED}" PARENT_SCOPE)
+  endfunction()
+  file(READ "${PASEO_PLUGIN_REGISTRANT_SOURCE}" PASEO_REGISTRANT)
+  paseo_remove_generated(PASEO_REGISTRANT
+    "#include <firebase_core/firebase_core_plugin_c_api\\.h>\r?\n" "")
+  paseo_remove_generated(PASEO_REGISTRANT
+    "  FirebaseCorePluginCApiRegisterWithRegistrar\\([^;]*;\r?\n" "")
+  file(READ "${PASEO_GENERATED_PLUGINS_CMAKE}" PASEO_PLUGINS)
+  paseo_remove_generated(PASEO_PLUGINS "\n  firebase_core\r?\n" "\n")
+  foreach(PASEO_FILTERED IN ITEMS PASEO_REGISTRANT PASEO_PLUGINS)
+    string(REGEX MATCH "firebase_core|FirebaseCore" PASEO_LEFTOVER
+      "${${PASEO_FILTERED}}")
+    if(PASEO_LEFTOVER)
+      message(FATAL_ERROR "Flutter's generated plugin files changed; "
+        "firebase_core remains in the windows-arm64 runner.")
+    endif()
+  endforeach()
+
+  set(PASEO_ARM64_PLUGIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/paseo_arm64_plugins")
+  configure_file("${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.h"
+    "${PASEO_ARM64_PLUGIN_DIR}/generated_plugin_registrant.h" COPYONLY)
+  set(PASEO_PLUGIN_REGISTRANT_SOURCE
+    "${PASEO_ARM64_PLUGIN_DIR}/generated_plugin_registrant.cc")
+  set(PASEO_GENERATED_PLUGINS_CMAKE "${PASEO_ARM64_PLUGIN_DIR}/generated_plugins.cmake")
+  # Rewrite only on change so unchanged configures do not force a rebuild.
+  function(paseo_write_if_changed PATH CONTENT)
+    if(EXISTS "${PATH}")
+      file(READ "${PATH}" EXISTING)
+      if("${EXISTING}" STREQUAL "${CONTENT}")
+        return()
+      endif()
+    endif()
+    file(WRITE "${PATH}" "${CONTENT}")
+  endfunction()
+  paseo_write_if_changed("${PASEO_PLUGIN_REGISTRANT_SOURCE}" "${PASEO_REGISTRANT}")
+  paseo_write_if_changed("${PASEO_GENERATED_PLUGINS_CMAKE}" "${PASEO_PLUGINS}")
+endif()
+
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
 
@@ -59,7 +117,7 @@ set(CMAKE_DISABLE_FIND_PACKAGE_JNI TRUE)
 
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
-include(flutter/generated_plugins.cmake)
+include("${PASEO_GENERATED_PLUGINS_CMAKE}")
 
 # permission_handler_windows 0.2.2 requests C++20 but also adds legacy /await,
 # which makes C++/WinRT select <experimental/coroutine>. Use standard C++20

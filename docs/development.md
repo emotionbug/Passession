@@ -73,6 +73,8 @@ Only run the desktop target matching the host OS. iOS requires macOS. `cargo xta
 
 Linux and Windows app CMake configurations disable optional JNI discovery. JNI arrives transitively through Android `path_provider`/`shared_preferences` implementations; native desktop implementations do not use it. This prevents an installed development JDK from silently adding `libdartjni` and a JVM runtime dependency to desktop bundles. Android JNI configuration and dependencies are unchanged.
 
+Windows ARM64 builds omit the unused `firebase_core` native plugin: its Windows C++ SDK has no ARM64 libraries, and Firebase initialization and push are mobile-only in Paseo. CMake filters configure-time copies of Flutter's generated registration and plugin list; regenerated originals and Windows x64 builds remain unchanged. Windows desktop notifications still use `flutter_local_notifications_windows`, and Android/iOS Firebase registration is unaffected.
+
 ## Source ownership
 
 - Rust: `packages/daemon/src`; CLI commands in `cli/`, providers in `providers/`, process ownership in `daemon_control/`, desktop IPC in `desktop_host/`.

@@ -65,6 +65,8 @@ Manual inputs include `tag`, `mode` (`build` or `publish-only`), `recovery_run_i
 
 `publish-only` consumes preserved artifacts from an exact prior completed canonical workflow run. Recovery requires a complete, unique, unexpired target inventory; one-architecture macOS recovery must not silently replace the other architecture. `cargo xtask release recovery`, `record`, `verify`, `manifests` and `publish` own recovery, artifact hashes, integrity, update feeds and publication. The publication repository is `emotionbug/paseo`; any manual `gh` command must name it explicitly with `--repo emotionbug/paseo`. Desktop rollout defaults to 36 hours; a rollout change is a publication-side operation requiring authorization, not a local check.
 
+`checkout_ref` may pin a native-packaging correction without moving an existing source tag, provided its workspace version still matches that tag. Artifact provenance records the exact resolved checkout SHA; identify that build-source commit in the published notes when it differs from the tag. All targets in one publication must pass verification against that same SHA. Successful artifacts from an older source SHA cannot be mixed into the corrected publication; rebuild those targets rather than relabeling their provenance.
+
 `.github/workflows/docker.yml`, `desktop-packages.yml`, and `release-notes-sync.yml` are also manual-only, alongside SDK assembly, relay deployment and rollout. Docker publication requires `publish=true` and an explicit matching source version, including when the selected ref is a tag. These workflows do not establish a completed release or remove the distribution requirements above.
 
 ### Reusable Linux and Windows ARM64 Flutter SDKs
