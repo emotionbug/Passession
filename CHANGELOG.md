@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.3 - 2026-11-03
+
 ### Fixed
 
 - Keep images and files dropped into a chat out of other retained session drafts, including after switching tabs or returning from split view.
@@ -25,7 +27,7 @@
 - Remove file-service confinement to the workspace cwd. Absolute, parent-relative and symlink paths may access other locations allowed by the daemon user's OS permissions; existing authentication, read/write grants, revision checks and destructive workspace-root protections remain in place.
 - Removed one-time migrations of previous Paseo data now that installs use native storage: JSON timeline and subagent checkpoint import, startup workspace registry materialization and agent workspaceId backfill, worktree branch-identity pinning, push token array conversion, pre-lifecycle creation receipt import, v1 Hub relationship scope conversion (such records are now quarantined and grant nothing), the Flutter import/re-sync of the original app's settings, layout, drafts, desktop settings and window bounds, the Flutter app's pre-v2 Explorer upgrade and terminal-to-execution-log tab remapping (stored browser, plugin and terminal tabs are dropped), the old per-provider `thinkingOptionId` shape in remembered agent preferences, the `__unlabelled__` label-filter alias, the original-attachment recovery review in the composer, and the rollback-only `state` field in message receipts (receipts without a `version` are now reported as invalid). Existing files are left untouched.
 
-## 0.13.2
+## 0.13.2 - 2026-11-01
 
 ### Added
 

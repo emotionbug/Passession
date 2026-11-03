@@ -218,7 +218,7 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13002' }}
+          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13003' }}
       - name: Inspect native macOS build output
         if: matrix.platform == 'macos'
         shell: bash

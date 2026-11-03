@@ -1,0 +1,5 @@
+Fixed
+- Keep images and files dropped into a chat out of other retained session drafts, including after switching tabs or returning from split view.
+- Scope draft, attachment-inbox and delivery notifications to the owning chat, workspace and host. Matching file references appear immediately and retain absolute host paths when the receiving agent uses a different working directory.
+
+Full notes: https://github.com/emotionbug/paseo/releases
