@@ -367,7 +367,7 @@ fn host_arch() -> Result<(&'static str, u16)> {
         arch => bail!("Unsupported Windows runtime architecture: {arch}"),
     }
 }
-fn validate_pe(path: &Path, machine: u16) -> Result<()> {
+fn pe_machine(path: &Path) -> Result<u16> {
     let mut file = fs::File::open(path)?;
     let mut header = [0; 64];
     file.read_exact(&mut header)
@@ -383,11 +383,167 @@ fn validate_pe(path: &Path, machine: u16) -> Result<()> {
     let mut pe = [0; 6];
     file.read_exact(&mut pe)?;
     ensure!(
-        &pe[..4] == b"PE\0\0" && u16::from_le_bytes([pe[4], pe[5]]) == machine,
-        "CRT architecture mismatch: {}",
+        &pe[..4] == b"PE\0\0",
+        "CRT is not a PE image: {}",
         path.display()
     );
-    Ok(())
+    Ok(u16::from_le_bytes([pe[4], pe[5]]))
+}
+
+/// DLL names a PE image imports directly or through its delay-load table.
+fn pe_imports(path: &Path) -> Result<Vec<String>> {
+    let image = fs::read(path)?;
+    let malformed = || format!("Malformed PE import table: {}", path.display());
+    let u16_at = |at: usize| {
+        image
+            .get(at..at + 2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let u32_at = |at: usize| {
+        image
+            .get(at..at + 4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let pe = u32_at(60).with_context(malformed)? as usize;
+    ensure!(
+        image.get(..2) == Some(b"MZ".as_slice())
+            && image.get(pe..pe + 4) == Some(b"PE\0\0".as_slice()),
+        "Not a PE image: {}",
+        path.display()
+    );
+    let sections = u16_at(pe + 6).with_context(malformed)? as usize;
+    let optional = pe + 24;
+    let section_table = optional + u16_at(pe + 20).with_context(malformed)? as usize;
+    let (image_base, directories) = match u16_at(optional).with_context(malformed)? {
+        0x20b => (
+            image
+                .get(optional + 24..optional + 32)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                .with_context(malformed)?,
+            optional + 112,
+        ),
+        0x10b => (
+            u64::from(u32_at(optional + 28).with_context(malformed)?),
+            optional + 96,
+        ),
+        magic => bail!("Unknown PE optional header {magic:#x}: {}", path.display()),
+    };
+    let directory_count = u32_at(directories - 4).with_context(malformed)? as usize;
+    let offset = |rva: u32| {
+        (0..sections).find_map(|index| {
+            let header = section_table + index * 40;
+            let delta = rva.checked_sub(u32_at(header + 12)?)?;
+            let raw = u32_at(header + 20)? as usize;
+            (delta < u32_at(header + 16)?).then_some(raw + delta as usize)
+        })
+    };
+    let name = |rva: u32| {
+        let start = offset(rva)?;
+        let length = image.get(start..)?.iter().position(|&byte| byte == 0)?;
+        String::from_utf8(image[start..start + length].to_vec()).ok()
+    };
+    let mut names = Vec::new();
+    // IMAGE_IMPORT_DESCRIPTOR (Name at +12) and ImgDelayDescr (DllNameRVA at +4).
+    for (directory, size, name_field) in [(1, 20, 12), (13, 32, 4)] {
+        if directory >= directory_count {
+            continue;
+        }
+        let table = u32_at(directories + directory * 8).with_context(malformed)?;
+        if table == 0 {
+            continue;
+        }
+        let mut entry = offset(table).with_context(malformed)?;
+        loop {
+            let mut dll = u32_at(entry + name_field).with_context(malformed)?;
+            if dll == 0 {
+                break;
+            }
+            // Delay descriptors without dlattrRva store virtual addresses.
+            if directory == 13 && u32_at(entry).with_context(malformed)? & 1 == 0 {
+                dll = u64::from(dll)
+                    .checked_sub(image_base)
+                    .and_then(|rva| u32::try_from(rva).ok())
+                    .with_context(malformed)?;
+            }
+            names.push(name(dll).with_context(malformed)?);
+            entry += size;
+        }
+    }
+    Ok(names)
+}
+
+/// Select the CRT DLLs that `machine` processes load. The ARM64 redistributable also carries
+/// x64-machine images (vcruntime140_1.dll) for emulated x64 applications; an ARM64 process can
+/// never load them, so they are omitted only after proving no packaged image imports them.
+fn runtime_dlls(crt: &Path, destination: &Path, machine: u16) -> Result<Vec<PathBuf>> {
+    let mut dlls = Vec::new();
+    let mut emulated = Vec::new();
+    for entry in fs::read_dir(crt)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || !entry
+                .path()
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case("dll"))
+        {
+            continue;
+        }
+        let found = pe_machine(&entry.path())?;
+        if found == machine {
+            dlls.push(entry.path());
+        } else if machine == 0xaa64 && found == 0x8664 {
+            emulated.push(entry.path());
+        } else {
+            bail!(
+                "CRT architecture mismatch: {} (machine {found:#06x})",
+                entry.path().display()
+            );
+        }
+    }
+    ensure!(
+        !dlls.is_empty(),
+        "Visual C++ CRT directory contains no DLLs"
+    );
+    if emulated.is_empty() {
+        return Ok(dlls);
+    }
+    let check_imports = |image: &Path| -> Result<()> {
+        for name in pe_imports(image)? {
+            if let Some(dll) = emulated.iter().find(|dll| {
+                dll.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|file| file.eq_ignore_ascii_case(&name))
+            }) {
+                bail!(
+                    "{} imports {name}, but the ARM64 CRT only provides an x64 image: {}",
+                    image.display(),
+                    dll.display()
+                );
+            }
+        }
+        Ok(())
+    };
+    for dll in &dlls {
+        check_imports(dll)?;
+    }
+    for entry in walkdir::WalkDir::new(destination) {
+        let entry = entry?;
+        if entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case("dll") || s.eq_ignore_ascii_case("exe"))
+        {
+            check_imports(entry.path())?;
+        }
+    }
+    for dll in emulated {
+        let name = dll.file_name().unwrap().to_string_lossy();
+        eprintln!("Omitting x64-only {name} from the ARM64 CRT; no packaged image imports it");
+    }
+    Ok(dlls)
 }
 
 pub fn windows_runtime(destination: &Path, standalone: bool) -> Result<()> {
@@ -453,24 +609,7 @@ pub fn windows_runtime(destination: &Path, standalone: bool) -> Result<()> {
     let crt = crts
         .last()
         .context("No architecture-specific Visual C++ CRT found")?;
-    let mut dlls = Vec::new();
-    for entry in fs::read_dir(crt)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .path()
-                .extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|s| s.eq_ignore_ascii_case("dll"))
-        {
-            validate_pe(&entry.path(), machine)?;
-            dlls.push(entry.path());
-        }
-    }
-    ensure!(
-        !dlls.is_empty(),
-        "Visual C++ CRT directory contains no DLLs"
-    );
+    let dlls = runtime_dlls(crt, destination, machine)?;
     let mut destinations = vec![destination.to_owned()];
     if !standalone {
         destinations.extend([
@@ -636,6 +775,128 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("Uninstall.exe"), b"").unwrap();
         assert!(nsis_inventory(temp.path(), &temp.path().join("out")).is_err());
+    }
+    /// Minimal PE32+ image with one section holding import and delay-import tables.
+    fn image(path: &Path, machine: u16, imports: &[&str], delayed: &[&str]) {
+        fn put(image: &mut [u8], at: usize, bytes: &[u8]) {
+            image[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        let mut pe = vec![0_u8; 0x400];
+        put(&mut pe, 0, b"MZ");
+        put(&mut pe, 60, &0x40_u32.to_le_bytes());
+        put(&mut pe, 0x40, b"PE\0\0");
+        put(&mut pe, 0x44, &machine.to_le_bytes());
+        put(&mut pe, 0x46, &1_u16.to_le_bytes());
+        put(&mut pe, 0x54, &0xf0_u16.to_le_bytes());
+        put(&mut pe, 0x58, &0x20b_u16.to_le_bytes());
+        put(&mut pe, 0xc4, &16_u32.to_le_bytes());
+        put(&mut pe, 0xd0, &0x1000_u32.to_le_bytes());
+        put(&mut pe, 0x130, &0x1080_u32.to_le_bytes());
+        put(&mut pe, 0x150, &0x200_u32.to_le_bytes());
+        put(&mut pe, 0x154, &0x1000_u32.to_le_bytes());
+        put(&mut pe, 0x158, &0x200_u32.to_le_bytes());
+        put(&mut pe, 0x15c, &0x200_u32.to_le_bytes());
+        let mut name = 0x1100_u32;
+        for (index, dll) in imports.iter().enumerate() {
+            put(&mut pe, 0x200 + index * 20 + 12, &name.to_le_bytes());
+            put(&mut pe, name as usize - 0xe00, dll.as_bytes());
+            name += 0x20;
+        }
+        for (index, dll) in delayed.iter().enumerate() {
+            put(&mut pe, 0x280 + index * 32, &1_u32.to_le_bytes());
+            put(&mut pe, 0x280 + index * 32 + 4, &name.to_le_bytes());
+            put(&mut pe, name as usize - 0xe00, dll.as_bytes());
+            name += 0x20;
+        }
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, pe).unwrap();
+    }
+    fn arm64_crt(root: &Path) -> PathBuf {
+        let crt = root.join("arm64/Microsoft.VC145.CRT");
+        image(&crt.join("vcruntime140.dll"), 0xaa64, &[], &[]);
+        image(
+            &crt.join("msvcp140.dll"),
+            0xaa64,
+            &["vcruntime140.dll"],
+            &[],
+        );
+        image(
+            &crt.join("vcruntime140_1.dll"),
+            0x8664,
+            &["vcruntime140.dll"],
+            &[],
+        );
+        crt
+    }
+    #[test]
+    fn reads_direct_and_delay_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.exe");
+        image(
+            &path,
+            0xaa64,
+            &["KERNEL32.dll", "VCRUNTIME140.dll"],
+            &["MSVCP140.dll"],
+        );
+        assert_eq!(
+            pe_imports(&path).unwrap(),
+            ["KERNEL32.dll", "VCRUNTIME140.dll", "MSVCP140.dll"]
+        );
+        assert_eq!(pe_machine(&path).unwrap(), 0xaa64);
+    }
+    #[test]
+    fn arm64_crt_omits_only_unimported_x64_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let crt = arm64_crt(temp.path());
+        let payload = temp.path().join("payload");
+        image(
+            &payload.join("paseo_sessions.exe"),
+            0xaa64,
+            &["VCRUNTIME140.dll"],
+            &["MSVCP140.dll"],
+        );
+        image(
+            &payload.join("runtime/neovim/bin/win32yank.exe"),
+            0x8664,
+            &["VCRUNTIME140.dll"],
+            &[],
+        );
+        let mut names = runtime_dlls(&crt, &payload, 0xaa64)
+            .unwrap()
+            .into_iter()
+            .map(|dll| dll.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["msvcp140.dll", "vcruntime140.dll"]);
+
+        image(
+            &payload.join("runtime/neovim/bin/tool.exe"),
+            0x8664,
+            &[],
+            &["VCRUNTIME140_1.dll"],
+        );
+        assert!(runtime_dlls(&crt, &payload, 0xaa64).is_err());
+    }
+    #[test]
+    fn crt_rejects_other_machine_mismatches() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = temp.path().join("payload");
+        fs::create_dir_all(&payload).unwrap();
+        let crt = arm64_crt(temp.path());
+        assert!(runtime_dlls(&crt, &payload, 0x8664).is_err());
+        image(&crt.join("vcruntime140_1.dll"), 0x14c, &[], &[]);
+        assert!(runtime_dlls(&crt, &payload, 0xaa64).is_err());
+        image(&crt.join("vcruntime140_1.dll"), 0xaa64, &[], &[]);
+        let mut names = runtime_dlls(&crt, &payload, 0xaa64)
+            .unwrap()
+            .into_iter()
+            .map(|dll| dll.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"]
+        );
     }
     #[cfg(unix)]
     #[test]

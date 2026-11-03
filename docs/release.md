@@ -45,6 +45,8 @@ Client artifacts and build descriptors live in `artifacts/flutter/`. Standalone 
 
 Bundle provenance records the executable digest **after relocation**, because runtime patching can change its bytes. `sourceExecutableSha256` separately identifies the input executable. Check an artifact against its final digest, not against the pre-relocation source hash.
 
+The Visual C++ ARM64 redistributable directory can also contain x64-view DLLs for emulated applications. Windows ARM64 packaging keeps the matching native CRT images (including Arm64X) and omits an x64-view image only after checking direct and delay-loaded imports of every bundled executable, DLL and selected CRT. A reference to an omitted image or any other unexpected CRT architecture fails packaging. The Flutter and daemon executable architecture checks remain strict.
+
 ## Signing and mobile build numbers
 
 `xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `13001`. Android enforces a minimum of `13000`. Confirm the next build number against the actual store history; do not infer store acceptance from a local version string.
