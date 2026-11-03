@@ -108,6 +108,11 @@ acknowledgment promises a notification. A pending replacement retains its predec
 accepts; rejected dispatch removes only the candidate. Recovery coalesces registrations for the same
 caller, child, and host into one watch.
 
+Local finish observation polls its initial read and live-event refreshes concurrently. A pending
+mutex acquisition can already reserve the agent's next permit before returning a guard; suspending
+that read inside a `select!` event handler that awaits the same agent would deadlock both reads.
+Cancellation drops both observation futures together.
+
 Bootstrap restores these watches after lifecycle recovery and before opening
 ingress. Reading a closed child's result does not load its provider. A finish notification reports that
 the child's run has settled; the parent decides whether its task is complete. Recovery never resumes

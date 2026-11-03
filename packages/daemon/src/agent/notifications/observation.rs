@@ -338,29 +338,44 @@ async fn local(
             reason: None,
         })
     };
-    tokio::pin!(initial);
-    let mut initial_pending = true;
+    let initialize = async {
+        buffer.initial(initial.await?).await;
+        Ok::<_, anyhow::Error>(())
+    };
+    let refresh = local_updates(&manager, id, &buffer, &mut events);
+    // A pending initial read can already own a mutex permit. Keep polling it
+    // while event refreshes await the same agent, rather than suspending it
+    // inside a select branch. Cancellation drops both futures together.
+    tokio::select! {
+        _ = cancel.cancelled() => Ok(()),
+        result = async {
+            tokio::try_join!(initialize, refresh)?;
+            Ok(())
+        } => result,
+    }
+}
+async fn local_updates(
+    manager: &crate::agent::AgentManager,
+    id: &str,
+    buffer: &Buffer,
+    events: &mut tokio::sync::broadcast::Receiver<Value>,
+) -> Result<()> {
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            result = &mut initial, if initial_pending => { initial_pending = false; buffer.initial(result?).await; }
-            event = events.recv() => {
-                let event = event.context("Finish observation event stream ended or lagged")?;
-                let id_matches = event["agentId"] == id || event["agent"]["id"] == id;
-                if !id_matches { continue; }
-                if event["type"] == "agent_stream" && relevant(&event["event"]) {
-                    let snapshot = manager.agent_snapshot(id).await?;
-                    let last = manager.last_assistant_message(id).await?;
-                    buffer.observe(snapshot, Some(&event["event"]), last).await;
-                } else if event["type"] == "agent_state" && event["agent"]["lifecycle"] != "idle" {
-                    let snapshot = manager.agent_snapshot(id).await?;
-                    let last = manager.last_assistant_message(id).await?;
-                    buffer.observe(snapshot, None, last).await;
-                }
-            }
+        let event = events.recv().await.context("Finish observation event stream ended or lagged")?;
+        let id_matches = event["agentId"] == id || event["agent"]["id"] == id;
+        if !id_matches { continue; }
+        if event["type"] == "agent_stream" && relevant(&event["event"]) {
+            let snapshot = manager.agent_snapshot(id).await?;
+            let last = manager.last_assistant_message(id).await?;
+            buffer.observe(snapshot, Some(&event["event"]), last).await;
+        } else if event["type"] == "agent_state" && event["agent"]["lifecycle"] != "idle" {
+            let snapshot = manager.agent_snapshot(id).await?;
+            let last = manager.last_assistant_message(id).await?;
+            buffer.observe(snapshot, None, last).await;
         }
     }
 }
+
 async fn remote_refresh(
     client: &HostClient,
     id: &str,
@@ -453,6 +468,53 @@ async fn remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn initial_snapshot_and_live_event_do_not_deadlock_on_same_agent() {
+        use crate::agent::storage::AgentStorage;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe().unwrap());
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(home) }).await;
+        let id = "00000000-0000-4000-8000-000000000044";
+        let snapshot = json!({"id":id,"provider":"mock","internal":true,"config":{},"cwd":root.path()});
+        let (cell, _receiver) = manager.make_cell(id, snapshot, true).await.unwrap();
+        let mut data = cell.data.lock().await;
+        data.ready = true;
+        data.snapshot["status"] = json!("idle");
+        data.snapshot["lifecycle"] = json!("idle");
+        let cancel = CancellationToken::new();
+        let observation = Observation {
+            buffer: Arc::new(Buffer::default()),
+            cancel: cancel.clone(),
+            task: None,
+        };
+        let observing = local(Arc::downgrade(&app), id, observation.buffer.clone(), cancel.clone());
+        tokio::pin!(observing);
+
+        // Queue the initial read first, then make the event handler contend for
+        // the same lock before either read can acquire it.
+        assert!(futures_util::poll!(&mut observing).is_pending());
+        manager.events.send(json!({"type":"agent_state","agent":{"id":id,"lifecycle":"running"}})).unwrap();
+        assert!(futures_util::poll!(&mut observing).is_pending());
+        drop(data);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = &mut observing => panic!("Observation ended before its initial result: {result:?}"),
+                outcome = observation.next() => outcome.unwrap(),
+            }
+        }).await.expect("Initial read and event refresh must both keep making progress");
+        assert_eq!(outcome.status, "idle");
+        assert_eq!(outcome.final_snapshot.unwrap()["id"], id);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), &mut observing).await.unwrap().unwrap();
+        assert_eq!(manager.agent_snapshot(id).await.unwrap().unwrap()["id"], id);
+    }
+
     fn permission(id: &str) -> Outcome {
         Outcome {
             status: "permission".into(),

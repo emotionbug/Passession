@@ -1,6 +1,6 @@
 # Release
 
-The checkout version is **0.13.3**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
+The checkout version is **0.13.4**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
 
 ## Distribution requirements
 
@@ -62,6 +62,8 @@ Optional Firebase configuration must match `sh.paseo.sessions`: `GOOGLE_SERVICES
 `.github/workflows/desktop-release.yml` is the manual-only **Native Release** workflow despite its retained filename. It builds Flutter/Rust targets, preserves complete per-target artifacts, validates recovery provenance, and publishes only through its publication path. Its matrix is for explicitly requested artifacts, not default CI or per-platform test repetition.
 
 The complete release matrix has **eight targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android universal and iOS arm64. Each target's artifacts are retained for **30 days**. macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android explicitly provisions platform-tools. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
+
+For a reduced Windows x64, Linux x64 and Android release, select `platform=linux-windows-x64-android`. This preset supports both building and `publish-only` recovery without requiring macOS, desktop ARM64 or iOS artifacts. Recovery and publication require all three selected targets from the same source SHA; desktop feed verification and later rollout changes use the declared desktop target inventory rather than assuming the full matrix.
 
 Manual inputs include `tag`, `mode` (`build` or `publish-only`), `recovery_run_id`, `platform`, `checkout_ref`, `publish`, and `rollout_hours`. **`publish` defaults to true**; explicitly select false for an authorized non-publishing build. Tag pushes do not trigger the workflow. Do not dispatch a publishing workflow as a build test.
 

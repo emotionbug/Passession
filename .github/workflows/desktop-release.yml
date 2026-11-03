@@ -17,9 +17,9 @@ on:
         type: string
         default: ""
       platform:
-        description: Native platform or individual desktop target to build
+        description: Native platform, individual desktop target, or Linux/Windows x64 plus Android
         type: choice
-        options: [all, desktop, macos, linux, windows, android, ios, macos-arm64, macos-x64, linux-arm64, linux-x64, windows-arm64, windows-x64]
+        options: [all, desktop, linux-windows-x64-android, macos, linux, windows, android, ios, macos-arm64, macos-x64, linux-arm64, linux-x64, windows-arm64, windows-x64]
         default: all
       checkout_ref:
         description: Optional source ref override (must have the same package version as tag)
@@ -218,7 +218,7 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13003' }}
+          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13004' }}
       - name: Inspect native macOS build output
         if: matrix.platform == 'macos'
         shell: bash

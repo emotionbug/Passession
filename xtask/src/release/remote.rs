@@ -112,13 +112,13 @@ fn download_asset(asset: &Value, path: &Path) -> Result<()> {
     ensure!(status.success(), "Release asset download failed");
     Ok(())
 }
-/// Complete all twelve feeds before a draft is visible. Hash downloaded binaries,
-/// not just the size reported by GitHub (same-sized stale uploads are possible).
-fn complete_feeds(release: &Value, template: &Identity) -> Result<()> {
+/// Complete every desktop feed in the declared publication inventory before a
+/// draft is visible. Hash downloaded binaries, not just GitHub's reported size.
+fn complete_feeds(release: &Value, ids: &[Identity]) -> Result<()> {
     let dir = tempfile::tempdir()?;
     complete_feeds_with(
         release,
-        template,
+        ids,
         |asset| Ok(serde_json::from_slice(&asset_bytes(asset)?)?),
         |remote, entry| {
             let path = dir
@@ -137,17 +137,18 @@ fn complete_feeds(release: &Value, template: &Identity) -> Result<()> {
 }
 fn complete_feeds_with(
     release: &Value,
-    template: &Identity,
+    ids: &[Identity],
     mut read_feed: impl FnMut(&Value) -> Result<Value>,
     mut check_binary: impl FnMut(&Value, &Value) -> Result<()>,
 ) -> Result<()> {
-    for t in TARGETS.iter().filter(|t| t.desktop) {
-        let mut id = template.clone();
-        id.target = t.id();
+    for id in ids {
+        if !target(&id.target)?.desktop {
+            continue;
+        }
         for runtime in ["flutter", "rust"] {
-            let name = feed(&id, runtime);
+            let name = feed(id, runtime);
             let manifest = read_feed(asset(release, &name)?)?;
-            for entry in validate_manifest(&manifest, &id, runtime)? {
+            for entry in validate_manifest(&manifest, id, runtime)? {
                 let remote = asset(release, entry["name"].as_str().unwrap())?;
                 ensure!(
                     remote["size"] == entry["size"],
@@ -293,7 +294,7 @@ pub(super) fn publish() -> Result<()> {
     // Mobile-only releases never publish a desktop draft.
     if !feeds.is_empty() {
         let fresh = lookup(&tag)?.context("Release disappeared")?;
-        complete_feeds(&fresh, first)?;
+        complete_feeds(&fresh, &ids)?;
         let id = fresh["id"].as_u64().context("Missing release ID")?;
         gh(&[
             "api",
@@ -369,6 +370,28 @@ pub(super) fn recovery(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+fn published_desktop_targets(release: &Value, channel: &str) -> Result<Vec<Target>> {
+    let assets = release["assets"].as_array().context("Missing release assets")?;
+    let mut targets = Vec::new();
+    for target in TARGETS.iter().copied().filter(|target| target.desktop) {
+        let id = target.id();
+        let names = [
+            format!("provenance-{id}.json"),
+            format!("flutter-{channel}-{id}.json"),
+            format!("daemon-{channel}-{id}.json"),
+        ];
+        if !assets.iter().any(|asset| names.iter().any(|name| asset["name"] == *name)) {
+            continue;
+        }
+        for name in names {
+            asset(release, &name)?;
+        }
+        targets.push(target);
+    }
+    ensure!(!targets.is_empty(), "Release has no declared desktop targets");
+    Ok(targets)
+}
+
 pub(super) fn rollout() -> Result<()> {
     repository()?;
     let tag = required("SOURCE_TAG")?;
@@ -379,7 +402,7 @@ pub(super) fn rollout() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut updates = Vec::new();
     let mut sha = None;
-    for t in TARGETS.iter().filter(|t| t.desktop) {
+    for t in published_desktop_targets(&release, channel(&v))? {
         let name = format!("flutter-{}-{}.json", channel(&v), t.id());
         let manifest: Value = serde_json::from_slice(&asset_bytes(asset(&release, &name)?)?)?;
         ensure!(
@@ -412,7 +435,7 @@ pub(super) fn rollout() -> Result<()> {
 mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::STANDARD};
-    fn fixture() -> (Value, Identity, std::collections::BTreeMap<String, Value>) {
+    fn fixture() -> (Value, Vec<Identity>, std::collections::BTreeMap<String, Value>) {
         let template = Identity {
             sha: "a".repeat(40),
             source_tag: "v0.13.1".into(),
@@ -423,9 +446,11 @@ mod tests {
         };
         let mut assets = Vec::new();
         let mut manifests = std::collections::BTreeMap::new();
+        let mut ids = Vec::new();
         for t in TARGETS.iter().filter(|t| t.desktop) {
             let mut id = template.clone();
             id.target = t.id();
+            ids.push(id.clone());
             for runtime in ["flutter", "rust"] {
                 let mut entries = Vec::new();
                 for name in integrity::names(&id, runtime).unwrap() {
@@ -448,7 +473,7 @@ mod tests {
                 manifests.insert(name, manifest);
             }
         }
-        (json!({"assets":assets}), template, manifests)
+        (json!({"assets":assets}), ids, manifests)
     }
     #[test]
     fn full_publication_requires_twelve_distinct_valid_feeds() {
@@ -493,6 +518,27 @@ mod tests {
         );
     }
     #[test]
+    fn partial_publication_requires_all_and_only_declared_desktop_feeds() {
+        let (mut release, mut ids, manifests) = fixture();
+        ids.retain(|id| ["linux-x64", "windows-x64"].contains(&id.target.as_str()));
+        release["assets"].as_array_mut().unwrap().retain(|asset| {
+            let name = asset["name"].as_str().unwrap();
+            name.contains("linux-x64") || name.contains("windows-x64")
+        });
+        complete_feeds_with(
+            &release, &ids,
+            |a| Ok(manifests[a["name"].as_str().unwrap()].clone()),
+            |_, _| Ok(()),
+        ).unwrap();
+        release["assets"].as_array_mut().unwrap()
+            .retain(|asset| asset["name"] != "daemon-stable-windows-x64.json");
+        assert!(complete_feeds_with(
+            &release, &ids,
+            |a| Ok(manifests[a["name"].as_str().unwrap()].clone()),
+            |_, _| Ok(()),
+        ).is_err());
+    }
+    #[test]
     fn remote_binary_integrity_failure_blocks_publication_gate() {
         let (release, id, manifests) = fixture();
         assert!(
@@ -505,6 +551,25 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn partial_rollout_requires_provenance_and_both_feeds_for_each_target() {
+        let names = [
+            "provenance-linux-x64.json", "flutter-stable-linux-x64.json",
+            "daemon-stable-linux-x64.json", "provenance-windows-x64.json",
+            "flutter-stable-windows-x64.json", "daemon-stable-windows-x64.json",
+            "provenance-android-universal.json",
+        ];
+        let release = json!({"assets":names.map(|name| json!({"name":name}))});
+        let targets = published_desktop_targets(&release, "stable").unwrap();
+        assert_eq!(targets.into_iter().map(Target::id).collect::<Vec<_>>(), ["linux-x64", "windows-x64"]);
+        for missing in ["provenance-windows-x64.json", "daemon-stable-linux-x64.json"] {
+            let mut incomplete = release.clone();
+            incomplete["assets"].as_array_mut().unwrap().retain(|asset| asset["name"] != missing);
+            assert!(published_desktop_targets(&incomplete, "stable").is_err());
+        }
+        assert!(published_desktop_targets(&json!({"assets":[{"name":"provenance-android-universal.json"}]}), "stable").is_err());
+    }
+
     #[test]
     fn failed_upload_never_reaches_feeds() {
         let binaries = BTreeSet::from(["app.zip".into(), "daemon.zip".into()]);

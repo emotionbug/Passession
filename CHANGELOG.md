@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.13.4 - 2026-11-04
+
+### Fixed
+
+- Prevent finish notifications from deadlocking a child session when its initial state read races with a live event refresh. Keep both reads progressing so subsequent agent messages, status reads and permission-list requests remain responsive.
+
+### Added
+
+- Support publishing and recovering a Linux x64, Windows x64 and Android-only native release, including target-scoped desktop feed validation and rollout updates.
+
 ## 0.13.3 - 2026-11-03
 
 ### Fixed
