@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Retain the numeric GitHub release ID when creating and finalizing native-release drafts, and explicitly preserve the canonical tag when updating draft metadata.
+
 ## 0.13.4 - 2026-11-04
 
 ### Fixed

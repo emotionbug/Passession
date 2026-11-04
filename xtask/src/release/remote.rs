@@ -221,33 +221,28 @@ pub(super) fn publish() -> Result<()> {
                 var("CREATE_RELEASE", "false") == "true",
                 "Platform-only repair requires an existing release"
             );
-            let mut args = vec![
-                "release",
-                "create",
-                &tag,
-                "--repo",
-                REPOSITORY,
-                "--target",
-                &first.sha,
-                "--title",
-                &tag,
-                "--notes-file",
-                notes_path.to_str().context("Non-UTF8 notes path")?,
-                "--draft",
-            ];
-            if !version(&first.version)?.pre.is_empty() {
-                args.push("--prerelease");
-            }
-            let created = gh(&args);
-            match lookup(&tag)? {
-                Some(release) => release,
-                None => {
-                    created?;
-                    bail!("Release creation did not produce a resolvable draft");
-                }
-            }
+            let created = gh(&[
+                "api",
+                "--method",
+                "POST",
+                &format!("repos/{REPOSITORY}/releases"),
+                "-f",
+                &format!("tag_name={tag}"),
+                "-f",
+                &format!("target_commitish={}", first.sha),
+                "-f",
+                &format!("name={tag}"),
+                "-F",
+                &format!("body=@{}", notes_path.display()),
+                "-F",
+                "draft=true",
+                "-F",
+                &format!("prerelease={}", !version(&first.version)?.pre.is_empty()),
+            ])?;
+            serde_json::from_slice(&created).context("Invalid created release response")?
         }
     };
+    let release_id = release["id"].as_u64().context("Missing release ID")?;
     let lookup_tag = release["tag_name"]
         .as_str()
         .context("Missing release tag")?;
@@ -282,7 +277,6 @@ pub(super) fn publish() -> Result<()> {
     upload_ordered(&dir, &binaries, &retained, &feeds, |path| {
         upload(lookup_tag, path)
     })?;
-    let release_id = release["id"].as_u64().context("Missing release ID")?;
     gh(&[
         "api",
         "--method",
@@ -290,17 +284,20 @@ pub(super) fn publish() -> Result<()> {
         &format!("repos/{REPOSITORY}/releases/{release_id}"),
         "-F",
         &format!("body=@{}", notes_path.display()),
+        "-f",
+        &format!("tag_name={tag}"),
     ])?;
     // Mobile-only releases never publish a desktop draft.
     if !feeds.is_empty() {
-        let fresh = lookup(&tag)?.context("Release disappeared")?;
+        let fresh = api(&format!("repos/{REPOSITORY}/releases/{release_id}"))?;
         complete_feeds(&fresh, &ids)?;
-        let id = fresh["id"].as_u64().context("Missing release ID")?;
         gh(&[
             "api",
             "--method",
             "PATCH",
-            &format!("repos/{REPOSITORY}/releases/{id}"),
+            &format!("repos/{REPOSITORY}/releases/{release_id}"),
+            "-f",
+            &format!("tag_name={tag}"),
             "-F",
             "draft=false",
             "-F",
