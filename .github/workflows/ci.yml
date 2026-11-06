@@ -25,8 +25,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: tests-linux-x64
-      # Makepad's Linux backend links X11, Xcursor, GLX, ALSA and PulseAudio.
+      # Makepad links X11/GL/audio; native file dialogs also require Wayland.
       - name: Install native GUI build libraries
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev libwayland-dev
       - name: Run Rust workspace tests
         run: cargo test --locked --workspace --all-targets
