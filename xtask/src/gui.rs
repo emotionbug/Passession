@@ -304,11 +304,18 @@ fn plist_set(plist: &Path, key: &str, kind: &str, value: &str) -> Result<()> {
 pub const SMOKE_FEATURE: &str = "desktop-smoke";
 
 fn build_desktop(target: &str, mode: &str, identity: &Identity, smoke: bool) -> Result<PathBuf> {
-    build::build_native(mode, false)?;
+    // macOS needs separate deployment targets; local builds need separate identity.
+    let combined_release = identity.release && target != "macos";
+    if !combined_release {
+        build::build_native(mode, false)?;
+    }
     let mut cargo = command(cargo())?;
     cargo
         .args(["build", "--locked", "-p", "paseo-gui", "--bin", CARGO_BIN])
         .env("MAKEPAD_PACKAGE_DIR", "makepad");
+    if combined_release {
+        cargo.args(["-p", "paseo-daemon", "--bin", "paseo"]);
+    }
     if smoke {
         cargo.arg("--features").arg(format!("paseo-gui/{SMOKE_FEATURE}"));
     }
@@ -319,7 +326,11 @@ fn build_desktop(target: &str, mode: &str, identity: &Identity, smoke: bool) -> 
             .env("MAKEPAD", "apple_bundle")
             .env("MACOSX_DEPLOYMENT_TARGET", MACOS_MINIMUM);
     }
-    run(&mut cargo)?;
+    if combined_release {
+        build::build_desktop_release(mode, &mut cargo)?;
+    } else {
+        run(&mut cargo)?;
+    }
     let compiled = target_root()?
         .join(profile_directory(mode))
         .join(format!("{CARGO_BIN}{}", env::consts::EXE_SUFFIX));

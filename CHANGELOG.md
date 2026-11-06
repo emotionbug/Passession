@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Compile the Linux/Windows official desktop client and daemon in one Cargo invocation, sharing dependency features instead of recompiling common dependencies in separate passes. Preserve release optimization and artifact checks; keep local identity separation and macOS deployment targets unchanged.
+
 ## 0.13.6 - 2026-11-06
 
 ### Fixed

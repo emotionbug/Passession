@@ -5,6 +5,7 @@ use std::{
     env, fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 fn valid_source(value: &str) -> bool {
@@ -124,6 +125,20 @@ pub fn build_daemon(args: &[String]) -> Result<()> {
 }
 
 pub fn build_native(profile: &str, container: bool) -> Result<()> {
+    build_native_command(profile, container, None)
+}
+
+/// Linux/Windows releases share one Cargo graph and compile-time identity.
+/// Local identities and macOS deployment targets require separate builds.
+pub fn build_desktop_release(profile: &str, command: &mut Command) -> Result<()> {
+    ensure!(
+        native_release_env(),
+        "Combined desktop builds require an official release identity"
+    );
+    build_native_command(profile, false, Some(command))
+}
+
+fn build_native_command(profile: &str, container: bool, desktop: Option<&mut Command>) -> Result<()> {
     platform()?;
     arch()?;
     ensure!(
@@ -169,23 +184,27 @@ pub fn build_native(profile: &str, container: bool) -> Result<()> {
     );
     let directory = directory(profile)?;
     remove_if_exists(&directory.join("paseo-build.json"))?;
-    let mut cargo = command(cargo())?;
-    cargo
-        .args(["build", "--locked", "-p", "paseo-daemon", "--bin", "paseo"])
-        .env("PASEO_BUILD_SOURCE_SHA", &source);
-    if profile == "release" {
-        cargo.arg("--release");
-    }
-    if !release {
-        for key in [
-            "PASEO_NATIVE_RELEASE",
-            "PASEO_UPDATE_REPOSITORY",
-            "PASEO_RELEASE_CHANNEL",
-        ] {
-            cargo.env_remove(key);
+    if let Some(command) = desktop {
+        run(command)?;
+    } else {
+        let mut cargo = command(cargo())?;
+        cargo
+            .args(["build", "--locked", "-p", "paseo-daemon", "--bin", "paseo"])
+            .env("PASEO_BUILD_SOURCE_SHA", &source);
+        if profile == "release" {
+            cargo.arg("--release");
         }
+        if !release {
+            for key in [
+                "PASEO_NATIVE_RELEASE",
+                "PASEO_UPDATE_REPOSITORY",
+                "PASEO_RELEASE_CHANNEL",
+            ] {
+                cargo.env_remove(key);
+            }
+        }
+        run(&mut cargo)?;
     }
-    run(&mut cargo)?;
     let executable = directory.join(executable());
     assert_architecture(&executable)?;
     for name in ["skills", "lib", "plugin-worker"] {
