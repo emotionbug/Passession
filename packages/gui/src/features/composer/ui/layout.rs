@@ -35,15 +35,9 @@ impl ComposerPanel {
         }
     }
 
-    /// Start fresh box/text/icon batches so what follows paints above everything drawn so
-    /// far. Makepad appends an instance to the latest batch of its shader, so without this a
-    /// box drawn after text lands in an earlier box batch and covers that text.
+    /// Isolate the card, tooltip or sheet from earlier blocks.
     pub(super) fn layer(&mut self, cx: &mut Cx2d) {
-        cx.new_draw_call(&self.painter.draw_box.draw_vars);
-        cx.new_draw_call(&self.painter.text_regular.draw_vars);
-        cx.new_draw_call(&self.painter.text_medium.draw_vars);
-        cx.new_draw_call(&self.painter.text_icon.draw_vars);
-        cx.new_draw_call(&self.painter.draw_ring.draw_vars);
+        self.painter.new_layer(cx);
     }
 
     pub(super) fn spinner(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4) {

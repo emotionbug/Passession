@@ -151,4 +151,67 @@ font-curve regression. The rebuilt debug APK was installed and these actual
 surfaces exercised. No full-suite, physical refresh-rate, native Wayland or
 Windows UI result is inferred from this pass.
 
+### Retained glyphs, overlay layers and touch-release focus
+
+The follow-up API 35 run used rebuilt production widgets with an isolated mock
+conversation containing 400 long ASCII code lines and 2,400 distinct Hangul
+syllables. No paid provider requests were sent in this pass. Evidence remains
+under `/home/emotionbug/.cache/paseo-android-qa-xkwu3602/`:
+
+- `screen-442` records widespread glyph corruption at 200% text size before the
+  paged-atlas fix. This reproduced common atlas exhaustion, not the exact
+  missing-selected-syllable sequence in the user's screenshot.
+- `screen-446`–`448`, `454` and `458` show intact Korean/code text after the fix,
+  including selected `나` with the adjacent `눠` still visible. Scrolling across
+  the distinct-syllable fixture preserves text and the opaque latest arrow.
+  First-time software-rendered rasterization of this stress fixture is slow;
+  these screenshots are not a throughput or frame-rate benchmark.
+- `screen-461`–`464` cover 100%/200% task/subagent pills, a separate latest
+  button and large-text subagent rows. `screen-455` verifies latest navigation.
+- `screen-465`–`472` cover the sidebar search border, Settings root/Appearance,
+  theme dropdown, Git diff options and file explorer at 200%.
+- `screen-478` verifies scaled/wrapped file source text and aligned line
+  numbers after correcting its missing system-size adapter. Android source
+  files intentionally remain read-only.
+- `screen-452`–`453`, `460` and `481`–`482`, with the
+  `release-focus-*.txt` input-method captures, cover composer, sidebar search
+  and manual file Find. DOWN, CANCEL and outside release do not open the IME;
+  a valid inside release does. `screen-483` verifies that held source dragging
+  selects text instead of scrolling.
+
+The scoped run passed three atlas allocator tests, three common TextInput
+touch-focus tests and four GUI manual-field/source touch tests. The rebuilt
+Linux smoke client also accepted keyboard input, selected Korean text with
+the mouse, cleared that selection on the same click into sidebar search, and
+scrolled to older content and back through the latest arrow. Desktop evidence
+is in `desktop-shared-renderer-*.png`; it used private X11/software rendering,
+not the user's Wayland session. No physical-device result is inferred.
+
+### Long-press native toolbar follow-up
+
+The same API 35 emulator exposed three remaining faults: inputs deferred the
+toolbar until release; an identical-position MOVE after IME relayout collapsed
+the selected word; and manual file views requested actions against a parent
+area that had not yet been published for the current frame. The common input,
+manual editor and parent-area paths now handle those cases. Closing the native
+toolbar no longer doubles as an editor blur/IME dismissal.
+
+- `screen-499`–`500` show Cut/Copy/Paste/Select All on the Korean composer,
+  first while the finger is still down and then after release.
+- `screen-501`–`505` exercise Select All, Copy, Cut, empty-composer long-press
+  Paste, and restoration of exactly one `계속 있는데` draft with the IME open.
+- `screen-508`–`509` show the read-only source Copy/Select All toolbar before
+  and after release. `screen-510` verifies that an outside click still opens
+  the sidebar.
+- `screen-511`–`513` exercise empty-search Paste, copying `한글` from source
+  into search, and the populated-search Cut/Copy/Paste/Select All toolbar while
+  the finger remains down. These checks used 200% system text size.
+- `screen-516`–`517` verify the manual file Find field's held native Paste
+  menu and an actual pasted `한글` query resolving to one match.
+
+The follow-up common input/manual-field scoped run passed seven tests and the
+Android debug APK was rebuilt, installed and exercised. Native toolbar evidence
+comes from the emulator's actual system UI, not a mocked menu or an automatic
+copy-on-selection substitute.
+
 Capture screenshots/logs without unrelated personal data or credentials. Preserve failing output, use bounded waits for observable conditions, and clean up only test-owned app instances, homes and processes. Installation or device changes require the appropriate authorization.

@@ -1111,7 +1111,7 @@ impl Cx {
         }) else { return; };
         let caps = request.capabilities;
         match action {
-            0 => self.call_event_handler(&Event::TextSelectionDismiss),
+            0 => self.hide_text_actions(request.area),
             1 | 2 if if action == 1 { caps.copy } else { caps.cut } => {
                 let response = Rc::new(RefCell::new(None));
                 let clipboard = TextClipboardEvent { response: response.clone() };

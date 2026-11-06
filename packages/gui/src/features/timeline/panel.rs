@@ -165,7 +165,7 @@ struct ModelSig {
     running: bool,
     permissions: usize,
     version: u64,
-    compact_tracks: bool,
+    track_clearance: f64,
     loading_older: bool,
 }
 
@@ -886,13 +886,14 @@ impl ChatPanel {
     }
 
     /// agent-panel.dart `_streamRows` + `_timeline` items, oldest first.
-    fn rebuild_items(&mut self, compact: bool) {
+    fn rebuild_items(&mut self, look: Look, track_height: f64) {
         let Some(snap) = self.snap.clone() else { return };
         let Some(target) = self.target.clone() else { return };
         let overview = get(&self.host.preferences, "toolCallDetailLevel") == "overview";
         let provider = str_of(get(&snap.agent, "provider")).to_owned();
         let outgoing = if target.is_subagent() { 0 } else { bridge::outgoing_revision() };
         let tracks = self.tracks_visible();
+        let clearance = if tracks { tracks::tail_clearance(look.compact, track_height) } else { 0.0 };
         let permission_count = if target.is_subagent() { 0 } else { snap.permissions.len() };
         let sig = ModelSig {
             timeline: Rc::as_ptr(&snap.timeline) as usize,
@@ -902,7 +903,7 @@ impl ChatPanel {
             running: snap.running,
             permissions: permission_count,
             version: snap.version,
-            compact_tracks: tracks && compact,
+            track_clearance: clearance,
             loading_older: self.older.loading(),
         };
         if self.model_sig.as_ref() == Some(&sig) {
@@ -992,7 +993,6 @@ impl ChatPanel {
         }
         // The tail inset keeps the newest rows clear of the floating track bar.
         let footer_at_end = has_auxiliary;
-        let clearance = if tracks { tracks::tail_clearance(compact) } else { 0.0 };
         let existing = if footer_at_end && permission_count == 0 { 32.0 } else { 0.0 };
         if clearance > existing {
             items.push(RowItem { id: "tail-inset".into(), kind: RowKind::Inset(clearance - existing) });
@@ -1863,8 +1863,9 @@ impl ChatPanel {
                     // The rows arrive with this frame's model rebuild.
                     self.model_sig = None;
                     if self.visible {
-                        let compact = crate::common::is_compact_width(self.content_rect.size.x);
-                        self.rebuild_items(compact);
+                        let look = self.look(self.content_rect.size.x);
+                        let track_height = tracks::pill_height(cx, &mut self.kit, look);
+                        self.rebuild_items(look, track_height);
                         self.finish_prompt_jump(cx, seq);
                     } else {
                         let row = self.target.as_ref().and_then(|target| with_store(|store| {
@@ -2265,7 +2266,7 @@ impl Widget for ChatPanel {
             Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::MouseLeave(_)
                 | Event::TouchUpdate(_) | Event::Scroll(_) | Event::KeyDown(_) | Event::KeyUp(_)
                 | Event::TextInput(_) | Event::TextIme(_) | Event::TextCopy(_) | Event::TextCut(_)
-                | Event::TextSelectAll | Event::TextSelectionDismiss | Event::BackPressed { .. }
+                | Event::TextSelectAll | Event::BackPressed { .. }
         );
         // Composer sheets are painted above the stream. Dispatch them before
         // any row can take the pointer/key focus, and retain ownership on close.
@@ -2513,7 +2514,8 @@ impl Widget for ChatPanel {
             return DrawStep::done();
         }
         let compact = look.compact;
-        self.rebuild_items(compact);
+        let track_height = tracks::pill_height(cx, &mut self.kit, look);
+        self.rebuild_items(look, track_height);
         if let Some((seq, offset, find)) = self.pending_jump.take() {
             // Once: a row still missing after the rebuild is not in the stream.
             if let Some(id) = self.row_id_of_seq(seq) {
@@ -2673,10 +2675,10 @@ impl Widget for ChatPanel {
                     providers: &self.providers,
                     host_label: &host_label_fn,
                 };
-                track_anchors = tracks::draw_bar(cx, &mut d, &mut self.painter, &model, open_track, stream_rect.pos.x, stream_rect.pos.y + stream_rect.size.y, stream_rect.size.x);
+                track_anchors = tracks::draw_bar(cx, &mut d, &mut self.painter, &model, open_track, stream_rect.pos.x, stream_rect.pos.y + stream_rect.size.y, stream_rect.size.x, track_height);
             }
             if jump_visible {
-                let clearance = if tracks_visible { tracks::control_clearance(compact) } else { 0.0 };
+                let clearance = if tracks_visible { tracks::control_clearance(compact, track_height) } else { 0.0 };
                 let bottom = stream_rect.pos.y + stream_rect.size.y - clearance.max(16.0);
                 chrome::jump_button(cx, &mut d, stream_rect.center().x, bottom);
             }

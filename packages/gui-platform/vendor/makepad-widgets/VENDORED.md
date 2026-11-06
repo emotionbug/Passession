@@ -74,6 +74,16 @@ width, wrapping and alignment. Live system-font changes and width reflow do not
 reuse stale glyph metrics or replace the editor's text, selection or history;
 color-only animation keeps the cached layout.
 
+Touch focus is acquired on a valid release inside the input, not on pointer
+down. Leaving the field, panning, cancellation, focus/model replacement or
+geometry changes invalidate the pending tap. Long press remains a distinct
+selection action; mouse and explicit programmatic focus stay immediate.
+`touch_focus_tests` cover the release boundary and invalidation transitions.
+
+Long press opens the native toolbar at the hold threshold, without waiting for
+finger-up. Identical-position move events do not remap a held selection when
+IME presentation moves the input; actual movement still extends the range.
+
 ## Touch scrolling
 
 `src/scroll_bars.rs` supplies the shared `TouchScroll` controller: slop-qualified

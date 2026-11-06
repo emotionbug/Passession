@@ -18,6 +18,7 @@ use crate::theme::{Palette, with_alpha};
 use super::buffer::{EditKind, Selection, TextBuffer};
 use crate::features::files::highlight::{self, Highlighted};
 use crate::features::files::kit::{Kit, RichFont, RichSpan, rect, spec};
+use makepad_widgets::makepad_draw::event::DigitId;
 
 /// Tab characters display as this many spaces.
 const TAB_WIDTH: usize = 4;
@@ -91,7 +92,7 @@ pub struct SourceEditor {
     ime_caret_area: Area,
     preferred_x: Option<f64>,
     drag: Option<(DragUnit, usize, usize)>,
-    touch_caret: Option<usize>,
+    touch_caret: Option<(DigitId, u64)>,
     thumb_drag: Option<(f64, f64)>,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     ime_last: Option<(usize, usize)>,
@@ -284,6 +285,7 @@ impl SourceEditor {
     /// Original `_goToLocation`: selects the line start (or the `line..line_end` range) and
     /// centres the line.
     pub fn go_to(&mut self, line: usize, column: usize, line_end: Option<usize>) {
+        self.touch_caret = None;
         let line = line.max(1);
         if !self.read_only {
             match line_end {
@@ -307,6 +309,7 @@ impl SourceEditor {
 
     /// Selects `start..end` and reveals it (find).
     pub fn select(&mut self, start: usize, end: usize) {
+        self.touch_caret = None;
         self.buffer.set_selection(Selection { anchor: start, head: end });
         self.reveal = Some(Reveal::Caret);
     }
@@ -733,6 +736,33 @@ impl SourceEditor {
         Some((rect(area.pos.x + area.size.x - 10.0, thumb_y, 10.0, thumb_h), max_scroll / (area.size.y - thumb_h).max(1.0)))
     }
 
+    pub fn cancel_touch_focus(&mut self) {
+        self.touch_caret = None;
+    }
+
+    pub fn wants_touch_focus(&self, hit: &Hit) -> bool {
+        match hit {
+            Hit::FingerUp(fe) => self.touch_caret == Some((fe.digit_id, self.buffer.revision))
+                && fe.is_over && fe.was_tap() && self.viewport.contains(fe.abs),
+            Hit::FingerLongPress(fe) => self.touch_caret == Some((fe.digit_id, self.buffer.revision))
+                && self.viewport.contains(fe.abs),
+            _ => false,
+        }
+    }
+
+    pub fn observe_event(&mut self, event: &Event) {
+        if matches!(event, Event::KeyFocus(_)) {
+            self.touch_caret = None;
+        }
+        if matches!(event, Event::TouchUpdate(update) if update.cancelled) {
+            self.touch_caret = None;
+            self.drag = None;
+            self.thumb_drag = None;
+            self.touch_scroll.reset();
+            self.show_actions = false;
+        }
+    }
+
     /// Pointer and keyboard input already routed to the editor.
     pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, look: &EditorLook, hit: &Hit) -> EditorResult {
         if self.selection_invalidated {
@@ -759,18 +789,16 @@ impl SourceEditor {
                         return result;
                     }
                 self.touch_scroll.handle_hit(hit);
+                if fe.device.is_touch() {
+                    self.touch_caret = Some((fe.digit_id, self.buffer.revision));
+                    self.drag = None;
+                    return result;
+                }
                 cx.claim_text_selection(self.ime_area);
                 self.owns_selection = true;
                 let offset = self.offset_at_point(cx, kit, look, fe.abs);
                 self.preferred_x = None;
                 self.ime_last = None;
-                if fe.device.is_touch() && fe.tap_count < 2 {
-                    // A scroll must not collapse the source range. Commit a tap
-                    // caret only after the gesture has been distinguished from pan.
-                    self.touch_caret = Some(offset);
-                    self.drag = None;
-                    return result;
-                }
                 match fe.tap_count {
                     2 => {
                         let (a, b) = self.buffer.word_at(offset);
@@ -787,11 +815,11 @@ impl SourceEditor {
                         self.drag = Some((DragUnit::Char, self.buffer.selection.anchor, self.buffer.selection.anchor));
                     }
                 }
-                if fe.device.is_touch() {
-                    self.drag = None;
-                }
             }
             Hit::FingerMove(fe) => {
+                if fe.device.is_touch() && (!fe.is_over || !self.viewport.contains(fe.abs)) {
+                    self.touch_caret = None;
+                }
                 if let Some((start_y, start_scroll)) = self.thumb_drag {
                     if let Some((_, ratio)) = self.thumb(look) {
                         self.scroll.y = start_scroll + (fe.abs.y - start_y) * ratio;
@@ -825,20 +853,38 @@ impl SourceEditor {
             }
             Hit::FingerUp(fe) => {
                 self.touch_scroll.release(fe.time);
-                if let Some(offset) = self.touch_caret.take()
-                    && fe.was_tap() {
-                        cx.clear_text_selection(self.ime_area);
-                        cx.claim_text_selection(self.ime_area);
-                        self.show_actions = false;
-                        self.buffer.set_selection(Selection::caret(offset));
+                if self.wants_touch_focus(hit) {
+                    let offset = self.offset_at_point(cx, kit, look, fe.abs);
+                    cx.clear_text_selection(self.ime_area);
+                    cx.claim_text_selection(self.ime_area);
+                    self.owns_selection = true;
+                    self.show_actions = false;
+                    self.preferred_x = None;
+                    self.ime_last = None;
+                    let selection = match fe.tap_count {
+                        2 => {
+                            let (anchor, head) = self.buffer.word_at(offset);
+                            Selection { anchor, head }
+                        }
+                        3 => {
+                            let (anchor, head) = self.buffer.line_range_at(offset);
+                            Selection { anchor, head }
+                        }
+                        _ => Selection::caret(offset),
+                    };
+                    self.buffer.set_selection(selection);
+                    if cfg!(target_os = "android") && !selection.is_empty() {
+                        self.show_actions = true;
                     }
+                }
+                self.touch_caret = None;
                 if cfg!(target_os = "android") && fe.device.is_touch() && self.drag.is_some() {
                     self.show_actions = true;
                 }
                 self.drag = None;
                 self.thumb_drag = None;
             }
-            Hit::FingerLongPress(fe) => {
+            Hit::FingerLongPress(fe) if self.wants_touch_focus(hit) => {
                 self.touch_scroll.reset();
                 self.touch_caret = None;
                 cx.claim_text_selection(self.ime_area);
@@ -847,6 +893,7 @@ impl SourceEditor {
                 let (a, b) = self.buffer.word_at(offset);
                 self.buffer.set_selection(Selection { anchor: a, head: b });
                 self.drag = Some((DragUnit::Word, a, b));
+                self.show_actions = cfg!(target_os = "android");
                 if !cfg!(target_os = "android") {
                     result.context_menu = Some(fe.abs);
                 }
@@ -1059,6 +1106,7 @@ impl SourceEditor {
     }
 
     pub fn select_all(&mut self) {
+        self.touch_caret = None;
         let len = self.buffer.len();
         self.buffer.set_selection(Selection { anchor: 0, head: len });
     }
@@ -1071,6 +1119,43 @@ impl SourceEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_touch_does_not_focus_or_move_selection_before_release() {
+        use super::super::field::touch_tests::{cancel, down, moved_out, up};
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut kit = Kit::new(&mut cx);
+        let look = EditorLook {
+            font_size: 14.0, compact: true, wrap: false, highlighting: false,
+            syntax: [Vec4::default(); 20], palette: crate::theme::current_palette(),
+        };
+        for transition in 0..8 {
+            let mut editor = SourceEditor::new("한글 text".into(), "test.txt", "touch".into(), false);
+            editor.viewport = rect(0.0, 0.0, 100.0, 100.0);
+            editor.select(0, "한글".len());
+            let selected = editor.buffer.selection;
+            editor.handle_hit(&mut cx, &mut kit, &look, &down());
+            assert!(!editor.focused);
+            assert_eq!(editor.buffer.selection, selected);
+            assert!(editor.wants_touch_focus(&Hit::FingerUp(up())));
+            let mut release = up();
+            match transition {
+                0 => release.abs.x = -1.0,
+                1 => { editor.handle_hit(&mut cx, &mut kit, &look, &moved_out()); }
+                2 => editor.observe_event(&cancel()),
+                3 => editor.sync_text("new model"),
+                4 => editor.observe_event(&Event::KeyFocus(KeyFocusEvent { prev: Area::Empty, focus: Area::Empty })),
+                5 => editor.viewport.pos.x = 20.0,
+                6 => release.tap_cancelled = true,
+                _ => editor.buffer.insert("model edit", EditKind::Other),
+            }
+            let selection = editor.buffer.selection;
+            assert!(!editor.wants_touch_focus(&Hit::FingerUp(release.clone())));
+            editor.handle_hit(&mut cx, &mut kit, &look, &Hit::FingerUp(release));
+            assert!(!editor.focused);
+            assert_eq!(editor.buffer.selection, selection);
+        }
+    }
+
 
     #[test]
     fn native_text_actions_respect_read_only_and_empty_selection() {

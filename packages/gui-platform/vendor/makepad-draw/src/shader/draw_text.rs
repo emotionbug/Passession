@@ -2,6 +2,7 @@ use {
     crate::{
         cx_2d::Cx2d,
         cx_draw::CxDraw,
+        draw_list_2d::ManyInstances,
         geometry::GeometryQuad2D,
         makepad_platform::*,
         text::{
@@ -128,6 +129,8 @@ pub struct DrawText {
     pub t_min: Vec2,
     #[calc]
     pub t_max: Vec2,
+    #[rust]
+    page_areas: Vec<Area>,
 }
 
 impl LiveHook for DrawText {
@@ -137,8 +140,13 @@ impl LiveHook for DrawText {
     }
 
     fn after_apply(&mut self, cx: &mut Cx, apply: &mut Apply, index: usize, nodes: &[LiveNode]) {
-        self.draw_vars
-            .after_apply_update_self(cx, apply, index, nodes, &self.geometry);
+        let area = self.draw_vars.area;
+        for &page_area in &self.page_areas {
+            self.draw_vars.area = page_area;
+            self.draw_vars.after_apply_update_self(cx, apply, index, nodes, &self.geometry);
+        }
+        self.draw_vars.area = area;
+        self.draw_vars.after_apply_update_self(cx, apply, index, nodes, &self.geometry);
     }
 }
 
@@ -357,25 +365,38 @@ impl DrawText {
     }
 
     fn draw_text(&mut self, cx: &mut Cx2d, origin_in_lpxs: Point<f32>, text: &LaidoutText) {
-        self.update_draw_vars(cx);
-        let Some(mut instances) = cx.begin_many_aligned_instances(&self.draw_vars) else {
-            return;
-        };
+        self.page_areas.clear();
+        let mut instances = None;
+        let mut pages = [0, 0];
         self.glyph_depth = self.draw_depth;
         for row in &text.rows {
             self.draw_row(
                 cx,
                 origin_in_lpxs + Size::from(row.origin_in_lpxs) * self.font_scale,
                 row,
-                &mut instances.instances,
+                &mut instances,
+                &mut pages,
             );
         }
-        let area = cx.end_many_instances(instances);
+        let mut area = instances.map(|instances| cx.end_many_instances(instances)).unwrap_or(Area::Empty);
+        if !self.page_areas.is_empty() {
+            self.page_areas.push(area);
+            // A multi-page layout still exposes one complete hit/focus area.
+            // Keep its instance areas separately for live color/animation updates.
+            area = Area::Empty;
+            cx.add_aligned_rect_area(&mut area, rect(
+                origin_in_lpxs.x as f64,
+                origin_in_lpxs.y as f64,
+                (text.size_in_lpxs.width * self.font_scale) as f64,
+                (text.size_in_lpxs.height * self.font_scale) as f64,
+            ));
+        }
         self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, area);
     }
 
-    fn update_draw_vars(&mut self, cx: &mut Cx2d) {
-        let fonts = cx.fonts.borrow();
+    fn update_draw_vars(&mut self, cx: &mut Cx2d, pages: [usize; 2]) {
+        let fonts = cx.fonts.clone();
+        let mut fonts = fonts.borrow_mut();
         let rasterizer = fonts.rasterizer().borrow();
         let sdfer_settings = rasterizer.sdfer().settings();
         self.draw_vars.user_uniforms[0] = sdfer_settings.radius;
@@ -386,8 +407,9 @@ impl DrawText {
         let color_atlas_size = rasterizer.color_atlas().size();
         self.draw_vars.user_uniforms[4] = color_atlas_size.width as f32;
         self.draw_vars.user_uniforms[5] = color_atlas_size.height as f32;
-        self.draw_vars.texture_slots[0] = Some(fonts.grayscale_texture().clone());
-        self.draw_vars.texture_slots[1] = Some(fonts.color_texture().clone());
+        drop(rasterizer);
+        self.draw_vars.texture_slots[0] = Some(fonts.grayscale_texture(cx, pages[0]).clone());
+        self.draw_vars.texture_slots[1] = Some(fonts.color_texture(cx, pages[1]).clone());
     }
 
     fn draw_row(
@@ -395,14 +417,16 @@ impl DrawText {
         cx: &mut Cx2d,
         origin_in_lpxs: Point<f32>,
         row: &LaidoutRow,
-        out_instances: &mut Vec<f32>,
+        instances: &mut Option<ManyInstances>,
+        pages: &mut [usize; 2],
     ) {
         for glyph in &row.glyphs {
             self.draw_glyph(
                 cx,
                 origin_in_lpxs + Size::from(glyph.origin_in_lpxs) * self.font_scale,
                 glyph,
-                out_instances,
+                instances,
+                pages,
             );
         }
 
@@ -455,11 +479,32 @@ impl DrawText {
         cx: &mut Cx2d,
         origin_in_lpxs: Point<f32>,
         glyph: &LaidoutGlyph,
-        output: &mut Vec<f32>,
+        instances: &mut Option<ManyInstances>,
+        pages: &mut [usize; 2],
     ) {
         use crate::text::geom::Point;
         let font_size_in_dpxs = glyph.font_size_in_lpxs * cx.current_dpi_factor() as f32;
         if let Some(rasterized_glyph) = glyph.rasterize(font_size_in_dpxs) {
+            let slot = match rasterized_glyph.atlas_kind {
+                AtlasKind::Grayscale => 0,
+                AtlasKind::Color => 1,
+            };
+            if pages[slot] != rasterized_glyph.atlas_page {
+                if let Some(previous) = instances.take() {
+                    self.page_areas.push(cx.end_many_instances(previous));
+                }
+                pages[slot] = rasterized_glyph.atlas_page;
+            }
+            if instances.is_none() {
+                self.update_draw_vars(cx, *pages);
+                if !self.page_areas.is_empty() {
+                    // Do not append a returning page to an older batch: combining
+                    // glyphs and styled spans must retain their submission order.
+                    cx.get_draw_call(false, &self.draw_vars);
+                }
+                *instances = cx.begin_many_aligned_instances(&self.draw_vars);
+            }
+            let Some(instances) = instances else { return };
             self.draw_rasterized_glyph(
                 Point::new(
                     origin_in_lpxs.x + glyph.offset_in_lpxs() * self.font_scale,
@@ -468,7 +513,7 @@ impl DrawText {
                 glyph.font_size_in_lpxs,
                 glyph.color,
                 rasterized_glyph,
-                output,
+                &mut instances.instances,
             );
         }
     }
@@ -527,8 +572,10 @@ impl DrawText {
         self.t_min = vec2(t_min.x, t_min.y);
         self.t_max = vec2(t_max.x, t_max.y);
 
+        // Backends use LEQUAL: overlapping glyphs keep submission order at
+        // equal depth. Accumulating depth per glyph lets long text escape its
+        // draw call and paint above later overlays.
         output.extend_from_slice(self.draw_vars.as_slice());
-        self.glyph_depth += 0.000001;
     }
 }
 

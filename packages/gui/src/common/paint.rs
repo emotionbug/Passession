@@ -250,7 +250,7 @@ impl Painter {
     /// A fresh batch alone is not a barrier: Makepad can search past it for an older batch
     /// with matching text textures/uniforms. Isolate every primitive with the same group,
     /// as TextInput does, and reserve the background before any foreground primitives.
-    pub fn new_layer(&mut self, cx: &mut Cx2d) {
+    pub fn new_layer(&mut self, cx: &mut Cx2d) -> LiveId {
         let group = LiveId::unique();
         for vars in [
             &mut self.draw_box.draw_vars,
@@ -263,6 +263,7 @@ impl Painter {
             vars.set_draw_call_group(group);
         }
         cx.new_draw_call(&self.draw_box.draw_vars);
+        group
     }
 
     /// Horizontal hairline (Flutter `Divider(height: 1)`).

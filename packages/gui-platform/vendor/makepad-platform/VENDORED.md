@@ -81,6 +81,11 @@ from provisional draw-time rectangles. Hidden anchors dismiss the native menu;
 stale tokens cannot edit a different owner. `TouchUpdateEvent::cancelled`
 preserves Android ACTION_CANCEL through common gesture dispatch.
 
+Native toolbar dismissal only retires its action request. It does not blur the
+editor or hide its keyboard when Android cannot offer an action (for example,
+an empty input with an empty clipboard). Outside-pointer and lifecycle focus
+teardown remain separate selection-invalidating operations.
+
 ## Touch activation and draw ordering
 
 `event/finger.rs` retains movement cancellation once a touch reaches the tap
@@ -96,6 +101,10 @@ text fields and overlay layers cannot merge primitives across each other's
 backgrounds. Draw-call/list uniform slices count floats, not bytes; their tests
 bound the exposed storage. The GLES uniform upload uses each mapping's actual
 slot count rather than padded uniform-buffer storage.
+
+`texture.rs` exposes `Texture::is_unique` for the adjacent draw crate's paged
+font atlas. Retained draw-call/DrawVars texture clones prevent recycling a page
+whose glyph UVs are still in use; this does not claim immediate GPU deallocation.
 
 The x86_64 Android path uses the libc thread-ID API instead of an ARM-specific
 syscall number. OpenXR string pointers use the target's `c_char` signedness

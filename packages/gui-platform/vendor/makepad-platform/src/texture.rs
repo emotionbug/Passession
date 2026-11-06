@@ -17,6 +17,9 @@ pub struct TextureId(pub (crate) usize, u64);
 
 impl Texture {
     pub fn texture_id(&self) -> TextureId {TextureId(self.0.id, self.0.generation)}
+
+    /// Whether no other owner (including retained draw calls) references this texture.
+    pub fn is_unique(&self) -> bool { Rc::strong_count(&self.0) == 1 }
 }
 
 #[derive(Default)]

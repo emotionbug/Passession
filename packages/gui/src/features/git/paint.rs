@@ -81,16 +81,12 @@ impl GitPaint {
         TextSpec::new(font, size_px, color)
     }
 
-    /// Starts new draw calls so what follows paints over everything drawn
-    /// earlier in this draw list (sticky headers over scrolled rows).
+    /// Keep sticky-header primitives above scrolled rows, including after a
+    /// font-atlas change makes an older text batch otherwise compatible.
     pub fn new_layer(&mut self, cx: &mut Cx2d) {
-        let p = &self.painter;
-        cx.new_draw_call(&p.draw_box.draw_vars);
-        cx.new_draw_call(&p.draw_ring.draw_vars);
-        cx.new_draw_call(&p.text_regular.draw_vars);
-        cx.new_draw_call(&p.text_medium.draw_vars);
-        cx.new_draw_call(&p.text_mono.draw_vars);
-        cx.new_draw_call(&p.text_icon.draw_vars);
+        let group = self.painter.new_layer(cx);
+        self.file_icon.draw_vars.set_draw_call_group(group);
+        self.manual_gear.draw_vars.set_draw_call_group(group);
     }
 
     /// The material icon of `file_name` in `area`; false while it is still

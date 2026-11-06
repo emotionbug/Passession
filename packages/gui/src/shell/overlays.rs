@@ -422,8 +422,8 @@ fn argb_scrim(compact: bool) -> Vec4 {
 }
 
 fn new_layer(shell: &mut PaseoShell, cx: &mut Cx2d) {
-    shell.overlay_painter.new_layer(cx);
-    shell.overlay_icon.new_draw_call(cx);
+    let group = shell.overlay_painter.new_layer(cx);
+    shell.overlay_icon.draw_vars.set_draw_call_group(group);
 }
 
 fn draw_modal(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, index: usize, window: Rect, top: bool) {

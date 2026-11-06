@@ -283,6 +283,11 @@ impl FileView {
     }
 
     fn set_focus(&mut self, cx: &mut Cx, focus: Focus) {
+        self.query.cancel_touch_focus();
+        self.replacement.cancel_touch_focus();
+        if let Some(editor) = self.editor.as_mut() {
+            editor.cancel_touch_focus();
+        }
         if self.focus != focus {
             cx.clear_text_selection(self.area);
             match self.focus {
@@ -897,6 +902,14 @@ impl FileView {
     /// Returns whether the view changed.
     pub fn handle_event(&mut self, cx: &mut Cx, kit: &mut Kit, event: &Event, ui: &mut UiContext, area: Area, observing: bool) -> bool {
         self.area = area;
+        self.query.observe_event(event);
+        self.replacement.observe_event(event);
+        if let Some(editor) = self.editor.as_mut() {
+            editor.observe_event(event);
+        }
+        if matches!(event, Event::TouchUpdate(update) if update.cancelled) {
+            self.pressed = None;
+        }
         let mut changed = false;
         if let Event::Timer(_) = event {
             if let Some(editor) = self.editor.as_mut() {
@@ -977,7 +990,7 @@ impl FileView {
         let palette = theme::current_palette();
         let theme_name = ui.preference("syntaxTheme").and_then(Value::as_str).unwrap_or("one").to_owned();
         EditorLook {
-            font_size: self.font_size,
+            font_size: theme::current_typography().system_size(self.font_size),
             compact: ui.compact,
             wrap: self.wrap,
             highlighting: self.highlighting,
@@ -1026,15 +1039,19 @@ impl FileView {
             }
             Hit::FingerDown(fe) => {
                 let hot = self.hits.at(fe.abs);
-                cx.set_key_focus(self.area);
+                if !fe.device.is_touch() {
+                    cx.set_key_focus(self.area);
+                }
+                self.pressed = hot.clone();
                 self.editor_drag = false;
                 self.preview_drag = false;
                 match hot {
                     Some(Hot::Editor) => {
-                        self.set_focus(cx, Focus::Editor);
+                        if !fe.device.is_touch() {
+                            self.set_focus(cx, Focus::Editor);
+                        }
                         self.editor_drag = true;
                         let result = self.editor.as_mut().map(|editor| {
-                            editor.focused = true;
                             editor.handle_hit(cx, kit, &look, hit)
                         });
                         if let Some(at) = result.and_then(|result| result.context_menu) {
@@ -1042,11 +1059,15 @@ impl FileView {
                         }
                     }
                     Some(Hot::FindField) => {
-                        self.set_focus(cx, Focus::Find);
+                        if !fe.device.is_touch() {
+                            self.set_focus(cx, Focus::Find);
+                        }
                         self.query.handle_hit(cx, kit, hit);
                     }
                     Some(Hot::ReplaceField) => {
-                        self.set_focus(cx, Focus::Replace);
+                        if !fe.device.is_touch() {
+                            self.set_focus(cx, Focus::Replace);
+                        }
                         self.replacement.handle_hit(cx, kit, hit);
                     }
                     Some(Hot::Preview) => {
@@ -1078,20 +1099,20 @@ impl FileView {
                     self.markdown.handle_hit(cx, self.area, hit);
                 } else if let Some((start, offset)) = self.zoom.drag {
                     self.zoom.offset = offset + (fe.abs - start);
-                } else if self.focus == Focus::Find {
+                } else if self.pressed == Some(Hot::FindField) {
                     self.query.handle_hit(cx, kit, hit);
-                } else if self.focus == Focus::Replace {
+                } else if self.pressed == Some(Hot::ReplaceField) {
                     self.replacement.handle_hit(cx, kit, hit);
                 }
                 true
             }
             Hit::FingerLongPress(fe) => {
-                self.pressed = None;
-                match self.hits.at(fe.abs) {
-                    Some(Hot::Editor) => {
-                        self.set_focus(cx, Focus::Editor);
+                match self.pressed.clone().filter(|hot| Some(hot) == self.hits.at(fe.abs).as_ref()) {
+                    Some(Hot::Editor) if self.editor.as_ref().is_some_and(|editor| editor.wants_touch_focus(hit)) => {
                         self.editor_drag = true;
                         let result = self.editor.as_mut().map(|editor| editor.handle_hit(cx, kit, &look, hit));
+                        self.set_focus(cx, Focus::Editor);
+                        cx.set_key_focus(self.area);
                         if let Some(at) = result.and_then(|result| result.context_menu) {
                             self.context_menu(ui, at);
                         }
@@ -1101,19 +1122,38 @@ impl FileView {
                         self.preview_drag = true;
                         self.markdown.handle_hit(cx, self.area, hit);
                     }
-                    Some(Hot::FindField) => {
-                        self.set_focus(cx, Focus::Find);
+                    Some(Hot::FindField) if self.query.wants_touch_focus(hit) => {
                         self.query.handle_hit(cx, kit, hit);
+                        self.set_focus(cx, Focus::Find);
+                        cx.set_key_focus(self.area);
                     }
-                    Some(Hot::ReplaceField) => {
-                        self.set_focus(cx, Focus::Replace);
+                    Some(Hot::ReplaceField) if self.replacement.wants_touch_focus(hit) => {
                         self.replacement.handle_hit(cx, kit, hit);
+                        self.set_focus(cx, Focus::Replace);
+                        cx.set_key_focus(self.area);
                     }
                     _ => {}
                 }
                 true
             }
             Hit::FingerUp(fe) => {
+                let hot = self.hits.at(fe.abs);
+                let touch_focus = if hot == Some(Hot::Editor) && self.editor_drag && self.editor.as_ref().is_some_and(|editor| editor.wants_touch_focus(hit)) {
+                    Some(Focus::Editor)
+                } else if hot == Some(Hot::FindField) && self.pressed == Some(Hot::FindField) && self.query.wants_touch_focus(hit) {
+                    Some(Focus::Find)
+                } else if hot == Some(Hot::ReplaceField) && self.pressed == Some(Hot::ReplaceField) && self.replacement.wants_touch_focus(hit) {
+                    Some(Focus::Replace)
+                } else {
+                    None
+                };
+                if touch_focus.is_none() {
+                    self.query.cancel_touch_focus();
+                    self.replacement.cancel_touch_focus();
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.cancel_touch_focus();
+                    }
+                }
                 if self.editor_drag
                     && let Some(editor) = self.editor.as_mut() {
                         editor.handle_hit(cx, kit, &look, hit);
@@ -1122,10 +1162,14 @@ impl FileView {
                     && let PreviewEvent::Link(href) = self.markdown.handle_hit(cx, self.area, hit) {
                         self.open_link(ui, &href);
                     }
-                if self.focus == Focus::Find {
+                if self.pressed == Some(Hot::FindField) {
                     self.query.handle_hit(cx, kit, hit);
-                } else if self.focus == Focus::Replace {
+                } else if self.pressed == Some(Hot::ReplaceField) {
                     self.replacement.handle_hit(cx, kit, hit);
+                }
+                if let Some(focus) = touch_focus {
+                    self.set_focus(cx, focus);
+                    cx.set_key_focus(self.area);
                 }
                 self.editor_drag = false;
                 self.preview_drag = false;

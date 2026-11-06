@@ -206,7 +206,7 @@ impl Cx {
         let owner = self.keyboard.text_selection;
         if owner == Area::Empty { return; }
         match event {
-            Event::MouseDown(_) | Event::TextSelectionDismiss => {}
+            Event::MouseDown(_) => {}
             Event::TouchUpdate(update) if update.touches.iter().any(|touch| matches!(touch.state, TouchState::Start)) => {}
             Event::AppLostFocus | Event::Pause | Event::Background | Event::Shutdown if cfg!(target_os = "android") => {}
             _ => return,
@@ -230,7 +230,7 @@ impl Cx {
         };
         let leaving = cfg!(target_os = "android")
             && matches!(event, Event::AppLostFocus | Event::Pause | Event::Background | Event::Shutdown);
-        if outside || leaving || matches!(event, Event::TextSelectionDismiss) {
+        if outside || leaving {
             self.clear_text_selection(owner);
             self.clear_key_focus_if(owner);
             // Deliver loss before the pointer so the old owner cannot erase a

@@ -50,9 +50,7 @@ impl<'a> DerefMut for CxDraw<'a> {fn deref_mut(&mut self) -> &mut Self::Target {
 
 impl<'a> Drop for CxDraw<'a> {
     fn drop(&mut self) {
-        if !self.fonts.borrow_mut().prepare_textures(&mut self.cx) {
-            self.cx.redraw_all();
-        }
+        self.fonts.borrow_mut().prepare_textures(&mut self.cx);
         self.draw_icon_atlas();
     }
 }

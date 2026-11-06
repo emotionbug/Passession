@@ -232,10 +232,26 @@ impl ChatKit {
         })
     }
 
-    /// Starts this kit's batching inside the current draw list: the rect draw
-    /// call is created before any text call, so backgrounds render beneath text
-    /// (makepad appends instances to the newest matching call of each shader).
+    /// Isolate every primitive from earlier batches, then reserve the
+    /// background before text. A new rect call alone is not a layer barrier.
     pub fn begin_layer(&mut self, cx: &mut Cx2d) {
+        let group = LiveId::unique();
+        for vars in [
+            &mut self.rect.draw_vars,
+            &mut self.image.draw_vars,
+            &mut self.spinner.draw_vars,
+            &mut self.logo.draw_vars,
+            &mut self.text_regular.draw_vars,
+            &mut self.text_medium.draw_vars,
+            &mut self.text_semibold.draw_vars,
+            &mut self.text_bold.draw_vars,
+            &mut self.text_italic.draw_vars,
+            &mut self.text_bold_italic.draw_vars,
+            &mut self.text_mono.draw_vars,
+            &mut self.text_icon.draw_vars,
+        ] {
+            vars.set_draw_call_group(group);
+        }
         self.rect.new_draw_call(cx);
     }
 

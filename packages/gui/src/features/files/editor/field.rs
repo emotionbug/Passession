@@ -3,6 +3,7 @@
 //! inset, optional trailing status text.
 
 use makepad_widgets::*;
+use makepad_widgets::makepad_draw::event::DigitId;
 
 use crate::common::paint::Font;
 use crate::theme::{Palette, with_alpha};
@@ -27,6 +28,8 @@ pub struct TextField {
     text_rect: Rect,
     font_size: f64,
     drag_anchor: Option<usize>,
+    touch_focus: Option<(DigitId, u64)>,
+    frame: Rect,
     ime_id: u64,
     ime_area: Area,
     ime_caret_area: Area,
@@ -40,7 +43,7 @@ impl TextField {
         let mut buffer = TextBuffer::new(text.replace('\n', " "));
         let len = buffer.len();
         buffer.set_selection(Selection::caret(len));
-        TextField { buffer, focused: false, blink: super::Blink::default(), scroll_x: 0.0, text_rect: Rect::default(), font_size: 14.0, drag_anchor: None, ime_id: LiveId::unique().0, ime_area: Area::Empty, ime_caret_area: Area::Empty, show_actions: false, selection_invalidated: false, owns_selection: false }
+        TextField { buffer, focused: false, blink: super::Blink::default(), scroll_x: 0.0, text_rect: Rect::default(), font_size: 14.0, drag_anchor: None, touch_focus: None, frame: Rect::default(), ime_id: LiveId::unique().0, ime_area: Area::Empty, ime_caret_area: Area::Empty, show_actions: false, selection_invalidated: false, owns_selection: false }
     }
 
     pub fn text(&self) -> &str {
@@ -52,11 +55,13 @@ impl TextField {
         let len = self.buffer.len();
         self.buffer.set_selection(Selection::caret(len));
         self.drag_anchor = None;
+        self.touch_focus = None;
         self.show_actions = false;
         self.selection_invalidated = true;
     }
 
     pub fn select_all(&mut self) {
+        self.touch_focus = None;
         let len = self.buffer.len();
         self.buffer.set_selection(Selection { anchor: 0, head: len });
     }
@@ -68,6 +73,7 @@ impl TextField {
         self.owns_selection = false;
         self.buffer.set_selection(Selection::caret(self.buffer.selection.head));
         self.drag_anchor = None;
+        self.touch_focus = None;
         self.show_actions = false;
         self.selection_invalidated = false;
     }
@@ -94,6 +100,7 @@ impl TextField {
             self.selection_invalidated = false;
         }
         self.font_size = font_size;
+        self.frame = frame;
         self.ime_area = ime_area;
         let border = if self.focused { p.border_accent } else { p.surface2 };
         kit.outline(cx, frame, p.surface2, border, 1.0, 6.0);
@@ -171,6 +178,46 @@ impl TextField {
         laid.rows.first().map(|row| row.x_in_lpxs_to_index(x as f32)).unwrap_or(0).min(self.buffer.len())
     }
 
+    pub fn cancel_touch_focus(&mut self) {
+        self.touch_focus = None;
+    }
+
+    /// Owners route the captured gesture here even before this field has focus.
+    pub fn wants_touch_focus(&self, hit: &Hit) -> bool {
+        match hit {
+            Hit::FingerUp(fe) => self.touch_focus == Some((fe.digit_id, self.buffer.revision))
+                && fe.is_over && fe.was_tap() && self.frame.contains(fe.abs),
+            Hit::FingerLongPress(fe) => self.touch_focus == Some((fe.digit_id, self.buffer.revision))
+                && self.frame.contains(fe.abs),
+            _ => false,
+        }
+    }
+
+    pub fn observe_event(&mut self, event: &Event) {
+        if matches!(event, Event::KeyFocus(_)) {
+            self.touch_focus = None;
+        }
+        if matches!(event, Event::TouchUpdate(update) if update.cancelled) {
+            self.touch_focus = None;
+            self.drag_anchor = None;
+            self.show_actions = false;
+        }
+    }
+
+    fn place_pointer_cursor(&mut self, cx: &mut Cx, kit: &mut Kit, abs: DVec2, tap_count: u32, shift: bool) {
+        cx.claim_text_selection(self.ime_area);
+        self.owns_selection = true;
+        let index = self.index_at(cx, kit, abs);
+        match tap_count {
+            2 => {
+                let (a, b) = self.buffer.word_at(index);
+                self.buffer.set_selection(Selection { anchor: a, head: b });
+            }
+            3 => self.select_all(),
+            _ => self.buffer.move_head(index, shift),
+        }
+    }
+
     pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, hit: &Hit) -> FieldEvent {
         if self.selection_invalidated {
             if self.owns_selection {
@@ -183,34 +230,41 @@ impl TextField {
         let mut event = FieldEvent::None;
         match hit {
             Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
-                cx.claim_text_selection(self.ime_area);
-                self.owns_selection = true;
-                let index = self.index_at(cx, kit, fe.abs);
-                match fe.tap_count {
-                    2 => {
-                        let (a, b) = self.buffer.word_at(index);
-                        self.buffer.set_selection(Selection { anchor: a, head: b });
-                    }
-                    3 => self.select_all(),
-                    _ => self.buffer.move_head(index, fe.modifiers.shift),
+                self.touch_focus = fe.device.is_touch().then_some((fe.digit_id, self.buffer.revision));
+                if fe.device.is_touch() {
+                    self.drag_anchor = None;
+                    return FieldEvent::None;
                 }
+                self.place_pointer_cursor(cx, kit, fe.abs, fe.tap_count, fe.modifiers.shift);
                 self.drag_anchor = (!fe.device.is_touch()).then_some(self.buffer.selection.anchor);
             }
-            Hit::FingerLongPress(fe) => {
+            Hit::FingerLongPress(fe) if self.wants_touch_focus(hit) => {
+                self.touch_focus = None;
                 cx.claim_text_selection(self.ime_area);
                 self.owns_selection = true;
                 let index = self.index_at(cx, kit, fe.abs);
                 let (a, b) = self.buffer.word_at(index);
                 self.buffer.set_selection(Selection { anchor: a, head: b });
                 self.drag_anchor = Some(a);
+                self.show_actions = cfg!(target_os = "android");
             }
             Hit::FingerMove(fe) => {
+                if fe.device.is_touch() && (!fe.is_over || !self.frame.contains(fe.abs)) {
+                    self.touch_focus = None;
+                }
                 if let Some(anchor) = self.drag_anchor {
                     let index = self.index_at(cx, kit, fe.abs);
                     self.buffer.set_selection(Selection { anchor, head: index });
                 }
             }
             Hit::FingerUp(fe) => {
+                if self.wants_touch_focus(hit) {
+                    self.place_pointer_cursor(cx, kit, fe.abs, fe.tap_count, false);
+                    if cfg!(target_os = "android") && !self.buffer.selection.is_empty() {
+                        self.show_actions = true;
+                    }
+                }
+                self.touch_focus = None;
                 if cfg!(target_os = "android") && fe.device.is_touch() && self.drag_anchor.is_some() {
                     self.show_actions = true;
                 }
@@ -282,5 +336,92 @@ impl TextField {
                 self.buffer.selection.anchor, self.buffer.selection.head, false, false);
         }
         event
+    }
+}
+
+#[cfg(test)]
+pub(super) mod touch_tests {
+    use super::*;
+    use makepad_widgets::makepad_draw::event::TouchUpdateEvent;
+
+    pub fn down() -> Hit {
+        Hit::FingerDown(FingerDownEvent {
+            window_id: WindowId(0, 0), abs: dvec2(5.0, 5.0),
+            digit_id: live_id_num!(touch, 1).into(), device: DigitDevice::Touch { uid: 1 },
+            tap_count: 2, modifiers: KeyModifiers::default(), time: 0.0, rect: rect(0.0, 0.0, 100.0, 100.0),
+        })
+    }
+
+    pub fn up() -> FingerUpEvent {
+        FingerUpEvent {
+            window_id: WindowId(0, 0), abs: dvec2(5.0, 5.0), abs_start: dvec2(5.0, 5.0),
+            capture_time: 0.0, time: 0.1, digit_id: live_id_num!(touch, 1).into(),
+            device: DigitDevice::Touch { uid: 1 }, has_long_press_occurred: false,
+            tap_cancelled: false, tap_count: 2, modifiers: KeyModifiers::default(),
+            rect: rect(0.0, 0.0, 100.0, 100.0), is_over: true, is_sweep: false,
+        }
+    }
+
+    pub fn moved_out() -> Hit {
+        Hit::FingerMove(FingerMoveEvent {
+            window_id: WindowId(0, 0), abs: dvec2(-1.0, 5.0), abs_start: dvec2(5.0, 5.0),
+            digit_id: live_id_num!(touch, 1).into(), device: DigitDevice::Touch { uid: 1 },
+            tap_count: 2, modifiers: KeyModifiers::default(), time: 0.05,
+            rect: rect(0.0, 0.0, 100.0, 100.0), is_over: true,
+        })
+    }
+
+    pub fn cancel() -> Event {
+        Event::TouchUpdate(TouchUpdateEvent {
+            window_id: WindowId(0, 0), time: 0.05, modifiers: KeyModifiers::default(),
+            touches: Vec::new(), cancelled: true,
+        })
+    }
+
+    #[test]
+    fn manual_field_defers_even_double_tap_selection_until_inside_release() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut kit = Kit::new(&mut cx);
+        let mut field = TextField::new("한글 text");
+        field.frame = rect(0.0, 0.0, 100.0, 100.0);
+        let selection = field.buffer.selection;
+        assert!(!field.wants_touch_focus(&Hit::FingerUp(up())));
+        field.handle_hit(&mut cx, &mut kit, &down());
+        assert!(!field.focused);
+        assert_eq!(field.buffer.selection, selection);
+        assert!(field.wants_touch_focus(&Hit::FingerUp(up())));
+        let mut outside = up();
+        // The owner's pane still contains the release, but the field does not.
+        outside.abs.x = -1.0;
+        field.handle_hit(&mut cx, &mut kit, &Hit::FingerUp(outside));
+        assert!(!field.focused);
+        assert_eq!(field.buffer.selection, selection);
+        assert!(!field.wants_touch_focus(&Hit::FingerUp(up())));
+    }
+
+    #[test]
+    fn manual_field_rejects_stale_cancelled_and_returned_gestures() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut kit = Kit::new(&mut cx);
+        for transition in 0..7 {
+            let mut field = TextField::new("한글 text");
+            field.frame = rect(0.0, 0.0, 100.0, 100.0);
+            field.handle_hit(&mut cx, &mut kit, &down());
+            let mut release = up();
+            match transition {
+                0 => { field.handle_hit(&mut cx, &mut kit, &moved_out()); }
+                1 => field.observe_event(&cancel()),
+                2 => field.set_text("new model"),
+                3 => field.observe_event(&Event::KeyFocus(KeyFocusEvent { prev: Area::Empty, focus: Area::Empty })),
+                4 => field.frame.pos.x = 20.0,
+                5 => release.tap_cancelled = true,
+                _ => field.buffer.insert("model edit", EditKind::Other),
+            }
+            let selection = field.buffer.selection;
+            assert!(!field.wants_touch_focus(&Hit::FingerUp(release.clone())));
+            field.handle_hit(&mut cx, &mut kit, &Hit::FingerUp(release));
+            assert!(!field.focused);
+            assert_eq!(field.buffer.selection, selection);
+        }
     }
 }

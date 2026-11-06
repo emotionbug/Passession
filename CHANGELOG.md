@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.13.8 - 2026-11-07
+
+### Fixed
+
+- Keep retained text on stable glyph-atlas pages instead of overwriting live glyph coordinates when long multilingual content fills the atlas. Preserve authored text depth across large runs.
+- Apply common paint-layer boundaries to text, icons, images and backgrounds so floating controls and menus remain opaque and their icons remain visible over long conversations.
+- Measure task/subagent pill height and timeline clearance from scaled fonts, keeping the latest button separate from the composer and bottom status controls.
+- Focus touch inputs only after a valid tap ends inside the same field. Panning, cancellation, outside releases and stale model/focus transitions do not activate another editor; mouse and explicit programmatic focus remain immediate.
+- Apply the Android system text-size curve to file source text as well as its surrounding controls, without rewriting saved code-font preferences.
+- Open Android's native edit toolbar as soon as a long-press is recognized, including empty-input Paste. Preserve the selected word through keyboard-driven relayout, publish manual editor areas before native action requests, and keep editor focus when the toolbar is dismissed.
+
+### Validation
+
+- Passed ten focused glyph-atlas and touch-focus regressions. Android emulator checks covered 100%/200% text size, 2,400 distinct Hangul glyphs, long code blocks, selected Korean text, latest navigation, status controls, subagent rows, Settings/Git menus and file search.
+- Rebuilt the Linux client and exercised actual keyboard input, mouse selection, same-click focus transfer, wheel navigation and the latest button in a private X11 display. Native Wayland and Windows interaction were not exercised in this pass.
+- Verified the native toolbar while the finger remained down in composer, search and read-only source text. Exercised Select All, Copy, Cut and Paste with Korean text, including empty-field Paste and source-to-search clipboard transfer at 200% system text size.
+
 ## 0.13.7 - 2026-11-06
 
 ### Changed

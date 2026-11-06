@@ -306,6 +306,7 @@ impl Widget for FilesPanel {
         cx.begin_turtle(walk, self.layout);
         let rect = cx.turtle().rect();
         self.drawn_at = rect.pos;
+        cx.add_aligned_rect_area(&mut self.area, rect);
         if let Some(ui) = scope.data.get::<UiContext>() {
             let area = self.area;
             if let Some(explorer) = self.explorer.as_mut() {
@@ -316,7 +317,7 @@ impl Widget for FilesPanel {
                 self.kit.fill(cx, rect, crate::theme::current_palette().surface0, 0.0);
             }
         }
-        cx.end_turtle_with_area(&mut self.area);
+        cx.end_turtle();
         DrawStep::done()
     }
 }

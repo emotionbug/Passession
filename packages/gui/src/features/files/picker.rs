@@ -92,6 +92,7 @@ impl RemoteFolderPicker {
 
 impl Widget for RemoteFolderPicker {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.location.observe_event(event);
         let Some((host_id, cwd)) = self.scope.clone() else { return };
         let owner = self.owner();
         let uid = self.widget_uid();
@@ -109,7 +110,8 @@ impl Widget for RemoteFolderPicker {
             let shift = if self.area.is_valid(cx) { self.area.rect(cx).pos - self.drawn_at } else { DVec2::default() };
             let hit = super::kit::unshift_hit(event.hits(cx, self.area), shift);
             if !matches!(hit, Hit::Nothing) {
-                if let Hit::FingerDown(_) = &hit {
+                if matches!(&hit, Hit::FingerDown(fe) if !fe.device.is_touch())
+                    || self.view.wants_touch_focus(&hit) {
                     cx.set_key_focus(self.area);
                 }
                 let look = Self::look(ui.compact);
@@ -144,6 +146,7 @@ impl Widget for RemoteFolderPicker {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         cx.begin_turtle(walk, self.layout);
         let rect = cx.turtle().rect();
+        cx.add_aligned_rect_area(&mut self.area, rect);
         let compact = scope.data.get::<UiContext>().is_some_and(|ui| ui.compact);
         let owner = self.owner();
         let area = self.area;
@@ -163,7 +166,7 @@ impl Widget for RemoteFolderPicker {
         if drawn.is_none() {
             self.kit.fill(cx, rect, crate::theme::current_palette().surface0, 0.0);
         }
-        cx.end_turtle_with_area(&mut self.area);
+        cx.end_turtle();
         DrawStep::done()
     }
 }

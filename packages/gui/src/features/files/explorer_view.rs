@@ -354,6 +354,16 @@ impl ExplorerView {
         self.touch_scroll.apply_delta(&mut self.scroll_y, delta, max)
     }
 
+    pub fn wants_touch_focus(&self, hit: &Hit) -> bool {
+        let abs = match hit {
+            Hit::FingerUp(fe) => fe.abs,
+            Hit::FingerLongPress(fe) => fe.abs,
+            _ => return false,
+        };
+        self.pressed == Some(Hot::Location) && self.hits.at(abs) == Some(Hot::Location)
+            && self.location.wants_touch_focus(hit)
+    }
+
     /// Pointer and keyboard input on the owner's area. `changed` tells the owner to redraw.
     pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, hit: &Hit, state: &mut ExplorerState, look: &ExplorerLook, changed: &mut bool) -> ExplorerEvent {
         match hit {
@@ -387,6 +397,11 @@ impl ExplorerView {
                     return ExplorerEvent::None;
                 }
                 let secondary = fe.device.mouse_button().is_some_and(|b| b.is_secondary());
+                self.pressed = hot.clone();
+                if fe.device.is_touch() && hot == Some(Hot::Location) {
+                    self.location.handle_hit(cx, kit, hit);
+                    return ExplorerEvent::None;
+                }
                 if self.location_focused && hot != Some(Hot::Location) {
                     self.location.clear_selection(cx);
                 }
@@ -435,7 +450,7 @@ impl ExplorerView {
                         self.pressed = None;
                         *changed = true;
                     }
-                } else if self.location_focused {
+                } else if self.pressed == Some(Hot::Location) {
                     self.location.handle_hit(cx, kit, hit);
                     *changed = true;
                 }
@@ -443,10 +458,10 @@ impl ExplorerView {
             Hit::FingerLongPress(fe) => {
                 self.touch_scroll.reset();
                 let hot = self.hits.at(fe.abs);
-                self.pressed = None;
+                let pressed = self.pressed.clone();
                 *changed = true;
                 match hot {
-                    Some(Hot::Location) => {
+                    Some(Hot::Location) if pressed == Some(Hot::Location) && self.wants_touch_focus(hit) => {
                         self.location_focused = true;
                         self.location.focused = true;
                         self.location.handle_hit(cx, kit, hit);
@@ -476,7 +491,14 @@ impl ExplorerView {
                 self.thumb_drag = None;
                 let pressed = self.pressed.take();
                 *changed = true;
-                if self.location_focused {
+                if pressed == Some(Hot::Location) {
+                    if self.hits.at(fe.abs) != Some(Hot::Location) {
+                        self.location.cancel_touch_focus();
+                    }
+                    if self.hits.at(fe.abs) == Some(Hot::Location) && self.location.wants_touch_focus(hit) {
+                        self.location_focused = true;
+                        self.location.focused = true;
+                    }
                     self.location.handle_hit(cx, kit, hit);
                     return ExplorerEvent::None;
                 }

@@ -125,6 +125,7 @@ impl ExplorerPanel {
     }
 
     pub fn handle_event(&mut self, cx: &mut Cx, kit: &mut Kit, event: &Event, ui: &mut UiContext, area: Area) -> bool {
+        self.view.location.observe_event(event);
         let Some(target) = self.ensure(ui) else { return false };
         let mut changed = self.handle_commands(cx, ui, &target);
         changed |= self.view.location.blink.handle_event(event);
@@ -143,7 +144,8 @@ impl ExplorerPanel {
             });
             return changed;
         }
-        if let Hit::FingerDown(_) = &hit {
+        if matches!(&hit, Hit::FingerDown(fe) if !fe.device.is_touch())
+            || self.view.wants_touch_focus(&hit) {
             cx.set_key_focus(area);
         }
         // The download dialog takes input first.

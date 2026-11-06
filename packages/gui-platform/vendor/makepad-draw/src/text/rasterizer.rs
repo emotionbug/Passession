@@ -72,16 +72,14 @@ impl Rasterizer {
         let bounds_in_ems = font.glyph_outline_bounds_in_ems(glyph_id, &mut outline)?;
         let atlas_image_size = glyph_outline_image_size(bounds_in_ems.size, dpxs_per_em);
         let atlas_image_padding = self.sdfer.settings().padding;
-        let atlas_image_bounds =
-            match self
-                .grayscale_atlas
-                .get_or_allocate_glyph_image(GlyphImageKey {
-                    font_id: font.id(),
-                    glyph_id,
-                    size: atlas_image_size + Size::from(self.sdfer.settings().padding) * 2,
-                })? {
-                GlyphImage::Cached(rect) => rect,
-                GlyphImage::Allocated(mut sdf) => {
+        let (atlas_page, image) = self.grayscale_atlas.get_or_allocate_glyph_image(GlyphImageKey {
+            font_id: font.id(),
+            glyph_id,
+            size: atlas_image_size + Size::from(self.sdfer.settings().padding) * 2,
+        })?;
+        let atlas_image_bounds = match image {
+            GlyphImage::Cached(rect) => rect,
+            GlyphImage::Allocated(mut sdf) => {
                     let outline = outline.unwrap_or_else(|| font.glyph_outline(glyph_id).unwrap());
                     let mut coverage = Image::new(atlas_image_size);
                     outline.rasterize(
@@ -96,6 +94,7 @@ impl Rasterizer {
 
         return Some(RasterizedGlyph {
             atlas_kind: AtlasKind::Grayscale,
+            atlas_page,
             atlas_size: self.grayscale_atlas().size(),
             atlas_image_bounds,
             atlas_image_padding,
@@ -113,16 +112,14 @@ impl Rasterizer {
         const PADDING: usize = 2;
 
         let raster_image = font.glyph_raster_image(glyph_id, dpxs_per_em)?;
-        let atlas_image_bounds =
-            match self
-                .color_atlas
-                .get_or_allocate_glyph_image(GlyphImageKey {
-                    font_id: font.id(),
-                    glyph_id,
-                    size: raster_image.decode_size() + Size::from(2 * PADDING),
-                })? {
-                GlyphImage::Cached(rect) => rect,
-                GlyphImage::Allocated(mut image) => {
+        let (atlas_page, image) = self.color_atlas.get_or_allocate_glyph_image(GlyphImageKey {
+            font_id: font.id(),
+            glyph_id,
+            size: raster_image.decode_size() + Size::from(2 * PADDING),
+        })?;
+        let atlas_image_bounds = match image {
+            GlyphImage::Cached(rect) => rect,
+            GlyphImage::Allocated(mut image) => {
                     let size = image.size();
                     image = image.subimage_mut(Rect::from(size).unpad(PADDING));
                     raster_image.decode(&mut image);
@@ -131,6 +128,7 @@ impl Rasterizer {
             };
         return Some(RasterizedGlyph {
             atlas_kind: AtlasKind::Color,
+            atlas_page,
             atlas_size: self.color_atlas.size(),
             atlas_image_bounds,
             atlas_image_padding: PADDING,
@@ -150,6 +148,7 @@ pub struct Settings {
 #[derive(Clone, Copy, Debug)]
 pub struct RasterizedGlyph {
     pub atlas_kind: AtlasKind,
+    pub atlas_page: usize,
     pub atlas_size: Size<usize>,
     pub atlas_image_bounds: Rect<usize>,
     pub atlas_image_padding: usize,

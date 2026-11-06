@@ -24,3 +24,21 @@ with trailing spaces; grapheme fitting keeps the upstream estimate.
 `paseo_linebreak_tests` covers punctuation, hanging spaces with cursor byte
 positions, and nonbreaking spaces using the adjacent widgets crate's existing
 Liberation Mono fixture. No font resources are added.
+
+## Stable glyph pages and overlay depth
+
+`src/text/{font_atlas,rasterizer,fonts}.rs` retain existing glyph coordinates when
+an atlas fills. Rasterization allocates another fixed-size page rather than
+dropping a glyph and resetting UVs still referenced by retained draw lists.
+Each grayscale/color page has its own texture; only unreferenced extra pages
+can be recycled. `Texture::is_unique` is provided by the adjacent platform patch.
+The atlas tests cover overflow pixel/coordinate preservation, safe page reuse
+and oversized glyph rejection.
+
+`src/shader/draw_text.rs` splits instances at page changes without appending
+returning pages behind intervening batches. Multi-page text retains one aligned
+hit/focus rectangle and the instance areas needed for live style updates.
+Glyph depth stays at the authored draw depth: per-glyph accumulation previously
+let long text paint above later overlay backgrounds and icons.
+`src/cx_draw.rs` uploads all live pages without the old atlas-reset redraw loop;
+the text debug exporter explicitly selects page zero.

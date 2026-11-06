@@ -7,28 +7,34 @@
 use super::canvas::*;
 use super::i18n::{t, ta};
 use super::json::*;
-use super::paint::Draw;
+use super::paint::{Draw, Look};
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::widgets::{STATUS_BUCKET_ORDER, StatusBucket, derive_status_bucket, paint_status_badge, status_dot_color, paint_status_ring};
 use makepad_widgets::*;
 use serde_json::Value;
 
-/// composer/pill-styles.ts geometry.
-pub const PILL_MIN_HEIGHT: f64 = 32.0;
+const PILL_MIN_HEIGHT: f64 = 32.0;
+
+pub fn pill_height(cx: &mut Cx, kit: &mut ChatKit, look: Look) -> f64 {
+    // Include fallback-font metrics, not just the Latin font's authored line box.
+    let regular = kit.measure(cx, Font::Regular, look.ui(12.0), 1.3, "Ag한글", None).y;
+    let mono = kit.measure(cx, Font::Mono, look.ui(12.0), 1.3, "Ag한글", None).y;
+    PILL_MIN_HEIGHT.max(regular.max(mono).ceil() + 16.0)
+}
 
 pub fn pill_clearance(compact: bool) -> f64 {
     if compact { 8.0 } else { 10.0 }
 }
 
-/// resolveComposerTrackTailClearance.
-pub fn tail_clearance(compact: bool) -> f64 {
-    (if compact { 24.0 } else { 20.0 }) + PILL_MIN_HEIGHT + pill_clearance(compact)
+/// Space after the newest row, including the scaled track bar.
+pub fn tail_clearance(compact: bool, height: f64) -> f64 {
+    (if compact { 24.0 } else { 20.0 }) + height + pill_clearance(compact)
 }
 
-/// resolveComposerTrackControlClearance.
-pub fn control_clearance(compact: bool) -> f64 {
-    pill_clearance(compact) * 2.0 + PILL_MIN_HEIGHT
+/// Distance from the stream bottom to the jump button's bottom edge.
+pub fn control_clearance(compact: bool, height: f64) -> f64 {
+    pill_clearance(compact) * 2.0 + height
 }
 
 /// subagents/select.ts SubagentRow.
@@ -218,7 +224,7 @@ fn subagent_segments(rows: &[SubagentRow]) -> Vec<(Option<StatusBucket>, String)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pill(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, x: f64, y: f64, max_w: f64, segments: &[(Option<StatusBucket>, String)], open: bool, id: &str) -> f64 {
+fn pill(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, x: f64, y: f64, height: f64, max_w: f64, segments: &[(Option<StatusBucket>, String)], open: bool, id: &str) -> f64 {
     let p = d.look.palette;
     let size = d.look.ui(12.0);
     let mut widths = Vec::new();
@@ -230,13 +236,13 @@ fn pill(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, x: f64, y: f64, max_
     }
     let w = total.min(max_w);
     let hovered = d.state.hover_hit.as_deref() == Some(id);
-    let r = rect_xywh(x, y, w, PILL_MIN_HEIGHT);
-    d.kit.bordered(cx, r, if hovered || open { p.surface2 } else { p.surface1 }, 16.0, p.border_accent, 1.0);
-    cx.begin_turtle(Walk { abs_pos: Some(r.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(PILL_MIN_HEIGHT) }, Layout::default());
+    let r = rect_xywh(x, y, w, height);
+    d.kit.bordered(cx, r, if hovered || open { p.surface2 } else { p.surface1 }, height * 0.5, p.border_accent, 1.0);
+    cx.begin_turtle(Walk { abs_pos: Some(r.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(height) }, Layout::default());
     let mut sx = x + 12.0;
     for ((bucket, text), sw) in segments.iter().zip(&widths) {
         if let Some(bucket) = bucket {
-            let center = dvec2(sx + 3.0, y + PILL_MIN_HEIGHT * 0.5);
+            let center = dvec2(sx + 3.0, y + height * 0.5);
             if *bucket == StatusBucket::Running {
                 paint_status_ring(painter, cx, center, &p, None);
                 d.animating = true;
@@ -246,7 +252,7 @@ fn pill(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, x: f64, y: f64, max_
             sx += 14.0;
         }
         let s = d.kit.measure(cx, Font::Regular, size, 1.3, text, None);
-        d.kit.label_line(cx, Font::Regular, size, 1.3, if open { p.foreground } else { p.muted }, dvec2(sx, y + (PILL_MIN_HEIGHT - s.y) * 0.5), text, (x + w - 12.0 - sx).max(8.0));
+        d.kit.label_line(cx, Font::Regular, size, 1.3, if open { p.foreground } else { p.muted }, dvec2(sx, y + (height - s.y) * 0.5), text, (x + w - 12.0 - sx).max(8.0));
         sx += sw - if bucket.is_some() { 14.0 } else { 0.0 } + 16.0;
     }
     cx.end_turtle();
@@ -256,11 +262,11 @@ fn pill(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, x: f64, y: f64, max_
 
 /// The track bar resting `pill_clearance` above `bottom`; returns pill rects.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_bar(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, model: &TrackModel, open: Option<TrackPanel>, x: f64, bottom: f64, w: f64) -> Vec<(TrackPanel, Rect)> {
+pub fn draw_bar(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, model: &TrackModel, open: Option<TrackPanel>, x: f64, bottom: f64, w: f64, height: f64) -> Vec<(TrackPanel, Rect)> {
     let p = d.look.palette;
     let outer = (w - 32.0).min(d.look.typo.content_max_width);
     let bx = x + (w - outer) * 0.5;
-    let y = bottom - pill_clearance(d.look.compact) - PILL_MIN_HEIGHT;
+    let y = bottom - pill_clearance(d.look.compact) - height;
     let mut cursor = bx;
     let mut out = Vec::new();
     let diff = model.additions > 0 || model.deletions > 0;
@@ -278,24 +284,26 @@ pub fn draw_bar(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, model: &Trac
     if !model.tasks.is_empty() {
         let completed = model.tasks.iter().filter(|task| is_true(get(task, "completed")) || get(task, "status") == "completed").count();
         let label = ta("message.todo.tasksProgress", &[("completed", &completed.to_string()), ("total", &model.tasks.len().to_string())]);
-        let pw = pill(cx, d, painter, cursor, y, each, &[(None, label)], open == Some(TrackPanel::Tasks), "track:tasks");
-        out.push((TrackPanel::Tasks, rect_xywh(cursor, y, pw, PILL_MIN_HEIGHT)));
+        let pw = pill(cx, d, painter, cursor, y, height, each, &[(None, label)], open == Some(TrackPanel::Tasks), "track:tasks");
+        out.push((TrackPanel::Tasks, rect_xywh(cursor, y, pw, height)));
         cursor += pw + 4.0;
     }
     if !model.rows.is_empty() || model.archive != ArchiveFinished::Idle {
         let segments = subagent_segments(model.rows);
-        let pw = pill(cx, d, painter, cursor, y, each, &segments, open == Some(TrackPanel::Subagents), "track:subagents");
-        out.push((TrackPanel::Subagents, rect_xywh(cursor, y, pw, PILL_MIN_HEIGHT)));
+        let pw = pill(cx, d, painter, cursor, y, height, each, &segments, open == Some(TrackPanel::Subagents), "track:subagents");
+        out.push((TrackPanel::Subagents, rect_xywh(cursor, y, pw, height)));
         cursor += pw + 4.0;
     }
     if diff {
-        let r = rect_xywh(cursor, y, diff_w, PILL_MIN_HEIGHT);
+        let r = rect_xywh(cursor, y, diff_w, height);
         let hovered = d.state.hover_hit.as_deref() == Some("track:diff");
-        d.kit.bordered(cx, r, if hovered { p.surface2 } else { p.surface1 }, 16.0, p.border_accent, 1.0);
+        d.kit.bordered(cx, r, if hovered { p.surface2 } else { p.surface1 }, height * 0.5, p.border_accent, 1.0);
         let size = d.look.ui(12.0);
         let a = format!("+{}", model.additions);
-        let s = d.kit.label(cx, Font::Mono, size, 1.3, p.added, dvec2(cursor + 12.0, y + 8.0), &a, None);
-        d.kit.label(cx, Font::Mono, size, 1.3, p.removed, dvec2(cursor + 18.0 + s.x, y + 8.0), &format!("-{}", model.deletions), None);
+        let label_height = d.kit.measure(cx, Font::Mono, size, 1.3, &a, None).y;
+        let text_y = y + (height - label_height) * 0.5;
+        let s = d.kit.label(cx, Font::Mono, size, 1.3, p.added, dvec2(cursor + 12.0, text_y), &a, None);
+        d.kit.label(cx, Font::Mono, size, 1.3, p.removed, dvec2(cursor + 18.0 + s.x, text_y), &format!("-{}", model.deletions), None);
         d.canvas.add_hit(r, HitTarget::Chrome("track:diff".into()));
     }
     out

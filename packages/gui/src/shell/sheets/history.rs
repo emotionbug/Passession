@@ -1334,8 +1334,8 @@ impl ImportSheet {
     /// provider with its 14px icon. A tap outside closes it.
     fn draw_provider_menu(&mut self, cx: &mut Cx2d, ui: &mut Ui, providers: &[String], interactive: bool) {
         let p = ui.p;
-        ui.painter.new_layer(cx);
-        ui.draw_icon.new_draw_call(cx);
+        let group = ui.painter.new_layer(cx);
+        ui.draw_icon.draw_vars.set_draw_call_group(group);
         let spec = ui.spec(Font::Medium, 14.0, p.foreground);
         let mut options = vec![(String::new(), tr("importSession.filters.all"))];
         options.extend(providers.iter().map(|p| (p.clone(), p.clone())));

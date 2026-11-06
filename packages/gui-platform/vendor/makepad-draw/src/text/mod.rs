@@ -102,7 +102,7 @@ mod tests {
         encoder.set_color(png::ColorType::Grayscale);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().unwrap();
-        let pixels = rasterizer.grayscale_atlas().image().as_pixels();
+        let pixels = rasterizer.grayscale_atlas().image(0).as_pixels();
         let data =
             unsafe { std::slice::from_raw_parts(pixels.as_ptr() as *const u8, pixels.len()) };
         writer.write_image_data(&data).unwrap();
@@ -114,7 +114,7 @@ mod tests {
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().unwrap();
-        let pixels = rasterizer.color_atlas().image().as_pixels();
+        let pixels = rasterizer.color_atlas().image(0).as_pixels();
         let data =
             unsafe { std::slice::from_raw_parts(pixels.as_ptr() as *const u8, pixels.len() * 4) };
         writer.write_image_data(&data).unwrap();

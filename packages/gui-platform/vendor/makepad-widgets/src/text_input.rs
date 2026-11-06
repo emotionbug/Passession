@@ -18,6 +18,7 @@ use {
     std::rc::Rc,
     unicode_segmentation::{GraphemeCursor, UnicodeSegmentation},
 };
+use crate::makepad_draw::event::DigitId;
 
 
 live_design! {
@@ -834,7 +835,8 @@ pub struct TextInput {
     #[rust] history: History,
     #[rust] blink_timer: Timer,
     #[rust] ime_composing: bool,
-    #[rust] touch_selecting: bool,
+    #[rust] touch_selection: Option<DVec2>,
+    #[rust] touch_focus: Option<DigitId>,
 }
 
  impl LiveHook for TextInput{
@@ -914,6 +916,7 @@ impl TextInput {
     }
 
     pub fn set_selection(&mut self, cx: &mut Cx, selection: Selection) {
+        self.touch_focus = None;
         self.selection = selection;
         let area = self.draw_bg.area();
         if cx.has_key_focus(area) {
@@ -994,7 +997,8 @@ impl TextInput {
 
     fn end_focus(&mut self, cx: &mut Cx, hide_ime: bool) {
         self.ime_composing = false;
-        self.touch_selecting = false;
+        self.touch_selection = None;
+        self.touch_focus = None;
         self.selection.anchor = self.selection.cursor;
         cx.clear_text_selection(self.draw_bg.area());
         self.history.force_new_edit_group();
@@ -1393,6 +1397,39 @@ impl TextInput {
         }
     }
 
+    fn touch_focus_hit(&mut self, hit: &Hit) -> bool {
+        match hit {
+            Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
+                self.touch_focus = fe.device.is_touch().then_some(fe.digit_id);
+            }
+            Hit::FingerMove(fe) if fe.device.is_touch() && !fe.is_over => {
+                self.touch_focus = None;
+            }
+            Hit::FingerUp(fe) => {
+                return self.touch_focus.take() == Some(fe.digit_id) && fe.is_over && fe.was_tap();
+            }
+            Hit::FingerLongPress(fe) => {
+                return self.touch_focus.take() == Some(fe.digit_id) && fe.rect.contains(fe.abs);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn place_pointer_cursor(&mut self, cx: &mut Cx, abs: DVec2, tap_count: u32, keep_selection: bool) {
+        let rel = abs - self.text_area.rect(cx).pos;
+        let Ok(cursor) = self.point_in_lpxs_to_cursor(Point::new(rel.x as f32, rel.y as f32)) else {
+            warning!("can't move cursor because layout was invalidated by earlier event");
+            return;
+        };
+        self.set_cursor(cx, cursor, keep_selection);
+        match tap_count {
+            2 => self.select_word(cx),
+            3 => self.select_all(cx),
+            _ => {}
+        }
+    }
+
     fn check_text_is_empty(&mut self, cx: &mut Cx) {
         if self.text.is_empty() {
             self.animator_play(cx, id!(empty.on));
@@ -1410,6 +1447,8 @@ impl Widget for TextInput {
     }
     
     fn set_text(&mut self, cx: &mut Cx, text: &str) {
+        self.touch_focus = None;
+        self.touch_selection = None;
         cx.clear_text_selection(self.draw_bg.area());
         self.text = self.filter_input(text, true);
         self.set_selection(
@@ -1486,8 +1525,12 @@ impl Widget for TextInput {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::KeyFocus(_)) {
+            self.touch_focus = None;
+        }
         if matches!(event, Event::TouchUpdate(update) if update.cancelled) {
-            self.touch_selecting = false;
+            self.touch_focus = None;
+            self.touch_selection = None;
         }
         if self.animator_handle_event(cx, event).must_redraw() {
             self.draw_bg.redraw(cx);
@@ -1503,7 +1546,9 @@ impl Widget for TextInput {
         }
 
         let uid = self.widget_uid();
-        match event.hits(cx, self.draw_bg.area()) {
+        let hit = event.hits(cx, self.draw_bg.area());
+        let touch_focus = self.touch_focus_hit(&hit);
+        match hit {
             Hit::FingerHoverIn(_) => {
                 self.animator_play(cx, id!(hover.on));
             }
@@ -1582,47 +1627,39 @@ impl Widget for TextInput {
                 modifiers,
                 ..
             }) if modifiers.is_primary() => self.select_all(cx),
-            Hit::FingerDown(FingerDownEvent {
-                abs,
-                tap_count,
-                device,
-                ..
-            }) if device.is_primary_hit() => {
-                self.touch_selecting = false;
+            Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
+                self.touch_selection = None;
+                // Touch owns neither focus nor the caret until release. In particular,
+                // a pan through another input must leave the current IME untouched.
+                if fe.device.is_touch() {
+                    return;
+                }
                 self.reset_blink_timer(cx);
                 self.set_key_focus(cx);
-                let rel = abs - self.text_area.rect(cx).pos;
-                let Ok(cursor) = self.point_in_lpxs_to_cursor(
-                    Point::new(rel.x as f32, rel.y as f32)
-                ) else {
-                    warning!("can't move cursor because layout was invalidated by earlier event");
-                    return;
-                };
-                self.set_cursor(
-                    cx,
-                    cursor,
-                    false
-                );
-                match tap_count {
-                    2 => self.select_word(cx),
-                    3 => self.select_all(cx),
-                    _ => {}
-                }
+                self.place_pointer_cursor(cx, fe.abs, fe.tap_count, false);
                 if self.selection.anchor.index != self.selection.cursor.index {
                     cx.claim_text_selection(self.draw_bg.area());
                 }
 
                 self.animator_play(cx, id!(hover.down));
             }
-            Hit::FingerLongPress(_) => {
-                self.touch_selecting = true;
-                self.select_word(cx);
+            Hit::FingerLongPress(fe) if touch_focus => {
+                // Selection is a distinct gesture, not a delayed ordinary tap.
+                self.touch_selection = Some(fe.abs);
+                self.set_key_focus(cx);
+                self.reset_blink_timer(cx);
+                self.place_pointer_cursor(cx, fe.abs, 2, false);
                 cx.claim_text_selection(self.draw_bg.area());
+                self.open_text_actions(cx);
             }
             Hit::FingerUp(fe) => {
-                let selected_by_touch = self.touch_selecting
-                    || (fe.device.is_touch() && fe.was_tap() && self.selection.anchor.index != self.selection.cursor.index);
-                self.touch_selecting = false;
+                if touch_focus {
+                    self.reset_blink_timer(cx);
+                    self.set_key_focus(cx);
+                    self.place_pointer_cursor(cx, fe.abs, fe.tap_count, false);
+                }
+                let selected_by_touch = self.touch_selection.take().is_some()
+                    || (touch_focus && self.selection.anchor.index != self.selection.cursor.index);
                 if selected_by_touch {
                     self.open_text_actions(cx);
                 }
@@ -1636,31 +1673,18 @@ impl Widget for TextInput {
                     self.animator_play(cx, id!(hover.off));
                 }
             }
-            Hit::FingerMove(FingerMoveEvent {
-                abs,
-                tap_count,
-                device,
-                ..
-            }) if device.is_primary_hit() && (!device.is_touch() || self.touch_selecting) => {
-                self.reset_blink_timer(cx);
-                self.set_key_focus(cx);
-                let rel = abs - self.text_area.rect(cx).pos;
-                let Ok(cursor) = self.point_in_lpxs_to_cursor(
-                    Point::new(rel.x as f32, rel.y as f32)
-                ) else {
-                    warning!("can't move cursor because layout was invalidated by earlier event");
-                    return;
-                };
-                self.set_cursor(
-                    cx,
-                    cursor,
-                    true
-                );
-                match tap_count {
-                    2 => self.select_word(cx),
-                    3 => self.select_all(cx),
-                    _ => {}
+            Hit::FingerMove(fe) if fe.device.is_primary_hit() => {
+                if fe.device.is_touch() {
+                    let Some(previous) = self.touch_selection.as_mut() else { return; };
+                    // IME reflow must not turn a stationary hold into a new selection.
+                    if *previous == fe.abs { return; }
+                    *previous = fe.abs;
                 }
+                self.reset_blink_timer(cx);
+                if !fe.device.is_touch() {
+                    self.set_key_focus(cx);
+                }
+                self.place_pointer_cursor(cx, fe.abs, fe.tap_count, true);
             }
             Hit::KeyDown(KeyEvent {
                 key_code: KeyCode::ReturnKey,
@@ -2245,4 +2269,91 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     while !text.is_char_boundary(index) { index -= 1; }
     index
+}
+
+#[cfg(test)]
+mod touch_focus_tests {
+    use super::*;
+    use crate::makepad_draw::event::{FingerLongPressEvent, TouchUpdateEvent};
+
+    fn down() -> Hit {
+        Hit::FingerDown(FingerDownEvent {
+            window_id: WindowId(0, 0), abs: dvec2(5.0, 5.0),
+            digit_id: live_id_num!(touch, 1).into(), device: DigitDevice::Touch { uid: 1 },
+            tap_count: 1, modifiers: KeyModifiers::default(), time: 0.0, rect: Rect::default(),
+        })
+    }
+
+    fn up() -> FingerUpEvent {
+        FingerUpEvent {
+            window_id: WindowId(0, 0), abs: dvec2(5.0, 5.0), abs_start: dvec2(5.0, 5.0),
+            capture_time: 0.0, time: 0.1, digit_id: live_id_num!(touch, 1).into(),
+            device: DigitDevice::Touch { uid: 1 }, has_long_press_occurred: false,
+            tap_cancelled: false, tap_count: 1, modifiers: KeyModifiers::default(),
+            rect: Rect::default(), is_over: true, is_sweep: false,
+        }
+    }
+
+    #[test]
+    fn input_focus_requires_its_own_uncancelled_inside_release() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut input = TextInput::new(&mut cx);
+        assert!(!input.touch_focus_hit(&Hit::FingerUp(up())));
+        for kind in 0..5 {
+            assert!(!input.touch_focus_hit(&down()));
+            let mut release = up();
+            match kind {
+                1 => release.is_over = false,
+                2 => release.tap_cancelled = true,
+                3 => release.has_long_press_occurred = true,
+                4 => release.digit_id = live_id_num!(touch, 2).into(),
+                _ => {}
+            }
+            assert_eq!(input.touch_focus_hit(&Hit::FingerUp(release)), kind == 0);
+            assert!(!input.touch_focus_hit(&Hit::FingerUp(up())));
+        }
+    }
+
+    #[test]
+    fn leaving_input_or_changing_model_or_focus_invalidates_touch() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut input = TextInput::new(&mut cx);
+        for transition in 0..4 {
+            assert!(!input.touch_focus_hit(&down()));
+            match transition {
+                0 => {
+                    input.touch_focus_hit(&Hit::FingerMove(FingerMoveEvent {
+                        window_id: WindowId(0, 0), abs: dvec2(6.0, 5.0), abs_start: dvec2(5.0, 5.0),
+                        digit_id: live_id_num!(touch, 1).into(), device: DigitDevice::Touch { uid: 1 },
+                        tap_count: 1, modifiers: KeyModifiers::default(), time: 0.05,
+                        rect: Rect::default(), is_over: false,
+                    }));
+                }
+                1 => input.set_text(&mut cx, "replacement"),
+                2 => input.handle_event(&mut cx, &Event::KeyFocus(KeyFocusEvent {
+                    prev: Area::Empty, focus: Area::Empty,
+                }), &mut Scope::empty()),
+                _ => input.handle_event(&mut cx, &Event::TouchUpdate(TouchUpdateEvent {
+                    window_id: WindowId(0, 0), time: 0.05, modifiers: KeyModifiers::default(),
+                    touches: Vec::new(), cancelled: true,
+                }), &mut Scope::empty()),
+            }
+            assert!(!input.touch_focus_hit(&Hit::FingerUp(up())));
+        }
+    }
+
+    #[test]
+    fn long_press_is_consumed_once_and_does_not_turn_into_a_tap() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut input = TextInput::new(&mut cx);
+        input.touch_focus_hit(&down());
+        let hold = Hit::FingerLongPress(FingerLongPressEvent {
+            window_id: WindowId(0, 0), abs: dvec2(5.0, 5.0), capture_time: 0.0, time: 0.5,
+            digit_id: live_id_num!(touch, 1).into(), device: DigitDevice::Touch { uid: 1 },
+            rect: Rect { pos: dvec2(0.0, 0.0), size: dvec2(10.0, 10.0) },
+        });
+        assert!(input.touch_focus_hit(&hold));
+        assert!(!input.touch_focus_hit(&hold));
+        assert!(!input.touch_focus_hit(&Hit::FingerUp(up())));
+    }
 }
