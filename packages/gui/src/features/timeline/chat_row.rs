@@ -95,6 +95,10 @@ pub struct ChatRow {
     next_frame: NextFrame,
     #[rust]
     last_width: f64,
+    #[rust]
+    show_actions: bool,
+    #[rust]
+    selection_source: Option<u64>,
 }
 
 /// The key painters compare `RowState.hover_hit` against.
@@ -109,10 +113,10 @@ pub fn hover_key(target: &HitTarget) -> String {
 }
 
 impl ChatRow {
-    pub fn set_model(&mut self, model: RowModel) {
-        if self.model.as_ref().is_some_and(|old| old.panel != model.panel || old.item.id != model.item.id) {
-            self.touch_scroll.reset();
-            self.drag = Drag::None;
+    pub fn set_model(&mut self, cx: &mut Cx, model: RowModel) {
+        if self.model.as_ref().is_none_or(|old| old.panel != model.panel || old.item.id != model.item.id) {
+            self.clear_selection(cx);
+            model.state.borrow_mut().selection = None;
         }
         self.model = Some(model);
     }
@@ -288,11 +292,26 @@ impl ChatRow {
         }
     }
 
+    fn clear_selection(&mut self, cx: &mut Cx) {
+        cx.clear_text_selection(self.area);
+        self.show_actions = false;
+        self.touch_scroll.reset();
+        self.drag = Drag::None;
+        self.pressed = None;
+        self.set_selection(cx, None);
+    }
+
     fn set_selection(&mut self, cx: &mut Cx, selection: Option<(usize, usize)>) {
         if let Some(model) = &self.model {
             model.state.borrow_mut().selection = selection;
         }
         self.canvas.selection = selection;
+        self.selection_source = self.canvas.selection_source_hash();
+        if selection.is_some() {
+            cx.claim_text_selection(self.area);
+        } else {
+            cx.clear_text_selection(self.area);
+        }
         self.area.redraw(cx);
     }
 }
@@ -367,7 +386,7 @@ impl Widget for ChatRow {
                     }
                     return;
                 }
-                cx.set_key_focus(self.area);
+                cx.claim_text_selection(self.area);
                 if let Some(offset) = self.canvas.offset_at(rel) {
                     let selection = if e.tap_count >= 3 {
                         Some((0, self.canvas.plain.len()))
@@ -425,17 +444,24 @@ impl Widget for ChatRow {
                 self.touch_scroll.schedule(cx);
                 if let Some((target, rect)) = self.pressed.take() {
                     let rel = self.rel(cx, e.abs);
-                    if e.is_over && (!e.device.is_touch() || e.was_tap()) && self.canvas.hit_at(rel) == Some(&target) && !self.tap_local(cx, scope, &target) {
-                        self.post(cx, RowEventKind::Tap { target, rect });
+                    if e.is_over && (!e.device.is_touch() || e.was_tap()) && self.canvas.hit_at(rel) == Some(&target) {
+                        self.clear_selection(cx);
+                        if !self.tap_local(cx, scope, &target) {
+                            self.post(cx, RowEventKind::Tap { target, rect });
+                        }
                     }
                     self.area.redraw(cx);
                 } else if self.drag == Drag::Select && e.device.is_touch() {
-                    // Touch has no copy shortcut: a finished selection is copied.
-                    if let Some(text) = self.canvas.selected_text()
+                    if cfg!(target_os = "android") {
+                        self.show_actions = self.canvas.selected_range().is_some();
+                        self.area.redraw(cx);
+                    } else if let Some(text) = self.canvas.selected_text()
                         && let Some(ui) = scope.data.get_mut::<UiContext>()
                     {
                         ui.push(UiEffect::CopyText { text, toast: Some(super::i18n::t("common.actions.copied")) });
                     }
+                } else if e.device.is_touch() && e.was_tap() {
+                    self.clear_selection(cx);
                 }
                 self.drag = Drag::None;
             }
@@ -448,7 +474,7 @@ impl Widget for ChatRow {
             Hit::KeyDown(ke) if ke.key_code == KeyCode::KeyA && (ke.modifiers.control || ke.modifiers.logo) => {
                 self.set_selection(cx, Some((0, self.canvas.plain.len())));
             }
-            Hit::KeyFocusLost(_) => self.set_selection(cx, None),
+            Hit::KeyFocusLost(_) => self.clear_selection(cx),
             _ => {}
         }
     }
@@ -488,12 +514,23 @@ impl Widget for ChatRow {
             }
             (h, field, animating)
         };
+        if self.selection_source != self.canvas.selection_source_hash() {
+            self.clear_selection(cx);
+        }
         // Selection from this frame's runs. Appended after the text, it still
         // joins this row's box batch, which `begin_layer` opened before any
         // text batch, so it renders beneath the glyphs.
-        for r in self.canvas.selection_rects() {
-            self.kit.rect(cx, r, selection_color, 2.0);
-        }
+        let selection_rects = self.canvas.selection_rects();
+        let selection_area = if selection_rects.is_empty() {
+            Area::Empty
+        } else {
+            self.kit.rect.begin_many_instances(cx);
+            for &r in &selection_rects {
+                self.kit.rect(cx, r, selection_color, 2.0);
+            }
+            self.kit.rect.end_many_instances(cx);
+            self.kit.rect.area()
+        };
         if let Some(field) = &field {
             let text = self.answer.text();
             if text != field.text {
@@ -512,6 +549,12 @@ impl Widget for ChatRow {
         cx.walk_turtle(Walk { abs_pos: None, margin: Margin::default(), width: Size::Fill, height: Size::Fixed(height) });
         cx.end_turtle_with_area(&mut self.area);
         self.draw_list.end(cx);
+        if self.show_actions || cx.text_actions_active(self.area) {
+            self.show_actions = false;
+            cx.show_text_actions_for_area(self.area, selection_area, TextActionCapabilities {
+                copy: true, select_all: true, ..Default::default()
+            });
+        }
         if animating {
             self.next_frame = cx.new_next_frame();
         }
@@ -520,9 +563,9 @@ impl Widget for ChatRow {
 }
 
 impl ChatRowRef {
-    pub fn set_model(&self, model: RowModel) {
+    pub fn set_model(&self, cx: &mut Cx, model: RowModel) {
         if let Some(mut row) = self.borrow_mut() {
-            row.set_model(model);
+            row.set_model(cx, model);
         }
     }
 

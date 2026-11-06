@@ -266,9 +266,6 @@ impl Cx {
                 CxOsOp::CancelHttpRequest {request_id} => {
                     self.os.http_requests.cancel_http_request(request_id);
                 },
-                CxOsOp::ShowClipboardActions(_request) => {
-                    crate::log!("Show clipboard actions not supported yet");
-                }
                 CxOsOp::CopyToClipboard(content) => {
                     with_ios_app(|app| app.copy_to_clipboard(&content));
                 }

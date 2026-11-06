@@ -51,6 +51,7 @@ pub enum FromJavaMessage {
     },
     Touch { touches: Vec<TouchPoint>, cancelled: bool },
     TextEdit(crate::event::TextImeEvent),
+    TextAction { token: u64, action: u32, text: Option<String> },
     Character {
         character: u32,
     },
@@ -523,12 +524,7 @@ unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTextEdit(
     composing_start: jni_sys::jint,
     composing_end: jni_sys::jint,
 ) {
-    // JNI modified UTF-8 is not UTF-8 (notably emoji and NUL). Read UTF-16.
-    let len = (**env).GetStringLength.unwrap()(env, text) as usize;
-    let chars = (**env).GetStringChars.unwrap()(env, text, std::ptr::null_mut());
-    if chars.is_null() { return; }
-    let value = String::from_utf16_lossy(std::slice::from_raw_parts(chars, len));
-    (**env).ReleaseStringChars.unwrap()(env, text, chars);
+    let Some(value) = editor_text_from_java(env, text) else { return; };
     send_from_java_message(FromJavaMessage::TextEdit(crate::event::TextImeEvent {
         session: session as u64,
         revision: revision as u64,
@@ -538,6 +534,29 @@ unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTextEdit(
         composing: (composing_start >= 0 && composing_end >= composing_start)
             .then_some((composing_start as usize, composing_end as usize)),
     }));
+}
+
+unsafe fn editor_text_from_java(env: *mut jni_sys::JNIEnv, text: jni_sys::jstring) -> Option<String> {
+    if text.is_null() { return None; }
+    // JNI modified UTF-8 cannot preserve emoji or embedded NUL.
+    let len = (**env).GetStringLength.unwrap()(env, text) as usize;
+    let chars = (**env).GetStringChars.unwrap()(env, text, std::ptr::null_mut());
+    if chars.is_null() { return None; }
+    let value = String::from_utf16_lossy(std::slice::from_raw_parts(chars, len));
+    (**env).ReleaseStringChars.unwrap()(env, text, chars);
+    Some(value)
+}
+
+#[no_mangle]
+unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTextAction(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jobject,
+    token: jni_sys::jlong,
+    action: jni_sys::jint,
+    text: jni_sys::jstring,
+) {
+    let text = if action == 3 { editor_text_from_java(env, text) } else { None };
+    send_from_java_message(FromJavaMessage::TextAction { token: token as u64, action: action as u32, text });
 }
 
 pub unsafe fn to_java_text_input(session: u64, revision: u64, text: Option<&str>,
@@ -553,6 +572,20 @@ pub unsafe fn to_java_text_input(session: u64, revision: u64, text: Option<&str>
         "(JJLjava/lang/String;IIZZZ)V", session as i64, revision as i64,
         string, start as i32, end as i32, password as i32, numeric as i32, restart as i32);
     if !string.is_null() { (**env).DeleteLocalRef.unwrap()(env, string); }
+}
+
+pub unsafe fn to_java_text_actions(token: u64, flags: i32, rect: Rect, dpi: f64) {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "showTextActions", "(JIIIII)V",
+        token as i64, flags,
+        (rect.pos.x * dpi).floor() as i32, (rect.pos.y * dpi).floor() as i32,
+        ((rect.pos.x + rect.size.x) * dpi).ceil() as i32,
+        ((rect.pos.y + rect.size.y) * dpi).ceil() as i32);
+}
+
+pub unsafe fn to_java_hide_text_actions() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "hideTextActions", "()V");
 }
 
 #[no_mangle]
@@ -819,9 +852,10 @@ pub unsafe fn to_java_show_keyboard(visible: bool) {
 
 pub unsafe fn to_java_copy_to_clipboard(content: String) {
     let env = attach_jni_env();
-    let content = CString::new(content.clone()).unwrap();
-    let content = ((**env).NewStringUTF.unwrap())(env, content.as_ptr());
+    let utf16: Vec<u16> = content.encode_utf16().collect();
+    let content = (**env).NewString.unwrap()(env, utf16.as_ptr(), utf16.len() as i32);
     ndk_utils::call_void_method!(env, get_activity(), "copyToClipboard", "(Ljava/lang/String;)V", content);
+    (**env).DeleteLocalRef.unwrap()(env, content);
 }
 
 pub unsafe fn to_java_http_request(request_id: LiveId, request: HttpRequest) {

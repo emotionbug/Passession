@@ -1,10 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.13.7 - 2026-11-06
 
 ### Changed
 
 - Compile the Linux/Windows official desktop client and daemon in one Cargo invocation, sharing dependency features instead of recompiling common dependencies in separate passes. Preserve release optimization and artifact checks; keep local identity separation and macOS deployment targets unchanged.
+
+### Added
+
+- Integrate Android's native floating Paste/Copy/Cut/Select All toolbar with common inputs, chat, source/Markdown and log selection. Preserve Hangul and emoji clipboard text, enforce read-only/password capabilities, and stop automatically copying on selection release.
+- Follow Android system text size, including nonlinear SP scaling, without changing display density or saved application font preferences.
+
+### Fixed
+
+- Clear the previous text selection and native menu when another control is clicked, while still delivering that click. Fence stale actions after focus, model and view ownership changes.
+- Resolve native text-action anchors after parent layout/clipping so long-press menus remain visible above the actual selected text or caret.
+- Reflow existing input drafts when font metrics or width change; size navigation, list, popup and shared Settings form controls from scaled text.
+- Preserve fast flick velocity in the common scrolling controller without changing one-to-one dragging or long-press selection. Stop stale inertia after a hold, reversal, cancellation or boundary.
+- Flatten hard line breaks in single-line subagent titles and measure each title/subtitle row before placing the next row, preventing overlap at large system text sizes.
+
+### Validation
+
+- Passed 40 focused Rust regressions covering common input ownership, font scaling, single-line titles and touch motion. Android emulator checks exercised the native edit toolbar, Hangul/emoji clipboard operations, held text selection, outside-click dismissal, fast/slow scrolling and live 100%/150%/200% system text-size changes.
+- Verified large-text Settings forms, menus and subagent rows without title/subtitle overlap. Rebuilt the Linux client and exercised mouse selection, same-click focus transfer and wheel scrolling in a private X11 display; native Wayland/physical-trackpad and Windows UI behavior remain unverified.
 
 ## 0.13.6 - 2026-11-06
 

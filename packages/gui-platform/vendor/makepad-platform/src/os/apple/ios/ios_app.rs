@@ -278,6 +278,7 @@ impl IosApp {
         let touches = with_ios_app(|app| app.touches.clone());
         IosApp::do_callback(IosEvent::TouchUpdate(TouchUpdateEvent {
             time: time_now,
+            cancelled: false,
             window_id: CxWindowPool::id_zero(),
             modifiers: KeyModifiers::default(),
             touches

@@ -237,8 +237,15 @@ pub(crate) fn idle_milliseconds(_shared: &Arc<Shared>, done: Completion) {
     done.fail(PlatformError::new("idle_unsupported", "Mobile clients report app activity only."));
 }
 
-pub(crate) fn system_prefers_dark() -> bool {
-    call("appearance", json!({})).ok().and_then(|v| v.get("dark").and_then(Value::as_bool)).unwrap_or(false)
+pub(crate) fn system_appearance() -> (bool, String, crate::appearance::TextScale) {
+    let value = call("appearance", json!({})).unwrap_or(Value::Null);
+    let dark = value.get("dark").and_then(Value::as_bool).unwrap_or(false);
+    let language = value.get("language").and_then(Value::as_str).unwrap_or("en").to_owned();
+    let text_scale = value.get("textScaleDp")
+        .and_then(|value| serde_json::from_value::<[f64; 10]>(value.clone()).ok())
+        .map(crate::appearance::TextScale::from_dp)
+        .unwrap_or_default();
+    (dark, language, text_scale)
 }
 
 pub(crate) fn set_system_bars(dark: bool, background: u32) {
@@ -247,12 +254,6 @@ pub(crate) fn set_system_bars(dark: bool, background: u32) {
     }
 }
 
-pub(crate) fn system_language() -> String {
-    call("appearance", json!({}))
-        .ok()
-        .and_then(|v| v.get("language").and_then(Value::as_str).map(str::to_owned))
-        .unwrap_or_else(|| "en".into())
-}
 
 pub(crate) fn insets_from_json(value: &Value) -> SafeInsets {
     let number = |key: &str| value.get(key).and_then(Value::as_f64).unwrap_or(0.0);

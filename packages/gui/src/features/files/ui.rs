@@ -181,15 +181,20 @@ pub fn segmented(
     t: &Typography,
 ) -> Vec<Rect> {
     let font = t.ui_size(12.0);
+    let mut height: f64 = 24.0;
     let widths: Vec<f64> = labels
         .iter()
-        .map(|label| kit.measure(cx, spec(Font::Regular, font, p.foreground), label).x + 16.0)
+        .map(|label| {
+            let measured = kit.measure(cx, spec(Font::Regular, font, p.foreground), label);
+            height = height.max(measured.y + 8.0);
+            measured.x + 16.0
+        })
         .collect();
     let total: f64 = widths.iter().sum::<f64>() + 4.0 * (labels.len().saturating_sub(1)) as f64;
     let mut x = right - total;
     let mut rects = Vec::new();
     for (index, label) in labels.iter().enumerate() {
-        let r = rect(x, center_y - 12.0, widths[index], 24.0);
+        let r = rect(x, center_y - height * 0.5, widths[index], height);
         let fill = if index == selected {
             p.surface3
         } else if hovered == Some(index) {

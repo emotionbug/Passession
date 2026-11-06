@@ -91,9 +91,13 @@ pub struct SourceEditor {
     ime_caret_area: Area,
     preferred_x: Option<f64>,
     drag: Option<(DragUnit, usize, usize)>,
+    touch_caret: Option<usize>,
     thumb_drag: Option<(f64, f64)>,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     ime_last: Option<(usize, usize)>,
+    show_actions: bool,
+    selection_invalidated: bool,
+    owns_selection: bool,
     reveal: Option<Reveal>,
     /// The text revision the last highlight request was for.
     highlight_requested: u64,
@@ -214,9 +218,13 @@ impl SourceEditor {
             ime_caret_area: Area::Empty,
             preferred_x: None,
             drag: None,
+            touch_caret: None,
             thumb_drag: None,
             touch_scroll: Default::default(),
             ime_last: None,
+            show_actions: false,
+            selection_invalidated: false,
+            owns_selection: false,
             reveal: None,
             highlight_requested: u64::MAX,
             content_rect: Rect::default(),
@@ -227,12 +235,41 @@ impl SourceEditor {
         self.buffer.text()
     }
 
-    /// Replaces the text from the model (reload, remote change) keeping the selection
-    /// clamped; no-op when equal.
+    /// Replaces the text from the model (reload, remote change), invalidating
+    /// selection ownership; no-op when equal.
     pub fn sync_text(&mut self, text: &str) {
         if self.buffer.text() != text {
             self.buffer.set_text(text.to_owned());
             self.ime_last = None;
+            self.buffer.set_selection(Selection::caret(self.buffer.selection.head));
+            self.drag = None;
+            self.touch_caret = None;
+            self.show_actions = false;
+            self.selection_invalidated = true;
+        }
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Cx) {
+        if self.owns_selection {
+            cx.clear_text_selection(self.ime_area);
+        }
+        self.owns_selection = false;
+        self.buffer.set_selection(Selection::caret(self.buffer.selection.head));
+        self.drag = None;
+        self.touch_caret = None;
+        self.thumb_drag = None;
+        self.touch_scroll.reset();
+        self.show_actions = false;
+        self.selection_invalidated = false;
+    }
+
+    fn text_action_capabilities(&self) -> TextActionCapabilities {
+        let selected = !self.buffer.selection.is_empty();
+        TextActionCapabilities {
+            copy: selected,
+            cut: selected && !self.read_only,
+            paste: !self.read_only,
+            select_all: !self.buffer.is_empty(),
         }
     }
 
@@ -491,6 +528,13 @@ impl SourceEditor {
     /// Draws the editor into `area`. The caret does not blink, so an idle editor draws nothing.
     /// `ime_area` owns keyboard focus; the caret has separate IME avoidance geometry.
     pub fn draw(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, look: &EditorLook, ime_area: Area) {
+        if self.selection_invalidated {
+            if self.owns_selection {
+                cx.clear_text_selection(self.ime_area);
+            }
+            self.owns_selection = false;
+            self.selection_invalidated = false;
+        }
         self.ime_area = ime_area;
         let p = look.palette;
         self.ensure_char_width(cx, kit, look.font_size);
@@ -566,6 +610,7 @@ impl SourceEditor {
         let sel = self.buffer.selection;
         let selection_color = with_alpha(p.accent, 0.35);
         let mut caret_rect = None;
+        let mut action_anchor = None;
         let active_line = self.buffer.line_of(sel.head);
         let mut numbers: Vec<(usize, f64)> = Vec::new();
         for row in first..last {
@@ -586,6 +631,10 @@ impl SourceEditor {
                 }
                 if xb > xa {
                     kit.fill(cx, rect(x0 + xa, y, xb - xa, line_height), selection_color, 0.0);
+                    let visible = rect(x0 + xa, y, xb - xa, line_height).clip((content.pos, content.pos + content.size));
+                    if action_anchor.is_none() && visible.size.x > 0.0 && visible.size.y > 0.0 {
+                        action_anchor = Some(visible);
+                    }
                 }
             }
             let text_h = laid.size_in_lpxs.height as f64;
@@ -616,6 +665,16 @@ impl SourceEditor {
             cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
                 self.buffer.selection.anchor, self.buffer.selection.head, false, false);
             cx.show_text_ime(self.ime_caret_area, dvec2(0.0, caret.size.y));
+        }
+        if self.focused && (self.show_actions || (self.owns_selection && cx.text_actions_active(self.ime_area))) {
+            self.show_actions = false;
+            let anchor = action_anchor.or(caret_rect).map(|r| r.clip((content.pos, content.pos + content.size)));
+            if let Some(anchor) = anchor.filter(|r| r.size.x > 0.0 && r.size.y > 0.0) {
+                cx.show_text_actions(self.ime_area, anchor, self.text_action_capabilities());
+            } else {
+                cx.clear_text_selection(self.ime_area);
+                cx.claim_text_selection(self.ime_area);
+            }
         }
         // Gutter over horizontally scrolled text.
         kit.fill(cx, rect(area.pos.x, area.pos.y, gutter, area.size.y), p.surface0, 0.0);
@@ -676,11 +735,19 @@ impl SourceEditor {
 
     /// Pointer and keyboard input already routed to the editor.
     pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, look: &EditorLook, hit: &Hit) -> EditorResult {
+        if self.selection_invalidated {
+            if self.owns_selection {
+                cx.clear_text_selection(self.ime_area);
+            }
+            self.owns_selection = false;
+            self.selection_invalidated = false;
+        }
         let mut result = EditorResult::default();
         let before = (self.buffer.revision, self.buffer.selection);
         match hit {
             Hit::FingerDown(fe) => {
                 self.touch_scroll.reset();
+                self.touch_caret = None;
                 if fe.device.mouse_button().is_some_and(|b| b.is_secondary()) {
                     result.context_menu = Some(fe.abs);
                     return result;
@@ -692,9 +759,18 @@ impl SourceEditor {
                         return result;
                     }
                 self.touch_scroll.handle_hit(hit);
+                cx.claim_text_selection(self.ime_area);
+                self.owns_selection = true;
                 let offset = self.offset_at_point(cx, kit, look, fe.abs);
                 self.preferred_x = None;
                 self.ime_last = None;
+                if fe.device.is_touch() && fe.tap_count < 2 {
+                    // A scroll must not collapse the source range. Commit a tap
+                    // caret only after the gesture has been distinguished from pan.
+                    self.touch_caret = Some(offset);
+                    self.drag = None;
+                    return result;
+                }
                 match fe.tap_count {
                     2 => {
                         let (a, b) = self.buffer.word_at(offset);
@@ -724,6 +800,7 @@ impl SourceEditor {
                     return result;
                 }
                 if let Some(dy) = self.touch_scroll.handle_hit(hit) {
+                    self.touch_caret = None;
                     self.scroll_by(look, dvec2(0.0, dy));
                     return result;
                 }
@@ -748,16 +825,31 @@ impl SourceEditor {
             }
             Hit::FingerUp(fe) => {
                 self.touch_scroll.release(fe.time);
+                if let Some(offset) = self.touch_caret.take()
+                    && fe.was_tap() {
+                        cx.clear_text_selection(self.ime_area);
+                        cx.claim_text_selection(self.ime_area);
+                        self.show_actions = false;
+                        self.buffer.set_selection(Selection::caret(offset));
+                    }
+                if cfg!(target_os = "android") && fe.device.is_touch() && self.drag.is_some() {
+                    self.show_actions = true;
+                }
                 self.drag = None;
                 self.thumb_drag = None;
             }
             Hit::FingerLongPress(fe) => {
                 self.touch_scroll.reset();
+                self.touch_caret = None;
+                cx.claim_text_selection(self.ime_area);
+                self.owns_selection = true;
                 let offset = self.offset_at_point(cx, kit, look, fe.abs);
                 let (a, b) = self.buffer.word_at(offset);
                 self.buffer.set_selection(Selection { anchor: a, head: b });
                 self.drag = Some((DragUnit::Word, a, b));
-                result.context_menu = Some(fe.abs);
+                if !cfg!(target_os = "android") {
+                    result.context_menu = Some(fe.abs);
+                }
             }
             Hit::FingerScroll(fe) => {
                 self.touch_scroll.reset();
@@ -806,10 +898,18 @@ impl SourceEditor {
                     self.buffer.insert("", EditKind::Other);
                 }
             }
+            Hit::KeyFocusLost(_) => {
+                self.focused = false;
+                self.clear_selection(cx);
+            }
             _ => {}
         }
         result.text_changed = self.buffer.revision != before.0;
         result.selection_changed = self.buffer.selection != before.1;
+        if result.selection_changed && !self.buffer.selection.is_empty() {
+            cx.claim_text_selection(self.ime_area);
+            self.owns_selection = true;
+        }
         if result.text_changed || result.selection_changed {
             self.blink.restart(cx);
         }
@@ -971,6 +1071,46 @@ impl SourceEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_text_actions_respect_read_only_and_empty_selection() {
+        let mut editor = SourceEditor::new("한글 text".into(), "test.txt", "text-actions".into(), true);
+        editor.select(0, "한글".len());
+        let actions = editor.text_action_capabilities();
+        assert!(actions.copy && actions.select_all);
+        assert!(!actions.cut && !actions.paste);
+        assert!(editor.cut().is_none());
+        assert!(!editor.paste("replacement"));
+        assert_eq!(editor.buffer.selected_text(), "한글");
+
+        editor.read_only = false;
+        let actions = editor.text_action_capabilities();
+        assert!(actions.copy && actions.cut && actions.paste);
+        assert_eq!(editor.cut().as_deref(), Some("한글"));
+        assert_eq!(editor.text(), " text");
+        let actions = editor.text_action_capabilities();
+        assert!(!actions.copy && !actions.cut);
+        assert!(actions.paste && actions.select_all);
+        editor.buffer.undo();
+        assert_eq!(editor.text(), "한글 text");
+    }
+
+    #[test]
+    fn model_replacement_invalidates_selection_without_breaking_unicode() {
+        let mut editor = SourceEditor::new("한글 text".into(), "test.txt", "replacement".into(), false);
+        editor.select(0, "한글".len());
+        editor.show_actions = true;
+        editor.sync_text("한글 text");
+        assert_eq!(editor.buffer.selected_text(), "한글");
+        assert!(editor.show_actions);
+
+        editor.sync_text("새 문서");
+        assert!(editor.buffer.selection.is_empty());
+        assert!(editor.text().is_char_boundary(editor.buffer.selection.head));
+        assert!(editor.selection_invalidated);
+        assert!(!editor.show_actions);
+        assert!(editor.drag.is_none());
+    }
 
     #[test]
     fn wraps_after_whitespace() {

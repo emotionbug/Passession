@@ -24,6 +24,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.util.Log;
+import android.util.DisplayMetrics;
+import android.util.TypedValue;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
@@ -277,9 +279,19 @@ final class PaseoBridge {
                     return ok(activity.getWindowManager().getDefaultDisplay().getRotation() * 90);
                 case "appearance": {
                     int night = activity.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+                    DisplayMetrics metrics = activity.getResources().getDisplayMetrics();
+                    // Keep in sync with appearance::TextScale::SP. applyDimension
+                    // uses Android 14's nonlinear converter, and scaledDensity
+                    // on earlier releases. Makepad applies density separately.
+                    JSONArray textScaleDp = new JSONArray();
+                    for (float sp : new float[]{0, 8, 10, 12, 14, 18, 20, 24, 30, 100}) {
+                        textScaleDp.put(TypedValue.applyDimension(
+                                TypedValue.COMPLEX_UNIT_SP, sp, metrics) / metrics.density);
+                    }
                     return ok(new JSONObject()
                             .put("dark", night == Configuration.UI_MODE_NIGHT_YES)
-                            .put("language", Locale.getDefault().toLanguageTag()));
+                            .put("language", Locale.getDefault().toLanguageTag())
+                            .put("textScaleDp", textScaleDp));
                 }
                 case "setSystemBars": {
                     boolean dark = args.getBoolean("dark");

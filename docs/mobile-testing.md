@@ -113,4 +113,42 @@ composition, not proof for Samsung/Gboard's full soft Hangul layout. Latin
 soft-key input and keyboard geometry were exercised separately. No physical
 device, hardware frame-rate or battery improvement is claimed.
 
+### Native text actions and system text size
+
+The next Android pass used the production Java/Rust classes on the API 35
+`emulator-5580`, with an isolated daemon and SDK-only instrumentation driver.
+Evidence is retained under
+`/home/emotionbug/.cache/paseo-android-qa-xkwu3602/`:
+
+- `screen-402`–`403`: real Android floating Cut/Copy/Paste/Select All, followed
+  by Paste-only on an empty input. Copy preserves the draft, Cut removes the
+  selected text, and Paste restores Korean and a UTF-16 emoji exactly once.
+- Production `InputConnection` edits retain composition across Shift for
+  `계속 있는데`. These operations exercise the actual editor bridge, not the
+  full Samsung/Gboard soft keyboard.
+- `screen-406` and `417`: read-only text exposes Copy/Select All only; selecting
+  all copies all 80 paragraphs, including offscreen content. A held drag selects
+  paragraphs without scrolling. Releasing selection does not automatically copy.
+- `screen-418`: one hamburger tap clears selection and the active native menu
+  and opens the sidebar. Android Back hides the IME first when it is open;
+  another Back dismisses the text-action menu.
+- `screen-412`–`414`: live 150% → 200% → 100% system text-size changes resize
+  an existing Korean draft without changing density, text or saved app sizes.
+  The common TextInput layout cache now includes font/width/wrap metrics.
+- `screen-415`–`416`: a 650-pixel/170-ms flick reaches substantially older
+  paragraphs; a slower 550-pixel/1600-ms reverse drag tracks directly without
+  activating a row. This is behavioral evidence, not a hardware benchmark.
+- `screen-420`–`421`: multiline English/Korean/emoji subagent titles remain
+  single-line and separate from their model/status subtitles at 100% and 200%.
+- `screen-423` exposed missing scaling in the shared Settings form toolkit.
+  After correction, `screen-427`–`430` show scaled root/General/Appearance
+  controls, complete dropdown rows, wrapped hints and editable numeric fields
+  at 200%, with measured row/field heights rather than fixed clipping boxes.
+
+The final scoped run passed 40 Rust tests: 11 GUI regressions, 10 platform
+input/ownership regressions, 18 common touch-motion regressions and one Android
+font-curve regression. The rebuilt debug APK was installed and these actual
+surfaces exercised. No full-suite, physical refresh-rate, native Wayland or
+Windows UI result is inferred from this pass.
+
 Capture screenshots/logs without unrelated personal data or credentials. Preserve failing output, use bounded waits for observable conditions, and clean up only test-owned app instances, homes and processes. Installation or device changes require the appropriate authorization.

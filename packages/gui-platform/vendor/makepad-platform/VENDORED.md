@@ -65,6 +65,22 @@ areas before publishing native state. Undrawn fields must not register phantom
 editors when the real field blurs, restart the IME or cancel its pending hide.
 The focus regression covers initial state, pending ownership, activation and blur.
 
+## Native text-action ownership
+
+`event/keyboard.rs`, `event/event.rs`, `event/finger.rs`, `cx_api.rs` and
+`os/cx_shared.rs` share selection ownership, action capabilities and request
+tokens. Copy/Cut/Paste/Select All are delivered only to the current owner.
+Outside pointer-down clears the previous selection before normal dispatch,
+without consuming the new target's click. Focus loss reaches retained editors
+even when their old area is no longer drawable.
+
+The Android JNI bridge presents the packaged Java floating ActionMode and
+uses UTF-16 for clipboard strings. Anchor areas follow redraw remapping and
+resolve from visible painted instances after layout/alignment/clipping, not
+from provisional draw-time rectangles. Hidden anchors dismiss the native menu;
+stale tokens cannot edit a different owner. `TouchUpdateEvent::cancelled`
+preserves Android ACTION_CANCEL through common gesture dispatch.
+
 ## Touch activation and draw ordering
 
 `event/finger.rs` retains movement cancellation once a touch reaches the tap

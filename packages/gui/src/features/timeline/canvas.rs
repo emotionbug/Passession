@@ -280,6 +280,8 @@ impl ChatKit {
     /// prefix (plus "…") that fits in `lines` rows of `max_width`.
     #[allow(clippy::too_many_arguments)]
     pub fn layout_clamped(&mut self, cx: &mut Cx, font: Font, size_px: f64, height: f64, text: &str, max_width: f64, lines: usize) -> Rc<LaidoutText> {
+        let line = (lines == 1).then(|| crate::common::paint::single_line_text(text));
+        let text = line.as_deref().unwrap_or(text);
         let wrap = lines > 1;
         let fits = |kit: &mut Self, cx: &mut Cx, candidate: &str| {
             let laid = kit.layout(cx, font, size_px, height, candidate, wrap.then_some(max_width), 0.0);
@@ -602,6 +604,16 @@ impl Canvas {
         let start = floor_char_boundary(&self.plain, start);
         let end = floor_char_boundary(&self.plain, end);
         Some(self.plain[start..end].to_owned())
+    }
+
+    /// Detect replacements before the selected endpoint, while allowing a streamed
+    /// suffix and geometry-only reflow to keep their source-indexed selection.
+    pub fn selection_source_hash(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let (_, end) = self.selected_range()?;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        self.plain[..floor_char_boundary(&self.plain, end)].hash(&mut hash);
+        Some(hash.finish())
     }
 
     /// Word around `offset` (double-tap / long-press selection).

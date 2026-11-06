@@ -2264,7 +2264,8 @@ impl Widget for ChatPanel {
             event,
             Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::MouseLeave(_)
                 | Event::TouchUpdate(_) | Event::Scroll(_) | Event::KeyDown(_) | Event::KeyUp(_)
-                | Event::TextInput(_) | Event::TextIme(_) | Event::TextCopy(_) | Event::TextCut(_) | Event::BackPressed { .. }
+                | Event::TextInput(_) | Event::TextIme(_) | Event::TextCopy(_) | Event::TextCut(_)
+                | Event::TextSelectAll | Event::TextSelectionDismiss | Event::BackPressed { .. }
         );
         // Composer sheets are painted above the stream. Dispatch them before
         // any row can take the pointer/key focus, and retain ownership on close.
@@ -2602,7 +2603,7 @@ impl Widget for ChatPanel {
                     let widget = list.item(cx, index, live_id!(Row));
                     if let Some(ctx) = &self.ctx {
                         let state = self.row_states.entry(item.id.clone()).or_default().clone();
-                        widget.as_chat_row().set_model(RowModel { panel: self.uid, item, ctx: ctx.clone(), state });
+                        widget.as_chat_row().set_model(cx, RowModel { panel: self.uid, item, ctx: ctx.clone(), state });
                     }
                     widget.draw_all(cx, scope);
                 }

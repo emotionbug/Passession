@@ -196,6 +196,7 @@ pub use {
             KeyFocusEvent,
             TextInputEvent,
             TextClipboardEvent,
+            TextActionCapabilities,
             WindowCloseRequestedEvent,
             WindowClosedEvent,
             WindowDragQueryResponse,

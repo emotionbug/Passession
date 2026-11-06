@@ -199,6 +199,7 @@ impl From<ToWasmTouchUpdate> for TouchUpdateEvent {
     fn from(v:ToWasmTouchUpdate) -> Self {
         Self {
             time: v.time,
+            cancelled: false,
             window_id: CxWindowPool::id_zero(),
             modifiers: unpack_key_modifier(v.modifiers),
             touches: v.touches.iter().map(|v| v.clone().into()).collect()

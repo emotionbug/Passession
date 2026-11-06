@@ -197,6 +197,11 @@ pub fn focused_target(shell: &PaseoShell) -> Option<&PanelTarget> {
 // ---------------------------------------------------------------------------------------------
 // Drawing
 
+/// Scale only an authored text line box, leaving surrounding padding and icons unchanged.
+pub(crate) fn text_line_height(height: f64, font_size: f64) -> f64 {
+    height * (theme::current_typography().ui_size(font_size) / font_size).max(1.0)
+}
+
 pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
     let p = theme::current_palette();
     let t = theme::current_typography();
@@ -233,7 +238,7 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
     let mut y = body.pos.y;
     let show_header = !(page_shown || (compact && sidebar_destination) || (compact && host_count == 0));
     if show_header {
-        let h = if compact { 8.0 + 56.0 } else { 36.0 };
+        let h = if compact { 28.0 + text_line_height(20.0, 14.0) + text_line_height(16.0, 12.0) } else { 12.0 + text_line_height(24.0, 16.0) };
         draw_header(shell, cx, scope, &state, rect(body.pos.x, y, body.size.x, h));
         y += h;
     }
@@ -316,7 +321,7 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
     let workspace = target.as_ref().and_then(|t| host.and_then(|h| h.workspace(&t.workspace_id))).cloned();
     let tabs_count = target.as_ref().map(|t| commands::workspace_tabs(shell, state, t).len()).unwrap_or(0);
     let new_workspace = target.as_ref().is_some_and(|t| t.kind == "new_tab" && t.workspace_id.is_empty());
-    let row = rect(r.pos.x + 12.0, r.pos.y + if compact { 8.0 } else { 0.0 }, r.size.x - 24.0, if compact { 56.0 } else { 36.0 });
+    let row = rect(r.pos.x + 12.0, r.pos.y + if compact { 8.0 } else { 0.0 }, r.size.x - 24.0, r.size.y - if compact { 8.0 } else { 0.0 });
     let mid = row.pos.y + row.size.y * 0.5;
     let has_scripts = workspace.as_ref().is_some_and(|w| !j::array(w, "scripts").is_empty());
     let header_git = !compact && target.as_ref().is_some_and(|t| !t.cwd.is_empty());
@@ -342,7 +347,8 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
             if compact {
                 let label = tr("importSession.title");
                 let w = ui.button_width(cx, &label, Some("import"), ControlSize::Sm);
-                ui.button(cx, rect(right - w, mid - 16.0, w, 32.0), "hdr:import", &label, Some("import"), Variant::Ghost, ControlSize::Sm, true);
+                let h = theme::control_height(ControlSize::Sm);
+                ui.button(cx, rect(right - w, mid - h * 0.5, w, h), "hdr:import", &label, Some("import"), Variant::Ghost, ControlSize::Sm, true);
             }
         } else {
             // Right island: explorer toggle, git widgets (wide), scripts (wide), menu, tabs (compact).
@@ -353,7 +359,8 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
                 // Git actions split button + open-in, laid out by their own widgets.
                 let w = 220.0_f64.min((right - x - 120.0).max(0.0));
                 if w > 0.0 {
-                    right_widgets = Some(rect(right - w, mid - 14.0, w, 28.0));
+                    let h = theme::control_height(ControlSize::Xs);
+                    right_widgets = Some(rect(right - w, mid - h * 0.5, w, h));
                     right -= w + 4.0;
                 }
             }
@@ -370,7 +377,8 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
                 let tabs = island(&mut ui, cx, dvec2(right - extent * 0.5, mid), "hdr:tabs", &tr_args("workspace.tabs.switcher.trigger", &[("count", &count)]), true);
                 let spec = ui.spec(Font::Medium, 10.0, p.muted);
                 let w = ui.measure(cx, spec, &count).max(12.0) + 4.0;
-                let badge = rect(tabs.pos.x + (extent - w) * 0.5, mid - 8.0, w, 16.0);
+                let badge_h = text_line_height(16.0, 10.0);
+                let badge = rect(tabs.pos.x + (extent - w) * 0.5, mid - badge_h * 0.5, w, badge_h);
                 ui.painter.outline(cx, badge, Vec4::default(), p.muted, 1.0, 2.0);
                 ui.text_centered(cx, badge, spec, &count);
                 right = tabs.pos.x;
@@ -382,12 +390,15 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
             let w = (right - x).max(0.0);
             if subtitle {
                 let spec = ui.spec(Font::Medium, 14.0, p.foreground);
-                ui.text(cx, rect(x, mid - 18.0, w, 20.0), spec, &title_text);
+                let title_h = text_line_height(20.0, 14.0);
+                let subtitle_h = text_line_height(16.0, 12.0);
+                let title_y = mid - (title_h + subtitle_h) * 0.5;
+                ui.text(cx, rect(x, title_y, w, title_h), spec, &title_text);
                 if let (Some(host), Some(target)) = (host, target.as_ref()) {
                     let project = workspace.as_ref().map(|w| j::text(w, "projectDisplayName").to_string()).unwrap_or_default();
                     let directory = target.cwd.split('/').rfind(|p| !p.is_empty()).unwrap_or("").to_string();
                     let project = if project.is_empty() { directory } else { project };
-                    header_subtitle(&mut ui, cx, rect(x, mid + 2.0, w, 16.0), &project, host);
+                    header_subtitle(&mut ui, cx, rect(x, title_y + title_h, w, subtitle_h), &project, host);
                 }
             } else {
                 let spec = ui.spec(Font::Medium, if compact { 14.0 } else { 16.0 }, p.foreground);
@@ -538,11 +549,12 @@ fn draw_pane(
     shell.data.chrome.pane_rects.push((pane_id.to_string(), r));
     let mut content = r;
     if !compact || explorer {
-        let bar = rect(r.pos.x, r.pos.y, r.size.x, 38.0);
+        let bar_h = if compact { 18.0 + text_line_height(20.0, 14.0) } else { 22.0 + text_line_height(16.0, 12.0) };
+        let bar = rect(r.pos.x, r.pos.y, r.size.x, bar_h);
         shell.data.chrome.tab_bars.push((pane_id.to_string(), bar));
         draw_tab_strip(shell, cx, state, pane_id, keys, selected, bar, explorer);
-        shell.painter.hline(cx, r.pos.x, r.pos.y + 38.0, r.size.x, p.border);
-        content = rect(r.pos.x, r.pos.y + 39.0, r.size.x, r.size.y - 39.0);
+        shell.painter.hline(cx, r.pos.x, r.pos.y + bar_h, r.size.x, p.border);
+        content = rect(r.pos.x, r.pos.y + bar_h + 1.0, r.size.x, (r.size.y - bar_h - 1.0).max(0.0));
     }
     if shell.data.chrome.drop_pane.as_deref() == Some(pane_id) && !explorer {
         shell.painter.outline(cx, r, Vec4::default(), p.primary, 1.0, 0.0);
@@ -613,11 +625,13 @@ fn draw_empty(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect) {
     let title = ui.spec(Font::Medium, 18.0, p.foreground);
     let message = ui.spec(Font::Regular, 14.0, p.muted);
     let cy = r.pos.y + r.size.y * 0.5;
-    ui.text_centered(cx, rect(r.pos.x, cy - 56.0, r.size.x, 24.0), title, "Paseo Sessions");
-    ui.text_centered(cx, rect(r.pos.x + 16.0, cy - 28.0, r.size.x - 32.0, 20.0), message, &tr("sessionNavigation.empty"));
+    let title_h = text_line_height(24.0, 18.0);
+    let message_h = text_line_height(20.0, 14.0);
+    ui.text_centered(cx, rect(r.pos.x, cy - 12.0 - message_h - title_h, r.size.x, title_h), title, "Paseo Sessions");
+    ui.text_centered(cx, rect(r.pos.x + 16.0, cy - 8.0 - message_h, r.size.x - 32.0, message_h), message, &tr("sessionNavigation.empty"));
     let label = tr("sessionNavigation.newSession");
     let w = ui.button_width(cx, &label, Some("plus"), ControlSize::Sm);
-    ui.button(cx, rect(r.pos.x + (r.size.x - w) * 0.5, cy + 4.0, w, 32.0), "empty:new", &label, Some("plus"), Variant::Primary, ControlSize::Sm, true);
+    ui.button(cx, rect(r.pos.x + (r.size.x - w) * 0.5, cy + 4.0, w, theme::control_height(ControlSize::Sm)), "empty:new", &label, Some("plus"), Variant::Primary, ControlSize::Sm, true);
 }
 
 /// Tab strip (`ReorderableListView` of chips): wide chips with icon, title, modified dot,
@@ -722,10 +736,10 @@ fn draw_tab_strip(
             let plus = rect(x + 4.0, bar.pos.y + 5.0, 28.0, 28.0);
             ui.icon_button(cx, plus, "explorer:new", "plus", 14.0, 6.0, &tr("workspace.tabs.actions.newTab"));
             if compact {
-                let close = rect(bar.pos.x + bar.size.x - 36.0, bar.pos.y + 3.0, 32.0, 32.0);
+                let close = rect(bar.pos.x + bar.size.x - 36.0, bar.pos.y + (bar.size.y - 32.0) * 0.5, 32.0, 32.0);
                 ui.icon_button(cx, close, "explorer:close", "x", 16.0, 16.0, &tr("workspace.tabs.explorerSidebar.close"));
             } else {
-                let close = rect(bar.pos.x + bar.size.x - 36.0, bar.pos.y + 3.0, 32.0, 32.0);
+                let close = rect(bar.pos.x + bar.size.x - 36.0, bar.pos.y + (bar.size.y - 32.0) * 0.5, 32.0, 32.0);
                 ui.icon_button(cx, close, "explorer:close", "x", 18.0, 16.0, &tr("common.actions.close"));
             }
         } else {

@@ -317,13 +317,13 @@ fn permission_card(cx: &mut Cx2d, d: &mut Draw, key: &str, r: &Value, plan_text:
         let inner = w - 24.0;
         let mut cy = y + 12.0;
         let title = title(r);
-        let laid = d.kit.layout(cx, Font::Regular, base, 22.0 / base, &title, Some(inner), 0.0);
+        let laid = d.kit.layout(cx, Font::Regular, base, d.look.typo.system_size(22.0) / base, &title, Some(inner), 0.0);
         d.kit.draw_laidout(cx, Font::Regular, p.foreground, dvec2(x + 12.0, cy), &laid);
         d.canvas.add_run(laid.clone(), dvec2(x + 12.0, cy), Some('\n'));
         cy += laidout_size(&laid).y + 8.0;
         let description = str_of(get(r, "description"));
         if !description.is_empty() {
-            let laid = d.kit.layout(cx, Font::Regular, base, 20.0 / base, description, Some(inner), 0.0);
+            let laid = d.kit.layout(cx, Font::Regular, base, d.look.typo.system_size(20.0) / base, description, Some(inner), 0.0);
             d.kit.draw_laidout(cx, Font::Regular, p.muted, dvec2(x + 12.0, cy), &laid);
             d.canvas.add_run(laid.clone(), dvec2(x + 12.0, cy), Some('\n'));
             cy += laidout_size(&laid).y + 8.0;
@@ -359,7 +359,7 @@ pub fn plan_card(cx: &mut Cx2d, d: &mut Draw, key: &str, title: &str, descriptio
     let paint = |cx: &mut Cx2d, d: &mut Draw, opts: &mut markdown::MdOpts| -> f64 {
         let inner = w - 24.0;
         let mut cy = y + 12.0;
-        let laid = d.kit.layout(cx, Font::Regular, base, 22.0 / base, title, Some(inner - 24.0), 0.0);
+        let laid = d.kit.layout(cx, Font::Regular, base, d.look.typo.system_size(22.0) / base, title, Some(inner - 24.0), 0.0);
         let row_h = laidout_size(&laid).y.max(24.0);
         d.kit.icon(cx, if expanded { "chevron-down" } else { "chevron-right" }, rect_xywh(x + 12.0, cy, 16.0, row_h), 16.0, p.muted);
         d.kit.draw_laidout(cx, Font::Regular, p.foreground, dvec2(x + 36.0, cy + (row_h - laidout_size(&laid).y) * 0.5), &laid);
@@ -368,7 +368,7 @@ pub fn plan_card(cx: &mut Cx2d, d: &mut Draw, key: &str, title: &str, descriptio
         if expanded {
             if !description.is_empty() {
                 cy += 8.0;
-                let laid = d.kit.layout(cx, Font::Regular, base, 20.0 / base, description, Some(inner), 0.0);
+                let laid = d.kit.layout(cx, Font::Regular, base, d.look.typo.system_size(20.0) / base, description, Some(inner), 0.0);
                 d.kit.draw_laidout(cx, Font::Regular, p.muted, dvec2(x + 12.0, cy), &laid);
                 cy += laidout_size(&laid).y;
             }
@@ -438,7 +438,7 @@ fn question_form(cx: &mut Cx2d, d: &mut Draw, key: &str, qs: &[Question], x: f64
             }
             cy += row_h + 12.0;
         }
-        let laid = d.kit.layout(cx, Font::Regular, base, 22.0 / base, &q.question, Some(inner - 24.0), 0.0);
+        let laid = d.kit.layout(cx, Font::Regular, base, d.look.typo.system_size(22.0) / base, &q.question, Some(inner - 24.0), 0.0);
         d.kit.draw_laidout(cx, Font::Regular, p.foreground, dvec2(x + 24.0, cy), &laid);
         d.canvas.add_run(laid.clone(), dvec2(x + 24.0, cy), Some('\n'));
         cy += laidout_size(&laid).y + 4.0 + 12.0;
@@ -501,14 +501,14 @@ fn question_option(cx: &mut Cx2d, d: &mut Draw, key: &str, option: &Value, j: us
     let target = HitTarget::QuestionOption { key: key.to_owned(), index: j };
     let hovered = d.state.hover_hit.as_deref() == Some(hit_key(&target).as_str());
     let inner = w - 24.0 - 26.0;
-    let label = d.kit.layout(cx, Font::Regular, base, 22.0 / base, str_of(get(option, "label")), Some(inner), 0.0);
+    let label = d.kit.layout(cx, Font::Regular, base, d.look.typo.system_size(22.0) / base, str_of(get(option, "label")), Some(inner), 0.0);
     let mut h = laidout_size(&label).y;
-    let description = non_empty_str(get(option, "description")).map(|text| d.kit.layout(cx, Font::Regular, base, 20.0 / base, text, Some(inner), 0.0));
+    let description = non_empty_str(get(option, "description")).map(|text| d.kit.layout(cx, Font::Regular, base, d.look.typo.system_size(20.0) / base, text, Some(inner), 0.0));
     if let Some(desc) = &description {
         h += 4.0 + laidout_size(desc).y;
     }
     let code = d.look.code();
-    let preview = non_empty_str(get(option, "preview")).map(|text| d.kit.layout(cx, Font::Mono, code, 20.0 / code, text, Some(inner - 32.0), 0.0));
+    let preview = non_empty_str(get(option, "preview")).map(|text| d.kit.layout(cx, Font::Mono, code, d.look.typo.system_size(20.0) / code, text, Some(inner - 32.0), 0.0));
     if let Some(prev) = &preview {
         h += 4.0 + laidout_size(prev).y + 24.0;
     }

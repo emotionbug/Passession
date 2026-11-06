@@ -191,6 +191,8 @@ pub enum Event {
     TextIme(TextImeEvent),
     TextCopy(TextClipboardEvent),
     TextCut(TextClipboardEvent),
+    TextSelectAll,
+    TextSelectionDismiss,
 
     Drag(DragEvent),
     Drop(DropEvent),
@@ -300,6 +302,8 @@ impl Event{
             53=>"DesignerPick",
             54=>"XrLocal",
             55=>"TextIme",
+            56=>"TextSelectAll",
+            57=>"TextSelectionDismiss",
             _=>panic!()
         }
     }
@@ -349,6 +353,8 @@ impl Event{
             Self::TextIme(_)=>55,
             Self::TextCopy(_)=>34,
             Self::TextCut(_)=>35,
+            Self::TextSelectAll=>56,
+            Self::TextSelectionDismiss=>57,
 
             Self::Drag(_)=>36,
             Self::Drop(_)=>37,

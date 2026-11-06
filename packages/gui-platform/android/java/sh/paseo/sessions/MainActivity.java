@@ -29,7 +29,9 @@ public class MainActivity extends MakepadActivity {
         bridge.onIntent(getIntent());
         if (Build.VERSION.SDK_INT >= 33) {
             // DEFAULT leaves the IME's higher-priority dismissal ahead of app navigation.
-            backCallback = MakepadNative::onBackPressed;
+            backCallback = () -> {
+                if (!dismissTextActionsOnBack()) MakepadNative.onBackPressed();
+            };
             getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                     OnBackInvokedDispatcher.PRIORITY_DEFAULT, backCallback);
         }
@@ -78,7 +80,7 @@ public class MainActivity extends MakepadActivity {
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
-        MakepadNative.onBackPressed();
+        if (!dismissTextActionsOnBack()) MakepadNative.onBackPressed();
     }
 
     @Override

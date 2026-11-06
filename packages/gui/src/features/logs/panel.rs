@@ -166,6 +166,7 @@ impl ExecutionLogPanel {
         self.init_error = None;
         let output = self.output();
         let Some(mut view) = output.borrow_mut() else { return };
+        view.clear_selection(cx);
         view.session = None;
         view.matches.clear();
         view.active_match = None;
@@ -383,6 +384,11 @@ impl Widget for ExecutionLogPanel {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         self.compact = scope.data.get_mut::<UiContext>().is_some_and(|ctx| ctx.compact);
+        let ty = crate::theme::current_typography();
+        let toolbar_h = 36.0_f64.max(ty.ui_size(12.0) * 1.4 + 12.0);
+        let field_h = 28.0_f64.max(ty.ui_size(14.0) * 1.4 + 8.0);
+        self.view.view(id!(toolbar)).apply_over(cx, live! { height: (toolbar_h) });
+        self.view.widget(id!(find_bar.field)).apply_over(cx, live! { height: (field_h) });
         let target_title = self.target.as_ref().map(|t| t.title.clone()).unwrap_or_default();
         let connected = self.connected;
         struct Facts {
@@ -498,6 +504,7 @@ impl ExecutionLogPanelRef {
         inner.session_opened = false;
         inner.init_error = None;
         if let Some(mut view) = inner.output().borrow_mut() {
+            view.clear_selection(cx);
             view.session = None;
         }
         inner.view.redraw(cx);

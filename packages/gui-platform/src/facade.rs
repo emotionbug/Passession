@@ -9,10 +9,69 @@ pub mod appearance {
         time::{Duration, Instant},
     };
 
+    /// Android's SP-to-DP curve, sampled at its nonlinear font-scaling knots.
+    /// Display density is removed on the Java side; these are text metrics only.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct TextScale {
+        dp: [f64; 10],
+    }
+
+    impl Default for TextScale {
+        fn default() -> Self {
+            Self { dp: Self::SP }
+        }
+    }
+
+    impl TextScale {
+        const SP: [f64; 10] = [0.0, 8.0, 10.0, 12.0, 14.0, 18.0, 20.0, 24.0, 30.0, 100.0];
+
+        /// Construct from native SP-to-DP samples at 0, 8, 10, 12, 14, 18,
+        /// 20, 24, 30 and 100 SP, with physical display density removed.
+        pub fn from_dp(dp: [f64; 10]) -> Self {
+            assert!(dp[0] == 0.0 && dp.iter().all(|value| value.is_finite()));
+            assert!(dp.windows(2).all(|pair| pair[1] > pair[0]));
+            Self { dp }
+        }
+
+        pub fn logical_size(&self, sp: f64) -> f64 {
+            if self.dp == Self::SP {
+                return sp;
+            }
+            let upper = Self::SP.iter().position(|knot| *knot >= sp).unwrap_or(Self::SP.len() - 1);
+            if upper == 0 {
+                return sp;
+            }
+            if sp > Self::SP[upper] {
+                return sp * self.dp[upper] / Self::SP[upper];
+            }
+            let lower = upper - 1;
+            let fraction = (sp - Self::SP[lower]) / (Self::SP[upper] - Self::SP[lower]);
+            self.dp[lower] + fraction * (self.dp[upper] - self.dp[lower])
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::TextScale;
+
+        #[test]
+        fn system_text_scale_interpolates_native_curve_without_density() {
+            let identity = TextScale::default();
+            assert_eq!(identity.logical_size(13.25), 13.25);
+            let linear = TextScale::from_dp(TextScale::SP.map(|sp| sp * 1.5));
+            assert_eq!(linear.logical_size(13.25), 19.875);
+            let nonlinear = TextScale::from_dp([0.0, 16.0, 20.0, 24.0, 28.0, 34.0, 36.0, 40.0, 46.0, 116.0]);
+            assert_eq!(nonlinear.logical_size(16.0), 31.0);
+            assert_eq!(nonlinear.logical_size(24.0), 40.0);
+            assert_eq!(nonlinear.logical_size(200.0), 232.0);
+        }
+    }
+
     struct Cached {
         at: Instant,
         dark: bool,
         language: String,
+        text_scale: TextScale,
     }
 
     static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
@@ -21,10 +80,19 @@ pub mod appearance {
         let mut cache = CACHE.lock().unwrap();
         let stale = cache.as_ref().is_none_or(|c| c.at.elapsed() > Duration::from_secs(5));
         if stale {
+            #[cfg(target_os = "android")]
+            let (dark, language, text_scale) = crate::native::system_appearance();
+            #[cfg(not(target_os = "android"))]
+            let (dark, language, text_scale) = (
+                crate::native::system_prefers_dark(),
+                crate::native::system_language(),
+                TextScale::default(),
+            );
             *cache = Some(Cached {
                 at: Instant::now(),
-                dark: crate::native::system_prefers_dark(),
-                language: crate::native::system_language(),
+                dark,
+                language,
+                text_scale,
             });
         }
         f(cache.as_ref().unwrap())
@@ -33,6 +101,10 @@ pub mod appearance {
     /// Theme `auto`: the OS prefers a dark appearance.
     pub fn system_prefers_dark() -> bool {
         read(|c| c.dark)
+    }
+
+    pub fn system_text_scale() -> TextScale {
+        read(|c| c.text_scale)
     }
 
     #[cfg(target_os = "android")]

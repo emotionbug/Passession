@@ -61,6 +61,19 @@ editor even when its last draw area is invalid. Retained panels and discarded
 settings fields use this lifecycle instead of waiting for an impossible hit on
 an undrawn area. A newer pending editor keeps its focus and IME.
 
+## Native text actions and typography
+
+`TextInput` publishes capability-limited native actions for its current
+selection or caret and applies them through existing edit/undo operations.
+Touch release no longer auto-copies on Android. Outside dismissal and focus
+teardown collapse selection and invalidate native action ownership. Painted
+selection/caret areas provide anchors that the platform resolves after layout.
+
+The retained text layout is keyed by font family/size/spacing/scale, available
+width, wrapping and alignment. Live system-font changes and width reflow do not
+reuse stale glyph metrics or replace the editor's text, selection or history;
+color-only animation keeps the cached layout.
+
 ## Touch scrolling
 
 `src/scroll_bars.rs` supplies the shared `TouchScroll` controller: slop-qualified
@@ -75,8 +88,14 @@ are removed; its separate smooth-scroll and pull-down behavior remains, with
 pull-down decay expressed in elapsed time. Nested children handle input first;
 selection and horizontal child drags retain their gesture ownership. Sticky tap
 qualification prevents a pan ending over its original control from becoming a
-click. Ten `touch_scroll_tests` cover slop, subdivision, reversal, bounds,
-interruption, frame-rate/clock independence and selection.
+click. Eighteen `touch_scroll_tests` cover slop, subdivision, reversal, bounds,
+interruption, frame-rate/clock independence, release velocity and selection.
+
+Release velocity uses a fixed-size 32-sample history over the last 100 ms,
+including interpolation at the window boundary. Equal-timestamp moves retain
+their displacement; a stationary hold cancels motion, while a late release
+does not dilute a genuine recent flick with a synthetic zero-velocity sample.
+Reversal and boundary termination discard velocity in the previous direction.
 
 ## History prepend anchors
 

@@ -94,6 +94,23 @@ Windows or hardware performance coverage. The corresponding Android build,
 actual emulator interactions and 26 focused Rust/Java checks are recorded in
 [mobile testing](mobile-testing.md).
 
+### Native selection ownership follow-up
+
+The native-text-actions changes rebuilt the Linux debug bundle and used a
+private 1440×960 Xvfb display with the existing isolated Astra QA home. No new
+provider requests were submitted. Evidence is under
+`/home/emotionbug/.cache/paseo-android-qa-xkwu3602/desktop-native-actions-nme85t6l/`.
+
+- Mouse dragging selected the read-only Korean response without moving it.
+- One click on sidebar search cleared that selection and accepted typing in
+  the search field; no second focus click was needed.
+- Composer Ctrl+A selection disappeared on an outside click while retaining
+  the draft. QA search/draft text was then removed.
+- Wheel-up revealed older content; jump-to-latest restored the tail.
+
+This is actual X11/software-renderer input evidence, not native Wayland,
+physical-trackpad, Windows or window-manager lifecycle verification.
+
 ## Android build and installation
 
 On 2026-11-06, `cargo xtask build-gui android --arch arm64` produced the release-mode, debug-signed `Paseo-Sessions-0.13.4-android-arm64-debug-signed.apk` (84,353,955 bytes; SHA-256 `5035e8d632ad65cd787314372646f6046ccaad9f6505e99884169a5f5b563c42`). Rust 1.93.1 compiled against NDK 28.2.13676358/API 24; Gradle completed after correcting a duplicate local variable in `PaseoBridge.onIntent`. `apksigner verify` passed with the installed app's certificate, and `zipalign -c -P 16 4` passed.

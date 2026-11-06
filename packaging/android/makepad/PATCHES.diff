@@ -8,7 +8,19 @@
  import android.graphics.Rect;
  import android.media.AudioDeviceInfo;
  import android.media.AudioManager;
-@@ -77,6 +76,34 @@
+@@ -24,8 +23,11 @@
+ import android.os.Looper;
+ import android.os.SystemClock;
+ import android.util.Log;
++import android.view.ActionMode;
+ import android.view.Display;
+ import android.view.KeyEvent;
++import android.view.Menu;
++import android.view.MenuItem;
+ import android.view.MotionEvent;
+ import android.view.Surface;
+ import android.view.SurfaceHolder;
+@@ -77,9 +79,310 @@
      private float latestTouchY;
      private int latestTouchPointerId;
  
@@ -16,6 +28,278 @@
 +    private long inputSession;
 +    private MakepadInputConnection inputConnection;
 +    private boolean inputPassword, inputNumeric;
++
++    private static final int CAN_COPY = 1, CAN_CUT = 2, CAN_PASTE = 4, CAN_SELECT_ALL = 8;
++    private static final int ACTION_DISMISS = 0, ACTION_COPY = 1, ACTION_CUT = 2,
++        ACTION_PASTE = 3, ACTION_SELECT_ALL = 4;
++    private final Handler textActionHandler = new Handler(Looper.getMainLooper());
++    private final Object textActionLock = new Object();
++    private final ClipboardManager textActionClipboard;
++    // Tokens increase across native owners. Retired tokens cannot reopen a menu
++    // while a native frame is still catching up with a Java dismissal.
++    private long latestTextActionToken, requestedTextActionToken, textActionRequestGeneration;
++    private int requestedTextActionCapabilities;
++    private boolean textActionsResumed, textActionsSurfaceReady, textActionBackPressed;
++    private TextActions textActions;
++
++    void requestTextActions(long token, int flags, int left, int top, int right, int bottom) {
++        synchronized (textActionLock) {
++            if (token <= 0 || token < latestTextActionToken
++                    || (token == latestTextActionToken && requestedTextActionToken == 0)) return;
++            latestTextActionToken = requestedTextActionToken = token;
++            requestedTextActionCapabilities = flags & (CAN_COPY | CAN_CUT | CAN_PASTE | CAN_SELECT_ALL);
++            long generation = ++textActionRequestGeneration;
++            textActionHandler.post(() -> {
++                synchronized (textActionLock) {
++                    if (generation != textActionRequestGeneration) return;
++                }
++                showTextActions(token, flags, left, top, right, bottom);
++            });
++        }
++    }
++
++    void requestHideTextActions() {
++        synchronized (textActionLock) {
++            requestedTextActionToken = 0;
++            long generation = ++textActionRequestGeneration;
++            textActionHandler.post(() -> {
++                synchronized (textActionLock) {
++                    if (generation != textActionRequestGeneration) return;
++                }
++                finishTextActions();
++            });
++        }
++    }
++
++    private void showTextActions(long token, int flags, int left, int top, int right, int bottom) {
++        boolean available = textActionsResumed && textActionsSurfaceReady
++            && isAttachedToWindow() && hasWindowFocus() && hasFocus();
++        if (!available) {
++            dismissTextActions(token);
++            return;
++        }
++        flags &= CAN_COPY | CAN_CUT | CAN_PASTE | CAN_SELECT_ALL;
++        if (textActions != null && textActions.token == token) {
++            TextActions current = textActions;
++            if (current.capabilities != flags) {
++                current.capabilities = flags;
++                current.mode.invalidate();
++            }
++            Rect rect = current.contentRect;
++            if (rect.left != left || rect.top != top || rect.right != right || rect.bottom != bottom) {
++                rect.set(left, top, right, bottom);
++                current.mode.invalidateContentRect();
++            }
++            return;
++        }
++        finishTextActions();
++        TextActions next = new TextActions(token, flags, left, top, right, bottom);
++        textActions = next;
++        ActionMode mode = startActionMode(next, ActionMode.TYPE_FLOATING);
++        if (mode == null) {
++            dismissTextActions(token);
++        } else if (!next.isCurrent()) {
++            finishTextActions();
++        } else {
++            next.mode = mode;
++            textActionClipboard.addPrimaryClipChangedListener(next);
++            next.observingClipboard = true;
++        }
++    }
++
++    private void finishTextActions() {
++        TextActions current = textActions;
++        textActions = null;
++        if (current == null) return;
++        // finish() may synchronously invoke onDestroyActionMode. Never let a
++        // replacement/hide callback dismiss the next native selection owner.
++        current.finished = true;
++        current.stopObservingClipboard();
++        if (current.mode != null) current.mode.finish();
++    }
++
++    private void dismissTextActions(long token) {
++        boolean notifyNative;
++        synchronized (textActionLock) {
++            notifyNative = requestedTextActionToken == token;
++            if (notifyNative) {
++                requestedTextActionToken = 0;
++                ++textActionRequestGeneration;
++            }
++        }
++        if (textActions != null && textActions.token == token) finishTextActions();
++        if (notifyNative) {
++            if (inputConnection != null) inputConnection.flushBeforeNativeAction();
++            MakepadNative.surfaceOnTextAction(token, ACTION_DISMISS, null);
++        }
++    }
++
++    void cancelTextActions() {
++        long token;
++        synchronized (textActionLock) {
++            token = requestedTextActionToken;
++            requestedTextActionToken = 0;
++            ++textActionRequestGeneration;
++        }
++        finishTextActions();
++        if (token != 0) {
++            if (inputConnection != null) inputConnection.flushBeforeNativeAction();
++            MakepadNative.surfaceOnTextAction(token, ACTION_DISMISS, null);
++        }
++    }
++
++    boolean dismissTextActionsOnBack() {
++        synchronized (textActionLock) {
++            if (requestedTextActionToken == 0 && textActions == null) return false;
++        }
++        cancelTextActions();
++        return true;
++    }
++
++    void setTextActionsResumed(boolean resumed) {
++        if (textActionsResumed == resumed) return;
++        textActionsResumed = resumed;
++        cancelTextActions();
++    }
++
++    @Override
++    public void onWindowFocusChanged(boolean hasWindowFocus) {
++        super.onWindowFocusChanged(hasWindowFocus);
++        cancelTextActions();
++    }
++
++    @Override
++    protected void onFocusChanged(boolean gainFocus, int direction, Rect previouslyFocusedRect) {
++        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect);
++        cancelTextActions();
++    }
++
++    @Override
++    protected void onDetachedFromWindow() {
++        cancelTextActions();
++        super.onDetachedFromWindow();
++    }
++
++    private final class TextActions extends ActionMode.Callback2
++            implements ClipboardManager.OnPrimaryClipChangedListener {
++        final long token;
++        final Rect contentRect;
++        int capabilities, menuFlags = -1;
++        ActionMode mode;
++        boolean finished, observingClipboard;
++
++        TextActions(long token, int flags, int left, int top, int right, int bottom) {
++            this.token = token;
++            capabilities = flags;
++            contentRect = new Rect(left, top, right, bottom);
++        }
++
++        boolean isCurrent() {
++            if (finished || textActions != this) return false;
++            synchronized (textActionLock) {
++                return requestedTextActionToken == token;
++            }
++        }
++
++        boolean updateMenu(Menu menu) {
++            int flags = capabilities;
++            if (!textActionClipboard.hasPrimaryClip()) flags &= ~CAN_PASTE;
++            if (flags == menuFlags) return false;
++            menuFlags = flags;
++            menu.clear();
++            if ((flags & CAN_CUT) != 0) menu.add(Menu.NONE, android.R.id.cut, 0,
++                android.R.string.cut).setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
++            if ((flags & CAN_COPY) != 0) menu.add(Menu.NONE, android.R.id.copy, 1,
++                android.R.string.copy).setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
++            if ((flags & CAN_PASTE) != 0) menu.add(Menu.NONE, android.R.id.paste, 2,
++                android.R.string.paste).setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
++            if ((flags & CAN_SELECT_ALL) != 0) menu.add(Menu.NONE, android.R.id.selectAll, 3,
++                android.R.string.selectAll).setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM);
++            return true;
++        }
++
++        @Override
++        public boolean onCreateActionMode(ActionMode mode, Menu menu) {
++            this.mode = mode;
++            if (!isCurrent()) return false;
++            updateMenu(menu);
++            return menu.size() > 0;
++        }
++
++        @Override
++        public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
++            return isCurrent() && updateMenu(menu);
++        }
++
++        @Override
++        public void onGetContentRect(ActionMode mode, View view, Rect outRect) {
++            // Callback2 expects SurfaceView-local physical pixels.
++            outRect.set(contentRect);
++        }
++
++        @Override
++        public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
++            if (!isCurrent()) return false;
++            int action, capability;
++            switch (item.getItemId()) {
++                case android.R.id.copy: action = ACTION_COPY; capability = CAN_COPY; break;
++                case android.R.id.cut: action = ACTION_CUT; capability = CAN_CUT; break;
++                case android.R.id.paste: action = ACTION_PASTE; capability = CAN_PASTE; break;
++                case android.R.id.selectAll:
++                    action = ACTION_SELECT_ALL; capability = CAN_SELECT_ALL; break;
++                default: return false;
++            }
++            if ((capabilities & capability) == 0) return false;
++            synchronized (textActionLock) {
++                if ((requestedTextActionCapabilities & capability) == 0) return false;
++            }
++            String text = null;
++            if (action == ACTION_PASTE) {
++                ClipData clip = textActionClipboard.getPrimaryClip();
++                if (clip == null || clip.getItemCount() == 0) {
++                    mode.invalidate();
++                    return false;
++                }
++                CharSequence value = clip.getItemAt(0).coerceToText(getContext());
++                if (value == null) return false;
++                text = value.toString();
++            }
++            if (inputConnection != null) inputConnection.flushBeforeNativeAction();
++            synchronized (textActionLock) {
++                if (requestedTextActionToken != token
++                        || (requestedTextActionCapabilities & capability) == 0) return false;
++                if (action != ACTION_SELECT_ALL) {
++                    requestedTextActionToken = 0;
++                    ++textActionRequestGeneration;
++                }
++            }
++            if (action != ACTION_SELECT_ALL) finishTextActions();
++            // Rust edits once and publishes the new IME snapshot. In particular,
++            // do not also run InputConnection.performContextMenuAction here.
++            MakepadNative.surfaceOnTextAction(token, action, text);
++            return true;
++        }
++
++        @Override
++        public void onDestroyActionMode(ActionMode mode) {
++            boolean notifyNative = !finished && textActions == this;
++            finished = true;
++            stopObservingClipboard();
++            if (textActions == this) textActions = null;
++            if (notifyNative) dismissTextActions(token);
++        }
++
++        @Override
++        public void onPrimaryClipChanged() {
++            if (isCurrent()) mode.invalidate();
++        }
++
++        void stopObservingClipboard() {
++            if (!observingClipboard) return;
++            observingClipboard = false;
++            textActionClipboard.removePrimaryClipChangedListener(this);
++        }
++    }
 +
 +    void updateTextInput(long session, long revision, String text, int start, int end,
 +                         boolean password, boolean numeric, boolean restart) {
@@ -43,7 +327,29 @@
  
      public MakepadSurface(Context context){
          super(context);
-@@ -131,10 +158,15 @@
++        textActionClipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+         getHolder().addCallback(this);
+ 
+         setFocusable(true);
+@@ -95,6 +398,8 @@
+     @Override
+     public void surfaceCreated(SurfaceHolder holder) {
+         Log.i("SAPP", "surfaceCreated");
++        textActionsSurfaceReady = true;
++        cancelTextActions();
+         Surface surface = holder.getSurface();
+         //surface.setFrameRate(120f,0);
+         MakepadNative.surfaceOnSurfaceCreated(surface);
+@@ -103,6 +408,8 @@
+     @Override
+     public void surfaceDestroyed(SurfaceHolder holder) {
+         Log.i("SAPP", "surfaceDestroyed");
++        textActionsSurfaceReady = false;
++        cancelTextActions();
+         Surface surface = holder.getSurface();
+         MakepadNative.surfaceOnSurfaceDestroyed(surface);
+     }
+@@ -131,10 +438,15 @@
          // Save the details of the latest touch-down event,
          // such that we can use them in the `onLongClick` method.
          if (actionMasked == MotionEvent.ACTION_DOWN) {
@@ -60,7 +366,7 @@
          }
          else if (actionMasked == MotionEvent.ACTION_MOVE) {
              latestTouchX = event.getX(index);
-@@ -142,6 +174,7 @@
+@@ -142,6 +454,7 @@
              latestTouchPointerId = pointerId;
              if (pointerId == latestDownTouchPointerId) {
                  if (isTouchBeyondSlopDistance(view)) {
@@ -68,7 +374,7 @@
                      retval = true;
                  }
              }
-@@ -204,7 +237,13 @@
+@@ -204,7 +517,13 @@
          int visibleHeight = r.height();
          int keyboardHeight = screenHeight - visibleHeight;
  
@@ -83,10 +389,19 @@
      }
  
      // docs says getCharacters are deprecated
-@@ -213,6 +252,12 @@
+@@ -213,6 +532,21 @@
      @SuppressWarnings("deprecation")
      @Override
      public boolean onKey(View v, int keyCode, KeyEvent event) {
++        if (keyCode == KeyEvent.KEYCODE_BACK) {
++            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
++                textActionBackPressed = dismissTextActionsOnBack();
++            }
++            if (textActionBackPressed) {
++                if (event.getAction() == KeyEvent.ACTION_UP) textActionBackPressed = false;
++                return true;
++            }
++        }
 +        if (inputConnection != null && inputConnection.handleTextKey(event)) return true;
 +        // Shift/Alt change the next composing character; they do not leave the editor.
 +        if (inputConnection != null && event.getAction() == KeyEvent.ACTION_DOWN
@@ -96,7 +411,7 @@
          if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode != 0) {
              int metaState = event.getMetaState();
              MakepadNative.surfaceOnKeyDown(keyCode, metaState);
-@@ -223,17 +268,15 @@
+@@ -223,17 +557,15 @@
              MakepadNative.surfaceOnKeyUp(keyCode, metaState);
          }
  
@@ -123,7 +438,7 @@
              }
          }
  
-@@ -248,16 +291,14 @@
+@@ -248,16 +580,14 @@
          return true;
      }
  
@@ -146,7 +461,7 @@
      }
  
      public Surface getNativeSurface() {
-@@ -280,9 +321,14 @@
+@@ -280,9 +610,14 @@
      }
  
      @Override
@@ -163,7 +478,7 @@
          return insets;
      }
  }
-@@ -295,6 +341,9 @@
+@@ -295,6 +630,9 @@
  
      private MakepadSurface view;
      Handler mHandler;
@@ -173,7 +488,38 @@
  
      // video playback
      Handler mVideoPlaybackHandler;
-@@ -430,7 +479,10 @@
+@@ -379,12 +717,14 @@
+     @Override
+     protected void onResume() {
+         super.onResume();
++        view.setTextActionsResumed(true);
+         MakepadNative.activityOnResume();
+ 
+         //% MAIN_ACTIVITY_ON_RESUME
+     }
+     @Override
+     protected void onPause() {
++        view.setTextActionsResumed(false);
+         super.onPause();
+         MakepadNative.activityOnPause();
+ 
+@@ -399,6 +739,7 @@
+ 
+     @Override
+     protected void onDestroy() {
++        view.cancelTextActions();
+         super.onDestroy();
+         MakepadNative.activityOnDestroy();
+     }
+@@ -406,6 +747,7 @@
+     @Override
+     @SuppressWarnings("deprecation")
+     public void onBackPressed() {
++        if (dismissTextActionsOnBack()) return;
+         super.onBackPressed();
+         MakepadNative.onBackPressed();
+     }
+@@ -430,7 +772,10 @@
  
                      if (fullscreen) {
                          getWindow().setFlags(LayoutParams.FLAG_LAYOUT_NO_LIMITS, LayoutParams.FLAG_LAYOUT_NO_LIMITS);
@@ -185,7 +531,7 @@
                          if (Build.VERSION.SDK_INT >= 30) {
                              getWindow().setDecorFitsSystemWindows(false);
                          } else {
-@@ -456,6 +508,12 @@
+@@ -456,6 +801,27 @@
          finish();
      }
      
@@ -195,18 +541,35 @@
 +        runOnUiThread(() -> view.updateTextInput(session, revision, text, start, end, password, numeric, restart));
 +    }
 +
++    // Paseo: these calls originate on the render thread. The Surface fences
++    // requests before posting so queued hides/shows cannot retarget callbacks.
++    public void showTextActions(long token, int flags, int left, int top, int right, int bottom) {
++        view.requestTextActions(token, flags, left, top, right, bottom);
++    }
++
++    public void hideTextActions() {
++        view.requestHideTextActions();
++    }
++
++    // Called on UI by both legacy and predictive-back application routing.
++    public boolean dismissTextActionsOnBack() {
++        return view != null && view.dismissTextActionsOnBack();
++    }
++
      public void showKeyboard(final boolean show) {
          runOnUiThread(new Runnable() {
              @Override
 --- a/java/dev/makepad/android/MakepadNative.java
 +++ b/java/dev/makepad/android/MakepadNative.java
-@@ -28,6 +28,9 @@
+@@ -28,6 +28,11 @@
      public native static void surfaceOnKeyDown(int keycode, int meta_state);
      public native static void surfaceOnKeyUp(int keycode, int meta_state);
      public native static void surfaceOnCharacter(int character);
 +    // Paseo: positions are UTF-16 code units, not Rust UTF-8 byte offsets.
 +    public native static void surfaceOnTextEdit(long session, long revision, String text,
 +        int selectionStart, int selectionEnd, int composingStart, int composingEnd);
++    // Paseo: token is the native selection owner, not the IME session.
++    public native static void surfaceOnTextAction(long token, int action, String text);
      public native static void surfaceOnResizeTextIME(int keyboard_height, boolean is_open);
  
      // networking

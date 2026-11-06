@@ -541,7 +541,7 @@ pub fn notification(cx: &mut Cx2d, d: &mut Draw, level: &str, message: &str, x: 
         _ => (rgba(0x1a93c5fd), "info", rgba(0xff93c5fd)),
     };
     let size = d.look.ui(14.0);
-    let laid = d.kit.layout(cx, Font::Regular, size, 20.0 / size, message, Some((w - 52.0).max(1.0)), 0.0);
+    let laid = d.kit.layout(cx, Font::Regular, size, d.look.typo.system_size(20.0) / size, message, Some((w - 52.0).max(1.0)), 0.0);
     let h = laidout_size(&laid).y.max(20.0) + 20.0;
     d.kit.rect(cx, rect_xywh(x, y, w, h), bg, 6.0);
     d.kit.icon(cx, icon, rect_xywh(x + 12.0, y + 10.0, 20.0, 20.0), 16.0, color);

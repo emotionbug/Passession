@@ -418,6 +418,11 @@ impl ComposerPanel {
         r
     }
 
+    fn sheet_header_height(&mut self, cx: &mut Cx2d, look: &Look) -> f64 {
+        let spec = TextSpec::new(Font::Medium, look.t.ui_size(16.0), look.p.foreground);
+        20.0 + self.painter.line_height(cx, spec).max(28.0)
+    }
+
     fn sheet_header(&mut self, cx: &mut Cx2d, look: &Look, r: Rect, header: Header) {
         let Header { title, back, leading, gear } = header;
         let p = look.p;
@@ -445,7 +450,8 @@ impl ComposerPanel {
             end = g.pos.x - 4.0;
         }
         let spec = TextSpec::new(Font::Medium, look.t.ui_size(16.0), p.foreground);
-        self.painter.text_in(cx, rect(x, y, (end - x).max(0.0), 28.0), spec, title, 0.0);
+        let height = self.sheet_header_height(cx, look) - 20.0;
+        self.painter.text_in(cx, rect(x, y, (end - x).max(0.0), height), spec, title, 0.0);
     }
 
     /// The search row of a sheet under another one: same look, placeholder only (the one
@@ -520,25 +526,29 @@ impl ComposerPanel {
         self.scrim(cx, look, size);
         let body = TextSpec::new(Font::Regular, look.body(), p.foreground);
         let small = TextSpec::new(Font::Regular, look.small(), p.muted);
-        let row_base = if look.compact { 44.0 } else { 36.0 };
+        let body_h = self.painter.line_height(cx, body);
+        let small_h = self.painter.line_height(cx, small);
+        let row_base = (if look.compact { 44.0_f64 } else { 36.0 }).max(body_h + 12.0);
         let heights: Vec<f64> = rows
             .iter()
             .map(|row| {
                 if row.divider {
                     9.0
                 } else if row.heading {
-                    28.0
+                    28.0_f64.max(small_h + 12.0)
                 } else if !row.description.is_empty() {
-                    row_base + 16.0
+                    (row_base + 16.0).max(body_h + small_h + 12.0)
                 } else {
                     row_base
                 }
             })
             .collect();
-        let header_h = 48.0;
-        let search_h = if view.searchable { 44.0 } else { 0.0 };
-        let empty_h = if view.empty.is_some() || view.loading { 64.0 } else { 0.0 };
-        let content_h = heights.iter().sum::<f64>() + 32.0 + if error.is_some() { 32.0 } else { 0.0 } + empty_h;
+        let header_h = self.sheet_header_height(cx, look);
+        let search_h = if view.searchable { 44.0_f64.max(body_h + 16.0) } else { 0.0 };
+        let empty_h = if view.empty.is_some() || view.loading { 64.0_f64.max(44.0 + body_h) } else { 0.0 };
+        let sheet_width = if look.compact { size.x } else { 480.0_f64.min(size.x - 32.0) };
+        let error_h = error.as_ref().map(|text| self.painter.paragraph_height(cx, (sheet_width - 32.0).max(1.0), small, text) + 16.0).unwrap_or(0.0);
+        let content_h = heights.iter().sum::<f64>() + 32.0 + error_h + empty_h;
         let frame = self.sheet_frame(cx, look, size, header_h + search_h + content_h);
         self.sheet_header(cx, look, frame, Header { title: &view.title, back: view.back, leading: view.leading_provider.clone(), gear: view.gear.is_some() });
         let mut y = frame.pos.y + header_h;
@@ -568,7 +578,7 @@ impl ComposerPanel {
         }
         if let Some((icon, text)) = &view.empty {
             self.painter.icon(cx, rect(list.pos.x, ry + 16.0, list.size.x, 16.0), icon, 16.0, p.muted);
-            self.painter.text_in(cx, rect(list.pos.x + 24.0, ry + 36.0, list.size.x - 48.0, 20.0), TextSpec::new(Font::Regular, look.body(), p.muted), text, 0.5);
+            self.painter.text_in(cx, rect(list.pos.x + 24.0, ry + 36.0, list.size.x - 48.0, body_h.max(20.0)), TextSpec::new(Font::Regular, look.body(), p.muted), text, 0.5);
             ry += empty_h;
         }
         for (index, (row, h)) in rows.iter().zip(heights.iter()).enumerate() {
@@ -582,7 +592,7 @@ impl ComposerPanel {
                 continue;
             }
             if row.heading {
-                self.painter.text_in(cx, rect(r.pos.x + inset, r.pos.y + 8.0, r.size.x - inset * 2.0, 16.0), small, &row.label, 0.0);
+                self.painter.text_in(cx, rect(r.pos.x + inset, r.pos.y + 8.0, r.size.x - inset * 2.0, small_h.max(16.0)), small, &row.label, 0.0);
                 if let Some((icon, _, label)) = &row.secondary {
                     let b = rect(r.pos.x + r.size.x - inset - 24.0, r.pos.y + 2.0, 24.0, 24.0);
                     self.painter.icon(cx, b, icon, 12.0, p.extra_muted);
@@ -687,28 +697,32 @@ impl ComposerPanel {
         let query = self.st.search_text.trim().to_owned();
         let body = TextSpec::new(Font::Regular, look.body(), p.foreground);
         let small = TextSpec::new(Font::Regular, look.small(), p.muted);
-        let row_h = if query.is_empty() { 36.0 } else { 44.0 };
-        let list_h = if items.is_empty() || error.is_some() { 40.0 } else { items.len() as f64 * row_h + 8.0 };
+        let body_h = self.painter.line_height(cx, body);
+        let small_h = self.painter.line_height(cx, small);
+        let row_h = if query.is_empty() { 36.0_f64.max(body_h + 12.0) } else { 44.0_f64.max(body_h + small_h + 12.0) };
+        let header_h = self.sheet_header_height(cx, look);
+        let search_h = 44.0_f64.max(body_h + 16.0);
+        let list_h = if items.is_empty() || error.is_some() { 40.0_f64.max(body_h + 16.0) } else { items.len() as f64 * row_h + 8.0 };
         let anchor = self.st.attach_rect;
         let frame = if look.compact {
-            let h = (48.0 + 44.0 + list_h).min(size.y * 0.8);
+            let h = (header_h + search_h + list_h).min(size.y * 0.8);
             let r = rect(0.0, size.y - h, size.x, h);
             self.painter.fill(cx, rect(0.0, 0.0, size.x, size.y), p.scrim, 0.0);
             self.painter.outline(cx, r, p.surface0, p.border, 1.0, 16.0);
             self.sheet_header(cx, look, r, Header::plain(&t(&format!("composer.github.title{suffix}"))));
-            rect(r.pos.x, r.pos.y + 48.0, r.size.x, h - 48.0)
+            rect(r.pos.x, r.pos.y + header_h, r.size.x, h - header_h)
         } else {
             let w = 400.0f64.min(size.x - 16.0);
             let max_h = (anchor.pos.y - 16.0).clamp(120.0, 400.0);
-            let h = (44.0 + list_h).min(max_h);
+            let h = (search_h + list_h).min(max_h);
             let x = anchor.pos.x.clamp(8.0, (size.x - w - 8.0).max(8.0));
             let r = rect(x, anchor.pos.y - 8.0 - h, w, h);
             self.card(cx, look, r, p.surface0);
             r
         };
         self.st.ohits.push(frame, OItem::Panel);
-        self.search_row(cx, look, rect(frame.pos.x, frame.pos.y, frame.size.x, 44.0), &t(&format!("composer.github.searchPlaceholder{suffix}")));
-        let list = rect(frame.pos.x, frame.pos.y + 44.0, frame.size.x, frame.size.y - 44.0);
+        self.search_row(cx, look, rect(frame.pos.x, frame.pos.y, frame.size.x, search_h), &t(&format!("composer.github.searchPlaceholder{suffix}")));
+        let list = rect(frame.pos.x, frame.pos.y + search_h, frame.size.x, frame.size.y - search_h);
         let message = if let Some(error) = error {
             Some(error)
         } else if items.is_empty() {
@@ -719,7 +733,7 @@ impl ComposerPanel {
         if let Some(message) = message {
             self.st.sheet_scroll_max = 0.0;
             self.st.sheet_scroll = 0.0;
-            self.painter.text_in(cx, rect(list.pos.x + 12.0, list.pos.y + 8.0, list.size.x - 24.0, 24.0), TextSpec::new(Font::Regular, look.body(), p.muted), &message, 0.0);
+            self.painter.text_in(cx, rect(list.pos.x + 12.0, list.pos.y + 8.0, list.size.x - 24.0, body_h.max(24.0)), TextSpec::new(Font::Regular, look.body(), p.muted), &message, 0.0);
             return;
         }
         let content = items.len() as f64 * row_h + 8.0;
@@ -827,12 +841,13 @@ impl ComposerPanel {
         self.scrim(cx, look, size);
         let width = size.x - 32.0;
         let content = self.context_details(cx, look, rect(0.0, 0.0, width, 0.0), Details::SHEET, false);
-        let h = (48.0 + content + 32.0).min(size.y * 0.9);
+        let header_h = self.sheet_header_height(cx, look);
+        let h = (header_h + content + 32.0).min(size.y * 0.9);
         let r = rect(0.0, size.y - h, size.x, h);
         self.painter.outline(cx, r, look.p.surface0, look.p.border, 1.0, 16.0);
         self.st.ohits.push(r, OItem::Panel);
         self.sheet_header(cx, look, r, Header::plain(&t("contextWindow.title")));
-        self.context_details(cx, look, rect(16.0, r.pos.y + 48.0, width, 0.0), Details::SHEET, true);
+        self.context_details(cx, look, rect(16.0, r.pos.y + header_h, width, 0.0), Details::SHEET, true);
     }
 
     /// Consume dismissal before dispatching to the editor/search.

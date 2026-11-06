@@ -17,7 +17,7 @@ use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::{TabPlacement, UiContext, json as j, tr, tr_args};
 use crate::features::command_center::matching::highlight_ranges;
-use crate::shell::chrome::make_ui;
+use crate::shell::chrome::{make_ui, text_line_height};
 use crate::shell::commands::{self, ShellOverlay};
 use crate::shell::hosts::{self, Host, Status};
 use crate::shell::sheets::{Field, FieldEvent, Sheet, SheetFlow, SheetOps, SheetStyle, spinner};
@@ -590,12 +590,13 @@ impl Sheet for ArchiveSheet {
         ui.painter.paragraph(cx, dvec2(x + (w - title_w) * 0.5, y), title_w, title, &self.title());
         let by = y + title_h + 16.0;
         let bw = (w - 12.0) * 0.5;
+        let button_h = text_line_height(20.0, 14.0) + 32.0;
         let buttons = [
             ("cancel", tr("common.actions.cancel"), p.surface1, p.foreground, true),
             ("archive", tr("agentList.archiveSheet.archive"), p.primary, p.on_primary, !self.host_offline),
         ];
         for (i, (id, label, fill, text, enabled)) in buttons.into_iter().enumerate() {
-            let r = rect(x + i as f64 * (bw + 12.0), by, bw, 52.0);
+            let r = rect(x + i as f64 * (bw + 12.0), by, bw, button_h);
             ui.fill(cx, r, fill, 8.0);
             if interactive && enabled {
                 if ui.is_hover(id) || ui.is_pressed(id) {
@@ -606,7 +607,7 @@ impl Sheet for ArchiveSheet {
             let spec = ui.spec(Font::Medium, 14.0, with_alpha(text, if enabled { text.w } else { text.w * 0.5 }));
             ui.text_centered(cx, r, spec, &label);
         }
-        title_h + 16.0 + 52.0
+        title_h + 16.0 + button_h
     }
 
     fn click(&mut self, _cx: &mut Cx, id: &str, ops: &mut SheetOps) -> SheetFlow {
@@ -693,10 +694,13 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
     let p = ui.p;
     ui.fill(cx, area, p.surface0, 0.0);
     let mut y = area.pos.y;
+    let line_h = text_line_height(20.0, 14.0);
+    let small_h = text_line_height(16.0, 12.0);
+    let field_h = crate::theme::control_height(ControlSize::Sm);
 
     // `MenuHeader`: compact 12/8 insets and a 56px row, else a 36px bordered row.
     let title = tr("sessions.title");
-    let (row_y, row_h) = if compact { (y + 8.0, 56.0) } else { (y, 36.0) };
+    let (row_y, row_h) = if compact { (y + 8.0, 32.0 + text_line_height(24.0, 16.0)) } else { (y, 16.0 + line_h) };
     let extent = if compact { 32.0 } else { 26.0 };
     let island = rect(area.pos.x + 12.0, row_y + (row_h - extent) * 0.5, extent, extent);
     if ui.is_hover("hist:menu") || ui.is_pressed("hist:menu") {
@@ -729,14 +733,14 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
         let mut fx = x;
         if search_supported {
             let sw = w.min(420.0) - if host_count > 1 { 180.0 } else { 0.0 };
-            let r = rect(fx, y, sw.max(160.0), 34.0);
+            let r = rect(fx, y, sw.max(160.0), field_h + 2.0);
             ui.painter.outline(cx, r, p.surface1, p.border, 1.0, 6.0);
-            ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + 10.0, 14.0, 14.0), "search", 14.0, p.muted);
+            ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "search", 14.0, p.muted);
             let has_text = !page.search_field.text().is_empty();
             let field_w = r.size.x - 12.0 - 14.0 - 8.0 - if has_text { 30.0 } else { 12.0 };
-            page.search_field.draw(cx, scope, rect(r.pos.x + 34.0, r.pos.y + 1.0, field_w, 32.0));
+            page.search_field.draw(cx, scope, rect(r.pos.x + 34.0, r.pos.y + 1.0, field_w, field_h));
             if has_text {
-                let clear = rect(r.pos.x + r.size.x - 30.0, r.pos.y + 2.0, 30.0, 30.0);
+                let clear = rect(r.pos.x + r.size.x - 30.0, r.pos.y + (r.size.y - 30.0) * 0.5, 30.0, 30.0);
                 ui.icon(cx, rect(clear.pos.x + 8.0, clear.pos.y + 8.0, 14.0, 14.0), "x", 14.0, p.muted);
                 ui.hit_tip(clear, "hist:clear", &tr("sessions.actions.clearSearch"));
             }
@@ -747,30 +751,30 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             let label = host.map(|h| h.display_label()).unwrap_or_else(|| "All hosts".to_string());
             let spec = ui.spec(Font::Medium, 14.0, p.foreground);
             let lw = ui.measure(cx, spec, &label).min(180.0);
-            let r = rect(fx, y, 12.0 + 14.0 + 6.0 + lw + 6.0 + 14.0 + 12.0, 34.0);
+            let r = rect(fx, y, 12.0 + 14.0 + 6.0 + lw + 6.0 + 14.0 + 12.0, field_h + 2.0);
             let bg = if ui.is_pressed("hist:filter") { p.surface3 } else if ui.is_hover("hist:filter") { p.surface2 } else { p.surface1 };
             ui.painter.outline(cx, r, bg, p.border, 1.0, 6.0);
             match host {
                 Some(host) => {
                     let color = sidebar::status_color(&p, &host);
-                    ui.dot(cx, dvec2(r.pos.x + 12.0 + 7.0, r.pos.y + 17.0), 8.0, color);
+                    ui.dot(cx, dvec2(r.pos.x + 12.0 + 7.0, r.pos.y + r.size.y * 0.5), 8.0, color);
                 }
-                None => ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + 10.0, 14.0, 14.0), "server", 14.0, p.muted),
+                None => ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "server", 14.0, p.muted),
             }
-            ui.text(cx, rect(r.pos.x + 32.0, r.pos.y, lw, 34.0), spec, &label);
-            ui.icon(cx, rect(r.pos.x + 32.0 + lw + 6.0, r.pos.y + 10.0, 14.0, 14.0), "chevron-down", 14.0, p.muted);
+            ui.text(cx, rect(r.pos.x + 32.0, r.pos.y, lw, r.size.y), spec, &label);
+            ui.icon(cx, rect(r.pos.x + 32.0 + lw + 6.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "chevron-down", 14.0, p.muted);
             ui.hit(r, "hist:filter");
         }
-        y += 34.0;
+        y += field_h + 2.0;
     }
     if !page.host_errors.is_empty() {
         y += 12.0;
         let spec = ui.spec(Font::Regular, 12.0, argb(RED_300));
         let lines: Vec<String> = page.host_errors.iter().map(|(_, label)| tr_args("sessions.hostLoadFailed", &[("host", label)])).collect();
-        let h = 24.0 + lines.len() as f64 * 16.0 + (lines.len().saturating_sub(1)) as f64 * 4.0;
+        let h = 24.0 + lines.len() as f64 * small_h + (lines.len().saturating_sub(1)) as f64 * 4.0;
         ui.painter.outline(cx, rect(x, y, w, h), Vec4::default(), p.border, 1.0, 8.0);
         for (i, line) in lines.iter().enumerate() {
-            ui.text(cx, rect(x + 12.0, y + 12.0 + i as f64 * 20.0, w - 24.0, 16.0), spec, line);
+            ui.text(cx, rect(x + 12.0, y + 12.0 + i as f64 * (small_h + 4.0), w - 24.0, small_h), spec, line);
         }
         y += h;
     }
@@ -781,15 +785,15 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
     let empty_state = |ui: &mut Ui, cx: &mut Cx2d, text: &str, actions: &[(&str, &str, Option<&str>)]| {
         let tw = ui.painter.measure(cx, muted, text).x.min(body.size.x - 48.0);
         let th = ui.painter.paragraph_height(cx, tw.max(1.0), muted, text);
-        let total = th + actions.len() as f64 * (24.0 + 32.0);
+        let total = th + actions.len() as f64 * (24.0 + field_h);
         let mut cy = body.pos.y + ((body.size.y - total) * 0.5).max(24.0);
         ui.painter.paragraph(cx, dvec2(body.pos.x + (body.size.x - tw) * 0.5, cy), tw.max(1.0), muted, text);
         cy += th;
         for (id, label, icon) in actions {
             cy += 24.0;
             let bw = ui.button_width(cx, label, *icon, ControlSize::Sm);
-            ui.button(cx, rect(body.pos.x + (body.size.x - bw) * 0.5, cy, bw, 32.0), id, label, *icon, Variant::Ghost, ControlSize::Sm, true);
-            cy += 32.0;
+            ui.button(cx, rect(body.pos.x + (body.size.x - bw) * 0.5, cy, bw, field_h), id, label, *icon, Variant::Ghost, ControlSize::Sm, true);
+            cy += field_h;
         }
     };
     if page.initial_load {
@@ -825,8 +829,8 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             if rows.is_empty() {
                 continue;
             }
-            ui.text(cx, rect(lx + 12.0, ry + 8.0, lw - 24.0, 20.0), section_spec, &tr(&format!("agentList.dateSections.{key}")));
-            ry += 36.0 + 4.0;
+            ui.text(cx, rect(lx + 12.0, ry + 8.0, lw - 24.0, line_h), section_spec, &tr(&format!("agentList.dateSections.{key}")));
+            ry += line_h + 20.0;
             for (index, agent) in rows {
                 let host_label = hosts::host(&state, &agent.server_id).map(|h| h.display_label()).unwrap_or_else(|| agent.server_id.clone());
                 ry += session_row(&mut ui, cx, lx, ry, lw, index, agent, &host_label, &query, compact) + 4.0;
@@ -835,14 +839,14 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
         if page.search_truncated {
             ry += 16.0;
             let text = tr("sessions.tooManyMatches");
-            ui.text_centered(cx, rect(lx, ry, lw, 20.0), muted, &text);
-            ry += 20.0 + 16.0;
+            ui.text_centered(cx, rect(lx, ry, lw, line_h), muted, &text);
+            ry += line_h + 16.0;
         } else if !page.cursors.is_empty() {
             ry += 16.0;
             let label = if page.loading_more { "Loading...".to_string() } else { tr("sessions.actions.loadMore") };
             let bw = ui.button_width(cx, &label, None, ControlSize::Sm);
-            ui.button(cx, rect(lx + (lw - bw) * 0.5, ry, bw, 32.0), "hist:more", &label, None, Variant::Ghost, ControlSize::Sm, !page.loading_more);
-            ry += 32.0 + 16.0;
+            ui.button(cx, rect(lx + (lw - bw) * 0.5, ry, bw, field_h), "hist:more", &label, None, Variant::Ghost, ControlSize::Sm, !page.loading_more);
+            ry += field_h + 16.0;
         }
         ry += 24.0;
         ui.hits.set_clip(None);
@@ -868,7 +872,7 @@ fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize,
     let pending = j::array(agent, "pendingPermissions").len();
     let base = ui.spec(Font::Regular, 14.0, p.foreground);
     let muted = ui.spec(Font::Regular, 14.0, p.muted);
-    let line = 20.0;
+    let line = text_line_height(20.0, 14.0);
     let h = if compact { 8.0 + line * 3.0 + 2.0 + 8.0 } else { 8.0 + line + 8.0 };
     let r = rect(x, y, w, h);
     let id = format!("hist:row:{index}");
@@ -881,7 +885,7 @@ fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize,
     let inner_w = w - 24.0;
     let workspace_title = if workspace_name.is_empty() { project_name } else { workspace_name };
     let draw_agent_title = |ui: &mut Ui, cx: &mut Cx2d, ax: f64, ay: f64, aw: f64| {
-        ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(ax, ay + 3.0, 14.0, 14.0), j::text(agent, "provider"), None, p.muted);
+        ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(ax, ay + (line - 14.0) * 0.5, 14.0, 14.0), j::text(agent, "provider"), None, p.muted);
         highlighted(ui, cx, rect(ax + 22.0, ay, (aw - 22.0).max(0.0), line), muted, &title, query);
     };
     let badges = |ui: &mut Ui, cx: &mut Cx2d, mut bx: f64, by: f64| {
@@ -919,7 +923,7 @@ fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize,
         let ws_w = ui.measure(cx, base, workspace_title).min(320.0).min(title_w);
         highlighted(ui, cx, rect(cx0, ty, ws_w, line), base, workspace_title, query);
         let mut tx = cx0 + ws_w + 8.0;
-        ui.icon(cx, rect(tx, ty + 4.0, 12.0, 12.0), "chevron-right", 12.0, p.muted);
+        ui.icon(cx, rect(tx, ty + (line - 12.0) * 0.5, 12.0, 12.0), "chevron-right", 12.0, p.muted);
         tx += 12.0 + 8.0;
         let agent_w = (cx0 + title_w - tx - badges_w).max(0.0);
         draw_agent_title(ui, cx, tx, ty, agent_w);
@@ -1042,18 +1046,21 @@ impl Sheet for ImportSheet {
         let p = ui.p;
         let start = y;
         let mut y = y;
+        let line_h = text_line_height(20.0, 14.0);
+        let small_h = text_line_height(16.0, 12.0);
+        let button_h = crate::theme::control_height(ControlSize::Sm);
         // Subtitle: scope + "Show all", refresh on the right.
         let host_label = hosts::host(&self.state, &self.server_id).map(|h| h.display_label()).unwrap_or_else(|| self.server_id.clone());
         let scope_text = if self.scope_cwd.is_empty() { tr_args("importSession.scope.host", &[("host", &host_label)]) } else { tr("importSession.scope.workspace") };
         let small = ui.spec(Font::Regular, 12.0, p.muted);
-        let refresh = rect(x + w - 32.0, y - 4.0, 32.0, 32.0);
+        let refresh = rect(x + w - 32.0, y + (small_h + 8.0 - 32.0) * 0.5, 32.0, 32.0);
         let sw = ui.measure(cx, small, &scope_text).min(w - 40.0 - 90.0);
-        ui.text(cx, rect(x, y, sw, 24.0), small, &scope_text);
+        ui.text(cx, rect(x, y, sw, small_h + 8.0), small, &scope_text);
         if !self.scope_cwd.is_empty() {
             let label = tr("importSession.actions.showAll");
             let spec = ui.spec(Font::Medium, 12.0, p.accent);
             let lw = ui.measure(cx, spec, &label) + 16.0;
-            let r = rect(x + sw + 8.0, y + 2.0, lw, 20.0);
+            let r = rect(x + sw + 8.0, y + 2.0, lw, small_h + 4.0);
             ui.text_centered(cx, r, spec, &label);
             if interactive {
                 ui.hit(r, "showall".to_string());
@@ -1064,9 +1071,9 @@ impl Sheet for ImportSheet {
         } else {
             ui.icon_button(cx, refresh, if interactive { "refresh" } else { "" }, "rotate-cw", 16.0, 8.0, &tr("importSession.actions.refresh"));
         }
-        y += 24.0 + 8.0;
+        y += small_h + 16.0;
         // Search row.
-        let fh = if ui.compact { 44.0 } else { 32.0 };
+        let fh = button_h + if ui.compact { 12.0 } else { 0.0 };
         ui.icon(cx, rect(x, y + (fh - 16.0) * 0.5, 16.0, 16.0), "search", 16.0, p.muted);
         self.search.draw(cx, scope, rect(x + 24.0, y, w - 24.0, fh));
         y += fh + 12.0;
@@ -1076,27 +1083,27 @@ impl Sheet for ImportSheet {
             let label = self.provider.clone().unwrap_or_else(|| tr("importSession.filters.all"));
             let spec = ui.spec(Font::Medium, 14.0, p.foreground);
             let lw = ui.measure(cx, spec, &label);
-            let r = rect(x, y, 12.0 + 14.0 + 6.0 + lw + 6.0 + 14.0 + 12.0, 32.0);
+            let r = rect(x, y, 12.0 + 14.0 + 6.0 + lw + 6.0 + 14.0 + 12.0, button_h);
             ui.painter.outline(cx, r, p.surface1, p.border, 1.0, 6.0);
             match &self.provider {
                 Some(provider) => {
-                    ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(r.pos.x + 12.0, r.pos.y + 9.0, 14.0, 14.0), provider, None, p.muted);
+                    ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(r.pos.x + 12.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), provider, None, p.muted);
                 }
-                None => ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + 9.0, 14.0, 14.0), "layers", 14.0, p.muted),
+                None => ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "layers", 14.0, p.muted),
             }
-            ui.text(cx, rect(r.pos.x + 32.0, r.pos.y, lw, 32.0), spec, &label);
-            ui.icon(cx, rect(r.pos.x + 32.0 + lw + 6.0, r.pos.y + 9.0, 14.0, 14.0), "chevron-down", 14.0, p.muted);
+            ui.text(cx, rect(r.pos.x + 32.0, r.pos.y, lw, r.size.y), spec, &label);
+            ui.icon(cx, rect(r.pos.x + 32.0 + lw + 6.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "chevron-down", 14.0, p.muted);
             if interactive {
                 ui.hit_tip(r, "provider", "Filter by provider");
             }
             self.filter_rect = r;
-            y += 32.0 + 8.0;
+            y += button_h + 8.0;
         }
         if self.busy && self.entries.is_empty() {
             spinner(ui, cx, rect(x, y + 11.0, 14.0, 14.0), p.muted);
             let spec = ui.spec(Font::Regular, 14.0, p.muted);
-            ui.text(cx, rect(x + 22.0, y + 8.0, w - 22.0, 20.0), spec, &tr("importSession.status.loading"));
-            y += 36.0 + 4.0;
+            ui.text(cx, rect(x + 22.0, y + 8.0, w - 22.0, line_h), spec, &tr("importSession.status.loading"));
+            y += line_h + 20.0;
         }
         if let Some(error) = self.error.clone() {
             let spec = ui.spec(Font::Regular, 12.0, p.danger);
@@ -1121,9 +1128,9 @@ impl Sheet for ImportSheet {
             let body_w = w - 8.0 - 16.0 - 8.0 - 8.0 + 8.0;
             let preview_spec = ui.spec(Font::Regular, 14.0, p.muted);
             let preview_text = if preview.is_empty() { tr("importSession.preview.noPrompt") } else { preview };
-            let preview_h = ui.painter.paragraph_height(cx, body_w, preview_spec, &preview_text).min(40.0);
+            let preview_h = ui.painter.paragraph_height(cx, body_w, preview_spec, &preview_text).min(line_h * 2.0);
             let show_cwd = self.scope_cwd.is_empty() && !j::text(row, "cwd").is_empty();
-            let h = 8.0 + 20.0 + 4.0 + preview_h + if show_cwd { 4.0 + 16.0 } else { 0.0 } + 8.0;
+            let h = 8.0 + line_h + 4.0 + preview_h + if show_cwd { 4.0 + small_h } else { 0.0 } + 8.0;
             let r = rect(x - 8.0, y, w + 8.0, h);
             let id = format!("row:{i}");
             if interactive && !self.busy {
@@ -1141,15 +1148,15 @@ impl Sheet for ImportSheet {
             let time_w = ui.measure(cx, small, &time);
             let title_spec = ui.spec(Font::Regular, 14.0, p.foreground);
             let fitted = ui.painter.fit(cx, title_spec, &title, (body_w - time_w - 8.0).max(0.0));
-            ui.text(cx, rect(tx, r.pos.y + 8.0, body_w - time_w - 8.0, 20.0), title_spec, &fitted);
-            ui.text_right(cx, rect(tx + body_w - time_w, r.pos.y + 8.0, time_w, 20.0), small, &time);
+            ui.text(cx, rect(tx, r.pos.y + 8.0, body_w - time_w - 8.0, line_h), title_spec, &fitted);
+            ui.text_right(cx, rect(tx + body_w - time_w, r.pos.y + 8.0, time_w, line_h), small, &time);
             // Two lines of preview at most.
-            cx.begin_turtle(Walk::abs_rect(rect(tx, r.pos.y + 32.0, body_w, preview_h)), Layout { clip_x: true, clip_y: true, ..Layout::default() });
-            ui.painter.paragraph(cx, dvec2(tx, r.pos.y + 32.0), body_w, preview_spec, &preview_text);
+            cx.begin_turtle(Walk::abs_rect(rect(tx, r.pos.y + 12.0 + line_h, body_w, preview_h)), Layout { clip_x: true, clip_y: true, ..Layout::default() });
+            ui.painter.paragraph(cx, dvec2(tx, r.pos.y + 12.0 + line_h), body_w, preview_spec, &preview_text);
             cx.end_turtle();
             if show_cwd {
                 let fitted = ui.painter.fit(cx, small, j::text(row, "cwd"), body_w);
-                ui.text(cx, rect(tx, r.pos.y + 32.0 + preview_h + 4.0, body_w, 16.0), small, &fitted);
+                ui.text(cx, rect(tx, r.pos.y + 12.0 + line_h + preview_h + 4.0, body_w, small_h), small, &fitted);
             }
             y += h + 4.0;
         }
@@ -1157,8 +1164,8 @@ impl Sheet for ImportSheet {
             y += 8.0;
             let label = tr("importSession.actions.loadMore");
             let bw = ui.button_width(cx, &label, None, ControlSize::Sm);
-            ui.button(cx, rect(x + (w - bw) * 0.5, y, bw, 32.0), "more", &label, None, Variant::Ghost, ControlSize::Sm, interactive && !self.busy);
-            y += 32.0;
+            ui.button(cx, rect(x + (w - bw) * 0.5, y, bw, button_h), "more", &label, None, Variant::Ghost, ControlSize::Sm, interactive && !self.busy);
+            y += button_h;
         }
         if self.loaded && !self.busy && self.entries.is_empty() && self.error.is_none() {
             y += 32.0;
@@ -1166,8 +1173,8 @@ impl Sheet for ImportSheet {
             y += 28.0;
             let text = tr(if self.search.text().trim().is_empty() { "importSession.empty.noRecent" } else { "sessions.noMatches" });
             let spec = ui.spec(Font::Regular, 14.0, p.foreground);
-            ui.text_centered(cx, rect(x, y, w, 20.0), spec, &text);
-            y += 20.0 + 32.0;
+            ui.text_centered(cx, rect(x, y, w, line_h), spec, &text);
+            y += line_h + 32.0;
         }
         if self.filter_open && providers.len() > 1 {
             self.draw_provider_menu(cx, ui, &providers, interactive);
@@ -1338,7 +1345,8 @@ impl ImportSheet {
             .fold(0.0, f64::max);
         let width = ((natural / 56.0).ceil() * 56.0).clamp(112.0, 280.0);
         let anchor = self.filter_rect;
-        let list = rect(anchor.pos.x, anchor.pos.y, width, 8.0 + options.len() as f64 * 36.0 + 8.0);
+        let row_h = text_line_height(20.0, 14.0) + 16.0;
+        let list = rect(anchor.pos.x, anchor.pos.y, width, 8.0 + options.len() as f64 * row_h + 8.0);
         if interactive {
             ui.hit(rect(-1.0e5, -1.0e5, 2.0e5, 2.0e5), "pick:dismiss");
         }
@@ -1346,17 +1354,17 @@ impl ImportSheet {
         ui.fill(cx, rect(list.pos.x - 1.0, list.pos.y + 2.0, list.size.x + 2.0, list.size.y + 3.0), argb(0x14000000), 6.0);
         ui.fill(cx, list, p.surface2, 4.0);
         for (i, (value, label)) in options.iter().enumerate() {
-            let row = rect(list.pos.x, list.pos.y + 8.0 + i as f64 * 36.0, list.size.x, 36.0);
+            let row = rect(list.pos.x, list.pos.y + 8.0 + i as f64 * row_h, list.size.x, row_h);
             let id = format!("pick:{i}");
             if ui.is_hover(&id) || ui.is_pressed(&id) {
                 ui.fill(cx, row, with_alpha(p.foreground, if ui.is_pressed(&id) { 0.1 } else { 0.08 }), 0.0);
             }
             let mut lx = row.pos.x + 12.0;
             if !value.is_empty() {
-                ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(lx, row.pos.y + 11.0, 14.0, 14.0), value, None, p.muted);
+                ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(lx, row.pos.y + (row_h - 14.0) * 0.5, 14.0, 14.0), value, None, p.muted);
                 lx += 14.0 + 8.0;
             }
-            ui.text(cx, rect(lx, row.pos.y, row.size.x - (lx - row.pos.x) - 12.0, 36.0), spec, label);
+            ui.text(cx, rect(lx, row.pos.y, row.size.x - (lx - row.pos.x) - 12.0, row_h), spec, label);
             if interactive {
                 ui.hit(row, id);
             }

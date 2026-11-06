@@ -686,12 +686,13 @@ impl<P> OverlayHost<P> {
         let list = rect(card.pos.x, top + header, card.size.x, list_height.min(card.pos.y + card.size.y - top - header));
         let rows = changed_tree_rows(&files, &collapsed);
         self.list_rect = list;
-        self.content_height = 8.0 + rows.len() as f64 * TREE_ROW_HEIGHT + 32.0;
+        let row_height = TREE_ROW_HEIGHT.max(paint.measure(cx, Font::Regular, ui(14.0), "Ag").y + 8.0);
+        self.content_height = 8.0 + rows.len() as f64 * row_height + 32.0;
         self.scroll = self.scroll.clamp(0.0, (self.content_height - list.size.y).max(0.0));
         paint.begin_clip(cx, list);
         let mut pending = false;
         for (index, row) in rows.iter().enumerate() {
-            let band = rect(list.pos.x + 12.0, list.pos.y + 8.0 + index as f64 * TREE_ROW_HEIGHT - self.scroll, list.size.x - 12.0 - 24.0, TREE_ROW_HEIGHT);
+            let band = rect(list.pos.x + 12.0, list.pos.y + 8.0 + index as f64 * row_height - self.scroll, list.size.x - 12.0 - 24.0, row_height);
             if band.pos.y + band.size.y < list.pos.y || band.pos.y > list.pos.y + list.size.y {
                 continue;
             }

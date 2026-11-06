@@ -1592,7 +1592,7 @@ impl ChangesView {
     /// Original `ChangedFilesTree`.
     fn draw_tree(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect, bottom_padding: f64) {
         let rows = changed_tree_rows(&self.controller.files, &self.collapsed_folders);
-        let row_height = TREE_ROW_HEIGHT;
+        let row_height = TREE_ROW_HEIGHT.max(paint.measure(cx, Font::Regular, ui_px(14.0), "Ag").y + 8.0);
         self.tree_area = area;
         self.tree_content = rows.len() as f64 * row_height + bottom_padding;
         self.tree_scroll = self.tree_scroll.clamp(0.0, (self.tree_content - area.size.y).max(0.0));
@@ -1628,13 +1628,14 @@ impl ChangesView {
             return header + 1.0;
         }
         let commits = self.workspace_commits();
+        let row_h = 28.0_f64.max(ui_px(14.0) * 1.4 + 8.0);
         // Error row (8 + 16 + 8) and loading spinner row (4 + 20 + 8) are both 32px.
         let content = if self.controller.commits_error.is_some() || (self.controller.commits_loading && commits.is_empty()) {
-            32.0
+            32.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4
         } else if commits.is_empty() {
-            4.0 + 16.0 + 8.0
+            28.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4
         } else {
-            (commits.len() as f64 * 28.0 + 4.0).min(window_height * 0.3)
+            (commits.len() as f64 * row_h + 4.0).min(window_height * 0.3)
         };
         header + content + 1.0
     }
@@ -1689,45 +1690,46 @@ impl ChangesView {
             return;
         }
         self.commits_area = content;
-        self.commits_content = commits.len() as f64 * 28.0 + 4.0;
+        let row_h = 28.0_f64.max(ui_px(14.0) * 1.4 + 8.0);
+        self.commits_content = commits.len() as f64 * row_h + 4.0;
         self.commits_scroll = self.commits_scroll.clamp(0.0, (self.commits_content - content.size.y).max(0.0));
         paint.begin_clip(cx, content);
         let now = now_ms();
         let count = commits.len();
         for (index, commit) in commits.iter().enumerate() {
-            let top = content.pos.y + index as f64 * 28.0 - self.commits_scroll;
-            if top + 28.0 < content.pos.y || top > content.pos.y + content.size.y {
+            let top = content.pos.y + index as f64 * row_h - self.commits_scroll;
+            if top + row_h < content.pos.y || top > content.pos.y + content.size.y {
                 continue;
             }
-            let band = rect(content.pos.x, top, content.size.x, 28.0);
+            let band = rect(content.pos.x, top, content.size.x, row_h);
             let sha = text(commit, "sha").to_owned();
             let hit = Hit::Commit(sha);
             if self.is_hovered(&hit) {
                 paint.fill(cx, band, colors.sidebar_hover);
             }
-            let center_y = top + 14.0;
+            let center_y = top + row_h / 2.0;
             // Original `CommitGraphNode`: rail, ring, filled once pushed.
             let rail = if flag(commit, "isOnBase") { colors.muted } else { colors.accent };
             let node_x = band.pos.x + 8.0 + 4.0;
             if count > 1 {
                 if index > 0 {
-                    paint.fill(cx, rect(node_x - 1.0, top, 2.0, 14.0), rail);
+                    paint.fill(cx, rect(node_x - 1.0, top, 2.0, row_h / 2.0), rail);
                 }
                 if index + 1 < count {
-                    paint.fill(cx, rect(node_x - 1.0, center_y, 2.0, 14.0), rail);
+                    paint.fill(cx, rect(node_x - 1.0, center_y, 2.0, row_h / 2.0), rail);
                 }
             }
             let fill = if flag(commit, "isOnRemote") { rail } else { colors.surface0 };
             paint.rounded(cx, rect(node_x - 4.0, center_y - 4.0, 8.0, 8.0), fill, 4.0, Some((rail, 2.0)));
             let mut x = band.pos.x + 8.0 + 8.0 + 8.0;
-            paint.text_centered(cx, Font::Mono, small, colors.muted, x, top, 28.0, text(commit, "shortSha"), 70.0);
+            paint.text_centered(cx, Font::Mono, small, colors.muted, x, top, row_h, text(commit, "shortSha"), 70.0);
             x += 70.0 + 4.0;
             let age = parse_iso8601_ms(text(commit, "authorDate")).map(|date| commit_time_ago(date, now)).unwrap_or_default();
             let caret_x = band.pos.x + band.size.x - 8.0 - 16.0;
             let age_width = paint.measure(cx, Font::Regular, small, &age).x;
-            paint.text_centered(cx, Font::Regular, small, colors.muted, caret_x - 8.0 - age_width, top, 28.0, &age, age_width + 1.0);
+            paint.text_centered(cx, Font::Regular, small, colors.muted, caret_x - 8.0 - age_width, top, row_h, &age, age_width + 1.0);
             paint.icon(cx, "chevron-right", 14.0, colors.muted, dvec2(caret_x + 8.0, center_y));
-            paint.text_centered(cx, Font::Regular, ui_px(14.0), colors.foreground, x, top, 28.0, text(commit, "subject"), (caret_x - 8.0 - age_width - 8.0 - x).max(0.0));
+            paint.text_centered(cx, Font::Regular, ui_px(14.0), colors.foreground, x, top, row_h, text(commit, "subject"), (caret_x - 8.0 - age_width - 8.0 - x).max(0.0));
             self.hits.push_clipped(band, content, hit);
         }
         paint.end_clip(cx);
@@ -1835,15 +1837,16 @@ impl ChangesView {
         let status = self.controller.status.clone();
         let is_git = status.as_ref().is_some_and(|s| flag(s, "isGit"));
         let mut y = area.pos.y;
+        let toolbar_h = TOOLBAR_HEIGHT.max(ui_px(14.0) * 1.4 + 12.0);
         if is_git || self.controller.is_commit {
             if presentation == Presentation::Diff {
-                self.diff_only_toolbar(cx, ui, store, paint, rect(area.pos.x, y, area.size.x, TOOLBAR_HEIGHT), compact, &prefs);
-                y += TOOLBAR_HEIGHT;
+                self.diff_only_toolbar(cx, ui, store, paint, rect(area.pos.x, y, area.size.x, toolbar_h), compact, &prefs);
+                y += toolbar_h;
             } else {
-                self.repository_toolbar(cx, ui, store, paint, rect(area.pos.x, y, area.size.x, TOOLBAR_HEIGHT), presentation == Presentation::Tree, compact);
-                y += TOOLBAR_HEIGHT;
-                self.comparison_toolbar(cx, ui, store, paint, rect(area.pos.x, y, area.size.x, TOOLBAR_HEIGHT), presentation, compact);
-                y += TOOLBAR_HEIGHT;
+                self.repository_toolbar(cx, ui, store, paint, rect(area.pos.x, y, area.size.x, toolbar_h), presentation == Presentation::Tree, compact);
+                y += toolbar_h;
+                self.comparison_toolbar(cx, ui, store, paint, rect(area.pos.x, y, area.size.x, toolbar_h), presentation, compact);
+                y += toolbar_h;
             }
         }
         let payload = store.checkout(self.host(), self.cwd()).and_then(|s| s.pr_payload.clone());

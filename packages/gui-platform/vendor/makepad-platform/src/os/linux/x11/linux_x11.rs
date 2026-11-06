@@ -339,8 +339,6 @@ impl Cx {
                         window.xlib_window.set_position(size);
                     }
                 },
-                CxOsOp::ShowClipboardActions(_) =>{
-                },
                 CxOsOp::CopyToClipboard(content) => {
                     if let Some(window) = opengl_windows.get(0) {
                         unsafe {

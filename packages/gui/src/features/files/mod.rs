@@ -220,6 +220,9 @@ impl FilesPanel {
         }
         let owner_changed = self.target.as_ref().is_some_and(|old| old.tab_key != target.tab_key);
         if owner_changed {
+            if let Some(file) = self.file.as_mut() {
+                file.release_focus(cx);
+            }
             if let Some(old) = self.target.take() {
                 store::release(&old.tab_key);
             }
@@ -241,7 +244,7 @@ impl FilesPanel {
                 self.explorer = None;
                 let uid = self.widget_uid();
                 let file = self.file.get_or_insert_with(|| FileView::new(&target.tab_key, uid));
-                file.set_target(FileTarget {
+                file.set_target(cx, FileTarget {
                     host_id: target.host_id.clone(),
                     workspace_id: target.workspace_id.clone(),
                     cwd: target.cwd.clone(),
@@ -332,6 +335,9 @@ impl FilesPanelRef {
         if let Some(mut inner) = self.borrow_mut()
             && inner.visible != visible {
                 inner.visible = visible;
+                if !visible && let Some(file) = inner.file.as_mut() {
+                    file.release_focus(cx);
+                }
                 inner.next_frame = cx.new_next_frame();
                 inner.area.redraw(cx);
             }

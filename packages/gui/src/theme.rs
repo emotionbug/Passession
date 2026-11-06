@@ -197,12 +197,20 @@ pub struct Typography {
     pub code_font_size: f64,
     pub content_max_width: f64,
     pub mobile: bool,
+    authored_ui_base_font_size: f64,
+    system_text_scale: paseo_gui_platform::appearance::TextScale,
 }
 
 impl Typography {
+    /// Scale a text-only metric (for example an authored fixed line height),
+    /// without changing spacing, display density, or app font preferences.
+    pub fn system_size(&self, authored_px: f64) -> f64 {
+        self.system_text_scale.logical_size(authored_px)
+    }
+
     /// `uiSize`: an authored size at the 14px base, scaled by `uiBaseFontSize`.
     pub fn ui_size(&self, authored_px: f64) -> f64 {
-        (authored_px * self.ui_base_font_size / 14.0).round()
+        self.system_text_scale.logical_size((authored_px * self.authored_ui_base_font_size / 14.0).round())
     }
 
     /// Logical pixels to a Makepad `font_size` (points at 96 dpi).
@@ -228,11 +236,15 @@ pub enum ControlSize {
 }
 
 pub fn control_height(size: ControlSize) -> f64 {
-    match size {
-        ControlSize::Xs => 28.0,
-        ControlSize::Sm => 32.0,
-        ControlSize::Md | ControlSize::Lg => 44.0,
-    }
+    let (height, font) = match size {
+        ControlSize::Xs => (28.0, 12.0),
+        ControlSize::Sm => (32.0, 14.0),
+        ControlSize::Md | ControlSize::Lg => (44.0, 14.0),
+    };
+    let typography = current_typography();
+    // Grow only for the extra text height, not the display-density scale.
+    let authored = (font * typography.authored_ui_base_font_size / 14.0).round();
+    height + (typography.ui_size(font) - authored).max(0.0) * 1.5
 }
 
 pub fn control_icon_size(size: ControlSize) -> f64 {
@@ -455,12 +467,23 @@ fn clamp_pref(preferences: &Value, key: &str, fallback: f64, min: f64, max: f64)
 
 /// `paseoTheme` typography (mobile defaults 15/16).
 pub fn typography_for(preferences: &Value, mobile: bool) -> Typography {
+    typography_with_text_scale(preferences, mobile, paseo_gui_platform::appearance::TextScale::default())
+}
+
+fn typography_with_text_scale(
+    preferences: &Value,
+    mobile: bool,
+    system_text_scale: paseo_gui_platform::appearance::TextScale,
+) -> Typography {
+    let ui_base = clamp_pref(preferences, "uiBaseFontSize", if mobile { 15.0 } else { 14.0 }, 10.0, 21.0);
     Typography {
-        ui_base_font_size: clamp_pref(preferences, "uiBaseFontSize", if mobile { 15.0 } else { 14.0 }, 10.0, 21.0),
-        content_font_size: clamp_pref(preferences, "contentFontSize", if mobile { 16.0 } else { 15.0 }, 10.0, 21.0),
-        code_font_size: clamp_pref(preferences, "codeFontSize", 12.0, 9.0, 22.0),
+        ui_base_font_size: system_text_scale.logical_size(ui_base),
+        content_font_size: system_text_scale.logical_size(clamp_pref(preferences, "contentFontSize", if mobile { 16.0 } else { 15.0 }, 10.0, 21.0)),
+        code_font_size: system_text_scale.logical_size(clamp_pref(preferences, "codeFontSize", 12.0, 9.0, 22.0)),
         content_max_width: clamp_pref(preferences, "contentMaxWidth", 820.0, 600.0, 4000.0),
         mobile,
+        authored_ui_base_font_size: ui_base,
+        system_text_scale,
     }
 }
 
@@ -483,9 +506,17 @@ thread_local! {
 
 /// Shell entry point: recomputes the palette and typography; returns whether anything changed.
 pub fn update(preferences: &Value, system_dark: bool) -> bool {
+    update_with_text_scale(preferences, system_dark, paseo_gui_platform::appearance::system_text_scale())
+}
+
+fn update_with_text_scale(
+    preferences: &Value,
+    system_dark: bool,
+    text_scale: paseo_gui_platform::appearance::TextScale,
+) -> bool {
     let dark = theme_mode(preferences).unwrap_or(system_dark);
     let palette = palette_for(preferences, dark);
-    let typography = typography_for(preferences, MOBILE);
+    let typography = typography_with_text_scale(preferences, MOBILE, text_scale);
     // Stock Makepad scrollbar DSL colors are dark-only. Keep every desktop
     // scrollbar (including nested PortalLists) on the same runtime palette.
     makepad_widgets::scroll_bar::set_desktop_scroll_bar_color(palette.foreground);
@@ -531,5 +562,48 @@ pub fn apply_if_changed(
     if *seen_epoch != now {
         *seen_epoch = now;
         apply(&current_palette(), &current_typography());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paseo_gui_platform::appearance::TextScale;
+    use serde_json::json;
+
+    fn enlarged_text() -> TextScale {
+        TextScale::from_dp([0.0, 16.0, 20.0, 24.0, 28.0, 34.0, 36.0, 40.0, 46.0, 116.0])
+    }
+
+    #[test]
+    fn system_text_scale_preserves_app_preferences_and_layout_width() {
+        let preferences = json!({"uiBaseFontSize": 18, "contentFontSize": 20, "codeFontSize": 10, "contentMaxWidth": 900});
+        let normal = typography_with_text_scale(&preferences, true, TextScale::default());
+        let enlarged = typography_with_text_scale(&preferences, true, enlarged_text());
+        assert_eq!(enlarged.ui_size(14.0), enlarged_text().logical_size(normal.ui_size(14.0)));
+        assert_eq!(enlarged.ui_size(12.0), enlarged_text().logical_size(normal.ui_size(12.0)));
+        assert_eq!(enlarged.content_font_size, 36.0);
+        assert_eq!(enlarged.code_font_size, 20.0);
+        assert_eq!(enlarged.content_max_width, normal.content_max_width);
+        assert_eq!(Typography::pt(enlarged.content_font_size), 27.0);
+        let clamped = typography_with_text_scale(&json!({"contentFontSize": 200}), true, enlarged_text());
+        assert_eq!(clamped.content_font_size, enlarged_text().logical_size(21.0));
+    }
+
+    #[test]
+    fn system_text_scale_invalidates_once_and_restores_metrics() {
+        let preferences = json!({"theme": "light", "uiBaseFontSize": 17});
+        update_with_text_scale(&preferences, false, TextScale::default());
+        let normal = current_typography();
+        let original_epoch = epoch();
+        let original_height = control_height(ControlSize::Sm);
+        assert!(update_with_text_scale(&preferences, false, enlarged_text()));
+        assert_eq!(epoch(), original_epoch + 1);
+        assert!(control_height(ControlSize::Sm) > original_height);
+        assert!(!update_with_text_scale(&preferences, false, enlarged_text()));
+        assert_eq!(epoch(), original_epoch + 1);
+        assert!(update_with_text_scale(&preferences, false, TextScale::default()));
+        assert_eq!(current_typography(), normal);
+        assert_eq!(control_height(ControlSize::Sm), original_height);
     }
 }

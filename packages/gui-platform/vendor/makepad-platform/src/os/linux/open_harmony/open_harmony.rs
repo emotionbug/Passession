@@ -200,6 +200,7 @@ impl Cx {
                 let e = Event::TouchUpdate(
                     TouchUpdateEvent {
                         time,
+                        cancelled: false,
                         window_id: CxWindowPool::id_zero(),
                         touches,
                         modifiers: Default::default()

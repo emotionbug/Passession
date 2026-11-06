@@ -301,6 +301,11 @@ pub fn draw_bar(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, model: &Trac
     out
 }
 
+fn subagent_row_height(compact: bool, text_height: f64) -> f64 {
+    let (minimum, padding): (f64, f64) = if compact { (40.0, 16.0) } else { (32.0, 8.0) };
+    minimum.max(text_height + padding)
+}
+
 /// Panel rows (ComposerTrackRow): returns the content height.
 #[allow(clippy::too_many_arguments)]
 fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut DrawIcon, model: &TrackModel, panel: TrackPanel, x: f64, y: f64, w: f64) -> f64 {
@@ -351,19 +356,25 @@ fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut Dra
                 let key = row.key();
                 let open_id = format!("subagent-open:{key}");
                 let hovered_row = d.state.hover_hit.as_deref().is_some_and(|h| h.ends_with(&key));
-                let facts: Vec<String> = if row.paseo {
-                    let mut lines = Vec::new();
-                    if row.server_id != model.host_id {
-                        lines.push((model.host_label)(&row.server_id));
-                    }
-                    if let Some(f) = facts_line(model.providers, &row.agent) {
-                        lines.push(f);
-                    }
-                    lines
+                let actions_w = if row.paseo { if model.can_detach { 64.0 } else { 32.0 } } else { 0.0 };
+                let text_w = (w - 8.0 - 38.0 - actions_w).max(20.0);
+                let label = row.label().unwrap_or_else(|| t("common.states.loading"));
+                let title = d.kit.layout_clamped(cx, Font::Regular, base, 1.4, &label, text_w, 1);
+                let facts = if row.paseo {
+                    [
+                        (row.server_id != model.host_id).then(|| (model.host_label)(&row.server_id)),
+                        facts_line(model.providers, &row.agent),
+                    ]
                 } else {
-                    row.row_subtitle().into_iter().collect()
+                    [row.row_subtitle(), None]
                 };
-                let h = row_h.max(base * 1.4 + facts.len() as f64 * small * 1.4 + if compact { 16.0 } else { 8.0 });
+                let facts = facts.each_ref().map(|line| {
+                    line.as_ref().map(|line| d.kit.layout_clamped(cx, Font::Regular, small, 1.4, line, text_w, 1))
+                });
+                // Fallback fonts can exceed the requested line-height ratio. Use the
+                // same layouts for measurement and painting, including the dry pass.
+                let text_h = laidout_size(&title).y + facts.iter().flatten().map(|line| laidout_size(line).y).sum::<f64>();
+                let h = subagent_row_height(compact, text_h);
                 let r = rect_xywh(x + 4.0, cy, w - 8.0, h);
                 if hovered_row {
                     d.kit.rect(cx, r, p.surface2, 6.0);
@@ -378,17 +389,14 @@ fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut Dra
                     }
                 }
                 let actions_visible = compact || d.look.mobile || hovered_row;
-                let actions_w = if row.paseo { if model.can_detach { 64.0 } else { 32.0 } } else { 0.0 };
                 let text_x = r.pos.x + 30.0;
-                let text_w = (r.size.x - 38.0 - actions_w).max(20.0);
-                let label = row.label().unwrap_or_else(|| t("common.states.loading"));
                 cx.begin_turtle(Walk { abs_pos: Some(dvec2(text_x, cy)), margin: Margin::default(), width: Size::Fixed(text_w), height: Size::Fixed(h) }, Layout::default());
-                let mut ty = cy + (h - (base * 1.4 + facts.len() as f64 * small * 1.4)) * 0.5;
-                d.kit.label_line(cx, Font::Regular, base, 1.4, p.foreground, dvec2(text_x, ty), &label, text_w);
-                ty += base * 1.4;
-                for line in &facts {
-                    d.kit.label_line(cx, Font::Regular, small, 1.4, p.muted, dvec2(text_x, ty), line, text_w);
-                    ty += small * 1.4;
+                let mut ty = cy + (h - text_h) * 0.5;
+                d.kit.draw_laidout(cx, Font::Regular, p.foreground, dvec2(text_x, ty), &title);
+                ty += laidout_size(&title).y;
+                for line in facts.iter().flatten() {
+                    d.kit.draw_laidout(cx, Font::Regular, p.muted, dvec2(text_x, ty), line);
+                    ty += laidout_size(line).y;
                 }
                 cx.end_turtle();
                 if row.paseo && actions_visible {
@@ -484,5 +492,39 @@ pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut
     cx.end_turtle();
     if max_y > 0.0 {
         d.canvas.add_hit(r, HitTarget::ScrollY(key));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{row_label, subagent_row_height};
+
+    #[test]
+    fn subagent_rows_contain_measured_text_and_action_targets_at_every_scale() {
+        for compact in [false, true] {
+            for scale in [1.0, 1.5, 2.0] {
+                // Include fallback-font metrics larger than size * requested height,
+                // no facts, provider facts, and host + provider facts.
+                for heights in [[23.0, 0.0, 0.0], [23.0, 21.0, 0.0], [23.0, 21.0, 24.0], [0.0; 3]] {
+                    let text_height = heights.iter().sum::<f64>() * scale;
+                    let row_height = subagent_row_height(compact, text_height);
+                    let top = (row_height - text_height) * 0.5;
+                    assert!(top >= if compact { 8.0 } else { 4.0 });
+                    assert!(top + text_height <= row_height);
+                    assert!(row_height >= 28.0);
+                    let action_top = (row_height - 28.0) * 0.5;
+                    assert!(action_top >= 0.0 && action_top + 28.0 <= row_height);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_titles_keep_multiline_content_and_reject_empty_placeholders() {
+        for title in [None, Some(""), Some(" \r\n\u{2028} "), Some("New Agent")] {
+            assert_eq!(row_label(title), None);
+        }
+        assert_eq!(row_label(Some("# Target\npackages/한글")), Some("# Target\npackages/한글".to_owned()));
+        assert_eq!(row_label(Some("  긴 Korean / English title  ")), Some("긴 Korean / English title".to_owned()));
     }
 }

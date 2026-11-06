@@ -30,6 +30,9 @@ pub struct TextField {
     ime_id: u64,
     ime_area: Area,
     ime_caret_area: Area,
+    show_actions: bool,
+    selection_invalidated: bool,
+    owns_selection: bool,
 }
 
 impl TextField {
@@ -37,7 +40,7 @@ impl TextField {
         let mut buffer = TextBuffer::new(text.replace('\n', " "));
         let len = buffer.len();
         buffer.set_selection(Selection::caret(len));
-        TextField { buffer, focused: false, blink: super::Blink::default(), scroll_x: 0.0, text_rect: Rect::default(), font_size: 14.0, drag_anchor: None, ime_id: LiveId::unique().0, ime_area: Area::Empty, ime_caret_area: Area::Empty }
+        TextField { buffer, focused: false, blink: super::Blink::default(), scroll_x: 0.0, text_rect: Rect::default(), font_size: 14.0, drag_anchor: None, ime_id: LiveId::unique().0, ime_area: Area::Empty, ime_caret_area: Area::Empty, show_actions: false, selection_invalidated: false, owns_selection: false }
     }
 
     pub fn text(&self) -> &str {
@@ -48,11 +51,25 @@ impl TextField {
         self.buffer.set_text(text.replace('\n', " "));
         let len = self.buffer.len();
         self.buffer.set_selection(Selection::caret(len));
+        self.drag_anchor = None;
+        self.show_actions = false;
+        self.selection_invalidated = true;
     }
 
     pub fn select_all(&mut self) {
         let len = self.buffer.len();
         self.buffer.set_selection(Selection { anchor: 0, head: len });
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Cx) {
+        if self.owns_selection {
+            cx.clear_text_selection(self.ime_area);
+        }
+        self.owns_selection = false;
+        self.buffer.set_selection(Selection::caret(self.buffer.selection.head));
+        self.drag_anchor = None;
+        self.show_actions = false;
+        self.selection_invalidated = false;
     }
 
     /// Draws the field in `frame` with `placeholder` and an optional trailing status.
@@ -69,6 +86,13 @@ impl TextField {
         p: &Palette,
         ime_area: Area,
     ) {
+        if self.selection_invalidated {
+            if self.owns_selection {
+                cx.clear_text_selection(self.ime_area);
+            }
+            self.owns_selection = false;
+            self.selection_invalidated = false;
+        }
         self.font_size = font_size;
         self.ime_area = ime_area;
         let border = if self.focused { p.border_accent } else { p.surface2 };
@@ -123,6 +147,21 @@ impl TextField {
             self.blink.disarm(cx);
         }
         cx.end_turtle();
+        if self.focused && (self.show_actions || (self.owns_selection && cx.text_actions_active(self.ime_area))) {
+            self.show_actions = false;
+            let a = x_of(sel.start());
+            let b = x_of(sel.end());
+            let anchor = rect(x0 + a, y, (b - a).max(1.5), h.max(font_size * 1.2))
+                .clip((text_rect.pos, text_rect.pos + text_rect.size));
+            if anchor.size.x > 0.0 && anchor.size.y > 0.0 {
+                cx.show_text_actions(self.ime_area, anchor, TextActionCapabilities {
+                    copy: !sel.is_empty(), cut: !sel.is_empty(), paste: true, select_all: !self.buffer.is_empty(),
+                });
+            } else {
+                cx.clear_text_selection(self.ime_area);
+                cx.claim_text_selection(self.ime_area);
+            }
+        }
     }
 
     fn index_at(&self, cx: &mut Cx, kit: &mut Kit, abs: DVec2) -> usize {
@@ -133,10 +172,19 @@ impl TextField {
     }
 
     pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, hit: &Hit) -> FieldEvent {
+        if self.selection_invalidated {
+            if self.owns_selection {
+                cx.clear_text_selection(self.ime_area);
+            }
+            self.owns_selection = false;
+            self.selection_invalidated = false;
+        }
         let (revision, selection) = (self.buffer.revision, self.buffer.selection);
         let mut event = FieldEvent::None;
         match hit {
             Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
+                cx.claim_text_selection(self.ime_area);
+                self.owns_selection = true;
                 let index = self.index_at(cx, kit, fe.abs);
                 match fe.tap_count {
                     2 => {
@@ -146,7 +194,15 @@ impl TextField {
                     3 => self.select_all(),
                     _ => self.buffer.move_head(index, fe.modifiers.shift),
                 }
-                self.drag_anchor = Some(self.buffer.selection.anchor);
+                self.drag_anchor = (!fe.device.is_touch()).then_some(self.buffer.selection.anchor);
+            }
+            Hit::FingerLongPress(fe) => {
+                cx.claim_text_selection(self.ime_area);
+                self.owns_selection = true;
+                let index = self.index_at(cx, kit, fe.abs);
+                let (a, b) = self.buffer.word_at(index);
+                self.buffer.set_selection(Selection { anchor: a, head: b });
+                self.drag_anchor = Some(a);
             }
             Hit::FingerMove(fe) => {
                 if let Some(anchor) = self.drag_anchor {
@@ -154,7 +210,12 @@ impl TextField {
                     self.buffer.set_selection(Selection { anchor, head: index });
                 }
             }
-            Hit::FingerUp(_) => self.drag_anchor = None,
+            Hit::FingerUp(fe) => {
+                if cfg!(target_os = "android") && fe.device.is_touch() && self.drag_anchor.is_some() {
+                    self.show_actions = true;
+                }
+                self.drag_anchor = None;
+            }
             Hit::KeyDown(ke) => {
                 let m = ke.modifiers;
                 let word = if cfg!(target_vendor = "apple") { m.alt } else { m.control };
@@ -200,7 +261,15 @@ impl TextField {
                     self.buffer.insert("", EditKind::Other);
                 }
             }
+            Hit::KeyFocusLost(_) => {
+                self.focused = false;
+                self.clear_selection(cx);
+            }
             _ => {}
+        }
+        if self.buffer.selection != selection && !self.buffer.selection.is_empty() {
+            cx.claim_text_selection(self.ime_area);
+            self.owns_selection = true;
         }
         if self.buffer.revision != revision {
             event = FieldEvent::Changed;

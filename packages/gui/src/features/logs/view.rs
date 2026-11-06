@@ -122,6 +122,10 @@ pub struct WaLogView {
     hit_origin: DVec2,
     #[rust]
     viewport: DVec2,
+    #[rust]
+    show_actions: bool,
+    #[rust]
+    action_anchor: Option<Rect>,
 }
 
 impl WaLogView {
@@ -278,10 +282,16 @@ impl WaLogView {
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
             if row >= start.row && row <= end.row && start != end {
                 let from = if row == start.row { start.col } else { 0 };
-                let to = if row == end.row { end.col } else { col.max(1) };
+                let to = if row == end.row { end.col.min(col.max(1)) } else { col.max(1) };
                 if to > from {
                     self.draw_cell.color = if palette.is_dark { vec4(1.0, 1.0, 1.0, 0.2) } else { vec4(0.0, 0.0, 0.0, 0.15) };
                     self.draw_cell.draw_abs(cx, Rect { pos: dvec2(origin.x + from as f64 * width, y), size: dvec2((to - from) as f64 * width, height) });
+                    let viewport = self.draw_hit.area().rect(cx);
+                    let visible = Rect { pos: dvec2(origin.x + from as f64 * width, y), size: dvec2((to - from) as f64 * width, height) }
+                        .clip((viewport.pos, viewport.pos + viewport.size));
+                    if self.action_anchor.is_none() && visible.size.x > 0.0 && visible.size.y > 0.0 {
+                        self.action_anchor = Some(visible);
+                    }
                 }
             }
         }
@@ -331,6 +341,10 @@ impl WaLogView {
     }
 
     pub fn clear_selection(&mut self, cx: &mut Cx) {
+        cx.clear_text_selection(self.draw_hit.area());
+        self.dragging = false;
+        self.show_actions = false;
+        self.action_anchor = None;
         self.selection = None;
         self.redraw(cx);
     }
@@ -343,15 +357,17 @@ impl Widget for WaLogView {
         self.scroll_bars.handle_main_event(cx, event, scope, &mut Vec::new());
         match event.hits(cx, self.draw_hit.area()) {
             Hit::FingerDown(down) => {
-                cx.set_key_focus(self.draw_hit.area());
-                if let Some(pos) = self.pos_to_cell(cx, down.abs) {
+                cx.claim_text_selection(self.draw_hit.area());
+                self.dragging = false;
+                if !down.device.is_touch() && let Some(pos) = self.pos_to_cell(cx, down.abs) {
                     self.selection = Some((pos, pos));
-                    self.dragging = !down.device.is_touch();
+                    self.dragging = true;
                     self.redraw(cx);
                 }
             }
             Hit::FingerLongPress(press) => {
                 if let Some(pos) = self.pos_to_cell(cx, press.abs) {
+                    cx.claim_text_selection(self.draw_hit.area());
                     self.selection = Some((pos, CellPos { row: pos.row, col: pos.col + 1 }));
                     self.dragging = true;
                     self.redraw(cx);
@@ -359,15 +375,28 @@ impl Widget for WaLogView {
             }
             Hit::FingerMove(moved) => {
                 if self.dragging && let (Some(pos), Some((anchor, _))) = (self.pos_to_cell(cx, moved.abs), self.selection) {
+                    if let Event::TouchUpdate(update) = event {
+                        for touch in &update.touches {
+                            if matches!(touch.state, makepad_widgets::makepad_draw::event::TouchState::Move) {
+                                touch.handled.set(self.draw_hit.area());
+                            }
+                        }
+                    }
                     self.selection = Some((anchor, pos));
                     self.redraw(cx);
                 }
             }
-            Hit::FingerUp(_) => {
+            Hit::FingerUp(up) => {
+                if up.device.is_touch() && up.was_tap() && !self.dragging {
+                    self.clear_selection(cx);
+                }
+                if cfg!(target_os = "android") && up.device.is_touch() && self.dragging {
+                    self.show_actions = self.selection.is_some_and(|(a, b)| a != b);
+                    self.redraw(cx);
+                }
                 self.dragging = false;
                 if let Some((a, b)) = self.selection && a == b {
-                    self.selection = None;
-                    self.redraw(cx);
+                    self.clear_selection(cx);
                 }
             }
             Hit::TextCopy(copy) => {
@@ -383,11 +412,13 @@ impl Widget for WaLogView {
                 if key.key_code == KeyCode::KeyA && key.modifiers.is_primary() {
                     let rows = self.session.as_ref().map(|s| s.line_count()).unwrap_or(0);
                     if rows > 0 {
+                        cx.claim_text_selection(self.draw_hit.area());
                         self.selection = Some((CellPos { row: 0, col: 0 }, CellPos { row: rows - 1, col: usize::MAX / 2 }));
                         self.redraw(cx);
                     }
                 }
             }
+            Hit::KeyFocusLost(_) => self.clear_selection(cx),
             _ => {}
         }
         self.scroll_bars.handle_scroll_event(cx, event, scope, &mut Vec::new());
@@ -423,6 +454,7 @@ impl Widget for WaLogView {
         // before any text, or a background on a later row can cover that row's glyphs.
         self.draw_cell.color = Vec4::default();
         self.draw_cell.draw_abs(cx, Rect { pos: origin, size: dvec2(1.0, 1.0) });
+        self.action_anchor = None;
         if let Some(session) = self.session.as_mut() && first < rows {
             let lines = session.read(first, count.min(rows - first));
             let paint = LinePaint { ansi: &ansi, palette: &palette, revision };
@@ -445,6 +477,17 @@ impl Widget for WaLogView {
             } else if self.follow {
                 let x = self.scroll_bars.get_scroll_pos().x;
                 self.scroll_bars.set_scroll_pos(cx, dvec2(x, (content.y - viewport.y).max(0.0)));
+            }
+        }
+        if self.show_actions || cx.text_actions_active(self.draw_hit.area()) {
+            self.show_actions = false;
+            if let Some(anchor) = self.action_anchor {
+                cx.show_text_actions(self.draw_hit.area(), anchor, TextActionCapabilities {
+                    copy: true, select_all: true, ..Default::default()
+                });
+            } else {
+                cx.clear_text_selection(self.draw_hit.area());
+                cx.claim_text_selection(self.draw_hit.area());
             }
         }
         // The turtle and visible row range were drawn with `scroll`. Repaint only

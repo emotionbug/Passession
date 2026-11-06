@@ -450,6 +450,10 @@ pub struct MarkdownPreview {
     area: Rect,
     origin: DVec2,
     selection: Option<((usize, usize), (usize, usize))>,
+    owner: Area,
+    selection_invalidated: bool,
+    show_actions: bool,
+    owns_selection: bool,
     dragging: bool,
     thumb_drag: Option<(f64, f64)>,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
@@ -472,6 +476,10 @@ impl Default for MarkdownPreview {
             area: Rect::default(),
             origin: DVec2::default(),
             selection: None,
+            owner: Area::Empty,
+            selection_invalidated: false,
+            show_actions: false,
+            owns_selection: false,
             dragging: false,
             thumb_drag: None,
             touch_scroll: Default::default(),
@@ -729,6 +737,11 @@ impl MarkdownPreview {
         self.source = Some(text.to_owned());
         self.layout_key = None;
         self.selection = None;
+        self.dragging = false;
+        self.thumb_drag = None;
+        self.touch_scroll.reset();
+        self.show_actions = false;
+        self.selection_invalidated = true;
     }
 
     fn layout(&mut self, cx: &mut Cx, kit: &mut Kit, look: &MarkdownLook, width: f64, images: &dyn Fn(&str) -> ImageState, image_epoch: u64) {
@@ -757,12 +770,12 @@ impl MarkdownPreview {
             for (index, (key, value)) in self.front.clone().iter().enumerate() {
                 let key_h = ctx
                     .kit
-                    .layout_rich(cx, key, &[RichSpan { len: key.len(), font: RichFont::Mono, size: base, color: p.muted }], Some(key_w - 24.0), 20.0 / base / 1.15)
+                    .layout_rich(cx, key, &[RichSpan { len: key.len(), font: RichFont::Mono, size: base, color: p.muted }], Some((key_w - 24.0).max(1.0)), 1.15)
                     .size_in_lpxs
                     .height as f64;
                 let value_h = ctx
                     .kit
-                    .layout_rich(cx, value, &[RichSpan { len: value.len(), font: RichFont::Regular, size: base, color: p.foreground }], Some(inner - key_w - 24.0), 20.0 / base / 1.15)
+                    .layout_rich(cx, value, &[RichSpan { len: value.len(), font: RichFont::Regular, size: base, color: p.foreground }], Some((inner - key_w - 24.0).max(1.0)), 1.15)
                     .size_in_lpxs
                     .height as f64;
                 let row_h = key_h.max(value_h) + 16.0;
@@ -794,7 +807,12 @@ impl MarkdownPreview {
         look: &MarkdownLook,
         images: &dyn Fn(&str) -> ImageState,
         image_epoch: u64,
+        owner: Area,
     ) {
+        if self.selection_invalidated || self.owner != owner {
+            self.clear_selection(cx);
+        }
+        self.owner = owner;
         self.layout(cx, kit, look, area.size.x, images, image_epoch);
         self.area = area;
         let max = (self.height - area.size.y).max(0.0);
@@ -805,6 +823,7 @@ impl MarkdownPreview {
         let (top, bottom) = (self.scroll_y, self.scroll_y + area.size.y);
         // Selection highlights under their text.
         let selection = self.ordered_selection();
+        let mut action_anchor = None;
         for (y, h, item) in &self.items {
             if y + h < top || *y > bottom {
                 continue;
@@ -822,6 +841,10 @@ impl MarkdownPreview {
                             let b = if *index == ea { eb } else { run.laid.text.len() };
                             for r in range_rects(&run.laid, a, b) {
                                 kit.fill(cx, r.translate(run.pos + self.origin), with_alpha(p.accent, 0.35), 0.0);
+                                let visible = r.translate(run.pos + self.origin).clip((area.pos, area.pos + area.size));
+                                if action_anchor.is_none() && visible.size.x > 0.0 && visible.size.y > 0.0 {
+                                    action_anchor = Some(visible);
+                                }
                             }
                         }
                     kit.draw_rich(cx, run.pos + self.origin, &run.laid);
@@ -841,6 +864,30 @@ impl MarkdownPreview {
             kit.fill(cx, rect(area.pos.x + area.size.x - 6.0, thumb_y, 4.0, thumb_h), with_alpha(p.muted, 0.35), 2.0);
         }
         cx.end_turtle();
+        if self.show_actions || (self.owns_selection && cx.text_actions_active(self.owner)) {
+            self.show_actions = false;
+            if let Some(anchor) = action_anchor {
+                cx.show_text_actions(self.owner, anchor, TextActionCapabilities {
+                    copy: true, select_all: true, ..Default::default()
+                });
+            } else {
+                cx.clear_text_selection(self.owner);
+                cx.claim_text_selection(self.owner);
+            }
+        }
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Cx) {
+        if self.owns_selection {
+            cx.clear_text_selection(self.owner);
+        }
+        self.owns_selection = false;
+        self.selection = None;
+        self.dragging = false;
+        self.thumb_drag = None;
+        self.touch_scroll.reset();
+        self.show_actions = false;
+        self.selection_invalidated = false;
     }
 
     fn ordered_selection(&self) -> Option<((usize, usize), (usize, usize))> {
@@ -913,7 +960,11 @@ impl MarkdownPreview {
         self.touch_scroll.apply_delta(&mut self.scroll_y, delta, self.height - self.area.size.y)
     }
 
-    pub fn handle_hit(&mut self, hit: &Hit) -> PreviewEvent {
+    pub fn handle_hit(&mut self, cx: &mut Cx, owner: Area, hit: &Hit) -> PreviewEvent {
+        if self.selection_invalidated || self.owner != owner {
+            self.clear_selection(cx);
+        }
+        self.owner = owner;
         match hit {
             Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
                 self.touch_scroll.reset();
@@ -925,12 +976,22 @@ impl MarkdownPreview {
                 self.touch_scroll.handle_hit(hit);
                 self.dragging = !fe.device.is_touch();
                 let point = self.point_at(fe.abs);
-                self.selection = point.map(|p| (p, p));
+                if !fe.device.is_touch() {
+                    self.selection = point.map(|p| (p, p));
+                }
+                if !fe.device.is_touch() && point.is_some() {
+                    cx.claim_text_selection(self.owner);
+                    self.owns_selection = true;
+                }
                 if fe.tap_count == 2
                     && let Some((run, offset)) = point {
                         let text = self.runs[run].laid.text.as_str();
                         let (a, b) = word_bounds(text, offset);
                         self.selection = Some(((run, a), (run, b)));
+                        self.dragging = true;
+                        self.touch_scroll.reset();
+                        cx.claim_text_selection(self.owner);
+                        self.owns_selection = true;
                     }
             }
             Hit::FingerLongPress(fe) => {
@@ -939,6 +1000,8 @@ impl MarkdownPreview {
                     let (a, b) = word_bounds(self.runs[run].laid.text.as_str(), offset);
                     self.selection = Some(((run, a), (run, b)));
                     self.dragging = true;
+                    cx.claim_text_selection(self.owner);
+                    self.owns_selection = true;
                 }
             }
             Hit::FingerMove(fe) => {
@@ -967,6 +1030,12 @@ impl MarkdownPreview {
                 self.thumb_drag = None;
                 let was_drag = self.dragging;
                 self.dragging = false;
+                if fe.device.is_touch() && fe.was_tap() && !was_drag {
+                    self.clear_selection(cx);
+                }
+                if cfg!(target_os = "android") && was_drag && fe.device.is_touch() {
+                    self.show_actions = self.ordered_selection().is_some();
+                }
                 if (was_drag || fe.device.is_touch()) && fe.is_over && fe.was_tap() && self.ordered_selection().is_none()
                     && let Some(href) = self.link_at(fe.abs) {
                         return PreviewEvent::Link(href);
@@ -984,8 +1053,11 @@ impl MarkdownPreview {
             Hit::KeyDown(ke) if ke.key_code == KeyCode::KeyA && ke.modifiers.is_primary() => {
                 if let Some(last) = self.runs.len().checked_sub(1) {
                     self.selection = Some(((0, 0), (last, self.runs[last].laid.text.len())));
+                    cx.claim_text_selection(self.owner);
+                    self.owns_selection = true;
                 }
             }
+            Hit::KeyFocusLost(_) => self.clear_selection(cx),
             _ => {}
         }
         PreviewEvent::None

@@ -300,6 +300,9 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Va
     shell.painter.fill(cx, r, p.sidebar, 0.0);
     let preferences = j::object(state, "preferences").clone();
     let mut y = r.pos.y;
+    let title_h = super::chrome::text_line_height(20.0, 14.0);
+    let small_h = super::chrome::text_line_height(16.0, 12.0);
+    let nav_h = title_h + 12.0;
 
     // Navigation rows (`SidebarHeaderRow`, 2px apart, top 8 bottom 6, bottom border).
     let order = nav_order(&preferences);
@@ -314,12 +317,12 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Va
                 _ => ("calendar-clock", tr("sidebar.sections.schedules")),
             };
             let row_w = if compact && index == 0 { r.size.x - 48.0 } else { r.size.x };
-            header_row(&mut ui, cx, rect(r.pos.x, y, row_w, 32.0), &format!("nav:{id}"), icon, &label);
+            header_row(&mut ui, cx, rect(r.pos.x, y, row_w, nav_h), &format!("nav:{id}"), icon, &label);
             if compact && index == 0 {
-                let close = rect(r.pos.x + r.size.x - 40.0, y, 32.0, 32.0);
+                let close = rect(r.pos.x + r.size.x - 40.0, y + (nav_h - 32.0) * 0.5, 32.0, 32.0);
                 ui.icon_button(cx, close, "nav:close", "x", 16.0, 16.0, &tr("sidebar.actions.closeSidebar"));
             }
-            y += 34.0;
+            y += nav_h + 2.0;
         }
         y += 4.0;
         ui.painter.hline(cx, r.pos.x, y, r.size.x, p.border);
@@ -327,7 +330,7 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Va
     }
 
     // Section header: muted small title + display menu trigger.
-    let header_h = if compact { 44.0 } else { 36.0 };
+    let header_h = small_h + if compact { 28.0 } else { 20.0 };
     {
         let mut ui = make_ui(shell);
         let spec = ui.small_muted();
@@ -420,6 +423,12 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
     let x0 = list.pos.x;
     let w = list.size.x;
     let group = ui.spec(Font::Medium, 14.0, p.muted);
+    // Uniform line metrics keep culling O(1) per row without shaping invisible titles.
+    let title_h = super::chrome::text_line_height(20.0, 14.0);
+    let small_h = super::chrome::text_line_height(16.0, 12.0);
+    let group_h = title_h + 16.0;
+    let session_h = 8.0 + title_h + 2.0 + small_h + 6.0;
+    let button_h = theme::control_height(ControlSize::Sm);
     let mut any = false;
     for host in &all {
         if !hf.is_empty() && !hf.iter().any(|h| h == host.server_id()) {
@@ -456,14 +465,14 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
         any = true;
         // Host row.
         y += 8.0;
-        let row = rect(x0 + 8.0, y, w - 16.0, 36.0);
-        let mid = row.pos.y + 18.0;
+        let row = rect(x0 + 8.0, y, w - 16.0, group_h);
+        let mid = row.pos.y + row.size.y * 0.5;
         ui.icon(cx, rect(row.pos.x, mid - 7.0, 14.0, 14.0), if host_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
         ui.dot(cx, dvec2(row.pos.x + 22.0, mid), 8.0, status_color(&p, host));
         ui.text(cx, rect(row.pos.x + 30.0, row.pos.y, row.size.x - 30.0 - 24.0, row.size.y), group, &label);
         ui.hit(rect(row.pos.x, row.pos.y, row.size.x - 24.0, row.size.y), format!("host:{sid}"));
         toolbar_button(&mut ui, cx, row.pos.x + row.size.x - 20.0, mid - 10.0, &format!("hostplus:{sid}"), "plus", &tr("sessionNavigation.newSession"));
-        y += 36.0;
+        y += group_h;
         if host_collapsed {
             continue;
         }
@@ -476,53 +485,53 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
         if !loading.is_empty() {
             let lists: Vec<String> = loading.iter().map(|k| tr(&format!("sidebar.refresh.{k}"))).collect();
             let text = tr_args("sidebar.refresh.loading", &[("lists", &lists.join(", "))]);
-            ui.text(cx, rect(x0 + 32.0, y + 4.0, w - 40.0, 16.0), small, &text);
-            y += 24.0;
+            ui.text(cx, rect(x0 + 32.0, y + 4.0, w - 40.0, small_h), small, &text);
+            y += small_h + 8.0;
         }
         let errors = host.list_errors();
         for (kind, error) in &errors {
             let text = tr_args("sidebar.refresh.failed", &[("list", &tr(&format!("sidebar.refresh.{kind}"))), ("error", error)]);
             let spec = ui.spec(Font::Regular, 12.0, p.destructive);
-            ui.text(cx, rect(x0 + 32.0, y + 4.0, w - 40.0, 16.0), spec, &text);
-            y += 24.0;
+            ui.text(cx, rect(x0 + 32.0, y + 4.0, w - 40.0, small_h), spec, &text);
+            y += small_h + 8.0;
         }
         if !errors.is_empty() {
             let label = tr("common.actions.retry");
             let bw = ui.button_width(cx, &label, None, ControlSize::Sm);
-            ui.button(cx, rect(x0 + 24.0, y, bw, 32.0), &format!("hostretry:{sid}"), &label, None, Variant::Ghost, ControlSize::Sm, loading.is_empty());
-            y += 36.0;
+            ui.button(cx, rect(x0 + 24.0, y, bw, button_h), &format!("hostretry:{sid}"), &label, None, Variant::Ghost, ControlSize::Sm, loading.is_empty());
+            y += button_h + 4.0;
         }
         if let Some(error) = host.error() {
             let spec = ui.spec(Font::Regular, 12.0, p.destructive);
             let tw = w - 40.0;
-            let h = ui.painter.paragraph_height(cx, tw, spec, &error).min(48.0);
             let clipped: String = error.lines().take(3).collect::<Vec<_>>().join("\n");
+            let h = ui.painter.paragraph_height(cx, tw, spec, &clipped);
             ui.painter.paragraph(cx, dvec2(x0 + 32.0, y), tw, spec, &clipped);
             y += h + 4.0;
             let retry = tr("common.actions.retry");
             let rw = ui.button_width(cx, &retry, None, ControlSize::Sm);
-            ui.button(cx, rect(x0 + 24.0, y, rw, 32.0), &format!("hostretry:{sid}"), &retry, None, Variant::Ghost, ControlSize::Sm, true);
+            ui.button(cx, rect(x0 + 24.0, y, rw, button_h), &format!("hostretry:{sid}"), &retry, None, Variant::Ghost, ControlSize::Sm, true);
             let auth = "Authentication / connection";
             let aw = ui.button_width(cx, auth, None, ControlSize::Sm);
-            ui.button(cx, rect(x0 + 24.0 + rw + 4.0, y, aw, 32.0), &format!("hostauth:{sid}"), auth, None, Variant::Ghost, ControlSize::Sm, true);
-            y += 36.0;
+            ui.button(cx, rect(x0 + 24.0 + rw + 4.0, y, aw, button_h), &format!("hostauth:{sid}"), auth, None, Variant::Ghost, ControlSize::Sm, true);
+            y += button_h + 4.0;
         }
         for (project, key, project_collapsed, rows) in &blocks {
             let name = j::text_or(project, "projectDisplayName", j::text(project, "projectRootPath"));
             let name = if name.is_empty() { j::text(project, "projectRootPath") } else { name };
-            let row = rect(x0 + 24.0, y, w - 32.0, 36.0);
-            let mid = row.pos.y + 18.0;
+            let row = rect(x0 + 24.0, y, w - 32.0, group_h);
+            let mid = row.pos.y + row.size.y * 0.5;
             ui.icon(cx, rect(row.pos.x, mid - 7.0, 14.0, 14.0), if *project_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
             ui.icon(cx, rect(row.pos.x + 18.0, mid - 7.0, 14.0, 14.0), "folder", 14.0, p.muted);
             ui.text(cx, rect(row.pos.x + 36.0, row.pos.y, row.size.x - 36.0 - 24.0, row.size.y), group, name);
             ui.hit(rect(row.pos.x, row.pos.y, row.size.x - 24.0, row.size.y), format!("project:{key}"));
             toolbar_button(&mut ui, cx, row.pos.x + row.size.x - 20.0, mid - 10.0, &format!("projplus:{key}"), "plus", &tr("sessionNavigation.newSession"));
-            y += 36.0;
+            y += group_h;
             if *project_collapsed {
                 continue;
             }
             for agent in rows {
-                let row = rect(x0 + 48.0, y, w - 56.0, 52.0);
+                let row = rect(x0 + 48.0, y, w - 56.0, session_h);
                 y += row.size.y;
                 // Clipping alone still shapes and paints every off-screen row
                 // on each touch move. Keep its extent, not its draw/hit work.
@@ -537,7 +546,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                 }
                 let hovered = ui.is_hover(&id) || ui.is_hover(&format!("sessionedit:{sid}:{agent_id}"));
                 let attention = j::boolean(agent, "requiresAttention", false);
-                ui.icon(cx, rect(row.pos.x + 12.0, row.pos.y + (52.0 - 14.0) * 0.5, 14.0, 14.0), "message-square", 14.0, if attention { p.foreground } else { p.muted });
+                ui.icon(cx, rect(row.pos.x + 12.0, row.pos.y + (row.size.y - 14.0) * 0.5, 14.0, 14.0), "message-square", 14.0, if attention { p.foreground } else { p.muted });
                 let title = j::text(agent, "title");
                 let title = if title.is_empty() { tr("sessionNavigation.untitled") } else { title.to_string() };
                 let trailing = if trailing_diff { String::new() } else { compact_time_ago(j::text_or(agent, "updatedAt", j::text(agent, "createdAt"))) };
@@ -545,16 +554,16 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                 let tx = row.pos.x + 34.0;
                 let tw = (row.size.x - 34.0 - trailing_w).max(0.0);
                 let title_spec = ui.spec(if attention { Font::Medium } else { Font::Regular }, 14.0, p.foreground);
-                ui.text(cx, rect(tx, row.pos.y + 8.0, tw, 20.0), title_spec, &title);
+                ui.text(cx, rect(tx, row.pos.y + 8.0, tw, title_h), title_spec, &title);
                 let status = j::text(agent, "status");
                 let status_key = format!("agentList.status.{status}");
                 let status_label = tr(&status_key);
                 let status_label = if status_label == status_key { status.to_string() } else { status_label };
                 let sub = ui.spec(Font::Regular, 12.0, p.muted);
-                ui.text(cx, rect(tx, row.pos.y + 30.0, tw, 16.0), sub, &format!("{} · {}", j::text(agent, "provider"), status_label));
+                ui.text(cx, rect(tx, row.pos.y + 8.0 + title_h + 2.0, tw, small_h), sub, &format!("{} · {}", j::text(agent, "provider"), status_label));
                 ui.hit(rect(row.pos.x, row.pos.y, row.size.x - if hovered { 32.0 } else { 0.0 }, row.size.y), id.clone());
                 if hovered {
-                    toolbar_button(&mut ui, cx, row.pos.x + row.size.x - 28.0, row.pos.y + 16.0, &format!("sessionedit:{sid}:{agent_id}"), "pencil", &tr("workspace.tabs.menu.renameAgent"));
+                    toolbar_button(&mut ui, cx, row.pos.x + row.size.x - 28.0, row.pos.y + (row.size.y - 20.0) * 0.5, &format!("sessionedit:{sid}:{agent_id}"), "pencil", &tr("workspace.tabs.menu.renameAgent"));
                 } else if !trailing.is_empty() {
                     let spec = ui.spec(Font::Regular, 12.0, p.extra_muted);
                     ui.text_right(cx, rect(row.pos.x + row.size.x - trailing_w, row.pos.y, trailing_w - 12.0, row.size.y), spec, &trailing);
@@ -563,28 +572,28 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
         }
         let project_list_loading = host.loading() || loading.contains(&"project") || errors.iter().any(|(k, _)| *k == "project");
         if projects.is_empty() && !project_list_loading && query.is_empty() {
-            let row = rect(x0 + 24.0, y, w - 32.0, 36.0);
-            let mid = row.pos.y + 18.0;
+            let row = rect(x0 + 24.0, y, w - 32.0, group_h);
+            let mid = row.pos.y + row.size.y * 0.5;
             ui.icon(cx, rect(row.pos.x + 18.0, mid - 7.0, 14.0, 14.0), "folder-plus", 14.0, p.muted);
             let spec = ui.spec(Font::Regular, 14.0, p.muted);
             ui.text(cx, rect(row.pos.x + 36.0, row.pos.y, row.size.x - 36.0, row.size.y), spec, &tr("sidebar.actions.addProject"));
             ui.hit(row, format!("addproject:{sid}"));
-            y += 36.0;
+            y += group_h;
         }
     }
     if !any {
         let spec = ui.spec(Font::Regular, 14.0, p.muted);
         let message = if all.is_empty() { "Connect to a Paseo host to see your sessions.".to_string() } else { tr("sessionNavigation.empty") };
-        ui.text(cx, rect(x0 + 16.0, y + 16.0, w - 32.0, 20.0), spec, &message);
-        y += 44.0;
+        ui.text(cx, rect(x0 + 16.0, y + 16.0, w - 32.0, title_h), spec, &message);
+        y += title_h + 24.0;
         let (id, label, variant) = if all.is_empty() {
             ("side:addhost", tr("settings.addHost"), Variant::Outline)
         } else {
             ("side:display", tr("sidebar.display.trigger"), Variant::Ghost)
         };
         let bw = ui.button_width(cx, &label, None, ControlSize::Sm);
-        ui.button(cx, rect(x0 + 16.0, y + 8.0, bw, 32.0), id, &label, None, variant, ControlSize::Sm, true);
-        y += 48.0;
+        ui.button(cx, rect(x0 + 16.0, y + 8.0, bw, button_h), id, &label, None, variant, ControlSize::Sm, true);
+        y += button_h + 16.0;
     }
     y += 8.0;
     ui.hits.set_clip(None);

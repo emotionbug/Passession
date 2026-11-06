@@ -329,7 +329,7 @@ pub fn show_tooltip(overlays: &mut Overlays, cx: &mut Cx, tip: Option<Tip>) {
 // Geometry
 
 fn menu_row_height(compact: bool) -> f64 {
-    if compact { 40.0 } else { 28.0 }
+    super::chrome::text_line_height(20.0, 14.0) + if compact { 20.0 } else { 8.0 }
 }
 
 fn entries_height(entries: &[MenuEntry], compact: bool) -> f64 {
@@ -337,8 +337,8 @@ fn entries_height(entries: &[MenuEntry], compact: bool) -> f64 {
     for entry in entries {
         h += match entry {
             MenuEntry::Separator => 9.0,
-            MenuEntry::Label(_) => 28.0,
-            MenuEntry::Item(item) => menu_row_height(compact) + if item.description.is_some() { 16.0 } else { 0.0 },
+            MenuEntry::Label(_) => 12.0 + super::chrome::text_line_height(16.0, 12.0),
+            MenuEntry::Item(item) => menu_row_height(compact) + if item.description.is_some() { super::chrome::text_line_height(16.0, 12.0) } else { 0.0 },
             MenuEntry::Submenu { .. } => menu_row_height(compact),
         };
     }
@@ -488,7 +488,7 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
     let depth = menu.pages.len();
     let (page_title, entries) = menu.pages[depth - 1].clone();
     let header = sheet || depth > 1;
-    let header_h = if header { if sheet { 40.0 } else { 44.0 } } else { 0.0 };
+    let header_h = if header { super::chrome::text_line_height(24.0, 14.0) + if sheet { 16.0 } else { 20.0 } } else { 0.0 };
     let content_h = entries_height(&entries, compact);
     let mut ui = overlay_ui(shell);
     let p = ui.p;
@@ -527,7 +527,7 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
             x += 32.0;
         }
         let spec = ui.spec(Font::Medium, 14.0, p.foreground);
-        ui.text(cx, rect(x, y + 4.0, surface.size.x - (x - surface.pos.x) - 12.0, 24.0), spec, &title);
+        ui.text(cx, rect(x, y + 4.0, surface.size.x - (x - surface.pos.x) - 12.0, header_h - if sheet { 16.0 } else { 20.0 }), spec, &title);
         y += header_h - 8.0;
     }
     // The header stays fixed while tall menus scroll within their visible, touchable body.
@@ -538,6 +538,7 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
     ui.hits.set_clip(Some(viewport));
     y += 4.0 - menu.scroll;
     let row_h = menu_row_height(compact);
+    let small_h = super::chrome::text_line_height(16.0, 12.0);
     for (i, entry) in entries.iter().enumerate() {
         match entry {
             MenuEntry::Separator => {
@@ -546,11 +547,11 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
             }
             MenuEntry::Label(text) => {
                 let spec = ui.spec(Font::Regular, 12.0, p.muted);
-                ui.text(cx, rect(surface.pos.x + 12.0, y + 8.0, surface.size.x - 24.0, 16.0), spec, text);
-                y += 28.0;
+                ui.text(cx, rect(surface.pos.x + 12.0, y + 8.0, surface.size.x - 24.0, small_h), spec, text);
+                y += small_h + 12.0;
             }
             MenuEntry::Item(item) => {
-                let h = row_h + if item.description.is_some() { 16.0 } else { 0.0 };
+                let h = row_h + if item.description.is_some() { small_h } else { 0.0 };
                 let id = if top { format!("menu:item:{i}") } else { String::new() };
                 let lead = match (&item.svg, &item.icon, item.dot) {
                     (_, _, Some(color)) => RowLead::Dot(color),
@@ -573,7 +574,10 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
                 );
                 if let Some(description) = &item.description {
                     let spec = ui.spec(Font::Regular, 12.0, p.muted);
-                    ui.text(cx, rect(surface.pos.x + 36.0, y + row_h - 4.0, surface.size.x - 48.0, 16.0), spec, description);
+                    ui.text(cx, rect(surface.pos.x + 36.0, y + row_h - 4.0, surface.size.x - 48.0, small_h), spec, description);
+                    if top && item.enabled {
+                        ui.hit(rect(surface.pos.x, y, surface.size.x, h), &id);
+                    }
                 }
                 y += h;
             }
@@ -601,19 +605,21 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
     cx.end_turtle();
 }
 
-/// `_SelectList` row height (36px min) and the sheet's row margin below each row.
-const SELECT_ROW_H: f64 = 36.0;
+/// `_SelectList` retains 8px padding above and below the scaled text line.
+fn select_row_height() -> f64 {
+    16.0 + super::chrome::text_line_height(20.0, 14.0)
+}
 
 fn select_list_height(select: &OpenSelect, visible: &[usize], sheet: bool) -> f64 {
     if visible.is_empty() {
-        return 8.0 + 20.0 + 8.0;
+        return 16.0 + super::chrome::text_line_height(20.0, 14.0);
     }
     let mut h = if sheet { 4.0 + 32.0 } else { 8.0 };
     for &i in visible {
         if select.options[i].separator_before && select.query.is_empty() {
             h += 9.0;
         }
-        h += SELECT_ROW_H + if sheet { 4.0 } else { 0.0 };
+        h += select_row_height() + if sheet { 4.0 } else { 0.0 };
     }
     h
 }
@@ -623,20 +629,21 @@ fn select_list_height(select: &OpenSelect, visible: &[usize], sheet: bool) -> f6
 /// medium title on compact ones. The optional search row filters label and description.
 fn draw_select(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, select: &mut OpenSelect, window: Rect, sheet: bool, top: bool) {
     let visible = select.visible();
-    let search_h = if select.search.is_some() { 45.0 } else { 0.0 };
+    let line_h = super::chrome::text_line_height(20.0, 14.0);
+    let search_h = if select.search.is_some() { 25.0 + line_h } else { 0.0 };
     let list_h = select_list_height(select, &visible, sheet);
     let field_rect = {
         let mut ui = overlay_ui(shell);
         let p = ui.p;
         let (surface, mut y) = if sheet {
-            let title_h = 28.0;
+            let title_h = line_h + 8.0;
             let h = (48.0 + title_h + search_h + list_h).min(window.size.y - 24.0);
             let r = rect(window.pos.x, window.pos.y + window.size.y - h, window.size.x, h);
             ui.painter.draw_box.paint(cx, rect(r.pos.x, r.pos.y, r.size.x, r.size.y + 16.0), p.surface0, 16.0);
             // Material 3 drag handle: 32x4 in a 48px band, onSurfaceVariant at 40%.
             ui.fill(cx, rect(r.pos.x + r.size.x * 0.5 - 16.0, r.pos.y + 22.0, 32.0, 4.0), with_alpha(p.muted, 0.4), 2.0);
             let spec = ui.spec(Font::Medium, 14.0, p.foreground);
-            ui.text(cx, rect(r.pos.x + 24.0, r.pos.y + 48.0, r.size.x - 48.0, 20.0), spec, &select.title);
+            ui.text(cx, rect(r.pos.x + 24.0, r.pos.y + 48.0, r.size.x - 48.0, line_h), spec, &select.title);
             (r, r.pos.y + 48.0 + title_h)
         } else {
             let a = select.anchor;
@@ -676,8 +683,8 @@ fn draw_select(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, select:
                 ui.fill(cx, rect(inner.pos.x, inner.pos.y + 8.0, inner.size.x, inner.size.y - 8.0), p.surface1, 0.0);
             }
             ui.painter.hline(cx, row.pos.x, row.pos.y + row.size.y - 1.0, row.size.x, p.border);
-            ui.icon(cx, rect(row.pos.x + 12.0, row.pos.y + (44.0 - 16.0) * 0.5, 16.0, 16.0), "search", 16.0, p.muted);
-            field_rect = Some(rect(row.pos.x + 12.0 + 16.0 + 8.0, row.pos.y, row.size.x - 12.0 - 16.0 - 8.0 - 12.0, 44.0));
+            ui.icon(cx, rect(row.pos.x + 12.0, row.pos.y + (search_h - 1.0 - 16.0) * 0.5, 16.0, 16.0), "search", 16.0, p.muted);
+            field_rect = Some(rect(row.pos.x + 12.0 + 16.0 + 8.0, row.pos.y, row.size.x - 12.0 - 16.0 - 8.0 - 12.0, search_h - 1.0));
             y += search_h;
         }
         let viewport = rect(surface.pos.x, y, surface.size.x, (surface.pos.y + surface.size.y - y).max(0.0));
@@ -687,7 +694,7 @@ fn draw_select(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, select:
         let mut ry = viewport.pos.y - select.scroll;
         if visible.is_empty() {
             let spec = ui.spec(Font::Regular, 14.0, p.muted);
-            ui.text(cx, rect(viewport.pos.x + 12.0, ry + 8.0, viewport.size.x - 24.0, 20.0), spec, &select.empty_text);
+            ui.text(cx, rect(viewport.pos.x + 12.0, ry + 8.0, viewport.size.x - 24.0, line_h), spec, &select.empty_text);
         } else {
             ry += 4.0;
             let (mx, mb) = if sheet { (8.0 + 4.0, 4.0) } else { (0.0, 0.0) };
@@ -697,7 +704,7 @@ fn draw_select(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, select:
                     ui.painter.hline(cx, viewport.pos.x + mx - if sheet { 4.0 } else { 0.0 }, ry + 4.0, viewport.size.x - (mx - if sheet { 4.0 } else { 0.0 }) * 2.0, p.border);
                     ry += 9.0;
                 }
-                let r = rect(viewport.pos.x + mx, ry, viewport.size.x - mx * 2.0, SELECT_ROW_H);
+                let r = rect(viewport.pos.x + mx, ry, viewport.size.x - mx * 2.0, select_row_height());
                 let id = format!("select:item:{i}");
                 draw_select_row(&mut ui, cx, r, &id, option, select.value.as_deref() == Some(option.value.as_str()));
                 if top && option.enabled {
@@ -706,7 +713,7 @@ fn draw_select(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, select:
                         ui.hit(clipped, id);
                     }
                 }
-                ry += SELECT_ROW_H + mb;
+                ry += r.size.y + mb;
             }
         }
         cx.end_turtle();
@@ -772,15 +779,17 @@ fn clip_rect(r: Rect, clip: Rect) -> Rect {
 #[allow(clippy::too_many_arguments)]
 fn dialog_frame(ui: &mut Ui, cx: &mut Cx2d, window: Rect, width: f64, height: f64, title: &str, compact: bool, top: bool, back: bool) -> Rect {
     let p = ui.p;
+    let title_h = super::chrome::text_line_height(24.0, 14.0);
+    let header_h = title_h + 33.0;
     let frame = if compact {
-        let h = (height + 57.0 + 24.0).min(window.size.y * 0.9);
+        let h = (height + header_h + 24.0).min(window.size.y * 0.9);
         let r = rect(window.pos.x, window.pos.y + window.size.y - h, window.size.x, h);
         ui.painter.draw_box.paint(cx, rect(r.pos.x, r.pos.y, r.size.x, r.size.y + 16.0), p.surface0, 16.0);
         ui.sheet_handle(cx, r.pos.x + r.size.x * 0.5, r.pos.y - 4.0);
         rect(r.pos.x, r.pos.y + 16.0, r.size.x, r.size.y - 16.0)
     } else {
         let w = width.min(window.size.x - 48.0);
-        let h = (height + 57.0).min(window.size.y * 0.85);
+        let h = (height + header_h).min(window.size.y * 0.85);
         let r = rect(window.pos.x + (window.size.x - w) * 0.5, window.pos.y + (window.size.y - h) * 0.5, w, h);
         ui.painter.outline(cx, r, p.surface1, p.surface2, 1.0, 12.0);
         r
@@ -795,11 +804,11 @@ fn dialog_frame(ui: &mut Ui, cx: &mut Cx2d, window: Rect, width: f64, height: f6
         ui.icon_button(cx, r, if top { "sheet:back" } else { "" }, "chevron-left", 16.0, 8.0, if compact { "" } else { "Back" });
         title_x = r.pos.x + 32.0 + 4.0;
     }
-    ui.text(cx, rect(title_x, frame.pos.y + 16.0, frame.pos.x + frame.size.x - 56.0 - title_x, 24.0), spec, title);
+    ui.text(cx, rect(title_x, frame.pos.y + 16.0, frame.pos.x + frame.size.x - 56.0 - title_x, title_h), spec, title);
     let close = rect(frame.pos.x + frame.size.x - 16.0 - 32.0, frame.pos.y + 12.0, 32.0, 32.0);
     ui.icon_button(cx, close, if top { "dialog:close" } else { "" }, "x", 16.0, 8.0, if compact { "" } else { "Close" });
-    ui.painter.hline(cx, frame.pos.x, frame.pos.y + 56.0, frame.size.x, p.surface2);
-    rect(frame.pos.x, frame.pos.y + 57.0, frame.size.x, frame.size.y - 57.0)
+    ui.painter.hline(cx, frame.pos.x, frame.pos.y + header_h - 1.0, frame.size.x, p.surface2);
+    rect(frame.pos.x, frame.pos.y + header_h, frame.size.x, (frame.size.y - header_h).max(0.0))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -811,15 +820,16 @@ fn draw_confirm(shell: &mut PaseoShell, cx: &mut Cx2d, window: Rect, title: &str
     let width: f64 = 420.0;
     let text_w = (width.min(window.size.x - 48.0)) - 48.0;
     let text_h = ui.painter.paragraph_height(cx, if compact { window.size.x - 48.0 } else { text_w }, spec, message);
-    let body = dialog_frame(&mut ui, cx, window, width, text_h + 24.0 + 56.0, title, compact, top, false);
+    let button_h = theme::control_height(ControlSize::Sm);
+    let body = dialog_frame(&mut ui, cx, window, width, text_h + 48.0 + button_h, title, compact, top, false);
     ui.painter.paragraph(cx, dvec2(body.pos.x + 24.0, body.pos.y + 16.0), body.size.x - 48.0, spec, message);
-    let y = body.pos.y + body.size.y - 48.0;
+    let y = body.pos.y + body.size.y - 16.0 - button_h;
     let cancel = tr("common.actions.cancel");
     let cw = ui.button_width(cx, &cancel, None, ControlSize::Sm);
     let ow = ui.button_width(cx, confirm_label, None, ControlSize::Sm);
     let right = body.pos.x + body.size.x - 24.0;
-    ui.button(cx, rect(right - ow, y, ow, 32.0), if top { "confirm:ok" } else { "" }, confirm_label, None, if destructive { Variant::Destructive } else { Variant::Primary }, ControlSize::Sm, top);
-    ui.button(cx, rect(right - ow - 8.0 - cw, y, cw, 32.0), if top { "confirm:cancel" } else { "" }, &cancel, None, Variant::Ghost, ControlSize::Sm, top);
+    ui.button(cx, rect(right - ow, y, ow, button_h), if top { "confirm:ok" } else { "" }, confirm_label, None, if destructive { Variant::Destructive } else { Variant::Primary }, ControlSize::Sm, top);
+    ui.button(cx, rect(right - ow - 8.0 - cw, y, cw, button_h), if top { "confirm:cancel" } else { "" }, &cancel, None, Variant::Ghost, ControlSize::Sm, top);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -840,7 +850,8 @@ fn draw_prompt(
         let mut ui = overlay_ui(shell);
         let p = ui.p;
         let spec = ui.spec(Font::Regular, 14.0, p.muted);
-        let message_h = message.map_or(0.0, |m| ui.painter.paragraph_height(cx, 432.0, spec, m) + 12.0);
+        let message_w = if compact { window.size.x - 48.0 } else { 480.0f64.min(window.size.x - 48.0) - 48.0 };
+        let message_h = message.map_or(0.0, |m| ui.painter.paragraph_height(cx, message_w, spec, m) + 12.0);
         // `minLines: 4, maxLines: 12`: the field grows with its wrapped text and scrolls past
         // twelve lines, keeping the end (where typing happens) in view.
         let (field_h, scroll) = if multiline {
@@ -852,22 +863,23 @@ fn draw_prompt(
             let visible = lines.clamp(4.0, 12.0);
             (visible * line_h + 12.0, (lines - visible) * line_h)
         } else {
-            (40.0, 0.0)
+            (20.0 + super::chrome::text_line_height(20.0, 14.0), 0.0)
         };
-        let body = dialog_frame(&mut ui, cx, window, 480.0, message_h + 16.0 + field_h + 4.0 + 72.0, title, compact, top, false);
+        let button_h = theme::control_height(ControlSize::Sm);
+        let body = dialog_frame(&mut ui, cx, window, 480.0, message_h + 16.0 + field_h + 4.0 + 40.0 + button_h, title, compact, top, false);
         let mut y = body.pos.y + 16.0;
         if let Some(message) = message {
             ui.painter.paragraph(cx, dvec2(body.pos.x + 24.0, y), body.size.x - 48.0, spec, message);
             y += message_h;
         }
         let field_rect = rect(body.pos.x + 24.0, y, body.size.x - 48.0, field_h);
-        let by = body.pos.y + body.size.y - 48.0;
+        let by = body.pos.y + body.size.y - 16.0 - button_h;
         let cancel = tr("common.actions.cancel");
         let cw = ui.button_width(cx, &cancel, None, ControlSize::Sm);
         let ow = ui.button_width(cx, confirm_label, None, ControlSize::Sm);
         let right = body.pos.x + body.size.x - 24.0;
-        ui.button(cx, rect(right - ow, by, ow, 32.0), if top { "prompt:ok" } else { "" }, confirm_label, None, Variant::Primary, ControlSize::Sm, top);
-        ui.button(cx, rect(right - ow - 8.0 - cw, by, cw, 32.0), if top { "prompt:cancel" } else { "" }, &cancel, None, Variant::Ghost, ControlSize::Sm, top);
+        ui.button(cx, rect(right - ow, by, ow, button_h), if top { "prompt:ok" } else { "" }, confirm_label, None, Variant::Primary, ControlSize::Sm, top);
+        ui.button(cx, rect(right - ow - 8.0 - cw, by, cw, button_h), if top { "prompt:cancel" } else { "" }, &cancel, None, Variant::Ghost, ControlSize::Sm, top);
         (field_rect, scroll)
     };
     cx.begin_turtle(Walk::abs_rect(field_rect), Layout { scroll: dvec2(0.0, scroll), ..Layout::default() });
@@ -988,8 +1000,9 @@ fn draw_draggable_sheet(
             24.0
         };
         let spec = ui.spec(Font::Medium, 14.0, p.foreground);
-        ui.text(cx, rect(frame.pos.x + 24.0, frame.pos.y + band, frame.size.x - 48.0, 20.0), spec, title);
-        let y = frame.pos.y + band + 20.0 + 8.0;
+        let title_h = super::chrome::text_line_height(20.0, 14.0);
+        ui.text(cx, rect(frame.pos.x + 24.0, frame.pos.y + band, frame.size.x - 48.0, title_h), spec, title);
+        let y = frame.pos.y + band + title_h + 8.0;
         let footer_h = sheet.footer_height();
         let footer_band = if footer_h > 0.0 { 1.0 + 12.0 + footer_h + 12.0 + insets.bottom } else { insets.bottom };
         let bottom = frame.pos.y + frame.size.y - footer_band;
@@ -1083,19 +1096,20 @@ fn draw_full_screen_sheet(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Sco
             ui.hit(window, "dialog:surface");
         }
         let row_y = window.pos.y + insets.top + 8.0;
-        let island = rect(window.pos.x + 12.0 + insets.left, row_y + 12.0, 32.0, 32.0);
+        let row_h = 32.0 + super::chrome::text_line_height(24.0, 16.0);
+        let island = rect(window.pos.x + 12.0 + insets.left, row_y + (row_h - 32.0) * 0.5, 32.0, 32.0);
         let id = if top { "sheet:close" } else { "" };
         if top && (ui.is_hover(id) || ui.is_pressed(id)) {
             ui.fill(cx, island, p.interaction_highlight, 16.0);
         }
         ui.icon(cx, island, "arrow-left", 16.0, p.muted);
         if top {
-            ui.hit(rect(island.pos.x, row_y + 4.0, 32.0, 48.0), id);
+            ui.hit(rect(island.pos.x, row_y + 4.0, 32.0, row_h - 8.0), id);
         }
         let spec = ui.spec(Font::Medium, 16.0, p.foreground);
         let tx = island.pos.x + 32.0 + 8.0;
-        ui.text(cx, rect(tx, row_y, window.pos.x + window.size.x - 12.0 - insets.right - tx, 56.0), spec, title);
-        let top_y = row_y + 56.0;
+        ui.text(cx, rect(tx, row_y, window.pos.x + window.size.x - 12.0 - insets.right - tx, row_h), spec, title);
+        let top_y = row_y + row_h;
         rect(window.pos.x + 24.0, top_y, window.size.x - 48.0, (window.pos.y + window.size.y - insets.bottom - 24.0 - top_y).max(0.0))
     };
     *viewport = body;

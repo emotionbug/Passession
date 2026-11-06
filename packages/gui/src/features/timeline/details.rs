@@ -15,7 +15,7 @@ use makepad_widgets::*;
 use std::rc::Rc;
 
 fn code_height(d: &Draw) -> f64 {
-    18.0 / d.look.code()
+    d.look.typo.system_size(18.0) / d.look.code()
 }
 
 /// A clipped, scrollable viewport over content of `content` size drawn by
@@ -121,7 +121,7 @@ fn draw_block(cx: &mut Cx2d, d: &mut Draw, block: &DetailBlock, key: &str, x: f6
         }
         DetailBlock::SubAgentLog { session, actions, log, fallback } => {
             let size = d.look.code();
-            let lh = 18.0;
+            let lh = d.look.typo.system_size(18.0);
             let mut lines: Vec<Vec<(String, Vec4)>> = Vec::new();
             if let Some(session) = session {
                 lines.push(vec![(format!("session {session}"), p.muted)]);
@@ -255,7 +255,7 @@ fn draw_block(cx: &mut Cx2d, d: &mut Draw, block: &DetailBlock, key: &str, x: f6
             })
         }
         DetailBlock::PlainText(text) => {
-            let laid = d.kit.layout(cx, Font::Regular, base, 22.0 / base, text, Some((w - 24.0).max(1.0)), 0.0);
+            let laid = d.kit.layout(cx, Font::Regular, base, d.look.typo.system_size(22.0) / base, text, Some((w - 24.0).max(1.0)), 0.0);
             let size = laidout_size(&laid);
             let h_full = size.y + 24.0;
             let h = max_h.map(|m| h_full.min(m)).unwrap_or(h_full);

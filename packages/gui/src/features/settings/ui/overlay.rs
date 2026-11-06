@@ -280,14 +280,12 @@ fn draw_paseo_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
         let lead_w = if item.lead.is_some() { 24.0 } else { 0.0 };
         let check_w = if item.selected { 24.0 } else { 0.0 };
         let label_w = (content_w - lead_w - hint_w - check_w).max(1.0);
-        let one = ui.measure(Font::Regular, 14.0, "Ag", None).y;
-        let lines = if ui.measure(Font::Regular, 14.0, &item.label, Some(label_w)).y > one * 1.5 { 2.0 } else { 1.0 };
-        // 18px lines, 4px vertical padding and the transparent 1px border.
-        let h = (lines * 18.0 + 8.0 + 2.0).max(row_min);
-        rows.push((h, label_w, lines));
+        let text_h = ui.measure(Font::Regular, 14.0, &item.label, Some(label_w)).y;
+        let h = (text_h + 8.0 + 2.0).max(row_min);
+        rows.push((h, label_w, text_h));
     }
     let list_h: f64 = 8.0 + visible.iter().zip(&rows).map(|(&i, (h, ..))| h + if menu.items[i].separator_before { 9.0 } else { 0.0 }).sum::<f64>();
-    let header_h = if sheet { 24.0 + if menu.title.is_empty() { 0.0 } else { 16.0 + 20.0 } } else { 0.0 };
+    let header_h = if sheet { 24.0 + if menu.title.is_empty() { 0.0 } else { 16.0 + ui.measure(Font::Medium, 14.0, &menu.title, None).y } } else { 0.0 };
     let (rect, list) = if sheet {
         let max_h = screen.size.y * 0.8;
         let total = (header_h + list_h + 4.0).min(max_h);
@@ -324,7 +322,7 @@ fn draw_paseo_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
             ui.rect(Rect { pos: dvec2(list.pos.x, y + 4.0), size: dvec2(list.size.x, 1.0) }, pal.border_accent, None, 0.0);
             y += 9.0;
         }
-        let (h, label_w, lines) = rows[row];
+        let (h, label_w, text_h) = rows[row];
         let item_rect = Rect { pos: dvec2(list.pos.x + 4.0, y), size: dvec2(list.size.x - 8.0, h) };
         let k = format!("menu.{}.item.{i}", menu.id);
         let (hovered, pressed) = ui.state(&k);
@@ -339,14 +337,8 @@ fn draw_paseo_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
             ui.lead(lead, dvec2(x, y + (h - 16.0) / 2.0), 16.0);
             x += 24.0;
         }
-        let text_h = lines * 18.0;
         let ty = y + (h - text_h) / 2.0;
-        if lines > 1.0 {
-            ui.text(Font::Regular, 14.0, fg, dvec2(x, ty), Some(label_w), &item.label);
-        } else {
-            let line = ui.measure(Font::Regular, 14.0, "Ag", None).y;
-            ui.text_line(Font::Regular, 14.0, fg, dvec2(x, ty + (18.0 - line) / 2.0), label_w, &item.label);
-        }
+        ui.text(Font::Regular, 14.0, fg, dvec2(x, ty), Some(label_w), &item.label);
         let mut right = item_rect.pos.x + item_rect.size.x - 8.0;
         if item.selected {
             right -= 16.0;
@@ -389,13 +381,14 @@ fn draw_select(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
     let a = menu.anchor;
     let width = if sheet { screen.size.x } else { a.size.x.max(220.0).min(screen.size.x - 16.0) };
     let separators = |i: usize| menu.items[i].separator_before && !searching;
-    let row_h = 36.0;
+    let row_h = visible.iter().map(|&i| ui.measure(Font::Regular, 14.0, &menu.items[i].label, None).y + 12.0).fold(36.0_f64, f64::max);
     let rows_h: f64 = visible.iter().map(|&i| row_h + if sheet { 4.0 } else { 0.0 } + if separators(i) { 9.0 } else { 0.0 }).sum();
-    let list_h = if visible.is_empty() { 8.0 + 20.0 + 8.0 } else { rows_h + if sheet { 4.0 + 32.0 } else { 8.0 } };
-    let search_h = if menu.searchable { 45.0 } else { 0.0 };
+    let list_h = if visible.is_empty() { 8.0 + ui.measure(Font::Regular, 14.0, &menu.empty_text, Some(width - 32.0)).y + 8.0 } else { rows_h + if sheet { 4.0 + 32.0 } else { 8.0 } };
+    let search_field_h = 20.0_f64.max(ui.measure(Font::Regular, 14.0, "Ag", None).y);
+    let search_h = if menu.searchable { search_field_h + 25.0 } else { 0.0 };
     let (rect, top) = if sheet {
         // Material drag handle area (48px) then the title (8px below).
-        let title_h = 20.0 + 8.0;
+        let title_h = ui.measure(Font::Medium, 14.0, &menu.title, None).y + 8.0;
         let total = (48.0 + title_h + search_h + list_h).min(screen.size.y * 0.9);
         let rect = bottom_sheet(ui, screen, total, 16.0, false);
         ui.rect(Rect { pos: dvec2(rect.pos.x + (rect.size.x - 32.0) / 2.0, rect.pos.y + 22.0), size: dvec2(32.0, 4.0) }, super::theme::alpha(pal.muted, 0.4), None, 2.0);
@@ -419,21 +412,21 @@ fn draw_select(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
     if menu.searchable {
         // Inside the popover's 1px rule on desktop.
         let edge = if sheet { inset } else { 1.0 };
-        let row = Rect { pos: dvec2(rect.pos.x + edge, y + if sheet { 0.0 } else { 1.0 }), size: dvec2(rect.size.x - edge * 2.0, if sheet { 44.0 } else { 43.0 }) };
+        let row = Rect { pos: dvec2(rect.pos.x + edge, y + if sheet { 0.0 } else { 1.0 }), size: dvec2(rect.size.x - edge * 2.0, search_h - if sheet { 1.0 } else { 2.0 }) };
         // Desktop popovers keep the 8px panel radius at the top edge.
         if sheet {
             ui.rect(row, pal.surface1, None, 0.0);
         } else {
             ui.rect_top(row, pal.surface1, 7.0);
         }
-        ui.rect(Rect { pos: dvec2(row.pos.x, y + 44.0), size: dvec2(row.size.x, 1.0) }, pal.border, None, 0.0);
-        ui.icon(Icon::Search, dvec2(row.pos.x + 12.0, y + 14.0), 16.0, pal.muted);
+        ui.rect(Rect { pos: dvec2(row.pos.x, y + search_h - 1.0), size: dvec2(row.size.x, 1.0) }, pal.border, None, 0.0);
+        ui.icon(Icon::Search, dvec2(row.pos.x + 12.0, y + (search_h - 1.0 - 16.0) / 2.0), 16.0, pal.muted);
         let field_x = row.pos.x + 12.0 + 16.0 + 8.0;
         let mut spec = FieldSpec::new(format!("menu.{}.search", menu.id), "").placeholder(menu.search_placeholder.clone()).bare();
         if !sheet {
             spec = spec.autofocus();
         }
-        ui.draw_ctl(Ctl::Field { spec, w: (row.pos.x + row.size.x - 12.0 - field_x).max(1.0), h: 20.0 }, dvec2(field_x, y + 12.0));
+        ui.draw_ctl(Ctl::Field { spec, w: (row.pos.x + row.size.x - 12.0 - field_x).max(1.0), h: search_field_h }, dvec2(field_x, y + 12.0));
         y += search_h;
     }
     let list = Rect { pos: dvec2(rect.pos.x, y), size: dvec2(rect.size.x, (rect.pos.y + rect.size.y - y).max(0.0)) };
@@ -503,9 +496,14 @@ fn draw_select(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
     (list, list_h)
 }
 
-/// Width of a sheet's header actions (8px apart, as in `SheetContents`).
-fn header_actions_w(ui: &mut Ui, head: &SheetHead) -> f64 {
-    head.header_actions.iter().map(|a| ui.measure_ctl(a).x + 8.0).sum()
+/// Size of a sheet's header actions (8px apart, as in `SheetContents`).
+fn header_actions_size(ui: &mut Ui, head: &SheetHead) -> DVec2 {
+    head.header_actions.iter().fold(DVec2::default(), |mut total, action| {
+        let size = ui.measure_ctl(action);
+        total.x += size.x + 8.0;
+        total.y = total.y.max(size.y);
+        total
+    })
 }
 
 /// Draws the frame of one sheet and positions `ui` for its body; returns the
@@ -516,7 +514,7 @@ fn header_actions_w(ui: &mut Ui, head: &SheetHead) -> f64 {
 /// of the window) over a 55% barrier; compact layouts a surface0 bottom
 /// sheet with 16px top corners and the Material drag handle over the
 /// default 54% barrier. Header: 24/16/16/16 insets, the 14px medium title
-/// (two lines at most), header actions and a 32px muted close glyph, a
+/// (wrapped to its measured height), header actions and a 32px muted close glyph, a
 /// surface2 rule below. Footer: a surface2 rule, 24/12 insets, actions
 /// 8px apart at the end (or sharing the row).
 pub fn sheet_frame(ui: &mut Ui, screen: Rect, id: u64, max_w: f64, head: &SheetHead, content_h: f64, busy_close: bool) -> (Rect, Rect) {
@@ -533,12 +531,13 @@ pub fn sheet_frame(ui: &mut Ui, screen: Rect, id: u64, max_w: f64, head: &SheetH
     let width = if compact { screen.size.x } else { max_w.min(screen.size.x - 48.0) };
     // Material bottom-sheet drag handle area.
     let handle_h = if compact { 48.0 } else { 0.0 };
-    let actions_w = header_actions_w(ui, head);
-    let title_w = (width - 24.0 - 16.0 - 32.0 - 8.0 - actions_w).max(40.0);
-    let title_h = ui.measure(Font::Medium, 14.0, &head.title, Some(title_w)).y.min(2.0 * 20.0);
-    // `_SheetSearchRow`: 24/0/24/12 insets around a 36px row.
-    let search_h = if head.search.is_some() { 36.0 + 12.0 } else { 0.0 };
-    let header_h = handle_h + 16.0 + title_h.max(32.0) + 16.0 + search_h + 1.0;
+    let header_actions = header_actions_size(ui, head);
+    let title_w = (width - 24.0 - 16.0 - 32.0 - 8.0 - header_actions.x).max(40.0);
+    let title_h = ui.measure(Font::Medium, 14.0, &head.title, Some(title_w)).y;
+    let row_h = title_h.max(header_actions.y).max(32.0);
+    let search_field_h = 20.0_f64.max(ui.measure(Font::Regular, 14.0, "Ag", None).y);
+    let search_h = if head.search.is_some() { search_field_h + 16.0 + 12.0 } else { 0.0 };
+    let header_h = handle_h + 16.0 + row_h + 16.0 + search_h + 1.0;
     let actions_h = footer_h(ui, head);
     let max_h = if compact { screen.size.y * 0.9 } else { (screen.size.y * 0.85).min(screen.size.y - 48.0) };
     // `content_h` already includes the 24px body padding on both sides.
@@ -558,7 +557,6 @@ pub fn sheet_frame(ui: &mut Ui, screen: Rect, id: u64, max_w: f64, head: &SheetH
     }
     ui.zone(&format!("sheet.{id}.panel"), rect, Some(handler(|_, _| {})));
     let row_top = pos.y + handle_h + 16.0;
-    let row_h = title_h.max(32.0);
     ui.text(Font::Medium, 14.0, pal.foreground, dvec2(pos.x + 24.0, row_top + (row_h - title_h) / 2.0), Some(title_w), &head.title);
     // Close: `IconButton` with 8px padding, a 16px X and the 8px-radius hover.
     let close_rect = Rect { pos: dvec2(pos.x + width - 16.0 - 32.0, row_top + (row_h - 32.0) / 2.0), size: dvec2(32.0, 32.0) };
@@ -573,10 +571,10 @@ pub fn sheet_frame(ui: &mut Ui, screen: Rect, id: u64, max_w: f64, head: &SheetH
     ui.set_last_tip_pub(&close_key, "Close".to_string());
     if let Some((field, placeholder)) = &head.search {
         let y = row_top + row_h + 16.0;
-        ui.icon(Icon::Search, dvec2(pos.x + 24.0, y + 10.0), 16.0, pal.muted);
+        ui.icon(Icon::Search, dvec2(pos.x + 24.0, y + search_field_h / 2.0), 16.0, pal.muted);
         let fx = pos.x + 24.0 + 16.0 + 8.0;
         let spec = FieldSpec::new(field.clone(), "").placeholder(placeholder.clone()).bare();
-        ui.draw_ctl(Ctl::Field { spec, w: (pos.x + width - 24.0 - fx).max(1.0), h: 20.0 }, dvec2(fx, y + 8.0));
+        ui.draw_ctl(Ctl::Field { spec, w: (pos.x + width - 24.0 - fx).max(1.0), h: search_field_h }, dvec2(fx, y + 8.0));
     }
     let rule_y = pos.y + header_h - 1.0;
     let rule_x = if compact { pos.x } else { pos.x + 1.0 };
@@ -591,11 +589,11 @@ pub fn sheet_frame(ui: &mut Ui, screen: Rect, id: u64, max_w: f64, head: &SheetH
 /// Draws header actions (left of the close button) and footer actions.
 pub fn sheet_controls(ui: &mut Ui, rect: Rect, mut head: SheetHead) {
     let handle_h = if ui.compact { 48.0 } else { 0.0 };
-    let actions_w = header_actions_w(ui, &head);
-    let title_w = (rect.size.x - 24.0 - 16.0 - 32.0 - 8.0 - actions_w).max(40.0);
-    let title_h = ui.measure(Font::Medium, 14.0, &head.title, Some(title_w)).y.min(40.0);
+    let header_actions = header_actions_size(ui, &head);
+    let title_w = (rect.size.x - 24.0 - 16.0 - 32.0 - 8.0 - header_actions.x).max(40.0);
+    let title_h = ui.measure(Font::Medium, 14.0, &head.title, Some(title_w)).y;
     let row_top = rect.pos.y + handle_h + 16.0;
-    let row_h = title_h.max(32.0);
+    let row_h = title_h.max(header_actions.y).max(32.0);
     let footer = footer_h(ui, &head);
     let mut x = rect.pos.x + rect.size.x - 16.0 - 32.0;
     for action in std::mem::take(&mut head.header_actions).into_iter().rev() {
@@ -911,9 +909,13 @@ fn draw_material_alert(ui: &mut Ui, screen: Rect, id: u64, confirm: &Confirm, ac
     let AlertActions { cancel: (cancel_label, cancel), confirm: (confirm_label, run) } = actions;
     let pal = ui.pal;
     let compact = ui.compact;
-    let (button_h, button_pad) = if compact { (44.0, 16.0) } else { (32.0, 12.0) };
+    let (mut button_h, button_pad): (f64, f64) = if compact { (44.0, 16.0) } else { (32.0, 12.0) };
     let labels = [cancel_label.as_str(), confirm_label.as_str()];
-    let label_w: Vec<f64> = labels.iter().map(|l| ui.measure(Font::Regular, 14.0, l, None).x).collect();
+    let label_w: Vec<f64> = labels.iter().map(|label| {
+        let size = ui.measure(Font::Regular, 14.0, label, None);
+        button_h = button_h.max(size.y + 8.0);
+        size.x
+    }).collect();
     let actions_w: f64 = label_w.iter().map(|w| w + button_pad * 2.0).sum::<f64>() + 8.0;
     let max_w = (screen.size.x - 80.0).clamp(0.0, 560.0);
     let title_natural = ui.measure(Font::Medium, 20.0, &confirm.title, None).x;

@@ -259,6 +259,7 @@ impl AppMain for App {
         let refresh_appearance = appearance_changed || matches!(event, Event::Foreground | Event::Resume | Event::AppGotFocus);
         if refresh_appearance {
             runtime.system_dark = shell_platform::system_prefers_dark();
+            runtime.theme_key.clear();
         }
         let mut appearance = refresh_appearance || matches!(event, Event::Startup);
         if let Event::Signal = event {

@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 #[allow(unused)]
 use makepad_jni_sys as jni_sys;
@@ -46,6 +46,8 @@ use {
             WindowGeomChangeEvent,
             //TimerEvent,
             TextInputEvent,
+            TextClipboardEvent,
+            TextActionCapabilities,
             KeyEvent,
             KeyModifiers,
             KeyCode,
@@ -146,6 +148,9 @@ impl Cx {
                 self.os.display.as_mut().unwrap().update_surface(window);
             },
             FromJavaMessage::SurfaceDestroyed => unsafe {
+                let owner = self.keyboard.text_selection;
+                self.clear_text_selection(owner);
+                self.clear_key_focus_if(owner);
                 self.os.display.as_mut().unwrap().destroy_surface();
             },
             FromJavaMessage::SurfaceChanged {
@@ -231,6 +236,7 @@ impl Cx {
                 let e = Event::TouchUpdate(
                     TouchUpdateEvent {
                         time,
+                        cancelled,
                         window_id: CxWindowPool::id_zero(),
                         touches,
                         modifiers: Default::default()
@@ -250,6 +256,9 @@ impl Cx {
                     self.call_event_handler(&Event::TextIme(edit));
                     self.os.text_input.processing = false;
                 }
+            }
+            FromJavaMessage::TextAction { token, action, text } => {
+                self.android_text_action(token, action, text);
             }
             FromJavaMessage::Character {character} => {
                 if let Some(character) = char::from_u32(character) {
@@ -497,6 +506,7 @@ impl Cx {
         if self.os.ime_blur_pending {
             self.hide_text_ime();
         }
+        self.android_sync_text_actions();
     }
 
     /// Processes events that need to be checked regularly, regardless of incoming messages.
@@ -1030,6 +1040,104 @@ pub(crate) struct AndroidTextInput {
 }
 
 impl Cx {
+    pub(crate) fn android_sync_text_actions(&mut self) {
+        if let Some(request) = self.keyboard.text_actions {
+            if !request.area.is_valid(self) || !self.has_key_focus(request.area)
+                || self.keyboard.text_selection != request.area {
+                self.keyboard.hide_text_actions(request.area);
+            }
+        }
+        let dpi = self.windows[CxWindowPool::id_zero()].dpi_override.unwrap_or(self.os.dpi_factor);
+        let request = self.keyboard.text_actions.and_then(|request| {
+            let clip = request.area.clipped_rect(self);
+            let rect = match request.anchor {
+                crate::event::TextActionsAnchor::Rect(relative) => {
+                    let mut origin = request.area.rect(self).pos;
+                    if let Some(id) = request.area.draw_list_id() {
+                        let list = &self.draw_lists[id];
+                        if list.draw_list_has_clip {
+                            origin += dvec2(list.draw_list_uniforms.view_shift.x as f64, list.draw_list_uniforms.view_shift.y as f64);
+                        }
+                    }
+                    Some(relative.translate(origin))
+                }
+                crate::event::TextActionsAnchor::Area(area) => self.android_visible_text_action_rect(area),
+            }?.clip((clip.pos, clip.pos + clip.size));
+            (rect.size.x > 0.0 && rect.size.y > 0.0)
+                .then_some((request.token, rect, request.capabilities, dpi))
+        });
+        if request.is_none() {
+            if let Some(stale) = self.keyboard.text_actions {
+                self.keyboard.hide_text_actions(stale.area);
+            }
+        }
+        if self.os.text_actions_sent == request { return; }
+        self.os.text_actions_sent = request;
+        if let Some((token, rect, caps, dpi)) = request {
+            let flags = caps.copy as i32 | ((caps.cut as i32) << 1)
+                | ((caps.paste as i32) << 2) | ((caps.select_all as i32) << 3);
+            unsafe { android_jni::to_java_text_actions(token, flags, rect, dpi); }
+        } else {
+            unsafe { android_jni::to_java_hide_text_actions(); }
+        }
+    }
+
+    fn android_visible_text_action_rect(&self, area: crate::area::Area) -> Option<crate::makepad_math::Rect> {
+        if !area.is_valid(self) { return None; }
+        if let crate::area::Area::Instance(instance) = area {
+            let item = &self.draw_lists[instance.draw_list_id].draw_items[instance.draw_item_id];
+            let shader = item.draw_call()?.draw_shader;
+            let stride = self.draw_shaders[shader.draw_shader_id].mapping.instances.total_slots;
+            for index in 0..instance.instance_count {
+                let part = crate::area::Area::Instance(crate::area::InstanceArea {
+                    instance_offset: instance.instance_offset + index * stride,
+                    instance_count: 1,
+                    ..instance
+                });
+                let rect = part.clipped_rect(self);
+                if rect.size.x > 0.0 && rect.size.y > 0.0 { return Some(rect); }
+            }
+            None
+        } else {
+            let rect = area.clipped_rect(self);
+            (rect.size.x > 0.0 && rect.size.y > 0.0).then_some(rect)
+        }
+    }
+
+    fn android_text_action(&mut self, token: u64, action: u32, text: Option<String>) {
+        let Some(request) = self.keyboard.text_actions.filter(|request| {
+            request.token == token && self.keyboard.text_selection == request.area
+                && request.area.is_valid(self) && self.has_key_focus(request.area)
+        }) else { return; };
+        let caps = request.capabilities;
+        match action {
+            0 => self.call_event_handler(&Event::TextSelectionDismiss),
+            1 | 2 if if action == 1 { caps.copy } else { caps.cut } => {
+                let response = Rc::new(RefCell::new(None));
+                let clipboard = TextClipboardEvent { response: response.clone() };
+                self.call_event_handler(&if action == 1 {
+                    Event::TextCopy(clipboard)
+                } else {
+                    Event::TextCut(clipboard)
+                });
+                if let Some(text) = response.borrow_mut().take() {
+                    unsafe { android_jni::to_java_copy_to_clipboard(text); }
+                }
+                self.hide_text_actions(request.area);
+            }
+            3 if caps.paste => {
+                if let Some(input) = text {
+                    self.call_event_handler(&Event::TextInput(TextInputEvent {
+                        input, replace_last: false, was_paste: true,
+                    }));
+                }
+                self.hide_text_actions(request.area);
+            }
+            4 if caps.select_all => self.call_event_handler(&Event::TextSelectAll),
+            _ => {}
+        }
+    }
+
     pub(crate) fn android_update_text_input(&mut self, area: crate::area::Area,
         editor: u64, text: &str, start: usize, end: usize, password: bool, numeric: bool) {
         if !area.is_valid(self) || !self.has_key_focus(area) { return; }
@@ -1075,6 +1183,7 @@ impl Default for CxOs {
     fn default() -> Self {
         Self {
             text_input: Default::default(),
+            text_actions_sent: None,
             start_time: Instant::now(),
             first_after_resize: true,
             frame_time: 0,
@@ -1115,6 +1224,7 @@ pub struct CxAndroidDisplay {
 
 pub struct CxOs {
     pub(crate) text_input: AndroidTextInput,
+    text_actions_sent: Option<(u64, Rect, TextActionCapabilities, f64)>,
     pub first_after_resize: bool,
     pub display_size: DVec2,
     pub dpi_factor: f64,

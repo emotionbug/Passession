@@ -121,12 +121,14 @@ impl ExplorerView {
         self.row_rects.clear();
         kit.fill(cx, area, if self.sidebar { p.sidebar } else { p.surface0 }, 0.0);
         // Toolbar.
-        let bar = rect(area.pos.x, area.pos.y, area.size.x, TOOLBAR_HEIGHT);
+        let toolbar_h = TOOLBAR_HEIGHT.max(ty.ui_size(12.0) * 1.4 + 12.0);
+        let bar = rect(area.pos.x, area.pos.y, area.size.x, toolbar_h);
         ui::toolbar(cx, kit, bar, self.sidebar, p);
         let small = ty.ui_size(12.0);
         let sort_label = t(&format!("workspace.fileExplorer.sort.{}", state.sort().id()));
         let sort_w = kit.measure(cx, spec(Font::Regular, small, p.muted), &sort_label).x + 4.0 + 12.0 + 8.0;
-        let sort = rect(bar.pos.x + 8.0, bar.pos.y + (TOOLBAR_HEIGHT - 24.0) / 2.0, sort_w, 24.0);
+        let sort_h = 24.0_f64.max(small * 1.4);
+        let sort = rect(bar.pos.x + 8.0, bar.pos.y + (toolbar_h - sort_h) / 2.0, sort_w, sort_h);
         let sort_state = self.state_of(&Hot::Sort, true, false);
         if sort_state.hovered || sort_state.pressed {
             kit.fill(cx, sort, ui::sidebar_hover(p), 4.0);
@@ -137,7 +139,7 @@ impl ExplorerView {
         // Trailing controls, right to left, 1px apart.
         let size = ui::toolbar_button_size(look.compact);
         let mut x = bar.pos.x + bar.size.x - ui::toolbar_trailing_padding(look.compact);
-        let y = bar.pos.y + (TOOLBAR_HEIGHT - size) / 2.0;
+        let y = bar.pos.y + (toolbar_h - size) / 2.0;
         let place = |x: &mut f64| {
             *x -= size;
             let r = rect(*x, y, size, size);
@@ -171,10 +173,10 @@ impl ExplorerView {
             ui::icon_button(cx, kit, r, action.icon, st, look.compact, p);
             self.hits.push(r, hot);
         }
-        let mut top = bar.pos.y + TOOLBAR_HEIGHT;
+        let mut top = bar.pos.y + toolbar_h;
         // Remote location field (picker, or the navigation menu's "Go to directory…").
         if state.show_location || state.directories_only {
-            let h = ui::ButtonSize::Sm.height();
+            let h = ui::ButtonSize::Sm.height().max(small * 1.4 + 12.0);
             let r = rect(area.pos.x + 8.0, top + 8.0, area.size.x - 16.0, h);
             self.location.focused = self.location_focused;
             self.location.draw(cx, kit, r, l("Remote directory"), None, ty.ui_size(12.0), p, ime.0);
@@ -183,7 +185,7 @@ impl ExplorerView {
         }
         if look.picker {
             let label = l("Use this directory");
-            let h = ui::ButtonSize::Sm.height();
+            let h = ui::ButtonSize::Sm.height().max(small * 1.4 + 12.0);
             let w = ui::button_width(cx, kit, label, Some("check"), ui::ButtonSize::Sm, ty);
             let r = rect(area.pos.x + 8.0, top + 8.0, w, h);
             let st = self.state_of(&Hot::UseDirectory, true, false);
@@ -310,7 +312,7 @@ impl ExplorerView {
             ("parent", "corner-left-up", l("Parent directory"), true),
             ("location", "folder-search", l("Go to directory…"), true),
         ];
-        let item_h = 32.0;
+        let item_h = 32.0_f64.max(ty.ui_size(14.0) * 1.4 + 12.0);
         let w = 200.0;
         let h = item_h * 4.0 + 9.0 + 8.0;
         let x = self.nav_anchor.pos.x + self.nav_anchor.size.x - w;
@@ -385,7 +387,11 @@ impl ExplorerView {
                     return ExplorerEvent::None;
                 }
                 let secondary = fe.device.mouse_button().is_some_and(|b| b.is_secondary());
+                if self.location_focused && hot != Some(Hot::Location) {
+                    self.location.clear_selection(cx);
+                }
                 self.location_focused = hot == Some(Hot::Location);
+                self.location.focused = self.location_focused;
                 if self.location_focused {
                     let event = self.location.handle_hit(cx, kit, hit);
                     *changed = true;
@@ -440,6 +446,12 @@ impl ExplorerView {
                 self.pressed = None;
                 *changed = true;
                 match hot {
+                    Some(Hot::Location) => {
+                        self.location_focused = true;
+                        self.location.focused = true;
+                        self.location.handle_hit(cx, kit, hit);
+                        return ExplorerEvent::None;
+                    }
                     Some(Hot::Row(index)) => {
                         let Some(row) = state.rows().get(index).cloned() else { return ExplorerEvent::None };
                         state.selected = Some(row.entry.path.clone());
@@ -484,11 +496,17 @@ impl ExplorerView {
                         let path = self.location.text().trim().to_owned();
                         state.navigate(&path, true);
                     }
-                    FieldEvent::Escaped => self.location_focused = false,
+                    FieldEvent::Escaped => {
+                        self.location.clear_selection(cx);
+                        self.location.focused = false;
+                        self.location_focused = false;
+                    }
                     _ => {}
                 }
             }
             Hit::KeyFocusLost(_) => {
+                self.location.clear_selection(cx);
+                self.location.focused = false;
                 if self.location_focused {
                     self.location_focused = false;
                     *changed = true;

@@ -220,6 +220,8 @@ pub struct TouchPoint {
 #[derive(Clone, Debug)]
 pub struct TouchUpdateEvent {
     pub time: f64,
+    /// The platform cancelled this gesture rather than releasing it.
+    pub cancelled: bool,
     pub window_id: WindowId,
     pub modifiers: KeyModifiers,
     pub touches: Vec<TouchPoint>,
@@ -856,15 +858,18 @@ impl Event {
     pub fn hits_with_options_and_test<F>(&self, cx: &mut Cx, area: Area, options: HitOptions, hit_test:F) -> Hit 
     where F: Fn(DVec2, &Rect, &Option<Margin>)->bool
     {
+        // Virtualized/offscreen owners must still release source selection.
+        if let Event::KeyFocus(kf) = self {
+            if area != Area::Empty && area == kf.prev {
+                return Hit::KeyFocusLost(kf.clone());
+            }
+        }
         if !area.is_valid(cx) {
             return Hit::Nothing
         }
         match self {
             Event::KeyFocus(kf) => {
-                if area == kf.prev {
-                    return Hit::KeyFocusLost(kf.clone())
-                }
-                else if area == kf.focus {
+                if area == kf.focus {
                     return Hit::KeyFocus(kf.clone())
                 }
             },
@@ -896,6 +901,21 @@ impl Event {
             Event::TextCut(tc) => {
                 if cx.keyboard.has_key_focus(area) {
                     return Hit::TextCut(tc.clone());
+                }
+            },
+            Event::TextSelectAll => {
+                if cx.keyboard.has_key_focus(area) {
+                    // Reuse widget editing commands without broadcasting a
+                    // synthetic shortcut to application-level key handlers.
+                    return Hit::KeyDown(crate::event::KeyEvent {
+                        key_code: crate::event::KeyCode::KeyA,
+                        modifiers: KeyModifiers {
+                            control: !cfg!(target_vendor = "apple"),
+                            logo: cfg!(target_vendor = "apple"),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
                 }
             },
             Event::Scroll(e) => {
@@ -1409,6 +1429,21 @@ mod paseo_touch_tests {
         assert!(!fingers.test_sweep_lock(area));
         fingers.sweep_unlock(area);
         assert!(!fingers.test_sweep_lock(Area::Empty));
+    }
+
+    #[test]
+    fn offscreen_owner_receives_focus_loss_without_granting_invalid_focus() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let list = cx.draw_lists.alloc();
+        let old = Area::Rect(crate::area::RectArea {
+            draw_list_id: list.id(), rect_id: 0, redraw_id: 1,
+        });
+        assert!(!old.is_valid(&cx));
+        let lost = Event::KeyFocus(crate::event::KeyFocusEvent { prev: old, focus: Area::Empty });
+        assert!(matches!(lost.hits(&mut cx, old), Hit::KeyFocusLost(_)));
+        assert!(matches!(lost.hits(&mut cx, Area::Empty), Hit::Nothing));
+        let gained = Event::KeyFocus(crate::event::KeyFocusEvent { prev: Area::Empty, focus: old });
+        assert!(matches!(gained.hits(&mut cx, old), Hit::Nothing));
     }
 
     fn touch(uid: u64, x: f64, state: TouchState) -> TouchPoint {

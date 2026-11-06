@@ -5,6 +5,7 @@
 //! [`Painter::capture_box`]) for capture/hover, and keeps the rects it painted in a [`HitMap`]
 //! to resolve which item is under the pointer.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use makepad_widgets::makepad_draw::text::layouter::LaidoutText;
@@ -71,6 +72,27 @@ impl TextSpec {
     pub fn new(font: Font, size: f64, color: Vec4) -> Self {
         Self { font, size, color }
     }
+}
+
+/// Presents hard line breaks as spaces without dropping later label content.
+/// Paragraph/code layout must keep the original text instead.
+pub fn single_line_text(text: &str) -> Cow<'_, str> {
+    let is_break = |c| matches!(c, '\n' | '\r' | '\u{000b}' | '\u{000c}' | '\u{0085}' | '\u{2028}' | '\u{2029}');
+    let Some(first) = text.find(is_break) else { return Cow::Borrowed(text) };
+    let mut line = String::with_capacity(text.len());
+    line.push_str(&text[..first]);
+    let mut chars = text[first..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if is_break(c) {
+            line.push(' ');
+            if c == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        } else {
+            line.push(c);
+        }
+    }
+    Cow::Owned(line)
 }
 
 impl Painter {
@@ -335,4 +357,28 @@ pub fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
 /// `rect` shrunk by `dx`/`dy` on each side.
 pub fn inset(r: Rect, dx: f64, dy: f64) -> Rect {
     rect(r.pos.x + dx, r.pos.y + dy, r.size.x - dx * 2.0, r.size.y - dy * 2.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_line_text;
+    use std::borrow::Cow;
+
+    #[test]
+    fn single_line_labels_borrow_unchanged_text() {
+        for text in ["", "hello world", "긴 한국어 제목과 English", "a\tb", "👩‍💻e\u{301}"] {
+            assert!(matches!(single_line_text(text), Cow::Borrowed(s) if s == text));
+        }
+    }
+
+    #[test]
+    fn single_line_labels_preserve_content_across_hard_breaks() {
+        for separator in ["\n", "\r", "\r\n", "\u{000b}", "\u{000c}", "\u{0085}", "\u{2028}", "\u{2029}"] {
+            let text = format!("# Target{separator}packages/한글");
+            assert_eq!(single_line_text(&text), "# Target packages/한글");
+            assert_eq!(single_line_text(separator), " ");
+        }
+        assert_eq!(single_line_text("\r\n한글\n\nEnglish\u{2029}"), " 한글  English ");
+        assert_eq!(single_line_text("\r\r\n\n"), "   ");
+    }
 }

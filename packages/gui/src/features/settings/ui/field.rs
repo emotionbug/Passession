@@ -29,6 +29,7 @@ pub struct FieldSpec {
     pub multiline: bool,
     pub enabled: bool,
     pub autofocus: bool,
+    /// Authored size at the shared 14px UI base; scaled exactly once on draw.
     pub font_px: f64,
     pub on_submit: Option<Handler>,
     pub on_blur: Option<Handler>,
@@ -261,7 +262,7 @@ impl FieldHost {
                 entry.epoch = Some(epoch);
                 entry.font_px = spec.font_px;
                 entry.styled_color = Some(plain.color);
-                let font = spec.font_px * 0.75;
+                let font = crate::theme::current_typography().ui_size(spec.font_px) * 0.75;
                 let fg = plain.color;
                 // Material 3 default: the primary colour at 40%.
                 let selection = super::theme::alpha(pal.accent, 0.4);
@@ -300,7 +301,7 @@ impl FieldHost {
             entry.epoch = Some(epoch);
             entry.font_px = spec.font_px;
             entry.styled_enabled = spec.enabled;
-            let font = spec.font_px * 0.75;
+            let font = crate::theme::current_typography().ui_size(spec.font_px) * 0.75;
             let fill = if spec.bare { pal.transparent } else if spec.enabled { pal.surface2 } else { pal.surface1 };
             let (border, focus, fg, hint) = (pal.border, pal.border_accent, pal.foreground, pal.muted);
             let (border, focus) = if spec.bare { (pal.transparent, pal.transparent) } else { (border, focus) };

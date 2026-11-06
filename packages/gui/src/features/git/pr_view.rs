@@ -659,17 +659,19 @@ impl PrView {
         }
         .to_owned();
         // Toolbar.
-        let band = rect(c.left, c.y, c.width, 36.0);
+        let toolbar_h = 36.0_f64.max(ui_px(12.0) * 1.4 + 12.0);
+        let band = rect(c.left, c.y, c.width, toolbar_h);
         toolbar_band(cx, paint, band, true);
-        let center_y = band.pos.y + 17.5;
+        let center_y = band.pos.y + (toolbar_h - 1.0) / 2.0;
         let label = t("workspace.git.pr.actions.viewPullRequest");
         let label_size = ui_px(12.0);
         let view_width = 4.0 + 12.0 + 4.0 + paint.measure(cx, Font::Regular, label_size, &label).x + 4.0;
-        let view = rect(band.pos.x + 12.0, center_y - 12.0, view_width, 24.0);
+        let view_h = 24.0_f64.max(label_size * 1.4);
+        let view = rect(band.pos.x + 12.0, center_y - view_h / 2.0, view_width, view_h);
         let hovered = self.hovered == Some(PrHit::ViewPr);
         let fg = if hovered { colors.foreground } else { colors.muted };
         paint.icon(cx, "external-link", 12.0, fg, dvec2(view.pos.x + 4.0 + 6.0, center_y));
-        paint.text_centered(cx, Font::Regular, label_size, fg, view.pos.x + 20.0, view.pos.y, 24.0, &label, view_width);
+        paint.text_centered(cx, Font::Regular, label_size, fg, view.pos.x + 20.0, view.pos.y, view_h, &label, view_width);
         self.hits.push_clipped(view, c.view, PrHit::ViewPr);
         if host::supports(ui, &self.target.server_id, "checkoutRefresh") {
             let right = band.pos.x + band.size.x - 12.0;
@@ -682,7 +684,7 @@ impl PrView {
                 self.hits.push_clipped(button, c.view, PrHit::Refresh);
             }
         }
-        c.y += 36.0;
+        c.y += toolbar_h;
         self.header(cx, paint, c, pr, &forge);
         let facts = object(pr, "forgeSpecific").clone();
         if self.pane.gitlab_pipeline_section(ui, &facts) {
@@ -740,11 +742,12 @@ impl PrView {
             _ => ("git-pull-request", colors.success),
         };
         let small = ui_px(12.0);
-        let center_y = row_y + 8.0;
+        let row_h = 16.0 + (small - 12.0).max(0.0) * 1.4;
+        let center_y = row_y + row_h / 2.0;
         let mut x = c.left + 16.0;
         paint.icon(cx, icon, 14.0, color, dvec2(x + 7.0, center_y));
         x += 18.0;
-        x += paint.text_centered(cx, Font::Regular, small, color, x, row_y, 16.0, &t(&format!("workspace.git.pr.states.{state}")), inner) + 4.0;
+        x += paint.text_centered(cx, Font::Regular, small, color, x, row_y, row_h, &t(&format!("workspace.git.pr.states.{state}")), inner) + 4.0;
         let facts = object(pr, "forgeSpecific");
         let required = if text(facts, "forge") == "gitlab" { int(facts, "approvalsRequired") } else { 0 };
         if required > 0 {
@@ -752,15 +755,15 @@ impl PrView {
             paint.icon(cx, "circle-check", 11.0, if given >= required { colors.success } else { colors.muted }, dvec2(x + 6.0, center_y));
             x += 16.0;
             let copy = tr("workspace.git.pr.approvals", &[("given", given.to_string()), ("required", required.to_string())]);
-            x += paint.text_centered(cx, Font::Regular, small, colors.muted, x, row_y, 16.0, &copy, inner) + 4.0;
+            x += paint.text_centered(cx, Font::Regular, small, colors.muted, x, row_y, row_h, &copy, inner) + 4.0;
         }
         let identity = repo_identity(pr);
         let right = c.left + c.width - 16.0 - 16.0;
         if !identity.is_empty() {
             x += 4.0;
-            x += paint.text_centered(cx, Font::Regular, small, colors.muted, x, row_y, 16.0, &identity, (right - x).max(0.0));
+            x += paint.text_centered(cx, Font::Regular, small, colors.muted, x, row_y, row_h, &identity, (right - x).max(0.0));
         }
-        let region = rect(c.left, top, c.width, 16.0 + title_height + 8.0 + 16.0 + 16.0);
+        let region = rect(c.left, top, c.width, 16.0 + title_height + 8.0 + row_h + 16.0);
         if self.hovered == Some(PrHit::Header) {
             paint.icon(cx, "external-link", 12.0, colors.muted, dvec2(x + 4.0 + 6.0, center_y));
         }
@@ -772,7 +775,7 @@ impl PrView {
     #[allow(clippy::too_many_arguments)]
     fn section_header(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, c: &mut Cursor, title: &str, open: bool, hit: PrHit, summary: &[(usize, Option<Check>, Vec4)]) {
         let colors = palette();
-        let height = 8.0 + 16.0 + 8.0;
+        let height = 32.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4;
         let band = rect(c.left, c.y, c.width, height);
         let center_y = band.pos.y + height / 2.0;
         paint.icon(cx, if open { "chevron-down" } else { "chevron-right" }, 14.0, colors.muted, dvec2(c.left + 12.0 + 7.0, center_y));
@@ -848,8 +851,10 @@ impl PrView {
             let key = if checks.len() == 1 { format!("{COPY}.detailOne") } else { format!("{COPY}.detailMany") };
             tr(&key, &[("parts", parts.join(", "))])
         };
-        let height = 12.0 + 36.0 + 12.0;
-        let band = rect(c.left, c.y, c.width, if detail.is_empty() { 12.0 + 20.0 + 12.0 } else { height });
+        let title_h = 20.0_f64.max(ui_px(14.0) * 1.4);
+        let detail_h = 16.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4;
+        let height = 24.0 + title_h + detail_h;
+        let band = rect(c.left, c.y, c.width, if detail.is_empty() { 24.0 + title_h } else { height });
         if self.hovered == Some(PrHit::ChecksToggle) {
             paint.fill(cx, band, colors.sidebar_hover);
         }
@@ -875,7 +880,7 @@ impl PrView {
             paint.text_centered(cx, Font::Medium, ui_px(14.0), colors.foreground, text_left, band.pos.y, band.size.y, &headline, text_width);
         } else {
             paint.text_fit(cx, Font::Medium, ui_px(14.0), colors.foreground, dvec2(text_left, band.pos.y + 12.0), &headline, text_width);
-            paint.text_fit(cx, Font::Regular, ui_px(12.0), colors.muted, dvec2(text_left, band.pos.y + 12.0 + 20.0), &detail, text_width);
+            paint.text_fit(cx, Font::Regular, ui_px(12.0), colors.muted, dvec2(text_left, band.pos.y + 12.0 + title_h), &detail, text_width);
         }
         paint.icon(cx, if self.pane.checks_open { "chevron-down" } else { "chevron-right" }, 14.0, colors.muted, dvec2(c.left + c.width - 12.0 - 7.0, center_y));
         self.hits.push_clipped(band, c.view, PrHit::ChecksToggle);
@@ -884,11 +889,13 @@ impl PrView {
             return;
         }
         // Roughly eight rows; past this the list scrolls in place.
+        let row_h = 32.0_f64.max(ui_px(14.0) * 1.4 + 8.0);
+        let heading_h = 16.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4;
         let mut inner = 0.0;
         for (presentation, matching) in &groups {
-            inner += 8.0 + 16.0 + 4.0;
+            inner += 8.0 + heading_h + 4.0;
             if !self.pane.collapsed_groups.contains(presentation) {
-                inner += matching.len() as f64 * 32.0;
+                inner += matching.len() as f64 * row_h;
             }
         }
         inner += 8.0;
@@ -903,22 +910,22 @@ impl PrView {
         let fallback = text(pr, "url").to_owned();
         for (presentation, matching) in &groups {
             let collapsed = self.pane.collapsed_groups.contains(presentation);
-            let header = rect(c.left, y, c.width, 8.0 + 16.0 + 4.0);
+            let header = rect(c.left, y, c.width, 8.0 + heading_h + 4.0);
             let key = format!("{COPY}.{}.{}", if matching.len() == 1 { "groupOne" } else { "groupMany" }, presentation.name());
             let copy = tr(&key, &[("count", matching.len().to_string())]);
-            let width = paint.text_centered(cx, Font::Medium, ui_px(12.0), colors.muted, c.left + 12.0, y + 8.0, 16.0, &copy, c.width - 40.0);
-            paint.icon(cx, if collapsed { "chevron-right" } else { "chevron-down" }, 12.0, colors.muted, dvec2(c.left + 12.0 + width + 4.0 + 6.0, y + 16.0));
+            let width = paint.text_centered(cx, Font::Medium, ui_px(12.0), colors.muted, c.left + 12.0, y + 8.0, heading_h, &copy, c.width - 40.0);
+            paint.icon(cx, if collapsed { "chevron-right" } else { "chevron-down" }, 12.0, colors.muted, dvec2(c.left + 12.0 + width + 4.0 + 6.0, y + 8.0 + heading_h / 2.0));
             self.hits.push_clipped(header, clip, PrHit::Group(*presentation));
             y += header.size.y;
             if collapsed {
                 continue;
             }
             for check in matching {
-                if y + 32.0 >= clip.pos.y && y <= clip.pos.y + clip.size.y {
+                if y + row_h >= clip.pos.y && y <= clip.pos.y + clip.size.y {
                     let url = Some(text(check, "url")).filter(|u| !u.is_empty()).unwrap_or(&fallback).to_owned();
-                    self.check_row(cx, paint, c.left, y, c.width, 32.0, 12.0, classify_check(check), text(check, "name"), text(check, "workflow"), check_timing(check), Some(url), clip);
+                    self.check_row(cx, paint, c.left, y, c.width, row_h, 12.0, classify_check(check), text(check, "name"), text(check, "workflow"), check_timing(check), Some(url), clip);
                 }
-                y += 32.0;
+                y += row_h;
             }
         }
         paint.end_clip(cx);
@@ -928,6 +935,9 @@ impl PrView {
     /// Original `_GitlabPipelineSection`.
     fn pipeline_section(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, c: &mut Cursor, facts: &Value) {
         let colors = palette();
+        let row_h = 32.0_f64.max(ui_px(14.0) * 1.4 + 8.0);
+        let job_h = 36.0_f64.max(row_h);
+        let heading_h = 16.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4;
         let raw_status = text(facts, "pipelineStatus").to_owned();
         let url = text(facts, "pipelineUrl").to_owned();
         let pipeline = self.pane.pipeline.clone();
@@ -960,11 +970,11 @@ impl PrView {
         let pipeline_name = format!("Pipeline #{}", int(facts, "pipelineId"));
         let launch = Some(url.clone()).filter(|u| !u.is_empty());
         let trailing = None;
-        self.check_row(cx, paint, c.left, c.y, c.width, 32.0, 12.0, classify_gitlab_job(&raw_status, false), &pipeline_name, &raw_status, trailing, launch.clone(), c.view);
+        self.check_row(cx, paint, c.left, c.y, c.width, row_h, 12.0, classify_gitlab_job(&raw_status, false), &pipeline_name, &raw_status, trailing, launch.clone(), c.view);
         if launch.is_some() {
-            paint.icon(cx, "external-link", 12.0, colors.muted, dvec2(c.left + c.width - 12.0 - 6.0, c.y + 16.0));
+            paint.icon(cx, "external-link", 12.0, colors.muted, dvec2(c.left + c.width - 12.0 - 6.0, c.y + row_h / 2.0));
         }
-        c.y += 32.0;
+        c.y += row_h;
         if self.pane.pipeline_loading {
             self.empty_text(cx, paint, c, &t("workspace.git.pr.empty.loadingPipeline"));
         } else if pipeline.is_some() && stages.is_empty() {
@@ -974,18 +984,18 @@ impl PrView {
         }
         if !self.pane.pipeline_loading {
             for stage in &stages {
-                let center_y = c.y + 8.0 + 8.0;
+                let center_y = c.y + 8.0 + heading_h / 2.0;
                 check_icon(paint, cx, classify_gitlab_job(text(stage, "status"), false), 14.0, dvec2(c.left + 12.0 + 7.0, center_y));
-                paint.text_centered(cx, Font::Medium, ui_px(12.0), colors.muted, c.left + 12.0 + 22.0, c.y + 8.0, 16.0, &text(stage, "name").to_uppercase(), c.width - 46.0);
-                c.y += 8.0 + 16.0 + 4.0;
+                paint.text_centered(cx, Font::Medium, ui_px(12.0), colors.muted, c.left + 12.0 + 22.0, c.y + 8.0, heading_h, &text(stage, "name").to_uppercase(), c.width - 46.0);
+                c.y += 8.0 + heading_h + 4.0;
                 for job in array(stage, "jobs") {
                     let allow = flag(job, "allowFailure");
                     let detail = if allow { t("workspace.git.pr.empty.allowedToFail") } else { String::new() };
                     let duration = int(job, "durationSeconds");
                     let trailing = (duration > 0).then(|| format_duration(duration));
                     let job_url = Some(text(job, "url").to_owned()).filter(|u| !u.is_empty());
-                    self.check_row(cx, paint, c.left, c.y, c.width, 36.0, 24.0, classify_gitlab_job(text(job, "status"), allow), text(job, "name"), &detail, trailing, job_url, c.view);
-                    c.y += 36.0;
+                    self.check_row(cx, paint, c.left, c.y, c.width, job_h, 24.0, classify_gitlab_job(text(job, "status"), allow), text(job, "name"), &detail, trailing, job_url, c.view);
+                    c.y += job_h;
                 }
             }
         }
@@ -1148,20 +1158,21 @@ impl PrView {
         let id = entry.id();
         let x = c.left + 12.0;
         let width = c.width - 24.0;
+        let header_h = 36.0_f64.max(ui_px(14.0) * 1.4 + 12.0);
         match entry {
             Entry::Single(activity) => {
                 let has_body = !text(activity, "body").trim().is_empty();
                 if !has_body {
                     // Original `eventRow`: an unbordered header row, 8px below.
-                    let band = rect(x, c.y, width, 36.0);
+                    let band = rect(x, c.y, width, header_h);
                     let hit = PrHit::Launch(text(activity, "url").to_owned());
                     if self.hovered.as_ref() == Some(&hit) {
                         paint.fill(cx, band, colors.sidebar_hover);
                     }
                     self.hits.push_clipped(band, c.view, hit);
                     self.regions.push((band, id.clone()));
-                    self.activity_header(cx, paint, activity, 20.0, x + 12.0, c.y, width - 24.0, 36.0, None, Some((id, false)), c.view);
-                    c.y += 36.0 + 8.0;
+                    self.activity_header(cx, paint, activity, 20.0, x + 12.0, c.y, width - 24.0, header_h, None, Some((id, false)), c.view);
+                    c.y += header_h + 8.0;
                     return;
                 }
                 let top = c.y;
@@ -1170,17 +1181,17 @@ impl PrView {
                 } else {
                     self.heights.get(&format!("{id}:body")).copied().unwrap_or(40.0) + 8.0 + 12.0
                 };
-                let card = rect(x, top, width, 36.0 + body_height);
+                let card = rect(x, top, width, header_h + body_height);
                 Self::card_border(cx, paint, card, 8.0, colors.sidebar);
-                let header = rect(x, top, width, 36.0);
+                let header = rect(x, top, width, header_h);
                 let hit = PrHit::Entry { id: id.clone(), default_collapsed: entry.collapsed_by_default() };
                 if self.hovered.as_ref() == Some(&hit) {
                     paint.rounded(cx, header, colors.sidebar_hover, 8.0, None);
                 }
                 self.hits.push_clipped(header, c.view, hit);
                 self.regions.push((card, id.clone()));
-                self.activity_header(cx, paint, activity, 20.0, x + 12.0, top, width - 24.0, 36.0, None, Some((id.clone(), false)), c.view);
-                let mut y = top + 36.0;
+                self.activity_header(cx, paint, activity, 20.0, x + 12.0, top, width - 24.0, header_h, None, Some((id.clone(), false)), c.view);
+                let mut y = top + header_h;
                 if !collapsed {
                     let height = self.markdown_body(cx, kit, &format!("{id}:body"), text(activity, "body"), dvec2(x + 12.0, y + 8.0), width - 24.0, c.view);
                     y += 8.0 + height + 12.0;
@@ -1200,7 +1211,7 @@ impl PrView {
                 let estimate = self.heights.get(&format!("{id}:card")).copied().unwrap_or(36.0);
                 let card = rect(x, top, width, estimate);
                 Self::card_border(cx, paint, card, 8.0, colors.sidebar);
-                let header = rect(x, top, width, 36.0);
+                let header = rect(x, top, width, header_h);
                 let hit = PrHit::Entry { id: id.clone(), default_collapsed: false };
                 if self.hovered.as_ref() == Some(&hit) {
                     paint.rounded(cx, header, colors.sidebar_hover, 8.0, None);
@@ -1208,8 +1219,8 @@ impl PrView {
                 self.hits.push_clipped(header, c.view, hit);
                 self.regions.push((card, id.clone()));
                 let count = collapsed.then_some(threads.len());
-                self.activity_header(cx, paint, review, 20.0, x + 12.0, top, width - 24.0, 36.0, count, Some((id.clone(), false)), c.view);
-                let mut y = top + 36.0;
+                self.activity_header(cx, paint, review, 20.0, x + 12.0, top, width - 24.0, header_h, count, Some((id.clone(), false)), c.view);
+                let mut y = top + header_h;
                 if !collapsed {
                     if !text(review, "body").trim().is_empty() {
                         let height = self.markdown_body(cx, kit, &format!("{id}:body"), text(review, "body"), dvec2(x + 12.0, y + 8.0), width - 24.0, c.view);
@@ -1246,12 +1257,13 @@ impl PrView {
         let colors = palette();
         let id = thread_id(thread);
         let collapsed = self.pane.is_collapsed(number, &id, thread_collapsed_by_default(thread));
-        let header = rect(x + 1.0, top + 1.0, width - 2.0, 36.0);
+        let header_h = 36.0_f64.max(ui_px(12.0) * 1.4 + 12.0);
+        let header = rect(x + 1.0, top + 1.0, width - 2.0, header_h);
         let hit = PrHit::Entry { id: id.clone(), default_collapsed: thread_collapsed_by_default(thread) };
         let hovered = self.hovered.as_ref() == Some(&hit);
         paint.fill(cx, header, if hovered { colors.sidebar_hover } else { colors.surface1 });
         self.hits.push_clipped(header, clip, hit);
-        let center_y = header.pos.y + 18.0;
+        let center_y = header.pos.y + header_h / 2.0;
         let mut right = header.pos.x + header.size.x - 12.0;
         let root = &thread.comments[0];
         let kebab_visible = self.hovered_region.as_deref() == Some(id.as_str()) || crate::common::is_compact_layout(cx) || host::is_mobile_platform();
@@ -1268,7 +1280,7 @@ impl PrView {
         if collapsed {
             let label = thread.comments.len().to_string();
             let w = paint.measure(cx, Font::Regular, ui_px(12.0), &label).x;
-            paint.text_centered(cx, Font::Regular, ui_px(12.0), colors.muted, right - w, header.pos.y, 36.0, &label, w + 1.0);
+            paint.text_centered(cx, Font::Regular, ui_px(12.0), colors.muted, right - w, header.pos.y, header_h, &label, w + 1.0);
             paint.icon(cx, "message-square", 11.0, colors.muted, dvec2(right - w - 9.0, center_y));
             right -= w + 3.0 + 12.0 + 8.0;
         }
@@ -1286,16 +1298,17 @@ impl PrView {
             badges.push((t("workspace.git.pr.thread.outdated"), colors.muted));
         }
         let badge_width: f64 = badges.iter().map(|(l, _)| paint.measure(cx, Font::Regular, ui_px(11.0), l).x + 12.0 + 8.0).sum();
-        cursor += paint.text_centered(cx, Font::Mono, ui_px(12.0), colors.foreground, cursor, header.pos.y, 36.0, &path_label, (right - cursor - badge_width).max(0.0)) + 8.0;
+        cursor += paint.text_centered(cx, Font::Mono, ui_px(12.0), colors.foreground, cursor, header.pos.y, header_h, &path_label, (right - cursor - badge_width).max(0.0)) + 8.0;
         for (label, color) in badges {
             let w = paint.measure(cx, Font::Regular, ui_px(11.0), &label).x + 12.0;
-            let pill = rect(cursor, center_y - 9.0, w, 18.0);
+            let pill_h = 18.0 + (ui_px(11.0) - 11.0).max(0.0) * 1.4;
+            let pill = rect(cursor, center_y - pill_h / 2.0, w, pill_h);
             paint.rounded(cx, pill, with_alpha(color, 0.15), 9.0, None);
-            paint.text_centered(cx, Font::Regular, ui_px(11.0), color, cursor + 6.0, pill.pos.y, 18.0, &label, w);
+            paint.text_centered(cx, Font::Regular, ui_px(11.0), color, cursor + 6.0, pill.pos.y, pill.size.y, &label, w);
             cursor += w + 8.0;
         }
         self.regions.push((rect(x, top, width, self.markdown_estimate(thread, collapsed)), id.clone()));
-        let mut y = top + 37.0;
+        let mut y = top + header_h + 1.0;
         if !collapsed {
             y = self.thread_comment(cx, paint, root, x, y, width, true, clip, kit);
             let replies = &thread.comments[1..];
@@ -1326,8 +1339,9 @@ impl PrView {
         let id = text(comment, "id").to_owned();
         let region = rect(x, top, width, self.heights.get(&format!("{id}:comment")).copied().unwrap_or(40.0));
         self.regions.push((region, id.clone()));
-        self.activity_header(cx, paint, comment, 16.0, x + 12.0, top + 8.0, width - 24.0, 24.0, None, Some((id.clone(), false)), clip);
-        let mut y = top + 8.0 + 24.0 + 4.0;
+        let header_h = 24.0_f64.max(ui_px(14.0) * 1.4);
+        self.activity_header(cx, paint, comment, 16.0, x + 12.0, top + 8.0, width - 24.0, header_h, None, Some((id.clone(), false)), clip);
+        let mut y = top + 8.0 + header_h + 4.0;
         if !text(comment, "body").trim().is_empty() {
             y += 8.0;
             y += self.markdown_body(cx, kit, &format!("{id}:body"), text(comment, "body"), dvec2(x + 12.0, y), width - 24.0, clip);

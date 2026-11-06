@@ -34,6 +34,7 @@ live_design!{
 #[derive(Default)]
 pub struct TouchScroll {
     motion: TouchMotion,
+    velocity: TouchVelocity,
     next_frame: Option<NextFrame>,
     origin: DVec2,
 }
@@ -41,13 +42,101 @@ pub struct TouchScroll {
 // Makepad's 0.97 decay and 0.2px stop speed at 60Hz, expressed in seconds.
 const SCROLL_DECAY: f64 = 1.8275524490825144;
 const SCROLL_STOP_SPEED: f64 = 12.0;
-const VELOCITY_WINDOW: f64 = 0.05;
+// Keep real motion samples, rather than warming a velocity filter up from rest.
+// 32 samples cover 100ms even at 240Hz without allocating during a gesture.
+const VELOCITY_WINDOW: f64 = 0.1;
+const RELEASE_IDLE_TIMEOUT: f64 = 0.1;
+
+#[derive(Clone, Copy, Default)]
+struct TouchSample {
+    position: f64,
+    time: f64,
+}
+
+#[derive(Default)]
+struct TouchVelocity {
+    samples: [TouchSample; 32],
+    first: usize,
+    len: usize,
+    direction: f64,
+    last_motion_time: f64,
+}
+
+impl TouchVelocity {
+    fn reset(&mut self, position: f64, time: f64) {
+        self.samples[0] = TouchSample { position, time };
+        self.first = 0;
+        self.len = 1;
+        self.direction = 0.0;
+        self.last_motion_time = time;
+    }
+
+    fn sample(&self, index: usize) -> TouchSample {
+        self.samples[(self.first + index) % self.samples.len()]
+    }
+
+    fn clear(&mut self) {
+        let last = self.sample(self.len - 1);
+        self.reset(last.position, last.time);
+    }
+
+    fn push(&mut self, position: f64, time: f64) {
+        let last = self.sample(self.len - 1);
+        let delta = last.position - position;
+        // Reversals and bounds must not retain momentum in the old direction.
+        if delta * self.direction < 0.0 {
+            self.clear();
+        }
+        if delta != 0.0 {
+            self.direction = delta;
+            self.last_motion_time = time;
+        }
+        if time <= last.time {
+            // Batched/quantized timestamps replace the endpoint, retaining the
+            // earlier timed sample instead of dropping this event's distance.
+            let index = (self.first + self.len - 1) % self.samples.len();
+            self.samples[index].position = position;
+            return;
+        }
+        if self.len == self.samples.len() {
+            self.first = (self.first + 1) % self.samples.len();
+            self.len -= 1;
+        }
+        let index = (self.first + self.len) % self.samples.len();
+        self.samples[index] = TouchSample { position, time };
+        self.len += 1;
+    }
+
+    fn estimate(&self, release_time: f64) -> f64 {
+        // UP is not a stationary MOVE. Normal delivery gaps must not damp a
+        // flick, but a held finger must not release stale momentum.
+        if self.len < 2 || release_time - self.last_motion_time >= RELEASE_IDLE_TIMEOUT {
+            return 0.0;
+        }
+        let last = self.sample(self.len - 1);
+        let cutoff = last.time - VELOCITY_WINDOW;
+        let mut first = self.sample(0);
+        for index in 1..self.len {
+            let next = self.sample(index);
+            if next.time > cutoff {
+                if first.time < cutoff {
+                    let fraction = (cutoff - first.time) / (next.time - first.time);
+                    first.position += (next.position - first.position) * fraction;
+                    first.time = cutoff;
+                }
+                break;
+            }
+            first = next;
+        }
+        (first.position - last.position) / (last.time - first.time)
+    }
+}
 
 #[derive(Default)]
 enum TouchMotion {
     #[default]
     Idle,
-    Drag { start: DVec2, last: DVec2, time: f64, velocity: f64, panning: bool },
+    Drag { start: DVec2, last: DVec2, panning: bool },
     Fling { time: Option<f64>, velocity: f64 },
 }
 
@@ -60,7 +149,8 @@ impl TouchScroll {
     pub fn begin(&mut self, abs: DVec2, time: f64, is_touch: bool) {
         self.reset();
         self.origin = abs;
-        self.motion = TouchMotion::Drag { start: abs, last: abs, time, velocity: 0.0, panning: !is_touch };
+        self.velocity.reset(abs.y, time);
+        self.motion = TouchMotion::Drag { start: abs, last: abs, panning: !is_touch };
     }
 
     pub fn origin(&self) -> DVec2 {
@@ -80,33 +170,23 @@ impl TouchScroll {
     }
 
     pub fn move_to(&mut self, abs: DVec2, time: f64) -> Option<f64> {
-        let TouchMotion::Drag { start, last, time: previous, mut velocity, panning } = self.motion else {
+        let TouchMotion::Drag { start, last, panning } = self.motion else {
             return None;
         };
         let displacement = abs - start;
         let pan = panning || (displacement.y.abs() >= TAP_COUNT_DISTANCE && displacement.y.abs() >= displacement.x.abs());
-        let dt = time - previous;
-        if dt > 0.0 {
-            let speed = (last.y - abs.y) / dt;
-            // A direction reversal must not release a fling in the old direction.
-            if speed * velocity < 0.0 {
-                velocity = 0.0;
-            }
-            let retention = (-dt / VELOCITY_WINDOW).exp();
-            velocity = velocity * retention + speed * (1.0 - retention);
-        }
-        self.motion = TouchMotion::Drag { start, last: abs, time, velocity, panning: pan };
+        self.velocity.push(abs.y, time);
+        self.motion = TouchMotion::Drag { start, last: abs, panning: pan };
         pan.then_some(if panning { last.y - abs.y } else { start.y - abs.y })
     }
 
     pub fn release(&mut self, time: f64) -> bool {
         let motion = std::mem::take(&mut self.motion);
-        let TouchMotion::Drag { time: previous, velocity, panning, .. } = motion else {
+        let TouchMotion::Drag { panning, .. } = motion else {
             self.motion = motion;
             return false;
         };
-        // A stationary hold must not launch the earlier swipe.
-        let velocity = velocity * (-(time - previous).max(0.0) / VELOCITY_WINDOW).exp();
+        let velocity = self.velocity.estimate(time);
         if panning && velocity.abs() > SCROLL_STOP_SPEED {
             self.motion = TouchMotion::Fling { time: None, velocity };
         }
@@ -114,9 +194,9 @@ impl TouchScroll {
     }
 
     pub fn stop_at_edge(&mut self) {
-        if let TouchMotion::Drag { velocity, .. } = &mut self.motion {
+        if let TouchMotion::Drag { .. } = &self.motion {
             // Preserve pan ownership so reversing at a bound takes effect immediately.
-            *velocity = 0.0;
+            self.velocity.clear();
         } else {
             self.reset();
         }
@@ -157,6 +237,7 @@ impl TouchScroll {
         let new_press = matches!(event, Event::MouseDown(_))
             || matches!(event, Event::TouchUpdate(update) if update.touches.iter().any(|touch| matches!(touch.state, TouchState::Start)));
         if matches!(event, Event::Pause | Event::AppLostFocus | Event::LongPress(_))
+            || matches!(event, Event::TouchUpdate(update) if update.cancelled)
             || (self.is_flinging() && new_press)
         {
             self.reset();
@@ -386,6 +467,152 @@ mod touch_scroll_tests {
         s.release(0.11);
         s.advance(1.0);
         assert!(s.advance(1.1).unwrap() < 0.0);
+    }
+
+    #[test]
+    fn release_uses_recent_speed_not_the_gesture_average() {
+        let mut accelerated = TouchScroll::default();
+        accelerated.begin(dvec2(20.0, 1000.0), 0.0, true);
+        accelerated.move_to(dvec2(20.0, 500.0), 0.5);
+        accelerated.move_to(dvec2(20.0, 300.0), 0.6);
+        accelerated.release(0.616);
+        assert!(first_tenth_second(&mut accelerated) > 160.0);
+
+        let mut slowed = TouchScroll::default();
+        slowed.begin(dvec2(20.0, 1000.0), 0.0, true);
+        slowed.move_to(dvec2(20.0, 500.0), 0.5);
+        slowed.move_to(dvec2(20.0, 499.0), 0.6);
+        slowed.release(0.616);
+        assert!(!slowed.is_flinging());
+    }
+
+    fn first_tenth_second(scroll: &mut TouchScroll) -> f64 {
+        assert_eq!(scroll.advance(10.0), None);
+        scroll.advance(10.1).unwrap_or(0.0)
+    }
+
+    #[test]
+    fn short_flick_keeps_speed_across_normal_up_delivery_gaps() {
+        let mut distances = Vec::new();
+        for gap in [0.0, 0.016, 0.032, 0.064] {
+            let mut s = TouchScroll::default();
+            s.begin(dvec2(20.0, 100.0), 50000.0, true);
+            for step in 1..=4 {
+                s.move_to(dvec2(20.0, 100.0 - step as f64 * 8.0), 50000.0 + step as f64 * 0.008);
+            }
+            s.release(50000.032 + gap);
+            let distance = first_tenth_second(&mut s);
+            // A 1000px/s flick should still cover most of 100px in its first
+            // 100ms, not lose its speed to filter startup or UP latency.
+            assert!(distance > 80.0 && distance < 100.0, "{distance}");
+            distances.push(distance);
+        }
+        for distance in &distances[1..] {
+            assert!((distance - distances[0]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn batched_moves_with_equal_timestamps_keep_their_distance() {
+        let mut coalesced = TouchScroll::default();
+        let mut batched = TouchScroll::default();
+        for s in [&mut coalesced, &mut batched] {
+            s.begin(dvec2(20.0, 100.0), 0.0, true);
+        }
+        assert_eq!(coalesced.move_to(dvec2(20.0, 80.0), 0.016), Some(20.0));
+        assert_eq!(batched.move_to(dvec2(20.0, 90.0), 0.016), Some(10.0));
+        assert_eq!(batched.move_to(dvec2(20.0, 80.0), 0.016), Some(10.0));
+        coalesced.release(0.032);
+        batched.release(0.032);
+        let distance = first_tenth_second(&mut coalesced);
+        assert!(distance > 100.0);
+        assert!((distance - first_tenth_second(&mut batched)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sustained_flick_is_independent_of_move_rate_after_history_wraps() {
+        let run = |steps: usize| {
+            let mut s = TouchScroll::default();
+            s.begin(dvec2(20.0, 400.0), 0.0, true);
+            let mut dragged = 0.0;
+            for step in 1..=steps {
+                let time = 0.25 * step as f64 / steps as f64;
+                dragged += s.move_to(dvec2(20.0, 400.0 - time * 1000.0), time).unwrap_or(0.0);
+            }
+            assert!((dragged - 250.0).abs() < 1e-9);
+            s.release(0.266);
+            first_tenth_second(&mut s)
+        };
+        let distance = run(8);
+        assert!((distance - run(32)).abs() < 1e-9);
+        assert!((distance - run(64)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slow_drag_remains_one_to_one_without_a_fling() {
+        let mut s = TouchScroll::default();
+        s.begin(dvec2(20.0, 100.0), 0.0, true);
+        let mut dragged = 0.0;
+        for step in 1..=20 {
+            dragged += s.move_to(dvec2(20.0, 100.0 - step as f64), step as f64 * 0.25).unwrap_or(0.0);
+        }
+        assert_eq!(dragged, 20.0);
+        assert!(s.release(5.016));
+        assert!(!s.is_flinging());
+    }
+
+    #[test]
+    fn held_release_cancels_fast_flick_even_with_stationary_move_events() {
+        for stationary_moves in [false, true] {
+            let mut s = TouchScroll::default();
+            s.begin(dvec2(20.0, 100.0), 0.0, true);
+            s.move_to(dvec2(20.0, 0.0), 0.025);
+            if stationary_moves {
+                for step in 1..=7 {
+                    assert_eq!(s.move_to(dvec2(20.0, 0.0), 0.025 + step as f64 * 0.016), Some(0.0));
+                }
+            }
+            assert!(s.release(0.145));
+            assert!(!s.is_flinging());
+        }
+    }
+
+    #[test]
+    fn bounds_discard_velocity_before_release_without_losing_pan() {
+        let mut s = TouchScroll::default();
+        s.begin(dvec2(20.0, 100.0), 0.0, true);
+        let delta = s.move_to(dvec2(20.0, 0.0), 0.032).unwrap();
+        let mut position = 90.0;
+        assert!(s.apply_delta(&mut position, delta, 100.0));
+        assert!(s.is_panning());
+        assert!(s.release(0.048));
+        assert!(!s.is_flinging());
+    }
+
+    #[test]
+    fn cancelled_touch_cannot_fling_regardless_of_adapter_event_order() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let event = Event::TouchUpdate(makepad_draw::event::TouchUpdateEvent {
+            window_id: WindowId(0, 0),
+            time: 0.048,
+            modifiers: KeyModifiers::default(),
+            touches: Vec::new(),
+            cancelled: true,
+        });
+        for release_first in [false, true] {
+            let mut s = TouchScroll::default();
+            s.begin(dvec2(20.0, 100.0), 0.0, true);
+            s.move_to(dvec2(20.0, 0.0), 0.032);
+            if release_first {
+                s.release(0.048);
+                assert!(s.is_flinging());
+            }
+            assert_eq!(s.frame(&mut cx, &event), None);
+            assert!(!s.release(0.048));
+            assert!(!s.is_dragging());
+            assert!(!s.is_flinging());
+            assert!(s.next_frame.is_none());
+        }
     }
 }
 

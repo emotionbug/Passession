@@ -209,7 +209,7 @@ impl FileView {
 
     /// A new target: another file resets everything file-specific (the store releases the
     /// previous identity on mount); another location only re-applies it.
-    pub fn set_target(&mut self, target: FileTarget) {
+    pub fn set_target(&mut self, cx: &mut Cx, target: FileTarget) {
         let same_file = self.target.as_ref().is_some_and(|old| {
             old.host_id == target.host_id && old.cwd == target.cwd && old.path == target.path
         });
@@ -221,6 +221,7 @@ impl FileView {
             }
             return;
         }
+        self.release_focus(cx);
         self.target = Some(target);
         self.reset_file();
     }
@@ -250,13 +251,63 @@ impl FileView {
         self.sync_gate = None;
     }
 
-    /// The panel went away.
+    /// Persist/release file state from Drop, where a UI context is unavailable.
     pub fn dispose(&mut self) {
         self.reset_file();
     }
 
+    pub fn release_focus(&mut self, cx: &mut Cx) {
+        self.clear_text_selection(cx);
+        cx.clear_text_input(self.area);
+        cx.clear_key_focus_if(self.area);
+    }
+
     // -----------------------------------------------------------------------------------------
     // Synchronisation with the store
+
+    fn clear_text_selection(&mut self, cx: &mut Cx) {
+        cx.clear_text_selection(self.area);
+        self.focus = Focus::None;
+        if let Some(editor) = self.editor.as_mut() {
+            editor.clear_selection(cx);
+            editor.focused = false;
+        }
+        self.markdown.clear_selection(cx);
+        self.query.clear_selection(cx);
+        self.query.focused = false;
+        self.replacement.clear_selection(cx);
+        self.replacement.focused = false;
+        self.editor_drag = false;
+        self.preview_drag = false;
+        self.pressed = None;
+    }
+
+    fn set_focus(&mut self, cx: &mut Cx, focus: Focus) {
+        if self.focus != focus {
+            cx.clear_text_selection(self.area);
+            match self.focus {
+                Focus::Find => self.query.clear_selection(cx),
+                Focus::Replace => self.replacement.clear_selection(cx),
+                Focus::Editor => {
+                    self.markdown.clear_selection(cx);
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.clear_selection(cx);
+                    }
+                }
+                Focus::None => {}
+            }
+        }
+        self.focus = focus;
+        self.query.focused = focus == Focus::Find;
+        self.replacement.focused = focus == Focus::Replace;
+        let preview = self.preview_visible();
+        if let Some(editor) = self.editor.as_mut() {
+            editor.focused = focus == Focus::Editor && !preview;
+        }
+        if focus == Focus::None || (focus == Focus::Editor && (preview || self.editor.as_ref().is_none_or(|editor| editor.read_only))) {
+            cx.clear_text_input(self.area);
+        }
+    }
 
     /// Mounts the session for the target and keeps editor and preview in step with the model.
     fn sync(&mut self, cx: &mut Cx, ui: &mut UiContext, observing: bool) {
@@ -270,6 +321,7 @@ impl FileView {
         let owner = self.owner.clone();
         let id = store::with(|s| s.mount(ui, &owner, &target.host_id, &target.cwd, &target.path));
         if self.session_id != Some(id) {
+            self.clear_text_selection(cx);
             self.session_id = Some(id);
             self.observing = false;
         }
@@ -303,6 +355,9 @@ impl FileView {
             ))
         });
         let Some((reset, presentation, has_text, changed_text, editable)) = snapshot else { return };
+        if changed_text.is_some() {
+            self.clear_text_selection(cx);
+        }
         if reset {
             // Original `selectSourcePresentation`: text past the highlighting budget is plain.
             self.highlighting = presentation != Some(FileTextPresentation::Plain);
@@ -490,15 +545,16 @@ impl FileView {
         }
     }
 
-    fn open_find(&mut self) {
+    fn open_find(&mut self, cx: &mut Cx) {
         self.find_visible = true;
-        self.focus = Focus::Find;
+        self.set_focus(cx, Focus::Find);
+        cx.claim_text_selection(self.area);
         self.query.select_all();
     }
 
-    fn close_find(&mut self) {
+    fn close_find(&mut self, cx: &mut Cx) {
         self.find_visible = false;
-        self.focus = Focus::Editor;
+        self.set_focus(cx, Focus::Editor);
     }
 
     fn count_matches(&mut self) {
@@ -674,9 +730,10 @@ impl FileView {
 
     fn run_more(&mut self, cx: &mut Cx, ui: &mut UiContext, action: &str) {
         match action {
-            "find" => self.open_find(),
+            "find" => self.open_find(cx),
             "settings" => self.settings_open = true,
             "html" => {
+                self.clear_text_selection(cx);
                 let owner = self.owner.clone();
                 store::with(|s| {
                     if let Some(session) = s.session_mut(&owner) {
@@ -797,7 +854,7 @@ impl FileView {
                         if let Some(editor) = self.editor.as_mut() {
                             editor.go_to(line, column, None);
                         }
-                        self.focus = Focus::Editor;
+                        self.set_focus(cx, Focus::Editor);
                         // The prompt owned keyboard focus; return it to the revealed source.
                         cx.set_key_focus(self.area);
                     }
@@ -895,7 +952,7 @@ impl FileView {
             if self.settings_open {
                 self.close_settings(ui);
             } else if self.find_visible {
-                self.close_find();
+                self.close_find(cx);
             } else {
                 return changed;
             }
@@ -957,7 +1014,7 @@ impl FileView {
                         }
                     }
                     Some(Hot::Preview) => {
-                        self.markdown.handle_hit(hit);
+                        self.markdown.handle_hit(cx, self.area, hit);
                     }
                     Some(Hot::Image) => {
                         let factor = if fe.scroll.y > 0.0 { 1.0 / 1.1 } else { 1.1 };
@@ -974,7 +1031,7 @@ impl FileView {
                 self.preview_drag = false;
                 match hot {
                     Some(Hot::Editor) => {
-                        self.focus = Focus::Editor;
+                        self.set_focus(cx, Focus::Editor);
                         self.editor_drag = true;
                         let result = self.editor.as_mut().map(|editor| {
                             editor.focused = true;
@@ -985,18 +1042,20 @@ impl FileView {
                         }
                     }
                     Some(Hot::FindField) => {
-                        self.focus = Focus::Find;
+                        self.set_focus(cx, Focus::Find);
                         self.query.handle_hit(cx, kit, hit);
                     }
                     Some(Hot::ReplaceField) => {
-                        self.focus = Focus::Replace;
+                        self.set_focus(cx, Focus::Replace);
                         self.replacement.handle_hit(cx, kit, hit);
                     }
                     Some(Hot::Preview) => {
+                        self.set_focus(cx, Focus::Editor);
                         self.preview_drag = true;
-                        self.markdown.handle_hit(hit);
+                        self.markdown.handle_hit(cx, self.area, hit);
                     }
                     Some(Hot::Image) => {
+                        self.set_focus(cx, Focus::None);
                         self.zoom.drag = Some((fe.abs, self.zoom.offset));
                         if fe.tap_count == 2 {
                             self.zoom.scale = 1.0;
@@ -1004,6 +1063,7 @@ impl FileView {
                         }
                     }
                     _ => {
+                        self.set_focus(cx, Focus::None);
                         self.pressed = hot;
                     }
                 }
@@ -1015,7 +1075,7 @@ impl FileView {
                         editor.handle_hit(cx, kit, &look, hit);
                     }
                 } else if self.preview_drag {
-                    self.markdown.handle_hit(hit);
+                    self.markdown.handle_hit(cx, self.area, hit);
                 } else if let Some((start, offset)) = self.zoom.drag {
                     self.zoom.offset = offset + (fe.abs - start);
                 } else if self.focus == Focus::Find {
@@ -1026,8 +1086,30 @@ impl FileView {
                 true
             }
             Hit::FingerLongPress(fe) => {
-                if self.hits.at(fe.abs) == Some(Hot::Editor) {
-                    self.context_menu(ui, fe.abs);
+                self.pressed = None;
+                match self.hits.at(fe.abs) {
+                    Some(Hot::Editor) => {
+                        self.set_focus(cx, Focus::Editor);
+                        self.editor_drag = true;
+                        let result = self.editor.as_mut().map(|editor| editor.handle_hit(cx, kit, &look, hit));
+                        if let Some(at) = result.and_then(|result| result.context_menu) {
+                            self.context_menu(ui, at);
+                        }
+                    }
+                    Some(Hot::Preview) => {
+                        self.set_focus(cx, Focus::Editor);
+                        self.preview_drag = true;
+                        self.markdown.handle_hit(cx, self.area, hit);
+                    }
+                    Some(Hot::FindField) => {
+                        self.set_focus(cx, Focus::Find);
+                        self.query.handle_hit(cx, kit, hit);
+                    }
+                    Some(Hot::ReplaceField) => {
+                        self.set_focus(cx, Focus::Replace);
+                        self.replacement.handle_hit(cx, kit, hit);
+                    }
+                    _ => {}
                 }
                 true
             }
@@ -1037,9 +1119,14 @@ impl FileView {
                         editor.handle_hit(cx, kit, &look, hit);
                     }
                 if self.preview_drag
-                    && let PreviewEvent::Link(href) = self.markdown.handle_hit(hit) {
+                    && let PreviewEvent::Link(href) = self.markdown.handle_hit(cx, self.area, hit) {
                         self.open_link(ui, &href);
                     }
+                if self.focus == Focus::Find {
+                    self.query.handle_hit(cx, kit, hit);
+                } else if self.focus == Focus::Replace {
+                    self.replacement.handle_hit(cx, kit, hit);
+                }
                 self.editor_drag = false;
                 self.preview_drag = false;
                 self.zoom.drag = None;
@@ -1064,9 +1151,11 @@ impl FileView {
                         self.replacement.handle_hit(cx, kit, hit);
                     }
                     Focus::Editor => {
-                        let result = self.editor.as_mut().map(|editor| editor.handle_hit(cx, kit, &look, hit));
-                        if result.is_some_and(|r| r.text_changed) {
-                            self.edited(cx, ui);
+                        if !self.preview_visible() {
+                            let result = self.editor.as_mut().map(|editor| editor.handle_hit(cx, kit, &look, hit));
+                            if result.is_some_and(|r| r.text_changed) {
+                                self.edited(cx, ui);
+                            }
                         }
                     }
                     Focus::None => return false,
@@ -1076,14 +1165,16 @@ impl FileView {
             Hit::TextCopy(_) | Hit::TextCut(_) => {
                 match self.focus {
                     Focus::Find => {
-                        self.query.handle_hit(cx, kit, hit);
+                        if self.query.handle_hit(cx, kit, hit) == FieldEvent::Changed {
+                            self.count_matches();
+                        }
                     }
                     Focus::Replace => {
                         self.replacement.handle_hit(cx, kit, hit);
                     }
                     Focus::Editor => {
                         if self.preview_visible() {
-                            self.markdown.handle_hit(hit);
+                            self.markdown.handle_hit(cx, self.area, hit);
                         } else {
                             let result = self.editor.as_mut().map(|editor| editor.handle_hit(cx, kit, &look, hit));
                             if result.is_some_and(|r| r.text_changed) {
@@ -1097,9 +1188,7 @@ impl FileView {
             }
             Hit::KeyFocusLost(_) => {
                 ui.push(UiEffect::SetFocusScope { owner: self.focus_owner, scope: None });
-                if let Some(editor) = self.editor.as_mut() {
-                    editor.focused = false;
-                }
+                self.clear_text_selection(cx);
                 cx.clear_text_input(self.area);
                 #[cfg(not(target_os = "android"))]
                 cx.hide_text_ime();
@@ -1107,10 +1196,7 @@ impl FileView {
             }
             Hit::KeyFocus(_) => {
                 ui.push(UiEffect::SetFocusScope { owner: self.focus_owner, scope: Some("editable".into()) });
-                if self.focus == Focus::Editor
-                    && let Some(editor) = self.editor.as_mut() {
-                        editor.focused = true;
-                    }
+                self.set_focus(cx, self.focus);
                 true
             }
             _ => false,
@@ -1133,7 +1219,7 @@ impl FileView {
             return true;
         }
         if primary && ke.key_code == KeyCode::KeyF {
-            self.open_find();
+            self.open_find(cx);
             return true;
         }
         if self.settings_open && ke.key_code == KeyCode::Escape {
@@ -1143,7 +1229,7 @@ impl FileView {
         match self.focus {
             Focus::Find | Focus::Replace => {
                 if ke.key_code == KeyCode::Escape {
-                    self.close_find();
+                    self.close_find(cx);
                     return true;
                 }
                 let field = if self.focus == Focus::Find { &mut self.query } else { &mut self.replacement };
@@ -1156,7 +1242,7 @@ impl FileView {
             }
             Focus::Editor => {
                 if self.preview_visible() {
-                    self.markdown.handle_hit(hit);
+                    self.markdown.handle_hit(cx, self.area, hit);
                     return true;
                 }
                 let result = self.editor.as_mut().map(|editor| editor.handle_hit(cx, kit, look, hit));
@@ -1193,6 +1279,7 @@ impl FileView {
                 self.more_menu(ui, anchor, has_text, panel_html, has_selection);
             }
             Hot::Segment(index) => {
+                self.clear_text_selection(cx);
                 let owner = self.owner.clone();
                 store::with(|s| {
                     if let Some(session) = s.session_mut(&owner) {
@@ -1207,7 +1294,7 @@ impl FileView {
             }
             Hot::FindPrev => self.find_next(ui, true),
             Hot::FindNext => self.find_next(ui, false),
-            Hot::FindClose => self.close_find(),
+            Hot::FindClose => self.close_find(cx),
             Hot::ReplaceOne => self.replace_selection(cx, ui),
             Hot::ReplaceAll => self.replace_all(cx, ui),
             Hot::Overwrite => self.overwrite(cx, ui),
@@ -1224,6 +1311,7 @@ impl FileView {
             Hot::OpenCopy => self.download(ui, TransferMode::Open),
             Hot::OpenHtml => self.open_html(ui),
             Hot::ShowSource => {
+                self.clear_text_selection(cx);
                 let owner = self.owner.clone();
                 store::with(|s| {
                     if let Some(session) = s.session_mut(&owner) {
@@ -1280,11 +1368,12 @@ impl FileView {
         }
         let compact = ui.compact;
         // Toolbar.
-        let bar = rect(area.pos.x, area.pos.y, area.size.x, TOOLBAR_HEIGHT);
+        let toolbar_h = TOOLBAR_HEIGHT.max(ty.ui_size(12.0) * 1.4 + 12.0);
+        let bar = rect(area.pos.x, area.pos.y, area.size.x, toolbar_h);
         ui::toolbar(cx, kit, bar, false, &p);
         let size = ui::toolbar_button_size(compact);
         let mut right = bar.pos.x + bar.size.x - ui::toolbar_trailing_padding(compact);
-        let by = bar.pos.y + (TOOLBAR_HEIGHT - size) / 2.0;
+        let by = bar.pos.y + (toolbar_h - size) / 2.0;
         let more = rect(right - size, by, size, size);
         ui::icon_button(cx, kit, more, "ellipsis", self.state_of(&Hot::More, true), compact, &p);
         self.hits.push(more, Hot::More);
@@ -1318,7 +1407,7 @@ impl FileView {
                 _ => None,
             };
             let width = ui::segmented_width(cx, kit, &labels, &ty);
-            let rects = ui::segmented(cx, kit, right, bar.pos.y + TOOLBAR_HEIGHT / 2.0, &labels, selected, hovered, &p, &ty);
+            let rects = ui::segmented(cx, kit, right, bar.pos.y + toolbar_h / 2.0, &labels, selected, hovered, &p, &ty);
             for (index, r) in rects.into_iter().enumerate() {
                 self.hits.push(r, Hot::Segment(index));
             }
@@ -1341,16 +1430,16 @@ impl FileView {
                 for (label, color) in items {
                     let font = Font::Regular;
                     let w = kit.measure(cx, spec(font, small, color), &label).x;
-                    kit.text_in(cx, rect(right - w, bar.pos.y, w + 1.0, TOOLBAR_HEIGHT), spec(font, small, color), &label, 0.0);
+                    kit.text_in(cx, rect(right - w, bar.pos.y, w + 1.0, toolbar_h), spec(font, small, color), &label, 0.0);
                     right -= w + 8.0;
                 }
                 if *model_status == FileEditorStatus::Saving {
-                    ui::spinner(cx, kit, rect(right - 14.0, bar.pos.y, 14.0, TOOLBAR_HEIGHT), 14.0, p.muted, clock::phase(900));
+                    ui::spinner(cx, kit, rect(right - 14.0, bar.pos.y, 14.0, toolbar_h), 14.0, p.muted, clock::phase(900));
                     clock::register(cx, widget_area);
                     right -= 14.0 + 8.0;
                 }
                 if *model_status == FileEditorStatus::Dirty {
-                    kit.dot(cx, dvec2(right - 3.0, bar.pos.y + TOOLBAR_HEIGHT / 2.0), 6.0, p.extra_muted);
+                    kit.dot(cx, dvec2(right - 3.0, bar.pos.y + toolbar_h / 2.0), 6.0, p.extra_muted);
                     right -= 6.0 + 8.0;
                 }
                 right -= 4.0;
@@ -1364,8 +1453,8 @@ impl FileView {
         } else {
             format!("{}   {file_size}", remote_basename(&target.path, Some(&target.cwd)))
         };
-        kit.text_in(cx, rect(bar.pos.x + 12.0, bar.pos.y, meta_w, TOOLBAR_HEIGHT), spec(Font::Regular, small, p.extra_muted), &meta, 0.0);
-        let mut top = bar.pos.y + TOOLBAR_HEIGHT;
+        kit.text_in(cx, rect(bar.pos.x + 12.0, bar.pos.y, meta_w, toolbar_h), spec(Font::Regular, small, p.extra_muted), &meta, 0.0);
+        let mut top = bar.pos.y + toolbar_h;
         // Alerts.
         if let Some((model_status, conflict, modified, _)) = &model
             && *model_status == FileEditorStatus::Conflict {
@@ -1415,7 +1504,7 @@ impl FileView {
             heights.push(h);
             total += h + 12.0;
         }
-        let button_h = ButtonSize::Sm.height();
+        let button_h = ButtonSize::Sm.height().max(ty.ui_size(12.0) * 1.4 + 12.0);
         if !buttons.is_empty() {
             total += button_h;
         } else {
@@ -1537,7 +1626,7 @@ impl FileView {
             {
                 let this = &*self;
                 let resolver = |source: &str| this.markdown_image_state(target, source);
-                markdown.draw(cx, kit, area, &look, &resolver, images_epoch);
+                markdown.draw(cx, kit, area, &look, &resolver, images_epoch, widget_area);
             }
             self.markdown = markdown;
             self.hits.push(area, Hot::Preview);
@@ -1619,7 +1708,7 @@ impl FileView {
         let title_h = kit.paragraph_height(cx, text_w, spec(Font::Medium, base, tone), title);
         let desc_h = description.map(|d| kit.paragraph_height(cx, text_w, spec(Font::Regular, small, p.muted), d) + 4.0).unwrap_or(0.0);
         let message_h = title_h + desc_h;
-        let button_h = ButtonSize::Sm.height();
+        let button_h = ButtonSize::Sm.height().max(small * 1.4 + 12.0);
         let content_h = if actions.is_empty() || wide { message_h.max(if actions.is_empty() { 0.0 } else { button_h }) } else { message_h + 8.0 + button_h };
         let h = (content_h + 16.0).max(48.0);
         let strip = rect(area.pos.x, top, area.size.x, h);
@@ -1655,7 +1744,7 @@ impl FileView {
         kit.painter.new_layer(cx);
         let can_replace = self.editor.as_ref().is_some_and(|e| !e.read_only);
         let button = ui::toolbar_button_size(compact);
-        let row_h = button.max(28.0);
+        let row_h = button.max(28.0).max(ty.ui_size(14.0) * 1.4 + 8.0);
         let rows = if can_replace && self.replace_expanded { 2.0 } else { 1.0 };
         let width = (content.size.x - 16.0).min(340.0);
         let card = rect(content.pos.x + content.size.x - 8.0 - width, content.pos.y + 8.0, width, 12.0 + rows * row_h + (rows - 1.0) * 4.0);
@@ -1714,7 +1803,8 @@ impl FileView {
             self.replacement.draw(cx, kit, field, &t("paneFind.replaceWith"), None, ty.ui_size(14.0), p, widget_area);
             self.hits.push(field, Hot::ReplaceField);
             for ((label, w), hot) in labels.iter().zip(widths).zip([Hot::ReplaceOne, Hot::ReplaceAll]) {
-                let r = rect(rx, y2 + (row_h - size.height()) / 2.0, w, size.height());
+                let height = size.height() + (ty.ui_size(12.0) - 12.0).max(0.0) * 1.4;
+                let r = rect(rx, y2 + (row_h - height) / 2.0, w, height);
                 let st = self.state_of(&hot, can_navigate);
                 ui::button(cx, kit, r, label, None, ButtonVariant::Ghost, size, st, p, ty);
                 if can_navigate {
@@ -1733,16 +1823,17 @@ impl FileView {
         let base = ty.ui_size(14.0);
         let width = (area.size.x - 32.0).min(420.0);
         let rows = 3.0;
-        let row_h = 44.0;
-        let h = 56.0 + rows * row_h + (rows - 1.0) * 16.0 + 24.0;
+        let row_h = 44.0_f64.max(base * 1.4 + 12.0);
+        let header_h = 56.0_f64.max(ty.ui_size(16.0) * 1.4 + 24.0);
+        let h = header_h + rows * row_h + (rows - 1.0) * 16.0 + 24.0;
         let card = rect(area.pos.x + (area.size.x - width) / 2.0, area.pos.y + ((area.size.y - h) / 2.0).max(16.0), width, h);
         kit.outline(cx, card, p.dialog, p.border, 1.0, 12.0);
         self.hits.push(card, Hot::Card);
-        kit.text_in(cx, rect(card.pos.x + 20.0, card.pos.y + 12.0, width - 64.0, 32.0), spec(Font::Medium, ty.ui_size(16.0), p.foreground), l("Editor settings"), 0.0);
+        kit.text_in(cx, rect(card.pos.x + 20.0, card.pos.y + 12.0, width - 64.0, header_h - 24.0), spec(Font::Medium, ty.ui_size(16.0), p.foreground), l("Editor settings"), 0.0);
         let close = rect(card.pos.x + width - 40.0, card.pos.y + 16.0, 24.0, 24.0);
         ui::icon_button(cx, kit, close, "x", self.state_of(&Hot::SettingsClose, true), false, p);
         self.hits.push(close, Hot::SettingsClose);
-        let mut y = card.pos.y + 56.0;
+        let mut y = card.pos.y + header_h;
         let switches = [(l("Word wrap"), self.wrap, Hot::SetWrap), (l("Syntax highlighting"), self.highlighting, Hot::SetHighlight)];
         for (label, on, hot) in switches {
             let text_w = width - 40.0 - 52.0;

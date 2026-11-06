@@ -1,6 +1,7 @@
 use {
     std::collections::{HashSet, HashMap},
     crate::{
+        area::Area,
         cx_api::CxOsApi,
         cx::Cx,
         pass::{
@@ -14,6 +15,7 @@ use {
             Event,
             KeyFocusEvent,
             NextFrameEvent,
+            TouchState,
         },
         studio::{AppToStudio,EventSample},
     }
@@ -149,6 +151,7 @@ impl Cx {
     
     fn inner_key_focus_change(&mut self) {
         if let Some((prev, focus)) = self.keyboard.cycle_key_focus_changed(){
+            self.clear_text_selection(prev);
             self.inner_call_event_handler(&Event::KeyFocus(KeyFocusEvent {
                 prev,
                 focus
@@ -192,10 +195,48 @@ impl Cx {
     }
     
     pub (crate) fn call_event_handler(&mut self, event: &Event) {
+        self.dismiss_text_selection_for_event(event);
         self.inner_call_event_handler(event);
         self.inner_key_focus_change();
         self.handle_triggers();
         self.handle_actions();
+    }
+
+    fn dismiss_text_selection_for_event(&mut self, event: &Event) {
+        let owner = self.keyboard.text_selection;
+        if owner == Area::Empty { return; }
+        match event {
+            Event::MouseDown(_) | Event::TextSelectionDismiss => {}
+            Event::TouchUpdate(update) if update.touches.iter().any(|touch| matches!(touch.state, TouchState::Start)) => {}
+            Event::AppLostFocus | Event::Pause | Event::Background | Event::Shutdown if cfg!(target_os = "android") => {}
+            _ => return,
+        }
+        let valid = owner.is_valid(self);
+        let rect = if valid { owner.clipped_rect(self) } else { Default::default() };
+        let window = if valid {
+            owner.draw_list_id()
+                .and_then(|id| self.draw_lists[id].pass_id)
+                .and_then(|id| self.get_pass_window_id(id))
+        } else {
+            None
+        };
+        let outside = match event {
+            Event::MouseDown(event) => window != Some(event.window_id) || !rect.contains(event.abs),
+            Event::TouchUpdate(event) => event.touches.iter().any(|touch| {
+                matches!(touch.state, TouchState::Start)
+                    && (window != Some(event.window_id) || !rect.contains(touch.abs))
+            }),
+            _ => false,
+        };
+        let leaving = cfg!(target_os = "android")
+            && matches!(event, Event::AppLostFocus | Event::Pause | Event::Background | Event::Shutdown);
+        if outside || leaving || matches!(event, Event::TextSelectionDismiss) {
+            self.clear_text_selection(owner);
+            self.clear_key_focus_if(owner);
+            // Deliver loss before the pointer so the old owner cannot erase a
+            // new selection or swallow the outside target's normal action.
+            self.inner_key_focus_change();
+        }
     }
 
     // helpers

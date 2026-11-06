@@ -618,7 +618,11 @@ impl Widget for PButton {
         let natural = dvec2(content_w + pad * 2.0, height);
         let walk = Walk {
             width: if self.expand { Size::Fill } else if matches!(walk.width, Size::Fit) { Size::Fixed(natural.x) } else { walk.width },
-            height: if matches!(walk.height, Size::Fit) { Size::Fixed(natural.y) } else { walk.height },
+            height: match walk.height {
+                Size::Fit => Size::Fixed(natural.y),
+                Size::Fixed(h) if cfg!(target_os = "android") => Size::Fixed(h.max(natural.y)),
+                height => height,
+            },
             ..walk
         };
         let r = cx.walk_turtle(walk);
@@ -1112,6 +1116,11 @@ impl Widget for PSegmented {
             _ => (38.0, 12.0, 16.0, 14.0, 16.0),
         };
         let outer = control_height(self.size);
+        let height = height + outer - match self.size {
+            ControlSize::Xs => 28.0,
+            ControlSize::Sm => 32.0,
+            _ => 44.0,
+        };
         let spec = TextSpec::new(Font::Regular, t.ui_size(font), p.muted);
         let widths: Vec<f64> = self
             .segments

@@ -40,6 +40,15 @@ Android resizes the native surface for the keyboard. The shell uses a plain root
 bottom occlusion as a union rather than adding overlapping insets. Composer and
 modal geometry share that allocation.
 
+## Text interaction and system font size
+
+Long-press input and selected content use Android's native floating Paste/Copy/Cut/Select All menu, with actions limited by editor capabilities and clipboard availability. Selecting text does not copy it automatically. Tapping another control dismisses the old selection without swallowing that control's click. See [native text selection](native-text-selection.md).
+
+Android's system text-size setting feeds the shared typography layer without changing display density, touch coordinates or saved application font preferences. The bridge caches Android SP conversion samples, including the nonlinear font curve on newer Android versions, and refreshes them on configuration/resume changes. Text, row allocation and hit geometry reflow together. The common TextInput layout cache includes font metrics, available width and alignment, so existing drafts resize without replacing their text, selection or edit history.
+
+Shared touch scrolling estimates release velocity from recent movement rather than a zero-biased smoothing accumulator. Short flicks retain their velocity; stationary holds, reversal, bounds and new input cancel stale motion. Direct dragging remains one-to-one and long-press text selection keeps its gesture ownership.
+
+
 ## Signing and identity
 
 The project uses the maintained Sessions debug keystore at `packaging/android/app/debug.keystore` for local debug compatibility; it is the same key the Flutter project used, so debug builds upgrade in place. This is not a production signing credential.

@@ -794,6 +794,18 @@ live_design! {
     }
 }
 
+#[derive(PartialEq)]
+struct TextInputLayoutMetrics {
+    font_family: crate::makepad_draw::shader::draw_text::FontFamily,
+    font_size: f32,
+    line_spacing: f32,
+    font_scale: f32,
+    max_width: Option<f32>,
+    wrap: bool,
+    align_x: f64,
+    align_y: f64,
+}
+
 #[derive(Live, Widget)]
 pub struct TextInput {
     #[animator] animator: Animator,
@@ -816,6 +828,7 @@ pub struct TextInput {
 
     #[rust] password_text: String,
     #[rust] laidout_text: Option<Rc<LaidoutText>>,
+    #[rust] layout_metrics: Option<TextInputLayoutMetrics>,
     #[rust] text_area: Area,
     #[rust] selection: Selection,
     #[rust] history: History,
@@ -902,6 +915,14 @@ impl TextInput {
 
     pub fn set_selection(&mut self, cx: &mut Cx, selection: Selection) {
         self.selection = selection;
+        let area = self.draw_bg.area();
+        if cx.has_key_focus(area) {
+            if self.selection.anchor.index != self.selection.cursor.index {
+                cx.claim_text_selection(area);
+            } else if !cx.text_actions_active(area) {
+                cx.clear_text_selection(area);
+            }
+        }
         self.history.force_new_edit_group();
         self.draw_bg.redraw(cx);
     }
@@ -926,6 +947,24 @@ impl TextInput {
     
     pub fn selected_text(&self) -> &str {
         &self.text[self.selection.start().index..self.selection.end().index]
+    }
+
+    fn text_action_capabilities(&self) -> TextActionCapabilities {
+        let selected = self.selection.anchor.index != self.selection.cursor.index;
+        TextActionCapabilities {
+            copy: selected && !self.is_password,
+            cut: selected && !self.is_password && !self.is_read_only,
+            paste: !self.is_read_only,
+            select_all: !self.text.is_empty(),
+        }
+    }
+
+    fn open_text_actions(&mut self, cx: &mut Cx) {
+        if !cfg!(target_os = "android") { return; }
+        let area = self.draw_bg.area();
+        // Keep the source area until parent layout finalizes its clip and alignment.
+        cx.show_text_actions_for_area(area, area, self.text_action_capabilities());
+        self.draw_bg.redraw(cx);
     }
 
     // Flutter animates cursor opacity on Apple platforms only. Cutting the same
@@ -955,6 +994,9 @@ impl TextInput {
 
     fn end_focus(&mut self, cx: &mut Cx, hide_ime: bool) {
         self.ime_composing = false;
+        self.touch_selecting = false;
+        self.selection.anchor = self.selection.cursor;
+        cx.clear_text_selection(self.draw_bg.area());
         self.history.force_new_edit_group();
         cx.clear_text_input(self.draw_bg.area());
         self.animator_cut(cx, id!(focus.off));
@@ -1049,9 +1091,27 @@ impl TextInput {
     }
 
     fn layout_text(&mut self, cx: &mut Cx2d) {
-        if self.laidout_text.is_some() {
+        let turtle_rect = cx.turtle().padded_rect();
+        let max_width_in_lpxs = if !turtle_rect.size.x.is_nan() {
+            Some(turtle_rect.size.x as f32)
+        } else {
+            None
+        };
+        let wrap = cx.turtle().layout().flow == Flow::RightWrap;
+        let metrics = TextInputLayoutMetrics {
+            font_family: self.draw_text.text_style.font_family.clone(),
+            font_size: self.draw_text.text_style.font_size,
+            line_spacing: self.draw_text.text_style.line_spacing,
+            font_scale: self.draw_text.font_scale,
+            max_width: max_width_in_lpxs,
+            wrap,
+            align_x: self.label_align.x,
+            align_y: self.label_align.y,
+        };
+        if self.laidout_text.is_some() && self.layout_metrics.as_ref() == Some(&metrics) {
             return;
         }
+        self.layout_metrics = Some(metrics);
         let text = if self.is_password {
             self.password_text.clear();
             for grapheme in self.text.graphemes(true) {
@@ -1065,13 +1125,6 @@ impl TextInput {
         } else {
             &self.text
         };
-        let turtle_rect = cx.turtle().padded_rect();
-        let max_width_in_lpxs = if !turtle_rect.size.x.is_nan() {
-            Some(turtle_rect.size.x as f32)
-        } else {
-            None
-        };
-        let wrap = cx.turtle().layout().flow == Flow::RightWrap;
         self.laidout_text = Some(self.draw_text.layout(
             cx,
             0.0,
@@ -1143,15 +1196,13 @@ impl TextInput {
         for rect_in_lpxs in laidout_text.selection_rects_in_lpxs(
             self.selection_to_password_selection(self.selection)
         ) {
-            self.draw_selection.draw_abs(
-                cx,
-                rect(
-                    text_rect.pos.x + (rect_in_lpxs.origin.x * self.draw_text.font_scale) as f64,
-                    text_rect.pos.y + (rect_in_lpxs.origin.y * self.draw_text.font_scale) as f64,
-                    (rect_in_lpxs.size.width * self.draw_text.font_scale) as f64,
-                    (rect_in_lpxs.size.height * self.draw_text.font_scale) as f64,
-                )
+            let selected = rect(
+                text_rect.pos.x + (rect_in_lpxs.origin.x * self.draw_text.font_scale) as f64,
+                text_rect.pos.y + (rect_in_lpxs.origin.y * self.draw_text.font_scale) as f64,
+                (rect_in_lpxs.size.width * self.draw_text.font_scale) as f64,
+                (rect_in_lpxs.size.height * self.draw_text.font_scale) as f64,
             );
+            self.draw_selection.draw_abs(cx, selected);
         }
         self.draw_selection.end_many_instances(cx);
     }
@@ -1359,6 +1410,7 @@ impl Widget for TextInput {
     }
     
     fn set_text(&mut self, cx: &mut Cx, text: &str) {
+        cx.clear_text_selection(self.draw_bg.area());
         self.text = self.filter_input(text, true);
         self.set_selection(
             cx,
@@ -1405,6 +1457,22 @@ impl Widget for TextInput {
                 cursor_pos,
             );
         }
+        let area = self.draw_bg.area();
+        if cx.has_key_focus(area) {
+            if self.selection.anchor.index != self.selection.cursor.index {
+                cx.claim_text_selection(area);
+            } else if !cx.text_actions_active(area) {
+                cx.clear_text_selection(area);
+            }
+            if cx.text_actions_active(area) {
+                let anchor = if self.selection.anchor.index == self.selection.cursor.index {
+                    self.draw_cursor.area()
+                } else {
+                    self.draw_selection.area()
+                };
+                cx.show_text_actions_for_area(area, anchor, self.text_action_capabilities());
+            }
+        }
         cx.add_nav_stop(self.draw_bg.area(), NavRole::TextInput, Margin::default());
         DrawStep::done()
     }
@@ -1418,6 +1486,9 @@ impl Widget for TextInput {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::TouchUpdate(update) if update.cancelled) {
+            self.touch_selecting = false;
+        }
         if self.animator_handle_event(cx, event).must_redraw() {
             self.draw_bg.redraw(cx);
         }
@@ -1537,15 +1608,24 @@ impl Widget for TextInput {
                     3 => self.select_all(cx),
                     _ => {}
                 }
+                if self.selection.anchor.index != self.selection.cursor.index {
+                    cx.claim_text_selection(self.draw_bg.area());
+                }
 
                 self.animator_play(cx, id!(hover.down));
             }
             Hit::FingerLongPress(_) => {
                 self.touch_selecting = true;
                 self.select_word(cx);
+                cx.claim_text_selection(self.draw_bg.area());
             }
             Hit::FingerUp(fe) => {
+                let selected_by_touch = self.touch_selecting
+                    || (fe.device.is_touch() && fe.was_tap() && self.selection.anchor.index != self.selection.cursor.index);
                 self.touch_selecting = false;
+                if selected_by_touch {
+                    self.open_text_actions(cx);
+                }
                 if fe.is_over && fe.was_tap() {
                     if fe.has_hovers() {
                         self.animator_play(cx, id!(hover.on));
@@ -1761,10 +1841,10 @@ impl Widget for TextInput {
                 self.draw_bg.redraw(cx);
                 cx.widget_action(uid, &scope.path, TextInputAction::Changed(self.text.clone()));
             }
-            Hit::TextCopy(event) => {
+            Hit::TextCopy(event) if !self.is_password => {
                 *event.response.borrow_mut() = Some(self.selected_text().to_string());
             }
-            Hit::TextCut(event) => {
+            Hit::TextCut(event) if !self.is_password && !self.is_read_only => {
                 *event.response.borrow_mut() = Some(self.selected_text().to_string());
                 if !self.selected_text().is_empty() {
                     self.history.create_or_extend_edit_group(EditKind::Other, self.selection);

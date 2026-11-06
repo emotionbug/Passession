@@ -300,6 +300,7 @@ pub struct Ui<'u, 'a, 'b> {
     alert_seq: u32,
     card: Option<Card>,
     clip: Option<Rect>,
+    typography: crate::theme::Typography,
 }
 
 impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
@@ -315,7 +316,7 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
         pressed: Option<u64>,
         compact: bool,
     ) -> Self {
-        Self { cx, d, zones, fields, layer, pal, hovered, pressed, x: 0.0, y: 0.0, w: 0.0, compact, animating: false, depth: 0, alert_seq: 0, card: None, clip: None }
+        Self { cx, d, zones, fields, layer, pal, hovered, pressed, x: 0.0, y: 0.0, w: 0.0, compact, animating: false, depth: 0, alert_seq: 0, card: None, clip: None, typography: crate::theme::current_typography() }
     }
 
     // ---------------------------------------------------------------- primitives
@@ -368,6 +369,7 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
 
     /// Measures `text` wrapped at `max_w` (unwrapped when `None`).
     pub fn measure(&mut self, font: Font, size: f64, text: &str, max_w: Option<f64>) -> DVec2 {
+        let size = self.typography.ui_size(size);
         if text.is_empty() {
             return dvec2(0.0, (size * 1.35).round());
         }
@@ -386,7 +388,7 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
     /// Draws `text` at `pos`, wrapped at `max_w`; returns its size.
     pub fn text(&mut self, font: Font, size: f64, color: Vec4, pos: DVec2, max_w: Option<f64>, text: &str) -> DVec2 {
         if text.is_empty() {
-            return dvec2(0.0, (size * 1.35).round());
+            return self.measure(font, size, text, max_w);
         }
         let measured = self.measure(font, size, text, max_w);
         let cx: &mut Cx = &mut *self.cx;
@@ -395,7 +397,7 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
             Font::Medium => &mut self.d.medium,
             Font::Code => &mut self.d.code,
         };
-        d.text_style.font_size = (size * 0.75) as f32;
+        d.text_style.font_size = (self.typography.ui_size(size) * 0.75) as f32;
         d.color = color;
         let laid = d.layout(cx, 0.0, 0.0, max_w.map(|w| w.max(1.0) as f32), max_w.is_some(), Align::default(), text);
         d.draw_walk_laidout(self.cx, Walk::fixed(measured.x.max(1.0), measured.y.max(1.0)).with_abs_pos(pos), &laid);
@@ -408,7 +410,7 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
     #[allow(clippy::too_many_arguments)]
     pub fn selectable(&mut self, key: &str, font: Font, size: f64, color: Vec4, pos: DVec2, max_w: Option<f64>, text: &str) -> DVec2 {
         if text.is_empty() {
-            return dvec2(0.0, (size * 1.35).round());
+            return self.measure(font, size, text, max_w);
         }
         let measured = self.measure(font, size, text, max_w);
         let spec = FieldSpec::selectable(format!("sel.{key}"), text, font, size, color);
@@ -504,35 +506,39 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
     pub fn measure_ctl(&mut self, c: &Ctl) -> DVec2 {
         match c {
             Ctl::Button(b) => {
-                let text = if b.label.is_empty() { 0.0 } else { self.measure(Font::Regular, b.size.font(), &b.label, None).x };
+                let text = if b.label.is_empty() { DVec2::default() } else { self.measure(Font::Regular, b.size.font(), &b.label, None) };
                 let icon = if b.icon.is_some() || b.loading { b.size.icon() } else { 0.0 };
-                let gap = if text > 0.0 && icon > 0.0 { 8.0 } else { 0.0 };
+                let gap = if text.x > 0.0 && icon > 0.0 { 8.0 } else { 0.0 };
                 let pad = if b.label.is_empty() { (b.size.height() - icon) / 2.0 } else { b.size.padding() };
-                dvec2(text + icon + gap + pad * 2.0, b.size.height())
+                dvec2(text.x + icon + gap + pad * 2.0, b.size.height().max(text.y + 8.0))
             }
             Ctl::Switch { .. } => dvec2(36.0, 20.0),
             Ctl::IconButton { size, .. } => dvec2(*size, *size),
             Ctl::Checkbox { .. } => dvec2(22.0, 22.0),
             Ctl::Dropdown { label, lead, max_w, .. } => {
-                let text = self.measure(Font::Regular, 14.0, label, None).x.min(*max_w);
+                let text = self.measure(Font::Regular, 14.0, label, None);
                 let lead_w = if lead.is_some() { 16.0 + 8.0 } else { 0.0 };
-                dvec2(12.0 + lead_w + text + 8.0 + 14.0 + 12.0, 32.0)
+                dvec2(12.0 + lead_w + text.x.min(*max_w) + 8.0 + 14.0 + 12.0, 32.0_f64.max(text.y + 8.0))
             }
             Ctl::Segmented { items, .. } => {
                 let mut w = 4.0;
+                let mut h = 28.0_f64;
                 for (text, _, _) in items {
-                    w += self.measure(Font::Regular, 14.0, text, None).x + 16.0;
+                    let text = self.measure(Font::Regular, 14.0, text, None);
+                    w += text.x + 16.0;
+                    h = h.max(text.y + 8.0);
                 }
-                dvec2(w, 28.0)
+                dvec2(w, h)
             }
             Ctl::Label { text, size, font, max_w, .. } => {
                 let m = self.measure(*font, *size, text, Some(*max_w));
                 dvec2(m.x.min(*max_w), m.y)
             }
             Ctl::Badge { label, xs, dot, icon, .. } => {
-                let text = self.measure(Font::Regular, 12.0, label, None).x.min(184.0);
+                let text = self.measure(Font::Regular, 12.0, label, None);
                 let extra = if dot.is_some() { 12.0 } else { 0.0 } + if icon.is_some() { 20.0 } else { 0.0 };
-                dvec2(text + extra + if *xs { 12.0 } else { 16.0 }, if *xs { 18.0 } else { 22.0 })
+                let (minimum, padding): (f64, f64) = if *xs { (18.0, 4.0) } else { (22.0, 8.0) };
+                dvec2(text.x.min(184.0) + extra + if *xs { 12.0 } else { 16.0 }, minimum.max(text.y + padding))
             }
             Ctl::Spinner(size) | Ctl::Lead(_, size) => dvec2(*size, *size),
             Ctl::Dot(_, size) => dvec2(*size, *size),
@@ -540,13 +546,24 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
             Ctl::Provider(_, _, size, _) => dvec2(*size, *size),
             Ctl::Keys(steps) => {
                 let mut w = 0.0;
+                let mut h = 20.0_f64;
                 for (i, step) in steps.iter().enumerate() {
-                    w += self.measure(Font::Regular, 12.0, step, None).x + 8.0 + if i > 0 { 4.0 } else { 0.0 };
+                    let text = self.measure(Font::Regular, 12.0, step, None);
+                    w += text.x + 8.0 + if i > 0 { 4.0 } else { 0.0 };
+                    h = h.max(text.y + 4.0);
                 }
-                dvec2(w, 20.0)
+                dvec2(w, h)
             }
-            Ctl::Link { label, .. } => dvec2(self.measure(Font::Regular, 12.0, label, None).x + 18.0, 16.0),
-            Ctl::Field { w, h, .. } => dvec2(*w, *h),
+            Ctl::Link { label, .. } => {
+                let text = self.measure(Font::Regular, 12.0, label, None);
+                dvec2(text.x + 18.0, 16.0_f64.max(text.y))
+            }
+            Ctl::Field { spec, w, h } => {
+                let font = spec.plain.map(|plain| plain.font).unwrap_or(Font::Regular);
+                let padding = if spec.bare || spec.plain.is_some() { 0.0 } else { 18.0 };
+                let minimum = self.measure(font, spec.font_px, "Ag", None).y + padding;
+                dvec2(*w, h.max(minimum))
+            }
             Ctl::Gap(w) => dvec2(*w, 0.0),
             Ctl::Row(items, gap) => {
                 let mut w = 0.0f64;
@@ -707,14 +724,14 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
                 self.rect(rect, fill, Some(alpha(self.pal.border_accent, fade)), 12.0);
                 let mut x = pos.x + 12.0;
                 if let Some(lead) = lead {
-                    self.lead(lead, dvec2(x, pos.y + 8.0), 16.0);
+                    self.lead(lead, dvec2(x, pos.y + (size.y - 16.0) / 2.0), 16.0);
                     x += 24.0;
                 }
                 let th = self.measure(Font::Regular, 14.0, &text, None).y;
                 let fg = alpha(self.pal.foreground, fade);
-                let tw = self.text_line(Font::Regular, 14.0, fg, dvec2(x, pos.y + (32.0 - th) / 2.0), max_w, &text).x.min(max_w);
+                let tw = self.text_line(Font::Regular, 14.0, fg, dvec2(x, pos.y + (size.y - th) / 2.0), max_w, &text).x.min(max_w);
                 let muted = alpha(self.pal.muted, fade);
-                self.icon(Icon::ChevronDown, dvec2(x + tw + 8.0, pos.y + 9.0), 14.0, muted);
+                self.icon(Icon::ChevronDown, dvec2(x + tw + 8.0, pos.y + (size.y - 14.0) / 2.0), 14.0, muted);
                 if enabled {
                     self.zone(&k, rect, act);
                 }
@@ -727,14 +744,14 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
                 for (i, (text, selected, act)) in items.into_iter().enumerate() {
                     let tw = self.measure(Font::Regular, 14.0, &text, None);
                     let w = tw.x + 16.0;
-                    let seg = Rect { pos: dvec2(x, pos.y + 2.0), size: dvec2(w, 24.0) };
+                    let seg = Rect { pos: dvec2(x, pos.y + 2.0), size: dvec2(w, size.y - 4.0) };
                     if selected {
                         let fill = if self.pal.dark { self.pal.surface3 } else { self.pal.surface0 };
                         self.rect(seg, fill, None, 8.0);
                     }
                     let enabled = act.is_some();
                     let color = if selected { self.pal.foreground } else { self.pal.muted };
-                    self.text(Font::Regular, 14.0, alpha(color, if enabled || selected { 1.0 } else { 0.5 }), dvec2(x + 8.0, pos.y + (28.0 - tw.y) / 2.0), None, &text);
+                    self.text(Font::Regular, 14.0, alpha(color, if enabled || selected { 1.0 } else { 0.5 }), dvec2(x + 8.0, pos.y + (size.y - tw.y) / 2.0), None, &text);
                     if enabled && !selected {
                         self.zone(&format!("{k}.{i}"), seg, act);
                     }
@@ -785,9 +802,9 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
                 for step in steps {
                     let tw = self.measure(Font::Regular, 12.0, &step, None);
                     let fill = alpha(self.pal.surface3, 0.5);
-                    self.rect(Rect { pos: dvec2(x, pos.y), size: dvec2(tw.x + 8.0, 20.0) }, fill, None, 6.0);
+                    self.rect(Rect { pos: dvec2(x, pos.y), size: dvec2(tw.x + 8.0, size.y) }, fill, None, 6.0);
                     let muted = self.pal.muted;
-                    self.text(Font::Regular, 12.0, muted, dvec2(x + 4.0, pos.y + (20.0 - tw.y) / 2.0), None, &step);
+                    self.text(Font::Regular, 12.0, muted, dvec2(x + 4.0, pos.y + (size.y - tw.y) / 2.0), None, &step);
                     x += tw.x + 12.0;
                 }
             }
@@ -795,15 +812,16 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
                 let muted = self.pal.muted;
                 let tw = self.measure(Font::Regular, 12.0, &text, None).x;
                 let (icon_x, text_x) = if leading { (pos.x, pos.x + 18.0) } else { (pos.x + tw + 4.0, pos.x) };
-                self.icon(Icon::ArrowUpRight, dvec2(icon_x, pos.y + 1.0), if leading { 14.0 } else { 12.0 }, muted);
+                let icon_size = if leading { 14.0 } else { 12.0 };
+                self.icon(Icon::ArrowUpRight, dvec2(icon_x, pos.y + (size.y - icon_size) / 2.0), icon_size, muted);
                 self.text(Font::Regular, 12.0, muted, dvec2(text_x, pos.y), None, &text);
                 let open = crate::features::settings::rpc::handler(move |_, env| env.open_url(&url));
                 self.zone(&k, Rect { pos, size }, Some(open));
             }
-            Ctl::Field { spec, w, h } => {
+            Ctl::Field { spec, .. } => {
                 let pal = self.pal;
                 let layer = self.layer;
-                self.fields.draw(self.cx, &pal, (layer, self.depth), spec, Rect { pos, size: dvec2(w, h) });
+                self.fields.draw(self.cx, &pal, (layer, self.depth), spec, Rect { pos, size });
             }
             Ctl::Gap(_) => {}
             Ctl::Row(items, gap) => {
@@ -1059,8 +1077,8 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
             self.y += s.y + 8.0;
         }
         let w = self.w;
-        self.draw_ctl(Ctl::Field { spec, w, h: height }, dvec2(self.x, self.y));
-        self.y += height;
+        let size = self.draw_ctl(Ctl::Field { spec, w, h: height }, dvec2(self.x, self.y));
+        self.y += size.y;
         if let Some(hint) = hint {
             let muted = self.pal.muted;
             let s = self.text(Font::Regular, 12.0, muted, dvec2(self.x, self.y + 6.0), Some(self.w), hint);
@@ -1122,8 +1140,8 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
 
     /// Multiline text height for a field showing `text`.
     pub fn multiline_height(&mut self, text: &str, min: f64) -> f64 {
-        let lines = text.split('\n').count().max(1) as f64;
-        (lines * 20.0 + 24.0).clamp(min, 360.0)
+        let height = self.measure(Font::Regular, 14.0, text, Some((self.w - 24.0).max(1.0))).y;
+        (height + 24.0).clamp(min, 360.0)
     }
 }
 

@@ -6,7 +6,7 @@ use {
         cursor::MouseCursor,
         cx::{Cx, CxRef, OsType, XrCapabilities},
         draw_list::DrawListId,
-        event::{DragItem, HttpRequest, NextFrame, Timer, Trigger, VideoSource},
+        event::{DragItem, HttpRequest, NextFrame, TextActionCapabilities, Timer, Trigger, VideoSource},
         gpu_info::GpuInfo,
         macos_menu::MacosMenu,
         makepad_futures::executor::Spawner,
@@ -85,7 +85,6 @@ pub enum CxOsOp {
 
     StartDragging(Vec<DragItem>),
     UpdateMacosMenu(MacosMenu),
-    ShowClipboardActions(String),
     CopyToClipboard(String),
 
     HttpRequest {
@@ -155,7 +154,6 @@ impl std::fmt::Debug for CxOsOp {
             
             Self::StartDragging(..)=>write!(f, "StartDragging"),
             Self::UpdateMacosMenu(..)=>write!(f, "UpdateMacosMenu"),
-            Self::ShowClipboardActions(..)=>write!(f, "ShowClipboardActions"),
             Self::CopyToClipboard(..)=>write!(f, "CopyToClipboard"),
             
             Self::HttpRequest{..}=>write!(f, "HttpRequest"),
@@ -331,9 +329,57 @@ impl Cx {
         self.platform_ops.push(CxOsOp::HideTextIME);
     }
 
-    pub fn show_clipboard_actions(&mut self, selected: String) {
-        self.platform_ops
-            .push(CxOsOp::ShowClipboardActions(selected));
+    /// One content owner retains selection, including when a toolbar is closed.
+    pub fn claim_text_selection(&mut self, area: Area) {
+        if area == Area::Empty || !area.is_valid(self) { return; }
+        if self.keyboard.key_focus == area && self.keyboard.next_key_focus != area { return; }
+        if self.keyboard.next_key_focus != area {
+            self.set_key_focus(area);
+        }
+        self.keyboard.claim_text_selection(area);
+    }
+
+    /// Clear only this owner's selection registration, not a newer editor's focus.
+    pub fn clear_text_selection(&mut self, area: Area) {
+        if area == Area::Empty || self.keyboard.text_selection != area { return; }
+        self.keyboard.clear_text_selection(area);
+        #[cfg(target_os = "android")]
+        self.android_sync_text_actions();
+    }
+
+    pub(crate) fn hide_text_actions(&mut self, area: Area) {
+        self.keyboard.hide_text_actions(area);
+        #[cfg(target_os = "android")]
+        self.android_sync_text_actions();
+    }
+
+    pub fn text_actions_active(&self, area: Area) -> bool {
+        self.keyboard.text_actions.is_some_and(|request| request.area == area)
+    }
+
+    /// Android uses the system floating toolbar; source selection stays in its widget.
+    pub fn show_text_actions(&mut self, area: Area, rect: Rect, capabilities: TextActionCapabilities) {
+        self.claim_text_selection(area);
+        #[cfg(target_os = "android")]
+        {
+            if area == Area::Empty || !area.is_valid(self) || self.keyboard.next_key_focus != area { return; }
+            let relative = Rect { pos: rect.pos - area.rect(self).pos, ..rect };
+            self.keyboard.show_text_actions(area, crate::event::TextActionsAnchor::Rect(relative), capabilities);
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = (rect, capabilities);
+    }
+
+    /// Resolve painted selection/caret geometry only after parent layout is complete.
+    pub fn show_text_actions_for_area(&mut self, owner: Area, anchor: Area, capabilities: TextActionCapabilities) {
+        self.claim_text_selection(owner);
+        #[cfg(target_os = "android")]
+        {
+            if owner == Area::Empty || !owner.is_valid(self) || self.keyboard.next_key_focus != owner { return; }
+            self.keyboard.show_text_actions(owner, crate::event::TextActionsAnchor::Area(anchor), capabilities);
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = (anchor, capabilities);
     }
 
     /// Copies the given string to the clipboard.
@@ -613,6 +659,9 @@ impl Cx {
     }
 
     pub fn set_key_focus(&mut self, focus_area: Area) {
+        if self.keyboard.text_selection != focus_area {
+            self.clear_text_selection(self.keyboard.text_selection);
+        }
         #[cfg(target_os = "android")]
         if !self.has_key_focus(focus_area) || !self.os.ime_show_requested {
             self.os.ime_show_pending = true;

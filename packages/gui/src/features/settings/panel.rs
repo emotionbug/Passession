@@ -689,6 +689,9 @@ impl Widget for SettingsPanel {
         cx.add_aligned_rect_area(&mut self.area, rect);
 
         let compact = view.compact;
+        let ty = crate::theme::current_typography();
+        let compact_header_h = 64.0_f64.max(ty.ui_size(16.0) * 1.4 + 40.0);
+        let wide_header_h = 36.0_f64.max(ty.ui_size(14.0) * 1.4 + 16.0);
         let mut content_h = 0.0;
         let mut sidebar_h = 0.0;
         let mut animating = false;
@@ -700,14 +703,14 @@ impl Widget for SettingsPanel {
                 if compact && self.st.section.is_none() && self.st.project_root.is_none() {
                     // Compact root: back header over the sidebar islands.
                     draw_compact_header(&mut kit, rect, &t("settings.title"), handler(|_, env| env.ctx.effects.push(UiEffect::CloseSettings)));
-                    let body = Rect { pos: dvec2(rect.pos.x, rect.pos.y + 64.0), size: dvec2(rect.size.x, rect.size.y - 64.0) };
+                    let body = Rect { pos: dvec2(rect.pos.x, rect.pos.y + compact_header_h), size: dvec2(rect.size.x, rect.size.y - compact_header_h) };
                     sidebar_h = scrolled(&mut kit, body, self.st.sidebar_scroll, 8.0, |kit| draw_sidebar_body(kit, &self.st, &view, true));
                     self.regions.push((Region::Sidebar, body));
                 } else if compact {
                     let title = page_title(&self.st, &view);
                     let back = handler(SettingsPanel::back_to_parent);
                     draw_compact_header(&mut kit, rect, &title.unwrap_or_default(), back);
-                    let body = Rect { pos: dvec2(rect.pos.x, rect.pos.y + 64.0), size: dvec2(rect.size.x, rect.size.y - 64.0) };
+                    let body = Rect { pos: dvec2(rect.pos.x, rect.pos.y + compact_header_h), size: dvec2(rect.size.x, rect.size.y - compact_header_h) };
                     if self.st.project_root.is_none() {
                         content_h = scrolled(&mut kit, body, self.st.scroll, 16.0, |kit| draw_detail(kit, &self.st, &view, None));
                         self.regions.push((Region::Content, body));
@@ -718,13 +721,13 @@ impl Widget for SettingsPanel {
                     kit.rect(sidebar, pal.sidebar, None, 0.0);
                     kit.rect(Rect { pos: dvec2(sidebar.pos.x + sidebar.size.x - 1.0, rect.pos.y), size: dvec2(1.0, rect.size.y) }, pal.border, None, 0.0);
                     // Back row in a 36px header strip.
-                    let header = Rect { pos: sidebar.pos, size: dvec2(sidebar.size.x - 1.0, 36.0) };
-                    kit.hline(header.pos.x, header.pos.y + 35.0, header.size.x);
-                    sidebar_item(&mut kit, Rect { pos: dvec2(header.pos.x + 8.0, header.pos.y + 4.0), size: dvec2(header.size.x - 16.0, 28.0) }, "settings.back", Icon::ArrowLeft, &t("settings.backToWorkspace"), false, false, handler(|_, env| env.ctx.effects.push(UiEffect::CloseSettings)));
-                    let list = Rect { pos: dvec2(sidebar.pos.x, sidebar.pos.y + 36.0), size: dvec2(sidebar.size.x - 1.0, sidebar.size.y - 36.0) };
+                    let header = Rect { pos: sidebar.pos, size: dvec2(sidebar.size.x - 1.0, wide_header_h) };
+                    kit.hline(header.pos.x, header.pos.y + wide_header_h - 1.0, header.size.x);
+                    sidebar_item(&mut kit, Rect { pos: dvec2(header.pos.x + 8.0, header.pos.y + 4.0), size: dvec2(header.size.x - 16.0, wide_header_h - 8.0) }, "settings.back", Icon::ArrowLeft, &t("settings.backToWorkspace"), false, false, handler(|_, env| env.ctx.effects.push(UiEffect::CloseSettings)));
+                    let list = Rect { pos: dvec2(sidebar.pos.x, sidebar.pos.y + wide_header_h), size: dvec2(sidebar.size.x - 1.0, sidebar.size.y - wide_header_h) };
                     sidebar_h = scrolled(&mut kit, list, self.st.sidebar_scroll, 0.0, |kit| draw_sidebar_body(kit, &self.st, &view, false));
                     self.regions.push((Region::Sidebar, list));
-                    let detail = Rect { pos: dvec2(sidebar.pos.x + sidebar.size.x, rect.pos.y + 36.0), size: dvec2(rect.size.x - sidebar.size.x, rect.size.y - 36.0) };
+                    let detail = Rect { pos: dvec2(sidebar.pos.x + sidebar.size.x, rect.pos.y + wide_header_h), size: dvec2(rect.size.x - sidebar.size.x, rect.size.y - wide_header_h) };
                     if self.st.project_root.is_none() {
                         let title = page_title(&self.st, &view);
                         content_h = scrolled(&mut kit, detail, self.st.scroll, 0.0, |kit| draw_detail(kit, &self.st, &view, title));
@@ -741,10 +744,10 @@ impl Widget for SettingsPanel {
             // Embedded project settings.
             if let (Some(root), Some(host)) = (self.st.project_root.clone(), view.active_host(&self.st).map(|h| h.server_id.clone())) {
                 let detail = if compact {
-                    Rect { pos: dvec2(rect.pos.x, rect.pos.y + 64.0), size: dvec2(rect.size.x, rect.size.y - 64.0) }
+                    Rect { pos: dvec2(rect.pos.x, rect.pos.y + compact_header_h), size: dvec2(rect.size.x, rect.size.y - compact_header_h) }
                 } else {
                     let sx = SIDEBAR_W.min(rect.size.x * 0.5);
-                    Rect { pos: dvec2(rect.pos.x + sx, rect.pos.y + 36.0), size: dvec2(rect.size.x - sx, rect.size.y - 36.0) }
+                    Rect { pos: dvec2(rect.pos.x + sx, rect.pos.y + wide_header_h), size: dvec2(rect.size.x - sx, rect.size.y - wide_header_h) }
                 };
                 let stale = self.project.as_ref().map(|(_, h, r)| *h != host || *r != root).unwrap_or(true);
                 if stale {
@@ -957,7 +960,7 @@ fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
     } else {
         current.as_deref().and_then(|c| c.strip_prefix("host/")).map(String::from)
     };
-    let row_h = if mobile { 52.0 } else { 28.0 };
+    let row_h = (if mobile { 52.0_f64 } else { 28.0 }).max(kit.measure(Font::Regular, if mobile { 16.0 } else { 14.0 }, "Ag", None).y + 8.0);
     let gap = 2.0;
     let no_local = DESKTOP && !v.hosts.iter().any(|h| h.local);
     let x = kit.x + 8.0;

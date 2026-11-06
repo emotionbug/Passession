@@ -14,6 +14,30 @@ use {
     },
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextActionCapabilities {
+    pub copy: bool,
+    pub cut: bool,
+    pub paste: bool,
+    pub select_all: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TextActionsAnchor {
+    /// Relative to the owner's unaligned origin; resolved after layout.
+    Rect(crate::makepad_math::Rect),
+    /// Painted caret/selection instances, including final alignment and clipping.
+    Area(Area),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextActionsRequest {
+    pub token: u64,
+    pub area: Area,
+    pub anchor: TextActionsAnchor,
+    pub capabilities: TextActionCapabilities,
+}
+
 
 #[derive(Default)]
 pub struct CxKeyboard {
@@ -22,7 +46,10 @@ pub struct CxKeyboard {
     pub (crate) key_focus: Area,
     #[allow(dead_code)]
     pub (crate) keys_down: Vec<KeyEvent>,
-    pub (crate) text_ime_dismissed: bool
+    pub (crate) text_ime_dismissed: bool,
+    pub (crate) text_selection: Area,
+    pub (crate) text_actions: Option<TextActionsRequest>,
+    text_action_token: u64,
 }
 
 impl CxKeyboard {
@@ -56,6 +83,42 @@ impl CxKeyboard {
         self.text_ime_dismissed = false;
     }
 
+    pub(crate) fn claim_text_selection(&mut self, area: Area) {
+        if self.text_selection != area {
+            self.text_actions = None;
+            self.text_selection = area;
+        }
+    }
+
+    pub(crate) fn clear_text_selection(&mut self, area: Area) {
+        if self.text_selection == area {
+            self.text_selection = Area::Empty;
+            self.hide_text_actions(area);
+        }
+    }
+
+    pub(crate) fn hide_text_actions(&mut self, area: Area) {
+        if self.text_actions.is_some_and(|request| request.area == area) {
+            self.text_actions = None;
+        }
+    }
+
+    pub(crate) fn show_text_actions(
+        &mut self,
+        area: Area,
+        anchor: TextActionsAnchor,
+        capabilities: TextActionCapabilities,
+    ) {
+        self.claim_text_selection(area);
+        let token = if let Some(request) = self.text_actions {
+            request.token
+        } else {
+            self.text_action_token += 1;
+            self.text_action_token
+        };
+        self.text_actions = Some(TextActionsRequest { token, area, anchor, capabilities });
+    }
+
     pub (crate) fn update_area(&mut self, old_area: Area, new_area: Area) {
         if self.key_focus == old_area {
             self.key_focus = new_area
@@ -65,6 +128,17 @@ impl CxKeyboard {
         }
         if self.next_key_focus == old_area {
             self.next_key_focus = new_area
+        }
+        if self.text_selection == old_area {
+            self.text_selection = new_area;
+        }
+        if let Some(request) = &mut self.text_actions {
+            if request.area == old_area {
+                request.area = new_area;
+            }
+            if request.anchor == TextActionsAnchor::Area(old_area) {
+                request.anchor = TextActionsAnchor::Area(new_area);
+            }
         }
     }
     /*
@@ -130,6 +204,64 @@ mod focus_tests {
         assert_eq!(keyboard.cycle_key_focus_changed(), Some((editor, Area::Empty)));
         assert!(!keyboard.has_key_focus(editor));
         assert!(!keyboard.has_key_focus(Area::Empty));
+    }
+
+    #[test]
+    fn text_actions_refresh_preserves_token_but_new_ownership_retires_it() {
+        let mut lists = crate::draw_list::CxDrawListPool::default();
+        let list = lists.alloc();
+        let first = Area::Rect(crate::area::RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 1 });
+        let second = Area::Rect(crate::area::RectArea { draw_list_id: list.id(), rect_id: 1, redraw_id: 1 });
+        let mut keyboard = CxKeyboard::default();
+        let mut caps = TextActionCapabilities { copy: true, ..Default::default() };
+        keyboard.show_text_actions(first, TextActionsAnchor::Rect(Default::default()), caps);
+        let first_token = keyboard.text_actions.unwrap().token;
+        caps.copy = false;
+        caps.paste = true;
+        keyboard.show_text_actions(first, TextActionsAnchor::Rect(Default::default()), caps);
+        assert_eq!(keyboard.text_actions.unwrap().token, first_token);
+        assert_eq!(keyboard.text_actions.unwrap().capabilities, caps);
+
+        keyboard.set_key_focus(second);
+        keyboard.cycle_key_focus_changed();
+        keyboard.show_text_actions(second, TextActionsAnchor::Rect(Default::default()), caps);
+        let second_token = keyboard.text_actions.unwrap().token;
+        assert!(second_token > first_token);
+        keyboard.clear_text_selection(first);
+        assert_eq!(keyboard.text_selection, second);
+        assert_eq!(keyboard.text_actions.unwrap().token, second_token);
+        assert!(keyboard.has_key_focus(second));
+
+        keyboard.hide_text_actions(second);
+        assert_eq!(keyboard.text_selection, second);
+        assert!(keyboard.text_actions.is_none());
+        keyboard.show_text_actions(second, TextActionsAnchor::Rect(Default::default()), caps);
+        assert!(keyboard.text_actions.unwrap().token > second_token);
+        keyboard.clear_text_selection(second);
+        assert_eq!(keyboard.text_selection, Area::Empty);
+        assert!(keyboard.text_actions.is_none());
+        assert!(keyboard.has_key_focus(second));
+    }
+
+    #[test]
+    fn text_actions_redraw_remaps_selection_and_ignores_old_area_cleanup() {
+        let mut lists = crate::draw_list::CxDrawListPool::default();
+        let list = lists.alloc();
+        let old = Area::Rect(crate::area::RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 1 });
+        let new = Area::Rect(crate::area::RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 2 });
+        let mut keyboard = CxKeyboard::default();
+        keyboard.set_key_focus(old);
+        keyboard.cycle_key_focus_changed();
+        keyboard.show_text_actions(old, TextActionsAnchor::Area(old), TextActionCapabilities { copy: true, ..Default::default() });
+        let token = keyboard.text_actions.unwrap().token;
+        keyboard.update_area(old, new);
+        keyboard.clear_text_selection(old);
+        assert!(keyboard.has_key_focus(new));
+        assert_eq!(keyboard.text_selection, new);
+        let request = keyboard.text_actions.unwrap();
+        assert_eq!(request.area, new);
+        assert_eq!(request.anchor, TextActionsAnchor::Area(new));
+        assert_eq!(request.token, token);
     }
 }
 
