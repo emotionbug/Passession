@@ -7,7 +7,7 @@
 - Linux desktop: `pkg-config` and the X11, Xcursor, GLX/EGL, ALSA and PulseAudio development packages Makepad links, plus Wayland development files for native file dialogs (Ubuntu: `libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev libwayland-dev`), and `patchelf`: `build-gui` rewrites the RPATHs of the bundled daemon runtime. Packaging adds `dpkg-dev`, `xdg-utils` and the runtime-loaded `libxss1 libsm6 libice6`.
 - macOS: Xcode command-line tools (`clang`, `codesign`, `iconutil`). iOS also needs full Xcode (`actool`, `devicectl`, `simctl`) and `rustup target add aarch64-apple-ios` (plus `aarch64-apple-ios-sim` for Apple-silicon simulators).
 - Windows: Visual Studio C++ tools (MSVC linker, `rc.exe`, CRT redistributable); NSIS for installers.
-- Android: JDK 17+, the Android SDK (`ANDROID_HOME`), NDK 28.2.13676358 and `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`. `xtask` downloads a pinned Gradle 9.3.1 into `$XDG_CACHE_HOME/paseo-packaging`; there is no Gradle wrapper in the repository.
+- Android: JDK 17+, the Android SDK (`ANDROID_HOME`), NDK 28.2.13676358 and `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`. `ANDROID_NDK_HOME` overrides SDK discovery and must point to that exact NDK; installing it with SDK Manager does not replace an inherited runner path. `xtask` downloads a pinned Gradle 9.3.1 into `$XDG_CACHE_HOME/paseo-packaging`; there is no Gradle wrapper in the repository.
 
 Fetch Rust dependencies with `cargo fetch --locked`. Desktop builds require their target host; `xtask` chooses the GUI target itself and rejects `CARGO_BUILD_TARGET`.
 

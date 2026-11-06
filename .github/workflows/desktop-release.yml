@@ -170,6 +170,10 @@ jobs:
         if: matrix.platform == 'android'
         with:
           packages: platform-tools ndk;28.2.13676358
+      - name: Select the pinned Android NDK
+        if: matrix.platform == 'android'
+        shell: bash
+        run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
       - name: Stage optional Android release signing key
         if: matrix.platform == 'android'
         shell: bash
