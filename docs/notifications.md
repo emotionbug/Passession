@@ -1,12 +1,12 @@
 # Notifications
 
-Notifications are native platform integration. Flutter mobile ownership is under `packages/flutter_app/lib/platform/mobile`: service lifecycle, notification delivery/settings and push-token transport. Desktop integration is under `lib/platform/desktop`. Navigation into a notification target is owned by the shared native app state.
+Notifications belong to `packages/gui-platform`: `src/mobile` owns push registration and token lifecycle; `src/android` plus `android/java/sh/paseo/sessions` owns Android delivery; `src/ios` owns APNs/native iOS callbacks; `src/desktop` owns desktop delivery and activation. `notification_policy.rs` owns shared policy. Platform events carry explicit targets to the Rust shell; platform code does not select another pane's global route.
 
 ## Identity and delivery
 
 A notification target identifies the host and session. Resolve it against saved hosts and current daemon data before opening; do not select an equal session/path on another host or create a replacement session when the target is unavailable. Wait for application initialization and host readiness, deduplicate delivery, and expose stale/unreachable-target failures.
 
-The native mobile implementation uses Firebase messaging and native local notifications. It retains compatibility with the existing push service's payload/token contract, including Expo-formatted FCM application data. That service compatibility is not an Expo/Metro application runtime or a web client.
+The native mobile implementation uses Firebase messaging on Android and APNs directly on iOS (the iOS app does not link Firebase), plus native local notifications. Both register their device token through the existing push service's Expo-compatible token exchange, and Android keeps Expo-formatted FCM application data. That service compatibility is not an Expo/Metro application runtime or a web client.
 
 OS-rendered background notifications and locally presented foreground notifications have different ownership. Avoid duplicate alerts. Background handler errors must remain available to the foreground UI rather than being silently discarded. Notification permission is a user choice, not a daemon requirement.
 

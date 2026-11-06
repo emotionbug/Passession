@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>Paseo Sessions</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>sh.paseo.sessions.desktop</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Paseo Sessions</string>
+	<key>CFBundleDisplayName</key>
+	<string>Paseo Sessions</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>sh.paseo.sessions.desktop</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>paseo</string>
+			</array>
+		</dict>
+	</array>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(PASEO_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(PASEO_BUILD_NUMBER)</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>$(MACOS_MINIMUM)</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Paseo Sessions connects to your local daemon and development servers.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 sh.paseo. All rights reserved.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+</dict>
+</plist>

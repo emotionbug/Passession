@@ -445,6 +445,7 @@ canonical assistant prefix, it stays in the head lane. No row may be returned in
 
 - Rust canonical timeline, persistence and forwarding: `packages/daemon/src/agent/timeline.rs`, `timeline_storage.rs`, `timeline_stream.rs`, and `transport/`
 - Rust saved reads, background preparation and lazy child bodies: `packages/daemon/src/agent/history_read.rs`
-- Dart protocol and reconciliation: `packages/flutter_app/lib/core/client.dart`
-- Flutter viewed-session/controller and timeline presentation: `packages/flutter_app/lib/features/chat/chat_controller.dart`, `agent_panel.dart`, and `timeline_item.dart`
+- Rust client transport, response rules and observations: `packages/gui-core/src/connection.rs`, `protocol.rs` and `runtime/`
+- Viewed-session history reconciliation and retained replicas: `packages/gui/src/features/timeline/{session,store,fold}.rs`
+- Virtualized rows, Markdown, reading hold and paced reveal: `packages/gui/src/features/timeline/{panel,chat_row,reveal}.rs` and `markdown/`
 - External Rust SDK: `packages/client`

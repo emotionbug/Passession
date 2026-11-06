@@ -2,9 +2,9 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-Paseo Sessions は、コーディングエージェントの作業を実行・レビューするためのネイティブ環境です。**Linux、macOS、Windows、Android、iOS** 向けのクライアントは Flutter、デーモンと `paseo` CLI は Rust で実装されています。デスクトップはローカルデーモンを管理でき、モバイルは別のマシンのデーモンへの接続専用です。
+Paseo Sessions は、コーディングエージェントの作業を実行・レビューするためのネイティブ環境です。**Linux、macOS、Windows、Android、iOS** 向けのクライアントはネイティブ Rust（Makepad）、デーモンと `paseo` CLI も Rust で実装されています。デスクトップはローカルデーモンを管理でき、モバイルは別のマシンのデーモンへの接続専用です。
 
-このチェックアウトのバージョンは **0.13.1** です。配布成果物は[このリポジトリのリリース](https://github.com/emotionbug/paseo/releases)を使用してください。上流のダウンロードはこのリポジトリのビルドではありません。自分でビルド・配布する場合は[リリース要件](docs/release.md)を確認してください。
+このチェックアウトのバージョンは **0.13.5** です。配布成果物は[このリポジトリのリリース](https://github.com/emotionbug/paseo/releases)を使用してください。上流のダウンロードはこのリポジトリのビルドではありません。自分でビルド・配布する場合は[リリース要件](docs/release.md)を確認してください。
 
 ## ホストをまたいだ作業と機能範囲
 
@@ -25,7 +25,7 @@ Paseo Sessions は、コーディングエージェントの作業を実行・�
 
 ## ソースからビルド・起動
 
-Rust/Cargo、Flutter SDK、対象プラットフォームのネイティブツールチェーンを用意します。少なくとも1つのエージェント CLI をインストールして認証を設定してください：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Copilot](https://github.com/features/copilot/cli/)、[OpenCode](https://github.com/anomalyco/opencode)、[Pi](https://pi.dev)。詳細は[開発ガイド](docs/development.md)にあります。
+Rust/Cargo と対象プラットフォームのネイティブツールチェーンを用意します。少なくとも1つのエージェント CLI をインストールして認証を設定してください：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Copilot](https://github.com/features/copilot/cli/)、[OpenCode](https://github.com/anomalyco/opencode)、[Pi](https://pi.dev)。詳細は[開発ガイド](docs/development.md)にあります。
 
 ```sh
 cargo fetch --locked
@@ -44,15 +44,15 @@ cargo xtask dev app
 開発環境はチェックアウト内の `.dev/paseo-home` とポート `6768` を使い、通常の `~/.paseo` とポート `6767` から分離します。ビルドとリリースのコマンドは Rust の `paseo-xtask` クレートで実行します。
 
 ```sh
-cargo xtask build-flutter linux
-cargo xtask build-flutter macos
-cargo xtask build-flutter windows
-cargo xtask build-flutter android
-cargo xtask build-flutter android --arch arm64
-cargo xtask build-flutter ios
+cargo xtask build-gui linux
+cargo xtask build-gui macos
+cargo xtask build-gui windows
+cargo xtask build-gui android
+cargo xtask build-gui android --arch arm64
+cargo xtask build-gui ios
 ```
 
-デスクトップは対象 OS 上でビルドし、iOS には macOS/Xcode が必要です。成果物とビルド記述は `artifacts/flutter/` に出力されます。Android/iOS にデーモンは含まれません。Android の名称は **Paseo Sessions**、パッケージ名は `sh.paseo.sessions` です。デバッグ署名 APK や未署名 iOS アプリアーカイブはストア公開用リリースではありません。[Android](docs/android.md)と[リリース](docs/release.md)を参照してください。
+デスクトップは対象 OS 上でビルドし、iOS には macOS/Xcode が必要です。成果物とビルド記述は `artifacts/native/` に出力されます。Android/iOS にデーモンは含まれません。Android の名称は **Paseo Sessions**、パッケージ名は `sh.paseo.sessions` です。デバッグ署名 APK や未署名 iOS アプリアーカイブはストア公開用リリースではありません。[Android](docs/android.md)と[リリース](docs/release.md)を参照してください。
 
 ヘッドレスホストでは生成された `target/debug/paseo`（Windows は `paseo.exe`）を使います。`CARGO_TARGET_DIR` 設定時は対応するディレクトリを使い、生成されたランタイム資産を実行ファイルの隣に保持してください。
 
@@ -81,22 +81,22 @@ paseo import --provider pi <native-session-id>
 paseo run --host workstation.local:6767 --cwd /workspace --provider codex "review the diff"
 ```
 
-外部連携用 Rust SDK `paseo-client` は `packages/client`、共通の通信仕様とリレー暗号化を持つ `paseo-protocol` は `packages/protocol` にあります。Rust デーモンと Dart クライアントの通信仕様は維持します。従来の TypeScript SDK をラップせず Rust SDK に置き換えます。
+外部連携用 Rust SDK `paseo-client` は `packages/client`、共通の通信仕様とリレー暗号化を持つ `paseo-protocol` は `packages/protocol` にあります。デーモンとネイティブクライアントは同じクレートを使います。従来の TypeScript SDK をラップせず Rust SDK に置き換えます。
 
 ## ソース構成と検証範囲
 
 | 領域                                                                             | パス                                                    |
 | -------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | Rust デーモン、CLI、プロバイダー、ストレージ、supervisor、デスクトップホスト IPC | `packages/daemon`                                       |
-| 5プラットフォーム向け Flutter クライアント                                       | `packages/flutter_app`                                  |
-| デスクトップのパッケージングとランタイム資産                                     | `packages/flutter_desktop_host`                         |
-| ネイティブオーディオ統合                                                         | `packages/flutter_audio`                                |
+| 5プラットフォーム向けネイティブクライアント                                      | `packages/gui`, `packages/gui-core`                     |
+| デスクトップとモバイルの OS 統合                                                 | `packages/gui-platform`                                 |
+| パッケージングリソースとインストーラー                                           | `packaging`                                             |
 | Rust SDK と共通プロトコル                                                       | `packages/client`、`packages/protocol`                  |
 | ネイティブバックエンドプラグイン SDK                                           | `packages/plugin`                                      |
 | Rust リレーと構文ハイライト                                                    | `packages/relay`、`packages/highlight`                  |
 | Rust ビルド・リリースツール                                                    | `xtask`                                                |
 
-ランタイム境界を変更する前に[アーキテクチャ](docs/architecture.md)、[開発](docs/development.md)、[テスト](docs/testing.md)、[リリース](docs/release.md)を確認してください。Linux ではネイティブデーモン/クライアントとデスクトップホストのライフサイクルの実行実績があります。Android ARM64 の release モードビルドは成功しましたが、デバッグ署名であり、インストールや端末実行は行っていません。この移行では Windows、macOS、iOS の実機実行はありません。各 OS の CI 定義は実行証拠ではありません。デスクトップの追加検証を含め、最新の証拠と制限はテスト文書を参照してください。
+ランタイム境界を変更する前に[アーキテクチャ](docs/architecture.md)、[開発](docs/development.md)、[テスト](docs/testing.md)、[リリース](docs/release.md)を確認してください。Linux ではデーモンとデスクトップホストのライフサイクルの実行実績があり、ネイティブ Rust クライアント自体の実行証拠は別途管理します。この移行では Windows、macOS、Android、iOS の実機実行はありません。各 OS の CI 定義は実行証拠ではありません。最新の証拠と制限はテスト文書を参照してください。
 
 ## ライセンスと配布
 

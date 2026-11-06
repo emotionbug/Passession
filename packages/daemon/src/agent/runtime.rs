@@ -16,6 +16,21 @@ impl AgentManager {
         }
         Ok(config)
     }
+    fn provider_environment(&self, config: &Value) -> Result<BTreeMap<String, String>> {
+        let app = self.app()?;
+        let mut env = app.config.environment();
+        // LaunchContext carries a complete environment and adapters apply it
+        // after their provider defaults. Preserve those defaults here before
+        // workspace, per-session, daemon identity, and plugin overrides.
+        env.extend(
+            app.providers
+                .entry(required(config, "provider")?)?
+                .spec
+                .env
+                .clone(),
+        );
+        Ok(env)
+    }
     async fn session_environment(
         &self,
         id: &str,
@@ -54,7 +69,7 @@ impl AgentManager {
         workspace: Option<&Value>,
     ) -> Result<crate::providers::api::LaunchContext> {
         let app = self.app()?;
-        let mut env = app.config.environment();
+        let mut env = self.provider_environment(config)?;
         if let Some(workspace) = workspace.and_then(Value::as_str) {
             env.extend(app.projects.teardown_environment(workspace).await?);
         }
@@ -147,7 +162,7 @@ impl AgentManager {
         let (cell, receiver) = self.make_cell(&id, snapshot, true).await?;
         *cell.task.lock().await = Some(self.start_events(&id, &cell, receiver));
         let result = async {
-            let mut env = app.config.environment();
+            let mut env = self.provider_environment(&config)?;
             if let Some(workspace) = text(&options, "workspaceId") {
                 env.extend(app.projects.teardown_environment(workspace).await?);
             }
@@ -388,7 +403,7 @@ impl AgentManager {
         {
             bail!("Provider '{provider}' is not available. Please ensure the CLI is installed.");
         }
-        let mut env = app.config.environment();
+        let mut env = self.provider_environment(&config)?;
         if let Some(workspace) = text(&record, "workspaceId") {
             env.extend(app.projects.teardown_environment(workspace).await?);
         }
@@ -470,7 +485,7 @@ impl AgentManager {
         let (cell, receiver) = self.make_cell(&id, snapshot, true).await?;
         *cell.task.lock().await = Some(self.start_events(&id, &cell, receiver));
         let result = async {
-            let mut env = app.config.environment();
+            let mut env = self.provider_environment(&config)?;
             if let Some(workspace) = text(&input, "workspaceId") {
                 env.extend(app.projects.teardown_environment(workspace).await?);
             }
@@ -1423,6 +1438,46 @@ pub(super) mod tests {
     use crate::providers::api::{AgentProvider, LaunchContext, ProviderSpec};
     use crate::providers::pi_omp::JsonlProvider;
     use crate::transport::{OutboundFrame, RequestContext};
+
+    #[tokio::test]
+    async fn provider_environment_selects_private_home_before_session_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let private_home = root.path().join("provider-home");
+        std::fs::create_dir(&private_home).unwrap();
+        std::fs::write(private_home.join("selection"), "provider configuration").unwrap();
+        let app = AppState::new(
+            root.path().join("daemon-home"),
+            root.path().into(),
+            std::env::current_exe().unwrap(),
+        );
+        // Register the real provider configuration without launching discovery
+        // or a model. The filesystem consumer distinguishes the selected HOME
+        // from the daemon's inherited HOME without reading any user files.
+        app.providers.catalogs.shutdown().await;
+        app.providers.apply_config(
+            &json!({"providerOverrides":{"pi":{"env":{
+                "HOME":private_home.to_str().unwrap(),
+                "PASEO_AGENT_ID":"configured-id"
+            }}}}),
+            &json!({}),
+        ).await.unwrap();
+        for internal in [false, true] {
+            let id = "00000000-0000-4000-8000-000000000045";
+            let context = app.agents.history_context(
+                id,
+                &json!({"provider":"pi","internal":internal,"cwd":root.path()}),
+                None,
+            ).await.unwrap();
+            let env = context.env;
+            assert_eq!(Path::new(&env["HOME"]), private_home.as_path());
+            assert_eq!(
+                std::fs::read_to_string(Path::new(&env["HOME"]).join("selection")).unwrap(),
+                "provider configuration"
+            );
+            assert_eq!(env["PASEO_AGENT_ID"], id);
+            assert_eq!(Path::new(&env["PASEO_AGENT_CWD"]), root.path());
+        }
+    }
 
     pub(in crate::agent) async fn staged_cell(app: &Arc<AppState>, id: &str) -> Arc<AgentCell> {
         let manager = &app.agents;

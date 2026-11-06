@@ -1,0 +1,88 @@
+[package]
+name = "paseo-gui-platform"
+description = "Desktop and mobile OS integration for the native Paseo Sessions client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "paseo_gui_platform"
+path = "src/lib.rs"
+
+[dependencies]
+makepad-widgets = "=1.0.0"
+paseo-gui-core = { path = "../gui-core" }
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+futures-util = "0.3"
+percent-encoding = "2"
+png = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "pcm", "adpcm", "ogg", "vorbis", "flac"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util", "process"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+# Desktop: Linux, macOS and Windows. Nothing here is compiled for Android or iOS.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+arboard = { version = "3.7", default-features = false, features = ["image-data"] }
+rfd = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", default-features = false, features = ["tokio"] }
+libloading = "0.8"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-collections = "0.2"
+windows-future = "0.2"
+windows = { version = "0.61", features = [
+  "Data_Xml_Dom",
+  "Foundation",
+  "Foundation_Collections",
+  "Storage",
+  "Storage_Streams",
+  "UI_Notifications",
+  "ApplicationModel_DataTransfer",
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WinRT",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Notifications",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+# Mobile: remote-only clients. No daemon, desktop-host or updater code is linked.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+rqrr = "0.10"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+makepad-android-state = "0.1"

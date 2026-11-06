@@ -6,7 +6,7 @@ nav: 原生客户端
 
 # 原生客户端与自托管 {#native-clients-and-self-hosting}
 
-Rust daemon **不捆绑或提供产品网页客户端**。原生客户端使用 Flutter，支持 Linux、macOS、Windows、Android 和 iOS。文档网站与产品应用是两个独立项目。
+Rust daemon **不捆绑或提供产品网页客户端**。原生客户端使用 Rust（Makepad），支持 Linux、macOS、Windows、Android 和 iOS。文档网站与产品应用是两个独立项目。
 
 不要把启用 `features.webUi`、设置 `PASEO_WEB_UI_ENABLED` 或访问 `http://localhost:6767/` 当作安装步骤；这些旧操作不会生成原生客户端。HTTP/WebSocket API、MCP 和工作区服务代理仍是 daemon 功能，但不代表包含浏览器 UI。
 

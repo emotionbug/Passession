@@ -145,7 +145,7 @@ fn complete_feeds_with(
         if !target(&id.target)?.desktop {
             continue;
         }
-        for runtime in ["flutter", "rust"] {
+        for runtime in [CLIENT, DAEMON] {
             let name = feed(id, runtime);
             let manifest = read_feed(asset(release, &name)?)?;
             for entry in validate_manifest(&manifest, id, runtime)? {
@@ -207,7 +207,7 @@ pub(super) fn publish() -> Result<()> {
             let name = entry["name"].as_str().unwrap().to_owned();
             if name.starts_with("Paseo-") {
                 binaries.insert(name);
-            } else if name.starts_with("flutter-") || name.starts_with("daemon-") {
+            } else if name.starts_with(&format!("{CLIENT}-")) || name.starts_with("daemon-") {
                 feeds.insert(name);
             } else {
                 retained.insert(name);
@@ -255,7 +255,7 @@ pub(super) fn publish() -> Result<()> {
     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     for id in &ids {
         if target(&id.target)?.desktop {
-            let name = feed(id, "flutter");
+            let name = feed(id, CLIENT);
             let mut manifest = integrity::restamp(common::read_json(&dir.join(&name))?, amount)?;
             manifest["releaseDate"] = json!(date);
             let provenance_path = dir.join(format!("provenance-{}.json", id.target));
@@ -374,7 +374,7 @@ fn published_desktop_targets(release: &Value, channel: &str) -> Result<Vec<Targe
         let id = target.id();
         let names = [
             format!("provenance-{id}.json"),
-            format!("flutter-{channel}-{id}.json"),
+            format!("{CLIENT}-{channel}-{id}.json"),
             format!("daemon-{channel}-{id}.json"),
         ];
         if !assets.iter().any(|asset| names.iter().any(|name| asset["name"] == *name)) {
@@ -400,7 +400,7 @@ pub(super) fn rollout() -> Result<()> {
     let mut updates = Vec::new();
     let mut sha = None;
     for t in published_desktop_targets(&release, channel(&v))? {
-        let name = format!("flutter-{}-{}.json", channel(&v), t.id());
+        let name = format!("{CLIENT}-{}-{}.json", channel(&v), t.id());
         let manifest: Value = serde_json::from_slice(&asset_bytes(asset(&release, &name)?)?)?;
         ensure!(
             manifest["version"] == v.to_string()
@@ -448,7 +448,7 @@ mod tests {
             let mut id = template.clone();
             id.target = t.id();
             ids.push(id.clone());
-            for runtime in ["flutter", "rust"] {
+            for runtime in [CLIENT, DAEMON] {
                 let mut entries = Vec::new();
                 for name in integrity::names(&id, runtime).unwrap() {
                     let format = if name.ends_with(".tar.gz") {
@@ -459,7 +459,7 @@ mod tests {
                     assets.push(json!({"name":name,"size":10}));
                     entries.push(json!({"name":name,"size":10,"format":format,"sha512":STANDARD.encode([0;64])}));
                 }
-                let mut manifest = json!({"schemaVersion":1,"runtime":runtime,"appId":if runtime=="rust"{"sh.paseo.daemon"}else{"sh.paseo.sessions.desktop"},"version":id.version,"channel":id.channel,"sourceSha":id.sha,"platform":t.platform,"arch":t.arch,"releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36});
+                let mut manifest = json!({"schemaVersion":1,"runtime":runtime,"appId":if runtime==DAEMON{"sh.paseo.daemon"}else{CLIENT_APP_ID},"version":id.version,"channel":id.channel,"sourceSha":id.sha,"platform":t.platform,"arch":t.arch,"releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36});
                 if entries.len() == 1 {
                     manifest["artifact"] = entries.remove(0);
                 } else {

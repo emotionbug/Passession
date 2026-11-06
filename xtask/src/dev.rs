@@ -31,7 +31,6 @@ pub fn run(command: &str, args: &[String]) -> Result<()> {
         });
         match command {
             "dev" => development(args, &cancel).await,
-            "flutter" => flutter(args, &cancel).await,
             "maintenance" => match args.first().map(String::as_str) {
                 Some("seed-dev-state") => { ensure!(args.len() == 1, "seed-dev-state takes environment configuration only"); seed_worktree() },
                 Some("acp-catalog") => catalog::run(&args[1..]).await,
@@ -293,46 +292,6 @@ async fn command_status(
         _ = cancel.cancelled() => { stop_child(&mut child).await?; bail!("Command cancelled") }
     }
 }
-async fn flutter(args: &[String], cancel: &CancellationToken) -> Result<()> {
-    ensure!(
-        matches!(args.first().map(String::as_str), Some("analyze" | "test")),
-        "Usage: cargo xtask flutter analyze|test [--package <repository-relative directory>] [Flutter arguments]"
-    );
-    let binary = crate::common::flutter()?;
-    let root = crate::common::root()?.canonicalize()?;
-    let mut arguments = args.to_vec();
-    let cwd = if let Some(index) = arguments.iter().position(|arg| arg == "--package") {
-        let package = arguments
-            .get(index + 1)
-            .context("--package requires a directory")?;
-        ensure!(
-            !Path::new(package).is_absolute(),
-            "Flutter package must be repository-relative"
-        );
-        let path = root.join(package).canonicalize()?;
-        ensure!(
-            path.starts_with(&root) && path.join("pubspec.yaml").is_file(),
-            "Flutter package must contain a pubspec inside the repository"
-        );
-        arguments.drain(index..=index + 1);
-        path
-    } else {
-        root.join("packages/flutter_app")
-    };
-    let mut restore = vec!["pub".into(), "get".into()];
-    if cwd.join("pubspec.lock").is_file() {
-        restore.push("--enforce-lockfile".into());
-    }
-    for arguments in [restore, arguments] {
-        let status = command_status(
-            Command::new(&binary).args(arguments).current_dir(&cwd),
-            cancel,
-        )
-        .await?;
-        ensure!(status.success(), "Flutter exited {status}");
-    }
-    Ok(())
-}
 fn snapshot(root: &Path) -> Result<BTreeMap<PathBuf, (SystemTime, u64)>> {
     fn visit(path: &Path, out: &mut BTreeMap<PathBuf, (SystemTime, u64)>) -> Result<()> {
         if !path.exists() {
@@ -379,12 +338,12 @@ async fn development(args: &[String], cancel: &CancellationToken) -> Result<()> 
     let root = crate::common::root()?;
     let env = development_env(&root)?;
     if args.first().is_some_and(|s| s == "app") {
-        // Build wrapper owns its cargo/Flutter descendants and credential
+        // Build wrapper owns its cargo/Gradle/device descendants and credential
         // restoration. A private sentinel also works without Unix signals.
         let cancellation = tempfile::tempdir()?;
         let cancellation_path = cancellation.path().join("cancel");
         let mut child = Command::new(std::env::current_exe()?)
-            .arg("build-flutter")
+            .arg("build-gui")
             .args(&args[1..])
             .args(["--debug", "--run"])
             .current_dir(&root)

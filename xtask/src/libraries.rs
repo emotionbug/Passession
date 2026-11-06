@@ -139,7 +139,9 @@ fn relocate_elf(file: &Path, destination: &Path) -> Result<bool> {
 
 /// Collect the complete non-host ELF closure and patch every ELF's own RPATH.
 /// The daemon remains independently runnable, without an AppRun environment.
-fn bundle(root: &Path, destination: &Path, notices: &Path) -> Result<()> {
+/// `dlopened` names sonames the payload loads at runtime (absent from
+/// `DT_NEEDED`); they and their own dependencies join the closure.
+fn bundle(root: &Path, destination: &Path, notices: &Path, dlopened: &[&str]) -> Result<()> {
     fs::create_dir_all(destination)?;
     fs::create_dir_all(notices)?;
     let root = fs::canonicalize(root)?;
@@ -156,8 +158,22 @@ fn bundle(root: &Path, destination: &Path, notices: &Path) -> Result<()> {
             queue.push_back(entry.into_path());
         }
     }
-    let mut visited = HashSet::new();
     let mut copies = BTreeMap::<PathBuf, PathBuf>::new();
+    for soname in dlopened {
+        let source = system_library(soname)?;
+        let target = destination.join(soname);
+        ensure!(
+            !target.exists(),
+            "Unexpected preexisting shared library {}",
+            target.display()
+        );
+        copy_tree(&source, &target)?;
+        copies.insert(target.clone(), source);
+        if relocate_elf(&target, &destination)? {
+            queue.push_back(target);
+        }
+    }
+    let mut visited = HashSet::new();
     while let Some(file) = queue.pop_front() {
         if !visited.insert(fs::canonicalize(&file)?) {
             continue;
@@ -232,7 +248,40 @@ pub fn native(runtime: &Path) -> Result<()> {
         runtime,
         &runtime.join("lib"),
         &runtime.join("lib/licenses/system"),
+        &[],
     )
+}
+
+/// Libraries the desktop client opens with `dlopen` (paseo-gui-platform): X11
+/// idle time and close-to-tray withdraw (`libX11`, `libXss`) and XSMP logout
+/// without a GNOME SessionManager (`libSM`, `libICE`). The Debian package
+/// declares the same set in `package.rs`.
+pub const LINUX_DLOPENED: [&str; 4] = ["libX11.so.6", "libXss.so.1", "libSM.so.6", "libICE.so.6"];
+
+/// Host path of a system soname for the build architecture, from the
+/// dynamic linker cache.
+fn system_library(soname: &str) -> Result<PathBuf> {
+    let output = Command::new("ldconfig")
+        .arg("-p")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .output()
+        .or_else(|_| Command::new("/sbin/ldconfig").arg("-p").env("LC_ALL", "C").output())
+        .context("Starting ldconfig -p")?;
+    ensure!(output.status.success(), "ldconfig -p failed");
+    let tag = if arch()? == "x64" { "x86-64" } else { "AArch64" };
+    let cache = String::from_utf8_lossy(&output.stdout);
+    let path = cache
+        .lines()
+        .filter_map(|line| {
+            let (name, rest) = line.trim().split_once(' ')?;
+            let (flags, path) = rest.split_once("=>")?;
+            (name == soname && flags.contains(tag)).then(|| PathBuf::from(path.trim()))
+        })
+        .next()
+        .with_context(|| format!("Install {soname} on the packaging host; the client loads it at runtime"))?;
+    assert_architecture(&path)?;
+    Ok(path)
 }
 
 pub fn appimage(appdir: &Path) -> Result<()> {
@@ -246,7 +295,12 @@ pub fn appimage(appdir: &Path) -> Result<()> {
         chmod(&executables.join(name), 0o755)?;
     }
     let notices = appdir.join("usr/share/doc/paseo-bundled-dependencies");
-    bundle(appdir, &appdir.join("usr/lib/paseo-dependencies"), &notices)?;
+    bundle(
+        appdir,
+        &appdir.join("usr/lib/paseo-dependencies"),
+        &notices,
+        &LINUX_DLOPENED,
+    )?;
     copy_tree(
         Path::new("/usr/share/doc/xdg-utils/copyright"),
         &notices.join("xdg-utils.copyright"),
@@ -314,7 +368,7 @@ mod tests {
             "lib"
         );
         assert_eq!(
-            relative(Path::new("/runtime/neovim/bin"), Path::new("/runtime/lib")).unwrap(),
+            relative(Path::new("/runtime/tools/bin"), Path::new("/runtime/lib")).unwrap(),
             "../../lib"
         );
         assert_eq!(

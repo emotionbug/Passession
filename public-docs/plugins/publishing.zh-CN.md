@@ -8,7 +8,7 @@ nav: 发布
 
 从一个可用的[原生插件](index.zh-CN.md)开始。本文说明 **0.13.1 源码检出的分发契约**，不表示 Paseo、SDK crate、注册表条目或你的插件已经发布。不再有 npm 获取或 JavaScript 运行时回退。使用原生 Git 源码、Cargo crate 或 HTTPS 发行归档；注册表记录可选择这些来源。
 
-可扩展的只有后端行为：RPC、钩子、设置数据、Provider 和用量。Flutter 不执行插件界面、面板、主题或 React 时间线渲染器。请说明实际功能、支持的操作系统/架构、外部 Agent 依赖和限制。
+可扩展的只有后端行为：RPC、钩子、设置数据、Provider 和用量。原生客户端不执行插件界面、面板、主题或 React 时间线渲染器。请说明实际功能、支持的操作系统/架构、外部 Agent 依赖和限制。
 
 ## 你的展示页 {#your-listing-page}
 
@@ -38,7 +38,7 @@ nav: 发布
 }
 ```
 
-此例是预编译 Unix 布局，必须在对应路径提供真实二进制，Windows 使用 `.exe`。本地路径相对清单且不得逃出插件目录；`media` 也可用 HTTPS URL。Provider/用量 SVG 有独立的[参考规则](reference.zh-CN.md#providers)，不等同展示 PNG。截图使用示例数据并隐藏隐私；旧客户端截图不能证明 Flutter 支持自定义 UI。
+此例是预编译 Unix 布局，必须在对应路径提供真实二进制，Windows 使用 `.exe`。本地路径相对清单且不得逃出插件目录；`media` 也可用 HTTPS URL。Provider/用量 SVG 有独立的[参考规则](reference.zh-CN.md#providers)，不等同展示 PNG。截图使用示例数据并隐藏隐私；旧客户端截图不能证明原生客户端支持自定义 UI。
 
 ## 通过 GitHub 或 Git 分享 {#share-through-github-or-git}
 

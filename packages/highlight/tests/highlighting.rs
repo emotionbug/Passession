@@ -158,6 +158,12 @@ fn every_previous_extension_uses_a_real_native_grammar() {
             "Heading",
             Style::Heading,
         ),
+        (
+            "sh",
+            "if [ -n \"$HOME\" ]; then echo ok; fi # done",
+            "then",
+            Style::Keyword,
+        ),
     ];
     for (extension, source, needle, style) in cases {
         let lines = highlight_code(source, extension).unwrap();

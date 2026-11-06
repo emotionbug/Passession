@@ -1,0 +1,10 @@
+/.gradle
+/local.properties
+.cxx/
+
+# Never commit signing or Firebase credentials.
+key.properties
+**/*.keystore
+!app/debug.keystore
+**/*.jks
+app/google-services.json

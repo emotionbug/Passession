@@ -8,7 +8,7 @@ category: Getting started
 
 # Native clients and self-hosting
 
-The Rust daemon does **not** bundle or serve a product web client. The native clients are Flutter applications for Linux, macOS, Windows, Android and iOS. The documentation website is separate from the application.
+The Rust daemon does **not** bundle or serve a product web client. The native clients are Rust (Makepad) applications for Linux, macOS, Windows, Android and iOS. The documentation website is separate from the application.
 
 Do not enable `features.webUi`, set `PASEO_WEB_UI_ENABLED`, or look for an app at `http://localhost:6767/` as an installation step. These former instructions do not create a native client. The HTTP/WebSocket API, MCP and workspace service proxy remain daemon functions; their existence does not imply a browser UI.
 

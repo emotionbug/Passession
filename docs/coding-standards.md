@@ -10,7 +10,7 @@ For testing rules, see [testing.md](testing.md).
 - **YAGNI** — build features and abstractions only when needed. A function called once is indirection, not abstraction.
 - **No "while I'm at it" cleanups** — make the change you came for. Drive-by edits hide in the diff.
 - **Functional and declarative** over object-oriented.
-- Keep one deliberate public API per Rust crate or Dart library; do not add pass-through modules that only hide the owner.
+- Keep one deliberate public API per Rust crate; do not add pass-through modules that only hide the owner.
 
 ## Shell scripts
 
@@ -35,7 +35,7 @@ For testing rules, see [testing.md](testing.md).
 
 ## Types
 
-- Use Rust structs/enums and Dart model types after boundary validation; avoid untyped maps for known internal shapes.
+- Use Rust structs/enums after boundary validation; avoid untyped maps for known internal shapes.
 - Keep one canonical type per concept. Import shared protocol types instead of maintaining parallel copies.
 - Name multi-property input/output shapes rather than hiding their meaning in tuple positions or anonymous maps.
 - Use enums when a value comes from a known set; use checked conversions where truncation or invalid values matter.
@@ -44,7 +44,7 @@ For testing rules, see [testing.md](testing.md).
 
 ## Errors
 
-- Return typed Rust errors or throw typed Dart exceptions with the fields consumers need. Keep error codes and structured details at public boundaries.
+- Return typed Rust errors with the fields consumers need. Keep error codes and structured details at public boundaries.
 - Handle only failures the caller can resolve; propagate other errors with context. Never turn an unknown failure into an empty success value.
 - Separate user-facing copy from log/debug strings — don't make one string serve telemetry, logs, and the UI.
 - Fail explicitly. If the caller asked for X and X isn't available, throw — don't silently substitute Y.
@@ -80,7 +80,7 @@ For testing rules, see [testing.md](testing.md).
 
 ## Native runtime
 
-Rust owns daemon/CLI execution and Flutter/Dart owns the native client. Keep process/PTY/storage authority on the daemon, protocol validation at each language boundary, and UI lifecycle separate from provider lifetime. Avoid avoidable allocations and whole-history work on hot paths. Do not introduce Node, Electron, Chromium, a webview or a React UI-plugin host as a fallback.
+Rust owns daemon/CLI execution and the native client (Makepad). Keep process/PTY/storage authority on the daemon, protocol validation at each wire boundary, network and disk IO off the GUI thread, and UI lifecycle separate from provider lifetime. Avoid avoidable allocations and whole-history work on hot paths. Do not introduce Node, Electron, Chromium, Flutter, a webview or a React UI-plugin host as a fallback.
 
 ## Naming
 

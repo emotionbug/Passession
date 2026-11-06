@@ -6,7 +6,7 @@ nav: Provider 插件
 
 # 构建 Provider 插件 {#build-a-provider-plugin}
 
-从[快速上手](index.zh-CN.md)开始。本文针对尚未发布的 **0.13.1 源码检出**。Provider 在 daemon 主机的原生可执行文件中运行；Flutter 渲染协议数据，不运行插件 React 组件。现有第一方原生 Provider 仍为内置功能；Kiro 保持禁用，开发插件不会启用它。
+从[快速上手](index.zh-CN.md)开始。本文针对尚未发布的 **0.13.1 源码检出**。Provider 在 daemon 主机的原生可执行文件中运行；原生客户端渲染协议数据，不运行插件 React 组件。现有第一方原生 Provider 仍为内置功能；Kiro 保持禁用，开发插件不会启用它。
 
 完整可运行示例是 [workspace-inspector](../../plugin-examples/workspace-inspector/src/lib.rs)，crate 名为 `paseo-workspace-inspector`。它实现经权限批准的本地 UTF-8 文件统计，不是 AI/模型服务。[快速上手命令](index.zh-CN.md#run-the-repository-example)提供构建、校验和安装步骤。示例有意不声明持久化、转向、配置变更、图片或输出 schema。应参考其真实注册/连接/会话流程，而不是认为它支持所有可选能力。
 
@@ -66,7 +66,7 @@ nav: Provider 插件
 
 只有真实 Agent 支持时才声明配置能力，并通过 `session.config` 提供标准 toggle/select 描述符。用户变更通过 `session.configure` 到达；应用后先发送已提交配置，再发 `request.completed`。未应用不能确认成功，控件可随模型变化。
 
-`providerOptions` 是创建会话时传入的不透明 JSON，不会自动生成设置面板。供应商 token 预算应放在实际选项或受支持配置描述符中，不要虚构提示字段。标准配置数据不是可执行 Flutter 扩展。
+`providerOptions` 是创建会话时传入的不透明 JSON，不会自动生成设置面板。供应商 token 预算应放在实际选项或受支持配置描述符中，不要虚构提示字段。标准配置数据不是可执行客户端扩展。
 
 ## 添加持久化与重放 {#add-persistence-and-replay}
 

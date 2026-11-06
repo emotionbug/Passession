@@ -1,6 +1,6 @@
 ---
 title: Docker
-description: Build and operate the native Rust daemon container with remote Flutter clients.
+description: Build and operate the native Rust daemon container with remote native clients.
 nav: Docker
 order: 6
 category: Getting started
@@ -8,7 +8,7 @@ category: Getting started
 
 # Docker
 
-The native container runs the Rust daemon and CLI for servers and development hosts. Connect with a remote Flutter desktop/mobile client or the CLI; it does not serve a web product client or include Node, Electron, Chromium, or embedded browser automation.
+The native container runs the Rust daemon and CLI for servers and development hosts. Connect with a remote native desktop/mobile client or the CLI; it does not serve a web product client or include Node, Electron, Chromium, or embedded browser automation.
 
 This guide describes the 0.13.1 source checkout, not a publication announcement. Published `latest` images are not evidence of this runtime. Build a local image from this checkout:
 
@@ -27,7 +27,7 @@ docker run -d --name paseo \
   paseo-native:local
 ```
 
-Add a direct connection to `127.0.0.1:6767` in the Flutter client, using the configured password. On another machine, use the daemon host's reachable address instead of loopback.
+Add a direct connection to `127.0.0.1:6767` in the native client, using the configured password. On another machine, use the daemon host's reachable address instead of loopback.
 
 ## What the image includes
 

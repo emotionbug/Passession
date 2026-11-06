@@ -1,6 +1,6 @@
 # Protocol Validation
 
-The native `paseo-protocol` crate owns the shared wire schemas, JSON validation, binary framing and encrypted-record codecs. There is no generated executable validator or package-install generation step. Rust consumers compile the crate with Cargo; the Flutter/Dart consumer remains a separate implementation of the same wire contract.
+The native `paseo-protocol` crate owns shared wire schemas, JSON validation, binary framing and encrypted-record codecs. Rust consumers compile the crate with Cargo; there is no executable-validator generation or package-install step. The GUI uses the `paseo-client` transport through `paseo-gui-core`; the core also owns response correlation, response-shape checks and domain rejection handling in `src/protocol.rs`. Schema acceptance alone does not establish that a feature handles delivery, cancellation or reconnect correctly.
 
 ## Runtime Path
 

@@ -126,7 +126,7 @@ See [Git worktrees](/docs/worktrees#scripts-and-services) for `paseo.json` confi
 
 ### Terminals
 
-These are daemon-side PTY APIs retained for script/setup automation. The Flutter client shows read-only logs, not an interactive terminal UI.
+These are daemon-side PTY APIs retained for script/setup automation. The native client shows read-only logs, not an interactive terminal UI.
 
 | Tool                 | Function                                                                     |
 | -------------------- | ---------------------------------------------------------------------------- |

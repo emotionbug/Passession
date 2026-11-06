@@ -8,7 +8,7 @@ category: Getting started
 
 # Why Paseo?
 
-Paseo is a native environment for agent-driven development: run coding agents, edit source, read Markdown, review diffs and pull requests, and inspect script output. Flutter clients connect to a Rust daemon that owns the work and preserves it across devices.
+Paseo is a native environment for agent-driven development: run coding agents, edit source, read Markdown, review diffs and pull requests, and inspect script output. Native Rust clients connect to a Rust daemon that owns the work and preserves it across devices.
 
 ## Develop in one workspace
 

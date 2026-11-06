@@ -12,7 +12,7 @@ See the [quickstart](index.md) and [migration guide](migration.md). This documen
 
 ## Runtime boundary
 
-The daemon and built-ins run in Rust. Third-party plugins are native executables launched by the daemon, communicating through bounded JSONL stdin/stdout; there is no dynamic-library ABI, JavaScript worker or interpreter fallback. Flutter renders supported protocol data, not executable plugin UI. Plugins, validation and build commands are unsandboxed daemon-user code.
+The daemon and built-ins run in Rust. Third-party plugins are native executables launched by the daemon, communicating through bounded JSONL stdin/stdout; there is no dynamic-library ABI, JavaScript worker or interpreter fallback. The native client renders supported protocol data, not executable plugin UI. Plugins, validation and build commands are unsandboxed daemon-user code.
 
 Sources of truth: [SDK](../../packages/plugin/src/lib.rs), [settings](../../packages/plugin/src/settings.rs), [provider traits](../../packages/plugin/src/provider.rs), [daemon bridge](../../packages/plugin/src/daemon.rs), [host manifest](../../packages/daemon/src/plugins/manifest.rs) and [CLI](../../packages/daemon/src/cli/catalog/plugins.rs). Use local path or explicitly pinned Git dependencies while the SDK is unpublished.
 

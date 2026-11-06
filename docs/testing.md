@@ -1,6 +1,6 @@
 # Testing
 
-Test observable behavior at the boundary that owns it. Rust unit tests, Dart/widget tests, wire integration tests, actual provider runs, native app interaction, packaging, and signed distribution each prove different things. None is a substitute for all the others.
+Test observable behavior at the boundary that owns it. Rust unit tests, wire integration tests, actual provider runs, native app interaction, packaging, and signed distribution each prove different things. None is a substitute for all the others.
 
 ## Commands and ownership
 
@@ -9,13 +9,12 @@ From the repository root:
 ```sh
 cargo check --locked -p <changed-crate> --all-targets
 cargo test --locked -p <changed-crate> --lib <test-name-filter>
-cargo xtask flutter test test/<file>_test.dart
-cargo xtask flutter analyze
+cargo clippy --locked -p paseo-gui-core -p paseo-gui-platform -p paseo-gui --all-targets
 ```
 
-Use bounded package/test filters locally; do not run the complete workspace or Flutter suite on the development host. Default CI runs Rust and Flutter tests sequentially on one Ubuntu x64 runner, without a platform matrix.
+Use bounded package/test filters locally; do not run the complete workspace suite on the development host. Default CI runs the Rust workspace tests, GUI crates included, on one Ubuntu x64 runner, without a platform matrix.
 
-Rust tests are colocated with the daemon, SDKs, relay and `xtask` modules, with protocol integration tests under each crate's `tests/`. Flutter tests live in `packages/flutter_app/test`; actual app integration runs must use the Flutter client, not a browser rendering of the old UI. Native plugin checks must exercise executable IPC. Packaging/tooling tests validate artifact contracts, not the actual behavior of every target OS.
+Rust tests are colocated with the daemon, GUI crates, SDKs, relay and `xtask` modules, with protocol integration tests under each crate's `tests/`. Actual app integration runs must launch the native Makepad client, not a browser rendering of the old UI. Native plugin checks must exercise executable IPC. Packaging/tooling tests validate artifact contracts, not the actual behavior of every target OS.
 
 Do not run all heavy suites concurrently. Select a bounded relevant check during an explicitly authorized verification pass. Preserve errors and failing output; do not suppress a real service failure or silently relabel a mock as end-to-end.
 
@@ -23,36 +22,73 @@ Do not run all heavy suites concurrently. Select a bounded relevant check during
 
 Use a disposable `PASEO_HOME`, checkout, endpoint, and model cache where applicable. Never stop, reset, install over, or reuse the user's installed daemon/application for a migration smoke.
 
-- Launch the real Rust daemon and native Flutter client; connect, authenticate, and restore persisted host state.
+- Launch the real Rust daemon and the native client; connect, authenticate, and restore persisted host state.
 - Exercise host → directory → session navigation, independent collapse, empty directories, filtering, and same-path separation across hosts.
 - Browse a remote host's folders; create a session in the selected directory; rename and reopen it.
 - Stream provider output, answer permissions, reconnect, restore history, and verify failures remain visible.
 - Render Markdown, edit/read back source, and open a large summary-first diff without eagerly loading every patch.
 - Start/stop workspace setup and service scripts; inspect read-only logs. Verify the backend PTY survives client presentation changes.
 - Exercise schedules, MCP, connected-host forwarding, profiles, and native CLI operations at their real protocol boundaries.
-- Exercise desktop start/idempotence, worker restart, supervisor ownership, owned shutdown, keep-running policy, and preservation of an unowned daemon. A direct Rust unit test is not a Dart-to-desktop-host IPC test.
-- Exercise native tray/menu behavior on the actual desktop, and bundled Neovim editing as a real process. Compilation alone does not prove either.
+- Exercise desktop start/idempotence, worker restart, supervisor ownership, owned shutdown, keep-running policy, and preservation of an unowned daemon. A direct Rust unit test is not a client-to-desktop-host IPC test.
+- Exercise native tray/menu behavior on the actual desktop. Compilation alone does not prove it.
 
 The client deliberately excludes interactive terminal UI, embedded browser/automation, web, and executable React UI plugins. Do not keep obsolete Electron/Metro/browser smoke commands as the acceptance path for the native product.
 
-## Retained Linux desktop regression
+## Linux desktop lifecycle regression
 
-`packages/flutter_app/integration_test/desktop_lifecycle.dart` exercises the real native primary user window, additional engines, managed daemon and editor. `tools/native-desktop-smoke/run.py` and `bus.py` provide isolated Linux desktop/session services and collect results. Prerequisites are Linux, Xvfb, `dbus-run-session`, Python 3 with `python3-dbus` and `python3-gi`, Gdk 3 introspection, the Flutter Linux toolchain, and a complete built native runtime directory. Do not replace that runtime with a bare Cargo executable missing its assets.
+The required cases are: single-instance startup, cold-start project routing, compact tool-detail rendering, primary close/Quit cancellation, retained-window reuse, secondary teardown without losing the primary, tray hide/activate/menu Quit, last-window close with no tray panel (a real watcher without a host), and GNOME logout while the user window is hidden, each asserting managed-daemon shutdown. The Flutter client's bundled-Neovim editing case was dropped with the Neovim runtime. They run in a private Xvfb/D-Bus session with private `HOME`/`PASEO_HOME`, the default renderer and a complete staged bundle, never a bare Cargo executable missing its Makepad resources and runtime.
 
-From `packages/flutter_app`, with consistent `ANDROID_HOME`/`ANDROID_SDK_ROOT` if Android tooling is also configured:
+Openbox must be on `PATH`, or supplied with `--openbox /path/to/openbox`. A bare Xvfb server has no window manager: it cannot prove EWMH hide/activate behavior. The harness starts its own Openbox and waits for it before launching the client.
 
 ```sh
-flutter build linux --debug --target=integration_test/desktop_lifecycle.dart
-python3 ../../tools/native-desktop-smoke/run.py --runtime /absolute/path/to/native-runtime-directory
+cargo xtask build-gui linux --smoke --debug
+python3 tools/native-desktop-smoke/run.py
 ```
 
-The runner uses private `HOME`/`PASEO_HOME` and the default renderer, without a Node product runtime. It waits for actual widgets before reporting case state. Check single-engine startup, cold-start project routing, primary close/Quit cancellation, hidden-primary reuse from another window, and secondary teardown without losing the primary. Its three lifecycle cases cover tray hide/activate/menu Quit, last-window close with no tray panel (a real watcher without a host), and GNOME logout while the user window is hidden. Assert managed-daemon shutdown in every case. Xvfb does not establish hardware-GPU performance; software-renderer overrides are diagnostic evidence, not a substitute for default-renderer coverage.
+`--smoke` compiles the real client with the `paseo-gui` feature `desktop-smoke`, whose in-process driver is `packages/gui/src/smoke.rs`, and stages it as `target/paseo-gui/desktop/linux-<arch>/smoke-debug/bundle` without a build descriptor, so it can never be packaged. `run.py`/`bus.py` provide the isolated session, StatusNotifier watcher, dbusmenu clicks, session logout and screenshots, and assert the daemon is stopped afterwards. Driver and harness talk only through files in the proof directory (`events.jsonl` phases, harness `captured-<phase>` acknowledgements, `panel-command.json` tray actions); keep both sides to that file protocol.
 
-Screenshot-ready phases wait for a rasterized frame, not just a completed widget build. A compact tool-detail capture checks a long, label-only Wait command without executing it. Screenshot phase acknowledgements keep the user window alive until capture completes, preventing a race with Quit. The visual assertion compares the same window immediately before hiding and after restoration: matching pixels establish that hide/restore preserved its rendered contents, not conformity to a style golden.
+Before hide, the harness waits for an unchanged rendered frame, so a newly mounted input's placeholder fade is not the baseline. Hidden windows must leave only the empty desktop; tray activation must restore the exact pre-hide pixels, including position and native window decorations. Driver existence or a successful staged build is not a passing lifecycle run. Xvfb does not establish hardware-GPU performance.
 
-### Vendored Linux multiwindow ownership
+The 2026-11-05 Linux Rust GUI integration run passed all three cases (`tray`, `no-panel`, `logout`) in `target/paseo-native-desktop-proof-b94udsrt/results.json`. It exercised the corrected compact standalone sheet, dynamic second-window drawing, retained-primary reuse, close guards, real tray activation/menu and owned-daemon shutdown. `tray/bus.jsonl` records `restored-pixels-match-before-hide`; all three final daemon statuses are stopped. This is Linux X11/Openbox evidence, not macOS, Windows, mobile, Wayland or hardware-GPU verification.
 
-The project vendors `desktop_multi_window` **0.3.1+paseo.1**, retaining its license and upstream macOS/Windows implementations. The Linux patch gives each Flutter engine a private `GdkDisplay`/`EGLDisplay`, scopes GL bindings during creation, unbinds EGL before GTK's before-paint phase, and keeps the display alive until engine teardown finishes. Flutter 3.47 terminates an engine's EGL display during teardown; sharing that display across live engines invalidated another window's rendering resources. A captured failure reached GTK's next-frame `gdk_gl_context_make_current` and libGLX `BadAccess` after deferred EGL teardown. The regression must cover closing and restoring actual windows, not merely engine construction or a mocked channel response.
+After removing the obsolete Flutter source trees, `cargo xtask build-gui linux --debug` also passed. The ordinary bundle (without `desktop-smoke`) opened the 1280×820 native shell and connected to its bundled v0.13.4 daemon in a new private home. Screenshot and runtime identity: `target/paseo-final-native-launch-1r8s_0n3/`; cleanup found no daemon still running. The capture used software rendering; the log retains the Xvfb DRI3 warning.
+
+### Linux input and real-provider regression pass
+
+The 2026-11-06 PC pass used the ordinary debug bundle, private Xvfb/Openbox/D-Bus/IBus state and a synthetic Git workspace. Production daemon state and the installed application were left untouched. Local screenshots, application logs and isolated provider sessions are under `/home/emotionbug/.cache/paseo-pc-astra-qa-7kvau93j/`.
+
+- IBus Hangul input failed in the original X11 client while a GTK control composed `한글` on the same display. The X11 backend now initializes locale/modifiers, filters XIM-owned events before shortcuts, manages input-context focus and destroys the context with its window. Native key input subsequently committed `한글`; the composition-confirming Return did not submit the draft.
+- Window-wide modal drawing now escapes ancestor pane clipping. Directory selection was checked at 1280×820 and 800×620; nested picker Escape closed only the top layer. Schedule form scrolling and ordinary/held-button wheel input did not activate covered controls.
+- Model pickers expose complete IDs, distinguishing `openai/gpt-6-astra` from `openai-codex/gpt-6-astra`, without repeating an identical description. Exact-ID search was exercised in new-session, schedule, profile and active-session controls.
+- New-session initialization waits for a connected daemon before loading profiles/default refs. New-session and schedule catalogs consume matching host/canonical-directory provider updates, rather than retaining the initial loading snapshot; refreshing an open selector preserves its search.
+- Four actual `omp` / `openai-codex/gpt-6-astra` requests used Low thinking and Always ask. The first returned the requested Korean marker; the second completed 30 Korean paragraphs and `STREAM-END-739`; the third was stopped from the native UI after a tab round-trip and scrolling; the fourth recalled `바다-739` after a full app/owned-daemon restart. The persisted session contains four user turns, three completed assistant turns and one `aborted` assistant turn. One long prompt contains two deliberate automation pastes; it was submitted once, not two app-generated requests.
+- The active-session model sheet initially swallowed search clicks in its full-window background. Dismissal is now handled before the editor, pointer hits after it, and desktop search focus waits for the first valid draw. Fresh-open physical typing, clipboard replacement, clicking the field, Hangul composition/Return confirmation and Escape were exercised; no search text reached the covered chat draft.
+- Route changes left obsolete draw-list generations in the persistent overlay. Overlay cleanup now validates both child and parent generations while preserving live cached subtrees. The previously noisy chat → schedules → nested pickers → chat sequence was replayed; fresh `app-87.log` and final `app-96.log` contain only the expected Xvfb DRI3 warnings, not stale-generation warnings.
+- Explicitly named directory workspaces no longer request generated metadata that cannot change their title. A temporary native SDK client sent `workspace.create.request` with an explicit title and `firstAgentContext`; the real daemon returned a completed workspace with the explicit title and no agent. The temporary source was removed. Provider-configured environment values now survive inherited daemon values in create/resume/import/history contexts; workspace/session/daemon identity overrides retain their existing higher priority.
+
+`cargo xtask build-gui linux --debug` passed. Targeted tests passed: 20 workspace GUI tests, three composer GUI tests, three overlay-lifetime tests, one naming-policy test, one provider-environment consumer test and five structured-generation tests (33 total). The three modal tests also passed in an earlier separate filter and are not counted twice. An intermediate build exhausted disk space and was not counted as a pass; removing only obsolete QA incremental caches allowed the build to complete. These are Linux X11/software-renderer results, not Windows, macOS, native Wayland, physical keyboard/trackpad coverage or hardware-GPU performance. Shared GUI changes in this PC pass were not subsequently rebuilt into an Android APK.
+
+Environment findings are not silently counted as passes: project watching failed with `EMFILE`, also reproduced by an independent `inotify_init1` probe while the daemon had only 20 open descriptors and a 524288-descriptor limit. No host limits or unrelated processes were changed. Automatic metadata generation uses its own configured model policy, not the chat model: this run also recorded failed auxiliary Haiku (context limit) and GPT-5.4 Mini (credit exhaustion) attempts. The final private QA configuration restricts metadata to Astra; production policy was not changed. The large provider-reported context size remains unexplained, not evidence of a daemon context-loading defect. Do not report failed auxiliary calls as successful Astra requests or read raw HTTP captures containing credentials.
+
+## Android build and installation
+
+On 2026-11-06, `cargo xtask build-gui android --arch arm64` produced the release-mode, debug-signed `Paseo-Sessions-0.13.4-android-arm64-debug-signed.apk` (84,353,955 bytes; SHA-256 `5035e8d632ad65cd787314372646f6046ccaad9f6505e99884169a5f5b563c42`). Rust 1.93.1 compiled against NDK 28.2.13676358/API 24; Gradle completed after correcting a duplicate local variable in `PaseoBridge.onIntent`. `apksigner verify` passed with the installed app's certificate, and `zipalign -c -P 16 4` passed.
+
+`adb install -r` initially updated `sh.paseo.sessions` on a OnePlus CPH2745 running Android 17/API 37 without uninstalling or clearing data. The phone was locked, so that launch did not establish app-surface correctness. It was subsequently restored to the original Flutter APK (SHA-256 `06c3b4f5735b1e24f3855670195162f807786360e9504595e607aa29239fe6b6`), and its chat surface was observed after restoration. The final Rust fixes below were not reinstalled on the phone.
+
+### Android emulator regression pass
+
+The Android 15/API 35 x86_64 pass ran the native Rust APK against isolated daemons, with a real Korean OpenWnn IME and synthetic provider/workspace data. The exercised surfaces and explicit unverified cases are recorded in [mobile testing](mobile-testing.md). The initial v22 APK compiled and installed successfully (223,122,121 bytes; SHA-256 `86c91474698e99a256b0ace34462b265ee1c036068aeb5c6b93c7d03be25f701`). Its surface checks showed the retained Korean draft after Home/resume, actual Hangul composition and sidebar scrolling without activation. That app process's captured log had no fatal exception, panic or fatal signal. All packaged Makepad Java files matched their `UPSTREAM.json` digests.
+
+Android-executed tests passed: two uniform-storage bounds tests, five platform input/gesture tests, three touch-scroll tests, and a seven-test `ime` filter including both custom-editor IME regressions. Earlier host and Android storage runs each passed five lock/state tests. Daemon checks passed the prequeued-upload ordering regression (which failed with close code 1008 before the fix), two configured-script process tests and seven script-lifecycle tests. Actual UI upload bytes and script exit/output were checked separately; tests alone are not the runtime proof.
+
+Intermediate failures were not app-test passes: the direct Cargo invocation first lacked the target C compiler variables, a later compile exhausted disk space, and the compiled test runner once had no emulator connected. Supplying the existing NDK compiler configuration, removing only QA incremental caches and restoring the AVD allowed the compiled tests to pass. The emulator itself also exited during the run; final verification used its supported ANGLE/SwiftShader backend. No full workspace suite, final ARM64 rebuild, physical-device performance, older-Android runtime, notification/audio/QR or iOS result is claimed.
+
+The subsequent input-ownership pass executed all **145 GUI library tests on Android**, plus **seven platform focus/IME/touch tests**. These cover modal dismissal ownership, provider-request sharing and reconnection, stale-owner focus clears, timer ownership, empty-focus rejection, Hangul/UTF-16 replacement and touch cancellation/sweep locks. Actual APK interaction separately exercised nested Back/Escape, covered-input isolation, keyboard teardown, context menus, compact project settings, schedule navigation and completion of an offscreen synthetic stream; see the follow-up evidence in [mobile testing](mobile-testing.md). These results do not certify desktop multi-window behavior or hardware performance.
+
+This pass also reproduced a native startup SIGSEGV while reading a rejected cached shader program's zero-length diagnostic log. The reader now uses initialized bounded bytes and the driver-written length; linked programs use `glDeleteProgram`. The repaired APK started with the existing shader cache left intact. A temporary IME ownership probe then identified never-drawn `Area::Empty` fields repeatedly registering native editors after blur; the probe was removed before the uninstrumented v30/v31 runs.
+
+Final follow-up artifact: uninstrumented v32 x86_64 debug APK, 223,189,577 bytes, SHA-256 `39978e7a04c584cacaf69d08abd7c770014f642756e64ea751b92af386d4180b`. The final GUI binary passed all 145 tests on the emulator; the seven platform tests had passed after the last platform change. Git's unchanged-summary Refresh regression and hide/show were exercised in the actual app, not a mocked controller test. The bounded final process log is `event-ownership-final-logcat.json` in the same local evidence directory; renderer warnings and missing Firebase configuration are retained. No release was published or final Rust build installed on the phone.
 
 ## Recorded 0.13.1 Rust cutover smoke
 
@@ -123,11 +159,9 @@ At the time of this record there was **no actual Windows, macOS, Android-device,
 
 ## CI definitions versus execution
 
-`.github/workflows/ci.yml` has one `tests` job on `ubuntu-24.04`. Pushes to `main`, pull requests, merge queues and manual dispatch run `cargo test --locked --workspace --all-targets`, then `flutter test --no-pub` after locked package resolution. Rust and Flutter share that runner; there are no per-platform test jobs, separate lint/build jobs, coverage uploads, release binaries or installers in default CI. A newer run cancels the superseded run for the same ref.
+`.github/workflows/ci.yml` has one `tests` job on `ubuntu-24.04`. Pushes to `main`, pull requests, merge queues and manual dispatch install the Makepad Linux build libraries and run `cargo test --locked --workspace --all-targets`, which includes the GUI crates and `xtask` packaging tests. There are no per-platform test jobs, separate lint/build jobs, coverage uploads, release binaries or installers in default CI. A newer run cancels the superseded run for the same ref.
 
-Native packaging, Docker, release publication, SDK assembly, relay deployment, rollout and release-note workflows are **manual-only**. Pushing a commit or tag does not launch them. The old path-routing file and CI Recovery workflow are removed; rerun the single CI job when needed.
-
-Explicitly requested Linux/Windows ARM64 builds consume the reserved SDK release defined by `.github/flutter-sdk.json`; normal Ubuntu x64 tests do not depend on that release. See [release prerequisites](release.md#reusable-linux-and-windows-arm64-flutter-sdks) before starting an ARM64 packaging run.
+Native packaging, Docker, release publication, relay deployment, rollout and release-note workflows are **manual-only**. Pushing a commit or tag does not launch them. The old path-routing file and CI Recovery workflow are removed; rerun the single CI job when needed.
 
 A workflow definition is not execution evidence. Report the actual run ID, platform, revision and result; a Linux test pass does not establish Windows/macOS/mobile execution, signing, publication or distribution readiness.
 

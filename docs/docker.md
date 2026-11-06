@@ -1,6 +1,6 @@
 # Running the native daemon in Docker
 
-The Dockerfile builds the **Rust daemon/CLI** and stages its native runtime assets. The final image has no Node executable, Electron, Chromium, bundled web UI, or speech runtime. Connect with a native Flutter client or the CLI; the HTTP root is not an application page.
+The Dockerfile builds the **Rust daemon/CLI** and stages its native runtime assets. The final image has no Node executable, Electron, Chromium, bundled web UI, or speech runtime. Connect with the native client or the CLI; the HTTP root is not an application page.
 
 Do not assume an existing registry `latest` image contains the native implementation. Select a release by its published provenance and review [release requirements](release.md#distribution-requirements) before publishing an image.
 

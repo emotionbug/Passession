@@ -11,6 +11,13 @@ mod remote;
 
 pub(super) const REPOSITORY: &str = "emotionbug/paseo";
 pub(super) const WORKFLOW: &str = ".github/workflows/desktop-release.yml";
+/// Desktop client feed runtime and asset prefix (`flutter-<channel>-<target>.json`).
+/// Installed clients, including Flutter-era builds, discover updates by this
+/// exact identity, so it stays `flutter` for the Rust client.
+pub(super) const CLIENT: &str = "flutter";
+pub(super) const CLIENT_APP_ID: &str = "sh.paseo.sessions.desktop";
+/// Standalone daemon feed runtime (`daemon-<channel>-<target>.json`).
+pub(super) const DAEMON: &str = "rust";
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Target {
     pub runner: &'static str,
@@ -106,7 +113,7 @@ pub(super) fn hours(raw: &str) -> Result<f64> {
     Ok(n)
 }
 pub(super) fn directory() -> Result<PathBuf> {
-    Ok(common::root()?.join(var("RELEASE_DIRECTORY", "artifacts/flutter")))
+    Ok(common::root()?.join(var("RELEASE_DIRECTORY", "artifacts/native")))
 }
 pub(super) fn version(raw: &str) -> Result<semver::Version> {
     let v = semver::Version::parse(raw)?;

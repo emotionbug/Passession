@@ -8,7 +8,7 @@ category: Native scope
 
 # External browser workflow
 
-The native Flutter client does **not** embed a browser or browser automation. It does not ship Electron, Chromium, webview tabs, a shared browser profile, or an agent-controlled browser surface. There is no setting that enables the former Paseo browser tools in this client.
+The native client does **not** embed a browser or browser automation. It does not ship Electron, Chromium, webview tabs, a shared browser profile, or an agent-controlled browser surface. There is no setting that enables the former Paseo browser tools in this client.
 
 You can still develop and test web projects:
 

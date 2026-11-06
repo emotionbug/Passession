@@ -2,9 +2,9 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-Paseo Sessions 是运行和审阅编程智能体工作的原生环境。Flutter 客户端面向 **Linux、macOS、Windows、Android 和 iOS**；守护进程与 `paseo` CLI 使用 Rust。桌面客户端可以管理本地守护进程，移动客户端仅连接其他机器上的守护进程。
+Paseo Sessions 是运行和审阅编程智能体工作的原生环境。原生 Rust（Makepad）客户端面向 **Linux、macOS、Windows、Android 和 iOS**；守护进程与 `paseo` CLI 同样使用 Rust。桌面客户端可以管理本地守护进程，移动客户端仅连接其他机器上的守护进程。
 
-当前检出版本为 **0.13.1**。请使用[本仓库的发布产物](https://github.com/emotionbug/paseo/releases)；上游下载不是本仓库的构建。自行构建或分发时，请阅读[发布要求](docs/release.md)。
+当前检出版本为 **0.13.5**。请使用[本仓库的发布产物](https://github.com/emotionbug/paseo/releases)；上游下载不是本仓库的构建。自行构建或分发时，请阅读[发布要求](docs/release.md)。
 
 ## 跨主机工作与功能范围
 
@@ -25,7 +25,7 @@ Paseo Sessions 是运行和审阅编程智能体工作的原生环境。Flutter 
 
 ## 从源码构建和运行
 
-安装 Rust/Cargo、Flutter SDK 和目标平台原生工具链。至少安装并配置一个智能体 CLI，例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Copilot](https://github.com/features/copilot/cli/)、[OpenCode](https://github.com/anomalyco/opencode) 或 [Pi](https://pi.dev)。完整前置条件见[开发指南](docs/development.md)。
+安装 Rust/Cargo 和目标平台原生工具链。至少安装并配置一个智能体 CLI，例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Copilot](https://github.com/features/copilot/cli/)、[OpenCode](https://github.com/anomalyco/opencode) 或 [Pi](https://pi.dev)。完整前置条件见[开发指南](docs/development.md)。
 
 ```sh
 cargo fetch --locked
@@ -44,15 +44,15 @@ cargo xtask dev app
 开发环境使用本检出的 `.dev/paseo-home` 和端口 `6768`，与正常运行的 `~/.paseo`、端口 `6767` 隔离。构建和发布命令通过 Rust `paseo-xtask` crate 执行。
 
 ```sh
-cargo xtask build-flutter linux
-cargo xtask build-flutter macos
-cargo xtask build-flutter windows
-cargo xtask build-flutter android
-cargo xtask build-flutter android --arch arm64
-cargo xtask build-flutter ios
+cargo xtask build-gui linux
+cargo xtask build-gui macos
+cargo xtask build-gui windows
+cargo xtask build-gui android
+cargo xtask build-gui android --arch arm64
+cargo xtask build-gui ios
 ```
 
-桌面构建须在对应操作系统上执行，iOS 需要 macOS/Xcode。产物和构建描述写入 `artifacts/flutter/`。Android/iOS 不含守护进程；Android 名称为 **Paseo Sessions**，包名 `sh.paseo.sessions`。调试签名 APK 或未签名 iOS 应用归档不等于可上架版本，参见 [Android](docs/android.md) 与[发布指南](docs/release.md)。
+桌面构建须在对应操作系统上执行，iOS 需要 macOS/Xcode。产物和构建描述写入 `artifacts/native/`。Android/iOS 不含守护进程；Android 名称为 **Paseo Sessions**，包名 `sh.paseo.sessions`。调试签名 APK 或未签名 iOS 应用归档不等于可上架版本，参见 [Android](docs/android.md) 与[发布指南](docs/release.md)。
 
 无头主机可使用生成的 `target/debug/paseo`（Windows 为 `paseo.exe`）；设置 `CARGO_TARGET_DIR` 时使用对应目录。必须保留相邻生成的运行时资源：
 
@@ -81,22 +81,22 @@ paseo import --provider pi <native-session-id>
 paseo run --host workstation.local:6767 --cwd /workspace --provider codex "review the diff"
 ```
 
-外部集成使用 Rust SDK `paseo-client`，位于 `packages/client`；共享通信类型与中继加密库 `paseo-protocol` 位于 `packages/protocol`。Rust 守护进程和 Dart 客户端维持相同的通信协议。原有 TypeScript SDK 已由 Rust SDK 取代，而非通过包装层运行。
+外部集成使用 Rust SDK `paseo-client`，位于 `packages/client`；共享通信类型与中继加密库 `paseo-protocol` 位于 `packages/protocol`。守护进程和原生客户端使用相同的 crate。原有 TypeScript SDK 已由 Rust SDK 取代，而非通过包装层运行。
 
 ## 源码与验证范围
 
 | 部分                                                       | 路径                                                    |
 | ---------------------------------------------------------- | ------------------------------------------------------- |
 | Rust 守护进程、CLI、提供商、存储、supervisor、桌面主机 IPC | `packages/daemon`                                       |
-| 五平台 Flutter 客户端                                      | `packages/flutter_app`                                  |
-| 桌面打包与运行时资源                                       | `packages/flutter_desktop_host`                         |
-| 原生音频集成                                               | `packages/flutter_audio`                                |
+| 五平台原生客户端                                           | `packages/gui`, `packages/gui-core`                     |
+| 桌面与移动端系统集成                                       | `packages/gui-platform`                                 |
+| 打包资源与安装程序                                         | `packaging`                                             |
 | Rust SDK 与共享协议                                        | `packages/client`、`packages/protocol`                  |
 | 原生后端插件 SDK                                           | `packages/plugin`                                      |
 | Rust 中继与语法高亮                                        | `packages/relay`、`packages/highlight`                  |
 | Rust 构建与发布工具                                        | `xtask`                                                |
 
-修改运行时边界前请阅读[架构](docs/architecture.md)、[开发](docs/development.md)、[测试](docs/testing.md)和[发布](docs/release.md)文档。Linux 已有原生守护进程/客户端和桌面主机生命周期的实际执行证据；Android ARM64 release 模式构建已通过，但使用调试签名，未安装或在设备上运行。此次迁移未在 Windows、macOS 或 iOS 实际运行。跨平台 CI 定义不等于执行证据，桌面后续验证及完整限制以测试文档为准。
+修改运行时边界前请阅读[架构](docs/architecture.md)、[开发](docs/development.md)、[测试](docs/testing.md)和[发布](docs/release.md)文档。Linux 已有守护进程和桌面主机生命周期的实际执行证据，原生 Rust 客户端本身的执行证据单独记录。此次迁移未在 Windows、macOS、Android 或 iOS 实际运行。跨平台 CI 定义不等于执行证据，完整限制以测试文档为准。
 
 ## 许可与分发
 

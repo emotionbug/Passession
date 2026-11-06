@@ -1,11 +1,10 @@
-use crate::{assets, common::*, libraries, notices, signing};
+use crate::{common::*, libraries, notices, signing};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     env, fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 fn valid_source(value: &str) -> bool {
@@ -66,7 +65,7 @@ pub fn directory(profile: &str) -> Result<PathBuf> {
         matches!(profile, "debug" | "release"),
         "Unknown native build profile: {profile}"
     );
-    Ok(absolute(env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))?.join(profile))
+    Ok(target_root()?.join(profile))
 }
 
 /// Decode the binary header, not a filename or `file` utility's textual guess.
@@ -124,7 +123,7 @@ pub fn build_daemon(args: &[String]) -> Result<()> {
     build_native(if args.is_empty() { "debug" } else { "release" }, false)
 }
 
-fn build_native(profile: &str, container: bool) -> Result<()> {
+pub fn build_native(profile: &str, container: bool) -> Result<()> {
     platform()?;
     arch()?;
     ensure!(
@@ -307,7 +306,6 @@ pub fn bundle_runtime(destination: &Path, profile: &str, kind: &str) -> Result<(
         copy_tree(&build.directory.join(name), &destination.join(name))?;
     }
     if kind == "desktop-bundled" {
-        assets::neovim(&destination)?;
         write_json(
             &destination.join("desktop-runtime.json"),
             &json!({"schemaVersion":1,"executable":executable(),"cliShimPath":executable(),"workingDirectory":".","environment":{}}),
@@ -452,371 +450,6 @@ pub fn container_runtime(args: &[String]) -> Result<()> {
     bundle_runtime(Path::new(&args[0]), "release", "container")
 }
 
-struct Credentials(Vec<(PathBuf, Option<Vec<u8>>, Option<fs::Permissions>)>);
-impl Credentials {
-    fn stage(&mut self, source: &Path, destination: PathBuf) -> Result<()> {
-        let before = if destination.exists() {
-            Some(fs::read(&destination)?)
-        } else {
-            None
-        };
-        let permissions = fs::metadata(&destination)
-            .ok()
-            .map(|metadata| metadata.permissions());
-        self.0.push((destination.clone(), before, permissions));
-        copy_tree(source, &destination)
-    }
-    fn restore(&mut self) -> Result<()> {
-        let mut failure = None;
-        for (path, before, permissions) in self.0.drain(..).rev() {
-            let result: Result<()> = (|| {
-                match before {
-                    Some(bytes) => {
-                        fs::write(&path, bytes)?;
-                        if let Some(permissions) = permissions {
-                            fs::set_permissions(&path, permissions)?;
-                        }
-                    }
-                    None => remove_if_exists(&path)?,
-                };
-                Ok(())
-            })();
-            if let Err(error) = result {
-                failure = Some(error);
-            }
-        }
-        if let Some(error) = failure {
-            return Err(error.context("Restoring staged signing/Firebase configuration"));
-        }
-        Ok(())
-    }
-}
-impl Drop for Credentials {
-    fn drop(&mut self) {
-        if let Err(error) = self.restore() {
-            eprintln!("Credential cleanup failed: {error:#}");
-        }
-    }
-}
-
-fn flutter_command(sdk: &Path, launch: bool) -> Result<Command> {
-    let mut process = command(sdk)?;
-    process.current_dir(app()?);
-    if env::var_os("PERMISSION_HANDLER_INFO_PLIST").is_none() {
-        process.env(
-            "PERMISSION_HANDLER_INFO_PLIST",
-            app()?.join("ios/Runner/Info.plist"),
-        );
-    }
-    if launch {
-        let home = root()?.join(".dev/paseo-home");
-        fs::create_dir_all(&home)?;
-        process
-            .env("PASEO_HOME", home)
-            .env(
-                "PASEO_LISTEN",
-                env::var("PASEO_LISTEN").unwrap_or_else(|_| "127.0.0.1:6768".into()),
-            )
-            .env("PASEO_NODE_ENV", "development");
-    }
-    Ok(process)
-}
-
-pub fn build_flutter(args: &[String]) -> Result<()> {
-    supervise_subprocesses()?;
-    let mut target = None;
-    let mut mode = "release";
-    let mut launch = false;
-    let mut device = None;
-    let mut android_arch = "universal";
-    let mut explicit_arch = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--debug" => mode = "debug",
-            "--run" => launch = true,
-            "--device" | "--arch" => {
-                let option = &args[index];
-                index += 1;
-                let value = args
-                    .get(index)
-                    .filter(|arg| !arg.starts_with("--"))
-                    .context("Missing option value")?;
-                if option == "--device" {
-                    device = Some(value.as_str());
-                } else {
-                    android_arch = value;
-                    explicit_arch = true;
-                }
-            }
-            value if !value.starts_with('-') && target.is_none() => target = Some(value),
-            other => bail!("Unknown build-flutter argument: {other}"),
-        }
-        index += 1;
-    }
-    let target = target.unwrap_or(platform()?);
-    let desktop = matches!(target, "linux" | "macos" | "windows");
-    ensure!(
-        desktop || matches!(target, "android" | "ios"),
-        "Unknown Flutter platform: {target}"
-    );
-    ensure!(
-        !desktop || target == platform()?,
-        "Desktop builds require a native host of the target platform"
-    );
-    ensure!(
-        target != "ios" || platform()? == "macos",
-        "iOS builds require macOS and Xcode"
-    );
-    ensure!(
-        matches!(android_arch, "universal" | "arm64")
-            && (!explicit_arch || target == "android" && !launch),
-        "--arch universal|arm64 is only supported for Android artifact builds, not --run"
-    );
-    ensure!(
-        device.is_none() || launch && !desktop,
-        "--device requires --run on Android or iOS"
-    );
-    ensure!(
-        !desktop || mode == "release" || env::var("PASEO_NATIVE_RELEASE").as_deref() != Ok("1"),
-        "PASEO_NATIVE_RELEASE=1 requires a release Flutter build"
-    );
-    let sdk = flutter()?;
-    let mut credentials = Credentials(Vec::new());
-    let result = (|| -> Result<()> {
-        if target == "android" {
-            if let Some(source) = env::var_os("GOOGLE_SERVICES_FILE_SESSIONS") {
-                let source = absolute(source)?;
-                let config = read_json(&source)?;
-                ensure!(
-                    config["client"]
-                        .as_array()
-                        .is_some_and(|clients| clients.iter().any(|client| client["client_info"]
-                            ["android_client_info"]["package_name"]
-                            == "sh.paseo.sessions")),
-                    "Firebase configuration is not for sh.paseo.sessions"
-                );
-                credentials.stage(&source, app()?.join("android/app/google-services.json"))?;
-            }
-        }
-        let mut ios_firebase = None;
-        if target == "ios" {
-            if let Some(source) = env::var_os("GOOGLE_SERVICE_INFO_PLIST_SESSIONS") {
-                let source = absolute(source)?;
-                let identifier = capture(
-                    command("/usr/libexec/PlistBuddy")?
-                        .args(["-c", "Print :BUNDLE_ID"])
-                        .arg(&source),
-                )?;
-                ensure!(
-                    identifier == "sh.paseo.sessions",
-                    "Firebase configuration is not for sh.paseo.sessions"
-                );
-                credentials.stage(&source, app()?.join("ios/Runner/GoogleService-Info.plist"))?;
-                ios_firebase = Some(source);
-            }
-        }
-        run(flutter_command(&sdk, launch)?.args(["pub", "get", "--enforce-lockfile"]))?;
-        if desktop {
-            build_native(mode, false)?;
-        }
-        let version = version()?;
-        let channel = env::var("PASEO_RELEASE_CHANNEL").unwrap_or_else(|_| {
-            if version.contains('-') {
-                "beta"
-            } else {
-                "stable"
-            }
-            .into()
-        });
-        ensure!(
-            matches!(channel.as_str(), "stable" | "beta"),
-            "PASEO_RELEASE_CHANNEL must be stable or beta"
-        );
-        let mut options = vec![
-            format!("--{mode}"),
-            format!("--build-name={version}"),
-            format!("--build-number={}", build_number(target)?),
-            format!("--dart-define=PASEO_VERSION={version}"),
-            format!("--dart-define=PASEO_RELEASE_CHANNEL={channel}"),
-        ];
-        if launch && !desktop {
-            let devices: Value = serde_json::from_str(&capture(
-                flutter_command(&sdk, true)?.args(["devices", "--machine"]),
-            )?)?;
-            let matching: Vec<_> = devices
-                .as_array()
-                .context("Invalid Flutter device list")?
-                .iter()
-                .filter(|item| {
-                    item["isSupported"] != false
-                        && item["targetPlatform"].as_str().is_some_and(|value| {
-                            if target == "android" {
-                                value.starts_with("android-")
-                            } else {
-                                value == "ios"
-                            }
-                        })
-                })
-                .collect();
-            let selected = if let Some(id) = device {
-                matching.iter().find(|item| item["id"] == id).copied()
-            } else if matching.len() == 1 {
-                matching.first().copied()
-            } else {
-                None
-            };
-            let selected = selected.with_context(|| {
-                format!(
-                    "Select an attached {target} device using --device ID; available: {}",
-                    matching
-                        .iter()
-                        .map(|item| format!("{} ({})", item["name"], item["id"]))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?;
-            let mut process = flutter_command(&sdk, true)?;
-            process
-                .args([
-                    "run",
-                    "-d",
-                    selected["id"].as_str().context("Device lacks id")?,
-                ])
-                .args(&options);
-            if let Some(source) = &ios_firebase {
-                process.env("GOOGLE_SERVICE_INFO_PLIST_SESSIONS", source);
-            }
-            return run(&mut process);
-        }
-        let mut flutter_target = target;
-        if target == "android" {
-            flutter_target = "apk";
-            if android_arch == "arm64" {
-                options.push("--target-platform=android-arm64".into());
-            }
-        }
-        if target == "ios" {
-            if let Some(plist) = env::var_os("PASEO_IOS_EXPORT_OPTIONS_PLIST") {
-                flutter_target = "ipa";
-                options.push(format!(
-                    "--export-options-plist={}",
-                    absolute(plist)?.display()
-                ));
-            } else {
-                options.push("--no-codesign".into());
-                eprintln!(
-                    "No iOS export/provisioning configuration: building an explicitly unsigned device .app, not an installable IPA"
-                );
-            }
-        }
-        let mut process = flutter_command(&sdk, launch)?;
-        process.args(["build", flutter_target]).args(&options);
-        if let Some(source) = &ios_firebase {
-            process.env("GOOGLE_SERVICE_INFO_PLIST_SESSIONS", source);
-        }
-        run(&mut process)?;
-        fs::create_dir_all(release()?)?;
-        let output;
-        if desktop {
-            let capital_mode = if mode == "release" {
-                "Release"
-            } else {
-                "Debug"
-            };
-            output = app()?.join(match target {
-                "linux" => format!("build/linux/{}/{mode}/bundle", arch()?),
-                "windows" => format!("build/windows/{}/runner/{capital_mode}", arch()?),
-                _ => format!("build/macos/Build/Products/{capital_mode}/Paseo Sessions.app"),
-            });
-            ensure!(
-                output.is_dir(),
-                "Native build output missing: {}",
-                output.display()
-            );
-            bundle_runtime(
-                &output.join(if target == "macos" {
-                    "Contents/Resources/runtime"
-                } else {
-                    "runtime"
-                }),
-                mode,
-                "desktop-bundled",
-            )?;
-            write_json(
-                &release()?.join(format!("build-{target}-{}.json", arch()?)),
-                &json!({"version":version,"platform":target,"arch":arch()?,"mode":mode,"output":output.strip_prefix(root()?)?.to_string_lossy().replace('\\',"/")}),
-            )?;
-            if launch {
-                let executable = output.join(match target {
-                    "macos" => "Contents/MacOS/Paseo Sessions",
-                    "windows" => "paseo_sessions.exe",
-                    _ => "paseo_sessions",
-                });
-                let mut process = flutter_command(&executable, true)?;
-                process.current_dir(&output);
-                run(&mut process)?;
-            }
-        } else if target == "android" {
-            let properties = app()?.join("android/key.properties");
-            let signing_properties = if properties.is_file() {
-                fs::read_to_string(properties)?
-            } else {
-                String::new()
-            };
-            let release_key = env::var("ANDROID_KEYSTORE_PATH")
-                .is_ok_and(|value| !value.trim().is_empty())
-                || regex::Regex::new(r"(?m)^\s*storeFile\s*(?:=|:|\s)\s*\S")?
-                    .is_match(&signing_properties);
-            let signing = if mode == "debug" || !release_key {
-                "-debug-signed"
-            } else {
-                ""
-            };
-            output = release()?.join(format!(
-                "{}{signing}.apk",
-                artifact_stem("android", android_arch)?
-            ));
-            copy_tree(
-                &app()?.join(format!("build/app/outputs/flutter-apk/app-{mode}.apk")),
-                &output,
-            )?;
-        } else if flutter_target == "ipa" {
-            let directory = app()?.join("build/ios/ipa");
-            let mut ipas = Vec::new();
-            for entry in fs::read_dir(directory)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|value| value == "ipa") {
-                    ipas.push(path);
-                }
-            }
-            ensure!(ipas.len() == 1, "Expected exactly one exported IPA");
-            output = release()?.join(format!("{}.ipa", artifact_stem("ios", "arm64")?));
-            copy_tree(&ipas[0], &output)?;
-        } else {
-            output = release()?.join(format!(
-                "{}-unsigned.app.zip",
-                artifact_stem("ios", "arm64")?
-            ));
-            run(command("ditto")?
-                .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
-                .arg(app()?.join("build/ios/iphoneos/Runner.app"))
-                .arg(&output))?;
-        }
-        println!("Flutter {target} {mode}: {}", output.display());
-        Ok(())
-    })();
-    let cleanup = credentials.restore();
-    match (result, cleanup) {
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("Credential restoration also failed: {cleanup:#}")))
-        }
-        (Err(error), _) => Err(error),
-        (_, Err(error)) => Err(error),
-        _ => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,23 +478,6 @@ mod tests {
             claimed[key] = value;
             assert!(ensure_local_identity(&claimed).is_err(), "{key}");
         }
-    }
-    #[test]
-    fn credentials_restore_existing_and_remove_temporary_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("source");
-        fs::write(&source, "secret").unwrap();
-        let existing = directory.path().join("existing");
-        fs::write(&existing, "original").unwrap();
-        let new = directory.path().join("new");
-        {
-            let mut guard = Credentials(Vec::new());
-            guard.stage(&source, existing.clone()).unwrap();
-            guard.stage(&source, new.clone()).unwrap();
-            assert_eq!(fs::read_to_string(&existing).unwrap(), "secret");
-        }
-        assert_eq!(fs::read_to_string(existing).unwrap(), "original");
-        assert!(!new.exists());
     }
     #[test]
     fn architecture_rejects_wrong_machine_and_truncated_headers() {

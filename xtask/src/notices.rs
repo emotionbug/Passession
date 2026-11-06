@@ -146,7 +146,7 @@ fn package_notices(directory: &Path, license_file: Option<&str>) -> Result<Vec<N
         .collect()
 }
 
-fn dependency_closure<'a>(metadata: &'a Value) -> Result<Vec<&'a Value>> {
+fn dependency_closure<'a>(metadata: &'a Value, root: &str) -> Result<Vec<&'a Value>> {
     let mut packages = BTreeMap::new();
     for pkg in array(metadata, "packages")? {
         ensure!(
@@ -161,12 +161,12 @@ fn dependency_closure<'a>(metadata: &'a Value) -> Result<Vec<&'a Value>> {
             "Duplicate Cargo node ID"
         );
     }
-    let daemon = packages
+    let root = packages
         .iter()
-        .find(|(_, pkg)| pkg["name"] == "paseo-daemon")
+        .find(|(_, pkg)| pkg["name"] == root && pkg["source"].is_null())
         .map(|(id, _)| *id)
-        .context("Cargo metadata lacks paseo-daemon")?;
-    let mut pending = vec![daemon];
+        .with_context(|| format!("Cargo metadata lacks workspace package {root}"))?;
+    let mut pending = vec![root];
     let mut visited = BTreeSet::new();
     while let Some(id) = pending.pop() {
         if !visited.insert(id) {
@@ -200,16 +200,28 @@ fn dependency_closure<'a>(metadata: &'a Value) -> Result<Vec<&'a Value>> {
     }
     Ok(visited
         .into_iter()
-        .filter(|id| *id != daemon)
+        .filter(|id| *id != root)
         .map(|id| packages[id])
         .collect())
 }
 
-fn supplement_notice(
+/// Pinned license texts for crates published without them. A vendored fork may
+/// cite its upstream project at `upstreamRevision`; `revision` still proves the
+/// exact published source through its `.cargo_vcs_info.json`. A crate published
+/// without VCS information is identified instead by `checksum`, the registry
+/// SHA-256 Cargo.lock records for the downloaded `.crate`, and its license URL
+/// must then be pinned by `upstreamRevision`. Supplements identify registry
+/// sources only: a vendored or patched path copy (`source` null) must carry its
+/// own license file, because its bytes no longer match the published revision.
+fn supplement_notices(
     pkg: &Value,
     directory: &Path,
     supplements: &[Value],
-) -> Result<Option<Notice>> {
+    checksum: Option<&str>,
+) -> Result<Vec<Notice>> {
+    if pkg["source"].is_null() {
+        return Ok(Vec::new());
+    }
     let matches: Vec<_> = supplements
         .iter()
         .filter(|entry| {
@@ -218,35 +230,97 @@ fn supplement_notice(
                 && entry["repository"] == pkg["repository"]
         })
         .collect();
-    ensure!(matches.len() <= 1, "Duplicate Cargo notice supplement");
-    let Some(entry) = matches.first() else {
-        return Ok(None);
+    if matches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let is_sha = |value: &str, length: usize| {
+        value.len() == length && value.bytes().all(|b| b.is_ascii_hexdigit())
     };
-    let revision = string(entry, "revision")?;
-    let url = string(entry, "url")?;
-    let value = string(entry, "text")?;
-    let vcs = read_json(&directory.join(".cargo_vcs_info.json"))?;
-    ensure!(
-        revision.len() == 40
-            && revision.bytes().all(|b| b.is_ascii_hexdigit())
-            && vcs["git"]["sha1"].as_str() == Some(revision)
-            && digest(value) == string(entry, "sha256")?,
-        "Stale Cargo notice supplement: {}@{}",
-        pkg["name"],
-        pkg["version"]
-    );
-    ensure!(
-        url.starts_with("https://") && url.split('/').any(|part| part == revision),
-        "Supplement URL is not revision-pinned: {url}"
-    );
-    Ok(Some(Notice {
-        source: url.to_owned(),
-        text: value.to_owned(),
-        license: true,
-    }))
+    let mut vcs = None;
+    let mut urls = BTreeSet::new();
+    let mut notices = Vec::new();
+    for entry in matches {
+        let url = string(entry, "url")?;
+        let value = string(entry, "text")?;
+        ensure!(
+            urls.insert(url),
+            "Duplicate Cargo notice supplement: {}@{} {url}",
+            pkg["name"],
+            pkg["version"]
+        );
+        let published = match entry.get("revision") {
+            Some(_) => {
+                let revision = string(entry, "revision")?;
+                if vcs.is_none() {
+                    vcs = Some(read_json(&directory.join(".cargo_vcs_info.json"))?);
+                }
+                is_sha(revision, 40)
+                    && vcs.as_ref().and_then(|vcs| vcs["git"]["sha1"].as_str()) == Some(revision)
+            }
+            None => {
+                let expected = string(entry, "checksum")?;
+                ensure!(
+                    entry.get("upstreamRevision").is_some(),
+                    "Checksum-bound supplement needs upstreamRevision: {}@{}",
+                    pkg["name"],
+                    pkg["version"]
+                );
+                is_sha(expected, 64) && checksum == Some(expected)
+            }
+        };
+        ensure!(
+            published && digest(value) == string(entry, "sha256")?,
+            "Stale Cargo notice supplement: {}@{}",
+            pkg["name"],
+            pkg["version"]
+        );
+        let pin = match entry.get("upstreamRevision") {
+            Some(_) => string(entry, "upstreamRevision")?,
+            None => string(entry, "revision")?,
+        };
+        ensure!(
+            is_sha(pin, 40) && url.starts_with("https://") && url.split('/').any(|part| part == pin),
+            "Supplement URL is not revision-pinned: {url}"
+        );
+        notices.push(Notice {
+            source: url.to_owned(),
+            text: value.to_owned(),
+            license: true,
+        });
+    }
+    Ok(notices)
 }
 
-fn collect_document(metadata: &Value, supplements: &[Value]) -> Result<Value> {
+/// Registry checksums from the workspace Cargo.lock, keyed by name, version and source.
+fn lock_checksums(workspace: &Path) -> Result<BTreeMap<(String, String, String), String>> {
+    let lock: toml::Value = toml::from_str(
+        &fs::read_to_string(workspace.join("Cargo.lock")).context("Reading Cargo.lock")?,
+    )?;
+    let mut checksums = BTreeMap::new();
+    for package in lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .context("Cargo.lock has no packages")?
+    {
+        let field = |key: &str| package.get(key).and_then(toml::Value::as_str);
+        if let (Some(name), Some(version), Some(source), Some(checksum)) =
+            (field("name"), field("version"), field("source"), field("checksum"))
+        {
+            checksums.insert(
+                (name.to_owned(), version.to_owned(), source.to_owned()),
+                checksum.to_owned(),
+            );
+        }
+    }
+    Ok(checksums)
+}
+
+fn collect_document(
+    metadata: &Value,
+    root: &str,
+    boundary: &str,
+    supplements: &[Value],
+) -> Result<Value> {
     let workspace = Path::new(string(metadata, "workspace_root")?).canonicalize()?;
     let members: BTreeSet<_> = array(metadata, "workspace_members")?
         .iter()
@@ -254,7 +328,14 @@ fn collect_document(metadata: &Value, supplements: &[Value]) -> Result<Value> {
         .collect::<Result<_>>()?;
     let mut packages = Vec::new();
     let mut texts = BTreeMap::new();
-    for pkg in dependency_closure(metadata)? {
+    // Fixture workspaces in tests have no lockfile; a checksum-bound
+    // supplement then fails as stale instead of matching.
+    let checksums = if workspace.join("Cargo.lock").is_file() {
+        lock_checksums(&workspace)?
+    } else {
+        BTreeMap::new()
+    };
+    for pkg in dependency_closure(metadata, root)? {
         let name = string(pkg, "name")?;
         let version = string(pkg, "version")?;
         let directory = Path::new(string(pkg, "manifest_path")?)
@@ -262,9 +343,12 @@ fn collect_document(metadata: &Value, supplements: &[Value]) -> Result<Value> {
             .context("Cargo manifest has no parent")?;
         let license_file = pkg.get("license_file").and_then(Value::as_str);
         let mut notices = package_notices(directory, license_file)?;
-        if let Some(notice) = supplement_notice(pkg, directory, supplements)? {
-            notices.push(notice);
-        }
+        let checksum = pkg["source"].as_str().and_then(|source| {
+            checksums
+                .get(&(name.to_owned(), version.to_owned(), source.to_owned()))
+                .map(String::as_str)
+        });
+        notices.extend(supplement_notices(pkg, directory, supplements, checksum)?);
         // Only native workspace members may inherit the application's license.
         if !notices.iter().any(|notice| notice.license)
             && pkg["source"].is_null()
@@ -327,7 +411,7 @@ fn collect_document(metadata: &Value, supplements: &[Value]) -> Result<Value> {
             p["source"].as_str().unwrap()
         )
     });
-    Ok(json!({"schemaVersion": 1, "boundary": BOUNDARY, "packages": packages, "texts": texts}))
+    Ok(json!({"schemaVersion": 1, "boundary": boundary, "packages": packages, "texts": texts}))
 }
 
 fn render(document: &Value) -> Result<String> {
@@ -530,9 +614,16 @@ fn render_native_document(root: &Path, document: &Value) -> Result<String> {
     Ok(format!("{}\n{}", render(document)?, render(&embedded)?))
 }
 
-pub fn collect(directory: &Path) -> Result<()> {
-    let root = root()?;
-    let target = host_target(std::env::consts::OS, std::env::consts::ARCH)?;
+const GUI_BOUNDARY: &str = "Paseo Sessions application Cargo dependency closure for the packaged target (normal and build dependencies; dev-only edges excluded). Includes upstream license/notice files and nested vendored-component notices; this is not a source-offer or a toolchain/system-library compliance certification.";
+const SUPPLEMENTS: &str = "packaging/cargo-notice-supplements.json";
+const RESOURCE_NOTICES: &str = "packaging/resource-notices.json";
+
+pub fn host_triple() -> Result<&'static str> {
+    host_target(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Resolved Cargo metadata as seen by one compilation target.
+pub fn cargo_metadata(target: &str) -> Result<Value> {
     let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .args([
             "metadata",
@@ -542,7 +633,7 @@ pub fn collect(directory: &Path) -> Result<()> {
             "--filter-platform",
             target,
         ])
-        .current_dir(&root)
+        .current_dir(root()?)
         .output()
         .context("Running Cargo notice metadata collection")?;
     ensure!(
@@ -550,17 +641,21 @@ pub fn collect(directory: &Path) -> Result<()> {
         "Cargo metadata failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let metadata: Value =
-        serde_json::from_slice(&output.stdout).context("Parsing Cargo notice metadata")?;
-    let supplements = read_json(
-        &root.join("packages/flutter_desktop_host/packaging/cargo-notice-supplements.json"),
-    )?;
-    let mut document = collect_document(
-        &metadata,
-        supplements
-            .as_array()
-            .context("Invalid Cargo notice supplements")?,
-    )?;
+    serde_json::from_slice(&output.stdout).context("Parsing Cargo notice metadata")
+}
+
+fn supplements(root: &Path) -> Result<Vec<Value>> {
+    read_json(&root.join(SUPPLEMENTS))?
+        .as_array()
+        .cloned()
+        .context("Invalid Cargo notice supplements")
+}
+
+pub fn collect(directory: &Path) -> Result<()> {
+    let root = root()?;
+    let metadata = cargo_metadata(host_triple()?)?;
+    let mut document =
+        collect_document(&metadata, "paseo-daemon", BOUNDARY, &supplements(&root)?)?;
     document["embeddedAbi"] = embedded_inventory(&root)?;
     let rendered = format!(
         "{}\n{}",
@@ -571,6 +666,270 @@ pub fn collect(directory: &Path) -> Result<()> {
     write_json(&directory.join("RUST-THIRD-PARTY-NOTICES.json"), &document)?;
     fs::write(directory.join("RUST-THIRD-PARTY-NOTICES.txt"), rendered)?;
     Ok(())
+}
+
+/// A `resources/` directory Makepad resolves as `crate://<name>/resources`.
+pub struct ResourceDirectory {
+    pub name: String,
+    pub version: String,
+    pub path: PathBuf,
+}
+
+/// Only Makepad-aware packages register live files, so only their resource
+/// directories are reachable through `crate://` dependencies.
+pub fn gui_resource_directories(metadata: &Value) -> Result<Vec<ResourceDirectory>> {
+    let root_package = array(metadata, "packages")?
+        .iter()
+        .find(|pkg| pkg["name"] == "paseo-gui" && pkg["source"].is_null())
+        .context("Cargo metadata lacks workspace package paseo-gui")?;
+    let mut result = Vec::new();
+    for pkg in std::iter::once(root_package).chain(dependency_closure(metadata, "paseo-gui")?) {
+        let name = string(pkg, "name")?;
+        let makepad = name.starts_with("makepad-")
+            || array(pkg, "dependencies")?.iter().any(|dep| {
+                dep["kind"].is_null()
+                    && dep["name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("makepad-"))
+            });
+        let path = Path::new(string(pkg, "manifest_path")?)
+            .parent()
+            .context("Cargo manifest has no parent")?
+            .join("resources");
+        if makepad && path.is_dir() {
+            result.push(ResourceDirectory {
+                name: name.to_owned(),
+                version: string(pkg, "version")?.to_owned(),
+                path,
+            });
+        }
+    }
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(result)
+}
+
+/// One file copied from a resource directory into a package.
+pub struct PackagedResource {
+    pub package: String,
+    pub version: String,
+    /// Slash-separated path below `resources/`.
+    pub file: String,
+    pub sha256: String,
+}
+
+fn is_font(file: &str) -> bool {
+    Regex::new(r"(?i)\.(?:ttf|otf|ttc|woff2?)(?:\.\d+)?$")
+        .expect("valid font pattern")
+        .is_match(file)
+}
+
+/// License text pinned to an exact upstream git revision in its URL, or to the
+/// digest of an immutable release archive it was taken from (`archiveSha256`).
+fn pinned(notice: &Value) -> Result<bool> {
+    let source = string(notice, "source")?;
+    let revision = source
+        .split(['/', '#'])
+        .any(|part| part.len() == 40 && part.bytes().all(|b| b.is_ascii_hexdigit()));
+    let archive = notice["archiveSha256"]
+        .as_str()
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()));
+    Ok(source.starts_with("https://") && (revision || archive))
+}
+
+/// Font and vendored-component attribution, bound to the exact packaged bytes.
+fn resource_document(manifest: &Value, packaged: &[PackagedResource], platform: &str) -> Result<Value> {
+    ensure!(
+        manifest["schemaVersion"] == 1,
+        "Unsupported resource notice schema"
+    );
+    let texts = manifest["texts"]
+        .as_object()
+        .context("Missing resource notice texts")?;
+    let mut packages = Vec::new();
+    let mut used = BTreeMap::new();
+    let mut attach = |entry: &Value, name: String, version: String| -> Result<()> {
+        let notices = array(entry, "notices")?;
+        ensure!(!notices.is_empty(), "Missing attribution for {name}");
+        for notice in notices {
+            let source = string(notice, "source")?;
+            let hash = string(notice, "sha256")?;
+            ensure!(pinned(notice)?, "Resource notice is not revision-pinned: {source}");
+            let value = texts
+                .get(hash)
+                .and_then(Value::as_str)
+                .with_context(|| format!("Missing notice text for {name}: {source}"))?;
+            ensure!(digest(value) == hash, "Corrupt resource notice text: {hash}");
+            used.insert(hash.to_owned(), json!(value));
+        }
+        packages.push(json!({"name": name, "version": version, "source": "packaged resource", "license": entry["license"], "notices": notices}));
+        Ok(())
+    };
+    let fonts = array(manifest, "fonts")?;
+    for resource in packaged.iter().filter(|resource| is_font(&resource.file)) {
+        let entry = fonts
+            .iter()
+            // Workspace resources omit `version`; the digest still binds the bytes.
+            .find(|entry| {
+                entry["crate"] == resource.package.as_str()
+                    && entry
+                        .get("version")
+                        .is_none_or(|version| version == resource.version.as_str())
+                    && entry["file"] == resource.file.as_str()
+            })
+            .with_context(|| {
+                format!(
+                    "No license entry in {RESOURCE_NOTICES} for font {}@{}/resources/{}",
+                    resource.package, resource.version, resource.file
+                )
+            })?;
+        ensure!(
+            entry["sha256"] == resource.sha256.as_str(),
+            "Font {}@{}/resources/{} differs from its reviewed license entry",
+            resource.package,
+            resource.version,
+            resource.file
+        );
+        attach(
+            entry,
+            format!("{}/resources/{}", resource.package, resource.file),
+            resource.version.clone(),
+        )?;
+    }
+    for component in array(manifest, "components")? {
+        if array(component, "platforms")?
+            .iter()
+            .any(|value| value == platform)
+        {
+            let path = root()?.join(string(component, "path")?);
+            ensure!(path.exists(), "Missing vendored component {}", path.display());
+            attach(component, string(component, "name")?.to_owned(), "vendored".into())?;
+        }
+    }
+    Ok(json!({"schemaVersion": 1, "boundary": manifest["boundary"], "packages": packages, "texts": used}))
+}
+
+/// A third-party resource deliberately left out of every package. It is bound
+/// to the exact reviewed bytes, so an upstream change is re-reviewed rather
+/// than silently excluded or silently shipped.
+pub struct ExcludedResource {
+    pub package: String,
+    pub version: String,
+    pub file: String,
+    pub sha256: String,
+}
+
+pub fn excluded_resources() -> Result<Vec<ExcludedResource>> {
+    let manifest = read_json(&root()?.join(RESOURCE_NOTICES))?;
+    let mut result = Vec::new();
+    for entry in array(&manifest, "excluded")? {
+        string(entry, "reason")?;
+        result.push(ExcludedResource {
+            package: string(entry, "crate")?.to_owned(),
+            version: string(entry, "version")?.to_owned(),
+            file: string(entry, "file")?.to_owned(),
+            sha256: string(entry, "sha256")?.to_owned(),
+        });
+    }
+    Ok(result)
+}
+
+/// Whether a resource file is excluded; a name match with different bytes is an error.
+pub fn is_excluded(
+    excluded: &[ExcludedResource],
+    package: &str,
+    version: &str,
+    file: &str,
+    sha256: &str,
+) -> Result<bool> {
+    let Some(entry) = excluded
+        .iter()
+        .find(|entry| entry.package == package && entry.version == version && entry.file == file)
+    else {
+        return Ok(false);
+    };
+    ensure!(
+        entry.sha256 == sha256,
+        "Excluded resource {package}@{version}/resources/{file} changed since review; update {RESOURCE_NOTICES}"
+    );
+    Ok(true)
+}
+
+/// Client source roots and the Cargo package `crate://self` means inside them.
+const CLIENT_SOURCES: [(&str, &str); 3] = [
+    ("packages/gui/src", "paseo-gui"),
+    ("packages/gui-core/src", "paseo-gui-core"),
+    ("packages/gui-platform/src", "paseo-gui-platform"),
+];
+
+/// `crate://<crate>/resources/<file>` references in one source text that name
+/// no staged resource, as `line: reference`.
+fn missing_references(source: &str, package: &str, packaged: &[PackagedResource]) -> Result<Vec<String>> {
+    let reference = Regex::new(r#"crate://([A-Za-z0-9_]+)/resources/([^"'\s)]+)"#)?;
+    let mut missing = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        for capture in reference.captures_iter(line) {
+            let owner = match &capture[1] {
+                "self" => package.replace('-', "_"),
+                name => name.to_owned(),
+            };
+            let file = &capture[2];
+            if !packaged
+                .iter()
+                .any(|resource| resource.package.replace('-', "_") == owner && resource.file == file)
+            {
+                missing.push(format!("{}: crate://{}/resources/{file}", index + 1, &capture[1]));
+            }
+        }
+    }
+    Ok(missing)
+}
+
+/// Every resource client sources reference must be staged. Makepad loads fonts
+/// lazily and panics on a missing dependency when a style uses it, so an
+/// excluded or absent font would otherwise surface only at runtime.
+pub fn ensure_references_staged(packaged: &[PackagedResource]) -> Result<()> {
+    let root = root()?;
+    let mut missing = Vec::new();
+    for (crate_directory, package) in CLIENT_SOURCES {
+        let directory = root.join(crate_directory);
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&directory).follow_links(false).sort_by_file_name() {
+            let entry = entry?;
+            if !entry.file_type().is_file()
+                || entry.path().extension().is_none_or(|extension| extension != "rs")
+            {
+                continue;
+            }
+            let source = fs::read_to_string(entry.path())
+                .with_context(|| format!("Reading {}", entry.path().display()))?;
+            let relative = entry.path().strip_prefix(&root)?.display().to_string();
+            for reference in missing_references(&source, package, packaged)? {
+                missing.push(format!("{relative}:{reference}"));
+            }
+        }
+    }
+    ensure!(
+        missing.is_empty(),
+        "Client sources reference resources that are not staged (excluded in {RESOURCE_NOTICES} or absent):\n{}",
+        missing.join("\n")
+    );
+    Ok(())
+}
+
+/// Complete application notices: GUI Cargo closure plus packaged fonts and
+/// vendored platform components.
+pub fn render_app(metadata: &Value, packaged: &[PackagedResource], platform: &str) -> Result<String> {
+    let root = root()?;
+    let gui = collect_document(metadata, "paseo-gui", GUI_BOUNDARY, &supplements(&root)?)?;
+    let resources = resource_document(&read_json(&root.join(RESOURCE_NOTICES))?, packaged, platform)?;
+    let mut output = render(&gui)?;
+    if !array(&resources, "packages")?.is_empty() {
+        output.push('\n');
+        output.push_str(&render(&resources)?);
+    }
+    Ok(output)
 }
 
 fn date_notice(source: &str) -> Result<&str> {
@@ -701,7 +1060,7 @@ mod tests {
             {"id":"normal","deps":[]}, {"id":"build","deps":[{"pkg":"nested","dep_kinds":[{"kind":null}]}]},
             {"id":"nested","deps":[{"pkg":"root","dep_kinds":[{"kind":null}]}]}, {"id":"dev","deps":[]}
         ]}});
-        let ids: Vec<_> = dependency_closure(&metadata)
+        let ids: Vec<_> = dependency_closure(&metadata, "paseo-daemon")
             .unwrap()
             .iter()
             .map(|p| p["id"].as_str().unwrap())
@@ -712,7 +1071,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .remove(3);
-        assert!(dependency_closure(&incomplete).is_err());
+        assert!(dependency_closure(&incomplete, "paseo-daemon").is_err());
     }
 
     #[test]
@@ -798,17 +1157,17 @@ mod tests {
                 {"id":"member", "deps":[]}
             ]}
         });
-        let document = collect_document(&metadata, &[]).unwrap();
+        let document = collect_document(&metadata, "paseo-daemon", BOUNDARY, &[]).unwrap();
         assert!(
             render(&document)
                 .unwrap()
                 .contains("workspace-root/LICENSE (inherited workspace.package.license)")
         );
         metadata["packages"][1]["source"] = json!("registry+https://example.com");
-        assert!(collect_document(&metadata, &[]).is_err());
+        assert!(collect_document(&metadata, "paseo-daemon", BOUNDARY, &[]).is_err());
         metadata["packages"][1]["source"] = Value::Null;
         metadata["workspace_members"] = json!(["root"]);
-        assert!(collect_document(&metadata, &[]).is_err());
+        assert!(collect_document(&metadata, "paseo-daemon", BOUNDARY, &[]).is_err());
     }
 
     #[test]
@@ -820,18 +1179,122 @@ mod tests {
             json!({"git":{"sha1":revision}}).to_string(),
         )
         .unwrap();
-        let pkg = json!({"name":"crate","version":"1","repository":"https://example.com/repo"});
+        let pkg = json!({"name":"crate","version":"1","repository":"https://example.com/repo","source":"registry+https://github.com/rust-lang/crates.io-index"});
         let mut supplement = pkg.clone();
+        supplement.as_object_mut().unwrap().remove("source");
         supplement["revision"] = json!(revision);
         supplement["url"] = json!(format!("https://example.com/repo/{revision}/LICENSE"));
         supplement["text"] = json!("upstream license");
         supplement["sha256"] = json!(digest("upstream license"));
-        assert!(
-            supplement_notice(&pkg, dir.path(), &[supplement.clone()])
+        assert_eq!(
+            supplement_notices(&pkg, dir.path(), &[supplement.clone()], None)
                 .unwrap()
-                .is_some()
+                .len(),
+            1
         );
+        // A vendored path copy must ship its own license file instead.
+        let mut vendored = pkg.clone();
+        vendored["source"] = Value::Null;
+        assert!(
+            supplement_notices(&vendored, dir.path(), &[supplement.clone()], None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            supplement_notices(&pkg, dir.path(), &[supplement.clone(), supplement.clone()], None)
+                .is_err()
+        );
+        let upstream = "2223456789012345678901234567890123456789";
+        let mut fork = supplement.clone();
+        fork["upstreamRevision"] = json!(upstream);
+        assert!(supplement_notices(&pkg, dir.path(), &[fork.clone()], None).is_err());
+        fork["url"] = json!(format!("https://example.com/upstream/{upstream}/LICENSE"));
+        assert_eq!(supplement_notices(&pkg, dir.path(), &[fork.clone()], None).unwrap().len(), 1);
+        // Without VCS information the registry checksum binds the published
+        // bytes; the upstream revision still pins the license URL.
+        let checksum = "c".repeat(64);
+        let mut unversioned = fork.clone();
+        unversioned.as_object_mut().unwrap().remove("revision");
+        unversioned["checksum"] = json!(checksum);
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            supplement_notices(&pkg, empty.path(), &[unversioned.clone()], Some(&checksum))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(supplement_notices(&pkg, empty.path(), &[unversioned.clone()], Some(&"d".repeat(64))).is_err());
+        assert!(supplement_notices(&pkg, empty.path(), &[unversioned.clone()], None).is_err());
+        unversioned.as_object_mut().unwrap().remove("upstreamRevision");
+        assert!(supplement_notices(&pkg, empty.path(), &[unversioned], Some(&checksum)).is_err());
         supplement["revision"] = json!("1123456789012345678901234567890123456789");
-        assert!(supplement_notice(&pkg, dir.path(), &[supplement]).is_err());
+        assert!(supplement_notices(&pkg, dir.path(), &[supplement], None).is_err());
+    }
+
+    #[test]
+    fn packaged_fonts_require_digest_bound_pinned_licenses() {
+        let license = "font license";
+        let source = format!("https://example.com/{}/OFL.txt", "a".repeat(40));
+        let manifest = json!({"schemaVersion":1,"boundary":"Fonts","components":[],
+            "fonts":[{"crate":"makepad-widgets","version":"1.0.0","file":"Font.ttf","sha256":"11","license":"OFL-1.1",
+                "notices":[{"source":source,"sha256":digest(license)}]}],
+            "texts":{(digest(license)):license}});
+        let resource = |file: &str, sha256: &str| PackagedResource {
+            package: "makepad-widgets".into(),
+            version: "1.0.0".into(),
+            file: file.into(),
+            sha256: sha256.into(),
+        };
+        let document =
+            resource_document(&manifest, &[resource("Font.ttf", "11"), resource("icons/a.svg", "22")], "linux")
+                .unwrap();
+        assert!(render(&document).unwrap().contains("makepad-widgets/resources/Font.ttf@1.0.0"));
+        assert!(resource_document(&manifest, &[resource("Font.ttf", "12")], "linux").is_err());
+        assert!(resource_document(&manifest, &[resource("Other.ttf.2", "11")], "linux").is_err());
+        let mut unpinned = manifest.clone();
+        unpinned["fonts"][0]["notices"][0]["source"] = json!("https://example.com/main/OFL.txt");
+        assert!(resource_document(&unpinned, &[resource("Font.ttf", "11")], "linux").is_err());
+    }
+
+    #[test]
+    fn exclusions_match_exact_reviewed_bytes() {
+        let excluded = [ExcludedResource {
+            package: "makepad-widgets".into(),
+            version: "1.0.0".into(),
+            file: "LiberationMono-Regular.ttf".into(),
+            sha256: "aa".into(),
+        }];
+        assert!(is_excluded(&excluded, "makepad-widgets", "1.0.0", "LiberationMono-Regular.ttf", "aa").unwrap());
+        // Another version or crate is a different, unreviewed file: it is packaged
+        // and must pass the font license check instead.
+        assert!(!is_excluded(&excluded, "makepad-widgets", "1.0.1", "LiberationMono-Regular.ttf", "aa").unwrap());
+        assert!(!is_excluded(&excluded, "paseo-gui", "1.0.0", "LiberationMono-Regular.ttf", "aa").unwrap());
+        // Changed bytes under the reviewed name need a new review.
+        assert!(is_excluded(&excluded, "makepad-widgets", "1.0.0", "LiberationMono-Regular.ttf", "bb").is_err());
+    }
+
+    #[test]
+    fn referenced_resources_must_be_staged() {
+        let staged = |package: &str, file: &str| PackagedResource {
+            package: package.into(),
+            version: "1".into(),
+            file: file.into(),
+            sha256: "a".repeat(64),
+        };
+        let packaged = [
+            staged("paseo-gui", "fonts/NotoSansKR-Regular.otf"),
+            staged("makepad-widgets", "IBMPlexSans-Text.ttf"),
+        ];
+        let source = r#"
+            latin = font("crate://makepad_widgets/resources/IBMPlexSans-Text.ttf", -0.1, 0.0),
+            korean = font("crate://self/resources/fonts/NotoSansKR-Regular.otf", 0.0, 0.0),
+            chinese = font("crate://makepad_fonts_chinese_regular/resources/LXGWWenKaiRegular.ttf",
+        "#;
+        assert_eq!(
+            missing_references(source, "paseo-gui", &packaged).unwrap(),
+            ["4: crate://makepad_fonts_chinese_regular/resources/LXGWWenKaiRegular.ttf"]
+        );
+        // `self` resolves to the crate whose sources reference it.
+        assert_eq!(missing_references(source, "paseo-gui-platform", &packaged).unwrap().len(), 2);
     }
 }

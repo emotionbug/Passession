@@ -267,7 +267,7 @@ skipped when it repeats the latest item. A rejected prompt still records the use
 
 ## The subagents track
 
-Native subagent presentation belongs to `packages/flutter_app/lib/features/chat`. Keep managed children and provider-owned child executions distinct even when a view combines them; neither a tab nor a compact view owns their daemon lifecycle.
+Native subagent presentation belongs to `packages/gui/src/features/timeline/{tracks,session,panel}.rs`. Keep managed children and provider-owned child executions distinct even when a view combines them; neither a tab nor a compact view owns their daemon lifecycle.
 
 The rows combine two kinds of children:
 

@@ -323,6 +323,79 @@ async fn loopback_websocket_rejects_wrong_protocol_and_reserved_plugin_identity(
     }
 }
 
+#[tokio::test]
+async fn upload_request_registers_ownership_before_buffered_binary_frames() {
+    use paseo_protocol::binary_frames::{
+        FileBeginMetadata, FileEncoding, FileTransferFrame, encode_file_transfer_frame,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let app = AppState::new(
+        root.path().join("home"),
+        root.path().into(),
+        std::env::current_exe().unwrap(),
+    );
+    app.config.initialize().await.unwrap();
+    app.files.initialize().await.unwrap();
+    let (input, inbound) = mpsc::channel(8);
+    let (outbound, mut output) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    let payload = "한글 첨부 파일\n".as_bytes();
+    // Queue the complete transfer before running the reader. Uploads have no
+    // intermediate acknowledgement, so these frames must remain ordered.
+    input.send(OutboundFrame::Text(json!({
+        "type":"hello", "clientId":"upload-test", "clientType":"cli",
+        "protocolVersion":1, "capabilities":{"owned_subscriptions":true}
+    }).to_string())).await.unwrap();
+    input.send(OutboundFrame::Text(json!({
+        "type":"session", "message":{
+            "type":"file.upload.request", "requestId":"upload", "fileName":"한글.txt",
+            "mimeType":"text/plain", "size":payload.len(), "modifiedAt":""
+        }
+    }).to_string())).await.unwrap();
+    for frame in [
+        FileTransferFrame::Begin {
+            request_id:"upload",
+            metadata:FileBeginMetadata {
+                mime:"text/plain".into(), size:payload.len() as u64,
+                encoding:FileEncoding::Binary, modified_at:String::new(),
+                revision:None, file_name:Some("한글.txt".into()),
+            },
+        },
+        FileTransferFrame::Chunk { request_id:"upload", payload },
+        FileTransferFrame::End { request_id:"upload" },
+    ] {
+        input.send(OutboundFrame::Binary(encode_file_transfer_frame(&frame).unwrap().into())).await.unwrap();
+    }
+    let server_app = app.clone();
+    let server_cancel = cancel.clone();
+    let server = tokio::spawn(async move {
+        server_app.transport.run_channel(inbound, outbound, server_cancel, Some(Admission::owner())).await
+    });
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match output.recv().await.expect("upload channel closed before its response") {
+                OutboundFrame::Text(text) => {
+                    let envelope:Value = serde_json::from_str(&text).unwrap();
+                    if envelope["message"]["type"] == "file.upload.response" {
+                        break envelope["message"]["payload"].clone();
+                    }
+                },
+                OutboundFrame::Flush(acknowledge) => { acknowledge.send(Ok(())).unwrap(); },
+                OutboundFrame::Close { code, reason } => panic!("upload closed: {code} {reason}"),
+                _ => {},
+            }
+        }
+    }).await.expect("upload response timed out");
+    assert_eq!(response["error"], Value::Null);
+    assert_eq!(response["file"]["fileName"], "한글.txt");
+    assert_eq!(response["file"]["size"], payload.len());
+    assert_eq!(tokio::fs::read(response["file"]["path"].as_str().unwrap()).await.unwrap(), payload);
+    cancel.cancel();
+    server.await.unwrap().unwrap();
+    app.files.shutdown().await.unwrap();
+}
+
 #[test]
 fn hello_validates_grant_vocabulary_without_rejecting_newer_protocol_versions() {
     let mut hello = json!({"type":"hello","clientId":"client","clientType":"cli","protocolVersion":2,"sessionPermissions":["workspace.read"]});

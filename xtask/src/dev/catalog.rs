@@ -74,7 +74,6 @@ impl Parser<'_> {
                 return Ok(value);
             }
             ensure!(c != '\n' && c != '\r', "Newline in catalog string");
-            ensure!(raw || c != '$', "Catalog interpolation is unsupported");
             if raw || c != '\\' {
                 value.push(c);
                 continue;
@@ -87,7 +86,7 @@ impl Parser<'_> {
                 'b' => '\u{8}',
                 'f' => '\u{c}',
                 'v' => '\u{b}',
-                '\\' | '\'' | '"' | '$' => escaped,
+                '\\' | '\'' | '"' | '$' | '/' => escaped,
                 'x' | 'u' => {
                     let braced = escaped == 'u' && self.source[self.at..].starts_with('{');
                     if braced {
@@ -204,14 +203,12 @@ impl Parser<'_> {
         })
     }
 }
+/// ACP provider catalog shipped by the Rust settings feature (JSON array).
+const CATALOG: &str = "packages/gui/src/features/settings/model/acp_catalog.json";
+
 fn catalog(source: &str) -> Result<Vec<Literal>> {
-    let token = "const acpProviderCatalog = <Map<String, dynamic>>[";
-    let start = source
-        .find(token)
-        .context("Could not find acpProviderCatalog")?
-        + token.len()
-        - 1;
-    let root = Parser { source, at: start }.literal()?;
+    let root = Parser { source, at: 0 }.literal()?;
+    ensure!(root.value.is_array(), "The ACP catalog must be a JSON array");
     for entry in &root.items {
         ensure!(entry.value.is_object(), "Catalog entries must be maps");
         if let Some(command) = entry.fields.get("command") {
@@ -258,8 +255,8 @@ fn split_package(spec: &str) -> (&str, Option<&str>) {
 fn exact(selector: &str) -> bool {
     semver::Version::parse(selector.strip_prefix("==").unwrap_or(selector)).is_ok()
 }
-fn dart_string(value: &str) -> Result<String> {
-    Ok(serde_json::to_string(value)?.replace('$', "\\$"))
+fn json_string(value: &str) -> Result<String> {
+    Ok(serde_json::to_string(value)?)
 }
 async fn latest(client: &reqwest::Client, registry: &str, name: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(if registry == "npm" {
@@ -310,8 +307,7 @@ pub(super) async fn run(args: &[String]) -> Result<()> {
         !has("--update") || !has("--no-network"),
         "--update requires registry access"
     );
-    let path = crate::common::root()?
-        .join("packages/flutter_app/lib/features/settings/provider_catalog.dart");
+    let path = crate::common::root()?.join(CATALOG);
     let source = std::fs::read_to_string(&path)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -372,11 +368,11 @@ pub(super) async fn run(args: &[String]) -> Result<()> {
                     .get("version")
                     .context("Cannot update entry without version")?;
                 let command_literal = entry.fields.get("command").unwrap();
-                replacements.push((version.range.clone(), dart_string(latest)?));
+                replacements.push((version.range.clone(), json_string(latest)?));
                 if updated[index] != command[index] {
                     replacements.push((
                         command_literal.items[index].range.clone(),
-                        dart_string(updated[index].as_str().unwrap())?,
+                        json_string(updated[index].as_str().unwrap())?,
                     ));
                 }
             }
@@ -415,14 +411,14 @@ pub(super) async fn run(args: &[String]) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn parses_literal_ranges_without_executing_dart() {
-        let source = "const acpProviderCatalog = <Map<String, dynamic>>[/* nested /* ok */ comment */{'id': 'é', 'command': ['npx', /* keep */ '@vendor/acp@1.2.3'], 'version': r'1.2.3', 'metadata': {'enabled': true}}];";
+    fn parses_literal_ranges_without_evaluating_code() {
+        let source = "[{\"id\": \"é\", \"command\": [\"npx\", \"@vendor/acp@1.2.3\"], \"version\": \"1.2.3\", \"metadata\": {\"enabled\": true}}]\n";
         let entries = catalog(source).unwrap();
         assert_eq!(entries[0].value["id"], "é");
         let range = entries[0].fields["command"].items[1].range.clone();
-        assert_eq!(&source[range], "'@vendor/acp@1.2.3'");
-        assert!(catalog(&source.replace("r'1.2.3'", "'${unsafe()}'")).is_err());
+        assert_eq!(&source[range], "\"@vendor/acp@1.2.3\"");
         assert!(catalog(&source.replace("true", "unsafe()")).is_err());
+        assert!(catalog("{\"id\": \"not a list\"}").is_err());
     }
     #[test]
     fn registry_specs_preserve_scopes_and_python_pins() {

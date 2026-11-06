@@ -2,7 +2,7 @@
 
 [中文](workspaces.zh-CN.md) · [Setup](quickstart.md)
 
-Workspaces provide durable ownership for agents, script/setup PTYs and files. The SDK can control retained daemon terminals; the Flutter app presents read-only task logs, not an embedded interactive terminal. All paths below belong to the daemon host.
+Workspaces provide durable ownership for agents, script/setup PTYs and files. The SDK can control retained daemon terminals; the native app presents read-only task logs, not an embedded interactive terminal. All paths below belong to the daemon host.
 
 ## Open a directory
 

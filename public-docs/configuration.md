@@ -104,7 +104,7 @@ Speech recognition, voice conversations and TTS are no longer supported. Legacy 
 
 ## Native clients
 
-The Rust daemon serves APIs, not a bundled web product client. Connect with the Flutter desktop/mobile app or the Rust CLI. Mobile clients connect to a remote desktop/server daemon; they do not run one locally.
+The Rust daemon serves APIs, not a bundled web product client. Connect with the native desktop/mobile app or the Rust CLI. Mobile clients connect to a remote desktop/server daemon; they do not run one locally.
 
 Retired `features.webUi` and `daemon.browserTools` settings are discarded during normalization. There is no web UI or embedded browser automation to enable. Script/setup PTYs remain available on the daemon with read-only logs in the client, not an interactive terminal UI.
 

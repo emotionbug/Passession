@@ -1,0 +1,58 @@
+[package]
+name = "paseo-gui"
+description = "Paseo Sessions native client (Makepad)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "paseo_gui"
+path = "src/lib.rs"
+# xtask builds the Android library with `cargo rustc --lib --crate-type cdylib`.
+
+[[bin]]
+name = "paseo-sessions"
+path = "src/main.rs"
+
+[features]
+# In-process desktop lifecycle smoke driver (desktop-smoke-driver.md); never packaged.
+desktop-smoke = []
+
+[dependencies]
+makepad-widgets = "=1.0.0"
+paseo-gui-core = { path = "../gui-core" }
+paseo-gui-platform = { path = "../gui-platform" }
+paseo-client = { path = "../client" }
+paseo-protocol = { path = "../protocol" }
+paseo-highlight = { path = "../highlight" }
+alacritty_terminal = { version = "=0.25.0", default-features = false }
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+fancy-regex = "0.19"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+mime_guess = "2"
+percent-encoding = "2"
+pulldown-cmark = { version = "0.12.2", default-features = false }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+resvg = { version = "0.45", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sys-locale = "0.3"
+tokio = { version = "1", features = ["sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+unicode-segmentation = "1.11"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+# alacritty_terminal expects std-owned file descriptors from rustix-openpty (as in the daemon).
+rustix = { version = "0.38", default-features = false, features = ["std"] }
+
+[build-dependencies]
+embed-resource = "3"

@@ -1,22 +1,28 @@
 # Release
 
-The checkout version is **0.13.4**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
+The checkout version is **0.13.5**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
 
 ## Distribution requirements
 
 Native packages exclude speech recognition, voice conversation and TTS, including Sherpa, the speech ONNX runtime and espeak-ng. Generic effect-sound playback remains.
 
-Rust tooling in `xtask/src/notices.rs` generates Cargo and bundled-asset attributions. Preserve those notices with the exact packaged artifacts and review the licenses of remaining bundled dependencies and platform runtimes. Generated attributions are not a compliance certification or a corresponding-source offer.
+Rust tooling in `xtask/src/notices.rs` generates Cargo and bundled-asset attributions: the daemon closure in `runtime/THIRD-PARTY-NOTICES.txt`, and the client's `paseo-gui` closure for the packaged target plus every packaged font in the application's `THIRD-PARTY-NOTICES.txt` (desktop bundle, APK assets, iOS bundle). Preserve those notices with the exact packaged artifacts and review the licenses of remaining bundled dependencies and platform runtimes. Generated attributions are not a compliance certification or a corresponding-source offer.
 
 The revision-pinned objc2 supplements preserve the authors' complete upstream `LICENSE.md`, including its Apple SDK caveat. That file is a licensing declaration linking standard terms, not a fabricated replacement license. Frozen OpenCode ABI bytes and the V8 notice use explicit LF checkout attributes so Windows cannot silently change their validated content.
+
+The makepad 1.0.0 crates are published without license files; `packaging/cargo-notice-supplements.json` carries the MIT text from the exact makepad commit each crate was published from. makepad's vendored zune-image forks cite the upstream zune-image commit of the same release (`upstreamRevision`). Supplements apply to registry sources only: a vendored, patched path crate such as `packages/gui-platform/vendor/makepad-platform` must contain its own license file. A Cargo dependency without license text fails packaging by name.
+
+A crate published without `.cargo_vcs_info.json` (the arborium highlighting crates, `cesu8`, `fxhash`) cannot prove its source revision, so its supplement binds `checksum`, the registry SHA-256 `Cargo.lock` records for the downloaded `.crate`, and pins the license URL with `upstreamRevision`. Each arborium grammar crate carries arborium's own license plus the license of the upstream tree-sitter grammar at the commit its `arborium.yaml` names.
+
+Fonts are third-party works with their own licenses. `packaging/resource-notices.json` binds each packaged font file's SHA-256 to license text pinned to an upstream revision or an immutable archive digest; an unknown or changed font fails packaging. Its `excluded` list removes reviewed files from every package: makepad-widgets 1.0.0 ships Liberation Mono 1.04 under Red Hat's GPL-2.0-with-font-exception agreement, so the client uses Jetendard (OFL-1.1; JetBrains Mono with Pretendard Hangul fitted to two cells) for code and the Liberation file is not redistributed. Jetendard's release asset is not immutable, so each shipped TTF is bound by its own digest, and its notices include the upstream JetBrains Mono, Nerd Fonts, Pretendard and Yeomil Mono licenses it asks redistributors to keep; Makepad's LXGW WenKai Chinese fallback (36 MB) is left out because the client supports English and Korean, and Han characters fall back to Noto Sans KR. The emoji font stays: Makepad has no system font fallback, so without it emoji would not render. An excluded file whose bytes change fails packaging, and so does any `crate://…/resources/…` reference in client sources that names a resource not staged: Makepad loads fonts lazily and a style using a missing font panics.
 
 ## Release contents
 
 | Target                        | Native artifact scope                                                                         |
 | ----------------------------- | --------------------------------------------------------------------------------------------- |
-| Linux, macOS, Windows desktop | Flutter application, Rust daemon/CLI, native desktop integration and runtime assets           |
-| Android                       | Flutter remote client APK; no daemon                                                          |
-| iOS                           | Flutter remote client; no daemon; unsigned app archive unless provisioning/export is supplied |
+| Linux, macOS, Windows desktop | Native Rust client, Rust daemon/CLI, native desktop integration and runtime assets            |
+| Android                       | Native Rust remote client APK; no daemon                                                      |
+| iOS                           | Native Rust remote client; no daemon; unsigned app archive unless a provisioning profile is supplied |
 | Standalone daemon             | Rust executable with libraries, skills, notices and provenance                                |
 | Container                     | Native daemon and runtime assets; no browser UI or Node executable in the default image       |
 | Rust libraries                | Client, protocol, plugin and highlighting crates; source/package availability is separate from binary releases |
@@ -25,43 +31,53 @@ No Electron, Chromium, web client, embedded automation, or interactive terminal 
 
 ## Local build versus distribution identity
 
-Use Rust/Cargo, Flutter, and each target's native toolchain. Build desktop artifacts on the matching OS; build iOS on macOS with Xcode. Build and release commands run through `cargo xtask`, without Node or npm.
+Use Rust/Cargo and each target's native toolchain. Build desktop artifacts on the matching OS; build iOS on macOS with Xcode. Build and release commands run through `cargo xtask`, without Node, npm or Flutter.
 
 ```sh
 cargo fetch --locked
 cargo xtask build-daemon                # debug binary and runtime assets
 cargo xtask build-daemon --release      # optimized local build, not publication
-cargo xtask build-flutter linux         # matching host only
+cargo xtask build-gui linux             # matching host only
 cargo xtask package-desktop
-cargo xtask build-flutter android --arch arm64
-cargo xtask build-flutter ios
+cargo xtask build-gui android --arch arm64
+cargo xtask build-gui ios
 ```
 
-The default Flutter release build uses optimized Rust; a debug development build uses the debug profile. Optimization is independent of publication: `--release` alone must not turn a local binary into an updater-enabled official build.
+The default GUI release build uses optimized Rust; a debug development build uses the debug profile. Optimization is independent of publication: `--release` alone must not turn a local binary into an updater-enabled official build.
 
 Published provenance is explicitly selected by `PASEO_NATIVE_RELEASE=1` together with the optimized build and validated `PASEO_UPDATE_REPOSITORY`, `PASEO_RELEASE_CHANNEL`, and `PASEO_BUILD_SOURCE_SHA`. The source SHA must identify the checked-out source. Standalone `cargo xtask package-daemon` requires that release identity; it is not a way to relabel an arbitrary local executable.
 
-Client artifacts and build descriptors live in `artifacts/flutter/`. Standalone daemon archives are `Paseo-Daemon-<version>-<platform>-<arch>.tar.gz` (ZIP on Windows), with a channel/platform/architecture manifest. Native runtime metadata includes `paseo-runtime.json`, `bundle-provenance.json`, and desktop-specific `desktop-runtime.json` when applicable. Preserve assets together; copying only the executable omits runtime libraries and skills.
+Client artifacts and build descriptors live in `artifacts/native/`: `Paseo-Sessions-<version>-<platform>-<arch>.<AppImage|deb|zip|exe>`, `Paseo-Sessions-<version>-android-<arch>[-debug-signed].apk`, `Paseo-Sessions-<version>-ios-arm64.ipa` or `-unsigned.app.zip`. Standalone daemon archives are `Paseo-Daemon-<version>-<platform>-<arch>.tar.gz` (ZIP on Windows), with a channel/platform/architecture manifest. Native runtime metadata includes `paseo-runtime.json`, `bundle-provenance.json`, and desktop-specific `desktop-runtime.json` when applicable. Preserve assets together; copying only the executable omits runtime libraries, Makepad resources and skills.
 
 Bundle provenance records the executable digest **after relocation**, because runtime patching can change its bytes. `sourceExecutableSha256` separately identifies the input executable. Check an artifact against its final digest, not against the pre-relocation source hash.
 
-The Visual C++ ARM64 redistributable directory can also contain x64-view DLLs for emulated applications. Windows ARM64 packaging keeps the matching native CRT images (including Arm64X) and omits an x64-view image only after checking direct and delay-loaded imports of every bundled executable, DLL and selected CRT. A reference to an omitted image or any other unexpected CRT architecture fails packaging. The Flutter and daemon executable architecture checks remain strict.
+The Visual C++ ARM64 redistributable directory can also contain x64-view DLLs for emulated applications. Windows ARM64 packaging keeps the matching native CRT images (including Arm64X) and omits an x64-view image only after checking direct and delay-loaded imports of every bundled executable, DLL and selected CRT. A reference to an omitted image or any other unexpected CRT architecture fails packaging. The client and daemon executable architecture checks remain strict.
+
+## Installed identity and the desktop update feed
+
+Installed paths keep the previous client's names, so `paseo open`, shortcuts, `paseo://` handlers and in-place updates keep working: `paseo_sessions` (Linux bundle, `/opt/paseo-sessions`, `/usr/bin/paseo-sessions`, Debian package `paseo-sessions`), `paseo_sessions.exe` in `%LOCALAPPDATA%\Programs\Paseo Sessions`, and `Paseo Sessions.app` with bundle ID `sh.paseo.sessions.desktop`. The cargo binary `paseo-sessions` is renamed when bundled.
+
+Linux packages also cover libraries the client opens at runtime, which `ldd` and `dpkg-shlibdeps` cannot see: Makepad's `libEGL`, `libX11` (idle time and close-to-tray), and the optional `libXss` (X11 idle time) and `libSM`/`libICE` (session logout without a GNOME SessionManager). The AppImage bundles all four X11/XSMP libraries with their closure (`libraries::LINUX_DLOPENED`; the packaging host must have them installed); the Debian package depends on `libegl1`, `libx11-6` and `xdg-utils` and recommends `libxss1`, `libsm6` and `libice6`. Add any new `dlopen` library to both lists.
+
+The desktop client feed keeps its exact wire identity: asset `flutter-<channel>-<platform>-<arch>.json` with `runtime: "flutter"` and `appId: "sh.paseo.sessions.desktop"`. Installed clients — including every Flutter-era build — discover updates only by that identity; renaming it would strand them. Artifact names are read from the manifest, so they changed freely. The daemon feed `daemon-<channel>-<platform>-<arch>.json` is unchanged.
+
+The NSIS installer upgrades in place: at the registered install location it first deletes every file listed in the previous installation's `.paseo-sessions-owned-files` inventory and removes emptied directories, then installs the new payload. Files the user created there are never deleted.
 
 ## Signing and mobile build numbers
 
-`xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `13001`. Android enforces a minimum of `13000`. Confirm the next build number against the actual store history; do not infer store acceptance from a local version string.
+`xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `packaging/android/version.properties`; empty variables count as unset. Android enforces a minimum of `13000`. Confirm the next build number against the actual store history; do not infer store acceptance from a local version string.
 
-Android release signing uses `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`, or the checked-in project's local signing properties. Without a release key, output is explicitly named **debug-signed**, not store-ready. Credentials are not part of this fork. The Android application ID is `sh.paseo.sessions`.
+Android release signing uses `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`, or `packaging/android/key.properties`. Without a release key, output is explicitly named **debug-signed**, not store-ready. Credentials are not part of this fork. The Android application ID is `sh.paseo.sessions`; the minimum SDK stays 24 (see [Android](android.md) for the Makepad compatibility patches that keep it).
 
-iOS uses `PASEO_IOS_EXPORT_OPTIONS_PLIST` for an exported IPA. Without it, the build emits an explicitly **unsigned device `.app` archive**, not an installable IPA or App Store submission. macOS and Windows signing use the native packaging signing configuration; neither platform has been claimed executed in the local migration evidence.
+iOS signs with `PASEO_IOS_PROVISIONING_PROFILE` (a `.mobileprovision` path) and `PASEO_IOS_SIGNING_IDENTITY` (a keychain code-signing identity): the profile is embedded, its application identifier, team, `get-task-allow` and `aps-environment` override the app entitlements, and the bundle is zipped as an `.ipa`. Without them, the build emits an explicitly **unsigned device `.app` archive**, not an installable IPA or App Store submission. The Xcode `PASEO_IOS_EXPORT_OPTIONS_PLIST` path no longer exists. macOS and Windows signing use the native packaging signing configuration; neither platform has been claimed executed in the local migration evidence.
 
-Optional Firebase configuration must match `sh.paseo.sessions`: `GOOGLE_SERVICES_FILE_SESSIONS` for Android and `GOOGLE_SERVICE_INFO_PLIST_SESSIONS` for iOS. The wrapper stages these files for the build and restores previous state afterward.
+Optional Firebase configuration for Android must match `sh.paseo.sessions`: `GOOGLE_SERVICES_FILE_SESSIONS` is staged into the Gradle project and restored afterward. iOS push uses APNs directly (device token exchanged with Expo, environment from the embedded provisioning profile) and does not link Firebase, so `GOOGLE_SERVICE_INFO_PLIST_SESSIONS` is no longer used.
 
 ## Workflow definitions and publication controls
 
-`.github/workflows/desktop-release.yml` is the manual-only **Native Release** workflow despite its retained filename. It builds Flutter/Rust targets, preserves complete per-target artifacts, validates recovery provenance, and publishes only through its publication path. Its matrix is for explicitly requested artifacts, not default CI or per-platform test repetition.
+`.github/workflows/desktop-release.yml` is the manual-only **Native Release** workflow despite its retained filename. It builds the Rust client and daemon for every target, preserves complete per-target artifacts, validates recovery provenance, and publishes only through its publication path. Its matrix is for explicitly requested artifacts, not default CI or per-platform test repetition.
 
-The complete release matrix has **eight targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android universal and iOS arm64. Each target's artifacts are retained for **30 days**. macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android explicitly provisions platform-tools. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
+The complete release matrix has **eight targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android universal and iOS arm64. Each target's artifacts are retained for **30 days**. macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android provisions platform-tools and NDK 28.2.13676358 and the Rust Android targets; iOS adds the `aarch64-apple-ios` target. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
 
 For a reduced Windows x64, Linux x64 and Android release, select `platform=linux-windows-x64-android`. This preset supports both building and `publish-only` recovery without requiring macOS, desktop ARM64 or iOS artifacts. Recovery and publication require all three selected targets from the same source SHA; desktop feed verification and later rollout changes use the declared desktop target inventory rather than assuming the full matrix.
 
@@ -73,35 +89,17 @@ Publication retains the numeric release ID returned by draft creation and uses t
 
 `checkout_ref` may pin a native-packaging correction without moving an existing source tag, provided its workspace version still matches that tag. Artifact provenance records the exact resolved checkout SHA; identify that build-source commit in the published notes when it differs from the tag. All targets in one publication must pass verification against that same SHA. Successful artifacts from an older source SHA cannot be mixed into the corrected publication; rebuild those targets rather than relabeling their provenance.
 
-`.github/workflows/docker.yml`, `desktop-packages.yml`, and `release-notes-sync.yml` are also manual-only, alongside SDK assembly, relay deployment and rollout. Docker publication requires `publish=true` and an explicit matching source version, including when the selected ref is a tag. These workflows do not establish a completed release or remove the distribution requirements above.
+`.github/workflows/docker.yml`, `desktop-packages.yml`, and `release-notes-sync.yml` are also manual-only, alongside relay deployment and rollout. Docker publication requires `publish=true` and an explicit matching source version, including when the selected ref is a tag. These workflows do not establish a completed release or remove the distribution requirements above.
 
-### Reusable Linux and Windows ARM64 Flutter SDKs
-
-Before explicitly requested Linux/Windows ARM64 app builds can succeed, publish the SDK pinned by `.github/flutter-sdk.json` through the manually dispatched **Flutter ARM64 SDK** workflow (`.github/workflows/flutter-sdk.yml`). Normal Ubuntu x64 tests do not require it. Dispatch only after the SDK tooling and pin are present at the approved workflow revision. It assembles both SDKs on native `ubuntu-24.04-arm` and `windows-11-arm` runners using `cargo xtask flutter-sdk build`, then publishes the complete pair with `cargo xtask flutter-sdk publish`. This bootstraps pinned official Flutter source and downloads official native Dart/engine artifacts; it is **not an engine build or a separately maintained Flutter repository**.
-
-The pin is the single source of SDK artifact identity: Flutter version/channel, official source repository and exact source/engine revisions, destination repository, and reserved release tag. The initial tag is `flutter-sdk-3.47.5-r1` in `emotionbug/paseo`. Each platform produces `paseo-flutter-sdk-<version>-<linux|windows>-arm64.tar.gz` and a matching JSON identity/checksum manifest in `artifacts/flutter-sdk/`. Intermediate workflow artifacts expire after **7 days**; the reserved GitHub release assets are the durable consumer source.
-
-For Flutter 3.47.5, the pin also records one Windows bootstrap correction: upstream `bin/internal/shared.bat` invokes literal `$git` when reading the revision. The producer changes that command to `git`, verifying both original and corrected SHA-256 values with the upstream-required CRLF checkout bytes. Published SDK validation permits only that exact declared change; other tracked-source changes still fail. This does not modify the engine. A future version with the upstream fix can set `windowsBootstrapPatch` to `null`.
-
-SDK archives encode sparse filesystem inputs as ordinary file data. Consumers continue accepting only regular files, directories and contained symlinks; GNU sparse and other special entry types are not permitted. The expanded-size limit therefore covers the full logical file data.
-
-Before making package roots relative, SDK assembly resolves filesystem aliases to canonical paths. In particular, Windows `RUNNER~1` temporary paths must not survive as references outside the archive. Validation rejects package URLs that leave the SDK even when a build-machine alias happens to resolve back into it; extracted SDKs must not depend on that machine's directory layout.
-
-Only the publish job has `contents: write`; builds and app consumers use read-only permissions. Publication validates both platform inventories and their builder revision, keeps the release draft until complete, and publishes a **non-latest prerelease**. The reserved `flutter-sdk-*` tag is not a Paseo product release and must never replace the product's latest release or update feeds. Published SDK assets are immutable: do not delete, clobber, or repurpose an existing SDK tag.
-
-Publication refuses any existing reserved release or tag, including a partial draft; it neither resumes nor overwrites that identity. If publication fails after creating a draft, leave it untouched and select a new `rN` release tag in the pin before another authorized producer run. Consumers reject drafts and require the complete four-asset inventory with matching tag/builder revision.
-
-The shared setup action downloads the exact reserved SDK assets with `cargo xtask flutter-sdk install --version <version> --channel <channel>`. It checks the requested version/channel against the pin, verifies archive identity/size/hash before safe extraction, and checks Flutter identity and native Dart ABI before exporting the SDK. Its optional cache stores downloaded archives/manifests, not an unvalidated executable SDK; restored bytes are checked again. A missing SDK release is an actionable prerequisite failure: run the dedicated SDK workflow, rather than bootstrapping Flutter inside an app job or substituting x64 Dart. Non-ARM64 Linux/Windows and Apple hosts continue using the existing archived SDK setup.
-
-For an upgrade, update `.github/flutter-sdk.json` with the reviewed official version/channel/source/engine identity and a **new reserved release tag**; increment the `rN` suffix for a same-version SDK assembly change. Update the requested Flutter version/channel in `ci.yml`, `desktop-packages.yml`, and `desktop-release.yml` together when those change. After approval, dispatch the SDK producer at that revision and retain its run evidence before starting dependent ARM64 builds. Do not reuse old assets under a new identity. SDK assembly/ABI validation alone is not proof of application execution on either platform.
+Linux/Windows ARM64 client builds need only the Rust toolchain on the native ARM64 runner; the former reusable Flutter ARM64 SDK release (`flutter-sdk-*` tags) is not consumed. Leave published `flutter-sdk-*` prereleases untouched; they are not product releases.
 
 ## Authorization and verification
 
 A release requires an explicit approved source revision, version/channel decision, publication target and authorization. Keep preparation separate from publication. Native release publishing commands, tag pushes and publishing workflow dispatches have external effects; they are not verification shortcuts.
 
-Before a release decision, gather actual Rust/Flutter/SDK checks, target-platform execution, packaging/signing/install/update evidence, and distribution review for the exact revision and binary inventory. Integrity verification is not a compliance audit, proof of signing, or permission to publish.
+Before a release decision, gather actual Rust checks, target-platform execution, packaging/signing/install/update evidence, and distribution review for the exact revision and binary inventory. Integrity verification is not a compliance audit, proof of signing, or permission to publish.
 
-Current actual Linux evidence and explicit missing platform checks are in [testing](testing.md). Android ARM64 release-mode compilation passed with debug signing, not production credentials; no Android device execution or Windows/macOS/iOS execution is claimed. Consult the testing record for desktop tray/editor follow-up results rather than treating a build as runtime proof. No release was published, installed, committed, pushed, or offered by the documentation update.
+Actual execution evidence and missing platform checks are recorded in [testing](testing.md). The Android emulator and Linux X11 runs do not establish Windows UI behavior, full GNOME Wayland/XWayland input behavior, signed installation or in-place update success. Keep those boundaries distinct from successful release builds and artifact-integrity checks.
 
 ## Release branch discipline
 

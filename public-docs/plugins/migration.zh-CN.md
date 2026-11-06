@@ -20,7 +20,7 @@ nav: 迁移
 | 直接 Provider | `Provider`/`Connection`、真实会话事件、权限和清理。 |
 | ACP 适配器 | `paseo_plugin::acp::AcpProvider` 接受命令或自有流，供应商扩展移植到 `AcpTransformer`。它替代 `runAcpProvider` 的功能，不兼容 JavaScript 源码 API。 |
 | 用量发现/获取 | `UsageSource`、显式输入校验及账号/凭据边界。 |
-| 界面、面板、侧边栏/标题组件、附件选择器、主题 | 没有可执行 Flutter 插件对应项，移除旧 UI 注册。 |
+| 界面、面板、侧边栏/标题组件、附件选择器、主题 | 没有可执行客户端插件对应项，移除旧 UI 注册。 |
 | React 时间线变换/渲染器 | 输出标准协议条目，重要输出不能依赖扩展代码。 |
 | 仅客户端插件 | 不是支持的原生插件，不能把空后端称作迁移。 |
 

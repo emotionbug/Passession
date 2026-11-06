@@ -1,4 +1,4 @@
-use crate::{build, common::*, libraries, signing};
+use crate::{build, common::*, gui, libraries, signing};
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
@@ -11,9 +11,11 @@ use std::{
 };
 use walkdir::WalkDir;
 
+/// Makepad sets WM_CLASS from argv[0]'s basename, the installed executable name.
 fn desktop_entry(command: &str) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName=Paseo Sessions\nComment=Native client for local AI coding agents\nExec={command} %U\nIcon=sh.paseo.Paseo\nTerminal=false\nCategories=Development;\nMimeType=x-scheme-handler/paseo;\nStartupWMClass=sh.paseo.sessions.desktop\n"
+        "[Desktop Entry]\nType=Application\nName=Paseo Sessions\nComment=Native client for local AI coding agents\nExec={command} %U\nIcon=sh.paseo.Paseo\nTerminal=false\nCategories=Development;\nMimeType=x-scheme-handler/paseo;\nStartupWMClass={}\n",
+        gui::desktop_executable("linux")
     )
 }
 
@@ -24,7 +26,7 @@ fn build_input() -> Result<PathBuf> {
             && metadata["mode"] == "release"
             && metadata["platform"] == platform()?
             && metadata["arch"] == arch()?,
-        "Build a matching release with cargo xtask build-flutter first"
+        "Build a matching release with cargo xtask build-gui first"
     );
     let relative = Path::new(
         metadata["output"]
@@ -36,29 +38,79 @@ fn build_input() -> Result<PathBuf> {
             && relative
                 .components()
                 .all(|part| matches!(part, Component::Normal(_))),
-        "Build output must be a relative workspace path without traversal"
+        "Build output must be a relative GUI output path without traversal"
     );
-    let input = fs::canonicalize(root()?.join(relative)).context("Flutter build output missing")?;
+    let output = fs::canonicalize(gui_output()?).context("GUI build output missing")?;
+    let input = fs::canonicalize(output.join(relative)).context("GUI build output missing")?;
     ensure!(
-        input.starts_with(fs::canonicalize(app()?.join("build"))?),
-        "Flutter build metadata points outside its build directory"
+        input.starts_with(output.join("desktop")),
+        "GUI build metadata points outside its desktop output directory"
     );
-    build::assert_architecture(&input.join(match platform()? {
-        "macos" => "Contents/MacOS/Paseo Sessions",
-        "windows" => "paseo_sessions.exe",
-        _ => "paseo_sessions",
-    }))?;
+    build::assert_architecture(&input.join(gui::desktop_executable(platform()?)))?;
     build::validate_runtime(
-        &input.join(if platform()? == "macos" {
-            "Contents/Resources/runtime"
-        } else {
-            "runtime"
-        }),
+        &input.join(gui::desktop_runtime(platform()?)),
         "desktop-bundled",
         "release",
     )?;
     Ok(input)
 }
+
+/// Debian dependencies of the packaged ELF files, computed by dpkg-shlibdeps
+/// from their DT_NEEDED entries, plus what the client loads at runtime and so
+/// never appears in DT_NEEDED: Makepad's libEGL, `libX11` (idle time and
+/// close-to-tray withdraw), and xdg-utils for opening links and mail. The
+/// optional X11 idle-time and XSMP logout libraries are `DEBIAN_RECOMMENDS`
+/// (`libraries::LINUX_DLOPENED` lists the same sonames for the AppImage).
+fn debian_depends(payload: &Path) -> Result<String> {
+    let work = tempfile::tempdir()?;
+    text(
+        &work.path().join("debian/control"),
+        "Source: paseo-sessions\n\nPackage: paseo-sessions\nArchitecture: any\n",
+        0o644,
+    )?;
+    let mut elves = Vec::new();
+    for entry in WalkDir::new(payload).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            let mut magic = [0; 4];
+            if fs::File::open(entry.path())?.read(&mut magic)? == 4 && magic == *b"\x7fELF" {
+                elves.push(entry.into_path());
+            }
+        }
+    }
+    ensure!(!elves.is_empty(), "No ELF files in the Debian payload");
+    let mut shlibdeps = command("dpkg-shlibdeps")?;
+    shlibdeps
+        .current_dir(work.path())
+        .args(["-O", "--ignore-missing-info"])
+        // Bundled daemon libraries resolve through their own RPATH.
+        .arg(format!("-l{}", payload.join("opt/paseo-sessions/runtime/lib").display()));
+    for elf in &elves {
+        shlibdeps.arg(format!("-e{}", elf.display()));
+    }
+    let output = capture(&mut shlibdeps)?;
+    let depends = output
+        .lines()
+        .find_map(|line| line.strip_prefix("shlibs:Depends="))
+        .context("dpkg-shlibdeps reported no shlibs:Depends")?;
+    ensure!(
+        !depends.trim().is_empty(),
+        "dpkg-shlibdeps reported empty dependencies"
+    );
+    let mut fields: Vec<String> = depends.split(',').map(|field| field.trim().to_owned()).collect();
+    for package in ["libegl1", "libx11-6", "xdg-utils"] {
+        let listed = fields
+            .iter()
+            .any(|field| field.split([' ', '(']).next() == Some(package));
+        if !listed {
+            fields.push(package.to_owned());
+        }
+    }
+    Ok(fields.join(", "))
+}
+
+/// libXss.so.1, libSM.so.6, libICE.so.6: features degrade without them.
+const DEBIAN_RECOMMENDS: &str = "libxss1, libsm6, libice6";
 
 pub fn desktop(args: &[String]) -> Result<()> {
     ensure!(
@@ -71,7 +123,7 @@ pub fn desktop(args: &[String]) -> Result<()> {
     let input = build_input()?;
     fs::create_dir_all(release()?)?;
     let stage = tempfile::Builder::new()
-        .prefix("paseo-flutter-package-")
+        .prefix("paseo-gui-package-")
         .tempdir()?;
     let mut artifacts = Vec::new();
     match platform()? {
@@ -90,7 +142,7 @@ pub fn desktop(args: &[String]) -> Result<()> {
                 desktop_entry("paseo_sessions"),
                 0o644,
             )?;
-            let icon = support()?.join("assets/icon.png");
+            let icon = packaging()?.join("desktop/icon.png");
             copy_tree(&icon, &appdir.join("sh.paseo.Paseo.png"))?;
             copy_tree(&icon, &appdir.join(".DirIcon"))?;
             let runtime = env::var_os("APPIMAGE_RUNTIME_FILE").context("Set APPIMAGE_RUNTIME_FILE to a pinned AppImage type-2 runtime; cargo xtask appimage-tools provisions it")?;
@@ -131,19 +183,11 @@ pub fn desktop(args: &[String]) -> Result<()> {
                 &icon,
                 &deb.join("usr/share/icons/hicolor/512x512/apps/sh.paseo.Paseo.png"),
             )?;
-            let libc = capture(command("getconf")?.arg("GNU_LIBC_VERSION"))?;
-            let libc = libc
-                .split_whitespace()
-                .nth(1)
-                .context("Cannot determine Linux glibc baseline")?;
-            ensure!(
-                regex::Regex::new(r"^\d+\.\d+$")?.is_match(libc),
-                "Invalid Linux glibc baseline"
-            );
+            let depends = debian_depends(&deb)?;
             text(
                 &deb.join("DEBIAN/control"),
                 format!(
-                    "Package: paseo-sessions\nVersion: {}\nArchitecture: {}\nMaintainer: Paseo contributors <hello@moboudra.com>\nSection: devel\nPriority: optional\nDepends: libgtk-3-0, libglib2.0-0, libstdc++6, libc6 (>= {libc}), libsecret-1-0, libayatana-appindicator3-1, xdg-utils\nDescription: Paseo Sessions native Flutter client\n",
+                    "Package: paseo-sessions\nVersion: {}\nArchitecture: {}\nMaintainer: Paseo contributors <hello@moboudra.com>\nSection: devel\nPriority: optional\nDepends: {depends}\nRecommends: {DEBIAN_RECOMMENDS}\nDescription: Paseo Sessions native client\n",
                     version()?,
                     if arch()? == "x64" { "amd64" } else { "arm64" }
                 ),
@@ -167,7 +211,7 @@ pub fn desktop(args: &[String]) -> Result<()> {
             signing::windows_runtime(&payload, false)?;
             signing::sign_windows(
                 &[
-                    payload.join("paseo_sessions.exe"),
+                    payload.join(gui::desktop_executable("windows")),
                     payload.join("runtime/paseo.exe"),
                 ],
                 stage.path(),
@@ -205,14 +249,14 @@ pub fn desktop(args: &[String]) -> Result<()> {
                 ))
                 .arg(format!(
                     "/DICON={}",
-                    support()?.join("assets/icon.ico").display()
+                    packaging()?.join("desktop/icon.ico").display()
                 ))
-                .arg(support()?.join("installer.nsi")))?;
+                .arg(packaging()?.join("desktop/installer.nsi")))?;
             signing::sign_windows(std::slice::from_ref(&installer), stage.path())?;
             artifacts.push(installer);
         }
         "macos" => {
-            let bundle = stage.path().join("Paseo Sessions.app");
+            let bundle = stage.path().join(gui::MACOS_BUNDLE);
             // ditto retains bundle/framework symlinks and macOS metadata.
             run(command("ditto")?.arg(&input).arg(&bundle))?;
             let plist = bundle.join("Contents/Info.plist");
@@ -222,7 +266,7 @@ pub fn desktop(args: &[String]) -> Result<()> {
                     .arg(&plist),
             )?;
             ensure!(
-                identifier == "sh.paseo.sessions.desktop",
+                identifier == gui::DESKTOP_APP_ID,
                 "Unexpected macOS bundle ID: {identifier}"
             );
             run(command("/usr/libexec/PlistBuddy")?

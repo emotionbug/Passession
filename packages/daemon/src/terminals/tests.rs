@@ -282,3 +282,255 @@ async fn update_without_claim_does_not_take_terminal_size() {
     assert_eq!(terminal.snapshot(false).await.unwrap()["cols"], 90);
     terminal.terminate().await.unwrap();
 }
+
+#[cfg(unix)]
+async fn script_workspace(config: Value) -> (tempfile::TempDir, Arc<AppState>, String) {
+    use crate::projects::store;
+
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("workspace");
+    let home = root.path().join("home");
+    tokio::fs::create_dir(&cwd).await.unwrap();
+    tokio::fs::write(cwd.join("paseo.json"), config.to_string())
+        .await
+        .unwrap();
+    let workspace_id = "wks_scripts".to_owned();
+    let store = store::Store::load(&home).await.unwrap();
+    store
+        .upsert_project(
+            store::create_project(json!({
+                "projectId":"prj_scripts", "rootPath":cwd, "kind":"non_git",
+                "displayName":"Scripts", "createdAt":"2026-01-01T00:00:00.000Z",
+                "updatedAt":"2026-01-01T00:00:00.000Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_workspace(
+            store::create_workspace(json!({
+                "workspaceId":workspace_id, "projectId":"prj_scripts", "cwd":cwd,
+                "kind":"directory", "displayName":"Scripts",
+                "createdAt":"2026-01-01T00:00:00.000Z",
+                "updatedAt":"2026-01-01T00:00:00.000Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let app = AppState::new(home, root.path().into(), std::env::current_exe().unwrap());
+    app.config.initialize().await.unwrap();
+    app.projects.initialize().await.unwrap();
+    // Deliberately use a shell without OSC completion integration.
+    app.terminals.register_workspace_env(
+        &workspace_id,
+        BTreeMap::from([
+            ("SHELL".into(), "/bin/sh".into()),
+            ("HOME".into(), root.path().to_string_lossy().into_owned()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]),
+    );
+    (root, app, workspace_id)
+}
+
+#[cfg(unix)]
+async fn subscribe_to_finished_script(service: &TerminalService, terminal_id: &str) {
+    use crate::transport::OutboundFrame;
+    use std::collections::HashSet;
+
+    let (context, mut frames) = RequestContext::attach(
+        "finished-log-reader".into(),
+        "finished-log-session".into(),
+        "finished-log-client".into(),
+        json!({"owned_subscriptions":true,"terminal_reflowable_snapshot":true}),
+        json!({"kind":"owner"}),
+        Arc::new(RwLock::new(HashSet::from(["workspace.read".to_owned()]))),
+        false,
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let message = json!({
+        "type":"subscribe_terminal_request", "terminalId":terminal_id,
+        "requestId":"finished-log"
+    });
+    let request = context.for_request(message.clone());
+    service.handle(&request, &message).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut restored = false;
+        let mut acknowledged = false;
+        loop {
+            match &frames.recv().await.unwrap().frame {
+                OutboundFrame::Text(text) => {
+                    let value: Value = serde_json::from_str(text).unwrap();
+                    let message = &value["message"];
+                    match message["type"].as_str() {
+                        Some("subscribe_terminal_response") => {
+                            assert!(message["payload"]["error"].is_null());
+                            acknowledged = true;
+                        }
+                        Some("terminal_stream_exit") => {
+                            assert!(acknowledged && restored);
+                            break;
+                        }
+                        Some("terminal_stream_error") => panic!("{message}"),
+                        _ => {}
+                    }
+                }
+                OutboundFrame::Binary(bytes) => {
+                    assert!(acknowledged);
+                    restored |= bytes[0] == 4;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    context.cancellation().cancel();
+    result.expect("finished script must restore logs and report stream exit");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_script_exit_tracks_process_and_retains_logs() {
+    let (root, app, workspace_id) = script_workspace(json!({})).await;
+    let cwd = root.path().join("workspace");
+    let mut previous_terminal: Option<String> = None;
+    for expected_code in [0, 7] {
+        let command = format!(
+            "test -t 0 && test -t 1 || exit 99\n\
+             printf '\\033]633;D;91\\007'\n\
+             printf 'READY\\n'\n\
+             while [ ! -f release-{expected_code} ]; do sleep 0.01; done\n\
+             i=1; while [ \"$i\" -le 240 ]; do printf 'script-log-%s\\n' \"$i\"; i=$((i+1)); done\n\
+             printf 'FINAL-{expected_code}\\n'\n{}",
+            if expected_code == 0 { "true" } else { "exit 7" },
+        );
+        tokio::fs::write(
+            cwd.join("paseo.json"),
+            json!({"scripts":{"build":{"command":command,"type":"script"}}}).to_string(),
+        )
+        .await
+        .unwrap();
+        let launched = app.terminals.script_start(&workspace_id, "build").await.unwrap();
+        let terminal_id = launched["terminalId"].as_str().unwrap();
+        let terminal = app.terminals.get(terminal_id).await.unwrap();
+        if let Some(previous) = previous_terminal.take() {
+            assert_ne!(terminal_id, previous);
+            assert!(app.terminals.get(&previous).await.is_err());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (lines, _) = terminal.capture(None, None, true).await.unwrap();
+                if lines.iter().any(|line| line.trim() == "READY") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let running = app.terminals.script_list(&workspace_id).await.unwrap();
+        assert_eq!(running[0]["lifecycle"], "running");
+        assert!(running[0]["exitCode"].is_null());
+        assert!(app.terminals.script_start(&workspace_id, "build").await.is_err());
+        tokio::fs::write(cwd.join(format!("release-{expected_code}")), b"")
+            .await
+            .unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let scripts = app.terminals.script_list(&workspace_id).await.unwrap();
+                if scripts[0]["lifecycle"] == "stopped" {
+                    break scripts[0].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("script must finish without interactive-shell completion hooks");
+        assert_eq!(stopped["exitCode"], expected_code);
+        assert_eq!(stopped["terminalId"], terminal_id);
+        assert_eq!(terminal.wait().await.unwrap(), expected_code);
+        assert!(app.terminals.list(Some(&workspace_id), None).await.is_empty());
+        let retained = app.terminals.get(terminal_id).await.unwrap();
+        let (lines, _) = retained.capture(None, None, true).await.unwrap();
+        for line in 1..=240 {
+            assert!(lines.iter().any(|text| text.trim() == format!("script-log-{line}")));
+        }
+        assert!(lines.iter().any(|line| line.trim() == format!("FINAL-{expected_code}")));
+        subscribe_to_finished_script(&app.terminals, terminal_id).await;
+        previous_terminal = Some(terminal_id.to_owned());
+    }
+    app.terminals.kill_workspace(&workspace_id).await.unwrap();
+    assert!(app.terminals.get(&previous_terminal.unwrap()).await.is_err());
+    app.terminals.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_service_exit_and_stop_release_routes_but_retain_logs() {
+    let (root, app, workspace_id) = script_workspace(json!({
+        "scripts":{"web":{
+            "type":"service",
+            "command":"printf 'SERVICE_LOG\\n'; while [ ! -f release ]; do sleep 0.01; done; exit 7"
+        }}
+    }))
+    .await;
+    for stop_requested in [false, true] {
+        let launched = app.terminals.script_start(&workspace_id, "web").await.unwrap();
+        let terminal_id = launched["terminalId"].as_str().unwrap();
+        let hostname = launched["hostname"].as_str().unwrap();
+        let terminal = app.terminals.get(terminal_id).await.unwrap();
+        assert_eq!(launched["lifecycle"], "running");
+        assert!(launched["health"].is_null());
+        assert!(app.terminals.scripts.route(hostname).is_some());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (lines, _) = terminal.capture(None, None, true).await.unwrap();
+                if lines.iter().any(|line| line.trim() == "SERVICE_LOG") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if stop_requested {
+            app.terminals.script_stop(&workspace_id, "web").await.unwrap();
+        } else {
+            tokio::fs::write(root.path().join("workspace/release"), b"")
+                .await
+                .unwrap();
+        }
+        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let scripts = app.terminals.script_list(&workspace_id).await.unwrap();
+                if scripts[0]["lifecycle"] == "stopped" {
+                    break scripts[0].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let code = terminal.wait().await.unwrap();
+        assert_eq!(stopped["exitCode"], code);
+        if !stop_requested {
+            assert_eq!(code, 7);
+            tokio::fs::remove_file(root.path().join("workspace/release"))
+                .await
+                .unwrap();
+        }
+        assert!(stopped["health"].is_null());
+        assert!(app.terminals.scripts.route(hostname).is_none());
+        let retained = app.terminals.get(terminal_id).await.unwrap();
+        let (lines, _) = retained.capture(None, None, true).await.unwrap();
+        assert!(lines.iter().any(|line| line.trim() == "SERVICE_LOG"));
+        subscribe_to_finished_script(&app.terminals, terminal_id).await;
+    }
+    let scripts = app.terminals.script_list(&workspace_id).await.unwrap();
+    let terminal_id = scripts[0]["terminalId"].as_str().unwrap();
+    app.terminals.remove_workspace_runtime(&workspace_id);
+    assert!(app.terminals.get(terminal_id).await.is_err());
+    app.terminals.shutdown().await.unwrap();
+}

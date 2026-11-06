@@ -1,8 +1,8 @@
 # Paseo Docker Image
 
 This directory builds the native Rust daemon/CLI and its runtime assets. The
-base image has no Node executable or bundled web UI; connect with a native
-Flutter client or the CLI, not a browser page at the daemon's HTTP root.
+base image has no Node executable or bundled web UI; connect with the native
+client or the CLI, not a browser page at the daemon's HTTP root.
 
 Build and run instructions are in [docs/docker.md](../docs/docker.md). Do not
 assume an existing registry `latest` image contains this implementation.

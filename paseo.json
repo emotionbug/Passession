@@ -17,7 +17,7 @@
       "command": "cargo xtask dev app android"
     },
     "typecheck": {
-      "command": "cargo xtask flutter analyze"
+      "command": "cargo check --locked -p paseo-gui-core -p paseo-gui-platform -p paseo-gui --all-targets"
     }
   }
 }

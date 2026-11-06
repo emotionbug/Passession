@@ -10,7 +10,7 @@ category: Plugins
 
 Start with a working [native plugin](index.md). This guide describes the **0.13.1 checkout's distribution contract**, not an announcement that Paseo, its SDK crates, a registry listing or your plugin has been published. There is no npm acquisition or JavaScript runtime fallback. Use native Git sources, Cargo crates or HTTPS release archives; registry records may select those sources.
 
-Only backend behavior is extensible: RPC, hooks, settings data, providers and usage. Flutter does not execute plugin screens, panels, themes or custom React timeline renderers. Document real behavior, supported operating systems/architectures, external agent dependencies and limitations.
+Only backend behavior is extensible: RPC, hooks, settings data, providers and usage. The native client does not execute plugin screens, panels, themes or custom React timeline renderers. Document real behavior, supported operating systems/architectures, external agent dependencies and limitations.
 
 ## Your listing page
 
@@ -40,7 +40,7 @@ Optional `name`/`description`, PNG `icon`, and `media` remain manifest listing f
 }
 ```
 
-This example is a prebuilt Unix layout; ship the actual binary at that path and choose `.exe` for Windows. Local paths are manifest-relative and contained within the plugin. `media` may also use HTTPS URLs. Provider/usage SVG metadata has its own [reference rules](reference.md#providers), separate from listing PNGs. Use sample data in screenshots and redact private information. Historical client screenshots are not evidence that custom UI works in Flutter.
+This example is a prebuilt Unix layout; ship the actual binary at that path and choose `.exe` for Windows. Local paths are manifest-relative and contained within the plugin. `media` may also use HTTPS URLs. Provider/usage SVG metadata has its own [reference rules](reference.md#providers), separate from listing PNGs. Use sample data in screenshots and redact private information. Historical client screenshots are not evidence that custom UI works in the native client.
 
 ## Share through GitHub or Git
 

@@ -1,6 +1,6 @@
 # Git forge integrations
 
-Forge operations are native daemon behavior. `packages/daemon/src/git/forge.rs` and `git/forge/` own service behavior; Flutter Git presentation is under `packages/flutter_app/lib/features/git`, with chat forge attachments under `features/chat/forge_attachments.dart`. Shared Rust wire types live in `packages/protocol` for the daemon and external Rust SDK.
+Forge operations are daemon behavior. `packages/daemon/src/git/forge.rs` and `git/forge/` own service behavior; Rust presentation belongs to `packages/gui/src/features/git` and forge attachments in `features/composer`. `packages/protocol` owns the shared wire metadata consumed by the daemon and Rust clients.
 
 Do not add a TypeScript server adapter or React client registry in a removed application tree. Keep forge-specific logic behind the current native boundary rather than branching by vendor throughout workspace orchestration.
 
@@ -10,7 +10,7 @@ Shared messages carry forge-neutral facts and open service-specific metadata. `f
 
 Unknown or schema-mismatched service-specific facts should render neutrally without rejecting an otherwise valid message. Check results preserve normalized status plus optional traits and raw native detail. Do not put one service's vocabulary into every consumer's normalized status enum.
 
-Preserve existing compatibility fields for supported peers and keep their serialization policy at one boundary. The Rust/Dart cutover does not authorize silently changing persisted IDs, URLs or request names. The protocol manifest and external SDK must stay aligned when adding a capability.
+Preserve existing compatibility fields for supported peers and keep their serialization policy at one boundary. Replacing the client renderer does not authorize changing persisted IDs, URLs or request names. The protocol schemas and external SDK must stay aligned when adding a capability.
 
 ## Native implementation
 
@@ -22,4 +22,4 @@ Client presentation owns labels, links, status and action availability. Open ext
 
 Exercise real read and mutation boundaries with authorized test repositories/credentials. Retain errors and service-native evidence; a fixture validates decoding, not authentication or remote effects. Use isolated daemon state and bounded queries so a large repository does not cause one process/request per visible row.
 
-Use the scoped Rust/Flutter checks in [testing](testing.md). `cargo xtask build-daemon` stages native runtime assets; `cargo check --locked -p paseo-client` checks the Rust SDK. Exercise affected Git/forge calls against an isolated daemon rather than treating compilation as interoperability evidence.
+Use scoped Rust checks from [testing](testing.md). `cargo xtask build-daemon` stages native runtime assets; `cargo check --locked -p paseo-client` checks the Rust SDK. Exercise affected Git/forge calls against an isolated daemon rather than treating compilation as interoperability evidence.

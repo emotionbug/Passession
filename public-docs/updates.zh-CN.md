@@ -10,19 +10,19 @@ nav: 更新
 
 ## 原生构建身份 {#native-build-identity}
 
-产品客户端使用 Flutter，目标为 Linux、macOS、Windows、Android 和 iOS。桌面/服务器运行 Rust daemon 与 Rust `paseo` CLI；移动客户端只连接远程 daemon。
+产品客户端为原生 Rust 应用，目标为 Linux、macOS、Windows、Android 和 iOS。桌面/服务器运行 Rust daemon 与 Rust `paseo` CLI；移动客户端只连接远程 daemon。
 
-本地源码构建需要 Rust/Cargo、Flutter 及目标平台的原生工具：
+本地源码构建需要 Rust/Cargo 及目标平台的原生工具：
 
 ```bash
 cargo fetch --locked
 cargo xtask build-daemon
 # 优化的本地构建，不代表发布来源身份：
 cargo xtask build-daemon --release
-cargo xtask build-flutter linux
+cargo xtask build-gui linux
 ```
 
-在匹配的桌面宿主系统选择 `linux`、`macos` 或 `windows`。Flutter 产物位于 `artifacts/flutter/`。daemon 位于 `target/debug/paseo` 或 `target/release/paseo`（Windows 为 `paseo.exe`），设置 `CARGO_TARGET_DIR` 时以其为根目录。请保留可执行文件旁生成的全部资源。
+在匹配的桌面宿主系统选择 `linux`、`macos` 或 `windows`。客户端产物位于 `artifacts/native/`。daemon 位于 `target/debug/paseo` 或 `target/release/paseo`（Windows 为 `paseo.exe`），设置 `CARGO_TARGET_DIR` 时以其为根目录。请保留可执行文件旁生成的全部资源。
 
 ## 更新本地安装 {#updating-a-local-installation}
 
@@ -34,11 +34,11 @@ cargo xtask build-flutter linux
 
 稳定版和测试版是发布身份，不证明此次迁移已经发布。优化本地二进制文件不等于启用官方更新来源身份。原生发布需要验证源代码身份、通道/仓库元数据、完整运行时资源、适用的签名以及明确发布授权。
 
-本地 Flutter 构建不应沿用旧桌面应用更新界面的操作说明。当前更新清单、灰度控制和打包要求见仓库[发布指南](../docs/release.md)。
+本地构建不应沿用旧桌面应用更新界面的操作说明。Rust 客户端取代 Flutter 客户端后，已安装的客户端仍通过同一桌面更新源发现新版本。当前更新清单、灰度控制和打包要求见仓库[发布指南](../docs/release.md)。
 
 ## 移动端与验证边界 {#mobile-and-verification-boundaries}
 
-`cargo xtask build-flutter android` 或 `cargo xtask build-flutter android --arch arm64` 构建 Android 远程客户端。没有发布签名凭据时，产物明确标记为调试签名。`cargo xtask build-flutter ios` 需要 macOS/Xcode；没有 provisioning/export 配置时输出未签名的设备应用归档。这些产物不自动具备上架条件。
+`cargo xtask build-gui android` 或 `cargo xtask build-gui android --arch arm64` 构建 Android 远程客户端。没有发布签名凭据时，产物明确标记为调试签名。`cargo xtask build-gui ios` 需要 macOS/Xcode；没有描述文件和签名身份时输出未签名的设备应用归档。这些产物不自动具备上架条件。
 
 实际执行记录与平台限制见[测试证据](../docs/testing.md)。历史编译结果或 CI 工作流定义不能证明新版本已安装或在设备上运行。
 

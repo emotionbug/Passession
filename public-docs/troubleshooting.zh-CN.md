@@ -8,9 +8,9 @@ nav: 常见问题
 
 ## 原生客户端或 daemon 无法启动 {#native-client-or-daemon-will-not-start}
 
-0.13.0 Rust/Flutter 迁移尚未发布。旧 Electron AppImage、npm CLI 包或商店下载不能证明包含原生运行时。请按[更新](/docs/updates)从迁移检出构建。
+此检出构建 Rust/Makepad 客户端。旧 Flutter、Electron 二进制文件或商店下载不能验证它。请按[更新](/docs/updates)从检出构建；源码构建不代表已发布或已完成发布签名。
 
-保留完整 Flutter 包和生成的 Rust 运行时资源。只复制 `paseo` 会遗漏所需库和技能。查看启动输出和 `paseo daemon status`；前台诊断使用 `paseo daemon run`。直接运行 `paseo` 打开聊天，不负责 daemon 设置或启动。
+保留完整客户端包和生成的 Rust 运行时资源。只复制 `paseo` 会遗漏所需库和技能。查看启动输出和 `paseo daemon status`；前台诊断使用 `paseo daemon run`。直接运行 `paseo` 打开聊天，不负责 daemon 设置或启动。
 
 开发环境默认使用 `.dev/paseo-home` 和端口 `6768`，普通运行使用 `~/.paseo` 和 `6767`。诊断前用 `--home` 或 `--host` 选择正确实例。移动应用只连接远程主机，不能启动本地 daemon。
 
@@ -65,14 +65,14 @@ paseo --host <host:port> provider diagnostic <provider> --json
 
 操作系统启动器、服务管理器、容器或远程主机可能提供不同于终端的环境。这会影响 Agent Provider、脚本/设置任务 PTY 和其他主机工具。
 
-请查看受影响 daemon 的 Provider 诊断，不要假定 Flutter 应用会导入交互式 shell 配置。`paseo daemon run` 使用终端启动环境；托管的 `paseo daemon start` 会有意移除 daemon 设置覆盖项，应将这些设置写入 `config.json`。
+请查看受影响 daemon 的 Provider 诊断，不要假定桌面应用会导入交互式 shell 配置。`paseo daemon run` 使用终端启动环境；托管的 `paseo daemon start` 会有意移除 daemon 设置覆盖项，应将这些设置写入 `config.json`。
 
 确保 Provider 二进制文件位于 daemon 启动时的 `PATH` 中，或配置绝对路径 `command`。修改启动环境后停止并重新启动 supervisor；只重启 worker 会保留原环境。原生插件可执行文件必须匹配 daemon 主机的操作系统和架构，并位于插件目录内。JavaScript/TypeScript 插件需要移植，不能通过设置 Node 运行时启用。
 
 ## 查看日志 {#reading-the-logs}
 
 - **daemon**：`~/.paseo/daemon.log`，自定义主目录则为 `$PASEO_HOME/daemon.log`。
-- **Flutter 桌面**：使用原生设置诊断中的 **Application logs** 和 **Daemon logs**。应用日志为支持目录中的每窗口 `desktop-<windowId>.log`；以返回的 `logPath` 为准，不要使用旧 Electron 日志路径。
+- **桌面客户端**：使用原生设置诊断中的 **Application logs** 和 **Daemon logs**。Rust 桌面进程的所有窗口共享支持目录中的 `desktop-main.log`；以返回的 `logPath` 为准，不要假定使用每窗口日志或旧 Electron 日志路径。
 - **脚本/设置任务**：查看只读日志。原生客户端没有交互式终端 UI。
 
 ## 我修改了 config.json，但什么都没发生 {#i-changed-configjson-but-nothing-happened}
@@ -91,5 +91,5 @@ Paseo 会应用可以在运行时安全生效的设置，并列出需要重启�
 
 - [自定义 Provider](/docs/custom-providers)：端点、多个配置、二进制文件、ACP Agent。
 - [配置](/docs/configuration)：`config.json`、环境变量、日志。
-- [原生桌面宿主](https://github.com/getpaseo/paseo/tree/main/packages/flutter_app/lib/platform/desktop)：Flutter 宿主启动与诊断实现。
+- [原生桌面宿主](https://github.com/getpaseo/paseo/tree/main/packages/gui-platform/src/desktop)：桌面宿主启动与诊断实现。
 - [报告问题](https://github.com/getpaseo/paseo/issues)。

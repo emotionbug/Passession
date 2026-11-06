@@ -620,13 +620,18 @@ impl TransportService {
                             if let Err(error) = validate_control_message(&message) { context.protocol_failure(&message,"invalid_message",&error.to_string()).await?; continue; }
                             if !permissions::allows_inbound(&message, |p| context.allows(p)) { context.protocol_failure(&message,if kind.starts_with("hosts.") {"permission_denied"} else {"access_denied"},&format!("Session is not authorized for {kind}")).await?; continue; }
                             if requests.len() >= 128 { context.protocol_failure(&message,"handler_error","Too many active requests").await?; continue; }
+                            let starts_upload = kind == "file.upload.request";
                             let request = context.for_request(message); let weak = self.app.clone();
-                            requests.spawn(async move {
+                            let dispatch = async move {
                                 let result = if !request.is_live() || !permissions::allows_inbound(request.request().unwrap(), |p| request.allows(p)) { Err(anyhow!("Request source authority was revoked")) }
                                     else if let Some(app) = weak.upgrade() { app.dispatch(&request,request.request().unwrap()).await } else { Err(anyhow!("Daemon is shutting down")) };
                                 if let Err(error) = result { let _ = request.protocol_failure(request.request().unwrap(),"handler_error",&error.to_string()).await; }
                                 request.finish_request();
-                            });
+                            };
+                            // Upload binary frames can already be buffered: establish their
+                            // source ownership before reading them, without serializing
+                            // unrelated long-running requests.
+                            if starts_upload { dispatch.await; } else { requests.spawn(dispatch); }
                         }
                         OutboundFrame::Binary(bytes) => {
                             if let Err(error) = context.validate_binary(&bytes,true) { send_close(&outbound,1008,&error.to_string()).await; break; }

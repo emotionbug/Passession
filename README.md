@@ -1,8 +1,8 @@
 # Paseo Sessions
 
-Paseo Sessions is a native environment for running and reviewing coding-agent work. The client is Flutter on **Linux, macOS, Windows, Android, and iOS**. The daemon and `paseo` CLI are Rust. Desktop clients can manage a local daemon; Android and iOS connect to a daemon on another machine.
+Paseo Sessions is a native environment for running and reviewing coding-agent work. The client is native Rust (Makepad) on **Linux, macOS, Windows, Android, and iOS**. The daemon and `paseo` CLI are Rust. Desktop clients can manage a local daemon; Android and iOS connect to a daemon on another machine.
 
-This checkout is version **0.13.1**. See [release requirements](docs/release.md) for native artifacts, signing and distribution.
+This checkout is version **0.13.5**. See [release requirements](docs/release.md) for native artifacts, signing and distribution.
 
 ## Work across hosts
 
@@ -27,7 +27,7 @@ Built-in provider and usage integrations execute in Rust. Backend plugins use na
 
 ## Build and run from this checkout
 
-Install Rust/Cargo, the Flutter SDK and the native toolchain for your target. See [development](docs/development.md) for prerequisites and isolated development state.
+Install Rust/Cargo and the native toolchain for your target. See [development](docs/development.md) for prerequisites and isolated development state.
 
 ```sh
 cargo fetch --locked
@@ -48,14 +48,14 @@ Both development commands target the checkout's `.dev/paseo-home` and port `6768
 Build a client on a suitable host:
 
 ```sh
-cargo xtask build-flutter linux
-cargo xtask build-flutter macos
-cargo xtask build-flutter windows
-cargo xtask build-flutter android --arch arm64
-cargo xtask build-flutter ios
+cargo xtask build-gui linux
+cargo xtask build-gui macos
+cargo xtask build-gui windows
+cargo xtask build-gui android --arch arm64
+cargo xtask build-gui ios
 ```
 
-Desktop builds require their target OS; iOS requires macOS/Xcode. Android/iOS builds contain no daemon. Artifacts and build descriptors are written under `artifacts/flutter/`. Android uses **Paseo Sessions**, package `sh.paseo.sessions`; unsigned/debug-signed output is not a store-ready release. See [Android](docs/android.md) and [release](docs/release.md) for signing and packaging.
+Desktop builds require their target OS; iOS requires macOS/Xcode. Android/iOS builds contain no daemon. Artifacts and build descriptors are written under `artifacts/native/`. Android uses **Paseo Sessions**, package `sh.paseo.sessions`; unsigned/debug-signed output is not a store-ready release. See [Android](docs/android.md) and [release](docs/release.md) for signing and packaging.
 
 For a headless host, the native build produces `target/debug/paseo` (`paseo.exe` on Windows), or the corresponding directory under `CARGO_TARGET_DIR`. Keep its generated runtime assets alongside it:
 
@@ -84,16 +84,16 @@ paseo import --provider pi <native-session-id>
 paseo run --host workstation.local:6767 --cwd /workspace --provider codex "review the diff"
 ```
 
-The Rust `paseo-client` SDK lives in `packages/client`. Shared wire types and relay cryptography live in `packages/protocol` (`paseo-protocol`); the Rust daemon and Dart client retain the same wire contract. The former TypeScript SDK is replaced rather than wrapped.
+The Rust `paseo-client` SDK lives in `packages/client`. Shared wire types and relay cryptography live in `packages/protocol` (`paseo-protocol`); the daemon and the native client use the same crates. The former TypeScript SDK is replaced rather than wrapped.
 
 ## Development map
 
 | Area                                                          | Source                                 |
 | ------------------------------------------------------------- | -------------------------------------- |
 | Daemon, CLI, providers, storage, supervisor, desktop-host IPC | `packages/daemon`                      |
-| Five-platform native client                                   | `packages/flutter_app`                 |
-| Desktop packaging and runtime assets                          | `packages/flutter_desktop_host`        |
-| Native audio integration                                      | `packages/flutter_audio`               |
+| Five-platform native client                                   | `packages/gui`, `packages/gui-core`    |
+| Desktop and mobile OS integration                             | `packages/gui-platform`                |
+| Packaging resources and installers                            | `packaging`                            |
 | Rust client SDK and shared protocol                           | `packages/client`, `packages/protocol` |
 | Native plugin SDK                                             | `packages/plugin`                      |
 | Rust relay and syntax highlighting                            | `packages/relay`, `packages/highlight` |
@@ -101,7 +101,7 @@ The Rust `paseo-client` SDK lives in `packages/client`. Shared wire types and re
 
 Read [architecture](docs/architecture.md), [development](docs/development.md), [testing](docs/testing.md), and [release](docs/release.md) before changing runtime boundaries.
 
-Linux has actual native daemon/client and desktop-host lifecycle execution coverage. Default CI runs tests in one Linux environment; manually available cross-platform build definitions are not evidence that Windows, macOS, Android, or iOS have been executed in this migration. The current evidence and outstanding checks are recorded in [testing](docs/testing.md).
+Linux daemon and desktop-host lifecycle execution is recorded; the native Rust client's own execution evidence is tracked separately. Default CI runs tests in one Linux environment; manually available cross-platform build definitions are not evidence that Windows, macOS, Android, or iOS have been executed in this migration. The current evidence and outstanding checks are recorded in [testing](docs/testing.md).
 
 ## License and distribution
 

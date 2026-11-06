@@ -13,7 +13,7 @@ arborium = { version = "=2.18.2", default-features = false, features = [
     "lang-svelte", "lang-vue", "lang-xml", "lang-java", "lang-python",
     "lang-go", "lang-php", "lang-yaml", "lang-rust", "lang-swift",
     "lang-dart", "lang-c-sharp", "lang-nix", "lang-elixir",
-    "lang-regex", "lang-jsdoc",
+    "lang-regex", "lang-jsdoc", "lang-bash",
 ] }
 tree-sitter-astro-next = "=0.1.1"
 tree-sitter-md = { version = "=0.5.4", default-features = false }

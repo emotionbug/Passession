@@ -32,7 +32,7 @@ pub(super) fn names(id: &Identity, runtime: &str) -> Result<Vec<String>> {
     let t = target(&id.target)?;
     ensure!(t.desktop, "Mobile targets have no desktop update feed");
     let (stem, extensions) = match runtime {
-        "rust" => (
+        DAEMON => (
             "Paseo-Daemon",
             if t.platform == "windows" {
                 vec!["zip"]
@@ -40,8 +40,8 @@ pub(super) fn names(id: &Identity, runtime: &str) -> Result<Vec<String>> {
                 vec!["tar.gz"]
             },
         ),
-        "flutter" => (
-            "Paseo-Sessions-Flutter",
+        CLIENT => (
+            "Paseo-Sessions",
             match t.platform {
                 "linux" => vec!["AppImage", "deb"],
                 "macos" => vec!["zip"],
@@ -58,11 +58,7 @@ pub(super) fn names(id: &Identity, runtime: &str) -> Result<Vec<String>> {
 pub(super) fn feed(id: &Identity, runtime: &str) -> String {
     format!(
         "{}-{}-{}.json",
-        if runtime == "rust" {
-            "daemon"
-        } else {
-            "flutter"
-        },
+        if runtime == DAEMON { "daemon" } else { CLIENT },
         id.channel,
         id.target
     )
@@ -74,13 +70,13 @@ pub(super) fn validate_manifest(
 ) -> Result<Vec<Value>> {
     let t = target(&id.target)?;
     ensure!(
-        t.desktop && ["rust", "flutter"].contains(&runtime),
+        t.desktop && [DAEMON, CLIENT].contains(&runtime),
         "Unsupported feed target/runtime"
     );
-    let app_id = if runtime == "rust" {
+    let app_id = if runtime == DAEMON {
         "sh.paseo.daemon"
     } else {
-        "sh.paseo.sessions.desktop"
+        CLIENT_APP_ID
     };
     for (key, value) in [
         ("runtime", runtime),
@@ -101,7 +97,7 @@ pub(super) fn validate_manifest(
         manifest["schemaVersion"] == 1,
         "Unsupported manifest schema"
     );
-    if runtime == "flutter" {
+    if runtime == CLIENT {
         chrono::DateTime::parse_from_rfc3339(
             manifest["releaseDate"]
                 .as_str()
@@ -164,7 +160,7 @@ pub(super) fn validate_manifest(
     Ok(entries)
 }
 fn validate_desktop(dir: &Path, id: &Identity) -> Result<()> {
-    for runtime in ["flutter", "rust"] {
+    for runtime in [CLIENT, DAEMON] {
         let manifest = common::read_json(&dir.join(feed(id, runtime)))?;
         for entry in validate_manifest(&manifest, id, runtime)? {
             let path = dir.join(entry["name"].as_str().unwrap());
@@ -193,7 +189,7 @@ fn inventory(dir: &Path, id: &Identity) -> Result<Vec<String>> {
             "Package metadata identity mismatch"
         );
         let actual: Vec<String> = serde_json::from_value(metadata["artifacts"].clone())?;
-        let expected = names(id, "flutter")?;
+        let expected = names(id, CLIENT)?;
         ensure!(
             actual.len() == expected.len()
                 && actual.iter().collect::<BTreeSet<_>>()
@@ -203,12 +199,12 @@ fn inventory(dir: &Path, id: &Identity) -> Result<Vec<String>> {
         validate_desktop(dir, id)?;
         let mut result = expected;
         result.push(metadata_name);
-        result.push(feed(id, "flutter"));
-        result.extend(names(id, "rust")?);
-        result.push(feed(id, "rust"));
+        result.push(feed(id, CLIENT));
+        result.extend(names(id, DAEMON)?);
+        result.push(feed(id, DAEMON));
         Ok(result)
     } else {
-        let stem = format!("Paseo-Sessions-Flutter-{}-{}", id.version, id.target);
+        let stem = format!("Paseo-Sessions-{}-{}", id.version, id.target);
         let allowed = if t.platform == "android" {
             vec![format!("{stem}.apk"), format!("{stem}-debug-signed.apk")]
         } else {
@@ -344,7 +340,7 @@ pub(super) fn manifests(dir: &Path) -> Result<()> {
                 && metadata["arch"] == t.arch,
             "Package metadata mismatch"
         );
-        let expected = names(&id, "flutter")?;
+        let expected = names(&id, CLIENT)?;
         let actual: Vec<String> = serde_json::from_value(metadata["artifacts"].clone())?;
         ensure!(
             expected.len() == actual.len()
@@ -359,14 +355,14 @@ pub(super) fn manifests(dir: &Path) -> Result<()> {
             check_header(&path, &format)?;
             artifacts.push(json!({"name":name,"format":format,"size":fs::metadata(&path)?.len(),"sha512":digest512(&path)?}));
         }
-        let mut manifest = json!({"schemaVersion":1,"runtime":"flutter","appId":"sh.paseo.sessions.desktop","channel":channel,"platform":t.platform,"arch":t.arch,"version":v,"releaseDate":date.to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"rolloutHours":hours(&var("ROLLOUT_HOURS","36"))?,"releaseNotes":notes,"sourceSha":sha});
+        let mut manifest = json!({"schemaVersion":1,"runtime":CLIENT,"appId":CLIENT_APP_ID,"channel":channel,"platform":t.platform,"arch":t.arch,"version":v,"releaseDate":date.to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"rolloutHours":hours(&var("ROLLOUT_HOURS","36"))?,"releaseNotes":notes,"sourceSha":sha});
         if artifacts.len() == 1 {
             manifest["artifact"] = artifacts.remove(0);
         } else {
             manifest["artifacts"] = json!(artifacts);
         }
-        validate_manifest(&manifest, &id, "flutter")?;
-        common::write_json(&dir.join(feed(&id, "flutter")), &manifest)?;
+        validate_manifest(&manifest, &id, CLIENT)?;
+        common::write_json(&dir.join(feed(&id, CLIENT)), &manifest)?;
         generated += 1;
     }
     ensure!(generated > 0, "No desktop package metadata found");
@@ -395,7 +391,7 @@ pub(super) fn restamp(mut manifest: Value, amount: f64) -> Result<Value> {
         ),
     };
     ensure!(valid_sha(&id.sha), "Invalid source SHA");
-    validate_manifest(&manifest, &id, "flutter")?;
+    validate_manifest(&manifest, &id, CLIENT)?;
     manifest["rolloutHours"] = json!(amount);
     Ok(manifest)
 }
@@ -425,13 +421,15 @@ mod tests {
             target: "windows-x64".into(),
         }
     }
+    /// Installed clients accept only this exact feed identity.
     fn manifest() -> Value {
-        json!({"schemaVersion":1,"runtime":"flutter","appId":"sh.paseo.sessions.desktop","platform":"windows","arch":"x64","version":"0.13.1","channel":"stable","sourceSha":"a".repeat(40),"releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36,"artifact":{"name":"Paseo-Sessions-Flutter-0.13.1-windows-x64.exe","size":42,"format":"exe","sha512":STANDARD.encode([0_u8;64])}})
+        json!({"schemaVersion":1,"runtime":"flutter","appId":"sh.paseo.sessions.desktop","platform":"windows","arch":"x64","version":"0.13.1","channel":"stable","sourceSha":"a".repeat(40),"releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36,"artifact":{"name":"Paseo-Sessions-0.13.1-windows-x64.exe","size":42,"format":"exe","sha512":STANDARD.encode([0_u8;64])}})
     }
     #[test]
     fn manifest_identity_and_hashes_are_strict() {
         let good = manifest();
-        assert!(validate_manifest(&good, &identity(), "flutter").is_ok());
+        assert!(validate_manifest(&good, &identity(), CLIENT).is_ok());
+        assert_eq!(feed(&identity(), CLIENT), "flutter-stable-windows-x64.json");
         for (field, value) in [
             ("sourceSha", json!("b".repeat(40))),
             ("version", json!("0.13.2")),
@@ -440,14 +438,14 @@ mod tests {
         ] {
             let mut bad = good.clone();
             bad[field] = value;
-            assert!(validate_manifest(&bad, &identity(), "flutter").is_err());
+            assert!(validate_manifest(&bad, &identity(), CLIENT).is_err());
         }
         let mut bad = good.clone();
         bad["artifact"]["sha512"] = json!("invalid");
-        assert!(validate_manifest(&bad, &identity(), "flutter").is_err());
+        assert!(validate_manifest(&bad, &identity(), CLIENT).is_err());
         let mut bad = good;
         bad["artifacts"] = json!([]);
-        assert!(validate_manifest(&bad, &identity(), "flutter").is_err());
+        assert!(validate_manifest(&bad, &identity(), CLIENT).is_err());
     }
     #[test]
     fn stamping_preserves_identity_date_and_hashes() {
@@ -470,7 +468,7 @@ mod tests {
         id.target = "android-universal".into();
         let file = dir
             .path()
-            .join("Paseo-Sessions-Flutter-0.13.1-android-universal-debug-signed.apk");
+            .join("Paseo-Sessions-0.13.1-android-universal-debug-signed.apk");
         fs::write(&file, b"actual APK bytes").unwrap();
         record(dir.path(), &id).unwrap();
         verify(dir.path(), &id).unwrap();
@@ -510,7 +508,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut id = identity();
             id.target = target.into();
-            let stem = format!("Paseo-Sessions-Flutter-{}-{target}", id.version);
+            let stem = format!("Paseo-Sessions-{}-{target}", id.version);
             for suffix in suffixes {
                 let name = format!("{stem}{suffix}");
                 fs::write(dir.path().join(&name), b"mobile artifact").unwrap();

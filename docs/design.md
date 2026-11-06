@@ -1,10 +1,10 @@
 # Native design
 
-Paseo is minimal, spacious and quiet. The agent workflow is primary; supporting tools help users understand, direct and review work. The native client is Flutter, with theme ownership in `packages/flutter_app/lib/ui/theme.dart`, shared widgets in `ui/common.dart`, and feature-specific UI under `features/`.
+Paseo is minimal, spacious and quiet. The agent workflow is primary; supporting tools help users understand, direct and review work. The native client uses Makepad Rust widgets in `packages/gui`. `src/theme.rs` owns palettes and typography; `src/theme_makepad.rs` supplies the stock-widget theme and font chains; `src/common` owns shared controls and painting. Feature presentation stays under `src/features`.
 
 ## Reuse and hierarchy
 
-Read the existing native widget before adding another primitive. Reuse semantic colors, typography, spacing and interaction states. Do not copy retired React Native components, CSS tokens or Unistyles APIs into a parallel styling system. Hierarchy should be legible through weight, contrast and grouping, not a different arbitrary font size for every row.
+Read the existing native widget before adding another primitive. Reuse semantic colors, typography, spacing and interaction states. Paseo primitives read the runtime palette; stock DSL widgets need the theme's change-driven application path rather than fixed light/dark literals. See [native styling](unistyles.md). Hierarchy should be legible through weight, contrast and grouping, not a different arbitrary font size for every row.
 
 Use sentence case and concrete action names. A destructive consequence needs an explicit confirmation at the operation boundary; red styling alone is not consent. Errors should say what failed and offer a relevant retry without replacing the user's work.
 
@@ -28,4 +28,4 @@ Loading, empty, unavailable, failed, pending and successful states are separate.
 
 ## Verification
 
-Review actual native screenshots and interaction, not mockups or a browser replica. Check light/dark theme, compact/wide sizes, keyboard, long content, loading/error states and slow networks. Measure Flutter frames and daemon work separately. Linux screenshots and smoke evidence are recorded in [testing](testing.md); unexecuted platforms remain unverified.
+Review actual native screenshots and interaction, not mockups or a browser replica. Check light/dark theme, compact/wide sizes, keyboard, long content, loading/error states and slow networks. Measure core event processing, Makepad layout/draw work and daemon work separately. [Testing](testing.md) distinguishes current Rust evidence from historical client runs; unexecuted platforms remain unverified.

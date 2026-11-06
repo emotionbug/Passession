@@ -10,9 +10,9 @@ category: Troubleshooting
 
 ## Native client or daemon will not start
 
-The 0.13.0 Rust/Flutter cutover is unpublished. Do not use an older Electron AppImage, npm CLI package, or store download as evidence of this native runtime. Build from the migration checkout as described in [Updates](/docs/updates).
+This checkout builds the Rust/Makepad client. Older Flutter or Electron binaries and store downloads do not verify it. Build from the checkout as described in [Updates](/docs/updates); source builds do not establish publication or signed-release status.
 
-Keep the complete Flutter bundle and generated Rust runtime assets together. Copying only `paseo` omits required libraries and skills. Inspect startup output and `paseo daemon status`; for foreground diagnostics use `paseo daemon run`. Bare `paseo` opens chat, not daemon setup or startup.
+Keep the complete client bundle and generated Rust runtime assets together. Copying only `paseo` omits required libraries and skills. Inspect startup output and `paseo daemon status`; for foreground diagnostics use `paseo daemon run`. Bare `paseo` opens chat, not daemon setup or startup.
 
 Development defaults to `.dev/paseo-home` and port `6768`; normal operation uses `~/.paseo` and `6767`. Select the intended `--home` or `--host` before diagnosing a different instance. Mobile apps are remote clients and cannot start a local daemon.
 
@@ -67,14 +67,14 @@ For alternative endpoints, multiple profiles, custom binaries, and ACP agents, s
 
 An OS launcher, service manager, container, or remote host can supply a different environment from your terminal. This affects agent providers and script/setup PTYs as well as other host tools.
 
-Use the affected daemon's provider diagnostic rather than assuming the Flutter app imports your interactive shell configuration. Start a foreground instance with `paseo daemon run` to use your terminal's launch environment. Managed `paseo daemon start` intentionally removes daemon-setting overrides; save those settings in `config.json`.
+Use the affected daemon's provider diagnostic rather than assuming the desktop app imports your interactive shell configuration. Start a foreground instance with `paseo daemon run` to use your terminal's launch environment. Managed `paseo daemon start` intentionally removes daemon-setting overrides; save those settings in `config.json`.
 
 Ensure provider binaries are on the daemon's launch `PATH`, or configure an absolute provider `command`. If you change the launch environment, stop and relaunch the owning supervisor; a worker restart retains its original environment. Native plugin executables must match the daemon host's OS and architecture and stay within their plugin directory. JavaScript/TypeScript plugins need porting, not a Node runtime setting.
 
 ## Reading the logs
 
 - **Daemon** — `~/.paseo/daemon.log` (`$PASEO_HOME/daemon.log` for a custom home).
-- **Flutter desktop** — use the native settings diagnostics' **Application logs** and **Daemon logs** actions. Application logs are per-window `desktop-<windowId>.log` files in the app support directory; use the returned `logPath` rather than old Electron log locations.
+- **Desktop client** — use the native settings diagnostics' **Application logs** and **Daemon logs** actions. The Rust desktop process shares `desktop-main.log` in the app support directory across its windows; use the returned `logPath` rather than an assumed per-window or old Electron log location.
 - **Script/setup tasks** — inspect their read-only logs. The native client has no interactive terminal UI.
 
 ## I changed config.json but nothing happened
@@ -93,5 +93,5 @@ Run `paseo daemon restart` only when reload requests it. In the app, open **Sett
 
 - [Custom providers](/docs/custom-providers) — endpoints, profiles, binaries, ACP agents.
 - [Configuration](/docs/configuration) — `config.json`, environment variables, logging.
-- [Native desktop host](https://github.com/getpaseo/paseo/tree/main/packages/flutter_app/lib/platform/desktop) — Flutter host launch and diagnostics implementation.
+- [Native desktop host](https://github.com/getpaseo/paseo/tree/main/packages/gui-platform/src/desktop) — desktop host launch and diagnostics implementation.
 - [Report an issue](https://github.com/getpaseo/paseo/issues).

@@ -29,11 +29,6 @@ on:
         description: Optional exact commit containing corrected Cargo license notices only; application source stays at the selected tag
         type: string
         default: ""
-      macos_arm64_runner:
-        description: Hosted Apple Silicon image with Swift 6.1 or newer for Firebase packages
-        type: choice
-        options: [macos-26, macos-15]
-        default: macos-26
       publish:
         description: Publish artifacts to GitHub Releases
         type: choice
@@ -60,7 +55,6 @@ env:
   RECOVERY_RUN_ID: ${{ github.event.inputs.recovery_run_id || '' }}
   ROLLOUT_HOURS: ${{ github.event.inputs.rollout_hours || '36' }}
   NOTICE_SUPPLEMENT_SHA: ${{ github.event.inputs.notice_supplement_sha || '' }}
-  FLUTTER_VERSION: "3.47.5"
 
 jobs:
   source:
@@ -111,7 +105,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.source.outputs.matrix) }}
     name: native (${{ matrix.platform }}-${{ matrix.arch }})
-    runs-on: ${{ matrix.platform == 'macos' && matrix.arch == 'arm64' && inputs.macos_arm64_runner || matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     env:
       SOURCE_SHA: ${{ needs.source.outputs.sha }}
       SOURCE_DATE_EPOCH: ${{ needs.source.outputs.epoch }}
@@ -135,39 +129,29 @@ jobs:
             exit 1
           }
           git fetch --no-tags --depth=1 origin "$NOTICE_SUPPLEMENT_SHA"
-          notice_path=packages/flutter_desktop_host/packaging/cargo-notice-supplements.json
+          notice_path=packaging/cargo-notice-supplements.json
           git show "$NOTICE_SUPPLEMENT_SHA:$notice_path" > "$RUNNER_TEMP/paseo-cargo-notices.json"
           cp "$RUNNER_TEMP/paseo-cargo-notices.json" "$notice_path"
           printf 'Application source: `%s`\n\nPackaging notices: `%s`\n' \
             "$SOURCE_SHA" "$NOTICE_SUPPLEMENT_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          targets: ${{ matrix.platform == 'android' && 'aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android' || matrix.platform == 'ios' && 'aarch64-apple-ios' || '' }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}
           cache-on-failure: true
-      - uses: ./.github/actions/setup-flutter
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: stable
-          cache: true
       - uses: actions/cache@v4
         with:
           path: |
-            ~/.pub-cache
-            ~/.cache/paseo-flutter-packaging
-          key: flutter-native-${{ runner.os }}-${{ matrix.arch }}-${{ env.FLUTTER_VERSION }}-${{ hashFiles('packages/flutter_app/pubspec.lock', 'xtask/src/**') }}
-      - name: Prepare SwiftPM plugin staging directories
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          # Flutter pub get stages both Apple platforms before a target build.
-          # Its plugin copier does not create parents required by macOS 14 rsync.
-          mkdir -p packages/flutter_app/build/{ios,macos}/SourcePackages
+            ~/.cache/paseo-packaging
+            ~/.gradle/caches
+          key: native-packaging-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('xtask/src/**', 'packaging/android/**/*.kts') }}
       - name: Install Linux native build prerequisites
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libx11-dev libxi-dev liblzma-dev libsecret-1-dev libayatana-appindicator3-dev libasound2-dev libpulse-dev libsm-dev dpkg-dev ffmpeg pulseaudio-utils xdg-utils patchelf
+          sudo apt-get install -y pkg-config libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev libxss1 libsm6 libice6 dpkg-dev xdg-utils patchelf
       - name: Provision pinned AppImage tools
         if: matrix.platform == 'linux'
         run: cargo xtask appimage-tools
@@ -185,9 +169,7 @@ jobs:
       - uses: android-actions/setup-android@v3
         if: matrix.platform == 'android'
         with:
-          packages: platform-tools
-      - uses: gradle/actions/setup-gradle@v4
-        if: matrix.platform == 'android'
+          packages: platform-tools ndk;28.2.13676358
       - name: Stage optional Android release signing key
         if: matrix.platform == 'android'
         shell: bash
@@ -198,32 +180,18 @@ jobs:
             printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/paseo-release.keystore"
             echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/paseo-release.keystore" >> "$GITHUB_ENV"
           fi
-      - name: Configure host-native macOS release architecture
-        if: matrix.platform == 'macos'
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$TARGET_ID" in
-            macos-x64) architecture=x86_64; excluded=arm64 ;;
-            macos-arm64) architecture=arm64; excluded=x86_64 ;;
-            *) exit 1 ;;
-          esac
-          configuration="$RUNNER_TEMP/paseo-native-architecture.xcconfig"
-          printf 'ARCHS = %s\nEXCLUDED_ARCHS = %s\nONLY_ACTIVE_ARCH = NO\n' \
-            "$architecture" "$excluded" > "$configuration"
-          echo "XCODE_XCCONFIG_FILE=$configuration" >> "$GITHUB_ENV"
-      - name: Build Flutter client and native Rust desktop runtime
-        run: cargo xtask build-flutter ${{ matrix.platform }}
+      - name: Build Rust GUI client and native Rust desktop runtime
+        run: cargo xtask build-gui ${{ matrix.platform }}
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER || '13004' }}
+          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER }}
       - name: Inspect native macOS build output
         if: matrix.platform == 'macos'
         shell: bash
         run: |
-          bundle="packages/flutter_app/build/macos/Build/Products/Release/Paseo Sessions.app"
+          bundle="target/paseo-gui/desktop/${TARGET_ID}/release/Paseo Sessions.app"
           /usr/bin/lipo -info "$bundle/Contents/MacOS/Paseo Sessions"
           "$bundle/Contents/Resources/runtime/paseo" --version
       # Without mobile signing credentials, artifacts are explicitly labelled
@@ -262,12 +230,12 @@ jobs:
           retention-days: 30
           if-no-files-found: error
           path: |
-            artifacts/flutter/Paseo-Sessions-Flutter-*
-            artifacts/flutter/Paseo-Daemon-*
-            artifacts/flutter/daemon-*.json
-            artifacts/flutter/flutter-*.json
-            artifacts/flutter/packages-*.json
-            artifacts/flutter/provenance-*.json
+            artifacts/native/Paseo-Sessions-*
+            artifacts/native/Paseo-Daemon-*
+            artifacts/native/daemon-*.json
+            artifacts/native/flutter-*.json
+            artifacts/native/packages-*.json
+            artifacts/native/provenance-*.json
 
   publish:
     needs: [source, native]
@@ -298,7 +266,7 @@ jobs:
         with:
           pattern: native-release-*
           merge-multiple: true
-          path: artifacts/flutter
+          path: artifacts/native
       - name: Download exact recovery artifacts
         if: env.RECOVERY_RUN_ID != ''
         env:

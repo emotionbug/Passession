@@ -8,7 +8,7 @@ category: Plugins
 
 # Build a provider plugin
 
-Start with the [quickstart](index.md). This guide targets the unpublished **0.13.1 source checkout**. Providers run in native executables on the daemon host; Flutter renders protocol data, never plugin React components. Existing first-party native providers remain built-in. Kiro remains disabled; developing a plugin does not enable it.
+Start with the [quickstart](index.md). This guide targets the unpublished **0.13.1 source checkout**. Providers run in native executables on the daemon host; the native client renders protocol data, never plugin React components. Existing first-party native providers remain built-in. Kiro remains disabled; developing a plugin does not enable it.
 
 The complete runnable example is [workspace-inspector](../../plugin-examples/workspace-inspector/src/lib.rs), crate `paseo-workspace-inspector`. It implements permission-gated local UTF-8 file statistics, not an AI/model service. The [quickstart commands](index.md#run-the-repository-example) build, validate and install it. It deliberately does not advertise persistence, steering, configuration changes, images or output schemas. Use its real registration/connection/session flow as a starting point, not a claim that it supports every optional protocol feature.
 
@@ -68,7 +68,7 @@ Permissions are structured operations, not universally shell strings. Preserve q
 
 Advertise supported configuration behavior and emit `session.config` with standard toggle/select descriptors when the actual agent supports them. User changes arrive as `session.configure`; apply them, emit committed configuration, then `request.completed`. Do not acknowledge a change you did not apply. Controls may change with the selected model.
 
-`providerOptions` is opaque JSON passed at session creation, not an automatically rendered settings panel. A provider-specific token budget belongs in actual provider options or a supported configuration descriptor, not an invented prompt field. Standard configuration data is not an executable Flutter extension.
+`providerOptions` is opaque JSON passed at session creation, not an automatically rendered settings panel. A provider-specific token budget belongs in actual provider options or a supported configuration descriptor, not an invented prompt field. Standard configuration data is not an executable client extension.
 
 ## Add persistence and replay
 

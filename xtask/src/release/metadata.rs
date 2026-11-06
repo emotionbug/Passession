@@ -239,23 +239,16 @@ pub(super) fn set_version(args: &[String]) -> Result<()> {
         }
     }
     ensure!(count > 0, "No native workspace packages in Cargo.lock");
-    let pubspec_path = root.join("packages/flutter_app/pubspec.yaml");
-    let pubspec = fs::read_to_string(&pubspec_path)?;
-    let re = Regex::new(r"(?m)^version:\s*[^\s+]+(?:\+([0-9]+))?\s*$")?;
-    ensure!(
-        re.find_iter(&pubspec).count() == 1,
-        "Expected exactly one Flutter app version"
-    );
     let build = build_number()?;
-    let updated = re
-        .replace(&pubspec, format!("version: {next}+{build}"))
-        .into_owned();
     // Resolve F-Droid content before writing any version file, so a missing
     // changelog cannot leave a version bump half-applied.
     let fdroid = fdroid_output(&root, &next, "en-US", build)?;
     fs::write(manifest, doc.to_string())?;
     fs::write(lock_path, lock.to_string())?;
-    fs::write(pubspec_path, updated)?;
+    fs::write(
+        root.join(common::VERSION_PROPERTIES),
+        format!("versionCode={build}\n"),
+    )?;
     if let Some((path, contents)) = fdroid {
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(path, contents)?;
@@ -263,8 +256,9 @@ pub(super) fn set_version(args: &[String]) -> Result<()> {
     println!("{current} -> {next}; metadata updated without committing or tagging");
     Ok(())
 }
+/// `PASEO_BUILD_NUMBER`/`ANDROID_VERSION_CODE`, else the recorded versionCode.
 fn build_number() -> Result<u64> {
-    let number: u64 = var("PASEO_BUILD_NUMBER", &var("ANDROID_VERSION_CODE", "13002")).parse()?;
+    let number = common::build_number("android")?;
     ensure!(
         number > 13000 && number <= 2_100_000_000,
         "Android build number must exceed legacy floor 13000 and fit Android versionCode"

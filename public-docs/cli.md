@@ -217,7 +217,7 @@ Add `--forge <name>` to PR checkout when Paseo cannot infer the forge from the s
 
 ## Terminals
 
-These commands control retained daemon-side PTYs for scripts and setup automation. They do not open an interactive terminal UI in Flutter; the native client presents read-only logs.
+These commands control retained daemon-side PTYs for scripts and setup automation. They do not open an interactive terminal UI in the app; the native client presents read-only logs.
 
 Use the workspace ID when multiple workspaces share a directory:
 
@@ -252,7 +252,7 @@ The output includes each script's lifecycle and supervised terminal ID. Services
 
 ## Plugins
 
-> **Trust every plugin you add.** Native plugin executables, validation and declared preparation commands run unsandboxed with the daemon user's file, process, network and credential access. Dependencies and future updates are part of the trust decision. There is no JavaScript worker or Node fallback; Flutter does not execute plugin UI. Global `--host` targets management at the remote daemon; directory paths must exist there and are not uploaded. `plugin init` creates a project locally.
+> **Trust every plugin you add.** Native plugin executables, validation and declared preparation commands run unsandboxed with the daemon user's file, process, network and credential access. Dependencies and future updates are part of the trust decision. There is no JavaScript worker or Node fallback; the native client does not execute plugin UI. Global `--host` targets management at the remote daemon; directory paths must exist there and are not uploaded. `plugin init` creates a project locally.
 
 The 0.13.1 checkout provides a Rust scaffold, not a claim that the SDK has been published. Use Rust 1.93+ and the local SDK path until your chosen native SDK revision is actually available remotely:
 

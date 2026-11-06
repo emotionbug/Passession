@@ -1,6 +1,6 @@
 # Product
 
-Paseo is an environment for running, monitoring, and interacting with coding agents through native Flutter clients on Linux, macOS, Windows, Android and iOS, and a Rust command-line client. The Rust daemon runs on desktop/server hosts; Android and iOS are remote clients.
+Paseo is an environment for running, monitoring, and interacting with coding agents through native Rust/Makepad clients on Linux, macOS, Windows, Android and iOS, and a Rust command-line client. The Rust daemon runs on desktop/server hosts; Android and iOS are remote clients.
 
 **Paseo has a lean, opinionated core built to be extended.** It should be easy to start using and leave room for people to build far beyond the default experience.
 

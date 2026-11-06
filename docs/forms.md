@@ -1,6 +1,6 @@
 # Native forms
 
-Forms are Flutter features. Reuse the current settings, schedule, host and creation widgets under `packages/flutter_app/lib/features`, plus shared presentation under `lib/ui`. The former TypeScript form-model hooks and React form kit are not the client implementation.
+Rust feature owners retain form state: `packages/gui/src/features/settings`, `schedules` and `composer` (creation), with host forms in `src/shell/sheets`. Use shared `common::widgets` controls, including `PTextField`, and `common::overlay` confirmation/select/prompt surfaces rather than a second form kit.
 
 ## State and data
 
@@ -14,7 +14,7 @@ Provider options are opaque provider-owned data. A provider or model change must
 
 Use localized labels, accessible focus order and native controls. Compact forms must remain usable with the keyboard and text scaling. Loading, pending, disabled, error and success are different states; a dismissed dialog is not proof that a mutation succeeded.
 
-Remote directory selection uses `features/files/remote_directory_browser.dart` against the selected host. Do not populate it with a local OS file dialog when the destination is remote.
+Remote directory selection uses `features/files/picker.rs` (`RemoteFolderPicker`) against the chosen host. Local attachment and save dialogs use `paseo-gui-platform`. Do not populate a remote destination with a client-side OS directory picker.
 
 ## Verification
 

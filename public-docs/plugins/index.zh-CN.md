@@ -6,9 +6,9 @@ nav: 快速上手
 
 # 插件快速上手 {#plugin-quickstart}
 
-Paseo 插件是在 daemon 主机上运行的**独立原生可执行文件**。Rust `paseo-plugin` SDK 提供有界逐行 JSON IPC、RPC、生命周期钩子、设置、Provider、用量来源及 daemon 客户端桥接。它不是 Rust 动态库，也不在 Flutter 内运行。
+Paseo 插件是在 daemon 主机上运行的**独立原生可执行文件**。Rust `paseo-plugin` SDK 提供有界逐行 JSON IPC、RPC、生命周期钩子、设置、Provider、用量来源及 daemon 客户端桥接。它不是 Rust 动态库，也不在客户端内运行。
 
-本文描述 **0.13.1 源码检出，不代表版本已经发布**。不再有 JavaScript worker、内嵌编译器或 Node 回退。旧 JavaScript 插件必须[显式移植](migration.zh-CN.md)。Flutter 不执行插件界面、React 组件、面板、主题或时间线渲染器；移动端远程连接，不运行插件。
+本文描述 **0.13.1 源码检出，不代表版本已经发布**。不再有 JavaScript worker、内嵌编译器或 Node 回退。旧 JavaScript 插件必须[显式移植](migration.zh-CN.md)。原生客户端不执行插件界面、React 组件、面板、主题或时间线渲染器；移动端远程连接，不运行插件。
 
 ## 准备 daemon 主机 {#prepare-the-daemon-host}
 

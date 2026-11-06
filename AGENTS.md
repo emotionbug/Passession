@@ -1,17 +1,18 @@
 # AGENTS.md
 
-Paseo is an environment for running, monitoring and controlling your local AI coding agents from anywhere. A Rust daemon runs on your desktop or server next to your code; native Flutter clients on Linux, macOS, Windows, Android and iOS connect to it directly or through the end-to-end encrypted relay. Your code stays on your machine.
+Paseo is an environment for running, monitoring and controlling your local AI coding agents from anywhere. A Rust daemon runs on your desktop or server next to your code; native Rust clients on Linux, macOS, Windows, Android and iOS connect to it directly or through the end-to-end encrypted relay. Your code stays on your machine.
 
 **Supported agents:** Claude Code, Codex, GitHub Copilot, OpenCode, Pi, Antigravity, and Muse Code.
 
 ## Repository map
 
-Rust and Flutter own the product. Cargo also owns the SDKs, relay, native plugin runtime, and build/release tooling. The unused website is retired.
+Rust owns the product: the daemon, the native client (Makepad widgets), SDKs, relay, native plugin runtime, and build/release tooling. The unused website is retired.
 
 - `packages/daemon` — Rust daemon and `paseo` CLI: agent lifecycle, WebSocket API, MCP server, providers, desktop host IPC
-- `packages/flutter_app` — Native client for Linux, macOS, Windows, Android and iOS
-- `packages/flutter_audio` — Native audio plugin for the Flutter client
-- `packages/flutter_desktop_host` — Desktop packaging, desktop integrations plugin, updater, vendored `desktop_multi_window`
+- `packages/gui` — Native client (`paseo-gui`, executable `paseo-sessions`) for Linux, macOS, Windows, Android and iOS: Makepad shell and feature widgets
+- `packages/gui-core` — Client runtime (`paseo-gui-core`): host connections, directory synchronization, persisted client state
+- `packages/gui-platform` — OS integration (`paseo-gui-platform`): desktop host, updater, tray, notifications, pickers, mobile bridges and their Android/iOS sources
+- `packaging/` — Installers, bundle templates, icons, Android Gradle project, vendored Makepad Android Java, notice supplements and font license records
 - `packages/protocol` — Shared Rust wire types, validation and relay cryptography (`paseo-protocol`)
 - `packages/client` — Rust client SDK (`paseo-client`)
 - `packages/plugin` — Native backend plugin SDK (`paseo-plugin`)
@@ -20,7 +21,7 @@ Rust and Flutter own the product. Cargo also owns the SDKs, relay, native plugin
 - `xtask` — Cargo development, build, packaging and release commands
 - `plugins/` — First-party backend extensions (usage sources, providers); `plugin-examples/` — SDK examples
 
-The native client is a port of the original React Native/Expo and Electron app at commit `c3bac24ccc2df8dcc67d807c805db0efa0817dff`. Behavior, copy and geometry follow that app; Dart doc comments name the original file a widget ports. Read it with `git show c3bac24:packages/app/src/<path>`.
+The native client is a port of the original React Native/Expo and Electron app at commit `c3bac24ccc2df8dcc67d807c805db0efa0817dff`. Behavior, copy and geometry follow that app; doc comments name the original file a widget ports. Read it with `git show c3bac24:packages/app/src/<path>`.
 
 ## Docs
 
@@ -31,28 +32,28 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | Doc                                                                  | What's in it                                                                                                      |
 | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | [docs/product.md](docs/product.md)                                   | What Paseo is, who it's for, where it's going                                                                     |
-| [docs/architecture.md](docs/architecture.md)                         | Rust daemon and Flutter client design, package layering, WebSocket protocol, data flow                            |
+| [docs/architecture.md](docs/architecture.md)                         | Rust daemon and native client design, package layering, WebSocket protocol, data flow                             |
 | [docs/agent-lifecycle.md](docs/agent-lifecycle.md)                   | Agent states, parent/child relationships, archive semantics, tabs vs archive, subagents track                     |
 | [docs/timeline-sync.md](docs/timeline-sync.md)                       | Live stream vs authoritative history, gap recovery, resume, projected pages vs live presentation                  |
-| [docs/data-model.md](docs/data-model.md)                             | File-based JSON persistence: agents, config, schedules, project/workspace registries, Flutter client stores       |
+| [docs/data-model.md](docs/data-model.md)                             | File-based JSON persistence: agents, config, schedules, project/workspace registries, native client stores        |
 | [docs/glossary.md](docs/glossary.md)                                 | Authoritative terminology — UI label wins, no synonyms                                                            |
 | [docs/coding-standards.md](docs/coding-standards.md)                 | Commit to a shape, types, errors, density, module structure and native runtime rules                              |
-| [docs/design.md](docs/design.md)                                     | Native design — theme ownership, reuse, hierarchy, density, states, what's forbidden                              |
-| [docs/forms.md](docs/forms.md)                                       | Native forms — settings, schedule, host and creation widgets, state and load gating                               |
-| [docs/hover.md](docs/hover.md)                                       | Hover and input affordances — shared hit regions for rows and their actions                                       |
-| [docs/unistyles.md](docs/unistyles.md)                               | Native styling — Flutter theme ownership; the filename is kept for links                                          |
-| [docs/floating-panels.md](docs/floating-panels.md)                   | Anchored menus, suggestions, tooltips and dialogs as native Flutter surfaces                                      |
-| [docs/menus.md](docs/menus.md)                                       | Native menus — trigger ownership, context menu and long-press alignment                                           |
-| [docs/expo-router.md](docs/expo-router.md)                           | Native navigation — shell, app store and startup restore ownership; the filename is kept for links                |
+| [docs/design.md](docs/design.md)                                     | Makepad design — theme ownership, reuse, hierarchy, density, states and native evidence                            |
+| [docs/forms.md](docs/forms.md)                                       | Rust feature forms — shared controls, owner-scoped state, catalog loading and pending mutations                    |
+| [docs/hover.md](docs/hover.md)                                       | Native hit regions — current-frame geometry, nested actions and overlay dismissal                                 |
+| [docs/unistyles.md](docs/unistyles.md)                               | Native styling — Rust palette, theme epoch and Makepad widget ownership; filename retained for links              |
+| [docs/floating-panels.md](docs/floating-panels.md)                   | Shell-drawn overlays — window/owner targeting, anchors, modal input and feature sheets                            |
+| [docs/menus.md](docs/menus.md)                                       | Shared overlay menus/selects — trigger identity, answer ownership and compact presentation                         |
+| [docs/expo-router.md](docs/expo-router.md)                           | Native navigation — per-window layout, pane-scoped targets, restore and platform routes; filename retained         |
 | [docs/mobile-panels.md](docs/mobile-panels.md)                       | Compact panels — sidebar → session → file view flow and back behavior                                             |
 | [docs/explorer-sidebar.md](docs/explorer-sidebar.md)                 | Explorer and supporting panes — file browsing, source/Markdown views and Changes next to sessions                 |
 | [docs/notifications.md](docs/notifications.md)                       | Notification identity and delivery, mobile and desktop integration                                                |
-| [docs/i18n.md](docs/i18n.md)                                         | Client localization — catalogs, locale list, loader behavior                                                      |
-| [docs/file-icons.md](docs/file-icons.md)                             | File and project icons — Flutter presentation, daemon-side project icon discovery                                 |
-| [docs/markdown-renderer.md](docs/markdown-renderer.md)               | Native Markdown rendering for chat and file preview                                                               |
-| [docs/native-text-selection.md](docs/native-text-selection.md)       | Selectable Markdown and text, selection while scrolling and resizing                                              |
+| [docs/i18n.md](docs/i18n.md)                                         | English/Korean catalogs, OS locale resolution, interpolation and count fallback                                    |
+| [docs/file-icons.md](docs/file-icons.md)                             | File and project icons — Rust presentation, shared decoding and daemon-side project icon discovery                |
+| [docs/markdown-renderer.md](docs/markdown-renderer.md)               | Rust Markdown block/render ownership, file identity and virtualized chat presentation                              |
+| [docs/native-text-selection.md](docs/native-text-selection.md)       | Source-indexed selection, current-frame reflow and copy/scroll boundaries                                          |
 | [docs/providers.md](docs/providers.md)                               | Adding a native agent provider end-to-end                                                                         |
-| [docs/forge-providers.md](docs/forge-providers.md)                   | Adding a git forge: native daemon boundary, Flutter Git presentation                                              |
+| [docs/forge-providers.md](docs/forge-providers.md)                   | Adding a git forge: daemon boundary, shared wire facts and Rust client presentation                               |
 | [docs/custom-providers.md](docs/custom-providers.md)                 | Custom provider config: Z.AI, Alibaba/Qwen, ACP agents, profiles, custom binaries                                 |
 | [docs/plugins.md](docs/plugins.md)                                   | Backend extensions — Rust built-ins, native plugin executables, manifests and RPCs                               |
 | [docs/hub.md](docs/hub.md)                                           | Paseo Hub — opt-in connection, authority, session grants, revocation                                              |
@@ -65,15 +66,15 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | [docs/connected-hosts.md](docs/connected-hosts.md)                   | Daemon-owned host registrations, routed SDK scopes, identity and authority boundaries                             |
 | [docs/permissions.md](docs/permissions.md)                           | Semantic daemon permissions, principals, credentials, pairing invitations, and Hub authority                      |
 | [docs/terminal-activity.md](docs/terminal-activity.md)               | Workspace setup and service scripts as daemon-owned PTYs with read-only client logs                               |
-| [docs/terminal-performance.md](docs/terminal-performance.md)         | Script and setup log pipeline performance, coalescing/backpressure invariants                                     |
-| [docs/agent-stream-performance.md](docs/agent-stream-performance.md) | Assistant text pipeline from the Rust agent owner to the Flutter timeline, paced reveal                           |
+| [docs/terminal-performance.md](docs/terminal-performance.md)         | Read-only execution logs — daemon PTYs, ANSI replay, observation slots and visible-row rendering                    |
+| [docs/agent-stream-performance.md](docs/agent-stream-performance.md) | Assistant text pipeline from the daemon through the Rust core to the virtualized Makepad timeline                 |
 | [docs/file-observation.md](docs/file-observation.md)                 | Daemon file and checkout observation, Linux constraints, teardown invariants                                      |
-| [docs/testing.md](docs/testing.md)                                   | Rust, Flutter and SDK checks, required native smoke boundaries, Linux desktop regression                          |
+| [docs/testing.md](docs/testing.md)                                   | Rust, GUI and SDK checks, required native smoke boundaries, Linux desktop regression                              |
 | [docs/qa.md](docs/qa.md)                                             | QA evidence bar for pull requests — platform matrix, version drift, performance, UI proof                         |
-| [docs/mobile-testing.md](docs/mobile-testing.md)                     | Flutter Android/iOS testing against a separate Rust daemon                                                        |
+| [docs/mobile-testing.md](docs/mobile-testing.md)                     | Android/iOS client testing against a separate Rust daemon                                                         |
 | [docs/ad-hoc-daemon-testing.md](docs/ad-hoc-daemon-testing.md)       | Running the real Rust daemon against a disposable home and endpoint                                               |
-| [docs/browser-capture-harness.md](docs/browser-capture-harness.md)   | Native capture boundary — capturing the real Flutter window; the filename is kept for links                       |
-| [docs/android.md](docs/android.md)                                   | The Flutter Android client: build and launch, signing, versions, F-Droid source builds and store metadata         |
+| [docs/browser-capture-harness.md](docs/browser-capture-harness.md)   | Native capture boundary — capturing the real staged Rust client; filename retained for links                     |
+| [docs/android.md](docs/android.md)                                   | The Android client: build and launch, signing, versions, F-Droid source builds and store metadata                 |
 | [docs/docker.md](docs/docker.md)                                     | Running the native daemon in Docker, volumes, agent images, security                                              |
 | [docs/release.md](docs/release.md)                                   | Release playbook, distribution requirements, draft releases, completion checklist                                 |
 | [SECURITY.md](SECURITY.md)                                           | Relay threat model, E2E encryption, DNS rebinding, agent auth                                                     |
@@ -107,17 +108,17 @@ Do not:
 
 ```bash
 cargo xtask dev daemon                 # Start the isolated Rust dev daemon
-cargo xtask dev app                    # Run the desktop Flutter client
+cargo xtask dev app                    # Build and run the desktop Rust client
 cargo xtask dev app android --device <id>
 cargo xtask dev cli ls -a -g            # List agents in the dev home
 cargo xtask dev cli daemon status
 cargo check --locked --workspace --all-targets
-cargo xtask flutter analyze
+cargo clippy --locked -p paseo-gui-core -p paseo-gui-platform -p paseo-gui --all-targets
 ```
 
 Repo dev commands use checkout-local state. `PASEO_HOME` resolves to `.dev/paseo-home`, the dev daemon listens on `127.0.0.1:6768`, and `cargo xtask dev cli ...` targets that same dev home. The installed daemon and app keep using `~/.paseo` on port `6767`.
 
-When Mo requests an APK, use `cargo xtask build-flutter android --arch arm64`: it writes the APK to `artifacts/flutter/` (debug-signed without a release key) without starting a device. Omit `--arch arm64` for a universal APK.
+When Mo requests an APK, use `cargo xtask build-gui android --arch arm64`: it writes the APK to `artifacts/native/` (debug-signed without a release key) without starting a device. Omit `--arch arm64` for a universal APK.
 
 See [docs/development.md](docs/development.md) for toolchains, isolated state, native builds and source ownership.
 
@@ -134,15 +135,15 @@ and updating `next`, integrating it after a release, and releasing a hotfix from
 - **NEVER assume a timeout means the service needs restarting** — timeouts can be transient.
 - **NEVER add auth checks to tests** — agent providers handle their own auth.
 - **Before changing navigation, startup routing, remembered workspace restore, or active workspace selection, read [docs/expo-router.md](docs/expo-router.md).**
-- **NEVER run the full test suites locally.** Rust and Flutter suites are heavy and will freeze the machine, especially if multiple agents run them in parallel. Rules:
-  - Run only the tests for what you changed: `cargo test --locked -p <crate> --lib <test-name-filter>` or `cargo xtask flutter test test/<file>_test.dart`.
+- **NEVER run the full test suites locally.** The Rust workspace suite is heavy and will freeze the machine, especially if multiple agents run it in parallel. Rules:
+  - Run only the tests for what you changed: `cargo test --locked -p <crate> --lib <test-name-filter>`.
   - Never run a whole suite unless explicitly asked, and never run two heavy suites at once.
   - Keep long check output in a captured log rather than flooding the conversation.
   - Never re-run a test suite that another agent already ran and reported green — trust the result.
   - For full suite verification, push to CI and check GitHub Actions instead.
-- Add behavioral tests to existing Rust and Flutter suites and reuse their CI jobs instead of creating feature-specific ones.
-- **Check and lint the changed surface.** Rust: `cargo check --locked -p <crate> --all-targets` and scoped Clippy. Dart: `cargo xtask flutter analyze`.
-- Match surrounding Rust/Dart formatting; do not mass-reformat unrelated legacy files. No npm formatter or TypeScript build step is required.
+- Add behavioral tests to existing Rust suites and reuse their CI jobs instead of creating feature-specific ones.
+- **Check and lint the changed surface.** `cargo check --locked -p <crate> --all-targets` and scoped Clippy.
+- Match surrounding Rust formatting; do not mass-reformat unrelated legacy files. No npm formatter or TypeScript build step is required.
 - **The protocol stays backward-compatible. Features don't have to.** Read [docs/protocol-compatibility.md](docs/protocol-compatibility.md) before touching the wire protocol in `packages/protocol` or the daemon's message handling. The short version:
   - **Protocol contract (always):** an old client parses messages from a new daemon, and a new daemon parses messages from an old client. New fields are optional; never narrow, never remove, never require. Validation must not silently transform messages or substitute defaults for malformed input.
   - **Feature contract (per-feature):** gate the capability once on `server_info.features.*`, then run the feature or tell the user to update the host. No fallback paths, no defensive branches.
@@ -151,17 +152,17 @@ and updating `next`, integrating it after a release, and releasing a hotfix from
 
 ## Platforms
 
-The Flutter client targets Linux, macOS and Windows desktops and Android and iOS. Desktop can manage a local daemon through the desktop host; Android and iOS are remote clients and never run a daemon. Code is cross-platform by default. Gate only when you must.
+The native client targets Linux, macOS and Windows desktops and Android and iOS. Desktop can manage a local daemon through the desktop host; Android and iOS are remote clients and never run a daemon. Code is cross-platform by default. Gate only when you must.
 
 | I need to...                                     | Use                                                                                                        |
 | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| Switch layout between phone and tablet/desktop   | `isCompactLayout(context)` from `packages/flutter_app/lib/ui/common.dart` (width below 600)                |
-| Branch on the operating system                   | `defaultTargetPlatform` from `package:flutter/foundation.dart`                                             |
-| Use a desktop or mobile platform service         | The integration under `packages/flutter_app/lib/platform/desktop` or `lib/platform/mobile`                 |
+| Switch layout between phone and tablet/desktop   | `common::is_compact_layout(cx)` in `packages/gui/src/common` (width below 600)                             |
+| Branch on the operating system                   | `cfg!(target_os = "…")` / `#[cfg(target_os = "…")]`                                                        |
+| Use a desktop or mobile platform service         | `paseo_gui_platform::PlatformHandle` (`packages/gui-platform`); see its `desktop` and mobile modules       |
 | Show something on hover, always visible on touch | Hover on desktop targets; keep the control visible on Android and iOS (see [docs/hover.md](docs/hover.md)) |
 
 - **Keep the original's platform branches.** The original app's native (iOS/Android) behavior maps to Android and iOS; its web and Electron behavior maps to the desktop targets. A branch that differs from the original is a bug, not a simplification.
-- **Don't use the platform as a proxy for layout.** A narrow desktop window is compact; use `isCompactLayout`, not `defaultTargetPlatform`.
+- **Don't use the platform as a proxy for layout.** A narrow desktop window is compact; use `is_compact_layout`, not `target_os`.
 - **The native product excludes** the interactive terminal UI (daemon PTYs and read-only script/setup logs stay), the web client, embedded browser and Electron, executable React UI plugins, speech recognition, voice conversation and TTS. Generic effect-sound playback stays. Don't reintroduce the excluded features.
 
 ## Debugging

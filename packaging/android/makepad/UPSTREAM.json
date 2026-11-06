@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "upstream": "https://github.com/makepad/makepad",
+  "revision": "a1868e19d3bb955200957efb3c880791a43424eb",
+  "path": "tools/cargo_makepad/src/android/java",
+  "reason": "Java side of makepad-platform 1.0.0's Android JNI (dev.makepad.android.MakepadNative); makepad-platform 1.0.0 was published from this revision. cargo-makepad itself is not published for 1.0.0.",
+  "license": "MIT",
+  "licenseFile": "LICENSE",
+  "licenseSource": "https://raw.githubusercontent.com/makepad/makepad/a1868e19d3bb955200957efb3c880791a43424eb/LICENSE",
+  "modified": true,
+  "files": {
+    "java/dev/makepad/android/ByteArrayMediaDataSource.java": "b807383f5a981d13b1da28445f2ae7c7b6f3bf02ace53f0cd65b25ddcd75e674",
+    "java/dev/makepad/android/MakepadActivity.java": "cc8878bc57dbe26f225c8d24e19a8d4b076ccdb57918f2d59ff3a344a0fb0f80",
+    "java/dev/makepad/android/MakepadNative.java": "0894b95557d07e84f6e5982342b7e070bfe5600784e4556f1b49c21d00761b02",
+    "java/dev/makepad/android/MakepadInputConnection.java": "c58578ac187780dd09e72f80feee876ba82238256618fef7ff0338f64fe362f8",
+    "java/dev/makepad/android/MakepadNetwork.java": "dddc5bda3038064e9785f994fa5c98b8bced26ef4609a80a12069c3fc425a973",
+    "java/dev/makepad/android/MakepadWebSocket.java": "14ca2e7c786e51ef7b14352d5c8caf3a4aba27dd3b55520ac494357e9a98d7fe",
+    "java/dev/makepad/android/MakepadWebSocketReader.java": "55a0dbc91b88324408141eb20e2ee7208c2110edb6d970137e9f1c77cceddd66",
+    "java/dev/makepad/android/VideoPlayer.java": "6e0a441962ee4212d4d13aa7198aecf20b66506919853196ea204248f56a2cdb",
+    "java/dev/makepad/android/VideoPlayerRunnable.java": "16a571e2287bd27f0cc4b0cd653a1c1628cce705d5c68a41643ae7d4791a9a44"
+  },
+  "upstreamFiles": {
+    "java/dev/makepad/android/MakepadActivity.java": "44aff8561cce34adb2ff6f16e7c1ba9ca1e90e54b1f16c9f054cf1cb5353558a",
+    "java/dev/makepad/android/MakepadNative.java": "6227e9d3fcf37f2ddc95428b2bc49802149d761f59710355f451473449eadc95"
+  },
+  "patches": {
+    "file": "PATCHES.diff",
+    "reason": "Android API 24 guards for WindowInsets and display cutouts; render-view accessor for surface-relative insets; Paseo-authored MakepadInputConnection implements a full Editable-backed IME, UTF-16 text/selection/composition snapshots, batch edits, surrounding-text queries, text/decimal/password editor metadata, hardware select/copy/cut/paste and native session/revision fencing. MakepadActivity and MakepadNative connect it to the matching vendored Rust platform, distinguishing editor restarts from same-editor synchronization and avoiding TYPE_NULL restarts between fields. MakepadInputConnection.java is new, not an upstream file."
+  }
+}

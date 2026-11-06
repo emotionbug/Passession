@@ -6,7 +6,7 @@ nav: 为什么选择 Paseo？
 
 # 为什么选择 Paseo？ {#why-paseo}
 
-Paseo 是面向 Agent 开发的原生环境：运行编程 Agent、编辑源码、阅读 Markdown、审查 diff 和 PR，并查看脚本输出。Flutter 客户端连接 Rust daemon，由 daemon 管理工作并跨设备保留状态。
+Paseo 是面向 Agent 开发的原生环境：运行编程 Agent、编辑源码、阅读 Markdown、审查 diff 和 PR，并查看脚本输出。原生 Rust 客户端连接 Rust daemon，由 daemon 管理工作并跨设备保留状态。
 
 ## 在一个工作区中开发 {#develop-in-one-workspace}
 

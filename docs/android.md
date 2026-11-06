@@ -1,31 +1,43 @@
 # Android
 
-The Android application is the Flutter **Paseo Sessions** client, package `sh.paseo.sessions`. It connects to a Rust daemon on another machine; it does not run a local daemon. The same Flutter client also targets iOS, Linux, macOS and Windows. There is no Expo/Metro, EAS, embedded browser, web client, or interactive terminal UI in the native application.
+The Android application is the native Rust **Paseo Sessions** client (Makepad), package `sh.paseo.sessions`. It connects to a Rust daemon on another machine; it does not run a local daemon. The same client also targets iOS, Linux, macOS and Windows. There is no Expo/Metro, EAS, Flutter engine, embedded browser, web client, or interactive terminal UI in the native application.
 
 ## Build and launch
 
-Use Rust/Cargo for `xtask`, Flutter, JDK 17-compatible tooling and the Android SDK. The checked-in project is `packages/flutter_app/android`, not a generated Expo project. Minimum SDK is 24. The current dependency set requires compile SDK **37.0** (API 37, minor 0), **Android Gradle Plugin 9.1.1**, **NDK 28.2.13676358**, and JNI **CMake 3.22.1**; retain the Flutter-selected target SDK. AGP 9.1.0 with integer compile SDK 37 does not resolve the required `android-37.0` platform.
+Use Rust/Cargo for `xtask`, a JDK 17+ and the Android SDK with NDK **28.2.13676358** (`ANDROID_HOME`; `ANDROID_NDK_HOME` overrides the NDK location). Install the Rust targets once:
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+```
 
 From the repository root:
 
 ```sh
 cargo fetch --locked
-cargo xtask build-flutter android              # universal APK
-cargo xtask build-flutter android --arch arm64 # arm64 APK
+cargo xtask build-gui android              # universal APK (arm64-v8a, armeabi-v7a, x86_64)
+cargo xtask build-gui android --arch arm64 # arm64 APK
 cargo xtask dev app android --device <device-id>
 ```
 
-The development wrapper uses an attached Android device/emulator selected through Flutter. If more than one supported device is attached, select its exact ID with `--device`. It runs `flutter pub get --enforce-lockfile` and uses the checked-in Dart dependency lock.
+The build compiles `paseo-gui` as a `cdylib` per ABI with the NDK clang for API 24, stores it as `lib/<abi>/libmakepad.so` (the library name the vendored `MakepadActivity` loads), copies every Makepad resource directory to `assets/makepad/<crate>/resources`, and adds `THIRD-PARTY-NOTICES.txt` and `LICENSE` to the assets. It then runs a pinned Gradle 9.3.1 (SHA-256 checked, cached under `$XDG_CACHE_HOME/paseo-packaging`) on `packaging/android` with AGP **9.1.1**, compile SDK **37.0**, target SDK 36 and `--no-daemon`; Gradle output stays under `target/paseo-gui/android`, not in the checkout.
 
-Set consistent `ANDROID_HOME` and `ANDROID_SDK_ROOT` for every Flutter build, including desktop builds from the same checkout. Flutter can rewrite Android `local.properties`; concurrent builds with different SDK environments can redirect Gradle to an unintended SDK. Avoid overlapping builds that mutate the same checkout's generated configuration.
+**Minimum SDK is 24**, as for the Flutter client. Published makepad-platform 1.0.0 cannot load below API 29: it links `libamidi` (API 29), `libaaudio` and `libnativewindow` (API 26), references `AChoreographer_postFrameCallback64` (API 29) directly, and its Java calls `WindowInsets.Type` (API 30). Paseo therefore patches makepad-platform through the vendored copy at `packages/gui-platform/vendor/makepad-platform` (newer libraries and symbols resolved at runtime; app audio uses AudioTrack on every version) and the Java in `packaging/android/makepad` (API guards, listed in `PATCHES.diff`). Linking against the API 24 NDK stubs turns a newer `-l` library into a link error, and xtask also rejects a library whose `DT_NEEDED` names a system library newer than API 24. A newer *symbol* in an API 24 library is not caught at link time; keep those behind runtime lookup.
 
-APK artifacts are copied into `artifacts/flutter/` and named with the version and architecture. Builds without a release key are explicitly marked `-debug-signed.apk`. The final Linux-hosted ARM64 release-mode wrapper build passed with Flutter 3.47.5. ZIP enumeration verified that every native library is under `arm64-v8a`, with both `libapp.so` and `libflutter.so` present; the Gradle target-platform filter covers all native dependencies while leaving split-per-ABI builds alone.
+The development run selects the single attached `adb` device or the `--device` serial, builds only that device's primary ABI (an x86_64 emulator gets an x86_64 library), installs with `adb install -r`, starts the launcher activity and follows `adb logcat` for the app process until interrupted.
 
-The verified local artifact is `artifacts/flutter/Paseo-Sessions-Flutter-0.13.0-android-arm64-debug-signed.apk`: **37,410,467 bytes** (37.4 MB decimal), SHA-256 `11a5c8ddca90e1dfa46e57474086dcf81099a10b2995a1864dc068df2f3d47b9`. `apksigner verify` passed with Android Debug certificate SHA-256 `fac61745dc0903786fb9ede62a962b399f7348f0bb6f899b8332667591033b9c`. No APK was installed or published, no phone/emulator was exercised, and no production signing credentials were supplied. Compilation and local signature verification are not device execution or store readiness; see [testing](testing.md).
+APK artifacts are copied into `artifacts/native/` and named with the version and architecture. Builds without a release key are explicitly marked `-debug-signed.apk`. The ARM64 Rust APK has been built, signature/alignment-checked and installed as an in-place update on Android 17; visual verification remains blocked by the device lock. This does not establish API 24 compatibility or store readiness; see [testing](testing.md).
+
+## Project layout
+
+- `packaging/android/` — Gradle project (`settings.gradle.kts`, `app/build.gradle.kts`), launcher and notification icons (`res/`), `app/debug.keystore`, `version.properties`.
+- `packaging/android/makepad/` — Makepad's Android Java (`dev.makepad.android.*`) vendored from makepad commit `a1868e19d3bb955200957efb3c880791a43424eb`, the revision makepad-platform 1.0.0 was published from. The only change is API 24–29 compatibility in `MakepadActivity.java` (`PATCHES.diff`, lines marked `Paseo:`); `UPSTREAM.json` records the upstream and current file digests. The crate's JNI symbols require these exact classes; crates.io has no `cargo-makepad` for 1.0.0.
+- `packages/gui-platform/android/` — `AndroidManifest.xml` (launcher `sh.paseo.sessions.MainActivity`, which extends `MakepadActivity`; `paseo` VIEW filter; Firebase messaging service; FileProvider `sh.paseo.sessions.files`), the Java glue in `java/sh/paseo/sessions/`, `res/` (theme and FileProvider paths) and `platform.gradle.kts` (androidx.core and the Firebase BOM/messaging). The Gradle project compiles these directly; there is no second Gradle app or Makepad Java copy there.
+
+Native code reaches the Java glue by class and method name over JNI, so the release build never minifies.
 
 ## Signing and identity
 
-The project uses the maintained Sessions debug keystore at `packages/flutter_app/android/app/debug.keystore` for local debug compatibility. This is not a production signing credential.
+The project uses the maintained Sessions debug keystore at `packaging/android/app/debug.keystore` for local debug compatibility; it is the same key the Flutter project used, so debug builds upgrade in place. This is not a production signing credential.
 
 For release signing supply all four values together:
 
@@ -34,15 +46,15 @@ For release signing supply all four values together:
 - `ANDROID_KEY_ALIAS`
 - `ANDROID_KEY_PASSWORD`
 
-Alternatively use the corresponding `storeFile`, `storePassword`, `keyAlias`, and `keyPassword` properties in `packages/flutter_app/android/key.properties`. A partial configuration is an error. `PASEO_ANDROID_REQUIRE_RELEASE_SIGNING=1` rejects a release build without production credentials instead of creating debug-signed output.
+Alternatively use the corresponding `storeFile`, `storePassword`, `keyAlias`, and `keyPassword` properties in `packaging/android/key.properties` (ignored by Git). A partial configuration is an error. `PASEO_ANDROID_REQUIRE_RELEASE_SIGNING=1` rejects a release build without production credentials instead of creating debug-signed output.
 
-The app ID stays `sh.paseo.sessions`, separate from the upstream app. Optional Firebase configuration is supplied with `GOOGLE_SERVICES_FILE_SESSIONS`; the wrapper checks that it belongs to this package. Play Store credentials, submission and signing authorization are not included in this source fork.
+The app ID stays `sh.paseo.sessions`, separate from the upstream app. Optional Firebase configuration is supplied with `GOOGLE_SERVICES_FILE_SESSIONS`; the wrapper checks that it belongs to this package, stages it as `packaging/android/app/google-services.json` for the Gradle Google Services plugin, and restores the previous state after success, failure or cancellation. Play Store credentials, submission and signing authorization are not included in this source fork.
 
 ## Version codes
 
-`xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `13001`. Android clamps it to at least `13000`, as does the Gradle project. Set the next code against actual installed/store history before a distribution. Do not reuse the former Expo version-code formula or EAS remote counters.
+`xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `packaging/android/version.properties` (`versionCode=`); empty variables count as unset. Android clamps it to at least `13000`. `cargo xtask release version` rewrites `version.properties` (it replaced the pubspec `+build` suffix). Set the next code against actual installed/store history before a distribution. Do not reuse the former Expo version-code formula or EAS remote counters.
 
-The repository's `fastlane/metadata/android` store text and changelog tooling are metadata, not evidence of a Flutter F-Droid/Play release. The old Expo source-only/F-Droid flags are not an Android build mode for this project. A source-distribution/store build needs its own completed dependency, signing and policy review; no such submission is claimed here.
+The repository's `fastlane/metadata/android` store text and changelog tooling are metadata, not evidence of an F-Droid/Play release. The old Expo source-only/F-Droid flags are not an Android build mode for this project. A source-distribution/store build needs its own completed dependency, signing and policy review; no such submission is claimed here.
 
 ## Connect to a development daemon
 
@@ -64,4 +76,4 @@ Markdown, source editing, large summary-first diffs, schedules, settings, generi
 
 ## Release boundary
 
-`cargo xtask build-flutter ios` is a separate macOS/Xcode path; without export/provisioning configuration it produces an unsigned app archive. Native mobile targets do not inherit desktop daemon ownership. Review [release](release.md) for exact signing and artifact rules before publishing.
+`cargo xtask build-gui ios` is a separate macOS/Xcode path; without a provisioning profile and signing identity it produces an unsigned app archive. Native mobile targets do not inherit desktop daemon ownership. Review [release](release.md) for exact signing and artifact rules before publishing.

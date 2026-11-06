@@ -12,7 +12,7 @@ These projects are related to Paseo and built by the community.
 
 ## Plugins
 
-Install only native backend plugins whose target architecture and Paseo version requirements match your host. The Flutter client does not execute React UI entries. To share a backend extension, follow [Publish a plugin](plugins/publishing.md).
+Install only native backend plugins whose target architecture and Paseo version requirements match your host. The native client does not execute React UI entries. To share a backend extension, follow [Publish a plugin](plugins/publishing.md).
 Extensions run unsandboxed; read their listing and source before installing.
 
 ## Tools and integrations
@@ -20,7 +20,7 @@ Extensions run unsandboxed; read their listing and source before installing.
 | Project                                                                                      | What it does                                                                                                                                        |
 | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [Paseo for VS Code](https://marketplace.visualstudio.com/items?itemName=hinnes.paseo-vscode) | Opens the matching Paseo project or worktree in VS Code and adds agent chat, file mentions, and editor links.                                       |
-| [VS Code Web plugin](https://github.com/itsjustanks/paseo-plugin-vscode-web)                 | Third-party VS Code tunnel integration. Its former Paseo UI entry is not a supported Flutter plugin; use an external browser/tool workflow instead. |
+| [VS Code Web plugin](https://github.com/itsjustanks/paseo-plugin-vscode-web)                 | Third-party VS Code tunnel integration. Its former Paseo UI entry is not a supported client plugin; use an external browser/tool workflow instead. |
 | [Paseo Icon](https://github.com/gpambrozio/paseo-menubar)                                    | Shows workspace status across Paseo hosts in the macOS menu bar and opens a workspace with one click.                                               |
 | [Paseo Cross-Daemon Comms](https://github.com/xpufx/paseo-cross-daemon-comms)                | Lets agents communicate with agents on another Paseo daemon through an MCP server.                                                                  |
 | [Paseo Antigravity ACP](https://github.com/tiezbro/paseo-agy-acp)                            | Connects Google Antigravity CLI to Paseo through ACP, with Paseo-specific context, permissions, and concurrency handling.                           |

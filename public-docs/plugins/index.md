@@ -8,9 +8,9 @@ category: Plugins
 
 # Plugin quickstart
 
-A Paseo plugin is a **standalone native executable** on the daemon host. The Rust `paseo-plugin` SDK supplies bounded newline-JSON IPC, RPC handlers, lifecycle hooks, settings, provider connections, usage sources and the daemon-client bridge. It is not a Rust dynamic library and does not run inside Flutter.
+A Paseo plugin is a **standalone native executable** on the daemon host. The Rust `paseo-plugin` SDK supplies bounded newline-JSON IPC, RPC handlers, lifecycle hooks, settings, provider connections, usage sources and the daemon-client bridge. It is not a Rust dynamic library and does not run inside the client.
 
-This guide describes the **0.13.1 source checkout, not a published release**. There is no JavaScript worker, embedded compiler or Node fallback. Existing JavaScript plugins need an [explicit port](migration.md). Flutter does not execute plugin screens, React components, panels, themes or timeline renderers; mobile connects remotely and does not host plugins.
+This guide describes the **0.13.1 source checkout, not a published release**. There is no JavaScript worker, embedded compiler or Node fallback. Existing JavaScript plugins need an [explicit port](migration.md). The native client does not execute plugin screens, React components, panels, themes or timeline renderers; mobile connects remotely and does not host plugins.
 
 ## Prepare the daemon host
 

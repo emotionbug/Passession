@@ -1,0 +1,652 @@
+//! Immediate-mode drawing kit shared by the stream rows and the chat chrome:
+//! rounded rects, text laid out with the pinned makepad text stack
+//! (`DrawText::layout`, `Fonts::get_or_layout` for multi-span paragraphs,
+//! `draw_walk_laidout`), Lucide glyphs from the shell's icon font, images,
+//! spinners, and a per-widget registry of selectable text runs and hit
+//! regions. Positions are stored relative to the widget rect so they stay
+//! valid after PortalList shifts its items.
+
+use crate::features::files::kit::DrawFilesImage;
+use crate::theme::DrawBox;
+use makepad_widgets::makepad_draw::cx_draw::CxDraw;
+use makepad_widgets::makepad_draw::shader::draw_text::FontFamily as DrawTextFontFamily;
+use makepad_widgets::makepad_draw::text::color::Color as TextColor;
+use makepad_widgets::makepad_draw::text::font_family::FontFamilyId;
+use makepad_widgets::makepad_draw::text::fonts::Fonts;
+use makepad_widgets::makepad_draw::text::geom::Point;
+use makepad_widgets::makepad_draw::text::layouter::{BorrowedLayoutParams, LaidoutText, LayoutOptions, Span, Style};
+use makepad_widgets::makepad_draw::text::selection::{Cursor, Selection};
+use makepad_widgets::*;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+live_design! {
+    use link::theme::*;
+    use link::shaders::*;
+    use crate::theme::*;
+    use crate::features::files::kit::DrawFilesImage;
+
+
+    pub DrawChatSpinner = {{DrawChatSpinner}} {
+        fn pixel(self) -> vec4 {
+            let sdf = Sdf2d::viewport(self.pos * self.rect_size);
+            let r = min(self.rect_size.x, self.rect_size.y) * 0.5 - self.thickness;
+            let c = self.rect_size * 0.5;
+            let start = self.phase * 6.283185307;
+            sdf.arc_round_caps(c.x, c.y, r, start, start + 4.2, self.thickness);
+            sdf.fill(self.color);
+            return sdf.result;
+        }
+    }
+
+    pub ChatKit = {{ChatKit}} {
+        rect: <DrawBox> {}
+        image: <DrawFilesImage> {}
+        text_regular: { text_style: <PASEO_FONT_REGULAR> {} }
+        text_medium: { text_style: <PASEO_FONT_MEDIUM> {} }
+        text_semibold: { text_style: <PASEO_FONT_SEMIBOLD> {} }
+        text_bold: { text_style: <PASEO_FONT_BOLD> {} }
+        text_italic: { text_style: <THEME_FONT_ITALIC> {} }
+        text_bold_italic: { text_style: <THEME_FONT_BOLD_ITALIC> {} }
+        text_mono: { text_style: <PASEO_FONT_MONO> {} }
+        text_icon: { text_style: <PASEO_FONT_ICON> {} }
+        logo: {
+            svg_path: "M291.495 91.399C333.897 104.892 379.155 135.075 416.229 173.191C453.389 211.394 484.429 259.725 495.708 311.251C497.555 319.693 498.865 328.216 499.586 336.776C509.755 326.554 519.867 317.815 529.89 311.547C540.647 304.821 553.808 299.297 568.641 299.785C584.29 300.299 597.395 307.326 607.747 317.632C632.173 341.947 629.612 372.898 619.872 397.936C610.185 422.833 591.557 447.826 572.732 469.124C553.591 490.78 532.713 510.308 516.779 524.318C508.775 531.355 501.936 537.073 497.07 541.052C494.635 543.043 492.689 544.603 491.334 545.679C490.657 546.217 490.126 546.635 489.756 546.926C489.571 547.071 489.425 547.184 489.321 547.265C489.269 547.305 489.227 547.338 489.196 547.362C489.181 547.374 489.168 547.385 489.157 547.393C489.153 547.397 489.147 547.401 489.144 547.403C489.134 547.4 488.837 547.06 473.001 528.499L489.135 547.411C478.157 555.911 462.033 554.334 453.122 543.89C444.213 533.448 445.887 518.094 456.861 509.592C456.863 509.591 456.865 509.588 456.869 509.586C456.88 509.577 456.902 509.561 456.933 509.536C456.997 509.487 457.101 509.404 457.245 509.292C457.533 509.066 457.979 508.715 458.569 508.247C459.749 507.31 461.506 505.901 463.742 504.073C468.216 500.414 474.589 495.088 482.073 488.508C497.114 475.284 516.315 457.282 533.578 437.75C551.157 417.862 565.26 398.01 571.859 381.048C578.403 364.227 575.681 356.302 570.724 351.367C568.928 349.579 567.744 348.902 567.267 348.676C566.888 348.496 566.811 348.52 566.804 348.52C566.605 348.513 563.971 348.537 557.953 352.3C545.161 360.299 528.815 377.492 506.807 403.867C494.927 418.106 481.871 434.435 467.547 451.957C463.709 457.28 459.503 462.538 454.91 467.717L454.702 467.549C420.808 508.347 380.37 553.856 332.335 593.848C301.853 619.226 262.656 622.597 228.642 614.743C194.834 606.936 162.658 587.448 142.217 561.686C108.054 518.631 100.57 469.801 108.223 427.836C115.56 387.606 137.391 351.005 166.502 331.557C161.248 315.813 156.813 299.49 153.519 283.013C142.593 228.368 143.239 167.031 174.28 119.619C186.922 100.31 205.846 89.1535 227.387 85.2773C248.1 81.5504 270.278 84.648 291.495 91.399ZM378.642 206.356C345.773 172.563 307.463 147.917 275.208 137.654C259.096 132.527 246.171 131.514 236.828 133.195C228.314 134.727 222.227 138.497 217.721 145.38C196.712 177.468 193.858 224.004 203.82 273.827C206.532 287.394 210.127 300.834 214.345 313.817C236.45 310.276 260.156 311.463 281.22 317.11C319.621 327.403 357.501 355.419 357.501 405.654C357.501 435.255 339.111 465.136 307.278 473.815C273.211 483.103 238.854 464.822 213.105 427.541C203.716 413.947 194.443 397.766 185.947 379.89C174.028 392.223 163.08 411.953 158.673 436.118C153.128 466.518 158.514 501.286 183.085 532.253C195.993 548.522 217.742 562.031 240.771 567.349C263.594 572.619 284.147 569.24 298.664 557.154C349.383 514.927 390.709 466.547 426.366 422.952C448.879 390.86 453.195 356.06 445.578 321.265C436.703 280.718 411.425 240.06 378.642 206.356ZM306.296 405.722C306.296 384.769 292.223 370.736 267.284 364.051C256.012 361.03 244.156 360.087 233.095 360.771C240.361 375.935 248.168 389.513 255.897 400.704C275.647 429.298 289.989 427.822 293.247 426.934C298.737 425.437 306.296 418.161 306.296 405.722Z"
+        }
+    }
+}
+
+
+#[derive(Live, LiveHook, LiveRegister)]
+#[repr(C)]
+pub struct DrawChatSpinner {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    pub color: Vec4,
+    #[live(2.0)]
+    pub thickness: f32,
+    #[live]
+    pub phase: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Font {
+    Regular,
+    Medium,
+    Semibold,
+    Bold,
+    Italic,
+    BoldItalic,
+    Mono,
+    Icon,
+}
+
+/// Natural line height of each family in ems (ascender − descender + gap),
+/// used to turn Flutter's `height` ratios into makepad line spacing scales.
+fn natural_line(font: Font) -> f64 {
+    match font {
+        Font::Mono => 1.13,
+        Font::Icon => 1.0,
+        _ => 1.3,
+    }
+}
+
+/// One styled stretch (in bytes) of a rich text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RichSpan {
+    pub len: usize,
+    pub font: Font,
+    pub size_px: f64,
+    pub color: Vec4,
+}
+
+/// The font family a DrawText's text style resolved to. Makepad 1.0.0 keeps
+/// `FontFamily::id` private while `Fonts::get_or_layout` needs it for
+/// multi-span layout; `FontFamily` is a single `LiveId` (u64) field, which the
+/// compile-time size check below pins for the pinned version.
+fn family_id(dt: &DrawText) -> FontFamilyId {
+    const _: () = assert!(std::mem::size_of::<DrawTextFontFamily>() == std::mem::size_of::<u64>());
+    // SAFETY: `FontFamily` (makepad-draw 1.0.0, shader/draw_text.rs) is
+    // `struct FontFamily { #[rust] id: LiveId }` with `LiveId(pub u64)`: one
+    // 8-byte field, so its bytes are exactly the id.
+    let raw: u64 = unsafe { std::mem::transmute_copy(&dt.text_style.font_family) };
+    raw.into()
+}
+
+fn text_color(color: Vec4) -> TextColor {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    TextColor { r: byte(color.x), g: byte(color.y), b: byte(color.z), a: byte(color.w) }
+}
+
+#[derive(Live, LiveHook, LiveRegister)]
+pub struct ChatKit {
+    #[live]
+    pub rect: DrawBox,
+    #[live]
+    pub image: DrawFilesImage,
+    #[live]
+    pub spinner: DrawChatSpinner,
+    #[live]
+    pub logo: DrawIcon,
+    #[live]
+    pub text_regular: DrawText,
+    #[live]
+    pub text_medium: DrawText,
+    #[live]
+    pub text_semibold: DrawText,
+    #[live]
+    pub text_bold: DrawText,
+    #[live]
+    pub text_italic: DrawText,
+    #[live]
+    pub text_bold_italic: DrawText,
+    #[live]
+    pub text_mono: DrawText,
+    #[live]
+    pub text_icon: DrawText,
+    /// Measuring pass: layout runs, nothing is drawn or registered.
+    #[rust]
+    pub dry: bool,
+}
+
+pub fn rgba(hex: u32) -> Vec4 {
+    let a = ((hex >> 24) & 0xff) as f32 / 255.0;
+    let r = ((hex >> 16) & 0xff) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xff) as f32 / 255.0;
+    let b = (hex & 0xff) as f32 / 255.0;
+    vec4(r, g, b, a)
+}
+
+/// `#rrggbb` (syntax theme colors).
+pub fn hex_color(hex: &str) -> Vec4 {
+    let digits = hex.trim_start_matches('#');
+    match u32::from_str_radix(digits, 16) {
+        Ok(v) if digits.len() == 6 => rgba(0xff00_0000 | v),
+        Ok(v) if digits.len() == 8 => rgba(v.rotate_right(8)),
+        _ => vec4(1.0, 1.0, 1.0, 1.0),
+    }
+}
+
+pub fn with_alpha(color: Vec4, alpha: f32) -> Vec4 {
+    vec4(color.x, color.y, color.z, color.w * alpha)
+}
+
+pub const TRANSPARENT: Vec4 = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+
+impl ChatKit {
+    fn text(&mut self, font: Font) -> &mut DrawText {
+        match font {
+            Font::Regular => &mut self.text_regular,
+            Font::Medium => &mut self.text_medium,
+            Font::Semibold => &mut self.text_semibold,
+            Font::Bold => &mut self.text_bold,
+            Font::Italic => &mut self.text_italic,
+            Font::BoldItalic => &mut self.text_bold_italic,
+            Font::Mono => &mut self.text_mono,
+            Font::Icon => &mut self.text_icon,
+        }
+    }
+
+    /// Lays out `text` in `font` at `size_px` logical pixels with a line
+    /// height of `height` × size (Flutter TextStyle.height), wrapping to
+    /// `max_width` when given.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout(&mut self, cx: &mut Cx, font: Font, size_px: f64, height: f64, text: &str, max_width: Option<f64>, indent: f64) -> Rc<LaidoutText> {
+        let dt = self.text(font);
+        dt.text_style.font_size = (size_px * 0.75) as f32;
+        dt.text_style.line_spacing = (height / natural_line(font)).max(0.5) as f32;
+        dt.layout(cx, indent as f32, 0.0, max_width.map(|w| w.max(1.0) as f32), max_width.is_some(), Align::default(), text)
+    }
+
+    /// One laid-out text with styled spans (bold/italic/mono/colored runs in
+    /// a single paragraph), so wrapping, baselines and selection are those of
+    /// the whole paragraph. `height` is the paragraph's line height ratio.
+    pub fn layout_rich(&mut self, cx: &mut Cx, text: &str, spans: &[RichSpan], max_width: Option<f64>, height: f64) -> Rc<LaidoutText> {
+        CxDraw::lazy_construct_fonts(cx);
+        let base = spans.first().map(|s| s.font).unwrap_or(Font::Regular);
+        let layout_spans: Vec<Span> = spans
+            .iter()
+            .map(|span| Span {
+                style: Style {
+                    font_family_id: family_id(self.text(span.font)),
+                    font_size_in_pts: (span.size_px * 0.75) as f32,
+                    color: Some(text_color(span.color)),
+                },
+                len: span.len,
+            })
+            .collect();
+        let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
+        let mut fonts = fonts.borrow_mut();
+        fonts.get_or_layout(BorrowedLayoutParams {
+            text,
+            spans: &layout_spans,
+            options: LayoutOptions {
+                first_row_indent_in_lpxs: 0.0,
+                first_row_min_line_spacing_below_in_lpxs: 0.0,
+                max_width_in_lpxs: max_width.map(|w| w.max(1.0) as f32),
+                wrap: max_width.is_some(),
+                align: 0.0,
+                line_spacing_scale: (height / natural_line(base)).max(0.5) as f32,
+            },
+        })
+    }
+
+    /// Starts this kit's batching inside the current draw list: the rect draw
+    /// call is created before any text call, so backgrounds render beneath text
+    /// (makepad appends instances to the newest matching call of each shader).
+    pub fn begin_layer(&mut self, cx: &mut Cx2d) {
+        self.rect.new_draw_call(cx);
+    }
+
+    pub fn draw_laidout(&mut self, cx: &mut Cx2d, font: Font, color: Vec4, pos: DVec2, laidout: &LaidoutText) {
+        if self.dry {
+            return;
+        }
+        let size = laidout_size(laidout);
+        let dt = self.text(font);
+        dt.color = color;
+        dt.draw_walk_laidout(
+            cx,
+            Walk { abs_pos: Some(pos), margin: Margin::default(), width: Size::Fixed(size.x.max(1.0)), height: Size::Fixed(size.y.max(1.0)) },
+            laidout,
+        );
+    }
+
+    /// Draws a rich layout; glyph colors come from its spans.
+    pub fn draw_rich(&mut self, cx: &mut Cx2d, pos: DVec2, laidout: &LaidoutText) {
+        self.draw_laidout(cx, Font::Regular, vec4(1.0, 1.0, 1.0, 1.0), pos, laidout);
+    }
+
+    /// One-shot label: lays out and draws, returning the drawn size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn label(&mut self, cx: &mut Cx2d, font: Font, size_px: f64, height: f64, color: Vec4, pos: DVec2, text: &str, max_width: Option<f64>) -> DVec2 {
+        if text.is_empty() {
+            return DVec2::default();
+        }
+        let laidout = self.layout(cx, font, size_px, height, text, max_width, 0.0);
+        self.draw_laidout(cx, font, color, pos, &laidout);
+        laidout_size(&laidout)
+    }
+
+    pub fn measure(&mut self, cx: &mut Cx, font: Font, size_px: f64, height: f64, text: &str, max_width: Option<f64>) -> DVec2 {
+        if text.is_empty() {
+            return DVec2::default();
+        }
+        laidout_size(&self.layout(cx, font, size_px, height, text, max_width, 0.0))
+    }
+
+    /// `maxLines: lines, overflow: ellipsis`: the wrapped layout of the longest
+    /// prefix (plus "…") that fits in `lines` rows of `max_width`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout_clamped(&mut self, cx: &mut Cx, font: Font, size_px: f64, height: f64, text: &str, max_width: f64, lines: usize) -> Rc<LaidoutText> {
+        let wrap = lines > 1;
+        let fits = |kit: &mut Self, cx: &mut Cx, candidate: &str| {
+            let laid = kit.layout(cx, font, size_px, height, candidate, wrap.then_some(max_width), 0.0);
+            let ok = if wrap { laid.rows.len() <= lines } else { laidout_size(&laid).x <= max_width + 0.5 };
+            (ok, laid)
+        };
+        let (ok, laid) = fits(self, cx, text);
+        if ok {
+            return laid;
+        }
+        let bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        let (mut lo, mut hi) = (0usize, bounds.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            let candidate = format!("{}…", text[..bounds.get(mid).copied().unwrap_or(text.len())].trim_end());
+            if fits(self, cx, &candidate).0 { lo = mid } else { hi = mid - 1 }
+        }
+        let candidate = format!("{}…", text[..bounds.get(lo).copied().unwrap_or(text.len())].trim_end());
+        fits(self, cx, &candidate).1
+    }
+
+    /// A single ellipsized line (`maxLines: 1`); returns the drawn size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn label_line(&mut self, cx: &mut Cx2d, font: Font, size_px: f64, height: f64, color: Vec4, pos: DVec2, text: &str, max_width: f64) -> DVec2 {
+        if text.is_empty() {
+            return DVec2::default();
+        }
+        let laid = self.layout_clamped(cx, font, size_px, height, text, max_width.max(1.0), 1);
+        self.draw_laidout(cx, font, color, pos, &laid);
+        laidout_size(&laid)
+    }
+
+    pub fn rect(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4, radius: f64) {
+        let rr = radius as f32;
+        self.rect_full(cx, r, color, vec4(rr, rr, rr, rr), TRANSPARENT, 0.0);
+    }
+
+    pub fn bordered(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4, radius: f64, border: Vec4, width: f64) {
+        let rr = radius as f32;
+        self.rect_full(cx, r, color, vec4(rr, rr, rr, rr), border, width);
+    }
+
+    /// A box with per-corner radii (left-top, right-top, right-bottom,
+    /// left-bottom) through the shell's exact rounded-rect `DrawBox`: equal
+    /// corners draw directly; top-only / bottom-only rounding draws the box
+    /// extended past its square side and clips the extension (redrawing that
+    /// side's border); mixed corners (the user bubble's 16/2/16/16) square the
+    /// smaller corners back in with corner patches of their own radius.
+    pub fn rect_full(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4, radii: Vec4, border: Vec4, width: f64) {
+        if r.size.x <= 0.0 || r.size.y <= 0.0 || self.dry {
+            return;
+        }
+        let corners = [radii.x as f64, radii.y as f64, radii.z as f64, radii.w as f64];
+        let [lt, rt, rb, lb] = corners;
+        if lt == rt && rt == rb && rb == lb {
+            self.rect.paint_bordered(cx, r, color, border, width, lt);
+            return;
+        }
+        let top = lt == rt && rb == 0.0 && lb == 0.0;
+        let bottom = rb == lb && lt == 0.0 && rt == 0.0;
+        if top || bottom {
+            let radius = if top { lt } else { rb };
+            let extended = if top {
+                Rect { pos: r.pos, size: dvec2(r.size.x, r.size.y + radius) }
+            } else {
+                Rect { pos: r.pos - dvec2(0.0, radius), size: dvec2(r.size.x, r.size.y + radius) }
+            };
+            cx.begin_turtle(Walk::abs_rect(r), Layout { clip_x: true, clip_y: true, ..Layout::default() });
+            self.rect.paint_bordered(cx, extended, color, border, width, radius);
+            cx.end_turtle();
+            if width > 0.0 && border.w > 0.0 {
+                let y = if top { r.pos.y + r.size.y - width } else { r.pos.y };
+                self.rect.paint(cx, rect_xywh(r.pos.x, y, r.size.x, width), border, 0.0);
+            }
+            return;
+        }
+        let big = lt.max(rt).max(rb).max(lb).min(r.size.x.min(r.size.y) * 0.5);
+        self.rect.paint_bordered(cx, r, color, border, width, big);
+        let (x0, y0, x1, y1) = (r.pos.x, r.pos.y, r.pos.x + r.size.x - big, r.pos.y + r.size.y - big);
+        for (radius, x, y) in [(lt, x0, y0), (rt, x1, y0), (rb, x1, y1), (lb, x0, y1)] {
+            if radius < big {
+                self.rect.paint(cx, rect_xywh(x, y, big, big), color, radius);
+            }
+        }
+    }
+
+    /// A Lucide glyph (shell icon font), centered in `r`.
+    pub fn icon(&mut self, cx: &mut Cx2d, name: &str, r: Rect, size_px: f64, color: Vec4) {
+        let Some(glyph) = crate::common::icons::glyph(name) else { return };
+        let mut buffer = [0u8; 4];
+        let text = glyph.encode_utf8(&mut buffer);
+        let laidout = self.layout(cx, Font::Icon, size_px, 1.0, text, None, 0.0);
+        let size = laidout_size(&laidout);
+        let pos = r.center() - size * 0.5;
+        self.draw_laidout(cx, Font::Icon, color, pos, &laidout);
+    }
+
+    pub fn paseo_logo(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4) {
+        if self.dry {
+            return;
+        }
+        self.logo.color = color;
+        self.logo.draw_walk(cx, Walk { abs_pos: Some(r.pos), margin: Margin::default(), width: Size::Fixed(r.size.x), height: Size::Fixed(r.size.y) });
+    }
+
+    pub fn spinner(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4, phase: f64) {
+        if self.dry {
+            return;
+        }
+        self.spinner.color = color;
+        self.spinner.phase = phase.fract() as f32;
+        self.spinner.thickness = (r.size.x / 9.0).max(1.5) as f32;
+        self.spinner.draw_abs(cx, r);
+    }
+
+    pub fn texture(&mut self, cx: &mut Cx2d, r: Rect, texture: &Texture, radius: f64) {
+        if self.dry {
+            return;
+        }
+        self.image.draw_texture(cx, r, texture, radius, 1.0);
+    }
+}
+
+pub fn laidout_size(laidout: &LaidoutText) -> DVec2 {
+    dvec2(laidout.size_in_lpxs.width as f64, laidout.size_in_lpxs.height as f64)
+}
+
+/// Rects (relative to the text origin) covering bytes `start..end`.
+pub fn range_rects(laidout: &LaidoutText, start: usize, end: usize) -> Vec<Rect> {
+    if end <= start {
+        return Vec::new();
+    }
+    let selection = Selection {
+        anchor: Cursor { index: start.min(laidout.text.len()), prefer_next_row: false },
+        cursor: Cursor { index: end.min(laidout.text.len()), prefer_next_row: false },
+    };
+    laidout
+        .selection_rects_in_lpxs(selection)
+        .into_iter()
+        .map(|r| Rect { pos: dvec2(r.origin.x as f64, r.origin.y as f64), size: dvec2(r.size.width as f64, r.size.height as f64) })
+        .collect()
+}
+
+/// Everything clickable in the timeline.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HitTarget {
+    Link { href: String, kind: super::links::FileLinkSourceType, text: String },
+    /// Copy a code block / turn / message; `key` drives the 1.5s check glyph.
+    Copy { key: String, text: String },
+    Image { key: String },
+    UserImage { index: usize },
+    Toggle(String),
+    OpenSheet(String),
+    OpenFile(String),
+    RewindMenu,
+    ForkMenu { completed: bool },
+    PermissionAction { key: String, action: String },
+    QuestionTab { key: String, index: usize },
+    QuestionOption { key: String, index: usize },
+    QuestionDismiss { key: String },
+    QuestionPrimary { key: String },
+    /// Horizontal scroll region (code panes, tables, detail blocks).
+    ScrollX(String),
+    /// Vertically capped detail region.
+    ScrollY(String),
+    /// Panel chrome.
+    Chrome(String),
+}
+
+impl HitTarget {
+    pub fn is_link(&self) -> bool {
+        matches!(self, HitTarget::Link { .. })
+    }
+
+    /// Scroll regions pass clicks through to selection.
+    pub fn is_scroll_region(&self) -> bool {
+        matches!(self, HitTarget::ScrollX(_) | HitTarget::ScrollY(_))
+    }
+}
+
+/// A selectable run of laid-out text.
+pub struct TextRun {
+    pub laidout: Rc<LaidoutText>,
+    /// Relative to the canvas origin (the widget rect's top-left).
+    pub origin: DVec2,
+    /// Offset of this run in [Canvas::plain].
+    pub offset: usize,
+    pub len: usize,
+    /// Visible part (clipped regions); hit tests ignore the rest.
+    pub clip: Option<Rect>,
+}
+
+/// Selectable text and hit regions recorded while drawing one widget.
+#[derive(Default)]
+pub struct Canvas {
+    /// Absolute position of the widget rect while drawing.
+    pub origin: DVec2,
+    pub runs: Vec<TextRun>,
+    pub plain: String,
+    pub hits: Vec<(Rect, HitTarget)>,
+    /// (anchor, cursor) offsets in `plain`.
+    pub selection: Option<(usize, usize)>,
+    pub clip_stack: Vec<Rect>,
+    /// Measuring pass: nothing is registered.
+    pub dry: bool,
+}
+
+impl Canvas {
+    pub fn begin(&mut self, origin: DVec2) {
+        self.origin = origin;
+        self.runs.clear();
+        self.plain.clear();
+        self.hits.clear();
+        self.clip_stack.clear();
+    }
+
+    /// Registers a run drawn at absolute `pos`; returns its plain offset.
+    /// Blocks are separated by `separator` in the copied text.
+    pub fn add_run(&mut self, laidout: Rc<LaidoutText>, pos: DVec2, separator: Option<char>) -> usize {
+        if self.dry {
+            return self.plain.len();
+        }
+        if let Some(sep) = separator
+            && !self.plain.is_empty()
+            && !self.plain.ends_with(sep)
+        {
+            self.plain.push(sep);
+        }
+        let offset = self.plain.len();
+        self.plain.push_str(&laidout.text);
+        let len = laidout.text.len();
+        let clip = self.clip_stack.last().copied();
+        self.runs.push(TextRun { laidout, origin: pos - self.origin, offset, len, clip });
+        offset
+    }
+
+    pub fn add_hit(&mut self, r: Rect, target: HitTarget) {
+        if self.dry {
+            return;
+        }
+        let mut r = Rect { pos: r.pos - self.origin, size: r.size };
+        if let Some(clip) = self.clip_stack.last() {
+            r = r.clip((clip.pos, clip.pos + clip.size));
+        }
+        if r.size.x > 0.0 && r.size.y > 0.0 {
+            self.hits.push((r, target));
+        }
+    }
+
+    /// A hit region beneath everything registered so far in this widget
+    /// (a badge header under its open-file glyph).
+    pub fn add_hit_under(&mut self, r: Rect, target: HitTarget) {
+        let before = self.hits.len();
+        self.add_hit(r, target);
+        if self.hits.len() > before {
+            let hit = self.hits.pop().expect("pushed above");
+            self.hits.insert(0, hit);
+        }
+    }
+
+    /// Clip region (absolute) for runs/hits registered until `pop_clip`.
+    pub fn push_clip(&mut self, r: Rect) {
+        let mut rel = Rect { pos: r.pos - self.origin, size: r.size };
+        if let Some(outer) = self.clip_stack.last() {
+            rel = rel.clip((outer.pos, outer.pos + outer.size));
+        }
+        self.clip_stack.push(rel);
+    }
+
+    pub fn pop_clip(&mut self) {
+        self.clip_stack.pop();
+    }
+
+    /// Topmost hit target at `rel` (relative to the widget rect).
+    pub fn hit_at(&self, rel: DVec2) -> Option<&HitTarget> {
+        self.hits.iter().rev().find(|(r, t)| r.contains(rel) && !t.is_scroll_region()).map(|(_, t)| t)
+    }
+
+    pub fn scroll_region_at(&self, rel: DVec2, vertical: bool) -> Option<&str> {
+        self.hits.iter().rev().find_map(|(r, t)| match t {
+            HitTarget::ScrollX(key) if !vertical && r.contains(rel) => Some(key.as_str()),
+            HitTarget::ScrollY(key) if vertical && r.contains(rel) => Some(key.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Text offset nearest to `rel`.
+    pub fn offset_at(&self, rel: DVec2) -> Option<usize> {
+        let mut best: Option<(f64, usize)> = None;
+        for run in &self.runs {
+            if let Some(clip) = run.clip
+                && !clip.contains(rel)
+            {
+                continue;
+            }
+            let local = rel - run.origin;
+            let size = laidout_size(&run.laidout);
+            let dy = if local.y < 0.0 { -local.y } else if local.y > size.y { local.y - size.y } else { 0.0 };
+            let dx = if local.x < 0.0 { -local.x } else if local.x > size.x { local.x - size.x } else { 0.0 };
+            let distance = dy * 1000.0 + dx;
+            if best.is_some_and(|(d, _)| d <= distance) {
+                continue;
+            }
+            let point = Point::new(local.x.clamp(0.0, size.x) as f32, local.y.clamp(0.0, size.y.max(0.0)) as f32);
+            let cursor = run.laidout.point_in_lpxs_to_cursor(point);
+            best = Some((distance, run.offset + cursor.index.min(run.len)));
+        }
+        best.map(|(_, offset)| offset)
+    }
+
+    pub fn selected_range(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.selection?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let end = end.min(self.plain.len());
+        (end > start).then_some((start, end))
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selected_range()?;
+        let start = floor_char_boundary(&self.plain, start);
+        let end = floor_char_boundary(&self.plain, end);
+        Some(self.plain[start..end].to_owned())
+    }
+
+    /// Word around `offset` (double-tap / long-press selection).
+    pub fn word_at(&self, offset: usize) -> (usize, usize) {
+        let text = &self.plain;
+        let offset = floor_char_boundary(text, offset.min(text.len()));
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let start = text[..offset].char_indices().rev().take_while(|(_, c)| is_word(*c)).last().map(|(i, _)| i).unwrap_or(offset);
+        let end = text[offset..].char_indices().find(|(_, c)| !is_word(*c)).map(|(i, _)| offset + i).unwrap_or(text.len());
+        (start, end)
+    }
+
+    /// Selection highlight rects (absolute, from the current canvas origin).
+    pub fn selection_rects(&self) -> Vec<Rect> {
+        let Some((start, end)) = self.selected_range() else { return Vec::new() };
+        let mut out = Vec::new();
+        for run in &self.runs {
+            let a = start.max(run.offset);
+            let b = end.min(run.offset + run.len);
+            if a >= b {
+                continue;
+            }
+            for r in range_rects(&run.laidout, a - run.offset, b - run.offset) {
+                let mut rect = r.translate(self.origin + run.origin);
+                if let Some(clip) = run.clip {
+                    let abs = clip.translate(self.origin);
+                    rect = rect.clip((abs.pos, abs.pos + abs.size));
+                }
+                if rect.size.x > 0.0 && rect.size.y > 0.0 {
+                    out.push(rect);
+                }
+            }
+        }
+        out
+    }
+}
+
+pub fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut i = index.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+pub fn rect_xywh(x: f64, y: f64, w: f64, h: f64) -> Rect {
+    Rect { pos: dvec2(x, y), size: dvec2(w, h) }
+}

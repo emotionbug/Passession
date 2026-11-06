@@ -85,7 +85,7 @@ Paseo 使用主机白名单校验传入请求的 `Host` 请求头。主机无法
 
 配置密码后，所有 HTTP 请求都必须包含 `Authorization: Bearer <password>` 请求头，所有 WebSocket 客户端（包括中继客户端）都必须在连接时发送密码。中继客户端在端到端加密通道内发送密码，中继无法看到它。未经验证的 HTTP 请求会收到 `401 Unauthorized` 响应。只有 `/api/health` 存活检查端点例外，以便进程管理器和负载均衡器无需凭据即可探测。
 
-原生 daemon 不提供内置 Web 产品客户端。Flutter 客户端和 Rust CLI 通过 API 认证，不需要公开的静态登录页。
+原生 daemon 不提供内置 Web 产品客户端。原生客户端和 Rust CLI 通过 API 认证，不需要公开的静态登录页。
 
 密码以 bcrypt 哈希的形式保存在 `config.json` 中，daemon 从不以明文保存它。设置说明见[配置](/docs/configuration#password-authentication)。
 
@@ -120,7 +120,7 @@ Compose 和反向代理的示例见 [Docker](/docs/docker)。
 
 ## 原生桌面信任边界 {#native-desktop-trust-boundary}
 
-Flutter 桌面客户端不包含 Electron 或 Chromium，Chromium 沙盒参数及辅助程序安装说明不适用。这并不隔离 Agent：Provider 和脚本/设置任务 PTY 拥有 daemon 用户的文件系统与凭据访问权限。客户端提供只读任务日志，不提供交互式终端 UI。
+原生桌面客户端不包含 Electron 或 Chromium，Chromium 沙盒参数及辅助程序安装说明不适用。这并不隔离 Agent：Provider 和脚本/设置任务 PTY 拥有 daemon 用户的文件系统与凭据访问权限。客户端提供只读任务日志，不提供交互式终端 UI。
 
 内置集成在 Rust 中运行。原生后端插件以 daemon 用户权限在独立进程中执行受信任代码。进程隔离不是安全沙盒，只安装可信插件。原生产品不包含可执行 React UI 插件或内嵌浏览器自动化。
 

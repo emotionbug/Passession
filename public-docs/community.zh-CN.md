@@ -10,14 +10,14 @@ nav: 相关项目
 
 ## 插件 {#plugins}
 
-仅安装目标架构和 Paseo 版本要求与主机一致的原生后端插件。Flutter 客户端不执行 React UI 入口。分享后端扩展请参阅[发布插件](plugins/publishing.zh-CN.md)。扩展不在沙箱中运行，安装前应阅读说明和源码。
+仅安装目标架构和 Paseo 版本要求与主机一致的原生后端插件。原生客户端不执行 React UI 入口。分享后端扩展请参阅[发布插件](plugins/publishing.zh-CN.md)。扩展不在沙箱中运行，安装前应阅读说明和源码。
 
 ## 工具与集成 {#tools-and-integrations}
 
 | 项目                                                                                         | 作用                                                                                                |
 | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | [Paseo for VS Code](https://marketplace.visualstudio.com/items?itemName=hinnes.paseo-vscode) | 在 VS Code 中打开对应的 Paseo 项目或 worktree，并添加 Agent 聊天、文件提及和编辑器链接。            |
-| [VS Code Web plugin](https://github.com/itsjustanks/paseo-plugin-vscode-web)                 | 第三方 VS Code 隧道集成。其旧 Paseo UI 入口不是受支持的 Flutter 插件，请使用外部浏览器/工具工作流。 |
+| [VS Code Web plugin](https://github.com/itsjustanks/paseo-plugin-vscode-web)                 | 第三方 VS Code 隧道集成。其旧 Paseo UI 入口不是受支持的客户端插件，请使用外部浏览器/工具工作流。 |
 | [Paseo Icon](https://github.com/gpambrozio/paseo-menubar)                                    | 在 macOS 菜单栏中显示各个 Paseo 主机上的工作区状态，一键打开工作区。                                |
 | [Paseo Cross-Daemon Comms](https://github.com/xpufx/paseo-cross-daemon-comms)                | 让 Agent 通过 MCP 服务器与另一个 Paseo daemon 上的 Agent 通信。                                     |
 | [Paseo Antigravity ACP](https://github.com/tiezbro/paseo-agy-acp)                            | 通过 ACP 把 Google Antigravity CLI 接入 Paseo，并处理 Paseo 特有的上下文、权限和并发。              |

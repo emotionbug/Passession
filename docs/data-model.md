@@ -516,15 +516,23 @@ These small files are persisted under `$PASEO_HOME` for native daemon identity a
 
 ---
 
-## Client-side stores (Flutter)
+## Client-side stores
 
-The native client stores state beneath the platform application-support directory in `paseo-native/`, independently of the daemon's `$PASEO_HOME`. `packages/flutter_app/lib/core/app_store.dart` owns this boundary.
+The native client keeps its state in the platform application-support directory, independently of the daemon's `$PASEO_HOME`. The Rust client uses the same directory and files as the Flutter client it replaces, so existing installs keep their hosts, preferences and layout. `packages/gui-core/src/storage` owns this boundary; `paseo-gui-platform` resolves the directory, and `PASEO_GUI_STATE_DIR` replaces it for development runs (`cargo xtask dev app` sets it to `.dev/gui-state`).
 
-- `state.json` contains versioned preferences, saved hosts, route suppression and layout. Unknown preference keys are retained. A newer unsupported state version is not overwritten.
-- `state.lock` serializes updates. Writes merge changes against the latest state so another client window's unrelated preference/host edits are not lost.
+Under `paseo-native/`:
+
+- `state.json` contains versioned preferences, saved hosts, route suppression and layout. Unknown keys are retained. A corrupt file or a newer unsupported version is never overwritten.
+- `state.lock` serializes updates. Writes merge changes three-way against the latest file so another window's or process's unrelated preference and host edits are not lost.
+- `layout-<window>.json` holds a window's saved tab and pane layout. Restoration drops removed browser, executable plugin and interactive terminal tabs.
 - `replica-<base64url-server-id>.json` stores a host's project/workspace/agent snapshot and cache timestamp. It is scoped to the saved server identity and reconciled with the live daemon.
-- Drafts are retained in preferences with explicit host/workspace/target keys. Layout restoration drops removed browser, executable plugin and interactive terminal tabs; other saved layout is restored as written.
+
+Next to it, `shared_preferences.json` keeps keyed values (client id, relay protection floors `paseo.relayProtected.<key>`, update-operation records) in the Flutter Linux/Windows format, including the `flutter.` key prefix. Foreign keys survive writes. On macOS and iOS (NSUserDefaults binary plist) and Android (`FlutterSharedPreferences.xml`) the Flutter values are imported once into that file.
+
+Composer drafts, queues and creation intents live in its `paseo.chat.drafts.v1` value, keyed by `[serverId, workspaceId, targetId]`, not in the general `preferences` object. The composer owns this data; retained image bytes live in immutable content-addressed blob files rather than repeated inline draft copies. A late acknowledgement may clear only the submitted editor generation, never newer input.
+
+Core state writes use atomic replacement; Linux/macOS restrict private state files to mode 0600 and directories to 0700. Windows profile ACLs and mobile sandboxes provide the platform boundary. Core commands run in order, and send/creation workflows wait for flushed draft state before submitting dependent requests.
 
 Directory identity includes `(serverId, cwd)`; equal paths on two hosts must not merge. Workspace-owned state remains scoped to workspace identity, not parsed from a pathname. Closing a tab changes layout, not the daemon's archive state.
 
-The Flutter client does not read or import the retired app's browser IndexedDB, React Native AsyncStorage, Electron localStorage or desktop settings. Cached client state is not the authoritative session history; the daemon remains the authority. Treat cached prompts, paths, credentials and tool output as sensitive data and do not infer encryption at rest from encrypted transport.
+The client does not read or import the retired app's browser IndexedDB, React Native AsyncStorage, Electron localStorage or desktop settings. Cached client state is not the authoritative session history; the daemon remains the authority. Treat cached prompts, paths, credentials and tool output as sensitive data and do not infer encryption at rest from encrypted transport.

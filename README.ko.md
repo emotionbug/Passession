@@ -2,9 +2,9 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-Paseo Sessions는 코딩 에이전트 작업을 실행하고 검토하는 네이티브 환경입니다. **Linux, macOS, Windows, Android, iOS** 클라이언트는 Flutter, 데몬과 `paseo` CLI는 Rust로 구현됩니다. 데스크톱은 로컬 데몬을 관리할 수 있으며, 모바일은 다른 컴퓨터의 데몬에 원격으로 연결하는 전용 클라이언트입니다.
+Paseo Sessions는 코딩 에이전트 작업을 실행하고 검토하는 네이티브 환경입니다. **Linux, macOS, Windows, Android, iOS** 클라이언트는 네이티브 Rust(Makepad), 데몬과 `paseo` CLI도 Rust로 구현됩니다. 데스크톱은 로컬 데몬을 관리할 수 있으며, 모바일은 다른 컴퓨터의 데몬에 원격으로 연결하는 전용 클라이언트입니다.
 
-현재 체크아웃 버전은 **0.13.1**입니다. 배포 산출물은 [이 저장소의 릴리스](https://github.com/emotionbug/paseo/releases)를 사용하세요. 업스트림 다운로드는 이 저장소의 빌드가 아닙니다. 직접 빌드하거나 바이너리를 배포할 때는 [출시 요구 사항](docs/release.md)을 확인하세요.
+현재 체크아웃 버전은 **0.13.5**입니다. 배포 산출물은 [이 저장소의 릴리스](https://github.com/emotionbug/paseo/releases)를 사용하세요. 업스트림 다운로드는 이 저장소의 빌드가 아닙니다. 직접 빌드하거나 바이너리를 배포할 때는 [출시 요구 사항](docs/release.md)을 확인하세요.
 
 ## 여러 호스트에서 작업하기와 기능 범위
 
@@ -25,7 +25,7 @@ Paseo Sessions는 코딩 에이전트 작업을 실행하고 검토하는 네이
 
 ## 소스에서 빌드하고 실행하기
 
-Rust/Cargo, Flutter SDK와 대상 플랫폼의 네이티브 도구 체인이 필요합니다. 에이전트 CLI도 하나 이상 설치하고 인증 정보를 설정하세요: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Copilot](https://github.com/features/copilot/cli/), [OpenCode](https://github.com/anomalyco/opencode), [Pi](https://pi.dev). 자세한 준비 사항은 [개발 가이드](docs/development.md)에 있습니다.
+Rust/Cargo와 대상 플랫폼의 네이티브 도구 체인이 필요합니다. 에이전트 CLI도 하나 이상 설치하고 인증 정보를 설정하세요: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Copilot](https://github.com/features/copilot/cli/), [OpenCode](https://github.com/anomalyco/opencode), [Pi](https://pi.dev). 자세한 준비 사항은 [개발 가이드](docs/development.md)에 있습니다.
 
 ```sh
 cargo fetch --locked
@@ -44,15 +44,15 @@ cargo xtask dev app
 개발 환경은 체크아웃의 `.dev/paseo-home`과 포트 `6768`을 사용하며, 일반 실행의 `~/.paseo` 및 포트 `6767`과 분리합니다. 빌드와 배포 명령은 Rust `paseo-xtask` 크레이트로 실행합니다.
 
 ```sh
-cargo xtask build-flutter linux
-cargo xtask build-flutter macos
-cargo xtask build-flutter windows
-cargo xtask build-flutter android
-cargo xtask build-flutter android --arch arm64
-cargo xtask build-flutter ios
+cargo xtask build-gui linux
+cargo xtask build-gui macos
+cargo xtask build-gui windows
+cargo xtask build-gui android
+cargo xtask build-gui android --arch arm64
+cargo xtask build-gui ios
 ```
 
-데스크톱은 대상 OS에서 빌드해야 하며 iOS는 macOS/Xcode가 필요합니다. 산출물과 빌드 설명은 `artifacts/flutter/`에 저장됩니다. Android/iOS에는 데몬이 없습니다. Android 앱 이름은 **Paseo Sessions**, 패키지는 `sh.paseo.sessions`입니다. 디버그 서명 APK나 서명되지 않은 iOS 앱 아카이브는 스토어 출시용 산출물이 아닙니다. [Android](docs/android.md)와 [출시 가이드](docs/release.md)를 참고하세요.
+데스크톱은 대상 OS에서 빌드해야 하며 iOS는 macOS/Xcode가 필요합니다. 산출물과 빌드 설명은 `artifacts/native/`에 저장됩니다. Android/iOS에는 데몬이 없습니다. Android 앱 이름은 **Paseo Sessions**, 패키지는 `sh.paseo.sessions`입니다. 디버그 서명 APK나 서명되지 않은 iOS 앱 아카이브는 스토어 출시용 산출물이 아닙니다. [Android](docs/android.md)와 [출시 가이드](docs/release.md)를 참고하세요.
 
 헤드리스 호스트에서는 생성된 `target/debug/paseo`(Windows에서는 `paseo.exe`)를 사용합니다. `CARGO_TARGET_DIR`를 설정했다면 해당 디렉터리를 사용하고, 생성된 런타임 자산을 실행 파일 옆에 유지하세요.
 
@@ -81,22 +81,22 @@ paseo import --provider pi <native-session-id>
 paseo run --host workstation.local:6767 --cwd /workspace --provider codex "review the diff"
 ```
 
-외부 통합용 Rust SDK `paseo-client`는 `packages/client`, 공유 통신 규약과 릴레이 암호화 구현 `paseo-protocol`은 `packages/protocol`에 있습니다. Rust 데몬과 Dart 클라이언트의 통신 규약은 유지합니다. 기존 TypeScript SDK를 감싸서 실행하지 않고 Rust SDK로 교체합니다.
+외부 통합용 Rust SDK `paseo-client`는 `packages/client`, 공유 통신 규약과 릴레이 암호화 구현 `paseo-protocol`은 `packages/protocol`에 있습니다. 데몬과 네이티브 클라이언트가 같은 크레이트를 사용합니다. 기존 TypeScript SDK를 감싸서 실행하지 않고 Rust SDK로 교체합니다.
 
 ## 소스 구성과 검증 범위
 
 | 영역                                                            | 경로                                                    |
 | --------------------------------------------------------------- | ------------------------------------------------------- |
 | Rust 데몬, CLI, 제공자, 저장소, supervisor, 데스크톱 호스트 IPC | `packages/daemon`                                       |
-| 5개 플랫폼용 Flutter 클라이언트                                 | `packages/flutter_app`                                  |
-| 데스크톱 패키징 및 런타임 자산                                  | `packages/flutter_desktop_host`                         |
-| 네이티브 오디오 통합                                            | `packages/flutter_audio`                                |
+| 5개 플랫폼용 네이티브 클라이언트                                | `packages/gui`, `packages/gui-core`                     |
+| 데스크톱 및 모바일 OS 통합                                      | `packages/gui-platform`                                 |
+| 패키징 리소스와 설치 프로그램                                   | `packaging`                                             |
 | Rust SDK 및 공유 프로토콜                                      | `packages/client`, `packages/protocol`                  |
 | 네이티브 백엔드 플러그인 SDK                                   | `packages/plugin`                                      |
 | Rust 릴레이 및 구문 강조                                       | `packages/relay`, `packages/highlight`                  |
 | Rust 빌드 및 배포 도구                                         | `xtask`                                                |
 
-런타임 경계를 변경하기 전에 [아키텍처](docs/architecture.md), [개발](docs/development.md), [테스트](docs/testing.md), [출시](docs/release.md) 문서를 읽으세요. Linux에는 네이티브 데몬/클라이언트 및 데스크톱 호스트 수명 주기의 실제 실행 증거가 있습니다. Android ARM64 release 모드 빌드는 통과했지만 디버그 서명을 사용했으며 설치나 기기 실행은 하지 않았습니다. 이번 전환에서 Windows, macOS, iOS의 실제 실행은 없습니다. 플랫폼별 CI 정의는 실행 증거가 아닙니다. 데스크톱 추가 검증을 포함한 최신 증거와 제한은 테스트 문서에서 관리합니다.
+런타임 경계를 변경하기 전에 [아키텍처](docs/architecture.md), [개발](docs/development.md), [테스트](docs/testing.md), [출시](docs/release.md) 문서를 읽으세요. Linux에는 데몬과 데스크톱 호스트 수명 주기의 실제 실행 증거가 있으며, 네이티브 Rust 클라이언트 자체의 실행 증거는 별도로 관리합니다. 이번 전환에서 Windows, macOS, Android, iOS의 실제 실행은 없습니다. 플랫폼별 CI 정의는 실행 증거가 아닙니다. 최신 증거와 제한은 테스트 문서에서 관리합니다.
 
 ## 라이선스와 배포
 
@@ -108,4 +108,4 @@ Paseo 소스는 Apache-2.0이며 의존성에는 각각의 라이선스가 적�
 
 - [getpaseo/paseo-relay](https://github.com/getpaseo/paseo-relay): 독립적인 Elixir 분산 릴레이 프로젝트.
 - [paseo-vscode](https://marketplace.visualstudio.com/items?itemName=hinnes.paseo-vscode): VS Code 확장 프로그램. 이번 네이티브 전환에서의 호환성 검증을 의미하지 않습니다.
-- [paseo-skins](https://github.com/huangguang1999/paseo-skins): 기존 커뮤니티 테마 프로젝트 링크입니다. 현재 Flutter 클라이언트와의 호환성이나 실행 가능한 UI 플러그인 지원을 의미하지 않습니다.
+- [paseo-skins](https://github.com/huangguang1999/paseo-skins): 기존 커뮤니티 테마 프로젝트 링크입니다. 현재 네이티브 클라이언트와의 호환성이나 실행 가능한 UI 플러그인 지원을 의미하지 않습니다.

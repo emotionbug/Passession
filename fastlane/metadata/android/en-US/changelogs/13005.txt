@@ -1,0 +1,6 @@
+Fixed
+- Fix Android APK compilation: keep launch-link and notification-data variables distinct in the Java intent bridge.
+- Restore native window reopening from the tray, a second launch and notification actions without reviving the retired Flutter window hierarchy.
+- Retain the numeric GitHub release ID when creating and finalizing native-release drafts, and explicitly preserve the canonical tag when updating draft metadata.
+
+Full notes: https://github.com/emotionbug/paseo/releases

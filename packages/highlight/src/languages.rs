@@ -28,6 +28,8 @@ pub enum Language {
     Nix,
     Elixir,
     Markdown,
+    /// Shell scripts (Flutter highlighted `sh`/`zsh` files and `bash`/`shell` fences as bash).
+    Bash,
 }
 
 impl Language {
@@ -60,6 +62,7 @@ impl Language {
             Self::Nix => "nix",
             Self::Elixir => "elixir",
             Self::Markdown => "markdown",
+            Self::Bash => "bash",
         }
     }
 
@@ -113,6 +116,9 @@ const EXTENSIONS: &[(&str, Language)] = &[
     ("exs", Language::Elixir),
     ("md", Language::Markdown),
     ("mdx", Language::Markdown),
+    ("sh", Language::Bash),
+    ("bash", Language::Bash),
+    ("zsh", Language::Bash),
 ];
 
 /// Case-insensitive final-extension lookup. Bare extension names are accepted,

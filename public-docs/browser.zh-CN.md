@@ -6,7 +6,7 @@ nav: 外部浏览器
 
 # 外部浏览器工作流 {#external-browser-workflow}
 
-原生 Flutter 客户端**不内嵌浏览器或浏览器自动化**，不附带 Electron、Chromium、webview 标签页、共享浏览器配置或 Agent 控制的浏览器界面。没有可以启用旧 Paseo 浏览器工具的开关。
+原生客户端**不内嵌浏览器或浏览器自动化**，不附带 Electron、Chromium、webview 标签页、共享浏览器配置或 Agent 控制的浏览器界面。没有可以启用旧 Paseo 浏览器工具的开关。
 
 你仍然可以开发和测试网页项目：
 

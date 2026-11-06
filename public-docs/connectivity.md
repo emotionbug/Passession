@@ -8,7 +8,7 @@ category: Getting started
 
 # Connectivity
 
-The Flutter client connects to the Rust daemon on your desktop computer or server. Linux, macOS, and Windows clients can use a local daemon or remote hosts; Android and iOS are remote-only clients. Desktop and the Rust CLI can tunnel through SSH; mobile can use the encrypted relay or a direct connection over Tailscale. There is no daemon-served web product client.
+The native client connects to the Rust daemon on your desktop computer or server. Linux, macOS, and Windows clients can use a local daemon or remote hosts; Android and iOS are remote-only clients. Desktop and the Rust CLI can tunnel through SSH; mobile can use the encrypted relay or a direct connection over Tailscale. There is no daemon-served web product client.
 
 On the daemon host, use `paseo onboard` for explicit setup, then `paseo daemon start` and `paseo daemon status`. Bare `paseo` opens chat. Normal operation uses port `6767`; repository development defaults to `.dev/paseo-home` and `6768`. This native migration is unpublished; see [Updates](/docs/updates) for local build availability.
 

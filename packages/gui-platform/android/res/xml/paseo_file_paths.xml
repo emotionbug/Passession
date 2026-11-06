@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- paseo_gui_platform::paths transfer staging (getCacheDir()/paseo-files). -->
+    <cache-path name="paseo_files" path="paseo-files/"/>
+</paths>

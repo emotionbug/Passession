@@ -12,7 +12,7 @@ The bar is four questions:
 Every pull request needs evidence for the questions its change touches. Pull requests without evidence get closed.
 
 For plugin changes, verify the [native executable boundary](plugins.md#native-executable-contract).
-Exercise the Rust host and native plugin executable; Flutter does not load React client plugins.
+Exercise the Rust host and native plugin executable; the native client does not load React client plugins.
 
 ## Evidence
 
@@ -41,7 +41,7 @@ The two things that go wrong most often:
 
 Paseo is composable by design, which means your change sits next to features you didn't touch. Open the surfaces around it. A change to the agent list affects archive, subagents, and tabs; a change to git actions affects worktrees and the checkout flow.
 
-Performance is part of this. The client is native Flutter on five platforms, not a browser shell. Measure native layout/frame behavior rather than React, CSS or Chromium behavior. A desktop result does not establish phone performance.
+Performance is part of this. The client is native Rust (Makepad) on five platforms, not a browser shell. Measure native layout/frame behavior rather than React, CSS or Chromium behavior. A desktop result does not establish phone performance.
 
 If your change touches a hot path such as script logs, the message list or Git polling, submit before/after measurements. [Script/log performance](terminal-performance.md) and [development](development.md) describe the current boundaries.
 
@@ -61,7 +61,7 @@ You aren't expected to own every device. You are expected to say what you covere
 
 Install what you reasonably can. An iOS simulator and an Android emulator cover most of the gap on a single machine, see [development.md](development.md) and [android.md](android.md).
 
-Use [architecture](architecture.md), [native styling](unistyles.md), [native navigation](expo-router.md), and the affected feature's current Flutter implementation. Old React/Electron source paths are not the native acceptance surface.
+Use [architecture](architecture.md), [native styling](unistyles.md), [native navigation](expo-router.md), and the affected feature's current Rust implementation under `packages/gui/src/features`. Old React/Electron/Flutter source paths are not the native acceptance surface.
 
 App and daemon versions also drift, in both directions. That has its own contract: [protocol-compatibility.md](protocol-compatibility.md).
 
@@ -71,7 +71,7 @@ Tests are evidence only when they exercise the real thing.
 
 - A bug fix needs a regression test that fails on the old code for the reported reason.
 - A feature needs tests that go through the same interface a user or a caller uses.
-- Native client flows need actual Flutter execution. Browser checks of a user's project do not cover the product client; the unused website is removed.
+- Native client flows need actual execution of the Rust client. Browser checks of a user's project do not cover the product client; the unused website is removed.
 - Agent provider work needs manual verification against the real provider by someone who can tell that it worked. A fixture and a mock prove the fixture parses, nothing more.
 
 Tests that mock away the behavior, assert on internals, or pass against the broken code claim coverage that isn't there.

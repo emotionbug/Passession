@@ -9,11 +9,15 @@ members = [
     "xtask",
     "plugin-examples/workspace-inspector",
     "packages/relay-cloudflare",
+    "packages/gui-core",
+    "packages/gui-platform",
+    "packages/gui",
 ]
+exclude = ["packages/gui-platform/vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.13.4"
+version = "0.13.5"
 edition = "2024"
 rust-version = "1.93"
 license = "Apache-2.0"
@@ -25,3 +29,11 @@ strip = "debuginfo"
 
 [profile.dev]
 debug = 1
+
+# Vendored Makepad patches: see component VENDORED.md files; makepad-platform's
+# also records the adjacent shader compiler's Android GLES compatibility patch.
+[patch.crates-io]
+makepad-platform = { path = "packages/gui-platform/vendor/makepad-platform" }
+makepad-draw = { path = "packages/gui-platform/vendor/makepad-draw" }
+makepad-widgets = { path = "packages/gui-platform/vendor/makepad-widgets" }
+makepad-shader-compiler = { path = "packages/gui-platform/vendor/makepad-shader-compiler" }

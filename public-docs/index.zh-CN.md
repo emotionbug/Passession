@@ -6,7 +6,7 @@ nav: 快速上手
 
 # 快速上手 {#getting-started}
 
-Paseo Sessions 使用 Flutter 构建 **Linux、macOS、Windows、Android 和 iOS** 原生客户端，daemon 与 CLI 使用 **Rust**。桌面或服务器运行 Agent，Android 和 iOS 远程连接。客户端保留 Markdown、源码编辑、摘要优先的 diff、远程文件夹选择和只读脚本日志，侧边栏按 **主机 → 目录 → 会话** 组织。
+Paseo Sessions 使用原生 Rust 构建 **Linux、macOS、Windows、Android 和 iOS** 客户端，daemon 与 CLI 同样使用 **Rust**。桌面或服务器运行 Agent，Android 和 iOS 远程连接。客户端保留 Markdown、源码编辑、摘要优先的 diff、远程文件夹选择和只读脚本日志，侧边栏按 **主机 → 目录 → 会话** 组织。
 
 请使用[本仓库的发布产物](https://github.com/emotionbug/paseo/releases)获取原生构建；上游下载和应用商店版本是独立产品。源码构建和分发要求见仓库 `docs/release.md`。
 
@@ -14,7 +14,7 @@ Paseo Sessions 使用 Flutter 构建 **Linux、macOS、Windows、Android 和 iOS
 
 在 daemon 所在机器安装并认证至少一个 Provider CLI。Paseo 管理这些程序，但不提供你的账号凭据。Git 以及相关代码托管操作所需的 CLI 也应配置好。
 
-源码构建需要 Rust/Cargo；客户端还需要 Flutter 和目标平台的原生工具链。桌面构建须在相应操作系统上运行；iOS 需要 macOS/Xcode。Paseo 的构建工具、SDK 和原生插件运行时不需要 Node 或 TypeScript，外部智能体 CLI 仍有各自的前置条件。
+源码构建需要 Rust/Cargo 和目标平台的原生工具链。桌面构建须在相应操作系统上运行；iOS 需要 macOS/Xcode；Android 需要 JDK、Android SDK 与 NDK。Paseo 的构建工具、SDK 和原生插件运行时不需要 Node 或 TypeScript，外部智能体 CLI 仍有各自的前置条件。
 
 ## 桌面应用 {#desktop-app-recommended}
 
@@ -25,7 +25,7 @@ cargo fetch --locked
 cargo xtask dev app
 ```
 
-此命令构建并运行原生桌面客户端，使用当前检出的 `.dev/paseo-home` 和端口 `6768`，不会替换已安装的应用和 daemon。优化构建使用 `cargo xtask build-flutter linux`、`macos` 或 `windows`，须在对应主机执行。构建与打包产物位于 `artifacts/flutter/`；本地构建不等于已发布的签名安装包。
+此命令构建并运行原生桌面客户端，使用当前检出的 `.dev/paseo-home` 和端口 `6768`，不会替换已安装的应用和 daemon。优化构建使用 `cargo xtask build-gui linux`、`macos` 或 `windows`，须在对应主机执行。构建与打包产物位于 `artifacts/native/`；本地构建不等于已发布的签名安装包。
 
 ## 服务器 / CLI {#server--cli}
 
@@ -48,11 +48,11 @@ daemon 通常监听 `ws://127.0.0.1:6767/ws`。配置和持久状态仍在 `PASE
 ## 移动客户端 {#mobile-clients}
 
 ```sh
-cargo xtask build-flutter android --arch arm64
-cargo xtask build-flutter ios
+cargo xtask build-gui android --arch arm64
+cargo xtask build-gui ios
 ```
 
-Android 包名为 `sh.paseo.sessions`。产物在 `artifacts/flutter/`；未配置正式签名或描述文件时，产物明确标记为调试签名或未签名，不是商店提交包。客户端需添加远程 daemon 的可达地址和密码。手机的 localhost 并不是 daemon 主机。
+Android 包名为 `sh.paseo.sessions`。产物在 `artifacts/native/`；未配置正式签名或描述文件时，产物明确标记为调试签名或未签名，不是商店提交包。客户端需添加远程 daemon 的可达地址和密码。手机的 localhost 并不是 daemon 主机。
 
 ## Docker {#docker}
 

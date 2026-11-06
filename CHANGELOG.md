@@ -2,9 +2,48 @@
 
 ## Unreleased
 
+## 0.13.5 - 2026-11-06
+
 ### Fixed
 
+- Fix Android APK compilation: keep launch-link and notification-data variables distinct in the Java intent bridge.
+- Restore native window reopening from the tray, a second launch and notification actions without reviving the retired Flutter window hierarchy.
 - Retain the numeric GitHub release ID when creating and finalizing native-release drafts, and explicitly preserve the canonical tag when updating draft metadata.
+- Keep nested modal dismissal, pointer capture and editor focus with the active layer. Closing a picker no longer also closes its parent, leaves an invisible editor focused or forwards typing into a covered chat draft.
+- Keep long conversations at the reader's scroll position while new output arrives; restore wheel, scrollbar and Home/End navigation.
+- Restore anchored Git tooltips across main and explorer panes, and render forge brand icons in the workspace header, session composer and new-session attachment menus. The new-session menu again opens the native file picker and returns input after cancellation.
+- Restore editor keyboard focus after Go to line, so typing edits the requested line without an extra click.
+- Render ANSI inverse, italic, strikethrough and hidden execution-log text correctly, and update compact toolbar geometry immediately on resize.
+- Restore Linux window resizing and repositioning through X11, preserve the client position when hiding to and reopening from the tray, and draw dynamically created windows before GPU presentation. Fresh-server clipboard copy/paste no longer fails on a missing atom, and the idle event loop no longer spins.
+- Keep macOS maximize state separate from native full screen, preserving normal window bounds through zoom and full-screen transitions.
+- Match native text wrapping and desktop scrollbar visibility to the previous client: preserve source whitespace, reveal the themed scrollbar while scrolling or hovering, and fade it after idle.
+- Fix Korean composition, replacement and commit in Android text fields, and initialize the Linux X11 input method with the desktop locale, input-method modifiers and focus lifecycle.
+- Cancel activation when a touch becomes a scroll, including session rows, links, attachment removal, permission dismissal and script actions.
+- Restore active-session model-search clicks, initial keyboard focus, clipboard input and Korean composition; identify same-named models by their complete provider model IDs.
+- Refresh model catalogs when the daemon connects or publishes the matching directory snapshot, rather than retaining loading state or a stale connection error.
+- Draw desktop modals outside ancestor pane clips and discard retired overlay draw-list generations during screen changes.
+- Skip generated metadata when an explicit workspace title cannot change, and preserve configured provider environment values beneath workspace/session overrides.
+- Refresh Git patch content after successful checkout actions even when added/deleted line counts are unchanged.
+- Preserve background stream completion and restored drafts across compact navigation, rotation and application restart.
+
+### Changed
+
+- Build, package and release the native Rust client (Makepad) instead of the Flutter client with `cargo xtask build-gui`; `build-flutter`, `flutter analyze|test` and the Flutter ARM64 SDK workflow are removed. Installed paths, app IDs, the `paseo://` handler and the desktop update feed (`flutter-<channel>-<platform>-<arch>.json`) stay identical, so existing installs update in place; release artifacts are now named `Paseo-Sessions-<version>-<platform>-<arch>` and collected in `artifacts/native/`.
+- Android keeps its Android 7.0 (API 24) minimum: the client patches Makepad's newer-only Android libraries, symbols and window-inset calls instead of raising it.
+- Code text uses Jetendard (OFL-1.1), so mixed Korean and ASCII code stays on the monospace grid; Makepad's GPL-licensed Liberation Mono is no longer shipped.
+- The Windows installer removes the previous installation's owned files before installing, so no Flutter-era payload remains after an upgrade.
+- Application notices now cover the client's Cargo closure for the packaged target and every bundled font, each bound to its file digest and revision-pinned license text.
+
+### Removed
+
+- Vim keybindings and the bundled Neovim runtime are removed from the desktop client.
+- Makepad's Chinese fallback font is no longer shipped; the client supports English and Korean, and Han characters render with Noto Sans KR.
+- Obsolete Flutter application, audio plugin and desktop-host source trees, after completing the Rust replacement and reference reads. Existing user-data keys and updater identities remain unchanged.
+
+### Validation
+
+- Exercised the native Android client on an Android 15 emulator with a real Korean IME, and the Linux client on isolated X11/IBus with four live OMP Astra requests. Actual GNOME Wayland/XWayland input-method connection was checked separately; full GNOME input/trackpad behavior and Windows UI interaction are not covered by those runs.
+- Release assets target Linux x64, Windows x64 and Android universal. Without release-signing credentials, the APK is explicitly debug-signed and is not a Play Store submission.
 
 ## 0.13.4 - 2026-11-04
 

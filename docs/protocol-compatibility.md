@@ -12,12 +12,11 @@ A schema change must not break parsing in either direction. An old app still par
 
 `hello` carries an optional credential. The daemon accepts a client protocol version from its minimum through newer client versions, selects the lower of client and daemon maximum, and reports it as optional `server_info.protocolVersion`. A `hello.rejected` frame precedes an auth close only when the client sent `hello.auth` or advertised `hello_rejection`; older clients receive the existing WebSocket close code and reason. This avoids sending them a new top-level message their validator does not recognize.
 
-- New fields are `.optional()` with a sensible default.
+- New fields remain optional for older peers. Any presentation default is explicit consumer policy, not a validator mutation.
 - Never flip optional to required, remove a field, or narrow a type. `string` to `enum` and nullable to non-null are both narrowing.
 - A field you stop sending stays accepted. You stop writing it, you don't stop reading it.
-- Wire schemas are pure structural declarations. No `.transform()`, `.catch()`, or `.preprocess()` on WebSocket message schemas — normalization happens in an explicit pass after validation. The reason is in [protocol-validation.md](protocol-validation.md): inbound validators are generated, and the generator only compiles pure schemas.
-- Plain `z.union()` is forbidden when every branch shares a literal tag. Use `z.discriminatedUnion()`.
-- `.default()` belongs on primitive leaves only, never on item schemas inside large arrays or big inbound containers.
+- Wire schemas are structural JSON Schema documents embedded by `paseo-protocol`. Validation never injects defaults, coerces types or transforms data; normalization is an explicitly named consumer pass. See [protocol validation](protocol-validation.md).
+- Preserve literal message discriminators and lossless extension fields. A Rust enum or schema edit must still accept unknown optional data from a newer peer.
 
 Two questions to ask before you commit a schema change:
 
@@ -36,17 +35,17 @@ The app checks for the capability and either runs the feature or tells the user 
 
 - **No fallback paths.** Don't build a degraded version of the feature for old daemons. Don't fan out across legacy RPCs to simulate a capability that isn't there. The user updates or doesn't get the feature.
 - **No defensive branches spread through the feature.** Detection happens in one place, and everything downstream reads a clean shape.
-- Capability flags live in `features` on the `server_info` message; keep the Rust protocol and Dart decoding aligned.
+- Capability flags live in `features` on the `server_info` message; keep shared Rust protocol definitions, core negotiation and feature consumers aligned.
 
 Existing functionality keeps working across versions because of the protocol contract. Gating a new feature never substitutes for that.
 
 ## Client capability ownership
 
-Each implementation advertises only the protocol behavior it actually implements: the Dart native
-client and shared Rust SDK/CLI/daemon client have separate decoding/subscription
-boundaries. Keep capabilities aligned with those implementations, not merely with accepted schemas.
-The native product does not advertise embedded browser automation. A schema accepting a message
-does not establish support for its delivery semantics.
+Each client boundary advertises only behavior it implements. The GUI core's connection pump uses
+the Rust SDK transport but owns its hello capability set and observation policy; SDK/CLI callers
+can have different consumers. Keep advertised capabilities aligned with those implementations,
+not merely with accepted schemas. The native product does not advertise embedded browser
+automation. A schema accepting a message does not establish support for its delivery semantics.
 
 On capable daemons, connecting creates no timeline or event demand. Client subscriptions own their network membership,
 release it on unsubscribe, and restore it after reconnect. Raw message observers inspect traffic
@@ -86,7 +85,7 @@ demand; broadcast-era hosts require an update before wire silence is guaranteed.
 
 A shim that exists for old-app or old-daemon support carries a comment naming it, the version it arrived in, and when it can go:
 
-```ts
+```rust
 // COMPAT(workspaceFileEditing): added in v0.2.0, remove after 2027-01-18 once daemon floor >= v0.2.0.
 ```
 

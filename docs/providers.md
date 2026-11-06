@@ -16,7 +16,7 @@ Optional backend provider extensions use native executables and the Rust `paseo-
 
 Agent orchestration, canonical timeline persistence and client publication belong to `packages/daemon/src/agent` rather than to a UI-specific provider implementation. Usage integrations live under `packages/daemon/src/usage`.
 
-Shared Rust wire metadata lives under `packages/protocol` for the daemon and Rust client SDK. Keep that contract aligned with Dart when adding a provider capability or changing serialization.
+Shared wire metadata lives under `packages/protocol` for the daemon, client SDK and native client. Keep feature capability handling in `packages/gui-core` and the affected GUI controllers aligned when changing serialization or provider behavior.
 
 ## Provider contract
 
@@ -44,12 +44,12 @@ Provider helpers that outlive one session belong to the daemon's managed-process
 
 1. Decide whether the integration is a native built-in or an optional native backend extension.
 2. Reuse the native provider interfaces and appropriate transport implementation. Keep protocol-specific details behind the provider boundary rather than branching throughout agent orchestration.
-3. Add the provider definition/catalog/options and preserve stable wire IDs. Update Rust protocol definitions and Dart presentation where the capability is client-visible.
+3. Add the provider definition/catalog/options and preserve stable wire IDs. Update shared protocol definitions and the affected Rust client presentation where the capability is client-visible.
 4. Preserve import/resume, native session identity, permissions, model/mode discovery, cancellation, errors and persistence behavior. Do not claim unsupported features.
 5. Update usage integration only if the provider supplies real attributable data; missing data must not become a fabricated zero balance.
 6. Add behavior checks for the actual boundary and run them in an authorized verification pass.
 
-Provider UI belongs to native Flutter features under `packages/flutter_app/lib`, not a new TSX icon/registry in a retired client tree.
+Provider configuration UI belongs to `packages/gui/src/features/settings`; creation and session model/mode/profile controls belong to `features/composer`. Catalog discovery remains daemon-owned. Reuse those consumers rather than introducing a UI-side provider registry.
 
 ## Verification
 

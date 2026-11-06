@@ -93,20 +93,22 @@ pub fn arch() -> Result<&'static str> {
 pub fn executable() -> &'static str {
     if cfg!(windows) { "paseo.exe" } else { "paseo" }
 }
-pub fn app() -> Result<PathBuf> {
-    Ok(root()?.join("packages/flutter_app"))
+/// Cargo's target directory (`CARGO_TARGET_DIR`, default `<root>/target`).
+pub fn target_root() -> Result<PathBuf> {
+    absolute(env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
+}
+/// Staged GUI bundles, APK/iOS work directories and Gradle state.
+pub fn gui_output() -> Result<PathBuf> {
+    Ok(target_root()?.join("paseo-gui"))
 }
 pub fn release() -> Result<PathBuf> {
-    Ok(root()?.join("artifacts/flutter"))
+    Ok(root()?.join("artifacts/native"))
 }
-pub fn support() -> Result<PathBuf> {
-    Ok(root()?.join("packages/flutter_desktop_host/packaging"))
+pub fn packaging() -> Result<PathBuf> {
+    Ok(root()?.join("packaging"))
 }
 pub fn artifact_stem(target: &str, cpu: &str) -> Result<String> {
-    Ok(format!(
-        "Paseo-Sessions-Flutter-{}-{target}-{cpu}",
-        version()?
-    ))
+    Ok(format!("Paseo-Sessions-{}-{target}-{cpu}", version()?))
 }
 pub fn cargo() -> std::ffi::OsString {
     env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
@@ -275,28 +277,6 @@ pub fn capture(command: &mut Command) -> Result<String> {
     Ok(String::from_utf8(bytes)?.trim().to_owned())
 }
 
-pub fn flutter() -> Result<PathBuf> {
-    let binary = if cfg!(windows) {
-        "flutter.bat"
-    } else {
-        "flutter"
-    };
-    let mut candidates = Vec::new();
-    if let Some(path) = env::var_os("FLUTTER_BIN") {
-        candidates.push(PathBuf::from(path));
-    }
-    for key in ["FLUTTER_ROOT", "FLUTTER_HOME"] {
-        if let Some(path) = env::var_os(key) {
-            candidates.push(PathBuf::from(path).join("bin").join(binary));
-        }
-    }
-    candidates.push(cache()?.join("paseo-flutter-sdk/bin").join(binary));
-    if let Some(path) = env::var_os("PATH") {
-        candidates.extend(env::split_paths(&path).map(|directory| directory.join(binary)));
-    }
-    candidates.into_iter().find(|path| path.is_file()).context("Flutter SDK not found. Set FLUTTER_BIN/FLUTTER_ROOT, use $XDG_CACHE_HOME/paseo-flutter-sdk, or add Flutter to PATH")
-}
-
 pub fn cache() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_CACHE_HOME") {
         return Ok(path.into());
@@ -306,15 +286,41 @@ pub fn cache() -> Result<PathBuf> {
         .join(".cache"))
 }
 
-pub fn build_number(target: &str) -> Result<u64> {
-    let value = env::var("PASEO_BUILD_NUMBER")
-        .or_else(|_| env::var("ANDROID_VERSION_CODE"))
-        .unwrap_or_else(|_| "13002".into());
+/// The Android versionCode record that replaced the pubspec `+build` suffix.
+pub const VERSION_PROPERTIES: &str = "packaging/android/version.properties";
+
+pub fn recorded_build_number() -> Result<u64> {
+    let path = root()?.join(VERSION_PROPERTIES);
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("Reading {}", path.display()))?;
+    let values: Vec<_> = contents
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("versionCode="))
+        .collect();
     ensure!(
-        !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
-        "PASEO_BUILD_NUMBER must be numeric"
+        values.len() == 1 && !values[0].is_empty() && values[0].bytes().all(|b| b.is_ascii_digit()),
+        "{} must contain exactly one numeric versionCode",
+        path.display()
     );
-    let number = value.parse::<u64>()?;
+    Ok(values[0].parse()?)
+}
+
+/// `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then the recorded
+/// versionCode. Empty variables (unset CI repository variables) are absent.
+pub fn build_number(target: &str) -> Result<u64> {
+    let configured = ["PASEO_BUILD_NUMBER", "ANDROID_VERSION_CODE"]
+        .into_iter()
+        .find_map(|key| env::var(key).ok().filter(|value| !value.is_empty()));
+    let number = match configured {
+        Some(value) => {
+            ensure!(
+                value.bytes().all(|b| b.is_ascii_digit()),
+                "PASEO_BUILD_NUMBER must be numeric"
+            );
+            value.parse::<u64>()?
+        }
+        None => recorded_build_number()?,
+    };
     Ok(if target == "android" {
         number.max(13000)
     } else {

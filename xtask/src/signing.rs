@@ -180,8 +180,7 @@ pub fn sign_mac(bundle: &Path, stage: &Path, application: bool) -> Result<()> {
             count == 0 || identity != "-",
             "Notarization requires Developer ID signing, not ad-hoc signing."
         );
-        let entitlements = crate::common::root()?
-            .join("packages/flutter_desktop_host/packaging/entitlements.plist");
+        let entitlements = crate::common::packaging()?.join("desktop/entitlements.plist");
         let mut paths = Vec::new();
         for entry in walkdir::WalkDir::new(bundle)
             .follow_links(false)
@@ -612,10 +611,7 @@ pub fn windows_runtime(destination: &Path, standalone: bool) -> Result<()> {
     let dlls = runtime_dlls(crt, destination, machine)?;
     let mut destinations = vec![destination.to_owned()];
     if !standalone {
-        destinations.extend([
-            destination.join("runtime"),
-            destination.join("runtime/neovim/bin"),
-        ]);
+        destinations.push(destination.join("runtime"));
     }
     for directory in destinations {
         fs::create_dir_all(&directory)?;
@@ -856,7 +852,7 @@ mod tests {
             &["MSVCP140.dll"],
         );
         image(
-            &payload.join("runtime/neovim/bin/win32yank.exe"),
+            &payload.join("runtime/helper-x64.exe"),
             0x8664,
             &["VCRUNTIME140.dll"],
             &[],
@@ -870,7 +866,7 @@ mod tests {
         assert_eq!(names, ["msvcp140.dll", "vcruntime140.dll"]);
 
         image(
-            &payload.join("runtime/neovim/bin/tool.exe"),
+            &payload.join("runtime/tool-x64.exe"),
             0x8664,
             &[],
             &["VCRUNTIME140_1.dll"],

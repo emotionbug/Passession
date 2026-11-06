@@ -10,7 +10,7 @@ nav: 参考
 
 ## 运行时边界 {#runtime-boundary}
 
-daemon 和内置功能由 Rust 实现。第三方插件是由 daemon 启动的原生可执行文件，通过有界 JSONL stdin/stdout 通信；没有动态库 ABI、JavaScript worker 或解释器回退。Flutter 渲染受支持的协议数据，不执行插件 UI。插件、校验和构建命令都是无沙箱的 daemon 用户代码。
+daemon 和内置功能由 Rust 实现。第三方插件是由 daemon 启动的原生可执行文件，通过有界 JSONL stdin/stdout 通信；没有动态库 ABI、JavaScript worker 或解释器回退。原生客户端渲染受支持的协议数据，不执行插件 UI。插件、校验和构建命令都是无沙箱的 daemon 用户代码。
 
 权威实现：[SDK](../../packages/plugin/src/lib.rs)、[设置](../../packages/plugin/src/settings.rs)、[Provider trait](../../packages/plugin/src/provider.rs)、[daemon 桥接](../../packages/plugin/src/daemon.rs)、[宿主清单](../../packages/daemon/src/plugins/manifest.rs)和 [CLI](../../packages/daemon/src/cli/catalog/plugins.rs)。SDK 未发布时使用本地路径或明确固定修订的 Git 依赖。
 

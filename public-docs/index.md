@@ -8,7 +8,7 @@ category: Getting started
 
 # Getting started
 
-Paseo Sessions uses Flutter on **Linux, macOS, Windows, Android and iOS**, with a **Rust daemon and CLI**. Desktop/server hosts run agents; Android and iOS connect remotely. The client includes Markdown, source editing, summary-first diffs, remote folder browsing and read-only script/setup logs, organized as host → directory → session.
+Paseo Sessions is a native Rust client on **Linux, macOS, Windows, Android and iOS**, with a **Rust daemon and CLI**. Desktop/server hosts run agents; Android and iOS connect remotely. The client includes Markdown, source editing, summary-first diffs, remote folder browsing and read-only script/setup logs, organized as host → directory → session.
 
 Use [this repository's releases](https://github.com/emotionbug/paseo/releases) for native build artifacts; upstream downloads and store listings are separate products. Source builds and redistribution requirements are documented in the repository's `docs/release.md`.
 
@@ -16,7 +16,7 @@ Use [this repository's releases](https://github.com/emotionbug/paseo/releases) f
 
 Install and authenticate at least one supported provider CLI on the daemon machine. Paseo manages these tools; it does not supply your provider credentials. Git and, for relevant forge operations, an authenticated forge CLI are also needed.
 
-Source builds require Rust/Cargo. Client builds also require Flutter and the target platform's native toolchain. Desktop builds require the matching OS; iOS requires macOS/Xcode. Paseo's build tools, SDKs and native plugin runtime do not require Node or TypeScript. External agent CLIs retain their own prerequisites.
+Source builds require Rust/Cargo and the target platform's native toolchain. Desktop builds require the matching OS; iOS requires macOS/Xcode; Android requires a JDK, the Android SDK and NDK. Paseo's build tools, SDKs and native plugin runtime do not require Node or TypeScript. External agent CLIs retain their own prerequisites.
 
 ## Desktop app
 
@@ -27,7 +27,7 @@ cargo fetch --locked
 cargo xtask dev app
 ```
 
-This builds/runs the native desktop client with an isolated checkout development home, `.dev/paseo-home`, on port `6768`. It does not replace an installed app or its daemon. For an optimized native build use `cargo xtask build-flutter linux`, `macos`, or `windows` on the corresponding host. Packaging outputs go under `artifacts/flutter/`; a local build is not a published signed installer.
+This builds/runs the native desktop client with an isolated checkout development home, `.dev/paseo-home`, on port `6768`. It does not replace an installed app or its daemon. For an optimized native build use `cargo xtask build-gui linux`, `macos`, or `windows` on the corresponding host. Packaging outputs go under `artifacts/native/`; a local build is not a published signed installer.
 
 ## Server / CLI
 
@@ -50,11 +50,11 @@ When using a native daemon archive, extract the **whole** archive, keep librarie
 ## Mobile clients
 
 ```sh
-cargo xtask build-flutter android --arch arm64
-cargo xtask build-flutter ios
+cargo xtask build-gui android --arch arm64
+cargo xtask build-gui ios
 ```
 
-Android uses package `sh.paseo.sessions`. Android/iOS outputs are under `artifacts/flutter/`; without signing/provisioning they are explicitly debug-signed or unsigned, not store submissions. Add the remote daemon's reachable address and credentials in the client. A phone's loopback address is not the daemon machine.
+Android uses package `sh.paseo.sessions`. Android/iOS outputs are under `artifacts/native/`; without signing/provisioning they are explicitly debug-signed or unsigned, not store submissions. Add the remote daemon's reachable address and credentials in the client. A phone's loopback address is not the daemon machine.
 
 ## Docker
 

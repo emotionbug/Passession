@@ -3,7 +3,6 @@ node_modules/
 
 # Build outputs
 target/
-.paseo-flutter-sdk/
 build/
 dist/
 .next/

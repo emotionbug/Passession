@@ -1,25 +1,25 @@
 # Agent stream performance
 
-Provider output flows through the Rust daemon's agent owner and transport into the Dart client and native Flutter timeline. It does not pass through React reducers, Hermes, a DOM canvas or an Electron renderer.
+Provider output flows through the Rust daemon's agent owner and transport into `paseo-gui-core` and the Makepad timeline. Network/disk work belongs off the GUI thread; feature controllers retain paged history rather than putting transcripts into the shared directory/preferences state.
 
 Ownership:
 
 - `packages/daemon/src/agent/timeline_stream.rs`, `timeline.rs`, `timeline_storage.rs`, and adjacent agent modules: canonical history, event ordering and publication.
 - `packages/daemon/src/transport`: connection lifecycle and output/backpressure.
-- `packages/flutter_app/lib/core/client.dart`: wire events and authoritative requests.
-- `packages/flutter_app/lib/features/chat`: timeline/controller and native rendering.
+- `packages/gui-core/src/connection.rs` and `runtime/`: wire delivery, correlated requests, owned observations and directory synchronization.
+- `packages/gui/src/features/timeline/{session,store,fold}.rs`: paged history and live reconciliation; `panel.rs`, `chat_row.rs`, `markdown/` and `reveal.rs`: virtualized presentation and paced reveal.
 
 ## Correctness before smoothing
 
 Live events provide immediacy; authoritative history and sequence/cursor reconciliation recover gaps. Never drop events or invent text to make a stream appear smoother. Client disconnect, hidden views and slow consumers must not lose durable provider output. Cancelling a view subscription is not cancelling a provider turn.
 
-Bound memory and update work. Avoid rereading/rebuilding the complete retained history for every delta, eagerly materializing offscreen content, or sending per-token filesystem writes without the owner's ordering guarantees. Measure provider arrival, daemon processing, network delivery, Dart state work and Flutter frames separately.
+Bound memory and update work. Avoid rereading/rebuilding the complete retained history for every delta, eagerly materializing offscreen content, or sending per-token filesystem writes without the owner's ordering guarantees. Measure provider arrival, daemon processing, network delivery, core queue work and Makepad layout/draw separately.
 
 Parent and provider-child timeline commits update only the affected projected row and cursor
 metadata in SQLite, not the complete retained history. Owners retain connections and prepared
 statements. Child descriptors have a separate parent index.
 Child storage work runs on blocking workers, without holding an agent data guard across I/O.
-Publication still follows durable commit; this does not change Flutter's text-reveal timing.
+Publication still follows durable commit; client text-reveal timing must not change that order.
 
 Pi/OMP stdout dispatch resolves RPC responses and routes host-tool calls/cancellation before
 transcript delivery. Ordinary frames go through a single FIFO delivery pump; consumer backlog
@@ -37,10 +37,15 @@ fabricate provider availability or discard previously displayed reports.
 The supervisor receives an authenticated stopping frame and enforces a ten-second worker
 teardown deadline for both normal stop and restart.
 
-Flutter hydrates project, workspace and agent directories independently, exposing per-list progress
+The core hydrates project, workspace and agent directories independently, exposing per-list progress
 and errors while retaining previous rows. Live directory updates remain ordered behind the relevant
 baselines, including workspace changes that also affect projects. Request/ACK waiting is distinct
 from the agent's actual activity; stale/offline snapshots do not animate as current running state.
+
+The app drains one core batch per dispatch. Hidden chat controllers can keep reconciling data without
+painting every row; `PortalList` limits mounted presentation, while row UI state remains outside
+recycled items. Reveal, streaming updates and composer growth must preserve the reader's anchor,
+selection and IME state. Cancelling presentation work is not cancelling the provider turn.
 
 ## Evidence
 

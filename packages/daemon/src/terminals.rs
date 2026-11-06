@@ -86,7 +86,16 @@ impl TerminalService {
             .unwrap()
             .insert(id.to_owned(), env);
     }
-    pub async fn create(&self, mut options: CreateTerminal) -> Result<Arc<Terminal>> {
+    pub async fn create(&self, options: CreateTerminal) -> Result<Arc<Terminal>> {
+        self.create_with_exit_retention(options, false).await
+    }
+    // Script logs must remain attachable after the owned process and PTY exit.
+    // Interactive terminals retain their existing remove-on-exit behavior.
+    async fn create_with_exit_retention(
+        &self,
+        mut options: CreateTerminal,
+        retain_on_exit: bool,
+    ) -> Result<Arc<Terminal>> {
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -199,7 +208,9 @@ impl TerminalService {
                 }
             }
             if let Some(app) = weak.upgrade() {
-                app.terminals.terminals.write().unwrap().remove(&id);
+                if !retain_on_exit {
+                    app.terminals.terminals.write().unwrap().remove(&id);
+                }
                 let _ = app.terminals.changed.send(());
                 if let Err(error) = app.projects.publish_workspace(&waiter.workspace_id).await {
                     tracing::warn!(%error,"Terminal exit projection failed");
@@ -324,6 +335,10 @@ impl TerminalService {
     }
     pub fn remove_workspace_runtime(&self, id: &str) {
         self.scripts.remove_workspace_runtime(id);
+        self.terminals
+            .write()
+            .unwrap()
+            .retain(|_, terminal| terminal.workspace_id != id || !terminal.is_exited());
         self.workspace_env.write().unwrap().remove(id);
     }
     pub async fn classify_service_host(&self, host: &str) -> Value {

@@ -88,7 +88,7 @@ By default, anyone who can reach the daemon's listening address can connect. On 
 
 When a password is configured, all HTTP requests must include an `Authorization: Bearer <password>` header, and every WebSocket client, including relay clients, must send the password when it connects. Relay clients send it inside the end-to-end encrypted channel, so the relay never sees it. Unauthenticated HTTP requests receive a `401 Unauthorized` response. Only the `/api/health` liveness endpoint is exempt, so that process supervisors and load balancers can probe without credentials.
 
-The native daemon does not serve a bundled web product client. Flutter clients and the Rust CLI authenticate to its API; no public static login page is required.
+The native daemon does not serve a bundled web product client. Native clients and the Rust CLI authenticate to its API; no public static login page is required.
 
 The password is stored as a bcrypt hash in `config.json`, the daemon never stores it in plaintext. See [Configuration](/docs/configuration#password-authentication) for setup instructions.
 
@@ -123,7 +123,7 @@ See [Docker](/docs/docker) for Compose and reverse proxy examples.
 
 ## Native desktop trust boundary
 
-The Flutter desktop client does not bundle Electron or Chromium. Chromium sandbox switches and helper-installation instructions do not apply. This does not sandbox agents: providers and script/setup PTYs run with the daemon user's filesystem and credential access. The client exposes read-only task logs, not an interactive terminal UI.
+The native desktop client does not bundle Electron or Chromium. Chromium sandbox switches and helper-installation instructions do not apply. This does not sandbox agents: providers and script/setup PTYs run with the daemon user's filesystem and credential access. The client exposes read-only task logs, not an interactive terminal UI.
 
 Built-in integrations run in Rust. Native backend plugins execute trusted code in separate processes with the daemon user's privileges. Process isolation is not a security sandbox; install only plugins you trust. Executable React UI plugins and embedded browser automation are not part of the native product.
 

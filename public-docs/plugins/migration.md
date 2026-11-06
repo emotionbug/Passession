@@ -22,7 +22,7 @@ The migration is a real port, not renaming an entry or changing a version requir
 | Direct provider | `Provider`/`Connection`, real session events, permissions and cleanup. |
 | ACP adapter | `paseo_plugin::acp::AcpProvider` with a command or owned stream; port vendor extensions to `AcpTransformer`. This replaces `runAcpProvider` behavior, not its JavaScript source API. |
 | Usage discovery/fetch | `UsageSource`, explicit input validation and account/credential boundaries. |
-| Screens, panels, sidebar/header components, attachment pickers, themes | No executable Flutter plugin equivalent. Remove obsolete UI registrations. |
+| Screens, panels, sidebar/header components, attachment pickers, themes | No executable client plugin equivalent. Remove obsolete UI registrations. |
 | React timeline transforms/renderers | Emit standard protocol items; do not require extension code to read important output. |
 | Client-only plugin | Not a supported native plugin; do not claim that an empty native backend is a migration. |
 

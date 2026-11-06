@@ -2,7 +2,7 @@ mod assets;
 mod build;
 mod common;
 mod dev;
-mod flutter_sdk;
+mod gui;
 mod libraries;
 mod notices;
 mod package;
@@ -19,7 +19,7 @@ fn dispatch() -> Result<()> {
     };
     match command.as_str() {
         "build-daemon" => build::build_daemon(args),
-        "build-flutter" => build::build_flutter(args),
+        "build-gui" => gui::build_gui(args),
         "build-relay" => {
             if args.iter().any(|arg| arg != "--release") || args.len() > 1 {
                 bail!("Usage: cargo xtask build-relay [--release]");
@@ -42,8 +42,7 @@ fn dispatch() -> Result<()> {
         }
         "release" => release::run(args),
         "relay-cloudflare" => relay_cloudflare::run(args),
-        "flutter-sdk" => flutter_sdk::run(args),
-        "dev" | "flutter" | "maintenance" => dev::run(command, args),
+        "dev" | "maintenance" => dev::run(command, args),
         "help" | "--help" | "-h" => help(),
         other => bail!("Unknown xtask command {other:?}; run cargo xtask --help"),
     }
@@ -51,10 +50,9 @@ fn dispatch() -> Result<()> {
 
 fn help() -> Result<()> {
     println!(
-        "Paseo native build and release tooling\n\n  build-daemon [--release]\n  build-relay [--release]\n  build-flutter [linux|macos|windows|android|ios] [--debug] [--run [--device ID]] [--arch universal|arm64]\n  package-desktop [linux|macos|windows]\n  package-daemon\n  stage-runtime DESTINATION [--profile debug|release] [--kind desktop-bundled|standalone-archive|standalone-local|container]\n      standalone-local packages the existing local build (no rebuild, release=false) for `paseo daemon update --from`\n  container-runtime DESTINATION\n  appimage-tools\n  release <plan|record|verify|stamp|publish|notes|version|fdroid|...>\n  dev ...\n  flutter <analyze|test|...>\n  maintenance <acp-catalog|codex-titles|...>"
+        "Paseo native build and release tooling\n\n  build-daemon [--release]\n  build-relay [--release]\n  build-gui [linux|macos|windows|android|ios] [--debug] [--run [--device ID]] [--arch universal|arm64]\n  build-gui [linux|macos|windows] --smoke [--debug]   unpackaged bundle with the lifecycle test driver\n  package-desktop [linux|macos|windows]\n  package-daemon\n  stage-runtime DESTINATION [--profile debug|release] [--kind desktop-bundled|standalone-archive|standalone-local|container]\n      standalone-local packages the existing local build (no rebuild, release=false) for `paseo daemon update --from`\n  container-runtime DESTINATION\n  appimage-tools\n  release <plan|record|verify|stamp|publish|notes|version|fdroid|...>\n  dev <daemon|app|cli|home> ...\n  maintenance <acp-catalog|codex-titles|...>"
     );
     println!("  relay-cloudflare <build|deploy>");
-    println!("  flutter-sdk <build|publish|install>");
     Ok(())
 }
 

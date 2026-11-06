@@ -1,0 +1,28 @@
+[package]
+name = "paseo-gui-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Non-UI runtime of the native Paseo GUI: host connections, directory sync, persistence and the request/event boundary"
+
+[dependencies]
+paseo-client = { path = "../client" }
+paseo-protocol = { path = "../protocol" }
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6"
+percent-encoding = "2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

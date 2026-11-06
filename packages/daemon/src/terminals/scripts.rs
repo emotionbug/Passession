@@ -356,36 +356,31 @@ impl Scripts {
                 }
             }
         }
-        let reusable = if !script.service {
-            if let Some(existing) = &existing {
-                app.terminals.get(&existing.terminal_id).await.ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let reused = reusable.is_some();
-        let terminal = match reusable {
-            Some(terminal) => terminal,
-            None => {
-                app.terminals
-                    .create(CreateTerminal {
-                        cwd,
-                        workspace_id: id.to_owned(),
-                        name: Some(name.to_owned()),
-                        command: None,
-                        args: Vec::new(),
-                        env,
-                        rows: 24,
-                        cols: 80,
-                    })
-                    .await?
-            }
-        };
-        if terminal.workspace_id != id {
-            bail!("Terminal does not belong to workspace: {id}");
+        if let Some(previous) = &existing {
+            app.terminals.kill(&previous.terminal_id).await?;
         }
+        // The configured command is the PTY child, not input to a persistent
+        // shell: bash/sh do not emit the zsh-only command-completion hooks.
+        #[cfg(windows)]
+        let args = vec!["/d".into(), "/s".into(), "/c".into(), script.command.clone()];
+        #[cfg(not(windows))]
+        let args = vec!["-c".into(), script.command.clone()];
+        let terminal = app
+            .terminals
+            .create_with_exit_retention(
+                CreateTerminal {
+                    cwd,
+                    workspace_id: id.to_owned(),
+                    name: Some(name.to_owned()),
+                    command: None,
+                    args,
+                    env,
+                    rows: 24,
+                    cols: 80,
+                },
+                true,
+            )
+            .await?;
         let mut events = terminal.subscribe_lifecycle();
         let generation = uuid::Uuid::new_v4();
         let cancel = self.inner.cancel.child_token();
@@ -419,11 +414,10 @@ impl Scripts {
                     result=terminal_for_events.wait()=>{this.finish(&event_key,generation,result.ok()).await;break;}
                     event=events.recv()=>match event {
                         Ok(TerminalEvent::Exit(code))=>{this.finish(&event_key,generation,Some(code)).await;break;}
-                        Ok(TerminalEvent::CommandFinished(code)) if !service=>{this.finish(&event_key,generation,code).await;break;}
                         Err(broadcast::error::RecvError::Closed)=>{let code=terminal_for_events.wait().await.ok();this.finish(&event_key,generation,code).await;break;}
                         Err(broadcast::error::RecvError::Lagged(count))=>{
                             tracing::error!(workspace_id=%event_key.0,script_name=%event_key.1,missed_events=count,"Script lifecycle observation overflowed; terminating owned terminal");
-                            if let Ok(app)=this.app(){let _=app.terminals.kill(&terminal_for_events.id).await;}
+                            let _=terminal_for_events.terminate().await;
                             let code=terminal_for_events.wait().await.ok();this.finish(&event_key,generation,code).await;break;
                         }
                         _=>{}
@@ -432,17 +426,6 @@ impl Scripts {
                 }
             }
         });
-        if !reused {
-            wait_ready(&terminal).await;
-        }
-        if let Err(error) = terminal
-            .input(format!("{}\r", script.command).as_bytes())
-            .await
-        {
-            let _ = app.terminals.kill(&terminal.id).await;
-            self.finish(&key, generation, None).await;
-            return Err(error);
-        }
         self.publish(id).await;
         self.list(id)
             .await?
@@ -535,7 +518,7 @@ impl Scripts {
         if terminal.workspace_id != id {
             bail!("Terminal does not belong to workspace: {id}");
         }
-        app.terminals.kill(&runtime.terminal_id).await?;
+        terminal.terminate().await?;
         let exit = terminal.wait().await.ok();
         self.finish(&key, runtime.generation, exit).await;
         self.list(id)
@@ -913,7 +896,7 @@ mod tests {
         assert_eq!(project_slug("/work/!!!", None), "untitled");
     }
     #[tokio::test]
-    async fn delayed_completion_cannot_stop_reused_terminal() {
+    async fn delayed_completion_cannot_stop_new_generation() {
         let scripts = Scripts::new(Weak::new());
         let old = uuid::Uuid::from_u128(1);
         let current = uuid::Uuid::from_u128(2);
@@ -921,7 +904,7 @@ mod tests {
         scripts.inner.entries.lock().unwrap().insert(
             key.clone(),
             Runtime {
-                terminal_id: "same-terminal".into(),
+                terminal_id: "current-terminal".into(),
                 generation: current,
                 service: false,
                 running: true,

@@ -1,12 +1,12 @@
 ---
 title: Docker
-description: 构建并运行原生 Rust daemon 容器，供远程 Flutter 客户端连接。
+description: 构建并运行原生 Rust daemon 容器，供远程原生客户端连接。
 nav: Docker
 ---
 
 # Docker {#docker}
 
-原生容器为服务器和开发主机运行 Rust daemon 与 CLI。请使用远程 Flutter 桌面/移动客户端或 CLI 连接；它不提供 Web 产品客户端，也不包含 Node、Electron、Chromium 或内嵌浏览器自动化。
+原生容器为服务器和开发主机运行 Rust daemon 与 CLI。请使用远程原生桌面/移动客户端或 CLI 连接；它不提供 Web 产品客户端，也不包含 Node、Electron、Chromium 或内嵌浏览器自动化。
 
 本文描述 0.13.1 源码检出，不代表版本已经发布。已发布的 `latest` 镜像不能证明包含此运行时。请从当前检出构建本地镜像：
 
@@ -25,7 +25,7 @@ docker run -d --name paseo \
   paseo-native:local
 ```
 
-在 Flutter 客户端中添加 `127.0.0.1:6767` 直连，使用配置的密码。从另一台机器连接时，请使用 daemon 主机的可达地址，而非回环地址。
+在原生客户端中添加 `127.0.0.1:6767` 直连，使用配置的密码。从另一台机器连接时，请使用 daemon 主机的可达地址，而非回环地址。
 
 ## 镜像包含什么 {#what-the-image-includes}
 

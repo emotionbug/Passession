@@ -1,6 +1,6 @@
 # Backend extensions
 
-Paseo's daemon, built-in providers and usage integrations are Rust. Third-party backend plugins are **standalone native executables** using bounded JSONL IPC, not Rust dynamic libraries, JavaScript workers or interpreted shims. Flutter does not execute plugin UI. This describes the 0.13.1 source checkout, not a published/deployed release. Kiro remains disabled and untouched.
+Paseo's daemon, built-in providers and usage integrations are Rust. Third-party backend plugins are **standalone native executables** using bounded JSONL IPC, not Rust dynamic libraries, JavaScript workers or interpreted shims. The Rust client does not execute plugin UI. This describes the source contract, not publication or deployment evidence. Kiro remains disabled and untouched.
 
 ## Runtime and source ownership
 
@@ -48,7 +48,7 @@ Details and complete author examples: [reference](../public-docs/plugins/referen
 
 ## Client compatibility boundary
 
-Protocol-defined configuration controls and standard timeline items are rendered by Flutter. Executable screens, workspace/file panels, sidebar/header components, custom timeline renderers, composer components, attachment pickers and theme code are not supported plugin surfaces. Historical examples/screenshots and former SDK exports do not imply compatibility. No empty native backend or browser fallback turns a client-only plugin into a useful native extension.
+Protocol-defined configuration controls and standard timeline items are rendered by the Rust settings and timeline features. Executable screens, workspace/file panels, sidebar/header components, custom timeline renderers, composer components, attachment pickers and theme code are not supported plugin surfaces. Historical examples/screenshots and former SDK exports do not imply compatibility. No empty native backend or browser fallback turns a client-only plugin into a useful native extension.
 
 ## Explicit JavaScript migration
 
