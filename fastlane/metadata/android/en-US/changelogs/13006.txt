@@ -1,0 +1,5 @@
+Fixed
+- Preserve Android Hangul composition across Shift and delayed native acknowledgements; hardware characters now append without replacing the current composing word.
+- Avoid applying keyboard avoidance twice, keeping the composer and modal inputs above the keyboard without the large empty gap or status-bar overlap.
+
+Full notes: https://github.com/emotionbug/paseo/releases

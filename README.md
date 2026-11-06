@@ -2,7 +2,7 @@
 
 Paseo Sessions is a native environment for running and reviewing coding-agent work. The client is native Rust (Makepad) on **Linux, macOS, Windows, Android, and iOS**. The daemon and `paseo` CLI are Rust. Desktop clients can manage a local daemon; Android and iOS connect to a daemon on another machine.
 
-This checkout is version **0.13.5**. See [release requirements](docs/release.md) for native artifacts, signing and distribution.
+This checkout is version **0.13.6**. See [release requirements](docs/release.md) for native artifacts, signing and distribution.
 
 ## Work across hosts
 

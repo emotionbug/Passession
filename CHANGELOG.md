@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.6 - 2026-11-06
+
 ### Fixed
 
 - Preserve Android Hangul composition across Shift and delayed native acknowledgements; hardware characters now append without replacing the current composing word.
@@ -10,6 +12,12 @@
 - Fit sidebar search to its actual text-field height and skip painting offscreen session rows without changing their layout.
 - Preserve the current visible message and pixel offset when older history arrives; paginate only after layout, without repeatedly pulling the reader upward.
 - Let Android system Back close the root Settings page after returning from a settings subsection.
+
+### Validation
+
+- Passed 20 focused Rust regressions and six Android instrumentation cases against the production input bridge. Actual Android 15 emulator interaction covered Hangul composition, keyboard layout, long-press selection, shared scrolling, history prepend anchoring and Settings Back.
+- Rebuilt and exercised the Linux desktop client for wheel scrolling, mouse selection, search and modal input isolation. This pass used private X11/software rendering; native Wayland/physical-trackpad behavior, Windows UI interaction and Samsung/Gboard soft Hangul layouts remain unverified.
+- Release assets target Linux x64, Windows x64 and Android universal. The APK remains explicitly debug-signed without release-signing credentials; this is not a Play Store submission.
 
 ## 0.13.5 - 2026-11-06
 

@@ -4,7 +4,7 @@
 
 Paseo Sessions 是运行和审阅编程智能体工作的原生环境。原生 Rust（Makepad）客户端面向 **Linux、macOS、Windows、Android 和 iOS**；守护进程与 `paseo` CLI 同样使用 Rust。桌面客户端可以管理本地守护进程，移动客户端仅连接其他机器上的守护进程。
 
-当前检出版本为 **0.13.5**。请使用[本仓库的发布产物](https://github.com/emotionbug/paseo/releases)；上游下载不是本仓库的构建。自行构建或分发时，请阅读[发布要求](docs/release.md)。
+当前检出版本为 **0.13.6**。请使用[本仓库的发布产物](https://github.com/emotionbug/paseo/releases)；上游下载不是本仓库的构建。自行构建或分发时，请阅读[发布要求](docs/release.md)。
 
 ## 跨主机工作与功能范围
 
