@@ -656,13 +656,22 @@ pub(crate) fn launch_command_script(environment: &HashMap<OsString, OsString>, c
     Ok(())
 }
 
+fn storage_item_for_share(path: &Path) -> windows::core::Result<windows::core::AgileReference<windows::Storage::IStorageItem>> {
+    use windows::Storage::{IStorageItem, StorageFile};
+    // Marshal the file across the worker, UI and share-event apartments.
+    StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str()))
+        .and_then(|op| op.get())
+        .and_then(|file| file.cast::<IStorageItem>())
+        .and_then(|item| windows::core::AgileReference::new(&item))
+}
+
 /// share_plus Windows: the DataTransferManager share UI for this window.
 pub(crate) fn share_file(shared: &Arc<Shared>, path: PathBuf, _mime_type: String, name: String, done: Completion) {
     use windows::{ApplicationModel::DataTransfer::*, Storage::*};
     let owner = shared.clone();
     shared.spawn_blocking(move || {
-        let file = match StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str())).and_then(|op| op.get()) {
-            Ok(file) => file,
+        let item = match storage_item_for_share(&path) {
+            Ok(item) => item,
             Err(error) => {
                 done.fail(native_error("Could not share the file", error));
                 return;
@@ -673,14 +682,13 @@ pub(crate) fn share_file(shared: &Arc<Shared>, path: PathBuf, _mime_type: String
                 let window = *own_windows().first().ok_or_else(|| windows::core::Error::from_win32())?;
                 let interop: IDataTransferManagerInterop = windows::core::factory::<DataTransferManager, IDataTransferManagerInterop>()?;
                 let manager: DataTransferManager = unsafe { interop.GetForWindow(window)? };
-                let item: IStorageItem = file.cast()?;
                 let title = HSTRING::from(name.as_str());
                 manager.DataRequested(&windows::Foundation::TypedEventHandler::new(
                     move |_sender, args: windows::core::Ref<'_, DataRequestedEventArgs>| {
                         if let Some(args) = args.as_ref() {
                             let data = args.Request()?.Data()?;
                             data.Properties()?.SetTitle(&title)?;
-                            let items: windows_collections::IIterable<IStorageItem> = vec![Some(item.clone())].into();
+                            let items: windows_collections::IIterable<IStorageItem> = vec![Some(item.resolve()?)].into();
                             data.SetStorageItemsReadOnly(&items)?;
                         }
                         Ok(())
@@ -745,4 +753,49 @@ pub(crate) fn system_prefers_dark() -> bool {
         )
     };
     status.is_ok() && value == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Com::{CoUninitialize, COINIT, COINIT_APARTMENTTHREADED};
+
+    struct Apartment;
+    impl Apartment {
+        fn initialize(kind: COINIT) -> Self {
+            unsafe { CoInitializeEx(None, kind).ok().unwrap() };
+            Self
+        }
+    }
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    #[test]
+    fn share_item_resolves_across_apartments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("공유.txt");
+        std::fs::write(&path, b"apartment-safe shared file").unwrap();
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let (finish, wait) = std::sync::mpsc::channel::<()>();
+        let source = std::thread::spawn(move || {
+            let _apartment = Apartment::initialize(COINIT_MULTITHREADED);
+            send.send(storage_item_for_share(&path)).unwrap();
+            let _ = wait.recv();
+        });
+        let reference = receive.recv().unwrap().unwrap();
+        let destination = std::thread::spawn(move || {
+            let _apartment = Apartment::initialize(COINIT_APARTMENTTHREADED);
+            let item = reference.resolve().unwrap();
+            assert_eq!(item.Name().unwrap().to_string(), "공유.txt");
+            let resolved = PathBuf::from(item.Path().unwrap().to_string());
+            assert_eq!(std::fs::read(resolved).unwrap(), b"apartment-safe shared file");
+        });
+        let result = destination.join();
+        drop(finish);
+        source.join().unwrap();
+        result.unwrap();
+    }
 }

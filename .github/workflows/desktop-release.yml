@@ -191,6 +191,9 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER }}
+      - name: Smoke Windows file-share COM marshalling
+        if: matrix.platform == 'windows'
+        run: cargo test --locked --release -p paseo-gui-platform --lib share_item_resolves_across_apartments
       - name: Inspect native macOS build output
         if: matrix.platform == 'macos'
         shell: bash
