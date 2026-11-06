@@ -115,6 +115,7 @@ struct Standalone {
     /// Drawn fully open (the open animation finished).
     settled: bool,
     state: RowState,
+    touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
 }
 
 #[derive(Default)]
@@ -126,7 +127,6 @@ struct Layer {
     sheets: Vec<Standalone>,
     next_id: u64,
     next_frame: NextFrame,
-    touch_scroll: Option<(DVec2, bool)>,
 }
 
 thread_local! {
@@ -149,6 +149,7 @@ pub fn show_tool_call_sheet(cx: &mut Cx, window_id: &str, display_name: &str, de
             opened: now_seconds(),
             settled: false,
             state: RowState::default(),
+            touch_scroll: Default::default(),
         });
         id
     });
@@ -185,10 +186,11 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
         if let Event::KeyDown(ke) = event {
             close |= ke.key_code == KeyCode::Escape;
         }
-        if let Event::Scroll(se) = event
-            && scroll_sheet(&mut layer.sheets[index].state, &layer.canvas, se.abs, se.scroll)
-        {
-            cx.redraw_area(layer.area);
+        if let Event::Scroll(se) = event {
+            layer.sheets[index].touch_scroll.reset();
+            if scroll_sheet(&mut layer.sheets[index].state, &layer.canvas, se.abs, se.scroll) {
+                cx.redraw_area(layer.area);
+            }
         }
         if let Event::BackPressed { handled } = event
             && !handled.get()
@@ -196,19 +198,16 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
             handled.set(true);
             close = true;
         }
-        match event.hits(cx, layer.area) {
-            Hit::FingerDown(e) => {
-                layer.touch_scroll = e.device.is_touch().then_some((e.abs, false));
+        let hit = event.hits(cx, layer.area);
+        if let Some(delta) = layer.sheets[index].touch_scroll.handle_event(cx, event, &hit) {
+            let origin = layer.sheets[index].touch_scroll.origin();
+            if scroll_sheet(&mut layer.sheets[index].state, &layer.canvas, origin, dvec2(0.0, delta)) {
+                cx.redraw_area(layer.area);
+            } else {
+                layer.sheets[index].touch_scroll.stop_at_edge();
             }
-            Hit::FingerMove(e) => {
-                if let Some((last, dragging)) = layer.touch_scroll {
-                    let dragging = dragging || e.move_distance() >= 5.0;
-                    layer.touch_scroll = Some((e.abs, dragging));
-                    if dragging && scroll_sheet(&mut layer.sheets[index].state, &layer.canvas, e.abs_start, last - e.abs) {
-                        cx.redraw_area(layer.area);
-                    }
-                }
-            }
+        }
+        match hit {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
                 let hit = layer.canvas.hit_at(e.abs - layer.canvas.origin).map(super::chat_row::hover_key);
                 let state = &mut layer.sheets[index].state;
@@ -219,7 +218,6 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
                 cx.set_cursor(if matches!(hit.as_deref(), Some("sheet:close")) { MouseCursor::Hand } else { MouseCursor::Default });
             }
             Hit::FingerUp(e) if e.is_over && e.was_tap() => {
-                layer.touch_scroll = None;
                 let target = layer.canvas.hit_at(e.abs - layer.canvas.origin).cloned();
                 match target {
                     Some(HitTarget::Chrome(id)) if id == "sheet:close" || id == "scrim" => close = true,
@@ -235,11 +233,9 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
                     _ => {}
                 }
             }
-            Hit::FingerUp(_) => layer.touch_scroll = None,
             _ => {}
         }
         if close {
-            layer.touch_scroll = None;
             layer.sheets.remove(index);
             cx.redraw_all();
         }

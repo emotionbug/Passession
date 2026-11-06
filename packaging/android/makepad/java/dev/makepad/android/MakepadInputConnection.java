@@ -174,6 +174,13 @@ final class MakepadInputConnection extends BaseInputConnection {
     void acknowledge(long acknowledgedRevision, String text, int start, int end) {
         // Never replace a newer local composition with a render-thread echo.
         if (closed || acknowledgedRevision != revision) return;
+        // An open batch can already contain a newer edit without a new revision.
+        // A no-op batch still permits the native editor's correction.
+        if (dirty && (!sentText.contentEquals(editable)
+                || sentStart != Selection.getSelectionStart(editable)
+                || sentEnd != Selection.getSelectionEnd(editable)
+                || sentComposeStart != getComposingSpanStart(editable)
+                || sentComposeEnd != getComposingSpanEnd(editable))) return;
         boolean textChanged = !text.contentEquals(editable);
         if (textChanged || start != Selection.getSelectionStart(editable)
                 || end != Selection.getSelectionEnd(editable)) {
@@ -280,6 +287,11 @@ final class MakepadInputConnection extends BaseInputConnection {
         });
         if (multiple != null) return commitText(multiple, 1);
         if (!Character.isValidCodePoint(character)) return false;
-        return commitText(new String(Character.toChars(character)), 1);
+        return edit(() -> {
+            // A hardware character inserts at the caret; it is not replacement
+            // text for the IME's current composing word.
+            removeComposingSpans(editable);
+            return super.commitText(new String(Character.toChars(character)), 1);
+        });
     }
 }

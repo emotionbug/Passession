@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Preserve Android Hangul composition across Shift and delayed native acknowledgements; hardware characters now append without replacing the current composing word.
+- Avoid applying keyboard avoidance twice, keeping the composer and modal inputs above the keyboard without the large empty gap or status-bar overlap.
+- Share touch drag, elapsed-time inertia, interruption and click cancellation across scroll surfaces. Long-press selection retains gesture ownership instead of scrolling the parent.
+- Fit sidebar search to its actual text-field height and skip painting offscreen session rows without changing their layout.
+- Preserve the current visible message and pixel offset when older history arrives; paginate only after layout, without repeatedly pulling the reader upward.
+- Let Android system Back close the root Settings page after returning from a settings subsection.
+
 ## 0.13.5 - 2026-11-06
 
 ### Fixed

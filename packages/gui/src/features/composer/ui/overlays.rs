@@ -122,6 +122,8 @@ impl ComposerPanel {
         };
         let max_h = SUGGEST_MAX.min(room);
         if let Some(message) = message {
+            self.st.suggest_scroll_max = 0.0;
+            self.st.suggest_scroll = 0.0;
             let h = (self.painter.paragraph_height(cx, wrapper.size.x - 24.0, muted, &message) + 24.0).min(max_h);
             let r = rect(wrapper.pos.x, wrapper.pos.y - 12.0 - h, wrapper.size.x, h);
             self.card(cx, look, r, p.surface1);
@@ -141,6 +143,7 @@ impl ComposerPanel {
         // Pin to the bottom; keep the keyboard selection visible.
         let content = options.len() as f64 * row_h + 8.0;
         let max_scroll = (content - list_h).max(0.0);
+        self.st.suggest_scroll_max = max_scroll;
         let mut scroll = (max_scroll - self.st.suggest_scroll).clamp(0.0, max_scroll);
         if let Some(index) = selected {
             let top = 4.0 + index as f64 * row_h;
@@ -553,6 +556,7 @@ impl ComposerPanel {
         let scroll = if top { self.st.sheet_scroll.clamp(0.0, max_scroll) } else { 0.0 };
         if top {
             self.st.sheet_scroll = scroll;
+            self.st.sheet_scroll_max = max_scroll;
         }
         cx.begin_turtle(Walk::abs_rect(list), Layout::flow_down().with_clip(true, true));
         self.st.ohits.set_clip(Some(list));
@@ -713,10 +717,13 @@ impl ComposerPanel {
             None
         };
         if let Some(message) = message {
+            self.st.sheet_scroll_max = 0.0;
+            self.st.sheet_scroll = 0.0;
             self.painter.text_in(cx, rect(list.pos.x + 12.0, list.pos.y + 8.0, list.size.x - 24.0, 24.0), TextSpec::new(Font::Regular, look.body(), p.muted), &message, 0.0);
             return;
         }
         let content = items.len() as f64 * row_h + 8.0;
+        self.st.sheet_scroll_max = (content - list.size.y).max(0.0);
         self.st.sheet_scroll = self.st.sheet_scroll.clamp(0.0, (content - list.size.y).max(0.0));
         cx.begin_turtle(Walk::abs_rect(list), Layout::flow_down().with_clip(true, true));
         self.st.ohits.set_clip(Some(list));
@@ -841,6 +848,9 @@ impl ComposerPanel {
     }
 
     pub(super) fn overlay_event(&mut self, cx: &mut Cx, event: &Event, ui: &mut UiContext, path: &HeapLiveIdPath, uid: WidgetUid) {
+        if matches!(event, Event::Scroll(_)) {
+            self.st.touch_scroll.reset();
+        }
         if let Event::Scroll(scroll) = event
             && matches!(self.st.overlay(), Overlay::Sheet(_) | Overlay::Forge)
         {
@@ -858,19 +868,20 @@ impl ComposerPanel {
         }
         // Fullscreen editor and sheet search inputs take their own pointer hits first.
         let hit = event.hits_with_capture_overload(cx, self.overlay_bg.area(), true);
-        if let Some(dy) = self.st.touch_scroll.handle_hit(&hit)
-            && let Hit::FingerMove(e) = &hit
-        {
+        if let Some(dy) = self.st.touch_scroll.handle_event(cx, event, &hit) {
+            let origin = self.st.touch_scroll.origin();
             if matches!(self.st.overlay(), Overlay::Sheet(_) | Overlay::Forge)
-                && self.st.overlay_rect.is_some_and(|r| r.contains(e.abs_start))
+                && self.st.overlay_rect.is_some_and(|r| r.contains(origin))
             {
-                self.st.sheet_scroll = (self.st.sheet_scroll + dy).max(0.0);
+                self.st.touch_scroll.apply_delta(&mut self.st.sheet_scroll, dy, self.st.sheet_scroll_max);
                 self.draw_bg.redraw(cx);
-            } else if matches!(self.st.overlay(), Overlay::Fullscreen) && self.st.input_clip.contains(e.abs_start) {
+            } else if matches!(self.st.overlay(), Overlay::Fullscreen) && self.st.input_clip.contains(origin) {
                 self.st.input_manual_scroll = true;
-                self.st.input_scroll = (self.st.input_scroll + dy)
-                    .clamp(0.0, (self.st.input_natural - self.st.input_clip.size.y).max(0.0));
+                let max = (self.st.input_natural - self.st.input_clip.size.y).max(0.0);
+                self.st.touch_scroll.apply_delta(&mut self.st.input_scroll, dy, max);
                 self.draw_bg.redraw(cx);
+            } else {
+                self.st.touch_scroll.reset();
             }
         }
         match hit {
@@ -958,6 +969,7 @@ impl ComposerPanel {
     }
 
     fn clear_search(&mut self, cx: &mut Cx) {
+        self.st.touch_scroll.reset();
         self.st.search_text.clear();
         self.st.sheet_scroll = 0.0;
         self.search.set_text(cx, "");
@@ -1083,9 +1095,12 @@ impl ComposerPanel {
             return false;
         }
         let hit = event.hits_with_capture_overload(cx, self.overlay_bg.area(), true);
-        if let Some(dy) = self.st.touch_scroll.handle_hit(&hit) {
+        let owns_pan = self.st.overlay_rect.is_some_and(|r| r.contains(self.st.touch_scroll.origin()));
+        if (owns_pan || matches!(hit, Hit::FingerDown(_)))
+            && let Some(dy) = self.st.touch_scroll.handle_event(cx, event, &hit)
+        {
             if self.suggestions_visible() {
-                self.st.suggest_scroll = (self.st.suggest_scroll - dy).max(0.0);
+                self.st.touch_scroll.apply_delta(&mut self.st.suggest_scroll, -dy, self.st.suggest_scroll_max);
                 self.draw_bg.redraw(cx);
             }
             return true;

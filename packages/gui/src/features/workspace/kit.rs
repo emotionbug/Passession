@@ -1693,7 +1693,7 @@ impl Widget for WaModal {
                     left: insets.left + 12.0,
                     right: insets.right + 12.0,
                     top: insets.top + 12.0,
-                    bottom: insets.bottom + insets.keyboard + 12.0,
+                    bottom: insets.bottom_occlusion() + 12.0,
                 };
             }
             self.draw_bg.begin(cx, self.walk, self.layout);
@@ -1722,7 +1722,7 @@ impl Widget for WaModal {
                 let size = cx.current_pass_size();
                 let available = dvec2(
                     (size.x - insets.left - insets.right - 24.0).max(0.0),
-                    (size.y - insets.top - insets.bottom - insets.keyboard - 24.0).max(0.0),
+                    (size.y - insets.top - insets.bottom_occlusion() - 24.0).max(0.0),
                 );
                 if let Size::Fixed(height) = body.walk(cx).height {
                     // A select can author a new preferred height when its options change.

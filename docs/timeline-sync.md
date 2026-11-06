@@ -119,11 +119,16 @@ Background retries are silent. The retry the user presses in the sync-error call
 user action and owns its pending state: `retrying` is a status the sync model publishes, not a view-local
 boolean, so the button reports in-flight and the callout returns to `error` when the attempt fails.
 
-Reaching the history-start threshold loads one older page and preserves the visible content anchor.
-Cursor progress does not trigger another page. The user must leave and return to the threshold unless
-the anchored page still leaves the viewport at history start, as with short or compacted content; in
-that case pagination continues as one loading operation until the page fills the viewport or history
-is exhausted.
+Reaching the history-start threshold loads one older page. Before replacing the visible model, the
+view samples the current measured content row and pixel offset, never the history/loading sentinel.
+Stable row identity, with projected-sequence fallback for merged groups, preserves that anchor and
+any drag or fling movement since the last draw.
+
+Pagination is evaluated after the replacement has been remapped and laid out. Cursor progress alone
+does not trigger another page: the user must leave and return to the threshold. Short or compacted
+content may continue automatically only while the viewport remains underfilled and the reply makes
+backward cursor progress in the same epoch. Errors, unchanged cursors and epoch replacement cannot
+create an automatic loading loop.
 
 ## Durable item anchors
 

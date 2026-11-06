@@ -63,13 +63,30 @@ an undrawn area. A newer pending editor keeps its focus and IME.
 
 ## Touch scrolling
 
-`src/scroll_bars.rs` supplies `TouchScroll`: a pan starts only after the slop
-threshold, then uses incremental deltas (including direction reversals).
-Nested children handle input before the scroll container. Activating controls
-uses the platform's sticky tap qualification, so a drag ending over its original
-button is still a scroll rather than a click. Tests cover threshold, incremental
-movement and reversal; actual Android sidebar, settings, logs and file surfaces
-were exercised separately.
+`src/scroll_bars.rs` supplies the shared `TouchScroll` controller: slop-qualified
+pan, complete initial displacement, incremental reversal, elapsed-time velocity
+and exponential inertia, bounds and animation scheduling. Its first animation
+frame establishes the render-clock epoch independently of Android touch uptime.
+New touches, wheel input, long presses, pause and focus loss cancel motion.
+
+`ScrollBars`, `PortalList` and the app's manually drawn scroll surfaces consume
+this controller. PortalList's duplicate drag/flick samples and per-frame decay
+are removed; its separate smooth-scroll and pull-down behavior remains, with
+pull-down decay expressed in elapsed time. Nested children handle input first;
+selection and horizontal child drags retain their gesture ownership. Sticky tap
+qualification prevents a pan ending over its original control from becoming a
+click. Ten `touch_scroll_tests` cover slop, subdivision, reversal, bounds,
+interruption, frame-rate/clock independence and selection.
+
+## History prepend anchors
+
+`src/portal_list.rs` adds `measured_scroll_anchor`,
+`PortalListRef::scroll_anchor(min_id)` and `not_filling_viewport()`. The anchor
+uses measured content rows and the current pending offset, excluding the
+history sentinel and end padding. Replacing rows preserves drag/fling state.
+Two `scroll_anchor_tests` cover sentinel exclusion and unmeasured movement;
+the app's pagination latch is evaluated after layout.
+
 
 ## Rust 1.93 diagnostics
 

@@ -162,8 +162,11 @@ class MakepadSurface
             if (inputConnection != null) inputConnection.flushBeforeNativeAction();
             latestDownTouchX = event.getX(index);
             latestDownTouchY = event.getY(index);
+            // A stationary hold has no MOVE; never compare it with the previous gesture.
+            latestTouchX = latestDownTouchX;
+            latestTouchY = latestDownTouchY;
             latestDownTouchPointerId = pointerId;
-            latestTouchPointerId = -1; // invalidate the previous latestTouchX/Y values.
+            latestTouchPointerId = -1; // no MOVE has arrived for this gesture.
         }
         else if (actionMasked == MotionEvent.ACTION_MOVE) {
             latestTouchX = event.getX(index);
@@ -171,6 +174,7 @@ class MakepadSurface
             latestTouchPointerId = pointerId;
             if (pointerId == latestDownTouchPointerId) {
                 if (isTouchBeyondSlopDistance(view)) {
+                    view.cancelLongPress();
                     retval = true;
                 }
             }
@@ -249,7 +253,9 @@ class MakepadSurface
     @Override
     public boolean onKey(View v, int keyCode, KeyEvent event) {
         if (inputConnection != null && inputConnection.handleTextKey(event)) return true;
-        if (inputConnection != null && event.getAction() == KeyEvent.ACTION_DOWN) {
+        // Shift/Alt change the next composing character; they do not leave the editor.
+        if (inputConnection != null && event.getAction() == KeyEvent.ACTION_DOWN
+                && !KeyEvent.isModifierKey(keyCode)) {
             inputConnection.flushBeforeNativeAction();
         }
         if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode != 0) {

@@ -26,6 +26,7 @@ pub struct OpenMenu {
     pub align_end: bool,
     pub sheet: bool,
     pub scroll: f64,
+    max_scroll: f64,
 }
 
 /// An open `showPaseoSelect` (original `Combobox`).
@@ -43,6 +44,7 @@ pub struct OpenSelect {
     /// Trimmed, lowercased search text.
     pub query: String,
     pub scroll: f64,
+    max_scroll: f64,
     pub focused: bool,
 }
 
@@ -160,6 +162,7 @@ pub struct Overlays {
 
 impl Overlays {
     pub fn open(&mut self, cx: &mut Cx, request: OverlayRequest, field_ptr: Option<LivePtr>) {
+        self.touch_scroll.reset();
         let modal = match request.kind {
             OverlayKind::Menu { title, anchor, entries, width, align_end, sheet } => Modal::Menu(OpenMenu {
                 id: request.id,
@@ -171,6 +174,7 @@ impl Overlays {
                 align_end,
                 sheet,
                 scroll: 0.0,
+                max_scroll: 0.0,
             }),
             OverlayKind::Confirm { title, message, confirm_label, destructive } => {
                 Modal::Confirm { id: request.id, owner: request.owner, title, message, confirm_label, destructive }
@@ -203,6 +207,7 @@ impl Overlays {
                     min_width,
                     query: String::new(),
                     scroll: 0.0,
+                    max_scroll: 0.0,
                     focused: false,
                 })
             }
@@ -213,6 +218,7 @@ impl Overlays {
     }
 
     pub fn open_sheet(&mut self, sheet: Box<dyn Sheet>) -> u64 {
+        self.touch_scroll.reset();
         self.next_sheet += 1;
         let id = 1_000_000 + self.next_sheet;
         self.stack.push(Modal::Sheet { id, sheet, scroll: 0.0, content_height: 0.0, viewport: Rect::default(), motion: SheetMotion::default() });
@@ -365,6 +371,11 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, window: Re
     shell.data.overlays.tooltips.clear();
     // Full-window capture area for the overlay layer.
     shell.data.overlays.area = shell.overlay_painter.capture_box(cx, window, Vec4::default(), Vec4::default(), 0.0, 0.0);
+    // Overlay roots allocate their own system-bar padding. Only remove the
+    // keyboard's additional coverage here; it may already be consumed natively.
+    let insets = crate::shell::platform::safe_insets();
+    let window = rect(window.pos.x, window.pos.y, window.size.x,
+        (window.size.y - (insets.bottom_occlusion() - insets.bottom)).max(0.0));
 
     crate::shell::chrome::draw_compact_explorer(shell, cx, scope, window);
 
@@ -521,7 +532,8 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
     }
     // The header stays fixed while tall menus scroll within their visible, touchable body.
     let viewport = rect(surface.pos.x, y, surface.size.x, (surface.pos.y + surface.size.y - y).max(0.0));
-    menu.scroll = menu.scroll.clamp(0.0, (content_h - viewport.size.y).max(0.0));
+    menu.max_scroll = (content_h - viewport.size.y).max(0.0);
+    menu.scroll = menu.scroll.clamp(0.0, menu.max_scroll);
     cx.begin_turtle(Walk::abs_rect(viewport), Layout { clip_x: true, clip_y: true, ..Layout::default() });
     ui.hits.set_clip(Some(viewport));
     y += 4.0 - menu.scroll;
@@ -669,7 +681,8 @@ fn draw_select(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, select:
             y += search_h;
         }
         let viewport = rect(surface.pos.x, y, surface.size.x, (surface.pos.y + surface.size.y - y).max(0.0));
-        select.scroll = select.scroll.min((list_h - viewport.size.y).max(0.0));
+        select.max_scroll = (list_h - viewport.size.y).max(0.0);
+        select.scroll = select.scroll.clamp(0.0, select.max_scroll);
         cx.begin_turtle(Walk::abs_rect(viewport), Layout::default());
         let mut ry = viewport.pos.y - select.scroll;
         if visible.is_empty() {
@@ -1152,6 +1165,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     }
     let explorer_open = shell.data.compact && shell.data.chrome.explorer_position > 0.0;
     if !shell.data.overlays.is_modal() && !explorer_open {
+        shell.data.overlays.touch_scroll.reset();
         // The last modal closed: release the layer's sweep lock, or every hover and click
         // below stays blocked.
         cx.sweep_unlock(area);
@@ -1225,7 +1239,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             if shell.data.compact && matches!(sheet.style(), SheetStyle::Draggable { .. }) && motion.window_h > 0.0)
     });
     if !draggable {
-        if let Some(dy) = shell.data.overlays.touch_scroll.handle_hit(&swept) {
+        if let Some(dy) = shell.data.overlays.touch_scroll.handle_event(cx, event, &swept) {
             scroll_top(shell, dy);
             shell.redraw(cx);
         }
@@ -1312,15 +1326,20 @@ fn drag_sheet(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, hit: &Hit)
 }
 
 fn scroll_top(shell: &mut PaseoShell, delta: f64) {
-    if let Some(Modal::Sheet { scroll, .. }) = shell.data.overlays.stack.last_mut() {
-        *scroll = (*scroll + delta).max(0.0);
-    }
-    if let Some(Modal::Menu(menu)) = shell.data.overlays.stack.last_mut() {
-        menu.scroll = (menu.scroll + delta).max(0.0);
-    }
-    if let Some(Modal::Select(select)) = shell.data.overlays.stack.last_mut() {
-        select.scroll = (select.scroll + delta).max(0.0);
-    }
+    let overlays = &mut shell.data.overlays;
+    let (scroll, max) = match overlays.stack.last_mut() {
+        Some(Modal::Sheet { scroll, content_height, viewport, sheet, .. }) => {
+            let padding = if shell.data.compact && matches!(sheet.style(), SheetStyle::Draggable { .. }) { 36.0 } else { 48.0 };
+            (scroll, *content_height + padding - viewport.size.y)
+        }
+        Some(Modal::Menu(menu)) => (&mut menu.scroll, menu.max_scroll),
+        Some(Modal::Select(select)) => (&mut select.scroll, select.max_scroll),
+        _ => {
+            overlays.touch_scroll.reset();
+            return;
+        }
+    };
+    overlays.touch_scroll.apply_delta(scroll, delta, max);
 }
 
 fn answer(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, owner: &str, id: u64, args: Value) {
@@ -1331,6 +1350,7 @@ fn answer(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, owner: &str, i
 }
 
 fn dismiss_top(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope) {
+    shell.data.overlays.touch_scroll.reset();
     let Some(modal) = shell.data.overlays.stack.pop() else { return };
     match modal {
         Modal::Menu(menu) => answer(shell, cx, scope, &menu.owner, menu.id, json!({ "cancelled": true })),

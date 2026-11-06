@@ -128,6 +128,10 @@ impl ExplorerPanel {
         let Some(target) = self.ensure(ui) else { return false };
         let mut changed = self.handle_commands(cx, ui, &target);
         changed |= self.view.location.blink.handle_event(event);
+        let scroll_enabled = area.is_valid(cx) && !self.transfer_hits_active();
+        changed |= store::with(|s| {
+            s.explorer_mut(&self.owner).is_some_and(|state| self.view.animate_scroll(cx, event, state, scroll_enabled))
+        });
         let hit = kit::unshift_hit(event.hits(cx, area), self.hit_shift);
         if matches!(hit, Hit::Nothing) {
             // Caret blinking is local paint only. Initialization, reveal and

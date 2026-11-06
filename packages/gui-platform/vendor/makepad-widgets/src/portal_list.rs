@@ -2,7 +2,9 @@ use crate::{
     widget::*,
     makepad_derive_widget::*,
     makepad_draw::*,
-    scroll_bar::{ScrollBar, ScrollAxis, ScrollBarAction}
+    makepad_draw::event::TouchState,
+    scroll_bar::{ScrollBar, ScrollAxis, ScrollBarAction},
+    scroll_bars::TouchScroll,
 };
 
 live_design!{
@@ -24,17 +26,9 @@ live_design!{
 /// The maximum number of items that will be shown as part of a smooth scroll animation.
 const SMOOTH_SCROLL_MAXIMUM_WINDOW: usize = 20;
 
-#[derive(Clone,Copy)]
-struct ScrollSample{
-    abs: f64,
-    time: f64,
-}
-
 enum ScrollState {
     Stopped,
-    Drag{samples:Vec<ScrollSample>},
-    Flick {delta: f64, next_frame: NextFrame},
-    Pulldown {next_frame: NextFrame},
+    Pulldown {next_frame: NextFrame, time: Option<f64>},
     ScrollingTo {target_id: usize, delta: f64, next_frame: NextFrame},
 }
 
@@ -71,10 +65,6 @@ pub struct PortalList {
     #[rust(usize::MAX)] range_end: usize,
     #[rust(0usize)] view_window: usize,
     #[rust(0usize)] visible_items: usize,
-    #[live(0.2)] flick_scroll_minimum: f64,
-    #[live(80.0)] flick_scroll_maximum: f64,
-    #[live(0.005)] flick_scroll_scaling: f64,
-    #[live(0.97)] flick_scroll_decay: f64,
     #[live(80.0)] max_pull_down: f64,
     #[live(true)] align_top_when_empty: bool,
     #[live(false)] grab_key_focus: bool,
@@ -103,6 +93,7 @@ pub struct PortalList {
     
     //#[rust(DragState::None)] drag_state: DragState,
     #[rust(ScrollState::Stopped)] scroll_state: ScrollState,
+    #[rust] touch_scroll: TouchScroll,
     /// Whether the PortalList was actively scrolling during the most recent finger down hit.
     #[rust] was_scrolling: bool,
 }
@@ -119,6 +110,39 @@ struct AlignItem {
     size: DVec2,
     shift: f64,
     index: usize
+}
+
+// Layout keeps measured off-screen neighbors too. Resolve the current offset,
+// including input received since that layout, without estimating row heights.
+fn measured_scroll_anchor<T>(
+    first_id: usize,
+    first_scroll: f64,
+    min_id: usize,
+    range_end: usize,
+    items: &[T],
+    measure: impl Fn(&T) -> (usize, f64),
+) -> Option<(usize, f64)> {
+    if first_id >= range_end {
+        return None;
+    }
+    let Ok(mut index) = items.binary_search_by_key(&first_id, |item| measure(item).0) else {
+        return (first_id >= min_id).then_some((first_id, first_scroll));
+    };
+    let mut offset = first_scroll;
+    while index > 0 && offset > 0.0 && measure(&items[index]).0 > min_id {
+        index -= 1;
+        offset -= measure(&items[index]).1;
+    }
+    while index + 1 < items.len() {
+        let (id, height) = measure(&items[index]);
+        if measure(&items[index + 1]).0 >= range_end || (id >= min_id && offset + height > 0.0) {
+            break;
+        }
+        offset += height;
+        index += 1;
+    }
+    let id = measure(&items[index]).0;
+    (id >= min_id && id < range_end).then_some((id, offset))
 }
 
 impl LiveHook for PortalList {
@@ -223,7 +247,8 @@ impl PortalList {
                 
                 // in this case we manage the 'pull down' situation when we are at the top
                 if list.first().unwrap().index == self.range_start && first_pos > 0.0 {
-                    let min = if let ScrollState::Stopped = self.scroll_state {
+                    let min = if matches!(self.scroll_state, ScrollState::Stopped)
+                        && !self.touch_scroll.is_dragging() && !self.touch_scroll.is_flinging() {
                         0.0
                     }
                     else {
@@ -691,7 +716,8 @@ impl PortalList {
         if self.first_id == self.range_start {
             self.first_scroll = self.first_scroll.min(self.max_pull_down);
             if transition_to_pulldown && self.first_scroll > 0.0 {
-                self.scroll_state = ScrollState::Pulldown {next_frame: cx.new_next_frame()};
+                self.touch_scroll.reset();
+                self.scroll_state = ScrollState::Pulldown {next_frame: cx.new_next_frame(), time: None};
             }
         }
         if clip_top && self.first_id == self.range_start && self.first_scroll > 0.0 {
@@ -701,6 +727,7 @@ impl PortalList {
         if self.at_end && delta < 0.0 {
             self.was_scrolling = false;
             self.scroll_state = ScrollState::Stopped;
+            self.touch_scroll.stop_at_edge();
         }
         // Pixel scrolling within one item does not change the index-based bar
         // position, but must still reveal the desktop thumb.
@@ -769,6 +796,7 @@ impl PortalList {
             self.first_id = start;
         }
         // Then, we kick off the actual smooth scroll process.
+        self.touch_scroll.reset();
         self.scroll_state = ScrollState::ScrollingTo {
             target_id,
             delta: speed.abs() * scroll_direction as f64,
@@ -807,6 +835,8 @@ impl Widget for PortalList {
             }
         });
         if let Some((scroll_to, at_end)) = scroll_to {
+            self.touch_scroll.reset();
+            self.scroll_state = ScrollState::Stopped;
             if at_end && self.auto_tail{
                 self.first_id = self.range_end.max(1) - 1;
                 self.first_scroll = 0.0;
@@ -829,6 +859,16 @@ impl Widget for PortalList {
             });
         }
         
+        if !self.area.is_valid(cx) {
+            self.touch_scroll.reset();
+            self.scroll_state = ScrollState::Stopped;
+        }
+        let child_scrolled = if let Event::TouchUpdate(update) = event {
+            update.touches.iter().any(|touch| matches!(touch.state, TouchState::Move) && !touch.handled.get().is_empty())
+        } else { false };
+        if child_scrolled {
+            self.touch_scroll.reset();
+        }
         match &mut self.scroll_state {
             ScrollState::ScrollingTo {target_id, delta, next_frame} => {
                 if let Some(_) = next_frame.is_event(event) {
@@ -864,26 +904,13 @@ impl Widget for PortalList {
                     }
                 }
             }
-            ScrollState::Flick {delta, next_frame} => {
-                if let Some(_) = next_frame.is_event(event) {
-                    *delta = *delta * self.flick_scroll_decay;
-                    if delta.abs()>self.flick_scroll_minimum {
-                        *next_frame = cx.new_next_frame();
-                        let delta = *delta;
-                        self.delta_top_scroll(cx, delta, false, true);
-                        cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
-                        self.area.redraw(cx);
-                    } else {
-                        self.was_scrolling = false;
-                        self.scroll_state = ScrollState::Stopped;
-                    }
-                }
-            }
-            ScrollState::Pulldown {next_frame} => {
-                if let Some(_) = next_frame.is_event(event) {
+            ScrollState::Pulldown {next_frame, time} => {
+                if let Some(frame) = next_frame.is_event(event) {
                     // we have to bounce back
                     if self.first_id == self.range_start && self.first_scroll > 0.0 {
-                        self.first_scroll *= 0.85;
+                        let dt = time.map_or(0.0, |previous| (frame.time - previous).max(0.0));
+                        *time = Some(frame.time);
+                        self.first_scroll *= 0.85_f64.powf(dt * 60.0);
                         if self.first_scroll < 1.0 {
                             self.first_scroll = 0.0;
                             // the pulldown animation is finished
@@ -908,6 +935,7 @@ impl Widget for PortalList {
         let is_scroll = if let Event::Scroll(_) = event {true} else {false};
         if self.scroll_bar.is_area_captured(cx){
             self.scroll_state = ScrollState::Stopped;
+            self.touch_scroll.reset();
         }
         if !self.scroll_bar.is_area_captured(cx) || is_scroll{ 
             match event.hits_with_capture_overload(cx, self.area, self.capture_overload) {
@@ -916,6 +944,7 @@ impl Widget for PortalList {
                     self.detect_tail_in_draw = true;
                     self.was_scrolling = false;
                     self.scroll_state = ScrollState::Stopped;
+                    self.touch_scroll.reset();
                     self.delta_top_scroll(cx, -e.scroll.index(vi), false, true);
                     cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
                     self.area.redraw(cx);
@@ -988,79 +1017,52 @@ impl Widget for PortalList {
                         cx.set_key_focus(self.area);
                     }
                     self.tail_range = false;
-                    self.was_scrolling = match &self.scroll_state {
-                        ScrollState::Drag { samples } => samples.len() > 1,
-                        ScrollState::Stopped => false,
-                        _ => true,
-                    };
+                    self.was_scrolling = self.touch_scroll.is_panning() || self.touch_scroll.is_flinging()
+                        || !matches!(self.scroll_state, ScrollState::Stopped);
+                    self.touch_scroll.reset();
+                    self.scroll_state = ScrollState::Stopped;
                     if self.drag_scrolling && fe.is_primary_hit() {
-                        self.scroll_state = ScrollState::Drag {
-                            samples: vec![ScrollSample{abs: fe.abs.index(vi), time: fe.time}]
-                        };
+                        let point = match vi { Vec2Index::X => dvec2(fe.abs.y, fe.abs.x), Vec2Index::Y => fe.abs };
+                        self.touch_scroll.begin(point, fe.time, fe.device.is_touch());
                     }
                 }
                 Hit::FingerMove(e) => {
-                    //log!("Finger move {} {}", e.time, e.abs);
                     cx.set_cursor(MouseCursor::Default);
-                    match &mut self.scroll_state {
-                        ScrollState::Drag {samples}=>{
-                            let new_abs = e.abs.index(vi);
-                            let old_sample = *samples.last().unwrap();
-                            samples.push(ScrollSample{abs:new_abs, time:e.time});
-                            if samples.len()>4{
-                                samples.remove(0);
+                    let point = match vi { Vec2Index::X => dvec2(e.abs.y, e.abs.x), Vec2Index::Y => e.abs };
+                    if let Some(delta) = self.touch_scroll.move_to(point, e.time) {
+                        if let Event::TouchUpdate(update) = event {
+                            for touch in &update.touches {
+                                if matches!(touch.state, TouchState::Move) {
+                                    touch.handled.set(self.area);
+                                }
                             }
-                            self.delta_top_scroll(cx, new_abs - old_sample.abs, false, false);
-                            self.area.redraw(cx);
                         }
-                        _=>()
+                        self.delta_top_scroll(cx, -delta, false, false);
+                        cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
+                        self.area.redraw(cx);
                     }
                 }
                 Hit::FingerUp(fe) if fe.is_primary_hit() => {
-                    //log!("Finger up {} {}", e.time, e.abs);
-                    match &mut self.scroll_state {
-                        ScrollState::Drag {samples}=>{
-                            // alright so we need to see if in the last couple of samples
-                            // we have a certain distance per time
-                            let mut last = None;
-                            let mut scaled_delta = 0.0;
-                            let mut total_delta = 0.0;
-                            for sample in samples.iter().rev(){
-                                if last.is_none(){
-                                    last = Some(sample);
-                                }
-                                else{
-                                    total_delta += last.unwrap().abs - sample.abs;
-                                    scaled_delta += (last.unwrap().abs - sample.abs)/ (last.unwrap().time - sample.time)
-                                }
-                            }
-                            scaled_delta *= self.flick_scroll_scaling;
-                            if self.first_id == self.range_start && self.first_scroll > 0.0 {
-                                self.scroll_state = ScrollState::Pulldown {next_frame: cx.new_next_frame()};
-                            }
-                            else if total_delta.abs() > 10.0 && scaled_delta.abs() > self.flick_scroll_minimum{
-                                
-                                self.scroll_state = ScrollState::Flick {
-                                    delta: scaled_delta.min(self.flick_scroll_maximum).max(-self.flick_scroll_maximum),
-                                    next_frame: cx.new_next_frame()
-                                };
-                            }
-                            else {
-                                self.was_scrolling = false;
-                                self.scroll_state = ScrollState::Stopped;
-                            }
-                        }
-                        _=>()
+                    self.touch_scroll.release(fe.time);
+                    if self.first_id == self.range_start && self.first_scroll > 0.0 {
+                        self.touch_scroll.reset();
+                        self.scroll_state = ScrollState::Pulldown { next_frame: cx.new_next_frame(), time: None };
+                    } else if !self.touch_scroll.is_flinging() {
+                        self.was_scrolling = false;
                     }
-                    // ok so. lets check our gap from 'drag'
-                    // here we kinda have to take our last delta and animate it
                 }
+                Hit::FingerLongPress(_) => self.touch_scroll.reset(),
                 Hit::KeyFocus(_) => {
                 }
                 Hit::KeyFocusLost(_) => {
                 }
                 _ => ()
             }
+        }
+        if let Some(delta) = self.touch_scroll.frame(cx, event) {
+            self.delta_top_scroll(cx, -delta, false, true);
+            cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
+            self.area.redraw(cx);
         }
     }
     
@@ -1108,6 +1110,28 @@ impl PortalListRef {
             0
         }
     }
+    /// A measured content anchor at the current scroll position. `min_id`
+    /// excludes leading decoration (for example a history-loading sentinel).
+    /// Unlike widget rectangles, the offset includes pending drag/flick input.
+    /// If input moved beyond the measured window, returns its nearest measured
+    /// row with the unconsumed pixel offset, for the next layout to resolve.
+    pub fn scroll_anchor(&self, min_id: usize) -> Option<(usize, f64)> {
+        let inner = self.borrow()?;
+        measured_scroll_anchor(
+            inner.first_id,
+            inner.first_scroll,
+            min_id.max(inner.range_start),
+            inner.range_end,
+            &inner.draw_align_list,
+            |item| (item.index, item.size.index(inner.vec_index)),
+        )
+    }
+
+    /// Whether the measured content is shorter than the viewport.
+    pub fn not_filling_viewport(&self) -> bool {
+        self.borrow().is_some_and(|inner| inner.not_filling_viewport)
+    }
+
     
     /// Enables whether the PortalList auto-tracks the last item in the list.
     ///
@@ -1302,5 +1326,26 @@ impl PortalListSet {
             list.items_with_actions_vec(actions, &mut set)
         }
         set
+    }
+}
+
+#[cfg(test)]
+mod scroll_anchor_tests {
+    use super::measured_scroll_anchor;
+
+    #[test]
+    fn content_anchor_excludes_header_and_keeps_pending_drag_offset() {
+        let rows = [(0, 48.0), (1, 170.0), (2, 35.0), (3, 420.0)];
+        assert_eq!(measured_scroll_anchor(0, 12.0, 1, 4, &rows, |r| *r), Some((1, 60.0)));
+        assert_eq!(measured_scroll_anchor(1, -195.0, 1, 4, &rows, |r| *r), Some((2, -25.0)));
+        assert_eq!(measured_scroll_anchor(3, 65.0, 1, 4, &rows, |r| *r), Some((1, -140.0)));
+    }
+
+    #[test]
+    fn content_anchor_keeps_unmeasured_scroll_distance_and_ignores_end_padding() {
+        let rows = [(3, 120.0), (4, 75.0), (5, 0.0)];
+        assert_eq!(measured_scroll_anchor(3, -300.0, 1, 5, &rows, |r| *r), Some((4, -180.0)));
+        assert_eq!(measured_scroll_anchor(8, -23.0, 1, 12, &rows, |r| *r), Some((8, -23.0)));
+        assert_eq!(measured_scroll_anchor(0, 0.0, 1, 5, &[], |r: &(usize, f64)| *r), None);
     }
 }

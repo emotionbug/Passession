@@ -342,6 +342,16 @@ impl ExplorerView {
         self.row_rects.iter().find(|(i, _)| *i == index).map(|(_, r)| *r)
     }
 
+    pub fn animate_scroll(&mut self, cx: &mut Cx, event: &Event, state: &ExplorerState, enabled: bool) -> bool {
+        if !enabled || self.nav_open {
+            self.touch_scroll.reset();
+            return false;
+        }
+        let Some(delta) = self.touch_scroll.frame(cx, event) else { return false };
+        let max = 8.0 + state.rows().len() as f64 * self.row_height + 16.0 - self.list_rect.size.y;
+        self.touch_scroll.apply_delta(&mut self.scroll_y, delta, max)
+    }
+
     /// Pointer and keyboard input on the owner's area. `changed` tells the owner to redraw.
     pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, hit: &Hit, state: &mut ExplorerState, look: &ExplorerLook, changed: &mut bool) -> ExplorerEvent {
         match hit {
@@ -360,12 +370,14 @@ impl ExplorerView {
                 }
             }
             Hit::FingerScroll(fe) => {
+                self.touch_scroll.reset();
                 if self.list_rect.contains(fe.abs) {
                     self.scroll_y += fe.scroll.y;
                     *changed = true;
                 }
             }
             Hit::FingerDown(fe) => {
+                self.touch_scroll.reset();
                 let hot = self.hits.at(fe.abs);
                 if self.nav_open && !matches!(hot, Some(Hot::NavItem(_) | Hot::Navigation)) {
                     self.nav_open = false;
@@ -400,7 +412,9 @@ impl ExplorerView {
                     }
                 }
                 self.pressed = hot;
-                self.touch_scroll.handle_hit(hit);
+                if self.list_rect.contains(fe.abs) {
+                    self.touch_scroll.handle_hit(hit);
+                }
                 *changed = true;
             }
             Hit::FingerMove(fe) => {
@@ -410,7 +424,8 @@ impl ExplorerView {
                     *changed = true;
                 } else if let Some(dy) = self.touch_scroll.handle_hit(hit) {
                     if self.list_rect.contains(fe.abs_start) {
-                        self.scroll_y += dy;
+                        let max = 8.0 + state.rows().len() as f64 * self.row_height + 16.0 - self.list_rect.size.y;
+                        self.touch_scroll.apply_delta(&mut self.scroll_y, dy, max);
                         self.pressed = None;
                         *changed = true;
                     }
@@ -444,7 +459,8 @@ impl ExplorerView {
                 }
             }
             Hit::FingerUp(fe) => {
-                self.touch_scroll.reset();
+                self.touch_scroll.release(fe.time);
+                self.touch_scroll.schedule(cx);
                 self.thumb_drag = None;
                 let pressed = self.pressed.take();
                 *changed = true;

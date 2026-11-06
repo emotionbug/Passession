@@ -904,9 +904,19 @@ impl MarkdownPreview {
         Some(out)
     }
 
+    pub fn animate_scroll(&mut self, cx: &mut Cx, event: &Event, enabled: bool) -> bool {
+        if !enabled {
+            self.touch_scroll.reset();
+            return false;
+        }
+        let Some(delta) = self.touch_scroll.frame(cx, event) else { return false };
+        self.touch_scroll.apply_delta(&mut self.scroll_y, delta, self.height - self.area.size.y)
+    }
+
     pub fn handle_hit(&mut self, hit: &Hit) -> PreviewEvent {
         match hit {
             Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
+                self.touch_scroll.reset();
                 let max = (self.height - self.area.size.y).max(0.0);
                 if max > 0.0 && fe.abs.x > self.area.pos.x + self.area.size.x - 10.0 {
                     self.thumb_drag = Some((fe.abs.y, self.scroll_y));
@@ -938,7 +948,7 @@ impl MarkdownPreview {
                     return PreviewEvent::None;
                 }
                 if let Some(dy) = self.touch_scroll.handle_hit(hit) {
-                    self.scroll_y += dy;
+                    self.touch_scroll.apply_delta(&mut self.scroll_y, dy, self.height - self.area.size.y);
                     return PreviewEvent::None;
                 }
                 if self.dragging {
@@ -953,7 +963,7 @@ impl MarkdownPreview {
                 }
             }
             Hit::FingerUp(fe) => {
-                self.touch_scroll.reset();
+                self.touch_scroll.release(fe.time);
                 self.thumb_drag = None;
                 let was_drag = self.dragging;
                 self.dragging = false;
@@ -962,7 +972,10 @@ impl MarkdownPreview {
                         return PreviewEvent::Link(href);
                     }
             }
-            Hit::FingerScroll(fe) => self.scroll_y += fe.scroll.y,
+            Hit::FingerScroll(fe) => {
+                self.touch_scroll.reset();
+                self.scroll_y += fe.scroll.y;
+            }
             Hit::TextCopy(ce) => {
                 if let Some(text) = self.selected_text() {
                     *ce.response.borrow_mut() = Some(text);

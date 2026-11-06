@@ -906,6 +906,13 @@ impl FileView {
         if !matches!(hit, Hit::Nothing) {
             changed |= self.hit(cx, kit, &hit, ui);
         }
+        let scrolling = observing && area.is_valid(cx) && !self.settings_open;
+        let preview = self.preview_visible();
+        changed |= self.markdown.animate_scroll(cx, event, scrolling && preview);
+        let look = self.editor_look(ui);
+        if let Some(editor) = self.editor.as_mut() {
+            changed |= editor.animate_scroll(cx, event, &look, scrolling && !preview);
+        }
         changed
     }
 

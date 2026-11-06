@@ -229,7 +229,7 @@ pub struct OverlayHost<P> {
     scroll: f64,
     list_rect: Rect,
     content_height: f64,
-    drag_last: Option<DVec2>,
+    touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     /// The backdrop area the sheet's sweep lock was taken with.
     locked: Area,
     window_modal: Option<shared::WindowModal>,
@@ -251,7 +251,7 @@ impl<P> Default for OverlayHost<P> {
             scroll: 0.0,
             list_rect: Rect::default(),
             content_height: 0.0,
-            drag_last: None,
+            touch_scroll: Default::default(),
             locked: Area::Empty,
             window_modal: None,
         }
@@ -355,6 +355,7 @@ impl<P> OverlayHost<P> {
     /// Drops the overlay without a result (the owner hid or rebound). A
     /// pending shared overlay's late answer is ignored.
     pub fn close(&mut self, cx: &mut Cx) -> Option<P> {
+        self.touch_scroll.reset();
         if let Some((purpose, _)) = self.queued.take() {
             return Some(purpose);
         }
@@ -392,6 +393,7 @@ impl<P> OverlayHost<P> {
     }
 
     fn finish(&mut self, cx: &mut Cx, make: impl FnOnce(P) -> OverlayResult<P>) -> Option<OverlayResult<P>> {
+        self.touch_scroll.reset();
         let sheet = self.sheet.take()?;
         self.unlock(cx);
         cx.redraw_all();
@@ -446,7 +448,15 @@ impl<P> OverlayHost<P> {
         if event.back_pressed() {
             return self.finish(cx, OverlayResult::Dismissed);
         }
-        match event.hits_with_sweep_area(cx, area, area) {
+        let hit = event.hits_with_sweep_area(cx, area, area);
+        if !area.is_valid(cx) {
+            self.touch_scroll.reset();
+        }
+        if let Some(delta) = self.touch_scroll.handle_event(cx, event, &hit) {
+            self.pressed = None;
+            self.scroll_list(cx, self.touch_scroll.origin(), delta);
+        }
+        match hit {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
                 let hovered = self.hits.find(e.abs).map(|(_, hit)| hit);
                 if hovered != self.hovered {
@@ -462,19 +472,8 @@ impl<P> OverlayHost<P> {
             Hit::FingerScroll(e) => self.scroll_list(cx, e.abs, e.scroll.y),
             Hit::FingerDown(e) => {
                 self.pressed = self.hits.find(e.abs).map(|(_, hit)| hit);
-                self.drag_last = e.device.is_touch().then_some(e.abs);
-            }
-            Hit::FingerMove(e) => {
-                if let Some(last) = self.drag_last {
-                    if e.move_distance() > 8.0 {
-                        self.pressed = None;
-                    }
-                    self.drag_last = Some(e.abs);
-                    self.scroll_list(cx, e.abs_start, last.y - e.abs.y);
-                }
             }
             Hit::FingerUp(e) => {
-                self.drag_last = None;
                 let pressed = self.pressed.take();
                 let released = self.hits.find(e.abs).map(|(_, hit)| hit);
                 if pressed != released || !e.is_over || (e.device.is_touch() && !e.was_tap()) {
@@ -503,8 +502,10 @@ impl<P> OverlayHost<P> {
     fn scroll_list(&mut self, cx: &mut Cx, point: DVec2, delta: f64) {
         if self.list_rect.contains(point) {
             let max = (self.content_height - self.list_rect.size.y).max(0.0);
-            self.scroll = (self.scroll + delta).clamp(0.0, max);
+            self.touch_scroll.apply_delta(&mut self.scroll, delta, max);
             cx.redraw_all();
+        } else {
+            self.touch_scroll.reset();
         }
     }
 

@@ -102,6 +102,10 @@ impl Widget for RemoteFolderPicker {
             store::with(|s| {
                 s.explorer(ui, &owner, &cwd, ".", true, None);
             });
+            let scroll_enabled = self.area.is_valid(cx);
+            changed |= store::with(|s| {
+                s.explorer_mut(&owner).is_some_and(|state| self.view.animate_scroll(cx, event, state, scroll_enabled))
+            });
             let shift = if self.area.is_valid(cx) { self.area.rect(cx).pos - self.drawn_at } else { DVec2::default() };
             let hit = super::kit::unshift_hit(event.hits(cx, self.area), shift);
             if !matches!(hit, Hit::Nothing) {

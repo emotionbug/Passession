@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use makepad_widgets::*;
+use makepad_widgets::event::TouchState;
 use paseo_gui_core::{CoreError, CoreEvent, RequestId};
 use serde_json::Value;
 
@@ -66,7 +67,10 @@ live_design! {
             file = Sub { name: "File", items: [new_window] }
             new_window = Item { name: "New Window", shift: true, key: KeyN, enabled: true }
         }
-        body = {
+        // Native surface resize and shell safe insets own keyboard avoidance.
+        // Window's default KeyboardView would pan the already-adjusted UI again.
+        body = <View> {
+            width: Fill, height: Fill,
             shell = <PaseoShell> {}
         }
     }
@@ -587,6 +591,17 @@ impl Widget for PaseoShell {
         // Modal overlays get the event first and lock the sweep for the content below.
         let modal = if tool_sheet || window_modal || command_center { true } else { overlays::handle_event(self, cx, event, scope) };
         let modal = shell_modal || modal;
+        let sidebar_blocked = !chrome::sidebar_visible(self) || self.data.app_inactive
+            || modal || overlay_api::window_modal_open(&self.data.window_id)
+            || (self.data.compact && self.data.chrome.explorer_position > 0.0);
+        let fresh_pointer = matches!(event, Event::MouseDown(_))
+            || matches!(event, Event::TouchUpdate(e) if e.touches.iter().any(|t| matches!(t.state, TouchState::Start)));
+        if sidebar_blocked || fresh_pointer {
+            self.data.sidebar.stop_motion();
+        }
+        if !sidebar_blocked {
+            sidebar::animate(self, cx, event);
+        }
 
         // Keyboard shortcuts (not while a modal overlay is open).
         let mut key_consumed = false;

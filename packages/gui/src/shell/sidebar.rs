@@ -25,6 +25,29 @@ pub struct SidebarState {
     pub viewport: Rect,
     /// Sidebar requests in flight (`_busy` progress bar).
     pub busy: usize,
+    motion: makepad_widgets::scroll_bars::TouchScroll,
+}
+
+impl SidebarState {
+    pub fn stop_motion(&mut self) {
+        self.motion.reset();
+    }
+
+    pub fn touch_down(&mut self, abs: DVec2, time: f64) {
+        self.motion.begin(abs, time, true);
+    }
+
+    fn scroll_by(&mut self, delta: f64) -> bool {
+        let max = (self.content_height - self.viewport.size.y).max(0.0);
+        self.motion.apply_delta(&mut self.scroll, delta, max)
+    }
+
+    /// True once this touch owns vertical scrolling, including at an edge.
+    pub fn touch_move(&mut self, abs: DVec2, time: f64) -> bool {
+        let Some(delta) = self.motion.move_to(abs, time) else { return false };
+        self.scroll_by(delta);
+        true
+    }
 }
 
 /// `preferences.navigation`.
@@ -327,12 +350,19 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Va
         shell.data.search = Some(field);
     }
     if let Some(field) = shell.data.search.clone() {
-        let search = rect(r.pos.x + 12.0, y, r.size.x - 24.0, 36.0);
-        cx.begin_turtle(Walk::abs_rect(search), Layout::default());
+        // The input owns its font metrics and padding; a fixed-height clip cuts
+        // off its bottom border when native text is taller.
+        let walk = Walk {
+            abs_pos: Some(dvec2(r.pos.x + 12.0, y)),
+            width: Size::Fixed(r.size.x - 24.0),
+            height: Size::Fit,
+            ..Walk::default()
+        };
+        cx.begin_turtle(walk, Layout::flow_down());
         field.draw_all(cx, scope);
-        cx.end_turtle();
+        y += cx.end_turtle().size.y;
     }
-    y += 44.0;
+    y += 8.0;
     if shell.data.sidebar.busy > 0 {
         shell.painter.fill(cx, rect(r.pos.x, y - 2.0, r.size.x, 2.0), p.accent, 0.0);
     }
@@ -492,9 +522,15 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                 continue;
             }
             for agent in rows {
+                let row = rect(x0 + 48.0, y, w - 56.0, 52.0);
+                y += row.size.y;
+                // Clipping alone still shapes and paints every off-screen row
+                // on each touch move. Keep its extent, not its draw/hit work.
+                if row.pos.y + row.size.y <= list.pos.y || row.pos.y >= list.pos.y + list.size.y {
+                    continue;
+                }
                 let agent_id = j::text(agent, "id");
                 let id = format!("session:{sid}:{agent_id}");
-                let row = rect(x0 + 48.0, y, w - 56.0, 52.0);
                 let is_selected = selected.as_ref().is_some_and(|t| t.kind == "agent" && t.server_id == sid && t.id.as_deref() == Some(agent_id));
                 if is_selected {
                     ui.fill(cx, row, p.border, 6.0);
@@ -523,7 +559,6 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                     let spec = ui.spec(Font::Regular, 12.0, p.extra_muted);
                     ui.text_right(cx, rect(row.pos.x + row.size.x - trailing_w, row.pos.y, trailing_w - 12.0, row.size.y), spec, &trailing);
                 }
-                y += 52.0;
             }
         }
         let project_list_loading = host.loading() || loading.contains(&"project") || errors.iter().any(|(k, _)| *k == "project");
@@ -594,10 +629,24 @@ fn draw_footer(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect) {
 
 pub fn scroll(shell: &mut PaseoShell, cx: &mut Cx, delta: f64) {
     let s = &mut shell.data.sidebar;
-    let max = (s.content_height - s.viewport.size.y).max(0.0);
-    let next = (s.scroll + delta).clamp(0.0, max);
-    if (next - s.scroll).abs() > f64::EPSILON {
-        s.scroll = next;
+    s.stop_motion();
+    if s.scroll_by(delta) {
+        shell.redraw(cx);
+    }
+}
+
+pub fn touch_up(shell: &mut PaseoShell, cx: &mut Cx, time: f64) -> bool {
+    let motion = &mut shell.data.sidebar.motion;
+    let panned = motion.release(time);
+    motion.schedule(cx);
+    panned
+}
+
+pub fn animate(shell: &mut PaseoShell, cx: &mut Cx, event: &Event) {
+    let s = &mut shell.data.sidebar;
+    let Some(delta) = s.motion.frame(cx, event) else { return };
+    let changed = s.scroll_by(delta);
+    if changed {
         shell.redraw(cx);
     }
 }
@@ -607,6 +656,7 @@ pub fn handle_actions(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, _ui: &
     let Event::Actions(actions) = event else { return };
     let Some(field) = shell.data.search.clone() else { return };
     if let Some(text) = field.as_ptext_field().changed(actions) {
+        shell.data.sidebar.stop_motion();
         shell.data.sidebar.query = text.trim().to_lowercase();
         shell.data.sidebar.scroll = 0.0;
         shell.redraw(cx);

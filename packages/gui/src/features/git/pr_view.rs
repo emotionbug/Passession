@@ -382,7 +382,15 @@ impl PrView {
         store: &mut GitStore,
     ) -> bool {
         let hit = event.hits(cx, area);
-        let pan = self.touch_scroll.handle_hit(&hit);
+        if !area.is_valid(cx) {
+            self.touch_scroll.reset();
+        }
+        let pan = self.touch_scroll.handle_event(cx, event, &hit);
+        if let Some(dy) = pan {
+            self.pressed = None;
+            self.body_pressed = None;
+            return self.scroll_at(self.touch_scroll.origin(), dy, false);
+        }
         if let Some(redraw) = self.body_event(cx, &hit, area, ui) {
             return redraw;
         }
@@ -415,16 +423,10 @@ impl PrView {
                 }
                 return self.hovered_region.take().is_some() || hovered;
             }
-            Hit::FingerScroll(e) => return self.scroll_at(e.abs, e.scroll.y),
+            Hit::FingerScroll(e) => return self.scroll_at(e.abs, e.scroll.y, true),
             Hit::FingerDown(e) => {
                 tooltip_at(ui, None, Rect::default(), 0.3);
                 self.pressed = self.hits.find(e.abs).map(|(_, hit)| hit);
-            }
-            Hit::FingerMove(e) => {
-                let Some(dy) = pan else { return false };
-                self.pressed = None;
-                self.body_pressed = None;
-                return self.scroll_at(e.abs_start, dy);
             }
             Hit::FingerUp(e) => {
                 let pressed = self.pressed.take();
@@ -443,20 +445,16 @@ impl PrView {
         false
     }
 
-    fn scroll_at(&mut self, point: DVec2, delta: f64) -> bool {
+    fn scroll_at(&mut self, point: DVec2, delta: f64, wheel: bool) -> bool {
         if self.checks_area.contains(point) && self.checks_content > self.checks_area.size.y {
             let max = self.checks_content - self.checks_area.size.y;
-            let next = (self.checks_scroll + delta).clamp(0.0, max);
-            if next != self.checks_scroll {
-                self.checks_scroll = next;
-                return true;
+            let changed = self.touch_scroll.apply_delta(&mut self.checks_scroll, delta, max);
+            if changed || !wheel {
+                return changed;
             }
         }
         let max = (self.content - self.viewport.size.y).max(0.0);
-        let next = (self.scroll + delta).clamp(0.0, max);
-        let changed = next != self.scroll;
-        self.scroll = next;
-        changed
+        self.touch_scroll.apply_delta(&mut self.scroll, delta, max)
     }
 
     fn activate(&mut self, cx: &mut Cx, ui: &mut UiContext, store: &mut GitStore, hit: PrHit, anchor: Rect) {

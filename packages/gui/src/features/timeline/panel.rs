@@ -22,7 +22,7 @@ use super::outline::{self, Rail, RailEvent};
 use super::paint::{Draw, Look, MOBILE, RowState, now_seconds};
 use super::permission;
 use super::rows::{self, FindTarget, LiveFooter, RowContext, RowItem, RowKind};
-use super::session::{ActionKind, ChatSession, Completion, ExecutionStatus, ForkTarget, Io, SessionKey, SyncStatus};
+use super::session::{ActionKind, ChatSession, Completion, Cursor, ExecutionStatus, ForkTarget, Io, SessionKey, SyncStatus};
 use super::store::with_store;
 use super::tracks::{self, ArchiveFinished, SubagentRow, TrackModel, TrackPanel};
 use crate::common::overlay::{self, MenuEntry, MenuItem, MenuOptions, WindowModal};
@@ -32,7 +32,7 @@ use crate::common::widgets::PTextFieldWidgetRefExt;
 use crate::common::{PanelTarget, TabPlacement, UiContext, UiEffect};
 use crate::features::composer::ComposerPanelWidgetRefExt;
 use makepad_widgets::*;
-use makepad_widgets::makepad_platform::event::TouchState;
+use makepad_widgets::scroll_bars::TouchScroll;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -169,6 +169,61 @@ struct ModelSig {
     loading_older: bool,
 }
 
+#[derive(Default)]
+struct OlderPaging {
+    at_start: bool,
+    request: Option<Cursor>,
+    continue_short: bool,
+}
+
+impl OlderPaging {
+    fn loading(&self) -> bool {
+        self.request.is_some()
+    }
+
+    fn settled(&mut self, start: Option<&Cursor>) {
+        if let Some(request) = self.request.take() {
+            self.continue_short = start.is_some_and(|start| start.epoch == request.epoch && start.seq < request.seq);
+        }
+    }
+
+    fn observe(&mut self, at_start: bool, underfilled: bool, available: bool) -> bool {
+        if !at_start {
+            self.at_start = false;
+            self.continue_short = false;
+            return false;
+        }
+        if !available || self.loading() {
+            return false;
+        }
+        let wanted = !self.at_start || (self.continue_short && underfilled);
+        self.at_start = true;
+        self.continue_short = false;
+        wanted
+    }
+}
+
+fn remap_reading_anchor(previous: &[RowItem], next: &[RowItem], anchor: (usize, f64)) -> Option<(usize, f64)> {
+    let row = previous.get(anchor.0)?;
+    let index = next.iter().position(|item| item.id == row.id).or_else(|| {
+        // A prepended tool run can absorb the first overview group and change
+        // its ID. The old projected sequence still belongs to that group.
+        let seq = row.seq()?;
+        next.iter().position(|item| match &item.kind {
+            RowKind::Entry { rows, index, .. } => {
+                let row = &rows[*index];
+                let contains = |entry: &Value| {
+                    get(entry, "seqStart").as_i64().is_some_and(|start| start <= seq)
+                        && get(entry, "seqEnd").as_i64().is_some_and(|end| seq <= end)
+                };
+                row.group.as_ref().map_or_else(|| contains(&row.entry), |group| group.iter().any(|entry| contains(entry)))
+            }
+            _ => false,
+        })
+    })?;
+    Some((index, anchor.1))
+}
+
 /// The session facts one frame presents.
 #[derive(Clone)]
 struct Snap {
@@ -179,6 +234,7 @@ struct Snap {
     subagents: Vec<Value>,
     turns: HashMap<String, Value>,
     epoch: Option<String>,
+    start_cursor: Option<Cursor>,
     has_older: bool,
     loading: bool,
     error: Option<String>,
@@ -208,6 +264,7 @@ impl Snap {
             subagents: s.subagents.clone(),
             turns: s.turns.clone(),
             epoch: s.epoch.clone(),
+            start_cursor: s.start_cursor.clone(),
             has_older: s.has_older,
             loading: s.loading,
             error: s.error.clone(),
@@ -365,9 +422,7 @@ pub struct ChatPanel {
     #[rust(true)]
     at_bottom: bool,
     #[rust]
-    anchor: Option<(String, f64)>,
-    #[rust]
-    loading_older: bool,
+    older: OlderPaging,
     #[rust]
     expanded_tools: bool,
     #[rust]
@@ -481,7 +536,9 @@ pub struct ChatPanel {
     #[rust]
     lightbox_drag: Option<DVec2>,
     #[rust]
-    modal_touch_scroll: Option<(DVec2, bool)>,
+    modal_touch_scroll: TouchScroll,
+    #[rust]
+    modal_horizontal_scroll: TouchScroll,
     #[rust]
     pressed: Option<(HitTarget, bool)>,
     /// The core handle from the last event pass (draws without a UiContext).
@@ -551,8 +608,7 @@ impl ChatPanel {
         self.row_states.clear();
         self.sticky = true;
         self.at_bottom = true;
-        self.anchor = None;
-        self.loading_older = false;
+        self.older = OlderPaging::default();
         self.find = FindController::default();
         self.find_open = false;
         self.rail = Rail::default();
@@ -599,6 +655,8 @@ impl ChatPanel {
     }
 
     fn dismiss_modal(&mut self, cx: &mut Cx) {
+        self.modal_touch_scroll.reset();
+        self.modal_horizontal_scroll.reset();
         if let Some(panel) = self.sheet_panel.take() {
             panel.as_chat_panel().set_visible(cx, false);
         }
@@ -845,7 +903,7 @@ impl ChatPanel {
             permissions: permission_count,
             version: snap.version,
             compact_tracks: tracks && compact,
-            loading_older: self.loading_older,
+            loading_older: self.older.loading(),
         };
         if self.model_sig.as_ref() == Some(&sig) {
             return;
@@ -883,7 +941,7 @@ impl ChatPanel {
             };
             if used.insert(id.clone()) { id } else { format!("{id}#{i}") }
         };
-        let mut items = vec![RowItem { id: "history-start".into(), kind: RowKind::HistoryStart { loading: self.loading_older } }];
+        let mut items = vec![RowItem { id: "history-start".into(), kind: RowKind::HistoryStart { loading: self.older.loading() } }];
         let mut ids: HashMap<usize, String> = HashMap::new();
         let mut previous_tasks: Option<Rc<Value>> = None;
         for i in 0..rows.len() {
@@ -939,12 +997,16 @@ impl ChatPanel {
         if clearance > existing {
             items.push(RowItem { id: "tail-inset".into(), kind: RowKind::Inset(clearance - existing) });
         }
-        // Reading hold: the first shown row keeps its place across prepends.
+        // Resolve against the current list state, not the previous frame:
+        // touch/flick input may have moved while an older page was in flight.
+        // The loading sentinel is not content and must never survive a prepend
+        // as the reading anchor.
+        let list = self.list.as_portal_list();
         if !self.sticky
-            && let Some((anchor, offset)) = self.anchor.clone()
-            && let Some(index) = items.iter().position(|i| i.id == anchor)
+            && let Some(anchor) = list.scroll_anchor(1)
+            && let Some((index, offset)) = remap_reading_anchor(&self.items, &items, anchor)
         {
-            self.list.as_portal_list().set_first_id_and_scroll(index, offset);
+            list.set_first_id_and_scroll(index, offset);
         }
         if self.row_states.len() > items.len() + 256 {
             let live: HashSet<&String> = items.iter().map(|i| &i.id).collect();
@@ -1024,7 +1086,6 @@ impl ChatPanel {
         self.sticky = true;
         self.at_bottom = true;
         self.reader_scrolled = false;
-        self.anchor = None;
         let list = self.list.as_portal_list();
         let last = self.items.len().saturating_sub(1);
         list.set_first_id_and_scroll(last, 0.0);
@@ -1038,7 +1099,6 @@ impl ChatPanel {
         self.detach();
         self.at_bottom = false;
         self.list.as_portal_list().set_first_id_and_scroll(index, offset);
-        self.anchor = Some((row_id.to_owned(), offset));
         self.area.redraw(cx);
     }
 
@@ -1048,11 +1108,13 @@ impl ChatPanel {
 
     fn load_older(&mut self, cx: &mut Cx, ui: &mut UiContext) {
         let Some(snap) = &self.snap else { return };
-        if !self.visible || self.loading_older || !snap.has_older || snap.loading {
+        if !self.visible || self.older.loading() || !snap.has_older || snap.loading {
             return;
         }
-        self.loading_older = true;
+        let Some(start) = snap.start_cursor.clone() else { return };
+        self.older.request = Some(start);
         self.with_session(cx, ui, |s, io| s.older(io));
+        self.area.redraw(cx);
     }
 
     // ── outline ─────────────────────────────────────────────────────────
@@ -2240,6 +2302,8 @@ impl Widget for ChatPanel {
         // moves that region instead of the stream.
         let mut swallow_scroll = false;
         if let Event::Scroll(se) = event {
+            self.modal_touch_scroll.reset();
+            self.modal_horizontal_scroll.reset();
             if modal_open {
                 swallow_scroll = true;
                 self.modal_scroll(cx, se.abs, se.scroll);
@@ -2266,7 +2330,6 @@ impl Widget for ChatPanel {
         }
         if !modal_open {
             let reader_input = match event {
-                Event::TouchUpdate(te) => te.touches.iter().any(|t| matches!(t.state, TouchState::Move) && self.stream_rect.contains(t.abs)),
                 Event::MouseDown(e) if self.stream_rect.contains(e.abs)
                     && e.abs.x >= self.stream_rect.pos.x + self.stream_rect.size.x - 16.0 => {
                     // Focus only the scrollbar gutter, not selectable rows or
@@ -2301,6 +2364,26 @@ impl Widget for ChatPanel {
             Some(None) => panel_rect.contains(abs),
             None => overlay_rects.iter().any(|r| r.contains(abs)),
         });
+        if !modal_open || matches!(self.modal, Some(Modal::Lightbox { .. })) {
+            self.modal_touch_scroll.reset();
+            self.modal_horizontal_scroll.reset();
+        } else {
+            let dy = self.modal_touch_scroll.handle_event(cx, event, &hit);
+            let dx = self.modal_horizontal_scroll.handle_axis_event(cx, event, &hit, Vec2Index::X);
+            let origin = self.modal_touch_scroll.origin();
+            if let Some(delta) = dy {
+                self.pressed = None;
+                if !self.modal_scroll(cx, origin, dvec2(0.0, delta)) {
+                    self.modal_touch_scroll.stop_at_edge();
+                }
+            }
+            if let Some(delta) = dx {
+                self.pressed = None;
+                if !self.modal_scroll(cx, origin, dvec2(delta, 0.0)) {
+                    self.modal_horizontal_scroll.stop_at_edge();
+                }
+            }
+        }
         let mut chrome_tap: Option<String> = escape_modal.then(|| "scrim".to_owned());
         match hit {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => self.chrome_hover(cx, Some(e.abs)),
@@ -2311,19 +2394,10 @@ impl Widget for ChatPanel {
                     && (target.is_none() || matches!(&target, Some(HitTarget::Chrome(id)) if id == "lightbox:image"))
                 {
                     self.lightbox_drag = Some(e.abs);
-                } else if modal_open && e.device.is_touch() {
-                    self.modal_touch_scroll = Some((e.abs, false));
                 }
                 self.pressed = target.map(|t| (t, true));
             }
             Hit::FingerMove(e) => {
-                if let Some((last, dragging)) = self.modal_touch_scroll {
-                    let dragging = dragging || e.move_distance() >= 5.0;
-                    self.modal_touch_scroll = Some((e.abs, dragging));
-                    if dragging {
-                        self.modal_scroll(cx, e.abs_start, last - e.abs);
-                    }
-                }
                 if let (Some(last), Some(Modal::Lightbox { offset, scale, .. })) = (self.lightbox_drag, &mut self.modal)
                     && *scale > 1.0
                 {
@@ -2333,7 +2407,6 @@ impl Widget for ChatPanel {
                 }
             }
             Hit::FingerUp(e) => {
-                self.modal_touch_scroll = None;
                 let dragged = self.lightbox_drag.take().is_some_and(|start| (e.abs - e.abs_start).length() > 4.0 && start != e.abs_start);
                 if let Some((target, _)) = self.pressed.take() {
                     if e.is_over && !dragged && (!e.device.is_touch() || e.was_tap()) && self.chrome_hit(e.abs).as_ref() == Some(&target) {
@@ -2369,7 +2442,16 @@ impl Widget for ChatPanel {
         // Children: the stream, the composer and the find field.
         let block_pointer = modal_open && modal_input;
         if !swallow_scroll && !block_pointer {
+            let list = self.list.as_portal_list();
+            let previous_scroll = list.scroll_position();
             self.list.handle_event(cx, event, scope);
+            // Selection and horizontal child drags are not timeline scrolling.
+            // Classify only after the common gesture owner has applied a delta.
+            if matches!(event, Event::TouchUpdate(_)) && list.scroll_position() != previous_scroll {
+                self.reader_scrolled = true;
+                self.at_bottom = false;
+                self.detach();
+            }
         }
         let effects_before = scope.data.get::<UiContext>().map(|ui| ui.effects.len()).unwrap_or(0);
         if !block_pointer || !composer_visible {
@@ -2662,6 +2744,13 @@ impl Widget for ChatPanel {
 
         // ── after layout ────────────────────────────────────────────────
         self.after_draw(cx);
+        // A reply must be rebuilt and laid out before deciding whether the
+        // reader is still at history start. Old indices can queue every page.
+        if let Some(ui) = scope.data.get_mut::<UiContext>()
+            && self.wants_older()
+        {
+            self.load_older(cx, ui);
+        }
         if let Some(target) = &self.target {
             MENUS.with(|m| {
                 m.borrow_mut().insert(
@@ -2810,11 +2899,11 @@ impl ChatPanel {
         }
     }
 
-    fn modal_scroll(&mut self, cx: &mut Cx, abs: DVec2, delta: DVec2) {
+    fn modal_scroll(&mut self, cx: &mut Cx, abs: DVec2, delta: DVec2) -> bool {
         if let Some(Modal::Lightbox { .. }) = &self.modal {
             self.zoom(if delta.y < 0.0 { 1.1 } else { 1.0 / 1.1 });
             self.area.redraw(cx);
-            return;
+            return true;
         }
         let rel = abs - self.modal_canvas.origin;
         if let Some(key) = self.modal_canvas.scroll_region_at(rel, delta.x.abs() <= delta.y.abs()).map(str::to_owned) {
@@ -2823,13 +2912,19 @@ impl ChatPanel {
             let max = extents.get(&key).copied().unwrap_or(0.0);
             let current = offsets.get(&key).copied().unwrap_or(0.0);
             let detach = key == "sheet:y";
-            offsets.insert(key, (current + if vertical { delta.y } else { delta.x }).clamp(0.0, max));
+            let next = (current + if vertical { delta.y } else { delta.x }).clamp(0.0, max);
+            if next == current {
+                return false;
+            }
+            offsets.insert(key, next);
             if detach {
                 // An overview sheet stays pinned to its newest call until scrolled.
                 self.modal_state.expanded.insert("sheet:detached".into(), true);
             }
             self.area.redraw(cx);
+            return true;
         }
+        false
     }
 
     /// Everything that needs the UiContext: commands, overlay answers,
@@ -3036,17 +3131,12 @@ impl ChatPanel {
         {
             self.ensure_providers(cx, ui);
         }
-
-        // Older history while the stream's start is in view.
-        if self.wants_older() {
-            self.load_older(cx, ui);
-        }
     }
 
     fn on_session_changed(&mut self, cx: &mut Cx, ui: &mut UiContext) {
         let Some(snap) = self.snap.clone() else { return };
-        if self.loading_older && !snap.loading {
-            self.loading_older = false;
+        if !snap.loading {
+            self.older.settled(snap.start_cursor.as_ref());
         }
         let rows = snap.timeline.clone();
         self.find.history_changed(snap.epoch.as_deref(), &rows);
@@ -3060,23 +3150,18 @@ impl ChatPanel {
         self.area.redraw(cx);
     }
 
-    fn wants_older(&self) -> bool {
+    fn wants_older(&mut self) -> bool {
         let Some(snap) = &self.snap else { return false };
-        if !self.visible || !snap.has_older || snap.loading || self.loading_older || self.items.is_empty() {
-            return false;
-        }
-        // The history-start slot (item 0) or the first row is on screen.
-        self.list.as_portal_list().first_id() <= 1
+        let available = self.visible && snap.has_older && !snap.loading && snap.start_cursor.is_some() && !self.stream_empty();
+        let list = self.list.as_portal_list();
+        let at_start = list.scroll_anchor(1).is_some_and(|(index, _)| index == 1);
+        self.older.observe(at_start, list.not_filling_viewport(), available)
     }
 
-    /// Post-layout bookkeeping: the reading anchor, the active prompt, the
-    /// find match position.
+    /// Post-layout bookkeeping: the active prompt and find match position.
     fn after_draw(&mut self, cx: &mut Cx2d) {
         let list = self.list.as_portal_list();
         let first = list.first_id();
-        if let Some(item) = self.items.get(first) {
-            self.anchor = Some((item.id.clone(), list.scroll_position()));
-        }
         // resolveActivePromptSeq: the last prompt at or before the first row on screen.
         if self.rail.prompts.len() >= 2 {
             let anchor = self.items.iter().skip(first).find_map(RowItem::seq);
@@ -3372,5 +3457,102 @@ impl ChatPanelRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.run_conversation_action(cx, action);
         }
+    }
+}
+
+#[cfg(test)]
+mod reading_hold_tests {
+    use super::*;
+
+    fn cursor(epoch: &str, seq: i64) -> Cursor {
+        Cursor { epoch: epoch.to_owned(), seq }
+    }
+
+    fn rows(ids: &[(&str, f64)]) -> Vec<RowItem> {
+        ids.iter().map(|(id, height)| RowItem { id: (*id).to_owned(), kind: RowKind::Inset(*height) }).collect()
+    }
+
+    #[test]
+    fn repeated_prepends_preserve_current_reader_row_and_pixel_offset() {
+        let original = rows(&[("history-start", 48.0), ("a", 170.0), ("b", 35.0), ("c", 420.0)]);
+        let first_page = rows(&[("history-start", 48.0), ("older-a", 310.0), ("older-b", 27.0), ("a", 170.0), ("b", 35.0), ("c", 420.0)]);
+        assert_eq!(remap_reading_anchor(&original, &first_page, (1, -37.5)), Some((3, -37.5)));
+
+        // The reader moved into older-b while the second request was in flight.
+        let second_page = rows(&[("history-start", 48.0), ("oldest", 750.0), ("older-a", 310.0), ("older-b", 27.0), ("a", 170.0), ("b", 35.0), ("c", 420.0)]);
+        assert_eq!(remap_reading_anchor(&first_page, &second_page, (2, -12.0)), Some((3, -12.0)));
+        assert_eq!(remap_reading_anchor(&second_page, &second_page, (6, -80.0)), Some((6, -80.0)));
+    }
+
+    #[test]
+    fn prepend_absorbed_overview_group_preserves_its_anchor() {
+        let entry = |seq| Rc::new(json!({"seqStart": seq, "seqEnd": seq, "item": {"type": "tool_call"}}));
+        let group = |id: &str, entries: Vec<Rc<Value>>| {
+            let stream = StreamRow { entry: entries.last().unwrap().clone(), group: Some(entries) };
+            RowItem {
+                id: id.to_owned(),
+                kind: RowKind::Entry {
+                    rows: Rc::new(vec![stream]), index: 0, previous_tasks: None,
+                    footer_below: false, streaming: false, live: false, gap_below: 0.0,
+                },
+            }
+        };
+        let previous = vec![group("group:20", vec![entry(20), entry(21)])];
+        let next = vec![group("group:10", vec![entry(10), entry(20), entry(21)])];
+        assert_eq!(remap_reading_anchor(&previous, &next, (0, -18.0)), Some((0, -18.0)));
+        let replacement = vec![group("group:30", vec![entry(30)])];
+        assert_eq!(remap_reading_anchor(&previous, &replacement, (0, -18.0)), None);
+    }
+
+    #[test]
+    fn older_pages_require_threshold_reentry_after_filling_viewport() {
+        let mut paging = OlderPaging::default();
+        assert!(paging.observe(true, false, true));
+        paging.request = Some(cursor("epoch", 100));
+        assert!(!paging.observe(true, false, true));
+        paging.settled(Some(&cursor("epoch", 80)));
+        assert!(!paging.observe(true, false, true));
+        assert!(!paging.observe(true, false, true));
+        assert!(!paging.observe(false, false, true));
+        assert!(paging.observe(true, false, true));
+    }
+
+    #[test]
+    fn compacted_pages_continue_only_while_short_and_making_progress() {
+        let mut paging = OlderPaging::default();
+        assert!(paging.observe(true, true, true));
+        paging.request = Some(cursor("epoch", 100));
+        paging.settled(Some(&cursor("epoch", 80)));
+        assert!(paging.observe(true, true, true));
+        paging.request = Some(cursor("epoch", 80));
+        paging.settled(Some(&cursor("epoch", 60)));
+        assert!(!paging.observe(true, false, true));
+
+        assert!(!paging.observe(false, false, true));
+        assert!(paging.observe(true, true, true));
+        paging.request = Some(cursor("epoch", 60));
+        paging.settled(Some(&cursor("epoch", 60)));
+        assert!(!paging.observe(true, true, true));
+    }
+
+    #[test]
+    fn older_reply_does_not_pull_reader_back_after_scrolling_away() {
+        let mut paging = OlderPaging::default();
+        assert!(paging.observe(true, false, true));
+        paging.request = Some(cursor("epoch", 100));
+        assert!(!paging.observe(false, false, false));
+        paging.settled(Some(&cursor("epoch", 80)));
+        assert!(!paging.observe(false, false, true));
+        assert!(paging.observe(true, false, true));
+    }
+
+    #[test]
+    fn epoch_replacement_is_not_progress_for_short_page_continuation() {
+        let mut paging = OlderPaging::default();
+        assert!(!paging.observe(true, true, false));
+        assert!(paging.observe(true, true, true));
+        paging.request = Some(cursor("old", 100));
+        paging.settled(Some(&cursor("new", 20)));
+        assert!(!paging.observe(true, true, true));
     }
 }

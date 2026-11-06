@@ -472,18 +472,20 @@ impl SourceEditor {
         dvec2(Self::x_in_row(&laid, &map, offset - start), row as f64 * line_height)
     }
 
-    fn clamp_scroll(&mut self, look: &EditorLook) {
+    fn scroll_bounds(&self, look: &EditorLook) -> DVec2 {
         let (_, top, _, bottom) = Self::padding(look);
         let content_h = top + self.total_rows() as f64 * self.line_height(look) + bottom;
-        let max_y = (content_h - self.content_rect.size.y).max(0.0);
-        self.scroll.y = self.scroll.y.clamp(0.0, max_y);
-        if look.wrap {
-            self.scroll.x = 0.0;
-        } else {
-            let content_w = self.geometry.max_cols as f64 * self.char_width + 2.0;
-            let max_x = (content_w - self.content_rect.size.x).max(0.0);
-            self.scroll.x = self.scroll.x.clamp(0.0, max_x);
-        }
+        let content_w = self.geometry.max_cols as f64 * self.char_width + 2.0;
+        dvec2(
+            if look.wrap { 0.0 } else { (content_w - self.content_rect.size.x).max(0.0) },
+            (content_h - self.content_rect.size.y).max(0.0),
+        )
+    }
+
+    fn clamp_scroll(&mut self, look: &EditorLook) {
+        let max = self.scroll_bounds(look);
+        self.scroll.x = self.scroll.x.clamp(0.0, max.x);
+        self.scroll.y = self.scroll.y.clamp(0.0, max.y);
     }
 
     /// Draws the editor into `area`. The caret does not blink, so an idle editor draws nothing.
@@ -642,8 +644,20 @@ impl SourceEditor {
     }
 
     pub fn scroll_by(&mut self, look: &EditorLook, delta: DVec2) {
-        self.scroll += delta;
-        self.clamp_scroll(look);
+        let max = self.scroll_bounds(look);
+        self.scroll.x = (self.scroll.x + delta.x).clamp(0.0, max.x);
+        self.touch_scroll.apply_delta(&mut self.scroll.y, delta.y, max.y);
+    }
+
+    pub fn animate_scroll(&mut self, cx: &mut Cx, event: &Event, look: &EditorLook, enabled: bool) -> bool {
+        if !enabled {
+            self.touch_scroll.reset();
+            return false;
+        }
+        let Some(delta) = self.touch_scroll.frame(cx, event) else { return false };
+        let before = self.scroll;
+        self.scroll_by(look, dvec2(0.0, delta));
+        self.scroll != before
     }
 
     /// The vertical thumb rect (for drags).
@@ -666,6 +680,7 @@ impl SourceEditor {
         let before = (self.buffer.revision, self.buffer.selection);
         match hit {
             Hit::FingerDown(fe) => {
+                self.touch_scroll.reset();
                 if fe.device.mouse_button().is_some_and(|b| b.is_secondary()) {
                     result.context_menu = Some(fe.abs);
                     return result;
@@ -731,8 +746,8 @@ impl SourceEditor {
                     self.buffer.set_selection(selection);
                 }
             }
-            Hit::FingerUp(_) => {
-                self.touch_scroll.reset();
+            Hit::FingerUp(fe) => {
+                self.touch_scroll.release(fe.time);
                 self.drag = None;
                 self.thumb_drag = None;
             }
@@ -745,6 +760,7 @@ impl SourceEditor {
                 result.context_menu = Some(fe.abs);
             }
             Hit::FingerScroll(fe) => {
+                self.touch_scroll.reset();
                 let mut delta = fe.scroll;
                 if fe.modifiers.shift && delta.x == 0.0 {
                     delta = dvec2(delta.y, 0.0);

@@ -172,6 +172,33 @@ pub struct SafeInsets {
     pub keyboard_visible: bool,
 }
 
+impl SafeInsets {
+    /// Occlusion remaining inside the render surface. The IME and navigation
+    /// bar cover the same bottom edge, so reserve their union, not their sum.
+    pub fn bottom_occlusion(self) -> f64 {
+        if self.keyboard_visible { self.bottom.max(self.keyboard) } else { self.bottom }
+    }
+}
+
+#[cfg(test)]
+mod inset_tests {
+    use super::SafeInsets;
+
+    #[test]
+    fn keyboard_and_navigation_share_the_bottom_edge() {
+        let mut insets = SafeInsets { bottom: 34.0, keyboard: 320.0, keyboard_visible: true, ..SafeInsets::default() };
+        assert_eq!(insets.bottom_occlusion(), 320.0);
+        insets.keyboard_visible = false;
+        assert_eq!(insets.bottom_occlusion(), 34.0);
+    }
+
+    #[test]
+    fn consumed_or_floating_keyboard_keeps_remaining_navigation_inset() {
+        let insets = SafeInsets { bottom: 34.0, keyboard: 0.0, keyboard_visible: true, ..SafeInsets::default() };
+        assert_eq!(insets.bottom_occlusion(), 34.0);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlatformRoute {
     Agent { server_id: String, agent_id: String },

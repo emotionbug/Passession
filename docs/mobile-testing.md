@@ -66,4 +66,51 @@ The routing changes separate interactive input from focus cleanup and background
 
 The final follow-up capture ends at `screen-319`. `empty-focus-probe-logcat.json` retains the temporary diagnosis; `event-ownership-final-logcat.json` retains the final APK process's bounded 100-line log. No fatal exception, panic, fatal signal or probe marker appeared in that capture. It does retain software-renderer configuration/SurfaceSyncGroup warnings and missing Firebase default-options configuration; push delivery remains unverified.
 
+### Common input, scrolling and Settings Back
+
+The next isolated API 35 x86_64 pass used the clean internal v37 debug APK, not
+a new published release. Evidence remains under
+`/home/emotionbug/.cache/paseo-android-qa-xkwu3602/`:
+
+- Shift-assisted OpenWnn composition produces `계속 있는데` in the composer,
+  session search and rename prompt (`screen-360`, `367`, `373`). Hardware
+  `xyz` and a visible Latin soft `q` preserve the existing Hangul prefix
+  (`screen-374`, `387`–`388`). Rename was cancelled without changing the session.
+- The full Latin keyboard, composer and modal fit without duplicate keyboard
+  avoidance or status-bar overlap (`screen-368`, `387`–`388`). Sidebar search
+  retains its complete border at the measured Hangul field height (`screen-360`).
+- Sidebar motion continues after release without selecting a session
+  (`screen-363`–`364`); reversal returns toward the beginning (`screen-372`).
+  Settings scrolling moves the list without opening a row (`screen-383`).
+- Stationary long-press followed by drag expands text selection while the
+  timeline stays still and does not falsely detach from latest (`screen-356`).
+- Android Back moves General → Settings root → sidebar (`screen-357`–`359`),
+  and also closes the scrolled root Settings page (`screen-383`–`384`).
+- A 351-row mock history crosses the initial 200-row tail boundary without
+  repeatedly fetching/climbing. The content viewport in `screen-380` and
+  `381`, captured two seconds apart after prepend, is pixel-identical.
+  Jump-to-latest returns to messages 346–350 (`screen-382`).
+
+Six SDK-only instrumentation cases against the installed production Java classes
+passed (`shared-ime-six-regressions.txt`): Shift composition, native navigation,
+delayed open-batch acknowledgements, no-op batch corrections, replacement/UTF-16
+backspace and hardware insertion after a composing prefix. The last case first
+failed with expected `한a`, actual `a` (`ime-hardware-prefix-before.txt`).
+Host regressions passed: ten shared motion tests, two measured-anchor tests,
+six history-hold tests and two inset tests. The six history tests were rerun
+after the selection-ownership change.
+
+The final APK is 223,030,137 bytes, SHA-256
+`90f0bea4ba802094bcf43d5a7723499451fbd40857e0f793169802a3894459c4`.
+All nine Java vendor digests match and the regenerated patch applies to the
+verified upstream baseline. The bounded final 100-line process capture
+(`shared-input-final-logcat.json`) contains no fatal exception, fatal signal,
+panic or temporary IME probe marker. The original emulator IME was restored,
+the QA instrumentation uninstalled and owned Android runtimes/scaffolds removed.
+
+OpenWnn runs in hardware-keyboard mode on this emulator; this is actual IME
+composition, not proof for Samsung/Gboard's full soft Hangul layout. Latin
+soft-key input and keyboard geometry were exercised separately. No physical
+device, hardware frame-rate or battery improvement is claimed.
+
 Capture screenshots/logs without unrelated personal data or credentials. Preserve failing output, use bounded waits for observable conditions, and clean up only test-owned app instances, homes and processes. Installation or device changes require the appropriate authorization.

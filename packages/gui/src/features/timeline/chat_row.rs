@@ -12,6 +12,8 @@ use super::rows::{RowContext, RowItem, RowKind, draw_row};
 use crate::common::widgets::PTextFieldWidgetRefExt;
 use crate::common::{UiContext, UiEffect};
 use makepad_widgets::*;
+use makepad_widgets::makepad_draw::event::{DigitDevice, TouchState};
+use makepad_widgets::scroll_bars::TouchScroll;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -88,7 +90,7 @@ pub struct ChatRow {
     #[rust]
     drag_key: String,
     #[rust]
-    drag_last: DVec2,
+    touch_scroll: TouchScroll,
     #[rust]
     next_frame: NextFrame,
     #[rust]
@@ -108,7 +110,26 @@ pub fn hover_key(target: &HitTarget) -> String {
 
 impl ChatRow {
     pub fn set_model(&mut self, model: RowModel) {
+        if self.model.as_ref().is_some_and(|old| old.panel != model.panel || old.item.id != model.item.id) {
+            self.touch_scroll.reset();
+            self.drag = Drag::None;
+        }
         self.model = Some(model);
+    }
+
+    fn pan_horizontal(&mut self, cx: &mut Cx, delta: f64) {
+        let Some(model) = &self.model else { return };
+        let mut state = model.state.borrow_mut();
+        let max = state.extent_x.get(&self.drag_key).copied().unwrap_or(0.0);
+        let mut position = state.scroll_x.get(&self.drag_key).copied().unwrap_or(0.0);
+        if self.touch_scroll.apply_delta(&mut position, delta, max) {
+            if let Some(offset) = state.scroll_x.get_mut(&self.drag_key) {
+                *offset = position;
+            } else {
+                state.scroll_x.insert(self.drag_key.clone(), position);
+            }
+            self.area.redraw(cx);
+        }
     }
 
     fn rel(&self, cx: &Cx, abs: DVec2) -> DVec2 {
@@ -130,6 +151,7 @@ impl ChatRow {
         if !rect.contains(abs) {
             return false;
         }
+        self.touch_scroll.reset();
         let rel = abs - rect.pos;
         let mut state = model.state.borrow_mut();
         let horizontal = delta.x.abs() > delta.y.abs();
@@ -280,6 +302,12 @@ impl Widget for ChatRow {
         if self.next_frame.is_event(event).is_some() {
             self.area.redraw(cx);
         }
+        if !self.area.is_valid(cx) {
+            self.touch_scroll.reset();
+        }
+        if let Some(delta) = self.touch_scroll.frame(cx, event) {
+            self.pan_horizontal(cx, delta);
+        }
         // The question answer field (a native text field).
         if self.answer_field.is_some() {
             self.answer.handle_event(cx, event, scope);
@@ -315,6 +343,7 @@ impl Widget for ChatRow {
             }
             Hit::FingerHoverOut(_) => self.set_hover(cx, None),
             Hit::FingerDown(e) => {
+                self.touch_scroll.reset();
                 let rel = self.rel(cx, e.abs);
                 self.drag = Drag::None;
                 self.pressed = None;
@@ -334,7 +363,7 @@ impl Widget for ChatRow {
                     if let Some(key) = self.canvas.scroll_region_at(rel, false) {
                         self.drag = Drag::ScrollX;
                         self.drag_key = key.to_owned();
-                        self.drag_last = e.abs;
+                        self.touch_scroll.begin(dvec2(e.abs.y, e.abs.x), e.time, true);
                     }
                     return;
                 }
@@ -354,6 +383,7 @@ impl Widget for ChatRow {
                 }
             }
             Hit::FingerLongPress(e) => {
+                self.touch_scroll.reset();
                 // Touch selection: the word under the finger, extended by moving.
                 let rel = self.rel(cx, e.abs);
                 if let Some(offset) = self.canvas.offset_at(rel) {
@@ -365,25 +395,34 @@ impl Widget for ChatRow {
             }
             Hit::FingerMove(e) => match self.drag {
                 Drag::Select => {
+                    if let (DigitDevice::Touch { uid }, Event::TouchUpdate(update)) = (e.device, event)
+                        && let Some(touch) = update.touches.iter().find(|touch| touch.uid == uid)
+                    {
+                        touch.handled.set(self.area);
+                    }
                     let rel = self.rel(cx, e.abs);
                     if let (Some(offset), Some((anchor, _))) = (self.canvas.offset_at(rel), self.canvas.selection) {
                         self.set_selection(cx, Some((anchor, offset)));
                     }
                 }
                 Drag::ScrollX => {
-                    let dx = self.drag_last.x - e.abs.x;
-                    self.drag_last = e.abs;
-                    if let Some(model) = &self.model {
-                        let mut state = model.state.borrow_mut();
-                        let max = state.extent_x.get(&self.drag_key).copied().unwrap_or(0.0);
-                        let current = state.scroll_x.get(&self.drag_key).copied().unwrap_or(0.0);
-                        state.scroll_x.insert(self.drag_key.clone(), (current + dx).clamp(0.0, max));
+                    if let Some(delta) = self.touch_scroll.move_to(dvec2(e.abs.y, e.abs.x), e.time) {
+                        self.pressed = None;
+                        if let Event::TouchUpdate(update) = event {
+                            for touch in &update.touches {
+                                if matches!(touch.state, TouchState::Move) {
+                                    touch.handled.set(self.area);
+                                }
+                            }
+                        }
+                        self.pan_horizontal(cx, delta);
                     }
-                    self.area.redraw(cx);
                 }
                 Drag::None => {}
             },
             Hit::FingerUp(e) => {
+                self.touch_scroll.release(e.time);
+                self.touch_scroll.schedule(cx);
                 if let Some((target, rect)) = self.pressed.take() {
                     let rel = self.rel(cx, e.abs);
                     if e.is_over && (!e.device.is_touch() || e.was_tap()) && self.canvas.hit_at(rel) == Some(&target) && !self.tap_local(cx, scope, &target) {
@@ -400,6 +439,7 @@ impl Widget for ChatRow {
                 }
                 self.drag = Drag::None;
             }
+            Hit::FingerScroll(_) => self.touch_scroll.reset(),
             Hit::TextCopy(ce) => {
                 if let Some(text) = self.canvas.selected_text() {
                     *ce.response.borrow_mut() = Some(text);

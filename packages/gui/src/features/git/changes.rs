@@ -131,7 +131,8 @@ pub struct ChangesView {
     pub spinning: bool,
     /// A material file icon was still decoding at the last draw.
     pub icons_pending: bool,
-    drag_last: Option<DVec2>,
+    touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
+    horizontal_scroll: makepad_widgets::scroll_bars::TouchScroll,
 }
 
 fn preferences(ui: &UiContext) -> Map<String, Value> {
@@ -190,7 +191,8 @@ impl ChangesView {
             flows: HashMap::new(),
             spinning: false,
             icons_pending: false,
-            drag_last: None,
+            touch_scroll: Default::default(),
+            horizontal_scroll: Default::default(),
         };
         view.bind_review(ui, store);
         view
@@ -1197,7 +1199,45 @@ impl ChangesView {
         compact: bool,
     ) -> bool {
         let wrap = pref_flag(&preferences(ui), "wrapLines");
-        match event.hits(cx, area) {
+        let hit = event.hits(cx, area);
+        if !area.is_valid(cx) {
+            self.touch_scroll.reset();
+            self.horizontal_scroll.reset();
+        }
+        let dy = self.touch_scroll.handle_event(cx, event, &hit);
+        let dx = self.horizontal_scroll.handle_axis_event(cx, event, &hit, Vec2Index::X);
+        let origin = self.touch_scroll.origin();
+        if !self.doc.contains(origin) {
+            self.horizontal_scroll.reset();
+        }
+        if dy.is_some() || dx.is_some() {
+            self.pressed = None;
+            if self.tree_area.contains(origin) {
+                let max = (self.tree_content - self.tree_area.size.y).max(0.0);
+                return self.touch_scroll.apply_delta(&mut self.tree_scroll, dy.unwrap_or(0.0), max);
+            }
+            if self.commits_area.contains(origin) {
+                let max = (self.commits_content - self.commits_area.size.y).max(0.0);
+                return self.touch_scroll.apply_delta(&mut self.commits_scroll, dy.unwrap_or(0.0), max);
+            }
+            if self.doc.contains(origin) {
+                let mut changed = false;
+                if let Some(delta) = dy {
+                    let moved = self.doc.scroll_by(dvec2(0.0, delta), wrap);
+                    if !moved { self.touch_scroll.stop_at_edge(); }
+                    changed |= moved;
+                }
+                if let Some(delta) = dx {
+                    let moved = self.doc.scroll_by(dvec2(delta, 0.0), wrap);
+                    if !moved { self.horizontal_scroll.stop_at_edge(); }
+                    changed |= moved;
+                }
+                return changed;
+            }
+            self.touch_scroll.reset();
+            self.horizontal_scroll.reset();
+        }
+        match hit {
             Pointer::FingerHoverIn(e) | Pointer::FingerHoverOver(e) => {
                 let (anchor, hovered) = self.hits.find(e.abs).map(|(anchor, hit)| (anchor, Some(hit))).unwrap_or_default();
                 let doc_hovered = match &hovered {
@@ -1247,7 +1287,6 @@ impl ChangesView {
                 // Original Tooltip hides when its control is pressed.
                 tooltip_at(ui, None, Rect::default(), 0.3);
                 self.pressed = self.hits.find(e.abs).map(|(_, hit)| hit);
-                self.drag_last = e.device.is_touch().then_some(e.abs);
                 // The document is one `SelectionArea`: a mouse press starts a
                 // selection (double click a word, triple click the whole text).
                 let had_selection = self.doc.selection.take().is_some();
@@ -1300,32 +1339,10 @@ impl ChangesView {
                 }
                 return true;
             }
-            Pointer::FingerMove(e) => {
-                // Touch drags scroll the region the drag started in.
-                let Some(last) = self.drag_last else { return false };
-                if e.move_distance() > 8.0 {
-                    self.pressed = None;
-                }
-                let delta = dvec2(last.x - e.abs.x, last.y - e.abs.y);
-                self.drag_last = Some(e.abs);
-                if self.tree_area.contains(e.abs_start) {
-                    let max = (self.tree_content - self.tree_area.size.y).max(0.0);
-                    self.tree_scroll = (self.tree_scroll + delta.y).clamp(0.0, max);
-                    return true;
-                }
-                if self.commits_area.contains(e.abs_start) {
-                    let max = (self.commits_content - self.commits_area.size.y).max(0.0);
-                    self.commits_scroll = (self.commits_scroll + delta.y).clamp(0.0, max);
-                    return true;
-                }
-                if self.doc.contains(e.abs_start) {
-                    return self.doc.scroll_by(delta, wrap);
-                }
-            }
             Pointer::FingerUp(e) => {
                 self.doc.drag_pointer = None;
                 let pressed = self.pressed.take();
-                if !e.is_over || e.has_long_press_occurred {
+                if !e.is_over || e.has_long_press_occurred || (e.device.is_touch() && !e.was_tap()) {
                     return false;
                 }
                 let secondary = e.mouse_button().is_some_and(|b| b.is_secondary());

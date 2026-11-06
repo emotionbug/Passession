@@ -1,6 +1,6 @@
 use crate::{
     makepad_draw::*,
-    makepad_draw::event::TouchState,
+    makepad_draw::event::{TouchState, TAP_COUNT_DISTANCE},
     scroll_bar::*
 };
 
@@ -27,38 +27,184 @@ live_design!{
     }
 }
 
-/// A touch starts as a tap, becomes a vertical pan after slop, or yields to
-/// long-press selection. Mouse selection and scrollbar drags are separate.
+/// Shared pan and kinetic scrolling. Positive deltas move the viewport towards
+/// the end of the content. Owners apply bounds and call `stop_at_edge` when hit.
+/// `handle_hit` supports direct panning; call `frame` after input handling to
+/// enable release inertia and retain its frame token until the matching event.
 #[derive(Default)]
 pub struct TouchScroll {
-    last: Option<DVec2>,
-    panning: bool,
+    motion: TouchMotion,
+    next_frame: Option<NextFrame>,
+    origin: DVec2,
+}
+
+// Makepad's 0.97 decay and 0.2px stop speed at 60Hz, expressed in seconds.
+const SCROLL_DECAY: f64 = 1.8275524490825144;
+const SCROLL_STOP_SPEED: f64 = 12.0;
+const VELOCITY_WINDOW: f64 = 0.05;
+
+#[derive(Default)]
+enum TouchMotion {
+    #[default]
+    Idle,
+    Drag { start: DVec2, last: DVec2, time: f64, velocity: f64, panning: bool },
+    Fling { time: Option<f64>, velocity: f64 },
 }
 
 impl TouchScroll {
     pub fn reset(&mut self) {
-        self.last = None;
-        self.panning = false;
+        self.motion = TouchMotion::Idle;
+        self.next_frame = None;
+    }
+
+    pub fn begin(&mut self, abs: DVec2, time: f64, is_touch: bool) {
+        self.reset();
+        self.origin = abs;
+        self.motion = TouchMotion::Drag { start: abs, last: abs, time, velocity: 0.0, panning: !is_touch };
+    }
+
+    pub fn origin(&self) -> DVec2 {
+        self.origin
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        matches!(self.motion, TouchMotion::Drag { .. })
+    }
+
+    pub fn is_panning(&self) -> bool {
+        matches!(self.motion, TouchMotion::Drag { panning: true, .. })
+    }
+
+    pub fn is_flinging(&self) -> bool {
+        matches!(self.motion, TouchMotion::Fling { .. })
+    }
+
+    pub fn move_to(&mut self, abs: DVec2, time: f64) -> Option<f64> {
+        let TouchMotion::Drag { start, last, time: previous, mut velocity, panning } = self.motion else {
+            return None;
+        };
+        let displacement = abs - start;
+        let pan = panning || (displacement.y.abs() >= TAP_COUNT_DISTANCE && displacement.y.abs() >= displacement.x.abs());
+        let dt = time - previous;
+        if dt > 0.0 {
+            let speed = (last.y - abs.y) / dt;
+            // A direction reversal must not release a fling in the old direction.
+            if speed * velocity < 0.0 {
+                velocity = 0.0;
+            }
+            let retention = (-dt / VELOCITY_WINDOW).exp();
+            velocity = velocity * retention + speed * (1.0 - retention);
+        }
+        self.motion = TouchMotion::Drag { start, last: abs, time, velocity, panning: pan };
+        pan.then_some(if panning { last.y - abs.y } else { start.y - abs.y })
+    }
+
+    pub fn release(&mut self, time: f64) -> bool {
+        let motion = std::mem::take(&mut self.motion);
+        let TouchMotion::Drag { time: previous, velocity, panning, .. } = motion else {
+            self.motion = motion;
+            return false;
+        };
+        // A stationary hold must not launch the earlier swipe.
+        let velocity = velocity * (-(time - previous).max(0.0) / VELOCITY_WINDOW).exp();
+        if panning && velocity.abs() > SCROLL_STOP_SPEED {
+            self.motion = TouchMotion::Fling { time: None, velocity };
+        }
+        panning
+    }
+
+    pub fn stop_at_edge(&mut self) {
+        if let TouchMotion::Drag { velocity, .. } = &mut self.motion {
+            // Preserve pan ownership so reversing at a bound takes effect immediately.
+            *velocity = 0.0;
+        } else {
+            self.reset();
+        }
+    }
+
+    pub fn apply_delta(&mut self, position: &mut f64, delta: f64, max: f64) -> bool {
+        let next = (*position + delta).clamp(0.0, max.max(0.0));
+        let changed = next != *position;
+        *position = next;
+        if (delta < 0.0 && next == 0.0) || (delta > 0.0 && next == max.max(0.0)) {
+            self.stop_at_edge();
+        }
+        changed
+    }
+
+    fn advance(&mut self, time: f64) -> Option<f64> {
+        let TouchMotion::Fling { time: previous, velocity } = self.motion else {
+            return None;
+        };
+        // Android touch timestamps use uptime; frames use the platform timer epoch.
+        let Some(previous) = previous else {
+            self.motion = TouchMotion::Fling { time: Some(time), velocity };
+            return None;
+        };
+        let remaining = (velocity.abs() / SCROLL_STOP_SPEED).ln() / SCROLL_DECAY;
+        let elapsed = (time - previous).max(0.0);
+        let decay = (-SCROLL_DECAY * elapsed.min(remaining)).exp();
+        let delta = velocity * (1.0 - decay) / SCROLL_DECAY;
+        self.motion = if elapsed >= remaining {
+            TouchMotion::Idle
+        } else {
+            TouchMotion::Fling { time: Some(time), velocity: velocity * decay }
+        };
+        Some(delta)
+    }
+
+    pub fn frame(&mut self, cx: &mut Cx, event: &Event) -> Option<f64> {
+        let new_press = matches!(event, Event::MouseDown(_))
+            || matches!(event, Event::TouchUpdate(update) if update.touches.iter().any(|touch| matches!(touch.state, TouchState::Start)));
+        if matches!(event, Event::Pause | Event::AppLostFocus | Event::LongPress(_))
+            || (self.is_flinging() && new_press)
+        {
+            self.reset();
+            return None;
+        }
+        let delta = if let Some(frame) = self.next_frame.and_then(|next| next.is_event(event)) {
+            self.next_frame = None;
+            self.advance(frame.time)
+        } else {
+            None
+        };
+        self.schedule(cx);
+        delta
+    }
+
+    pub fn schedule(&mut self, cx: &mut Cx) {
+        if self.is_flinging() && self.next_frame.is_none() {
+            self.next_frame = Some(cx.new_next_frame());
+        }
+    }
+
+    pub fn handle_event(&mut self, cx: &mut Cx, event: &Event, hit: &Hit) -> Option<f64> {
+        self.handle_axis_event(cx, event, hit, Vec2Index::Y)
+    }
+
+    pub fn handle_axis_event(&mut self, cx: &mut Cx, event: &Event, hit: &Hit, axis: Vec2Index) -> Option<f64> {
+        let pan = self.handle_axis_hit(hit, axis);
+        let fling = self.frame(cx, event);
+        pan.or(fling)
     }
 
     pub fn handle_hit(&mut self, hit: &Hit) -> Option<f64> {
+        self.handle_axis_hit(hit, Vec2Index::Y)
+    }
+
+    fn handle_axis_hit(&mut self, hit: &Hit, axis: Vec2Index) -> Option<f64> {
+        let point = |abs: DVec2| match axis { Vec2Index::X => dvec2(abs.y, abs.x), Vec2Index::Y => abs };
         match hit {
             Hit::FingerDown(e) => {
                 self.reset();
                 if e.device.is_touch() {
-                    self.last = Some(e.abs);
+                    self.begin(point(e.abs), e.time, true);
+                    self.origin = e.abs;
                 }
             }
-            Hit::FingerMove(e) if e.device.is_touch() => {
-                let last = self.last?;
-                if !self.panning && (e.abs.y - e.abs_start.y).abs() < 10.0 {
-                    return None;
-                }
-                self.panning = true;
-                self.last = Some(e.abs);
-                return Some(last.y - e.abs.y);
-            }
-            Hit::FingerLongPress(_) | Hit::FingerUp(_) => self.reset(),
+            Hit::FingerMove(e) if e.device.is_touch() => return self.move_to(point(e.abs), e.time),
+            Hit::FingerUp(e) => { self.release(e.time); }
+            Hit::FingerLongPress(_) | Hit::FingerScroll(_) => self.reset(),
             _ => {}
         }
         None
@@ -115,6 +261,131 @@ mod touch_scroll_tests {
         let mut scroll = TouchScroll::default();
         scroll.handle_hit(&down(DigitDevice::Mouse { button: MouseButton::PRIMARY }));
         assert_eq!(scroll.handle_hit(&moved(50.0, DigitDevice::Mouse { button: MouseButton::PRIMARY })), None);
+    }
+
+    #[test]
+    fn touch_motion_preserves_subdivided_drag_and_release_velocity() {
+        let mut coalesced = TouchScroll::default();
+        coalesced.begin(dvec2(20.0, 100.0), 0.0, true);
+        assert_eq!(coalesced.move_to(dvec2(20.0, 80.0), 0.1), Some(20.0));
+        let mut subdivided = TouchScroll::default();
+        subdivided.begin(dvec2(20.0, 100.0), 0.0, true);
+        let mut distance = 0.0;
+        for step in 1..=10 {
+            let delta = subdivided.move_to(dvec2(20.0, 100.0 - step as f64 * 2.0), step as f64 * 0.01);
+            assert_eq!(delta.is_some(), step >= 3);
+            distance += delta.unwrap_or(0.0);
+        }
+        assert_eq!(distance, 20.0);
+        coalesced.release(0.1);
+        subdivided.release(0.1);
+        coalesced.advance(0.1);
+        subdivided.advance(0.1);
+        assert!((coalesced.advance(0.2).unwrap() - subdivided.advance(0.2).unwrap()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn touch_motion_fling_is_independent_of_frame_rate_and_clock_epoch() {
+        let run = |fps: usize| {
+            let mut s = TouchScroll::default();
+            s.begin(dvec2(20.0, 200.0), 50000.0, true);
+            s.move_to(dvec2(20.0, 100.0), 50000.1);
+            assert!(s.release(50000.1));
+            assert_eq!(s.advance(2.0), None);
+            let mut distance = 0.0;
+            for frame in 1..=fps * 4 {
+                distance += s.advance(2.0 + frame as f64 / fps as f64).unwrap_or(0.0);
+            }
+            assert!(!s.is_flinging());
+            distance
+        };
+        let at_30hz = run(30);
+        assert!(at_30hz > 100.0);
+        assert!((at_30hz - run(120)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn touch_motion_edge_keeps_pan_ownership_and_reversal() {
+        let mut s = TouchScroll::default();
+        s.begin(dvec2(20.0, 100.0), 0.0, true);
+        assert_eq!(s.move_to(dvec2(20.0, 120.0), 0.1), Some(-20.0));
+        s.stop_at_edge();
+        assert!(s.is_panning());
+        assert_eq!(s.move_to(dvec2(20.0, 115.0), 0.2), Some(5.0));
+        s.release(0.2);
+        s.advance(1.0);
+        assert!(s.advance(1.1).unwrap() > 0.0);
+        s.stop_at_edge();
+        assert_eq!(s.advance(1.2), None);
+    }
+
+    #[test]
+    fn touch_motion_hold_tap_and_new_touch_cancel_inertia() {
+        let mut s = TouchScroll::default();
+        s.begin(dvec2(20.0, 100.0), 0.0, true);
+        assert_eq!(s.move_to(dvec2(20.0, 98.0), 0.01), None);
+        assert!(!s.release(0.02));
+        assert!(!s.is_flinging());
+        s.begin(dvec2(20.0, 100.0), 1.0, true);
+        s.move_to(dvec2(20.0, 50.0), 1.1);
+        assert!(s.release(1.6));
+        assert!(!s.is_flinging());
+        s.begin(dvec2(20.0, 100.0), 2.0, true);
+        s.move_to(dvec2(20.0, 50.0), 2.1);
+        s.release(2.1);
+        assert!(s.is_flinging());
+        s.begin(dvec2(20.0, 50.0), 2.2, true);
+        assert_eq!(s.advance(3.0), None);
+        s.reset();
+        assert_eq!(s.move_to(dvec2(20.0, 0.0), 2.3), None);
+    }
+
+    #[test]
+    fn touch_motion_bounds_stop_fling_but_allow_drag_reversal() {
+        let mut s = TouchScroll::default();
+        let mut offset = 15.0;
+        s.begin(dvec2(20.0, 100.0), 0.0, true);
+        let delta = s.move_to(dvec2(20.0, 80.0), 0.1).unwrap();
+        assert!(s.apply_delta(&mut offset, delta, 20.0));
+        assert_eq!(offset, 20.0);
+        assert!(s.is_panning());
+        let delta = s.move_to(dvec2(20.0, 90.0), 0.2).unwrap();
+        assert!(s.apply_delta(&mut offset, delta, 20.0));
+        assert_eq!(offset, 10.0);
+        s.release(0.2);
+        s.advance(1.0);
+        let delta = s.advance(3.0).unwrap();
+        s.apply_delta(&mut offset, delta, 20.0);
+        assert_eq!(offset, 0.0);
+        assert!(!s.is_flinging());
+    }
+
+    #[test]
+    fn touch_motion_horizontal_axis_uses_same_slop_and_keeps_origin() {
+        let mut s = TouchScroll::default();
+        let down = down(DigitDevice::Touch { uid: 1 });
+        s.handle_axis_hit(&down, Vec2Index::X);
+        let mut movement = moved(100.0, DigitDevice::Touch { uid: 1 });
+        if let Hit::FingerMove(e) = &mut movement {
+            e.abs.x = 16.0;
+        }
+        assert_eq!(s.handle_axis_hit(&movement, Vec2Index::X), None);
+        if let Hit::FingerMove(e) = &mut movement {
+            e.abs.x = 10.0;
+        }
+        assert_eq!(s.handle_axis_hit(&movement, Vec2Index::X), Some(10.0));
+        assert_eq!(s.origin(), dvec2(20.0, 100.0));
+    }
+
+    #[test]
+    fn touch_motion_reversal_cannot_fling_in_previous_direction() {
+        let mut s = TouchScroll::default();
+        s.begin(dvec2(20.0, 100.0), 0.0, true);
+        s.move_to(dvec2(20.0, 0.0), 0.1);
+        assert_eq!(s.move_to(dvec2(20.0, 5.0), 0.11), Some(-5.0));
+        s.release(0.11);
+        s.advance(1.0);
+        assert!(s.advance(1.1).unwrap() < 0.0);
     }
 }
 
@@ -203,12 +474,15 @@ impl ScrollBars {
     pub fn handle_scroll_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope, actions: &mut Vec<ScrollBarsAction> ) {
         // Run after children: the deepest scroll region owns each touch move.
         // Overloaded capture preserves child taps and their long-press handling.
-        if self.show_scroll_y
+        let can_pan = self.show_scroll_y
+            && self.area.is_valid(cx)
             && self.scroll_bar_y.get_scroll_view_total() > self.scroll_bar_y.get_scroll_view_visible()
             && !self.scroll_bar_x.is_area_captured(cx)
-            && !self.scroll_bar_y.is_area_captured(cx)
-            && matches!(event, Event::TouchUpdate(_) | Event::LongPress(_))
-        {
+            && !self.scroll_bar_y.is_area_captured(cx);
+        if !can_pan {
+            self.touch_scroll.reset();
+        }
+        if can_pan && matches!(event, Event::TouchUpdate(_) | Event::LongPress(_)) {
             let child_scrolled = if let Event::TouchUpdate(e) = event {
                 e.touches.iter().any(|t| matches!(t.state, TouchState::Move) && !t.handled.get().is_empty())
             } else { false };
@@ -223,12 +497,16 @@ impl ScrollBars {
                         }
                     }
                 }
-                let pos = self.scroll + dvec2(0.0, dy);
-                if self.set_scroll_pos(cx, pos) {
-                    actions.push(ScrollBarsAction::ScrollY(self.scroll.y));
-                    self.redraw(cx);
-                }
+                self.apply_touch_scroll(cx, dy, actions);
             }
+        }
+        if let Event::Scroll(e) = event {
+            if self.area.rect(cx).contains(e.abs) {
+                self.touch_scroll.reset();
+            }
+        }
+        if let Some(dy) = self.touch_scroll.frame(cx, event) {
+            self.apply_touch_scroll(cx, dy, actions);
         }
         
         if self.show_scroll_x {
@@ -256,6 +534,17 @@ impl ScrollBars {
                 }
             });
             if let Some(y) = ret_y {self.scroll.y = y; self.redraw(cx);}
+        }
+    }
+
+    fn apply_touch_scroll(&mut self, cx: &mut Cx, dy: f64, actions: &mut Vec<ScrollBarsAction>) {
+        if self.set_scroll_pos(cx, self.scroll + dvec2(0.0, dy)) {
+            actions.push(ScrollBarsAction::ScrollY(self.scroll.y));
+            self.redraw(cx);
+        }
+        let max = (self.scroll_bar_y.get_scroll_view_total() - self.scroll_bar_y.get_scroll_view_visible()).max(0.0);
+        if (dy < 0.0 && self.scroll.y == 0.0) || (dy > 0.0 && self.scroll.y == max) {
+            self.touch_scroll.stop_at_edge();
         }
     }
     

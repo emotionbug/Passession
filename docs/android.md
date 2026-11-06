@@ -30,10 +30,15 @@ APK artifacts are copied into `artifacts/native/` and named with the version and
 ## Project layout
 
 - `packaging/android/` — Gradle project (`settings.gradle.kts`, `app/build.gradle.kts`), launcher and notification icons (`res/`), `app/debug.keystore`, `version.properties`.
-- `packaging/android/makepad/` — Makepad's Android Java (`dev.makepad.android.*`) vendored from makepad commit `a1868e19d3bb955200957efb3c880791a43424eb`, the revision makepad-platform 1.0.0 was published from. The only change is API 24–29 compatibility in `MakepadActivity.java` (`PATCHES.diff`, lines marked `Paseo:`); `UPSTREAM.json` records the upstream and current file digests. The crate's JNI symbols require these exact classes; crates.io has no `cargo-makepad` for 1.0.0.
+- `packaging/android/makepad/` — Makepad's Android Java (`dev.makepad.android.*`) vendored from makepad commit `a1868e19d3bb955200957efb3c880791a43424eb`, the revision makepad-platform 1.0.0 was published from. Local changes include API 24–29 guards and the shared Editable-backed `MakepadInputConnection`: UTF-16 text/selection/composition snapshots, session/revision fencing, batch ownership, modifier-preserving composition and hardware insertion. The activity also keeps long-press coordinates within the current gesture and cancels long presses after scrolling starts. `PATCHES.diff` records the changes; `UPSTREAM.json` records upstream/current digests. The crate's JNI symbols require these exact classes; crates.io has no `cargo-makepad` for 1.0.0.
 - `packages/gui-platform/android/` — `AndroidManifest.xml` (launcher `sh.paseo.sessions.MainActivity`, which extends `MakepadActivity`; `paseo` VIEW filter; Firebase messaging service; FileProvider `sh.paseo.sessions.files`), the Java glue in `java/sh/paseo/sessions/`, `res/` (theme and FileProvider paths) and `platform.gradle.kts` (androidx.core and the Firebase BOM/messaging). The Gradle project compiles these directly; there is no second Gradle app or Makepad Java copy there.
 
 Native code reaches the Java glue by class and method name over JNI, so the release build never minifies.
+
+Android resizes the native surface for the keyboard. The shell uses a plain root
+`View`, not a second keyboard-panning container, and treats navigation/keyboard
+bottom occlusion as a union rather than adding overlapping insets. Composer and
+modal geometry share that allocation.
 
 ## Signing and identity
 

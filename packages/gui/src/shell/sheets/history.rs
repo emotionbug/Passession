@@ -211,6 +211,7 @@ impl HistoryPage {
 
     /// A new query key: no data yet, so the screen shows its initial spinner again.
     fn reset(&mut self) {
+        self.touch_scroll.reset();
         self.agents.clear();
         self.cursors.clear();
         self.initial_load = true;
@@ -415,20 +416,25 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
         }
         None => {}
     }
-    if matches!(event, Event::TouchUpdate(_) | Event::LongPress(_)) {
-        let hit = event.hits(cx, shell.data.bg_area);
-        if let Some(dy) = page.touch_scroll.handle_hit(&hit)
-            && let Hit::FingerMove(e) = &hit
-            && page.viewport.contains(e.abs_start)
-        {
-            let max = (page.content_h - page.viewport.size.y).max(0.0);
-            page.scroll = (page.scroll + dy).clamp(0.0, max);
+    let hit = if matches!(event, Event::TouchUpdate(_) | Event::LongPress(_)) {
+        event.hits(cx, shell.data.bg_area)
+    } else {
+        Hit::Nothing
+    };
+    if let Hit::FingerDown(e) = &hit
+        && !page.viewport.contains(e.abs)
+    {
+        page.touch_scroll.reset();
+    } else if let Some(dy) = page.touch_scroll.handle_event(cx, event, &hit) {
+        let max = (page.content_h - page.viewport.size.y).max(0.0);
+        if page.touch_scroll.apply_delta(&mut page.scroll, dy, max) {
             shell.redraw(cx);
         }
     }
     if let Event::Scroll(e) = event
         && page.viewport.contains(e.abs)
     {
+        page.touch_scroll.reset();
         let max = (page.content_h - page.viewport.size.y).max(0.0);
         page.scroll = (page.scroll + e.scroll.y).clamp(0.0, max);
         shell.redraw(cx);

@@ -190,6 +190,8 @@ pub struct PanelState {
     pub guard: Option<(String, bool)>,
     pub suggest_scroll: f64,
     pub sheet_scroll: f64,
+    pub suggest_scroll_max: f64,
+    pub sheet_scroll_max: f64,
     pub touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     pub window: DVec2,
     pub search_text: String,
@@ -891,6 +893,7 @@ impl ComposerPanel {
     }
 
     pub(super) fn open_forge(&mut self, cx: &mut Cx, ui: &mut UiContext) {
+        self.st.touch_scroll.reset();
         self.input.release_focus(cx);
         self.st.input_focused = false;
         ui.push(UiEffect::SetFocusScope { owner: self.input.widget_uid(), scope: None });
@@ -904,6 +907,7 @@ impl ComposerPanel {
     }
 
     pub(super) fn open_sheet(&mut self, cx: &mut Cx, ui: &mut UiContext, state: SheetState) {
+        self.st.touch_scroll.reset();
         self.ctl().refetch_if_loading(ui);
         self.ctl().reload_daemon_config(ui);
         if self.ctl_ref().is_draft() {
@@ -921,6 +925,7 @@ impl ComposerPanel {
     }
 
     pub(super) fn open_fullscreen(&mut self, cx: &mut Cx) {
+        self.st.touch_scroll.reset();
         self.st.overlay = Some(Overlay::Fullscreen);
         self.ctl().fullscreen_open = true;
         self.input.set_key_focus(cx);
@@ -928,6 +933,7 @@ impl ComposerPanel {
     }
 
     pub(super) fn close_overlay(&mut self, cx: &mut Cx, ui: &mut UiContext) {
+        self.st.touch_scroll.reset();
         let was_fullscreen = matches!(self.st.overlay(), Overlay::Fullscreen);
         self.search.release_focus(cx);
         self.st.search_focused = false;
@@ -950,6 +956,7 @@ impl ComposerPanel {
     /// Pointer events on the inline composer.
     fn pointer_event(&mut self, cx: &mut Cx, event: &Event, ui: &mut UiContext, path: &HeapLiveIdPath, uid: WidgetUid) {
         if let Event::Scroll(scroll) = event {
+            self.st.touch_scroll.reset();
             if self.st.input_clip.contains(scroll.abs) && self.st.input_natural > self.st.input_clip.size.y + 0.5 {
                 self.st.input_manual_scroll = true;
                 self.st.input_scroll = (self.st.input_scroll + scroll.scroll.y)
@@ -964,17 +971,18 @@ impl ComposerPanel {
             return;
         }
         let hit = event.hits_with_capture_overload(cx, self.draw_bg.area(), true);
-        if let Some(dy) = self.st.touch_scroll.handle_hit(&hit)
-            && let Hit::FingerMove(e) = &hit
-        {
-            if self.st.input_clip.contains(e.abs_start) {
+        if let Some(dy) = self.st.touch_scroll.handle_event(cx, event, &hit) {
+            let origin = self.st.touch_scroll.origin();
+            if self.st.input_clip.contains(origin) {
                 self.st.input_manual_scroll = true;
-                self.st.input_scroll = (self.st.input_scroll + dy)
-                    .clamp(0.0, (self.st.input_natural - self.st.input_clip.size.y).max(0.0));
+                let max = (self.st.input_natural - self.st.input_clip.size.y).max(0.0);
+                self.st.touch_scroll.apply_delta(&mut self.st.input_scroll, dy, max);
                 self.draw_bg.redraw(cx);
-            } else if self.suggestions_rect().is_some_and(|r| r.contains(e.abs_start)) {
-                self.st.suggest_scroll = (self.st.suggest_scroll - dy).max(0.0);
+            } else if self.suggestions_rect().is_some_and(|r| r.contains(origin)) {
+                self.st.touch_scroll.apply_delta(&mut self.st.suggest_scroll, -dy, self.st.suggest_scroll_max);
                 self.draw_bg.redraw(cx);
+            } else {
+                self.st.touch_scroll.reset();
             }
         }
         match hit {

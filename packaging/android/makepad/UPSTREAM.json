@@ -10,9 +10,9 @@
   "modified": true,
   "files": {
     "java/dev/makepad/android/ByteArrayMediaDataSource.java": "b807383f5a981d13b1da28445f2ae7c7b6f3bf02ace53f0cd65b25ddcd75e674",
-    "java/dev/makepad/android/MakepadActivity.java": "cc8878bc57dbe26f225c8d24e19a8d4b076ccdb57918f2d59ff3a344a0fb0f80",
+    "java/dev/makepad/android/MakepadActivity.java": "37c7730b2b2b9eb81657aefca1f7b5d9028cb0352cc13bdbbd52c2359d34b93c",
     "java/dev/makepad/android/MakepadNative.java": "0894b95557d07e84f6e5982342b7e070bfe5600784e4556f1b49c21d00761b02",
-    "java/dev/makepad/android/MakepadInputConnection.java": "c58578ac187780dd09e72f80feee876ba82238256618fef7ff0338f64fe362f8",
+    "java/dev/makepad/android/MakepadInputConnection.java": "20822128dc0c81b0338fb56c893e87b94015fbf38c91539ab5527998e3c4f172",
     "java/dev/makepad/android/MakepadNetwork.java": "dddc5bda3038064e9785f994fa5c98b8bced26ef4609a80a12069c3fc425a973",
     "java/dev/makepad/android/MakepadWebSocket.java": "14ca2e7c786e51ef7b14352d5c8caf3a4aba27dd3b55520ac494357e9a98d7fe",
     "java/dev/makepad/android/MakepadWebSocketReader.java": "55a0dbc91b88324408141eb20e2ee7208c2110edb6d970137e9f1c77cceddd66",
@@ -25,6 +25,6 @@
   },
   "patches": {
     "file": "PATCHES.diff",
-    "reason": "Android API 24 guards for WindowInsets and display cutouts; render-view accessor for surface-relative insets; Paseo-authored MakepadInputConnection implements a full Editable-backed IME, UTF-16 text/selection/composition snapshots, batch edits, surrounding-text queries, text/decimal/password editor metadata, hardware select/copy/cut/paste and native session/revision fencing. MakepadActivity and MakepadNative connect it to the matching vendored Rust platform, distinguishing editor restarts from same-editor synchronization and avoiding TYPE_NULL restarts between fields. MakepadInputConnection.java is new, not an upstream file."
+    "reason": "Android API 24 guards for WindowInsets and display cutouts; render-view accessor for surface-relative insets; Paseo-authored MakepadInputConnection implements a full Editable-backed IME, UTF-16 text/selection/composition snapshots, batch edits, surrounding-text queries, text/decimal/password editor metadata, hardware select/copy/cut/paste and native session/revision fencing. Modifier-only keys preserve composition; native acknowledgements cannot overwrite newer unpublished batch edits; hardware characters preserve the existing composing prefix. MakepadActivity and MakepadNative connect it to the matching vendored Rust platform, distinguishing editor restarts from same-editor synchronization and avoiding TYPE_NULL restarts between fields. Stationary long presses use current gesture coordinates and scrolling cancels the pending long press. MakepadInputConnection.java is new, not an upstream file."
   }
 }

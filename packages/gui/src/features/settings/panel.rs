@@ -297,22 +297,24 @@ impl SettingsPanel {
     }
 
     fn scroll_region(&mut self, pos: DVec2, dy: f64) {
-        let Some((region, _)) = self.regions.iter().rev().find(|(_, r)| r.contains(pos)).copied() else { return };
-        match region {
-            Region::Sidebar => self.st.sidebar_scroll = (self.st.sidebar_scroll + dy).max(0.0),
-            Region::Content => self.st.scroll = (self.st.scroll + dy).max(0.0),
+        let Some((region, rect)) = self.regions.iter().rev().find(|(_, r)| r.contains(pos)).copied() else {
+            self.touch_scroll.reset();
+            return;
+        };
+        let (scroll, max) = match region {
+            Region::Sidebar => (&mut self.st.sidebar_scroll, self.st.sidebar_h - rect.size.y),
+            Region::Content => (&mut self.st.scroll, self.st.content_h - rect.size.y),
             Region::Menu => {
                 let (content, visible) = self.menu_height;
-                if let Some(menu) = &mut self.st.menu {
-                    menu.scroll = (menu.scroll + dy).clamp(0.0, (content - visible).max(0.0));
-                }
+                let Some(menu) = &mut self.st.menu else { return };
+                (&mut menu.scroll, content - visible)
             }
             Region::Sheet(id) => {
-                if let Some(sheet) = self.st.sheets.iter_mut().find(|s| s.id == id) {
-                    sheet.scroll = (sheet.scroll + dy).max(0.0);
-                }
+                let Some(sheet) = self.st.sheets.iter_mut().find(|s| s.id == id) else { return };
+                (&mut sheet.scroll, self.sheet_heights.get(&id).copied().unwrap_or(0.0) - rect.size.y)
             }
-        }
+        };
+        self.touch_scroll.apply_delta(scroll, dy, max);
     }
 
     /// Core batch, connection changes, intents and loads.
@@ -525,8 +527,9 @@ impl Widget for SettingsPanel {
                 handled.set(true);
             }
             dirty = true;
-        } else if self.compact && !self.sheet_only && event.back_pressed()
+        } else if self.compact && !self.sheet_only
             && (self.st.section.is_some() || self.st.project_root.is_some())
+            && event.back_pressed()
         {
             self.with_env(cx, ui, Self::back_to_parent);
             if let Event::BackPressed { handled } = event {
@@ -548,10 +551,11 @@ impl Widget for SettingsPanel {
             // An embedded project's ScrollYView owns this gesture.
             self.touch_scroll.reset();
         }
-        if let Some(dy) = self.touch_scroll.handle_hit(&hit)
-            && let Hit::FingerMove(e) = &hit
-        {
-            self.scroll_region(e.abs_start, dy);
+        if !area.is_valid(cx) {
+            self.touch_scroll.reset();
+        }
+        if let Some(dy) = self.touch_scroll.handle_event(cx, event, &hit) {
+            self.scroll_region(self.touch_scroll.origin(), dy);
             self.pressed = None;
             dirty = true;
         }

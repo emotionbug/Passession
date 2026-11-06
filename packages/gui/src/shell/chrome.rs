@@ -36,7 +36,6 @@ pub struct ChromeState {
     pub explorer_anim: Option<NextFrame>,
     pub explorer_anim_start: Option<(f64, f64, f64)>,
     pub edge_start: Option<DVec2>,
-    pub sidebar_touch: Option<(DVec2, bool)>,
     pub drop_pane: Option<String>,
 }
 
@@ -208,6 +207,8 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
     shell.data.chrome.pane_rects.clear();
     shell.data.chrome.tab_bars.clear();
     shell.data.chrome.tab_rects.clear();
+    shell.data.chrome.sidebar_rect = Rect::default();
+    shell.data.sidebar.viewport = Rect::default();
 
     let compact = shell.data.compact;
     let sidebar_destination = compact && shell.data.layout.compact_destination == CompactDestination::Sidebar;
@@ -220,7 +221,7 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
     };
 
     let insets = crate::shell::platform::safe_insets();
-    let body = rect(r.pos.x + insets.left, r.pos.y + insets.top, r.size.x - insets.left - insets.right, r.size.y - insets.top - insets.bottom - insets.keyboard);
+    let body = rect(r.pos.x + insets.left, r.pos.y + insets.top, r.size.x - insets.left - insets.right, (r.size.y - insets.top - insets.bottom_occlusion()).max(0.0));
     let host_count = hosts::hosts(&state).len();
 
     // Settings is a pushed full-window route.
@@ -838,9 +839,24 @@ pub fn draw_compact_explorer(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut 
 // ---------------------------------------------------------------------------------------------
 // Events
 
+pub(crate) fn sidebar_visible(shell: &PaseoShell) -> bool {
+    if matches!(shell.data.page.as_ref(), Some(crate::shell::Page::Settings { .. })) {
+        return false;
+    }
+    if shell.data.compact {
+        shell.data.page.is_none() && shell.data.layout.compact_destination == CompactDestination::Sidebar
+    } else {
+        shell.data.layout.sidebar_visible
+    }
+}
+
 /// Pointer handling for chrome ids recorded in `shell.data.hits`.
 pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &mut Scope) {
     sync_hidden(shell, cx);
+    let sidebar_visible = sidebar_visible(shell);
+    if !sidebar_visible {
+        shell.data.sidebar.stop_motion();
+    }
     let area = shell.data.bg_area;
     match event.hits(cx, area) {
         Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
@@ -868,6 +884,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             }
         }
         Hit::FingerDown(fe) => {
+            shell.data.sidebar.stop_motion();
             let id = shell.data.hits.at(fe.abs);
             if fe.mouse_button().is_some_and(|b| b.is_secondary()) {
                 if let Some(id) = id
@@ -884,29 +901,26 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             if shell.data.compact && (fe.abs.x < 24.0 || shell.data.layout.compact_destination == CompactDestination::Sidebar) {
                 shell.data.chrome.edge_start = Some(fe.abs);
             }
-            shell.data.chrome.sidebar_touch =
-                (fe.device.is_touch() && shell.data.sidebar.viewport.contains(fe.abs)).then_some((fe.abs, false));
+            if sidebar_visible && fe.device.is_touch() && shell.data.sidebar.viewport.contains(fe.abs) {
+                shell.data.sidebar.touch_down(fe.abs, fe.time);
+            }
             start_drag(shell, id.as_deref(), fe.abs);
             shell.data.pointer.pressed = id;
             shell.redraw(cx);
         }
         Hit::FingerMove(fe) => {
-            if let Some((last, dragging)) = shell.data.chrome.sidebar_touch {
-                let delta = fe.abs - fe.abs_start;
-                let dragging = dragging || (delta.y.abs() >= 5.0 && delta.y.abs() >= delta.x.abs());
-                shell.data.chrome.sidebar_touch = Some((fe.abs, dragging));
-                if dragging {
-                    shell.data.pointer.pressed = None;
-                    shell.data.chrome.edge_start = None;
-                    sidebar::scroll(shell, cx, last.y - fe.abs.y);
-                    return;
-                }
+            if fe.device.is_touch() && shell.data.sidebar.touch_move(fe.abs, fe.time) {
+                shell.data.pointer.pressed = None;
+                shell.data.chrome.edge_start = None;
+                shell.redraw(cx);
+                return;
             }
             if update_drag(shell, cx, fe.abs, fe.time) {
                 shell.redraw(cx);
             }
         }
         Hit::FingerLongPress(lp) => {
+            shell.data.sidebar.stop_motion();
             if let Some(id) = shell.data.pointer.pressed.take()
                 && !matches!(shell.data.chrome.drag, Some(Drag::Tab { moving: true, .. }))
             {
@@ -917,7 +931,10 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             }
         }
         Hit::FingerUp(fe) => {
-            shell.data.chrome.sidebar_touch = None;
+            if sidebar::touch_up(shell, cx, fe.time) {
+                shell.data.pointer.pressed = None;
+                shell.data.chrome.edge_start = None;
+            }
             let pressed = shell.data.pointer.pressed.take();
             let dragged = finish_drag(shell, cx, fe.abs);
             let edge = shell.data.chrome.edge_start.take();
@@ -953,7 +970,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             shell.redraw(cx);
         }
         Hit::FingerScroll(e) => {
-            if shell.data.chrome.sidebar_rect.contains(e.abs) {
+            if sidebar_visible && shell.data.chrome.sidebar_rect.contains(e.abs) {
                 sidebar::scroll(shell, cx, e.scroll.y);
             }
         }

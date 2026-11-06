@@ -70,6 +70,30 @@ The 2026-11-06 PC pass used the ordinary debug bundle, private Xvfb/Openbox/D-Bu
 
 Environment findings are not silently counted as passes: project watching failed with `EMFILE`, also reproduced by an independent `inotify_init1` probe while the daemon had only 20 open descriptors and a 524288-descriptor limit. No host limits or unrelated processes were changed. Automatic metadata generation uses its own configured model policy, not the chat model: this run also recorded failed auxiliary Haiku (context limit) and GPT-5.4 Mini (credit exhaustion) attempts. The final private QA configuration restricts metadata to Astra; production policy was not changed. The large provider-reported context size remains unexplained, not evidence of a daemon context-loading defect. Do not report failed auxiliary calls as successful Astra requests or read raw HTTP captures containing credentials.
 
+### Shared input follow-up on Linux
+
+The common scrolling and Android-input follow-up rebuilt the ordinary Linux
+debug bundle and exercised it in a fresh private Xvfb display. Evidence is under
+`/home/emotionbug/.cache/paseo-pc-astra-qa-7kvau93j/shared-input-final/`.
+It reused the previous persisted Astra conversation without submitting another
+provider request:
+
+- Timeline wheel input reached older content; settled before/after mouse-drag
+  captures retain the viewport while changing text selection (`06`–`07`).
+- In a 1000×620 window, Settings wheel input reveals clipped rows without
+  opening a selector (`09`–`10`). The visible Back control returns to chat (`12`).
+  Escape was not counted as closing the full Settings page.
+- Physical typing targets the composer, then model search; Escape dismisses
+  only the model picker and leaves the covered draft unchanged (`14`–`15`).
+- Sidebar search keeps its complete border and does not alter the composer
+  (`16`). QA text was removed and jump-to-latest restored the tail (`17`).
+
+The app log contains only the expected Xvfb DRI3 warnings. This pass is X11
+software-renderer regression evidence, not native Wayland/physical-trackpad,
+Windows or hardware performance coverage. The corresponding Android build,
+actual emulator interactions and 26 focused Rust/Java checks are recorded in
+[mobile testing](mobile-testing.md).
+
 ## Android build and installation
 
 On 2026-11-06, `cargo xtask build-gui android --arch arm64` produced the release-mode, debug-signed `Paseo-Sessions-0.13.4-android-arm64-debug-signed.apk` (84,353,955 bytes; SHA-256 `5035e8d632ad65cd787314372646f6046ccaad9f6505e99884169a5f5b563c42`). Rust 1.93.1 compiled against NDK 28.2.13676358/API 24; Gradle completed after correcting a duplicate local variable in `PaseoBridge.onIntent`. `apksigner verify` passed with the installed app's certificate, and `zipalign -c -P 16 4` passed.
