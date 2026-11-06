@@ -25,6 +25,7 @@
 - Skip generated metadata when an explicit workspace title cannot change, and preserve configured provider environment values beneath workspace/session overrides.
 - Refresh Git patch content after successful checkout actions even when added/deleted line counts are unchanged.
 - Preserve background stream completion and restored drafts across compact navigation, rotation and application restart.
+- Declare Windows SDK and COM macro dependencies in their owning crates, select the pinned Android NDK explicitly on CI, and install the Wayland development files required by Linux native dialogs.
 
 ### Changed
 
