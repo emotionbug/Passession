@@ -480,6 +480,12 @@ impl Cx {
     }
 
     pub(crate) fn handle_drawing(&mut self) {
+        // SurfaceDestroyed unbinds the EGL context, but a queued RenderLoop can
+        // still arrive. Do not consume redraws/next frames or cache GPU objects
+        // from no-context GL calls; SurfaceCreated/Changed makes it current again.
+        if !self.os.display.as_ref().is_some_and(|display| !display.surface.is_null()) {
+            return;
+        }
         if self.any_passes_dirty() || self.need_redrawing() || !self.new_next_frames.is_empty() || self.demo_time_repaint {
             if !self.new_next_frames.is_empty() {
                 self.call_next_frame_event(self.os.timers.time_now());
@@ -548,6 +554,10 @@ impl Cx {
     }
 
     fn get_video_updates(&mut self) -> Vec<LiveId> {
+        // SurfaceTexture.updateTexImage also requires the current EGL context.
+        if !self.os.display.as_ref().is_some_and(|display| !display.surface.is_null()) {
+            return Vec::new();
+        }
         let mut videos_to_update = Vec::new();
         for (live_id, surface_texture) in self.os.video_surfaces.iter_mut() {
                 unsafe {

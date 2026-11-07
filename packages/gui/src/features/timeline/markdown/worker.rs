@@ -1,7 +1,6 @@
-//! Whole-document parsing and semantic flattening away from the event thread.
-//! The event thread only captures a bounded UTF-8 chunk from an immutable entry.
-//! A capture is never restarted by token arrival: one active revision finishes,
-//! then the newest demand replaces all intermediate demands.
+//! Small live revisions follow the reveal clock without a worker round trip.
+//! Larger documents capture bounded chunks for whole-document worker parsing.
+//! A captured revision finishes before newer demand replaces it.
 
 use super::model::{self, Block, Inline, Style};
 use super::super::links::FileLinkSourceType;
@@ -13,6 +12,7 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
 
 const CAPTURE_BYTES: usize = 64 * 1024;
+pub(super) const INTERACTIVE_SOURCE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ParagraphKey {
@@ -55,6 +55,7 @@ pub struct ParsedSnapshot {
     pub source: Arc<str>,
     pub replaces_previous: bool,
     pub find_pattern: Option<String>,
+    pub interactive: bool,
     pub codes: HashMap<usize, Arc<SemanticParagraph>>,
     pub blocks: Rc<Vec<Block>>,
     pub paragraphs: HashMap<ParagraphKey, Arc<SemanticParagraph>>,
@@ -66,9 +67,21 @@ struct ParsedDocument {
     source: Arc<str>,
     replaces_previous: bool,
     find_pattern: Option<String>,
+    interactive: bool,
     codes: HashMap<usize, Arc<SemanticParagraph>>,
     blocks: Vec<Block>,
     paragraphs: HashMap<ParagraphKey, Arc<SemanticParagraph>>,
+}
+
+impl From<ParsedDocument> for ParsedSnapshot {
+    fn from(document: ParsedDocument) -> Self {
+        Self {
+            revision: document.revision, epoch: document.epoch, source: document.source,
+            replaces_previous: document.replaces_previous, find_pattern: document.find_pattern,
+            interactive: document.interactive, codes: document.codes,
+            blocks: Rc::new(document.blocks), paragraphs: document.paragraphs,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +121,31 @@ struct ParseRequest {
     bytes: usize,
     reveal_bytes: usize,
     live: bool,
+    interactive: bool,
+}
+
+fn parse_document(request: &mut ParseRequest) -> ParsedDocument {
+    let mut text = String::with_capacity(request.bytes);
+    for chunk in std::mem::take(&mut request.chunks) {
+        text.push_str(&chunk);
+    }
+    let end = revealed_end(&text, request.reveal_bytes, request.live);
+    let replaces_previous = request.previous.as_ref().is_some_and(|old| !text.starts_with(old.as_ref()));
+    let blocks = model::parse(&text[..end], request.root.as_deref(), request.linkify);
+    let mut paragraphs = HashMap::new();
+    let mut codes = HashMap::new();
+    collect_blocks(&blocks, &mut paragraphs, &mut codes);
+    if let Some(pattern) = &request.find {
+        for rich in paragraphs.values_mut().chain(codes.values_mut()) {
+            let rich = Arc::get_mut(rich).expect("unshared paragraph");
+            rich.find_matches = pattern.find_iter(&rich.text).map(|m| (m.start(), m.end())).collect::<Vec<_>>().into();
+        }
+    }
+    ParsedDocument {
+        revision: request.revision, epoch: request.epoch, source: Arc::from(text),
+        replaces_previous, blocks, paragraphs, codes, interactive: request.interactive,
+        find_pattern: request.find.as_ref().map(|pattern| pattern.as_str().to_owned()),
+    }
 }
 
 struct ParserMailbox {
@@ -135,28 +173,8 @@ static PARSER_QUEUE: LazyLock<mpsc::SyncSender<ParseRequest>> = LazyLock::new(||
                     let receive = receive.lock().expect("Markdown request queue");
                     receive.recv()
                 };
-                let Ok(request) = request else { break };
-                let mut text = String::with_capacity(request.bytes);
-                for chunk in request.chunks {
-                    text.push_str(&chunk);
-                }
-                // All Unicode context walks belong to this thread as well.
-                let end = revealed_end(&text, request.reveal_bytes, request.live);
-                let replaces_previous = request.previous.as_ref().is_some_and(|old| !text.starts_with(old.as_ref()));
-                let blocks = model::parse(&text[..end], request.root.as_deref(), request.linkify);
-                let mut paragraphs = HashMap::new();
-                let mut codes = HashMap::new();
-                collect_blocks(&blocks, &mut paragraphs, &mut codes);
-                if let Some(pattern) = &request.find {
-                    for rich in paragraphs.values_mut().chain(codes.values_mut()) {
-                        let rich = Arc::get_mut(rich).expect("unshared worker paragraph");
-                        rich.find_matches = pattern.find_iter(&rich.text).map(|m| (m.start(), m.end())).collect::<Vec<_>>().into();
-                    }
-                }
-                let document = ParsedDocument {
-                    revision: request.revision, epoch: request.epoch, source: Arc::from(text), replaces_previous, blocks, paragraphs, codes,
-                    find_pattern: request.find.as_ref().map(|pattern| pattern.as_str().to_owned()),
-                };
+                let Ok(mut request) = request else { break };
+                let document = parse_document(&mut request);
                 // Every owner has only one in-flight job and a one-slot result
                 // mailbox; a deleted row simply drops this completed result.
                 let _ = request.result.send(document);
@@ -228,16 +246,7 @@ impl MarkdownWorker {
                 let finished = self.active.take();
                 if document.epoch == self.epoch {
                     self.completed = finished;
-                    self.candidate = Some(Rc::new(ParsedSnapshot {
-                        revision: document.revision,
-                        epoch: document.epoch,
-                        source: document.source,
-                        replaces_previous: document.replaces_previous,
-                        find_pattern: document.find_pattern,
-                        codes: document.codes,
-                        blocks: Rc::new(document.blocks),
-                        paragraphs: document.paragraphs,
-                    }));
+                    self.candidate = Some(Rc::new(document.into()));
                 }
             }
         }
@@ -249,8 +258,8 @@ impl MarkdownWorker {
         }
         if let Some(capture) = &mut self.capture {
             let text = capture.demand.text();
-            // Capture complete context; the worker chooses the grapheme-safe
-            // paced prefix without rescanning source text on the event thread.
+            // Capture complete context so both inline and worker parsing choose
+            // the same grapheme-safe paced prefix.
             let target = text.len();
             let mut end = capture.offset.saturating_add(CAPTURE_BYTES).min(target);
             while !text.is_char_boundary(end) {
@@ -266,12 +275,20 @@ impl MarkdownWorker {
                 let parser = self.parser.get_or_insert_with(ParserMailbox::new);
                 // Queue saturation retains the completed bounded capture; it
                 // never blocks the UI or restarts source copying.
-                let request = ParseRequest {
+                let interactive = capture.offset <= INTERACTIVE_SOURCE_BYTES
+                    && (capture.demand.live || self.published.as_ref().is_some_and(|snapshot| snapshot.interactive));
+                let mut request = ParseRequest {
                     revision: self.revision, epoch: self.epoch, root: self.root.clone(), linkify: self.linkify, find: self.find.clone(),
                     previous: self.published.as_ref().map(|snapshot| snapshot.source.clone()),
                     result: parser.send.clone(),
                     chunks: capture.chunks, bytes: capture.offset, reveal_bytes: capture.demand.bytes, live: capture.demand.live,
+                    interactive,
                 };
+                if interactive {
+                    self.candidate = Some(Rc::new(parse_document(&mut request).into()));
+                    self.completed = Some(capture.demand);
+                    return self.is_pending();
+                }
                 match PARSER_QUEUE.try_send(request) {
                     Ok(()) => self.active = Some(capture.demand),
                     Err(mpsc::TrySendError::Full(request)) => {
@@ -526,7 +543,7 @@ mod tests {
         let entry = Rc::new(json!({"item": {"text": "latest"}}));
         let snapshot = Rc::new(ParsedSnapshot {
             revision: 7, epoch: 0, source: Arc::from("old"), replaces_previous: false,
-            find_pattern: None, codes: HashMap::new(),
+            find_pattern: None, codes: HashMap::new(), interactive: false,
             blocks: Rc::new(Vec::new()), paragraphs: HashMap::new(),
         });
         let mut worker = MarkdownWorker {

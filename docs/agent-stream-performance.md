@@ -55,17 +55,24 @@ painting; `PortalList` limits mounted rows and row UI state remains outside recy
 Reveal, streaming updates and composer growth must preserve the reader's anchor, selection and
 IME state. Cancelling presentation work is not cancelling the provider turn.
 
-Assistant presentation captures immutable source in 64-KiB preparation slices.
-Whole-document normalization, parsing, semantic flattening, find matching and
-grapheme-boundary walks run in a bounded two-worker parser pool. One captured
-revision proceeds to publication while newer demand coalesces behind it; a
-continuously growing open paragraph cannot repeatedly cancel all progress.
-This presentation queue does not discard or reorder canonical events.
+Small live assistant documents prepare the paced reveal inline, avoiding a
+mandatory parser/layout worker round trip per visible update. The source and
+aggregate inline-layout byte limits plus a soft between-layout deadline are
+defined in [Markdown rendering](markdown-renderer.md#streaming-work). The
+deadline does not preempt an individual layout call.
+
+Larger assistant documents capture immutable source in 64-KiB preparation
+slices. Whole-document normalization, parsing, semantic flattening, find
+matching and grapheme-boundary walks run in a bounded two-worker parser pool.
+One captured revision proceeds to publication while newer demand coalesces
+behind it; a continuously growing open paragraph cannot repeatedly cancel all
+progress. This presentation queue does not discard or reorder canonical events.
 
 `MarkdownPresentation` prepares a complete successor while retaining the previous
-coherent source/layout snapshot. Semantic font-span conversion is sliced; native
-`AsyncLayout` shapes and wraps on an independent worker-local loader/shaper with
-immutable font definitions. UI hydration and final glyph destruction are sliced.
+coherent source/layout snapshot. Beyond the inline allowance, semantic font-span
+conversion is sliced; native `AsyncLayout` shapes and wraps on an independent
+worker-local loader/shaper with immutable font definitions. Background layout
+hydration and final glyph destruction are sliced.
 The app drains retired layouts on an initial signal and then a 1/60-second timer
 while work remains, independent of drawing and row/window lifetime; additional
 signals cannot bypass the timer cadence.

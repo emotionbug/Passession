@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.11 - 2026-11-07
+
+### Fixed
+
+- Defer Android drawing and video texture updates while the window Surface is absent. Preserve queued redraws and GPU upload state until EGL is current again instead of caching zero buffer/VAO names from no-context calls.
+- Restore frame-local paced reveal for small live assistant messages instead of requiring a whole-document worker round trip for every visible update. Bound inline source/layout work and retain coherent background preparation for larger documents without truncating text.
+
 ## 0.13.10 - 2026-11-07
 
 ### Changed

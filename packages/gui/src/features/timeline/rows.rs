@@ -1,5 +1,5 @@
 //! Stream row painters (timeline_item.dart TimelineItem + agent_panel.dart
-//! turn footers): user bubbles, assistant Markdown (paced whole-source worker
+//! turn footers): user bubbles, assistant Markdown (paced inline/worker
 //! snapshots), Thinking and tool badges with inline details, overview tool
 //! groups, speak messages, plan cards, task activity badges, compaction
 //! markers, notifications/errors, unknown items as structured details, the

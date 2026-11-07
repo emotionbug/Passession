@@ -53,6 +53,11 @@ Android resizes the native surface for the keyboard. The shell uses a plain root
 bottom occlusion as a union rather than adding overlapping insets. Composer and
 modal geometry share that allocation.
 
+When Android destroys the window Surface, rendering and video texture updates
+wait for a replacement Surface and current EGL context. Background events may
+still update the model; pending redraws remain queued. See the vendored
+[Surface lifetime constraint](../packages/gui-platform/vendor/makepad-platform/VENDORED.md#android-surface-lifetime).
+
 ## Text interaction and system font size
 
 Long-press input and selected content use Android's native floating Paste/Copy/Cut/Select All menu, with actions limited by editor capabilities and clipboard availability. Selecting text does not copy it automatically. Tapping another control dismisses the old selection without swallowing that control's click. See [native text selection](native-text-selection.md).

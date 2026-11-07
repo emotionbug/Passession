@@ -21,8 +21,9 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use makepad_widgets::makepad_draw::text::AsyncLayout;
+use std::time::{Duration, Instant};
 use makepad_widgets::makepad_draw::text::layouter::{LaidoutText, Span as FontSpan};
-use super::worker::{ParagraphKey, ParsedSnapshot, SemanticParagraph};
+use super::worker::{INTERACTIVE_SOURCE_BYTES, ParagraphKey, ParsedSnapshot, SemanticParagraph};
 use makepad_widgets::makepad_draw::text::selection::Cursor;
 use makepad_widgets::makepad_draw::text::substr::Substr;
 
@@ -114,9 +115,16 @@ pub struct ParagraphCache {
     pending: bool,
     advance_available: bool,
     frozen: bool,
+    inline_remaining: usize,
+    inline_deadline: Option<Instant>,
 }
 
 impl ParagraphCache {
+    fn can_layout_inline(&self, bytes: usize) -> bool {
+        bytes <= self.inline_remaining
+            && self.inline_deadline.is_some_and(|deadline| Instant::now() < deadline)
+    }
+
     pub(super) fn set_owner(&mut self, owner: Option<Rc<Vec<Block>>>) -> Option<Rc<Vec<Block>>> {
         self.entries.retain(|_, entry| entry.owner.strong_count() > 0);
         std::mem::replace(&mut self.owner, owner)
@@ -146,8 +154,8 @@ impl DocumentLayout {
     }
 }
 
-/// Publish a whole coherent source/layout revision, never a new parse paired
-/// with old glyphs. One bounded preparation slice runs per measured row frame.
+/// Publish coherent source/layout revisions. Small live revisions can finish
+/// in this frame; larger or over-budget work retains the previous snapshot.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f64, w: f64) -> f64 {
     let mut presentation = std::mem::take(&mut d.state.markdown_presentation);
@@ -173,6 +181,8 @@ pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f6
             preparing.cache.pending = false;
             preparing.cache.advance_available = true;
             preparing.cache.frozen = false;
+            preparing.cache.inline_remaining = if preparing.snapshot.interactive { INTERACTIVE_SOURCE_BYTES } else { 0 };
+            preparing.cache.inline_deadline = preparing.snapshot.interactive.then(|| Instant::now() + Duration::from_millis(4));
             measured(cx, d, opts, |cx, d, opts| draw_document(cx, d, opts, &mut preparing, x, y));
             if !preparing.cache.pending {
                 d.state.markdown_worker.publish(preparing.snapshot.revision);
@@ -276,7 +286,10 @@ fn prepare_semantic(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, key: (usize,
             colors, color_cursor: 0, layout: AsyncLayout::default(),
         }),
     });
-    if entry.prepared.is_none() && d.state.markdown_paragraphs.advance_available {
+    let inline = entry.pending.as_ref().is_some_and(|pending| {
+        !pending.layout.is_pending() && d.state.markdown_paragraphs.can_layout_inline(pending.rich.text.len())
+    });
+    if entry.prepared.is_none() && (inline || d.state.markdown_paragraphs.advance_available) {
         d.state.markdown_paragraphs.advance_available = false;
         let pending = entry.pending.as_mut().expect("unpublished paragraph");
         for _ in 0..256 {
@@ -331,11 +344,15 @@ fn prepare_semantic(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, key: (usize,
                 let mut style = span.style; style.bold |= para.bold;
                 if span.code { Font::Mono } else { style_font(style) }
             }).unwrap_or(Font::Regular);
-            d.kit.advance_rich_layout(cx, &mut pending.layout, 1, pending.rich.text.clone(), spans, base, w.is_finite().then_some(w), height);
-            if !pending.layout.is_pending()
-                && let Some(laidout) = pending.layout.completed()
-            {
-                entry.prepared = Some(Rc::new(PreparedRich { rich: pending.rich.clone(), laidout: laidout.clone(), found }));
+            let laidout = if inline && d.state.markdown_paragraphs.can_layout_inline(pending.rich.text.len()) {
+                d.state.markdown_paragraphs.inline_remaining -= pending.rich.text.len();
+                Some(d.kit.layout_mapped_rich(cx, &pending.rich.text, &spans, base, w.is_finite().then_some(w), height))
+            } else {
+                d.kit.advance_rich_layout(cx, &mut pending.layout, 1, pending.rich.text.clone(), spans, base, w.is_finite().then_some(w), height);
+                (!pending.layout.is_pending()).then(|| pending.layout.completed().cloned()).flatten()
+            };
+            if let Some(laidout) = laidout {
+                entry.prepared = Some(Rc::new(PreparedRich { rich: pending.rich.clone(), laidout, found }));
                 entry.pending = None;
             }
         }

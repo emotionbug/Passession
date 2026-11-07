@@ -208,32 +208,23 @@ impl ChatKit {
     /// a single paragraph), so wrapping, baselines and selection are those of
     /// the whole paragraph. `height` is the paragraph's line height ratio.
     pub fn layout_rich(&mut self, cx: &mut Cx, text: &str, spans: &[RichSpan], max_width: Option<f64>, height: f64) -> Rc<LaidoutText> {
-        CxDraw::lazy_construct_fonts(cx);
         let base = spans.first().map(|s| s.font).unwrap_or(Font::Regular);
         let layout_spans: Vec<Span> = spans
             .iter()
-            .map(|span| Span {
-                style: Style {
-                    font_family_id: family_id(self.text(span.font)),
-                    font_size_in_pts: (span.size_px * 0.75) as f32,
-                    color: Some(text_color(span.color)),
-                },
-                len: span.len,
-            })
+            .map(|span| self.rich_span(*span))
             .collect();
+        self.layout_mapped_rich(cx, text, &layout_spans, base, max_width, height)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout_mapped_rich(&mut self, cx: &mut Cx, text: &str, spans: &[Span], base: Font, max_width: Option<f64>, height: f64) -> Rc<LaidoutText> {
+        CxDraw::lazy_construct_fonts(cx);
         let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
         let mut fonts = fonts.borrow_mut();
         fonts.get_or_layout(BorrowedLayoutParams {
             text,
-            spans: &layout_spans,
-            options: LayoutOptions {
-                first_row_indent_in_lpxs: 0.0,
-                first_row_min_line_spacing_below_in_lpxs: 0.0,
-                max_width_in_lpxs: max_width.map(|w| w.max(1.0) as f32),
-                wrap: max_width.is_some(),
-                align: 0.0,
-                line_spacing_scale: (height / natural_line(base)).max(0.5) as f32,
-            },
+            spans,
+            options: Self::rich_layout_options(base, max_width, height),
         })
     }
 
@@ -253,15 +244,19 @@ impl ChatKit {
         CxDraw::lazy_construct_fonts(cx);
         let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
         let mut fonts = fonts.borrow_mut();
-        request.request(&mut fonts, revision, text, spans, LayoutOptions {
+        request.request(&mut fonts, revision, text, spans, Self::rich_layout_options(base, max_width, height));
+        request.poll(&mut fonts, 4096, 128);
+    }
+
+    fn rich_layout_options(base: Font, max_width: Option<f64>, height: f64) -> LayoutOptions {
+        LayoutOptions {
             first_row_indent_in_lpxs: 0.0,
             first_row_min_line_spacing_below_in_lpxs: 0.0,
             max_width_in_lpxs: max_width.map(|w| w.max(1.0) as f32),
             wrap: max_width.is_some(),
             align: 0.0,
             line_spacing_scale: (height / natural_line(base)).max(0.5) as f32,
-        });
-        request.poll(&mut fonts, 4096, 128);
+        }
     }
 
     /// Isolate every primitive from earlier batches, then reserve the

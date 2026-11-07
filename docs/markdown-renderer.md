@@ -10,21 +10,33 @@ Use native theme/text styles and preserve copy/selection, code formatting, lists
 
 ## Streaming work
 
-Assistant messages use a staged whole-document pipeline, including an open
-paragraph with no safe Markdown split:
+Assistant messages retain grapheme-safe paced reveal rather than waiting to
+accumulate a minimum batch. Small live documents (at most 16 KiB of captured
+source) normalize, parse and flatten inline using the same parser as the worker.
+The final update of an inline-published document uses that path too. Preparation
+admits at most 16 KiB of inline layout text per pass, with a soft 4 ms deadline
+checked between layout calls. Multiple ready paragraphs can therefore publish
+in the current frame instead of requiring a worker round trip for every reveal.
+This is an admission limit, not a hard frame-time guarantee: one font
+initialization or shaping operation can exceed the deadline.
+
+Larger documents and work exceeding the inline layout allowance retain the
+staged whole-document pipeline, including an open paragraph with no safe
+Markdown split:
 
 1. `MarkdownWorker` retains the immutable timeline entry and copies at most
    64 KiB per preparation pass. Two parser workers share a 64-request queue.
    Normalization, Markdown parsing, semantic flattening, find ranges and
-   grapheme-boundary walks run there, not during UI paint.
+   grapheme-boundary walks for larger documents run there, not during UI paint.
 2. One captured revision finishes even while newer tokens arrive. The latest
    demand replaces intermediate demands; it cannot continuously cancel the
    revision being prepared. Canonical timeline events are never coalesced here.
 3. `MarkdownPresentation` retains the published document while preparing its
-   successor. Font-span mapping advances at most 256 segments in one paragraph
-   per preparation pass. `AsyncLayout` shapes and wraps the complete immutable
-   text with a worker-local font loader/shaper and shared immutable font bytes.
-   Arbitrary byte/word splitting is not used to approximate Unicode shaping.
+   successor. Background font-span mapping advances at most 256 segments in one
+   paragraph per preparation pass. `AsyncLayout` shapes and wraps the complete
+   immutable text with a worker-local font loader/shaper and shared immutable
+   font bytes. Inline and worker layout use identical options. Arbitrary
+   byte/word splitting is not used to approximate Unicode shaping.
 4. UI hydration admits at most 4096 glyphs and 128 rows per preparation pass.
    Source, styles, find results, links, copy ranges and all paragraph/code/table
    layouts publish together. Width, typography, appearance and find occurrence
@@ -58,7 +70,7 @@ paragraph into a new source string on every paint. Explicit selection copy
 materializes only the requested source range; code-copy hits share a `Substr`.
 
 The assistant pipeline no longer uses the previous desktop presentation cap.
-Full source reaches the parser and layout worker; no new truncation was added.
+Full source reaches the parser and layout path; no new truncation was added.
 Synchronous Markdown entry points remain for other feature surfaces. Work still
 scales with document content on the workers and with rendered block/decorative
 structure on the UI; pathological overlapping glyphs cannot be safely discarded
@@ -74,3 +86,9 @@ The staged pipeline, Unicode/layout boundary cases, queue saturation, retained
 source selection and final-position geometry have regression test source.
 Those additions were not executed during the static-only implementation request;
 they are not runtime or performance evidence.
+
+An isolated smoke using the production parser, worker and reveal code exercised
+incremental short Hangul/ZWJ updates, final publication, a 198,003-byte worker
+handoff retaining the prior snapshot, and owner replacement. It does not prove
+native frame cadence, layout latency or Android interaction; no GUI build or
+device scenario was run for the inline-reveal change.

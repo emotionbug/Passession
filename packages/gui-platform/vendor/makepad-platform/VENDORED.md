@@ -56,6 +56,22 @@ scoped entry point. Lifecycle and non-input notifications remain broadcasts.
 The adjacent widgets patch applies this scope before navigation and overlays,
 not merely before the window's content view.
 
+## Android Surface lifetime
+
+`os/linux/android/android.rs` gates drawing and `SurfaceTexture.updateTexImage`
+on a live window Surface. `SurfaceDestroyed` unbinds EGL, but queued RenderLoop
+messages and background model updates can still arrive. Those events must not
+consume redraw/next-frame work, clear upload dirty bits or allocate GPU objects
+until `update_surface` has made the retained EGL context current again.
+
+The installed 0.13.10 APK's crash PC `0x27bebe8` is the indirect
+`glDrawElementsInstanced` call. The device's Adreno stack then copies from null
+in `memcpy`. An isolated host EGL run of the drawing handler and buffer uploader
+reproduced the missing-context state corruption: the old path cached `Some(0)`
+and cleared upload state; the gated path deferred work and uploaded after
+restoration. This establishes the lifecycle defect, not the device's missing
+pre-crash event sequence or an on-device confirmation of the fix.
+
 ## Android composing input
 
 `event/keyboard.rs`, `event/event.rs`, `event/finger.rs`, `cx_api.rs`, and
