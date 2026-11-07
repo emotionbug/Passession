@@ -86,7 +86,8 @@ impl Cx {
         
         //self.process_desktop_pre_event(&mut event);
         match event {
-            XlibEvent::AppGotFocus => { // repaint all window passes. Metal sometimes doesnt flip buffers when hidden/no focus
+            XlibEvent::AppGotFocus(window_id) => {
+                self.set_window_keyboard_focus(window_id, true);
                 for window in opengl_windows.iter_mut() {
                     if let Some(main_pass_id) = self.windows[window.window_id].main_pass_id {
                         self.repaint_pass(main_pass_id);
@@ -95,7 +96,8 @@ impl Cx {
                 //paint_dirty = true;
                 self.call_event_handler(&Event::AppGotFocus);
             }
-            XlibEvent::AppLostFocus => { 
+            XlibEvent::AppLostFocus(window_id) => {
+                self.set_window_keyboard_focus(window_id, false);
                 self.call_event_handler(&Event::AppLostFocus);
             }
             XlibEvent::WindowGeomChange(mut re) => { // do this here because mac
@@ -182,8 +184,8 @@ impl Cx {
             XlibEvent::WindowCloseRequested(e) => {
                 self.call_event_handler(&Event::WindowCloseRequested(e))
             }
-            XlibEvent::TextInput(e) => {
-                self.call_event_handler(&Event::TextInput(e))
+            XlibEvent::TextInput(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextInput(e))
             }
             XlibEvent::Drag(e) => {
                 self.call_event_handler(&Event::Drag(e))
@@ -194,19 +196,17 @@ impl Cx {
             XlibEvent::DragEnd => {
                 self.call_event_handler(&Event::DragEnd)
             }
-            XlibEvent::KeyDown(e) => {
-                self.keyboard.process_key_down(e.clone());
-                self.call_event_handler(&Event::KeyDown(e))
+            XlibEvent::KeyDown(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::KeyDown(e))
             }
-            XlibEvent::KeyUp(e) => {
-                self.keyboard.process_key_up(e.clone());
-                self.call_event_handler(&Event::KeyUp(e))
+            XlibEvent::KeyUp(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::KeyUp(e))
             }
-            XlibEvent::TextCopy(e) => {
-                self.call_event_handler(&Event::TextCopy(e))
+            XlibEvent::TextCopy(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextCopy(e))
             }
-            XlibEvent::TextCut(e) => {
-                self.call_event_handler(&Event::TextCut(e))
+            XlibEvent::TextCut(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextCut(e))
             }
             XlibEvent::Timer(e) => {
                 //println!("TIMER! {:?}", std::time::Instant::now());

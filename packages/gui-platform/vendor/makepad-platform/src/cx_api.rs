@@ -656,6 +656,7 @@ impl Cx {
         self.fingers.update_area(old_area, new_area);
         self.drag_drop.update_area(old_area, new_area);
         self.keyboard.update_area(old_area, new_area);
+        self.windows.update_keyboard_focus_area(old_area, new_area);
         #[cfg(target_os = "android")]
         if self.os.text_input.area == old_area {
             self.os.text_input.area = new_area;
@@ -681,6 +682,8 @@ impl Cx {
 
     /// Release an input that is closing without stealing a newer focus request.
     pub fn clear_key_focus_if(&mut self, focus_area: Area) -> bool {
+        // An inactive window can close an editor without owning global key focus.
+        self.windows.update_keyboard_focus_area(focus_area, Area::Empty);
         if focus_area != Area::Empty && self.keyboard.next_key_focus == focus_area {
             self.set_key_focus(Area::Empty);
             true

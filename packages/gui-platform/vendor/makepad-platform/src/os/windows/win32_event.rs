@@ -23,8 +23,8 @@ use {
 
 #[derive(Debug)]
 pub enum Win32Event {
-    AppGotFocus,
-    AppLostFocus,
+    AppGotFocus(WindowId),
+    AppLostFocus(WindowId),
     WindowResizeLoopStart(WindowId),
     WindowResizeLoopStop(WindowId),
     WindowGeomChange(WindowGeomChangeEvent),
@@ -39,14 +39,14 @@ pub enum Win32Event {
     
     WindowDragQuery(WindowDragQueryEvent),
     WindowCloseRequested(WindowCloseRequestedEvent),
-    TextInput(TextInputEvent),
+    TextInput(WindowId, TextInputEvent),
     Drag(DragEvent),
     Drop(DropEvent),
     DragEnd,
-    KeyDown(KeyEvent),
-    KeyUp(KeyEvent),
-    TextCopy(TextClipboardEvent),
-    TextCut(TextClipboardEvent),
+    KeyDown(WindowId, KeyEvent),
+    KeyUp(WindowId, KeyEvent),
+    TextCopy(WindowId, TextClipboardEvent),
+    TextCut(WindowId, TextClipboardEvent),
     Timer(TimerEvent),
     Signal,
 }

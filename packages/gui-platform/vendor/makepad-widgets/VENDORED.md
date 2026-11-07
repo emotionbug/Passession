@@ -9,6 +9,14 @@ to the existing makepad-platform vendor license. The manifest declares
 MIT OR Apache-2.0. Upstream fonts and icons remain unchanged; keep their existing
 packaging notice coverage when staging resources from this path dependency.
 
+## Window input ownership
+
+`src/window.rs` applies the platform's native window-input scope before dispatching
+to navigation, overlays or content. A key sent to one OS window must not dismiss a
+different window's sheet or move its keyboard focus. Pointer routing and lifecycle
+broadcasts keep their existing behavior; the platform patch owns native source
+identity and unambiguous headless admission.
+
 ## Desktop scrollbar visibility
 
 `src/scroll_bar.rs` adds desktop auto-hide, enabled by `fade_when_idle` by
@@ -125,6 +133,19 @@ including interpolation at the window boundary. Equal-timestamp moves retain
 their displacement; a stationary hold cancels motion, while a late release
 does not dilute a genuine recent flick with a synthetic zero-velocity sample.
 Reversal and boundary termination discard velocity in the previous direction.
+
+## Final-position list painting
+
+`PortalList::begin_measurement` opts into an exact extent-only pass, followed by
+`next_final_item` for painting at resolved row positions. Ordinary consumers
+retain their single-pass behavior. The measurement pass must not replace live
+hit areas or emit primitives; the prepared immutable snapshot supplies both its
+height and the later visible content.
+
+Upward rows and sticky-bottom groups previously moved after glyph emission.
+Their preliminary origins cannot safely decide which glyphs are offscreen.
+The final pass supplies the resolved viewport while keeping measured neighbors,
+full source geometry, scroll anchors and selection available to the owner.
 
 ## History prepend anchors
 

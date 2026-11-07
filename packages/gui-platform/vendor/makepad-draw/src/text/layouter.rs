@@ -9,6 +9,7 @@ use {
         sdfer,
         selection::{Cursor, CursorPosition, Selection},
         shaper::{self, ShapedText},
+        source_index::{GlyphIndex, SourceIndex},
         substr::Substr,
     },
     std::{
@@ -17,6 +18,7 @@ use {
         collections::{HashMap, VecDeque},
         hash::{Hash, Hasher},
         rc::Rc,
+        sync::Arc,
     },
     unicode_segmentation::UnicodeSegmentation,
 };
@@ -60,6 +62,20 @@ impl Layouter {
 
     pub fn define_font(&mut self, id: FontId, definition: FontDefinition) {
         self.loader.define_font(id, definition);
+    }
+
+    pub(super) fn load_font(&mut self, id: FontId) -> Rc<Font> {
+        self.loader.get_or_load_font(id).clone()
+    }
+
+    /// Uncached authoritative layout for the worker; never hashes or copies the source.
+    pub(super) fn layout_shared(
+        &mut self,
+        text: Substr,
+        spans: &[Span],
+        options: LayoutOptions,
+    ) -> LaidoutText {
+        LayoutContext::new(&mut self.loader, text, options).layout(spans)
     }
 
     pub fn get_or_layout(&mut self, params: impl LayoutParams) -> Rc<LaidoutText> {
@@ -267,6 +283,7 @@ impl<'a> LayoutContext<'a> {
                 cluster: self.current_row_len() + glyph.cluster,
                 advance_in_ems: glyph.advance_in_ems,
                 offset_in_ems: glyph.offset_in_ems,
+                paint_bounds_in_ems: glyph.font.paint_bounds_in_ems(glyph.id),
             };
             glyph.origin_in_lpxs.x = self.current_point_in_lpxs.x;
             self.current_point_in_lpxs.x += glyph.advance_in_lpxs();
@@ -322,6 +339,7 @@ impl<'a> LayoutContext<'a> {
             } else {
                 0.0
             });
+        let glyph_index = Arc::new(GlyphIndex::new(&text, &glyphs, width_in_lpxs));
         let mut row = LaidoutRow {
             origin_in_lpxs: Point::ZERO,
             text,
@@ -332,6 +350,7 @@ impl<'a> LayoutContext<'a> {
             line_gap_in_lpxs,
             line_spacing_above_in_lpxs,
             line_spacing_below_in_lpxs,
+            glyph_index,
             glyphs,
         };
 
@@ -353,6 +372,7 @@ impl<'a> LayoutContext<'a> {
 
     fn finish(self) -> LaidoutText {
         LaidoutText {
+            source_index: Arc::new(SourceIndex::new(&self.text, &self.rows)),
             text: self.text,
             size_in_lpxs: Size::new(
                 self.rows
@@ -360,7 +380,7 @@ impl<'a> LayoutContext<'a> {
                     .map(|row| row.width_in_lpxs)
                     .reduce(f32::max)
                     .unwrap_or(0.0),
-                self.current_point_in_lpxs.y - self.rows.last().unwrap().descender_in_lpxs,
+                self.current_point_in_lpxs.y - self.rows.last().map_or(0.0, |row| row.descender_in_lpxs),
             ),
             rows: self.rows,
         }
@@ -372,8 +392,8 @@ struct Fitter {
     text: Substr,
     font_family: Rc<FontFamily>,
     font_size_in_lpxs: f32,
-    lens: Vec<usize>,
-    widths_in_lpxs: Vec<f32>,
+    lens: VecDeque<usize>,
+    widths_in_lpxs: VecDeque<f32>,
     hang_spaces: bool,
 }
 
@@ -384,7 +404,7 @@ impl Fitter {
         font_size_in_lpxs: f32,
         segment_kind: SegmentKind,
     ) -> Self {
-        let lens: Vec<_> = match segment_kind {
+        let lens: VecDeque<_> = match segment_kind {
             SegmentKind::Word => unicode_linebreak::linebreaks(&text)
                 .scan(0, |start, (end, _)| {
                     let len = end - *start;
@@ -396,7 +416,7 @@ impl Fitter {
         };
         // Keep the upstream fast rejection for grapheme fallback. Word fitting
         // measures trimmed candidates, so shaping every untrimmed word is wasted.
-        let widths_in_lpxs: Vec<_> = if matches!(segment_kind, SegmentKind::Grapheme) { lens
+        let widths_in_lpxs: VecDeque<_> = if matches!(segment_kind, SegmentKind::Grapheme) { lens
             .iter()
             .copied()
             .scan(0, |state, len| {
@@ -407,7 +427,7 @@ impl Fitter {
                 *state = end;
                 Some(width_in_lpxs)
             })
-            .collect() } else { Vec::new() };
+            .collect() } else { VecDeque::new() };
         Self {
             text,
             font_family,
@@ -423,11 +443,20 @@ impl Fitter {
     }
 
     fn fit(&mut self, wrap_width_in_lpxs: f32) -> Option<Rc<ShapedText>> {
+        // Bracket the next line locally, rather than shaping half the remaining
+        // paragraph on every row. As in the original binary search, fitting is
+        // monotonic in the ordered Unicode break opportunities.
         let mut min_count = 1;
-        let mut max_count = self.lens.len() + 1;
+        let mut max_count = 1;
         let mut best_count = None;
+        while max_count <= self.lens.len() && self.can_fit(max_count, wrap_width_in_lpxs) {
+            best_count = Some(max_count);
+            min_count = max_count + 1;
+            max_count = max_count.saturating_mul(2);
+        }
+        max_count = max_count.min(self.lens.len() + 1);
         while min_count < max_count {
-            let mid_count = (min_count + max_count) / 2;
+            let mid_count = min_count + (max_count - min_count) / 2;
             if self.can_fit(mid_count, wrap_width_in_lpxs) {
                 best_count = Some(mid_count);
                 min_count = mid_count + 1;
@@ -436,7 +465,7 @@ impl Fitter {
             }
         }
         if let Some(best_count) = best_count {
-            let best_len = self.lens[..best_count].iter().sum();
+            let best_len = self.lens.iter().take(best_count).sum();
             let best_text = self.font_family.get_or_shape(self.text.substr(0..best_len));
             self.lens.drain(..best_count);
             if !self.hang_spaces {
@@ -450,7 +479,7 @@ impl Fitter {
     }
 
     fn can_fit(&self, count: usize, wrap_width_in_lpxs: f32) -> bool {
-        let len = self.lens[..count].iter().sum();
+        let len = self.lens.iter().take(count).sum();
         let candidate = self.text.substr(0..len);
         // Fit the ink before trailing breakable whitespace, but return the complete
         // shaped substring from `fit`: selection/copy offsets must keep those bytes.
@@ -466,7 +495,7 @@ impl Fitter {
             return true;
         }
         if !self.hang_spaces {
-            let estimated_width_in_lpxs: f32 = self.widths_in_lpxs[..count].iter().sum();
+            let estimated_width_in_lpxs: f32 = self.widths_in_lpxs.iter().take(count).sum();
             if 0.5 * estimated_width_in_lpxs > wrap_width_in_lpxs {
                 return false;
             }
@@ -480,9 +509,9 @@ impl Fitter {
     }
 
     fn pop(&mut self) -> usize {
-        let len = self.lens.remove(0);
+        let len = self.lens.pop_front().unwrap();
         if !self.hang_spaces {
-            self.widths_in_lpxs.remove(0);
+            self.widths_in_lpxs.pop_front();
         }
         self.text = self.text.substr(len..);
         len
@@ -679,6 +708,7 @@ impl Hash for LayoutOptions {
             .hash(hasher);
         self.max_width_in_lpxs.map(f32::to_bits).hash(hasher);
         self.align.to_bits().hash(hasher);
+        self.wrap.hash(hasher);
         self.line_spacing_scale.to_bits().hash(hasher);
     }
 }
@@ -696,7 +726,10 @@ impl PartialEq for LayoutOptions {
         if self.max_width_in_lpxs.map(f32::to_bits) != other.max_width_in_lpxs.map(f32::to_bits) {
             return false;
         }
-        if self.align != other.align {
+        if self.align.to_bits() != other.align.to_bits()
+            || self.wrap != other.wrap
+            || self.line_spacing_scale.to_bits() != other.line_spacing_scale.to_bits()
+        {
             return false;
         }
         true
@@ -708,9 +741,42 @@ pub struct LaidoutText {
     pub text: Substr,
     pub size_in_lpxs: Size<f32>,
     pub rows: Vec<LaidoutRow>,
+    pub(super) source_index: Arc<SourceIndex>,
+}
+
+impl Drop for LaidoutText {
+    fn drop(&mut self) {
+        super::async_layout::retire_rows(&mut self.rows);
+    }
 }
 
 impl LaidoutText {
+    /// Construct from authoritative rows, or no rows for source-only consumers.
+    /// Builds the complete source index synchronously: giant UI documents must
+    /// use AsyncLayout instead. Existing row indexes and disposal ownership stay
+    /// attached to the rows; empty rows have zero layout size.
+    pub fn from_rows(text: Substr, rows: Vec<LaidoutRow>) -> Self {
+        let source_index = Arc::new(SourceIndex::new(&text, &rows));
+        let size_in_lpxs = Size::new(
+            rows.iter().map(|row| row.width_in_lpxs).reduce(f32::max).unwrap_or(0.0),
+            rows.last().map_or(0.0, |row| row.origin_in_lpxs.y - row.descender_in_lpxs),
+        );
+        Self { text, size_in_lpxs, rows, source_index }
+    }
+
+    /// Hash of exactly the first `end` source bytes (at most 4095 bytes scanned).
+    pub fn text_prefix_hash(&self, end: usize) -> u64 {
+        self.source_index.prefix_hash(&self.text, end)
+    }
+
+    pub fn word_at(&self, byte: usize) -> (usize, usize) {
+        self.source_index.word_at(byte, self.text.len())
+    }
+
+    pub fn visible_row_range(&self, top: f32, bottom: f32) -> std::ops::Range<usize> {
+        self.source_index.visible_rows(top, bottom)
+    }
+
     pub fn cursor_to_position(&self, cursor: Cursor) -> CursorPosition {
         let row_index = self.cursor_to_row_index(cursor);
         let row = &self.rows[row_index];
@@ -722,17 +788,10 @@ impl LaidoutText {
     }
 
     fn cursor_to_row_index(&self, cursor: Cursor) -> usize {
-        for (row_index, row) in self.rows.iter().enumerate() {
-            if cursor.index < row.text.end_in_parent() {
-                return row_index;
-            }
-            if cursor.index == row.text.end_in_parent() {
-                if row.newline || !cursor.prefer_next_row {
-                    return row_index;
-                }
-            }
-        }
-        self.rows.len() - 1
+        self.rows.partition_point(|row| {
+            row.text.end_in_parent() < cursor.index
+                || (row.text.end_in_parent() == cursor.index && !row.newline && cursor.prefer_next_row)
+        }).min(self.rows.len().saturating_sub(1))
     }
 
     pub fn point_in_lpxs_to_cursor(&self, point_in_lpxs: Point<f32>) -> Cursor {
@@ -744,19 +803,7 @@ impl LaidoutText {
     }
 
     fn y_in_lpxs_to_row_index(&self, y_in_lpxs: f32) -> usize {
-        if y_in_lpxs < 0.0 {
-            return 0;
-        }
-        for (row_index, row) in self.rows.iter().enumerate() {
-            let line_spacing_in_lpxs = self
-                .rows
-                .get(row_index + 1)
-                .map_or(0.0, |next_row| row.line_spacing_in_lpxs(next_row));
-            if y_in_lpxs < row.origin_in_lpxs.y + 0.5 * line_spacing_in_lpxs {
-                return row_index;
-            }
-        }
-        self.rows.len() - 1
+        self.source_index.row_at_y(y_in_lpxs)
     }
 
     pub fn position_to_cursor(&self, position: CursorPosition) -> Cursor {
@@ -769,59 +816,31 @@ impl LaidoutText {
     }
 
     pub fn selection_rects_in_lpxs(&self, selection: Selection) -> Vec<Rect<f32>> {
-        let CursorPosition {
-            row_index: start_row_index,
-            x_in_lpxs: start_x_in_lpxs,
-        } = self.cursor_to_position(selection.start());
-        let CursorPosition {
-            row_index: end_row_index,
-            x_in_lpxs: end_x_in_lpxs,
-        } = self.cursor_to_position(selection.end());
-        let mut rects_in_lpxs = Vec::new();
-        if start_row_index == end_row_index {
-            let row = &self.rows[start_row_index];
-            rects_in_lpxs.push(Rect::new(
-                Point::new(start_x_in_lpxs, row.origin_in_lpxs.y - row.ascender_in_lpxs),
-                Size::new(
-                    end_x_in_lpxs - start_x_in_lpxs,
-                    row.ascender_in_lpxs - row.descender_in_lpxs,
-                ),
-            ));
-        } else {
-            let start_row = &self.rows[start_row_index];
-            let end_row = &self.rows[end_row_index];
-            rects_in_lpxs.push(Rect::new(
-                Point::new(
-                    start_x_in_lpxs,
-                    start_row.origin_in_lpxs.y - start_row.ascender_in_lpxs,
-                ),
-                Size::new(
-                    start_row.width_in_lpxs - start_x_in_lpxs,
-                    start_row.ascender_in_lpxs - start_row.descender_in_lpxs,
-                ),
-            ));
-            for row_index in start_row_index + 1..end_row_index {
-                let row = &self.rows[row_index];
-                rects_in_lpxs.push(Rect::new(
-                    Point::new(
-                        row.origin_in_lpxs.x,
-                        row.origin_in_lpxs.y - row.ascender_in_lpxs,
-                    ),
-                    Size::new(
-                        row.width_in_lpxs,
-                        row.ascender_in_lpxs - row.descender_in_lpxs,
-                    ),
-                ));
-            }
-            rects_in_lpxs.push(Rect::new(
-                Point::new(0.0, end_row.origin_in_lpxs.y - end_row.ascender_in_lpxs),
-                Size::new(
-                    end_x_in_lpxs,
-                    end_row.ascender_in_lpxs - end_row.descender_in_lpxs,
-                ),
+        self.selection_rects_in_lpxs_clipped(selection, f32::NEG_INFINITY, f32::INFINITY)
+    }
+
+    pub fn selection_rects_in_lpxs_clipped(&self, selection: Selection, top: f32, bottom: f32) -> Vec<Rect<f32>> {
+        if self.rows.is_empty() { return Vec::new(); }
+        let start_row = self.cursor_to_row_index(selection.start());
+        let end_row = self.cursor_to_row_index(selection.end());
+        let visible = self.visible_row_range(top, bottom);
+        let start = visible.start.max(start_row);
+        let end = visible.end.min(end_row + 1);
+        let mut rects = Vec::with_capacity(end.saturating_sub(start));
+        for row_index in start..end {
+            let row = &self.rows[row_index];
+            let left = if row_index == start_row {
+                row.index_to_x_in_lpxs(selection.start().index - row.text.start_in_parent())
+            } else if row_index == end_row { 0.0 } else { row.origin_in_lpxs.x };
+            let right = if row_index == end_row {
+                row.index_to_x_in_lpxs(selection.end().index - row.text.start_in_parent())
+            } else if row_index == start_row { row.width_in_lpxs } else { row.origin_in_lpxs.x + row.width_in_lpxs };
+            rects.push(Rect::new(
+                Point::new(left, row.origin_in_lpxs.y - row.ascender_in_lpxs),
+                Size::new(right - left, row.ascender_in_lpxs - row.descender_in_lpxs),
             ));
         }
-        rects_in_lpxs
+        rects
     }
 }
 
@@ -837,77 +856,26 @@ pub struct LaidoutRow {
     pub line_spacing_above_in_lpxs: f32,
     pub line_spacing_below_in_lpxs: f32,
     pub glyphs: Vec<LaidoutGlyph>,
+    pub(super) glyph_index: Arc<GlyphIndex>,
 }
 
 impl LaidoutRow {
+    /// Conservative glyph candidates, including marks, bitmap strikes and atlas
+    /// fringe. Coordinates exclude the row origin, and include glyph offsets.
+    pub fn visible_glyph_range(&self, left: f32, right: f32) -> std::ops::Range<usize> {
+        self.glyph_index.visible(left, right)
+    }
+
     pub fn line_spacing_in_lpxs(&self, next_row: &LaidoutRow) -> f32 {
         self.line_spacing_below_in_lpxs + next_row.line_spacing_above_in_lpxs
     }
 
     pub fn x_in_lpxs_to_index(&self, x_in_lpxs: f32) -> usize {
-        use {super::slice::SliceExt, unicode_segmentation::UnicodeSegmentation};
-
-        let mut glyph_groups = self
-            .glyphs
-            .group_by(|glyph_0, glyph_1| glyph_0.cluster == glyph_1.cluster)
-            .peekable();
-        while let Some(glyph_group) = glyph_groups.next() {
-            let start = glyph_group[0].cluster;
-            let start_x_in_lpxs = glyph_group[0].origin_in_lpxs.x;
-            let next_glyph_group = glyph_groups.peek();
-            let end = next_glyph_group.map_or(self.text.len(), |next_glyph_group| {
-                next_glyph_group[0].cluster
-            });
-            let end_x_in_lpxs = next_glyph_group.map_or(self.width_in_lpxs, |next_glyph_group| {
-                next_glyph_group[0].origin_in_lpxs.x
-            });
-            let width_in_lpxs = end_x_in_lpxs - start_x_in_lpxs;
-            let grapheme_count = self.text[start..end].graphemes(true).count();
-            let grapheme_width_in_lpxs = width_in_lpxs / grapheme_count as f32;
-            let mut current_x_in_lpxs = start_x_in_lpxs;
-            for (grapheme_start, _) in self.text[start..end].grapheme_indices(true) {
-                if x_in_lpxs < current_x_in_lpxs + 0.5 * grapheme_width_in_lpxs {
-                    return start + grapheme_start;
-                }
-                current_x_in_lpxs += grapheme_width_in_lpxs;
-            }
-        }
-        self.text.len()
+        self.glyph_index.x_to_index(x_in_lpxs, self.text.len())
     }
 
     pub fn index_to_x_in_lpxs(&self, index: usize) -> f32 {
-        use {super::slice::SliceExt, unicode_segmentation::UnicodeSegmentation};
-
-        let mut glyph_groups = self
-            .glyphs
-            .group_by(|glyph_0, glyph_1| glyph_0.cluster == glyph_1.cluster)
-            .peekable();
-        while let Some(glyph_group) = glyph_groups.next() {
-            let start = glyph_group[0].cluster;
-            let start_x_in_lpxs = glyph_group[0].origin_in_lpxs.x;
-            let end = glyph_groups
-                .peek()
-                .map_or(self.text.len(), |next_glyph_group| {
-                    next_glyph_group[0].cluster
-                });
-            let end_x_in_lpxs = glyph_groups
-                .peek()
-                .map_or(self.width_in_lpxs, |next_glyph_group| {
-                    next_glyph_group[0].origin_in_lpxs.x
-                });
-            let width_in_lpxs = end_x_in_lpxs - start_x_in_lpxs;
-            let grapheme_count = self.text[start..end].graphemes(true).count();
-            let grapheme_width_in_lpxs = width_in_lpxs / grapheme_count as f32;
-            let mut current_x_in_lpxs = start_x_in_lpxs;
-            for (grapheme_start, _) in self.text[start..end].grapheme_indices(true) {
-                let grapheme_start = start + grapheme_start;
-                if index == grapheme_start {
-                    return current_x_in_lpxs;
-                }
-                current_x_in_lpxs += grapheme_width_in_lpxs;
-            }
-        }
-        self.width_in_lpxs
+        self.glyph_index.index_to_x(index, self.width_in_lpxs)
     }
 }
 
@@ -921,9 +889,21 @@ pub struct LaidoutGlyph {
     pub cluster: usize,
     pub advance_in_ems: f32,
     pub offset_in_ems: f32,
+    pub(super) paint_bounds_in_ems: Rect<f32>,
 }
 
 impl LaidoutGlyph {
+    pub fn paint_bounds_in_lpxs(&self) -> Rect<f32> {
+        let bounds = self.paint_bounds_in_ems;
+        Rect::new(
+            Point::new(
+                self.origin_in_lpxs.x + self.offset_in_lpxs() + bounds.origin.x * self.font_size_in_lpxs,
+                self.origin_in_lpxs.y + bounds.origin.y * self.font_size_in_lpxs,
+            ),
+            bounds.size * self.font_size_in_lpxs,
+        )
+    }
+
     pub fn advance_in_lpxs(&self) -> f32 {
         self.advance_in_ems * self.font_size_in_lpxs
     }
@@ -960,7 +940,7 @@ mod paseo_linebreak_tests {
         // Existing upstream fixture in the adjacent vendored widgets crate.
         let data = include_bytes!("../../../makepad-widgets/resources/LiberationMono-Regular.ttf");
         layouter.define_font(font_id, FontDefinition {
-            data: Rc::new(data.to_vec()),
+            data: std::sync::Arc::new(data.to_vec()),
             index: 0,
             ascender_fudge_in_ems: 0.0,
             descender_fudge_in_ems: 0.0,

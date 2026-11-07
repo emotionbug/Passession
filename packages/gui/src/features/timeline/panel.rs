@@ -2658,6 +2658,7 @@ impl Widget for ChatPanel {
             while list_ref.draw_walk(cx, scope, walk).is_step() {
                 let Some(mut list) = portal.borrow_mut() else { break };
                 list.set_item_range(cx, 0, self.items.len());
+                list.begin_measurement();
                 while let Some(index) = list.next_visible_item(cx) {
                     let Some(item) = self.items.get(index).cloned() else { continue };
                     let widget = list.item(cx, index, live_id!(Row));
@@ -2665,7 +2666,19 @@ impl Widget for ChatPanel {
                         let state = self.row_states.entry(item.id.clone()).or_default().clone();
                         widget.as_chat_row().set_model(cx, RowModel { panel: self.uid, item, ctx: ctx.clone(), state });
                     }
-                    widget.draw_all(cx, scope);
+                    let width = cx.turtle().rect().size.x;
+                    let height = widget.as_chat_row().measure(cx, width);
+                    cx.walk_turtle(Walk {
+                        abs_pos: None,
+                        margin: Margin::default(),
+                        width: Size::Fill,
+                        height: Size::Fixed(height),
+                    });
+                }
+                while let Some((index, walk, viewport)) = list.next_final_item(cx) {
+                    if let Some((_, widget)) = list.get_item(index) {
+                        widget.as_chat_row().paint_final(cx, scope, walk, viewport);
+                    }
                 }
             }
             if self.reader_scrolled {

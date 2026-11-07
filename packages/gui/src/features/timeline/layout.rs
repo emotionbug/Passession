@@ -4,7 +4,8 @@
 use super::json::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+use makepad_widgets::makepad_draw::text::substr::Substr;
 
 /// One rendered stream row: a timeline entry, or (overview detail level) a
 /// run of consecutive tool calls hosted by its latest call.
@@ -191,24 +192,55 @@ pub fn latest_assistant_in_response(rows: &[StreamRow], start: usize) -> Option<
     None
 }
 
-/// strategy.ts collectAssistantResponseContent.
-pub fn collect_assistant_response_content(rows: &[StreamRow], start: usize) -> String {
-    let mut messages = Vec::new();
-    let mut later: Option<&Value> = None;
-    let mut index = start as isize;
-    while index >= 0 && (index as usize) < rows.len() {
-        let entry: &Value = &rows[index as usize].entry;
-        if later.is_some() && !continues_response(Some(entry), later) {
-            break;
+/// Retain clipboard text by immutable response sources, not by each frame.
+/// A weak snapshot fast path avoids retaining complete historical row vectors.
+#[derive(Default)]
+pub struct ResponseCopyCache {
+    snapshot: Weak<Vec<StreamRow>>,
+    host: usize,
+    sources: Vec<Rc<Value>>,
+    text: Option<Substr>,
+}
+
+impl ResponseCopyCache {
+    pub fn text(&mut self, rows: &Rc<Vec<StreamRow>>, host: usize) -> Substr {
+        let snapshot = Rc::downgrade(rows);
+        if self.host == host && Weak::ptr_eq(&self.snapshot, &snapshot)
+            && let Some(text) = &self.text
+        {
+            return text.clone();
         }
-        if stream_kind(Some(entry)) == "assistant_message" {
-            messages.push(str_of(get(get(entry, "item"), "text")).to_owned());
+        let response = if host < rows.len() {
+            let mut first = host;
+            while first > 0 && continues_response(Some(&rows[first - 1].entry), Some(&rows[first].entry)) {
+                first -= 1;
+            }
+            &rows[first..=host]
+        } else {
+            &rows[..0]
+        };
+        let entries = response.iter().filter(|row| row.kind() == "assistant_message").map(|row| &row.entry);
+        let mut previous = self.sources.iter();
+        let unchanged = entries.clone().all(|entry| previous.next().is_some_and(|old| Rc::ptr_eq(old, entry)))
+            && previous.next().is_none();
+        if !unchanged || self.text.is_none() {
+            self.sources.clear();
+            self.sources.extend(entries.cloned());
+            let bytes = self.sources.iter().map(|entry| str_of(get(get(entry, "item"), "text")).len()).sum::<usize>()
+                + self.sources.len().saturating_sub(1) * 2;
+            let mut text = String::with_capacity(bytes);
+            for (index, entry) in self.sources.iter().enumerate() {
+                if index > 0 {
+                    text.push_str("\n\n");
+                }
+                text.push_str(str_of(get(get(entry, "item"), "text")));
+            }
+            self.text = Some(text.into());
         }
-        later = Some(entry);
-        index -= 1;
+        self.snapshot = snapshot;
+        self.host = host;
+        self.text.as_ref().expect("response text initialized above").clone()
     }
-    messages.reverse();
-    messages.join("\n\n")
 }
 
 /// layout.ts resolveCompletedFooter.
@@ -284,4 +316,38 @@ pub fn derive_turn_timing(rows: &[StreamRow], turn_active: bool) -> HashMap<usiz
         close(&mut timing, user_at, last_item_at, &assistants);
     }
     timing
+}
+
+#[cfg(test)]
+mod response_copy_tests {
+    use super::*;
+
+    fn row(kind: &str, text: &str, turn: &str) -> StreamRow {
+        StreamRow { entry: Rc::new(json!({"turnId": turn, "item": {"type": kind, "text": text}})), group: None }
+    }
+
+    #[test]
+    fn response_copy_tracks_prepends_replacements_and_response_boundaries() {
+        let tail = row("assistant_message", "계속", "current");
+        let initial = Rc::new(vec![tail.clone()]);
+        let mut cache = ResponseCopyCache::default();
+        let original = cache.text(&initial, 0);
+        assert_eq!(&*original, "계속");
+
+        let expanded = Rc::new(vec![
+            row("assistant_message", "다른 응답", "older"),
+            row("user_message", "질문", "current"),
+            row("assistant_message", "앞부분", "current"),
+            tail,
+        ]);
+        assert_eq!(&*cache.text(&expanded, 3), "앞부분\n\n계속");
+        assert_eq!(&*original, "계속");
+
+        let mut changed = (*expanded).clone();
+        changed[3] = row("assistant_message", "수정된 끝", "current");
+        let changed = Rc::new(changed);
+        assert_eq!(&*cache.text(&changed, 3), "앞부분\n\n수정된 끝");
+        assert_eq!(&*cache.text(&changed, 0), "다른 응답");
+        assert_eq!(&*cache.text(&changed, changed.len()), "");
+    }
 }

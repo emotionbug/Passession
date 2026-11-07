@@ -72,6 +72,34 @@ pub struct RowLayout {
     pub trailing: Rect,
 }
 
+/// A shared baseline for adjacent labels that may use different fallback fonts.
+/// Centering each label independently (or giving both the same top) misaligns
+/// Latin and Hangul; reserve the union above and below their actual baselines.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InlineMetrics {
+    above: f64,
+    below: f64,
+}
+
+impl InlineMetrics {
+    pub fn from_layout(layout: &makepad_widgets::makepad_draw::text::layouter::LaidoutText) -> Self {
+        let above = layout.rows.first().map_or(0.0, |row| row.origin_in_lpxs.y as f64);
+        Self { above, below: (layout.size_in_lpxs.height as f64 - above).max(0.0) }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self { above: self.above.max(other.above), below: self.below.max(other.below) }
+    }
+
+    pub fn height(self) -> f64 {
+        self.above + self.below
+    }
+
+    pub fn top(self, bounds: Rect, label: Self) -> f64 {
+        bounds.pos.y + (bounds.size.y - self.height()) * 0.5 + self.above - label.above
+    }
+}
+
 #[cfg(test)]
 mod row_tests {
     use super::*;
@@ -117,6 +145,24 @@ mod row_tests {
         assert_eq!(slots.title.pos, dvec2(8.0, 4.0));
         assert_eq!(slots.title.size, dvec2(104.0, 20.0));
         assert_eq!(slots.subtitle.size.y, 0.0);
+    }
+
+    #[test]
+    fn adjacent_fallback_labels_share_a_baseline_without_escaping_the_row() {
+        for scale in [1.0, 1.5, 2.0] {
+            let latin = InlineMetrics { above: 11.0 * scale, below: 4.0 * scale };
+            let hangul = InlineMetrics { above: 17.0 * scale, below: 3.0 * scale };
+            let joined = latin.union(hangul);
+            let height = RowMetrics::new(joined.height(), 0.0, 0.0).height(30.0, 4.0, 22.0);
+            let bounds = rect(0.0, 40.0, 240.0, height);
+            let latin_top = joined.top(bounds, latin);
+            let hangul_top = joined.top(bounds, hangul);
+            assert_eq!(latin_top + latin.above, hangul_top + hangul.above);
+            assert!(latin_top >= bounds.pos.y + 4.0);
+            assert!(hangul_top >= bounds.pos.y + 4.0);
+            assert!(latin_top + latin.height() <= bounds.pos.y + bounds.size.y - 4.0);
+            assert!(hangul_top + hangul.height() <= bounds.pos.y + bounds.size.y - 4.0);
+        }
     }
 }
 

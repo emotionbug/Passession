@@ -66,6 +66,7 @@ fn core_config() -> CoreConfig {
 // Leave event-loop turns between transcript batches for input and painting.
 const CORE_BATCH_LIMIT: usize = 64;
 const CORE_BATCH_INTERVAL: f64 = 1.0 / 60.0;
+const LAYOUT_RETIREMENT_INTERVAL: f64 = 1.0 / 60.0;
 
 /// Everything that exists once startup succeeded.
 struct Runtime {
@@ -91,6 +92,8 @@ pub struct App {
     runtime: Option<Runtime>,
     #[rust]
     startup_error: Option<String>,
+    #[rust]
+    layout_retirement_timer: Timer,
 }
 
 impl LiveRegister for App {
@@ -248,6 +251,17 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if let Event::Startup = event {
             self.start(cx);
+        }
+        // Retired layouts outlive their row/window. Drain independently of drawing
+        // and core startup, with one paced continuation rather than a signal loop.
+        let retirement_tick = self.layout_retirement_timer.is_event(event).is_some();
+        if retirement_tick {
+            self.layout_retirement_timer = Timer::default();
+        }
+        if (retirement_tick || (matches!(event, Event::Signal) && self.layout_retirement_timer.is_empty()))
+            && makepad_widgets::makepad_draw::text::collect_retired_layouts()
+        {
+            self.layout_retirement_timer = cx.start_timeout(LAYOUT_RETIREMENT_INTERVAL);
         }
         let Some(runtime) = self.runtime.as_mut() else {
             // Startup failed: the shell still renders the error (no core, no dispatch scope).

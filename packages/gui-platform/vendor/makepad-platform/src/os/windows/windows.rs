@@ -87,7 +87,8 @@ impl Cx {
 
         //self.process_desktop_pre_event(&mut event);
         match event {
-            Win32Event::AppGotFocus => { // repaint all window passes. Metal sometimes doesnt flip buffers when hidden/no focus
+            Win32Event::AppGotFocus(window_id) => { // repaint all window passes. Metal sometimes doesnt flip buffers when hidden/no focus
+                self.set_window_keyboard_focus(window_id, true);
                 for window in d3d11_windows.iter_mut() {
                     if let Some(main_pass_id) = self.windows[window.window_id].main_pass_id {
                         self.repaint_pass(main_pass_id);
@@ -96,7 +97,8 @@ impl Cx {
                 //paint_dirty = true;
                 self.call_event_handler(&Event::AppGotFocus);
             }
-            Win32Event::AppLostFocus => {
+            Win32Event::AppLostFocus(window_id) => {
+                self.set_window_keyboard_focus(window_id, false);
                 self.call_event_handler(&Event::AppLostFocus);
             }
             Win32Event::WindowResizeLoopStart(window_id) => {
@@ -190,8 +192,8 @@ impl Cx {
             Win32Event::WindowCloseRequested(e) => {
                 self.call_event_handler(&Event::WindowCloseRequested(e))
             }
-            Win32Event::TextInput(e) => {
-                self.call_event_handler(&Event::TextInput(e))
+            Win32Event::TextInput(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextInput(e))
             }
             Win32Event::Drag(e) => {
                 self.call_event_handler(&Event::Drag(e));
@@ -213,19 +215,17 @@ impl Cx {
                 self.fingers.mouse_up(MouseButton::PRIMARY);
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
             }
-            Win32Event::KeyDown(e) => {
-                self.keyboard.process_key_down(e.clone());
-                self.call_event_handler(&Event::KeyDown(e))
+            Win32Event::KeyDown(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::KeyDown(e))
             }
-            Win32Event::KeyUp(e) => {
-                self.keyboard.process_key_up(e.clone());
-                self.call_event_handler(&Event::KeyUp(e))
+            Win32Event::KeyUp(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::KeyUp(e))
             }
-            Win32Event::TextCopy(e) => {
-                self.call_event_handler(&Event::TextCopy(e))
+            Win32Event::TextCopy(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextCopy(e))
             }
-            Win32Event::TextCut(e) => {
-                self.call_event_handler(&Event::TextCut(e))
+            Win32Event::TextCut(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextCut(e))
             }
             Win32Event::Timer(e) => {
                 self.call_event_handler(&Event::Timer(e))

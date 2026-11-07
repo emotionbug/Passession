@@ -324,6 +324,10 @@ impl WindowRef{
 
 impl Widget for Window {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Filter before nav, debug views and overlays: all can consume raw keys.
+        if !cx.keyboard_event_is_for_window(event, self.window.window_id()) {
+            return;
+        }
         if let Event::Draw(e) = event {
             let mut cx_draw = CxDraw::new(cx, e);
             let cx = &mut Cx2d::new(&mut cx_draw);

@@ -1,6 +1,6 @@
 //! Syntax colors for fenced code and read/write tool content. Both use one
-//! native parser worker with a bounded latest-per-block queue; UI font shaping
-//! stays on the drawing thread.
+//! native parser worker with a bounded latest-per-block queue. This worker does
+//! not access Makepad fonts or UI draw state.
 
 use makepad_widgets::{ToUIReceiver, Vec4};
 use paseo_highlight::{ColorScheme, Highlighter, Language, StyledRange, SyntaxThemeId, get_language_for_file, resolve_syntax_colors};
@@ -52,6 +52,13 @@ impl FenceSlot {
 /// Owned by a row/block, so completion cannot attach to a recycled row.
 #[derive(Default)]
 pub struct FenceRequest(Rc<RefCell<FenceSlot>>);
+
+impl FenceRequest {
+    pub fn is_pending(&self) -> bool {
+        let slot = self.0.borrow();
+        slot.key.is_some() && !slot.ready
+    }
+}
 
 struct FenceWork {
     key: u64,

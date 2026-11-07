@@ -77,6 +77,9 @@ pub struct PortalList {
     #[live(false)] keep_invisible: bool,
     #[rust] draw_state: DrawStateWrap<ListDrawState>,
     #[rust] draw_align_list: Vec<AlignItem>,
+    #[rust] measuring: bool,
+    #[rust] positions_resolved: bool,
+    #[rust] paint_index: usize,
     #[rust] detect_tail_in_draw: bool,
     #[live(false)] auto_tail: bool,
     #[live(false)] draw_caching: bool,
@@ -110,6 +113,34 @@ struct AlignItem {
     size: DVec2,
     shift: f64,
     index: usize
+}
+
+impl AlignItem {
+    fn position(&mut self, cx: &mut Cx2d, axis: Vec2Index, pos: f64, measuring: bool) {
+        if !measuring {
+            cx.shift_align_range(
+                &self.align_range,
+                DVec2::from_index_pair(axis, pos - self.shift, 0.0),
+            );
+        }
+        self.shift = pos;
+    }
+}
+
+/// Resolve bottom/underfill alignment before any viewport visibility query.
+fn final_alignment(
+    first_pos: f64,
+    last_pos: Option<f64>,
+    viewport_size: f64,
+    align_underfill_to_top: bool,
+    measured_tail: bool,
+) -> (f64, bool) {
+    let Some(last_pos) = last_pos else { return (0.0, false) };
+    if align_underfill_to_top {
+        return (-first_pos, false);
+    }
+    let shift = viewport_size - last_pos;
+    (if measured_tail { shift } else { shift.max(0.0) }, shift >= 0.0 || measured_tail)
 }
 
 // Layout keeps measured off-screen neighbors too. Resolve the current offset,
@@ -190,10 +221,13 @@ impl PortalList {
     fn begin(&mut self, cx: &mut Cx2d, walk: Walk) {
         cx.begin_turtle(walk, self.layout);
         self.draw_align_list.clear();
+        self.measuring = false;
+        self.positions_resolved = false;
+        self.paint_index = 0;
     }
     
-    fn end(&mut self, cx: &mut Cx2d) {
-        // in this code we position all the drawn items 
+    fn resolve_positions(&mut self, cx: &mut Cx2d) {
+        // Both draw modes use exactly the same current-frame alignment.
 
         self.at_end = false;
         self.not_filling_viewport = false;
@@ -257,8 +291,7 @@ impl PortalList {
                     
                     let mut pos = first_pos.min(min); // lets do a maximum for first scroll
                     for item in list {
-                        let shift = DVec2::from_index_pair(vi, pos, 0.0);
-                        cx.shift_align_range(&item.align_range, shift - DVec2::from_index_pair(vi, item.shift, 0.0));
+                        item.position(cx, vi, pos, self.measuring);
                         pos += item.size.index(vi);
                         visible_items += 1;
                     }
@@ -268,31 +301,27 @@ impl PortalList {
                 else {
                     // this is the normal case, however we have to here compute
                     // the 'stick to bottom' case 
-                    let shift = if let Some(last_item_pos) = last_item_pos {
-                        if self.align_top_when_empty && self.not_filling_viewport {
-                            -first_pos
-                        }
-                        else {
-                            let ret = viewport.size.index(vi) - last_item_pos;
-                            if ret >= 0.0 {
-                                self.at_end = true;
-                            }
-                            ret.max(0.0)
-                        }
-                    }
-                    else {
-                        0.0
-                    };
+                    // Only the measured path follows a giant last row's bottom
+                    // using its exact height; readers retain their anchor.
+                    let measured_tail = self.measuring && self.tail_range
+                        && list.iter().any(|item| item.index.checked_add(1) == Some(self.range_end));
+                    let (shift, at_end) = final_alignment(
+                        first_pos,
+                        last_item_pos,
+                        viewport.size.index(vi),
+                        self.align_top_when_empty && self.not_filling_viewport,
+                        measured_tail,
+                    );
+                    self.at_end = at_end;
                     // first we scan upwards and move items in place
                     let mut first_id_changed = false;
                     let start_pos = self.first_scroll + shift;
                     let mut pos = start_pos;
                     for i in (0..first_index).rev() {
-                        let item = &list[i];
+                        let item = &mut list[i];
                         let visible = pos > 0.0;
                         pos -= item.size.index(vi);
-                        let shift = DVec2::from_index_pair(vi, pos, 0.0);
-                        cx.shift_align_range(&item.align_range, shift - DVec2::from_index_pair(vi, item.shift, 0.0));
+                        item.position(cx, vi, pos, self.measuring);
                         if visible { // move up
                             self.first_scroll = pos;
                             self.first_id = item.index;
@@ -305,9 +334,8 @@ impl PortalList {
                     // then we scan downwards
                     let mut pos = start_pos;
                     for i in first_index..list.len() {
-                        let item = &list[i];
-                        let shift = DVec2::from_index_pair(vi, pos, 0.0);
-                        cx.shift_align_range(&item.align_range, shift - DVec2::from_index_pair(vi, item.shift, 0.0));
+                        let item = &mut list[i];
+                        item.position(cx, vi, pos, self.measuring);
                         pos += item.size.index(vi);
                         let invisible = pos < 0.0;
                         if invisible { // move down
@@ -332,6 +360,15 @@ impl PortalList {
         else {
             //log!("Draw state not at end in listview, please review your next_visible_item loop")
         }
+        self.visible_items = visible_items;
+        self.positions_resolved = true;
+    }
+
+    fn end(&mut self, cx: &mut Cx2d) {
+        if !self.positions_resolved {
+            self.resolve_positions(cx);
+        }
+        let visible_items = self.visible_items;
         let rect = cx.turtle().rect();
         if self.at_end || self.view_window == 0 || self.view_window > visible_items{
             self.view_window = visible_items.max(4) - 3;
@@ -368,6 +405,47 @@ impl PortalList {
         self.visible_items = visible_items;
     }
     
+    /// Opt in to exact measurement followed by final-position painting.
+    /// Call immediately before `next_visible_item`. That loop must only measure
+    /// each requested item, advancing its turtle by the prepared snapshot's
+    /// exact extent. It must not emit primitives or replace live hit areas.
+    /// Then exhaust `next_final_item` and paint the same prepared snapshots.
+    /// Ordinary consumers keep their existing single-pass drawing behavior.
+    pub fn begin_measurement(&mut self) {
+        self.measuring = true;
+    }
+
+    /// Final current-frame placement, after Up scans, underfill and tail
+    /// alignment. The returned viewport is safe for glyph visibility queries:
+    /// unlike preliminary measurement origins it will never subsequently move.
+    /// Every measured in-range item is returned, including neighbors needed
+    /// for selection/anchor geometry; callers may clip painting to the viewport.
+    pub fn next_final_item(&mut self, cx: &mut Cx2d) -> Option<(usize, Walk, Rect)> {
+        if !self.measuring {
+            return None;
+        }
+        let Some(ListDrawState::End {viewport}) = self.draw_state.get() else {
+            return None;
+        };
+        if !self.positions_resolved {
+            self.resolve_positions(cx);
+        }
+        while let Some(item) = self.draw_align_list.get(self.paint_index) {
+            self.paint_index += 1;
+            if item.index < self.range_start || item.index >= self.range_end {
+                continue;
+            }
+            let pos = viewport.pos + DVec2::from_index_pair(self.vec_index, item.shift, 0.0);
+            return Some((item.index, Walk {
+                abs_pos: Some(pos),
+                margin: Default::default(),
+                width: Size::Fixed(item.size.x),
+                height: Size::Fixed(item.size.y),
+            }, viewport));
+        }
+        None
+    }
+
     
     /// Returns the index of the next visible item that will be drawn by this PortalList.
     pub fn next_visible_item(&mut self, cx: &mut Cx2d) -> Option<usize> {
@@ -415,7 +493,7 @@ impl PortalList {
                 }
                 ListDrawState::Down {index, pos, viewport} | ListDrawState::DownAgain {index, pos, viewport} => {
                     let is_down_again = draw_state.is_down_again();
-                    let did_draw = cx.turtle_has_align_items();
+                    let did_draw = if self.measuring { index < self.range_end } else { cx.turtle_has_align_items() };
                     let align_range = cx.get_turtle_align_range();
                     let rect = cx.end_turtle();
                     self.draw_align_list.push(AlignItem {
@@ -494,7 +572,7 @@ impl PortalList {
                     return Some(index + 1);
                 }
                 ListDrawState::Up {index, pos, hit_bottom, viewport} => {
-                    let did_draw = cx.turtle_has_align_items();
+                    let did_draw = if self.measuring { index >= self.range_start && index < self.range_end } else { cx.turtle_has_align_items() };
                     let align_range = cx.get_turtle_align_range();
                     let rect = cx.end_turtle();
                     self.draw_align_list.push(AlignItem {
@@ -1350,7 +1428,7 @@ impl PortalListSet {
 
 #[cfg(test)]
 mod scroll_anchor_tests {
-    use super::measured_scroll_anchor;
+    use super::{final_alignment, measured_scroll_anchor};
 
     #[test]
     fn content_anchor_excludes_header_and_keeps_pending_drag_offset() {
@@ -1366,5 +1444,21 @@ mod scroll_anchor_tests {
         assert_eq!(measured_scroll_anchor(3, -300.0, 1, 5, &rows, |r| *r), Some((4, -180.0)));
         assert_eq!(measured_scroll_anchor(8, -23.0, 1, 12, &rows, |r| *r), Some((8, -23.0)));
         assert_eq!(measured_scroll_anchor(0, 0.0, 1, 5, &[], |r: &(usize, f64)| *r), None);
+    }
+
+    #[test]
+    fn final_tail_alignment_uses_current_giant_row_height() {
+        assert_eq!(final_alignment(0.0, Some(40_000.0), 600.0, false, true), (-39_400.0, true));
+        // Completed asynchronous snapshots may grow or shrink this frame.
+        assert_eq!(final_alignment(0.0, Some(50_000.0), 600.0, false, true), (-49_400.0, true));
+        assert_eq!(final_alignment(0.0, Some(900.0), 600.0, false, true), (-300.0, true));
+    }
+
+    #[test]
+    fn final_alignment_preserves_reader_and_short_underfill() {
+        assert_eq!(final_alignment(-120.0, Some(40_000.0), 600.0, false, false), (0.0, false));
+        assert_eq!(final_alignment(-120.0, Some(180.0), 600.0, true, true), (120.0, false));
+        assert_eq!(final_alignment(-120.0, Some(580.0), 600.0, false, false), (20.0, true));
+        assert_eq!(final_alignment(0.0, None, 600.0, false, true), (0.0, false));
     }
 }

@@ -2,12 +2,12 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     ops::{Deref, RangeBounds},
-    rc::Rc,
+    sync::Arc,
 };
 
 #[derive(Clone)]
 pub struct Substr {
-    parent: Rc<str>,
+    parent: Arc<str>,
     start: usize,
     end: usize,
 }
@@ -28,7 +28,7 @@ impl Substr {
         )
     }
 
-    pub fn parent(&self) -> &Rc<str> {
+    pub fn parent(&self) -> &Arc<str> {
         &self.parent
     }
 
@@ -45,7 +45,7 @@ impl Substr {
     }
 
     pub fn shallow_eq(&self, other: &Self) -> bool {
-        if !Rc::ptr_eq(&self.parent, &other.parent) {
+        if !Arc::ptr_eq(&self.parent, &other.parent) {
             return false;
         }
         if self.start != other.start {
@@ -108,12 +108,12 @@ impl From<&String> for Substr {
 
 impl From<&str> for Substr {
     fn from(string: &str) -> Self {
-        Rc::<str>::from(string).into()
+        Arc::<str>::from(string).into()
     }
 }
 
-impl From<Rc<str>> for Substr {
-    fn from(string: Rc<str>) -> Self {
+impl From<Arc<str>> for Substr {
+    fn from(string: Arc<str>) -> Self {
         let len = string.len();
         Self {
             parent: string,

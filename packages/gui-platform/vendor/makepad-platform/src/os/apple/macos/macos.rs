@@ -246,9 +246,9 @@ impl Cx {
             MacosEvent::MouseMove(_) |
             MacosEvent::MouseUp(_) |
             MacosEvent::Scroll(_) |
-            MacosEvent::KeyDown(_) |
-            MacosEvent::KeyUp(_) |
-            MacosEvent::TextInput(_) => {
+            MacosEvent::KeyDown(_, _) |
+            MacosEvent::KeyUp(_, _) |
+            MacosEvent::TextInput(_, _) => {
                 self.os.keep_alive_counter = KEEP_ALIVE_COUNT;
             }
             MacosEvent::Timer(te) => {
@@ -284,7 +284,8 @@ impl Cx {
         }
         //self.process_desktop_pre_event(&mut event);
         match event {
-            MacosEvent::AppGotFocus => { // repaint all window passes. Metal sometimes doesnt flip buffers when hidden/no focus
+            MacosEvent::AppGotFocus(window_id) => { // repaint all window passes. Metal sometimes doesnt flip buffers when hidden/no focus
+                self.set_window_keyboard_focus(window_id, true);
                 for window in metal_windows.iter_mut() {
                     if let Some(main_pass_id) = self.windows[window.window_id].main_pass_id {
                         self.repaint_pass(main_pass_id);
@@ -292,7 +293,8 @@ impl Cx {
                 }
                 self.call_event_handler(&Event::AppGotFocus);
             }
-            MacosEvent::AppLostFocus => {
+            MacosEvent::AppLostFocus(window_id) => {
+                self.set_window_keyboard_focus(window_id, false);
                 self.call_event_handler(&Event::AppLostFocus);
             }
             MacosEvent::WindowResizeLoopStart(window_id) => {
@@ -385,8 +387,8 @@ impl Cx {
             MacosEvent::WindowCloseRequested(e) => {
                 self.call_event_handler(&Event::WindowCloseRequested(e))
             }
-            MacosEvent::TextInput(e) => {
-                self.call_event_handler(&Event::TextInput(e))
+            MacosEvent::TextInput(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextInput(e))
             }
             MacosEvent::Drag(e) => {
                 self.call_event_handler(&Event::Drag(e));
@@ -412,19 +414,17 @@ impl Cx {
                 self.call_event_handler(&Event::DragEnd);
                 self.drag_drop.cycle_drag();
             }
-            MacosEvent::KeyDown(e) => {
-                self.keyboard.process_key_down(e.clone());
-                self.call_event_handler(&Event::KeyDown(e))
+            MacosEvent::KeyDown(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::KeyDown(e))
             }
-            MacosEvent::KeyUp(e) => {
-                self.keyboard.process_key_up(e.clone());
-                self.call_event_handler(&Event::KeyUp(e))
+            MacosEvent::KeyUp(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::KeyUp(e))
             }
-            MacosEvent::TextCopy(e) => {
-                self.call_event_handler(&Event::TextCopy(e))
+            MacosEvent::TextCopy(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextCopy(e))
             }
-            MacosEvent::TextCut(e) => {
-                self.call_event_handler(&Event::TextCut(e))
+            MacosEvent::TextCut(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextCut(e))
             }
             MacosEvent::Timer(e) => {
                 self.call_event_handler(&Event::Timer(e));

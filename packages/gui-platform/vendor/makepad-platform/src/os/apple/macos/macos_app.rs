@@ -5,7 +5,7 @@ use {
         rc::Rc,
         cell::RefCell,
         time::Instant,
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         os::raw::c_void,
     },
     crate::{
@@ -43,6 +43,7 @@ use {
         },
         cursor::MouseCursor,
         macos_menu::MacosMenu,
+        window::WindowId,
     }
 };
 
@@ -128,6 +129,7 @@ pub struct MacosApp {
     pasteboard: ObjcId,
     startup_focus_hack_ran: bool,
     event_callback: Option<Box<dyn FnMut(MacosEvent) -> EventFlow >>,
+    pending_window_focus: VecDeque<(WindowId, bool)>,
     event_flow: EventFlow,
     
     pub cursors: HashMap<MouseCursor, ObjcId>,
@@ -159,6 +161,7 @@ impl MacosApp {
                 event_flow: EventFlow::Poll,
                 last_key_mod: KeyModifiers {..Default::default()},
                 event_callback: Some(event_callback),
+                pending_window_focus: VecDeque::new(),
                 cursors: HashMap::new(),
                 current_cursor: MouseCursor::Default,
                 //current_ns_event: None,
@@ -355,8 +358,36 @@ impl MacosApp {
         (time_now.duration_since(self.time_start)).as_secs_f64() 
     }
     
+    unsafe fn event_window_id(ns_event: ObjcId) -> Option<WindowId> {
+        let window: ObjcId = msg_send![ns_event, window];
+        if window == nil {
+            return None;
+        }
+        let delegate: ObjcId = msg_send![window, delegate];
+        if delegate == nil {
+            return None;
+        }
+        let is_macos_delegate: BOOL = msg_send![delegate, isKindOfClass: get_macos_class_global().window_delegate];
+        if is_macos_delegate != YES {
+            return None;
+        }
+        let ptr: *mut c_void = *(*delegate).get_ivar("macos_window_ptr");
+        if ptr.is_null() {
+            return None;
+        }
+        Some((*(ptr as *const MacosWindow)).window_id)
+    }
+
     unsafe fn process_ns_event(ns_event: ObjcId) {
         let ev_type: NSEventType = msg_send![ns_event, type];
+        // sendEvent can invoke responder/IME callbacks or change/close the key window.
+        // Preserve the event's own source, never a later key window or widget focus.
+        let window_id = match ev_type {
+            NSEventType::NSKeyDown | NSEventType::NSKeyUp | NSEventType::NSFlagsChanged => {
+                Self::event_window_id(ns_event)
+            }
+            _ => None,
+        };
         
         let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
         let () = msg_send![ns_app, sendEvent: ns_event];
@@ -369,13 +400,14 @@ impl MacosApp {
             NSEventType::NSApplicationDefined => { // event loop unblocker
             },
             NSEventType::NSKeyUp => {
+                let Some(window_id) = window_id else { return };
                 if let Some(key_code) = get_event_keycode(ns_event) {
                     let modifiers = get_event_key_modifier(ns_event);
                     //let key_char = get_event_char(ns_event);
                     let is_repeat: bool = msg_send![ns_event, isARepeat];
                     let time = with_macos_app(|app| app.time_now());
                     MacosApp::do_callback(
-                        MacosEvent::KeyUp(KeyEvent {
+                        MacosEvent::KeyUp(window_id, KeyEvent {
                             key_code: key_code,
                             //key_char: key_char,
                             is_repeat: is_repeat,
@@ -386,6 +418,7 @@ impl MacosApp {
                 }
             },
             NSEventType::NSKeyDown => {
+                let Some(window_id) = window_id else { return };
                 if let Some(key_code) = get_event_keycode(ns_event) {
                     let modifiers = get_event_key_modifier(ns_event);
                     //let key_char = get_event_char(ns_event);
@@ -402,7 +435,7 @@ impl MacosApp {
                             if nsstring != std::ptr::null_mut() {
                                 let string = nsstring_to_string(nsstring);
                                 MacosApp::do_callback(
-                                    MacosEvent::TextInput(TextInputEvent {
+                                    MacosEvent::TextInput(window_id, TextInputEvent {
                                         input: string,
                                         was_paste: true,
                                         replace_last: false
@@ -414,7 +447,7 @@ impl MacosApp {
                             let pasteboard: ObjcId = with_macos_app(|app| app.pasteboard);
                             let response = Rc::new(RefCell::new(None));
                             MacosApp::do_callback(
-                                MacosEvent::TextCopy(TextClipboardEvent {
+                                MacosEvent::TextCopy(window_id, TextClipboardEvent {
                                     response: response.clone()
                                 })
                             );
@@ -430,7 +463,7 @@ impl MacosApp {
                             let pasteboard: ObjcId = with_macos_app(|app| app.pasteboard);
                             let response = Rc::new(RefCell::new(None));
                             MacosApp::do_callback(
-                                MacosEvent::TextCut(TextClipboardEvent {
+                                MacosEvent::TextCut(window_id, TextClipboardEvent {
                                     response: response.clone()
                                 })
                             );
@@ -445,20 +478,8 @@ impl MacosApp {
                         _ => {}
                     }
                     let time = with_macos_app(|app: &mut MacosApp| app.time_now());
-                    // lets check if we have marked text
-                    if KeyCode::Backspace == key_code {
-                        // we have to check if we dont have any marked text in our windows
-                        with_macos_app(|app| {
-                            for (_,view) in &app.cocoa_windows {
-                                let marked = unsafe{msg_send![*view, hasMarkedText]};
-                                if marked{
-                                    return
-                                }
-                            }
-                        });
-                    }
                     MacosApp::do_callback(
-                        MacosEvent::KeyDown(KeyEvent {
+                        MacosEvent::KeyDown(window_id, KeyEvent {
                             key_code: key_code,
                             is_repeat: is_repeat,
                             modifiers: modifiers,
@@ -484,8 +505,9 @@ impl MacosApp {
                 let modifiers = get_event_key_modifier(ns_event);
                 let last_key_mod = with_macos_app(|app| app.last_key_mod.clone());
                 with_macos_app(|app| app.last_key_mod = modifiers.clone());
+                let Some(window_id) = window_id else { return };
                 let mut events = Vec::new();
-                fn add_event(time: f64, old: bool, new: bool, modifiers: KeyModifiers, events: &mut Vec<MacosEvent>, key_code: KeyCode) {
+                fn add_event(window_id: WindowId, time: f64, old: bool, new: bool, modifiers: KeyModifiers, events: &mut Vec<MacosEvent>, key_code: KeyCode) {
                     if old != new {
                         let event = KeyEvent {
                             key_code: key_code,
@@ -495,18 +517,18 @@ impl MacosApp {
                             time: time
                         };
                         if new {
-                            events.push(MacosEvent::KeyDown(event));
+                            events.push(MacosEvent::KeyDown(window_id, event));
                         }
                         else {
-                            events.push(MacosEvent::KeyUp(event));
+                            events.push(MacosEvent::KeyUp(window_id, event));
                         }
                     }
                 }
                 let time = with_macos_app(|app| app.time_now());
-                add_event(time, last_key_mod.shift, modifiers.shift, modifiers.clone(), &mut events, KeyCode::Shift);
-                add_event(time, last_key_mod.alt, modifiers.alt, modifiers.clone(), &mut events, KeyCode::Alt);
-                add_event(time, last_key_mod.logo, modifiers.logo, modifiers.clone(), &mut events, KeyCode::Logo);
-                add_event(time, last_key_mod.control, modifiers.control, modifiers.clone(), &mut events, KeyCode::Control);
+                add_event(window_id, time, last_key_mod.shift, modifiers.shift, modifiers.clone(), &mut events, KeyCode::Shift);
+                add_event(window_id, time, last_key_mod.alt, modifiers.alt, modifiers.clone(), &mut events, KeyCode::Alt);
+                add_event(window_id, time, last_key_mod.logo, modifiers.logo, modifiers.clone(), &mut events, KeyCode::Logo);
+                add_event(window_id, time, last_key_mod.control, modifiers.control, modifiers.clone(), &mut events, KeyCode::Control);
                 if events.len() >0 {
                     for event in events {
                         MacosApp::do_callback(event);
@@ -591,18 +613,40 @@ impl MacosApp {
         }
     }
     
-    pub fn do_callback(event: MacosEvent) {
+    pub fn do_callback(mut event: MacosEvent) {
         let cb = with_macos_app(|app| app.event_callback.take());
         if let Some(mut callback) = cb {
-            let event_flow = callback(event);
-            with_macos_app(|app| app.event_flow = event_flow);
-            if let EventFlow::Exit = event_flow {
-                unsafe {
-                    let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
-                    let () = msg_send![ns_app, terminate: nil];
+            loop {
+                let event_flow = callback(event);
+                with_macos_app(|app| app.event_flow = event_flow);
+                if let EventFlow::Exit = event_flow {
+                    unsafe {
+                        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+                        let () = msg_send![ns_app, terminate: nil];
+                    }
+                    break;
                 }
+                let Some((window_id, focused)) = with_macos_app(|app| app.pending_window_focus.pop_front()) else {
+                    break;
+                };
+                event = if focused {
+                    MacosEvent::AppGotFocus(window_id)
+                } else {
+                    MacosEvent::AppLostFocus(window_id)
+                };
             }
             with_macos_app(|app| app.event_callback = Some(callback));
+        } else {
+            // Native activation can synchronously change focus during a Cx callback.
+            // Defer only focus; query and clipboard callbacks must stay synchronous.
+            let focus = match event {
+                MacosEvent::AppGotFocus(window_id) => Some((window_id, true)),
+                MacosEvent::AppLostFocus(window_id) => Some((window_id, false)),
+                _ => None,
+            };
+            if let Some(focus) = focus {
+                with_macos_app(|app| app.pending_window_focus.push_back(focus));
+            }
         }
     }
     /*

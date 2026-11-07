@@ -1,5 +1,6 @@
 use {
     crate::{
+        window::WindowId,
         event::{
             MouseDownEvent,
             MouseUpEvent,
@@ -21,8 +22,8 @@ use {
 
 #[derive(Debug)]
 pub enum XlibEvent {
-    AppGotFocus,
-    AppLostFocus,
+    AppGotFocus(WindowId),
+    AppLostFocus(WindowId),
     WindowGeomChange(WindowGeomChangeEvent),
     WindowClosed(WindowClosedEvent),
     Paint,
@@ -34,13 +35,13 @@ pub enum XlibEvent {
     
     WindowDragQuery(WindowDragQueryEvent),
     WindowCloseRequested(WindowCloseRequestedEvent),
-    TextInput(TextInputEvent),
+    TextInput(WindowId, TextInputEvent),
     Drag(DragEvent),
     Drop(DropEvent),
     DragEnd,
-    KeyDown(KeyEvent),
-    KeyUp(KeyEvent),
-    TextCopy(TextClipboardEvent),
-    TextCut(TextClipboardEvent),
+    KeyDown(WindowId, KeyEvent),
+    KeyUp(WindowId, KeyEvent),
+    TextCopy(WindowId, TextClipboardEvent),
+    TextCut(WindowId, TextClipboardEvent),
     Timer(TimerEvent),
 }

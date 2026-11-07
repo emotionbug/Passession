@@ -45,6 +45,11 @@ impl Look {
 /// Per-row UI state keyed by the row's stable identity.
 #[derive(Default)]
 pub struct RowState {
+    /// Measured timeline rows publish prepared snapshots only during measurement.
+    pub managed_preparation: bool,
+    pub preparing: bool,
+    pub markdown_worker: super::markdown::worker::MarkdownWorker,
+    pub markdown_presentation: super::markdown::view::MarkdownPresentation,
     /// Expanded badges / cards by key (tool, thinking, plan, group…).
     pub expanded: HashMap<String, bool>,
     /// Horizontal / vertical scroll offsets of code panes and capped details.
@@ -55,8 +60,9 @@ pub struct RowState {
     pub extent_y: HashMap<String, f64>,
     /// Copy glyph shows a check for 1.5s (`TurnCopyButton`).
     pub copied: HashMap<String, f64>,
+    pub response_copy: super::layout::ResponseCopyCache,
     pub hovered: bool,
-    pub hover_link: Option<String>,
+    pub hover_link: Option<std::sync::Arc<str>>,
     pub hover_hit: Option<String>,
     /// Paced reveal of streaming text by key.
     pub reveals: HashMap<String, Reveal>,

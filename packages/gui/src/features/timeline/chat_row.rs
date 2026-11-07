@@ -98,6 +98,8 @@ pub struct ChatRow {
     #[rust]
     last_width: f64,
     #[rust]
+    prepared_time: Option<f64>,
+    #[rust]
     show_actions: bool,
     #[rust]
     selection_source: Option<u64>,
@@ -121,6 +123,41 @@ pub fn hover_key(target: &HitTarget) -> String {
 }
 
 impl ChatRow {
+    /// Prepare the snapshot used by both passes and obtain its exact height.
+    /// No draw list, hit area, selection run or glyph batch is replaced here.
+    pub fn measure(&mut self, cx: &mut Cx2d, width: f64) -> f64 {
+        let Some(model) = self.model.clone() else { return 0.0 };
+        if width.is_finite() && width > 0.0 {
+            self.last_width = width;
+        }
+        let width = self.last_width.max(1.0);
+        let now = now_seconds();
+        self.prepared_time = Some(now);
+        let (kit_dry, canvas_dry) = (self.kit.dry, self.canvas.dry);
+        self.kit.dry = true;
+        self.canvas.dry = true;
+        let mut state = model.state.borrow_mut();
+        state.managed_preparation = true;
+        state.preparing = true;
+        let height = {
+            let mut d = Draw {
+                kit: &mut self.kit,
+                canvas: &mut self.canvas,
+                look: model.ctx.look,
+                state: &mut state,
+                now,
+                area: self.area,
+                animating: false,
+            };
+            draw_row(cx, &mut d, &model.ctx, &model.item, 0.0, 0.0, width).0
+        };
+        state.height = height;
+        state.preparing = false;
+        self.kit.dry = kit_dry;
+        self.canvas.dry = canvas_dry;
+        height
+    }
+
     pub fn set_model(&mut self, cx: &mut Cx, model: RowModel) {
         if self.model.as_ref().is_none_or(|old| old.panel != model.panel || old.item.id != model.item.id) {
             self.clear_selection(cx);
@@ -456,7 +493,7 @@ impl Widget for ChatRow {
                 self.touch_selection = false;
                 if let Some(offset) = self.canvas.offset_at(rel) {
                     let selection = if e.tap_count >= 3 {
-                        Some((0, self.canvas.plain.len()))
+                        Some((0, self.canvas.source_len()))
                     } else if e.tap_count == 2 {
                         Some(self.canvas.word_at(offset))
                     } else {
@@ -534,7 +571,7 @@ impl Widget for ChatRow {
                 }
             }
             Hit::KeyDown(ke) if ke.key_code == KeyCode::KeyA && (ke.modifiers.control || ke.modifiers.logo) => {
-                self.set_selection(cx, Some((0, self.canvas.plain.len())));
+                self.set_selection(cx, Some((0, self.canvas.source_len())));
             }
             Hit::KeyFocusLost(_) => self.clear_selection(cx),
             _ => {}
@@ -556,6 +593,7 @@ impl Widget for ChatRow {
         let selection = model.state.borrow().selection;
         self.canvas.begin(origin);
         self.canvas.selection = selection;
+        let now = self.prepared_time.take().unwrap_or_else(now_seconds);
         let (height, field, animating) = {
             let mut state = model.state.borrow_mut();
             state.find_y = None;
@@ -564,7 +602,7 @@ impl Widget for ChatRow {
                 canvas: &mut self.canvas,
                 look: model.ctx.look,
                 state: &mut state,
-                now: now_seconds(),
+                now,
                 area: self.area,
                 animating: false,
             };
@@ -639,6 +677,19 @@ impl ChatRowRef {
     pub fn set_model(&self, cx: &mut Cx, model: RowModel) {
         if let Some(mut row) = self.borrow_mut() {
             row.set_model(cx, model);
+        }
+    }
+
+    pub fn measure(&self, cx: &mut Cx2d, width: f64) -> f64 {
+        self.borrow_mut().map_or(0.0, |mut row| row.measure(cx, width))
+    }
+
+    /// Paint only after PortalList resolves this frame's exact row positions.
+    pub fn paint_final(&self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk, viewport: Rect) {
+        if let Some(mut row) = self.borrow_mut() {
+            row.kit.viewport = Some(viewport);
+            row.canvas.viewport = Some(viewport);
+            let _ = row.draw_walk(cx, scope, walk);
         }
     }
 

@@ -4,6 +4,7 @@ use {
         makepad_live_id::*,
         makepad_math::*,
         id_pool::*,
+        area::Area,
         event::{
             WindowGeom
         },
@@ -69,6 +70,26 @@ impl CxWindowPool {
         }
         false
     }
+
+    pub fn is_created(&self, id: WindowId) -> bool {
+        self.is_valid(id) && self[id].is_created
+    }
+
+    /// Legacy source-less transports may address only an unambiguous live window.
+    pub fn single_created_window(&self) -> Option<WindowId> {
+        let mut created = self.0.pool.iter().enumerate()
+            .filter(|(_, entry)| entry.item.is_created);
+        let (index, entry) = created.next()?;
+        if created.next().is_some() { return None; }
+        Some(WindowId(index, entry.generation))
+    }
+
+    pub(crate) fn update_keyboard_focus_area(&mut self, old: Area, new: Area) {
+        for entry in &mut self.0.pool {
+            if entry.item.keyboard_focus == old { entry.item.keyboard_focus = new; }
+            if entry.item.keyboard_previous_focus == old { entry.item.keyboard_previous_focus = new; }
+        }
+    }
     
     pub fn id_zero()->WindowId{
         WindowId(0, 0)
@@ -107,6 +128,8 @@ impl LiveNew for WindowHandle {
         let window = cx.windows.alloc();
         let cxwindow = &mut cx.windows[window.window_id()];
         cxwindow.is_created = false;
+        cxwindow.keyboard_focus = Area::Empty;
+        cxwindow.keyboard_previous_focus = Area::Empty;
         cxwindow.create_title = "Makepad".to_string();
         cxwindow.create_inner_size = None;
         cxwindow.create_position = None;
@@ -258,6 +281,8 @@ pub struct CxWindow {
     pub is_created: bool,
     pub window_geom: WindowGeom,
     pub main_pass_id: Option<PassId>,
+    pub(crate) keyboard_focus: Area,
+    pub(crate) keyboard_previous_focus: Area,
 }
 
 impl CxWindow {

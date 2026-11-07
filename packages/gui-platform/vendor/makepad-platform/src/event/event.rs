@@ -228,6 +228,13 @@ pub enum Event {
 }
 
 impl Event{
+    /// Window-owned input. Focus transitions and derived actions remain broadcasts.
+    /// Source identity lives in the Cx dispatch scope, not the serialized payload.
+    pub fn is_keyboard_input(&self) -> bool {
+        matches!(self, Self::KeyDown(_) | Self::KeyUp(_) | Self::TextInput(_)
+            | Self::TextIme(_) | Self::TextCopy(_) | Self::TextCut(_) | Self::TextSelectAll)
+    }
+
     pub fn name(&self)->&'static str{
         Self::name_from_u32(self.to_u32())
     }

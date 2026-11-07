@@ -514,11 +514,11 @@ impl XlibWindow {
     }
     
     pub fn send_focus_event(&mut self) {
-        self.do_callback(XlibEvent::AppGotFocus);
+        self.do_callback(XlibEvent::AppGotFocus(self.window_id));
     }
     
     pub fn send_focus_lost_event(&mut self) {
-        self.do_callback(XlibEvent::AppLostFocus);
+        self.do_callback(XlibEvent::AppLostFocus(self.window_id));
     }
     
     pub fn send_mouse_down(&mut self, button: MouseButton, modifiers: KeyModifiers) {
@@ -567,7 +567,7 @@ impl XlibWindow {
     }
     
     pub fn send_text_input(&mut self, input: String, replace_last: bool) {
-        self.do_callback(XlibEvent::TextInput(TextInputEvent {
+        self.do_callback(XlibEvent::TextInput(self.window_id, TextInputEvent {
             input,
             was_paste: false,
             replace_last,

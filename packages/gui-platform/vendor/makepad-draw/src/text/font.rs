@@ -1,7 +1,7 @@
 use {
     super::{
         font_face::FontFace,
-        geom::{Point, Rect},
+        geom::{Point, Rect, Size},
         glyph_outline,
         glyph_outline::GlyphOutline,
         glyph_raster_image::GlyphRasterImage,
@@ -41,6 +41,7 @@ pub struct Font {
     ascender_fudge_in_ems: f32,
     descender_fudge_in_ems: f32,
     cached_glyph_outline_bounds_in_ems: RefCell<HashMap<GlyphId, Option<Rect<f32>>>>,
+    cached_paint_bounds_in_ems: RefCell<HashMap<GlyphId, Rect<f32>>>,
 }
 
 impl Font {
@@ -58,6 +59,7 @@ impl Font {
             ascender_fudge_in_ems,
             descender_fudge_in_ems,
             cached_glyph_outline_bounds_in_ems: RefCell::new(HashMap::new()),
+            cached_paint_bounds_in_ems: RefCell::new(HashMap::new()),
         }
     }
 
@@ -88,6 +90,55 @@ impl Font {
 
     pub fn line_gap_in_ems(&self) -> f32 {
         self.ttf_parser_face().line_gap() as f32 / self.units_per_em()
+    }
+
+    /// Conservative bounds for every raster size used by Rasterizer. Cached per
+    /// glyph; background layout transfers the resulting rectangle, not this cache.
+    pub(super) fn paint_bounds_in_ems(&self, glyph_id: GlyphId) -> Rect<f32> {
+        if let Some(bounds) = self.cached_paint_bounds_in_ems.borrow().get(&glyph_id) {
+            return *bounds;
+        }
+        let face = self.ttf_parser_face();
+        let bbox = face.global_bounding_box();
+        // Outline rasterization selects 64 or 128 dpx/em. Include padding and
+        // the ceil-to-pixel extent, using the larger (64 dpx/em) fringe.
+        let fringe = (self.rasterizer.borrow().sdfer().settings().padding as f32 + 1.0) / 64.0;
+        let units = self.units_per_em();
+        let mut left = bbox.x_min as f32 / units - fringe;
+        let mut right = bbox.x_max as f32 / units + fringe;
+        let mut top = -bbox.y_max as f32 / units - fringe;
+        let mut bottom = -bbox.y_min as f32 / units + fringe;
+        let mut include = |image: ttf_parser::RasterGlyphImage<'_>| {
+            if image.pixels_per_em == 0 {
+                left = f32::NEG_INFINITY;
+                top = f32::NEG_INFINITY;
+                right = f32::INFINITY;
+                bottom = f32::INFINITY;
+                return;
+            }
+            let em = image.pixels_per_em as f32;
+            // Color rasterizer uses two pixels of atlas padding.
+            left = left.min((image.x as f32 - 2.0) / em);
+            right = right.max((image.x as f32 + image.width as f32 + 2.0) / em);
+            top = top.min((-image.y as f32 - image.height as f32 - 2.0) / em);
+            bottom = bottom.max((-image.y as f32 + 2.0) / em);
+        };
+        let id = ttf_parser::GlyphId(glyph_id);
+        if let Some(table) = face.tables().sbix {
+            for strike in table.strikes {
+                if let Some(image) = strike.get(id) { include(image); }
+            }
+        }
+        if face.tables().cbdt.is_some() || face.tables().ebdt.is_some() || face.tables().bdat.is_some() {
+            // These tables encode ppem as u8. Enumerating the finite selection
+            // domain includes intermediate strikes, not just the two endpoints.
+            for ppem in 0..=255 {
+                if let Some(image) = face.glyph_raster_image(id, ppem) { include(image); }
+            }
+        }
+        let bounds = Rect::new(Point::new(left, top), Size::new(right - left, bottom - top));
+        self.cached_paint_bounds_in_ems.borrow_mut().insert(glyph_id, bounds);
+        bounds
     }
 
     pub fn glyph_outline(&self, glyph_id: GlyphId) -> Option<GlyphOutline> {

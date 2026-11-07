@@ -1,11 +1,12 @@
 //! Native Markdown for chat and plan cards: HTML normalization, the block
-//! model and the painter. Parses are cached in the row state; a streaming
-//! message reuses its stable head (StreamingMarkdown) so only the last block
-//! is parsed again for each revealed slice.
+//! model and the painter. Assistant rows capture immutable source revisions
+//! cooperatively and parse/flatten whole documents on their worker. Legacy
+//! callers retain their synchronous content-keyed block cache.
 
 pub mod html;
 pub mod model;
 pub mod view;
+pub mod worker;
 
 use super::paint::Draw;
 use makepad_widgets::*;
@@ -58,8 +59,8 @@ fn draw_parsed(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, blocks: &Rc<Vec<B
     height
 }
 
-/// Draws Markdown `text`; returns its height. `streaming` keeps the stable
-/// head parsed once while the tail grows.
+/// Synchronous Markdown entry point for non-assistant surfaces; returns height.
+/// `streaming` reuses a stable head. Assistant rows use `view::draw_worker`.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, text: &str, x: f64, y: f64, w: f64, linkify: bool, streaming: bool) -> f64 {
     let color = d.look.palette.foreground;

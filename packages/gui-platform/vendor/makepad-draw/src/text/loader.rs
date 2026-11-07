@@ -9,7 +9,7 @@ use {
         shaper,
         shaper::Shaper,
     },
-    std::{cell::RefCell, collections::HashMap, rc::Rc},
+    std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc},
 };
 
 #[derive(Clone, Debug)]
@@ -137,7 +137,7 @@ pub struct FontFamilyDefinition {
 
 #[derive(Clone, Debug)]
 pub struct FontDefinition {
-    pub data: Rc<Vec<u8>>,
+    pub data: Arc<Vec<u8>>,
     pub index: u32,
     pub ascender_fudge_in_ems: f32,
     pub descender_fudge_in_ems: f32,

@@ -35,6 +35,27 @@ Paseo's own audio output on Android uses `android.media.AudioTrack` through
 `paseo-gui-platform` on every Android version, so app audio does not depend on
 AAudio being present. MIDI is unused by Paseo.
 
+## Window-scoped desktop input
+
+Desktop backends preserve the originating `WindowId` through
+`Cx::call_window_event_handler`; a scoped native key, text or clipboard event
+cannot become a broadcast to every retained window. OS keyboard focus is tracked
+independently of the last pointer position or editable field. Window generations
+remain part of identity so a delayed event cannot target a replacement window.
+
+Each `CxWindow` retains its editable/previous focus references across native
+focus changes. Area remapping updates inactive windows too; editor closure,
+window closure and slot reuse retire the corresponding references. Area-level
+keyboard hit testing checks the same source scope, so an old global text focus
+cannot consume another window's native input.
+
+`KeyEvent`, `TextInputEvent` and the existing headless input payloads retain their
+serialized shapes. An unscoped headless keyboard event is admitted only when its
+live destination is unambiguous; multi-window synthetic callers use the explicit
+scoped entry point. Lifecycle and non-input notifications remain broadcasts.
+The adjacent widgets patch applies this scope before navigation and overlays,
+not merely before the window's content view.
+
 ## Android composing input
 
 `event/keyboard.rs`, `event/event.rs`, `event/finger.rs`, `cx_api.rs`, and

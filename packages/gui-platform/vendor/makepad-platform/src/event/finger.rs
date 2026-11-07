@@ -867,6 +867,9 @@ impl Event {
         if !area.is_valid(cx) {
             return Hit::Nothing
         }
+        if self.is_keyboard_input() && !cx.keyboard_event_is_for_area(self, area) {
+            return Hit::Nothing;
+        }
         match self {
             Event::KeyFocus(kf) => {
                 if area == kf.focus {

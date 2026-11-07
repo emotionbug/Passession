@@ -1,5 +1,6 @@
 use {
     super::{
+        async_layout::{FontCatalog, Service},
         font::FontId,
         font_family::FontFamilyId,
         layouter::{self, LaidoutText, LayoutParams, Layouter},
@@ -7,12 +8,15 @@ use {
         rasterizer::Rasterizer,
     },
     makepad_platform::*,
-    std::{cell::RefCell, mem, rc::Rc},
+    std::{cell::RefCell, mem, rc::Rc, sync::Arc},
 };
 
 #[derive(Debug)]
 pub struct Fonts {
     layouter: Layouter,
+    pub(super) catalog: Arc<FontCatalog>,
+    pub(super) async_service: Option<Arc<Service>>,
+    pub(super) settings: layouter::Settings,
     needs_prepare_atlases: bool,
     grayscale_textures: Vec<Option<Texture>>,
     color_textures: Vec<Option<Texture>>,
@@ -20,6 +24,7 @@ pub struct Fonts {
 
 impl Fonts {
     pub fn new(cx: &mut Cx, settings: layouter::Settings) -> Self {
+        super::async_layout::enable_deferred_layout_drop();
         let layouter = Layouter::new(settings);
         let rasterizer = layouter.rasterizer().borrow();
         let grayscale_atlas_size = rasterizer.grayscale_atlas().size();
@@ -27,6 +32,9 @@ impl Fonts {
         drop(rasterizer);
         Self {
             layouter,
+            catalog: Arc::new(FontCatalog::default()),
+            async_service: None,
+            settings,
             needs_prepare_atlases: false,
             grayscale_textures: vec![Some(Texture::new_with_format(
                 cx,
@@ -86,15 +94,25 @@ impl Fonts {
     }
 
     pub fn define_font_family(&mut self, id: FontFamilyId, definition: FontFamilyDefinition) {
+        let catalog = Arc::make_mut(&mut self.catalog);
+        catalog.revision += 1;
+        catalog.families.insert(id, definition.clone());
         self.layouter.define_font_family(id, definition);
     }
 
     pub fn define_font(&mut self, id: FontId, definition: FontDefinition) {
+        let catalog = Arc::make_mut(&mut self.catalog);
+        catalog.revision += 1;
+        catalog.fonts.insert(id, definition.clone());
         self.layouter.define_font(id, definition);
     }
 
     pub fn get_or_layout(&mut self, params: impl LayoutParams) -> Rc<LaidoutText> {
         self.layouter.get_or_layout(params)
+    }
+
+    pub(super) fn load_font(&mut self, id: FontId) -> Rc<super::font::Font> {
+        self.layouter.load_font(id)
     }
 
     pub fn prepare_textures(&mut self, cx: &mut Cx) {

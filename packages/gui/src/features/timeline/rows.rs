@@ -1,6 +1,6 @@
 //! Stream row painters (timeline_item.dart TimelineItem + agent_panel.dart
-//! turn footers): user bubbles, assistant Markdown (paced while live, 32k
-//! desktop cap), Thinking and tool badges with inline details, overview tool
+//! turn footers): user bubbles, assistant Markdown (paced whole-source worker
+//! snapshots), Thinking and tool badges with inline details, overview tool
 //! groups, speak messages, plan cards, task activity badges, compaction
 //! markers, notifications/errors, unknown items as structured details, the
 //! history-start slot, turn footers and permission cards.
@@ -10,19 +10,18 @@ use super::details::draw_details;
 use super::format;
 use super::i18n::{t, ta};
 use super::json::*;
-use super::layout::{StreamRow, TurnTiming, collect_assistant_response_content, parse_time};
+use super::layout::{StreamRow, TurnTiming, parse_time};
 use super::markdown::{self, FindMark, MdOpts};
 use super::paint::{Draw, Look};
 use super::permission::{self, AnswerField};
 use super::tools::{self, ToolGlyph, build_tool_call_presentation, detail_blocks, detail_is_full_bleed};
+use crate::common::widgets::{InlineMetrics, RowMetrics};
 use makepad_widgets::*;
 use paseo_gui_core::CoreHandle;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-/// assistant-message-render-limit.web.ts: desktop caps at 32,000 chars.
-pub const ASSISTANT_RENDER_LIMIT: usize = 32_000;
 pub const STREAM_METADATA_SIZE: f64 = 13.0;
 
 /// Chat find's current match inside one row.
@@ -186,34 +185,14 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
         }
         "assistant_message" => {
             let (cx0, cw) = content_box(&look, x, w, false);
-            let full = str_of(get(item, "text"));
-            let expanded_by_find = find.is_some();
-            let capped = if look.mobile || expanded_by_find || full.len() <= ASSISTANT_RENDER_LIMIT {
-                full
-            } else {
-                let mut end = ASSISTANT_RENDER_LIMIT;
-                while !full.is_char_boundary(end) {
-                    end -= 1;
-                }
-                &full[..end]
-            };
-            // RevealedText: growth while live is paced.
-            let reveal = d.state.reveals.entry("assistant".to_owned()).or_insert_with(|| super::reveal::Reveal::new(capped));
-            let pacing = reveal.sync(capped, live, true);
-            if pacing {
-                reveal.arm(d.now);
-                reveal.step(d.now);
-                d.animating = true;
+            // Preparation alone advances capture and publication. The final
+            // paint pass uses the same complete source/layout snapshot.
+            if !d.state.managed_preparation || d.state.preparing {
+                d.animating |= d.state.markdown_worker.update((id, &ctx.host_id, &ctx.agent_id), row.entry.clone(), live, ctx.cwd.as_deref(), true, d.now, find.as_ref().map(|mark| &mark.pattern));
             }
-            let visible = reveal.visible(capped, live);
             let top = 12.0;
             let mut opts = md_opts(ctx, id, find.as_mut());
-            let mut h = markdown::draw(cx, d, &mut opts, visible, cx0, y + top, cw, true, live);
-            if capped.len() < full.len() && !live {
-                let notice = ta("agentStream.messageCapped", &[("bytes", &full.len().to_string())]);
-                h += 12.0;
-                h += d.kit.label(cx, Font::Italic, look.ui(14.0), 1.3, look.palette.muted, dvec2(cx0, y + top + h), &notice, Some(cw)).y;
-            }
+            let h = markdown::view::draw_worker(cx, d, &mut opts, cx0, y + top, cw);
             top + h + if footer_below { 0.0 } else { 12.0 } + gap_below
         }
         "reasoning" => {
@@ -347,6 +326,7 @@ fn user_message(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, entry: 
     let height = if look.mobile { 1.3 } else { (size * 1.4).round() / size };
     let max_inner = (w - 32.0).max(1.0);
     let laid = has_text.then(|| d.kit.layout(cx, Font::Regular, size, height, text, Some(max_inner), 0.0));
+    let copy_text = laid.as_ref().map(|layout| layout.text.clone());
     // Attachment pills.
     let pills: Vec<(String, Option<String>)> = attachments
         .iter()
@@ -473,7 +453,9 @@ fn user_message(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, entry: 
             let copy = rect_xywh(rx, ry + 1.0, 22.0, 22.0);
             let hovered = d.state.hover_hit.as_deref() == Some(copy_key.as_str());
             d.kit.icon(cx, if copied { "check" } else { "copy" }, copy, 14.0, if hovered { p.foreground } else { p.muted });
-            d.canvas.add_hit(copy, HitTarget::Copy { key: copy_key, text: text.to_owned() });
+            if let Some(text) = copy_text {
+                d.canvas.add_hit(copy, HitTarget::Copy { key: copy_key, text });
+            }
             let modes = rewind_modes(&ctx.capabilities);
             if !ctx.is_subagent && !get(item, "messageId").is_null() && !modes.is_empty() {
                 rx -= 8.0 + 24.0;
@@ -735,8 +717,22 @@ pub fn draw_badge(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, badge: &Badge, 
     let base = look.ui(14.0);
     let label_color = if badge.loading { with_alpha(p.foreground, 0.72) } else if active { p.foreground } else { p.muted };
     let secondary_color = if active { p.foreground } else { p.muted };
-    let label_size = d.kit.measure(cx, Font::Regular, base, 1.3, &badge.label, None);
-    let header_h = label_size.y.max(22.0) + 8.0;
+    let lx = x + 8.0 + 26.0;
+    let avail = (w - 8.0 - 26.0 - 8.0 - if badge.open_file.is_some() && hovered { 26.0 } else { 0.0 }).max(1.0);
+    let label = d.kit.layout_clamped(cx, Font::Regular, base, 1.3, &badge.label, avail, 1);
+    let label_size = laidout_size(&label);
+    let secondary_x = lx + label_size.x.min(avail) + 8.0;
+    let secondary_w = (lx + avail - secondary_x).max(0.0);
+    let secondary_text = badge.secondary.as_ref().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "));
+    let secondary = secondary_text.as_ref().filter(|text| !text.is_empty() && secondary_w > 0.0)
+        .map(|text| d.kit.layout_clamped(cx, Font::Regular, base, 1.3, text, secondary_w, 1));
+    let label_metrics = InlineMetrics::from_layout(&label);
+    let secondary_metrics = secondary.as_ref().map_or(InlineMetrics::default(), |layout| InlineMetrics::from_layout(layout));
+    let metrics = label_metrics.union(secondary_metrics);
+    let header_h = RowMetrics::new(metrics.height(), 0.0, 0.0).height(30.0, 4.0, 22.0);
+    let header = rect_xywh(x, y, w, header_h);
+    let label_pos = dvec2(lx, metrics.top(header, label_metrics));
+    let secondary_pos = dvec2(secondary_x, metrics.top(header, secondary_metrics));
     let attached = expanded && !badge.borderless;
 
     let body_h = if expanded {
@@ -761,23 +757,15 @@ pub fn draw_badge(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, badge: &Badge, 
     } else {
         draw_glyph(cx, d, badge.glyph, Rect { pos: rail.pos - dvec2(0.5, 0.0), ..rail }, 12.0, if active { p.foreground } else { p.muted });
     }
-    // Labels.
-    let lx = x + 8.0 + 26.0;
-    let avail = (w - 8.0 - 26.0 - 8.0 - if badge.open_file.is_some() && hovered { 26.0 } else { 0.0 }).max(1.0);
-    let ly = y + (header_h - label_size.y) * 0.5;
-    let label_w = label_size.x.min(avail);
+    // Adjacent labels share a baseline; fallback-font ascent/descent contributes
+    // to the row height, hit box and attached detail offset.
     let clip = rect_xywh(lx, y, avail, header_h);
     cx.begin_turtle(Walk { abs_pos: Some(clip.pos), margin: Margin::default(), width: Size::Fixed(clip.size.x), height: Size::Fixed(clip.size.y) }, Layout::default());
-    // ToolBadge label row: both labels `maxLines: 1, overflow: ellipsis`;
-    // the label keeps its width (flex 0), the secondary takes the rest.
-    let drawn = d.kit.label_line(cx, Font::Regular, base, 1.3, label_color, dvec2(lx, ly), &badge.label, avail);
-    let mut end_x = lx + drawn.x.min(label_w);
-    let secondary_text = badge.secondary.as_ref().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "));
-    let secondary_w = (lx + avail - end_x - 8.0).max(1.0);
-    if let Some(collapsed) = &secondary_text {
-        let sx = end_x + 8.0;
-        let s = d.kit.label_line(cx, Font::Regular, base, 1.3, secondary_color, dvec2(sx, ly), collapsed, secondary_w);
-        end_x = (sx + s.x).min(lx + avail);
+    d.kit.draw_laidout(cx, Font::Regular, label_color, label_pos, &label);
+    let mut end_x = lx + label_size.x.min(avail);
+    if let Some(secondary) = &secondary {
+        d.kit.draw_laidout(cx, Font::Regular, secondary_color, secondary_pos, secondary);
+        end_x = (secondary_x + laidout_size(secondary).x).min(lx + avail);
     }
     if badge.loading {
         // Shimmer: a bright peak sweeping across the labels.
@@ -793,9 +781,9 @@ pub fn draw_badge(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, badge: &Badge, 
         if sweep.size.x > 0.0 {
             cx.begin_turtle(Walk { abs_pos: Some(sweep.pos), margin: Margin::default(), width: Size::Fixed(sweep.size.x), height: Size::Fixed(sweep.size.y) }, Layout::default());
             let white = vec4(1.0, 1.0, 1.0, if look.dark() { 0.9 } else { 0.55 });
-            let drawn = d.kit.label_line(cx, Font::Regular, base, 1.3, white, dvec2(lx, ly), &badge.label, avail);
-            if let Some(collapsed) = &secondary_text {
-                d.kit.label_line(cx, Font::Regular, base, 1.3, white, dvec2(lx + drawn.x + 8.0, ly), collapsed, secondary_w);
+            d.kit.draw_laidout(cx, Font::Regular, white, label_pos, &label);
+            if let Some(secondary) = &secondary {
+                d.kit.draw_laidout(cx, Font::Regular, white, secondary_pos, secondary);
             }
             cx.end_turtle();
         }
@@ -932,7 +920,7 @@ fn working_dots(cx: &mut Cx2d, d: &mut Draw, x: f64, y: f64, color: Vec4) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn footer(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, rows: &[StreamRow], host: Option<usize>, timing: Option<TurnTiming>, x: f64, y: f64, w: f64) -> f64 {
+fn footer(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, rows: &Rc<Vec<StreamRow>>, host: Option<usize>, timing: Option<TurnTiming>, x: f64, y: f64, w: f64) -> f64 {
     let look = ctx.look;
     let p = look.palette;
     let outer = (w - 2.0 * look.list_inset).min(look.typo.content_max_width);
@@ -980,7 +968,10 @@ fn footer(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, rows: &[Strea
             let r = rect_xywh(cursor - 4.0, top + 1.0, 22.0, 22.0);
             let hovered = d.state.hover_hit.as_deref() == Some(copy_key.as_str());
             d.kit.icon(cx, if copied { "check" } else { "copy" }, r, 14.0, if hovered { p.foreground } else { p.muted });
-            d.canvas.add_hit(r, HitTarget::Copy { key: copy_key, text: collect_assistant_response_content(rows, host) });
+            if !d.dry() {
+                let text = d.state.response_copy.text(rows, host);
+                d.canvas.add_hit(r, HitTarget::Copy { key: copy_key, text });
+            }
             cursor += 18.0 + 8.0;
             let entry = &rows[host].entry;
             let can_fork = !ctx.is_subagent

@@ -19,6 +19,8 @@ use makepad_widgets::makepad_draw::text::selection::{Cursor, Selection};
 use makepad_widgets::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
+use makepad_widgets::makepad_draw::text::AsyncLayout;
 
 live_design! {
     use link::theme::*;
@@ -148,6 +150,9 @@ pub struct ChatKit {
     /// Measuring pass: layout runs, nothing is drawn or registered.
     #[rust]
     pub dry: bool,
+    /// Only set by final-position painting, never preliminary PortalList layout.
+    #[rust]
+    pub viewport: Option<Rect>,
 }
 
 pub fn rgba(hex: u32) -> Vec4 {
@@ -232,6 +237,33 @@ impl ChatKit {
         })
     }
 
+    pub fn rich_span(&mut self, span: RichSpan) -> Span {
+        Span {
+            style: Style {
+                font_family_id: family_id(self.text(span.font)),
+                font_size_in_pts: (span.size_px * 0.75) as f32,
+                color: Some(text_color(span.color)),
+            },
+            len: span.len,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_rich_layout(&mut self, cx: &mut Cx, request: &mut AsyncLayout, revision: u64, text: Arc<str>, spans: Arc<Vec<Span>>, base: Font, max_width: Option<f64>, height: f64) {
+        CxDraw::lazy_construct_fonts(cx);
+        let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
+        let mut fonts = fonts.borrow_mut();
+        request.request(&mut fonts, revision, text, spans, LayoutOptions {
+            first_row_indent_in_lpxs: 0.0,
+            first_row_min_line_spacing_below_in_lpxs: 0.0,
+            max_width_in_lpxs: max_width.map(|w| w.max(1.0) as f32),
+            wrap: max_width.is_some(),
+            align: 0.0,
+            line_spacing_scale: (height / natural_line(base)).max(0.5) as f32,
+        });
+        request.poll(&mut fonts, 4096, 128);
+    }
+
     /// Isolate every primitive from earlier batches, then reserve the
     /// background before text. A new rect call alone is not a layer barrier.
     pub fn begin_layer(&mut self, cx: &mut Cx2d) {
@@ -260,13 +292,18 @@ impl ChatKit {
             return;
         }
         let size = laidout_size(laidout);
+        let viewport = self.viewport;
         let dt = self.text(font);
         dt.color = color;
-        dt.draw_walk_laidout(
-            cx,
-            Walk { abs_pos: Some(pos), margin: Margin::default(), width: Size::Fixed(size.x.max(1.0)), height: Size::Fixed(size.y.max(1.0)) },
-            laidout,
-        );
+        if let Some(viewport) = viewport {
+            dt.draw_abs_laidout_viewport(cx, pos, laidout, viewport);
+        } else {
+            dt.draw_walk_laidout(
+                cx,
+                Walk { abs_pos: Some(pos), margin: Margin::default(), width: Size::Fixed(size.x.max(1.0)), height: Size::Fixed(size.y.max(1.0)) },
+                laidout,
+            );
+        }
     }
 
     /// Draws a rich layout; glyph colors come from its spans.
@@ -441,12 +478,28 @@ pub fn range_rects(laidout: &LaidoutText, start: usize, end: usize) -> Vec<Rect>
         .collect()
 }
 
+/// Paint-only range geometry. Source offsets and hit-testing keep the full layout.
+pub fn range_rects_visible(laidout: &LaidoutText, start: usize, end: usize, pos: DVec2, viewport: Option<Rect>) -> Vec<Rect> {
+    let Some(viewport) = viewport else { return range_rects(laidout, start, end) };
+    if end <= start {
+        return Vec::new();
+    }
+    let selection = Selection {
+        anchor: Cursor { index: start.min(laidout.text.len()), prefer_next_row: false },
+        cursor: Cursor { index: end.min(laidout.text.len()), prefer_next_row: false },
+    };
+    laidout.selection_rects_in_lpxs_clipped(selection, (viewport.pos.y - pos.y) as f32, (viewport.pos.y + viewport.size.y - pos.y) as f32)
+        .into_iter()
+        .map(|r| Rect { pos: dvec2(r.origin.x as f64, r.origin.y as f64), size: dvec2(r.size.width as f64, r.size.height as f64) })
+        .collect()
+}
+
 /// Everything clickable in the timeline.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HitTarget {
-    Link { href: String, kind: super::links::FileLinkSourceType, text: String },
+    Link { href: Arc<str>, kind: super::links::FileLinkSourceType, text: Arc<str> },
     /// Copy a code block / turn / message; `key` drives the 1.5s check glyph.
-    Copy { key: String, text: String },
+    Copy { key: String, text: makepad_widgets::makepad_draw::text::substr::Substr },
     Image { key: String },
     UserImage { index: usize },
     Toggle(String),
@@ -483,11 +536,13 @@ pub struct TextRun {
     pub laidout: Rc<LaidoutText>,
     /// Relative to the canvas origin (the widget rect's top-left).
     pub origin: DVec2,
-    /// Offset of this run in [Canvas::plain].
+    /// Offset of this run in the logical concatenated source.
     pub offset: usize,
     pub len: usize,
     /// Visible part (clipped regions); hit tests ignore the rest.
     pub clip: Option<Rect>,
+    /// Separator inserted before this run, if any; not copied every paint.
+    pub separator: Option<char>,
 }
 
 /// Selectable text and hit regions recorded while drawing one widget.
@@ -496,9 +551,12 @@ pub struct Canvas {
     /// Absolute position of the widget rect while drawing.
     pub origin: DVec2,
     pub runs: Vec<TextRun>,
-    pub plain: String,
+    source_len: usize,
+    last_char: Option<char>,
+    /// Final absolute viewport, supplied only after measurement/alignment.
+    pub viewport: Option<Rect>,
     pub hits: Vec<(Rect, HitTarget)>,
-    /// (anchor, cursor) offsets in `plain`.
+    /// (anchor, cursor) offsets in the logical concatenated source.
     pub selection: Option<(usize, usize)>,
     pub clip_stack: Vec<Rect>,
     /// Measuring pass: nothing is registered.
@@ -509,7 +567,8 @@ impl Canvas {
     pub fn begin(&mut self, origin: DVec2) {
         self.origin = origin;
         self.runs.clear();
-        self.plain.clear();
+        self.source_len = 0;
+        self.last_char = None;
         self.hits.clear();
         self.clip_stack.clear();
     }
@@ -518,20 +577,60 @@ impl Canvas {
     /// Blocks are separated by `separator` in the copied text.
     pub fn add_run(&mut self, laidout: Rc<LaidoutText>, pos: DVec2, separator: Option<char>) -> usize {
         if self.dry {
-            return self.plain.len();
+            return self.source_len;
         }
-        if let Some(sep) = separator
-            && !self.plain.is_empty()
-            && !self.plain.ends_with(sep)
-        {
-            self.plain.push(sep);
+        let separator = separator.filter(|sep| self.source_len > 0 && self.last_char != Some(*sep));
+        if let Some(sep) = separator {
+            self.source_len += sep.len_utf8();
+            self.last_char = Some(sep);
         }
-        let offset = self.plain.len();
-        self.plain.push_str(&laidout.text);
+        let offset = self.source_len;
         let len = laidout.text.len();
+        self.source_len += len;
+        if let Some(last) = laidout.text.chars().next_back() {
+            self.last_char = Some(last);
+        }
         let clip = self.clip_stack.last().copied();
-        self.runs.push(TextRun { laidout, origin: pos - self.origin, offset, len, clip });
+        self.runs.push(TextRun { laidout, origin: pos - self.origin, offset, len, clip, separator });
         offset
+    }
+
+    pub fn source_len(&self) -> usize {
+        self.source_len
+    }
+
+    fn source_boundary(&self, index: usize) -> usize {
+        let index = index.min(self.source_len);
+        let next = self.runs.partition_point(|run| run.offset <= index);
+        if let Some(run) = next.checked_sub(1).and_then(|index| self.runs.get(index))
+            && index <= run.offset + run.len
+        {
+            return run.offset + floor_char_boundary(&run.laidout.text, index - run.offset);
+        }
+        self.runs.get(next).and_then(|run| run.separator.map(|sep| run.offset - sep.len_utf8())).unwrap_or(index)
+    }
+
+    /// Materialize only on explicit copy/word operations, never during repaint.
+    fn source_slice(&self, start: usize, end: usize) -> String {
+        let (start, end) = (self.source_boundary(start), self.source_boundary(end));
+        let mut text = String::with_capacity(end.saturating_sub(start));
+        for run in &self.runs {
+            if let Some(sep) = run.separator {
+                let at = run.offset - sep.len_utf8();
+                if at >= start && at < end {
+                    text.push(sep);
+                }
+            }
+            let a = start.max(run.offset);
+            let b = end.min(run.offset + run.len);
+            if a < b {
+                text.push_str(&run.laidout.text[a - run.offset..b - run.offset]);
+            }
+            if run.offset + run.len >= end {
+                break;
+            }
+        }
+        text
     }
 
     pub fn add_hit(&mut self, r: Rect, target: HitTarget) {
@@ -646,32 +745,62 @@ impl Canvas {
     pub fn selected_range(&self) -> Option<(usize, usize)> {
         let (a, b) = self.selection?;
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let end = end.min(self.plain.len());
+        let end = end.min(self.source_len);
         (end > start).then_some((start, end))
     }
 
     pub fn selected_text(&self) -> Option<String> {
         let (start, end) = self.selected_range()?;
-        let start = floor_char_boundary(&self.plain, start);
-        let end = floor_char_boundary(&self.plain, end);
-        Some(self.plain[start..end].to_owned())
+        Some(self.source_slice(start, end))
     }
 
     /// Detect replacements before the selected endpoint, while allowing a streamed
     /// suffix and geometry-only reflow to keep their source-indexed selection.
     pub fn selection_source_hash(&self) -> Option<u64> {
-        use std::hash::{Hash, Hasher};
         let (_, end) = self.selected_range()?;
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        self.plain[..floor_char_boundary(&self.plain, end)].hash(&mut hash);
-        Some(hash.finish())
+        let end = self.source_boundary(end);
+        let mut hash = 0u64;
+        for run in &self.runs {
+            if let Some(sep) = run.separator
+                && run.offset - sep.len_utf8() < end
+            {
+                let mut bytes = [0; 4];
+                for byte in sep.encode_utf8(&mut bytes).bytes() {
+                    hash = hash.wrapping_mul(257).wrapping_add(byte as u64 + 1);
+                }
+            }
+            let len = end.saturating_sub(run.offset).min(run.len);
+            let (mut power, mut base, mut exponent) = (1u64, 257u64, len);
+            while exponent != 0 {
+                if exponent & 1 != 0 { power = power.wrapping_mul(base); }
+                base = base.wrapping_mul(base);
+                exponent >>= 1;
+            }
+            hash = hash.wrapping_mul(power).wrapping_add(run.laidout.text_prefix_hash(len));
+            if run.offset + run.len >= end {
+                break;
+            }
+        }
+        Some(hash)
     }
 
     /// Word around `offset` (double-tap / long-press selection).
     pub fn word_at(&self, offset: usize) -> (usize, usize) {
+        let offset = self.source_boundary(offset);
+        let Some(index) = self.runs.iter().position(|run| offset >= run.offset && offset < run.offset + run.len)
+            .or_else(|| (offset == self.source_len).then(|| self.runs.len().checked_sub(1)).flatten())
+        else { return (offset, offset) };
+        let run = &self.runs[index];
+        // A rich paragraph is one indexed run. Only legacy adjacent runs without
+        // separators require joining for cross-run Unicode word boundaries.
+        let joined_before = index > 0 && run.separator.is_none();
+        let joined_after = self.runs.get(index + 1).is_some_and(|next| next.separator.is_none());
+        if !joined_before && !joined_after {
+            let (a, b) = run.laidout.word_at(offset - run.offset);
+            return (run.offset + a, run.offset + b);
+        }
         use unicode_segmentation::UnicodeSegmentation;
-        let text = &self.plain;
-        let offset = floor_char_boundary(text, offset.min(text.len()));
+        let text = self.source_slice(0, self.source_len);
         text.split_word_bound_indices()
             .find(|(start, word)| offset >= *start && offset < *start + word.len())
             .or_else(|| text.split_word_bound_indices().next_back().filter(|_| offset == text.len()))
@@ -689,7 +818,7 @@ impl Canvas {
             if a >= b {
                 continue;
             }
-            for r in range_rects(&run.laidout, a - run.offset, b - run.offset) {
+            for r in range_rects_visible(&run.laidout, a - run.offset, b - run.offset, self.origin + run.origin, self.viewport) {
                 let mut rect = r.translate(self.origin + run.origin);
                 if let Some(clip) = run.clip {
                     let abs = clip.translate(self.origin);
@@ -720,26 +849,56 @@ pub fn rect_xywh(x: f64, y: f64, w: f64, h: f64) -> Rect {
 mod selection_handle_tests {
     use super::*;
 
+    fn append(canvas: &mut Canvas, text: &str, separator: Option<char>) {
+        let layout = LaidoutText::from_rows(text.into(), Vec::new());
+        canvas.add_run(Rc::new(layout), DVec2::default(), separator);
+    }
+
+    fn source(text: &str) -> Canvas {
+        let mut canvas = Canvas::default();
+        append(&mut canvas, text, None);
+        canvas
+    }
+
     #[test]
     fn touch_word_selection_keeps_hangul_and_emoji_clusters() {
-        let canvas = Canvas { plain: "한글 👩\u{200d}💻 e\u{301}".to_owned(), ..Default::default() };
+        let text = "한글 👩\u{200d}💻 e\u{301}";
+        let canvas = source(text);
         for word in ["한글", "👩\u{200d}💻", "e\u{301}"] {
-            let offset = canvas.plain.find(word).unwrap();
+            let offset = text.find(word).unwrap();
             let (a, b) = canvas.word_at(offset);
-            assert_eq!(&canvas.plain[a..b], word);
+            assert_eq!(canvas.source_slice(a, b), word);
         }
     }
 
     #[test]
     fn crossing_endpoints_keeps_source_text_and_whitespace() {
-        let mut canvas = Canvas { plain: "한글\n  code\t🙂\n".to_owned(), ..Default::default() };
-        let end = canvas.plain.len();
+        let text = "한글\n  code\t🙂\n";
+        let mut canvas = source(text);
+        let end = canvas.source_len();
         canvas.selection = Some((end, 0));
-        assert_eq!(canvas.selected_text().as_deref(), Some(canvas.plain.as_str()));
+        assert_eq!(canvas.selected_text().as_deref(), Some(text));
         let hash = canvas.selection_source_hash();
-        canvas.plain.push_str("streamed suffix");
+        append(&mut canvas, "streamed suffix", None);
         assert_eq!(canvas.selection_source_hash(), hash);
-        canvas.plain.replace_range(..3, "다");
+        canvas.begin(DVec2::default());
+        append(&mut canvas, "다글\n  code\t🙂\nstreamed suffix", None);
         assert_ne!(canvas.selection_source_hash(), hash);
+    }
+
+    #[test]
+    fn retained_runs_preserve_separators_and_cross_run_words() {
+        let mut canvas = source("e");
+        append(&mut canvas, "\u{301}", None);
+        append(&mut canvas, "한글", Some('\n'));
+        append(&mut canvas, "🙂", Some('🚀'));
+        canvas.selection = Some((0, canvas.source_len()));
+        assert_eq!(canvas.selected_text().as_deref(), Some("e\u{301}\n한글🚀🙂"));
+        assert_eq!(canvas.word_at(0), (0, "e\u{301}".len()));
+        let expected = source("e\u{301}\n한글🚀🙂");
+        assert_eq!(canvas.source_slice(0, canvas.source_len()), expected.source_slice(0, expected.source_len()));
+        let mut expected = expected;
+        expected.selection = canvas.selection;
+        assert_eq!(canvas.selection_source_hash(), expected.selection_source_hash());
     }
 }

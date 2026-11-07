@@ -8,6 +8,8 @@ Read the existing native widget before adding another primitive. Reuse semantic 
 
 Custom-painted lists share `common::widgets::RowMetrics` and `RowLayout` for leading, title, subtitle and trailing slots. Measure scaled font styles before laying out a list; use the resulting extent for painting, hit regions, scroll content and row advancement. Keep virtualized lists uniform within a draw rather than shaping off-screen labels, and reserve badge/icon height as well as text height. Wrapped bodies and editable fields keep content-driven `Fit` layout and their existing text/selection owners.
 
+Adjacent labels use `InlineMetrics` to align their measured baselines and reserve the union above and below them. Giving Latin and Hangul labels the same top, or centering each independently, misaligns fallback fonts. Measure the actual truncated layouts and reuse them for ordinary and animated painting; the combined height also owns the row hit box and attached-detail offset.
+
 Trailing actions reserve their space before title truncation. Empty text slots paint nothing; a long label must not cover a neighboring action. Row geometry does not own input: keep the surface's existing touch-up activation, scroll cancellation, long press and selection routing.
 
 Use sentence case and concrete action names. A destructive consequence needs an explicit confirmation at the operation boundary; red styling alone is not consent. Errors should say what failed and offer a relevant retry without replacing the user's work.

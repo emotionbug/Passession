@@ -283,7 +283,7 @@ impl PrView {
                 cx.set_key_focus(area);
                 body.canvas.selection = body.canvas.offset_at(rel).map(|offset| {
                     if e.tap_count >= 3 {
-                        (0, body.canvas.plain.len())
+                        (0, body.canvas.source_len())
                     } else if e.tap_count == 2 {
                         body.canvas.word_at(offset)
                     } else {
@@ -341,7 +341,7 @@ impl PrView {
             }
             Hit::KeyDown(ke) if ke.key_code == KeyCode::KeyA && (ke.modifiers.control || ke.modifiers.logo) => {
                 let body = self.bodies.values_mut().find(|b| b.canvas.selection.is_some())?;
-                body.canvas.selection = Some((0, body.canvas.plain.len()));
+                body.canvas.selection = Some((0, body.canvas.source_len()));
                 Some(true)
             }
             Hit::KeyFocusLost(_) => {

@@ -14,6 +14,10 @@
 - Yield between bounded GUI core-event batches rather than draining an actively refilled queue indefinitely. Publish timeline projections once per batch and append private text/range storage without repeatedly copying the growing message.
 - Reuse unchanged Markdown preparation/layout, avoid prefix-wide grapheme rescans and defer hidden reasoning details. Move code syntax highlighting off the GUI thread with bounded, identity-checked pending work while keeping unhighlighted text selectable.
 - Share same-target release, dismissal claiming, bounded popup geometry and modal focus teardown. Keep one dismiss event with its arrival-time owner, preserve nested subagent input and isolate standalone tool-sheet hit maps by window.
+- Align adjacent tool/event labels on a shared measured baseline, including Latin/Hangul fallback-font extents. Reuse the same truncated layouts for normal and shimmer paint, and size the header, hit region and attached details from their combined height.
+- Route native desktop keys, text and clipboard events through their originating window before navigation, overlays and content. Retain editable focus per window across OS focus switches and reject stale or ambiguous window destinations without changing serialized input payloads.
+- Prepare complete assistant Markdown snapshots with background parsing and exact isolated text layout, then publish matching source, glyphs and selection geometry together. Replace the desktop render cap with the retained full-content path; paint only final-position visible glyph ranges.
+- Avoid repeated whole-paragraph prefix shaping, boundary-vector shifts and per-frame selection/clipboard text reconstruction. Retain source indexes and shared clipboard payloads, including response copies invalidated by changed history sources.
 
 ### Removed
 
@@ -21,7 +25,7 @@
 
 ### Validation
 
-- Final build-tool smoke: compiled `paseo-xtask` and ran `housekeeping --max-bytes 0` in dry-run mode; no managed-cache removal was applied. GUI/Android execution, regression tests, CI and performance/size comparisons remain unexecuted.
+- Earlier build-tool smoke: compiled `paseo-xtask` and ran `housekeeping --max-bytes 0` in dry-run mode; no managed-cache removal was applied. This predates the full-text rendering and native-window input changes. GUI/Android execution, regression tests, CI and performance/size comparisons remain unexecuted.
 
 ## 0.13.9 - 2026-11-07
 

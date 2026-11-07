@@ -55,19 +55,47 @@ painting; `PortalList` limits mounted rows and row UI state remains outside recy
 Reveal, streaming updates and composer growth must preserve the reader's anchor, selection and
 IME state. Cancelling presentation work is not cancelling the provider turn.
 
-Reveal boundary lookup starts at the current Unicode grapheme boundary rather than rescanning
-the complete prefix. Visible assistant text is borrowed; collapsed reasoning does not build its
-hidden detail body. Markdown preparation/layout caches reuse unchanged paragraphs. Code syntax
-highlighting runs on one native worker with a bounded latest-snapshot queue; pending text remains
-plain and selectable, and results apply only to the matching content, language and theme.
-Completion is polled by the central timeline signal handler, not by an arbitrary mounted row.
+Assistant presentation captures immutable source in 64-KiB preparation slices.
+Whole-document normalization, parsing, semantic flattening, find matching and
+grapheme-boundary walks run in a bounded two-worker parser pool. One captured
+revision proceeds to publication while newer demand coalesces behind it; a
+continuously growing open paragraph cannot repeatedly cancel all progress.
+This presentation queue does not discard or reorder canonical events.
 
-These changes bound admission and remove repeated work; they are not a hard frame-time guarantee.
-A single changing Markdown paragraph still requires parsing and exact layout on the UI path,
-and virtualization cannot avoid the cost of one very large row. The existing desktop assistant
-presentation limit is unchanged; no additional truncation or canonical-history loss is used as
-a streaming optimization. Absolute-position culling before `PortalList`'s final row alignment
-is unsafe and is not enabled.
+`MarkdownPresentation` prepares a complete successor while retaining the previous
+coherent source/layout snapshot. Semantic font-span conversion is sliced; native
+`AsyncLayout` shapes and wraps on an independent worker-local loader/shaper with
+immutable font definitions. UI hydration and final glyph destruction are sliced.
+The app drains retired layouts on an initial signal and then a 1/60-second timer
+while work remains, independent of drawing and row/window lifetime; additional
+signals cannot bypass the timer cadence.
+The layout queue admits at most 64 waiting jobs, replaces latest demand per owner,
+and retries full-queue admission without blocking. Full source geometry, links,
+styles, find ranges and copy offsets are published as one revision. No new text
+cap or arbitrary Markdown/shaping split is used; the old assistant desktop
+presentation cap is no longer on this path.
+
+Exact measure-first `PortalList` drawing resolves upward rows, bottom alignment
+and reader-anchor geometry before assigning a viewport. Indexed visible rows and
+glyph ranges then restrict paint/rasterization, including ordinary unwrapped code
+lines. Selection retains the full layout; `Canvas` records source-owning runs and
+separators instead of rebuilding all plain text each paint. Indexed cursor, word
+and prefix-hash operations avoid rescanning the selected prefix every frame.
+
+Collapsed reasoning still avoids building its hidden body. Fences and source
+previews preserve the shared syntax worker, bounded latest-snapshot queue and
+existing syntax-color size limit; central timeline signal handling polls results.
+Tool previews may display selectable plain text while waiting. Assistant layout
+publication waits for matching colors or the existing plain-text fallback so
+new source is never paired with previous glyph geometry.
+
+These are source-level work-placement and admission guarantees, not measured
+frame-time claims. Whole-source parsing/layout still costs worker CPU and memory.
+Font initialization, allocations, many block/decorative objects and pathological
+overlapping glyphs are not hard real-time bounded. Other synchronous Markdown
+surfaces are not implicitly migrated by the assistant worker path. The current
+request prohibited builds, tests, runtime scenarios and benchmarks; newly added
+regression cases remain unexecuted.
 
 ## Evidence
 

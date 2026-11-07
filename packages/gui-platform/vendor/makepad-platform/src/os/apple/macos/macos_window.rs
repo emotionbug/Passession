@@ -351,11 +351,11 @@ impl MacosWindow {
     }
     
     pub fn send_got_focus_event(&mut self) {
-        self.do_callback(MacosEvent::AppGotFocus);
+        self.do_callback(MacosEvent::AppGotFocus(self.window_id));
     }
     
     pub fn send_lost_focus_event(&mut self) {
-        self.do_callback(MacosEvent::AppLostFocus);
+        self.do_callback(MacosEvent::AppLostFocus(self.window_id));
     }
     
     pub fn mouse_down_can_drag_window(&mut self) -> bool {
@@ -449,7 +449,7 @@ impl MacosWindow {
     }
     
     pub fn send_text_input(&mut self, input: String, replace_last: bool) {
-        self.do_callback(MacosEvent::TextInput(TextInputEvent {
+        self.do_callback(MacosEvent::TextInput(self.window_id, TextInputEvent {
             input: input,
             was_paste: false,
             replace_last: replace_last

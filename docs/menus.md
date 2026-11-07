@@ -12,9 +12,24 @@ Submenus are useful when a current value matters more than the full option list.
 
 Test actual pointer, touch, focus, cancellation, failure and resize behavior. Desktop application/tray menus are separate native integration with their own platform verification requirement. See [testing](testing.md).
 
-Window-local overlay state does not supply OS-window identity for raw keyboard events.
-The current Makepad window wrapper filters pointer events by window, but forwards raw
-`KeyDown` events to every window; those events carry no window identifier. The shared
-dismissal helpers prevent repeated/nested dismissal within an owner, not cross-window
-keyboard broadcast. Multi-window Escape/shortcut routing remains a separate native input
-limitation and must not be claimed fixed by the overlay consolidation.
+Desktop keyboard ownership is established by the native backend, not by the overlay stack
+or the last clicked/editor-focused widget. macOS `NSEvent`/responder windows, Windows HWNDs
+and X11 event windows retain their full generation-bearing `WindowId` through
+`Cx::call_window_event_handler`. X11 asynchronous paste retains its requestor window.
+The Makepad window wrapper filters raw key, text/IME and clipboard input **before** navigation
+and overlay handlers; area hit-testing also rejects another window's input. Escape can
+therefore reach only the source window's existing topmost eligible modal owner.
+
+OS focus gain/loss saves and restores each window's editable focus independently of
+Alt-Tab and pointer activity. Retained areas follow redraw remapping and are cleared when
+their editor/window closes; recycled window slots cannot receive an older generation's
+input. Focus transitions, actions, timers and other lifecycle events still broadcast.
+Native macOS/Windows reentrant focus notifications are queued in source order, without
+deferring synchronous clipboard or close-query responses.
+
+Serialized `KeyEvent`, text input and existing stdin transport formats are unchanged.
+Source-less legacy stdin input is accepted only with one live window; ambiguous multi-window
+input is rejected, not assigned to the first/main window. Synthetic multi-window callers must
+use the explicitly addressed Cx dispatch API. Mobile/web/direct single-window routing is
+unchanged. These source changes and regression cases still require native macOS, Windows
+and X11 runtime verification; static routing changes are not proof of exercised UI behavior.

@@ -104,10 +104,10 @@ use {
                         SW_MINIMIZE,
                         SWP_NOMOVE,
                         SWP_NOSIZE,
-                        WM_ACTIVATE,
+                        WM_SETFOCUS,
+                        WM_KILLFOCUS,
                         WM_NCCALCSIZE,
                         WM_NCHITTEST,
-                        WA_ACTIVE,
                         WM_ERASEBKGND,
                         WM_MOUSEMOVE,
                         WM_MOUSEWHEEL,
@@ -392,13 +392,13 @@ impl Win32Window {
         
         let window = &mut (*(user_data as *mut Win32Window));
         match msg {
-            WM_ACTIVATE => {
-                if wparam.0 & 0xffff == WA_ACTIVE as usize {
-                    window.do_callback(Win32Event::AppGotFocus);
-                }
-                else {
-                    window.do_callback(Win32Event::AppLostFocus);
-                }
+            WM_SETFOCUS => {
+                window.send_focus_event();
+                return LRESULT(0)
+            },
+            WM_KILLFOCUS => {
+                window.send_focus_lost_event();
+                return LRESULT(0)
             },
             WM_NCCALCSIZE => {
                 // check if we are maximised
@@ -566,7 +566,7 @@ impl Win32Window {
                                     CloseClipboard().unwrap();
                                     if let Ok(utf8) = String::from_utf16(&data) {
                                         window.do_callback(
-                                            Win32Event::TextInput(TextInputEvent {
+                                            Win32Event::TextInput(window.window_id, TextInputEvent {
                                                 input: utf8,
                                                 was_paste: true,
                                                 replace_last: false
@@ -583,7 +583,7 @@ impl Win32Window {
                         KeyCode::KeyC => {
                             let response = Rc::new(RefCell::new(None));
                             window.do_callback(
-                                Win32Event::TextCopy(TextClipboardEvent {
+                                Win32Event::TextCopy(window.window_id, TextClipboardEvent {
                                     response: response.clone()
                                 })
                             );
@@ -595,7 +595,7 @@ impl Win32Window {
                         KeyCode::KeyX => {
                             let response = Rc::new(RefCell::new(None));
                             window.do_callback(
-                                Win32Event::TextCut(TextClipboardEvent {
+                                Win32Event::TextCut(window.window_id, TextClipboardEvent {
                                     response: response.clone()
                                 })
                             );
@@ -608,7 +608,7 @@ impl Win32Window {
                     }
                 }
                 window.do_callback(
-                    Win32Event::KeyDown(KeyEvent {
+                    Win32Event::KeyDown(window.window_id, KeyEvent {
                         key_code: key_code,
                         is_repeat: (lparam.0 & 0x7000_0000)>0,
                         modifiers: modifiers,
@@ -618,7 +618,7 @@ impl Win32Window {
             },
             WM_KEYUP | WM_SYSKEYUP => {
                 window.do_callback(
-                    Win32Event::KeyUp(KeyEvent {
+                    Win32Event::KeyUp(window.window_id, KeyEvent {
                         key_code: Self::virtual_key_to_key_code(wparam),
                         is_repeat: lparam.0 & 0x7fff>0,
                         modifiers: Self::get_key_modifiers(),
@@ -632,7 +632,7 @@ impl Win32Window {
                     let char_code = utf8.chars().next().unwrap();
                     if char_code >= ' ' {
                         window.do_callback(
-                            Win32Event::TextInput(TextInputEvent {
+                            Win32Event::TextInput(window.window_id, TextInputEvent {
                                 input: utf8,
                                 was_paste: false,
                                 replace_last: false
@@ -1030,11 +1030,11 @@ impl Win32Window {
     }
     
     pub fn send_focus_event(&mut self) {
-        self.do_callback(Win32Event::AppGotFocus);
+        self.do_callback(Win32Event::AppGotFocus(self.window_id));
     }
     
     pub fn send_focus_lost_event(&mut self) {
-        self.do_callback(Win32Event::AppLostFocus);
+        self.do_callback(Win32Event::AppLostFocus(self.window_id));
     }
     
     pub fn send_mouse_down(&mut self, button: MouseButton, modifiers: KeyModifiers) {
@@ -1119,7 +1119,7 @@ impl Win32Window {
     }
     
     pub fn send_text_input(&mut self, input: String, replace_last: bool) {
-        self.do_callback(Win32Event::TextInput(TextInputEvent {
+        self.do_callback(Win32Event::TextInput(self.window_id, TextInputEvent {
             input: input,
             was_paste: false,
             replace_last: replace_last

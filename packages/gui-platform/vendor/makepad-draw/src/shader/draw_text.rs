@@ -161,6 +161,55 @@ impl DrawText {
         self.draw_text(cx, Point::new(pos.x as f32, pos.y as f32), text);
     }
 
+    /// Paint borrowed rows from an existing, complete layout at its final origin.
+    /// Row/glyph coordinates and the exposed hit area remain those of the full
+    /// layout; selecting a viewport must never rebase or clone its glyphs.
+    pub fn draw_abs_laidout_rows(
+        &mut self,
+        cx: &mut Cx2d,
+        pos: DVec2,
+        text: &LaidoutText,
+        rows: std::ops::Range<usize>,
+    ) {
+        self.draw_text_rows(
+            cx,
+            Point::new(pos.x as f32, pos.y as f32),
+            text,
+            &text.rows[rows],
+            true,
+            None,
+        );
+    }
+
+    /// Select visible rows using layout-owned bounds at a final absolute origin.
+    /// Full source geometry and hit extent are retained, including when the
+    /// viewport contains no glyphs. Callers still own the actual scissor clip.
+    pub fn draw_abs_laidout_viewport(
+        &mut self,
+        cx: &mut Cx2d,
+        pos: DVec2,
+        text: &LaidoutText,
+        viewport: makepad_platform::Rect,
+    ) {
+        let rows = if self.font_scale > 0.0 && self.temp_y_shift == 0.0 {
+            text.visible_row_range(
+                ((viewport.pos.y - pos.y) / self.font_scale as f64) as f32,
+                ((viewport.pos.y + viewport.size.y - pos.y) / self.font_scale as f64) as f32,
+            )
+        } else {
+            // Nonstandard animated shader offsets are not layout coordinates.
+            0..text.rows.len()
+        };
+        self.draw_text_rows(
+            cx,
+            Point::new(pos.x as f32, pos.y as f32),
+            text,
+            &text.rows[rows],
+            true,
+            Some(viewport),
+        );
+    }
+
     pub fn draw_walk(
         &mut self,
         cx: &mut Cx2d,
@@ -370,21 +419,34 @@ impl DrawText {
     }
 
     fn draw_text(&mut self, cx: &mut Cx2d, origin_in_lpxs: Point<f32>, text: &LaidoutText) {
+        self.draw_text_rows(cx, origin_in_lpxs, text, &text.rows, false, None);
+    }
+
+    fn draw_text_rows(
+        &mut self,
+        cx: &mut Cx2d,
+        origin_in_lpxs: Point<f32>,
+        text: &LaidoutText,
+        rows: &[LaidoutRow],
+        full_area: bool,
+        viewport: Option<makepad_platform::Rect>,
+    ) {
         self.page_areas.clear();
         let mut instances = None;
         let mut pages = [0, 0];
         self.glyph_depth = self.draw_depth;
-        for row in &text.rows {
+        for row in rows {
             self.draw_row(
                 cx,
                 origin_in_lpxs + Size::from(row.origin_in_lpxs) * self.font_scale,
                 row,
                 &mut instances,
                 &mut pages,
+                viewport,
             );
         }
         let mut area = instances.map(|instances| cx.end_many_instances(instances)).unwrap_or(Area::Empty);
-        if !self.page_areas.is_empty() {
+        if full_area || !self.page_areas.is_empty() {
             self.page_areas.push(area);
             // A multi-page layout still exposes one complete hit/focus area.
             // Keep its instance areas separately for live color/animation updates.
@@ -424,8 +486,35 @@ impl DrawText {
         row: &LaidoutRow,
         instances: &mut Option<ManyInstances>,
         pages: &mut [usize; 2],
+        viewport: Option<makepad_platform::Rect>,
     ) {
-        for glyph in &row.glyphs {
+        let visible = viewport.filter(|_| self.font_scale > 0.0 && self.temp_y_shift == 0.0);
+        let glyph_range = if let Some(viewport) = visible {
+            row.visible_glyph_range(
+                (viewport.pos.x as f32 - origin_in_lpxs.x) / self.font_scale,
+                ((viewport.pos.x + viewport.size.x) as f32 - origin_in_lpxs.x) / self.font_scale,
+            )
+        } else {
+            0..row.glyphs.len()
+        };
+        for glyph in &row.glyphs[glyph_range] {
+            if let Some(viewport) = visible {
+                let bounds = glyph.paint_bounds_in_lpxs();
+                let left = origin_in_lpxs.x + bounds.origin.x * self.font_scale;
+                let top = origin_in_lpxs.y + bounds.origin.y * self.font_scale;
+                let right = left + bounds.size.width * self.font_scale;
+                let bottom = top + bounds.size.height * self.font_scale;
+                // Unknown raster extents are deliberately unbounded. Never
+                // interpret a nonfinite bound as evidence of invisibility.
+                if left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite()
+                    && (right < viewport.pos.x as f32
+                        || left > (viewport.pos.x + viewport.size.x) as f32
+                        || bottom < viewport.pos.y as f32
+                        || top > (viewport.pos.y + viewport.size.y) as f32)
+                {
+                    continue;
+                }
+            }
             self.draw_glyph(
                 cx,
                 origin_in_lpxs + Size::from(glyph.origin_in_lpxs) * self.font_scale,
@@ -645,10 +734,10 @@ impl LiveHook for FontFamily {
                                 let dep = cx.get_dependency(path).unwrap();
                                 data.extend(&*dep);
                             }
-                            Rc::new(data)
+                            std::sync::Arc::new(data)
                         }
                         else{
-                            cx.get_dependency(font.paths[0].as_str()).unwrap().into()
+                            std::sync::Arc::new((*cx.get_dependency(font.paths[0].as_str()).unwrap()).clone())
                         };
                         fonts.define_font(
                             font_id,

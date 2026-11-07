@@ -81,6 +81,8 @@ pub struct Cx {
     pub (crate) next_frame_id: u64,
     
     pub keyboard: CxKeyboard,
+    pub(crate) keyboard_window: Option<crate::window::WindowId>,
+    pub(crate) keyboard_event_window: Option<crate::window::WindowId>,
     pub fingers: CxFingers,
     pub (crate) ime_area: Area,
     pub (crate) drag_drop: CxDragDrop,
@@ -284,6 +286,8 @@ impl Cx {
             next_frame_id: 1,
             
             keyboard: Default::default(),
+            keyboard_window: None,
+            keyboard_event_window: None,
             fingers: Default::default(),
             drag_drop: Default::default(),
             ime_area: Default::default(),

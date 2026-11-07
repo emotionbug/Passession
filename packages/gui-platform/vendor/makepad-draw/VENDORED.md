@@ -25,6 +25,33 @@ with trailing spaces; grapheme fitting keeps the upstream estimate.
 positions, and nonbreaking spaces using the adjacent widgets crate's existing
 Liberation Mono fixture. No font resources are added.
 
+## Retained asynchronous layout
+
+`text::AsyncLayout` runs the existing exact layouter with an independent CPU font
+loader/shaper and immutable font-byte snapshots. UI `Rc<Font>` values and GPU
+atlas state never cross threads. Results are hydrated back to UI fonts in bounded
+glyph/row batches and become visible only as a complete revision; newer requests
+do not splice new source text into old glyph geometry.
+
+The fitter probes nearby line-break opportunities instead of repeatedly shaping
+half of the remaining paragraph. Consuming a boundary no longer shifts every
+remaining entry. Unicode breaking and shaping still use the original algorithms;
+the optimization does not insert artificial paragraph boundaries.
+
+`text/source_index.rs` retains source fingerprints, word boundaries, row lookup
+and conservative glyph visibility ranges with each immutable layout. Painting
+uses final viewport coordinates to avoid emitting/rasterizing offscreen glyphs,
+including horizontally scrolled lines, without reordering glyphs or losing
+source-indexed selection. The widgets crate supplies the final-position list
+pass; preliminary `PortalList` coordinates are not a valid culling boundary.
+
+Retiring a large UI layout queues its rows rather than synchronously releasing
+every glyph. `text::collect_retired_layouts()` drains at most 4096 glyphs and
+128 rows and reports remaining work. Worker-owned layouts dispose on their
+worker. The application owns the UI continuation: an initial signal followed by
+one-shot 60 Hz timers while work remains, independent of drawing or the lifetime
+of the original row/window. Atlas preparation does not drive retirement.
+
 ## Stable glyph pages and overlay depth
 
 `src/text/{font_atlas,rasterizer,fonts}.rs` retain existing glyph coordinates when

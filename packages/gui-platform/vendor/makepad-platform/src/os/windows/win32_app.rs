@@ -3,6 +3,7 @@ use {
         ffi::OsStr,
         os::windows::ffi::OsStrExt,
         mem,
+        collections::VecDeque,
         cell::{
             Cell,
             RefCell,
@@ -149,6 +150,7 @@ P1: IntoParam<IDropSource>,
 
 pub struct Win32App {
     event_callback: Option<Box<dyn FnMut(Win32Event) -> EventFlow >>,
+    pending_focus_events: VecDeque<Win32Event>,
     pub window_class_name: Vec<u16>,
     pub all_windows: Vec<HWND>,
     pub time: Win32Time,
@@ -237,6 +239,7 @@ impl Win32App {
             was_signal_poll: false,
             time: Win32Time::new(),
             event_callback: Some(event_callback),
+            pending_focus_events: VecDeque::new(),
             event_flow: EventFlow::Poll,
             all_windows: Vec::new(),
             timers: Vec::new(),
@@ -294,12 +297,26 @@ impl Win32App {
     pub fn do_callback(event: Win32Event) {
         let cb = with_win32_app(|app| app.event_callback.take());
         if let Some(mut callback) = cb {
-            let event_flow = callback(event);
-            with_win32_app(|app| app.event_flow = event_flow);
-            if let EventFlow::Exit = event_flow {
-                unsafe {ExitProcess(0);}
+            let mut event = event;
+            loop {
+                let event_flow = callback(event);
+                with_win32_app(|app| app.event_flow = event_flow);
+                if let EventFlow::Exit = event_flow {
+                    unsafe {ExitProcess(0);}
+                }
+                // Keep the callback taken while draining: nested focus changes append
+                // behind earlier notifications, including those from platform ops.
+                if let Some(pending) = with_win32_app(|app| app.pending_focus_events.pop_front()) {
+                    event = pending;
+                } else {
+                    break;
+                }
             }
             with_win32_app(|app| app.event_callback = Some(callback));
+        } else if matches!(&event, Win32Event::AppGotFocus(_) | Win32Event::AppLostFocus(_)) {
+            // Only focus notifications may be deferred. Clipboard and window-query
+            // callbacks require an immediate response and keep their existing contract.
+            with_win32_app(|app| app.pending_focus_events.push_back(event));
         }
     }
     

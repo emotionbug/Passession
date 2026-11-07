@@ -124,7 +124,11 @@ impl XlibApp {
                                 x11_sys::XUnsetICFocus(ic);
                             }
                         }
-                        self.do_callback(if gained { XlibEvent::AppGotFocus } else { XlibEvent::AppLostFocus });
+                        self.do_callback(if gained {
+                            XlibEvent::AppGotFocus(window.window_id)
+                        } else {
+                            XlibEvent::AppLostFocus(window.window_id)
+                        });
                     }
                 },
                 x11_sys::SelectionNotify => {
@@ -132,6 +136,12 @@ impl XlibApp {
                     if selection.property == self.dnd.atoms.selection {
                         self.dnd.handle_selection_event(&selection);
                     } else if selection.property != 0 {
+                        // Clipboard conversion is asynchronous: its requestor, not
+                        // whichever window now has focus, owns the resulting text.
+                        let Some(window_ptr) = self.window_map.get(&selection.requestor) else {
+                            continue;
+                        };
+                        let window_id = (**window_ptr).window_id;
                         // Paseo: property None means the owner refused the conversion (no
                         // clipboard owner, or no UTF8_STRING target, e.g. an image-only
                         // clipboard); reading property None is a BadAtom that exits the process.
@@ -180,7 +190,7 @@ impl XlibApp {
                         if ret != ptr::null_mut() && bytes_to_read > 0 {
                             let utf8_slice = std::slice::from_raw_parts::<u8>(ret as *const _ as *const u8, bytes_to_read as usize);
                             if let Ok(utf8_string) = String::from_utf8(utf8_slice.to_vec()) {
-                                self.do_callback(XlibEvent::TextInput(TextInputEvent {
+                                self.do_callback(XlibEvent::TextInput(window_id, TextInputEvent {
                                     input: utf8_string,
                                     was_paste: true,
                                     replace_last: false
@@ -484,7 +494,7 @@ impl XlibApp {
                                     }
                                     KeyCode::KeyC => {
                                         let response = Rc::new(RefCell::new(None));
-                                        self.do_callback(XlibEvent::TextCopy(TextClipboardEvent {
+                                        self.do_callback(XlibEvent::TextCopy(window.window_id, TextClipboardEvent {
                                             response: response.clone()
                                         }));
                                         let response = response.borrow();
@@ -494,7 +504,7 @@ impl XlibApp {
                                     }
                                     KeyCode::KeyX => {
                                         let response = Rc::new(RefCell::new(None));
-                                        self.do_callback(XlibEvent::TextCut(TextClipboardEvent {
+                                        self.do_callback(XlibEvent::TextCut(window.window_id, TextClipboardEvent {
                                             response: response.clone()
                                         }));
                                         let response = response.borrow();
@@ -507,7 +517,7 @@ impl XlibApp {
                             }
                             
                             let block_text = modifiers.control || modifiers.logo || modifiers.alt;
-                            self.do_callback(XlibEvent::KeyDown(KeyEvent {
+                            self.do_callback(XlibEvent::KeyDown(window.window_id, KeyEvent {
                                 key_code: key_code,
                                 is_repeat: self.next_keypress_is_repeat,
                                 modifiers: modifiers,
@@ -547,7 +557,7 @@ impl XlibApp {
                                 let utf8 = std::str::from_utf8(&buffer[..count as usize]).unwrap_or("").to_string();
                                 let char_code = utf8.chars().next().unwrap_or('\0');
                                 if char_code >= ' ' && char_code != 127 as char {
-                                    self.do_callback(XlibEvent::TextInput(TextInputEvent {
+                                    self.do_callback(XlibEvent::TextInput(window.window_id, TextInputEvent {
                                         input: utf8,
                                         was_paste: false,
                                         replace_last: false
@@ -566,17 +576,21 @@ impl XlibApp {
                         let nev = nev.assume_init();
                         if nev.type_ as u32 == x11_sys::KeyPress
                             && nev.xkey.time == event.xkey.time
+                            && nev.xkey.window == event.xkey.window
                             && nev.xkey.keycode == event.xkey.keycode {
                             self.next_keypress_is_repeat = true;
                         }
                     }
                     if !self.next_keypress_is_repeat {
-                        self.do_callback(XlibEvent::KeyUp(KeyEvent {
-                            key_code: self.xkeyevent_to_keycode(&mut event.xkey),
-                            is_repeat: false,
-                            modifiers: self.xkeystate_to_modifiers(event.xkey.state),
-                            time: self.time_now()
-                        }));
+                        if let Some(window_ptr) = self.window_map.get(&event.xkey.window) {
+                            let window_id = (**window_ptr).window_id;
+                            self.do_callback(XlibEvent::KeyUp(window_id, KeyEvent {
+                                key_code: self.xkeyevent_to_keycode(&mut event.xkey),
+                                is_repeat: false,
+                                modifiers: self.xkeystate_to_modifiers(event.xkey.state),
+                                time: self.time_now()
+                            }));
+                        }
                     }
                 },
                 x11_sys::ClientMessage => {

@@ -136,13 +136,13 @@ impl Cx {
 
             match msg {
                 HostToStdin::KeyDown(e) => {
-                    self.call_event_handler(&Event::KeyDown(e));
+                    self.call_single_window_event_handler(&Event::KeyDown(e));
                 }
                 HostToStdin::KeyUp(e) => {
-                    self.call_event_handler(&Event::KeyUp(e));
+                    self.call_single_window_event_handler(&Event::KeyUp(e));
                 }
                 HostToStdin::TextInput(e) => {
-                    self.call_event_handler(&Event::TextInput(e));
+                    self.call_single_window_event_handler(&Event::TextInput(e));
                 }
                 HostToStdin::MouseDown(e) => {
                     self.fingers.process_tap_count(
