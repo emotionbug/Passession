@@ -6,7 +6,7 @@
 
 - Share measured list-row slots and paint/hit/layout extents across sidebar, history, Settings, Git and timeline metadata. Scale sheet headers from their actual text height and reserve trailing actions before truncating labels.
 - Add a `dev-fast` native profile, Git-common-directory build caches and checkout-local staging. Preserve release optimization; support opt-in installed compiler caches and fast Linux linkers without installing tools.
-- Make Android APK builds arm64 by default, with explicit arm, x64 and universal variants; add universal AAB packaging and format/ABI-aware release metadata and archive validation.
+- Publish Android arm64 APKs only. Keep explicit local ABI/AAB build options and format/ABI-aware metadata validation without building universal or other-ABI artifacts in releases.
 - Add explicit dry-run-first cache housekeeping with active/recent generation protection and a soft size budget. Keep operator-owned targets, Unicode fonts and licenses; retain existing combined desktop compilation and no-rebuild packaging.
 
 ### Fixed
@@ -18,6 +18,7 @@
 - Route native desktop keys, text and clipboard events through their originating window before navigation, overlays and content. Retain editable focus per window across OS focus switches and reject stale or ambiguous window destinations without changing serialized input payloads.
 - Prepare complete assistant Markdown snapshots with background parsing and exact isolated text layout, then publish matching source, glyphs and selection geometry together. Replace the desktop render cap with the retained full-content path; paint only final-position visible glyph ranges.
 - Avoid repeated whole-paragraph prefix shaping, boundary-vector shifts and per-frame selection/clipboard text reconstruction. Retain source indexes and shared clipboard payloads, including response copies invalidated by changed history sources.
+- Fix the Makepad widget derive's qualified-generic field declaration and restore the retained-layout type import required by the native release build.
 
 ### Removed
 

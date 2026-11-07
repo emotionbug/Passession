@@ -28,11 +28,10 @@ pub(super) struct Target {
 }
 impl Target {
     pub fn id(self) -> String {
-        let suffix = if self.format == "aab" { "-aab" } else { "" };
-        format!("{}-{}{suffix}", self.platform, self.arch)
+        format!("{}-{}", self.platform, self.arch)
     }
 }
-pub(super) const TARGETS: [Target; 12] = [
+pub(super) const TARGETS: [Target; 8] = [
     Target {
         runner: "ubuntu-24.04",
         platform: "linux",
@@ -81,34 +80,6 @@ pub(super) const TARGETS: [Target; 12] = [
         arch: "arm64",
         desktop: false,
         format: "apk",
-    },
-    Target {
-        runner: "ubuntu-24.04",
-        platform: "android",
-        arch: "arm",
-        desktop: false,
-        format: "apk",
-    },
-    Target {
-        runner: "ubuntu-24.04",
-        platform: "android",
-        arch: "x64",
-        desktop: false,
-        format: "apk",
-    },
-    Target {
-        runner: "ubuntu-24.04",
-        platform: "android",
-        arch: "universal",
-        desktop: false,
-        format: "apk",
-    },
-    Target {
-        runner: "ubuntu-24.04",
-        platform: "android",
-        arch: "universal",
-        desktop: false,
-        format: "aab",
     },
     Target {
         runner: "macos-15",
@@ -404,7 +375,7 @@ mod tests {
     #[test]
     fn all_targets_and_recovery_are_exact() {
         let p = plan("v0.13.1", "all", "build", true, "", "push").unwrap();
-        assert_eq!(p["expected"].as_array().unwrap().len(), 12);
+        assert_eq!(p["expected"].as_array().unwrap().len(), 8);
         for id in ["linux-x64", "windows-arm64", "macos-x64"] {
             let p = plan("v0.13.1", id, "build", true, "123", "workflow_dispatch").unwrap();
             assert_eq!(p["expected"].as_array().unwrap().len(), 2);
@@ -440,10 +411,7 @@ mod tests {
     #[test]
     fn x64_android_publication_and_recovery_keep_exact_scope() {
         let scope = "linux-windows-x64-android";
-        let targets = json!([
-            "linux-x64", "windows-x64", "android-arm64", "android-arm",
-            "android-x64", "android-universal", "android-universal-aab",
-        ]);
+        let targets = json!(["linux-x64", "windows-x64", "android-arm64"]);
         let build = plan("v0.13.4", scope, "build", true, "", "workflow_dispatch").unwrap();
         assert_eq!(build["expected"], targets);
         assert_eq!(build["recovery"], json!([]));
@@ -454,17 +422,14 @@ mod tests {
         assert!(plan("v0.13.4", scope, "publish-only", true, "", "workflow_dispatch").is_err());
     }
     #[test]
-    fn android_formats_have_distinct_recovery_identity() {
+    fn android_publication_only_accepts_arm64_apk() {
         let p = plan("v0.13.4", "android", "build", true, "", "workflow_dispatch").unwrap();
-        assert_eq!(
-            p["expected"],
-            json!(["android-arm64", "android-arm", "android-x64", "android-universal", "android-universal-aab"])
-        );
-        let p = plan("v0.13.4", "android-universal-aab", "build", false, "", "workflow_dispatch").unwrap();
-        assert_eq!(p["expected"], json!(["android-universal-aab"]));
-        assert_eq!(p["matrix"]["include"][0]["format"], "aab");
-        assert_eq!(target("android-universal").unwrap().format, "apk");
-        assert!(target("android-universal-apk").is_err());
+        assert_eq!(p["expected"], json!(["android-arm64"]));
+        assert_eq!(p["matrix"]["include"][0]["format"], "apk");
+        for removed in ["android-arm", "android-x64", "android-universal", "android-universal-aab"] {
+            assert!(target(removed).is_err());
+            assert!(plan("v0.13.4", removed, "build", true, "", "workflow_dispatch").is_err());
+        }
     }
     #[test]
     fn versions_and_rollout_are_strict() {

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use makepad_widgets::makepad_draw::text::AsyncLayout;
-use makepad_widgets::makepad_draw::text::layouter::Span as FontSpan;
+use makepad_widgets::makepad_draw::text::layouter::{LaidoutText, Span as FontSpan};
 use super::worker::{ParagraphKey, ParsedSnapshot, SemanticParagraph};
 use makepad_widgets::makepad_draw::text::selection::Cursor;
 use makepad_widgets::makepad_draw::text::substr::Substr;

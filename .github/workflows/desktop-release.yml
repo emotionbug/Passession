@@ -19,7 +19,7 @@ on:
       platform:
         description: Native platform, individual target, or Linux/Windows x64 plus Android
         type: choice
-        options: [all, desktop, linux-windows-x64-android, macos, linux, windows, android, ios, macos-arm64, macos-x64, linux-arm64, linux-x64, windows-arm64, windows-x64, android-arm64, android-arm, android-x64, android-universal, android-universal-aab]
+        options: [all, desktop, linux-windows-x64-android, macos, linux, windows, android, ios, macos-arm64, macos-x64, linux-arm64, linux-x64, windows-arm64, windows-x64, android-arm64]
         default: all
       checkout_ref:
         description: Optional source ref override (must have the same package version as tag)
@@ -137,7 +137,7 @@ jobs:
             "$SOURCE_SHA" "$NOTICE_SUPPLEMENT_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: dtolnay/rust-toolchain@1.93.1
         with:
-          targets: ${{ matrix.platform == 'android' && 'aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android' || matrix.platform == 'ios' && 'aarch64-apple-ios' || '' }}
+          targets: ${{ matrix.platform == 'android' && 'aarch64-linux-android' || matrix.platform == 'ios' && 'aarch64-apple-ios' || '' }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}

@@ -192,7 +192,11 @@ pub(super) fn publish() -> Result<()> {
         numeric_id(&publication_run),
         "Missing exact publication run identity"
     );
-    let notes = metadata::release_notes(&first.version)?;
+    let notes = format!(
+        "{}\n\nBuild source: [`{sha}`](https://github.com/{REPOSITORY}/commit/{sha}).\n",
+        metadata::release_notes(&first.version)?,
+        sha = first.sha,
+    );
     let notes_dir = tempfile::tempdir()?;
     let notes_path = notes_dir.path().join("notes.txt");
     fs::write(&notes_path, notes)?;

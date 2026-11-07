@@ -612,7 +612,7 @@ mod tests {
     fn provenance_rejects_tampering_and_wrong_run() {
         let dir = tempfile::tempdir().unwrap();
         let mut id = identity();
-        id.target = "android-universal".into();
+        id.target = "android-arm64".into();
         let file = android_fixture(dir.path(), &id, true);
         record(dir.path(), &id).unwrap();
         verify(dir.path(), &id).unwrap();
@@ -715,21 +715,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn universal_apk_and_aab_keep_separate_provenance() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut apk = identity();
-        apk.target = "android-universal".into();
-        let mut aab = apk.clone();
-        aab.target = "android-universal-aab".into();
-        android_fixture(dir.path(), &apk, true);
-        let bundle = android_fixture(dir.path(), &aab, true);
-        record(dir.path(), &apk).unwrap();
-        record(dir.path(), &aab).unwrap();
-        verify(dir.path(), &apk).unwrap();
-        verify(dir.path(), &aab).unwrap();
-        fs::write(bundle, b"corrupted bundle").unwrap();
-        verify(dir.path(), &apk).unwrap();
-        assert!(verify(dir.path(), &aab).is_err());
-    }
 }

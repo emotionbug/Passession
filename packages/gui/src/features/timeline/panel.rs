@@ -25,7 +25,7 @@ use super::rows::{self, FindTarget, LiveFooter, RowContext, RowItem, RowKind};
 use super::session::{ActionKind, ChatSession, Completion, Cursor, ExecutionStatus, ForkTarget, Io, SessionKey, SyncStatus};
 use super::store::with_store;
 use super::tracks::{self, ArchiveFinished, SubagentRow, TrackModel, TrackPanel};
-use crate::common::overlay::{self, MenuEntry, MenuItem, MenuOptions, WindowModal};
+use crate::common::overlay::{self, MenuEntry, MenuItem, MenuOptions, TapTarget, WindowModal};
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics};
@@ -540,7 +540,7 @@ pub struct ChatPanel {
     #[rust]
     modal_horizontal_scroll: TouchScroll,
     #[rust]
-    pressed: overlay::TapTarget<HitTarget>,
+    pressed: TapTarget<HitTarget>,
     /// The owning subagent sheet, assigned by its dispatcher before child input.
     #[rust]
     input_parent: Option<u64>,
