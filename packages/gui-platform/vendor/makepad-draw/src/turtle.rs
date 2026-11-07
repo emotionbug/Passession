@@ -107,6 +107,7 @@ pub enum AlignEntry{
     Unset,
     Area(Area),
     ShiftTurtle{area:Area, shift:DVec2, skip:usize},
+    AnchoredOverlay{owner:Area, origin:DVec2, area:Area, anchor_offset:DVec2, skip:usize},
     SkipTurtle{skip:usize},
     BeginTurtle(DVec2,DVec2),
     EndTurtle
@@ -269,6 +270,19 @@ impl<'a,'b> Cx2d<'a,'b> {
             area,
             shift, 
             skip: self.align_list.len()
+        };
+        self.turtle_walks.truncate(turtle.turtle_walks_start);
+    }
+
+    /// Completes a pass-sized decoration which escapes text-content clipping,
+    /// follows its owner's final layout, and disappears if its anchor is clipped.
+    /// Draw-list/window clipping still applies to the decoration itself.
+    pub fn end_pass_sized_turtle_with_visible_anchor(&mut self, owner: Area, origin: DVec2, area: Area, anchor_offset: DVec2) {
+        let turtle = self.turtles.pop().unwrap();
+        self.align_list.push(AlignEntry::EndTurtle);
+        self.perform_nested_clipping_on_align_list_and_shift(turtle.align_start, self.align_list.len());
+        self.align_list[turtle.align_start] = AlignEntry::AnchoredOverlay {
+            owner, origin, area, anchor_offset, skip: self.align_list.len(),
         };
         self.turtle_walks.truncate(turtle.turtle_walks_start);
     }
@@ -719,7 +733,7 @@ impl<'a,'b> Cx2d<'a,'b> {
                     *clip0 += d;
                     *clip1 += d;
                 }
-                AlignEntry::SkipTurtle{skip} | AlignEntry::ShiftTurtle{skip,..} =>{
+                AlignEntry::SkipTurtle{skip} | AlignEntry::ShiftTurtle{skip,..} | AlignEntry::AnchoredOverlay{skip,..} =>{
                     c = *skip;
                     continue;
                 }
@@ -737,6 +751,26 @@ impl<'a,'b> Cx2d<'a,'b> {
             match align_item {
                 AlignEntry::SkipTurtle{skip} =>{
                     i = *skip;
+                    continue;
+                }
+                AlignEntry::AnchoredOverlay{owner, origin, area, anchor_offset, skip} =>{
+                    let (owner, origin, area, anchor_offset, skip) = (*owner, *origin, *area, *anchor_offset, *skip);
+                    let shift = owner.rect(self).pos - origin;
+                    self.move_align_list(shift.x, shift.y, i + 1, skip, false, dvec2(0.0,0.0));
+                    let mut anchor = area.rect(self).pos + anchor_offset;
+                    if let Some(id) = area.draw_list_id() {
+                        let list = &self.cx.cx.draw_lists[id];
+                        if list.draw_list_has_clip {
+                            anchor += dvec2(list.draw_list_uniforms.view_shift.x as f64, list.draw_list_uniforms.view_shift.y as f64);
+                        }
+                    }
+                    let visible = owner.clipped_rect(self);
+                    if !owner.is_valid(self) || visible.size.x <= 0.0 || visible.size.y <= 0.0 || !visible.contains(anchor) {
+                        let mut hidden = area.rect(self);
+                        hidden.size = DVec2::default();
+                        area.set_rect(self, &hidden);
+                    }
+                    i = skip;
                     continue;
                 }
                 AlignEntry::ShiftTurtle{area, shift, skip} =>{

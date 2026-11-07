@@ -19,6 +19,8 @@ live_design! {
     use link::theme::*;
     use link::shaders::*;
     use link::widgets::*;
+    // Manual editors construct handles lazily; wildcard imports prune unused Live types.
+    use makepad_widgets::text_selection_handles::DrawTextSelectionHandle;
     use crate::shell::PaseoWindow;
 
     App = {{App}} {

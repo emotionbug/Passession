@@ -86,6 +86,22 @@ editor or hide its keyboard when Android cannot offer an action (for example,
 an empty input with an empty clipboard). Outside-pointer and lifecycle focus
 teardown remain separate selection-invalidating operations.
 
+## Shared text-handle routing
+
+`event/text_handle.rs`, the keyboard ownership registry and `os/cx_shared.rs`
+route `Event::TextHandle` before ordinary touch updates. Registration follows
+redraw area remapping; the captured touch and endpoint remain stable across
+selection crossing. One controller supplies slop, bounded elapsed-time edge
+scrolling, lifecycle cancellation and magnifier requests for every text owner.
+The crate root reexports the event/action/endpoint/phase/target types.
+
+Android JNI connects these requests to the packaged Java API-28 Magnifier.
+Selection and editing remain Rust-owned; this does not add a native EditText.
+Native toolbar presentation is suspended during capture and resumes through
+the owning widget after a successful release.
+Magnifier updates use one latest-state UI runnable, refresh stationary sampling
+during edge scrolling, and constrain the sample to the visible owner viewport.
+
 ## Touch activation and draw ordering
 
 `event/finger.rs` retains movement cancellation once a touch reaches the tap

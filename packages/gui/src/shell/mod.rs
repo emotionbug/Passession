@@ -594,7 +594,7 @@ impl Widget for PaseoShell {
         let sidebar_blocked = !chrome::sidebar_visible(self) || self.data.app_inactive
             || modal || overlay_api::window_modal_open(&self.data.window_id)
             || (self.data.compact && self.data.chrome.explorer_position > 0.0);
-        let fresh_pointer = matches!(event, Event::MouseDown(_))
+        let fresh_pointer = matches!(event, Event::MouseDown(_) | Event::TextHandle(_))
             || matches!(event, Event::TouchUpdate(e) if e.touches.iter().any(|t| matches!(t.state, TouchState::Start)));
         if sidebar_blocked || fresh_pointer {
             self.data.sidebar.stop_motion();

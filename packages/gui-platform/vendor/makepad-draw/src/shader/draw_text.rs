@@ -156,6 +156,11 @@ impl DrawText {
         self.draw_text(cx, Point::new(pos.x as f32, pos.y as f32), &text);
     }
 
+    /// Paint an existing layout at a scrolled origin without reshaping text.
+    pub fn draw_abs_laidout(&mut self, cx: &mut Cx2d, pos: DVec2, text: &LaidoutText) {
+        self.draw_text(cx, Point::new(pos.x as f32, pos.y as f32), text);
+    }
+
     pub fn draw_walk(
         &mut self,
         cx: &mut Cx2d,

@@ -176,6 +176,26 @@ impl TextBuffer {
         self.open_group = false;
     }
 
+    /// Move one semantic endpoint without swapping the fixed end when handles cross.
+    /// Layout hit tests use source byte offsets; clamp through the same UTF-8 boundary
+    /// path as keyboard selection without editing text or disturbing IME composition.
+    pub fn move_selection_handle(&mut self, endpoint: makepad_widgets::TextHandleEndpoint, offset: usize) {
+        use makepad_widgets::TextHandleEndpoint;
+        let selection = match endpoint {
+            TextHandleEndpoint::Caret => Selection::caret(offset),
+            TextHandleEndpoint::Anchor => Selection { anchor: offset, head: self.selection.head },
+            TextHandleEndpoint::Cursor => Selection { anchor: self.selection.anchor, head: offset },
+        };
+        let composing_group = self.ime_composing && self.open_group;
+        self.set_selection(selection);
+        if composing_group {
+            self.open_group = true;
+            if let Some(group) = self.undo.last_mut() {
+                group.after = self.selection;
+            }
+        }
+    }
+
     /// Moves the head, keeping the anchor when extending.
     pub fn move_head(&mut self, head: usize, extend: bool) {
         let head = floor_boundary(&self.text, head.min(self.text.len()));
@@ -472,6 +492,49 @@ pub fn next_grapheme(text: &str, offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_handles_cross_without_moving_the_opposite_endpoint_or_text() {
+        use makepad_widgets::TextHandleEndpoint::{Anchor, Caret, Cursor};
+        let mut buffer = TextBuffer::new("한😀글".into());
+        buffer.set_selection(Selection { anchor: 0, head: 3 });
+        let revision = buffer.revision;
+        buffer.move_selection_handle(Anchor, 3);
+        assert_eq!(buffer.selection, Selection::caret(3));
+        buffer.move_selection_handle(Anchor, 8);
+        assert_eq!(buffer.selection, Selection { anchor: 7, head: 3 });
+        assert_eq!(buffer.selected_text(), "😀");
+        buffer.move_selection_handle(Cursor, usize::MAX);
+        assert_eq!(buffer.selection, Selection { anchor: 7, head: 10 });
+        buffer.move_selection_handle(Caret, 5);
+        assert_eq!(buffer.selection, Selection::caret(3));
+        assert_eq!(buffer.revision, revision);
+        assert_eq!(buffer.text(), "한😀글");
+        assert!(!buffer.undo());
+    }
+
+    #[test]
+    fn selection_handles_preserve_hangul_composition_undo_group() {
+        let mut buffer = TextBuffer::new("A😀".into());
+        buffer.set_selection(Selection::caret(buffer.len()));
+        buffer.apply_ime(&TextImeEvent {
+            session: 1, revision: 1, text: "A😀ㅎ".into(),
+            selection_start: 4, selection_end: 4, composing: Some((3, 4)),
+        }, false);
+        buffer.move_selection_handle(makepad_widgets::TextHandleEndpoint::Caret, 1);
+        assert!(buffer.ime_composing);
+        buffer.apply_ime(&TextImeEvent {
+            session: 1, revision: 2, text: "A😀한".into(),
+            selection_start: 4, selection_end: 4, composing: None,
+        }, false);
+        assert_eq!(buffer.text(), "A😀한");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "A😀");
+        assert_eq!(buffer.selection, Selection::caret(5));
+        assert!(!buffer.undo());
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "A😀한");
+    }
 
     #[test]
     fn android_ime_composition_is_one_undo_group_and_commit_is_not_duplicated() {

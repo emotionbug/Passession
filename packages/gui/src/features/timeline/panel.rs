@@ -1985,6 +1985,19 @@ impl ChatPanel {
     fn on_row_event(&mut self, cx: &mut Cx, ui: &mut UiContext, event: ChatRowEvent) {
         let row = event.row;
         match event.kind {
+            RowEventKind::SelectionScroll { delta } => {
+                if self.modal.is_none()
+                    && self.items.iter().any(|item| item.id == row)
+                    && self.row_states.get(&row).is_some_and(|state| state.borrow().selection.is_some())
+                {
+                    if delta != 0.0 {
+                        self.reader_scrolled = true;
+                        self.at_bottom = false;
+                        self.detach();
+                    }
+                    self.list.as_portal_list().scroll_selection(cx, delta);
+                }
+            }
             RowEventKind::Answer { key, dismiss } => {
                 let Some(snap) = &self.snap else { return };
                 let Some((_, request)) = snap.permissions.iter().find(|(k, _)| *k == key).cloned() else { return };
@@ -2266,7 +2279,7 @@ impl Widget for ChatPanel {
             Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::MouseLeave(_)
                 | Event::TouchUpdate(_) | Event::Scroll(_) | Event::KeyDown(_) | Event::KeyUp(_)
                 | Event::TextInput(_) | Event::TextIme(_) | Event::TextCopy(_) | Event::TextCut(_)
-                | Event::TextSelectAll | Event::BackPressed { .. }
+                | Event::TextSelectAll | Event::TextHandle(_) | Event::BackPressed { .. }
         );
         // Composer sheets are painted above the stream. Dispatch them before
         // any row can take the pointer/key focus, and retain ownership on close.

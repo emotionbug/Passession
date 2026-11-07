@@ -43,6 +43,7 @@ import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.LinearLayout;
+import android.widget.Magnifier;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -96,6 +97,82 @@ class MakepadSurface
     private int requestedTextActionCapabilities;
     private boolean textActionsResumed, textActionsSurfaceReady, textActionBackPressed;
     private TextActions textActions;
+    private Magnifier textMagnifier;
+    private boolean textMagnifierUpdateQueued, requestedTextMagnifierVisible;
+    private float requestedTextMagnifierX, requestedTextMagnifierY;
+    private float requestedTextMagnifierLeft, requestedTextMagnifierTop;
+    private float requestedTextMagnifierRight, requestedTextMagnifierBottom;
+    private float shownTextMagnifierX = Float.NaN, shownTextMagnifierY = Float.NaN;
+    private final Runnable textMagnifierUpdate = this::applyTextMagnifier;
+
+    void requestTextMagnifier(boolean visible, float x, float y, float left, float top, float right, float bottom) {
+        synchronized (textActionLock) {
+            requestedTextMagnifierVisible = visible;
+            requestedTextMagnifierX = x;
+            requestedTextMagnifierY = y;
+            requestedTextMagnifierLeft = left;
+            requestedTextMagnifierTop = top;
+            requestedTextMagnifierRight = right;
+            requestedTextMagnifierBottom = bottom;
+            // One queued callback consumes the newest state. Rejecting callbacks
+            // whenever another render frame arrives can starve the UI thread.
+            if (textMagnifierUpdateQueued) return;
+            textMagnifierUpdateQueued = true;
+            textActionHandler.post(textMagnifierUpdate);
+        }
+    }
+
+    private void applyTextMagnifier() {
+        final boolean visible;
+        final float x, y, left, top, right, bottom;
+        synchronized (textActionLock) {
+            textMagnifierUpdateQueued = false;
+            visible = requestedTextMagnifierVisible;
+            x = requestedTextMagnifierX;
+            y = requestedTextMagnifierY;
+            left = Math.max(0, requestedTextMagnifierLeft);
+            top = Math.max(0, requestedTextMagnifierTop);
+            right = Math.min(getWidth(), requestedTextMagnifierRight);
+            bottom = Math.min(getHeight(), requestedTextMagnifierBottom);
+        }
+        if (Build.VERSION.SDK_INT < 28) return;
+        if (!visible || !textActionsResumed || !textActionsSurfaceReady
+                || !isAttachedToWindow() || !hasWindowFocus() || !hasFocus()
+                || !getHolder().getSurface().isValid()
+                || getWidth() <= 0 || getHeight() <= 0 || right <= left || bottom <= top) {
+            dismissTextMagnifier();
+            return;
+        }
+        try {
+            if (textMagnifier == null) textMagnifier = new Magnifier(this);
+            // Inset by the sampled half-size where it fits, or use the midpoint
+            // of a smaller viewport. Edge handles should not sample the header.
+            final float halfWidth = Math.min((right - left) / 2, textMagnifier.getWidth() / textMagnifier.getZoom() / 2);
+            final float halfHeight = Math.min((bottom - top) / 2, textMagnifier.getHeight() / textMagnifier.getZoom() / 2);
+            final float sourceX = Math.max(left + halfWidth, Math.min(x, right - halfWidth));
+            final float sourceY = Math.max(top + halfHeight, Math.min(y, bottom - halfHeight));
+            if (sourceX != shownTextMagnifierX || sourceY != shownTextMagnifierY) {
+                textMagnifier.show(sourceX, sourceY);
+                shownTextMagnifierX = sourceX;
+                shownTextMagnifierY = sourceY;
+            } else {
+                // show() skips unchanged coordinates. Edge autoscroll changes
+                // the pixels beneath a stationary finger and needs a fresh copy.
+                textMagnifier.update();
+            }
+        } catch (IllegalArgumentException | IllegalStateException surfaceUnavailable) {
+            // Surface teardown can race PixelCopy even after isValid().
+            dismissTextMagnifier();
+        }
+    }
+
+    private void dismissTextMagnifier() {
+        shownTextMagnifierX = shownTextMagnifierY = Float.NaN;
+        if (Build.VERSION.SDK_INT >= 28 && textMagnifier != null) {
+            textMagnifier.dismiss();
+            textMagnifier = null;
+        }
+    }
 
     void requestTextActions(long token, int flags, int left, int top, int right, int bottom) {
         synchronized (textActionLock) {
@@ -190,6 +267,8 @@ class MakepadSurface
     }
 
     void cancelTextActions() {
+        synchronized (textActionLock) { requestedTextMagnifierVisible = false; }
+        dismissTextMagnifier();
         long token;
         synchronized (textActionLock) {
             token = requestedTextActionToken;
@@ -815,6 +894,10 @@ public class MakepadActivity
 
     public void hideTextActions() {
         view.requestHideTextActions();
+    }
+
+    public void updateTextMagnifier(boolean visible, float x, float y, float left, float top, float right, float bottom) {
+        view.requestTextMagnifier(visible, x, y, left, top, right, bottom);
     }
 
     // Called on UI by both legacy and predictive-back application routing.

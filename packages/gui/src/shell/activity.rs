@@ -142,7 +142,7 @@ impl Activity {
             self.idle_request = paseo_gui_platform::platform().map(|p| p.idle_milliseconds());
         }
         match event {
-            Event::MouseDown(_) | Event::TouchUpdate(_) | Event::Scroll(_) | Event::KeyDown(_) => self.record_input(ui),
+            Event::MouseDown(_) | Event::TouchUpdate(_) | Event::TextHandle(_) | Event::Scroll(_) | Event::KeyDown(_) => self.record_input(ui),
             Event::Actions(actions) => {
                 for action in crate::shell::platform::actions(actions) {
                     if let PlatformAction::Completed { request, result } = action {

@@ -195,6 +195,12 @@ impl Cx {
     }
     
     pub (crate) fn call_event_handler(&mut self, event: &Event) {
+        if self.route_text_handle_event(event) {
+            self.inner_key_focus_change();
+            self.handle_triggers();
+            self.handle_actions();
+            return;
+        }
         self.dismiss_text_selection_for_event(event);
         self.inner_call_event_handler(event);
         self.inner_key_focus_change();

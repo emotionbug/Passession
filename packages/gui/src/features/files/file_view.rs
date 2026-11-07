@@ -380,7 +380,10 @@ impl FileView {
                     editor.sync_text(text);
                 }
             }
-            _ => {
+            old => {
+                if let Some(editor) = old {
+                    editor.clear_selection(cx);
+                }
                 let key = format!("{owner}\u{0}{id}");
                 let text = changed_text.clone().unwrap_or_default();
                 self.editor = Some(SourceEditor::new(text, &target.path, key, !editable));
@@ -972,14 +975,40 @@ impl FileView {
             handled.set(true);
             return true;
         }
+        let preview = self.preview_visible();
+        let look = self.editor_look(ui);
+        let handles_enabled = observing && area.is_valid(cx) && !self.settings_open;
+        if !handles_enabled || !self.find_visible {
+            self.query.cancel_selection_handles(cx);
+            self.replacement.cancel_selection_handles(cx);
+        } else if !self.replace_expanded {
+            self.replacement.cancel_selection_handles(cx);
+        }
+        if (!handles_enabled || preview) && let Some(editor) = self.editor.as_mut() {
+            editor.cancel_selection_handles(cx);
+        }
+        let mut handle_consumed = false;
+        if handles_enabled {
+            handle_consumed |= self.query.handle_selection_handles(cx, kit, event);
+            handle_consumed |= self.replacement.handle_selection_handles(cx, kit, event);
+            if preview {
+                handle_consumed |= self.markdown.handle_selection_handles(cx, event);
+            } else if let Some(editor) = self.editor.as_mut() {
+                handle_consumed |= editor.handle_selection_handles(cx, kit, &look, event);
+            }
+        }
+        if handle_consumed {
+            self.pressed = None;
+            self.editor_drag = false;
+            self.preview_drag = false;
+            return true;
+        }
         let hit = kit::unshift_hit(event.hits(cx, self.area), self.hit_shift);
         if !matches!(hit, Hit::Nothing) {
             changed |= self.hit(cx, kit, &hit, ui);
         }
         let scrolling = observing && area.is_valid(cx) && !self.settings_open;
-        let preview = self.preview_visible();
         changed |= self.markdown.animate_scroll(cx, event, scrolling && preview);
-        let look = self.editor_look(ui);
         if let Some(editor) = self.editor.as_mut() {
             changed |= editor.animate_scroll(cx, event, &look, scrolling && !preview);
         }

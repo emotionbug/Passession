@@ -45,6 +45,8 @@ pub enum RowEventKind {
     Tap { target: HitTarget, rect: Rect },
     /// The question card's primary button on its last question / dismiss.
     Answer { key: String, dismiss: bool },
+    /// Content-signed edge movement while a row-owned selection handle is captured.
+    SelectionScroll { delta: f64 },
 }
 
 /// The model a row paints, shared with the panel.
@@ -99,6 +101,12 @@ pub struct ChatRow {
     show_actions: bool,
     #[rust]
     selection_source: Option<u64>,
+    #[rust(TextSelectionHandles::new(cx))]
+    selection_handles: TextSelectionHandles,
+    #[rust]
+    touch_selection: bool,
+    #[rust]
+    handle_endpoint: Option<TextHandleEndpoint>,
 }
 
 /// The key painters compare `RowState.hover_hit` against.
@@ -293,6 +301,9 @@ impl ChatRow {
     }
 
     fn clear_selection(&mut self, cx: &mut Cx) {
+        self.selection_handles.cancel(cx);
+        self.touch_selection = false;
+        self.handle_endpoint = None;
         cx.clear_text_selection(self.area);
         self.show_actions = false;
         self.touch_scroll.reset();
@@ -314,10 +325,65 @@ impl ChatRow {
         }
         self.area.redraw(cx);
     }
+
+    fn move_handle(&mut self, cx: &mut Cx, endpoint: TextHandleEndpoint, abs: DVec2) {
+        if let (Some(offset), Some((anchor, cursor))) = (self.canvas.offset_at_handle(self.rel(cx, abs)), self.canvas.selection) {
+            self.set_selection(cx, Some(match endpoint {
+                TextHandleEndpoint::Anchor => (offset, cursor),
+                TextHandleEndpoint::Cursor | TextHandleEndpoint::Caret => (anchor, offset),
+            }));
+        }
+    }
+
+    fn handle_selection_event(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        let Some(action) = self.selection_handles.handle_event(cx, event, self.area) else { return false };
+        self.touch_scroll.reset();
+        self.show_actions = false;
+        self.drag = Drag::None;
+        self.pressed = None;
+        self.handle_endpoint = Some(action.endpoint);
+        if action.phase == TextHandlePhase::Start {
+            self.post(cx, RowEventKind::SelectionScroll { delta: 0.0 });
+        }
+        if action.phase != TextHandlePhase::Cancel {
+            let owner = self.area.clipped_rect(cx);
+            let mut scroll_point = dvec2(
+                action.abs.x.clamp(owner.pos.x, (owner.pos.x + owner.size.x - 0.5).max(owner.pos.x)),
+                action.abs.y.clamp(owner.pos.y, (owner.pos.y + owner.size.y - 0.5).max(owner.pos.y)),
+            );
+            if let Some((anchor, cursor)) = self.canvas.selection {
+                let active = if action.endpoint == TextHandleEndpoint::Anchor { anchor } else { cursor };
+                if let Some(clip) = self.canvas.runs.iter()
+                    .find(|run| active >= run.offset && active <= run.offset + run.len)
+                    .and_then(|run| run.clip)
+                {
+                    let clip = clip.translate(self.area.rect(cx).pos);
+                    scroll_point.x = scroll_point.x.clamp(clip.pos.x, (clip.pos.x + clip.size.x - 0.5).max(clip.pos.x));
+                    scroll_point.y = scroll_point.y.clamp(clip.pos.y, (clip.pos.y + clip.size.y - 0.5).max(clip.pos.y));
+                }
+            }
+            self.move_handle(cx, action.endpoint, action.abs);
+            if action.scroll.x != 0.0 {
+                self.scroll_inner(cx, scroll_point, dvec2(action.scroll.x, 0.0));
+            }
+            if action.scroll.y != 0.0 && !self.scroll_inner(cx, scroll_point, dvec2(0.0, action.scroll.y)) {
+                self.post(cx, RowEventKind::SelectionScroll { delta: action.scroll.y });
+            }
+        }
+        if matches!(action.phase, TextHandlePhase::End | TextHandlePhase::Cancel) {
+            self.handle_endpoint = None;
+            self.show_actions = action.phase == TextHandlePhase::End && self.canvas.selected_range().is_some();
+        }
+        self.area.redraw(cx);
+        true
+    }
 }
 
 impl Widget for ChatRow {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.handle_selection_event(cx, event) {
+            return;
+        }
         if self.next_frame.is_event(event).is_some() {
             self.area.redraw(cx);
         }
@@ -387,6 +453,7 @@ impl Widget for ChatRow {
                     return;
                 }
                 cx.claim_text_selection(self.area);
+                self.touch_selection = false;
                 if let Some(offset) = self.canvas.offset_at(rel) {
                     let selection = if e.tap_count >= 3 {
                         Some((0, self.canvas.plain.len()))
@@ -403,6 +470,7 @@ impl Widget for ChatRow {
             }
             Hit::FingerLongPress(e) => {
                 self.touch_scroll.reset();
+                self.touch_selection = true;
                 // Touch selection: the word under the finger, extended by moving.
                 let rel = self.rel(cx, e.abs);
                 if let Some(offset) = self.canvas.offset_at(rel) {
@@ -452,14 +520,8 @@ impl Widget for ChatRow {
                     }
                     self.area.redraw(cx);
                 } else if self.drag == Drag::Select && e.device.is_touch() {
-                    if cfg!(target_os = "android") {
-                        self.show_actions = self.canvas.selected_range().is_some();
-                        self.area.redraw(cx);
-                    } else if let Some(text) = self.canvas.selected_text()
-                        && let Some(ui) = scope.data.get_mut::<UiContext>()
-                    {
-                        ui.push(UiEffect::CopyText { text, toast: Some(super::i18n::t("common.actions.copied")) });
-                    }
+                    self.show_actions = self.canvas.selected_range().is_some();
+                    self.area.redraw(cx);
                 } else if e.device.is_touch() && e.was_tap() {
                     self.clear_selection(cx);
                 }
@@ -548,8 +610,19 @@ impl Widget for ChatRow {
         self.answer_field = field;
         cx.walk_turtle(Walk { abs_pos: None, margin: Margin::default(), width: Size::Fill, height: Size::Fixed(height) });
         cx.end_turtle_with_area(&mut self.area);
+        if self.touch_selection && let Some((anchor, cursor)) = self.canvas.selection {
+            let a = self.canvas.caret_rect(anchor, anchor <= cursor).unwrap_or_default();
+            let b = self.canvas.caret_rect(cursor, cursor < anchor).unwrap_or_default();
+            let active = if self.handle_endpoint == Some(TextHandleEndpoint::Anchor) { anchor } else { cursor };
+            let viewport = self.canvas.runs.iter()
+                .find(|run| active >= run.offset && active <= run.offset + run.len)
+                .and_then(|run| run.clip)
+                .map(|clip| clip.translate(origin))
+                .unwrap_or(Rect { pos: origin, size: dvec2(width, height) });
+            self.selection_handles.draw(cx, self.area, viewport, a, b, anchor == cursor, false);
+        }
         self.draw_list.end(cx);
-        if self.show_actions || cx.text_actions_active(self.area) {
+        if !self.selection_handles.is_dragging() && (self.show_actions || cx.text_actions_active(self.area)) {
             self.show_actions = false;
             cx.show_text_actions_for_area(self.area, selection_area, TextActionCapabilities {
                 copy: true, select_all: true, ..Default::default()

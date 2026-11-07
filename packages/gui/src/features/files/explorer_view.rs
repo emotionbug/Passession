@@ -104,6 +104,20 @@ pub struct ExplorerLook<'a> {
 }
 
 impl ExplorerView {
+    pub fn handle_selection_handles(&mut self, cx: &mut Cx, kit: &mut Kit, event: &Event) -> bool {
+        if !self.location_focused || self.nav_open {
+            self.location.cancel_selection_handles(cx);
+            return false;
+        }
+        if !self.location.handle_selection_handles(cx, kit, event) {
+            return false;
+        }
+        self.touch_scroll.reset();
+        self.thumb_drag = None;
+        self.pressed = None;
+        true
+    }
+
     fn state_of(&self, hot: &Hot, enabled: bool, selected: bool) -> Interaction {
         Interaction {
             hovered: self.hovered.as_ref() == Some(hot),

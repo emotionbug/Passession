@@ -214,4 +214,37 @@ Android debug APK was rebuilt, installed and exercised. Native toolbar evidence
 comes from the emulator's actual system UI, not a mocked menu or an automatic
 copy-on-selection substitute.
 
+### Shared cursor and selection handles
+
+The API 35 emulator exercised the Rust-owned common handles with native
+ActionMode and Magnifier; there is no EditText overlay.
+
+- `screen-538`–`543` cover Korean source selection, both endpoint directions,
+  crossing, stationary edge scrolling and same-click outside navigation.
+- `screen-550`–`551` cover a virtualized conversation row and selection-owned
+  PortalList edge scrolling instead of an independent parent pan.
+- `screen-554`–`557` verify full composer insertion/range knobs, capture below
+  the text-content clip, a dragged range spanning `계속 있는데`, native
+  magnification and toolbar restoration after release.
+- `screen-558`–`559` verify the shared sidebar-search knob at 100% and 200%
+  system text size. The test restored 100% afterward.
+- `screen-561`–`563` hold the finger stationary at the source viewport edge.
+  The native lens changes from line 031 to 035 as selection scrolls, then
+  disappears and restores Copy/Select All on release. Offscreen endpoints
+  do not leave detached knobs.
+- `screen-566`–`569` compose `계속` through the actual Korean IME in manual
+  file Find, display insertion and native Select All range handles, then
+  close Find and verify that handles, toolbar and IME are dismissed.
+
+Runtime checks caught missing Live shader expansion and nested text clipping;
+the common renderer now has an explicit reachable Live dependency and an
+owner-aligned overlay. A single latest-state UI runnable prevents magnifier
+update starvation; stationary source coordinates call `Magnifier.update()`
+so scrolling refreshes the native sample.
+
+`cargo test --locked -p paseo-gui -p makepad-platform -p makepad-widgets --lib`
+passed 207 tests. The Android debug APK was rebuilt, installed and exercised.
+This pass did not exercise physical-device handles, API 24–27 fallback, desktop
+touchscreens, log-view gestures or the standalone Markdown preview.
+
 Capture screenshots/logs without unrelated personal data or credentials. Preserve failing output, use bounded waits for observable conditions, and clean up only test-owned app instances, homes and processes. Installation or device changes require the appropriate authorization.

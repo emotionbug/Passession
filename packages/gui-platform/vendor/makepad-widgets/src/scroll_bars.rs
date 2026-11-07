@@ -635,6 +635,10 @@ pub enum ScrollBarsAction {
 }
 
 impl ScrollBars {
+    pub fn cancel_touch_scroll(&mut self) {
+        self.touch_scroll.reset();
+    }
+
     
     pub fn set_scroll_x(&mut self, _cx: &mut Cx, value: f64) {
         self.scroll.x = value;
@@ -656,6 +660,9 @@ impl ScrollBars {
     }
     
     pub fn handle_main_event(&mut self, cx: &mut Cx, event: &Event, _scope:&mut Scope, actions: &mut Vec<ScrollBarsAction> ) {
+        if matches!(event, Event::TextHandle(handle) if handle.action.phase == TextHandlePhase::Start) {
+            self.touch_scroll.reset();
+        }
         if let Event::Trigger(te) = event{
             if let Some(triggers) = te.triggers.get(&self.area){
                 if let Some(trigger) = triggers.iter().find(|t| t.id == live_id!(scroll_focus_nav)){

@@ -688,6 +688,15 @@ impl PortalList {
         self.scroll_bar.set_scroll_pos_no_action(cx, scroll_pos);
     }
 
+    /// Scrolls selection handles without retaining touch inertia or pulldown.
+    pub fn scroll_selection(&mut self, cx: &mut Cx, delta: f64) {
+        self.touch_scroll.reset();
+        self.scroll_state = ScrollState::Stopped;
+        self.tail_range = false;
+        self.delta_top_scroll(cx, -delta, true, false);
+        self.area.redraw(cx);
+    }
+
     /// Sets the current scroll offset (`first_scroll`) based on the given `delta` value.
     ///
     /// ## Arguments
@@ -825,6 +834,10 @@ impl PortalList {
 impl Widget for PortalList {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::TextHandle(handle) if handle.action.phase == TextHandlePhase::Start) {
+            self.touch_scroll.reset();
+            self.scroll_state = ScrollState::Stopped;
+        }
         let uid = self.widget_uid();
         
         let mut scroll_to = None;
@@ -1194,6 +1207,12 @@ impl PortalListRef {
         }
         else{
             (WidgetRef::empty(), false)
+        }
+    }
+
+    pub fn scroll_selection(&self, cx: &mut Cx, delta: f64) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.scroll_selection(cx, delta);
         }
     }
 

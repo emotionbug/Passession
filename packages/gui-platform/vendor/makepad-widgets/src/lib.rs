@@ -20,6 +20,8 @@ pub mod popup_menu;
 pub mod check_box;
 pub mod radio_button;
 pub mod text_input;
+pub mod text_selection_handles;
+pub use text_selection_handles::TextSelectionHandles;
 pub mod slider;
 pub mod scroll_bar;
 pub mod scroll_bars;
@@ -184,6 +186,7 @@ pub fn live_design(cx: &mut Cx) {
     makepad_fonts_chinese_bold::live_design(cx);
     makepad_fonts_chinese_bold_2::live_design(cx);
     makepad_draw::live_design(cx);
+    crate::text_selection_handles::live_design(cx);
     crate::page_flip::live_design(cx);
     crate::debug_view::live_design(cx);
     crate::performance_view::live_design(cx);

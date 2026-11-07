@@ -26,6 +26,9 @@ live_design! {
 
     use link::theme::*;
     use makepad_draw::shader::std::*;
+    // Explicit import retains the lazily constructed handle shader in the
+    // expanded dependency graph; wildcard imports only retain used identifiers.
+    use crate::text_selection_handles::DrawTextSelectionHandle;
 
     pub TextInputBase = {{TextInput}} {}
     
@@ -837,6 +840,11 @@ pub struct TextInput {
     #[rust] ime_composing: bool,
     #[rust] touch_selection: Option<DVec2>,
     #[rust] touch_focus: Option<DigitId>,
+    #[rust] selection_handles: Option<crate::TextSelectionHandles>,
+    #[rust] touch_handles: bool,
+    #[rust] text_scroll: DVec2,
+    #[rust] text_scroll_max: DVec2,
+    #[rust(true)] reveal_cursor: bool,
 }
 
  impl LiveHook for TextInput{
@@ -918,9 +926,10 @@ impl TextInput {
     pub fn set_selection(&mut self, cx: &mut Cx, selection: Selection) {
         self.touch_focus = None;
         self.selection = selection;
+        self.reveal_cursor = true;
         let area = self.draw_bg.area();
         if cx.has_key_focus(area) {
-            if self.selection.anchor.index != self.selection.cursor.index {
+            if self.touch_handles || self.selection.anchor.index != self.selection.cursor.index {
                 cx.claim_text_selection(area);
             } else if !cx.text_actions_active(area) {
                 cx.clear_text_selection(area);
@@ -996,6 +1005,8 @@ impl TextInput {
     }
 
     fn end_focus(&mut self, cx: &mut Cx, hide_ime: bool) {
+        self.touch_handles = false;
+        if let Some(handles) = &mut self.selection_handles { handles.cancel(cx); }
         self.ime_composing = false;
         self.touch_selection = None;
         self.touch_focus = None;
@@ -1143,6 +1154,8 @@ impl TextInput {
     fn draw_text(&mut self, cx: &mut Cx2d) -> Rect {
         let inner_walk = self.inner_walk();
         let text_rect = if self.text.is_empty() {
+            self.text_scroll = DVec2::default();
+            self.text_scroll_max = DVec2::default();
             self.draw_text.draw_walk(
                 cx,
                 inner_walk,
@@ -1151,14 +1164,46 @@ impl TextInput {
             )
         } else {
             let laidout_text = self.laidout_text.as_ref().unwrap();
-            self.draw_text.draw_walk_laidout(
-                cx,
-                inner_walk,
-                laidout_text,
-            )
+            let size = laidout_text.size_in_lpxs * self.draw_text.font_scale;
+            let viewport = cx.turtle().padded_rect();
+            let width = if viewport.size.x.is_finite() { viewport.size.x.max(0.0) } else { size.width as f64 };
+            let height = if viewport.size.y.is_finite() { viewport.size.y.max(0.0) } else { size.height as f64 };
+            self.text_scroll_max = dvec2((size.width as f64 - width).max(0.0), (size.height as f64 - height).max(0.0));
+            self.text_scroll.x = self.text_scroll.x.clamp(0.0, self.text_scroll_max.x);
+            self.text_scroll.y = self.text_scroll.y.clamp(0.0, self.text_scroll_max.y);
+            if self.reveal_cursor && cx.has_key_focus(self.draw_bg.area()) && !self.selection_handles.as_ref().is_some_and(|h| h.is_dragging()) {
+                let caret = self.caret_rect(self.selection.cursor, DVec2::default());
+                if caret.pos.x < self.text_scroll.x { self.text_scroll.x = caret.pos.x.max(0.0); }
+                if caret.pos.x + caret.size.x > self.text_scroll.x + width {
+                    self.text_scroll.x = (caret.pos.x + caret.size.x - width).clamp(0.0, self.text_scroll_max.x);
+                }
+                if caret.pos.y < self.text_scroll.y { self.text_scroll.y = caret.pos.y.max(0.0); }
+                if caret.pos.y + caret.size.y > self.text_scroll.y + height {
+                    self.text_scroll.y = (caret.pos.y + caret.size.y - height).clamp(0.0, self.text_scroll_max.y);
+                }
+            }
+            self.reveal_cursor = false;
+            let walk_rect = cx.walk_turtle(Walk {
+                width: Size::Fixed(cx.turtle().max_width(inner_walk).unwrap_or(size.width as f64)),
+                height: Size::Fixed(cx.turtle().max_height(inner_walk).unwrap_or(size.height as f64)),
+                ..inner_walk
+            });
+            let pos = walk_rect.pos - self.text_scroll;
+            self.draw_text.draw_abs_laidout(cx, pos, laidout_text);
+            Rect { pos, size: dvec2(size.width as f64, size.height as f64) }
         };
         cx.add_aligned_rect_area(&mut self.text_area, text_rect);
         text_rect
+    }
+
+    fn caret_rect(&self, cursor: Cursor, origin: DVec2) -> Rect {
+        let Some(layout) = self.laidout_text.as_ref() else { return Rect::default(); };
+        let Ok(position) = self.cursor_to_position(cursor) else { return Rect::default(); };
+        let row = &layout.rows[position.row_index];
+        Rect {
+            pos: origin + dvec2(position.x_in_lpxs as f64, ((row.origin_in_lpxs.y - row.ascender_in_lpxs) * self.draw_text.font_scale) as f64),
+            size: dvec2(2.0, ((row.ascender_in_lpxs - row.descender_in_lpxs) * self.draw_text.font_scale) as f64),
+        }
     }
 
     fn draw_cursor(&mut self, cx: &mut Cx2d, text_rect: Rect) -> DVec2 {
@@ -1368,6 +1413,7 @@ impl TextInput {
     }
 
     fn apply_edit(&mut self, cx: &mut Cx, edit: Edit) {
+        self.reveal_cursor = true;
         self.selection.cursor.index = edit.start + edit.replace_with.len();
         self.selection.anchor.index = self.selection.cursor.index;
         self.history.apply_edit(edit, &mut self.text);
@@ -1379,6 +1425,7 @@ impl TextInput {
         if let Some(new_selection) = self.history.undo(self.selection, &mut self.text) {
             self.laidout_text = None;
             self.selection = new_selection;
+            self.reveal_cursor = true;
             self.check_text_is_empty(cx);
             true
         } else {
@@ -1390,6 +1437,7 @@ impl TextInput {
         if let Some(new_selection) = self.history.redo(self.selection, &mut self.text) {
             self.laidout_text = None;
             self.selection = new_selection;
+            self.reveal_cursor = true;
             self.check_text_is_empty(cx);
             true
         } else {
@@ -1449,6 +1497,8 @@ impl Widget for TextInput {
     fn set_text(&mut self, cx: &mut Cx, text: &str) {
         self.touch_focus = None;
         self.touch_selection = None;
+        self.touch_handles = false;
+        if let Some(handles) = &mut self.selection_handles { handles.cancel(cx); }
         cx.clear_text_selection(self.draw_bg.area());
         self.text = self.filter_input(text, true);
         self.set_selection(
@@ -1483,10 +1533,13 @@ impl Widget for TextInput {
         self.draw_bg.begin(cx, walk, self.layout);
         self.draw_selection.append_to_draw_call(cx);
         self.layout_text(cx);
+        let mut handle_viewport = cx.turtle().padded_rect();
         let text_rect = self.draw_text(cx);
         let cursor_pos = self.draw_cursor(cx, text_rect);
         self.draw_selection(cx, text_rect);
         self.draw_bg.end(cx);
+        if !handle_viewport.size.x.is_finite() { handle_viewport.size.x = text_rect.size.x.max(1.0); }
+        if !handle_viewport.size.y.is_finite() { handle_viewport.size.y = text_rect.size.y.max(1.0); }
         if cx.has_key_focus(self.draw_bg.area()) && !self.is_read_only {
             cx.update_text_input(self.draw_bg.area(), self.widget_uid().0, &self.text,
                 self.selection.anchor.index, self.selection.cursor.index,
@@ -1498,12 +1551,12 @@ impl Widget for TextInput {
         }
         let area = self.draw_bg.area();
         if cx.has_key_focus(area) {
-            if self.selection.anchor.index != self.selection.cursor.index {
+            if self.touch_handles || self.selection.anchor.index != self.selection.cursor.index {
                 cx.claim_text_selection(area);
             } else if !cx.text_actions_active(area) {
                 cx.clear_text_selection(area);
             }
-            if cx.text_actions_active(area) {
+            if cx.text_actions_active(area) && !self.selection_handles.as_ref().is_some_and(|h| h.is_dragging()) {
                 let anchor = if self.selection.anchor.index == self.selection.cursor.index {
                     self.draw_cursor.area()
                 } else {
@@ -1512,11 +1565,24 @@ impl Widget for TextInput {
                 cx.show_text_actions_for_area(area, anchor, self.text_action_capabilities());
             }
         }
+        if self.touch_handles && cx.has_key_focus(area) {
+            let anchor = self.caret_rect(self.selection.anchor, self.text_area.rect(cx).pos);
+            let cursor = self.caret_rect(self.selection.cursor, self.text_area.rect(cx).pos);
+            self.selection_handles.get_or_insert_with(|| crate::TextSelectionHandles::new(cx))
+                .draw(cx, area, handle_viewport, anchor, cursor,
+                    self.selection.anchor.index == self.selection.cursor.index, !self.is_read_only);
+        } else if let Some(handles) = &mut self.selection_handles {
+            handles.cancel(cx);
+        }
         cx.add_nav_stop(self.draw_bg.area(), NavRole::TextInput, Margin::default());
         DrawStep::done()
     }
 
     fn set_disabled(&mut self, cx:&mut Cx, disabled:bool){
+        if disabled {
+            self.touch_handles = false;
+            if let Some(handles) = &mut self.selection_handles { handles.cancel(cx); }
+        }
         self.animator_toggle(cx, disabled, Animate::Yes, id!(disabled.on), id!(disabled.off));
     }
                 
@@ -1525,6 +1591,38 @@ impl Widget for TextInput {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let area = self.draw_bg.area();
+        let handle_action = self.selection_handles.as_mut().and_then(|handles| handles.handle_event(cx, event, area));
+        if let Some(action) = handle_action {
+            self.reveal_cursor = false;
+            self.touch_focus = None;
+            self.touch_selection = None;
+            if action.phase != TextHandlePhase::Cancel {
+                if action.phase == TextHandlePhase::Start {
+                    self.ime_composing = false;
+                    self.history.force_new_edit_group();
+                }
+                let before = self.text_scroll;
+                self.text_scroll.x = (before.x + action.scroll.x).clamp(0.0, self.text_scroll_max.x);
+                self.text_scroll.y = (before.y + action.scroll.y).clamp(0.0, self.text_scroll_max.y);
+                let rel = action.abs - self.text_area.rect(cx).pos + self.text_scroll - before;
+                if let Ok(cursor) = self.point_in_lpxs_to_cursor(Point::new(rel.x as f32, rel.y as f32)) {
+                    match action.endpoint {
+                        TextHandleEndpoint::Caret => self.selection = Selection { anchor: cursor, cursor },
+                        TextHandleEndpoint::Anchor => self.selection.anchor = cursor,
+                        TextHandleEndpoint::Cursor => self.selection.cursor = cursor,
+                    }
+                }
+                self.reset_blink_timer(cx);
+                if !self.is_read_only {
+                    cx.update_text_input(area, self.widget_uid().0, &self.text,
+                        self.selection.anchor.index, self.selection.cursor.index, self.is_password, self.is_numeric_only);
+                }
+                if action.phase == TextHandlePhase::End { self.open_text_actions(cx); }
+            }
+            self.draw_bg.redraw(cx);
+            return;
+        }
         if matches!(event, Event::KeyFocus(_)) {
             self.touch_focus = None;
         }
@@ -1634,6 +1732,8 @@ impl Widget for TextInput {
                 if fe.device.is_touch() {
                     return;
                 }
+                self.touch_handles = false;
+                if let Some(handles) = &mut self.selection_handles { handles.cancel(cx); }
                 self.reset_blink_timer(cx);
                 self.set_key_focus(cx);
                 self.place_pointer_cursor(cx, fe.abs, fe.tap_count, false);
@@ -1645,6 +1745,7 @@ impl Widget for TextInput {
             }
             Hit::FingerLongPress(fe) if touch_focus => {
                 // Selection is a distinct gesture, not a delayed ordinary tap.
+                self.touch_handles = true;
                 self.touch_selection = Some(fe.abs);
                 self.set_key_focus(cx);
                 self.reset_blink_timer(cx);
@@ -1654,6 +1755,7 @@ impl Widget for TextInput {
             }
             Hit::FingerUp(fe) => {
                 if touch_focus {
+                    self.touch_handles = true;
                     self.reset_blink_timer(cx);
                     self.set_key_focus(cx);
                     self.place_pointer_cursor(cx, fe.abs, fe.tap_count, false);
@@ -1829,6 +1931,7 @@ impl Widget for TextInput {
                 self.selection.anchor.index = floor_char_boundary(&self.text, anchor);
                 self.selection.cursor.index = floor_char_boundary(&self.text, cursor);
                 self.ime_composing = edit.composing.is_some();
+                self.reveal_cursor = true;
                 if !self.ime_composing && (composition || !changed) { self.history.force_new_edit_group(); }
                 self.reset_blink_timer(cx);
                 self.draw_bg.redraw(cx);

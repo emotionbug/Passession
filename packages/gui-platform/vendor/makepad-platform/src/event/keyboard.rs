@@ -49,6 +49,8 @@ pub struct CxKeyboard {
     pub (crate) text_ime_dismissed: bool,
     pub (crate) text_selection: Area,
     pub (crate) text_actions: Option<TextActionsRequest>,
+    pub(crate) text_handles: Option<super::text_handle::TextHandleRegistration>,
+    pub(crate) text_handle_drag: Option<super::text_handle::TextHandleDrag>,
     text_action_token: u64,
 }
 
@@ -86,6 +88,7 @@ impl CxKeyboard {
     pub(crate) fn claim_text_selection(&mut self, area: Area) {
         if self.text_selection != area {
             self.text_actions = None;
+            self.text_handles = None;
             self.text_selection = area;
         }
     }
@@ -93,6 +96,7 @@ impl CxKeyboard {
     pub(crate) fn clear_text_selection(&mut self, area: Area) {
         if self.text_selection == area {
             self.text_selection = Area::Empty;
+            self.text_handles = None;
             self.hide_text_actions(area);
         }
     }
@@ -139,6 +143,15 @@ impl CxKeyboard {
             if request.anchor == TextActionsAnchor::Area(old_area) {
                 request.anchor = TextActionsAnchor::Area(new_area);
             }
+        }
+        if let Some(handles) = &mut self.text_handles {
+            if handles.owner == old_area { handles.owner = new_area; }
+            for target in handles.targets.iter_mut().flatten() {
+                if target.area == old_area { target.area = new_area; }
+            }
+        }
+        if let Some(drag) = &mut self.text_handle_drag {
+            if drag.owner == old_area { drag.owner = new_area; }
         }
     }
     /*
@@ -262,6 +275,31 @@ mod focus_tests {
         assert_eq!(request.area, new);
         assert_eq!(request.anchor, TextActionsAnchor::Area(new));
         assert_eq!(request.token, token);
+    }
+
+    #[test]
+    fn handle_registration_follows_redraw_and_stale_owner_cannot_clear_it() {
+        use crate::event::{TextHandleEndpoint, TextHandleTarget, text_handle::TextHandleRegistration};
+        let mut lists = crate::draw_list::CxDrawListPool::default();
+        let list = lists.alloc();
+        let old = Area::Rect(crate::area::RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 1 });
+        let new = Area::Rect(crate::area::RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 2 });
+        let other = Area::Rect(crate::area::RectArea { draw_list_id: list.id(), rect_id: 1, redraw_id: 2 });
+        let mut keyboard = CxKeyboard::default();
+        keyboard.claim_text_selection(old);
+        keyboard.text_handles = Some(TextHandleRegistration { id: 1, owner: old, viewport: Default::default(),
+            targets: [Some(TextHandleTarget { area: old, endpoint: TextHandleEndpoint::Anchor, caret_offset: Default::default() }), None] });
+        keyboard.update_area(old, new);
+        keyboard.clear_text_selection(old);
+        let registration = keyboard.text_handles.unwrap();
+        assert_eq!(registration.owner, new);
+        assert_eq!(registration.targets[0].unwrap().area, new);
+        keyboard.claim_text_selection(other);
+        assert!(keyboard.text_handles.is_none());
+        keyboard.clear_text_selection(new);
+        assert_eq!(keyboard.text_selection, other);
+        keyboard.clear_text_selection(other);
+        assert_eq!(keyboard.text_selection, Area::Empty);
     }
 }
 

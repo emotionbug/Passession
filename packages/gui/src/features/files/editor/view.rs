@@ -99,6 +99,10 @@ pub struct SourceEditor {
     show_actions: bool,
     selection_invalidated: bool,
     owns_selection: bool,
+    handles: Option<TextSelectionHandles>,
+    handles_revision: u64,
+    touch_handles: bool,
+    owner_draw_pos: DVec2,
     reveal: Option<Reveal>,
     /// The text revision the last highlight request was for.
     highlight_requested: u64,
@@ -226,6 +230,10 @@ impl SourceEditor {
             show_actions: false,
             selection_invalidated: false,
             owns_selection: false,
+            handles: None,
+            handles_revision: 0,
+            touch_handles: false,
+            owner_draw_pos: DVec2::default(),
             reveal: None,
             highlight_requested: u64::MAX,
             content_rect: Rect::default(),
@@ -247,10 +255,12 @@ impl SourceEditor {
             self.touch_caret = None;
             self.show_actions = false;
             self.selection_invalidated = true;
+            self.touch_handles = false;
         }
     }
 
     pub fn clear_selection(&mut self, cx: &mut Cx) {
+        self.cancel_selection_handles(cx);
         if self.owns_selection {
             cx.clear_text_selection(self.ime_area);
         }
@@ -532,6 +542,7 @@ impl SourceEditor {
     /// `ime_area` owns keyboard focus; the caret has separate IME avoidance geometry.
     pub fn draw(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, look: &EditorLook, ime_area: Area) {
         if self.selection_invalidated {
+            self.cancel_selection_handles(cx);
             if self.owns_selection {
                 cx.clear_text_selection(self.ime_area);
             }
@@ -539,6 +550,13 @@ impl SourceEditor {
             self.selection_invalidated = false;
         }
         self.ime_area = ime_area;
+        self.owner_draw_pos = ime_area.rect(cx).pos;
+        if self.handles_revision != self.buffer.revision || !self.focused {
+            if let Some(handles) = self.handles.as_mut() {
+                handles.cancel(cx);
+            }
+        }
+        self.handles_revision = self.buffer.revision;
         let p = look.palette;
         self.ensure_char_width(cx, kit, look.font_size);
         let gutter = self.gutter(look);
@@ -669,7 +687,8 @@ impl SourceEditor {
                 self.buffer.selection.anchor, self.buffer.selection.head, false, false);
             cx.show_text_ime(self.ime_caret_area, dvec2(0.0, caret.size.y));
         }
-        if self.focused && (self.show_actions || (self.owns_selection && cx.text_actions_active(self.ime_area))) {
+        if self.focused && !self.handles.as_ref().is_some_and(TextSelectionHandles::is_dragging)
+            && (self.show_actions || (self.owns_selection && cx.text_actions_active(self.ime_area))) {
             self.show_actions = false;
             let anchor = action_anchor.or(caret_rect).map(|r| r.clip((content.pos, content.pos + content.size)));
             if let Some(anchor) = anchor.filter(|r| r.size.x > 0.0 && r.size.y > 0.0) {
@@ -703,6 +722,17 @@ impl SourceEditor {
             kit.fill(cx, rect(area.pos.x + area.size.x - 6.0, thumb_y, 4.0, thumb_h), with_alpha(p.muted, 0.35), 2.0);
         }
         cx.end_turtle();
+        if self.focused && self.touch_handles {
+            let anchor = self.caret_point(cx, kit, look, sel.anchor);
+            let cursor = self.caret_point(cx, kit, look, sel.head);
+            let origin = content.pos + dvec2(0.0, top) - self.scroll;
+            self.handles.get_or_insert_with(|| TextSelectionHandles::new(cx)).draw(
+                cx, self.ime_area, content,
+                rect(origin.x + anchor.x, origin.y + anchor.y, 2.0, line_height),
+                rect(origin.x + cursor.x, origin.y + cursor.y, 2.0, line_height),
+                sel.is_empty(), !self.read_only,
+            );
+        }
     }
 
     pub fn scroll_by(&mut self, look: &EditorLook, delta: DVec2) {
@@ -736,6 +766,45 @@ impl SourceEditor {
         Some((rect(area.pos.x + area.size.x - 10.0, thumb_y, 10.0, thumb_h), max_scroll / (area.size.y - thumb_h).max(1.0)))
     }
 
+    pub fn cancel_selection_handles(&mut self, cx: &mut Cx) {
+        if let Some(handles) = self.handles.as_mut() {
+            handles.cancel(cx);
+        }
+        self.touch_handles = false;
+    }
+
+    pub fn handle_selection_handles(&mut self, cx: &mut Cx, kit: &mut Kit, look: &EditorLook, event: &Event) -> bool {
+        if self.selection_invalidated || !self.focused || self.handles_revision != self.buffer.revision {
+            self.cancel_selection_handles(cx);
+            return false;
+        }
+        let Some(action) = self.handles.as_mut().and_then(|handles| handles.handle_event(cx, event, self.ime_area)) else {
+            return false;
+        };
+        self.touch_scroll.reset();
+        self.touch_caret = None;
+        self.thumb_drag = None;
+        self.drag = None;
+        self.preferred_x = None;
+        self.ime_last = None;
+        self.reveal = None;
+        self.show_actions = false;
+        if action.phase != TextHandlePhase::Cancel {
+            self.scroll += action.scroll;
+            self.clamp_scroll(look);
+            let shift = self.ime_area.rect(cx).pos - self.owner_draw_pos;
+            let offset = self.offset_at_point(cx, kit, look, action.abs - shift);
+            self.buffer.move_selection_handle(action.endpoint, offset);
+            self.blink.restart(cx);
+            if !self.read_only {
+                cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
+                    self.buffer.selection.anchor, self.buffer.selection.head, false, false);
+            }
+            self.show_actions = action.phase == TextHandlePhase::End && cfg!(target_os = "android");
+        }
+        true
+    }
+
     pub fn cancel_touch_focus(&mut self) {
         self.touch_caret = None;
     }
@@ -766,6 +835,7 @@ impl SourceEditor {
     /// Pointer and keyboard input already routed to the editor.
     pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, look: &EditorLook, hit: &Hit) -> EditorResult {
         if self.selection_invalidated {
+            self.cancel_selection_handles(cx);
             if self.owns_selection {
                 cx.clear_text_selection(self.ime_area);
             }
@@ -776,6 +846,9 @@ impl SourceEditor {
         let before = (self.buffer.revision, self.buffer.selection);
         match hit {
             Hit::FingerDown(fe) => {
+                if !fe.device.is_touch() {
+                    self.cancel_selection_handles(cx);
+                }
                 self.touch_scroll.reset();
                 self.touch_caret = None;
                 if fe.device.mouse_button().is_some_and(|b| b.is_secondary()) {
@@ -854,6 +927,7 @@ impl SourceEditor {
             Hit::FingerUp(fe) => {
                 self.touch_scroll.release(fe.time);
                 if self.wants_touch_focus(hit) {
+                    self.touch_handles = true;
                     let offset = self.offset_at_point(cx, kit, look, fe.abs);
                     cx.clear_text_selection(self.ime_area);
                     cx.claim_text_selection(self.ime_area);
@@ -885,6 +959,7 @@ impl SourceEditor {
                 self.thumb_drag = None;
             }
             Hit::FingerLongPress(fe) if self.wants_touch_focus(hit) => {
+                self.touch_handles = true;
                 self.touch_scroll.reset();
                 self.touch_caret = None;
                 cx.claim_text_selection(self.ime_area);
@@ -907,6 +982,9 @@ impl SourceEditor {
                 self.scroll_by(look, delta);
             }
             Hit::KeyDown(ke) => {
+                if ke.key_code != KeyCode::KeyA || !ke.modifiers.is_primary() {
+                    self.cancel_selection_handles(cx);
+                }
                 self.handle_key(cx, kit, look, ke);
             }
             Hit::TextIme(edit) if !self.read_only => {

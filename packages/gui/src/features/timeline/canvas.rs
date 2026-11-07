@@ -586,10 +586,18 @@ impl Canvas {
 
     /// Text offset nearest to `rel`.
     pub fn offset_at(&self, rel: DVec2) -> Option<usize> {
+        self.offset_at_impl(rel, false)
+    }
+
+    pub fn offset_at_handle(&self, rel: DVec2) -> Option<usize> {
+        self.offset_at_impl(rel, true)
+    }
+
+    fn offset_at_impl(&self, rel: DVec2, handle: bool) -> Option<usize> {
         let mut best: Option<(f64, usize)> = None;
         for run in &self.runs {
             if let Some(clip) = run.clip
-                && !clip.contains(rel)
+                && !clip.contains(rel) && !handle
             {
                 continue;
             }
@@ -601,11 +609,38 @@ impl Canvas {
             if best.is_some_and(|(d, _)| d <= distance) {
                 continue;
             }
-            let point = Point::new(local.x.clamp(0.0, size.x) as f32, local.y.clamp(0.0, size.y.max(0.0)) as f32);
+            let visible = run.clip.map(|clip| dvec2(
+                rel.x.clamp(clip.pos.x, (clip.pos.x + clip.size.x).max(clip.pos.x)),
+                rel.y.clamp(clip.pos.y, (clip.pos.y + clip.size.y).max(clip.pos.y)),
+            )).unwrap_or(rel) - run.origin;
+            let point = Point::new(visible.x.clamp(0.0, size.x) as f32, visible.y.clamp(0.0, size.y.max(0.0)) as f32);
             let cursor = run.laidout.point_in_lpxs_to_cursor(point);
             best = Some((distance, run.offset + cursor.index.min(run.len)));
         }
         best.map(|(_, offset)| offset)
+    }
+
+    /// Endpoint geometry in current draw coordinates, retaining inner pane clipping.
+    pub fn caret_rect(&self, offset: usize, prefer_next: bool) -> Option<Rect> {
+        let run = if prefer_next {
+            self.runs.iter().rev().find(|run| offset >= run.offset && offset <= run.offset + run.len)
+        } else {
+            self.runs.iter().find(|run| offset >= run.offset && offset <= run.offset + run.len)
+        }?;
+        if run.laidout.rows.is_empty() {
+            return None;
+        }
+        let index = floor_char_boundary(&run.laidout.text, offset - run.offset);
+        let pos = run.laidout.cursor_to_position(Cursor { index, prefer_next_row: prefer_next });
+        let row = &run.laidout.rows[pos.row_index];
+        let mut caret = Rect {
+            pos: run.origin + dvec2(pos.x_in_lpxs as f64, (row.origin_in_lpxs.y - row.ascender_in_lpxs) as f64),
+            size: dvec2(1.0, (row.ascender_in_lpxs - row.descender_in_lpxs) as f64),
+        };
+        if let Some(clip) = run.clip {
+            caret = caret.clip((clip.pos, clip.pos + clip.size));
+        }
+        Some(caret.translate(self.origin))
     }
 
     pub fn selected_range(&self) -> Option<(usize, usize)> {
@@ -634,12 +669,14 @@ impl Canvas {
 
     /// Word around `offset` (double-tap / long-press selection).
     pub fn word_at(&self, offset: usize) -> (usize, usize) {
+        use unicode_segmentation::UnicodeSegmentation;
         let text = &self.plain;
         let offset = floor_char_boundary(text, offset.min(text.len()));
-        let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        let start = text[..offset].char_indices().rev().take_while(|(_, c)| is_word(*c)).last().map(|(i, _)| i).unwrap_or(offset);
-        let end = text[offset..].char_indices().find(|(_, c)| !is_word(*c)).map(|(i, _)| offset + i).unwrap_or(text.len());
-        (start, end)
+        text.split_word_bound_indices()
+            .find(|(start, word)| offset >= *start && offset < *start + word.len())
+            .or_else(|| text.split_word_bound_indices().next_back().filter(|_| offset == text.len()))
+            .map(|(start, word)| (start, start + word.len()))
+            .unwrap_or((offset, offset))
     }
 
     /// Selection highlight rects (absolute, from the current canvas origin).
@@ -677,4 +714,32 @@ pub fn floor_char_boundary(text: &str, index: usize) -> usize {
 
 pub fn rect_xywh(x: f64, y: f64, w: f64, h: f64) -> Rect {
     Rect { pos: dvec2(x, y), size: dvec2(w, h) }
+}
+
+#[cfg(test)]
+mod selection_handle_tests {
+    use super::*;
+
+    #[test]
+    fn touch_word_selection_keeps_hangul_and_emoji_clusters() {
+        let canvas = Canvas { plain: "한글 👩\u{200d}💻 e\u{301}".to_owned(), ..Default::default() };
+        for word in ["한글", "👩\u{200d}💻", "e\u{301}"] {
+            let offset = canvas.plain.find(word).unwrap();
+            let (a, b) = canvas.word_at(offset);
+            assert_eq!(&canvas.plain[a..b], word);
+        }
+    }
+
+    #[test]
+    fn crossing_endpoints_keeps_source_text_and_whitespace() {
+        let mut canvas = Canvas { plain: "한글\n  code\t🙂\n".to_owned(), ..Default::default() };
+        let end = canvas.plain.len();
+        canvas.selection = Some((end, 0));
+        assert_eq!(canvas.selected_text().as_deref(), Some(canvas.plain.as_str()));
+        let hash = canvas.selection_source_hash();
+        canvas.plain.push_str("streamed suffix");
+        assert_eq!(canvas.selection_source_hash(), hash);
+        canvas.plain.replace_range(..3, "다");
+        assert_ne!(canvas.selection_source_hash(), hash);
+    }
 }

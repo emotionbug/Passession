@@ -130,6 +130,11 @@ impl ExplorerPanel {
         let mut changed = self.handle_commands(cx, ui, &target);
         changed |= self.view.location.blink.handle_event(event);
         let scroll_enabled = area.is_valid(cx) && !self.transfer_hits_active();
+        if !scroll_enabled {
+            self.view.location.cancel_selection_handles(cx);
+        } else if self.view.handle_selection_handles(cx, kit, event) {
+            return true;
+        }
         changed |= store::with(|s| {
             s.explorer_mut(&self.owner).is_some_and(|state| self.view.animate_scroll(cx, event, state, scroll_enabled))
         });

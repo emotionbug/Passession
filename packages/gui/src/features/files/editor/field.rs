@@ -36,6 +36,12 @@ pub struct TextField {
     show_actions: bool,
     selection_invalidated: bool,
     owns_selection: bool,
+    handles: Option<TextSelectionHandles>,
+    handles_revision: u64,
+    touch_handles: bool,
+    owner_draw_pos: DVec2,
+    max_scroll_x: f64,
+    scroll_follows_anchor: bool,
 }
 
 impl TextField {
@@ -43,7 +49,7 @@ impl TextField {
         let mut buffer = TextBuffer::new(text.replace('\n', " "));
         let len = buffer.len();
         buffer.set_selection(Selection::caret(len));
-        TextField { buffer, focused: false, blink: super::Blink::default(), scroll_x: 0.0, text_rect: Rect::default(), font_size: 14.0, drag_anchor: None, touch_focus: None, frame: Rect::default(), ime_id: LiveId::unique().0, ime_area: Area::Empty, ime_caret_area: Area::Empty, show_actions: false, selection_invalidated: false, owns_selection: false }
+        TextField { buffer, focused: false, blink: super::Blink::default(), scroll_x: 0.0, text_rect: Rect::default(), font_size: 14.0, drag_anchor: None, touch_focus: None, frame: Rect::default(), ime_id: LiveId::unique().0, ime_area: Area::Empty, ime_caret_area: Area::Empty, show_actions: false, selection_invalidated: false, owns_selection: false, handles: None, handles_revision: 0, touch_handles: false, owner_draw_pos: DVec2::default(), max_scroll_x: 0.0, scroll_follows_anchor: false }
     }
 
     pub fn text(&self) -> &str {
@@ -58,6 +64,7 @@ impl TextField {
         self.touch_focus = None;
         self.show_actions = false;
         self.selection_invalidated = true;
+        self.touch_handles = false;
     }
 
     pub fn select_all(&mut self) {
@@ -67,6 +74,7 @@ impl TextField {
     }
 
     pub fn clear_selection(&mut self, cx: &mut Cx) {
+        self.cancel_selection_handles(cx);
         if self.owns_selection {
             cx.clear_text_selection(self.ime_area);
         }
@@ -93,6 +101,7 @@ impl TextField {
         ime_area: Area,
     ) {
         if self.selection_invalidated {
+            self.cancel_selection_handles(cx);
             if self.owns_selection {
                 cx.clear_text_selection(self.ime_area);
             }
@@ -102,6 +111,13 @@ impl TextField {
         self.font_size = font_size;
         self.frame = frame;
         self.ime_area = ime_area;
+        self.owner_draw_pos = ime_area.rect(cx).pos;
+        if self.handles_revision != self.buffer.revision || !self.focused {
+            if let Some(handles) = self.handles.as_mut() {
+                handles.cancel(cx);
+            }
+        }
+        self.handles_revision = self.buffer.revision;
         let border = if self.focused { p.border_accent } else { p.surface2 };
         kit.outline(cx, frame, p.surface2, border, 1.0, 6.0);
         let trailing_w = match trailing {
@@ -123,11 +139,16 @@ impl TextField {
         let x_of = |index: usize| laid.rows.first().map(|row| row.index_to_x_in_lpxs(index) as f64).unwrap_or(0.0);
         let sel = self.buffer.selection;
         let caret_x = x_of(sel.head);
-        if caret_x - self.scroll_x > text_rect.size.x - 2.0 {
-            self.scroll_x = caret_x - text_rect.size.x + 2.0;
-        } else if caret_x < self.scroll_x {
-            self.scroll_x = caret_x;
+        self.max_scroll_x = (laid.size_in_lpxs.width as f64 - text_rect.size.x + 2.0).max(0.0);
+        if !self.handles.as_ref().is_some_and(TextSelectionHandles::is_dragging) {
+            let reveal_x = if self.scroll_follows_anchor { x_of(sel.anchor) } else { caret_x };
+            if reveal_x - self.scroll_x > text_rect.size.x - 2.0 {
+                self.scroll_x = reveal_x - text_rect.size.x + 2.0;
+            } else if reveal_x < self.scroll_x {
+                self.scroll_x = reveal_x;
+            }
         }
+        self.scroll_x = self.scroll_x.clamp(0.0, self.max_scroll_x);
         let x0 = text_rect.pos.x - self.scroll_x;
         let h = laid.size_in_lpxs.height as f64;
         let y = text_rect.pos.y + (text_rect.size.y - h.max(font_size * 1.2)) / 2.0;
@@ -154,7 +175,15 @@ impl TextField {
             self.blink.disarm(cx);
         }
         cx.end_turtle();
-        if self.focused && (self.show_actions || (self.owns_selection && cx.text_actions_active(self.ime_area))) {
+        if self.focused && self.touch_handles {
+            self.handles.get_or_insert_with(|| TextSelectionHandles::new(cx)).draw(
+                cx, self.ime_area, text_rect,
+                rect(x0 + x_of(sel.anchor), y, 1.5, h.max(font_size * 1.2)),
+                rect(x0 + caret_x, y, 1.5, h.max(font_size * 1.2)), sel.is_empty(), true,
+            );
+        }
+        if self.focused && !self.handles.as_ref().is_some_and(TextSelectionHandles::is_dragging)
+            && (self.show_actions || (self.owns_selection && cx.text_actions_active(self.ime_area))) {
             self.show_actions = false;
             let a = x_of(sel.start());
             let b = x_of(sel.end());
@@ -176,6 +205,40 @@ impl TextField {
         let laid = kit.layout(cx, s, self.buffer.text(), None);
         let x = (abs.x - self.text_rect.pos.x + self.scroll_x).max(0.0);
         laid.rows.first().map(|row| row.x_in_lpxs_to_index(x as f32)).unwrap_or(0).min(self.buffer.len())
+    }
+
+    pub fn cancel_selection_handles(&mut self, cx: &mut Cx) {
+        if let Some(handles) = self.handles.as_mut() {
+            handles.cancel(cx);
+        }
+        self.touch_handles = false;
+    }
+
+    /// Handle events are routed before ordinary owner hits, including frame-driven
+    /// scrolling with a stationary pointer outside the field.
+    pub fn handle_selection_handles(&mut self, cx: &mut Cx, kit: &mut Kit, event: &Event) -> bool {
+        if self.selection_invalidated || !self.focused || self.handles_revision != self.buffer.revision {
+            self.cancel_selection_handles(cx);
+            return false;
+        }
+        let Some(action) = self.handles.as_mut().and_then(|handles| handles.handle_event(cx, event, self.ime_area)) else {
+            return false;
+        };
+        self.touch_focus = None;
+        self.drag_anchor = None;
+        self.show_actions = false;
+        if action.phase != TextHandlePhase::Cancel {
+            self.scroll_x = (self.scroll_x + action.scroll.x).clamp(0.0, self.max_scroll_x);
+            let shift = self.ime_area.rect(cx).pos - self.owner_draw_pos;
+            let index = self.index_at(cx, kit, action.abs - shift);
+            self.buffer.move_selection_handle(action.endpoint, index);
+            self.scroll_follows_anchor = action.endpoint == TextHandleEndpoint::Anchor;
+            self.blink.restart(cx);
+            cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
+                self.buffer.selection.anchor, self.buffer.selection.head, false, false);
+            self.show_actions = action.phase == TextHandlePhase::End && cfg!(target_os = "android");
+        }
+        true
     }
 
     pub fn cancel_touch_focus(&mut self) {
@@ -220,6 +283,7 @@ impl TextField {
 
     pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, hit: &Hit) -> FieldEvent {
         if self.selection_invalidated {
+            self.cancel_selection_handles(cx);
             if self.owns_selection {
                 cx.clear_text_selection(self.ime_area);
             }
@@ -231,6 +295,9 @@ impl TextField {
         match hit {
             Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
                 self.touch_focus = fe.device.is_touch().then_some((fe.digit_id, self.buffer.revision));
+                if !fe.device.is_touch() {
+                    self.cancel_selection_handles(cx);
+                }
                 if fe.device.is_touch() {
                     self.drag_anchor = None;
                     return FieldEvent::None;
@@ -240,6 +307,7 @@ impl TextField {
             }
             Hit::FingerLongPress(fe) if self.wants_touch_focus(hit) => {
                 self.touch_focus = None;
+                self.touch_handles = true;
                 cx.claim_text_selection(self.ime_area);
                 self.owns_selection = true;
                 let index = self.index_at(cx, kit, fe.abs);
@@ -259,6 +327,7 @@ impl TextField {
             }
             Hit::FingerUp(fe) => {
                 if self.wants_touch_focus(hit) {
+                    self.touch_handles = true;
                     self.place_pointer_cursor(cx, kit, fe.abs, fe.tap_count, false);
                     if cfg!(target_os = "android") && !self.buffer.selection.is_empty() {
                         self.show_actions = true;
@@ -271,6 +340,9 @@ impl TextField {
                 self.drag_anchor = None;
             }
             Hit::KeyDown(ke) => {
+                if ke.key_code != KeyCode::KeyA || !ke.modifiers.is_primary() {
+                    self.cancel_selection_handles(cx);
+                }
                 let m = ke.modifiers;
                 let word = if cfg!(target_vendor = "apple") { m.alt } else { m.control };
                 let head = self.buffer.selection.head;
@@ -329,6 +401,7 @@ impl TextField {
             event = FieldEvent::Changed;
         }
         if self.buffer.revision != revision || self.buffer.selection != selection {
+            self.scroll_follows_anchor = false;
             self.blink.restart(cx);
         }
         if self.focused {

@@ -42,3 +42,12 @@ Glyph depth stays at the authored draw depth: per-glyph accumulation previously
 let long text paint above later overlay backgrounds and icons.
 `src/cx_draw.rs` uploads all live pages without the old atlas-reset redraw loop;
 the text debug exporter explicitly selects page zero.
+
+## Selection handle geometry
+
+`DrawText::draw_abs_laidout` paints retained text at a scrolled origin without
+reshaping it, keeping selection hit testing and rendered text on the same layout.
+`Cx2d::end_pass_sized_turtle_with_visible_anchor` anchors handle decorations to
+their owner's final alignment while escaping nested text-content clips.
+Draw-list/window clipping still applies; a clipped caret hides its decoration.
+The widget layer shares this mechanism across editable and read-only owners.

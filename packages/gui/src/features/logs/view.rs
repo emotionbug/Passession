@@ -126,6 +126,10 @@ pub struct WaLogView {
     show_actions: bool,
     #[rust]
     action_anchor: Option<Rect>,
+    #[rust(TextSelectionHandles::new(cx))]
+    selection_handles: TextSelectionHandles,
+    #[rust]
+    touch_selection: bool,
 }
 
 impl WaLogView {
@@ -199,13 +203,52 @@ impl WaLogView {
         (fg, bg)
     }
 
-    fn pos_to_cell(&self, cx: &Cx, abs: DVec2) -> Option<CellPos> {
+    fn pos_to_cell(&mut self, cx: &Cx, abs: DVec2) -> Option<CellPos> {
         let (width, height, _) = self.cell?;
         let rect = self.draw_hit.area().rect(cx);
         let local = abs - rect.pos + self.hit_origin;
         let row = (local.y / height).floor().max(0.0) as usize;
         let col = (local.x / width).round().max(0.0) as usize;
-        Some(CellPos { row, col })
+        self.snap_cell(CellPos { row, col }, false)
+    }
+
+    fn snap_cell(&mut self, pos: CellPos, next: bool) -> Option<CellPos> {
+        let session = self.session.as_mut()?;
+        let row = pos.row.min(session.line_count().checked_sub(1)?);
+        let lines = session.read(row, 1);
+        let line = lines.first()?;
+        Some(CellPos { row, col: grapheme_column(line, pos.col, next) })
+    }
+
+    fn handle_selection_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) -> bool {
+        let Some(action) = self.selection_handles.handle_event(cx, event, self.draw_hit.area()) else { return false };
+        self.dragging = false;
+        self.scroll_bars.cancel_touch_scroll();
+        self.show_actions = false;
+        if action.phase == TextHandlePhase::Start {
+            self.follow = false;
+            cx.widget_action(self.widget_uid(), &scope.path, WaLogViewAction::UserScrolled);
+        }
+        if action.phase != TextHandlePhase::Cancel {
+            if action.scroll != DVec2::default() {
+                let scroll = self.scroll_bars.get_scroll_pos();
+                self.scroll_bars.set_scroll_pos(cx, scroll + action.scroll);
+                self.hit_origin = self.scroll_bars.get_scroll_pos();
+                self.follow = false;
+                cx.widget_action(self.widget_uid(), &scope.path, WaLogViewAction::UserScrolled);
+            }
+            if let (Some(point), Some((anchor, cursor))) = (self.pos_to_cell(cx, action.abs), self.selection) {
+                self.selection = Some(match action.endpoint {
+                    TextHandleEndpoint::Anchor => (point, cursor),
+                    TextHandleEndpoint::Cursor | TextHandleEndpoint::Caret => (anchor, point),
+                });
+            }
+        }
+        if action.phase == TextHandlePhase::End {
+            self.show_actions = self.selection.is_some_and(|(a, b)| a != b);
+        }
+        self.redraw(cx);
+        true
     }
 
     /// The selected text, with logical lines joined like `renderedText`.
@@ -341,6 +384,8 @@ impl WaLogView {
     }
 
     pub fn clear_selection(&mut self, cx: &mut Cx) {
+        self.selection_handles.cancel(cx);
+        self.touch_selection = false;
         cx.clear_text_selection(self.draw_hit.area());
         self.dragging = false;
         self.show_actions = false;
@@ -352,6 +397,9 @@ impl WaLogView {
 
 impl Widget for WaLogView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.handle_selection_event(cx, event, scope) {
+            return;
+        }
         let uid = self.widget_uid();
         let before = self.scroll_bars.get_scroll_pos();
         self.scroll_bars.handle_main_event(cx, event, scope, &mut Vec::new());
@@ -360,6 +408,7 @@ impl Widget for WaLogView {
                 cx.claim_text_selection(self.draw_hit.area());
                 self.dragging = false;
                 if !down.device.is_touch() && let Some(pos) = self.pos_to_cell(cx, down.abs) {
+                    self.touch_selection = false;
                     self.selection = Some((pos, pos));
                     self.dragging = true;
                     self.redraw(cx);
@@ -368,7 +417,9 @@ impl Widget for WaLogView {
             Hit::FingerLongPress(press) => {
                 if let Some(pos) = self.pos_to_cell(cx, press.abs) {
                     cx.claim_text_selection(self.draw_hit.area());
-                    self.selection = Some((pos, CellPos { row: pos.row, col: pos.col + 1 }));
+                    self.touch_selection = true;
+                    let end = self.snap_cell(pos, true).unwrap_or(pos);
+                    self.selection = Some((pos, end));
                     self.dragging = true;
                     self.redraw(cx);
                 }
@@ -413,7 +464,8 @@ impl Widget for WaLogView {
                     let rows = self.session.as_ref().map(|s| s.line_count()).unwrap_or(0);
                     if rows > 0 {
                         cx.claim_text_selection(self.draw_hit.area());
-                        self.selection = Some((CellPos { row: 0, col: 0 }, CellPos { row: rows - 1, col: usize::MAX / 2 }));
+                        let end = self.snap_cell(CellPos { row: rows - 1, col: usize::MAX }, false).unwrap_or_default();
+                        self.selection = Some((CellPos { row: 0, col: 0 }, end));
                         self.redraw(cx);
                     }
                 }
@@ -479,7 +531,15 @@ impl Widget for WaLogView {
                 self.scroll_bars.set_scroll_pos(cx, dvec2(x, (content.y - viewport.y).max(0.0)));
             }
         }
-        if self.show_actions || cx.text_actions_active(self.draw_hit.area()) {
+        if self.touch_selection && let Some((anchor, cursor)) = self.selection {
+            let caret = |point: CellPos| Rect {
+                pos: origin + dvec2(point.col as f64 * width, point.row as f64 * height),
+                size: dvec2(1.0, height),
+            };
+            let viewport = self.draw_hit.area().rect(cx);
+            self.selection_handles.draw(cx, self.draw_hit.area(), viewport, caret(anchor), caret(cursor), anchor == cursor, false);
+        }
+        if !self.selection_handles.is_dragging() && (self.show_actions || cx.text_actions_active(self.draw_hit.area())) {
             self.show_actions = false;
             if let Some(anchor) = self.action_anchor {
                 cx.show_text_actions(self.draw_hit.area(), anchor, TextActionCapabilities {
@@ -502,6 +562,23 @@ impl Widget for WaLogView {
     }
 }
 
+/// Terminal cells may share a column (combining marks) or span two columns.
+/// Snap only at complete grapheme boundaries, never in a Hangul/emoji cluster.
+fn grapheme_column(line: &Line, col: usize, next: bool) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut chars = 0;
+    let cells: usize = line.runs.iter().map(|run| run.cells).sum();
+    for grapheme in line.text.graphemes(true) {
+        let start = line.columns.get(chars).copied().unwrap_or(cells);
+        chars += grapheme.chars().count();
+        let end = line.columns.get(chars).copied().unwrap_or(cells);
+        if col < end {
+            return if next || col.saturating_sub(start) > end.saturating_sub(col) { end } else { start };
+        }
+    }
+    cells
+}
+
 impl WaLogViewRef {
     pub fn user_scrolled(&self, actions: &Actions) -> bool {
         actions
@@ -513,5 +590,42 @@ impl WaLogViewRef {
         actions
             .filter_widget_actions(self.widget_uid())
             .any(|action| matches!(action.cast(), WaLogViewAction::FindRequested))
+    }
+}
+
+#[cfg(test)]
+mod selection_handle_tests {
+    use super::*;
+
+    fn line(text: &str, columns: &[usize], cells: usize) -> Line {
+        Line {
+            text: text.to_owned(),
+            columns: columns.to_vec(),
+            runs: vec![Run {
+                text: text.to_owned(), cells, fg: TermColor::Default, bg: TermColor::Default,
+                bold: false, dim: false, italic: false, underline: false, inverse: false,
+                strike: false, hidden: false,
+            }],
+            wraps_next: false,
+        }
+    }
+
+    #[test]
+    fn endpoints_skip_wide_hangul_and_combining_cells() {
+        let row = line("한e\u{301}🙂", &[0, 2, 2, 3], 5);
+        assert_eq!(grapheme_column(&row, 1, false), 0);
+        assert_eq!(grapheme_column(&row, 0, true), 2);
+        assert_eq!(grapheme_column(&row, 2, true), 3);
+        assert_eq!(grapheme_column(&row, 4, false), 3);
+        assert_eq!(grapheme_column(&row, usize::MAX, false), 5);
+    }
+
+    #[test]
+    fn endpoints_keep_joined_emoji_and_code_whitespace() {
+        let row = line("  👩\u{200d}💻\t", &[0, 1, 2, 2, 4, 6], 7);
+        assert_eq!(grapheme_column(&row, 1, false), 1);
+        assert_eq!(grapheme_column(&row, 2, true), 6);
+        assert_eq!(grapheme_column(&row, 4, false), 2);
+        assert_eq!(grapheme_column(&row, 6, true), 7);
     }
 }

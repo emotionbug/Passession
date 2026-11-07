@@ -84,6 +84,25 @@ Long press opens the native toolbar at the hold threshold, without waiting for
 finger-up. Identical-position move events do not remap a held selection when
 IME presentation moves the input; actual movement still extends the range.
 
+## Shared touch selection handles
+
+`src/text_selection_handles.rs` paints insertion/range handles and delegates
+gesture ownership to the platform registry. `TextInput` uses the same helper as
+Paseo's manual source, Markdown, chat and log owners. It preserves endpoint
+identity through crossing, publishes IME selection through existing edit history,
+and suppresses native actions during a handle drag. The Live shader requires an
+explicit reachable import and `new_local`, not bare Rust-field initialization.
+
+Knobs use an owner-aligned overlay turtle to escape nested text-content clips
+without escaping draw-list/window clipping. A clipped caret suppresses its knob;
+the overlay still follows the owner's final alignment.
+
+`ScrollBars` and `PortalList` cancel touch inertia on handle capture.
+`PortalListRef::scroll_selection` scrolls selected content without starting an
+independent pan/fling; the owning timeline row remains responsible for source
+hit testing after layout. Handle timing and edge speeds are not duplicated in
+these consumers.
+
 ## Touch scrolling
 
 `src/scroll_bars.rs` supplies the shared `TouchScroll` controller: slop-qualified

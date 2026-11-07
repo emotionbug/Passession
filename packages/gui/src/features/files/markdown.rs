@@ -457,6 +457,9 @@ pub struct MarkdownPreview {
     dragging: bool,
     thumb_drag: Option<(f64, f64)>,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
+    selection_handles: Option<TextSelectionHandles>,
+    touch_selection: bool,
+    owner_draw_pos: DVec2,
     /// Image sources in document order (relative to the file), for the owner to resolve.
     pub image_sources: Vec<String>,
 }
@@ -483,6 +486,9 @@ impl Default for MarkdownPreview {
             dragging: false,
             thumb_drag: None,
             touch_scroll: Default::default(),
+            selection_handles: None,
+            touch_selection: false,
+            owner_draw_pos: DVec2::default(),
             image_sources: Vec::new(),
         }
     }
@@ -814,6 +820,7 @@ impl MarkdownPreview {
         }
         self.owner = owner;
         self.layout(cx, kit, look, area.size.x, images, image_epoch);
+        self.owner_draw_pos = owner.rect(cx).pos;
         self.area = area;
         let max = (self.height - area.size.y).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max);
@@ -864,7 +871,14 @@ impl MarkdownPreview {
             kit.fill(cx, rect(area.pos.x + area.size.x - 6.0, thumb_y, 4.0, thumb_h), with_alpha(p.muted, 0.35), 2.0);
         }
         cx.end_turtle();
-        if self.show_actions || (self.owns_selection && cx.text_actions_active(self.owner)) {
+        if self.touch_selection && let Some((anchor, cursor)) = self.selection {
+            let a = self.caret_rect(anchor, anchor <= cursor).unwrap_or_default();
+            let b = self.caret_rect(cursor, cursor < anchor).unwrap_or_default();
+            self.selection_handles.get_or_insert_with(|| TextSelectionHandles::new(cx))
+                .draw(cx, owner, area, a, b, anchor == cursor, false);
+        }
+        if !self.selection_handles.as_ref().is_some_and(TextSelectionHandles::is_dragging)
+            && (self.show_actions || (self.owns_selection && cx.text_actions_active(self.owner))) {
             self.show_actions = false;
             if let Some(anchor) = action_anchor {
                 cx.show_text_actions(self.owner, anchor, TextActionCapabilities {
@@ -878,6 +892,10 @@ impl MarkdownPreview {
     }
 
     pub fn clear_selection(&mut self, cx: &mut Cx) {
+        if let Some(handles) = &mut self.selection_handles {
+            handles.cancel(cx);
+        }
+        self.touch_selection = false;
         if self.owns_selection {
             cx.clear_text_selection(self.owner);
         }
@@ -916,6 +934,49 @@ impl MarkdownPreview {
         let local = rel - run.pos;
         let cursor = run.laid.point_in_lpxs_to_cursor(makepad_widgets::makepad_draw::text::geom::Point::new(local.x as f32, local.y as f32));
         Some((index, cursor.index))
+    }
+
+    fn caret_rect(&self, point: (usize, usize), prefer_next: bool) -> Option<Rect> {
+        let run = self.runs.get(point.0)?;
+        if run.laid.rows.is_empty() {
+            return None;
+        }
+        let pos = run.laid.cursor_to_position(TextCursor { index: point.1.min(run.laid.text.len()), prefer_next_row: prefer_next });
+        let row = &run.laid.rows[pos.row_index];
+        Some(Rect {
+            pos: self.origin + run.pos + dvec2(pos.x_in_lpxs as f64, (row.origin_in_lpxs.y - row.ascender_in_lpxs) as f64),
+            size: dvec2(1.0, (row.ascender_in_lpxs - row.descender_in_lpxs) as f64),
+        })
+    }
+
+    /// Routed before the file panel's ordinary hit/scroll dispatch.
+    pub fn handle_selection_handles(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        if self.selection_invalidated || !self.owner.is_valid(cx) {
+            self.clear_selection(cx);
+            return false;
+        }
+        let Some(action) = self.selection_handles.as_mut()
+            .and_then(|handles| handles.handle_event(cx, event, self.owner)) else { return false };
+        self.touch_scroll.reset();
+        self.show_actions = false;
+        self.dragging = false;
+        self.thumb_drag = None;
+        if action.phase != TextHandlePhase::Cancel {
+            self.scroll_y = (self.scroll_y + action.scroll.y).clamp(0.0, (self.height - self.area.size.y).max(0.0));
+            self.origin.y = self.area.pos.y - self.scroll_y;
+            let abs = action.abs - (self.owner.rect(cx).pos - self.owner_draw_pos);
+            if let (Some(point), Some((anchor, cursor))) = (self.point_at(abs), self.selection) {
+                self.selection = Some(match action.endpoint {
+                    TextHandleEndpoint::Anchor => (point, cursor),
+                    TextHandleEndpoint::Cursor | TextHandleEndpoint::Caret => (anchor, point),
+                });
+            }
+        }
+        if action.phase == TextHandlePhase::End {
+            self.show_actions = self.ordered_selection().is_some();
+        }
+        self.owner.redraw(cx);
+        true
     }
 
     fn link_at(&self, abs: DVec2) -> Option<String> {
@@ -977,6 +1038,7 @@ impl MarkdownPreview {
                 self.dragging = !fe.device.is_touch();
                 let point = self.point_at(fe.abs);
                 if !fe.device.is_touch() {
+                    self.touch_selection = false;
                     self.selection = point.map(|p| (p, p));
                 }
                 if !fe.device.is_touch() && point.is_some() {
@@ -996,6 +1058,7 @@ impl MarkdownPreview {
             }
             Hit::FingerLongPress(fe) => {
                 self.touch_scroll.reset();
+                self.touch_selection = true;
                 if let Some((run, offset)) = self.point_at(fe.abs) {
                     let (a, b) = word_bounds(self.runs[run].laid.text.as_str(), offset);
                     self.selection = Some(((run, a), (run, b)));

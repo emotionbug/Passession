@@ -588,6 +588,15 @@ pub unsafe fn to_java_hide_text_actions() {
     ndk_utils::call_void_method!(env, get_activity(), "hideTextActions", "()V");
 }
 
+pub unsafe fn to_java_text_magnifier(source: Option<(DVec2, Rect)>, dpi: f64) {
+    let env = attach_jni_env();
+    let (pos, viewport) = source.unwrap_or_default();
+    ndk_utils::call_void_method!(env, get_activity(), "updateTextMagnifier", "(ZFFFFFF)V",
+        source.is_some() as i32, pos.x * dpi, pos.y * dpi,
+        viewport.pos.x * dpi, viewport.pos.y * dpi,
+        (viewport.pos.x + viewport.size.x) * dpi, (viewport.pos.y + viewport.size.y) * dpi);
+}
+
 #[no_mangle]
 extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnResizeTextIME(
     _: *mut jni_sys::JNIEnv,

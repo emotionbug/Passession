@@ -189,6 +189,7 @@ pub enum Event {
     KeyUp(KeyEvent),
     TextInput(TextInputEvent),
     TextIme(TextImeEvent),
+    TextHandle(super::TextHandleEvent),
     TextCopy(TextClipboardEvent),
     TextCut(TextClipboardEvent),
     TextSelectAll,
@@ -302,6 +303,7 @@ impl Event{
             54=>"XrLocal",
             55=>"TextIme",
             56=>"TextSelectAll",
+            57=>"TextHandle",
             _=>panic!()
         }
     }
@@ -352,6 +354,7 @@ impl Event{
             Self::TextCopy(_)=>34,
             Self::TextCut(_)=>35,
             Self::TextSelectAll=>56,
+            Self::TextHandle(_)=>57,
 
             Self::Drag(_)=>36,
             Self::Drop(_)=>37,

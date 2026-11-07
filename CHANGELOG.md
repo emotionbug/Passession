@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.9 - 2026-11-07
+
+### Added
+
+- Add shared touch insertion and range-selection handles to inputs, search, source editors, Markdown, chat and logs. Keep endpoint identity through crossing, capture handle drags before parent scrolling, and extend selection with frame-timed edge scrolling.
+- Connect handle dragging to Android's native magnifier on API 28 and later. Keep Rust selection/edit history and the existing native IME and floating edit toolbar; do not introduce an EditText overlay.
+
+### Validation
+
+- Passed 207 GUI/platform/widget regressions. Android API 35 emulator checks covered Korean composer and manual Find input, sidebar search at 100%/200% text size, source/chat endpoint crossing and edge scrolling, native magnifier refresh, toolbar restoration and owner disposal.
+
 ## 0.13.8 - 2026-11-07
 
 ### Fixed

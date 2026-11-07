@@ -104,12 +104,19 @@ impl Widget for RemoteFolderPicker {
                 s.explorer(ui, &owner, &cwd, ".", true, None);
             });
             let scroll_enabled = self.area.is_valid(cx);
+            let handle_consumed = if scroll_enabled {
+                self.view.handle_selection_handles(cx, &mut self.kit, event)
+            } else {
+                self.view.location.cancel_selection_handles(cx);
+                false
+            };
+            changed |= handle_consumed;
             changed |= store::with(|s| {
                 s.explorer_mut(&owner).is_some_and(|state| self.view.animate_scroll(cx, event, state, scroll_enabled))
             });
             let shift = if self.area.is_valid(cx) { self.area.rect(cx).pos - self.drawn_at } else { DVec2::default() };
             let hit = super::kit::unshift_hit(event.hits(cx, self.area), shift);
-            if !matches!(hit, Hit::Nothing) {
+            if !handle_consumed && !matches!(hit, Hit::Nothing) {
                 if matches!(&hit, Hit::FingerDown(fe) if !fe.device.is_touch())
                     || self.view.wants_touch_focus(&hit) {
                     cx.set_key_focus(self.area);
@@ -179,6 +186,7 @@ impl RemoteFolderPickerRef {
             let cwd = if cwd.trim().is_empty() { "~".to_owned() } else { cwd.trim().to_owned() };
             let owner = inner.owner();
             store::release(&owner);
+            inner.view.location.clear_selection(cx);
             inner.view = ExplorerView::default();
             inner.scope = Some((host_id.to_owned(), cwd));
             inner.next_frame = cx.new_next_frame();

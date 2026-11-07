@@ -12,6 +12,30 @@ The shared selection registry fences native actions by owner and request token. 
 
 Toolbar anchors come from the painted caret/selection area and are resolved after parent layout, alignment and clipping finish. An early draw-time zero-size clip must not destroy a valid request. Reflow, scrolling and keyboard resizing update the visible anchor; offscreen selections do not leave a floating toolbar at stale coordinates.
 
+`TextSelectionHandles` is the common touch renderer for insertion and range
+handles. Platform `event/text_handle.rs` owns hit testing, touch capture, fixed
+endpoint identity, slop, frame timing, edge-scroll deltas and magnifier lifetime.
+Owners only map current coordinates to their source/terminal positions, apply
+their bounded scrolling and update their existing selection/edit model. Do not
+add per-screen handle physics or Android editor overlays.
+
+Handle touches are routed before ordinary touch dispatch, including when the
+knob extends outside the text owner. Parent scrolling cannot steal the drag.
+Crossing the opposite endpoint preserves which endpoint is held. Frame events
+continue edge selection while the finger is stationary; release, cancellation,
+owner replacement and focus loss stop it. A completed drag restores the native
+action toolbar; cancellation does not open one.
+
+Android API 28+ supplies the magnifier; older supported Android versions retain
+the common handles without a magnifier. IME and ActionMode remain OS integrations,
+while selection, source offsets and undo remain Rust-owned. Password capability
+restrictions remain unchanged.
+
+Rust-only owners explicitly import
+`makepad_widgets::text_selection_handles::DrawTextSelectionHandle` into a reachable
+Live document before lazy construction. Wildcard Live imports prune unused
+identifiers and are not sufficient to initialize this shader.
+
 Touch-down in an editable field only starts a pending gesture. Focus, caret
 placement and keyboard presentation require an uncancelled tap released inside
 the same field. A pan, leaving the field, cancellation or owner/model/geometry

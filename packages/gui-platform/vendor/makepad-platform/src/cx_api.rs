@@ -342,6 +342,10 @@ impl Cx {
     /// Clear only this owner's selection registration, not a newer editor's focus.
     pub fn clear_text_selection(&mut self, area: Area) {
         if area == Area::Empty || self.keyboard.text_selection != area { return; }
+        if self.keyboard.text_handles.is_some_and(|handles| handles.owner == area) {
+            self.keyboard.text_handles = None;
+            self.text_handle_magnifier(None);
+        }
         self.keyboard.clear_text_selection(area);
         #[cfg(target_os = "android")]
         self.android_sync_text_actions();
@@ -359,6 +363,7 @@ impl Cx {
 
     /// Android uses the system floating toolbar; source selection stays in its widget.
     pub fn show_text_actions(&mut self, area: Area, rect: Rect, capabilities: TextActionCapabilities) {
+        if self.keyboard.text_handle_drag.is_some_and(|drag| drag.owner == area) { return; }
         self.claim_text_selection(area);
         #[cfg(target_os = "android")]
         {
@@ -372,6 +377,7 @@ impl Cx {
 
     /// Resolve painted selection/caret geometry only after parent layout is complete.
     pub fn show_text_actions_for_area(&mut self, owner: Area, anchor: Area, capabilities: TextActionCapabilities) {
+        if self.keyboard.text_handle_drag.is_some_and(|drag| drag.owner == owner) { return; }
         self.claim_text_selection(owner);
         #[cfg(target_os = "android")]
         {

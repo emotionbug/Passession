@@ -37,7 +37,7 @@ pub(crate) fn is_user_input(event: &Event) -> bool {
         Event::MouseDown(_) | Event::MouseMove(_) | Event::MouseUp(_) | Event::MouseLeave(_)
         | Event::TouchUpdate(_) | Event::LongPress(_) | Event::Scroll(_)
         | Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_) | Event::TextIme(_)
-        | Event::TextCopy(_) | Event::TextCut(_) | Event::TextSelectAll | Event::BackPressed { .. }
+        | Event::TextCopy(_) | Event::TextCut(_) | Event::TextSelectAll | Event::TextHandle(_) | Event::BackPressed { .. }
         | Event::Drag(_) | Event::Drop(_))
 }
 
