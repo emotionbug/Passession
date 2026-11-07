@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+
+- Remove unused npm dependency patches for the retired Node/Expo client and daemon. The native Rust build does not consume `patch-package`.
+
 ## 0.13.9 - 2026-11-07
 
 ### Added
