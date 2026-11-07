@@ -19,6 +19,7 @@
 - Prepare complete assistant Markdown snapshots with background parsing and exact isolated text layout, then publish matching source, glyphs and selection geometry together. Replace the desktop render cap with the retained full-content path; paint only final-position visible glyph ranges.
 - Avoid repeated whole-paragraph prefix shaping, boundary-vector shifts and per-frame selection/clipboard text reconstruction. Retain source indexes and shared clipboard payloads, including response copies invalidated by changed history sources.
 - Fix the Makepad widget derive's qualified-generic field declaration and restore the retained-layout type import required by the native release build.
+- Serialize Android artifact filenames as JSON strings rather than platform-specific `OsStr` objects so release provenance can consume the generated package manifest.
 
 ### Removed
 

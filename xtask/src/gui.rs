@@ -792,7 +792,7 @@ fn android_artifact(
             "format": format,
             "profile": mode,
             "sourceSha": identity.source,
-            "artifacts": [output.file_name().context("Android artifact has no filename")?],
+            "artifacts": [output.file_name().and_then(|name| name.to_str()).context("Android artifact has no UTF-8 filename")?],
         }),
     )?;
     Ok(output)
