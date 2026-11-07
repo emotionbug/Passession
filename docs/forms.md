@@ -12,7 +12,7 @@ Provider options are opaque provider-owned data. A provider or model change must
 
 ## Presentation
 
-Use localized labels, accessible focus order and native controls. Compact forms must remain usable with the keyboard and text scaling. Loading, pending, disabled, error and success are different states; a dismissed dialog is not proof that a mutation succeeded.
+Use localized labels, accessible focus order and native controls. Compact forms must remain usable with the keyboard and text scaling. Navigation and choice rows follow the [shared measured-row contract](design.md#reuse-and-hierarchy); editable fields still size from their native content and padding. Loading, pending, disabled, error and success are different states; a dismissed dialog is not proof that a mutation succeeded.
 
 Remote directory selection uses `features/files/picker.rs` (`RemoteFolderPicker`) against the chosen host. Local attachment and save dialogs use `paseo-gui-platform`. Do not populate a remote destination with a client-side OS directory picker.
 

@@ -30,6 +30,15 @@ strip = "debuginfo"
 [profile.dev]
 debug = 1
 
+# Interactive builds keep optimizations without release's whole-program link.
+[profile.dev-fast]
+inherits = "dev"
+opt-level = 1
+lto = false
+codegen-units = 256
+incremental = true
+debug = 1
+
 # Vendored Makepad patches: see component VENDORED.md files; makepad-platform's
 # also records the adjacent shader compiler's Android GLES compatibility patch.
 [patch.crates-io]

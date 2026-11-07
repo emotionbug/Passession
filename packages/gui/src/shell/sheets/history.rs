@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::common::overlay::{SelectOption, SelectRequest};
 use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::provider_icon::ProviderIcon;
+use crate::common::widgets::RowMetrics;
 use crate::common::{TabPlacement, UiContext, json as j, tr, tr_args};
 use crate::features::command_center::matching::highlight_ranges;
 use crate::shell::chrome::{make_ui, text_line_height};
@@ -823,6 +824,13 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
         let lx = body.pos.x + inset;
         let lw = body.size.x - inset * 2.0;
         let section_spec = ui.spec(Font::Medium, 14.0, p.muted);
+        let row_spec = ui.spec(Font::Regular, 14.0, p.foreground);
+        let badge_spec = ui.spec(Font::Regular, 12.0, p.muted);
+        let row_metrics = RowMetrics::new(
+            ui.painter.line_height(cx, row_spec).max(ui.painter.line_height(cx, badge_spec) + 8.0),
+            0.0,
+            0.0,
+        );
         let agents = page.agents.clone();
         for (section, key) in SECTIONS {
             let rows: Vec<(usize, &HistoryAgent)> = agents.iter().enumerate().filter(|(_, a)| date_section(a.last_activity) == section).collect();
@@ -833,7 +841,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             ry += line_h + 20.0;
             for (index, agent) in rows {
                 let host_label = hosts::host(&state, &agent.server_id).map(|h| h.display_label()).unwrap_or_else(|| agent.server_id.clone());
-                ry += session_row(&mut ui, cx, lx, ry, lw, index, agent, &host_label, &query, compact) + 4.0;
+                ry += session_row(&mut ui, cx, lx, ry, lw, index, agent, &host_label, &query, compact, row_metrics) + 4.0;
             }
         }
         if page.search_truncated {
@@ -860,7 +868,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
 /// then `project · branch · time · host`. Wider layouts: one line with fixed project (132),
 /// host (120, right-aligned), branch (132) and time (72, right-aligned) columns.
 #[allow(clippy::too_many_arguments)]
-fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize, row: &HistoryAgent, host_label: &str, query: &str, compact: bool) -> f64 {
+fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize, row: &HistoryAgent, host_label: &str, query: &str, compact: bool, metrics: RowMetrics) -> f64 {
     let p = ui.p;
     let agent = &row.agent;
     let project = j::object(agent, "project");
@@ -872,21 +880,24 @@ fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize,
     let pending = j::array(agent, "pendingPermissions").len();
     let base = ui.spec(Font::Regular, 14.0, p.foreground);
     let muted = ui.spec(Font::Regular, 14.0, p.muted);
-    let line = text_line_height(20.0, 14.0);
-    let h = if compact { 8.0 + line * 3.0 + 2.0 + 8.0 } else { 8.0 + line + 8.0 };
-    let r = rect(x, y, w, h);
+    let line = metrics.title_height;
+    let row_metrics = RowMetrics::new(line, if compact { line * 2.0 + 2.0 } else { 0.0 }, 0.0);
+    let h = row_metrics.height(0.0, 8.0, 14.0);
+    let slots = row_metrics.layout(rect(x, y, w, h), 12.0, 0.0, 0.0, 0.0);
+    let r = slots.bounds;
     let id = format!("hist:row:{index}");
     let bg = if ui.is_pressed(&id) { Some(p.surface2) } else if ui.is_hover(&id) { Some(p.surface1) } else { None };
     if let Some(bg) = bg {
         ui.fill(cx, r, bg, if compact { 8.0 } else { 0.0 });
     }
     ui.hit(r, id);
-    let cx0 = x + 12.0;
-    let inner_w = w - 24.0;
+    let cx0 = slots.title.pos.x;
+    let inner_w = slots.title.size.x;
     let workspace_title = if workspace_name.is_empty() { project_name } else { workspace_name };
     let draw_agent_title = |ui: &mut Ui, cx: &mut Cx2d, ax: f64, ay: f64, aw: f64| {
-        ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(ax, ay + (line - 14.0) * 0.5, 14.0, 14.0), j::text(agent, "provider"), None, p.muted);
-        highlighted(ui, cx, rect(ax + 22.0, ay, (aw - 22.0).max(0.0), line), muted, &title, query);
+        let content = metrics.layout(rect(ax, ay, aw, line), 0.0, 14.0, 0.0, 8.0);
+        ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(content.leading.pos.x, ay + (line - 14.0) * 0.5, content.leading.size.x, 14.0), j::text(agent, "provider"), None, p.muted);
+        highlighted(ui, cx, content.title, muted, &title, query);
     };
     let badges = |ui: &mut Ui, cx: &mut Cx2d, mut bx: f64, by: f64| {
         if !agent.get("archivedAt").is_none_or(Value::is_null) {
@@ -906,7 +917,7 @@ fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize,
         }
         total
     };
-    let ty = y + 8.0;
+    let ty = slots.title.pos.y;
     if compact {
         let ww = (inner_w - badges_w).max(0.0);
         let shown = ui.measure(cx, base, workspace_title).min(ww);
@@ -1345,7 +1356,8 @@ impl ImportSheet {
             .fold(0.0, f64::max);
         let width = ((natural / 56.0).ceil() * 56.0).clamp(112.0, 280.0);
         let anchor = self.filter_rect;
-        let row_h = text_line_height(20.0, 14.0) + 16.0;
+        let metrics = RowMetrics::measure(ui.painter, cx, spec, None, 0.0);
+        let row_h = metrics.height(36.0, 8.0, 14.0);
         let list = rect(anchor.pos.x, anchor.pos.y, width, 8.0 + options.len() as f64 * row_h + 8.0);
         if interactive {
             ui.hit(rect(-1.0e5, -1.0e5, 2.0e5, 2.0e5), "pick:dismiss");
@@ -1359,12 +1371,11 @@ impl ImportSheet {
             if ui.is_hover(&id) || ui.is_pressed(&id) {
                 ui.fill(cx, row, with_alpha(p.foreground, if ui.is_pressed(&id) { 0.1 } else { 0.08 }), 0.0);
             }
-            let mut lx = row.pos.x + 12.0;
+            let slots = metrics.layout(row, 12.0, if value.is_empty() { 0.0 } else { 14.0 }, 0.0, 8.0);
             if !value.is_empty() {
-                ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(lx, row.pos.y + (row_h - 14.0) * 0.5, 14.0, 14.0), value, None, p.muted);
-                lx += 14.0 + 8.0;
+                ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(slots.leading.pos.x, row.pos.y + (row_h - 14.0) * 0.5, slots.leading.size.x, 14.0), value, None, p.muted);
             }
-            ui.text(cx, rect(lx, row.pos.y, row.size.x - (lx - row.pos.x) - 12.0, row_h), spec, label);
+            ui.text(cx, slots.title, spec, label);
             if interactive {
                 ui.hit(row, id);
             }

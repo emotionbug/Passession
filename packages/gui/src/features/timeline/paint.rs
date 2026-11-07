@@ -64,6 +64,12 @@ pub struct RowState {
     pub markdown: HashMap<u64, Rc<Vec<super::markdown::model::Block>>>,
     /// Stable split head cache (streaming).
     pub stable_head: Option<(u64, Rc<Vec<super::markdown::model::Block>>)>,
+    /// Prepared paragraph geometry retained by immutable parsed-block identity.
+    pub markdown_paragraphs: super::markdown::view::ParagraphCache,
+    /// Only the current growing parse is retained, never older live snapshots.
+    pub markdown_tail: Option<(u64, Rc<Vec<super::markdown::model::Block>>)>,
+    /// Worker results belong to this exact row and sequential code-block key.
+    pub fence_highlights: HashMap<String, super::highlight::FenceRequest>,
     pub selection: Option<(usize, usize)>,
     /// Permission card / question form state.
     pub permission: Option<super::permission::CardState>,

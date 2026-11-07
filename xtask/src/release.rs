@@ -24,60 +24,98 @@ pub(super) struct Target {
     pub platform: &'static str,
     pub arch: &'static str,
     pub desktop: bool,
+    pub format: &'static str,
 }
 impl Target {
     pub fn id(self) -> String {
-        format!("{}-{}", self.platform, self.arch)
+        let suffix = if self.format == "aab" { "-aab" } else { "" };
+        format!("{}-{}{suffix}", self.platform, self.arch)
     }
 }
-pub(super) const TARGETS: [Target; 8] = [
+pub(super) const TARGETS: [Target; 12] = [
     Target {
         runner: "ubuntu-24.04",
         platform: "linux",
         arch: "x64",
         desktop: true,
+        format: "",
     },
     Target {
         runner: "ubuntu-24.04-arm",
         platform: "linux",
         arch: "arm64",
         desktop: true,
+        format: "",
     },
     Target {
         runner: "macos-15",
         platform: "macos",
         arch: "arm64",
         desktop: true,
+        format: "",
     },
     Target {
         runner: "macos-15-intel",
         platform: "macos",
         arch: "x64",
         desktop: true,
+        format: "",
     },
     Target {
         runner: "windows-latest",
         platform: "windows",
         arch: "x64",
         desktop: true,
+        format: "",
     },
     Target {
         runner: "windows-11-arm",
         platform: "windows",
         arch: "arm64",
         desktop: true,
+        format: "",
+    },
+    Target {
+        runner: "ubuntu-24.04",
+        platform: "android",
+        arch: "arm64",
+        desktop: false,
+        format: "apk",
+    },
+    Target {
+        runner: "ubuntu-24.04",
+        platform: "android",
+        arch: "arm",
+        desktop: false,
+        format: "apk",
+    },
+    Target {
+        runner: "ubuntu-24.04",
+        platform: "android",
+        arch: "x64",
+        desktop: false,
+        format: "apk",
     },
     Target {
         runner: "ubuntu-24.04",
         platform: "android",
         arch: "universal",
         desktop: false,
+        format: "apk",
+    },
+    Target {
+        runner: "ubuntu-24.04",
+        platform: "android",
+        arch: "universal",
+        desktop: false,
+        format: "aab",
     },
     Target {
         runner: "macos-15",
         platform: "ios",
         arch: "arm64",
         desktop: false,
+        format: "",
     },
 ];
 pub(super) fn target(id: &str) -> Result<Target> {
@@ -366,7 +404,7 @@ mod tests {
     #[test]
     fn all_targets_and_recovery_are_exact() {
         let p = plan("v0.13.1", "all", "build", true, "", "push").unwrap();
-        assert_eq!(p["expected"].as_array().unwrap().len(), 8);
+        assert_eq!(p["expected"].as_array().unwrap().len(), 12);
         for id in ["linux-x64", "windows-arm64", "macos-x64"] {
             let p = plan("v0.13.1", id, "build", true, "123", "workflow_dispatch").unwrap();
             assert_eq!(p["expected"].as_array().unwrap().len(), 2);
@@ -402,7 +440,10 @@ mod tests {
     #[test]
     fn x64_android_publication_and_recovery_keep_exact_scope() {
         let scope = "linux-windows-x64-android";
-        let targets = json!(["linux-x64", "windows-x64", "android-universal"]);
+        let targets = json!([
+            "linux-x64", "windows-x64", "android-arm64", "android-arm",
+            "android-x64", "android-universal", "android-universal-aab",
+        ]);
         let build = plan("v0.13.4", scope, "build", true, "", "workflow_dispatch").unwrap();
         assert_eq!(build["expected"], targets);
         assert_eq!(build["recovery"], json!([]));
@@ -411,6 +452,19 @@ mod tests {
         assert_eq!(recovery["expected"], targets);
         assert_eq!(recovery["recovery"], targets);
         assert!(plan("v0.13.4", scope, "publish-only", true, "", "workflow_dispatch").is_err());
+    }
+    #[test]
+    fn android_formats_have_distinct_recovery_identity() {
+        let p = plan("v0.13.4", "android", "build", true, "", "workflow_dispatch").unwrap();
+        assert_eq!(
+            p["expected"],
+            json!(["android-arm64", "android-arm", "android-x64", "android-universal", "android-universal-aab"])
+        );
+        let p = plan("v0.13.4", "android-universal-aab", "build", false, "", "workflow_dispatch").unwrap();
+        assert_eq!(p["expected"], json!(["android-universal-aab"]));
+        assert_eq!(p["matrix"]["include"][0]["format"], "aab");
+        assert_eq!(target("android-universal").unwrap().format, "apk");
+        assert!(target("android-universal-apk").is_err());
     }
     #[test]
     fn versions_and_rollout_are_strict() {

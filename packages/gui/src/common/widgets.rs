@@ -9,6 +9,117 @@ use crate::common::paint::{Font, HitMap, Painter, TextSpec, rect};
 use crate::common::{UiContext, UiEffect, clock};
 use crate::theme::{self, ControlSize, Palette, Typography, control_height, control_icon_size, fade};
 
+/// Measured line extents shared by custom-painted list rows. Measure once per
+/// style per draw; virtualized lists use `height` for culling and advancing too.
+#[derive(Clone, Copy, Debug)]
+pub struct RowMetrics {
+    pub title_height: f64,
+    pub subtitle_height: f64,
+    pub gap: f64,
+}
+
+impl RowMetrics {
+    pub fn new(title_height: f64, subtitle_height: f64, gap: f64) -> Self {
+        Self {
+            title_height: title_height.max(0.0),
+            subtitle_height: subtitle_height.max(0.0),
+            gap: if subtitle_height > 0.0 { gap.max(0.0) } else { 0.0 },
+        }
+    }
+
+    pub fn measure(painter: &mut Painter, cx: &mut Cx, title: TextSpec, subtitle: Option<TextSpec>, gap: f64) -> Self {
+        let title_height = painter.line_height(cx, title);
+        let subtitle_height = subtitle.map_or(0.0, |spec| painter.line_height(cx, spec));
+        Self::new(title_height, subtitle_height, gap)
+    }
+
+    pub fn height(self, minimum: f64, padding_y: f64, leading_height: f64) -> f64 {
+        minimum.max((self.title_height + self.gap + self.subtitle_height).max(leading_height) + padding_y * 2.0)
+    }
+
+    /// Side slots reserve space before text. Narrow rows sacrifice text width,
+    /// never let it overlap a trailing action. The caller paints custom icons
+    /// or metadata in the slots and registers `bounds` with its existing hits.
+    pub fn layout(self, bounds: Rect, padding_x: f64, leading_width: f64, trailing_width: f64, slot_gap: f64) -> RowLayout {
+        let padding = padding_x.max(0.0).min(bounds.size.x.max(0.0) * 0.5);
+        let left = bounds.pos.x + padding;
+        let right = bounds.pos.x + bounds.size.x.max(0.0) - padding;
+        let trailing_width = trailing_width.max(0.0).min(right - left);
+        let trailing = rect(right - trailing_width, bounds.pos.y, trailing_width, bounds.size.y);
+        let content_right = (trailing.pos.x - if trailing_width > 0.0 { slot_gap.max(0.0) } else { 0.0 }).max(left);
+        let leading_width = leading_width.max(0.0).min(content_right - left);
+        let leading = rect(left, bounds.pos.y, leading_width, bounds.size.y);
+        let text_left = (left + leading_width + if leading_width > 0.0 { slot_gap.max(0.0) } else { 0.0 }).min(content_right);
+        let text_width = content_right - text_left;
+        let text_height = self.title_height + self.gap + self.subtitle_height;
+        let top = bounds.pos.y + (bounds.size.y - text_height) * 0.5;
+        RowLayout {
+            bounds,
+            leading,
+            title: rect(text_left, top, text_width, self.title_height),
+            subtitle: rect(text_left, top + self.title_height + self.gap, text_width, self.subtitle_height),
+            trailing,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RowLayout {
+    pub bounds: Rect,
+    pub leading: Rect,
+    pub title: Rect,
+    pub subtitle: Rect,
+    pub trailing: Rect,
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+
+    #[test]
+    fn scaled_subtitle_stays_inside_the_row_hit_and_advance() {
+        let metrics = RowMetrics::new(28.0, 24.0, 2.0);
+        let height = metrics.height(48.0, 7.0, 14.0);
+        let first = metrics.layout(rect(10.0, 50.0, 280.0, height), 12.0, 14.0, 32.0, 8.0);
+        let second = metrics.layout(rect(10.0, 50.0 + height, 280.0, height), 12.0, 14.0, 32.0, 8.0);
+        assert_eq!(height, 68.0);
+        assert_eq!(first.title.pos.y, 57.0);
+        assert_eq!(first.subtitle.pos.y, 87.0);
+        assert_eq!(first.subtitle.pos.y + first.subtitle.size.y, 111.0);
+        assert_eq!(second.bounds.pos.y, first.bounds.pos.y + first.bounds.size.y);
+        let mut hits = HitMap::default();
+        hits.push(first.bounds, 1);
+        hits.push(second.bounds, 2);
+        assert_eq!(hits.at(dvec2(first.subtitle.pos.x, 110.0)), Some(1));
+        assert_eq!(hits.at(dvec2(first.subtitle.pos.x, 118.5)), Some(2));
+    }
+
+    #[test]
+    fn narrow_rows_reserve_trailing_actions_without_text_overlap() {
+        let metrics = RowMetrics::new(20.0, 0.0, 0.0);
+        for width in [0.0, 12.0, 24.0, 40.0, 64.0, 96.0] {
+            let slots = metrics.layout(rect(10.0, 0.0, width, 32.0), 12.0, 16.0, 24.0, 8.0);
+            assert!(slots.title.size.x >= 0.0);
+            assert!(slots.leading.pos.x + slots.leading.size.x <= slots.title.pos.x);
+            assert!(slots.title.pos.x + slots.title.size.x <= slots.trailing.pos.x);
+            assert!(slots.trailing.pos.x + slots.trailing.size.x <= 10.0 + width);
+            if width >= 48.0 {
+                assert_eq!(slots.trailing.size.x, 24.0);
+            }
+        }
+    }
+
+    #[test]
+    fn absent_slots_and_subtitle_do_not_consume_label_space() {
+        let metrics = RowMetrics::new(20.0, 0.0, 6.0);
+        assert_eq!(metrics.height(28.0, 4.0, 16.0), 28.0);
+        let slots = metrics.layout(rect(0.0, 0.0, 120.0, 28.0), 8.0, 0.0, 0.0, 8.0);
+        assert_eq!(slots.title.pos, dvec2(8.0, 4.0));
+        assert_eq!(slots.title.size, dvec2(104.0, 20.0));
+        assert_eq!(slots.subtitle.size.y, 0.0);
+    }
+}
+
 live_design! {
     use link::theme::*;
     use link::shaders::*;
@@ -1660,6 +1771,14 @@ impl PTextFieldRef {
     pub fn set_key_focus(&self, cx: &mut Cx) {
         if let Some(input) = self.input() {
             input.set_key_focus(cx);
+        }
+    }
+
+    /// Stops native input and cursor blinking when the owning modal closes,
+    /// including after the field's last painted area has expired.
+    pub fn release_focus(&self, cx: &mut Cx) {
+        if let Some(input) = self.input() {
+            input.release_focus(cx);
         }
     }
 

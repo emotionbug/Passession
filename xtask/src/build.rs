@@ -63,10 +63,10 @@ pub fn release_identity() -> Result<Value> {
 
 pub fn directory(profile: &str) -> Result<PathBuf> {
     ensure!(
-        matches!(profile, "debug" | "release"),
+        matches!(profile, "debug" | "dev-fast" | "release"),
         "Unknown native build profile: {profile}"
     );
-    Ok(target_root()?.join(profile))
+    Ok(root()?.join(".dev/build/native").join(profile))
 }
 
 /// Decode the binary header, not a filename or `file` utility's textual guess.
@@ -117,11 +117,13 @@ pub fn assert_architecture(path: &Path) -> Result<()> {
 }
 
 pub fn build_daemon(args: &[String]) -> Result<()> {
-    ensure!(
-        args.len() <= 1 && args.iter().all(|arg| arg == "--release"),
-        "Usage: cargo xtask build-daemon [--release]"
-    );
-    build_native(if args.is_empty() { "debug" } else { "release" }, false)
+    let profile = match args {
+        [] => "dev-fast",
+        [option] if option == "--release" => "release",
+        [option, profile] if option == "--profile" => profile.as_str(),
+        _ => bail!("Usage: cargo xtask build-daemon [--release | --profile dev-fast|debug|release]"),
+    };
+    build_native(profile, false)
 }
 
 pub fn build_native(profile: &str, container: bool) -> Result<()> {
@@ -191,9 +193,7 @@ fn build_native_command(profile: &str, container: bool, desktop: Option<&mut Com
         cargo
             .args(["build", "--locked", "-p", "paseo-daemon", "--bin", "paseo"])
             .env("PASEO_BUILD_SOURCE_SHA", &source);
-        if profile == "release" {
-            cargo.arg("--release");
-        }
+        cargo.args(["--profile", if profile == "debug" { "dev" } else { profile }]);
         if !release {
             for key in [
                 "PASEO_NATIVE_RELEASE",
@@ -205,7 +205,9 @@ fn build_native_command(profile: &str, container: bool, desktop: Option<&mut Com
         }
         run(&mut cargo)?;
     }
+    fs::create_dir_all(&directory)?;
     let executable = directory.join(executable());
+    copy_tree(&target_root()?.join(profile).join(crate::common::executable()), &executable)?;
     assert_architecture(&executable)?;
     for name in ["skills", "lib", "plugin-worker"] {
         remove_if_exists(&directory.join(name))?;
@@ -420,13 +422,13 @@ pub fn refresh_runtime_hash(runtime: &Path) -> Result<()> {
 pub fn stage_command(args: &[String]) -> Result<()> {
     let Some((destination, options)) = args.split_first() else {
         bail!(
-            "Usage: cargo xtask stage-runtime DESTINATION [--profile debug|release] [--kind desktop-bundled|standalone-archive|standalone-local|container]"
+            "Usage: cargo xtask stage-runtime DESTINATION [--profile dev-fast|debug|release] [--kind desktop-bundled|standalone-archive|standalone-local|container]"
         );
     };
     let mut profile = if native_release_env() {
         "release"
     } else {
-        "debug"
+        "dev-fast"
     };
     let mut kind = "desktop-bundled";
     let mut chunks = options.chunks_exact(2);

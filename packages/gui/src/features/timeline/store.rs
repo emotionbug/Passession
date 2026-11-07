@@ -154,9 +154,14 @@ impl TimelineStore {
                     self.remap_host(event);
                     return;
                 }
-                for key in self.keys_for_host(host_id) {
+                let subscription = ty.starts_with("subscription.");
+                let keys: Vec<_> = self.sessions.iter()
+                    .filter(|(key, session)| key.host_id == *host_id && (subscription || session.wants(event)))
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in keys {
                     self.with_session(cx, effects, &key, |s, io| {
-                        if ty.starts_with("subscription.") {
+                        if subscription {
                             s.on_subscription_event(io, event);
                         } else {
                             s.on_event(io, event);
@@ -219,6 +224,9 @@ impl TimelineStore {
 
 /// Shell hook: once per Makepad event, before widget dispatch.
 pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
+    if matches!(event, Event::Signal) && super::highlight::poll() {
+        cx.redraw_all();
+    }
     with_store(|store| {
         if store.core.is_none() {
             store.core = Some(ui.core.clone());
@@ -256,6 +264,9 @@ pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
                 }
             }
             _ => {}
+        }
+        for session in store.sessions.values_mut() {
+            session.flush_projection();
         }
         // Notices from action results surface as the panel toast; sync
         // failures stay in the callout. Nothing else is pushed globally.

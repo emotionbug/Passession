@@ -6,7 +6,7 @@
 //! compact jump-to-file tree (`_jumpToFile`) — are drawn here with the
 //! original `AdaptiveModalSheet` + `SheetContents` chrome.
 
-use super::chrome::{ButtonSize, ButtonVariant, TREE_ROW_HEIGHT, button, button_height, file_tree_row, measure_button, palette, ui};
+use super::chrome::{ButtonSize, ButtonVariant, TREE_ROW_HEIGHT, button, button_height, file_tree_row, tree_row_metrics, measure_button, palette, ui};
 use super::json::text;
 use super::model::{TreeRow, changed_tree_rows};
 use super::paint::{Font, GitPaint, Hits, rect, with_alpha};
@@ -686,7 +686,8 @@ impl<P> OverlayHost<P> {
         let list = rect(card.pos.x, top + header, card.size.x, list_height.min(card.pos.y + card.size.y - top - header));
         let rows = changed_tree_rows(&files, &collapsed);
         self.list_rect = list;
-        let row_height = TREE_ROW_HEIGHT.max(paint.measure(cx, Font::Regular, ui(14.0), "Ag").y + 8.0);
+        let metrics = tree_row_metrics(cx, paint);
+        let row_height = metrics.height(TREE_ROW_HEIGHT, 4.0, 16.0);
         self.content_height = 8.0 + rows.len() as f64 * row_height + 32.0;
         self.scroll = self.scroll.clamp(0.0, (self.content_height - list.size.y).max(0.0));
         paint.begin_clip(cx, list);
@@ -702,7 +703,7 @@ impl<P> OverlayHost<P> {
             };
             let hit = SheetHit::Row(index);
             let hovered = self.hovered.as_ref() == Some(&hit);
-            if !file_tree_row(cx, paint, band, row, &files, &collapsed, hovered, selected.as_deref() == Some(path)) {
+            if !file_tree_row(cx, paint, band, metrics, row, &files, &collapsed, hovered, selected.as_deref() == Some(path)) {
                 pending = true;
             }
             self.hits.push_clipped(band, list, hit);

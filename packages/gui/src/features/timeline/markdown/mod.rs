@@ -36,6 +36,28 @@ pub fn blocks(d: &mut Draw, text: &str, root: Option<&str>, linkify: bool) -> Rc
     parsed
 }
 
+/// Live snapshots replace one another; keeping nine ever-growing tails retains
+/// their parsed strings and layouts long after they can be drawn again.
+fn stream_blocks(d: &mut Draw, text: &str, root: Option<&str>, linkify: bool) -> Rc<Vec<Block>> {
+    let key = hash(text, linkify, root);
+    if let Some((old, blocks)) = &d.state.markdown_tail
+        && *old == key
+    {
+        return blocks.clone();
+    }
+    let parsed = Rc::new(model::parse(text, root, linkify));
+    d.state.markdown_tail = Some((key, parsed.clone()));
+    parsed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_parsed(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, blocks: &Rc<Vec<Block>>, x: f64, y: f64, w: f64, color: Vec4) -> f64 {
+    let previous = d.state.markdown_paragraphs.set_owner(Some(blocks.clone()));
+    let height = view::draw_blocks(cx, d, opts, blocks, x, y, w, color, false);
+    d.state.markdown_paragraphs.set_owner(previous);
+    height
+}
+
 /// Draws Markdown `text`; returns its height. `streaming` keeps the stable
 /// head parsed once while the tail grows.
 #[allow(clippy::too_many_arguments)]
@@ -56,12 +78,17 @@ pub fn draw(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, text: &str, x: f64, 
                 parsed
             }
         };
-        let tail = Rc::new(model::parse(&text[split..], root, linkify));
-        let mut h = view::draw_blocks(cx, d, opts, &head, x, y, w, color, false);
+        let tail = stream_blocks(d, &text[split..], root, linkify);
+        let mut h = draw_parsed(cx, d, opts, &head, x, y, w, color);
         h += view::block_gap(d.look.compact);
-        h += view::draw_blocks(cx, d, opts, &tail, x, y + h, w, color, false);
+        h += draw_parsed(cx, d, opts, &tail, x, y + h, w, color);
         return h;
     }
-    let parsed = blocks(d, text, root, linkify);
-    view::draw_blocks(cx, d, opts, &parsed, x, y, w, color, false)
+    let parsed = if streaming {
+        stream_blocks(d, text, root, linkify)
+    } else {
+        d.state.markdown_tail = None;
+        blocks(d, text, root, linkify)
+    };
+    draw_parsed(cx, d, opts, &parsed, x, y, w, color)
 }

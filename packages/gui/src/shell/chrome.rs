@@ -908,8 +908,11 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 }
                 return;
             }
-            // Pane focus on any pointer down inside a pane (Listener.onPointerDown).
-            if let Some((pane, _)) = shell.data.chrome.pane_rects.iter().find(|(id, r)| id != "explorer" && r.contains(fe.abs)).cloned() {
+            // Mouse focus follows press; a touch drag must not retarget the pane.
+            shell.data.pointer.down_pos = Some(fe.abs);
+            if !fe.device.is_touch()
+                && let Some((pane, _)) = shell.data.chrome.pane_rects.iter().find(|(id, r)| id != "explorer" && r.contains(fe.abs)).cloned()
+            {
                 shell.data.layout.focus_pane(&pane);
             }
             if shell.data.compact && (fe.abs.x < 24.0 || shell.data.layout.compact_destination == CompactDestination::Sidebar) {
@@ -950,6 +953,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 shell.data.chrome.edge_start = None;
             }
             let pressed = shell.data.pointer.pressed.take();
+            let down = shell.data.pointer.down_pos.take();
             let dragged = finish_drag(shell, cx, fe.abs);
             let edge = shell.data.chrome.edge_start.take();
             if let (Some(start), false) = (edge, dragged) {
@@ -968,6 +972,13 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             if dragged {
                 shell.redraw(cx);
                 return;
+            }
+            if fe.device.is_touch() && fe.is_over && fe.was_tap() && !fe.has_long_press_occurred
+                && let Some(start) = down
+                && let Some((pane, _)) = shell.data.chrome.pane_rects.iter()
+                    .find(|(id, r)| id != "explorer" && r.contains(start) && r.contains(fe.abs)).cloned()
+            {
+                shell.data.layout.focus_pane(&pane);
             }
             if let Some(id) = pressed
                 && fe.is_over

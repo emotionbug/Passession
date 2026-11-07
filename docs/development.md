@@ -33,7 +33,7 @@ For direct Rust iteration, `cargo build --locked -p paseo-daemon --bin paseo` co
 
 `cargo run -p paseo-gui --bin paseo-sessions` runs the client from the source tree: Makepad then loads fonts and icons from each crate's `resources/` directory through absolute build paths. `cargo xtask dev app` instead runs the staged bundle exactly as it is packaged (resources under `makepad/`, bundled daemon runtime), so packaging mistakes show up in development.
 
-`cargo xtask build-daemon --release` produces an optimized local native runtime, not a published release identity. Default GUI release builds use optimized Rust; debug development builds use the debug profile. `PASEO_NATIVE_RELEASE=1` is a separate, validated publication-provenance choice; see [release](release.md).
+`cargo xtask build-daemon` and `cargo xtask dev app` default to `dev-fast`: optimization level 1, incremental compilation, 256 codegen units and no LTO. Use `build-daemon --profile debug` or `dev app --profile debug` for unoptimized debugging. `build-gui` still defaults to `release`; `--profile dev-fast` selects the iterative profile explicitly. Release keeps thin LTO and one codegen unit. None of these profiles grants publication identity: `PASEO_NATIVE_RELEASE=1` remains a separate validated choice; see [release](release.md).
 
 `paseo daemon status` reports daemon liveness without running external provider/model discovery.
 Its `providers` list is a cached observation (`providersCached: true`); `available` is `null`
@@ -41,6 +41,23 @@ until availability is known, with catalog `status` and `fetchedAt` retaining con
 The CLI's 1500ms status RPC deadline is unchanged. Use the existing
 `list_available_providers_request`, `provider_diagnostic_request` or catalog refresh for
 fresh provider diagnostics instead of treating basic status as a fresh provider probe.
+
+## Build cache and retention
+
+Commands launched by `xtask` share Cargo outputs across worktrees of the same Git common directory. They use `$XDG_CACHE_HOME/paseo-build/v1/<repository-hash>/generation-<epoch>/target` (or `~/.cache` without `XDG_CACHE_HOME`), rotating generations every 30 days. A source archive without Git uses its canonical source directory as its cache identity. Cargo still fingerprints compiler, target, profile, features and source paths; switching worktrees does not promise reuse of workspace crates whose absolute resource paths changed.
+
+An explicit `CARGO_TARGET_DIR` wins and is never adopted or pruned by housekeeping. It must be outside the internal managed cache tree; leave it unset to use that tree. The initial `cargo xtask` bootstrap and direct `cargo build` retain Cargo's own target-directory configuration; the shared directory applies to the product builds launched inside `xtask`. CI sets an explicit checkout target to retain its existing Rust-cache integration.
+
+Mutable output stays source-bound: `.dev/build/native/<profile>` contains the staged daemon executable, skills and provenance; `.dev/build/gui` contains GUI bundles and mobile/Gradle staging. Compilation and copying out of a shared target hold a cache lease. Running a staged GUI releases that cache lease but pins its checkout bundle, so another worktree can build without replacing the running client's resources. Development launchers also pin native staging. Do not point a direct Cargo invocation at the managed internal directory; use `CARGO_TARGET_DIR` for operator-owned caches.
+
+Optional accelerators require existing tools and never install them:
+
+- `PASEO_SCCACHE=1` selects `sccache` from `PATH` unless `RUSTC_WRAPPER` is already set. It sets child `CARGO_INCREMENTAL=0` unless explicitly supplied: sccache does not cache incremental Rust compilations. Choose this mode for compiler-cache reuse rather than local incremental rebuilds; its external cache is not managed here.
+- `PASEO_FAST_LINKER=1` selects `clang` with `mold`, or `ld.lld` when mold is absent, for native Linux GNU targets only. Explicit linker/target environment variables, `RUSTFLAGS`, or `CARGO_ENCODED_RUSTFLAGS` take precedence. The target-scoped flags do not replace Android NDK or Apple linkers. Missing requested tools fail with a prerequisite error.
+
+`cargo xtask housekeeping` previews removal of old, marked cache generations, oldest first, toward a **20 GiB soft budget**. `--max-bytes N` changes that budget; `--apply` performs the listed removals. Current generations, active leases, and anything used within seven days are retained even above budget. No automatic deletion occurs during builds, and legacy checkout targets, explicit targets, downloads, artifacts, and external compiler caches are outside this command's ownership.
+
+Add `--staging` to include this checkout's marked `.dev/build` tree only when unused for seven days and no build/development lease is held. It never removes `.dev/paseo-home`, `.dev/gui-state`, or `artifacts/`. Review the dry run first; recreating deleted generations requires compilation. CI upload retention is documented in [release](release.md).
 
 ## Isolated state and endpoints
 
@@ -67,13 +84,13 @@ A mobile emulator's `localhost` is not the development machine. On an Android AV
 cargo xtask build-gui linux
 cargo xtask build-gui macos
 cargo xtask build-gui windows
-cargo xtask build-gui android
-cargo xtask build-gui android --arch arm64
+cargo xtask build-gui android             # arm64 APK
+cargo xtask build-gui android --arch universal --format aab
 cargo xtask build-gui ios
 cargo xtask package-desktop
 ```
 
-Only run the desktop target matching the host OS. iOS requires macOS. `cargo xtask build-gui ios` without `PASEO_IOS_PROVISIONING_PROFILE`/`PASEO_IOS_SIGNING_IDENTITY` emits an explicitly unsigned device app archive, not an installable IPA. Android output without a release key is marked debug-signed. Build descriptors and client artifacts live under `artifacts/native/`; staged bundles, Android work directories and Gradle state live under `target/paseo-gui/`. See [release](release.md) before producing distribution artifacts.
+Only run the desktop target matching the host OS. iOS requires macOS. `cargo xtask build-gui ios` without `PASEO_IOS_PROVISIONING_PROFILE`/`PASEO_IOS_SIGNING_IDENTITY` emits an explicitly unsigned device app archive, not an installable IPA. Android output without a release key is marked debug-signed. Build descriptors and client artifacts live under `artifacts/native/`; staged bundles, Android work directories and Gradle state live under `.dev/build/gui/`. See [release](release.md) before producing distribution artifacts.
 
 Every build passes the client's identity at compile time (`PASEO_VERSION`, `PASEO_RELEASE_CHANNEL`, `PASEO_UPDATE_REPOSITORY`, `PASEO_BUILD_NUMBER`, `PASEO_BUILD_SOURCE_SHA`). Staged desktop builds (`build-gui`, `dev app`) also set `MAKEPAD_PACKAGE_DIR=makepad`: Makepad then opens resources at `makepad/<crate>/resources/…` relative to the working directory on Linux and Windows (the client switches to its executable directory at startup) and relative to `Contents/Resources` on macOS (`MAKEPAD=apple_bundle`). Android and iOS always use `makepad/` inside the APK assets or app bundle.
 

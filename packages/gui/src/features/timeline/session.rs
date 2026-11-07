@@ -203,6 +203,7 @@ pub struct ChatSession {
     pub key: SessionKey,
     rows: Vec<Value>,
     fold: TimelineFold,
+    projection_pending: bool,
     /// The projection (fold entries); a new Rc only when an entry changed.
     pub timeline: Rc<Vec<Rc<Value>>>,
     pub agent: Value,
@@ -273,6 +274,7 @@ impl ChatSession {
             key,
             rows: Vec::new(),
             fold: TimelineFold::default(),
+            projection_pending: false,
             timeline: Rc::new(Vec::new()),
             agent: Value::Object(Default::default()),
             permissions: Vec::new(),
@@ -1258,6 +1260,7 @@ impl ChatSession {
             || get(get(payload, "subagent"), "parentAgentId") == id
     }
 
+    /// Applies ordered live state now; the store publishes projection once per GUI batch.
     pub fn on_event(&mut self, io: &mut Io, message: &Value) {
         if self.disposed || !self.wants(message) {
             return;
@@ -1267,7 +1270,7 @@ impl ChatSession {
             return;
         }
         self.apply_event_inner(Some(io), message);
-        self.project();
+        self.projection_pending = true;
     }
 
     fn apply_event_inner(&mut self, mut io: Option<&mut Io>, message: &Value) {
@@ -1515,18 +1518,24 @@ impl ChatSession {
 
     // ── projection ──────────────────────────────────────────────────────
 
+    pub fn flush_projection(&mut self) {
+        if self.projection_pending {
+            self.project();
+        }
+    }
+
     /// Folds the stored rows not yet projected (all of them after any change
     /// other than an append) and keeps unchanged entries identical.
     pub fn project(&mut self) {
+        self.projection_pending = false;
         if self.fold.consumed > self.rows.len() {
             self.fold.reset();
         }
         if self.fold.consumed < self.rows.len() || (self.rows.is_empty() && !self.timeline.is_empty()) {
             let refold = self.fold.consumed == 0;
             let agent_id = self.key.agent_id.clone();
-            for i in self.fold.consumed..self.rows.len() {
-                let row = self.rows[i].clone();
-                self.fold.add(&agent_id, &row);
+            for row in &self.rows[self.fold.consumed..] {
+                self.fold.add(&agent_id, row);
             }
             self.fold.consumed = self.rows.len();
             if refold && !self.timeline.is_empty() {

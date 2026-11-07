@@ -9,7 +9,7 @@ use makepad_widgets::*;
 use serde_json::{Value, json};
 
 use crate::common::paint::{Font, rect};
-use crate::common::widgets::PTextFieldWidgetRefExt;
+use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics};
 use crate::common::{UiContext, UiEffect, json as j, tr, tr_args};
 use crate::shell::chrome::make_ui;
 use crate::shell::hosts::{self, Host, Status, parent_agent_id};
@@ -300,9 +300,10 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Va
     shell.painter.fill(cx, r, p.sidebar, 0.0);
     let preferences = j::object(state, "preferences").clone();
     let mut y = r.pos.y;
-    let title_h = super::chrome::text_line_height(20.0, 14.0);
-    let small_h = super::chrome::text_line_height(16.0, 12.0);
-    let nav_h = title_h + 12.0;
+    let typography = theme::current_typography();
+    let title_h = shell.painter.line_height(cx, crate::common::paint::TextSpec::new(Font::Regular, typography.ui_size(14.0), p.foreground));
+    let small_h = shell.painter.line_height(cx, crate::common::paint::TextSpec::new(Font::Regular, typography.ui_size(12.0), p.muted));
+    let nav_h = RowMetrics::new(title_h, 0.0, 0.0).height(32.0, 6.0, 16.0);
 
     // Navigation rows (`SidebarHeaderRow`, 2px apart, top 8 bottom 6, bottom border).
     let order = nav_order(&preferences);
@@ -387,9 +388,11 @@ fn header_row(ui: &mut Ui, cx: &mut Cx2d, r: Rect, id: &str, icon: &str, label: 
         ui.fill(cx, body, hover, 6.0);
     }
     let p = ui.p;
-    ui.icon(cx, rect(body.pos.x + 8.0, body.pos.y + (body.size.y - 16.0) * 0.5, 16.0, 16.0), icon, 16.0, p.muted);
     let spec = ui.spec(Font::Regular, 14.0, p.foreground);
-    ui.text(cx, rect(body.pos.x + 32.0, body.pos.y, body.size.x - 40.0, body.size.y), spec, label);
+    let metrics = RowMetrics::measure(ui.painter, cx, spec, None, 0.0);
+    let slots = metrics.layout(body, 8.0, 16.0, 0.0, 8.0);
+    ui.icon(cx, slots.leading, icon, 16.0, p.muted);
+    ui.text(cx, slots.title, spec, label);
     ui.hit(body, id);
 }
 
@@ -424,10 +427,14 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
     let w = list.size.x;
     let group = ui.spec(Font::Medium, 14.0, p.muted);
     // Uniform line metrics keep culling O(1) per row without shaping invisible titles.
-    let title_h = super::chrome::text_line_height(20.0, 14.0);
-    let small_h = super::chrome::text_line_height(16.0, 12.0);
-    let group_h = title_h + 16.0;
-    let session_h = 8.0 + title_h + 2.0 + small_h + 6.0;
+    let regular = ui.spec(Font::Regular, 14.0, p.foreground);
+    let subtitle = ui.spec(Font::Regular, 12.0, p.muted);
+    let title_h = ui.painter.line_height(cx, regular).max(ui.painter.line_height(cx, group));
+    let small_h = ui.painter.line_height(cx, subtitle);
+    let group_metrics = RowMetrics::new(title_h, 0.0, 0.0);
+    let session_metrics = RowMetrics::new(title_h, small_h, 2.0);
+    let group_h = group_metrics.height(36.0, 8.0, 14.0);
+    let session_h = session_metrics.height(0.0, 7.0, 14.0);
     let button_h = theme::control_height(ControlSize::Sm);
     let mut any = false;
     for host in &all {
@@ -466,12 +473,13 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
         // Host row.
         y += 8.0;
         let row = rect(x0 + 8.0, y, w - 16.0, group_h);
+        let slots = group_metrics.layout(row, 0.0, 26.0, 20.0, 4.0);
         let mid = row.pos.y + row.size.y * 0.5;
-        ui.icon(cx, rect(row.pos.x, mid - 7.0, 14.0, 14.0), if host_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
-        ui.dot(cx, dvec2(row.pos.x + 22.0, mid), 8.0, status_color(&p, host));
-        ui.text(cx, rect(row.pos.x + 30.0, row.pos.y, row.size.x - 30.0 - 24.0, row.size.y), group, &label);
+        ui.icon(cx, rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0), if host_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
+        ui.dot(cx, dvec2(slots.leading.pos.x + 22.0, mid), 8.0, status_color(&p, host));
+        ui.text(cx, slots.title, group, &label);
         ui.hit(rect(row.pos.x, row.pos.y, row.size.x - 24.0, row.size.y), format!("host:{sid}"));
-        toolbar_button(&mut ui, cx, row.pos.x + row.size.x - 20.0, mid - 10.0, &format!("hostplus:{sid}"), "plus", &tr("sessionNavigation.newSession"));
+        toolbar_button(&mut ui, cx, slots.trailing.pos.x, mid - 10.0, &format!("hostplus:{sid}"), "plus", &tr("sessionNavigation.newSession"));
         y += group_h;
         if host_collapsed {
             continue;
@@ -520,12 +528,13 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
             let name = j::text_or(project, "projectDisplayName", j::text(project, "projectRootPath"));
             let name = if name.is_empty() { j::text(project, "projectRootPath") } else { name };
             let row = rect(x0 + 24.0, y, w - 32.0, group_h);
+            let slots = group_metrics.layout(row, 0.0, 32.0, 20.0, 4.0);
             let mid = row.pos.y + row.size.y * 0.5;
-            ui.icon(cx, rect(row.pos.x, mid - 7.0, 14.0, 14.0), if *project_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
-            ui.icon(cx, rect(row.pos.x + 18.0, mid - 7.0, 14.0, 14.0), "folder", 14.0, p.muted);
-            ui.text(cx, rect(row.pos.x + 36.0, row.pos.y, row.size.x - 36.0 - 24.0, row.size.y), group, name);
+            ui.icon(cx, rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0), if *project_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
+            ui.icon(cx, rect(slots.leading.pos.x + 18.0, mid - 7.0, 14.0, 14.0), "folder", 14.0, p.muted);
+            ui.text(cx, slots.title, group, name);
             ui.hit(rect(row.pos.x, row.pos.y, row.size.x - 24.0, row.size.y), format!("project:{key}"));
-            toolbar_button(&mut ui, cx, row.pos.x + row.size.x - 20.0, mid - 10.0, &format!("projplus:{key}"), "plus", &tr("sessionNavigation.newSession"));
+            toolbar_button(&mut ui, cx, slots.trailing.pos.x, mid - 10.0, &format!("projplus:{key}"), "plus", &tr("sessionNavigation.newSession"));
             y += group_h;
             if *project_collapsed {
                 continue;
@@ -546,37 +555,37 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                 }
                 let hovered = ui.is_hover(&id) || ui.is_hover(&format!("sessionedit:{sid}:{agent_id}"));
                 let attention = j::boolean(agent, "requiresAttention", false);
-                ui.icon(cx, rect(row.pos.x + 12.0, row.pos.y + (row.size.y - 14.0) * 0.5, 14.0, 14.0), "message-square", 14.0, if attention { p.foreground } else { p.muted });
                 let title = j::text(agent, "title");
                 let title = if title.is_empty() { tr("sessionNavigation.untitled") } else { title.to_string() };
                 let trailing = if trailing_diff { String::new() } else { compact_time_ago(j::text_or(agent, "updatedAt", j::text(agent, "createdAt"))) };
                 let trailing_w = if hovered { 32.0 } else if trailing.is_empty() { 12.0 } else { ui.measure(cx, ui.spec(Font::Regular, 12.0, p.extra_muted), &trailing) + 16.0 };
-                let tx = row.pos.x + 34.0;
-                let tw = (row.size.x - 34.0 - trailing_w).max(0.0);
+                let slots = session_metrics.layout(row, 12.0, 14.0, (trailing_w - 12.0).max(0.0), 8.0);
+                ui.icon(cx, slots.leading, "message-square", 14.0, if attention { p.foreground } else { p.muted });
                 let title_spec = ui.spec(if attention { Font::Medium } else { Font::Regular }, 14.0, p.foreground);
-                ui.text(cx, rect(tx, row.pos.y + 8.0, tw, title_h), title_spec, &title);
+                ui.text(cx, slots.title, title_spec, &title);
                 let status = j::text(agent, "status");
                 let status_key = format!("agentList.status.{status}");
                 let status_label = tr(&status_key);
                 let status_label = if status_label == status_key { status.to_string() } else { status_label };
                 let sub = ui.spec(Font::Regular, 12.0, p.muted);
-                ui.text(cx, rect(tx, row.pos.y + 8.0 + title_h + 2.0, tw, small_h), sub, &format!("{} · {}", j::text(agent, "provider"), status_label));
+                ui.text(cx, slots.subtitle, sub, &format!("{} · {}", j::text(agent, "provider"), status_label));
                 ui.hit(rect(row.pos.x, row.pos.y, row.size.x - if hovered { 32.0 } else { 0.0 }, row.size.y), id.clone());
                 if hovered {
-                    toolbar_button(&mut ui, cx, row.pos.x + row.size.x - 28.0, row.pos.y + (row.size.y - 20.0) * 0.5, &format!("sessionedit:{sid}:{agent_id}"), "pencil", &tr("workspace.tabs.menu.renameAgent"));
+                    toolbar_button(&mut ui, cx, slots.trailing.pos.x, row.pos.y + (row.size.y - 20.0) * 0.5, &format!("sessionedit:{sid}:{agent_id}"), "pencil", &tr("workspace.tabs.menu.renameAgent"));
                 } else if !trailing.is_empty() {
                     let spec = ui.spec(Font::Regular, 12.0, p.extra_muted);
-                    ui.text_right(cx, rect(row.pos.x + row.size.x - trailing_w, row.pos.y, trailing_w - 12.0, row.size.y), spec, &trailing);
+                    ui.text_right(cx, slots.trailing, spec, &trailing);
                 }
             }
         }
         let project_list_loading = host.loading() || loading.contains(&"project") || errors.iter().any(|(k, _)| *k == "project");
         if projects.is_empty() && !project_list_loading && query.is_empty() {
             let row = rect(x0 + 24.0, y, w - 32.0, group_h);
+            let slots = group_metrics.layout(row, 0.0, 32.0, 0.0, 4.0);
             let mid = row.pos.y + row.size.y * 0.5;
-            ui.icon(cx, rect(row.pos.x + 18.0, mid - 7.0, 14.0, 14.0), "folder-plus", 14.0, p.muted);
+            ui.icon(cx, rect(slots.leading.pos.x + 18.0, mid - 7.0, 14.0, 14.0), "folder-plus", 14.0, p.muted);
             let spec = ui.spec(Font::Regular, 14.0, p.muted);
-            ui.text(cx, rect(row.pos.x + 36.0, row.pos.y, row.size.x - 36.0, row.size.y), spec, &tr("sidebar.actions.addProject"));
+            ui.text(cx, slots.title, spec, &tr("sidebar.actions.addProject"));
             ui.hit(row, format!("addproject:{sid}"));
             y += group_h;
         }

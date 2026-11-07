@@ -26,6 +26,7 @@ use super::ui::overlay::{self, Menu, item};
 use super::ui::theme::{Palette, palette};
 use crate::common::{Route, UiContext, UiEffect};
 use crate::common::overlay::WindowModal;
+use crate::common::widgets::RowMetrics;
 use crate::features::workspace::{WorkspacePanelWidgetRefExt, WorkspaceTarget};
 
 const SIDEBAR_W: f64 = 320.0;
@@ -942,12 +943,15 @@ fn sidebar_item(kit: &mut Ui, r: Rect, key_text: &str, icon: Icon, label: &str, 
     let color = if selected { pal.foreground } else { pal.muted };
     let pad = if mobile { 16.0 } else { 8.0 };
     let icon_size = if mobile { 18.0 } else { 16.0 };
-    kit.icon(icon, dvec2(r.pos.x + pad, r.pos.y + (r.size.y - icon_size) / 2.0), icon_size, color);
     let font = if mobile { 16.0 } else { 14.0 };
-    let th = kit.measure(Font::Regular, font, label, None).y;
+    let metrics = RowMetrics::new(kit.measure(Font::Regular, font, "Ag", None).y, 0.0, 0.0);
     let gap = if mobile { 12.0 } else { 8.0 };
-    kit.text_line(Font::Regular, font, color, dvec2(r.pos.x + pad + icon_size + gap, r.pos.y + (r.size.y - th) / 2.0), r.size.x - pad * 2.0 - icon_size - gap, label);
-    kit.zone(key_text, r, Some(on));
+    let slots = metrics.layout(r, pad, icon_size, 0.0, gap);
+    kit.icon(icon, dvec2(slots.leading.pos.x, slots.leading.pos.y + (slots.leading.size.y - icon_size) * 0.5), icon_size, color);
+    if slots.title.size.x > 0.0 {
+        kit.text_line(Font::Regular, font, color, slots.title.pos, slots.title.size.x, label);
+    }
+    kit.zone(key_text, slots.bounds, Some(on));
 }
 
 /// Original `_sidebarBody`: App group, then the Host group (picker + host
@@ -960,7 +964,8 @@ fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
     } else {
         current.as_deref().and_then(|c| c.strip_prefix("host/")).map(String::from)
     };
-    let row_h = (if mobile { 52.0_f64 } else { 28.0 }).max(kit.measure(Font::Regular, if mobile { 16.0 } else { 14.0 }, "Ag", None).y + 8.0);
+    let metrics = RowMetrics::new(kit.measure(Font::Regular, if mobile { 16.0 } else { 14.0 }, "Ag", None).y, 0.0, 0.0);
+    let row_h = metrics.height(if mobile { 52.0 } else { 28.0 }, 4.0, if mobile { 18.0 } else { 16.0 });
     let gap = 2.0;
     let no_local = DESKTOP && !v.hosts.iter().any(|h| h.local);
     let x = kit.x + 8.0;
@@ -990,14 +995,16 @@ fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
         let fill = if pressed { pal.surface2 } else if hovered { pal.sidebar_hover } else if mobile { pal.surface1 } else { pal.transparent };
         kit.rect(r, fill, None, if mobile { 0.0 } else { 8.0 });
         let pad = if mobile { 16.0 } else { 8.0 };
+        let slots = metrics.layout(r, pad, 16.0, 14.0, 8.0);
         if let Some(h) = active {
             let color = status_color(&pal, h);
-            kit.rect(Rect { pos: dvec2(r.pos.x + pad + 4.0, r.pos.y + (row_h - 8.0) / 2.0), size: dvec2(8.0, 8.0) }, color, None, 4.0);
+            kit.rect(Rect { pos: dvec2(slots.leading.pos.x + 4.0, slots.leading.pos.y + (row_h - 8.0) * 0.5), size: dvec2(8.0, 8.0) }, color, None, 4.0);
         }
         let font = if mobile { 16.0 } else { 14.0 };
-        let th = kit.measure(Font::Regular, font, &label, None).y;
-        kit.text_line(Font::Regular, font, pal.foreground, dvec2(r.pos.x + pad + 24.0, r.pos.y + (row_h - th) / 2.0), w - pad * 2.0 - 44.0, &label);
-        kit.icon(Icon::ChevronDown, dvec2(r.pos.x + w - pad - 14.0, r.pos.y + (row_h - 14.0) / 2.0 + 1.0), 14.0, pal.muted);
+        if slots.title.size.x > 0.0 {
+            kit.text_line(Font::Regular, font, pal.foreground, slots.title.pos, slots.title.size.x, &label);
+        }
+        kit.icon(Icon::ChevronDown, dvec2(slots.trailing.pos.x, slots.trailing.pos.y + (row_h - 14.0) * 0.5 + 1.0), 14.0, pal.muted);
         let hosts = v.hosts.clone();
         let active_id = active.map(|h| h.server_id.clone());
         let picker = handler(move |s, _| {

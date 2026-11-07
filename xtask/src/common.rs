@@ -93,13 +93,13 @@ pub fn arch() -> Result<&'static str> {
 pub fn executable() -> &'static str {
     if cfg!(windows) { "paseo.exe" } else { "paseo" }
 }
-/// Cargo's target directory (`CARGO_TARGET_DIR`, default `<root>/target`).
+/// Cargo's managed shared cache, or the caller's explicit CARGO_TARGET_DIR.
 pub fn target_root() -> Result<PathBuf> {
-    absolute(env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
+    crate::build_cache::target_root()
 }
-/// Staged GUI bundles, APK/iOS work directories and Gradle state.
+/// Source-bound GUI bundles, APK/iOS work directories and Gradle state.
 pub fn gui_output() -> Result<PathBuf> {
-    Ok(target_root()?.join("paseo-gui"))
+    Ok(root()?.join(".dev/build/gui"))
 }
 pub fn release() -> Result<PathBuf> {
     Ok(root()?.join("artifacts/native"))
@@ -114,8 +114,12 @@ pub fn cargo() -> std::ffi::OsString {
     env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 pub fn command(program: impl AsRef<OsStr>) -> Result<Command> {
+    let program = program.as_ref();
     let mut command = Command::new(program);
     command.current_dir(root()?);
+    if program == cargo().as_os_str() {
+        crate::build_cache::configure(&mut command)?;
+    }
     Ok(command)
 }
 

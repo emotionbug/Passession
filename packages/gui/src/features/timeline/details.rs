@@ -205,7 +205,10 @@ fn draw_block(cx: &mut Cx2d, d: &mut Draw, block: &DetailBlock, key: &str, x: f6
             .max(h)
         }
         DetailBlock::Source { content, path, start_line } => {
-            let colors = highlight::file(content, path, d.look.syntax.as_str(), d.look.dark());
+            if !d.state.fence_highlights.contains_key(key) {
+                d.state.fence_highlights.insert(key.to_owned(), Default::default());
+            }
+            let colors = highlight::file(d.state.fence_highlights.get_mut(key).unwrap(), content, path, d.look.syntax.as_str(), d.look.dark());
             let (text, spans) = code_rich(content, colors.as_ref(), p.foreground, d.look.code());
             let laid = d.kit.layout_rich(cx, &text, &spans, None, code_height(d));
             let mut gutter: Option<(Rc<_>, f64)> = None;

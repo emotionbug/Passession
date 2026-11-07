@@ -3,7 +3,7 @@ repo = pathlib.Path(__file__).resolve().parents[2]
 target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', repo / 'target'))
 arch = {'x86_64': 'x64', 'aarch64': 'arm64'}.get(platform.machine(), platform.machine())
 parser = argparse.ArgumentParser(description='Exercise the real Linux desktop, native tray, and Rust daemon in a private Xvfb/D-Bus session.')
-parser.add_argument('--bundle', type=pathlib.Path, default=(repo / target / f'paseo-gui/desktop/linux-{arch}/smoke-debug/bundle'), help='Client bundle from `cargo xtask build-gui linux --smoke --debug` (lifecycle driver compiled in)')
+parser.add_argument('--bundle', type=pathlib.Path, default=(repo / f'.dev/build/gui/desktop/linux-{arch}/smoke-debug/bundle'), help='Client bundle from `cargo xtask build-gui linux --smoke --debug` (lifecycle driver compiled in)')
 parser.add_argument('--runtime', type=pathlib.Path, help='Native desktop runtime containing desktop-runtime.json (default: the bundle\'s runtime/)')
 parser.add_argument('--openbox', default=shutil.which('openbox'), help='Openbox executable for the private Xvfb session (default: PATH)')
 options = parser.parse_args()

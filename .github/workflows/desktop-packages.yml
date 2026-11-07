@@ -12,6 +12,7 @@ permissions:
   packages: read
 
 env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
   PASEO_NATIVE_RELEASE: "1"
   PASEO_UPDATE_REPOSITORY: emotionbug/paseo
   PASEO_BUILD_SOURCE_SHA: ${{ github.sha }}
@@ -63,4 +64,4 @@ jobs:
             artifacts/native/flutter-*.json
             artifacts/native/packages-*.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7

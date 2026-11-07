@@ -19,6 +19,8 @@ use super::store::{GitStore, pr_status};
 use super::text::{t, tr};
 use super::wire::payload_error;
 use crate::common::overlay::tooltip_at;
+use crate::common::paint::TextSpec;
+use crate::common::widgets::RowMetrics;
 use crate::common::{PanelTarget, UiContext, UiEffect};
 use crate::features::timeline::canvas::{Canvas, ChatKit, HitTarget};
 use crate::features::timeline::chat_row::hover_key;
@@ -806,7 +808,7 @@ impl PrView {
 
     /// Original `_CheckRow`; returns its height.
     #[allow(clippy::too_many_arguments)]
-    fn check_row(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, x: f64, y: f64, width: f64, height: f64, left_pad: f64, icon: Check, name: &str, detail: &str, trailing: Option<String>, url: Option<String>, clip: Rect) {
+    fn check_row(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, x: f64, y: f64, width: f64, height: f64, metrics: RowMetrics, left_pad: f64, icon: Check, name: &str, detail: &str, trailing: Option<String>, url: Option<String>, clip: Rect) {
         let colors = palette();
         let band = rect(x, y, width, height);
         if let Some(url) = &url {
@@ -816,20 +818,22 @@ impl PrView {
             }
             self.hits.push_clipped(band, clip, hit);
         }
-        let center_y = y + height / 2.0;
-        check_icon(paint, cx, icon, 14.0, dvec2(x + left_pad + 7.0, center_y));
-        let mut right = x + width - 12.0;
-        if let Some(trailing) = trailing {
-            let w = paint.measure(cx, Font::Regular, ui_px(12.0), &trailing).x;
-            paint.text_centered(cx, Font::Regular, ui_px(12.0), colors.muted, right - w, y, height, &trailing, w + 1.0);
-            right -= w + 8.0;
+        let small = TextSpec::new(Font::Regular, ui_px(12.0), colors.muted);
+        let title = TextSpec::new(Font::Regular, ui_px(14.0), colors.foreground);
+        let trailing_width = trailing.as_deref().map_or(0.0, |text| paint.painter.measure(cx, small, text).x);
+        let indent = (left_pad - 12.0).max(0.0);
+        let slots = metrics.layout(rect(x + indent, y, width - indent, height), 12.0, 14.0, trailing_width, 8.0);
+        if slots.leading.size.x >= 14.0 {
+            check_icon(paint, cx, icon, 14.0, dvec2(slots.leading.pos.x + 7.0, y + height * 0.5));
         }
-        let text_left = x + left_pad + 14.0 + 8.0;
-        let available = (right - text_left).max(0.0);
-        let name_width = if detail.is_empty() { available } else { available * 0.6 };
-        let drawn = paint.text_centered(cx, Font::Regular, ui_px(14.0), colors.foreground, text_left, y, height, name, name_width);
+        if let Some(trailing) = trailing {
+            paint.painter.text_in(cx, slots.trailing, small, &trailing, 1.0);
+        }
+        let name_width = if detail.is_empty() { slots.title.size.x } else { slots.title.size.x * 0.6 };
+        let drawn = paint.painter.text_in(cx, rect(slots.title.pos.x, y, name_width, height), title, name, 0.0);
         if !detail.is_empty() {
-            paint.text_centered(cx, Font::Regular, ui_px(12.0), colors.muted, text_left + drawn + 8.0, y, height, detail, (available - drawn - 8.0).max(0.0));
+            let detail_left = drawn.pos.x + drawn.size.x + 8.0;
+            paint.painter.text_in(cx, rect(detail_left, y, slots.title.pos.x + slots.title.size.x - detail_left, height), small, detail, 0.0);
         }
     }
 
@@ -889,8 +893,9 @@ impl PrView {
             return;
         }
         // Roughly eight rows; past this the list scrolls in place.
-        let row_h = 32.0_f64.max(ui_px(14.0) * 1.4 + 8.0);
-        let heading_h = 16.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4;
+        let metrics = RowMetrics::measure(&mut paint.painter, cx, TextSpec::new(Font::Regular, ui_px(14.0), colors.foreground), None, 0.0);
+        let row_h = metrics.height(32.0, 4.0, 14.0);
+        let heading_h = paint.measure(cx, Font::Medium, ui_px(12.0), "Ag").y;
         let mut inner = 0.0;
         for (presentation, matching) in &groups {
             inner += 8.0 + heading_h + 4.0;
@@ -923,7 +928,7 @@ impl PrView {
             for check in matching {
                 if y + row_h >= clip.pos.y && y <= clip.pos.y + clip.size.y {
                     let url = Some(text(check, "url")).filter(|u| !u.is_empty()).unwrap_or(&fallback).to_owned();
-                    self.check_row(cx, paint, c.left, y, c.width, row_h, 12.0, classify_check(check), text(check, "name"), text(check, "workflow"), check_timing(check), Some(url), clip);
+                    self.check_row(cx, paint, c.left, y, c.width, row_h, metrics, 12.0, classify_check(check), text(check, "name"), text(check, "workflow"), check_timing(check), Some(url), clip);
                 }
                 y += row_h;
             }
@@ -935,9 +940,10 @@ impl PrView {
     /// Original `_GitlabPipelineSection`.
     fn pipeline_section(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, c: &mut Cursor, facts: &Value) {
         let colors = palette();
-        let row_h = 32.0_f64.max(ui_px(14.0) * 1.4 + 8.0);
+        let metrics = RowMetrics::measure(&mut paint.painter, cx, TextSpec::new(Font::Regular, ui_px(14.0), colors.foreground), None, 0.0);
+        let row_h = metrics.height(32.0, 4.0, 14.0);
         let job_h = 36.0_f64.max(row_h);
-        let heading_h = 16.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4;
+        let heading_h = paint.measure(cx, Font::Medium, ui_px(12.0), "Ag").y;
         let raw_status = text(facts, "pipelineStatus").to_owned();
         let url = text(facts, "pipelineUrl").to_owned();
         let pipeline = self.pane.pipeline.clone();
@@ -970,7 +976,7 @@ impl PrView {
         let pipeline_name = format!("Pipeline #{}", int(facts, "pipelineId"));
         let launch = Some(url.clone()).filter(|u| !u.is_empty());
         let trailing = None;
-        self.check_row(cx, paint, c.left, c.y, c.width, row_h, 12.0, classify_gitlab_job(&raw_status, false), &pipeline_name, &raw_status, trailing, launch.clone(), c.view);
+        self.check_row(cx, paint, c.left, c.y, c.width, row_h, metrics, 12.0, classify_gitlab_job(&raw_status, false), &pipeline_name, &raw_status, trailing, launch.clone(), c.view);
         if launch.is_some() {
             paint.icon(cx, "external-link", 12.0, colors.muted, dvec2(c.left + c.width - 12.0 - 6.0, c.y + row_h / 2.0));
         }
@@ -994,7 +1000,7 @@ impl PrView {
                     let duration = int(job, "durationSeconds");
                     let trailing = (duration > 0).then(|| format_duration(duration));
                     let job_url = Some(text(job, "url").to_owned()).filter(|u| !u.is_empty());
-                    self.check_row(cx, paint, c.left, c.y, c.width, job_h, 24.0, classify_gitlab_job(text(job, "status"), allow), text(job, "name"), &detail, trailing, job_url, c.view);
+                    self.check_row(cx, paint, c.left, c.y, c.width, job_h, metrics, 24.0, classify_gitlab_job(text(job, "status"), allow), text(job, "name"), &detail, trailing, job_url, c.view);
                     c.y += job_h;
                 }
             }

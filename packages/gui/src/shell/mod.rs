@@ -589,7 +589,7 @@ impl Widget for PaseoShell {
         }
 
         // Modal overlays get the event first and lock the sweep for the content below.
-        let modal = if tool_sheet || window_modal || command_center { true } else { overlays::handle_event(self, cx, event, scope) };
+        let modal = if tool_sheet || window_modal || (command_center && !shell_modal) { true } else { overlays::handle_event(self, cx, event, scope) };
         let modal = shell_modal || modal;
         let sidebar_blocked = !chrome::sidebar_visible(self) || self.data.app_inactive
             || modal || overlay_api::window_modal_open(&self.data.window_id)
@@ -648,6 +648,7 @@ impl Widget for PaseoShell {
         }
         // Commands above can change the destination. Arm motion in the same event,
         // and consume animation frames even when a modal temporarily owns input.
+        self.data.overlays.sync_focus(cx);
         chrome::animate_explorer(self, cx, event);
     }
 

@@ -9,15 +9,15 @@ Build the executable and required runtime assets with `cargo xtask build-daemon`
 ```sh
 PASEO_HOME=/absolute/path/to/disposable-home \
 PASEO_LISTEN=127.0.0.1:17678 \
-./target/debug/paseo daemon run
+./.dev/build/native/dev-fast/paseo daemon run
 ```
 
-Choose an unused endpoint and a genuinely disposable directory. Respect `CARGO_TARGET_DIR` and use `paseo.exe` on Windows. `daemon run` is the foreground mode; managed supervisor tests must deliberately use the managed start path instead.
+Choose an unused endpoint and a genuinely disposable directory. Native runtime staging stays source-local even with `CARGO_TARGET_DIR`; use `paseo.exe` on Windows. `daemon run` is the foreground mode; managed supervisor tests must deliberately use the managed start path instead.
 
 Connect using the native CLI, the Rust GUI, or the `paseo-client` SDK from `packages/client` (see `packages/client/examples/inspect.rs`). For example, in another terminal:
 
 ```sh
-./target/debug/paseo --host 127.0.0.1:17678 ls
+./.dev/build/native/dev-fast/paseo --host 127.0.0.1:17678 ls
 ```
 
 The SDK is an external protocol client and requires no Node runtime. Preserve request IDs, authentication and advertised capabilities in a protocol test rather than calling internal state directly and calling that end-to-end.

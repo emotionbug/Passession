@@ -30,6 +30,7 @@ thread_local! {
     static FIELD_PTR: Cell<Option<LivePtr>> = const { Cell::new(None) };
     /// The shell's `QrScanView` template (pairing scan sheet).
     static QR_PTR: Cell<Option<LivePtr>> = const { Cell::new(None) };
+    static FIELDS_ACTIVE: Cell<bool> = const { Cell::new(true) };
 }
 
 /// Shell: the `PTextField` template sheet fields are built from.
@@ -40,6 +41,11 @@ pub fn register_field_ptr(ptr: Option<LivePtr>) {
 /// Shell: the `QrScanView` template.
 pub fn register_qr_ptr(ptr: Option<LivePtr>) {
     QR_PTR.with(|p| p.set(ptr));
+}
+
+/// Covered sheets still draw their fields, but only the top owner may autofocus.
+pub(super) fn set_fields_active(active: bool) {
+    FIELDS_ACTIVE.with(|current| current.set(active));
 }
 
 pub(crate) fn qr_ptr() -> Option<LivePtr> {
@@ -131,7 +137,7 @@ impl Field {
         }
         let widget = self.widget.clone().unwrap();
         draw_widget(cx, scope, &widget, r);
-        if std::mem::take(&mut self.focus) {
+        if FIELDS_ACTIVE.with(Cell::get) && std::mem::take(&mut self.focus) {
             widget.as_ptext_field().set_key_focus(cx);
         }
     }

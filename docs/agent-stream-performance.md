@@ -42,10 +42,32 @@ and errors while retaining previous rows. Live directory updates remain ordered 
 baselines, including workspace changes that also affect projects. Request/ACK waiting is distinct
 from the agent's actual activity; stale/offline snapshots do not animate as current running state.
 
-The app drains one core batch per dispatch. Hidden chat controllers can keep reconciling data without
-painting every row; `PortalList` limits mounted presentation, while row UI state remains outside
-recycled items. Reveal, streaming updates and composer growth must preserve the reader's anchor,
-selection and IME state. Cancelling presentation work is not cancelling the provider turn.
+The app admits at most 64 queued core events in one dispatch, taking a finite queue snapshot
+under one lock. A nonempty batch arms a 1/60-second continuation timer; incoming signals cannot
+bypass that timer. This yields between batches even while a producer keeps refilling the queue,
+including when no window is drawing. It does not drop canonical events or impose a byte/time
+budget on an individual event.
+
+Timeline sessions apply matching events in order, then publish one projection after the batch.
+Fold text and sequence ranges append in place while privately owned, using copy-on-write when
+an older screen snapshot still references the row. Hidden controllers can reconcile without
+painting; `PortalList` limits mounted rows and row UI state remains outside recycled items.
+Reveal, streaming updates and composer growth must preserve the reader's anchor, selection and
+IME state. Cancelling presentation work is not cancelling the provider turn.
+
+Reveal boundary lookup starts at the current Unicode grapheme boundary rather than rescanning
+the complete prefix. Visible assistant text is borrowed; collapsed reasoning does not build its
+hidden detail body. Markdown preparation/layout caches reuse unchanged paragraphs. Code syntax
+highlighting runs on one native worker with a bounded latest-snapshot queue; pending text remains
+plain and selectable, and results apply only to the matching content, language and theme.
+Completion is polled by the central timeline signal handler, not by an arbitrary mounted row.
+
+These changes bound admission and remove repeated work; they are not a hard frame-time guarantee.
+A single changing Markdown paragraph still requires parsing and exact layout on the UI path,
+and virtualization cannot avoid the cost of one very large row. The existing desktop assistant
+presentation limit is unchanged; no additional truncation or canonical-history loss is used as
+a streaming optimization. Absolute-position culling before `PortalList`'s final row alignment
+is unsafe and is not enabled.
 
 ## Evidence
 

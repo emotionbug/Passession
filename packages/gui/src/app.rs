@@ -63,6 +63,10 @@ fn core_config() -> CoreConfig {
     CoreConfig { state_dir, daemon_home, default_endpoint: None }
 }
 
+// Leave event-loop turns between transcript batches for input and painting.
+const CORE_BATCH_LIMIT: usize = 64;
+const CORE_BATCH_INTERVAL: f64 = 1.0 / 60.0;
+
 /// Everything that exists once startup succeeded.
 struct Runtime {
     core: GuiCore,
@@ -74,6 +78,7 @@ struct Runtime {
     system_dark: bool,
     theme_key: String,
     window_ready: bool,
+    core_batch_timer: Timer,
 }
 
 #[derive(Live, LiveHook)]
@@ -141,6 +146,7 @@ impl App {
             system_dark,
             theme_key: String::new(),
             window_ready: false,
+            core_batch_timer: Timer::default(),
         });
         self.ui.widget(id!(main_window.shell)).as_paseo_shell().set_window(cx, common::MAIN_WINDOW_ID);
         shell::register_window(common::MAIN_WINDOW_ID);
@@ -176,12 +182,13 @@ impl App {
         }
     }
 
-    /// Drains the core queue into this batch; returns whether a new `State` arrived.
+    /// Admits one bounded FIFO batch; a live producer cannot extend this dispatch.
     fn drain_core(runtime: &mut Runtime) -> bool {
         let mut state_changed = false;
-        while let Some(event) = runtime.core.try_recv() {
+        runtime.core.drain_events(&mut runtime.ui.events, CORE_BATCH_LIMIT);
+        for event in &runtime.ui.events {
             if let Some(platform) = runtime.platform.as_mut() {
-                platform.observe_core_event(&event);
+                platform.observe_core_event(event);
             }
             if let CoreEvent::State { state } = &event {
                 runtime.ui.state = state.clone();
@@ -192,7 +199,6 @@ impl App {
                 infos.insert(host_id.clone(), server_info.clone());
                 runtime.ui.server_infos = std::rc::Rc::new(infos);
             }
-            runtime.ui.events.push(event);
         }
         state_changed
     }
@@ -264,8 +270,18 @@ impl AppMain for App {
             runtime.theme_key.clear();
         }
         let mut appearance = refresh_appearance || matches!(event, Event::Startup);
-        if let Event::Signal = event {
+        let core_tick = runtime.core_batch_timer.is_event(event).is_some();
+        if core_tick {
+            runtime.core_batch_timer = Timer::default();
+        }
+        if core_tick || (matches!(event, Event::Signal) && runtime.core_batch_timer.is_empty()) {
             appearance |= Self::drain_core(runtime);
+            if !runtime.ui.events.is_empty() {
+                // Poll once more even if the queue was empty after admission:
+                // arrivals during processing must not bypass the cadence. A timer
+                // also services hidden windows which have no animation frames.
+                runtime.core_batch_timer = cx.start_timeout(CORE_BATCH_INTERVAL);
+            }
         }
         if appearance {
             Self::appearance(runtime, cx);

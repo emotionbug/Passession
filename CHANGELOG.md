@@ -2,9 +2,26 @@
 
 ## Unreleased
 
+### Changed
+
+- Share measured list-row slots and paint/hit/layout extents across sidebar, history, Settings, Git and timeline metadata. Scale sheet headers from their actual text height and reserve trailing actions before truncating labels.
+- Add a `dev-fast` native profile, Git-common-directory build caches and checkout-local staging. Preserve release optimization; support opt-in installed compiler caches and fast Linux linkers without installing tools.
+- Make Android APK builds arm64 by default, with explicit arm, x64 and universal variants; add universal AAB packaging and format/ABI-aware release metadata and archive validation.
+- Add explicit dry-run-first cache housekeeping with active/recent generation protection and a soft size budget. Keep operator-owned targets, Unicode fonts and licenses; retain existing combined desktop compilation and no-rebuild packaging.
+
+### Fixed
+
+- Yield between bounded GUI core-event batches rather than draining an actively refilled queue indefinitely. Publish timeline projections once per batch and append private text/range storage without repeatedly copying the growing message.
+- Reuse unchanged Markdown preparation/layout, avoid prefix-wide grapheme rescans and defer hidden reasoning details. Move code syntax highlighting off the GUI thread with bounded, identity-checked pending work while keeping unhighlighted text selectable.
+- Share same-target release, dismissal claiming, bounded popup geometry and modal focus teardown. Keep one dismiss event with its arrival-time owner, preserve nested subagent input and isolate standalone tool-sheet hit maps by window.
+
 ### Removed
 
 - Remove unused npm dependency patches for the retired Node/Expo client and daemon. The native Rust build does not consume `patch-package`.
+
+### Validation
+
+- Final build-tool smoke: compiled `paseo-xtask` and ran `housekeeping --max-bytes 0` in dry-run mode; no managed-cache removal was applied. GUI/Android execution, regression tests, CI and performance/size comparisons remain unexecuted.
 
 ## 0.13.9 - 2026-11-07
 

@@ -158,8 +158,20 @@ impl Painter {
     /// (0 left, 0.5 centre, 1 right) and truncated with an ellipsis (`maxLines: 1`,
     /// `TextOverflow.ellipsis`). Returns the drawn rect.
     pub fn text_in(&mut self, cx: &mut Cx2d, rect: Rect, spec: TextSpec, text: &str, align_x: f64) -> Rect {
-        let fitted = self.fit(cx, spec, text, rect.size.x);
-        let size = self.measure(cx, spec, &fitted);
+        if rect.size.x <= 0.0 || rect.size.y <= 0.0 || text.is_empty() {
+            return Rect { pos: rect.pos, size: DVec2::default() };
+        }
+        let line = single_line_text(text);
+        let measured = self.measure(cx, spec, &line);
+        // Most labels fit: keep their borrowed text rather than allocating a
+        // String for every visible row on every scroll frame.
+        let (fitted, size) = if measured.x <= rect.size.x {
+            (line, measured)
+        } else {
+            let fitted = self.fit(cx, spec, &line, rect.size.x);
+            let size = self.measure(cx, spec, &fitted);
+            (Cow::Owned(fitted), size)
+        };
         let pos = dvec2(
             rect.pos.x + ((rect.size.x - size.x) * align_x).max(0.0),
             rect.pos.y + ((rect.size.y - size.y) * 0.5),
@@ -170,12 +182,18 @@ impl Painter {
 
     /// `text` shortened with "…" so it fits `max_width`.
     pub fn fit(&mut self, cx: &mut Cx, spec: TextSpec, text: &str, max_width: f64) -> String {
-        let line = text.lines().next().unwrap_or("");
-        let laid = self.layout(cx, spec, line, None);
-        if (laid.size_in_lpxs.width as f64) <= max_width + 0.5 || max_width <= 0.0 {
-            return line.to_string();
+        if max_width <= 0.0 || text.is_empty() {
+            return String::new();
+        }
+        let line = single_line_text(text);
+        let laid = self.layout(cx, spec, &line, None);
+        if (laid.size_in_lpxs.width as f64) <= max_width {
+            return line.into_owned();
         }
         let ellipsis = self.measure(cx, spec, "…").x;
+        if ellipsis > max_width {
+            return String::new();
+        }
         let Some(row) = laid.rows.first() else { return String::new() };
         let budget = (max_width - ellipsis).max(0.0) as f32;
         let mut index = row.x_in_lpxs_to_index(budget).min(line.len());
@@ -183,9 +201,12 @@ impl Painter {
             index -= 1;
         }
         // x_in_lpxs_to_index rounds to the nearest grapheme; step back until it fits.
+        let mut candidate = String::with_capacity(index + '…'.len_utf8());
         loop {
-            let candidate = format!("{}…", line[..index].trim_end());
-            if index == 0 || self.measure(cx, spec, &candidate).x <= max_width + 0.5 {
+            candidate.clear();
+            candidate.push_str(line[..index].trim_end());
+            candidate.push('…');
+            if index == 0 || self.measure(cx, spec, &candidate).x <= max_width {
                 return candidate;
             }
             index -= 1;

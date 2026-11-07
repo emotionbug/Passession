@@ -17,9 +17,9 @@ on:
         type: string
         default: ""
       platform:
-        description: Native platform, individual desktop target, or Linux/Windows x64 plus Android
+        description: Native platform, individual target, or Linux/Windows x64 plus Android
         type: choice
-        options: [all, desktop, linux-windows-x64-android, macos, linux, windows, android, ios, macos-arm64, macos-x64, linux-arm64, linux-x64, windows-arm64, windows-x64]
+        options: [all, desktop, linux-windows-x64-android, macos, linux, windows, android, ios, macos-arm64, macos-x64, linux-arm64, linux-x64, windows-arm64, windows-x64, android-arm64, android-arm, android-x64, android-universal, android-universal-aab]
         default: all
       checkout_ref:
         description: Optional source ref override (must have the same package version as tag)
@@ -48,6 +48,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
   SOURCE_TAG: ${{ inputs.tag }}
   CHECKOUT_REF: ${{ inputs.checkout_ref || inputs.tag }}
   SHOULD_PUBLISH: ${{ inputs.publish != 'false' }}
@@ -104,7 +105,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.source.outputs.matrix) }}
-    name: native (${{ matrix.platform }}-${{ matrix.arch }})
+    name: native (${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }})
     runs-on: ${{ matrix.runner }}
     env:
       SOURCE_SHA: ${{ needs.source.outputs.sha }}
@@ -114,7 +115,7 @@ jobs:
       PASEO_NATIVE_RELEASE: "1"
       PASEO_UPDATE_REPOSITORY: emotionbug/paseo
       PASEO_BUILD_SOURCE_SHA: ${{ needs.source.outputs.sha }}
-      TARGET_ID: ${{ matrix.platform }}-${{ matrix.arch }}
+      TARGET_ID: ${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -185,7 +186,7 @@ jobs:
             echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/paseo-release.keystore" >> "$GITHUB_ENV"
           fi
       - name: Build Rust GUI client and native Rust desktop runtime
-        run: cargo xtask build-gui ${{ matrix.platform }}
+        run: cargo xtask build-gui ${{ matrix.platform }} --profile release ${{ matrix.platform == 'android' && format('--arch {0} --format {1}', matrix.arch, matrix.format) || '' }}
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -198,11 +199,11 @@ jobs:
         if: matrix.platform == 'macos'
         shell: bash
         run: |
-          bundle="target/paseo-gui/desktop/${TARGET_ID}/release/Paseo Sessions.app"
+          bundle=".dev/build/gui/desktop/${TARGET_ID}/release/Paseo Sessions.app"
           /usr/bin/lipo -info "$bundle/Contents/MacOS/Paseo Sessions"
           "$bundle/Contents/Resources/runtime/paseo" --version
       # Without mobile signing credentials, artifacts are explicitly labelled
-      # debug-signed APK / unsigned iOS .app, never presented as store submissions.
+      # debug-signed APK/AAB / unsigned iOS .app, never presented as store submissions.
       - name: Package native desktop installers
         if: matrix.desktop
         run: cargo xtask package-desktop ${{ matrix.platform }}
@@ -232,9 +233,9 @@ jobs:
         run: cargo xtask release record
       - uses: actions/upload-artifact@v4
         with:
-          name: native-release-${{ matrix.platform }}-${{ matrix.arch }}
+          name: native-release-${{ env.TARGET_ID }}
           compression-level: 0
-          retention-days: 30
+          retention-days: 7
           if-no-files-found: error
           path: |
             artifacts/native/Paseo-Sessions-*

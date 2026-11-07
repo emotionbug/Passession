@@ -289,14 +289,21 @@ thread_local! {
 /// sheet in an overlay draw list (`DrawList2d::begin_overlay_last`) sized to
 /// `cx.current_pass_size()` so it covers the shell header.
 pub fn set_window_modal(ui: &UiContext, owner: u64, open: bool) {
-    release_window_modal(&ui.window_id, owner);
-    if open {
-        WINDOW_MODALS.with(|modals| modals.borrow_mut().push(WindowModalOwner {
-            window: ui.window_id.clone(),
-            widget: owner,
-            tab: Some(ui.tab_key.as_deref().unwrap_or(PAGE_OWNER).to_owned()),
-        }));
-    }
+    WINDOW_MODALS.with(|modals| {
+        let mut modals = modals.borrow_mut();
+        if !open {
+            modals.retain(|modal| !(modal.window == ui.window_id && modal.widget == owner));
+        } else if let Some(modal) = modals.iter_mut().find(|modal| modal.window == ui.window_id && modal.widget == owner) {
+            // Retained owners sync every frame; only an actual opening changes z-order.
+            modal.tab = Some(ui.tab_key.as_deref().unwrap_or(PAGE_OWNER).to_owned());
+        } else {
+            modals.push(WindowModalOwner {
+                window: ui.window_id.clone(),
+                widget: owner,
+                tab: Some(ui.tab_key.as_deref().unwrap_or(PAGE_OWNER).to_owned()),
+            });
+        }
+    });
 }
 
 /// Releases one sheet's slot on hide, retarget or drop, when no `UiContext` is available.
@@ -317,6 +324,70 @@ pub(crate) fn window_modal_accepts_tab(window: &str, tab: &str) -> bool {
         modals.borrow().iter().rev().find(|m| m.window == window)
             .is_none_or(|m| m.tab.as_deref() == Some(tab))
     })
+}
+
+/// Snapshot before dispatch when multiple retained modals share a tab.
+pub fn window_modal_accepts_owner(window: &str, owner: u64) -> bool {
+    WINDOW_MODALS.with(|modals| {
+        modals.borrow().iter().rev().find(|modal| modal.window == window)
+            .is_none_or(|modal| modal.widget == owner)
+    })
+}
+
+/// Claim dismissal before dispatching to children; a handled Back or repeat must not
+/// unwind another owner. Escape is contained by the caller's arrival-time modal lock.
+pub fn take_dismissal(event: &makepad_widgets::Event) -> bool {
+    use makepad_widgets::{Event, KeyCode};
+    match event {
+        Event::BackPressed { handled } if !handled.get() => {
+            handled.set(true);
+            true
+        }
+        Event::KeyDown(key) => key.key_code == KeyCode::Escape && !key.is_repeat,
+        _ => false,
+    }
+}
+
+/// Fit a popup into the visible viewport, including viewports smaller than its margin.
+/// Callers remove keyboard coverage before positioning; this never imposes a minimum
+/// size that could move the popup back underneath the keyboard.
+pub fn fit_in_viewport(mut popup: Rect, viewport: Rect, margin: f64) -> Rect {
+    let width = viewport.size.x.max(0.0);
+    let height = viewport.size.y.max(0.0);
+    let mx = margin.max(0.0).min(width * 0.5);
+    let my = margin.max(0.0).min(height * 0.5);
+    popup.size.x = popup.size.x.clamp(0.0, width - 2.0 * mx);
+    popup.size.y = popup.size.y.clamp(0.0, height - 2.0 * my);
+    popup.pos.x = popup.pos.x.clamp(viewport.pos.x + mx, viewport.pos.x + width - mx - popup.size.x);
+    popup.pos.y = popup.pos.y.clamp(viewport.pos.y + my, viewport.pos.y + height - my - popup.size.y);
+    popup
+}
+
+/// A release must resolve to the target that accepted the press, not a neighbour
+/// exposed by scrolling or a redraw. Gesture owners cancel this when they take over.
+pub struct TapTarget<T> {
+    pressed: Option<T>,
+}
+
+impl<T> Default for TapTarget<T> {
+    fn default() -> Self {
+        Self { pressed: None }
+    }
+}
+
+impl<T: PartialEq> TapTarget<T> {
+    pub fn press(&mut self, target: Option<T>) {
+        self.pressed = target;
+    }
+
+    pub fn cancel(&mut self) {
+        self.pressed = None;
+    }
+
+    pub fn release(&mut self, target: Option<T>, valid: bool) -> Option<T> {
+        let pressed = self.pressed.take()?;
+        (valid && target.as_ref() == Some(&pressed)).then_some(pressed)
+    }
 }
 
 /// Owner prefix for overlays opened by widgets without a tab key.
@@ -592,6 +663,61 @@ pub fn result_of(command: &crate::common::UiCommand) -> Option<(u64, &Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backdrop_requires_same_target_valid_release_and_cannot_replay() {
+        let mut tap = TapTarget::default();
+        tap.press(Some("surface"));
+        assert_eq!(tap.release(Some("backdrop"), true), None);
+        tap.press(Some("backdrop"));
+        assert_eq!(tap.release(Some("backdrop"), false), None);
+        tap.press(Some("backdrop"));
+        tap.cancel();
+        assert_eq!(tap.release(Some("backdrop"), true), None);
+        tap.press(Some("backdrop"));
+        assert_eq!(tap.release(Some("backdrop"), true), Some("backdrop"));
+        assert_eq!(tap.release(Some("backdrop"), true), None);
+    }
+
+    #[test]
+    fn back_is_claimed_once_and_repeated_escape_does_not_unwind_stack() {
+        use makepad_widgets::{Event, KeyCode, KeyEvent};
+        let back = Event::BackPressed { handled: Cell::new(false) };
+        assert!(take_dismissal(&back));
+        assert!(!take_dismissal(&back));
+        let escape = KeyEvent { key_code: KeyCode::Escape, ..Default::default() };
+        assert!(take_dismissal(&Event::KeyDown(escape)));
+        assert!(!take_dismissal(&Event::KeyDown(KeyEvent { is_repeat: true, ..escape })));
+        assert!(!take_dismissal(&Event::KeyDown(KeyEvent { key_code: KeyCode::ReturnKey, ..Default::default() })));
+    }
+
+    #[test]
+    fn popup_fits_keyboard_viewport_and_degenerate_window() {
+        use makepad_widgets::dvec2;
+        let popup = Rect { pos: dvec2(-20.0, 400.0), size: dvec2(480.0, 300.0) };
+        let viewport = Rect { pos: dvec2(20.0, 30.0), size: dvec2(320.0, 140.0) };
+        let fitted = fit_in_viewport(popup, viewport, 8.0);
+        assert_eq!(fitted.pos, dvec2(28.0, 38.0));
+        assert_eq!(fitted.size, dvec2(304.0, 124.0));
+        let tiny = fit_in_viewport(popup, Rect { pos: dvec2(10.0, 12.0), size: dvec2(4.0, 0.0) }, 8.0);
+        assert_eq!(tiny.pos, dvec2(12.0, 12.0));
+        assert_eq!(tiny.size, dvec2(0.0, 0.0));
+    }
+
+    #[test]
+    fn modal_owner_gates_siblings_even_when_they_share_a_tab() {
+        WINDOW_MODALS.with(|modals| {
+            *modals.borrow_mut() = vec![
+                WindowModalOwner { window: "main".into(), widget: 1, tab: Some("same".into()) },
+                WindowModalOwner { window: "main".into(), widget: 2, tab: Some("same".into()) },
+            ];
+        });
+        assert!(!window_modal_accepts_owner("main", 1));
+        assert!(window_modal_accepts_owner("main", 2));
+        release_window_modal("main", 2);
+        assert!(window_modal_accepts_owner("main", 1));
+        release_window_modal("main", 1);
+    }
 
     #[test]
     fn tooltip_enter_wins_over_sibling_leave_in_either_order() {

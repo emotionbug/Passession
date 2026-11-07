@@ -7,6 +7,7 @@ use super::look::Look;
 use super::panel::{ComposerPanel, Item, OItem, Overlay};
 use super::sheet::{Leading, Page, RowAction};
 use crate::common::paint::{rect, Font, TextSpec};
+use crate::common::overlay::{fit_in_viewport, take_dismissal};
 use crate::common::{Route, UiContext, UiEffect};
 use crate::features::settings::SettingsPanelWidgetRefExt;
 use crate::features::composer::autocomplete::clean_label;
@@ -20,6 +21,12 @@ use makepad_widgets::*;
 use serde_json::Value;
 
 const SUGGEST_MAX: f64 = 220.0;
+
+fn overlay_viewport(size: DVec2) -> Rect {
+    let insets = crate::shell::platform::safe_insets();
+    rect(insets.left, insets.top, (size.x - insets.left - insets.right).max(0.0),
+        (size.y - insets.top - insets.bottom_occlusion()).max(0.0))
+}
 
 /// Context window details presentation (`ContextWindowDetails` showTitle/gap/refreshable).
 #[derive(Clone, Copy)]
@@ -63,9 +70,11 @@ impl ComposerPanel {
     pub(super) fn draw_overlays(&mut self, cx: &mut Cx2d, ui: &mut UiContext, look: &Look) {
         self.st.ohits.clear();
         self.st.overlay_rect = None;
+        self.st.sheet_viewport = Rect::default();
         self.overlay_list.begin_overlay_reuse(cx);
         let size = cx.current_pass_size();
         cx.begin_sized_turtle(size, Layout::flow_down());
+        let size = dvec2(size.x, (size.y - crate::shell::platform::safe_insets().bottom_occlusion()).max(0.0));
         match self.st.overlay().clone() {
             Overlay::None => {
                 if self.suggestions_visible() {
@@ -226,7 +235,7 @@ impl ComposerPanel {
         if y < 4.0 {
             y = anchor.pos.y + anchor.size.y + 6.0;
         }
-        let r = rect(x, y, w, h);
+        let r = fit_in_viewport(rect(x, y, w, h), overlay_viewport(cx.current_pass_size()), 4.0);
         self.painter.outline(cx, r, look.p.surface2, look.p.border, 1.0, 6.0);
         self.painter.text_in(cx, r, spec, text, 0.5);
     }
@@ -388,9 +397,10 @@ impl ComposerPanel {
         let h = self.context_details(cx, look, rect(0.0, 0.0, inner, 0.0), Details::CARD, false) + pad * 2.0;
         let anchor = self.st.meter_rect;
         let x = (anchor.pos.x + anchor.size.x - width).clamp(8.0, (self.st.window.x - width - 8.0).max(8.0));
-        let r = rect(x, anchor.pos.y - 8.0 - h, width, h);
+        let r = fit_in_viewport(rect(x, anchor.pos.y - 8.0 - h, width, h), overlay_viewport(cx.current_pass_size()), 8.0);
         self.card(cx, look, r, look.p.surface1);
-        self.context_details(cx, look, rect(r.pos.x + pad, r.pos.y + pad, inner, 0.0), Details::CARD, true);
+        let body = rect(r.pos.x + pad, r.pos.y + pad, (r.size.x - pad * 2.0).max(0.0), (r.size.y - pad * 2.0).max(0.0));
+        self.draw_context_body(cx, look, body, Details::CARD, h - pad * 2.0);
         self.overlay_bg.draw_abs(cx, r);
         self.st.overlay_rect = Some(r);
     }
@@ -412,6 +422,7 @@ impl ComposerPanel {
             let h = content_h.min(size.y * 0.8).max(120.0);
             rect((size.x - w) * 0.5, (size.y - h) * 0.5, w, h)
         };
+        let r = fit_in_viewport(r, overlay_viewport(cx.current_pass_size()), if look.compact { 0.0 } else { 8.0 });
         self.painter.outline(cx, r, look.p.surface0, look.p.border, 1.0, 16.0);
         self.st.ohits.push(r, OItem::Panel);
         self.st.overlay_rect = Some(r);
@@ -561,10 +572,11 @@ impl ComposerPanel {
             }
             y += search_h;
         }
-        let list = rect(frame.pos.x, y, frame.size.x, frame.pos.y + frame.size.y - y);
+        let list = rect(frame.pos.x, y, frame.size.x, (frame.pos.y + frame.size.y - y).max(0.0));
         let max_scroll = (content_h - list.size.y).max(0.0);
         let scroll = if top { self.st.sheet_scroll.clamp(0.0, max_scroll) } else { 0.0 };
         if top {
+            self.st.sheet_viewport = list;
             self.st.sheet_scroll = scroll;
             self.st.sheet_scroll_max = max_scroll;
         }
@@ -712,17 +724,18 @@ impl ComposerPanel {
             self.sheet_header(cx, look, r, Header::plain(&t(&format!("composer.github.title{suffix}"))));
             rect(r.pos.x, r.pos.y + header_h, r.size.x, h - header_h)
         } else {
-            let w = 400.0f64.min(size.x - 16.0);
+            let w = 400.0f64.min((size.x - 16.0).max(0.0));
             let max_h = (anchor.pos.y - 16.0).clamp(120.0, 400.0);
             let h = (search_h + list_h).min(max_h);
             let x = anchor.pos.x.clamp(8.0, (size.x - w - 8.0).max(8.0));
-            let r = rect(x, anchor.pos.y - 8.0 - h, w, h);
+            let r = fit_in_viewport(rect(x, anchor.pos.y - 8.0 - h, w, h), overlay_viewport(cx.current_pass_size()), 8.0);
             self.card(cx, look, r, p.surface0);
             r
         };
         self.st.ohits.push(frame, OItem::Panel);
         self.search_row(cx, look, rect(frame.pos.x, frame.pos.y, frame.size.x, search_h), &t(&format!("composer.github.searchPlaceholder{suffix}")));
-        let list = rect(frame.pos.x, frame.pos.y + search_h, frame.size.x, frame.size.y - search_h);
+        let list = rect(frame.pos.x, frame.pos.y + search_h, frame.size.x, (frame.size.y - search_h).max(0.0));
+        self.st.sheet_viewport = list;
         let message = if let Some(error) = error {
             Some(error)
         } else if items.is_empty() {
@@ -819,7 +832,10 @@ impl ComposerPanel {
             None => 0.0,
         };
         let bottom = 16.0 + 28.0 + 12.0 + error_h;
-        let editor = rect(16.0, 16.0 + 28.0 + 12.0, size.x - 32.0, (size.y - 16.0 - 28.0 - 12.0 - bottom).max(40.0));
+        let editor = fit_in_viewport(
+            rect(16.0, 16.0 + 28.0 + 12.0, (size.x - 32.0).max(0.0), (size.y - 16.0 - 28.0 - 12.0 - bottom).max(0.0)),
+            overlay_viewport(cx.current_pass_size()), 0.0,
+        );
         self.draw_input(cx, look, editor, 0.0, 0.0, editor.size.y);
         if let Some(text) = error {
             self.painter.paragraph(cx, dvec2(16.0, editor.pos.y + editor.size.y + 12.0), size.x - 32.0, TextSpec::new(Font::Regular, look.body(), look.red500()), &text);
@@ -843,20 +859,31 @@ impl ComposerPanel {
         let content = self.context_details(cx, look, rect(0.0, 0.0, width, 0.0), Details::SHEET, false);
         let header_h = self.sheet_header_height(cx, look);
         let h = (header_h + content + 32.0).min(size.y * 0.9);
-        let r = rect(0.0, size.y - h, size.x, h);
+        let r = fit_in_viewport(rect(0.0, size.y - h, size.x, h), overlay_viewport(cx.current_pass_size()), 0.0);
         self.painter.outline(cx, r, look.p.surface0, look.p.border, 1.0, 16.0);
         self.st.ohits.push(r, OItem::Panel);
         self.sheet_header(cx, look, r, Header::plain(&t("contextWindow.title")));
-        self.context_details(cx, look, rect(16.0, r.pos.y + header_h, width, 0.0), Details::SHEET, true);
+        let body = rect(r.pos.x + 16.0, r.pos.y + header_h, (r.size.x - 32.0).max(0.0), (r.size.y - header_h - 16.0).max(0.0));
+        self.draw_context_body(cx, look, body, Details::SHEET, content);
+    }
+
+    fn draw_context_body(&mut self, cx: &mut Cx2d, look: &Look, viewport: Rect, details: Details, content: f64) {
+        self.st.sheet_viewport = viewport;
+        self.st.sheet_scroll_max = (content - viewport.size.y).max(0.0);
+        self.st.sheet_scroll = self.st.sheet_scroll.clamp(0.0, self.st.sheet_scroll_max);
+        cx.begin_turtle(Walk::abs_rect(viewport), Layout::flow_down().with_clip(true, true));
+        self.st.ohits.set_clip(Some(viewport));
+        self.context_details(cx, look, rect(viewport.pos.x, viewport.pos.y - self.st.sheet_scroll, viewport.size.x, 0.0), details, true);
+        self.st.ohits.set_clip(None);
+        cx.end_turtle();
     }
 
     /// Consume dismissal before dispatching to the editor/search.
     pub(super) fn dismiss_overlay_event(&mut self, cx: &mut Cx, event: &Event, ui: &mut UiContext, path: &HeapLiveIdPath, uid: WidgetUid) -> bool {
-        if event.back_pressed()
-            || (matches!(event, Event::KeyDown(ke) if ke.key_code == KeyCode::Escape)
-                && !matches!(self.st.overlay(), Overlay::Fullscreen))
-        {
-            self.overlay_click(cx, ui, path, uid, OItem::Close);
+        if matches!(event, Event::BackPressed { .. } | Event::KeyDown(KeyEvent { key_code: KeyCode::Escape, .. })) {
+            if take_dismissal(event) {
+                self.overlay_click(cx, ui, path, uid, OItem::Close);
+            }
             return true;
         }
         false
@@ -864,12 +891,13 @@ impl ComposerPanel {
 
     pub(super) fn overlay_event(&mut self, cx: &mut Cx, event: &Event, ui: &mut UiContext, path: &HeapLiveIdPath, uid: WidgetUid) {
         if matches!(event, Event::Scroll(_)) {
-            self.st.touch_scroll.reset();
+            self.st.cancel_gestures();
         }
         if let Event::Scroll(scroll) = event
-            && matches!(self.st.overlay(), Overlay::Sheet(_) | Overlay::Forge)
+            && matches!(self.st.overlay(), Overlay::Sheet(_) | Overlay::Forge | Overlay::Context)
+            && self.st.sheet_viewport.contains(scroll.abs)
         {
-            self.st.sheet_scroll = (self.st.sheet_scroll + scroll.scroll.y).max(0.0);
+            self.st.sheet_scroll = (self.st.sheet_scroll + scroll.scroll.y).clamp(0.0, self.st.sheet_scroll_max);
             self.draw_bg.redraw(cx);
         }
         if let Event::Scroll(scroll) = event
@@ -884,9 +912,10 @@ impl ComposerPanel {
         // Fullscreen editor and sheet search inputs take their own pointer hits first.
         let hit = event.hits_with_capture_overload(cx, self.overlay_bg.area(), true);
         if let Some(dy) = self.st.touch_scroll.handle_event(cx, event, &hit) {
+            self.st.overlay_tap.cancel();
             let origin = self.st.touch_scroll.origin();
-            if matches!(self.st.overlay(), Overlay::Sheet(_) | Overlay::Forge)
-                && self.st.overlay_rect.is_some_and(|r| r.contains(origin))
+            if matches!(self.st.overlay(), Overlay::Sheet(_) | Overlay::Forge | Overlay::Context)
+                && self.st.sheet_viewport.contains(origin)
             {
                 self.st.touch_scroll.apply_delta(&mut self.st.sheet_scroll, dy, self.st.sheet_scroll_max);
                 self.draw_bg.redraw(cx);
@@ -911,8 +940,10 @@ impl ComposerPanel {
                 self.st.ohover = None;
                 self.draw_bg.redraw(cx);
             }
-            Hit::FingerUp(e) if e.is_over && e.was_tap() => {
-                if let Some(item) = self.st.ohits.at(e.abs) {
+            Hit::FingerDown(e) => self.st.overlay_tap.press(self.st.ohits.at(e.abs)),
+            Hit::FingerLongPress(_) => self.st.overlay_tap.cancel(),
+            Hit::FingerUp(e) => {
+                if let Some(item) = self.st.overlay_tap.release(self.st.ohits.at(e.abs), e.is_over && e.was_tap() && !e.has_long_press_occurred) {
                     self.overlay_click(cx, ui, path, uid, item);
                 }
             }
@@ -921,6 +952,7 @@ impl ComposerPanel {
     }
 
     fn overlay_click(&mut self, cx: &mut Cx, ui: &mut UiContext, path: &HeapLiveIdPath, uid: WidgetUid, item: OItem) {
+        self.st.cancel_gestures();
         match item {
             OItem::Scrim | OItem::Close => {
                 // A stacked model sheet closes back to the controls sheet.
@@ -984,7 +1016,7 @@ impl ComposerPanel {
     }
 
     fn clear_search(&mut self, cx: &mut Cx) {
-        self.st.touch_scroll.reset();
+        self.st.cancel_gestures();
         self.st.search_text.clear();
         self.st.sheet_scroll = 0.0;
         self.search.set_text(cx, "");
@@ -1109,15 +1141,27 @@ impl ComposerPanel {
         if self.st.overlay_rect.is_none() {
             return false;
         }
+        if let Event::Scroll(scroll) = event
+            && !self.suggestions_visible() && self.st.sheet_viewport.contains(scroll.abs)
+        {
+            self.st.cancel_gestures();
+            self.st.sheet_scroll = (self.st.sheet_scroll + scroll.scroll.y).clamp(0.0, self.st.sheet_scroll_max);
+            self.draw_bg.redraw(cx);
+            return true;
+        }
         let hit = event.hits_with_capture_overload(cx, self.overlay_bg.area(), true);
         let owns_pan = self.st.overlay_rect.is_some_and(|r| r.contains(self.st.touch_scroll.origin()));
         if (owns_pan || matches!(hit, Hit::FingerDown(_)))
             && let Some(dy) = self.st.touch_scroll.handle_event(cx, event, &hit)
         {
+            self.st.tap.cancel();
+            self.st.overlay_tap.cancel();
             if self.suggestions_visible() {
                 self.st.touch_scroll.apply_delta(&mut self.st.suggest_scroll, -dy, self.st.suggest_scroll_max);
-                self.draw_bg.redraw(cx);
+            } else {
+                self.st.touch_scroll.apply_delta(&mut self.st.sheet_scroll, dy, self.st.sheet_scroll_max);
             }
+            self.draw_bg.redraw(cx);
             return true;
         }
         match hit {
@@ -1141,12 +1185,15 @@ impl ComposerPanel {
                 self.draw_bg.redraw(cx);
                 true
             }
-            Hit::FingerUp(e) if e.is_over && e.was_tap() => {
-                if let Some(OItem::UsageRefresh(index)) = self.st.ohits.at(e.abs) {
+            Hit::FingerUp(e) => {
+                let valid = e.is_over && e.was_tap() && !e.has_long_press_occurred;
+                let overlay = self.st.overlay_tap.release(self.st.ohits.at(e.abs), valid);
+                let item = self.st.tap.release(self.st.hits.at(e.abs), valid);
+                if let Some(OItem::UsageRefresh(index)) = overlay {
                     if let Some(id) = self.ctl_ref().usage_reports.get(index).map(|r| get(r, "id").clone()) {
                         self.ctl().refresh_usage(ui, &id);
                     }
-                } else if let Some(Item::Suggest(index)) = self.st.hits.at(e.abs)
+                } else if let Some(Item::Suggest(index)) = item
                     && let Some(option) = self.ctl_ref().autocomplete.options.get(index).cloned()
                 {
                     let out = self.ctl().apply_autocomplete(ui, &option);
@@ -1154,8 +1201,17 @@ impl ComposerPanel {
                 }
                 true
             }
-            Hit::FingerDown(_) => true,
-            _ => false,
+            Hit::FingerDown(e) => {
+                self.st.tap.press(self.st.hits.at(e.abs));
+                self.st.overlay_tap.press(self.st.ohits.at(e.abs));
+                true
+            }
+            Hit::FingerLongPress(_) => {
+                self.st.tap.cancel();
+                self.st.overlay_tap.cancel();
+                true
+            }
+            _ => owns_pan && (self.st.touch_scroll.is_dragging() || self.st.touch_scroll.is_flinging()),
         }
     }
 }

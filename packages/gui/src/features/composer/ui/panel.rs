@@ -158,6 +158,10 @@ pub struct PanelState {
     pub hover: Option<Item>,
     pub ohits: HitMap<OItem>,
     pub ohover: Option<OItem>,
+    pub tap: crate::common::overlay::TapTarget<Item>,
+    pub overlay_tap: crate::common::overlay::TapTarget<OItem>,
+    pub sheet_viewport: Rect,
+    pub restore_input_focus: bool,
     pub overlay_rect: Option<Rect>,
     pub overlay: Option<Overlay>,
     pub menus: HashMap<u64, Menu>,
@@ -207,6 +211,12 @@ impl PanelState {
 
     pub fn modal_open(&self) -> bool {
         !matches!(self.overlay(), Overlay::None)
+    }
+
+    pub(super) fn cancel_gestures(&mut self) {
+        self.touch_scroll.reset();
+        self.tap.cancel();
+        self.overlay_tap.cancel();
     }
 }
 
@@ -363,6 +373,11 @@ impl Widget for ComposerPanel {
             }
         }
         let focus_transition = matches!(event, Event::KeyFocus(_) | Event::KeyFocusLost(_));
+        if matches!(event, Event::TextHandle(_) | Event::Pause | Event::AppLostFocus)
+            || matches!(event, Event::TouchUpdate(update) if update.cancelled)
+        {
+            self.st.cancel_gestures();
+        }
         if editor_open && !focus_transition {
             return;
         }
@@ -474,6 +489,8 @@ impl Widget for ComposerPanel {
 impl ComposerPanel {
     /// A retained composer must release its editors even after their areas expired.
     fn hide(&mut self, cx: &mut Cx) {
+        self.st.cancel_gestures();
+        self.st.restore_input_focus = false;
         self.input.release_focus(cx);
         self.search.release_focus(cx);
         self.st.input_focused = false;
@@ -651,6 +668,7 @@ impl ComposerPanel {
         for action in actions.filter_widget_actions_cast::<TextInputAction>(uid) {
             match action {
                 TextInputAction::Changed(text) => {
+                    self.st.cancel_gestures();
                     self.st.search_text = text;
                     self.st.sheet_scroll = 0.0;
                     if matches!(self.st.overlay(), Overlay::Forge) {
@@ -893,7 +911,8 @@ impl ComposerPanel {
     }
 
     pub(super) fn open_forge(&mut self, cx: &mut Cx, ui: &mut UiContext) {
-        self.st.touch_scroll.reset();
+        self.st.cancel_gestures();
+        self.st.restore_input_focus = self.st.input_focused;
         self.input.release_focus(cx);
         self.st.input_focused = false;
         ui.push(UiEffect::SetFocusScope { owner: self.input.widget_uid(), scope: None });
@@ -907,7 +926,8 @@ impl ComposerPanel {
     }
 
     pub(super) fn open_sheet(&mut self, cx: &mut Cx, ui: &mut UiContext, state: SheetState) {
-        self.st.touch_scroll.reset();
+        self.st.cancel_gestures();
+        self.st.restore_input_focus = self.st.input_focused;
         self.ctl().refetch_if_loading(ui);
         self.ctl().reload_daemon_config(ui);
         if self.ctl_ref().is_draft() {
@@ -925,7 +945,7 @@ impl ComposerPanel {
     }
 
     pub(super) fn open_fullscreen(&mut self, cx: &mut Cx) {
-        self.st.touch_scroll.reset();
+        self.st.cancel_gestures();
         self.st.overlay = Some(Overlay::Fullscreen);
         self.ctl().fullscreen_open = true;
         self.input.set_key_focus(cx);
@@ -933,8 +953,9 @@ impl ComposerPanel {
     }
 
     pub(super) fn close_overlay(&mut self, cx: &mut Cx, ui: &mut UiContext) {
-        self.st.touch_scroll.reset();
+        self.st.cancel_gestures();
         let was_fullscreen = matches!(self.st.overlay(), Overlay::Fullscreen);
+        let restore_input = std::mem::take(&mut self.st.restore_input_focus);
         self.search.release_focus(cx);
         self.st.search_focused = false;
         self.st.search_focus_pending = false;
@@ -946,7 +967,7 @@ impl ComposerPanel {
         if let Some(ctl) = self.st.ctl.as_mut() {
             ctl.fullscreen_open = false;
         }
-        if was_fullscreen {
+        if (was_fullscreen || restore_input) && !self.st.hidden {
             self.input.set_key_focus(cx);
         }
         ui.push(UiEffect::Redraw);
@@ -972,6 +993,7 @@ impl ComposerPanel {
         }
         let hit = event.hits_with_capture_overload(cx, self.draw_bg.area(), true);
         if let Some(dy) = self.st.touch_scroll.handle_event(cx, event, &hit) {
+            self.st.tap.cancel();
             let origin = self.st.touch_scroll.origin();
             if self.st.input_clip.contains(origin) {
                 self.st.input_manual_scroll = true;
@@ -1011,8 +1033,12 @@ impl ComposerPanel {
                 }
                 self.set_hover(cx, None, DVec2::default());
             }
-            Hit::FingerUp(e) if e.is_over && e.was_tap() => {
-                if let Some(item) = self.st.hits.at(e.abs) {
+            Hit::FingerDown(e) => {
+                self.st.tap.press(self.st.hits.at(e.abs));
+            }
+            Hit::FingerLongPress(_) => self.st.tap.cancel(),
+            Hit::FingerUp(e) => {
+                if let Some(item) = self.st.tap.release(self.st.hits.at(e.abs), e.is_over && e.was_tap() && !e.has_long_press_occurred) {
                     self.click(cx, ui, path, uid, item);
                 }
             }

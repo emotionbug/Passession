@@ -177,6 +177,78 @@ fn validate_desktop(dir: &Path, id: &Identity) -> Result<()> {
     }
     Ok(())
 }
+/// Reject renamed APKs as bundles and ABI labels that disagree with the payload.
+/// Store/signature acceptance still requires the platform signing tools.
+fn validate_android(path: &Path, arch: &str, format: &str) -> Result<()> {
+    let abis: &[(&str, u8, u16)] = match arch {
+        "arm64" => &[("arm64-v8a", 2, 183)],
+        "arm" => &[("armeabi-v7a", 1, 40)],
+        "x64" => &[("x86_64", 2, 62)],
+        "universal" => &[("arm64-v8a", 2, 183), ("armeabi-v7a", 1, 40), ("x86_64", 2, 62)],
+        _ => bail!("Unknown Android architecture {arch}"),
+    };
+    let (required, prefix): (&[&str], &str) = match format {
+        "apk" => (
+            &["AndroidManifest.xml", "classes.dex", "resources.arsc", "assets/THIRD-PARTY-NOTICES.txt"],
+            "lib/",
+        ),
+        "aab" => (
+            &["BundleConfig.pb", "base/manifest/AndroidManifest.xml", "base/dex/classes.dex", "base/resources.pb", "base/assets/THIRD-PARTY-NOTICES.txt"],
+            "base/lib/",
+        ),
+        _ => bail!("Unknown Android artifact format {format}"),
+    };
+    let mut archive = zip::ZipArchive::new(File::open(path)?)?;
+    let mut members = BTreeSet::new();
+    let mut libraries = BTreeSet::new();
+    for index in 0..archive.len() {
+        let mut member = archive.by_index(index)?;
+        let name = member.name().to_owned();
+        ensure!(
+            member.enclosed_name().is_some() && members.insert(name.clone()),
+            "Unsafe or duplicate Android archive member: {name}"
+        );
+        if required.contains(&name.as_str()) {
+            ensure!(member.size() > 0 && member.is_file(), "Empty Android member: {name}");
+        }
+        if let Some(relative) = name.strip_prefix(prefix) {
+            if member.is_dir() {
+                continue;
+            }
+            let (abi, library) = relative.split_once('/').context("Invalid Android library path")?;
+            let (_, class, machine) = abis
+                .iter()
+                .find(|(expected, _, _)| *expected == abi)
+                .with_context(|| format!("Unexpected Android ABI: {abi}"))?;
+            ensure!(
+                !library.contains('/') && library.ends_with(".so"),
+                "Invalid Android native library: {name}"
+            );
+            let mut header = [0; 20];
+            member.read_exact(&mut header)?;
+            ensure!(
+                &header[..4] == b"\x7fELF"
+                    && header[4] == *class
+                    && header[5] == 1
+                    && u16::from_le_bytes([header[18], header[19]]) == *machine,
+                "Android native library architecture mismatch: {name}"
+            );
+            if library == "libmakepad.so" {
+                libraries.insert(abi.to_owned());
+            }
+        }
+    }
+    ensure!(
+        required.iter().all(|name| members.contains(*name)),
+        "Incomplete Android {format} structure"
+    );
+    ensure!(
+        libraries == abis.iter().map(|(abi, _, _)| (*abi).to_owned()).collect(),
+        "Android native ABI inventory mismatch"
+    );
+    Ok(())
+}
+
 fn inventory(dir: &Path, id: &Identity) -> Result<Vec<String>> {
     let t = target(&id.target)?;
     if t.desktop {
@@ -203,13 +275,43 @@ fn inventory(dir: &Path, id: &Identity) -> Result<Vec<String>> {
         result.extend(names(id, DAEMON)?);
         result.push(feed(id, DAEMON));
         Ok(result)
+    } else if t.platform == "android" {
+        let metadata_name = format!("packages-{}.json", id.target);
+        let metadata = common::read_json(&dir.join(&metadata_name))?;
+        ensure!(
+            metadata["version"] == id.version
+                && metadata["platform"] == "android"
+                && metadata["arch"] == t.arch
+                && metadata["format"] == t.format
+                && metadata["profile"] == "release"
+                && metadata["sourceSha"] == id.sha,
+            "Android package metadata identity mismatch"
+        );
+        let stem = format!("Paseo-Sessions-{}-android-{}", id.version, t.arch);
+        let allowed = [
+            format!("{stem}.{}", t.format),
+            format!("{stem}-debug-signed.{}", t.format),
+        ];
+        let actual: Vec<String> = serde_json::from_value(metadata["artifacts"].clone())?;
+        ensure!(
+            actual.len() == 1 && allowed.contains(&actual[0]),
+            "Expected exactly one correctly signing-labelled Android artifact"
+        );
+        let siblings: Vec<_> = fs::read_dir(dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| {
+                (name.starts_with(&format!("{stem}.")) || name.starts_with(&format!("{stem}-")))
+                    && name.ends_with(&format!(".{}", t.format))
+            })
+            .collect();
+        ensure!(siblings == actual, "Ambiguous Android artifact inventory");
+        validate_android(&dir.join(&actual[0]), t.arch, t.format)?;
+        Ok(vec![actual[0].clone(), metadata_name])
     } else {
         let stem = format!("Paseo-Sessions-{}-{}", id.version, id.target);
-        let allowed = if t.platform == "android" {
-            vec![format!("{stem}.apk"), format!("{stem}-debug-signed.apk")]
-        } else {
-            vec![format!("{stem}.ipa"), format!("{stem}-unsigned.app.zip")]
-        };
+        let allowed = [format!("{stem}.ipa"), format!("{stem}-unsigned.app.zip")];
         let actual: Vec<_> = fs::read_dir(dir)?
             .map(|e| Ok(e?.file_name().to_string_lossy().into_owned()))
             .collect::<Result<Vec<_>>>()?
@@ -411,6 +513,51 @@ pub(super) fn stamp(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn android_fixture(dir: &Path, id: &Identity, debug_signed: bool) -> PathBuf {
+        let t = target(&id.target).unwrap();
+        let label = if debug_signed { "-debug-signed" } else { "" };
+        let name = format!("Paseo-Sessions-{}-android-{}{label}.{}", id.version, t.arch, t.format);
+        let path = dir.join(&name);
+        let mut archive = zip::ZipWriter::new(File::create(&path).unwrap());
+        let required: &[&str] = if t.format == "apk" {
+            &["AndroidManifest.xml", "classes.dex", "resources.arsc", "assets/THIRD-PARTY-NOTICES.txt"]
+        } else {
+            &["BundleConfig.pb", "base/manifest/AndroidManifest.xml", "base/dex/classes.dex", "base/resources.pb", "base/assets/THIRD-PARTY-NOTICES.txt"]
+        };
+        for name in required {
+            archive.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            archive.write_all(b"fixture").unwrap();
+        }
+        for (arch, abi, class, machine) in [
+            ("arm64", "arm64-v8a", 2, 183_u16),
+            ("arm", "armeabi-v7a", 1, 40_u16),
+            ("x64", "x86_64", 2, 62_u16),
+        ] {
+            if t.arch != arch && t.arch != "universal" {
+                continue;
+            }
+            let prefix = if t.format == "aab" { "base/" } else { "" };
+            archive.start_file(
+                format!("{prefix}lib/{abi}/libmakepad.so"),
+                zip::write::SimpleFileOptions::default(),
+            ).unwrap();
+            let mut header = [0; 20];
+            header[..4].copy_from_slice(b"\x7fELF");
+            header[4] = class;
+            header[5] = 1;
+            header[18..20].copy_from_slice(&machine.to_le_bytes());
+            archive.write_all(&header).unwrap();
+        }
+        archive.finish().unwrap();
+        common::write_json(
+            &dir.join(format!("packages-{}.json", id.target)),
+            &json!({"version":id.version,"platform":"android","arch":t.arch,"format":t.format,"profile":"release","sourceSha":id.sha,"artifacts":[name]}),
+        ).unwrap();
+        path
+    }
+
     fn identity() -> Identity {
         Identity {
             sha: "a".repeat(40),
@@ -466,10 +613,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut id = identity();
         id.target = "android-universal".into();
-        let file = dir
-            .path()
-            .join("Paseo-Sessions-0.13.1-android-universal-debug-signed.apk");
-        fs::write(&file, b"actual APK bytes").unwrap();
+        let file = android_fixture(dir.path(), &id, true);
         record(dir.path(), &id).unwrap();
         verify(dir.path(), &id).unwrap();
         let mut wrong = id.clone();
@@ -501,10 +645,7 @@ mod tests {
     }
     #[test]
     fn mobile_inventory_preserves_signing_labels_and_rejects_ambiguity() {
-        for (target, suffixes) in [
-            ("android-universal", [".apk", "-debug-signed.apk"]),
-            ("ios-arm64", [".ipa", "-unsigned.app.zip"]),
-        ] {
+        for (target, suffixes) in [("ios-arm64", [".ipa", "-unsigned.app.zip"])] {
             let dir = tempfile::tempdir().unwrap();
             let mut id = identity();
             id.target = target.into();
@@ -524,5 +665,71 @@ mod tests {
             }
             assert!(inventory(dir.path(), &id).is_err());
         }
+    }
+    #[test]
+    fn android_variants_preserve_identity_and_reject_ambiguous_signing() {
+        for t in TARGETS.iter().filter(|t| t.platform == "android") {
+            let dir = tempfile::tempdir().unwrap();
+            let mut id = identity();
+            id.target = t.id();
+            for debug_signed in [false, true] {
+                let path = android_fixture(dir.path(), &id, debug_signed);
+                record(dir.path(), &id).unwrap();
+                let verified = verify(dir.path(), &id).unwrap();
+                let names: BTreeSet<_> = verified["files"].as_array().unwrap()
+                    .iter().map(|entry| entry["name"].as_str().unwrap()).collect();
+                let metadata_name = format!("packages-{}.json", id.target);
+                assert_eq!(names, BTreeSet::from([
+                    path.file_name().unwrap().to_str().unwrap(),
+                    metadata_name.as_str(),
+                ]));
+                fs::remove_file(path).unwrap();
+            }
+            android_fixture(dir.path(), &id, false);
+            android_fixture(dir.path(), &id, true);
+            assert!(record(dir.path(), &id).is_err());
+        }
+    }
+
+    #[test]
+    fn android_rejects_wrong_format_abi_and_source_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut id = identity();
+        id.target = "android-arm64".into();
+        let apk = android_fixture(dir.path(), &id, true);
+        assert!(validate_android(&apk, "arm64", "aab").is_err());
+        assert!(validate_android(&apk, "x64", "apk").is_err());
+        assert!(validate_android(&apk, "universal", "apk").is_err());
+        let metadata_path = dir.path().join("packages-android-arm64.json");
+        let metadata = common::read_json(&metadata_path).unwrap();
+        for (key, value) in [
+            ("sourceSha", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            ("profile", "dev-fast"),
+            ("format", "aab"),
+            ("arch", "x64"),
+        ] {
+            let mut wrong = metadata.clone();
+            wrong[key] = json!(value);
+            common::write_json(&metadata_path, &wrong).unwrap();
+            assert!(record(dir.path(), &id).is_err());
+        }
+    }
+
+    #[test]
+    fn universal_apk_and_aab_keep_separate_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut apk = identity();
+        apk.target = "android-universal".into();
+        let mut aab = apk.clone();
+        aab.target = "android-universal-aab".into();
+        android_fixture(dir.path(), &apk, true);
+        let bundle = android_fixture(dir.path(), &aab, true);
+        record(dir.path(), &apk).unwrap();
+        record(dir.path(), &aab).unwrap();
+        verify(dir.path(), &apk).unwrap();
+        verify(dir.path(), &aab).unwrap();
+        fs::write(bundle, b"corrupted bundle").unwrap();
+        verify(dir.path(), &apk).unwrap();
+        assert!(verify(dir.path(), &aab).is_err());
     }
 }

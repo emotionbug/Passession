@@ -11,12 +11,14 @@ use super::super::canvas::*;
 use super::super::highlight;
 use super::super::images::{self, ImageState};
 use super::super::links::FileLinkSourceType;
-use super::super::paint::Draw;
+use super::super::paint::{Draw, Look};
 use super::model::{AlertKind, Block, Inline, ListItem, Style};
 use makepad_widgets::*;
 use paseo_gui_core::CoreHandle;
 use pulldown_cmark::Alignment;
 use regex::Regex;
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 
 /// Find highlight: the `occurrence`-th match across the message's text blocks.
 pub struct FindMark {
@@ -51,13 +53,81 @@ pub fn block_gap(compact: bool) -> f64 {
 }
 
 /// A paragraph under construction: text, styled spans and decorated ranges.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Rich {
     text: String,
     spans: Vec<RichSpan>,
     codes: Vec<(usize, usize)>,
     strikes: Vec<(usize, usize)>,
     links: Vec<(usize, usize, String, FileLinkSourceType)>,
+}
+
+struct PreparedRich {
+    rich: Rich,
+    laidout: Rc<LaidoutText>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ParagraphStyle {
+    look: Look,
+    size: f64,
+    color: Vec4,
+    bold: bool,
+    width: f64,
+    height: f64,
+}
+
+struct CachedParagraph {
+    owner: Weak<Vec<Block>>,
+    len: usize,
+    style: ParagraphStyle,
+    prepared: Rc<PreparedRich>,
+}
+
+/// Pointer keys are valid only while the exact immutable parse owner survives.
+/// Weak ownership prevents old revealed tails from retaining whole documents.
+#[derive(Default)]
+pub struct ParagraphCache {
+    owner: Option<Rc<Vec<Block>>>,
+    entries: HashMap<usize, CachedParagraph>,
+}
+
+impl ParagraphCache {
+    pub(super) fn set_owner(&mut self, owner: Option<Rc<Vec<Block>>>) -> Option<Rc<Vec<Block>>> {
+        if let Some(next) = &owner
+            && !self.owner.as_ref().is_some_and(|old| Rc::ptr_eq(old, next))
+        {
+            self.entries.retain(|_, entry| entry.owner.strong_count() > 0);
+        }
+        std::mem::replace(&mut self.owner, owner)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_paragraph(cx: &mut Cx2d, d: &mut Draw, inlines: &[Inline], w: f64, para: &Para, height: f64) -> Option<Rc<PreparedRich>> {
+    let key = inlines.as_ptr() as usize;
+    let style = ParagraphStyle { look: d.look, size: para.size, color: para.color, bold: para.bold, width: w, height };
+    let owner = d.state.markdown_paragraphs.owner.clone();
+    if let Some(owner) = &owner
+        && let Some(cached) = d.state.markdown_paragraphs.entries.get(&key)
+        && cached.len == inlines.len() && cached.style == style
+        && cached.owner.upgrade().is_some_and(|old| Rc::ptr_eq(&old, owner))
+    {
+        return Some(cached.prepared.clone());
+    }
+    let mut rich = Rich::default();
+    build_inlines(&mut rich, inlines, d, para, None);
+    if rich.text.trim_matches('\n').is_empty() {
+        return None;
+    }
+    let laidout = d.kit.layout_rich(cx, &rich.text, &rich.spans, Some(w), height);
+    let prepared = Rc::new(PreparedRich { rich, laidout });
+    if let Some(owner) = owner {
+        d.state.markdown_paragraphs.entries.insert(key, CachedParagraph {
+            owner: Rc::downgrade(&owner), len: inlines.len(), style, prepared: prepared.clone(),
+        });
+    }
+    Some(prepared)
 }
 
 impl Rich {
@@ -151,10 +221,17 @@ fn build_inlines(rich: &mut Rich, inlines: &[Inline], d: &Draw, para: &Para, lin
 
 /// Draws a rich paragraph at (x, y) wrapped to `w`; returns its height.
 #[allow(clippy::too_many_arguments)]
-fn draw_rich(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, mut rich: Rich, x: f64, y: f64, w: f64, height: f64) -> f64 {
+fn draw_rich(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, rich: Rich, x: f64, y: f64, w: f64, height: f64) -> f64 {
     if rich.text.is_empty() {
         return 0.0;
     }
+    let laidout = d.kit.layout_rich(cx, &rich.text, &rich.spans, Some(w), height);
+    draw_prepared(cx, d, opts, &PreparedRich { rich, laidout }, x, y, w, height)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_prepared(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, prepared: &PreparedRich, x: f64, y: f64, w: f64, height: f64) -> f64 {
+    let rich = &prepared.rich;
     let p = d.look.palette;
     // Find: the target occurrence's range inside this block, if it falls here.
     let mut found = None;
@@ -166,10 +243,17 @@ fn draw_rich(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, mut rich: Rich, x: 
             find.seen += 1;
         }
     }
-    if let Some((s, e)) = found {
-        rich.recolor(s, e, p.surface0);
+    let laidout = if let Some((s, e)) = found {
+        let mut highlighted = rich.clone();
+        highlighted.recolor(s, e, p.surface0);
+        d.kit.layout_rich(cx, &highlighted.text, &highlighted.spans, Some(w), height)
+    } else {
+        prepared.laidout.clone()
+    };
+    let size = laidout_size(&laidout);
+    if d.dry() {
+        return size.y;
     }
-    let laidout = d.kit.layout_rich(cx, &rich.text, &rich.spans, Some(w), height);
     let pos = dvec2(x, y);
     for &(s, e) in &rich.codes {
         for r in range_rects(&laidout, s, e) {
@@ -201,7 +285,6 @@ fn draw_rich(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, mut rich: Rich, x: 
             d.canvas.add_hit(r, HitTarget::Link { href: href.clone(), kind: *kind, text: text.clone() });
         }
     }
-    let size = laidout_size(&laidout);
     d.canvas.add_run(laidout, pos, Some('\n'));
     size.y
 }
@@ -210,38 +293,31 @@ fn draw_rich(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, mut rich: Rich, x: 
 fn paragraph(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, inlines: &[Inline], x: f64, y: f64, w: f64, para: &Para, height: f64) -> f64 {
     // Images break the paragraph into text / image / text segments.
     let mut cursor = y;
-    let mut segment: Vec<Inline> = Vec::new();
+    let mut start = 0;
     let mut first = true;
-    let flush = |cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, segment: &mut Vec<Inline>, cursor: &mut f64, first: &mut bool| {
+    let flush = |cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, segment: &[Inline], cursor: &mut f64, first: &mut bool| {
         if segment.is_empty() {
             return;
         }
-        let mut rich = Rich::default();
-        build_inlines(&mut rich, segment, d, para, None);
-        segment.clear();
-        let trimmed = rich.text.trim_matches('\n').is_empty();
-        if trimmed {
-            return;
-        }
+        let Some(prepared) = prepare_paragraph(cx, d, segment, w, para, height) else { return };
         if !*first {
             *cursor += 8.0;
         }
-        *cursor += draw_rich(cx, d, opts, rich, x, *cursor, w, height);
+        *cursor += draw_prepared(cx, d, opts, &prepared, x, *cursor, w, height);
         *first = false;
     };
-    for inline in inlines {
+    for (index, inline) in inlines.iter().enumerate() {
         if let Inline::Image { url, alt } = inline {
-            flush(cx, d, opts, &mut segment, &mut cursor, &mut first);
+            flush(cx, d, opts, &inlines[start..index], &mut cursor, &mut first);
+            start = index + 1;
             if !first {
                 cursor += 8.0;
             }
             cursor += image(cx, d, opts, url, alt, x, cursor, w, para);
             first = false;
-        } else {
-            segment.push(inline.clone());
         }
     }
-    flush(cx, d, opts, &mut segment, &mut cursor, &mut first);
+    flush(cx, d, opts, &inlines[start..], &mut cursor, &mut first);
     cursor - y
 }
 
@@ -573,9 +649,10 @@ pub fn code_rich(code: &str, colors: Option<&highlight::Colored>, fg: Vec4, size
 fn code_block(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, lang: &str, text: &str, x: f64, y: f64, w: f64) -> f64 {
     let p = d.look.palette;
     let code_size = d.look.code();
-    let colors = highlight::fence(text, lang, opts.syntax_theme, d.look.dark());
-    let (code, mut spans) = code_rich(text, colors.as_ref(), p.foreground, code_size);
     let key = opts.next_key("code");
+    let request = d.state.fence_highlights.entry(key.clone()).or_default();
+    let colors = highlight::fence(request, text, lang, opts.syntax_theme, d.look.dark());
+    let (code, mut spans) = code_rich(text, colors.as_ref(), p.foreground, code_size);
     let copy_text = text.trim_end_matches('\n').to_owned();
     let copied = d.state.copied_now(&key, d.now);
     if copied {

@@ -58,9 +58,8 @@ fn build() -> Result<()> {
                 == format!("wasm-bindgen {BINDGEN_VERSION}"),
         "wasm-bindgen-cli must be exactly {BINDGEN_VERSION}"
     );
-    let target = root.join("target/relay-cloudflare");
-    let status = Command::new("cargo")
-        .current_dir(&root)
+    let target = crate::common::target_root()?;
+    let status = crate::common::command(crate::common::cargo())?
         .args([
             "build",
             "--locked",

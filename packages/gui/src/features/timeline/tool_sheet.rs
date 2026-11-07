@@ -16,9 +16,11 @@ use super::i18n::t;
 use super::paint::{Draw, Look, MOBILE, RowState, now_seconds};
 use super::rows::{SheetHeader, paint_glyph};
 use super::tools::{self, detail_blocks, detail_is_full_bleed};
+use crate::common::overlay::{take_dismissal, TapTarget};
 use makepad_widgets::*;
 use serde_json::Value;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// showModalBottomSheet's enter transition.
 pub const OPEN_SECS: f64 = 0.25;
@@ -52,20 +54,24 @@ pub fn paint_detail_sheet(
     // Gorhom handle: 32x4 zinc-600 with 10px insets.
     d.kit.rect(cx, rect_xywh(sheet.center().x - 16.0, sheet.pos.y + 10.0, 32.0, 4.0), rgba(0xff52525b), 2.0);
     let header_y = sheet.pos.y + 24.0;
-    paint_glyph(cx, d, header.glyph, rect_xywh(sheet.pos.x + 16.0, header_y + 12.0, 20.0, 36.0), 20.0, p.foreground);
+    let measurement = crate::common::widgets::RowMetrics::new(0.0, 0.0, 0.0)
+        .layout(sheet, 16.0, 20.0, 36.0, 8.0);
     let size = d.look.ui(14.0);
     let font = if header.semibold { Font::Semibold } else { Font::Medium };
-    let laid = d.kit.layout_clamped(cx, font, size, 1.3, &header.title, (sheet.size.x - 16.0 - 28.0 - 52.0).max(1.0), header.max_lines);
-    let th = laidout_size(&laid).y;
-    d.kit.draw_laidout(cx, font, p.foreground, dvec2(sheet.pos.x + 44.0, header_y + 12.0 + (36.0 - th) * 0.5), &laid);
-    let close = rect_xywh(sheet.pos.x + sheet.size.x - 16.0 - 36.0, header_y + 12.0, 36.0, 36.0);
+    let laid = d.kit.layout_clamped(cx, font, size, 1.3, &header.title, measurement.title.size.x, header.max_lines);
+    let metrics = crate::common::widgets::RowMetrics::new(laidout_size(&laid).y, 0.0, 0.0);
+    let header_height = metrics.height(60.0, 12.0, 36.0);
+    let slots = metrics.layout(rect_xywh(sheet.pos.x, header_y, sheet.size.x, header_height), 16.0, 20.0, 36.0, 8.0);
+    paint_glyph(cx, d, header.glyph, rect_xywh(slots.leading.pos.x, header_y + (header_height - 36.0) * 0.5, 20.0, 36.0), 20.0, p.foreground);
+    d.kit.draw_laidout(cx, font, p.foreground, slots.title.pos, &laid);
+    let close = rect_xywh(slots.trailing.pos.x, header_y + (header_height - 36.0) * 0.5, 36.0, 36.0);
     d.kit.icon(cx, "x", close, 20.0, p.muted);
     d.canvas.add_hit(close, HitTarget::Chrome("sheet:close".into()));
-    d.kit.rect(cx, rect_xywh(sheet.pos.x, header_y + 60.0, sheet.size.x, 1.0), p.border, 0.0);
+    d.kit.rect(cx, rect_xywh(sheet.pos.x, header_y + header_height, sheet.size.x, 1.0), p.border, 0.0);
     // The body scrolls inside the visible part of the 95% layout.
-    let body_top = header_y + 61.0;
+    let body_top = header_y + header_height + 1.0;
     let view = rect_xywh(sheet.pos.x, body_top, sheet.size.x, (rect.pos.y + rect.size.y - body_top).max(1.0));
-    let fill = (full - 85.0).max(0.0);
+    let fill = (full - 24.0 - header_height - 1.0).max(0.0);
     let content = d.measure(|d| body(cx, d, view.pos.x, 0.0, view.size.x, fill));
     let key = "sheet:y".to_owned();
     let max_y = (content - view.size.y).max(0.0);
@@ -108,7 +114,6 @@ pub fn scroll_sheet(state: &mut RowState, canvas: &Canvas, abs: DVec2, delta: DV
 
 struct Standalone {
     id: u64,
-    window: String,
     title: String,
     detail: Value,
     opened: f64,
@@ -116,6 +121,7 @@ struct Standalone {
     settled: bool,
     state: RowState,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
+    tap: TapTarget<HitTarget>,
 }
 
 #[derive(Default)]
@@ -125,12 +131,12 @@ struct Layer {
     canvas: Canvas,
     area: Area,
     sheets: Vec<Standalone>,
-    next_id: u64,
     next_frame: NextFrame,
+    painted_top: Option<u64>,
 }
 
 thread_local! {
-    static LAYER: RefCell<Layer> = RefCell::new(Layer::default());
+    static LAYER: RefCell<HashMap<String, Layer>> = RefCell::new(HashMap::new());
 }
 
 /// Opens the tool-call detail sheet for `display_name` / `detail` over the
@@ -138,18 +144,22 @@ thread_local! {
 /// Returns its id.
 pub fn show_tool_call_sheet(cx: &mut Cx, window_id: &str, display_name: &str, detail: &Value) -> u64 {
     let id = LAYER.with(|layer| {
-        let mut layer = layer.borrow_mut();
-        layer.next_id += 1;
-        let id = layer.next_id;
+        let mut layers = layer.borrow_mut();
+        let layer = layers.entry(window_id.to_owned()).or_default();
+        if let Some(parent) = layer.sheets.last_mut() {
+            parent.touch_scroll.reset();
+            parent.tap.cancel();
+        }
+        let id = crate::common::overlay::next_id();
         layer.sheets.push(Standalone {
             id,
-            window: window_id.to_owned(),
             title: display_name.to_owned(),
             detail: detail.clone(),
             opened: now_seconds(),
             settled: false,
             state: RowState::default(),
             touch_scroll: Default::default(),
+            tap: TapTarget::default(),
         });
         id
     });
@@ -159,16 +169,20 @@ pub fn show_tool_call_sheet(cx: &mut Cx, window_id: &str, display_name: &str, de
 
 /// Whether the sheet finished opening and was drawn fully open.
 pub fn tool_call_sheet_settled(id: u64) -> bool {
-    LAYER.with(|layer| layer.borrow().sheets.iter().any(|s| s.id == id && s.settled))
+    LAYER.with(|layers| layers.borrow().values().any(|layer| layer.sheets.iter().any(|s| s.id == id && s.settled)))
 }
 
 pub fn close_tool_call_sheet(cx: &mut Cx, id: u64) {
-    LAYER.with(|layer| layer.borrow_mut().sheets.retain(|s| s.id != id));
+    LAYER.with(|layers| {
+        for layer in layers.borrow_mut().values_mut() {
+            layer.sheets.retain(|sheet| sheet.id != id);
+        }
+    });
     cx.redraw_all();
 }
 
-fn top_index(layer: &Layer, window_id: &str) -> Option<usize> {
-    layer.sheets.iter().rposition(|s| s.window == window_id)
+fn top_index(layer: &Layer) -> Option<usize> {
+    layer.sheets.len().checked_sub(1)
 }
 
 /// Shell hook, before content dispatch: taps (close, scrim), wheel scrolling
@@ -176,30 +190,48 @@ fn top_index(layer: &Layer, window_id: &str) -> Option<usize> {
 /// is open (the content below is modal-locked).
 pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> bool {
     LAYER.with(|cell| {
-        let mut layer = cell.borrow_mut();
-        let layer = &mut *layer;
+        let mut layers = cell.borrow_mut();
+        let Some(layer) = layers.get_mut(window_id) else { return false };
         if layer.next_frame.is_event(event).is_some() {
             cx.redraw_area(layer.area);
         }
-        let Some(index) = top_index(layer, window_id) else { return false };
-        let mut close = false;
-        if let Event::KeyDown(ke) = event {
-            close |= ke.key_code == KeyCode::Escape;
+        let Some(index) = top_index(layer) else { return false };
+        if take_dismissal(event) {
+            layer.sheets.remove(index);
+            cx.redraw_all();
+            return true;
         }
+        if matches!(event, Event::BackPressed { .. } | Event::KeyDown(KeyEvent { key_code: KeyCode::Escape, .. })) {
+            return true;
+        }
+        if matches!(event, Event::TextHandle(_) | Event::Pause | Event::AppLostFocus)
+            || matches!(event, Event::TouchUpdate(update) if update.cancelled)
+        {
+            layer.sheets[index].touch_scroll.reset();
+            layer.sheets[index].tap.cancel();
+        }
+        // A newly pushed/revealed owner cannot reuse the previous owner's hit map.
+        if layer.painted_top != Some(layer.sheets[index].id) {
+            return true;
+        }
+        let mut close = false;
         if let Event::Scroll(se) = event {
             layer.sheets[index].touch_scroll.reset();
+            layer.sheets[index].tap.cancel();
             if scroll_sheet(&mut layer.sheets[index].state, &layer.canvas, se.abs, se.scroll) {
                 cx.redraw_area(layer.area);
             }
         }
-        if let Event::BackPressed { handled } = event
-            && !handled.get()
-        {
-            handled.set(true);
-            close = true;
-        }
         let hit = event.hits(cx, layer.area);
-        if let Some(delta) = layer.sheets[index].touch_scroll.handle_event(cx, event, &hit) {
+        let scroll_start = match &hit {
+            Hit::FingerDown(e) => layer.canvas.scroll_region_at(e.abs - layer.canvas.origin, true).is_some(),
+            _ => true,
+        };
+        if !scroll_start {
+            layer.sheets[index].touch_scroll.reset();
+        }
+        if scroll_start && let Some(delta) = layer.sheets[index].touch_scroll.handle_event(cx, event, &hit) {
+            layer.sheets[index].tap.cancel();
             let origin = layer.sheets[index].touch_scroll.origin();
             if scroll_sheet(&mut layer.sheets[index].state, &layer.canvas, origin, dvec2(0.0, delta)) {
                 cx.redraw_area(layer.area);
@@ -217,9 +249,14 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
                 }
                 cx.set_cursor(if matches!(hit.as_deref(), Some("sheet:close")) { MouseCursor::Hand } else { MouseCursor::Default });
             }
-            Hit::FingerUp(e) if e.is_over && e.was_tap() => {
+            Hit::FingerDown(e) => {
+                layer.sheets[index].tap.press(layer.canvas.hit_at(e.abs - layer.canvas.origin).cloned());
+            }
+            Hit::FingerLongPress(_) => layer.sheets[index].tap.cancel(),
+            Hit::FingerUp(e) => {
                 let target = layer.canvas.hit_at(e.abs - layer.canvas.origin).cloned();
-                match target {
+                let released = layer.sheets[index].tap.release(target, e.is_over && e.was_tap() && !e.has_long_press_occurred);
+                match released {
                     Some(HitTarget::Chrome(id)) if id == "sheet:close" || id == "scrim" => close = true,
                     Some(HitTarget::Copy { key, text }) => {
                         cx.copy_to_clipboard(&text);
@@ -246,9 +283,9 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
 /// Shell hook, in the window's last overlay pass: draws its standalone sheets.
 pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
     LAYER.with(|cell| {
-        let mut layer = cell.borrow_mut();
-        let layer = &mut *layer;
-        if top_index(layer, window_id).is_none() {
+        let mut layers = cell.borrow_mut();
+        let Some(layer) = layers.get_mut(window_id) else { return };
+        if top_index(layer).is_none() {
             return;
         }
         if layer.kit.is_none() {
@@ -275,10 +312,11 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
         // redraws, unlike the first instance of a primitive drawn many times).
         cx.begin_turtle(Walk::abs_rect(window), Layout::default());
         kit.begin_layer(cx);
-        layer.canvas.begin(window.pos);
         let now = now_seconds();
         let mut animating = false;
-        for sheet in layer.sheets.iter_mut().filter(|s| s.window == window_id) {
+        for sheet in &mut layer.sheets {
+            // Lower sheets paint normally, but only the top sheet contributes input.
+            layer.canvas.begin(window.pos);
             let progress = ((now - sheet.opened) / OPEN_SECS).clamp(0.0, 1.0);
             let glyph = tools::resolve_tool_call_icon(&sheet.title, Some(&sheet.detail), false);
             let header = SheetHeader { glyph, title: sheet.title.clone(), max_lines: 1, semibold: true };
@@ -298,8 +336,47 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
         }
         cx.end_turtle_with_area(&mut layer.area);
         list.end(cx);
-        if animating || layer.sheets.iter().any(|s| s.window == window_id && !s.settled) {
+        layer.painted_top = layer.sheets.last().map(|sheet| sheet.id);
+        if animating || layer.sheets.iter().any(|s| !s.settled) {
             layer.next_frame = cx.new_next_frame();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn sheet(id: u64) -> Standalone {
+        Standalone {
+            id, title: String::new(), detail: Value::Null, opened: 0.0,
+            settled: false, state: RowState::default(), touch_scroll: Default::default(),
+            tap: TapTarget::default(),
+        }
+    }
+
+    #[test]
+    fn dismissal_closes_only_top_sheet_in_its_window_and_ignores_repeats() {
+        LAYER.with(|layers| {
+            *layers.borrow_mut() = HashMap::from([
+                ("main".into(), Layer { sheets: vec![sheet(1), sheet(2)], ..Default::default() }),
+                ("other".into(), Layer { sheets: vec![sheet(3)], ..Default::default() }),
+            ]);
+        });
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let escape = KeyEvent { key_code: KeyCode::Escape, ..Default::default() };
+        assert!(handle_tool_call_sheets(&mut cx, &Event::KeyDown(escape), "main"));
+        assert!(handle_tool_call_sheets(&mut cx, &Event::KeyDown(KeyEvent { is_repeat: true, ..escape }), "main"));
+        LAYER.with(|layers| {
+            let layers = layers.borrow();
+            assert_eq!(layers["main"].sheets.iter().map(|sheet| sheet.id).collect::<Vec<_>>(), vec![1]);
+            assert_eq!(layers["other"].sheets.iter().map(|sheet| sheet.id).collect::<Vec<_>>(), vec![3]);
+        });
+        let back = Event::BackPressed { handled: Cell::new(false) };
+        assert!(handle_tool_call_sheets(&mut cx, &back, "main"));
+        assert!(!handle_tool_call_sheets(&mut cx, &back, "main"));
+        assert!(!take_dismissal(&back));
+        LAYER.with(|layers| layers.borrow_mut().clear());
+    }
 }

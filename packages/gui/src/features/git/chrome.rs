@@ -5,6 +5,8 @@
 use super::json::{int, text};
 use super::model::{ChangeKind, TreeRow, change_kind, format_diff_count};
 use super::paint::{Font, GitPaint, rect, with_alpha};
+use crate::common::paint::TextSpec;
+use crate::common::widgets::RowMetrics;
 use crate::theme::{Palette, Typography, current_palette, current_typography};
 use makepad_widgets::*;
 use serde_json::Value;
@@ -12,6 +14,10 @@ use std::collections::HashSet;
 
 /// Height of a `ChangedFilesTree` row.
 pub const TREE_ROW_HEIGHT: f64 = 28.0;
+
+pub fn tree_row_metrics(cx: &mut Cx2d, paint: &mut GitPaint) -> RowMetrics {
+    RowMetrics::measure(&mut paint.painter, cx, TextSpec::new(Font::Regular, ui(14.0), palette().foreground), None, 0.0)
+}
 
 /// Original `FileTreeRow` of `ChangedFilesTree` in its 28px `band`: 12px plus
 /// 12px per depth, a 16px chevron (folders) or material file icon, the name
@@ -23,6 +29,7 @@ pub fn file_tree_row(
     cx: &mut Cx2d,
     paint: &mut GitPaint,
     band: Rect,
+    metrics: RowMetrics,
     row: &TreeRow,
     files: &[Value],
     collapsed: &HashSet<String>,
@@ -34,7 +41,6 @@ pub fn file_tree_row(
         paint.fill(cx, band, colors.sidebar_hover);
     }
     let center_y = band.pos.y + band.size.y / 2.0;
-    let right = band.pos.x + band.size.x - 8.0;
     let (depth, label) = match row {
         TreeRow::Folder { display, depth, .. } => (*depth, display.as_str()),
         TreeRow::File { index, depth } => {
@@ -42,25 +48,36 @@ pub fn file_tree_row(
             (*depth, path.rsplit('/').next().unwrap_or(path))
         }
     };
-    let left = band.pos.x + 12.0 + depth as f64 * 12.0;
-    let mut icon_ready = true;
+    let indent = (4.0 + depth as f64 * 12.0).min(band.size.x);
+    let content = rect(band.pos.x + indent, band.pos.y, band.size.x - indent, band.size.y);
+    let right = band.pos.x + band.size.x - 8.0;
+    // Stats return their measured width; do not format/shape them a second time
+    // just to reserve the trailing slot.
+    paint.begin_clip(cx, content);
     let trailing_width = match row {
-        TreeRow::Folder { path, additions, deletions, .. } => {
-            let chevron = if collapsed.contains(path) { "chevron-right" } else { "chevron-down" };
-            paint.icon(cx, chevron, 16.0, colors.extra_muted, dvec2(left + 8.0, center_y));
-            diff_stat(cx, paint, right, center_y, *additions, *deletions, true)
-        }
+        TreeRow::Folder { additions, deletions, .. } => diff_stat(cx, paint, right, center_y, *additions, *deletions, true),
         TreeRow::File { index, .. } => {
             let file = &files[*index];
-            // Original `MaterialFileIcon` in the 16px icon slot.
-            icon_ready = paint.file_icon(cx, rect(left, center_y - 8.0, 16.0, 16.0), label);
             change_icon(cx, paint, dvec2(right - 7.0, center_y), change_kind(file));
-            14.0 + 8.0 + diff_stat(cx, paint, right - 14.0 - 8.0, center_y, int(file, "additions"), int(file, "deletions"), true)
+            22.0 + diff_stat(cx, paint, right - 22.0, center_y, int(file, "additions"), int(file, "deletions"), true)
         }
     };
-    let name_left = left + 16.0 + 8.0;
+    let slots = metrics.layout(content, 8.0, 16.0, trailing_width, 8.0);
+    let mut icon_ready = true;
+    if slots.leading.size.x >= 16.0 {
+        match row {
+            TreeRow::Folder { path, .. } => {
+                let chevron = if collapsed.contains(path) { "chevron-right" } else { "chevron-down" };
+                paint.painter.icon(cx, slots.leading, chevron, 16.0, colors.extra_muted);
+            }
+            TreeRow::File { .. } => {
+                icon_ready = paint.file_icon(cx, rect(slots.leading.pos.x, center_y - 8.0, 16.0, 16.0), label);
+            }
+        }
+    }
     let alpha = if hovered { 1.0 } else { 0.76 };
-    paint.text_centered(cx, Font::Regular, ui(14.0), with_alpha(colors.foreground, alpha), name_left, band.pos.y, band.size.y, label, (right - trailing_width - 4.0 - name_left).max(0.0));
+    paint.painter.text_in(cx, slots.title, TextSpec::new(Font::Regular, ui(14.0), with_alpha(colors.foreground, alpha)), label, 0.0);
+    paint.end_clip(cx);
     icon_ready
 }
 

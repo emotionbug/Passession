@@ -14,18 +14,27 @@ From the repository root:
 
 ```sh
 cargo fetch --locked
-cargo xtask build-gui android              # universal APK (arm64-v8a, armeabi-v7a, x86_64)
-cargo xtask build-gui android --arch arm64 # arm64 APK
+cargo xtask build-gui android                       # arm64 APK
+cargo xtask build-gui android --arch universal      # APK with all three ABIs
+cargo xtask build-gui android --arch x64            # x86_64 emulator APK
+cargo xtask build-gui android --format aab          # universal Android App Bundle
+cargo xtask build-gui android --profile dev-fast    # debug-signed arm64 APK
 cargo xtask dev app android --device <device-id>
 ```
 
-The build compiles `paseo-gui` as a `cdylib` per ABI with the NDK clang for API 24, stores it as `lib/<abi>/libmakepad.so` (the library name the vendored `MakepadActivity` loads), copies every Makepad resource directory to `assets/makepad/<crate>/resources`, and adds `THIRD-PARTY-NOTICES.txt` and `LICENSE` to the assets. It then runs a pinned Gradle 9.3.1 (SHA-256 checked, cached under `$XDG_CACHE_HOME/paseo-packaging`) on `packaging/android` with AGP **9.1.1**, compile SDK **37.0**, target SDK 36 and `--no-daemon`; Gradle output stays under `target/paseo-gui/android`, not in the checkout.
+`build-gui` defaults to the release Rust profile. Use `--profile dev-fast|debug|release` to select one; `--debug` remains an alias for `--profile debug`. `dev app` defaults to `dev-fast`. Both non-release profiles use the Android debug variant and debug key, even when production credentials are present.
+
+APK builds default to `--arch arm64`; AAB builds default to `--arch universal`. Either format accepts `--arch arm64|arm|x64|universal`. An AAB contains the selected ABIs for store-generated device APKs; it is not directly installable with `adb`. Use an APK for local installation.
+
+The build compiles `paseo-gui` as a `cdylib` per ABI with the NDK clang for API 24, stores it as `lib/<abi>/libmakepad.so` (the library name the vendored `MakepadActivity` loads), copies every Makepad resource directory to `assets/makepad/<crate>/resources`, and adds `THIRD-PARTY-NOTICES.txt` and `LICENSE` to the assets. It then runs a pinned Gradle 9.3.1 (SHA-256 checked, cached under `$XDG_CACHE_HOME/paseo-packaging`) on `packaging/android` with AGP **9.1.1**, compile SDK **37.0**, target SDK 36 and `--no-daemon`. APKs use the assemble task; AABs use the bundle task. Gradle state and staged resources stay in the checkout's `.dev/build/gui/android/<profile>/`; Cargo compilation uses the [shared target cache](development.md).
 
 **Minimum SDK is 24**, as for the Flutter client. Published makepad-platform 1.0.0 cannot load below API 29: it links `libamidi` (API 29), `libaaudio` and `libnativewindow` (API 26), references `AChoreographer_postFrameCallback64` (API 29) directly, and its Java calls `WindowInsets.Type` (API 30). Paseo therefore patches makepad-platform through the vendored copy at `packages/gui-platform/vendor/makepad-platform` (newer libraries and symbols resolved at runtime; app audio uses AudioTrack on every version) and the Java in `packaging/android/makepad` (API guards, listed in `PATCHES.diff`). Linking against the API 24 NDK stubs turns a newer `-l` library into a link error, and xtask also rejects a library whose `DT_NEEDED` names a system library newer than API 24. A newer *symbol* in an API 24 library is not caught at link time; keep those behind runtime lookup.
 
-The development run selects the single attached `adb` device or the `--device` serial, builds only that device's primary ABI (an x86_64 emulator gets an x86_64 library), installs with `adb install -r`, starts the launcher activity and follows `adb logcat` for the app process until interrupted.
+The development run selects the single attached `adb` device or the `--device` serial, builds only that device's primary ABI (an x86_64 emulator gets an x86_64 library), installs with `adb install -r`, starts the launcher activity and follows `adb logcat` for the app process until interrupted. `--run` rejects an explicit `--arch` or AAB output.
 
-APK artifacts are copied into `artifacts/native/` and named with the version and architecture. Builds without a release key are explicitly marked `-debug-signed.apk`. The ARM64 Rust APK has been built, signature/alignment-checked and installed as an in-place update on Android 17; visual verification remains blocked by the device lock. This does not establish API 24 compatibility or store readiness; see [testing](testing.md).
+Artifacts are copied into `artifacts/native/` as `Paseo-Sessions-<version>-android-<arch>[-debug-signed].apk` or `.aab`. Non-release profiles and release builds without a production key carry the `-debug-signed` suffix. `packages-android-<arch>[-aab].json` records the artifact filename, format, profile and source revision for release validation. The independent artifact copy keeps Gradle's incremental output intact.
+
+The earlier ARM64 Rust APK was signature/alignment-checked and installed as an in-place update on Android 17; visual verification remained blocked by the device lock. That evidence does not cover the new profile/AAB paths, establish API 24 compatibility or prove store readiness; see [testing](testing.md).
 
 ## Project layout
 

@@ -198,18 +198,17 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
                 &full[..end]
             };
             // RevealedText: growth while live is paced.
-            let reveal_key = "assistant".to_owned();
-            let reveal = d.state.reveals.entry(reveal_key).or_insert_with(|| super::reveal::Reveal::new(capped));
+            let reveal = d.state.reveals.entry("assistant".to_owned()).or_insert_with(|| super::reveal::Reveal::new(capped));
             let pacing = reveal.sync(capped, live, true);
             if pacing {
                 reveal.arm(d.now);
                 reveal.step(d.now);
                 d.animating = true;
             }
-            let visible = reveal.visible(capped, live).to_owned();
+            let visible = reveal.visible(capped, live);
             let top = 12.0;
             let mut opts = md_opts(ctx, id, find.as_mut());
-            let mut h = markdown::draw(cx, d, &mut opts, &visible, cx0, y + top, cw, true, live);
+            let mut h = markdown::draw(cx, d, &mut opts, visible, cx0, y + top, cw, true, live);
             if capped.len() < full.len() && !live {
                 let notice = ta("agentStream.messageCapped", &[("bytes", &full.len().to_string())]);
                 h += 12.0;
@@ -226,10 +225,9 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
                 reveal.step(d.now);
                 d.animating = true;
             }
-            let visible = reveal.visible(text, streaming).to_owned();
-            let detail = json!({"type": "unknown", "input": visible, "output": null});
-            let status = if streaming { "executing" } else { "completed" };
-            let skeleton = tools::is_pending_tool_call_detail(&detail, status, &Value::Null);
+            let visible = reveal.visible(text, streaming);
+            let meaningful = !visible.trim().is_empty();
+            let skeleton = !meaningful && streaming;
             let badge = Badge {
                 key: format!("thinking:{id}"),
                 glyph: ToolGlyph::Brain,
@@ -237,7 +235,7 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
                 secondary: None,
                 loading: streaming,
                 error: false,
-                can_open: tools::has_meaningful_tool_call_detail(&detail) || skeleton,
+                can_open: meaningful || skeleton,
                 initially_expanded: ctx.auto_expand_reasoning,
                 force_inline: ctx.auto_expand_reasoning,
                 open_file: None,
@@ -245,6 +243,7 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
                 sheet: format!("thinking:{id}"),
             };
             draw_badge(cx, d, ctx, &badge, cx0, y, cw, |cx, d, x, y, w| {
+                let detail = json!({"type": "unknown", "input": visible, "output": null});
                 let blocks = detail_blocks(&detail, Some("thinking"), None, &|k| t(k));
                 draw_details(cx, d, &blocks, false, skeleton, &format!("{id}:thinking"), x, y, w, Some(400.0), None)
             }) + gap_below

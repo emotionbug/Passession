@@ -8,7 +8,7 @@ use super::actions::{ArchiveConfirm, Checkout, ahead_count, menu_entries};
 use super::chrome::{
     ButtonSize, ButtonVariant, TOOLBAR_HEIGHT, button, button_height, diff_stat, label_trigger,
     measure_button, measure_diff_stat, palette, toolbar_band, toolbar_button, toolbar_button_size, ui as ui_px,
-    TREE_ROW_HEIGHT, file_tree_row,
+    TREE_ROW_HEIGHT, file_tree_row, tree_row_metrics,
 };
 use super::controller::DiffController;
 use super::diff_doc::{DiffDoc, DocHit, DocInput, LineTarget};
@@ -28,6 +28,7 @@ use super::store::GitStore;
 use super::text::{msg, t, tr};
 use super::wire::{self, payload_error};
 use crate::common::overlay::tooltip_at;
+use crate::common::widgets::RowMetrics;
 use crate::common::{PanelTarget, TabPlacement, UiContext, UiEffect};
 use crate::theme::DrawBox;
 use makepad_widgets::*;
@@ -1592,7 +1593,8 @@ impl ChangesView {
     /// Original `ChangedFilesTree`.
     fn draw_tree(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect, bottom_padding: f64) {
         let rows = changed_tree_rows(&self.controller.files, &self.collapsed_folders);
-        let row_height = TREE_ROW_HEIGHT.max(paint.measure(cx, Font::Regular, ui_px(14.0), "Ag").y + 8.0);
+        let metrics = tree_row_metrics(cx, paint);
+        let row_height = metrics.height(TREE_ROW_HEIGHT, 4.0, 16.0);
         self.tree_area = area;
         self.tree_content = rows.len() as f64 * row_height + bottom_padding;
         self.tree_scroll = self.tree_scroll.clamp(0.0, (self.tree_content - area.size.y).max(0.0));
@@ -1613,7 +1615,7 @@ impl ChangesView {
             };
             let selected = self.selected_tree_path.as_deref() == Some(path);
             let hovered = self.is_hovered(&hit);
-            if !file_tree_row(cx, paint, band, row, &self.controller.files, &self.collapsed_folders, hovered, selected) {
+            if !file_tree_row(cx, paint, band, metrics, row, &self.controller.files, &self.collapsed_folders, hovered, selected) {
                 self.icons_pending = true;
             }
             self.hits.push_clipped(band, area, hit);
@@ -1628,7 +1630,7 @@ impl ChangesView {
             return header + 1.0;
         }
         let commits = self.workspace_commits();
-        let row_h = 28.0_f64.max(ui_px(14.0) * 1.4 + 8.0);
+        let row_h = tree_row_metrics(cx, paint).height(28.0, 4.0, 16.0);
         // Error row (8 + 16 + 8) and loading spinner row (4 + 20 + 8) are both 32px.
         let content = if self.controller.commits_error.is_some() || (self.controller.commits_loading && commits.is_empty()) {
             32.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4
@@ -1690,7 +1692,9 @@ impl ChangesView {
             return;
         }
         self.commits_area = content;
-        let row_h = 28.0_f64.max(ui_px(14.0) * 1.4 + 8.0);
+        let metrics = tree_row_metrics(cx, paint);
+        let row_h = metrics.height(28.0, 4.0, 16.0);
+        let trailing_metrics = RowMetrics::new(paint.measure(cx, Font::Regular, small, "Ag").y, 0.0, 0.0);
         self.commits_content = commits.len() as f64 * row_h + 4.0;
         self.commits_scroll = self.commits_scroll.clamp(0.0, (self.commits_content - content.size.y).max(0.0));
         paint.begin_clip(cx, content);
@@ -1725,11 +1729,13 @@ impl ChangesView {
             paint.text_centered(cx, Font::Mono, small, colors.muted, x, top, row_h, text(commit, "shortSha"), 70.0);
             x += 70.0 + 4.0;
             let age = parse_iso8601_ms(text(commit, "authorDate")).map(|date| commit_time_ago(date, now)).unwrap_or_default();
-            let caret_x = band.pos.x + band.size.x - 8.0 - 16.0;
             let age_width = paint.measure(cx, Font::Regular, small, &age).x;
-            paint.text_centered(cx, Font::Regular, small, colors.muted, caret_x - 8.0 - age_width, top, row_h, &age, age_width + 1.0);
-            paint.icon(cx, "chevron-right", 14.0, colors.muted, dvec2(caret_x + 8.0, center_y));
-            paint.text_centered(cx, Font::Regular, ui_px(14.0), colors.foreground, x, top, row_h, text(commit, "subject"), (caret_x - 8.0 - age_width - 8.0 - x).max(0.0));
+            let row_content = rect(x, top, band.pos.x + band.size.x - x, row_h);
+            let slots = metrics.layout(row_content, 8.0, 0.0, age_width + 24.0, 8.0);
+            let trailing = trailing_metrics.layout(slots.trailing, 0.0, 0.0, 16.0, 8.0);
+            paint.painter.text_in(cx, trailing.title, crate::common::paint::TextSpec::new(Font::Regular, small, colors.muted), &age, 1.0);
+            paint.painter.icon(cx, trailing.trailing, "chevron-right", 14.0, colors.muted);
+            paint.painter.text_in(cx, slots.title, crate::common::paint::TextSpec::new(Font::Regular, ui_px(14.0), colors.foreground), text(commit, "subject"), 0.0);
             self.hits.push_clipped(band, content, hit);
         }
         paint.end_clip(cx);

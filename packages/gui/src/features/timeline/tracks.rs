@@ -10,7 +10,7 @@ use super::json::*;
 use super::paint::{Draw, Look};
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
-use crate::common::widgets::{STATUS_BUCKET_ORDER, StatusBucket, derive_status_bucket, paint_status_badge, status_dot_color, paint_status_ring};
+use crate::common::widgets::{RowMetrics, STATUS_BUCKET_ORDER, StatusBucket, derive_status_bucket, paint_status_badge, status_dot_color, paint_status_ring};
 use makepad_widgets::*;
 use serde_json::Value;
 
@@ -309,19 +309,16 @@ pub fn draw_bar(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, model: &Trac
     out
 }
 
-fn subagent_row_height(compact: bool, text_height: f64) -> f64 {
-    let (minimum, padding): (f64, f64) = if compact { (40.0, 16.0) } else { (32.0, 8.0) };
-    minimum.max(text_height + padding)
-}
 
 /// Panel rows (ComposerTrackRow): returns the content height.
 #[allow(clippy::too_many_arguments)]
 fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut DrawIcon, model: &TrackModel, panel: TrackPanel, x: f64, y: f64, w: f64) -> f64 {
     let p = d.look.palette;
     let compact = d.look.compact;
-    let row_h = if compact { 40.0 } else { 32.0 };
     let base = d.look.ui(14.0);
     let small = d.look.ui(12.0);
+    let row_h = RowMetrics::new(d.kit.measure(cx, Font::Regular, base, 1.4, "Ag한글", None).y, 0.0, 0.0)
+        .height(if compact { 40.0 } else { 32.0 }, if compact { 8.0 } else { 4.0 }, 28.0);
     let mut cy = y;
     match panel {
         TrackPanel::Tasks => {
@@ -365,7 +362,9 @@ fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut Dra
                 let open_id = format!("subagent-open:{key}");
                 let hovered_row = d.state.hover_hit.as_deref().is_some_and(|h| h.ends_with(&key));
                 let actions_w = if row.paseo { if model.can_detach { 64.0 } else { 32.0 } } else { 0.0 };
-                let text_w = (w - 8.0 - 38.0 - actions_w).max(20.0);
+                let measurement = RowMetrics::new(0.0, 0.0, 0.0)
+                    .layout(rect_xywh(x + 4.0, cy, w - 8.0, row_h), 8.0, 14.0, actions_w, 8.0);
+                let text_w = measurement.title.size.x;
                 let label = row.label().unwrap_or_else(|| t("common.states.loading"));
                 let title = d.kit.layout_clamped(cx, Font::Regular, base, 1.4, &label, text_w, 1);
                 let facts = if row.paseo {
@@ -381,14 +380,19 @@ fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut Dra
                 });
                 // Fallback fonts can exceed the requested line-height ratio. Use the
                 // same layouts for measurement and painting, including the dry pass.
-                let text_h = laidout_size(&title).y + facts.iter().flatten().map(|line| laidout_size(line).y).sum::<f64>();
-                let h = subagent_row_height(compact, text_h);
+                let metrics = RowMetrics::new(
+                    laidout_size(&title).y,
+                    facts.iter().flatten().map(|line| laidout_size(line).y).sum(),
+                    0.0,
+                );
+                let h = metrics.height(if compact { 40.0 } else { 32.0 }, if compact { 8.0 } else { 4.0 }, 28.0);
                 let r = rect_xywh(x + 4.0, cy, w - 8.0, h);
+                let slots = metrics.layout(r, 8.0, 14.0, actions_w, 8.0);
                 if hovered_row {
                     d.kit.rect(cx, r, p.surface2, 6.0);
                 }
                 d.canvas.add_hit(r, HitTarget::Chrome(open_id));
-                let icon_rect = rect_xywh(r.pos.x + 8.0, cy + (h - 14.0) * 0.5, 14.0, 14.0);
+                let icon_rect = rect_xywh(slots.leading.pos.x, cy + (h - 14.0) * 0.5, 14.0, 14.0);
                 if !d.dry() {
                     let svg = super::composer_bridge::provider_svg(model.providers, &row.provider);
                     ProviderIcon::paint(painter, icon, cx, icon_rect, &row.provider, svg.as_deref(), p.muted);
@@ -397,11 +401,10 @@ fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut Dra
                     }
                 }
                 let actions_visible = compact || d.look.mobile || hovered_row;
-                let text_x = r.pos.x + 30.0;
+                let text_x = slots.title.pos.x;
                 cx.begin_turtle(Walk { abs_pos: Some(dvec2(text_x, cy)), margin: Margin::default(), width: Size::Fixed(text_w), height: Size::Fixed(h) }, Layout::default());
-                let mut ty = cy + (h - text_h) * 0.5;
-                d.kit.draw_laidout(cx, Font::Regular, p.foreground, dvec2(text_x, ty), &title);
-                ty += laidout_size(&title).y;
+                d.kit.draw_laidout(cx, Font::Regular, p.foreground, slots.title.pos, &title);
+                let mut ty = slots.subtitle.pos.y;
                 for line in facts.iter().flatten() {
                     d.kit.draw_laidout(cx, Font::Regular, p.muted, dvec2(text_x, ty), line);
                     ty += laidout_size(line).y;
@@ -505,27 +508,7 @@ pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut
 
 #[cfg(test)]
 mod tests {
-    use super::{row_label, subagent_row_height};
-
-    #[test]
-    fn subagent_rows_contain_measured_text_and_action_targets_at_every_scale() {
-        for compact in [false, true] {
-            for scale in [1.0, 1.5, 2.0] {
-                // Include fallback-font metrics larger than size * requested height,
-                // no facts, provider facts, and host + provider facts.
-                for heights in [[23.0, 0.0, 0.0], [23.0, 21.0, 0.0], [23.0, 21.0, 24.0], [0.0; 3]] {
-                    let text_height = heights.iter().sum::<f64>() * scale;
-                    let row_height = subagent_row_height(compact, text_height);
-                    let top = (row_height - text_height) * 0.5;
-                    assert!(top >= if compact { 8.0 } else { 4.0 });
-                    assert!(top + text_height <= row_height);
-                    assert!(row_height >= 28.0);
-                    let action_top = (row_height - 28.0) * 0.5;
-                    assert!(action_top >= 0.0 && action_top + 28.0 <= row_height);
-                }
-            }
-        }
-    }
+    use super::row_label;
 
     #[test]
     fn subagent_titles_keep_multiline_content_and_reject_empty_placeholders() {

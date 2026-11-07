@@ -2,7 +2,7 @@
 //! use-revealed-text.ts): streamed text is painted at a pace derived from the
 //! backlog, so 60ms coalesced deltas do not show up as jagged jumps.
 
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::GraphemeCursor;
 
 /// Backlog is drained over this horizon.
 pub const TEXT_REVEAL_HORIZON_MS: f64 = 150.0;
@@ -34,14 +34,18 @@ pub fn clamp_to_safe_reveal_boundary(text: &str, index: usize) -> usize {
     if index >= text.len() {
         return text.len();
     }
-    let mut start = 0;
-    for (offset, _) in text.grapheme_indices(true) {
-        if offset > index {
-            break;
-        }
-        start = offset;
+    // Start at the requested cut, not at byte zero. GraphemeCursor requests
+    // only the context needed for this boundary (including RI/ZWJ sequences).
+    let mut cut = index;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
     }
-    start
+    let mut cursor = GraphemeCursor::new(cut, text.len(), true);
+    if cursor.is_boundary(text, 0).expect("complete grapheme context") {
+        cut
+    } else {
+        cursor.prev_boundary(text, 0).expect("complete grapheme context").unwrap_or(0)
+    }
 }
 
 fn trailing_regional_indicators(text: &str) -> usize {
@@ -121,5 +125,42 @@ impl Reveal {
         if self.last_step.is_none() {
             self.last_step = Some(now);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn reveal_cuts_preserve_extended_clusters_at_every_byte() {
+        for text in [
+            "a\u{301}b",
+            "👩🏽‍💻 family 👨‍👩‍👧‍👦",
+            "🇦🇧🇨🇩🇪",
+            "한글",
+            "क्\u{200d}ष",
+            "a\r\nb",
+        ] {
+            let boundaries: Vec<_> = text.grapheme_indices(true).map(|(offset, _)| offset).collect();
+            for cut in 0..text.len() {
+                let expected = boundaries.iter().copied().take_while(|offset| *offset <= cut).last().unwrap_or(0);
+                assert_eq!(clamp_to_safe_reveal_boundary(text, cut), expected, "{text:?} at {cut}");
+            }
+            assert_eq!(clamp_to_safe_reveal_boundary(text, text.len()), text.len());
+        }
+    }
+
+    #[test]
+    fn reveal_boundary_uses_current_text_after_appended_cluster_extension() {
+        let prefix = "ordinary text ".repeat(4096);
+        let first = format!("{prefix}👩");
+        let mut reveal = Reveal::new(&first);
+        let extended = format!("{first}🏽‍💻");
+        assert!(reveal.sync(&extended, true, true));
+        assert_eq!(reveal.visible(&extended, true), prefix);
+        assert!(!reveal.sync(&extended, false, true));
+        assert_eq!(reveal.visible(&extended, false), extended);
     }
 }

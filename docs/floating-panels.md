@@ -12,7 +12,11 @@ The trigger and overlay share one operation lifetime. Tab-owned answers return a
 
 Keep content readable, bounded and scrollable. A searchable picker needs room for both its query and results; opening the keyboard must not cover the selected result or confirmation. Avoid first-frame flashes at an unmeasured position. Do not use offscreen placement as a substitute for an explicit opening/loading state.
 
-Pointer travel between anchor and content must not dismiss the surface prematurely. The shell's modal sweep lock prevents input reaching covered content; release it when the final modal closes so later input is not trapped. Touch users need a deliberate trigger and dismissal path; keyboard users need predictable focus and Escape/Back behavior. Nested overlays should dismiss in order and restore focus without submitting the underlying composer.
+Input follows the drawn layer order: standalone tool-call sheets, shell menus/dialogs/sheets, then the Command Center and retained feature surfaces. Snapshot the arrival-time owner before dispatch. Escape or Android Back belongs to that owner even if it closes or replaces itself; do not forward the same dismissal to its parent. Repeated Escape and an already-handled Back do not unwind another layer. Retained owners keep their registration order until they actually close and reopen. Nested subagent content remains reachable through its ancestor owner; a different widget ID alone is not grounds to block it. Unrelated modal siblings in the same tab remain blocked.
+
+Outside dismissal is a release action. The press and valid release must resolve to the same backdrop; moving from content to the backdrop, scrolling, long press, touch cancellation and native text-handle dragging must not dismiss or activate a row. Reuse the existing `TouchScroll` for list motion, stop its inertia when ownership changes, and keep sheet resizing separate from field selection. Scroll starts in the list viewport, not the title, search field or scrim.
+
+Covered fields may draw but must not autofocus. Closing an owner releases its editor and restores only a still-valid originating focus target; a newer focus request wins. Release the modal sweep lock when the final modal closes. Keep geometry within the keyboard-adjusted viewport even when it is smaller than the preferred popup minimum; clipped content needs a scrollable body rather than offscreen actions.
 
 ## Verification
 

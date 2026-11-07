@@ -23,6 +23,7 @@ jobs:
     permissions:
       contents: write
     env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
       SOURCE_TAG: ${{ inputs.tag }}
       NEW_HOURS: ${{ inputs.rollout_hours }}
       GH_TOKEN: ${{ github.token }}

@@ -170,14 +170,8 @@ impl Identity {
     }
 }
 
-fn profile_directory(mode: &str) -> &'static str {
-    if mode == "release" { "release" } else { "debug" }
-}
-
 fn cargo_profile(cargo: &mut Command, mode: &str) {
-    if mode == "release" {
-        cargo.arg("--release");
-    }
+    cargo.args(["--profile", if mode == "debug" { "dev" } else { mode }]);
 }
 
 /// Fresh directory under the GUI output root; never a caller-chosen path.
@@ -332,16 +326,16 @@ fn build_desktop(target: &str, mode: &str, identity: &Identity, smoke: bool) -> 
         run(&mut cargo)?;
     }
     let compiled = target_root()?
-        .join(profile_directory(mode))
+        .join(mode)
         .join(format!("{CARGO_BIN}{}", env::consts::EXE_SUFFIX));
     build::assert_architecture(&compiled)?;
     let output = gui_output()?
         .join("desktop")
         .join(format!("{target}-{}", arch()?))
         .join(if smoke {
-            format!("smoke-{}", profile_directory(mode))
+            format!("smoke-{mode}")
         } else {
-            profile_directory(mode).to_owned()
+            mode.to_owned()
         });
     fresh(&output)?;
     let bundle = output.join(if target == "macos" { MACOS_BUNDLE } else { "bundle" });
@@ -423,6 +417,16 @@ static ANDROID_ABIS: [AndroidAbi; 3] = [
         machine: 62,
     },
 ];
+
+fn android_abis(arch: &str) -> Result<&'static [AndroidAbi]> {
+    match arch {
+        "arm64" => Ok(&ANDROID_ABIS[..1]),
+        "arm" => Ok(&ANDROID_ABIS[1..2]),
+        "x64" => Ok(&ANDROID_ABIS[2..]),
+        "universal" => Ok(&ANDROID_ABIS),
+        _ => bail!("Unknown Android architecture: {arch}; expected arm64|arm|x64|universal"),
+    }
+}
 
 fn android_sdk() -> Result<PathBuf> {
     let home = env::var_os("ANDROID_HOME").filter(|value| !value.is_empty());
@@ -634,8 +638,8 @@ fn release_key(android: &Path) -> Result<bool> {
     )
 }
 
-/// Build the APK for `abis`; returns Gradle's output inside the GUI work directory.
-fn build_android(mode: &str, abis: &[&AndroidAbi], identity: &Identity) -> Result<PathBuf> {
+/// Build the APK or AAB for `abis`; returns Gradle's output inside the GUI work directory.
+fn build_android(mode: &str, format: &str, abis: &[AndroidAbi], identity: &Identity) -> Result<PathBuf> {
     let sdk = android_sdk()?;
     let ndk = android_ndk(&sdk)?;
     let host = match platform()? {
@@ -644,7 +648,7 @@ fn build_android(mode: &str, abis: &[&AndroidAbi], identity: &Identity) -> Resul
         _ => "windows-x86_64",
     };
     let tools = ndk.join("toolchains/llvm/prebuilt").join(host).join("bin");
-    let work = gui_output()?.join("android").join(profile_directory(mode));
+    let work = gui_output()?.join("android").join(mode);
     fresh(&work.join("jniLibs"))?;
     fresh(&work.join("assets"))?;
     for abi in abis {
@@ -682,7 +686,7 @@ fn build_android(mode: &str, abis: &[&AndroidAbi], identity: &Identity) -> Resul
         run(&mut cargo)?;
         let library = target_root()?
             .join(abi.triple)
-            .join(profile_directory(mode))
+            .join(mode)
             .join("libpaseo_gui.so");
         ensure!(
             elf_identity(&library)? == (abi.class, abi.machine),
@@ -714,10 +718,14 @@ fn build_android(mode: &str, abis: &[&AndroidAbi], identity: &Identity) -> Resul
             );
             credentials.stage(&source, android.join("app/google-services.json"))?;
         }
-        let task = if mode == "release" {
-            "assembleRelease"
-        } else {
-            "assembleDebug"
+        // Rust's dev-fast profile packages as an Android debug variant.
+        let variant = if mode == "release" { "release" } else { "debug" };
+        let task = match (format, variant) {
+            ("apk", "release") => "assembleRelease",
+            ("apk", _) => "assembleDebug",
+            ("aab", "release") => "bundleRelease",
+            ("aab", _) => "bundleDebug",
+            _ => bail!("Unknown Android format: {format}"),
         };
         let gradle_build = work.join("gradle");
         run(command(gradle()?)?
@@ -737,8 +745,12 @@ fn build_android(mode: &str, abis: &[&AndroidAbi], identity: &Identity) -> Resul
             ))
             .env("ANDROID_HOME", &sdk)
             .env("ANDROID_SDK_ROOT", &sdk))?;
-        let built = gradle_build.join(format!("app/outputs/apk/{mode}/app-{mode}.apk"));
-        ensure!(built.is_file(), "Gradle produced no APK at {}", built.display());
+        let built = if format == "aab" {
+            gradle_build.join(format!("app/outputs/bundle/{variant}/app-{variant}.aab"))
+        } else {
+            gradle_build.join(format!("app/outputs/apk/{variant}/app-{variant}.apk"))
+        };
+        ensure!(built.is_file(), "Gradle produced no {format} at {}", built.display());
         Ok(built)
     })();
     let cleanup = credentials.restore();
@@ -751,19 +763,38 @@ fn build_android(mode: &str, abis: &[&AndroidAbi], identity: &Identity) -> Resul
     }
 }
 
-/// Copy a built APK to its release name; signing is labelled from the actual key configuration.
-fn android_artifact(built: &Path, mode: &str, android_arch: &str) -> Result<PathBuf> {
-    let signing = if mode == "debug" || !release_key(&packaging()?.join("android"))? {
+/// Keep Gradle's output in place for incremental builds; publish an independent artifact copy.
+fn android_artifact(
+    built: &Path,
+    mode: &str,
+    format: &str,
+    android_arch: &str,
+    identity: &Identity,
+) -> Result<PathBuf> {
+    let signing = if mode != "release" || !release_key(&packaging()?.join("android"))? {
         "-debug-signed"
     } else {
         ""
     };
     fs::create_dir_all(release()?)?;
     let output = release()?.join(format!(
-        "{}{signing}.apk",
+        "{}{signing}.{format}",
         artifact_stem("android", android_arch)?
     ));
     copy_tree(built, &output)?;
+    let suffix = if format == "aab" { "-aab" } else { "" };
+    write_json(
+        &release()?.join(format!("packages-android-{android_arch}{suffix}.json")),
+        &json!({
+            "version": identity.version,
+            "platform": "android",
+            "arch": android_arch,
+            "format": format,
+            "profile": mode,
+            "sourceSha": identity.source,
+            "artifacts": [output.file_name().context("Android artifact has no filename")?],
+        }),
+    )?;
     Ok(output)
 }
 
@@ -779,7 +810,7 @@ fn build_ios(mode: &str, identity: &Identity, simulator: bool) -> Result<PathBuf
         (true, "arm64") => "aarch64-apple-ios-sim",
         (true, _) => "x86_64-apple-ios",
     };
-    let work = gui_output()?.join("ios").join(triple).join(profile_directory(mode));
+    let work = gui_output()?.join("ios").join(triple).join(mode);
     fresh(&work)?;
     let build_number = identity.build_number.to_string();
     let plist = work.join("Info.plist");
@@ -814,7 +845,7 @@ fn build_ios(mode: &str, identity: &Identity, simulator: bool) -> Result<PathBuf
     copy_tree(
         &target_root()?
             .join(triple)
-            .join(profile_directory(mode))
+            .join(mode)
             .join(CARGO_BIN),
         &executable,
     )?;
@@ -1143,31 +1174,37 @@ fn run_ios(app: &Path, simulator: bool, device: &str) -> Result<()> {
 
 pub fn build_gui(args: &[String]) -> Result<()> {
     supervise_subprocesses()?;
+    let mut lease = crate::build_cache::acquire()?;
     let mut target = None;
     let mut mode = "release";
     let mut launch = false;
     let mut smoke = false;
     let mut device = None;
-    let mut android_arch = "universal";
-    let mut explicit_arch = false;
+    let mut android_arch = None;
+    let mut format = "apk";
+    let mut explicit_format = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--debug" => mode = "debug",
             "--run" => launch = true,
             "--smoke" => smoke = true,
-            "--device" | "--arch" => {
+            "--device" | "--arch" | "--profile" | "--format" => {
                 let option = &args[index];
                 index += 1;
                 let value = args
                     .get(index)
                     .filter(|arg| !arg.starts_with("--"))
                     .context("Missing option value")?;
-                if option == "--device" {
-                    device = Some(value.as_str());
-                } else {
-                    android_arch = value;
-                    explicit_arch = true;
+                match option.as_str() {
+                    "--device" => device = Some(value.as_str()),
+                    "--arch" => android_arch = Some(value.as_str()),
+                    "--profile" => mode = value,
+                    "--format" => {
+                        format = value;
+                        explicit_format = true;
+                    }
+                    _ => unreachable!(),
                 }
             }
             value if !value.starts_with('-') && target.is_none() => target = Some(value),
@@ -1190,10 +1227,20 @@ pub fn build_gui(args: &[String]) -> Result<()> {
         "CARGO_BUILD_TARGET is not supported; xtask selects the GUI target"
     );
     ensure!(
-        matches!(android_arch, "universal" | "arm64")
-            && (!explicit_arch || target == "android" && !launch),
-        "--arch universal|arm64 is only supported for Android artifact builds, not --run"
+        matches!(mode, "dev-fast" | "debug" | "release"),
+        "--profile must be dev-fast|debug|release"
     );
+    ensure!(
+        android_arch.is_none() || target == "android" && !launch,
+        "--arch arm64|arm|x64|universal is only supported for Android artifact builds, not --run"
+    );
+    ensure!(
+        matches!(format, "apk" | "aab") && (!explicit_format || target == "android"),
+        "--format apk|aab is only supported for Android"
+    );
+    ensure!(!launch || format == "apk", "--run requires APK output, not an Android App Bundle");
+    let android_arch = android_arch.unwrap_or(if format == "aab" { "universal" } else { "arm64" });
+    let abis = android_abis(android_arch)?;
     ensure!(
         device.is_none() || launch && !desktop,
         "--device requires --run on Android or iOS"
@@ -1211,16 +1258,14 @@ pub fn build_gui(args: &[String]) -> Result<()> {
         "android" if launch => {
             let adb = adb()?;
             let (serial, abi) = android_device(&adb, device)?;
-            let apk = build_android(mode, &[abi], &identity)?;
+            let apk = build_android(mode, "apk", std::slice::from_ref(abi), &identity)?;
+            lease.release_target();
             run_android(&adb, &serial, &apk)?;
         }
         "android" => {
-            let abis: Vec<&AndroidAbi> = ANDROID_ABIS
-                .iter()
-                .filter(|abi| android_arch == "universal" || abi.abi == "arm64-v8a")
-                .collect();
-            let apk = android_artifact(&build_android(mode, &abis, &identity)?, mode, android_arch)?;
-            println!("GUI android {mode}: {}", apk.display());
+            let built = build_android(mode, format, abis, &identity)?;
+            let artifact = android_artifact(&built, mode, format, android_arch, &identity)?;
+            println!("GUI android {mode} {format}: {}", artifact.display());
         }
         "ios" => {
             let (simulator, selected) = if launch {
@@ -1237,6 +1282,7 @@ pub fn build_gui(args: &[String]) -> Result<()> {
                         signed,
                         "Running on an iOS device requires PASEO_IOS_PROVISIONING_PROFILE and PASEO_IOS_SIGNING_IDENTITY"
                     );
+                    lease.release_target();
                     run_ios(&app, simulator, &selected)?;
                 }
                 None => println!("GUI ios {mode}: {}", package_ios(&app, signed)?.display()),
@@ -1245,6 +1291,7 @@ pub fn build_gui(args: &[String]) -> Result<()> {
         _ => {
             let bundle = build_desktop(target, mode, &identity, smoke)?;
             println!("GUI {target} {mode}{}: {}", if smoke { " smoke" } else { "" }, bundle.display());
+            lease.release_target();
             if launch {
                 let mut process = command(bundle.join(desktop_executable(target)))?;
                 process.current_dir(&bundle);
@@ -1296,6 +1343,22 @@ mod tests {
         assert_eq!(select("Android", &devices, Some("9A")).unwrap().0, "9A");
         assert!(select("Android", &devices, Some("R5CT")).is_err());
         assert_eq!(select("Android", &devices[..1], None).unwrap().0, "emulator-5554");
+    }
+    #[test]
+    fn android_arch_selection_never_includes_another_abi() {
+        for (arch, expected) in [
+            ("arm64", "arm64-v8a"),
+            ("arm", "armeabi-v7a"),
+            ("x64", "x86_64"),
+        ] {
+            let selected = android_abis(arch).unwrap();
+            assert_eq!(selected.iter().map(|abi| abi.abi).collect::<Vec<_>>(), [expected]);
+        }
+        assert_eq!(
+            android_abis("universal").unwrap().iter().map(|abi| abi.abi).collect::<Vec<_>>(),
+            ["arm64-v8a", "armeabi-v7a", "x86_64"]
+        );
+        assert!(android_abis("aarch64").is_err());
     }
     /// Minimal ELF64 shared library: PT_DYNAMIC at file offset 0x100 and a
     /// PT_LOAD mapping the string table (file offset 0x200) at 0x1200.

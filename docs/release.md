@@ -21,7 +21,7 @@ Fonts are third-party works with their own licenses. `packaging/resource-notices
 | Target                        | Native artifact scope                                                                         |
 | ----------------------------- | --------------------------------------------------------------------------------------------- |
 | Linux, macOS, Windows desktop | Native Rust client, Rust daemon/CLI, native desktop integration and runtime assets            |
-| Android                       | Native Rust remote client APK; no daemon                                                      |
+| Android                       | Native Rust remote client APKs per ABI and universal APK/AAB; no daemon                        |
 | iOS                           | Native Rust remote client; no daemon; unsigned app archive unless a provisioning profile is supplied |
 | Standalone daemon             | Rust executable with libraries, skills, notices and provenance                                |
 | Container                     | Native daemon and runtime assets; no browser UI or Node executable in the default image       |
@@ -35,21 +35,22 @@ Use Rust/Cargo and each target's native toolchain. Build desktop artifacts on th
 
 ```sh
 cargo fetch --locked
-cargo xtask build-daemon                # debug binary and runtime assets
+cargo xtask build-daemon                # dev-fast binary and runtime assets
 cargo xtask build-daemon --release      # optimized local build, not publication
 cargo xtask build-gui linux             # matching host only
 cargo xtask package-desktop
-cargo xtask build-gui android --arch arm64
+cargo xtask build-gui android --arch arm64 --format apk
+cargo xtask build-gui android --arch universal --format aab
 cargo xtask build-gui ios
 ```
 
-The default GUI release build uses optimized Rust; a debug development build uses the debug profile. Optimization is independent of publication: `--release` alone must not turn a local binary into an updater-enabled official build.
+The default GUI release build uses optimized Rust; `--profile debug` and `--profile dev-fast` select development builds. Optimization is independent of publication: `--release` alone must not turn a local binary into an updater-enabled official build.
 
 Published provenance is explicitly selected by `PASEO_NATIVE_RELEASE=1` together with the optimized build and validated `PASEO_UPDATE_REPOSITORY`, `PASEO_RELEASE_CHANNEL`, and `PASEO_BUILD_SOURCE_SHA`. The source SHA must identify the checked-out source. Standalone `cargo xtask package-daemon` requires that release identity; it is not a way to relabel an arbitrary local executable.
 
-Official Linux/Windows desktop builds compile `paseo-sessions` and `paseo` in one Cargo invocation. Their shared release identity and dependency feature graph avoid a second compilation pass for common dependencies. Both binary architecture checks, native runtime provenance, notices and packaging validation still run, with the existing optimized release profile. Local builds remain separate because the daemon must not inherit the client's update channel/repository; macOS remains separate because the client sets its own deployment target. Android/iOS build paths are unchanged.
+Official Linux/Windows desktop builds compile `paseo-sessions` and `paseo` in one Cargo invocation. Their shared release identity and dependency feature graph avoid a second compilation pass for common dependencies. Both binary architecture checks, native runtime provenance, notices and packaging validation still run, with the existing optimized release profile. Local builds remain separate because the daemon must not inherit the client's update channel/repository; macOS remains separate because the client sets its own deployment target. `package-desktop` and `package-daemon` consume the staged build rather than compiling again; packaging still checks source identity and executable hashes. Shared compilation caches do not replace checkout-local staging or its provenance checks.
 
-Client artifacts and build descriptors live in `artifacts/native/`: `Paseo-Sessions-<version>-<platform>-<arch>.<AppImage|deb|zip|exe>`, `Paseo-Sessions-<version>-android-<arch>[-debug-signed].apk`, `Paseo-Sessions-<version>-ios-arm64.ipa` or `-unsigned.app.zip`. Standalone daemon archives are `Paseo-Daemon-<version>-<platform>-<arch>.tar.gz` (ZIP on Windows), with a channel/platform/architecture manifest. Native runtime metadata includes `paseo-runtime.json`, `bundle-provenance.json`, and desktop-specific `desktop-runtime.json` when applicable. Preserve assets together; copying only the executable omits runtime libraries, Makepad resources and skills.
+Client artifacts and build descriptors live in `artifacts/native/`: `Paseo-Sessions-<version>-<platform>-<arch>.<AppImage|deb|zip|exe>`, `Paseo-Sessions-<version>-android-<arch>[-debug-signed].<apk|aab>`, `Paseo-Sessions-<version>-ios-arm64.ipa` or `-unsigned.app.zip`. APK builds default to arm64; AAB builds default to universal. Standalone daemon archives are `Paseo-Daemon-<version>-<platform>-<arch>.tar.gz` (ZIP on Windows), with a channel/platform/architecture manifest. Native runtime metadata includes `paseo-runtime.json`, `bundle-provenance.json`, and desktop-specific `desktop-runtime.json` when applicable. Preserve assets together; copying only the executable omits runtime libraries, Makepad resources and skills.
 
 Bundle provenance records the executable digest **after relocation**, because runtime patching can change its bytes. `sourceExecutableSha256` separately identifies the input executable. Check an artifact against its final digest, not against the pre-relocation source hash.
 
@@ -69,7 +70,7 @@ The NSIS installer upgrades in place: at the registered install location it firs
 
 `xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `packaging/android/version.properties`; empty variables count as unset. Android enforces a minimum of `13000`. Confirm the next build number against the actual store history; do not infer store acceptance from a local version string.
 
-Android release signing uses `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`, or `packaging/android/key.properties`. Without a release key, output is explicitly named **debug-signed**, not store-ready. Credentials are not part of this fork. The Android application ID is `sh.paseo.sessions`; the minimum SDK stays 24 (see [Android](android.md) for the Makepad compatibility patches that keep it).
+Android release signing uses `ANDROID_KEYSTORE_PATH`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`, or `packaging/android/key.properties`. Without a release key, APK and AAB output is explicitly named **debug-signed**, not store-ready. An AAB is produced by Gradle's bundle task, not by renaming an APK; it is a store upload bundle, not a directly installable package. Credentials are not part of this fork. The Android application ID is `sh.paseo.sessions`; the minimum SDK stays 24 (see [Android](android.md) for the Makepad compatibility patches that keep it).
 
 iOS signs with `PASEO_IOS_PROVISIONING_PROFILE` (a `.mobileprovision` path) and `PASEO_IOS_SIGNING_IDENTITY` (a keychain code-signing identity): the profile is embedded, its application identifier, team, `get-task-allow` and `aps-environment` override the app entitlements, and the bundle is zipped as an `.ipa`. Without them, the build emits an explicitly **unsigned device `.app` archive**, not an installable IPA or App Store submission. The Xcode `PASEO_IOS_EXPORT_OPTIONS_PLIST` path no longer exists. macOS and Windows signing use the native packaging signing configuration; neither platform has been claimed executed in the local migration evidence.
 
@@ -79,9 +80,13 @@ Optional Firebase configuration for Android must match `sh.paseo.sessions`: `GOO
 
 `.github/workflows/desktop-release.yml` is the manual-only **Native Release** workflow despite its retained filename. It builds the Rust client and daemon for every target, preserves complete per-target artifacts, validates recovery provenance, and publishes only through its publication path. Its matrix is for explicitly requested artifacts, not default CI or per-platform test repetition.
 
-The complete release matrix has **eight targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android universal and iOS arm64. Each target's artifacts are retained for **30 days**. macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android provisions platform-tools and NDK 28.2.13676358 and the Rust Android targets; iOS adds the `aarch64-apple-ios` target. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
+The complete release matrix has **twelve targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android arm64/arm/x64/universal APKs, Android universal AAB and iOS arm64. Android APK target IDs are `android-<arch>`; the bundle target is `android-universal-aab`, with separate package metadata and provenance so recovery cannot substitute one format for another. macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android provisions platform-tools and NDK 28.2.13676358 and the Rust Android targets; iOS adds the `aarch64-apple-ios` target. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
 
-For a reduced Windows x64, Linux x64 and Android release, select `platform=linux-windows-x64-android`. This preset supports both building and `publish-only` recovery without requiring macOS, desktop ARM64 or iOS artifacts. Recovery and publication require all three selected targets from the same source SHA; desktop feed verification and later rollout changes use the declared desktop target inventory rather than assuming the full matrix.
+Workflow artifact uploads are temporary: both Native Release and Native Desktop Packages retain them for **7 days**. Recover within that window or rebuild the exact authorized source; expired uploads cannot support `publish-only`. This retention does not delete published GitHub Release assets.
+
+Android `record` and `verify` require matching release-profile metadata, source SHA, architecture and format; the metadata and artifact are both covered by provenance hashes. Archive validation checks APK versus AAB layout, bundled notices and the exact Makepad native ABI inventory against ELF headers. These structural checks reject a renamed APK and mislabeled native libraries; they do not replace Android signing verification, bundletool validation, installation or store acceptance.
+
+For a reduced Windows x64, Linux x64 and Android release, select `platform=linux-windows-x64-android`. This preset supports both building and `publish-only` recovery without requiring macOS, desktop ARM64 or iOS artifacts. Recovery and publication require all seven selected targets (two desktop and five Android variants) from the same source SHA; desktop feed verification and later rollout changes use the declared desktop target inventory rather than assuming the full matrix.
 
 Manual inputs include `tag`, `mode` (`build` or `publish-only`), `recovery_run_id`, `platform`, `checkout_ref`, `publish`, and `rollout_hours`. **`publish` defaults to true**; explicitly select false for an authorized non-publishing build. Tag pushes do not trigger the workflow. Do not dispatch a publishing workflow as a build test.
 

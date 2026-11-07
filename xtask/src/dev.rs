@@ -336,6 +336,7 @@ fn snapshot(root: &Path) -> Result<BTreeMap<PathBuf, (SystemTime, u64)>> {
 }
 async fn development(args: &[String], cancel: &CancellationToken) -> Result<()> {
     let root = crate::common::root()?;
+    let _runtime_lease = crate::build_cache::runtime_lease()?;
     let env = development_env(&root)?;
     if args.first().is_some_and(|s| s == "app") {
         // Build wrapper owns its cargo/Gradle/device descendants and credential
@@ -344,8 +345,9 @@ async fn development(args: &[String], cancel: &CancellationToken) -> Result<()> 
         let cancellation_path = cancellation.path().join("cancel");
         let mut child = Command::new(std::env::current_exe()?)
             .arg("build-gui")
+            .args(["--profile", "dev-fast"])
             .args(&args[1..])
-            .args(["--debug", "--run"])
+            .arg("--run")
             .current_dir(&root)
             .env_clear()
             .envs(&env)
@@ -412,17 +414,7 @@ async fn development(args: &[String], cancel: &CancellationToken) -> Result<()> 
     } else {
         args.to_vec()
     };
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target"));
-    let target = if target.is_absolute() {
-        target
-    } else {
-        root.join(target)
-    };
-    let executable = target
-        .join("debug")
-        .join(if cfg!(windows) { "paseo.exe" } else { "paseo" });
+    let executable = crate::build::directory("dev-fast")?.join(crate::common::executable());
     let mut changed = if watch {
         snapshot(&root)?
     } else {

@@ -118,7 +118,7 @@ cargo clippy --locked -p paseo-gui-core -p paseo-gui-platform -p paseo-gui --all
 
 Repo dev commands use checkout-local state. `PASEO_HOME` resolves to `.dev/paseo-home`, the dev daemon listens on `127.0.0.1:6768`, and `cargo xtask dev cli ...` targets that same dev home. The installed daemon and app keep using `~/.paseo` on port `6767`.
 
-When Mo requests an APK, use `cargo xtask build-gui android --arch arm64`: it writes the APK to `artifacts/native/` (debug-signed without a release key) without starting a device. Omit `--arch arm64` for a universal APK.
+When Mo requests an APK, use `cargo xtask build-gui android`: it defaults to arm64 and writes the APK to `artifacts/native/` (debug-signed without a release key) without starting a device. Use `--arch universal` for a universal APK; `--format aab` produces a universal Android App Bundle by default.
 
 See [docs/development.md](docs/development.md) for toolchains, isolated state, native builds and source ownership.
 

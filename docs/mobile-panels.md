@@ -8,6 +8,6 @@ Keep navigation intent separate from transient geometry. Resizing or rotating mu
 
 The sidebar remains host → directory → session on compact screens. Every host is represented, empty directories remain visible, and equal paths on different hosts stay separate. Directory creation and remote browsing retain their explicit host/path target.
 
-Keyboard and safe-area changes must keep the composer and primary actions reachable. Menus, pickers and supporting views must not intercept input intended for a different layer. Provide visible controls as well as gestures.
+Keyboard and safe-area changes must keep the composer and primary actions reachable. Menus, pickers and supporting views must not intercept input intended for a different layer. A touch drag does not focus a different pane: focus changes on a valid release within the pane that received the press. Modal Back handling precedes compact navigation; see [floating-panel ownership](floating-panels.md#sizing-and-interaction). Provide visible controls as well as gestures.
 
 Exercise the real Rust app with rapid navigation, rotation, keyboard, reconnect, persisted restart and Back. Linux compact-window evidence is not Android/iOS device evidence; see [mobile testing](mobile-testing.md) and [testing](testing.md).
