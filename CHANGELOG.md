@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.10 - 2026-11-07
 
 ### Changed
 
@@ -25,7 +25,8 @@
 
 ### Validation
 
-- Earlier build-tool smoke: compiled `paseo-xtask` and ran `housekeeping --max-bytes 0` in dry-run mode; no managed-cache removal was applied. This predates the full-text rendering and native-window input changes. GUI/Android execution, regression tests, CI and performance/size comparisons remain unexecuted.
+- Earlier build-tool smoke: compiled `paseo-xtask` and ran `housekeeping --max-bytes 0` in dry-run mode; no managed-cache removal was applied. This predates the full-text rendering and native-window input changes.
+- Source changes were prepared without GUI/Android execution, regression tests, separate test CI or performance/size comparisons. Publication runs the native build and artifact-integrity pipeline; successful packaging does not establish interactive runtime correctness.
 
 ## 0.13.9 - 2026-11-07
 
