@@ -1,3 +1,5 @@
+> Passession is a fork of [Paseo](https://github.com/getpaseo/paseo).
+
 # Paseo Sessions
 
 Paseo Sessions is a native environment for running and reviewing coding-agent work. The client is native Rust (Makepad) on **Linux, macOS, Windows, Android, and iOS**. The daemon and `paseo` CLI are Rust. Desktop clients can manage a local daemon; Android and iOS connect to a daemon on another machine.
