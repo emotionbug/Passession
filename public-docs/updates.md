@@ -8,7 +8,7 @@ category: Getting started
 
 # Updates
 
-The checkout version is **0.13.1**. Use [this repository's releases](https://github.com/emotionbug/paseo/releases) and their recorded source revision to identify published artifacts. Upstream downloads, legacy npm CLI packages, store listings and container `latest` tags do not establish this fork's release identity.
+The checkout version is **0.13.1**. Use [this repository's releases](https://github.com/emotionbug/Passession/releases) and their recorded source revision to identify published artifacts. Upstream downloads, legacy npm CLI packages, store listings and container `latest` tags do not establish this fork's release identity.
 
 ## Native build identity
 

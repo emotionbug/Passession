@@ -8,7 +8,7 @@ nav: 快速上手
 
 Paseo Sessions 使用原生 Rust 构建 **Linux、macOS、Windows、Android 和 iOS** 客户端，daemon 与 CLI 同样使用 **Rust**。桌面或服务器运行 Agent，Android 和 iOS 远程连接。客户端保留 Markdown、源码编辑、摘要优先的 diff、远程文件夹选择、交互式终端和只读脚本日志，侧边栏按 **主机 → 目录 → 会话** 组织。
 
-请使用[本仓库的发布产物](https://github.com/emotionbug/paseo/releases)获取原生构建；上游下载和应用商店版本是独立产品。源码构建和分发要求见仓库 `docs/release.md`。
+请使用[本仓库的发布产物](https://github.com/emotionbug/Passession/releases)获取原生构建；上游下载和应用商店版本是独立产品。源码构建和分发要求见仓库 `docs/release.md`。
 
 ## 前置条件 {#prerequisites}
 

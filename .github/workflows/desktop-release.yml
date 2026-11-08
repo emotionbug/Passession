@@ -113,7 +113,7 @@ jobs:
       RELEASE_VERSION: ${{ needs.source.outputs.version }}
       PASEO_RELEASE_CHANNEL: ${{ needs.source.outputs.channel }}
       PASEO_NATIVE_RELEASE: "1"
-      PASEO_UPDATE_REPOSITORY: emotionbug/paseo
+      PASEO_UPDATE_REPOSITORY: emotionbug/Passession
       PASEO_BUILD_SOURCE_SHA: ${{ needs.source.outputs.sha }}
       TARGET_ID: ${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}
     steps:
@@ -253,7 +253,7 @@ jobs:
 
   publish:
     needs: [source, native]
-    if: ${{ !cancelled() && github.repository == 'emotionbug/paseo' && needs.source.result == 'success' && needs.source.outputs.publish == 'true' && (needs.native.result == 'success' || github.event.inputs.mode == 'publish-only') }}
+    if: ${{ !cancelled() && github.repository == 'emotionbug/Passession' && needs.source.result == 'success' && needs.source.outputs.publish == 'true' && (needs.native.result == 'success' || github.event.inputs.mode == 'publish-only') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read

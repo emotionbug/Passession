@@ -2,4 +2,4 @@ Fixed
 - Keep retained text on stable glyph-atlas pages instead of overwriting live glyph coordinates when long multilingual content fills the atlas. Preserve authored text depth across large runs.
 - Apply common paint-layer boundaries to text, icons, images and backgrounds so floating controls and menus remain opaque and their icons remain visible over long conversations.
 
-Full notes: https://github.com/emotionbug/paseo/releases
+Full notes: https://github.com/emotionbug/Passession/releases

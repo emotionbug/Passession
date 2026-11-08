@@ -22,7 +22,7 @@ env:
 
 jobs:
   sync-release-notes:
-    if: github.repository == 'emotionbug/paseo'
+    if: github.repository == 'emotionbug/Passession'
     runs-on: ubuntu-latest
     permissions:
       contents: write

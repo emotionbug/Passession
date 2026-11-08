@@ -1,4 +1,4 @@
 Added
 - Add shared touch insertion and range-selection handles to inputs, search, source editors, Markdown, chat and logs. Keep endpoint identity through crossing, capture handle drags before parent scrolling, and extend selection with frame-timed edge scrolling.
 
-Full notes: https://github.com/emotionbug/paseo/releases
+Full notes: https://github.com/emotionbug/Passession/releases

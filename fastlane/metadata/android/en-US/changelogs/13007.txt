@@ -1,4 +1,4 @@
 Changed
 - Compile the Linux/Windows official desktop client and daemon in one Cargo invocation, sharing dependency features instead of recompiling common dependencies in separate passes. Preserve release optimization and artifact checks; keep local identity separation and macOS deployment targets unchanged.
 
-Full notes: https://github.com/emotionbug/paseo/releases
+Full notes: https://github.com/emotionbug/Passession/releases

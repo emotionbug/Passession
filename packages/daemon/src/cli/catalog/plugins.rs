@@ -452,7 +452,7 @@ pub(super) async fn init(m: &ArgMatches) -> Result<Output> {
         let path = path.to_str().ok_or_else(|| anyhow!("SDK path must be valid UTF-8"))?;
         format!("{{ path = {}, version = \"={version}\" }}", serde_json::to_string(path)?)
     } else {
-        format!("{{ git = \"https://github.com/emotionbug/paseo.git\", version = \"={version}\" }}")
+        format!("{{ git = \"https://github.com/emotionbug/Passession.git\", version = \"={version}\" }}")
     };
     tokio::fs::create_dir_all(&directory).await?;
     if tokio::fs::read_dir(&directory)

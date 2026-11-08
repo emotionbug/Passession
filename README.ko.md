@@ -4,7 +4,7 @@
 
 Paseo Sessions는 코딩 에이전트 작업을 실행하고 검토하는 네이티브 환경입니다. **Linux, macOS, Windows, Android, iOS** 클라이언트는 네이티브 Rust(Makepad), 데몬과 `paseo` CLI도 Rust로 구현됩니다. 데스크톱은 로컬 데몬을 관리할 수 있으며, 모바일은 다른 컴퓨터의 데몬에 원격으로 연결하는 전용 클라이언트입니다.
 
-현재 체크아웃 버전은 **0.13.6**입니다. 배포 산출물은 [이 저장소의 릴리스](https://github.com/emotionbug/paseo/releases)를 사용하세요. 업스트림 다운로드는 이 저장소의 빌드가 아닙니다. 직접 빌드하거나 바이너리를 배포할 때는 [출시 요구 사항](docs/release.md)을 확인하세요.
+현재 체크아웃 버전은 **0.13.6**입니다. 배포 산출물은 [이 저장소의 릴리스](https://github.com/emotionbug/Passession/releases)를 사용하세요. 업스트림 다운로드는 이 저장소의 빌드가 아닙니다. 직접 빌드하거나 바이너리를 배포할 때는 [출시 요구 사항](docs/release.md)을 확인하세요.
 
 ## 여러 호스트에서 작업하기와 기능 범위
 

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Native executable plugin SDK for Paseo"
-repository = "https://github.com/emotionbug/paseo"
+repository = "https://github.com/emotionbug/Passession"
 include = ["src/**/*.rs", "Cargo.toml"]
 
 [dependencies]

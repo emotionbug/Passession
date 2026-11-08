@@ -39,10 +39,10 @@ pub fn release_identity() -> Result<Value> {
         "Release packaging requires PASEO_NATIVE_RELEASE=1; local builds are not verified releases"
     );
     let repository = env::var("PASEO_UPDATE_REPOSITORY")
-        .context("Set PASEO_UPDATE_REPOSITORY=emotionbug/paseo")?;
+        .context("Set PASEO_UPDATE_REPOSITORY=emotionbug/Passession")?;
     ensure!(
-        repository == "emotionbug/paseo",
-        "Release repository must be emotionbug/paseo"
+        repository == "emotionbug/Passession",
+        "Release repository must be emotionbug/Passession"
     );
     let channel =
         env::var("PASEO_RELEASE_CHANNEL").context("Set PASEO_RELEASE_CHANNEL to stable or beta")?;
@@ -493,7 +493,7 @@ mod tests {
         for (key, value) in [
             ("release", json!(true)),
             ("channel", json!("stable")),
-            ("repository", json!("emotionbug/paseo")),
+            ("repository", json!("emotionbug/Passession")),
             ("sourceDirty", json!("unknown")),
         ] {
             let mut claimed = local.clone();

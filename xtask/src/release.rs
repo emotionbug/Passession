@@ -9,7 +9,7 @@ mod integrity;
 mod metadata;
 mod remote;
 
-pub(super) const REPOSITORY: &str = "emotionbug/paseo";
+pub(super) const REPOSITORY: &str = "emotionbug/Passession";
 pub(super) const WORKFLOW: &str = ".github/workflows/desktop-release.yml";
 /// Desktop client feed runtime and asset prefix (`flutter-<channel>-<target>.json`).
 /// Installed clients, including Flutter-era builds, discover updates by this

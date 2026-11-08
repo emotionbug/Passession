@@ -1,4 +1,4 @@
 Changed
 - Share measured list-row slots and paint/hit/layout extents across sidebar, history, Settings, Git and timeline metadata. Scale sheet headers from their actual text height and reserve trailing actions before truncating labels.
 
-Full notes: https://github.com/emotionbug/paseo/releases
+Full notes: https://github.com/emotionbug/Passession/releases

@@ -32,7 +32,7 @@ env:
 
 jobs:
   deploy:
-    if: github.repository == 'emotionbug/paseo' && inputs.target == 'fly' && vars.ENABLE_RELAY_DEPLOY == 'true' && inputs.confirm_single_machine
+    if: github.repository == 'emotionbug/Passession' && inputs.target == 'fly' && vars.ENABLE_RELAY_DEPLOY == 'true' && inputs.confirm_single_machine
     environment: relay-production
     runs-on: ubuntu-24.04
     steps:
@@ -54,7 +54,7 @@ jobs:
         run: flyctl deploy --ha=false --config packages/relay/fly.toml --dockerfile packages/relay/Dockerfile
 
   deploy-edge:
-    if: github.repository == 'emotionbug/paseo' && inputs.target == 'cloudflare' && vars.ENABLE_RELAY_EDGE_DEPLOY == 'true' && inputs.confirm_edge_upload
+    if: github.repository == 'emotionbug/Passession' && inputs.target == 'cloudflare' && vars.ENABLE_RELAY_EDGE_DEPLOY == 'true' && inputs.confirm_edge_upload
     environment: relay-edge-production
     runs-on: ubuntu-24.04
     steps:

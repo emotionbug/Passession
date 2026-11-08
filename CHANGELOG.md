@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.13.12 - 2026-11-08
+## 0.13.12 - 2026-11-09
 
 ### Added
 
@@ -9,6 +9,7 @@
 ### Changed
 
 - Replace `alacritty_terminal` with Ghostty's VT engine (`libghostty-vt` through the new `paseo-terminal` crate) for daemon screens, execution logs and terminal tabs. Building now requires Zig 0.15.2; Android builds are 64-bit only (arm64-v8a, x86_64) and the x86_64 iOS simulator is no longer built. Native notices attribute the statically linked Ghostty archive and its bundled libraries.
+- Publish releases, update feeds and the plugin SDK source from [`emotionbug/Passession`](https://github.com/emotionbug/Passession). Clients and daemons from 0.13.11 or earlier look for updates in the previous repository, so install this release manually once; later updates arrive in-app.
 
 ### Fixed
 

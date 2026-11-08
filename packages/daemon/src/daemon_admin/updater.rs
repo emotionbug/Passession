@@ -55,7 +55,7 @@ pub(crate) fn platform() -> Result<(&'static str, &'static str)> {
 /// The only repository whose releases are official for this distribution.
 /// Local builds deliberately compile without release identity, yet may still
 /// install a genuine newer official release verified against this root.
-const OFFICIAL_REPOSITORY: &str = "emotionbug/paseo";
+const OFFICIAL_REPOSITORY: &str = "emotionbug/Passession";
 fn repository() -> Result<&'static str> {
     let repository = option_env!("PASEO_UPDATE_REPOSITORY").unwrap_or(OFFICIAL_REPOSITORY);
     let parts = repository.split('/').collect::<Vec<_>>();

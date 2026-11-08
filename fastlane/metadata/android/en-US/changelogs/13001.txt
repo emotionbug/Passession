@@ -1,4 +1,4 @@
 Added
 - Replaced the product daemon and CLI with Rust and the client with native Flutter targets for Linux, macOS, Windows, Android and iOS. Desktop/server hosts run the daemon; mobile clients connect remotely.
 
-Full notes: https://github.com/emotionbug/paseo/releases
+Full notes: https://github.com/emotionbug/Passession/releases

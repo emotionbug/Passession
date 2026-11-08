@@ -19,7 +19,7 @@ const DEFAULT_CHANNEL: &str = match option_env!("PASEO_RELEASE_CHANNEL") {
 };
 const REPOSITORY: &str = match option_env!("PASEO_UPDATE_REPOSITORY") {
     Some(repository) => repository,
-    None => "emotionbug/paseo",
+    None => "emotionbug/Passession",
 };
 /// Release-feed runtime identity: manifests are `<runtime>-<channel>-<platform>-<arch>.json`
 /// with a matching `runtime` field. The default keeps the existing native feed so

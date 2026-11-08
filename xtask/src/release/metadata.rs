@@ -291,7 +291,7 @@ fn fit(text: &str, budget: usize) -> String {
     )
 }
 fn fdroid_text(body: &str) -> String {
-    const FOOTER: &str = "Full notes: https://github.com/emotionbug/paseo/releases";
+    const FOOTER: &str = "Full notes: https://github.com/emotionbug/Passession/releases";
     let budget = 500 - FOOTER.chars().count() - 3;
     let mut notes = Vec::new();
     let mut sections: Vec<(String, Vec<String>)> = Vec::new();
@@ -498,7 +498,7 @@ mod tests {
         ));
         assert!(text.starts_with("Important\nReinstall manually."));
         assert!(text.chars().count() <= 500);
-        assert!(text.ends_with("Full notes: https://github.com/emotionbug/paseo/releases\n"));
+        assert!(text.ends_with("Full notes: https://github.com/emotionbug/Passession/releases\n"));
         assert!(!text.contains("Fixes"));
     }
     #[test]

@@ -6,7 +6,7 @@ nav: 更新
 
 # 更新 {#updates}
 
-当前检出版本为 **0.13.1**。请使用[本仓库的发布页面](https://github.com/emotionbug/paseo/releases)及其记录的源代码修订确认产物身份。上游下载、旧 npm CLI 包、应用商店条目和容器 `latest` 标签不能证明此分支的发布身份。
+当前检出版本为 **0.13.1**。请使用[本仓库的发布页面](https://github.com/emotionbug/Passession/releases)及其记录的源代码修订确认产物身份。上游下载、旧 npm CLI 包、应用商店条目和容器 `latest` 标签不能证明此分支的发布身份。
 
 ## 原生构建身份 {#native-build-identity}
 

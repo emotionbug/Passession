@@ -14,7 +14,7 @@ permissions:
 env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
   PASEO_NATIVE_RELEASE: "1"
-  PASEO_UPDATE_REPOSITORY: emotionbug/paseo
+  PASEO_UPDATE_REPOSITORY: emotionbug/Passession
   PASEO_BUILD_SOURCE_SHA: ${{ github.sha }}
   SOURCE_SHA: ${{ github.sha }}
 
