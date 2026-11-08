@@ -33,10 +33,12 @@ runs:
         name="zig-$target-$ZIG_VERSION"
         archive="$RUNNER_TEMP/$name.$ext"
         curl -fsSL --retry 3 -o "$archive" "https://ziglang.org/download/$ZIG_VERSION/$name.$ext"
+        # Hash stdin: with a backslash path (Windows RUNNER_TEMP) sha256sum escapes the
+        # file name and prefixes the digest line with '\'.
         if command -v sha256sum >/dev/null; then
-          actual=$(sha256sum "$archive" | cut -d' ' -f1)
+          actual=$(sha256sum < "$archive" | cut -d' ' -f1)
         else
-          actual=$(shasum -a 256 "$archive" | cut -d' ' -f1)
+          actual=$(shasum -a 256 < "$archive" | cut -d' ' -f1)
         fi
         if [[ "$actual" != "$sha256" ]]; then
           echo "Zig archive SHA-256 mismatch: expected $sha256, got $actual" >&2
