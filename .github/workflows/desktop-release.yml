@@ -268,26 +268,33 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      # ubuntu-24.04 ships Android platform android-37.0 (compileSdk 37.0) and
-      # platform-tools; download the pinned NDK only when the image lacks it.
-      - name: Check preinstalled Android SDK packages
-        id: android-sdk
+      # ubuntu-24.04 ships Android platform android-37.0 (compileSdk 37.0) but not NDK
+      # 28.2.13676358 (r28c). Install it from Google's archive, pinned by SHA-256 (the
+      # SHA-1 Google publishes is a7b54a5d…), instead of through sdkmanager, which the
+      # image's cmdline-tools 22 report as deprecated on every call.
+      - name: Install the pinned Android NDK
         if: matrix.platform == 'android'
         shell: bash
         run: |
-          ndk="$ANDROID_HOME/ndk/28.2.13676358/source.properties"
-          if [[ -f "$ndk" ]] && tr -d ' ' < "$ndk" | grep -qx 'Pkg.Revision=28.2.13676358' &&
-            [[ -x "$ANDROID_HOME/platform-tools/adb" ]]; then
-            echo "installed=true" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          ndk="$ANDROID_HOME/ndk/28.2.13676358"
+          pinned() { [[ -f "$ndk/source.properties" ]] && tr -d ' ' < "$ndk/source.properties" | grep -qx 'Pkg.Revision=28.2.13676358'; }
+          if ! pinned; then
+            archive="$RUNNER_TEMP/android-ndk-r28c-linux.zip"
+            curl -fsSL --retry 3 -o "$archive" https://dl.google.com/android/repository/android-ndk-r28c-linux.zip
+            actual=$(sha256sum < "$archive" | cut -d' ' -f1)
+            if [[ "$actual" != dfb20d396df28ca02a8c708314b814a4d961dc9074f9a161932746f815aa552f ]]; then
+              echo "Android NDK archive SHA-256 mismatch: got $actual" >&2
+              exit 1
+            fi
+            mkdir -p "$ANDROID_HOME/ndk"
+            rm -rf "$ndk" "$ANDROID_HOME/ndk/android-ndk-r28c"
+            unzip -q "$archive" -d "$ANDROID_HOME/ndk"
+            mv "$ANDROID_HOME/ndk/android-ndk-r28c" "$ndk"
+            rm "$archive"
+            pinned
           fi
-      - uses: android-actions/setup-android@v4
-        if: matrix.platform == 'android' && steps.android-sdk.outputs.installed != 'true'
-        with:
-          packages: platform-tools ndk;28.2.13676358
-      - name: Select the pinned Android NDK
-        if: matrix.platform == 'android'
-        shell: bash
-        run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
       - name: Stage optional Android release signing key
         if: matrix.platform == 'android'
         shell: bash

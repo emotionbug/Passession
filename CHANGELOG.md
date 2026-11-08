@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Native Release installs the pinned Android NDK r28c from Google's archive (SHA-256 checked) when the runner lacks it, instead of through `sdkmanager`, whose deprecation warning appeared on every Android release build.
+
+### Fixed
+
+- Native Release checks the Zig archive digest on Windows runners again: Git Bash's `sha256sum` prefixed the digest with `\` for the backslash `RUNNER_TEMP` path, failing the Windows build before it started.
+
 ## 0.13.13 - 2026-11-09
 
 ### Changed
