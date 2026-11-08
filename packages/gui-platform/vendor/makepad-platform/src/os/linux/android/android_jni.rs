@@ -560,7 +560,7 @@ unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTextAction(
 }
 
 pub unsafe fn to_java_text_input(session: u64, revision: u64, text: Option<&str>,
-    start: usize, end: usize, password: bool, numeric: bool, restart: bool) {
+    start: usize, end: usize, password: bool, numeric: bool, terminal: bool, restart: bool) {
     let env = attach_jni_env();
     let string = if let Some(text) = text {
         let utf16: Vec<u16> = text.encode_utf16().collect();
@@ -569,8 +569,9 @@ pub unsafe fn to_java_text_input(session: u64, revision: u64, text: Option<&str>
         std::ptr::null_mut()
     };
     ndk_utils::call_void_method!(env, get_activity(), "updateTextInput",
-        "(JJLjava/lang/String;IIZZZ)V", session as i64, revision as i64,
-        string, start as i32, end as i32, password as i32, numeric as i32, restart as i32);
+        "(JJLjava/lang/String;IIZZZZ)V", session as i64, revision as i64,
+        string, start as i32, end as i32, password as i32, numeric as i32, terminal as i32,
+        restart as i32);
     if !string.is_null() { (**env).DeleteLocalRef.unwrap()(env, string); }
 }
 

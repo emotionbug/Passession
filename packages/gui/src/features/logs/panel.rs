@@ -6,7 +6,7 @@
 use makepad_widgets::*;
 
 use super::find;
-use super::session::{display_title, scrollback_preference, LogSession};
+use super::session::{self, display_title, scrollback_preference, LogSession};
 use super::view::{WaLogView, WaLogViewWidgetExt};
 use crate::common::{Route, UiContext, UiEffect};
 use crate::features::workspace::host;
@@ -176,7 +176,13 @@ impl ExecutionLogPanel {
             return;
         }
         let scrollback = scrollback_preference(host::preferences(&ctx.state));
-        let mut session = LogSession::new(&target.host_id, &target.terminal_id, scrollback);
+        let mut session = match session::open(&target.host_id, &target.terminal_id, scrollback) {
+            Ok(session) => session,
+            Err(error) => {
+                self.init_error = Some(error);
+                return;
+            }
+        };
         self.connected = host::host(&ctx.state, &target.host_id).is_some_and(|h| h.connected());
         session.set_visible(&ctx.core, !self.hidden, self.connected);
         view.session = Some(session);
@@ -191,8 +197,8 @@ impl ExecutionLogPanel {
             if query.is_empty() {
                 view.matches.clear();
                 view.active_match = None;
-                view.matches_revision = session.revision;
-                return (session.revision, None);
+                view.matches_revision = session.revision();
+                return (session.revision(), None);
             }
             let matches = find::find_matches(session, &query);
             let active = if reset {
@@ -202,12 +208,12 @@ impl ExecutionLogPanel {
             };
             view.matches = matches;
             view.active_match = active;
-            view.matches_revision = session.revision;
+            view.matches_revision = session.revision();
             let target = active.map(|index| view.matches[index]);
             if target.is_some() {
                 view.follow = false;
             }
-            (session.revision, target)
+            (session.revision(), target)
         });
         if let Some((revision, target)) = outcome {
             self.searched_revision = Some(revision);
@@ -428,7 +434,7 @@ impl Widget for ExecutionLogPanel {
                 attaching: session.is_some_and(|s| s.attaching),
                 error: self.init_error.clone().or_else(|| session.and_then(|s| s.error.clone())),
                 follow: view.as_ref().is_some_and(|v| v.follow),
-                revision: session.map(|s| s.revision).unwrap_or(0),
+                revision: session.map(|s| s.revision()).unwrap_or(0),
                 total: view.as_ref().map(|v| v.matches.len()).unwrap_or(0),
                 active: view.as_ref().and_then(|v| v.active_match),
             }

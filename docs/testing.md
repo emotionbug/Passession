@@ -28,11 +28,12 @@ Use a disposable `PASEO_HOME`, checkout, endpoint, and model cache where applica
 - Stream provider output, answer permissions, reconnect, restore history, and verify failures remain visible.
 - Render Markdown, edit/read back source, and open a large summary-first diff without eagerly loading every patch.
 - Start/stop workspace setup and service scripts; inspect read-only logs. Verify the backend PTY survives client presentation changes.
+- Open a Terminal session; type, paste, resize, run a full-screen program, reconnect, and close the tab. Verify the size follows the focused client and closing kills the daemon terminal.
 - Exercise schedules, MCP, connected-host forwarding, profiles, and native CLI operations at their real protocol boundaries.
 - Exercise desktop start/idempotence, worker restart, supervisor ownership, owned shutdown, keep-running policy, and preservation of an unowned daemon. A direct Rust unit test is not a client-to-desktop-host IPC test.
 - Exercise native tray/menu behavior on the actual desktop. Compilation alone does not prove it.
 
-The client deliberately excludes interactive terminal UI, embedded browser/automation, web, and executable React UI plugins. Do not keep obsolete Electron/Metro/browser smoke commands as the acceptance path for the native product.
+The client deliberately excludes embedded browser/automation, web, and executable React UI plugins. Do not keep obsolete Electron/Metro/browser/xterm smoke commands as the acceptance path for the native product.
 
 ## Linux desktop lifecycle regression
 

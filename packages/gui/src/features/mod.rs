@@ -7,14 +7,16 @@ pub mod git;
 pub mod logs;
 pub mod schedules;
 pub mod settings;
+pub mod terminal;
 pub mod timeline;
 pub mod workspace;
 
 use makepad_widgets::Cx;
 
 /// Registered before the shell DSL, which references the feature roots. `workspace` comes
-/// before `settings`, `schedules`, `logs` and `command_center`: their DSL imports
+/// before `settings`, `schedules`, `terminal`, `logs` and `command_center`: their DSL imports
 /// `crate::features::workspace::kit::*` and the settings Projects page embeds `WorkspacePanel`.
+/// `terminal` comes before `logs`, whose output view uses the terminal cell grid.
 pub fn live_design(cx: &mut Cx) {
     composer::live_design(cx);
     timeline::live_design(cx);
@@ -26,6 +28,7 @@ pub fn live_design(cx: &mut Cx) {
     settings::live_design(cx);
     schedules::register_modules(cx);
     schedules::live_design(cx);
+    terminal::live_design(cx);
     logs::live_design(cx);
     command_center::register_modules(cx);
     command_center::live_design(cx);

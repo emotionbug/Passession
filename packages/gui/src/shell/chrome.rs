@@ -80,6 +80,7 @@ pub fn title(state: &Value, target: &PanelTarget) -> String {
         "working_diff" | "commit_diff" => "Diff".to_string(),
         "pull_request" => "Pull request".to_string(),
         "execution_log" => "Execution log".to_string(),
+        "terminal" => tr("workspace.tabs.fallback.terminal"),
         "setup" => "Workspace setup".to_string(),
         "project_settings" => "Project settings".to_string(),
         "provider_subagent" => "Subagent".to_string(),
@@ -103,6 +104,7 @@ pub fn kind_label(target: &PanelTarget) -> String {
         "new_tab" => tr("workspace.tabs.actions.newTab"),
         "draft" => tr("workspace.tabs.fallback.newAgent"),
         "setup" => tr("workspace.tabs.fallback.setup"),
+        "terminal" => tr("workspace.tabs.fallback.terminal"),
         "file" => {
             let path = j::text_or(&target.data, "path", target.id.as_deref().unwrap_or(""));
             path.split('/').rfind(|p| !p.is_empty()).unwrap_or(path).to_string()

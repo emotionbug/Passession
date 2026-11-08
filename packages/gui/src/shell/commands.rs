@@ -74,6 +74,8 @@ pub enum ShellOverlay {
     HostPicker,
     DisplayMenu,
     Guard { key: String, file: bool },
+    /// `handleCloseTerminalTab`: closing a live terminal tab kills its daemon terminal.
+    CloseTerminal { key: String, host_id: String, terminal_id: String },
     BulkClose { keys: Vec<String>, after: AfterClose },
     RemoveHost { host_id: String },
     RemoveProject { host_id: String, project: Value },
@@ -559,6 +561,8 @@ fn advance_closing(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
         let Some(closing) = shell.data.closing.as_mut() else { return };
         let Some(key) = closing.queue.pop_front() else { break };
         let remove = closing.remove;
+        // Removing a saved host only forgets its tabs; the daemon keeps its terminals.
+        let kills_terminals = remove && !matches!(closing.after, AfterClose::RemoveHost(_));
         let Some(target) = shell.data.layout.target(&key).cloned() else { continue };
         if shell.data.dirty.contains(&key) {
             if target.kind == "file" {
@@ -592,6 +596,13 @@ fn advance_closing(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
                 return;
             }
         }
+        if kills_terminals
+            && target.kind == "terminal"
+            && let Some(terminal_id) = target.id.clone().filter(|id| !id.is_empty())
+        {
+            check_terminal_close(shell, cx, ui, key, &target, terminal_id);
+            return;
+        }
         if remove {
             remove_tab(shell, cx, ui, &key);
         }
@@ -606,6 +617,45 @@ fn abort_closing(shell: &mut PaseoShell) {
     {
         vote_quit(token, false);
     }
+}
+
+/// A live terminal asks `closeTerminalTitle` first; one that already exited (gone from the
+/// daemon's live list) closes directly. A host without a connection cannot answer, so the
+/// terminal counts as live.
+fn check_terminal_close(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, key: String, target: &PanelTarget, terminal_id: String) {
+    let host_id = target.server_id.clone();
+    if !hosts::host(&ui.state, &host_id).is_some_and(|h| h.connected()) {
+        confirm_terminal_close(shell, cx, key, host_id, terminal_id);
+        return;
+    }
+    let mut message = json!({ "type": "list_terminals_request" });
+    if target.workspace_id.is_empty() {
+        message["cwd"] = json!(target.cwd);
+    } else {
+        message["workspaceId"] = json!(target.workspace_id);
+    }
+    let pending = Pending::TerminalCloseCheck { key, host_id: host_id.clone(), terminal_id };
+    request(shell, ui, &host_id, message, "list_terminals_response", pending);
+}
+
+fn confirm_terminal_close(shell: &mut PaseoShell, cx: &mut Cx, key: String, host_id: String, terminal_id: String) {
+    confirm(
+        shell,
+        cx,
+        &tr("workspace.tabs.confirmations.closeTerminalTitle"),
+        &tr("workspace.tabs.confirmations.closeTerminalMessage"),
+        &tr("workspace.tabs.confirmations.close"),
+        true,
+        ShellOverlay::CloseTerminal { key, host_id, terminal_id },
+    );
+}
+
+/// The confirmed terminal tab leaves the layout, then its daemon terminal is killed; a failed
+/// kill stays silent like the original's `killTerminal(..).catch(invalidate)`.
+fn close_terminal_confirmed(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, key: &str, host_id: &str, terminal_id: &str) {
+    remove_tab(shell, cx, ui, key);
+    request(shell, ui, host_id, json!({ "type": "kill_terminal_request", "terminalId": terminal_id }), "kill_terminal_response", Pending::Silent);
+    advance_closing(shell, cx, ui);
 }
 
 /// `_removeTab` plus the shell's release work and the child-tab label (`_closeWorkspaceTab`).
@@ -896,6 +946,7 @@ pub fn execute(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, action: 
         "agent.new" | "workspace.project.pick" | "workspace.new" => new_session(shell, cx, ui, true, false),
         "worktree.new" => new_session(shell, cx, ui, true, true),
         "workspace.tab.menu.open" | "workspace.tab.target.agent" => new_session(shell, cx, ui, false, false),
+        "workspace.terminal.new" => new_terminal(shell, cx, ui, TabPlacement::Main),
         "workspace.tab.target.changes" => open_workspace_panel(shell, cx, ui, "changes_tree", true),
         "workspace.tab.target.files" => open_workspace_panel(shell, cx, ui, "files", true),
         // Closing a view must not change the session's lifecycle.
@@ -1108,7 +1159,11 @@ pub fn handle_shortcut(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, 
         request_new_window();
         return true;
     }
-    let scope = shell.data.focus_scope.name();
+    let focus = shell.data.focus_scope.name();
+    // A focused terminal tab owns the keyboard unless a field claimed another scope: its shell
+    // keys (Ctrl+W, Ctrl+L, Ctrl+K, ...) must not become app shortcuts (`terminal: false`).
+    let terminal = focus == "workspace" && shell.data.page.is_none() && chrome::focused_target(shell).is_some_and(|t| t.kind == "terminal");
+    let scope = if terminal { "terminal" } else { focus };
     let command_center = shell.data.command_center_open;
     match shell.data.router.handle_key(cx, key, scope, command_center) {
         None => false,
@@ -1294,11 +1349,21 @@ fn navigate(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, route: Rout
             // An unknown workspace refreshes its host instead of opening.
             open_execution_log(shell, cx, ui, &host_id, &workspace_id, &terminal_id, None);
         }
+        Route::Terminal { host_id, workspace_id, terminal_id } => {
+            let cwd = cwd_of(&host_id, &workspace_id);
+            open_tab(shell, cx, ui, PanelTarget::new("terminal", &host_id, &workspace_id, &cwd).with_id(terminal_id), TabPlacement::Main);
+        }
     }
 }
 
-/// `openExecutionLog`: the workspace must be known (refresh when it is not yet).
+/// `openExecutionLog`: the workspace must be known (refresh when it is not yet). A terminal
+/// already open as an interactive tab (attention notifications) is shown there instead.
 fn open_execution_log(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_id: &str, workspace_id: &str, terminal_id: &str, title: Option<String>) -> bool {
+    let open = shell.data.layout.tabs.iter().find(|t| t.kind == "terminal" && t.server_id == host_id && t.id.as_deref() == Some(terminal_id)).cloned();
+    if let Some(target) = open {
+        open_tab(shell, cx, ui, target, TabPlacement::Main);
+        return true;
+    }
     let Some(workspace) = workspace_value(&ui.state, host_id, workspace_id) else {
         ui.core.refresh_host(host_id);
         return false;
@@ -1374,6 +1439,31 @@ pub fn on_response(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, _req
             }
         }
         Pending::Silent => {}
+        Pending::TerminalCloseCheck { key, host_id, terminal_id } => {
+            let live = match result {
+                Ok(payload) => j::array(payload, "terminals").iter().any(|t| j::text(t, "id") == terminal_id),
+                Err(_) => true,
+            };
+            if live {
+                confirm_terminal_close(shell, cx, key, host_id, terminal_id);
+            } else {
+                remove_tab(shell, cx, ui, &key);
+                advance_closing(shell, cx, ui);
+            }
+        }
+        Pending::CreateTerminal { host_id, workspace_id, cwd, placement } => {
+            if let Some(message) = response_message(result) {
+                return toast(shell, cx, message, true);
+            }
+            let terminal = result.as_ref().map(|p| j::object(p, "terminal").clone()).unwrap_or(Value::Null);
+            let terminal_id = j::text(&terminal, "id");
+            if terminal_id.is_empty() {
+                return toast(shell, cx, tr("newWorkspace.errors.createWorktreeFailed"), true);
+            }
+            let target = PanelTarget::new("terminal", &host_id, j::text_or(&terminal, "workspaceId", &workspace_id), j::text_or(&terminal, "cwd", &cwd))
+                .with_id(terminal_id);
+            open_tab(shell, cx, ui, target, placement);
+        }
         Pending::SavePreference { key, previous } => {
             if let Err(error) = result {
                 // The core already holds the failed value in memory: put the previous one back
@@ -1543,6 +1633,13 @@ fn click_prefixed(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, state
     } else if let Some(rest) = id.strip_prefix("session:") {
         if let Some((sid, agent)) = find_session(state, rest) {
             open_navigation_agent(shell, cx, ui, &sid, &agent, None);
+            if shell.data.compact {
+                shell.data.layout.show_sidebar(false);
+            }
+        }
+    } else if let Some(rest) = id.strip_prefix("sideterm:") {
+        if let Some(row) = sidebar::find_terminal(&shell.data.sidebar.terminals, state, rest) {
+            open_tab(shell, cx, ui, row.target(), TabPlacement::Main);
             if shell.data.compact {
                 shell.data.layout.show_sidebar(false);
             }
@@ -1829,7 +1926,7 @@ fn workspace_tab_menu_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiCon
     }
 }
 
-/// Original explorer "+" (`SUPPORTING_LAUNCH_ORDER` minus terminal/browser).
+/// Original explorer "+" (`SUPPORTING_LAUNCH_ORDER` minus browser).
 fn explorer_new_tab(shell: &mut PaseoShell, cx: &mut Cx, anchor: Rect) {
     let (keys, _) = chrome::explorer_keys(shell);
     let kinds: Vec<String> = keys.iter().filter_map(|k| shell.data.layout.target(k)).map(|t| t.kind.clone()).collect();
@@ -1837,6 +1934,7 @@ fn explorer_new_tab(shell: &mut PaseoShell, cx: &mut Cx, anchor: Rect) {
     if !kinds.iter().any(|k| k == "changes_tree") {
         entries.push(item("changes_tree", tr("panels.diff.changesLabel"), crate::common::icons::for_tab_kind("changes_tree")));
     }
+    entries.push(item("terminal", tr("workspace.tabs.fallback.terminal"), crate::common::icons::for_tab_kind("terminal")));
     if !shell.data.compact {
         entries.push(item("working_diff", tr("panels.diff.diffLabel"), crate::common::icons::for_tab_kind("working_diff")));
     }
@@ -1849,6 +1947,10 @@ fn explorer_new_tab(shell: &mut PaseoShell, cx: &mut Cx, anchor: Rect) {
 }
 
 fn explorer_new_tab_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, value: &str) {
+    if value == "terminal" {
+        new_terminal(shell, cx, ui, TabPlacement::Explorer);
+        return;
+    }
     if value != "new_tab" {
         open_workspace_panel(shell, cx, ui, value, true);
         return;
@@ -1860,6 +1962,27 @@ fn explorer_new_tab_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, 
         .with_id(new_id())
         .with_title(tr("sessionNavigation.newSession"));
     open_tab(shell, cx, ui, draft, TabPlacement::Explorer);
+}
+
+/// `workspace.terminal.new` (`createTerminal` of `useWorkspaceTerminals`): a default shell in
+/// the focused workspace, opened as its terminal tab once the daemon created it.
+fn new_terminal(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, placement: TabPlacement) {
+    let Some(target) = selected(shell).filter(|t| !t.workspace_id.is_empty()) else {
+        return toast(shell, cx, "Open a session or workspace first.", true);
+    };
+    let Some(host) = hosts::host(&ui.state, &target.server_id) else { return };
+    if !host.connected() {
+        return toast(shell, cx, tr("workspace.terminal.hostDisconnected"), true);
+    }
+    let cwd = host
+        .workspace(&target.workspace_id)
+        .map(|w| j::text(w, "workspaceDirectory"))
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or(target.cwd.as_str())
+        .to_string();
+    let message = json!({ "type": "create_terminal_request", "cwd": cwd, "workspaceId": target.workspace_id });
+    let pending = Pending::CreateTerminal { host_id: target.server_id.clone(), workspace_id: target.workspace_id.clone(), cwd, placement };
+    request(shell, ui, &target.server_id, message, "create_terminal_response", pending);
 }
 
 /// `WorkspaceHeaderMenu` (copy path/branch, import session, show setup; compact scripts first).
@@ -2515,14 +2638,16 @@ pub fn shell_overlay_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiCont
                 display_result(shell, cx, ui, &value);
             }
         }
-        _ if cancelled => {
-            if let ShellOverlay::Guard { key, file } = &overlay {
+        _ if cancelled => match &overlay {
+            ShellOverlay::Guard { key, file } => {
                 if *file {
                     panels::file_close_cancelled(key);
                 }
                 abort_closing(shell);
             }
-        }
+            ShellOverlay::CloseTerminal { .. } => abort_closing(shell),
+            _ => {}
+        },
         ShellOverlay::TabMenu { target, pane_id, explorer } => tab_menu_result(shell, cx, ui, target, &pane_id, explorer, &value),
         ShellOverlay::WorkspaceTabMenu { tab, workspace } => workspace_tab_menu_result(shell, cx, ui, tab, workspace, &value),
         ShellOverlay::HostMenu { host_id, order } => host_action(shell, cx, ui, &host_id, &value, &order),
@@ -2551,6 +2676,13 @@ pub fn shell_overlay_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiCont
                 if file {
                     panels::file_close_cancelled(&key);
                 }
+                abort_closing(shell);
+            }
+        }
+        ShellOverlay::CloseTerminal { key, host_id, terminal_id } => {
+            if confirmed {
+                close_terminal_confirmed(shell, cx, ui, &key, &host_id, &terminal_id);
+            } else {
                 abort_closing(shell);
             }
         }

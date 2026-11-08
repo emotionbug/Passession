@@ -104,7 +104,7 @@ Agent Provider，包括 Paseo 自带的一等 Provider 和你在 `agents.provide
 
 Rust daemon 提供 API，不提供内置 Web 产品客户端。请使用原生桌面/移动应用或 Rust CLI 连接。移动端只连接远程桌面/服务器 daemon，不在本地运行 daemon。
 
-已移除的 `features.webUi` 和 `daemon.browserTools` 设置会在规范化时丢弃。没有可启用的 Web UI 或内嵌浏览器自动化。daemon 保留脚本/设置任务的 PTY，客户端提供只读日志，而非交互式终端 UI。
+已移除的 `features.webUi` 和 `daemon.browserTools` 设置会在规范化时丢弃。没有可启用的 Web UI 或内嵌浏览器自动化。交互式 **Terminal** 会话和脚本/设置任务的 PTY 都在 daemon 上运行；脚本/设置任务的输出在客户端中以只读日志显示。
 
 ## 日志 {#logging}
 

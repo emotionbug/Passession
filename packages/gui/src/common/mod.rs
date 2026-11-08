@@ -197,6 +197,7 @@ pub enum Route {
     Setup { host_id: String, workspace_id: String },
     ProjectSettings { host_id: String, project_key: String },
     ExecutionLog { host_id: String, workspace_id: String, terminal_id: String },
+    Terminal { host_id: String, workspace_id: String, terminal_id: String },
     Sessions { host_id: Option<String> },
 }
 
@@ -227,6 +228,7 @@ impl Route {
                 Route::Git { host_id, workspace_id }
             }
             "execution_log" => Route::ExecutionLog { host_id, workspace_id, terminal_id: id },
+            "terminal" => Route::Terminal { host_id, workspace_id, terminal_id: id },
             "setup" => Route::Setup { host_id, workspace_id },
             "project_settings" => Route::ProjectSettings {
                 host_id,

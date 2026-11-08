@@ -15,7 +15,6 @@ name = "paseo"
 path = "src/main.rs"
 
 [dependencies]
-alacritty_terminal = { version = "=0.25.0", default-features = false }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws", "multipart"] }
@@ -50,6 +49,7 @@ notify = "8"
 node-semver = "2.2"
 paseo-client = { path = "../client" }
 paseo-protocol = { path = "../protocol" }
+paseo-terminal = { path = "../terminal" }
 percent-encoding = "2"
 portable-pty = "0.9"
 pulldown-cmark = "0.13"
@@ -88,7 +88,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-vt100 = "0.16"
+vte = "0.15"
 walkdir = "2"
 which = "7"
 zeroize = "1"
@@ -101,8 +101,6 @@ jiff = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# alacritty_terminal expects std-owned file descriptors from rustix-openpty.
-rustix = { version = "0.38", default-features = false, features = ["std"] }
 nix = { version = "0.30", features = ["fs", "process", "signal", "term", "user"] }
 
 [target.'cfg(windows)'.dependencies]

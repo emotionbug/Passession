@@ -2,7 +2,7 @@
 
 [English](workspaces.md) · [环境配置](quickstart.zh-CN.md)
 
-工作区为 Agent、脚本/初始化 PTY 和文件提供持久归属。SDK 可以控制 daemon 保留的终端；原生应用显示只读任务日志，不包含交互式终端。以下路径均属于 daemon 主机。
+工作区为 Agent、脚本/初始化 PTY 和文件提供持久归属。SDK 可以控制 daemon 保留的终端；原生应用以 **Terminal** 标签页打开交互式 shell，并以只读任务日志显示脚本/初始化输出。以下路径均属于 daemon 主机。
 
 ## 打开目录
 

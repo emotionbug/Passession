@@ -217,7 +217,7 @@ Add `--forge <name>` to PR checkout when Paseo cannot infer the forge from the s
 
 ## Terminals
 
-These commands control retained daemon-side PTYs for scripts and setup automation. They do not open an interactive terminal UI in the app; the native client presents read-only logs.
+These commands control daemon-side PTYs on the host. The app opens interactive shells as **Terminal** tabs and shows script/setup output as read-only logs.
 
 Use the workspace ID when multiple workspaces share a directory:
 

@@ -604,7 +604,9 @@ pub fn todo_activities(item: &Value, previous: Option<&Value>) -> Vec<(&'static 
     out
 }
 
-/// components/task-list-row.tsx rows (16px glyph, 8px from base text).
+/// components/task-list-row.tsx rows (16px glyph, 8px from base text). Text
+/// wraps instead of the original's one-line truncation so the whole task stays
+/// readable on narrow sheets; the glyph stays on the first line.
 pub fn task_rows(cx: &mut Cx2d, d: &mut Draw, tasks: &[Value], x: f64, y: f64, w: f64) -> f64 {
     let p = d.look.palette;
     let base = d.look.ui(14.0);
@@ -618,18 +620,23 @@ pub fn task_rows(cx: &mut Cx2d, d: &mut Draw, tasks: &[Value], x: f64, y: f64, w
         let completed = status == "completed";
         let text = if running && !str_of(get(task, "activeForm")).is_empty() { str_of(get(task, "activeForm")) } else { str_of(get(task, "text")) };
         let color = if completed { p.extra_muted } else if running { p.foreground } else { p.muted };
-        let laid = d.kit.layout(cx, Font::Regular, base, 1.4, text, None, 0.0);
-        let size = laidout_size(&laid);
-        let row_h = size.y.max(16.0);
-        let icon = if completed { "circle-check" } else if running { "circle-dot" } else { "circle" };
-        d.kit.icon(cx, icon, rect_xywh(x, cy, 16.0, row_h), 16.0, if running { p.running } else { p.extra_muted });
         let tx = x + 24.0;
         let avail = (w - 24.0).max(1.0);
+        let laid = d.kit.layout(cx, Font::Regular, base, 1.4, text, Some(avail), 0.0);
+        let size = laidout_size(&laid);
+        let row_h = size.y.max(16.0);
+        let first_line = (base * 1.4).clamp(16.0, row_h);
+        let icon = if completed { "circle-check" } else if running { "circle-dot" } else { "circle" };
+        d.kit.icon(cx, icon, rect_xywh(x, cy, 16.0, first_line), 16.0, if running { p.running } else { p.extra_muted });
+        let ty = cy + (row_h - size.y) * 0.5;
         cx.begin_turtle(Walk { abs_pos: Some(dvec2(tx, cy)), margin: Margin::default(), width: Size::Fixed(avail), height: Size::Fixed(row_h) }, Layout::default());
-        d.kit.draw_laidout(cx, Font::Regular, color, dvec2(tx, cy + (row_h - size.y) * 0.5), &laid);
+        d.kit.draw_laidout(cx, Font::Regular, color, dvec2(tx, ty), &laid);
         cx.end_turtle();
         if completed {
-            d.kit.rect(cx, rect_xywh(tx, cy + row_h * 0.5, size.x.min(avail), 1.0), p.extra_muted, 0.0);
+            for line in &laid.rows {
+                let mid = (line.origin_in_lpxs.y - (line.ascender_in_lpxs + line.descender_in_lpxs) * 0.5) as f64;
+                d.kit.rect(cx, rect_xywh(tx, ty + mid, (line.width_in_lpxs as f64).min(avail), 1.0), p.extra_muted, 0.0);
+            }
         }
         cy += row_h;
     }

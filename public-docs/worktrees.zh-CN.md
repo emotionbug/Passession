@@ -216,7 +216,7 @@ PASEO_SERVICE_WEB_URL=http://web--my-app.localhost:6767
 
 ## 设置 PTY 输出 {#terminals}
 
-现有 `worktree.terminals` 配置在创建 worktree 时启动 daemon 管理的 PTY 命令。原生客户端只显示只读输出，不提供交互式 shell 或 REPL。例如持续查看日志：
+现有 `worktree.terminals` 配置在创建 worktree 时启动 daemon 管理的 PTY 命令。原生客户端只显示只读输出；如需交互式 shell 或 REPL，请改为打开 **Terminal** 会话。例如持续查看日志：
 
 ```json
 {

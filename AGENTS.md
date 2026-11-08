@@ -65,8 +65,8 @@ At the start of non-trivial work, list `docs/` and skim anything relevant to the
 | [docs/protocol-validation.md](docs/protocol-validation.md)           | Rust wire validation, forward-compatible decoding and native validation boundaries                              |
 | [docs/connected-hosts.md](docs/connected-hosts.md)                   | Daemon-owned host registrations, routed SDK scopes, identity and authority boundaries                             |
 | [docs/permissions.md](docs/permissions.md)                           | Semantic daemon permissions, principals, credentials, pairing invitations, and Hub authority                      |
-| [docs/terminal-activity.md](docs/terminal-activity.md)               | Workspace setup and service scripts as daemon-owned PTYs with read-only client logs                               |
-| [docs/terminal-performance.md](docs/terminal-performance.md)         | Read-only execution logs — daemon PTYs, ANSI replay, observation slots and visible-row rendering                    |
+| [docs/terminal-activity.md](docs/terminal-activity.md)               | Interactive terminals and setup/service scripts as daemon-owned PTYs; terminal tabs and read-only logs            |
+| [docs/terminal-performance.md](docs/terminal-performance.md)         | Ghostty emulation via `paseo-terminal`, daemon screen threads, observation slots and visible-row rendering         |
 | [docs/agent-stream-performance.md](docs/agent-stream-performance.md) | Assistant text pipeline from the daemon through the Rust core to the virtualized Makepad timeline                 |
 | [docs/file-observation.md](docs/file-observation.md)                 | Daemon file and checkout observation, Linux constraints, teardown invariants                                      |
 | [docs/testing.md](docs/testing.md)                                   | Rust, GUI and SDK checks, required native smoke boundaries, Linux desktop regression                              |
@@ -163,7 +163,7 @@ The native client targets Linux, macOS and Windows desktops and Android and iOS.
 
 - **Keep the original's platform branches.** The original app's native (iOS/Android) behavior maps to Android and iOS; its web and Electron behavior maps to the desktop targets. A branch that differs from the original is a bug, not a simplification.
 - **Don't use the platform as a proxy for layout.** A narrow desktop window is compact; use `is_compact_layout`, not `target_os`.
-- **The native product excludes** the interactive terminal UI (daemon PTYs and read-only script/setup logs stay), the web client, embedded browser and Electron, executable React UI plugins, speech recognition, voice conversation and TTS. Generic effect-sound playback stays. Don't reintroduce the excluded features.
+- **The native product excludes** the web client, embedded browser and Electron, executable React UI plugins, speech recognition, voice conversation and TTS. Generic effect-sound playback stays. Don't reintroduce the excluded features.
 
 ## Debugging
 

@@ -12,7 +12,7 @@ From the repository root:
 docker build -f docker/base/Dockerfile -t paseo:local .
 ```
 
-The multi-stage build uses Rust and `cargo xtask container-runtime` for the daemon, runtime staging and notices. Neither stage requires Node or npm. Build stages target the final platform so the executable and native libraries agree on architecture. The final image is Debian-based and includes shell, Git, SSH, certificates and process-management utilities.
+The multi-stage build uses Rust and `cargo xtask container-runtime` for the daemon, runtime staging and notices. The build stage also installs the pinned Zig 0.15.2 tarball (SHA-256 checked) for the Ghostty terminal library and needs network access to clone Ghostty and fetch its Zig packages; Zig stays out of the final image. Neither stage requires Node or npm. Build stages target the final platform so the executable and native libraries agree on architecture. The final image is Debian-based and includes shell, Git, SSH, certificates and process-management utilities.
 
 ## Run an isolated instance
 
@@ -37,7 +37,7 @@ Install and authenticate the agent CLIs you need in an explicitly extended image
 
 Backend plugins use native executables and the Rust `paseo-plugin` SDK. Build or acquire plugins for the container's target architecture and install them explicitly. JavaScript/TypeScript plugins require porting; the base image has no Node worker or compiler.
 
-The daemon retains workspace setup/service PTYs. Native clients show their read-only logs; there is no interactive terminal emulator or embedded browser in the app.
+The daemon owns every PTY: interactive terminals clients open in the container's workspace, and workspace setup/service scripts, whose output clients show as read-only logs. There is no embedded browser in the app.
 
 ## Diagnostics
 

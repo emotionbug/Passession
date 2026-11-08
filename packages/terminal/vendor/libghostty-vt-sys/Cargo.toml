@@ -1,0 +1,29 @@
+# Vendored libghostty-vt-sys 0.2.2 (libghostty-rs c9876b2902d5bb3e1f3d61b6395059f1e5e7b721).
+# See ../VENDORED.md for the build-script changes; bindings are unmodified.
+[package]
+edition = "2024"
+rust-version = "1.90"
+name = "libghostty-vt-sys"
+version = "0.2.2"
+build = "build.rs"
+links = "ghostty-vt"
+description = "Raw FFI bindings for libghostty-vt, the Ghostty terminal emulation library"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/uzaaft/libghostty-rs"
+
+[features]
+default = ["vendored"]
+kitty-graphics = []
+link-dynamic = []
+pkg-config = ["dep:pkg-config"]
+vendored = []
+
+[lib]
+name = "libghostty_vt_sys"
+path = "src/lib.rs"
+doctest = false
+
+[build-dependencies.pkg-config]
+version = "0.3"
+optional = true

@@ -3,6 +3,7 @@
 //! collapse state, row actions and the footer buttons.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike, Local, Utc};
 use makepad_widgets::*;
@@ -10,7 +11,8 @@ use serde_json::{Value, json};
 
 use crate::common::paint::{Font, rect};
 use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics};
-use crate::common::{UiContext, UiEffect, json as j, tr, tr_args};
+use crate::common::{PanelTarget, UiContext, UiEffect, json as j, tr, tr_args};
+use crate::features::workspace::observe::{ObsEvent, Observation};
 use crate::shell::chrome::make_ui;
 use crate::shell::hosts::{self, Host, Status, parent_agent_id};
 use crate::shell::ui::{Ui, Variant};
@@ -25,6 +27,8 @@ pub struct SidebarState {
     pub viewport: Rect,
     /// Sidebar requests in flight (`_busy` progress bar).
     pub busy: usize,
+    /// Live terminal streams of the workspaces the sidebar shows.
+    pub terminals: TerminalDirectories,
     motion: makepad_widgets::scroll_bars::TouchScroll,
 }
 
@@ -240,6 +244,184 @@ pub fn sessions<'a>(host: &Host<'a>, project: &Value, prefs: &Value) -> Vec<&'a 
     out
 }
 
+/// One shown workspace's `subscribe_terminals_request {cwd, workspaceId}` stream. Dropping it
+/// releases the observation.
+pub struct TerminalDirectory {
+    observation: Observation,
+    cwd: String,
+    /// Live terminals in first-seen order: the daemon lists them in no stable order.
+    terminals: Vec<Value>,
+}
+
+/// Terminal streams by (host, workspace).
+pub type TerminalDirectories = HashMap<(String, String), TerminalDirectory>;
+
+impl TerminalDirectory {
+    /// Applies a `terminals_changed` list; true when the rows changed.
+    fn apply(&mut self, listed: &[Value]) -> bool {
+        let next = merge_terminals(&self.terminals, listed);
+        if next == self.terminals {
+            return false;
+        }
+        self.terminals = next;
+        true
+    }
+}
+
+/// The listed terminals in first-seen order: known ones keep their place (with fresh fields),
+/// new ones follow in list order, gone ones drop.
+fn merge_terminals(previous: &[Value], listed: &[Value]) -> Vec<Value> {
+    let same = |a: &Value, b: &Value| j::text(a, "id") == j::text(b, "id");
+    let mut next: Vec<Value> = previous.iter().filter_map(|old| listed.iter().find(|t| same(t, old)).cloned()).collect();
+    for terminal in listed {
+        if !j::text(terminal, "id").is_empty() && !next.iter().any(|t| same(t, terminal)) {
+            next.push(terminal.clone());
+        }
+    }
+    next
+}
+
+/// Workspaces whose terminals the sidebar lists, as (host, workspace, directory): every
+/// non-archived workspace of a project the host/project/label/background filters keep, on a
+/// connected host. Collapse and search only hide rows; their streams stay.
+fn terminal_directories(state: &Value) -> Vec<(String, String, String)> {
+    let prefs = nav_prefs(state);
+    let hf = host_filters(state, &prefs);
+    let pf = project_filters(state, &prefs);
+    let labels = label_filters(&prefs);
+    let show_background = j::boolean(&prefs, "showBackground", false);
+    let mut out = Vec::new();
+    for host in hosts::hosts(state) {
+        let sid = host.server_id();
+        if !host.connected() || (!hf.is_empty() && !hf.iter().any(|h| h == sid)) {
+            continue;
+        }
+        let kept: Vec<String> = projects(&host)
+            .iter()
+            .filter(|p| pf.is_empty() || pf.contains(&project_key(&host, p)))
+            .map(|p| j::text(p, "projectId").to_string())
+            .collect();
+        for workspace in host.workspaces() {
+            let id = j::text(workspace, "id");
+            let directory = j::text(workspace, "workspaceDirectory");
+            if id.is_empty()
+                || directory.is_empty()
+                || !j::is_null_or_missing(workspace, "archivedAt")
+                || !kept.iter().any(|p| p == j::text(workspace, "projectId"))
+                || (!show_background && j::boolean(workspace, "background", false))
+                || !workspace_matches_labels(workspace, &labels)
+            {
+                continue;
+            }
+            out.push((sid.to_string(), id.to_string(), directory.to_string()));
+        }
+    }
+    out
+}
+
+/// Keeps one terminal stream per [`terminal_directories`] entry, applies the batch's
+/// `terminals_changed` snapshots and releases streams of workspaces no longer shown. True when
+/// the sidebar must redraw.
+pub fn sync_terminals(sidebar: &mut SidebarState, ui: &UiContext) -> bool {
+    let wanted = terminal_directories(&ui.state);
+    let before = sidebar.terminals.len();
+    sidebar.terminals.retain(|(host, workspace), dir| wanted.iter().any(|(h, w, cwd)| h == host && w == workspace && *cwd == dir.cwd));
+    let mut changed = sidebar.terminals.len() != before;
+    for (host_id, workspace_id, cwd) in wanted {
+        sidebar.terminals.entry((host_id.clone(), workspace_id.clone())).or_insert_with(|| {
+            let fields = json!({ "cwd": cwd, "workspaceId": workspace_id });
+            let observation = Observation::start(&ui.core, &host_id, "subscribe_terminals_request", "terminals_changed", fields);
+            TerminalDirectory { observation, cwd, terminals: Vec::new() }
+        });
+    }
+    for dir in sidebar.terminals.values_mut() {
+        for item in dir.observation.take(&ui.events) {
+            changed |= match item {
+                ObsEvent::Snapshot { payload, .. } => dir.apply(j::array(&payload, "terminals")),
+                ObsEvent::Event(message) if j::text(&message, "type") == "terminals_changed" => dir.apply(j::array(j::object(&message, "payload"), "terminals")),
+                ObsEvent::Failed(_) | ObsEvent::RestoreFailed(_) => dir.apply(&[]),
+                ObsEvent::Event(_) => false,
+            };
+        }
+    }
+    changed
+}
+
+/// A live interactive terminal row of the sidebar.
+#[derive(Clone, Debug)]
+pub struct TerminalRow {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub cwd: String,
+    pub id: String,
+    pub label: String,
+    pub activity: Value,
+}
+
+impl TerminalRow {
+    /// The terminal tab this row opens (`PanelTarget` kind `terminal`).
+    pub fn target(&self) -> PanelTarget {
+        PanelTarget::new("terminal", &self.host_id, &self.workspace_id, &self.cwd).with_id(&self.id).with_title(&self.label)
+    }
+}
+
+/// Terminal row label: its title, else a given name; the daemon's default name "Terminal" and
+/// an empty one read as the localized fallback.
+pub fn terminal_label(terminal: &Value) -> String {
+    let title = j::text(terminal, "title").trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    let name = j::text(terminal, "name").trim();
+    if name.is_empty() || name == "Terminal" { tr("workspace.tabs.fallback.terminal") } else { name.to_string() }
+}
+
+/// Live terminals of a project's shown workspaces in workspace order. Configured script and
+/// service terminals (the workspace's `scripts[].terminalId`) stay in their log surfaces.
+pub fn terminal_rows(terminals: &TerminalDirectories, host: &Host<'_>, project_id: &str) -> Vec<TerminalRow> {
+    let sid = host.server_id();
+    let mut out = Vec::new();
+    for workspace in host.workspaces().iter().filter(|w| j::text(w, "projectId") == project_id) {
+        let workspace_id = j::text(workspace, "id");
+        let Some(dir) = terminals.get(&(sid.to_string(), workspace_id.to_string())) else { continue };
+        let scripts: Vec<&str> = j::array(workspace, "scripts").iter().map(|s| j::text(s, "terminalId")).filter(|id| !id.is_empty()).collect();
+        for terminal in &dir.terminals {
+            let id = j::text(terminal, "id");
+            if scripts.contains(&id) {
+                continue;
+            }
+            out.push(TerminalRow {
+                host_id: sid.to_string(),
+                workspace_id: workspace_id.to_string(),
+                cwd: dir.cwd.clone(),
+                id: id.to_string(),
+                label: terminal_label(terminal),
+                activity: j::object(terminal, "activity").clone(),
+            });
+        }
+    }
+    out
+}
+
+/// The row behind a `sideterm:<host>:<terminal>` hit.
+pub fn find_terminal(terminals: &TerminalDirectories, state: &Value, rest: &str) -> Option<TerminalRow> {
+    let (sid, terminal_id) = rest.rsplit_once(':')?;
+    let host = hosts::host(state, sid)?;
+    let (_, workspace_id) = terminals.iter().find(|((h, _), dir)| h == sid && dir.terminals.iter().any(|t| j::text(t, "id") == terminal_id))?.0;
+    let project_id = j::text(host.workspace(workspace_id)?, "projectId");
+    terminal_rows(terminals, &host, project_id).into_iter().find(|row| row.id == terminal_id)
+}
+
+/// `deriveTerminalActivityStatusBucket` as the row subtitle's status.
+fn terminal_status(activity: &Value) -> String {
+    match (j::text(activity, "attentionReason"), j::text(activity, "state")) {
+        ("needs_input", _) => tr("sidebar.statusBucket.needsInput"),
+        ("finished", _) => tr("sidebar.statusBucket.readyToReview"),
+        (_, "working") => tr("sidebar.statusBucket.working"),
+        _ => tr("agentList.status.idle"),
+    }
+}
+
 /// `formatCompactTimeAgo`.
 pub fn compact_time_ago(iso: &str) -> String {
     let Ok(date) = DateTime::parse_from_rfc3339(iso) else { return String::new() };
@@ -417,6 +599,8 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
     let selected = shell.data.layout.selected().cloned();
     let scroll = shell.data.sidebar.scroll;
     let compact = shell.data.compact;
+    // The rows read the streams while `ui` borrows the shell; they go back after drawing.
+    let terminals = std::mem::take(&mut shell.data.sidebar.terminals);
 
     cx.begin_turtle(Walk::abs_rect(list), Layout { clip_x: true, clip_y: true, ..Layout::default() });
     let mut ui = make_ui(shell);
@@ -447,7 +631,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
         let host_collapsed = query.is_empty() && collapsed.iter().any(|c| *c == format!("host:{sid}"));
         let projects = ordered_projects(host, &project_order);
         // Build visible project blocks first (search may hide the host).
-        let mut blocks: Vec<(Value, String, bool, Vec<&Value>)> = Vec::new();
+        let mut blocks: Vec<(Value, String, bool, Vec<&Value>, Vec<TerminalRow>)> = Vec::new();
         for project in &projects {
             let key = project_key(host, project);
             if !pf.is_empty() && !pf.contains(&key) {
@@ -460,11 +644,16 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                     query.is_empty() || host_matches || project_matches || format!("{} {}", j::text(agent, "title"), j::text(agent, "provider")).to_lowercase().contains(&query)
                 })
                 .collect();
-            if !query.is_empty() && !host_matches && !project_matches && rows.is_empty() {
+            // Live terminals follow the directory's sessions; search matches their label.
+            let terms: Vec<TerminalRow> = terminal_rows(&terminals, host, j::text(project, "projectId"))
+                .into_iter()
+                .filter(|row| query.is_empty() || host_matches || project_matches || row.label.to_lowercase().contains(&query))
+                .collect();
+            if !query.is_empty() && !host_matches && !project_matches && rows.is_empty() && terms.is_empty() {
                 continue;
             }
             let project_collapsed = query.is_empty() && collapsed.contains(&key);
-            blocks.push((project.clone(), key, project_collapsed, rows));
+            blocks.push((project.clone(), key, project_collapsed, rows, terms));
         }
         if !query.is_empty() && !host_matches && blocks.is_empty() {
             continue;
@@ -524,7 +713,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
             ui.button(cx, rect(x0 + 24.0 + rw + 4.0, y, aw, button_h), &format!("hostauth:{sid}"), auth, None, Variant::Ghost, ControlSize::Sm, true);
             y += button_h + 4.0;
         }
-        for (project, key, project_collapsed, rows) in &blocks {
+        for (project, key, project_collapsed, rows, terms) in &blocks {
             let name = j::text_or(project, "projectDisplayName", j::text(project, "projectRootPath"));
             let name = if name.is_empty() { j::text(project, "projectRootPath") } else { name };
             let row = rect(x0 + 24.0, y, w - 32.0, group_h);
@@ -577,6 +766,25 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                     ui.text_right(cx, slots.trailing, spec, &trailing);
                 }
             }
+            for terminal in terms {
+                let row = rect(x0 + 48.0, y, w - 56.0, session_h);
+                y += row.size.y;
+                if row.pos.y + row.size.y <= list.pos.y || row.pos.y >= list.pos.y + list.size.y {
+                    continue;
+                }
+                let is_selected = selected.as_ref().is_some_and(|t| t.kind == "terminal" && t.server_id == sid && t.id.as_deref() == Some(terminal.id.as_str()));
+                if is_selected {
+                    ui.fill(cx, row, p.border, 6.0);
+                }
+                let attention = !j::text(&terminal.activity, "attentionReason").is_empty();
+                let slots = session_metrics.layout(row, 12.0, 14.0, 0.0, 8.0);
+                ui.icon(cx, slots.leading, "square-terminal", 14.0, if attention { p.foreground } else { p.muted });
+                let title_spec = ui.spec(if attention { Font::Medium } else { Font::Regular }, 14.0, p.foreground);
+                ui.text(cx, slots.title, title_spec, &terminal.label);
+                let sub = ui.spec(Font::Regular, 12.0, p.muted);
+                ui.text(cx, slots.subtitle, sub, &format!("{} · {}", tr("workspace.tabs.fallback.terminal"), terminal_status(&terminal.activity)));
+                ui.hit(row, format!("sideterm:{sid}:{}", terminal.id));
+            }
         }
         let project_list_loading = host.loading() || loading.contains(&"project") || errors.iter().any(|(k, _)| *k == "project");
         if projects.is_empty() && !project_list_loading && query.is_empty() {
@@ -608,6 +816,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
     ui.hits.set_clip(None);
     let _ = compact;
     cx.end_turtle();
+    shell.data.sidebar.terminals = terminals;
     shell.data.sidebar.content_height = y + scroll - list.pos.y;
     let max = (shell.data.sidebar.content_height - list.size.y).max(0.0);
     if shell.data.sidebar.scroll > max {
@@ -741,5 +950,42 @@ mod tests {
     fn nav_order_keeps_stored_order_and_appends_missing_defaults() {
         let prefs = json!({"sidebarNavItems": [{"key": "search"}, {"key": "history", "visible": false}]});
         assert_eq!(nav_order(&prefs), vec!["search", "new-workspace", "schedules"]);
+    }
+
+    #[test]
+    fn terminal_merge_keeps_first_seen_order_and_fresh_fields() {
+        let previous = vec![json!({"id": "a", "name": "one"}), json!({"id": "b"})];
+        let listed = vec![json!({"id": "c"}), json!({"id": "a", "name": "renamed"}), json!({"id": ""})];
+        let merged = merge_terminals(&previous, &listed);
+        assert_eq!(merged, vec![json!({"id": "a", "name": "renamed"}), json!({"id": "c"})]);
+    }
+
+    #[test]
+    fn terminal_directories_follow_connection_and_sidebar_filters() {
+        let workspace = |id: &str, project: &str, extra: Value| {
+            let mut w = json!({"id": id, "projectId": project, "workspaceDirectory": format!("/w/{id}")});
+            w.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
+            w
+        };
+        let state = json!({
+            "hosts": [
+                {"serverId": "on", "status": "connected", "workspaces": [
+                    workspace("a", "p", json!({})),
+                    workspace("archived", "p", json!({"archivedAt": "2026-01-01T00:00:00Z"})),
+                    workspace("bg", "p", json!({"background": true})),
+                    workspace("other", "q", json!({})),
+                ]},
+                {"serverId": "off", "status": "disconnected", "workspaces": [workspace("z", "p", json!({}))]},
+            ],
+            "preferences": {"navigation": {"projectFilters": ["project:on:p"]}},
+        });
+        assert_eq!(terminal_directories(&state), vec![("on".to_string(), "a".to_string(), "/w/a".to_string())]);
+    }
+
+    #[test]
+    fn terminal_labels_prefer_title_then_a_given_name() {
+        assert_eq!(terminal_label(&json!({"title": " vim ", "name": "dev"})), "vim");
+        assert_eq!(terminal_label(&json!({"name": "dev"})), "dev");
+        assert_eq!(terminal_label(&json!({"name": "Terminal"})), tr("workspace.tabs.fallback.terminal"));
     }
 }

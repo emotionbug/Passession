@@ -26,15 +26,16 @@ Paseo's runtime, SDKs and build tools require neither Node, Electron, nor Chromi
 | Agents                      | `agent.rs`, `agent/`, `providers/`                                                     | Provider processes, permissions, lifecycle, snapshots, timeline persistence and streaming |
 | Projects and workspaces     | `projects.rs`, `projects/`, `directory_sync/`                                          | Checkout/worktree identity, acquisition, registries, directory reconciliation             |
 | Files and Git               | `files/`, `git/`                                                                       | Remote picker, reads/writes, observation, Git facts and lazy diff bodies                  |
-| Scripts                     | `terminals.rs`, `terminals/`                                                           | PTY lifecycle, setup, service scripts, replayable output                                  |
+| Terminals and scripts       | `terminals.rs`, `terminals/`                                                           | PTY lifecycle, interactive shells, setup, service scripts, screen state, replayable output |
 | Automation and integrations | `automation/`, `mcp/`, `mcp_client/`, `hosts/`, `hub/`                                 | Schedules, MCP client/server, connected-host and Hub behavior                             |
 | Desktop lifecycle           | `desktop_host.rs`, `desktop_host/`, `daemon_control/`                                  | Structured IPC, process identity, ownership, supervisor and worker lifecycle              |
 | Client runtime              | `packages/gui-core/src`                                                                | Host connections, directory synchronization, persisted client state, request/event boundary |
 | Client UI                   | `packages/gui/src` (`shell/`, `common/`, `features/*`)                                 | Makepad shell, navigation, tabs/windows, feature views and controllers                    |
 | Platform integration        | `packages/gui-platform/src`, `packages/gui-platform/{android,ios}`                     | Desktop host, updater, tray, notifications, pickers, audio, mobile bridges                |
+| Terminal emulation          | `packages/terminal`                                                                    | Ghostty VT engine shared by daemon screens, terminal tabs and logs                        |
 | Packaging                   | `xtask/src`, `packaging/`                                                              | Native runtime assets, installers, provenance, updates, attributions                      |
 
-Paths in the daemon rows are relative to `packages/daemon/src` unless otherwise shown. The client (`paseo-client`), shared protocol (`paseo-protocol`), relay (`paseo-relay`), plugin SDK (`paseo-plugin`) and highlighting (`paseo-highlight`) are Rust workspace crates. `paseo-xtask` owns development and release commands. The unused website source is removed; Markdown documentation remains in the repository.
+Paths in the daemon rows are relative to `packages/daemon/src` unless otherwise shown. The client (`paseo-client`), shared protocol (`paseo-protocol`), relay (`paseo-relay`), plugin SDK (`paseo-plugin`), highlighting (`paseo-highlight`) and terminal emulation (`paseo-terminal`, wrapping Ghostty's `libghostty-vt`) are Rust workspace crates. `paseo-xtask` owns development and release commands. The unused website source is removed; Markdown documentation remains in the repository.
 
 ## Protocol and persistence
 
@@ -60,9 +61,9 @@ All desktop windows live in one process and share one set of host connections; e
 
 Platform tray/menu/window behavior is native integration, not an Electron renderer feature. Runtime verification is platform-specific; Linux lifecycle evidence does not establish Windows or macOS execution.
 
-## Retained and excluded surfaces
+## Terminals and excluded surfaces
 
-Script and workspace setup PTYs are retained. Their client presentation is **read-only output**: script start/stop and log observation are not an interactive terminal emulator. Native CLI chat remains available outside the application.
+Daemon PTYs back interactive terminals and script/setup runs. The client opens interactive shells as Terminal tabs on every platform and presents script/setup output as read-only logs; see [terminal activity](terminal-activity.md). Native CLI chat remains available outside the application.
 
 The client has no embedded browser, browser automation, web target, Chromium capture surface, or executable React UI-plugin host. Links open externally. Backend plugin RPCs/providers/lifecycle/usage contributions remain an optional extension boundary, described in [plugins](plugins.md); a server extension does not imply support for its former React client entry.
 

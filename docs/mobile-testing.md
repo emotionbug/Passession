@@ -17,7 +17,8 @@ Exercise compact and wide layouts, keyboard visible/hidden, rotation/resize, for
 - Add Project through the selected daemon's remote folder browser.
 - Chat streaming, draft retention, Korean IME composition during streaming, permissions, session rename/import/history and closing a tab without archiving. Exercise composing-syllable replacement, backspace, selection, focus transfer and keyboard dismissal, not only pasted Korean text.
 - Markdown selection/copy/links, file search/read-only source on mobile, and large summary-first diff navigation. Source editing/save-failure coverage belongs to desktop; Android and iOS intentionally disable source editing.
-- Setup/service scripts and read-only log output; no interactive terminal emulator. Check natural process exit, retained output after exit, initial tail positioning, touch-scroll pause and explicit Follow without new output.
+- Setup/service scripts and read-only log output. Check natural process exit, retained output after exit, initial tail positioning, touch-scroll pause and explicit Follow without new output.
+- Interactive terminals on the remote host: create one from New session → Terminal, type through the soft keyboard and Korean IME, paste, run a full-screen program, rotate, background/resume and reconnect, then close the tab and confirm the daemon terminal is gone.
 - Schedules, profiles, connected hosts, and server errors.
 - Drag across actionable rows/buttons/links, return to the touch origin, and cancel a gesture. Scrolling must not open a session, follow a link, dismiss a permission, remove an attachment or run a script.
 - Open nested pickers over forms; one Back/Escape must close only the top layer. Close a focused search, then open and activate a context menu. Closed or never-drawn inputs must not retain keyboard ownership.

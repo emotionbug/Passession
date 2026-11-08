@@ -123,6 +123,41 @@ pub fn command(program: impl AsRef<OsStr>) -> Result<Command> {
     Ok(command)
 }
 
+/// Zig release that builds the pinned Ghostty VT library in libghostty-vt-sys.
+const ZIG_VERSION: &str = "0.15.2";
+
+/// Fail before compiling when the Zig that libghostty-vt-sys runs (`ZIG`, else
+/// `zig` on PATH) is missing or rejected by Ghostty's `requireZig` (same major
+/// and minor, patch at least the pinned one); otherwise the failure surfaces
+/// deep inside a Cargo build script.
+pub fn require_zig() -> Result<()> {
+    let zig = env::var_os("ZIG").unwrap_or_else(|| "zig".into());
+    let missing = || {
+        format!(
+            "Zig {ZIG_VERSION} is required to build the Ghostty terminal library; install it on PATH or set ZIG to its executable (tried {})",
+            zig.to_string_lossy()
+        )
+    };
+    let output = Command::new(&zig)
+        .arg("version")
+        .stderr(Stdio::inherit())
+        .output()
+        .with_context(missing)?;
+    ensure!(output.status.success(), "{}", missing());
+    let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let required = semver::Version::parse(ZIG_VERSION)?;
+    ensure!(
+        semver::Version::parse(&reported).is_ok_and(|found| {
+            found.major == required.major
+                && found.minor == required.minor
+                && found.patch >= required.patch
+        }),
+        "Zig {ZIG_VERSION} is required to build the Ghostty terminal library; {} reports {reported}",
+        zig.to_string_lossy()
+    );
+    Ok(())
+}
+
 static SUPERVISED: AtomicBool = AtomicBool::new(false);
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 

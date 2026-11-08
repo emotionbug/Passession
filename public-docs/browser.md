@@ -19,4 +19,4 @@ You can still develop and test web projects:
 
 An external testing tool owns its own installation, processes, credentials, cookies and permissions. It is not bundled with Paseo, does not inherit a Paseo browser login, and must not be advertised as a built-in capability. If an agent uses such a tool through its own CLI or MCP configuration, authorize its consequential actions at that tool's boundary.
 
-Paseo retains native Markdown/source editing, summary-first diffs, remote folder selection, and script/setup PTYs with read-only logs. See [parallel tasks](/docs/parallel-development), [MCP](/docs/mcp), and [native setup](/docs).
+Paseo retains native Markdown/source editing, summary-first diffs, remote folder selection, interactive **Terminal** sessions, and script/setup PTYs with read-only logs. See [parallel tasks](/docs/parallel-development), [MCP](/docs/mcp), and [native setup](/docs).

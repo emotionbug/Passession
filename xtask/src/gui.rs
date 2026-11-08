@@ -394,20 +394,15 @@ struct AndroidAbi {
     class: u8,
     machine: u16,
 }
-static ANDROID_ABIS: [AndroidAbi; 3] = [
+/// 64-bit ABIs only: the Ghostty terminal bindings (libghostty-vt-sys) assert
+/// a 64-bit layout, so `armeabi-v7a` cannot be built.
+static ANDROID_ABIS: [AndroidAbi; 2] = [
     AndroidAbi {
         abi: "arm64-v8a",
         triple: "aarch64-linux-android",
         clang: "aarch64-linux-android",
         class: 2,
         machine: 183,
-    },
-    AndroidAbi {
-        abi: "armeabi-v7a",
-        triple: "armv7-linux-androideabi",
-        clang: "armv7a-linux-androideabi",
-        class: 1,
-        machine: 40,
     },
     AndroidAbi {
         abi: "x86_64",
@@ -421,10 +416,12 @@ static ANDROID_ABIS: [AndroidAbi; 3] = [
 fn android_abis(arch: &str) -> Result<&'static [AndroidAbi]> {
     match arch {
         "arm64" => Ok(&ANDROID_ABIS[..1]),
-        "arm" => Ok(&ANDROID_ABIS[1..2]),
-        "x64" => Ok(&ANDROID_ABIS[2..]),
+        "x64" => Ok(&ANDROID_ABIS[1..]),
         "universal" => Ok(&ANDROID_ABIS),
-        _ => bail!("Unknown Android architecture: {arch}; expected arm64|arm|x64|universal"),
+        "arm" => bail!(
+            "32-bit Android (armeabi-v7a) is not supported: the Ghostty terminal library is 64-bit only; use --arch arm64|x64|universal"
+        ),
+        _ => bail!("Unknown Android architecture: {arch}; expected arm64|x64|universal"),
     }
 }
 
@@ -808,7 +805,9 @@ fn build_ios(mode: &str, identity: &Identity, simulator: bool) -> Result<PathBuf
     let triple = match (simulator, arch()?) {
         (false, _) => "aarch64-apple-ios",
         (true, "arm64") => "aarch64-apple-ios-sim",
-        (true, _) => "x86_64-apple-ios",
+        (true, _) => bail!(
+            "The iOS simulator build needs an Apple-silicon Mac: Ghostty ships no x86_64 simulator library"
+        ),
     };
     let work = gui_output()?.join("ios").join(triple).join(mode);
     fresh(&work)?;
@@ -1046,7 +1045,9 @@ fn android_device(adb: &Path, device: Option<&str>) -> Result<(String, &'static 
     let abi = ANDROID_ABIS
         .iter()
         .find(|abi| abi.abi == reported)
-        .with_context(|| format!("Unsupported Android ABI {reported} on {serial}"))?;
+        .with_context(|| {
+            format!("Unsupported Android ABI {reported} on {serial}; Paseo Sessions builds 64-bit arm64-v8a and x86_64 only")
+        })?;
     Ok((serial.clone(), abi))
 }
 
@@ -1232,7 +1233,7 @@ pub fn build_gui(args: &[String]) -> Result<()> {
     );
     ensure!(
         android_arch.is_none() || target == "android" && !launch,
-        "--arch arm64|arm|x64|universal is only supported for Android artifact builds, not --run"
+        "--arch arm64|x64|universal is only supported for Android artifact builds, not --run"
     );
     ensure!(
         matches!(format, "apk" | "aab") && (!explicit_format || target == "android"),
@@ -1253,6 +1254,7 @@ pub fn build_gui(args: &[String]) -> Result<()> {
         mode == "release" || env::var("PASEO_NATIVE_RELEASE").as_deref() != Ok("1"),
         "PASEO_NATIVE_RELEASE=1 requires a release GUI build"
     );
+    require_zig()?;
     let identity = Identity::resolve(target)?;
     match target {
         "android" if launch => {
@@ -1346,18 +1348,16 @@ mod tests {
     }
     #[test]
     fn android_arch_selection_never_includes_another_abi() {
-        for (arch, expected) in [
-            ("arm64", "arm64-v8a"),
-            ("arm", "armeabi-v7a"),
-            ("x64", "x86_64"),
-        ] {
+        for (arch, expected) in [("arm64", "arm64-v8a"), ("x64", "x86_64")] {
             let selected = android_abis(arch).unwrap();
             assert_eq!(selected.iter().map(|abi| abi.abi).collect::<Vec<_>>(), [expected]);
         }
         assert_eq!(
             android_abis("universal").unwrap().iter().map(|abi| abi.abi).collect::<Vec<_>>(),
-            ["arm64-v8a", "armeabi-v7a", "x86_64"]
+            ["arm64-v8a", "x86_64"]
         );
+        assert!(ANDROID_ABIS.iter().all(|abi| abi.class == 2));
+        assert!(android_abis("arm").is_err());
         assert!(android_abis("aarch64").is_err());
     }
     /// Minimal ELF64 shared library: PT_DYNAMIC at file offset 0x100 and a

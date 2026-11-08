@@ -524,7 +524,7 @@ Under `paseo-native/`:
 
 - `state.json` contains versioned preferences, saved hosts, route suppression and layout. Unknown keys are retained. A corrupt file or a newer unsupported version is never overwritten.
 - `state.lock` serializes updates. Writes merge changes three-way against the latest file so another window's or process's unrelated preference and host edits are not lost.
-- `layout-<window>.json` holds a window's saved tab and pane layout. Restoration drops removed browser, executable plugin and interactive terminal tabs.
+- `layout-<window>.json` holds a window's saved tab and pane layout. Restoration drops removed browser and executable plugin tabs.
 - `replica-<base64url-server-id>.json` stores a host's project/workspace/agent snapshot and cache timestamp. It is scoped to the saved server identity and reconciled with the live daemon.
 
 Next to it, `shared_preferences.json` keeps keyed values (client id, relay protection floors `paseo.relayProtected.<key>`, update-operation records) in the Flutter Linux/Windows format, including the `flutter.` key prefix. Foreign keys survive writes. On macOS and iOS (NSUserDefaults binary plist) and Android (`FlutterSharedPreferences.xml`) the Flutter values are imported once into that file.

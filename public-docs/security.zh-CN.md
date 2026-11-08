@@ -120,7 +120,7 @@ Compose 和反向代理的示例见 [Docker](/docs/docker)。
 
 ## 原生桌面信任边界 {#native-desktop-trust-boundary}
 
-原生桌面客户端不包含 Electron 或 Chromium，Chromium 沙盒参数及辅助程序安装说明不适用。这并不隔离 Agent：Provider 和脚本/设置任务 PTY 拥有 daemon 用户的文件系统与凭据访问权限。客户端提供只读任务日志，不提供交互式终端 UI。
+原生桌面客户端不包含 Electron 或 Chromium，Chromium 沙盒参数及辅助程序安装说明不适用。这并不隔离 Agent：Provider、脚本/设置任务 PTY 和 **Terminal** shell 拥有 daemon 用户的文件系统与凭据访问权限。脚本/设置任务显示只读日志；你在 **Terminal** 标签页中输入的内容会发送到 daemon 主机上的该 shell。
 
 内置集成在 Rust 中运行。原生后端插件以 daemon 用户权限在独立进程中执行受信任代码。进程隔离不是安全沙盒，只安装可信插件。原生产品不包含可执行 React UI 插件或内嵌浏览器自动化。
 

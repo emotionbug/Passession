@@ -1,13 +1,13 @@
 # Android
 
-The Android application is the native Rust **Paseo Sessions** client (Makepad), package `sh.paseo.sessions`. It connects to a Rust daemon on another machine; it does not run a local daemon. The same client also targets iOS, Linux, macOS and Windows. There is no Expo/Metro, EAS, Flutter engine, embedded browser, web client, or interactive terminal UI in the native application.
+The Android application is the native Rust **Paseo Sessions** client (Makepad), package `sh.paseo.sessions`. It connects to a Rust daemon on another machine; it does not run a local daemon, and its terminal tabs control shells on that host. The same client also targets iOS, Linux, macOS and Windows. There is no Expo/Metro, EAS, Flutter engine, embedded browser or web client in the native application.
 
 ## Build and launch
 
-Use Rust/Cargo for `xtask`, a JDK 17+ and the Android SDK with NDK **28.2.13676358** (`ANDROID_HOME`; `ANDROID_NDK_HOME` overrides the NDK location). Install the Rust targets once:
+Use Rust/Cargo for `xtask`, Zig 0.15.2 (see [development](development.md#toolchains)), a JDK 17+ and the Android SDK with NDK **28.2.13676358** (`ANDROID_HOME`; `ANDROID_NDK_HOME` overrides the NDK location). Install the Rust targets once:
 
 ```sh
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+rustup target add aarch64-linux-android x86_64-linux-android
 ```
 
 From the repository root:
@@ -15,7 +15,7 @@ From the repository root:
 ```sh
 cargo fetch --locked
 cargo xtask build-gui android                       # arm64 APK
-cargo xtask build-gui android --arch universal      # APK with all three ABIs
+cargo xtask build-gui android --arch universal      # APK with both 64-bit ABIs
 cargo xtask build-gui android --arch x64            # x86_64 emulator APK
 cargo xtask build-gui android --format aab          # universal Android App Bundle
 cargo xtask build-gui android --profile dev-fast    # debug-signed arm64 APK
@@ -24,7 +24,7 @@ cargo xtask dev app android --device <device-id>
 
 `build-gui` defaults to the release Rust profile. Use `--profile dev-fast|debug|release` to select one; `--debug` remains an alias for `--profile debug`. `dev app` defaults to `dev-fast`. Both non-release profiles use the Android debug variant and debug key, even when production credentials are present.
 
-APK builds default to `--arch arm64`; AAB builds default to `--arch universal`. Either format accepts `--arch arm64|arm|x64|universal`. An AAB contains the selected ABIs for store-generated device APKs; it is not directly installable with `adb`. Use an APK for local installation.
+APK builds default to `--arch arm64`; AAB builds default to `--arch universal` (arm64-v8a and x86_64). Either format accepts `--arch arm64|x64|universal`. The client is 64-bit only: the Ghostty terminal library's Rust bindings assume a 64-bit layout, so `armeabi-v7a` is not built and `--arch arm` fails with that reason. An AAB contains the selected ABIs for store-generated device APKs; it is not directly installable with `adb`. Use an APK for local installation.
 
 Published releases contain only the arm64 APK. Other ABI and AAB options above
 remain explicit local tooling for emulator/development or store preparation;
@@ -34,7 +34,7 @@ The build compiles `paseo-gui` as a `cdylib` per ABI with the NDK clang for API 
 
 **Minimum SDK is 24**, as for the Flutter client. Published makepad-platform 1.0.0 cannot load below API 29: it links `libamidi` (API 29), `libaaudio` and `libnativewindow` (API 26), references `AChoreographer_postFrameCallback64` (API 29) directly, and its Java calls `WindowInsets.Type` (API 30). Paseo therefore patches makepad-platform through the vendored copy at `packages/gui-platform/vendor/makepad-platform` (newer libraries and symbols resolved at runtime; app audio uses AudioTrack on every version) and the Java in `packaging/android/makepad` (API guards, listed in `PATCHES.diff`). Linking against the API 24 NDK stubs turns a newer `-l` library into a link error, and xtask also rejects a library whose `DT_NEEDED` names a system library newer than API 24. A newer *symbol* in an API 24 library is not caught at link time; keep those behind runtime lookup.
 
-The development run selects the single attached `adb` device or the `--device` serial, builds only that device's primary ABI (an x86_64 emulator gets an x86_64 library), installs with `adb install -r`, starts the launcher activity and follows `adb logcat` for the app process until interrupted. `--run` rejects an explicit `--arch` or AAB output.
+The development run selects the single attached `adb` device or the `--device` serial, builds only that device's primary ABI (an x86_64 emulator gets an x86_64 library; a 32-bit-only device is rejected), installs with `adb install -r`, starts the launcher activity and follows `adb logcat` for the app process until interrupted. `--run` rejects an explicit `--arch` or AAB output.
 
 Artifacts are copied into `artifacts/native/` as `Paseo-Sessions-<version>-android-<arch>[-debug-signed].apk` or `.aab`. Non-release profiles and release builds without a production key carry the `-debug-signed` suffix. `packages-android-<arch>[-aab].json` records the artifact filename, format, profile and source revision for release validation. The independent artifact copy keeps Gradle's incremental output intact.
 
@@ -104,7 +104,7 @@ An explicitly configured ADB reverse tunnel can instead forward the daemon port 
 
 The compact sidebar is host → directory → session. Back returns from an open file explorer to the session and from the session to the sidebar; leaving the app must not stop remote sessions. Directory collapse is persisted per host/path. Add Project browses folders on the selected host, not Android's local filesystem.
 
-Markdown, source editing, large summary-first diffs, schedules, settings, generic effect-sound playback and read-only script/setup logs are native client surfaces. Notification permissions and delivery require actual Android testing; desktop execution does not prove Android push delivery.
+Markdown, source editing, large summary-first diffs, schedules, settings, generic effect-sound playback, interactive terminals on the host's shell and read-only script/setup logs are native client surfaces. Notification permissions and delivery require actual Android testing; desktop execution does not prove Android push delivery.
 
 ## Release boundary
 

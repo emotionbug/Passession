@@ -324,8 +324,13 @@ fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut Dra
         TrackPanel::Tasks => {
             for task in model.tasks {
                 let r = rect_xywh(x + 4.0, cy, w - 8.0, row_h);
-                super::rows::task_rows(cx, d, std::slice::from_ref(task), r.pos.x + 8.0, cy + (row_h - base * 1.4) * 0.5, r.size.x - 16.0);
-                cy += row_h;
+                // Wrapped tasks grow their row; single-line rows keep the
+                // shared row height and vertical centering.
+                let text_h = d.measure(|d| super::rows::task_rows(cx, d, std::slice::from_ref(task), 0.0, 0.0, r.size.x - 16.0));
+                let pad = ((row_h - base * 1.4) * 0.5).max(0.0);
+                let h = row_h.max(text_h + pad * 2.0);
+                super::rows::task_rows(cx, d, std::slice::from_ref(task), r.pos.x + 8.0, cy + (h - text_h) * 0.5, r.size.x - 16.0);
+                cy += h;
             }
         }
         TrackPanel::Subagents => {

@@ -14,7 +14,7 @@ Paseo Sessions は、コーディングエージェントの作業を実行・�
 
 - エージェントチャット、権限、プロバイダー/モデル選択、プロファイル、セッションのインポートと履歴。
 - Markdown 表示、ファイル閲覧、ソース編集。Git diff は概要を先に表示し、パッチ本文は必要時に読み込みます。
-- ワークスペースのセットアップとサービススクリプトはデーモン所有の PTY で実行します。アプリは**読み取り専用ログ**を表示し、対話型ターミナルエミュレーターは提供しません。
+- 対話型ターミナル：デスクトップでもモバイルでも、任意のホストで**ターミナル**セッションを開始できます。すべてのシェル、セットアップスクリプト、サービスはデーモン所有の PTY で実行され、スクリプトは**読み取り専用ログ**で表示します。ターミナルエミュレーションは両側とも Ghostty の VT エンジンを使います。
 - スケジュール、MCP ツールとサーバー、接続ホスト、リモートディレクトリ選択。
 - ネイティブデスクトップ統合とローカルデーモンのライフサイクル管理。モバイルはリモート接続のみ。
 - 一般的な効果音の再生は維持します。音声認識、音声会話、TTS は提供しません。
@@ -25,7 +25,7 @@ Paseo Sessions は、コーディングエージェントの作業を実行・�
 
 ## ソースからビルド・起動
 
-Rust/Cargo と対象プラットフォームのネイティブツールチェーンを用意します。少なくとも1つのエージェント CLI をインストールして認証を設定してください：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Copilot](https://github.com/features/copilot/cli/)、[OpenCode](https://github.com/anomalyco/opencode)、[Pi](https://pi.dev)。詳細は[開発ガイド](docs/development.md)にあります。
+Rust/Cargo、Zig 0.15.2（Ghostty ターミナルライブラリのビルド用）、対象プラットフォームのネイティブツールチェーンを用意します。少なくとも1つのエージェント CLI をインストールして認証を設定してください：[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Copilot](https://github.com/features/copilot/cli/)、[OpenCode](https://github.com/anomalyco/opencode)、[Pi](https://pi.dev)。詳細は[開発ガイド](docs/development.md)にあります。
 
 ```sh
 cargo fetch --locked
@@ -90,6 +90,7 @@ paseo run --host workstation.local:6767 --cwd /workspace --provider codex "revie
 | Rust デーモン、CLI、プロバイダー、ストレージ、supervisor、デスクトップホスト IPC | `packages/daemon`                                       |
 | 5プラットフォーム向けネイティブクライアント                                      | `packages/gui`, `packages/gui-core`                     |
 | デスクトップとモバイルの OS 統合                                                 | `packages/gui-platform`                                 |
+| デーモンとクライアントの Ghostty ターミナルエミュレーション                      | `packages/terminal`                                     |
 | パッケージングリソースとインストーラー                                           | `packaging`                                             |
 | Rust SDK と共通プロトコル                                                       | `packages/client`、`packages/protocol`                  |
 | ネイティブバックエンドプラグイン SDK                                           | `packages/plugin`                                      |

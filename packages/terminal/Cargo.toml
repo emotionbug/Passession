@@ -1,0 +1,12 @@
+[package]
+name = "paseo-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ghostty terminal emulation shared by the Paseo daemon and native client"
+
+[dependencies]
+# The vendored libghostty-vt-sys patch (workspace `[patch.crates-io]`) builds the
+# pinned Ghostty source with Zig 0.15.2; see packages/terminal/vendor/VENDORED.md.
+libghostty-vt = { version = "=0.2.2", default-features = false }

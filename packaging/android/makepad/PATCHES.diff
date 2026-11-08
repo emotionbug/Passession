@@ -28,14 +28,14 @@
  
  import java.io.BufferedReader;
  import java.io.IOException;
-@@ -77,9 +80,388 @@
+@@ -77,9 +80,389 @@
      private float latestTouchY;
      private int latestTouchPointerId;
  
 +    // Paseo: native widgets share one SurfaceView but not one editing session.
 +    private long inputSession;
 +    private MakepadInputConnection inputConnection;
-+    private boolean inputPassword, inputNumeric;
++    private boolean inputPassword, inputNumeric, inputTerminal;
 +
 +    private static final int CAN_COPY = 1, CAN_CUT = 2, CAN_PASTE = 4, CAN_SELECT_ALL = 8;
 +    private static final int ACTION_DISMISS = 0, ACTION_COPY = 1, ACTION_CUT = 2,
@@ -388,11 +388,12 @@
 +    }
 +
 +    void updateTextInput(long session, long revision, String text, int start, int end,
-+                         boolean password, boolean numeric, boolean restart) {
++                         boolean password, boolean numeric, boolean terminal, boolean restart) {
 +        if (session != inputSession) {
 +            inputSession = session;
 +            inputPassword = password;
 +            inputNumeric = numeric;
++            inputTerminal = terminal;
 +            if (text == null) {
 +                if (inputConnection != null) inputConnection.invalidate();
 +                inputConnection = null;
@@ -417,7 +418,7 @@
          getHolder().addCallback(this);
  
          setFocusable(true);
-@@ -95,6 +477,8 @@
+@@ -95,6 +478,8 @@
      @Override
      public void surfaceCreated(SurfaceHolder holder) {
          Log.i("SAPP", "surfaceCreated");
@@ -426,7 +427,7 @@
          Surface surface = holder.getSurface();
          //surface.setFrameRate(120f,0);
          MakepadNative.surfaceOnSurfaceCreated(surface);
-@@ -103,6 +487,8 @@
+@@ -103,6 +488,8 @@
      @Override
      public void surfaceDestroyed(SurfaceHolder holder) {
          Log.i("SAPP", "surfaceDestroyed");
@@ -435,7 +436,7 @@
          Surface surface = holder.getSurface();
          MakepadNative.surfaceOnSurfaceDestroyed(surface);
      }
-@@ -131,10 +517,15 @@
+@@ -131,10 +518,15 @@
          // Save the details of the latest touch-down event,
          // such that we can use them in the `onLongClick` method.
          if (actionMasked == MotionEvent.ACTION_DOWN) {
@@ -452,7 +453,7 @@
          }
          else if (actionMasked == MotionEvent.ACTION_MOVE) {
              latestTouchX = event.getX(index);
-@@ -142,6 +533,7 @@
+@@ -142,6 +534,7 @@
              latestTouchPointerId = pointerId;
              if (pointerId == latestDownTouchPointerId) {
                  if (isTouchBeyondSlopDistance(view)) {
@@ -460,7 +461,7 @@
                      retval = true;
                  }
              }
-@@ -204,7 +596,13 @@
+@@ -204,7 +597,13 @@
          int visibleHeight = r.height();
          int keyboardHeight = screenHeight - visibleHeight;
  
@@ -475,7 +476,7 @@
      }
  
      // docs says getCharacters are deprecated
-@@ -213,6 +611,21 @@
+@@ -213,6 +612,21 @@
      @SuppressWarnings("deprecation")
      @Override
      public boolean onKey(View v, int keyCode, KeyEvent event) {
@@ -497,7 +498,7 @@
          if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode != 0) {
              int metaState = event.getMetaState();
              MakepadNative.surfaceOnKeyDown(keyCode, metaState);
-@@ -223,17 +636,15 @@
+@@ -223,17 +637,15 @@
              MakepadNative.surfaceOnKeyUp(keyCode, metaState);
          }
  
@@ -524,7 +525,7 @@
              }
          }
  
-@@ -248,16 +659,14 @@
+@@ -248,16 +660,14 @@
          return true;
      }
  
@@ -533,21 +534,21 @@
 -    // This code is a workaround which fixes the bug.
 -    // See https://groups.google.com/g/android-developers/c/50XcWooqk7I
 -    // For some reason it only works if placed here and not in the parent layout.
-+    @Override
+     @Override
 +    public boolean onCheckIsTextEditor() { return inputConnection != null; }
 +
-     @Override
++    @Override
      public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
 -        InputConnection connection = super.onCreateInputConnection(outAttrs);
 -        outAttrs.imeOptions |= EditorInfo.IME_FLAG_NO_FULLSCREEN;
 -        return connection;
 +        if (inputConnection != null) inputConnection = inputConnection.reconnect();
-+        if (inputConnection != null) inputConnection.editorInfo(outAttrs, inputPassword, inputNumeric);
++        if (inputConnection != null) inputConnection.editorInfo(outAttrs, inputPassword, inputNumeric, inputTerminal);
 +        return inputConnection;
      }
  
      public Surface getNativeSurface() {
-@@ -280,9 +689,14 @@
+@@ -280,9 +690,14 @@
      }
  
      @Override
@@ -564,17 +565,17 @@
          return insets;
      }
  }
-@@ -295,6 +709,9 @@
- 
+@@ -296,6 +711,9 @@
      private MakepadSurface view;
      Handler mHandler;
-+
+ 
 +    // Paseo: platform insets are relative to the actual resized render surface.
 +    public View getRenderView() { return view; }
- 
++
      // video playback
      Handler mVideoPlaybackHandler;
-@@ -379,12 +796,14 @@
+     HashMap<Long, VideoPlayerRunnable> mVideoPlayerRunnables;
+@@ -379,12 +797,14 @@
      @Override
      protected void onResume() {
          super.onResume();
@@ -589,7 +590,7 @@
          super.onPause();
          MakepadNative.activityOnPause();
  
-@@ -399,6 +818,7 @@
+@@ -399,6 +819,7 @@
  
      @Override
      protected void onDestroy() {
@@ -597,7 +598,7 @@
          super.onDestroy();
          MakepadNative.activityOnDestroy();
      }
-@@ -406,6 +826,7 @@
+@@ -406,6 +827,7 @@
      @Override
      @SuppressWarnings("deprecation")
      public void onBackPressed() {
@@ -605,7 +606,7 @@
          super.onBackPressed();
          MakepadNative.onBackPressed();
      }
-@@ -430,7 +851,10 @@
+@@ -430,7 +852,10 @@
  
                      if (fullscreen) {
                          getWindow().setFlags(LayoutParams.FLAG_LAYOUT_NO_LIMITS, LayoutParams.FLAG_LAYOUT_NO_LIMITS);
@@ -617,14 +618,14 @@
                          if (Build.VERSION.SDK_INT >= 30) {
                              getWindow().setDecorFitsSystemWindows(false);
                          } else {
-@@ -456,6 +880,31 @@
+@@ -456,6 +881,31 @@
          finish();
      }
      
 +    // Paseo: JNI runs on Makepad's render thread; Editable and IMM stay on UI.
 +    public void updateTextInput(long session, long revision, String text, int start, int end,
-+                                boolean password, boolean numeric, boolean restart) {
-+        runOnUiThread(() -> view.updateTextInput(session, revision, text, start, end, password, numeric, restart));
++                                boolean password, boolean numeric, boolean terminal, boolean restart) {
++        runOnUiThread(() -> view.updateTextInput(session, revision, text, start, end, password, numeric, terminal, restart));
 +    }
 +
 +    // Paseo: these calls originate on the render thread. The Surface fences
@@ -665,7 +666,7 @@
      // networking
 --- /dev/null
 +++ b/java/dev/makepad/android/MakepadInputConnection.java
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,300 @@
 +package dev.makepad.android;
 +
 +import android.content.ClipData;
@@ -735,11 +736,14 @@
 +        publish();
 +    }
 +
-+    void editorInfo(EditorInfo info, boolean password, boolean numeric) {
++    void editorInfo(EditorInfo info, boolean password, boolean numeric, boolean terminal) {
++        // Terminal editors keep shell input literal: no auto-capitalization, suggestion strip or
++        // autocorrect; composing input methods (Hangul) stay available.
 +        info.inputType = numeric
 +            ? InputType.TYPE_CLASS_NUMBER | (password ? InputType.TYPE_NUMBER_VARIATION_PASSWORD
 +                : InputType.TYPE_NUMBER_FLAG_DECIMAL)
 +            : InputType.TYPE_CLASS_TEXT | (password ? InputType.TYPE_TEXT_VARIATION_PASSWORD
++                : terminal ? InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
 +                : InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
 +        info.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI
 +            | EditorInfo.IME_ACTION_NONE;

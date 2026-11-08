@@ -462,6 +462,22 @@
     "parsedChord": [{ "code": "KeyW", "meta": true, "shift": true, "key": "w" }]
   },
   {
+    "id": "workspace-terminal-new-cmd-shift-t-mac",
+    "action": "workspace.terminal.new",
+    "combo": "Cmd+Shift+T",
+    "when": { "mac": true, "commandCenter": false },
+    "help": { "id": "workspace-terminal-new", "section": "tabs-panes", "label": "New terminal" },
+    "parsedChord": [{ "code": "KeyT", "meta": true, "shift": true, "key": "t" }]
+  },
+  {
+    "id": "workspace-terminal-new-ctrl-shift-t-non-mac",
+    "action": "workspace.terminal.new",
+    "combo": "Ctrl+Shift+T",
+    "when": { "mac": false, "commandCenter": false, "terminal": false },
+    "help": { "id": "workspace-terminal-new", "section": "tabs-panes", "label": "New terminal" },
+    "parsedChord": [{ "code": "KeyT", "ctrl": true, "shift": true, "key": "t" }]
+  },
+  {
     "id": "command-center-toggle-cmd-k-mac",
     "action": "command-center.toggle",
     "combo": "Cmd+K",

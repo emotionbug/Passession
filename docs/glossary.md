@@ -37,7 +37,8 @@ Use product terms consistently across the Rust daemon, Makepad client, CLI and e
 - **Markdown preview** — Native rendering of source Markdown; no embedded browser or executable HTML/React client runtime.
 - **Source editor** — Native editing of a host-side file, with draft/revision/save ownership. A remote file is not a local-client path.
 - **Summary-first diff** — Load file-tree/statistics first, then individual patch bodies on demand.
-- **PTY** — Daemon-owned pseudo-terminal used by setup and script processes. The backend remains supported; the app has no interactive terminal emulator.
+- **PTY** — Daemon-owned pseudo-terminal behind every terminal and setup/script process. Clients never own one.
+- **Terminal** — An interactive shell PTY opened from New session → Launch → Terminal and shown as a terminal tab. Clients send it input; the focused client sets its size.
 - **Script logs** — Read-only output/replay of script or setup execution, with real running/completed/failed state.
 - **Workspace script** — A named `paseo.json` command. A **service** is the long-running kind; not every script is a service.
 - **Schedule** — A durable trigger/cadence for sending work or creating an agent. **Heartbeat** is a recurring prompt associated with an existing agent's lifecycle.

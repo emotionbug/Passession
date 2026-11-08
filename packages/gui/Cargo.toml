@@ -27,7 +27,7 @@ paseo-gui-platform = { path = "../gui-platform" }
 paseo-client = { path = "../client" }
 paseo-protocol = { path = "../protocol" }
 paseo-highlight = { path = "../highlight" }
-alacritty_terminal = { version = "=0.25.0", default-features = false }
+paseo-terminal = { path = "../terminal" }
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -49,10 +49,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 unicode-segmentation = "1.11"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-
-[target.'cfg(unix)'.dependencies]
-# alacritty_terminal expects std-owned file descriptors from rustix-openpty (as in the daemon).
-rustix = { version = "0.38", default-features = false, features = ["std"] }
 
 [build-dependencies]
 embed-resource = "3"

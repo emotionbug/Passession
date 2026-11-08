@@ -593,7 +593,14 @@
       "unableToSubscribe": "Unable to subscribe to terminal",
       "fileUploaded": "File uploaded",
       "pasteFileFailed": "Failed to paste file: {{reason}}",
-      "uploadingFile": "Uploading file…"
+      "uploadingFile": "Uploading file…",
+      "exited": "Terminal exited",
+      "connecting": "Connecting…",
+      "missingId": "Terminal requires an existing terminal identifier",
+      "restoreFailed": "Terminal stream could not be restored",
+      "invalidSnapshot": "Invalid terminal snapshot",
+      "copy": "Copy selection or all output",
+      "keys": { "paste": "Paste" }
     },
     "sheet": { "openAsTab": "Open as tab" },
     "tabs": {

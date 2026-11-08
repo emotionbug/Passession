@@ -596,7 +596,14 @@
       "unableToSubscribe": "터미널을 구독할 수 없습니다",
       "fileUploaded": "파일을 업로드했습니다",
       "pasteFileFailed": "파일을 붙여넣지 못했습니다: {{reason}}",
-      "uploadingFile": "파일 업로드 중…"
+      "uploadingFile": "파일 업로드 중…",
+      "exited": "터미널이 종료되었습니다",
+      "connecting": "연결 중…",
+      "missingId": "기존 터미널 식별자가 필요합니다",
+      "restoreFailed": "터미널 스트림을 복원할 수 없습니다",
+      "invalidSnapshot": "잘못된 터미널 스냅샷",
+      "copy": "선택 영역 또는 전체 출력 복사",
+      "keys": { "paste": "붙여넣기" }
     },
     "sheet": { "openAsTab": "탭으로 열기" },
     "tabs": {
@@ -1281,7 +1288,7 @@
       "host": "Choose the host",
       "isolation": "Choose the isolation level",
       "startingRef": "시작 위치를 선택하세요",
-      "launch": "Choose what to launch"
+      "launch": "실행할 항목을 선택하세요"
     },
     "refPicker": {
       "startingRef": "시작 ref",
@@ -1292,13 +1299,13 @@
       "title": "시작 위치"
     },
     "launch": {
-      "title": "What to launch",
-      "chat": "Chat",
-      "terminal": "Terminal",
-      "manageProfiles": "Manage profiles",
-      "submit": "Launch",
-      "promptPlaceholder": "Prompt {{name}}",
-      "commandPlaceholder": "Run a command, or leave empty for a blank terminal"
+      "title": "실행할 항목",
+      "chat": "채팅",
+      "terminal": "터미널",
+      "manageProfiles": "프로필 관리",
+      "submit": "실행",
+      "promptPlaceholder": "{{name}}에 프롬프트 입력",
+      "commandPlaceholder": "명령을 실행하거나, 비워 두면 빈 터미널을 엽니다"
     }
   },
   "desktop": {

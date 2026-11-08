@@ -8,7 +8,7 @@ category: Getting started
 
 # Getting started
 
-Paseo Sessions is a native Rust client on **Linux, macOS, Windows, Android and iOS**, with a **Rust daemon and CLI**. Desktop/server hosts run agents; Android and iOS connect remotely. The client includes Markdown, source editing, summary-first diffs, remote folder browsing and read-only script/setup logs, organized as host → directory → session.
+Paseo Sessions is a native Rust client on **Linux, macOS, Windows, Android and iOS**, with a **Rust daemon and CLI**. Desktop/server hosts run agents; Android and iOS connect remotely. The client includes Markdown, source editing, summary-first diffs, remote folder browsing, interactive terminals and read-only script/setup logs, organized as host → directory → session.
 
 Use [this repository's releases](https://github.com/emotionbug/paseo/releases) for native build artifacts; upstream downloads and store listings are separate products. Source builds and redistribution requirements are documented in the repository's `docs/release.md`.
 
@@ -74,7 +74,7 @@ Choose a real password. Connect a native client or CLI; there is **no bundled we
 
 ## Runtime scope
 
-There is no product web client, Electron/Chromium, embedded browser/automation, interactive terminal UI or executable React UI-plugin host. Workspace/service scripts still run in daemon-owned PTYs and provide read-only logs. Native backend plugins and the external Rust SDK remain supported.
+There is no product web client, Electron/Chromium, embedded browser/automation or executable React UI-plugin host. **Terminal** sessions open an interactive shell in a daemon-owned PTY on the selected host; workspace/service scripts also run in daemon-owned PTYs and provide read-only logs. Native backend plugins and the external Rust SDK remain supported.
 
 Recorded Linux execution evidence and unverified platform boundaries are documented in the repository's `docs/testing.md`. Cross-platform CI entries are not successful device tests. Native packages exclude speech recognition, voice conversations and TTS; generic effect-sound playback remains.
 

@@ -2,7 +2,7 @@
 
 [中文](workspaces.zh-CN.md) · [Setup](quickstart.md)
 
-Workspaces provide durable ownership for agents, script/setup PTYs and files. The SDK can control retained daemon terminals; the native app presents read-only task logs, not an embedded interactive terminal. All paths below belong to the daemon host.
+Workspaces provide durable ownership for agents, script/setup PTYs and files. The SDK can control retained daemon terminals; the native app opens interactive shells as **Terminal** tabs and shows script/setup output as read-only task logs. All paths below belong to the daemon host.
 
 ## Open a directory
 

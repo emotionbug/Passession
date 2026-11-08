@@ -126,7 +126,7 @@ See [Git worktrees](/docs/worktrees#scripts-and-services) for `paseo.json` confi
 
 ### Terminals
 
-These are daemon-side PTY APIs retained for script/setup automation. The native client shows read-only logs, not an interactive terminal UI.
+These are daemon-side PTY APIs. The native client opens interactive shells as **Terminal** tabs and shows script/setup output as read-only logs.
 
 | Tool                 | Function                                                                     |
 | -------------------- | ---------------------------------------------------------------------------- |

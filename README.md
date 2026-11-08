@@ -18,7 +18,7 @@ Workspace grouping controls are not part of this sidebar. Workspaces still exist
 
 - Agent chat, permissions, provider/model selection, profiles, session import, and history.
 - Markdown rendering, file browsing and source editing, and summary-first Git diffs with patch bodies loaded on demand.
-- Workspace setup and service scripts run in daemon-owned PTYs. The app shows **read-only logs**, not an interactive terminal emulator.
+- Interactive terminals: start a **Terminal** session on any host, from desktop or mobile. Every shell, setup script and service runs in a daemon-owned PTY; scripts show **read-only logs**. Terminal emulation is Ghostty's VT engine on both sides.
 - Schedules, MCP tools and servers, connected hosts, and remote directory selection.
 - Native desktop integration and local-daemon lifecycle, with remote-only mobile clients.
 - Generic effect-sound playback; no speech recognition, voice conversation or TTS.
@@ -29,7 +29,7 @@ Built-in provider and usage integrations execute in Rust. Backend plugins use na
 
 ## Build and run from this checkout
 
-Install Rust/Cargo and the native toolchain for your target. See [development](docs/development.md) for prerequisites and isolated development state.
+Install Rust/Cargo, Zig 0.15.2 (it builds the Ghostty terminal library) and the native toolchain for your target. See [development](docs/development.md) for prerequisites and isolated development state.
 
 ```sh
 cargo fetch --locked
@@ -95,6 +95,7 @@ The Rust `paseo-client` SDK lives in `packages/client`. Shared wire types and re
 | Daemon, CLI, providers, storage, supervisor, desktop-host IPC | `packages/daemon`                      |
 | Five-platform native client                                   | `packages/gui`, `packages/gui-core`    |
 | Desktop and mobile OS integration                             | `packages/gui-platform`                |
+| Ghostty terminal emulation for daemon and client              | `packages/terminal`                    |
 | Packaging resources and installers                            | `packaging`                            |
 | Rust client SDK and shared protocol                           | `packages/client`, `packages/protocol` |
 | Native plugin SDK                                             | `packages/plugin`                      |

@@ -18,7 +18,7 @@ Back returns from file explorer to the session, then from session to sidebar. Le
 
 ## Startup and external targets
 
-Wait for initialized client state before restoring a window's layout. Platform activation is queued until the window is ready; the shell retains pending routes while resolving their host. Handle stale or unavailable targets visibly. Do not discard saved hosts or drafts because startup or reconnect failed. Restored browser, plugin and interactive-terminal targets are not live product surfaces.
+Wait for initialized client state before restoring a window's layout. Platform activation is queued until the window is ready; the shell retains pending routes while resolving their host. Handle stale or unavailable targets visibly, including a restored terminal tab whose daemon terminal has exited. Do not discard saved hosts or drafts because startup or reconnect failed. Restored browser and plugin targets are not live product surfaces.
 
 Window close and application Quit go through file close guards and platform lifetime policy. A tray-hidden window remains logically open; the retained first window can become dormant while other windows remain. Reusing it must not stop/restart the shared daemon or steal another window's layout.
 

@@ -73,7 +73,7 @@ paseo --host <host:port> provider diagnostic <provider> --json
 
 - **daemon**：`~/.paseo/daemon.log`，自定义主目录则为 `$PASEO_HOME/daemon.log`。
 - **桌面客户端**：使用原生设置诊断中的 **Application logs** 和 **Daemon logs**。Rust 桌面进程的所有窗口共享支持目录中的 `desktop-main.log`；以返回的 `logPath` 为准，不要假定使用每窗口日志或旧 Electron 日志路径。
-- **脚本/设置任务**：查看只读日志。原生客户端没有交互式终端 UI。
+- **脚本/设置任务**：查看只读日志。如需交互式 shell，请改为打开 **Terminal** 会话。
 
 ## 我修改了 config.json，但什么都没发生 {#i-changed-configjson-but-nothing-happened}
 

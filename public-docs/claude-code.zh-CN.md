@@ -22,7 +22,7 @@ Paseo 通过官方的 `claude` CLI，借助 Claude Agent SDK 运行 Claude Code�
 
 ## 在外部终端中使用 Claude Code {#use-claude-code-in-an-external-terminal}
 
-如需标准 Claude CLI 体验，在 daemon 主机上打开自己的终端，进入检出目录并运行 `claude`。原生 Paseo 应用没有交互式终端 UI 或网页客户端；它保留 daemon 管理的脚本/设置 PTY（只读日志）和原生 Agent 对话。
+如需标准 Claude CLI 体验，在 daemon 主机上打开终端，进入检出目录并运行 `claude`。可以使用自己的终端，也可以使用 Paseo 的 **Terminal** 会话（**New session → Launch → Terminal**）。原生 Paseo 应用没有网页客户端；它还保留 daemon 管理的脚本/设置 PTY（只读日志）和原生 Agent 对话。
 
 ## 另请参阅 {#see-also}
 

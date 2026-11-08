@@ -1318,5 +1318,15 @@
     "sha256": "49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559",
     "text": "The MIT License (MIT)\n\nCopyright (c) 2017 Max Brunsfeld\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n",
     "note": "Grammar from https://github.com/tree-sitter/tree-sitter-bash at 20f55fb9663568f16ebceaac7673d2aa530add46 (langs/group-hazel/bash/def/arborium.yaml in arborium v2.18.2)."
+  },
+  {
+    "name": "libghostty-vt",
+    "version": "0.2.2",
+    "repository": "https://github.com/uzaaft/libghostty-rs",
+    "revision": "c9876b2902d5bb3e1f3d61b6395059f1e5e7b721",
+    "url": "https://raw.githubusercontent.com/Uzaaft/libghostty-rs/c9876b2902d5bb3e1f3d61b6395059f1e5e7b721/LICENSE",
+    "sha256": "64afe9aa17b5a1bf58375ea0e1bcfef3503b2ef85c1cfae7e00c3f7555f29137",
+    "text": "MIT License\n\nCopyright (c) 2026 Uzair Aftab, Leah Amelia Chen\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n",
+    "reason": "libghostty-vt 0.2.2 is published without a license file; MIT text from the repository root at the published commit (the crate's other license option, Apache-2.0, has no text upstream)"
   }
 ]

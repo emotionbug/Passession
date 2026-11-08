@@ -14,7 +14,7 @@ Paseo Sessions는 코딩 에이전트 작업을 실행하고 검토하는 네이
 
 - 에이전트 채팅, 권한, 제공자/모델 선택, 프로필, 세션 가져오기와 기록.
 - Markdown 표시, 파일 탐색과 소스 편집. Git diff는 요약부터 보여 주고 패치 본문은 필요할 때 불러옵니다.
-- 워크스페이스 설정 및 서비스 스크립트는 데몬이 소유한 PTY에서 실행합니다. 앱은 **읽기 전용 로그**만 표시하며 대화형 터미널 에뮬레이터를 제공하지 않습니다.
+- 대화형 터미널: 데스크톱과 모바일 어디서든 원하는 호스트에서 **터미널** 세션을 시작합니다. 모든 셸, 설정 스크립트, 서비스는 데몬이 소유한 PTY에서 실행되며 스크립트는 **읽기 전용 로그**로 표시합니다. 터미널 에뮬레이션은 양쪽 모두 Ghostty VT 엔진을 사용합니다.
 - 예약 작업, MCP 도구와 서버, 연결된 호스트, 원격 디렉터리 선택.
 - 네이티브 데스크톱 통합과 로컬 데몬 수명 주기 관리. 모바일은 원격 연결만 지원합니다.
 - 일반 효과음 재생은 유지하며 음성 인식, 음성 대화, TTS는 제공하지 않습니다.
@@ -25,7 +25,7 @@ Paseo Sessions는 코딩 에이전트 작업을 실행하고 검토하는 네이
 
 ## 소스에서 빌드하고 실행하기
 
-Rust/Cargo와 대상 플랫폼의 네이티브 도구 체인이 필요합니다. 에이전트 CLI도 하나 이상 설치하고 인증 정보를 설정하세요: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Copilot](https://github.com/features/copilot/cli/), [OpenCode](https://github.com/anomalyco/opencode), [Pi](https://pi.dev). 자세한 준비 사항은 [개발 가이드](docs/development.md)에 있습니다.
+Rust/Cargo, Zig 0.15.2(Ghostty 터미널 라이브러리 빌드용), 대상 플랫폼의 네이티브 도구 체인이 필요합니다. 에이전트 CLI도 하나 이상 설치하고 인증 정보를 설정하세요: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [Copilot](https://github.com/features/copilot/cli/), [OpenCode](https://github.com/anomalyco/opencode), [Pi](https://pi.dev). 자세한 준비 사항은 [개발 가이드](docs/development.md)에 있습니다.
 
 ```sh
 cargo fetch --locked
@@ -90,6 +90,7 @@ paseo run --host workstation.local:6767 --cwd /workspace --provider codex "revie
 | Rust 데몬, CLI, 제공자, 저장소, supervisor, 데스크톱 호스트 IPC | `packages/daemon`                                       |
 | 5개 플랫폼용 네이티브 클라이언트                                | `packages/gui`, `packages/gui-core`                     |
 | 데스크톱 및 모바일 OS 통합                                      | `packages/gui-platform`                                 |
+| 데몬과 클라이언트의 Ghostty 터미널 에뮬레이션                   | `packages/terminal`                                     |
 | 패키징 리소스와 설치 프로그램                                   | `packaging`                                             |
 | Rust SDK 및 공유 프로토콜                                      | `packages/client`, `packages/protocol`                  |
 | 네이티브 백엔드 플러그인 SDK                                   | `packages/plugin`                                      |

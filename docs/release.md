@@ -1,18 +1,20 @@
 # Release
 
-The checkout version is **0.13.11**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
+The checkout version is **0.13.12**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
 
 ## Distribution requirements
 
 Native packages exclude speech recognition, voice conversation and TTS, including Sherpa, the speech ONNX runtime and espeak-ng. Generic effect-sound playback remains.
 
-Rust tooling in `xtask/src/notices.rs` generates Cargo and bundled-asset attributions: the daemon closure in `runtime/THIRD-PARTY-NOTICES.txt`, and the client's `paseo-gui` closure for the packaged target plus every packaged font in the application's `THIRD-PARTY-NOTICES.txt` (desktop bundle, APK assets, iOS bundle). Preserve those notices with the exact packaged artifacts and review the licenses of remaining bundled dependencies and platform runtimes. Generated attributions are not a compliance certification or a corresponding-source offer.
+Rust tooling in `xtask/src/notices.rs` generates Cargo and bundled-asset attributions: the daemon closure in `runtime/THIRD-PARTY-NOTICES.txt`, and the client's `paseo-gui` closure for the packaged target plus every packaged font in the application's `THIRD-PARTY-NOTICES.txt` (desktop bundle, APK assets, iOS bundle). Both also attribute the natively built Ghostty library described below. Preserve those notices with the exact packaged artifacts and review the licenses of remaining bundled dependencies and platform runtimes. Generated attributions are not a compliance certification or a corresponding-source offer.
 
 The revision-pinned objc2 supplements preserve the authors' complete upstream `LICENSE.md`, including its Apple SDK caveat. That file is a licensing declaration linking standard terms, not a fabricated replacement license. Frozen OpenCode ABI bytes and the V8 notice use explicit LF checkout attributes so Windows cannot silently change their validated content.
 
 The makepad 1.0.0 crates are published without license files; `packaging/cargo-notice-supplements.json` carries the MIT text from the exact makepad commit each crate was published from. makepad's vendored zune-image forks cite the upstream zune-image commit of the same release (`upstreamRevision`). Supplements apply to registry sources only: a vendored, patched path crate such as `packages/gui-platform/vendor/makepad-platform` must contain its own license file. A Cargo dependency without license text fails packaging by name.
 
 A crate published without `.cargo_vcs_info.json` (the arborium highlighting crates, `cesu8`, `fxhash`) cannot prove its source revision, so its supplement binds `checksum`, the registry SHA-256 `Cargo.lock` records for the downloaded `.crate`, and pins the license URL with `upstreamRevision`. Each arborium grammar crate carries arborium's own license plus the license of the upstream tree-sitter grammar at the commit its `arborium.yaml` names.
+
+The daemon and the client statically link Ghostty's VT library, which `libghostty-vt-sys` compiles with Zig from a pinned Ghostty commit instead of shipping it in a Cargo package. `packaging/native-notices.json` lists the works inside that archive (Ghostty, the simdutf and Highway SIMD libraries, uucode and its Unicode data, Zig's compiler-rt and standard library) with license text pinned at upstream revisions, and binds the list to the crate version and the `GHOSTTY_COMMIT` its `build.rs` pins. Bumping either fails notice generation until the list is re-reviewed against Ghostty's `src/build/GhosttyZig.zig` and `SharedDeps.zig`. `libghostty-vt` 0.2.2 is published without a license file and uses a supplement; the vendored `libghostty-vt-sys` path crate carries its own `LICENSE`.
 
 Fonts are third-party works with their own licenses. `packaging/resource-notices.json` binds each packaged font file's SHA-256 to license text pinned to an upstream revision or an immutable archive digest; an unknown or changed font fails packaging. Its `excluded` list removes reviewed files from every package: makepad-widgets 1.0.0 ships Liberation Mono 1.04 under Red Hat's GPL-2.0-with-font-exception agreement, so the client uses Jetendard (OFL-1.1; JetBrains Mono with Pretendard Hangul fitted to two cells) for code and the Liberation file is not redistributed. Jetendard's release asset is not immutable, so each shipped TTF is bound by its own digest, and its notices include the upstream JetBrains Mono, Nerd Fonts, Pretendard and Yeomil Mono licenses it asks redistributors to keep; Makepad's LXGW WenKai Chinese fallback (36 MB) is left out because the client supports English and Korean, and Han characters fall back to Noto Sans KR. The emoji font stays: Makepad has no system font fallback, so without it emoji would not render. An excluded file whose bytes change fails packaging, and so does any `crate://…/resources/…` reference in client sources that names a resource not staged: Makepad loads fonts lazily and a style using a missing font panics.
 
@@ -27,7 +29,7 @@ Fonts are third-party works with their own licenses. `packaging/resource-notices
 | Container                     | Native daemon and runtime assets; no browser UI or Node executable in the default image       |
 | Rust libraries                | Client, protocol, plugin and highlighting crates; source/package availability is separate from binary releases |
 
-No Electron, Chromium, web client, embedded automation, or interactive terminal UI is shipped. Script/setup PTY support stays in the daemon and the client presents read-only logs. Backend plugins use native executables; no Node worker or JavaScript compiler is packaged.
+No Electron, Chromium, web client or embedded automation is shipped. Daemon PTYs back interactive Terminal tabs and read-only script/setup logs. Backend plugins use native executables; no Node worker or JavaScript compiler is packaged.
 
 ## Local build versus distribution identity
 
@@ -80,7 +82,7 @@ Optional Firebase configuration for Android must match `sh.paseo.sessions`: `GOO
 
 `.github/workflows/desktop-release.yml` is the manual-only **Native Release** workflow despite its retained filename. It builds the Rust client and daemon for every target, preserves complete per-target artifacts, validates recovery provenance, and publishes only through its publication path. Its matrix is for explicitly requested artifacts, not default CI or per-platform test repetition.
 
-The complete release matrix has **eight targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android arm64 APK and iOS arm64. Android publication uses only `android-arm64`; other APK ABIs, universal APKs and AABs are not release targets. macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android provisions platform-tools, NDK 28.2.13676358 and only `aarch64-linux-android`; iOS adds `aarch64-apple-ios`. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
+The complete release matrix has **eight targets**: Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, Android arm64 APK and iOS arm64. Android publication uses only `android-arm64`; x86_64 and universal APKs and AABs are not release targets, and 32-bit Android is not built at all ([Android](android.md#build-and-launch)). macOS uses `macos-15` (arm64) and `macos-15-intel` (x64); Android provisions platform-tools, NDK 28.2.13676358 and only `aarch64-linux-android`; iOS adds `aarch64-apple-ios`. Every native job installs Zig 0.15.2 with `mlugg/setup-zig`, which also restores Zig's global cache with Ghostty's fetched packages; CI and Native Desktop Packages do the same, and `docker/base/Dockerfile` installs the official Zig tarball checked against its pinned SHA-256. Without signing secrets, Android remains debug-signed and iOS remains unsigned. No npm package publication or website build is part of this workflow.
 
 Workflow artifact uploads are temporary: both Native Release and Native Desktop Packages retain them for **7 days**. Recover within that window or rebuild the exact authorized source; expired uploads cannot support `publish-only`. This retention does not delete published GitHub Release assets.
 
@@ -100,7 +102,7 @@ Publication retains the numeric release ID returned by draft creation and uses t
 
 `.github/workflows/docker.yml`, `desktop-packages.yml`, and `release-notes-sync.yml` are also manual-only, alongside relay deployment and rollout. Docker publication requires `publish=true` and an explicit matching source version, including when the selected ref is a tag. These workflows do not establish a completed release or remove the distribution requirements above.
 
-Linux/Windows ARM64 client builds need only the Rust toolchain on the native ARM64 runner; the former reusable Flutter ARM64 SDK release (`flutter-sdk-*` tags) is not consumed. Leave published `flutter-sdk-*` prereleases untouched; they are not product releases.
+Linux/Windows ARM64 client builds need only the Rust toolchain and Zig on the native ARM64 runner; the former reusable Flutter ARM64 SDK release (`flutter-sdk-*` tags) is not consumed. Leave published `flutter-sdk-*` prereleases untouched; they are not product releases.
 
 ## Authorization and verification
 

@@ -83,7 +83,7 @@ class MakepadSurface
     // Paseo: native widgets share one SurfaceView but not one editing session.
     private long inputSession;
     private MakepadInputConnection inputConnection;
-    private boolean inputPassword, inputNumeric;
+    private boolean inputPassword, inputNumeric, inputTerminal;
 
     private static final int CAN_COPY = 1, CAN_CUT = 2, CAN_PASTE = 4, CAN_SELECT_ALL = 8;
     private static final int ACTION_DISMISS = 0, ACTION_COPY = 1, ACTION_CUT = 2,
@@ -436,11 +436,12 @@ class MakepadSurface
     }
 
     void updateTextInput(long session, long revision, String text, int start, int end,
-                         boolean password, boolean numeric, boolean restart) {
+                         boolean password, boolean numeric, boolean terminal, boolean restart) {
         if (session != inputSession) {
             inputSession = session;
             inputPassword = password;
             inputNumeric = numeric;
+            inputTerminal = terminal;
             if (text == null) {
                 if (inputConnection != null) inputConnection.invalidate();
                 inputConnection = null;
@@ -665,7 +666,7 @@ class MakepadSurface
     @Override
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
         if (inputConnection != null) inputConnection = inputConnection.reconnect();
-        if (inputConnection != null) inputConnection.editorInfo(outAttrs, inputPassword, inputNumeric);
+        if (inputConnection != null) inputConnection.editorInfo(outAttrs, inputPassword, inputNumeric, inputTerminal);
         return inputConnection;
     }
 
@@ -882,8 +883,8 @@ public class MakepadActivity
     
     // Paseo: JNI runs on Makepad's render thread; Editable and IMM stay on UI.
     public void updateTextInput(long session, long revision, String text, int start, int end,
-                                boolean password, boolean numeric, boolean restart) {
-        runOnUiThread(() -> view.updateTextInput(session, revision, text, start, end, password, numeric, restart));
+                                boolean password, boolean numeric, boolean terminal, boolean restart) {
+        runOnUiThread(() -> view.updateTextInput(session, revision, text, start, end, password, numeric, terminal, restart));
     }
 
     // Paseo: these calls originate on the render thread. The Surface fences

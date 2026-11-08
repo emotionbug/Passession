@@ -54,7 +54,7 @@ paseo workspace create --isolation worktree --path ~/dev/my-app --base origin/ma
 
 You can also create a workspace without starting an agent immediately. Its working directory is ready for services, scripts and file browsing.
 
-Add another agent to review changes or inspect a running script's read-only output. For manual shell interaction or a web project's UI, use your own external terminal/browser. The native client has no interactive terminal emulator or embedded browser.
+Add another agent to review changes, inspect a running script's read-only output, or open a **Terminal** session for manual shell work on the host. For a web project's UI, use your own external browser. The native client has no embedded browser.
 
 Creating an agent and creating a workspace are separate actions. Pass a workspace ID when you want an agent in a specific existing workspace. A bare `paseo run` from a human shell creates a new local workspace; when one agent runs it, Paseo recognizes the caller and creates a subagent in the caller's workspace.
 

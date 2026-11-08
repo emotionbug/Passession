@@ -81,7 +81,7 @@ SSH 使用本机 `ssh` 可执行文件、非交互批量认证及指向远端回
 <a id="terminals-and-files"></a>
 ## 终端与文件
 
-`create_terminal`、`list_terminals`、`rename_terminal`、`capture_terminal`、`kill_terminal` 管理 daemon PTY。包括工作区身份和实际目录。`observe_terminal(id, restore, options)` 返回 `TerminalStream`；`recv` 产生 `TerminalEvent::{Frame,Exit}`，`input` 发送字节，`resize` 接受 `paseo_protocol::binary_frames::TerminalResize`。显式释放 `stream.subscription`。这些 API 不会为原生客户端添加交互终端 UI。
+`create_terminal`、`list_terminals`、`rename_terminal`、`capture_terminal`、`kill_terminal` 管理 daemon PTY。包括工作区身份和实际目录。`observe_terminal(id, restore, options)` 返回 `TerminalStream`；`recv` 产生 `TerminalEvent::{Frame,Exit}`，`input` 发送字节，`resize` 接受 `paseo_protocol::binary_frames::TerminalResize`。显式释放 `stream.subscription`。原生客户端的 **Terminal** 标签页使用的也是这些 daemon 终端。
 
 `read_file(cwd, path, max_bytes, options)` 返回有字节上限的 `DownloadedFile { metadata, bytes }`。`upload_file(file_name, mime, modified_at, bytes, options)` 使用有限大小二进制帧。`list_directory`、`write_file`、`create_file_entry`、`rename_file_entry`、`duplicate_file_entry`、`delete_file_entry` 提供文件操作；破坏性调用前确认准确 schema。上传取消不保证回滚或自动重试。
 

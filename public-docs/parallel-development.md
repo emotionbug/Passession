@@ -31,7 +31,7 @@ Send corrections to that workspace's agent. To get another opinion, use **New ag
 
 ## Run and test the app
 
-Run the project's test or development command through a configured workspace script or ask the agent to run it. Inspect the script's read-only output in Paseo. For manual interactive shell work, use your own external terminal on the daemon host; the native app has no interactive terminal emulator.
+Run the project's test or development command through a configured workspace script or ask the agent to run it. Inspect the script's read-only output in Paseo. For manual interactive shell work, choose **New session → Launch → Terminal** to open a shell on the daemon host, or use your own external terminal.
 
 Each worktree has its own files, but processes still share the machine's network ports. Assign a different dev-server port to each running copy. For repeatable setup and service ports, configure [worktree setup and scripts](/docs/worktrees#paseojson).
 

@@ -30,7 +30,7 @@ Paseo runs the coding agents you already use, with your subscriptions, credentia
 
 The daemon owns running agents and workspaces. Native desktop/mobile clients and the Rust CLI connect to the same environment. Existing IDs, history, configuration and host-side files are preserved.
 
-Use Paseo on your laptop or connect to another machine. Android and iOS provide remote chat, files, diffs and read-only script logs, without running a daemon. [Connect your devices](/docs/connectivity) directly or through the optional end-to-end encrypted relay. There is no product web client, embedded browser/automation or interactive terminal UI; use your own external browser/terminal when needed.
+Use Paseo on your laptop or connect to another machine. Android and iOS provide remote chat, files, diffs, terminals and read-only script logs, without running a daemon; a mobile **Terminal** tab drives the host's shell, not a local one. [Connect your devices](/docs/connectivity) directly or through the optional end-to-end encrypted relay. There is no product web client or embedded browser/automation; use your own external browser when needed.
 
 ## Automate and extend your workflow
 

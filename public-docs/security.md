@@ -123,7 +123,7 @@ See [Docker](/docs/docker) for Compose and reverse proxy examples.
 
 ## Native desktop trust boundary
 
-The native desktop client does not bundle Electron or Chromium. Chromium sandbox switches and helper-installation instructions do not apply. This does not sandbox agents: providers and script/setup PTYs run with the daemon user's filesystem and credential access. The client exposes read-only task logs, not an interactive terminal UI.
+The native desktop client does not bundle Electron or Chromium. Chromium sandbox switches and helper-installation instructions do not apply. This does not sandbox agents: providers, script/setup PTYs and **Terminal** shells run with the daemon user's filesystem and credential access. Script/setup tasks show read-only logs; what you type in a **Terminal** tab goes to that shell on the daemon host.
 
 Built-in integrations run in Rust. Native backend plugins execute trusted code in separate processes with the daemon user's privileges. Process isolation is not a security sandbox; install only plugins you trust. Executable React UI plugins and embedded browser automation are not part of the native product.
 

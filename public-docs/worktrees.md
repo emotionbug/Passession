@@ -12,7 +12,7 @@ Git worktrees are one kind of workspace.
 
 A [workspace](/docs/workspaces) is the place where a task happens. When that workspace is backed by a git worktree, Paseo creates a separate directory on a separate branch so parallel agents never step on each other.
 
-This page covers where worktrees live, branch selection, and `paseo.json` setup hooks, scripts and long-running services. The Rust daemon retains PTYs; the native client presents read-only logs rather than an interactive terminal.
+This page covers where worktrees live, branch selection, and `paseo.json` setup hooks, scripts and long-running services. The Rust daemon owns the PTYs; the native client shows setup and script output as read-only logs and opens interactive shells as **Terminal** tabs.
 
 ## Layout and workflow
 
@@ -225,7 +225,7 @@ Script names are upper-cased and non-alphanumerics become `_`. Point your fronte
 
 ## Setup PTY output
 
-Existing `worktree.terminals` configuration starts daemon-owned PTY commands when a worktree is created. Their native presentation is read-only output; do not use this as an instruction to open an interactive shell or REPL in the client. For a log-following command:
+Existing `worktree.terminals` configuration starts daemon-owned PTY commands when a worktree is created. Their native presentation is read-only output; for an interactive shell or REPL, open a **Terminal** session instead. For a log-following command:
 
 ```json
 {

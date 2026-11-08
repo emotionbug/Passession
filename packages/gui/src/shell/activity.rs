@@ -101,7 +101,7 @@ impl Activity {
                 "type": "client_heartbeat",
                 "deviceType": if cfg!(any(target_os = "android", target_os = "ios")) { "mobile" } else { "web" },
                 "focusedAgentId": if focused && kind == Some("agent") { id.clone() } else { None },
-                "focusedTerminalId": if focused && kind == Some("execution_log") { id } else { None },
+                "focusedTerminalId": if focused && matches!(kind, Some("execution_log" | "terminal")) { id } else { None },
                 "lastActivityAt": iso(self.last_activity),
                 "appVisible": self.visible,
                 "appVisibilityChangedAt": iso(self.visibility_changed),

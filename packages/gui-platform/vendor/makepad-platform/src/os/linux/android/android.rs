@@ -1047,6 +1047,8 @@ pub(crate) struct AndroidTextInput {
     selection: (usize, usize),
     password: bool,
     numeric: bool,
+    /// Terminal editors ask for no auto-capitalization, suggestions or autocorrect.
+    terminal: bool,
 }
 
 impl Cx {
@@ -1149,7 +1151,7 @@ impl Cx {
     }
 
     pub(crate) fn android_update_text_input(&mut self, area: crate::area::Area,
-        editor: u64, text: &str, start: usize, end: usize, password: bool, numeric: bool) {
+        editor: u64, text: &str, start: usize, end: usize, password: bool, numeric: bool, terminal: bool) {
         if !area.is_valid(self) || !self.has_key_focus(area) { return; }
         self.os.ime_blur_pending = false;
         let editor_changed = self.os.text_input.area != area || self.os.text_input.editor != editor;
@@ -1159,8 +1161,10 @@ impl Cx {
         }
         let state = &mut self.os.text_input;
         if state.area == area && state.editor == editor && state.text == text && state.selection == (start, end)
-            && state.password == password && state.numeric == numeric && !state.processing { return; }
-        let restart = editor_changed || state.password != password || state.numeric != numeric;
+            && state.password == password && state.numeric == numeric && state.terminal == terminal
+            && !state.processing { return; }
+        let restart = editor_changed || state.password != password || state.numeric != numeric
+            || state.terminal != terminal;
         if restart || !state.processing {
             state.session += 1;
             state.revision = 0;
@@ -1172,9 +1176,10 @@ impl Cx {
         state.selection = (start, end);
         state.password = password;
         state.numeric = numeric;
+        state.terminal = terminal;
         unsafe { android_jni::to_java_text_input(state.session, state.revision, Some(text),
             text[..start].encode_utf16().count(), text[..end].encode_utf16().count(),
-            password, numeric, restart); }
+            password, numeric, terminal, restart); }
     }
 
     pub(crate) fn android_clear_text_input(&mut self, area: crate::area::Area) {
@@ -1185,7 +1190,7 @@ impl Cx {
         state.session += 1;
         state.revision = 0;
         state.text.clear();
-        unsafe { android_jni::to_java_text_input(state.session, 0, None, 0, 0, false, false, true); }
+        unsafe { android_jni::to_java_text_input(state.session, 0, None, 0, 0, false, false, false, true); }
     }
 }
 

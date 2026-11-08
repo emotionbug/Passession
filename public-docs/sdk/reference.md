@@ -80,7 +80,7 @@ Owned observations require `Arc<DaemonClient>`: `observe_agents`, `observe_works
 
 ## Terminals and files
 
-`create_terminal`, `list_terminals`, `rename_terminal`, `capture_terminal`, `kill_terminal` manage daemon PTYs. Include workspace identity and actual directory. `observe_terminal(id, restore, options)` returns `TerminalStream`; `recv` yields `TerminalEvent::{Frame,Exit}`, `input` sends bytes, and `resize` takes `paseo_protocol::binary_frames::TerminalResize`. Release `stream.subscription` explicitly. These APIs do not add an interactive terminal UI to the native client.
+`create_terminal`, `list_terminals`, `rename_terminal`, `capture_terminal`, `kill_terminal` manage daemon PTYs. Include workspace identity and actual directory. `observe_terminal(id, restore, options)` returns `TerminalStream`; `recv` yields `TerminalEvent::{Frame,Exit}`, `input` sends bytes, and `resize` takes `paseo_protocol::binary_frames::TerminalResize`. Release `stream.subscription` explicitly. The native client's **Terminal** tabs use these same daemon terminals.
 
 `read_file(cwd, path, max_bytes, options)` returns `DownloadedFile { metadata, bytes }` with a byte ceiling. `upload_file(file_name, mime, modified_at, bytes, options)` uses bounded binary frames. `list_directory`, `write_file`, `create_file_entry`, `rename_file_entry`, `duplicate_file_entry`, `delete_file_entry` expose file operations; check their exact schema before destructive calls. Upload cancellation does not promise rollback or automatic retry.
 

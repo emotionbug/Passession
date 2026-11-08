@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.13.12 - 2026-11-08
+
+### Added
+
+- Add **Terminal** to New session → Launch next to Chat: a daemon-owned interactive shell on the selected host and directory, opened as a terminal tab on desktop, Android and iOS. Keyboard, committed IME text (including Hangul), paste, Ctrl/Alt combinations, a mobile key bar, scrollback, selection/copy and focused-pane size claiming are supported; Android keyboards do not auto-capitalize or autocorrect shell input. Live terminals are listed in the sidebar, restore with the layout and are killed on confirmed tab close.
+
+### Changed
+
+- Replace `alacritty_terminal` with Ghostty's VT engine (`libghostty-vt` through the new `paseo-terminal` crate) for daemon screens, execution logs and terminal tabs. Building now requires Zig 0.15.2; Android builds are 64-bit only (arm64-v8a, x86_64) and the x86_64 iOS simulator is no longer built. Native notices attribute the statically linked Ghostty archive and its bundled libraries.
+
+### Fixed
+
+- Wrap long task-list items in the task sheet and popover instead of clipping them at the screen edge.
+
 ## 0.13.11 - 2026-11-07
 
 ### Fixed

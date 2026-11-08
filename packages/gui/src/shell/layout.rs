@@ -121,8 +121,8 @@ pub const MAIN_PANE: &str = "main";
 pub const DEFAULT_SIDEBAR_WIDTH: f64 = 320.0;
 pub const DEFAULT_EXPLORER_WIDTH: f64 = 340.0;
 
-/// Removed surfaces that are dropped when a saved layout is restored.
-const REMOVED_KINDS: [&str; 3] = ["browser", "plugin", "terminal"];
+/// Removed surfaces (browser, executable plugin) that are dropped when a saved layout is restored.
+const REMOVED_KINDS: [&str; 2] = ["browser", "plugin"];
 
 #[derive(Clone, Debug)]
 pub struct Layout {
@@ -852,18 +852,21 @@ mod tests {
     }
 
     #[test]
-    fn restore_drops_removed_kinds_and_places_unplaced_tabs_in_the_focused_pane() {
+    fn restore_drops_removed_kinds_keeps_terminals_and_places_unplaced_tabs_in_the_focused_pane() {
         let terminal = PanelTarget::new("terminal", "srv", "ws", "/w").with_id("t");
+        let browser = PanelTarget::new("browser", "srv", "ws", "/w").with_id("b");
         let saved = json!({
             "version": 2,
-            "tabs": [agent("a").to_json(), agent("b").to_json(), terminal.to_json()],
-            "tree": {"kind": "pane", "id": "main", "tabs": [agent("a").key(), terminal.key()], "selected": terminal.key()},
+            "tabs": [agent("a").to_json(), agent("b").to_json(), terminal.to_json(), browser.to_json()],
+            "tree": {"kind": "pane", "id": "main", "tabs": [agent("a").key(), browser.key(), terminal.key()], "selected": browser.key()},
             "sidebarWidth": 9999,
         });
         let layout = Layout::restore(&saved);
-        assert_eq!(layout.tabs.len(), 2);
+        assert_eq!(layout.tabs.len(), 3);
+        assert!(layout.target(&terminal.key()).is_some());
+        assert!(layout.target(&browser.key()).is_none());
         let pane = layout.focused();
-        assert_eq!(pane.tabs, vec![agent("a").key(), agent("b").key()]);
+        assert_eq!(pane.tabs, vec![agent("a").key(), terminal.key(), agent("b").key()]);
         assert_eq!(pane.selected, Some(agent("a").key()));
         assert_eq!(layout.sidebar_width, 600.0);
         assert_eq!(layout.compact_destination, CompactDestination::Agent);

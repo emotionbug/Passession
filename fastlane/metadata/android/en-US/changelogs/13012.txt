@@ -1,0 +1,3 @@
+- Add Terminal to New session → Launch next to Chat: a daemon-owned interactive shell on the selected host and directory, opened as a terminal tab on desktop, Android and iOS. Keyboard, committed IME text (including Hangul), paste, Ctrl/Alt combinations, a mobile key bar, scrollback, selection/copy and focused-pane size claiming are supported; Android keyboards do not auto-capitalize or autocorrect shell input. Live terminals are list...
+
+Full notes: https://github.com/emotionbug/paseo/releases

@@ -67,11 +67,14 @@ final class MakepadInputConnection extends BaseInputConnection {
         publish();
     }
 
-    void editorInfo(EditorInfo info, boolean password, boolean numeric) {
+    void editorInfo(EditorInfo info, boolean password, boolean numeric, boolean terminal) {
+        // Terminal editors keep shell input literal: no auto-capitalization, suggestion strip or
+        // autocorrect; composing input methods (Hangul) stay available.
         info.inputType = numeric
             ? InputType.TYPE_CLASS_NUMBER | (password ? InputType.TYPE_NUMBER_VARIATION_PASSWORD
                 : InputType.TYPE_NUMBER_FLAG_DECIMAL)
             : InputType.TYPE_CLASS_TEXT | (password ? InputType.TYPE_TEXT_VARIATION_PASSWORD
+                : terminal ? InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
                 : InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
         info.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI
             | EditorInfo.IME_ACTION_NONE;

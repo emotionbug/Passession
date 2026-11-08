@@ -296,7 +296,15 @@ impl Cx {
     pub fn update_text_input(&mut self, _area: Area, _editor: u64, _text: &str, _start: usize,
         _end: usize, _password: bool, _numeric: bool) {
         #[cfg(target_os = "android")]
-        self.android_update_text_input(_area, _editor, _text, _start, _end, _password, _numeric);
+        self.android_update_text_input(_area, _editor, _text, _start, _end, _password, _numeric, false);
+    }
+
+    /// Publish a terminal's hidden editor: Android asks the input method for plain text
+    /// without auto-capitalization, suggestions or autocorrect. Offsets are UTF-8 bytes.
+    pub fn update_terminal_text_input(&mut self, _area: Area, _editor: u64, _text: &str, _start: usize,
+        _end: usize) {
+        #[cfg(target_os = "android")]
+        self.android_update_text_input(_area, _editor, _text, _start, _end, false, false, true);
     }
 
     pub fn clear_text_input(&mut self, _area: Area) {

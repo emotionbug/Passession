@@ -75,7 +75,7 @@ The provider should become available once Paseo can find and start the `codex` c
 
 ## Use Codex in an external terminal
 
-For the standard Codex CLI experience, open your own terminal on the daemon host, change to the checkout and run `codex`. The native Paseo application has no interactive terminal UI; workspace script/setup PTYs remain supported with read-only logs.
+For the standard Codex CLI experience, open a terminal on the daemon host, change to the checkout and run `codex`. Use your own terminal or a Paseo **Terminal** session (**New session → Launch → Terminal**); workspace script/setup PTYs remain supported with read-only logs.
 
 ## See also
 

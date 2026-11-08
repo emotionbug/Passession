@@ -213,6 +213,10 @@ pub enum Pending {
     /// `AppPreferenceSettings.save`: a failed durable write of `key` restores `previous`
     /// (`None`: the key was absent) and toasts the error.
     SavePreference { key: String, previous: Option<Value> },
+    /// `list_terminals_request` deciding whether closing `key` needs the terminal confirmation.
+    TerminalCloseCheck { key: String, host_id: String, terminal_id: String },
+    /// `workspace.terminal.new`: `create_terminal_request`, then the terminal tab opens.
+    CreateTerminal { host_id: String, workspace_id: String, cwd: String, placement: crate::common::TabPlacement },
 }
 
 #[derive(Default)]
@@ -559,6 +563,9 @@ impl Widget for PaseoShell {
         }
         if !ui.events.is_empty() {
             self.handle_core_batch(cx, ui);
+            if sidebar::sync_terminals(&mut self.data.sidebar, ui) {
+                self.redraw(cx);
+            }
         }
         self.data.router.update(ui.preferences());
         self.data.router.handle_timer(event);

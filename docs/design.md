@@ -28,7 +28,7 @@ Hover is a convenience, never the only access to an action. Provide pointer, key
 
 ## Content surfaces
 
-Markdown and source editing are native. Diffs are summary-first and load bodies lazily; do not block opening the entire Changes view on every patch. Preserve drafts and selection through transient errors. Display script/setup output as read-only logs, with real lifecycle state and exit errors. The app does not contain an interactive terminal emulator or browser.
+Markdown and source editing are native. Diffs are summary-first and load bodies lazily; do not block opening the entire Changes view on every patch. Preserve drafts and selection through transient errors. Interactive terminals are native terminal tabs; display script/setup output as read-only logs, with real lifecycle state and exit errors. The app does not contain a browser.
 
 Loading, empty, unavailable, failed, pending and successful states are separate. A disconnected host must not look like an empty host. A failed save must not look like a completed save. A permission request must not disappear merely because a different pane is selected.
 

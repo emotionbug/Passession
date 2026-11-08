@@ -1,20 +1,16 @@
 //! Native terminal grid and the Paseo wire projection of it.
 //!
-//! Alacritty owns VT parsing, scrolling, character sets, reflow, and both screen
-//! buffers. A second, incremental VTE parser observes Paseo's shell protocol and
-//! input-mode extensions; it never attempts to emulate the display with lines.
+//! Ghostty (`paseo_terminal`) owns VT parsing, query replies, scrolling,
+//! character sets, reflow and both screen buffers. A second, incremental VTE
+//! parser observes only the Paseo shell protocol and input-mode extensions
+//! Ghostty does not model; it never attempts to emulate the display.
 
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte;
-use alacritty_terminal::vte::ansi::{Color, Processor, Timeout};
+use paseo_terminal::{
+    CellStyle, CellWidth, Color, Cursor, CursorShape, Emulator, Options, Row, RowCell,
+    ThreadBound,
+};
 use serde_json::{Value, json};
 
 const HISTORY_LINES: usize = 1000;
@@ -29,283 +25,39 @@ pub struct ScreenEffects {
     pub title: Option<String>,
 }
 
-#[derive(Default)]
-struct PendingEffects {
-    effects: ScreenEffects,
-    suppress_reply: bool,
-}
-
-#[derive(Clone, Default)]
-struct Events(Arc<Mutex<PendingEffects>>);
-
-impl Events {
-    fn reply(&self, bytes: &[u8]) {
-        self.0
-            .lock()
-            .unwrap()
-            .effects
-            .replies
-            .extend_from_slice(bytes);
-    }
-
-    fn suppress(&self, suppress: bool) {
-        self.0.lock().unwrap().suppress_reply = suppress;
-    }
-}
-
-impl EventListener for Events {
-    fn send_event(&self, event: Event) {
-        match event {
-            Event::PtyWrite(text) => {
-                let mut pending = self.0.lock().unwrap();
-                if !pending.suppress_reply {
-                    pending.effects.replies.extend_from_slice(text.as_bytes());
-                }
-            }
-            Event::Title(title) => self.0.lock().unwrap().effects.title = Some(title),
-            Event::ResetTitle => self.0.lock().unwrap().effects.title = Some(String::new()),
-            // The server has no host clipboard or pixel-sized terminal window.
-            // Color queries supported by terminal.ts are answered by Controls.
-            _ => {}
-        }
-    }
-}
-
-/// Synchronized updates defer painting, not the authoritative headless grid.
-/// Keeping the parser synchronous also lets DSR observe all preceding output.
-#[derive(Default)]
-struct HeadlessUpdates;
-
-impl Timeout for HeadlessUpdates {
-    fn set_timeout(&mut self, _: Duration) {}
-    fn clear_timeout(&mut self) {}
-    fn pending_timeout(&self) -> bool {
-        false
-    }
-}
-
-struct Size {
-    rows: usize,
-    cols: usize,
-}
-
-impl Size {
-    fn new(rows: u16, cols: u16) -> Self {
-        // Like xterm, keep space for a full-width character even for a 1-column
-        // size request. Empty dimensions are never valid terminal geometry.
-        Self {
-            rows: usize::from(rows.max(1)),
-            cols: usize::from(cols.max(2)),
-        }
-    }
-}
-
-impl Dimensions for Size {
-    fn total_lines(&self) -> usize {
-        self.rows
-    }
-    fn screen_lines(&self) -> usize {
-        self.rows
-    }
-    fn columns(&self) -> usize {
-        self.cols
-    }
-}
-
-#[derive(Default)]
-struct InputModes {
-    kitty: u16,
-    kitty_stack: Vec<u16>,
-    win32: bool,
-    application_cursor: bool,
-    bracketed_paste: bool,
-    cursor_style: Option<&'static str>,
-    cursor_blink: Option<bool>,
-}
-
-/// VTE normalizes an omitted numeric parameter to zero. The input-mode
-/// protocol distinguishes CSI > u from CSI > 0 u, so retain presence only;
-/// VTE remains responsible for recognizing and dispatching the sequence.
-#[derive(Default)]
-struct ParameterPresence {
-    state: u8,
-    parameter: usize,
-    present: [bool; 2],
-}
-
-impl ParameterPresence {
-    fn advance(&mut self, byte: u8) {
-        if byte == 0x1b {
-            self.state = 1;
-        } else if self.state == 1 {
-            self.state = if byte == b'[' { 2 } else { 0 };
-            self.parameter = 0;
-            self.present = [false; 2];
-        } else if self.state == 2 {
-            match byte {
-                b'0'..=b'9' if self.parameter < 2 => self.present[self.parameter] = true,
-                b';' => self.parameter = self.parameter.saturating_add(1),
-                0x40..=0x7e | 0x18 | 0x1a => self.state = 0,
-                _ => {}
-            }
-        }
-    }
-}
-
+/// Ghostty objects are `!Send`; the emulator lives on its own thread and every
+/// call is serialized there. The screen thread never locks anything of the
+/// caller's, so calling it under the terminal's display lock cannot deadlock.
 pub struct Screen {
-    terminal: Term<Events>,
-    parser: Processor<HeadlessUpdates>,
-    control_parser: vte::Parser,
-    parameter_presence: ParameterPresence,
-    events: Events,
-    modes: InputModes,
-    title: Option<String>,
+    state: ThreadBound<State>,
 }
 
 impl Screen {
-    pub fn new(rows: u16, cols: u16) -> Self {
-        let events = Events::default();
-        let config = Config {
-            scrolling_history: HISTORY_LINES,
-            ..Config::default()
-        };
-        Self {
-            terminal: Term::new(config, &Size::new(rows, cols), events.clone()),
-            parser: Processor::new(),
-            control_parser: vte::Parser::new(),
-            parameter_presence: ParameterPresence::default(),
-            events,
-            modes: InputModes::default(),
-            title: None,
-        }
+    pub fn new(rows: u16, cols: u16) -> Result<Self, paseo_terminal::Error> {
+        Ok(Self {
+            state: ThreadBound::spawn("paseo-screen", move || State::new(rows, cols))?,
+        })
     }
 
     pub fn process(&mut self, bytes: &[u8]) -> ScreenEffects {
-        for &byte in bytes {
-            let mut suppress = false;
-            self.parameter_presence.advance(byte);
-            self.control_parser.advance(
-                &mut Controls {
-                    terminal: &self.terminal,
-                    modes: &mut self.modes,
-                    events: &self.events,
-                    suppress: &mut suppress,
-                    parameter_presence: self.parameter_presence.present,
-                },
-                byte,
-            );
-            if suppress {
-                self.events.suppress(true);
-            }
-            self.parser.advance(&mut self.terminal, byte);
-            if suppress {
-                self.events.suppress(false);
-            }
-        }
-        let effects = std::mem::take(&mut self.events.0.lock().unwrap().effects);
-        if let Some(title) = &effects.title {
-            self.title = (!title.trim().is_empty()).then(|| title.clone());
-        }
-        self.terminal.reset_damage();
-        effects
+        let bytes = bytes.to_vec();
+        self.state.call(move |state| state.process(&bytes))
     }
 
-    pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.terminal.resize(Size::new(rows, cols));
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), paseo_terminal::Error> {
+        let (rows, cols) = size(rows, cols);
+        self.state
+            .call(move |state| state.emulator.resize(rows, cols))
     }
 
     pub fn snapshot(&self, wrapped: bool) -> Value {
-        let rows = self.terminal.screen_lines();
-        let history = self.terminal.history_size() as i32;
-        let mut state = json!({
-            "rows": rows,
-            "cols": self.terminal.columns(),
-            "grid": (0..rows as i32).map(|row| self.row_json(row)).collect::<Vec<_>>(),
-            "scrollback": (-history..0).map(|row| self.row_json(row)).collect::<Vec<_>>(),
-            "cursor": self.cursor_json(),
-        });
-        if let Some(title) = &self.title {
-            state["title"] = json!(title);
-        }
-        if wrapped {
-            state["gridWrapped"] = json!(
-                (0..rows as i32)
-                    .map(|r| self.wrapped(r))
-                    .collect::<Vec<_>>()
-            );
-            state["scrollbackWrapped"] =
-                json!((-history..0).map(|r| self.wrapped(r)).collect::<Vec<_>>());
-        }
-        state
-    }
-
-    fn row_json(&self, row: i32) -> Value {
-        Value::Array(
-            (0..self.terminal.columns())
-                .map(|column| {
-                    let cell = &self.terminal.grid()[Line(row)][Column(column)];
-                    let style = Style::from(cell);
-                    let mut value = json!({
-                        "char": cell_text(cell),
-                        "bold": style.flags.contains(Flags::BOLD),
-                        "italic": style.flags.contains(Flags::ITALIC),
-                        "underline": style.flags.intersects(Flags::ALL_UNDERLINES),
-                        "dim": style.flags.contains(Flags::DIM),
-                        "inverse": style.flags.contains(Flags::INVERSE),
-                        "strikethrough": style.flags.contains(Flags::STRIKEOUT),
-                    });
-                    for (field, mode_field, color) in
-                        [("fg", "fgMode", style.fg), ("bg", "bgMode", style.bg)]
-                    {
-                        if let Some((mode, color)) = color {
-                            value[field] = json!(color);
-                            value[mode_field] = json!(mode);
-                        }
-                    }
-                    value
-                })
-                .collect(),
-        )
-    }
-
-    fn cursor_json(&self) -> Value {
-        let (row, col) = cursor_position(&self.terminal);
-        let mut cursor = json!({ "row": row, "col": col });
-        if !self.terminal.mode().contains(TermMode::SHOW_CURSOR) {
-            cursor["hidden"] = json!(true);
-        }
-        if let Some(style) = self.modes.cursor_style {
-            cursor["style"] = json!(style);
-        }
-        if let Some(blink) = self.modes.cursor_blink {
-            cursor["blink"] = json!(blink);
-        }
-        cursor
-    }
-
-    fn wrapped(&self, row: i32) -> bool {
-        self.terminal.grid()[Line(row)][Column(self.terminal.columns() - 1)]
-            .flags
-            .contains(Flags::WRAPLINE)
+        self.state.call(move |state| state.snapshot(wrapped))
     }
 
     /// Matches TerminalInputModeTracker.getPreamble, including its ordering and
     /// replacement (rather than bitwise) semantics for CSI = flags ; mode u.
     pub fn replay_preamble(&self) -> String {
-        let mut result = String::new();
-        if self.modes.kitty > 0 {
-            let _ = write!(result, "\x1b[={};1u", self.modes.kitty);
-        }
-        if self.modes.win32 {
-            result.push_str("\x1b[?9001h");
-        }
-        if self.modes.application_cursor {
-            result.push_str("\x1b[?1h");
-        }
-        if self.modes.bracketed_paste {
-            result.push_str("\x1b[?2004h");
-        }
-        result
+        self.state.call(|state| state.replay_preamble())
     }
 
     /// ANSI rendering follows protocol/terminal-snapshot.ts. The caller resets
@@ -313,77 +65,9 @@ impl Screen {
     /// only the input preamble. The caller supplies 200 for an absent visible
     /// scrollback limit. Full snapshots always contain all retained history.
     pub fn restore(&self, mode: &str, scrollback: usize) -> Vec<u8> {
-        if mode == "live" {
-            return self.replay_preamble().into_bytes();
-        }
-        let history = self.terminal.history_size();
-        let history = if mode == "visible-snapshot" {
-            history.min(scrollback.min(MAX_VISIBLE_HISTORY))
-        } else {
-            history
-        };
-        let mut output = String::new();
-        let last = self.terminal.screen_lines() as i32 - 1;
-        for row in -(history as i32)..=last {
-            let wrapped = self.wrapped(row);
-            self.render_row(row, wrapped, &mut output);
-            if row < last && !wrapped {
-                output.push_str("\r\n");
-            }
-        }
-        output.push_str("\x1b[0m");
-        if let Some(style) = self.modes.cursor_style {
-            let base = match style {
-                "underline" => 3,
-                "bar" => 5,
-                _ => 1,
-            };
-            let code = base + usize::from(self.modes.cursor_blink == Some(false));
-            let _ = write!(output, "\x1b[{code} q");
-        }
-        let (row, col) = cursor_position(&self.terminal);
-        let _ = write!(output, "\x1b[{};{}H", row + 1, col + 1);
-        output.push_str(if self.terminal.mode().contains(TermMode::SHOW_CURSOR) {
-            "\x1b[?25h"
-        } else {
-            "\x1b[?25l"
-        });
-        output.push_str(&self.replay_preamble());
-        output.into_bytes()
-    }
-
-    fn render_row(&self, row: i32, wrapped: bool, output: &mut String) {
-        let cells = &self.terminal.grid()[Line(row)];
-        let default = Style::default();
-        let length = if wrapped {
-            self.terminal.columns()
-        } else {
-            (0..self.terminal.columns())
-                .rfind(|&column| {
-                    let cell = &cells[Column(column)];
-                    cell.c != ' ' && cell.c != '\t'
-                        || cell.zerowidth().is_some_and(|chars| !chars.is_empty())
-                        || cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-                        || Style::from(cell) != default
-                })
-                .map_or(0, |column| column + 1)
-        };
-        let mut previous = default;
-        for column in 0..length {
-            let cell = &cells[Column(column)];
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let style = Style::from(cell);
-            if style != previous {
-                style.write_ansi(output);
-                previous = style;
-            }
-            append_cell(output, cell);
-        }
-        if previous != default {
-            output.push_str("\x1b[0m");
-        }
+        let mode = mode.to_owned();
+        self.state
+            .call(move |state| state.restore(&mode, scrollback))
     }
 
     /// Source capture is plain rendered cell text even with stripAnsi=false:
@@ -395,8 +79,202 @@ impl Screen {
         end: Option<f64>,
         _strip: bool,
     ) -> (Vec<String>, usize) {
-        let history = self.terminal.history_size();
-        let total = history + self.terminal.screen_lines();
+        self.state.call(move |state| state.capture(start, end))
+    }
+
+    pub(crate) fn exit_lines(&self, limit: usize) -> Vec<String> {
+        self.state.call(move |state| state.exit_lines(limit))
+    }
+}
+
+fn size(rows: u16, cols: u16) -> (u16, u16) {
+    // Like xterm, keep space for a full-width character even for a 1-column
+    // size request. Empty dimensions are never valid terminal geometry.
+    (rows.max(1), cols.max(2))
+}
+
+/// Presented rows addressed physically: `0..history` is scrollback (at most
+/// `HISTORY_LINES`), `history..history + rows` the screen.
+#[derive(Clone, Copy)]
+struct Extent {
+    history: usize,
+    rows: usize,
+}
+
+impl Extent {
+    fn total(self) -> usize {
+        self.history + self.rows
+    }
+}
+
+struct State {
+    emulator: Emulator,
+    parser: vte::Parser,
+    extensions: Extensions,
+    title: Option<String>,
+}
+
+impl State {
+    fn new(rows: u16, cols: u16) -> Result<Self, paseo_terminal::Error> {
+        let (rows, cols) = size(rows, cols);
+        Ok(Self {
+            emulator: Emulator::new(Options {
+                rows,
+                cols,
+                scrollback: HISTORY_LINES,
+                respond: true,
+            })?,
+            parser: vte::Parser::new(),
+            extensions: Extensions::default(),
+            title: None,
+        })
+    }
+
+    fn process(&mut self, bytes: &[u8]) -> ScreenEffects {
+        self.parser.advance(&mut self.extensions, bytes);
+        self.emulator.write(bytes);
+        let current = self
+            .emulator
+            .title()
+            .filter(|title| !title.trim().is_empty());
+        // A reset clears Ghostty's title without a change notification.
+        let title = self
+            .emulator
+            .take_title()
+            .or_else(|| (current != self.title).then(|| current.clone().unwrap_or_default()));
+        self.title = current;
+        ScreenEffects {
+            replies: self.emulator.take_replies(),
+            command_finished: std::mem::take(&mut self.extensions.command_finished),
+            title,
+        }
+    }
+
+    fn extent(&self) -> Extent {
+        Extent {
+            history: self.emulator.history(),
+            rows: usize::from(self.emulator.rows()),
+        }
+    }
+
+    fn snapshot(&mut self, wrapped: bool) -> Value {
+        let extent = self.extent();
+        let scrollback: Vec<Row> = (0..extent.history)
+            .map(|row| self.emulator.row(row))
+            .collect();
+        let grid: Vec<Row> = (extent.history..extent.total())
+            .map(|row| self.emulator.row(row))
+            .collect();
+        let mut state = json!({
+            "rows": extent.rows,
+            "cols": self.emulator.cols(),
+            "grid": grid.iter().map(row_json).collect::<Vec<_>>(),
+            "scrollback": scrollback.iter().map(row_json).collect::<Vec<_>>(),
+            "cursor": self.cursor_json(),
+        });
+        if let Some(title) = &self.title {
+            state["title"] = json!(title);
+        }
+        if wrapped {
+            state["gridWrapped"] = json!(grid.iter().map(|row| row.wrapped).collect::<Vec<_>>());
+            state["scrollbackWrapped"] =
+                json!(scrollback.iter().map(|row| row.wrapped).collect::<Vec<_>>());
+        }
+        state
+    }
+
+    fn cursor_json(&mut self) -> Value {
+        let cursor = self.emulator.cursor();
+        let (row, col) = cursor_position(&cursor);
+        let mut value = json!({ "row": row, "col": col });
+        if !cursor.visible {
+            value["hidden"] = json!(true);
+        }
+        if let Some(style) = self.cursor_style(&cursor) {
+            value["style"] = json!(style);
+        }
+        if let Some(blink) = self.cursor_blink(&cursor) {
+            value["blink"] = json!(blink);
+        }
+        value
+    }
+
+    /// Presentation is reported only once a program chose it (DECSCUSR, or
+    /// DECSET 12 for blinking) since the last reset.
+    fn cursor_style(&self, cursor: &Cursor) -> Option<&'static str> {
+        self.extensions.cursor_style.then_some(match cursor.shape {
+            CursorShape::Underline => "underline",
+            CursorShape::Bar => "bar",
+            CursorShape::Block | CursorShape::BlockHollow => "block",
+        })
+    }
+
+    fn cursor_blink(&self, cursor: &Cursor) -> Option<bool> {
+        self.extensions.cursor_blink.then_some(cursor.blinking)
+    }
+
+    fn replay_preamble(&self) -> String {
+        let modes = self.emulator.modes();
+        let mut result = String::new();
+        if modes.kitty_flags > 0 {
+            let _ = write!(result, "\x1b[={};1u", modes.kitty_flags);
+        }
+        if self.extensions.win32 {
+            result.push_str("\x1b[?9001h");
+        }
+        if modes.application_cursor {
+            result.push_str("\x1b[?1h");
+        }
+        if modes.bracketed_paste {
+            result.push_str("\x1b[?2004h");
+        }
+        result
+    }
+
+    fn restore(&mut self, mode: &str, scrollback: usize) -> Vec<u8> {
+        if mode == "live" {
+            return self.replay_preamble().into_bytes();
+        }
+        let extent = self.extent();
+        let history = if mode == "visible-snapshot" {
+            extent.history.min(scrollback.min(MAX_VISIBLE_HISTORY))
+        } else {
+            extent.history
+        };
+        let mut output = String::new();
+        let last = extent.total() - 1;
+        for physical in extent.history - history..=last {
+            let row = self.emulator.row(physical);
+            render_row(&row, &mut output);
+            if physical < last && !row.wrapped {
+                output.push_str("\r\n");
+            }
+        }
+        output.push_str("\x1b[0m");
+        let cursor = self.emulator.cursor();
+        if let Some(style) = self.cursor_style(&cursor) {
+            let base = match style {
+                "underline" => 3,
+                "bar" => 5,
+                _ => 1,
+            };
+            let code = base + usize::from(self.cursor_blink(&cursor) == Some(false));
+            let _ = write!(output, "\x1b[{code} q");
+        }
+        let (row, col) = cursor_position(&cursor);
+        let _ = write!(output, "\x1b[{};{}H", row + 1, col + 1);
+        output.push_str(if cursor.visible {
+            "\x1b[?25h"
+        } else {
+            "\x1b[?25l"
+        });
+        output.push_str(&self.replay_preamble());
+        output.into_bytes()
+    }
+
+    fn capture(&self, start: Option<f64>, end: Option<f64>) -> (Vec<String>, usize) {
+        let extent = self.extent();
+        let total = extent.total();
         let resolve = |number: Option<f64>, fallback: usize| {
             let number = number.unwrap_or(fallback as f64);
             let index = if number < 0.0 {
@@ -418,33 +296,24 @@ impl Screen {
             return (Vec::new(), total);
         }
         let end_exclusive = ((end + 1.0) as usize).min(total);
-        let mut lines = Vec::with_capacity(end_exclusive - start as usize);
-        for index in start as usize..end_exclusive {
-            let row = Line(index as i32 - history as i32);
-            let mut text = String::new();
-            for column in 0..self.terminal.columns() {
-                append_cell(&mut text, &self.terminal.grid()[row][Column(column)]);
-            }
-            text.truncate(text.trim_end_matches(js_whitespace).len());
-            lines.push(text);
-        }
+        let lines = (start as usize..end_exclusive)
+            .map(|physical| row_text(&self.emulator.row(physical)))
+            .collect();
         (lines, total)
     }
 
-    pub(crate) fn exit_lines(&self, limit: usize) -> Vec<String> {
-        let history = self.terminal.history_size() as i32;
+    fn exit_lines(&self, limit: usize) -> Vec<String> {
+        let extent = self.extent();
         let mut lines: Vec<String> = Vec::new();
-        for row in -history..self.terminal.screen_lines() as i32 {
-            let mut text = String::new();
-            for column in 0..self.terminal.columns() {
-                append_cell(&mut text, &self.terminal.grid()[Line(row)][Column(column)]);
+        let mut continues = false;
+        for physical in 0..extent.total() {
+            let row = self.emulator.row(physical);
+            let text = row_text(&row);
+            match lines.last_mut() {
+                Some(line) if continues => line.push_str(&text),
+                _ => lines.push(text),
             }
-            text.truncate(text.trim_end_matches(js_whitespace).len());
-            if row > -history && self.wrapped(row - 1) && !lines.is_empty() {
-                lines.last_mut().unwrap().push_str(&text);
-            } else {
-                lines.push(text);
-            }
+            continues = row.wrapped;
         }
         while lines
             .last()
@@ -462,11 +331,11 @@ impl Screen {
     }
 }
 
-fn cursor_position(terminal: &Term<Events>) -> (usize, usize) {
-    let cursor = &terminal.grid().cursor;
+/// Cursor cell including a pending wrap past the last column.
+fn cursor_position(cursor: &Cursor) -> (usize, usize) {
     (
-        cursor.point.line.0 as usize,
-        cursor.point.column.0 + usize::from(cursor.input_needs_wrap),
+        usize::from(cursor.row),
+        usize::from(cursor.col) + usize::from(cursor.pending_wrap),
     )
 }
 
@@ -476,168 +345,180 @@ fn js_whitespace(c: char) -> bool {
         | '\u{3000}' | '\u{feff}')
 }
 
-fn append_cell(text: &mut String, cell: &Cell) {
-    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-        return;
-    }
-    text.push(if cell.c == '\t' { ' ' } else { cell.c });
-    if let Some(chars) = cell.zerowidth() {
-        text.extend(chars);
+/// Wire text of one column: a wide character's trailing spacer is empty, an
+/// erased cell or the padding before a wrapped wide character is a space.
+fn cell_text(cells: &[RowCell], column: usize) -> &str {
+    let cell = &cells[column];
+    if cell.width == CellWidth::Spacer
+        && column > 0
+        && cells[column - 1].width == CellWidth::Wide
+    {
+        ""
+    } else if cell.text.is_empty() {
+        " "
+    } else {
+        &cell.text
     }
 }
 
-fn cell_text(cell: &Cell) -> String {
-    let mut text = String::new();
-    append_cell(&mut text, cell);
+fn row_text(row: &Row) -> String {
+    let mut text: String = (0..row.cells.len())
+        .map(|column| cell_text(&row.cells, column))
+        .collect();
+    text.truncate(text.trim_end_matches(js_whitespace).len());
     text
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Style {
-    fg: Option<(u8, u32)>,
-    bg: Option<(u8, u32)>,
-    flags: Flags,
-}
-
-impl Default for Style {
-    fn default() -> Self {
-        Self {
-            fg: None,
-            bg: None,
-            flags: Flags::empty(),
-        }
-    }
-}
-
-impl From<&Cell> for Style {
-    fn from(cell: &Cell) -> Self {
-        fn color(color: Color) -> Option<(u8, u32)> {
-            match color {
-                Color::Named(name) if (name as u32) < 16 => Some((1, name as u32)),
-                Color::Indexed(index) => Some((2, u32::from(index))),
-                Color::Spec(rgb) => Some((
-                    3,
-                    (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b),
-                )),
-                _ => None,
-            }
-        }
-        let flags = cell.flags
-            & (Flags::BOLD
-                | Flags::DIM
-                | Flags::ITALIC
-                | Flags::ALL_UNDERLINES
-                | Flags::INVERSE
-                | Flags::STRIKEOUT);
-        Self {
-            fg: color(cell.fg),
-            bg: color(cell.bg),
-            flags,
-        }
-    }
-}
-
-impl Style {
-    fn write_ansi(self, output: &mut String) {
-        output.push_str("\x1b[0");
-        for (flag, code) in [
-            (Flags::BOLD, 1),
-            (Flags::DIM, 2),
-            (Flags::ITALIC, 3),
-            (Flags::ALL_UNDERLINES, 4),
-            (Flags::INVERSE, 7),
-            (Flags::STRIKEOUT, 9),
-        ] {
-            if self.flags.intersects(flag) {
-                let _ = write!(output, ";{code}");
-            }
-        }
-        for (background, color) in [(false, self.fg), (true, self.bg)] {
-            match color {
-                Some((1, value)) => {
-                    let base = match (background, value >= 8) {
-                        (false, false) => 30,
-                        (true, false) => 40,
-                        (false, true) => 90,
-                        (true, true) => 100,
-                    };
-                    let _ = write!(output, ";{}", base + value % 8);
-                }
-                Some((2, value)) => {
-                    let _ = write!(output, ";{};5;{value}", if background { 48 } else { 38 });
-                }
-                Some((3, value)) => {
-                    let _ = write!(
-                        output,
-                        ";{};2;{};{};{}",
-                        if background { 48 } else { 38 },
-                        (value >> 16) & 255,
-                        (value >> 8) & 255,
-                        value & 255
-                    );
-                }
-                _ => {}
-            }
-        }
-        output.push('m');
-    }
-}
-
-struct Controls<'a> {
-    terminal: &'a Term<Events>,
-    modes: &'a mut InputModes,
-    events: &'a Events,
-    suppress: &'a mut bool,
-    parameter_presence: [bool; 2],
-}
-
-impl Controls<'_> {
-    fn reply(&mut self, response: &[u8]) {
-        self.events.reply(response);
-        *self.suppress = true;
-    }
-}
-
-impl vte::Perform for Controls<'_> {
-    fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
-        match params {
-            [b"633", b"D"] => {
-                self.events
-                    .0
-                    .lock()
-                    .unwrap()
-                    .effects
-                    .command_finished
-                    .push(None);
-            }
-            [b"633", b"D", status] => {
-                let digits = status.strip_prefix(b"-").unwrap_or(status);
-                if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
-                    if let Ok(status) = std::str::from_utf8(status).unwrap_or("").parse::<i32>() {
-                        self.events
-                            .0
-                            .lock()
-                            .unwrap()
-                            .effects
-                            .command_finished
-                            .push(Some(status));
+fn row_json(row: &Row) -> Value {
+    Value::Array(
+        row.cells
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| {
+                let style = wire_style(cell.style);
+                let mut value = json!({
+                    "char": cell_text(&row.cells, column),
+                    "bold": style.bold,
+                    "italic": style.italic,
+                    "underline": style.underline,
+                    "dim": style.dim,
+                    "inverse": style.inverse,
+                    "strikethrough": style.strike,
+                });
+                for (field, mode_field, color) in
+                    [("fg", "fgMode", style.fg), ("bg", "bgMode", style.bg)]
+                {
+                    if let Some((mode, color)) = wire_color(color) {
+                        value[field] = json!(color);
+                        value[mode_field] = json!(mode);
                     }
                 }
+                value
+            })
+            .collect(),
+    )
+}
+
+fn render_row(row: &Row, output: &mut String) {
+    let default = CellStyle::default();
+    let length = if row.wrapped {
+        row.cells.len()
+    } else {
+        row.cells
+            .iter()
+            .rposition(|cell| {
+                cell.width == CellWidth::Spacer
+                    || (!cell.text.is_empty() && cell.text != " ")
+                    || wire_style(cell.style) != default
+            })
+            .map_or(0, |column| column + 1)
+    };
+    let mut previous = default;
+    for column in 0..length {
+        let text = cell_text(&row.cells, column);
+        if text.is_empty() {
+            continue;
+        }
+        let style = wire_style(row.cells[column].style);
+        if style != previous {
+            write_ansi(style, output);
+            previous = style;
+        }
+        output.push_str(text);
+    }
+    if previous != default {
+        output.push_str("\x1b[0m");
+    }
+}
+
+/// The attributes carried on the wire; concealment is not one of them.
+fn wire_style(style: CellStyle) -> CellStyle {
+    CellStyle {
+        hidden: false,
+        ..style
+    }
+}
+
+/// Wire colour modes: 1 = palette 0..16, 2 = palette 16..256, 3 = RGB packed
+/// as 0xRRGGBB.
+fn wire_color(color: Color) -> Option<(u8, u32)> {
+    match color {
+        Color::Default => None,
+        Color::Indexed(index) if index < 16 => Some((1, u32::from(index))),
+        Color::Indexed(index) => Some((2, u32::from(index))),
+        Color::Rgb(r, g, b) => Some((
+            3,
+            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
+        )),
+    }
+}
+
+fn write_ansi(style: CellStyle, output: &mut String) {
+    output.push_str("\x1b[0");
+    for (enabled, code) in [
+        (style.bold, 1),
+        (style.dim, 2),
+        (style.italic, 3),
+        (style.underline, 4),
+        (style.inverse, 7),
+        (style.strike, 9),
+    ] {
+        if enabled {
+            let _ = write!(output, ";{code}");
+        }
+    }
+    for (background, color) in [(false, style.fg), (true, style.bg)] {
+        match wire_color(color) {
+            Some((1, value)) => {
+                let base = match (background, value >= 8) {
+                    (false, false) => 30,
+                    (true, false) => 40,
+                    (false, true) => 90,
+                    (true, true) => 100,
+                };
+                let _ = write!(output, ";{}", base + value % 8);
             }
-            [code @ (b"10" | b"11" | b"12"), query] => {
-                if std::str::from_utf8(query).is_ok_and(|s| s.trim_matches(js_whitespace) == "?") {
-                    let color = if *code == b"11" {
-                        "0b0b/0b0b/0b0b"
-                    } else {
-                        "e6e6/e6e6/e6e6"
-                    };
-                    self.reply(
-                        format!(
-                            "\x1b]{};rgb:{color}\x1b\\",
-                            std::str::from_utf8(code).unwrap()
-                        )
-                        .as_bytes(),
-                    );
+            Some((2, value)) => {
+                let _ = write!(output, ";{};5;{value}", if background { 48 } else { 38 });
+            }
+            Some((_, value)) => {
+                let _ = write!(
+                    output,
+                    ";{};2;{};{};{}",
+                    if background { 48 } else { 38 },
+                    (value >> 16) & 255,
+                    (value >> 8) & 255,
+                    value & 255
+                );
+            }
+            None => {}
+        }
+    }
+    output.push('m');
+}
+
+/// Paseo protocol state Ghostty does not model: shell command completion,
+/// the win32 input mode, and whether a program has chosen the cursor
+/// presentation (Ghostty holds the values themselves).
+#[derive(Default)]
+struct Extensions {
+    command_finished: Vec<Option<i32>>,
+    win32: bool,
+    cursor_style: bool,
+    cursor_blink: bool,
+}
+
+impl vte::Perform for Extensions {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+        match params {
+            [b"633", b"D"] => self.command_finished.push(None),
+            [b"633", b"D", status] => {
+                let digits = status.strip_prefix(b"-").unwrap_or(status);
+                if !digits.is_empty()
+                    && digits.iter().all(u8::is_ascii_digit)
+                    && let Ok(status) = std::str::from_utf8(status).unwrap_or("").parse::<i32>()
+                {
+                    self.command_finished.push(Some(status));
                 }
             }
             _ => {}
@@ -654,68 +535,33 @@ impl vte::Perform for Controls<'_> {
         if ignore || params.iter().any(|p| p.len() != 1) {
             return;
         }
-        let mut values = params.iter();
-        let first = values.next().and_then(|v| v.first()).copied().unwrap_or(0);
         match (action, intermediates) {
-            ('c', []) if first == 0 && params.len() <= 1 => self.reply(b"\x1b[?62;4;22c"),
-            ('n', []) if first == 5 && params.len() == 1 => self.reply(b"\x1b[0n"),
-            ('n', [] | [b'?']) if first == 6 && params.len() == 1 => {
-                let (row, col) = cursor_position(self.terminal);
-                let private = if intermediates.is_empty() { "" } else { "?" };
-                self.reply(format!("\x1b[{private}{};{}R", row + 1, col + 1).as_bytes());
-            }
             ('h' | 'l', [b'?']) => {
-                let enabled = action == 'h';
                 for mode in params.iter().filter_map(|p| p.first()) {
                     match mode {
-                        1 => self.modes.application_cursor = enabled,
-                        12 => self.modes.cursor_blink = Some(enabled),
-                        2004 => self.modes.bracketed_paste = enabled,
-                        9001 => self.modes.win32 = enabled,
+                        12 => self.cursor_blink = true,
+                        9001 => self.win32 = action == 'h',
                         _ => {}
                     }
                 }
             }
-            ('q', [b' ']) if first <= 6 => {
-                self.modes.cursor_style = Some(match first {
-                    3 | 4 => "underline",
-                    5 | 6 => "bar",
-                    _ => "block",
-                });
-                self.modes.cursor_blink = Some(first == 0 || first % 2 == 1);
+            ('q', [b' ']) => {
+                let style = params.iter().next().and_then(|p| p.first()).copied();
+                if style.unwrap_or(0) <= 6 {
+                    self.cursor_style = true;
+                    self.cursor_blink = true;
+                }
             }
-            ('u', [b'>']) => {
-                self.modes.kitty_stack.push(self.modes.kitty);
-                self.modes.kitty = if self.parameter_presence[0] { first } else { 1 };
-            }
-            ('u', [b'=']) => {
-                let mode = if self.parameter_presence[1] {
-                    values.next().and_then(|v| v.first()).copied().unwrap_or(1)
-                } else {
-                    1
-                };
-                self.modes.kitty = if mode == 0 { 0 } else { first };
-            }
-            ('u', [b'<']) => {
-                let count = usize::from(first.max(1));
-                let length = self.modes.kitty_stack.len();
-                self.modes.kitty = if count <= length {
-                    self.modes.kitty_stack[length - count]
-                } else {
-                    0
-                };
-                self.modes
-                    .kitty_stack
-                    .truncate(length.saturating_sub(count));
-            }
-            ('u', [b'?']) => self.reply(format!("\x1b[?{}u", self.modes.kitty).as_bytes()),
             _ => {}
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         if !ignore && intermediates.is_empty() && byte == b'c' {
-            *self.modes = InputModes::default();
+            *self = Self {
+                command_finished: std::mem::take(&mut self.command_finished),
+                ..Self::default()
+            };
         }
     }
 }

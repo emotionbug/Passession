@@ -29,7 +29,7 @@ nav: 运行并行任务
 
 ## 运行并测试应用 {#run-and-test-the-app}
 
-通过配置好的工作区脚本运行项目测试/开发命令，或让 Agent 执行，再在 Paseo 查看只读输出。手动交互式 shell 操作请使用 daemon 主机上的外部终端；原生应用没有交互式终端模拟器。
+通过配置好的工作区脚本运行项目测试/开发命令，或让 Agent 执行，再在 Paseo 查看只读输出。手动交互式 shell 操作可选择 **New session → Launch → Terminal**，在 daemon 主机上打开 shell，也可以使用自己的外部终端。
 
 每个 worktree 都有自己的文件，但进程仍然共享机器的网络端口。请为每个正在运行的副本分配不同的开发服务器端口。要让 setup 和服务端口可重复配置，请设置 [worktree setup 和脚本](/docs/worktrees#paseojson)。
 

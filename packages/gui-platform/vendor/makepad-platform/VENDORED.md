@@ -84,6 +84,10 @@ Session changes fence stale connections; revision acknowledgements cannot replac
 newer IME text. Focused custom editors must publish via `update_text_input` after
 edits and during drawing, and handle `Hit::TextIme` through their own undo model.
 The focused-area reference follows Makepad redraw area remapping.
+`update_terminal_text_input` publishes the same editor as a terminal kind: the Java
+`EditorInfo` drops `CAP_SENTENCES` and sets `NO_SUGGESTIONS`, so shell input is not
+auto-capitalized or autocorrected while composing IMEs keep working. Changing the
+kind restarts the input session like the password and numeric flags.
 
 The `android_ime_tests` unit tests cover replacement boundaries and offset
 conversion. They are not evidence that a particular Android keyboard works.

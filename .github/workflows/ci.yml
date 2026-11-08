@@ -25,6 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@1.93.1
+      # libghostty-vt-sys builds the Ghostty VT library with Zig 0.15.2; the
+      # action also restores Zig's global cache (Ghostty's fetched packages).
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+          cache-key: tests-linux-x64
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: tests-linux-x64

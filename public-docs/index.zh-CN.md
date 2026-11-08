@@ -6,7 +6,7 @@ nav: 快速上手
 
 # 快速上手 {#getting-started}
 
-Paseo Sessions 使用原生 Rust 构建 **Linux、macOS、Windows、Android 和 iOS** 客户端，daemon 与 CLI 同样使用 **Rust**。桌面或服务器运行 Agent，Android 和 iOS 远程连接。客户端保留 Markdown、源码编辑、摘要优先的 diff、远程文件夹选择和只读脚本日志，侧边栏按 **主机 → 目录 → 会话** 组织。
+Paseo Sessions 使用原生 Rust 构建 **Linux、macOS、Windows、Android 和 iOS** 客户端，daemon 与 CLI 同样使用 **Rust**。桌面或服务器运行 Agent，Android 和 iOS 远程连接。客户端保留 Markdown、源码编辑、摘要优先的 diff、远程文件夹选择、交互式终端和只读脚本日志，侧边栏按 **主机 → 目录 → 会话** 组织。
 
 请使用[本仓库的发布产物](https://github.com/emotionbug/paseo/releases)获取原生构建；上游下载和应用商店版本是独立产品。源码构建和分发要求见仓库 `docs/release.md`。
 
@@ -72,7 +72,7 @@ docker run -d --name paseo-native \
 
 ## 运行范围 {#runtime-scope}
 
-原生产品没有网页客户端、Electron/Chromium、内嵌浏览器或浏览器自动化、交互式终端界面，也不执行 React UI 插件。工作区和服务脚本仍在 daemon 管理的 PTY 中运行，客户端显示只读日志。原生后端插件与外部 Rust SDK 仍受支持。
+原生产品没有网页客户端、Electron/Chromium、内嵌浏览器或浏览器自动化，也不执行 React UI 插件。**Terminal** 会话在所选主机上 daemon 管理的 PTY 中打开交互式 shell；工作区和服务脚本同样在 daemon 管理的 PTY 中运行，客户端显示只读日志。原生后端插件与外部 Rust SDK 仍受支持。
 
 已记录的 Linux 执行证据和未验证的平台边界见仓库 `docs/testing.md`。CI 矩阵定义不等于设备测试通过。原生包不提供语音识别、语音对话或 TTS，保留一般音效播放。
 

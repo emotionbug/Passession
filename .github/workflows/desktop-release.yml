@@ -138,6 +138,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.1
         with:
           targets: ${{ matrix.platform == 'android' && 'aarch64-linux-android' || matrix.platform == 'ios' && 'aarch64-apple-ios' || '' }}
+      # libghostty-vt-sys builds the Ghostty VT library with Zig 0.15.2; the
+      # action also restores Zig's global cache (Ghostty's fetched packages).
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+          cache-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}

@@ -611,12 +611,91 @@ fn render_native_document(root: &Path, document: &Value) -> Result<String> {
         document["embeddedAbi"] == embedded,
         "Missing or stale embedded OpenCode ABI attribution in native build"
     );
-    Ok(format!("{}\n{}", render(document)?, render(&embedded)?))
+    let native = document
+        .get("nativeBuilds")
+        .context("Missing native build attribution in native build")?;
+    Ok(format!(
+        "{}{}\n{}",
+        render(document)?,
+        render_section(native)?,
+        render(&embedded)?
+    ))
+}
+
+/// A supplementary inventory that may legitimately be empty for a target,
+/// rendered after a blank line when it attributes anything.
+fn render_section(document: &Value) -> Result<String> {
+    Ok(if array(document, "packages")?.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", render(document)?)
+    })
 }
 
 const GUI_BOUNDARY: &str = "Paseo Sessions application Cargo dependency closure for the packaged target (normal and build dependencies; dev-only edges excluded). Includes upstream license/notice files and nested vendored-component notices; this is not a source-offer or a toolchain/system-library compliance certification.";
 const SUPPLEMENTS: &str = "packaging/cargo-notice-supplements.json";
 const RESOURCE_NOTICES: &str = "packaging/resource-notices.json";
+const NATIVE_NOTICES: &str = "packaging/native-notices.json";
+
+/// Native libraries a Cargo build script compiles from non-Cargo sources and
+/// links statically, such as the Ghostty VT archive libghostty-vt-sys builds
+/// with Zig. Their bytes never appear in a Cargo package, so each reviewed
+/// build is bound to the exact source revision the build script pins: a
+/// version bump or a new pin fails until the bundled works are re-reviewed.
+fn native_document(metadata: &Value, root: &str, manifest: &Value) -> Result<Value> {
+    ensure!(
+        manifest["schemaVersion"] == 1,
+        "Unsupported native notice schema"
+    );
+    let texts = manifest["texts"]
+        .as_object()
+        .context("Missing native notice texts")?;
+    let builds = array(manifest, "builds")?;
+    let mut packages = Vec::new();
+    let mut used = BTreeMap::new();
+    for pkg in dependency_closure(metadata, root)? {
+        let name = string(pkg, "name")?;
+        let version = string(pkg, "version")?;
+        if !builds.iter().any(|build| build["crate"] == name) {
+            continue;
+        }
+        let build = builds
+            .iter()
+            .find(|build| build["crate"] == name && build["version"] == version)
+            .with_context(|| {
+                format!("No reviewed native build in {NATIVE_NOTICES} for {name}@{version}")
+            })?;
+        let pin = &build["pin"];
+        let constant = string(pin, "constant")?;
+        let value = string(pin, "value")?;
+        let file = Path::new(string(pkg, "manifest_path")?)
+            .parent()
+            .context("Cargo manifest has no parent")?
+            .join(string(pin, "file")?);
+        ensure!(
+            text(&file)?.contains(&format!("const {constant}: &str = \"{value}\";")),
+            "{name}@{version} no longer builds {constant} {value}; review its bundled native works in {NATIVE_NOTICES}"
+        );
+        for work in array(build, "works")? {
+            let work_name = string(work, "name")?;
+            let notices = array(work, "notices")?;
+            ensure!(!notices.is_empty(), "Missing attribution for {work_name}");
+            for notice in notices {
+                let source = string(notice, "source")?;
+                let hash = string(notice, "sha256")?;
+                ensure!(pinned(notice)?, "Native notice is not revision-pinned: {source}");
+                let value = texts
+                    .get(hash)
+                    .and_then(Value::as_str)
+                    .with_context(|| format!("Missing notice text for {work_name}: {source}"))?;
+                ensure!(digest(value) == hash, "Corrupt native notice text: {hash}");
+                used.insert(hash.to_owned(), json!(value));
+            }
+            packages.push(json!({"name": work_name, "version": string(work, "version")?, "source": format!("native build of {name}@{version}"), "license": work["license"], "notices": notices}));
+        }
+    }
+    Ok(json!({"schemaVersion": 1, "boundary": manifest["boundary"], "packages": packages, "texts": used}))
+}
 
 pub fn host_triple() -> Result<&'static str> {
     host_target(std::env::consts::OS, std::env::consts::ARCH)
@@ -656,12 +735,10 @@ pub fn collect(directory: &Path) -> Result<()> {
     let metadata = cargo_metadata(host_triple()?)?;
     let mut document =
         collect_document(&metadata, "paseo-daemon", BOUNDARY, &supplements(&root)?)?;
+    document["nativeBuilds"] =
+        native_document(&metadata, "paseo-daemon", &read_json(&root.join(NATIVE_NOTICES))?)?;
     document["embeddedAbi"] = embedded_inventory(&root)?;
-    let rendered = format!(
-        "{}\n{}",
-        render(&document)?,
-        render(&document["embeddedAbi"])?
-    );
+    let rendered = render_native_document(&root, &document)?;
     fs::create_dir_all(directory)?;
     write_json(&directory.join("RUST-THIRD-PARTY-NOTICES.json"), &document)?;
     fs::write(directory.join("RUST-THIRD-PARTY-NOTICES.txt"), rendered)?;
@@ -918,18 +995,19 @@ pub fn ensure_references_staged(packaged: &[PackagedResource]) -> Result<()> {
     Ok(())
 }
 
-/// Complete application notices: GUI Cargo closure plus packaged fonts and
-/// vendored platform components.
+/// Complete application notices: GUI Cargo closure, natively built libraries,
+/// packaged fonts and vendored platform components.
 pub fn render_app(metadata: &Value, packaged: &[PackagedResource], platform: &str) -> Result<String> {
     let root = root()?;
     let gui = collect_document(metadata, "paseo-gui", GUI_BOUNDARY, &supplements(&root)?)?;
+    let native = native_document(metadata, "paseo-gui", &read_json(&root.join(NATIVE_NOTICES))?)?;
     let resources = resource_document(&read_json(&root.join(RESOURCE_NOTICES))?, packaged, platform)?;
-    let mut output = render(&gui)?;
-    if !array(&resources, "packages")?.is_empty() {
-        output.push('\n');
-        output.push_str(&render(&resources)?);
-    }
-    Ok(output)
+    Ok(format!(
+        "{}{}{}",
+        render(&gui)?,
+        render_section(&native)?,
+        render_section(&resources)?
+    ))
 }
 
 fn date_notice(source: &str) -> Result<&str> {
@@ -1254,6 +1332,62 @@ mod tests {
         let mut unpinned = manifest.clone();
         unpinned["fonts"][0]["notices"][0]["source"] = json!("https://example.com/main/OFL.txt");
         assert!(resource_document(&unpinned, &[resource("Font.ttf", "11")], "linux").is_err());
+    }
+
+    #[test]
+    fn native_builds_require_reviewed_version_pin_and_pinned_licenses() {
+        let dir = tempfile::tempdir().unwrap();
+        let commit = "a".repeat(40);
+        fs::write(dir.path().join("build.rs"), format!("const SOURCE_COMMIT: &str = \"{commit}\";\n")).unwrap();
+        let license = "native license";
+        let manifest = json!({"schemaVersion":1,"boundary":"Native","builds":[{"crate":"native-sys","version":"1",
+            "pin":{"file":"build.rs","constant":"SOURCE_COMMIT","value":commit},
+            "works":[{"name":"native","version":commit,"license":"MIT",
+                "notices":[{"source":format!("https://example.com/{commit}/LICENSE"),"sha256":digest(license)}]}]}],
+            "texts":{(digest(license)):license}});
+        let mut metadata = json!({
+            "packages": [
+                {"id":"root", "name":"paseo-daemon"},
+                {"id":"sys", "name":"native-sys", "version":"1", "manifest_path":dir.path().join("Cargo.toml"), "source":null}
+            ],
+            "resolve":{"nodes":[
+                {"id":"root", "deps":[{"pkg":"sys","dep_kinds":[{"kind":null}]}]},
+                {"id":"sys", "deps":[]}
+            ]}
+        });
+        let document = native_document(&metadata, "paseo-daemon", &manifest).unwrap();
+        assert!(render(&document).unwrap().contains(&format!("native@{commit} (MIT): https://example.com/{commit}/LICENSE")));
+        let mut unpinned = manifest.clone();
+        unpinned["builds"][0]["works"][0]["notices"][0]["source"] = json!("https://example.com/main/LICENSE");
+        assert!(native_document(&metadata, "paseo-daemon", &unpinned).is_err());
+        let mut moved = manifest.clone();
+        moved["builds"][0]["pin"]["value"] = json!("b".repeat(40));
+        assert!(native_document(&metadata, "paseo-daemon", &moved).is_err());
+        metadata["packages"][1]["version"] = json!("2");
+        assert!(native_document(&metadata, "paseo-daemon", &manifest).is_err());
+    }
+
+    #[test]
+    fn checked_in_native_builds_match_their_vendored_pins() {
+        let root = root().unwrap();
+        let manifest = read_json(&root.join(NATIVE_NOTICES)).unwrap();
+        for build in array(&manifest, "builds").unwrap() {
+            let crate_name = string(build, "crate").unwrap();
+            let metadata = json!({
+                "packages": [
+                    {"id":"root", "name":"paseo-daemon"},
+                    {"id":"sys", "name":crate_name, "version":build["version"],
+                        "manifest_path":root.join("packages/terminal/vendor").join(crate_name).join("Cargo.toml"), "source":null}
+                ],
+                "resolve":{"nodes":[
+                    {"id":"root", "deps":[{"pkg":"sys","dep_kinds":[{"kind":null}]}]},
+                    {"id":"sys", "deps":[]}
+                ]}
+            });
+            let document = native_document(&metadata, "paseo-daemon", &manifest).unwrap();
+            assert!(!array(&document, "packages").unwrap().is_empty());
+            render(&document).unwrap();
+        }
     }
 
     #[test]

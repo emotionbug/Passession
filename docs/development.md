@@ -3,11 +3,12 @@
 ## Toolchains
 
 - Rust and Cargo for everything: the daemon/CLI, the native client (`packages/gui*`, Makepad 1.0.0), client/protocol/plugin/highlighting SDKs, relay and `xtask` tooling. `Cargo.toml` specifies the minimum Rust version.
+- Zig **0.15.2** on every target. `paseo-terminal` links Ghostty's VT library, which the vendored `libghostty-vt-sys` build script compiles with `zig build` (`packages/terminal/vendor/VENDORED.md`). Put `zig` on `PATH` or set `ZIG` to the executable; `xtask` build commands stop before compiling when it is missing or outside Ghostty's accepted range (0.15.x, patch 2 or newer). A cold build `git clone`s Ghostty at the pinned commit into Cargo's `OUT_DIR` and lets Zig fetch Ghostty's package dependencies, so it needs network access. Offline, set `GHOSTTY_SOURCE_DIR` to a checkout of that commit and `GHOSTTY_ZIG_SYSTEM_DIR` to a pre-populated Zig package directory (passed to `zig build --system`).
 - Node, npm, Flutter/Dart and a TypeScript compiler are not Paseo build prerequisites. Separately installed agent CLIs retain their own runtime requirements.
 - Linux desktop: `pkg-config` and the X11, Xcursor, GLX/EGL, ALSA and PulseAudio development packages Makepad links, plus Wayland development files for native file dialogs (Ubuntu: `libx11-dev libxcursor-dev libglx-dev libgl-dev libegl-dev libasound2-dev libpulse-dev libwayland-dev`), and `patchelf`: `build-gui` rewrites the RPATHs of the bundled daemon runtime. Packaging adds `dpkg-dev`, `xdg-utils` and the runtime-loaded `libxss1 libsm6 libice6`.
-- macOS: Xcode command-line tools (`clang`, `codesign`, `iconutil`). iOS also needs full Xcode (`actool`, `devicectl`, `simctl`) and `rustup target add aarch64-apple-ios` (plus `aarch64-apple-ios-sim` for Apple-silicon simulators).
+- macOS: Xcode command-line tools (`clang`, `codesign`, `iconutil`). iOS also needs full Xcode (`actool`, `devicectl`, `simctl`) and `rustup target add aarch64-apple-ios` (plus `aarch64-apple-ios-sim` for simulators). Simulator builds need an Apple-silicon Mac: Ghostty ships no x86_64 simulator library.
 - Windows: Visual Studio C++ tools (MSVC linker, `rc.exe`, CRT redistributable); NSIS for installers.
-- Android: JDK 17+, the Android SDK (`ANDROID_HOME`), NDK 28.2.13676358 and `rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android`. `ANDROID_NDK_HOME` overrides SDK discovery and must point to that exact NDK; installing it with SDK Manager does not replace an inherited runner path. `xtask` downloads a pinned Gradle 9.3.1 into `$XDG_CACHE_HOME/paseo-packaging`; there is no Gradle wrapper in the repository.
+- Android: JDK 17+, the Android SDK (`ANDROID_HOME`), NDK 28.2.13676358 and `rustup target add aarch64-linux-android x86_64-linux-android` (64-bit only; see [Android](android.md#build-and-launch)). `ANDROID_NDK_HOME` overrides SDK discovery and must point to that exact NDK; installing it with SDK Manager does not replace an inherited runner path. `xtask` downloads a pinned Gradle 9.3.1 into `$XDG_CACHE_HOME/paseo-packaging`; there is no Gradle wrapper in the repository.
 
 Fetch Rust dependencies with `cargo fetch --locked`. Desktop builds require their target host; `xtask` chooses the GUI target itself and rejects `CARGO_BUILD_TARGET`.
 
@@ -96,12 +97,13 @@ Every build passes the client's identity at compile time (`PASEO_VERSION`, `PASE
 
 Makepad platform, draw and widgets are patched through `packages/gui-platform/vendor/` and root `[patch.crates-io]`. Each crate retains its upstream license and `VENDORED.md` provenance. Platform carries Android API 24 compatibility, native lifecycle/input fixes and the packaged live-watcher guard; draw carries Unicode line breaking; widgets carries scrollbar and caret behavior. Keep changes in the existing copy, not a second framework fork. The source watcher is disabled when `MAKEPAD_PACKAGE_DIR` is set: staged builds have no live reload; plain `cargo run` keeps it.
 
-Packages copy the `resources/` directory of every Makepad-aware crate in the `paseo-gui` dependency closure, minus the reviewed `excluded` files in `packaging/resource-notices.json`. A font without a digest-bound, revision-pinned license entry fails the build; so does a Cargo dependency without license text (add a revision-pinned entry to `packaging/cargo-notice-supplements.json`, never an SPDX template).
+Packages copy the `resources/` directory of every Makepad-aware crate in the `paseo-gui` dependency closure, minus the reviewed `excluded` files in `packaging/resource-notices.json`. A font without a digest-bound, revision-pinned license entry fails the build; so does a Cargo dependency without license text (add a revision-pinned entry to `packaging/cargo-notice-supplements.json`, never an SPDX template) and a natively built library whose pinned source changed without a reviewed `packaging/native-notices.json` entry (see [release](release.md#distribution-requirements)).
 
 ## Source ownership
 
 - Rust daemon: `packages/daemon/src`; CLI commands in `cli/`, providers in `providers/`, process ownership in `daemon_control/`, desktop IPC in `desktop_host/`.
 - Native client: `packages/gui` (Makepad shell, theme, common widgets, `src/features/*`), `packages/gui-core` (host connections, directory synchronization, persisted client state), `packages/gui-platform` (desktop host, updater, tray, notifications, pickers, audio, Android/iOS sources).
+- Terminal emulation: `packages/terminal` (`paseo-terminal`, Ghostty VT for daemon screens, terminal tabs and logs) and its vendored `libghostty-vt-sys` build-script patch under `vendor/`.
 - Native build, packaging and release: `xtask/src`; packaging resources, the Android Gradle project and vendored Makepad Android Java: `packaging/`.
 - Rust SDKs: `packages/client`, `packages/protocol`, `packages/plugin`, `packages/highlight`; relay: `packages/relay`.
 
@@ -109,7 +111,7 @@ Use Rust instrumentation for daemon and client work. Browser/CDP and React profi
 
 ## Scripts, logs, and diagnostics
 
-Workspace setup and services remain daemon-side shell/PTY operations. The client exposes start/stop and **read-only logs**. Do not remove PTY backend support because the interactive terminal UI is excluded.
+Workspace setup and services remain daemon-side shell/PTY operations. The client exposes start/stop and **read-only logs**; interactive shells are separate Terminal tabs ([terminal activity](terminal-activity.md)).
 
 Inspect the selected home's `daemon.log` and native CLI status. Keep diagnostic captures free of credentials and unrelated user state. A script or provider process is owned by the host daemon, never the mobile client.
 

@@ -24,7 +24,7 @@ If your Claude login expires, re-authenticate with the Claude Code CLI, then sta
 
 ## Use Claude Code in an external terminal
 
-For the standard Claude CLI experience, open your own terminal on the daemon host, change to the checkout and run `claude`. The native Paseo application has no interactive terminal UI or web client. It retains daemon-owned script/setup PTYs with read-only logs and native agent conversations.
+For the standard Claude CLI experience, open a terminal on the daemon host, change to the checkout and run `claude`. Use your own terminal or a Paseo **Terminal** session (**New session → Launch → Terminal**). The native Paseo application has no web client. It also retains daemon-owned script/setup PTYs with read-only logs and native agent conversations.
 
 ## See also
 

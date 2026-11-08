@@ -122,7 +122,7 @@ impl Terminal {
         let io_finished = Arc::new(AtomicBool::new(false));
         let (exit_sender, exit) = watch::channel(None);
         let display = Arc::new(Mutex::new(Display {
-            screen: Screen::new(rows, cols),
+            screen: Screen::new(rows, cols)?,
             revision: 0,
             rows,
             cols,
@@ -587,18 +587,20 @@ impl Owner {
             match command {
                 Some(Command::Resize(rows, cols, display, tx)) => {
                     let mut display = display.lock().unwrap();
-                    let result = if display.rows == rows && display.cols == cols {
-                        Ok(())
+                    let changed = display.rows != rows || display.cols != cols;
+                    let result = if changed {
+                        self.master
+                            .resize(PtySize {
+                                rows,
+                                cols,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            })
+                            .and_then(|()| display.screen.resize(rows, cols).map_err(Into::into))
                     } else {
-                        self.master.resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        })
+                        Ok(())
                     };
-                    if result.is_ok() && (display.rows != rows || display.cols != cols) {
-                        display.screen.resize(rows, cols);
+                    if result.is_ok() && changed {
                         display.rows = rows;
                         display.cols = cols;
                         display.revision = display.revision.wrapping_add(1);

@@ -5,12 +5,13 @@
 use makepad_widgets::*;
 
 use crate::common::{PanelTarget, UiContext, json as j};
-use crate::features::{command_center, composer, files, logs, timeline, workspace};
+use crate::features::{command_center, composer, files, logs, terminal, timeline, workspace};
 use crate::features::git::{GitActionsButtonWidgetRefExt, GitPanelWidgetRefExt, OpenInButtonWidgetRefExt};
 use crate::features::command_center::CommandCenterPanelWidgetRefExt;
 use crate::features::composer::CreationPanelWidgetRefExt;
 use crate::features::files::FilesPanelWidgetRefExt;
 use crate::features::logs::ExecutionLogPanelWidgetRefExt;
+use crate::features::terminal::TerminalPanelWidgetRefExt;
 use crate::features::timeline::ChatPanelWidgetRefExt;
 use crate::features::workspace::WorkspacePanelWidgetRefExt;
 
@@ -24,6 +25,7 @@ live_design! {
     use crate::features::git::GitActionsButton;
     use crate::features::git::OpenInButton;
     use crate::features::logs::panel::ExecutionLogPanel;
+    use crate::features::terminal::panel::TerminalPanel;
     use crate::features::workspace::WorkspacePanel;
     use crate::features::settings::panel::SettingsPanel;
     use crate::features::schedules::SchedulesPanel;
@@ -35,6 +37,7 @@ live_design! {
         files: <FilesPanel> {}
         git: <GitPanel> {}
         logs: <ExecutionLogPanel> {}
+        terminal: <TerminalPanel> {}
         workspace: <WorkspacePanel> {}
         settings: <SettingsPanel> {}
         schedules: <SchedulesPanel> {}
@@ -57,6 +60,8 @@ pub struct PanelTemplates {
     #[live]
     pub logs: Option<LivePtr>,
     #[live]
+    pub terminal: Option<LivePtr>,
+    #[live]
     pub workspace: Option<LivePtr>,
     #[live]
     pub settings: Option<LivePtr>,
@@ -77,6 +82,7 @@ pub enum RootKind {
     Files,
     Git,
     Logs,
+    Terminal,
     Workspace,
 }
 
@@ -88,6 +94,7 @@ pub fn root_kind(kind: &str) -> Option<RootKind> {
         "files" | "file" => RootKind::Files,
         "changes_tree" | "working_diff" | "commit_diff" | "pull_request" => RootKind::Git,
         "execution_log" => RootKind::Logs,
+        "terminal" => RootKind::Terminal,
         "new_tab" | "setup" | "project_settings" => RootKind::Workspace,
         _ => return None,
     })
@@ -161,6 +168,16 @@ fn log_target(target: &PanelTarget) -> logs::LogTarget {
     }
 }
 
+fn terminal_target(target: &PanelTarget) -> terminal::TerminalTarget {
+    terminal::TerminalTarget {
+        host_id: target.server_id.clone(),
+        workspace_id: target.workspace_id.clone(),
+        terminal_id: target.id.clone().unwrap_or_default(),
+        title: target.title.clone().unwrap_or_default(),
+        tab_key: target.key(),
+    }
+}
+
 /// Instantiates the root for `target` and hands it its target.
 pub fn mount(cx: &mut Cx, templates: &PanelTemplates, target: &PanelTarget) -> Option<Panel> {
     let kind = root_kind(&target.kind)?;
@@ -170,6 +187,7 @@ pub fn mount(cx: &mut Cx, templates: &PanelTemplates, target: &PanelTarget) -> O
         RootKind::Files => templates.files,
         RootKind::Git => templates.git,
         RootKind::Logs => templates.logs,
+        RootKind::Terminal => templates.terminal,
         RootKind::Workspace => templates.workspace,
     };
     let widget = WidgetRef::new_from_ptr(cx, ptr);
@@ -187,6 +205,7 @@ pub fn retarget(cx: &mut Cx, panel: &Panel) {
         RootKind::Files => panel.widget.as_files_panel().set_target(cx, files::FilesTarget::from_panel(target)),
         RootKind::Git => panel.widget.as_git_panel().set_target(cx, target.clone()),
         RootKind::Logs => panel.widget.as_execution_log_panel().set_target(cx, log_target(target)),
+        RootKind::Terminal => panel.widget.as_terminal_panel().set_target(cx, terminal_target(target)),
         RootKind::Workspace => panel.widget.as_workspace_panel().set_target(cx, workspace_target(target)),
     }
 }
@@ -199,14 +218,17 @@ pub fn set_activity(cx: &mut Cx, panel: &mut Panel, visible: bool, focused: bool
             RootKind::Chat => panel.widget.as_chat_panel().set_visible(cx, visible),
             RootKind::Files => panel.widget.as_files_panel().set_visible(cx, visible),
             RootKind::Logs => panel.widget.as_execution_log_panel().set_visible_log(cx, visible),
+            RootKind::Terminal => panel.widget.as_terminal_panel().set_visible_terminal(cx, visible),
             RootKind::Git => panel.widget.as_git_panel().set_visible(cx, visible),
             RootKind::Creation | RootKind::Workspace => {}
         }
     }
     if panel.focused != focused {
         panel.focused = focused;
-        if panel.kind == RootKind::Chat {
-            panel.widget.as_chat_panel().set_focused(cx, focused);
+        match panel.kind {
+            RootKind::Chat => panel.widget.as_chat_panel().set_focused(cx, focused),
+            RootKind::Terminal => panel.widget.as_terminal_panel().set_focused_terminal(cx, focused),
+            _ => {}
         }
     }
 }

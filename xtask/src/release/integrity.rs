@@ -182,9 +182,8 @@ fn validate_desktop(dir: &Path, id: &Identity) -> Result<()> {
 fn validate_android(path: &Path, arch: &str, format: &str) -> Result<()> {
     let abis: &[(&str, u8, u16)] = match arch {
         "arm64" => &[("arm64-v8a", 2, 183)],
-        "arm" => &[("armeabi-v7a", 1, 40)],
         "x64" => &[("x86_64", 2, 62)],
-        "universal" => &[("arm64-v8a", 2, 183), ("armeabi-v7a", 1, 40), ("x86_64", 2, 62)],
+        "universal" => &[("arm64-v8a", 2, 183), ("x86_64", 2, 62)],
         _ => bail!("Unknown Android architecture {arch}"),
     };
     let (required, prefix): (&[&str], &str) = match format {
@@ -532,7 +531,6 @@ mod tests {
         }
         for (arch, abi, class, machine) in [
             ("arm64", "arm64-v8a", 2, 183_u16),
-            ("arm", "armeabi-v7a", 1, 40_u16),
             ("x64", "x86_64", 2, 62_u16),
         ] {
             if t.arch != arch && t.arch != "universal" {

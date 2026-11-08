@@ -5,7 +5,7 @@ use super::session::LogSession;
 use super::view::LogMatch;
 
 /// Every match of `query` in the presented rows, ordered by position.
-pub fn find_matches(session: &mut LogSession, query: &str) -> Vec<LogMatch> {
+pub fn find_matches(session: &LogSession, query: &str) -> Vec<LogMatch> {
     if query.is_empty() {
         return Vec::new();
     }
@@ -16,7 +16,7 @@ pub fn find_matches(session: &mut LogSession, query: &str) -> Vec<LogMatch> {
     let mut previous_wraps = false;
     let mut start = 0;
     while start < count {
-        let chunk = session.read(start, 1024.min(count - start));
+        let chunk = session.screen.read_uncached(start, 1024.min(count - start));
         if chunk.is_empty() {
             break;
         }

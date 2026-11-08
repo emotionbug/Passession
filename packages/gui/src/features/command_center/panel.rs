@@ -543,6 +543,9 @@ impl CommandCenterPanel {
         let copied = t("common.states.copied");
         let path = workspace.as_ref().map(|w| str_or(w, "workspaceDirectory", &target.cwd).to_owned()).unwrap_or_else(|| target.cwd.clone());
         let mut out = vec![item("tab:new-agent", 0, t("workspace.tabs.actions.newAgent"), "square-pen", kw(&["tab", "new", "agent", "chat"]), command("workspace.tab.target.agent", Value::Null), false, "workspace-tab-target-agent")];
+        if !target.workspace_id.is_empty() {
+            out.push(item("tab:new-terminal", 2, t("workspace.tabs.actions.newTerminal"), "square-terminal", kw(&["terminal", "shell", "console"]), command("workspace.terminal.new", Value::Null), true, "workspace-terminal-new"));
+        }
         if is_git {
             out.push(item("tab:open:changes", 4, open("workspace.tabs.actions.changes"), "git-compare-arrows", kw(&["open", "changes", "tab", "supporting"]), command("workspace.tab.target.changes", Value::Null), true, ""));
         }

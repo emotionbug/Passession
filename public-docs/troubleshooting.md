@@ -75,7 +75,7 @@ Ensure provider binaries are on the daemon's launch `PATH`, or configure an abso
 
 - **Daemon** — `~/.paseo/daemon.log` (`$PASEO_HOME/daemon.log` for a custom home).
 - **Desktop client** — use the native settings diagnostics' **Application logs** and **Daemon logs** actions. The Rust desktop process shares `desktop-main.log` in the app support directory across its windows; use the returned `logPath` rather than an assumed per-window or old Electron log location.
-- **Script/setup tasks** — inspect their read-only logs. The native client has no interactive terminal UI.
+- **Script/setup tasks** — inspect their read-only logs. For an interactive shell, open a **Terminal** session instead.
 
 ## I changed config.json but nothing happened
 

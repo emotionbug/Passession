@@ -147,6 +147,7 @@ fn build_native_command(profile: &str, container: bool, desktop: Option<&mut Com
         env::var_os("CARGO_BUILD_TARGET").is_none(),
         "Build native runtimes on their target host; CARGO_BUILD_TARGET is not supported"
     );
+    require_zig()?;
     let release = env::var("PASEO_NATIVE_RELEASE").as_deref() == Ok("1");
     ensure!(
         !release || profile == "release",

@@ -14,7 +14,7 @@ Paseo Sessions 是运行和审阅编程智能体工作的原生环境。原生 R
 
 - 智能体聊天、权限、提供商/模型选择、配置档、会话导入和历史。
 - Markdown 渲染、文件浏览与源码编辑；Git diff 先显示摘要，按需加载补丁正文。
-- 工作区初始化和服务脚本由守护进程在 PTY 中运行；应用仅显示**只读日志**，不提供交互式终端模拟器。
+- 交互式终端：在桌面或移动端都可以在任意主机上启动**终端**会话。所有 shell、初始化脚本和服务都运行在守护进程拥有的 PTY 中；脚本以**只读日志**显示。两端的终端仿真都使用 Ghostty 的 VT 引擎。
 - 定时任务、MCP 工具与服务器、已连接主机和远程目录选择。
 - 原生桌面集成与本地守护进程生命周期管理；移动端仅远程连接。
 - 保留一般音效播放，不提供语音识别、语音对话或 TTS。
@@ -25,7 +25,7 @@ Paseo Sessions 是运行和审阅编程智能体工作的原生环境。原生 R
 
 ## 从源码构建和运行
 
-安装 Rust/Cargo 和目标平台原生工具链。至少安装并配置一个智能体 CLI，例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Copilot](https://github.com/features/copilot/cli/)、[OpenCode](https://github.com/anomalyco/opencode) 或 [Pi](https://pi.dev)。完整前置条件见[开发指南](docs/development.md)。
+安装 Rust/Cargo、Zig 0.15.2（用于构建 Ghostty 终端库）和目标平台原生工具链。至少安装并配置一个智能体 CLI，例如 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、[Copilot](https://github.com/features/copilot/cli/)、[OpenCode](https://github.com/anomalyco/opencode) 或 [Pi](https://pi.dev)。完整前置条件见[开发指南](docs/development.md)。
 
 ```sh
 cargo fetch --locked
@@ -90,6 +90,7 @@ paseo run --host workstation.local:6767 --cwd /workspace --provider codex "revie
 | Rust 守护进程、CLI、提供商、存储、supervisor、桌面主机 IPC | `packages/daemon`                                       |
 | 五平台原生客户端                                           | `packages/gui`, `packages/gui-core`                     |
 | 桌面与移动端系统集成                                       | `packages/gui-platform`                                 |
+| 守护进程与客户端的 Ghostty 终端仿真                        | `packages/terminal`                                     |
 | 打包资源与安装程序                                         | `packaging`                                             |
 | Rust SDK 与共享协议                                        | `packages/client`、`packages/protocol`                  |
 | 原生后端插件 SDK                                           | `packages/plugin`                                      |

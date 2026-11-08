@@ -208,7 +208,7 @@ paseo workspace archive <workspace-id>
 
 ## 终端 {#terminals}
 
-这些命令控制 daemon 保留的脚本和设置任务 PTY，不会在应用中打开交互式终端 UI；原生客户端仅呈现只读日志。
+这些命令控制主机上 daemon 端的 PTY。应用以 **Terminal** 标签页打开交互式 shell，并以只读日志显示脚本/设置任务的输出。
 
 当多个工作区共享同一个目录时，请使用工作区 ID：
 

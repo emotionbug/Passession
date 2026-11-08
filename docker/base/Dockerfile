@@ -7,8 +7,26 @@ FROM ${RUST_IMAGE} AS native-build
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends patchelf; \
+    apt-get install -y --no-install-recommends patchelf xz-utils; \
     rm -rf /var/lib/apt/lists/*
+
+# libghostty-vt-sys builds the Ghostty VT library with Zig 0.15.2 and clones
+# the pinned Ghostty source, so the build stage needs network access. Digests
+# come from https://ziglang.org/download/index.json.
+ARG ZIG_VERSION=0.15.2
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) zig_arch=x86_64; zig_sha256=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239 ;; \
+      arm64) zig_arch=aarch64; zig_sha256=958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f ;; \
+      *) echo "unsupported Zig build architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    zig_dir="zig-${zig_arch}-linux-${ZIG_VERSION}"; \
+    curl -fsSLo /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz"; \
+    echo "${zig_sha256}  /tmp/zig.tar.xz" | sha256sum -c -; \
+    tar -xJf /tmp/zig.tar.xz -C /opt; \
+    rm /tmp/zig.tar.xz; \
+    ln -s "/opt/${zig_dir}/zig" /usr/local/bin/zig; \
+    zig version
 
 WORKDIR /tmp/paseo-src
 COPY . .
