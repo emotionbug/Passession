@@ -131,7 +131,7 @@ live_design! {
                             prompt_box = <View> {
                                 width: Fill, height: Fit, flow: Down, padding: { left: 16., right: 16., top: 16. }
                                 prompt = <WaBareInput> {
-                                    faint_hint: true
+                                    faint_hint: true, content: true
                                     input = {
                                         padding: 0.
                                         draw_text: { text_style: { line_spacing: 1.4 } }
@@ -165,6 +165,11 @@ live_design! {
                                 submit = <WaSubmitButton> { icon: "corner-down-left" }
                             }
                         }
+                    }
+                    // A Terminal launch opens a blank shell: no composer, one action.
+                    terminal_launch = <View> {
+                        width: Fill, height: Fit, visible: false, padding: { left: 16., right: 16., bottom: 16. }
+                        open_terminal = <WaButtonPrimary> { width: Fill, size: Lg, icon: "square-terminal" }
                     }
                     error = <View> { width: Fill, height: Fit, visible: false, padding: { left: 16., right: 16., bottom: 16. }, text = <WaDangerText> {} }
                     bottom = <View> {
@@ -435,8 +440,8 @@ enum Req {
     ForgePicker,
     Images,
     Upload,
-    /// `create_terminal_request` of a Terminal launch; `command` is typed into the new shell.
-    CreateTerminal { workspace_id: String, cwd: String, command: String },
+    /// `create_terminal_request` of a Terminal launch.
+    CreateTerminal { workspace_id: String, cwd: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,9 +502,6 @@ pub struct WaNewTabView {
     /// Launch choice (`LaunchControl`): Terminal opens a daemon shell instead of a chat.
     #[rust]
     launch_terminal: bool,
-    /// The Terminal composer's command (`terminalPromptText`), kept apart from the chat prompt.
-    #[rust]
-    command: String,
     /// A workspace a Terminal launch already created whose terminal failed: a retry only
     /// creates the terminal (`ensureWorkspace` reuses it). (workspace id, directory)
     #[rust]
@@ -648,7 +650,6 @@ impl WaNewTabView {
         self.initial_config = self.config.clone();
         // `resolveLaunchTarget`: a carried draft's choice, else the remembered one; only the blank
         // terminal exists here (no terminal profiles), anything else is Chat.
-        self.command = str_of(draft, "command").to_owned();
         self.terminal_workspace = None;
         self.launch_terminal = !add_project
             && match str_of(draft, "launch") {
@@ -665,7 +666,6 @@ impl WaNewTabView {
         if intent.as_object().is_some_and(|m| !m.is_empty()) {
             if str_of(intent, "launch") == "terminal" {
                 self.launch_terminal = true;
-                self.command = str_of(intent, "command").to_owned();
             }
             self.intent = Some(intent.clone());
         }
@@ -879,17 +879,12 @@ impl WaNewTabView {
                 self.terminal_workspace.clone()
             };
             if let Some((workspace_id, directory)) = workspace {
-                let command = self.command.clone();
-                return self.create_terminal(ctx, workspace_id, directory, command);
+                return self.create_terminal(ctx, workspace_id, directory);
             }
         }
         // `isEmptyWorkspaceSubmission`: no prompt and no attachments creates the workspace alone.
-        // A Terminal launch creates it without an agent; its command only names it.
-        let has_input = if terminal {
-            !self.command.trim().is_empty()
-        } else {
-            !self.prompt.trim().is_empty() || !self.images.is_empty() || !self.attachments.is_empty()
-        };
+        // A Terminal launch creates it without an agent or a naming context.
+        let has_input = !terminal && (!self.prompt.trim().is_empty() || !self.images.is_empty() || !self.attachments.is_empty());
         let with_agent = !terminal && self.with_agent && (self.existing || has_input);
         if with_agent && self.catalog_cwd != cwd {
             forget_timer(&mut self.directory_timer);
@@ -957,7 +952,7 @@ impl WaNewTabView {
             config.insert("title".into(), self.title.trim().into());
         }
         let terminal = self.terminal();
-        let prompt = if terminal { self.command.trim().to_owned() } else { self.prompt.trim().to_owned() };
+        let prompt = self.prompt.trim().to_owned();
         let mut agent = Map::new();
         agent.insert("config".into(), Value::Object(config));
         if !prompt.is_empty() {
@@ -1014,9 +1009,8 @@ impl WaNewTabView {
         }
         let mut intent = json!({ "kind": kind, "request": Value::Object(request) });
         if terminal {
-            // Local only (never sent): the finished workspace opens a terminal running `command`.
+            // Local only (never sent): the finished workspace opens a blank terminal.
             intent["launch"] = json!("terminal");
-            intent["command"] = json!(self.command.trim());
         }
         // Persist the exact immutable intent before submission. Recovery never creates
         // another key or silently replays a changed form after an uncertain outcome.
@@ -1125,13 +1119,13 @@ impl WaNewTabView {
         self.observation = None;
         let fallback_cwd = if self.target.cwd.is_empty() { self.path.trim().to_owned() } else { self.target.cwd.clone() };
         let cwd = str_or(&agent, "cwd", str_or(&workspace, "workspaceDirectory", &fallback_cwd)).to_owned();
-        let terminal_command = self.intent.as_ref().filter(|i| str_of(i, "launch") == "terminal").map(|i| str_of(i, "command").to_owned());
+        let terminal = self.intent.as_ref().is_some_and(|i| str_of(i, "launch") == "terminal");
         self.opened = true;
         self.intent = None;
         self.busy = false;
-        if let Some(command) = terminal_command {
+        if terminal {
             self.terminal_workspace = Some((workspace_id.clone(), cwd.clone()));
-            self.create_terminal(ctx, workspace_id, cwd, command);
+            self.create_terminal(ctx, workspace_id, cwd);
         } else if agent_id.is_empty() {
             let target = PanelTarget::new("setup", &self.target.host_id, &workspace_id, &cwd)
                 .with_title(str_or(&workspace, "name", l("Session")))
@@ -1143,12 +1137,12 @@ impl WaNewTabView {
         self.finishing = false;
     }
 
-    /// `createTerminal` + `sendTerminalInput(prompt.trim() + "\r")` of `runCreateTerminalWorkspace`.
-    fn create_terminal(&mut self, ctx: &UiContext, workspace_id: String, cwd: String, command: String) {
+    /// `createTerminal` of `runCreateTerminalWorkspace`: a blank shell in the workspace.
+    fn create_terminal(&mut self, ctx: &UiContext, workspace_id: String, cwd: String) {
         self.busy = true;
         self.error = None;
         let fields = json!({ "cwd": cwd, "workspaceId": workspace_id });
-        self.pending.send(&ctx.core, &self.target.host_id, "create_terminal_request", fields, Req::CreateTerminal { workspace_id, cwd, command });
+        self.pending.send(&ctx.core, &self.target.host_id, "create_terminal_request", fields, Req::CreateTerminal { workspace_id, cwd });
     }
 
     fn handle_core(&mut self, cx: &mut Cx, ctx: &mut UiContext) {
@@ -1429,7 +1423,7 @@ impl WaNewTabView {
                     Err(error) => self.toast_upload_error(ctx, &error.to_string()),
                 }
             }
-            Req::CreateTerminal { workspace_id, cwd, command } => {
+            Req::CreateTerminal { workspace_id, cwd } => {
                 self.busy = false;
                 // `createTerminal` surfaces `payload.error` with a null terminal (e.g. a missing
                 // shell) instead of treating the create as a no-op success.
@@ -1446,14 +1440,6 @@ impl WaNewTabView {
                     return self.fail(ctx, t("newWorkspace.errors.createWorktreeFailed"), true);
                 }
                 self.terminal_workspace = None;
-                let command = command.trim();
-                if !command.is_empty() {
-                    // A blank terminal has no argv: the command is typed at the shell's prompt.
-                    ctx.core.notify(
-                        &self.target.host_id,
-                        json!({ "type": "terminal_input", "terminalId": terminal_id, "message": { "type": "input", "data": format!("{command}\r") } }),
-                    );
-                }
                 self.opened = true;
                 let target = PanelTarget::new("terminal", &self.target.host_id, str_or(&terminal, "workspaceId", &workspace_id), str_or(&terminal, "cwd", &cwd))
                     .with_id(terminal_id);
@@ -1692,30 +1678,22 @@ impl WaNewTabView {
         }
         let prompt = view.wa_input(id!(prompt));
         if let Some(text) = prompt.changed(actions) {
-            if self.terminal() {
-                self.command = text;
-            } else {
-                self.prompt = text;
-                self.sync_forge(cx, ctx);
-            }
+            self.prompt = text;
+            self.sync_forge(cx, ctx);
             self.view.redraw(cx);
         }
         if let Some((_, modifiers)) = prompt.returned(actions) {
             // Desktop: Enter submits, Shift+Enter inserts (handled by TextInput); phones only
             // use the send button, so Enter inserts a newline there.
             if self.compact || host::is_mobile() || modifiers.shift {
-                let text = super::kit::insert_newline(cx, &prompt);
-                if self.terminal() {
-                    self.command = text;
-                } else {
-                    self.prompt = text;
-                }
+                self.prompt = super::kit::insert_newline(cx, &prompt);
             } else if self.can_create() {
                 self.start_create(ctx);
             }
             self.view.redraw(cx);
         }
-        if view.wa_button(id!(submit)).clicked(actions) && self.can_create() {
+        let open_terminal = view.wa_button(id!(open_terminal)).clicked(actions);
+        if (view.wa_button(id!(submit)).clicked(actions) || open_terminal) && self.can_create() {
             self.start_create(ctx);
             self.view.redraw(cx);
         }
@@ -2020,7 +1998,7 @@ impl WaNewTabView {
                 let launch = if self.terminal() { "terminal" } else { "chat" };
                 data.insert(
                     "creationDraft".into(),
-                    json!({ "title": self.title, "prompt": self.prompt, "config": self.config, "launch": launch, "command": self.command }),
+                    json!({ "title": self.title, "prompt": self.prompt, "config": self.config, "launch": launch }),
                 );
                 let target = PanelTarget::new("new_tab", &value, "", "").with_id(new_id()).with_title(t("sessionNavigation.newSession")).with_data(Value::Object(data));
                 ctx.effects.push(UiEffect::OpenTab { target, placement: TabPlacement::Main });
@@ -2037,10 +2015,7 @@ impl WaNewTabView {
                 let terminal = value == "terminal";
                 if terminal != self.launch_terminal {
                     self.launch_terminal = terminal;
-                    // Chat and Terminal keep separate composer texts.
-                    let text = if terminal { self.command.clone() } else { self.prompt.clone() };
-                    sync_input(cx, &self.view.wa_input(id!(prompt)), &text);
-                    self.focus_prompt = !self.compact;
+                    self.focus_prompt = !terminal && !self.compact;
                 }
             }
             "repo" => {
@@ -2161,11 +2136,22 @@ impl WaNewTabView {
             if (column - self.column_width).abs() > 0.5 {
                 self.column_width = column;
                 view.widget(id!(column)).apply_over(cx, live! { width: (column) });
+                // Original `inputWrapper` below the 720px breakpoint: 8 top/bottom and 12
+                // side insets, the button row 6 from the border (12 − 6), no gap between
+                // "+" and the model trigger; the compact dock is bottom-anchored with no
+                // reserved space under the card.
+                let (card_bottom, box_top, box_side, bar_side, gap, scroll_bottom) =
+                    if self.compact { (8.0, 8.0, 12.0, 6.0, 0.0, 0.0) } else { (12.0, 16.0, 16.0, 10.0, 4.0, 60.0) };
                 if self.compact {
                     view.widget(id!(fields)).apply_over(cx, live! { flow: Down });
                 } else {
                     view.widget(id!(fields)).apply_over(cx, live! { flow: Right });
                 }
+                view.widget(id!(composer.card)).apply_over(cx, live! { padding: { bottom: (card_bottom) } });
+                view.widget(id!(prompt_box)).apply_over(cx, live! { padding: { left: (box_side), right: (box_side), top: (box_top) } });
+                view.widget(id!(toolbar)).apply_over(cx, live! { padding: { left: (bar_side), right: (bar_side) } });
+                view.widget(id!(agent_controls)).apply_over(cx, live! { spacing: (gap) });
+                view.widget(id!(scroll)).apply_over(cx, live! { padding: { bottom: (scroll_bottom) } });
             }
         }
         if !self.synced {
@@ -2173,9 +2159,14 @@ impl WaNewTabView {
             for (path, text) in [
                 (id!(path), self.path.clone()),
                 (id!(title_input), self.title.clone()),
-                (id!(prompt), if self.terminal() { self.command.clone() } else { self.prompt.clone() }),
+                (id!(prompt), self.prompt.clone()),
             ] {
                 sync_input(cx, &view.wa_input(path), &text);
+            }
+            // Native composer: 30px minimum input (6px vertical inset) and 20px glyphs.
+            if host::is_mobile() {
+                view.widget(id!(prompt.input)).apply_over(cx, live! { padding: { top: 6., bottom: 6. } });
+                view.widget(id!(provider)).apply_over(cx, live! { width: 20., height: 20. });
             }
         }
         let pending_intent = self.intent.is_some();
@@ -2293,19 +2284,16 @@ impl WaNewTabView {
             let subtitle = attachments::file_type_label(name).unwrap_or_default();
             uploading.set(cx, PillBody::Pending { title: name.clone(), subtitle }, false, false);
         }
+        // A Terminal launch replaces the composer with one Open terminal action.
+        view.widget(id!(composer)).set_visible(cx, !terminal);
+        view.widget(id!(terminal_launch)).set_visible(cx, terminal);
         let prompt = view.wa_input(id!(prompt));
-        prompt.set_visible(cx, self.with_agent || terminal);
+        prompt.set_visible(cx, self.with_agent);
         prompt.set_is_read_only(cx, locked);
-        let placeholder = if terminal {
-            t("newWorkspace.launch.commandPlaceholder")
-        } else {
-            t(if self.compact { "composer.placeholders.mobile" } else { "composer.placeholders.desktop" })
-        };
-        prompt.set_empty_text(cx, placeholder);
-        let preview = if self.with_agent || terminal { String::new() } else if self.title.is_empty() { t("newWorkspace.title") } else { self.title.clone() };
+        prompt.set_empty_text(cx, t(if self.compact { "composer.placeholders.mobile" } else { "composer.placeholders.desktop" }));
+        let preview = if self.with_agent { String::new() } else if self.title.is_empty() { t("newWorkspace.title") } else { self.title.clone() };
         set_optional(cx, &view.widget(id!(title_preview)), &preview);
-        // Terminal hides the agent-only controls (attachments, model, thinking, mode, features).
-        view.widget(id!(agent_controls)).set_visible(cx, self.with_agent && !terminal);
+        view.widget(id!(agent_controls)).set_visible(cx, self.with_agent);
         let attach = view.wa_button(id!(attach));
         attach.set_enabled(cx, self.connected && !locked);
         attach.set_tooltip(cx, &t("composer.input.addAttachment"));
@@ -2384,7 +2372,11 @@ impl WaNewTabView {
         submit.set_text(cx, &if self.with_agent || creating { String::new() } else { t("newWorkspace.create") });
         submit.set_icon(cx, if self.with_agent { "corner-down-left" } else { "" });
         submit.set_enabled(cx, self.can_create());
-        submit.set_tooltip(cx, &t(if terminal { "newWorkspace.launch.submit" } else { "newWorkspace.create" }));
+        submit.set_tooltip(cx, &t("newWorkspace.create"));
+        let open_terminal = view.wa_button(id!(open_terminal));
+        open_terminal.set_busy(cx, terminal && creating);
+        open_terminal.set_text(cx, &if creating { String::new() } else { t("newWorkspace.launch.openTerminal") });
+        open_terminal.set_enabled(cx, self.can_create());
         set_optional(cx, &view.widget(id!(error)), self.error.as_deref().or(self.profiles_error.as_deref()).unwrap_or(""));
         let import = view.wa_button(id!(import_session));
         import.set_visible(cx, !self.compact);
@@ -2591,7 +2583,7 @@ impl Widget for WaNewTabView {
         }
         if self.focus_prompt {
             self.focus_prompt = false;
-            if self.with_agent || self.terminal() {
+            if self.with_agent && !self.terminal() {
                 self.view.wa_input(id!(prompt)).set_key_focus(cx);
             }
         }

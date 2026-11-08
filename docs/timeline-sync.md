@@ -211,6 +211,12 @@ Persistence uses `agent-subagents/{parentId}/index.sqlite3` for descriptors and 
 commit-before-publication contract as parent timelines. Blocking storage work runs outside
 the async executor; ordinary events do not clone/rewrite sibling histories.
 
+User deletion (`agent.provider_subagents.delete.request`) removes a finished child's catalog row
+and timeline file and inserts its id into the catalog's `tombstones` table in the same
+transaction (catalogs written before this gain the table on open). Replayed history (parent
+resume, daemon restart, child-body reads) and every live event for a tombstoned child are dropped
+without publication; only a live `running` upsert lifts the tombstone, as a new run.
+
 Parent cards that summarize child work keep their recorded log across resume without reading any
 child: `resume_session` options carry `subagentCardLogs` (call ID → stored card log). A replayed card
 replaces the stored row by call ID, so the provider must emit the seeded log in it and append live

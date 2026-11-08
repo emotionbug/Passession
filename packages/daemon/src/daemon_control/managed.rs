@@ -33,6 +33,7 @@ const LEGACY_UPDATE_RECORD: &str = "native-update.json";
 const CONTROL_PROTOCOL: u32 = 1;
 const DROP_IN: &str = "zz-paseo-managed.conf";
 const DROP_IN_HEADER: &str = "# Managed by Paseo: fixed control entry.";
+#[cfg(target_os = "linux")]
 const EXECUTOR_UNIT_PREFIX: &str = "paseo-update-";
 const EXECUTABLE: &str = if cfg!(windows) { "paseo.exe" } else { "paseo" };
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -353,6 +354,7 @@ async fn unit_properties(unit: &str, properties: &[&str]) -> Result<BTreeMap<Str
 }
 
 /// Returns (cgroup path, unit) for a process in a systemd user-manager service.
+#[cfg(any(target_os = "linux", test))]
 fn user_service_cgroup(cgroup_file: &str) -> Option<(String, String)> {
     let path = cgroup_file
         .lines()

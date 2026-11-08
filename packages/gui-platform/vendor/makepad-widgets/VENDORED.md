@@ -92,6 +92,12 @@ Long press opens the native toolbar at the hold threshold, without waiting for
 finger-up. Identical-position move events do not remap a held selection when
 IME presentation moves the input; actual movement still extends the range.
 
+Word selection (long press, double tap) keeps the caret when the only segment
+under it is a line break. At the end of a text that ends in a break, upstream's
+boundary search selected that invisible break, so the toolbar had no drawn
+anchor and the empty last line offered no Paste. `touch_focus_tests` pin both
+the kept caret and ordinary word selection.
+
 ## Shared touch selection handles
 
 `src/text_selection_handles.rs` paints insertion/range handles and delegates

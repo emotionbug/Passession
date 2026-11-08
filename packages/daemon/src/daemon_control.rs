@@ -7,8 +7,6 @@ mod supervisor;
 mod tests;
 #[cfg(windows)]
 mod windows;
-#[cfg(windows)]
-pub(crate) use identity::start_identity as read_process_start_identity;
 pub use supervisor::{
     WorkerExit, WorkerGuard, attach_worker, publish_worker_ready, publish_worker_stopping,
     run_internal,

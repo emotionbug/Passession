@@ -503,6 +503,8 @@ impl Owner {
         }
         #[cfg(windows)]
         {
+            // Job termination is always forceful; there is no SIGHUP analogue.
+            let _ = force;
             self.job.terminate()?;
         }
         Ok(())

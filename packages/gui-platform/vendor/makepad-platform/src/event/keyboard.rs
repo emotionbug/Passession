@@ -25,6 +25,7 @@ pub struct TextActionCapabilities {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum TextActionsAnchor {
     /// Relative to the owner's unaligned origin; resolved after layout.
+    #[cfg(any(target_os = "android", test))]
     Rect(crate::makepad_math::Rect),
     /// Painted caret/selection instances, including final alignment and clipping.
     Area(Area),
@@ -51,6 +52,7 @@ pub struct CxKeyboard {
     pub (crate) text_actions: Option<TextActionsRequest>,
     pub(crate) text_handles: Option<super::text_handle::TextHandleRegistration>,
     pub(crate) text_handle_drag: Option<super::text_handle::TextHandleDrag>,
+    #[cfg(any(target_os = "android", test))]
     text_action_token: u64,
 }
 
@@ -107,6 +109,7 @@ impl CxKeyboard {
         }
     }
 
+    #[cfg(any(target_os = "android", test))]
     pub(crate) fn show_text_actions(
         &mut self,
         area: Area,

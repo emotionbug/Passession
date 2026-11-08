@@ -1296,7 +1296,7 @@
       "manageProfiles": "Manage profiles",
       "submit": "Launch",
       "promptPlaceholder": "Prompt {{name}}",
-      "commandPlaceholder": "Run a command, or leave empty for a blank terminal"
+      "openTerminal": "Open terminal"
     }
   },
   "desktop": {
@@ -1772,8 +1772,9 @@
     "detachTooltip": "Detach subagent",
     "archiveAction": "Archive {{label}}",
     "archiveTooltip": "Archive subagent",
-    "archiveFinishedAction": "Archive finished subagents",
-    "archiveFinishedRetry": "Retry ({{failed}}/{{total}})"
+    "deleteFinishedAction": "Delete finished subagents",
+    "deleteFinishedConfirm": "Delete {{count}} finished subagents? Their transcripts are deleted too.",
+    "deleteFinishedRetry": "Retry ({{failed}}/{{total}})"
   },
   "panels": {
     "draft": { "newAgent": "New Agent", "creatingAgent": "Creating agent" },

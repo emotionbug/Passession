@@ -28,7 +28,7 @@
  
  import java.io.BufferedReader;
  import java.io.IOException;
-@@ -77,9 +80,389 @@
+@@ -77,9 +80,390 @@
      private float latestTouchY;
      private int latestTouchPointerId;
  
@@ -87,7 +87,8 @@
 +            right = Math.min(getWidth(), requestedTextMagnifierRight);
 +            bottom = Math.min(getHeight(), requestedTextMagnifierBottom);
 +        }
-+        if (Build.VERSION.SDK_INT < 28) return;
++        // Magnifier.Builder and the size/zoom getters used below are API 29.
++        if (Build.VERSION.SDK_INT < 29) return;
 +        if (!visible || !textActionsResumed || !textActionsSurfaceReady
 +                || !isAttachedToWindow() || !hasWindowFocus() || !hasFocus()
 +                || !getHolder().getSurface().isValid()
@@ -96,7 +97,7 @@
 +            return;
 +        }
 +        try {
-+            if (textMagnifier == null) textMagnifier = new Magnifier(this);
++            if (textMagnifier == null) textMagnifier = new Magnifier.Builder(this).build();
 +            // Inset by the sampled half-size where it fits, or use the midpoint
 +            // of a smaller viewport. Edge handles should not sample the header.
 +            final float halfWidth = Math.min((right - left) / 2, textMagnifier.getWidth() / textMagnifier.getZoom() / 2);
@@ -120,7 +121,7 @@
 +
 +    private void dismissTextMagnifier() {
 +        shownTextMagnifierX = shownTextMagnifierY = Float.NaN;
-+        if (Build.VERSION.SDK_INT >= 28 && textMagnifier != null) {
++        if (Build.VERSION.SDK_INT >= 29 && textMagnifier != null) {
 +            textMagnifier.dismiss();
 +            textMagnifier = null;
 +        }
@@ -418,7 +419,7 @@
          getHolder().addCallback(this);
  
          setFocusable(true);
-@@ -95,6 +478,8 @@
+@@ -95,6 +479,8 @@
      @Override
      public void surfaceCreated(SurfaceHolder holder) {
          Log.i("SAPP", "surfaceCreated");
@@ -427,7 +428,7 @@
          Surface surface = holder.getSurface();
          //surface.setFrameRate(120f,0);
          MakepadNative.surfaceOnSurfaceCreated(surface);
-@@ -103,6 +488,8 @@
+@@ -103,6 +489,8 @@
      @Override
      public void surfaceDestroyed(SurfaceHolder holder) {
          Log.i("SAPP", "surfaceDestroyed");
@@ -436,7 +437,7 @@
          Surface surface = holder.getSurface();
          MakepadNative.surfaceOnSurfaceDestroyed(surface);
      }
-@@ -131,10 +518,15 @@
+@@ -131,10 +519,15 @@
          // Save the details of the latest touch-down event,
          // such that we can use them in the `onLongClick` method.
          if (actionMasked == MotionEvent.ACTION_DOWN) {
@@ -453,7 +454,7 @@
          }
          else if (actionMasked == MotionEvent.ACTION_MOVE) {
              latestTouchX = event.getX(index);
-@@ -142,6 +534,7 @@
+@@ -142,6 +535,7 @@
              latestTouchPointerId = pointerId;
              if (pointerId == latestDownTouchPointerId) {
                  if (isTouchBeyondSlopDistance(view)) {
@@ -461,7 +462,7 @@
                      retval = true;
                  }
              }
-@@ -204,7 +597,13 @@
+@@ -204,7 +598,13 @@
          int visibleHeight = r.height();
          int keyboardHeight = screenHeight - visibleHeight;
  
@@ -476,7 +477,7 @@
      }
  
      // docs says getCharacters are deprecated
-@@ -213,6 +612,21 @@
+@@ -213,6 +613,21 @@
      @SuppressWarnings("deprecation")
      @Override
      public boolean onKey(View v, int keyCode, KeyEvent event) {
@@ -498,7 +499,7 @@
          if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode != 0) {
              int metaState = event.getMetaState();
              MakepadNative.surfaceOnKeyDown(keyCode, metaState);
-@@ -223,17 +637,15 @@
+@@ -223,17 +638,15 @@
              MakepadNative.surfaceOnKeyUp(keyCode, metaState);
          }
  
@@ -525,7 +526,7 @@
              }
          }
  
-@@ -248,16 +660,14 @@
+@@ -248,16 +661,14 @@
          return true;
      }
  
@@ -534,10 +535,10 @@
 -    // This code is a workaround which fixes the bug.
 -    // See https://groups.google.com/g/android-developers/c/50XcWooqk7I
 -    // For some reason it only works if placed here and not in the parent layout.
-     @Override
++    @Override
 +    public boolean onCheckIsTextEditor() { return inputConnection != null; }
 +
-+    @Override
+     @Override
      public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
 -        InputConnection connection = super.onCreateInputConnection(outAttrs);
 -        outAttrs.imeOptions |= EditorInfo.IME_FLAG_NO_FULLSCREEN;
@@ -548,7 +549,7 @@
      }
  
      public Surface getNativeSurface() {
-@@ -280,9 +690,14 @@
+@@ -280,9 +691,14 @@
      }
  
      @Override
@@ -565,17 +566,17 @@
          return insets;
      }
  }
-@@ -296,6 +711,9 @@
+@@ -295,6 +711,9 @@
+ 
      private MakepadSurface view;
      Handler mHandler;
- 
++
 +    // Paseo: platform insets are relative to the actual resized render surface.
 +    public View getRenderView() { return view; }
-+
+ 
      // video playback
      Handler mVideoPlaybackHandler;
-     HashMap<Long, VideoPlayerRunnable> mVideoPlayerRunnables;
-@@ -379,12 +797,14 @@
+@@ -379,12 +798,14 @@
      @Override
      protected void onResume() {
          super.onResume();
@@ -590,7 +591,7 @@
          super.onPause();
          MakepadNative.activityOnPause();
  
-@@ -399,6 +819,7 @@
+@@ -399,6 +820,7 @@
  
      @Override
      protected void onDestroy() {
@@ -598,7 +599,7 @@
          super.onDestroy();
          MakepadNative.activityOnDestroy();
      }
-@@ -406,6 +827,7 @@
+@@ -406,6 +828,7 @@
      @Override
      @SuppressWarnings("deprecation")
      public void onBackPressed() {
@@ -606,7 +607,7 @@
          super.onBackPressed();
          MakepadNative.onBackPressed();
      }
-@@ -430,7 +852,10 @@
+@@ -430,7 +853,10 @@
  
                      if (fullscreen) {
                          getWindow().setFlags(LayoutParams.FLAG_LAYOUT_NO_LIMITS, LayoutParams.FLAG_LAYOUT_NO_LIMITS);
@@ -618,7 +619,7 @@
                          if (Build.VERSION.SDK_INT >= 30) {
                              getWindow().setDecorFitsSystemWindows(false);
                          } else {
-@@ -456,6 +881,31 @@
+@@ -456,6 +882,31 @@
          finish();
      }
      
@@ -666,7 +667,7 @@
      // networking
 --- /dev/null
 +++ b/java/dev/makepad/android/MakepadInputConnection.java
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,309 @@
 +package dev.makepad.android;
 +
 +import android.content.ClipData;
@@ -942,7 +943,7 @@
 +        if (event.isCtrlPressed() || event.isAltPressed() || event.isMetaPressed()) return false;
 +        int character = event.getUnicodeChar();
 +        boolean delete = key == KeyEvent.KEYCODE_DEL || key == KeyEvent.KEYCODE_FORWARD_DEL;
-+        String multiple = event.getAction() == KeyEvent.ACTION_MULTIPLE ? event.getCharacters() : null;
++        String multiple = multipleCharacters(event);
 +        if (!delete && (character < 32 || character == 127) && multiple == null) return false;
 +        if (event.getAction() == KeyEvent.ACTION_UP) return true;
 +        if (delete) return edit(() -> {
@@ -965,5 +966,14 @@
 +            removeComposingSpans(editable);
 +            return super.commitText(new String(Character.toChars(character)), 1);
 +        });
++    }
++    // Committed text from IMEs that call sendKeyEvent with a character string,
++    // and non-Latin hardware input (see MakepadActivity.onKey), arrives only as
++    // one ACTION_MULTIPLE event whose text is in getCharacters(). API 29
++    // deprecated both because the input system no longer creates such events;
++    // apps on the API 24 floor still receive them.
++    @SuppressWarnings("deprecation")
++    private static String multipleCharacters(KeyEvent event) {
++        return event.getAction() == KeyEvent.ACTION_MULTIPLE ? event.getCharacters() : null;
 +    }
 +}

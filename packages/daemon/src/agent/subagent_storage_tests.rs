@@ -318,3 +318,76 @@ fn replay_reconciles_against_stored_child_that_is_not_hydrated() {
     assert_eq!(replaced["rows"].as_array().unwrap().len(), 4);
     assert_eq!(listed(&mut restarted, root, "parent"), 1);
 }
+
+fn finished(store: &mut SubagentStore, root: &Path, parent: &str, id: &str, status: &str) {
+    store.apply_persisted(root, parent, "omp",
+        &json!({"type":"upsert","id":id,"title":id,"status":status,"timestamp":TIMESTAMP})).unwrap();
+}
+
+#[test]
+fn deleting_finished_children_removes_them_and_skips_running_or_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut store = SubagentStore::default();
+    for (id, status) in [("done", "completed"), ("broke", "failed"), ("busy", "running")] {
+        finished(&mut store, root, "parent", id, status);
+        message(&mut store, root, "parent", id, 1);
+    }
+    let ids = ["done", "broke", "busy", "ghost", "done"].map(str::to_owned);
+    let (deleted, skipped) = store.delete_persisted(root, "parent", &ids).unwrap();
+    assert_eq!(deleted, ["done", "broke"]);
+    assert_eq!(skipped, [("busy".to_owned(), "running".to_owned()), ("ghost".to_owned(), "unknown".to_owned())]);
+    assert!(!timeline_path(root, "parent", "done").try_exists().unwrap());
+    assert!(timeline_path(root, "parent", "busy").try_exists().unwrap());
+    assert!(store.fetch_persisted(root, "parent", "done", &json!({})).is_err());
+    assert_eq!(listed(&mut store, root, "parent"), 1);
+    let mut restarted = SubagentStore::default();
+    assert_eq!(listed(&mut restarted, root, "parent"), 1);
+    // A parent without stored children has nothing to delete.
+    let (deleted, skipped) = restarted.delete_persisted(root, "nobody", &["x".to_owned()]).unwrap();
+    assert!(deleted.is_empty());
+    assert_eq!(skipped, [("x".to_owned(), "unknown".to_owned())]);
+}
+
+/// Provider history re-ingested after a daemon restart or agent resume, and
+/// late provider events, must not restore a deleted child; only a live
+/// `running` upsert (the child genuinely runs again) brings it back.
+#[test]
+fn deleted_children_are_not_resurrected_by_replay_or_late_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    {
+        let mut store = SubagentStore::default();
+        finished(&mut store, root, "parent", "done", "completed");
+        message(&mut store, root, "parent", "done", 1);
+        store.delete_persisted(root, "parent", &["done".to_owned()]).unwrap();
+    }
+    let mut restarted = SubagentStore::default();
+    let mut timeline = message_event("done", 1);
+    timeline["historyComplete"] = json!(true);
+    let replay = vec![
+        json!({"provider":"omp","event":{"type":"upsert","id":"done","status":"completed","timestamp":TIMESTAMP}}),
+        // Replayed spawn declarations report `running`: still history, not a new run.
+        json!({"provider":"omp","event":{"type":"upsert","id":"done","status":"running","timestamp":TIMESTAMP}}),
+        json!({"provider":"omp","event":timeline}),
+    ];
+    assert!(restarted.replay_history(Some(root), "parent", replay, false).unwrap().is_empty());
+    assert!(restarted.replay_history(Some(root), "parent",
+        vec![json!({"provider":"omp","event":timeline})], true).unwrap().is_empty());
+    assert!(restarted.apply_persisted(root, "parent", "omp", &message_event("done", 2)).unwrap().is_null());
+    assert!(restarted.apply_persisted(root, "parent", "omp",
+        &json!({"type":"upsert","id":"done","source":{"file":"/tmp/done.jsonl"}})).unwrap().is_null());
+    assert!(restarted.apply_persisted_event(root, "parent", "omp",
+        &json!({"type":"upsert","id":"done","status":"running"}), false).unwrap().is_null());
+    assert_eq!(listed(&mut restarted, root, "parent"), 0);
+    assert!(!timeline_path(root, "parent", "done").try_exists().unwrap());
+
+    // The child runs again: the tombstone is lifted durably.
+    let output = restarted.apply_persisted(root, "parent", "omp",
+        &json!({"type":"upsert","id":"done","status":"running","timestamp":TIMESTAMP})).unwrap();
+    assert_eq!(output["subagent"]["status"], "running");
+    message(&mut restarted, root, "parent", "done", 3);
+    let mut again = SubagentStore::default();
+    assert_eq!(listed(&mut again, root, "parent"), 1);
+    assert_eq!(page(&mut again, root, "parent", "done", json!({"limit":0}))["rows"].as_array().unwrap().len(), 1);
+}

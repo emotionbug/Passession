@@ -88,6 +88,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SYS_CPU");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_SYS_OPTIMIZE");
     println!("cargo:rerun-if-env-changed=GHOSTTY_SOURCE_DIR");
+    println!("cargo:rerun-if-env-changed=GHOSTTY_CACHE_DIR");
     println!("cargo:rerun-if-env-changed=GHOSTTY_ZIG_SYSTEM_DIR");
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
@@ -121,8 +122,11 @@ fn main() {
 fn build_vendored(link_mode: LinkMode, target: &str) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
     let host = env::var("HOST").expect("HOST must be set");
+    // Held until the Zig build finishes, so concurrent builds sharing the
+    // persistent cache never see a half-made or replaced Ghostty clone.
+    let persistent_cache = PersistentCache::open();
 
-    // Locate ghostty source: env override > fetch into OUT_DIR.
+    // Locate ghostty source: env override > persistent cache > fetch into OUT_DIR.
     let ghostty_dir = match env::var("GHOSTTY_SOURCE_DIR") {
         Ok(dir) => {
             let p = PathBuf::from(dir);
@@ -133,12 +137,18 @@ fn build_vendored(link_mode: LinkMode, target: &str) {
             );
             p
         }
-        Err(_) => fetch_ghostty(&out_dir),
+        Err(_) => match &persistent_cache {
+            Some(cache) => cache.fetch_ghostty(),
+            None => fetch_ghostty(&out_dir),
+        },
     };
 
-    // Build libghostty-vt via zig.
+    // Build libghostty-vt via zig. Zig's local cache is content-addressed, so
+    // reusing a persistent one only skips work; it cannot change the outputs.
     let install_prefix = out_dir.join("ghostty-install");
-    let zig_cache_dir = out_dir.join("zig-cache");
+    let zig_cache_dir = persistent_cache
+        .as_ref()
+        .map_or_else(|| out_dir.join("zig-cache"), PersistentCache::zig_cache_dir);
     let zig_global_cache_dir = out_dir.join("zig-global-cache");
 
     let optimize = zig_optimize_mode();
@@ -404,11 +414,105 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
     }
 
     // Clean and clone fresh.
-    if src_dir.exists() {
-        std::fs::remove_dir_all(&src_dir)
-            .unwrap_or_else(|e| panic!("failed to remove {}: {e}", src_dir.display()));
+    remove_dir_if_exists(&src_dir);
+    clone_ghostty(&src_dir);
+    std::fs::write(&stamp, GHOSTTY_COMMIT).unwrap_or_else(|e| panic!("failed to write stamp: {e}"));
+
+    src_dir
+}
+
+/// `GHOSTTY_CACHE_DIR`: a directory that outlives Cargo's target directory
+/// (CI caches it between runs). It holds a reusable Ghostty clone
+/// (`ghostty-src`) and Zig's local cache (`zig-cache-<GHOSTTY_COMMIT>`); when
+/// unset, both stay in `OUT_DIR` as before.
+struct PersistentCache {
+    dir: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl PersistentCache {
+    fn open() -> Option<Self> {
+        let dir = PathBuf::from(env::var_os("GHOSTTY_CACHE_DIR")?);
+        assert!(
+            !dir.as_os_str().is_empty(),
+            "GHOSTTY_CACHE_DIR must not be empty when set"
+        );
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
+        let lock_path = dir.join(".lock");
+        let lock = std::fs::File::create(&lock_path)
+            .unwrap_or_else(|e| panic!("failed to open {}: {e}", lock_path.display()));
+        lock.lock()
+            .unwrap_or_else(|e| panic!("failed to lock {}: {e}", lock_path.display()));
+        let cache = Self { dir, _lock: lock };
+        cache.remove_stale_zig_caches();
+        Some(cache)
     }
 
+    /// Named by the pinned commit, so a Ghostty bump starts a fresh cache
+    /// instead of growing the old one.
+    fn zig_cache_dir(&self) -> PathBuf {
+        self.dir.join(format!("zig-cache-{GHOSTTY_COMMIT}"))
+    }
+
+    fn remove_stale_zig_caches(&self) {
+        let current = self.zig_cache_dir();
+        let entries = std::fs::read_dir(&self.dir)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", self.dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", self.dir.display()))
+                .path();
+            let stale = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("zig-cache"));
+            if stale && path != current {
+                remove_dir_if_exists(&path);
+            }
+        }
+    }
+
+    /// Reuse the cached clone only when it is checked out at the pinned commit
+    /// with no modified, untracked or ignored files, because the native notices
+    /// are bound to `GHOSTTY_COMMIT`. Anything else is replaced by a fresh
+    /// clone.
+    fn fetch_ghostty(&self) -> PathBuf {
+        let src_dir = self.dir.join("ghostty-src");
+        if pristine_ghostty_checkout(&src_dir) {
+            return src_dir;
+        }
+        remove_dir_if_exists(&src_dir);
+        clone_ghostty(&src_dir);
+        assert!(
+            pristine_ghostty_checkout(&src_dir),
+            "fresh Ghostty clone at {} is not a clean checkout of {GHOSTTY_COMMIT}",
+            src_dir.display()
+        );
+        src_dir
+    }
+}
+
+fn pristine_ghostty_checkout(src_dir: &Path) -> bool {
+    // Without its own `.git`, git would resolve an enclosing repository.
+    if !src_dir.join(".git").is_dir() {
+        return false;
+    }
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(src_dir)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    git(&["rev-parse", "--verify", "HEAD"]).is_some_and(|head| head.trim() == GHOSTTY_COMMIT)
+        && git(&["status", "--porcelain", "--untracked-files=all", "--ignored"])
+            .is_some_and(|status| status.is_empty())
+}
+
+fn clone_ghostty(src_dir: &Path) {
     eprintln!("Fetching ghostty {GHOSTTY_COMMIT} ...");
 
     let mut clone = Command::new("git");
@@ -421,19 +525,22 @@ fn fetch_ghostty(out_dir: &Path) -> PathBuf {
         .arg("--filter=blob:none")
         .arg("--no-checkout")
         .arg(GHOSTTY_REPO)
-        .arg(&src_dir);
+        .arg(src_dir);
     run(clone, "git clone ghostty");
 
     let mut checkout = Command::new("git");
     checkout
         .arg("checkout")
         .arg(GHOSTTY_COMMIT)
-        .current_dir(&src_dir);
+        .current_dir(src_dir);
     run(checkout, "git checkout ghostty commit");
+}
 
-    std::fs::write(&stamp, GHOSTTY_COMMIT).unwrap_or_else(|e| panic!("failed to write stamp: {e}"));
-
-    src_dir
+fn remove_dir_if_exists(dir: &Path) {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)
+            .unwrap_or_else(|e| panic!("failed to remove {}: {e}", dir.display()));
+    }
 }
 
 fn run(mut command: Command, context: &str) {

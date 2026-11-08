@@ -64,7 +64,7 @@ SSH uses the local `ssh` executable, noninteractive batch authentication and `-W
 | Turns | `send_agent_message`, `wait_for_finish(agent_id, options)`, `cancel_agent`, `rewind_agent` |
 | Configuration | `update_agent`, `set_agent_mode`, `set_agent_model`, `set_agent_feature`, `set_agent_thinking_option`, `apply_agent_config` |
 | Lifecycle | `resume_agent`, `import_agent`, `refresh_agent`, `archive_agent`, `detach_agent`, `delete_agent` |
-| Subagents | `list_provider_subagents`, `fetch_provider_subagent_timeline`, `build_agent_fork_context` |
+| Subagents | `list_provider_subagents`, `fetch_provider_subagent_timeline`, `delete_provider_subagents`, `build_agent_fork_context` |
 | Projects | `open_project`, `add_project`, `list_projects`, `rename_project`, `set_project_icon`, `remove_project` |
 | Workspaces | `fetch_workspaces`, `archive_workspace`, `set_workspace_title`, `set_workspace_pinned`, `inspect_workspace_recovery`, `restore_workspace` |
 | Setup/scripts | `fetch_workspace_setup_status`, `run_workspace_setup`, `list_workspace_scripts`, `start_workspace_script_with_status`, `stop_workspace_script` |

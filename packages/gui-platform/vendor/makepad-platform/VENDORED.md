@@ -185,6 +185,9 @@ MIT license. `src/generate.rs` emits GLSL floating-point literals without the
 unsupported ES 1.00 `f` suffix. Android shader generation inlines constants
 instead of exhausting the GLES uniform limit. These changes were exercised by
 the API 35 emulator's real native renderer, not merely shader-source checks.
+Methods returning borrowed checker/analyser structs (`analyse.rs`, `ty_check.rs`,
+`swizzle.rs`) spell their elided lifetime (`TyChecker<'_>`), as Rust's
+`mismatched_lifetime_syntaxes` lint asks; behavior is unchanged.
 
 ## Packaged builds do not poll live files (GuiShell)
 
@@ -267,3 +270,20 @@ platform operations used for saved geometry and compact-window transitions did
 nothing. They now call `XResizeWindow` and `XMoveWindow`, followed by `XFlush`.
 Resize uses logical size × DPI, matching window creation and `get_inner_size`;
 position remains in X11 pixels, matching creation and `get_position`.
+
+## Build-warning fixes
+
+These patches only remove compiler warnings; they change no behavior.
+
+- `component_map.rs` (`entry`) and `event/network.rs` (`split_url`) spell their
+  elided return lifetimes (`Entry<'_, K, V>`, `SplitUrl<'_>`).
+- The Android-only text-action request path (`TextActionsAnchor::Rect`,
+  `CxKeyboard::show_text_actions` and its token counter in `event/keyboard.rs`)
+  compiles only for Android and the crate's unit tests.
+- `Cx::call_single_window_event_handler` (`os/cx_shared.rs`) serves only the
+  desktop stdin transports and tests, so mobile targets omit it.
+- `os/linux/openxr.rs` dropped an unused duplicate `AnchorAdvertisement` struct
+  (and the serde import it alone needed). Upstream's unfinished Quest
+  colocation payload in `os/linux/openxr_anchor.rs` is kept as published under a
+  reasoned `#[allow(dead_code)]`, since only its `_start_colocation_*`
+  placeholders reference it.

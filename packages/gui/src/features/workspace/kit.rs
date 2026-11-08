@@ -570,9 +570,13 @@ impl Widget for WaButton {
         let border = if self.pill { border } else { fade(border, opacity) };
         self.area = self.painter.capture_box(cx, r, fade(fill, opacity), border, border_w, radius);
         let content = fade(content, opacity);
-        // Field triggers start at the padding; every other kind centres its content.
+        // Field triggers start at the padding; square icon buttons centre the glyph exactly
+        // (a 20px mobile glyph in a 28px circle); every other kind centres its content but
+        // keeps at least the padding.
         let start = if self.kind == WaButtonKind::Field {
             r.pos.x + g.pad
+        } else if square {
+            r.pos.x + (r.size.x - content_w) * 0.5
         } else {
             r.pos.x + ((r.size.x - content_w) * 0.5).max(g.pad.min(r.size.x * 0.5))
         };
@@ -965,6 +969,9 @@ pub struct WaInput {
     /// The composer prompt's surface4 hint instead of muted.
     #[live(false)]
     faint_hint: bool,
+    /// Typed content (the composer prompt) uses the content font size, not the 14px UI size.
+    #[live(false)]
+    content: bool,
     /// Multi-line fields keep 12px vertical padding (`paseoInputDecoration(multiline)`).
     #[live(false)]
     multiline: bool,
@@ -1077,7 +1084,11 @@ impl WaInput {
         let p = theme::current_palette();
         let t = theme::current_typography();
         let input = self.view.text_input(id!(input));
-        let font_size = t.ui_pt(if self.mono { 12.0 } else { 14.0 }) as f64;
+        let font_size = f64::from(if self.content {
+            theme::Typography::pt(t.content_font_size)
+        } else {
+            t.ui_pt(if self.mono { 12.0 } else { 14.0 })
+        });
         let clear = Vec4::default();
         // `Sdf2d::box` (the TextInput shader) draws twice the radius it is given.
         let (fill, border, active, radius) = match self.look {

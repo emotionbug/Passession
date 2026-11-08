@@ -273,6 +273,25 @@ impl AgentManager {
             })
             .collect())
     }
+    /// Deletes finished provider subagents of a public parent: their stored
+    /// descriptors and histories go, a per-parent tombstone keeps replayed
+    /// history and later provider events from restoring them, and every
+    /// client is told through the existing `remove` update. Running, unknown
+    /// and unreadable children are reported as skipped with a reason.
+    pub async fn delete_subagents(&self, parent: &str, ids: Vec<String>) -> Result<Value> {
+        let root = self.subagent_root(parent).await?;
+        let store = self.subagent_store.clone();
+        let owner = parent.to_owned();
+        let (deleted, skipped) = tokio::task::spawn_blocking(move || {
+            store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.delete_persisted(&root, &owner, &ids)
+        }).await??;
+        for id in &deleted {
+            self.emit_subagent_output(parent, false, json!({"type":"remove","parentAgentId":parent,"subagentId":id}))
+                .await?;
+        }
+        let skipped: Vec<Value> = skipped.into_iter().map(|(id, reason)| json!({"id":id,"reason":reason})).collect();
+        Ok(json!({"deleted":deleted,"skipped":skipped}))
+    }
     /// Pages one child without listing (or hydrating) its siblings.
     pub async fn subagent_timeline(
         &self,

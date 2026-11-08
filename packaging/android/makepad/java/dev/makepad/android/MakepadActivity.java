@@ -135,7 +135,8 @@ class MakepadSurface
             right = Math.min(getWidth(), requestedTextMagnifierRight);
             bottom = Math.min(getHeight(), requestedTextMagnifierBottom);
         }
-        if (Build.VERSION.SDK_INT < 28) return;
+        // Magnifier.Builder and the size/zoom getters used below are API 29.
+        if (Build.VERSION.SDK_INT < 29) return;
         if (!visible || !textActionsResumed || !textActionsSurfaceReady
                 || !isAttachedToWindow() || !hasWindowFocus() || !hasFocus()
                 || !getHolder().getSurface().isValid()
@@ -144,7 +145,7 @@ class MakepadSurface
             return;
         }
         try {
-            if (textMagnifier == null) textMagnifier = new Magnifier(this);
+            if (textMagnifier == null) textMagnifier = new Magnifier.Builder(this).build();
             // Inset by the sampled half-size where it fits, or use the midpoint
             // of a smaller viewport. Edge handles should not sample the header.
             final float halfWidth = Math.min((right - left) / 2, textMagnifier.getWidth() / textMagnifier.getZoom() / 2);
@@ -168,7 +169,7 @@ class MakepadSurface
 
     private void dismissTextMagnifier() {
         shownTextMagnifierX = shownTextMagnifierY = Float.NaN;
-        if (Build.VERSION.SDK_INT >= 28 && textMagnifier != null) {
+        if (Build.VERSION.SDK_INT >= 29 && textMagnifier != null) {
             textMagnifier.dismiss();
             textMagnifier = null;
         }

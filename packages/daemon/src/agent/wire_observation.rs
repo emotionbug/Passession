@@ -271,6 +271,25 @@ pub(super) async fn handle(
             )
             .await?;
         }
+        "agent.provider_subagents.delete.request" => {
+            let ids = strings(&message["subagentIds"]).into_iter().map(str::to_owned).collect();
+            let payload = match manager.delete_subagents(text(message, "parentAgentId"), ids).await {
+                Ok(mut result) => {
+                    result["parentAgentId"] = message["parentAgentId"].clone();
+                    result["error"] = Value::Null;
+                    result
+                }
+                Err(error) => {
+                    json!({"parentAgentId":message["parentAgentId"],"deleted":[],"skipped":[],"error":error.to_string()})
+                }
+            };
+            reply(
+                context,
+                "agent.provider_subagents.delete.response",
+                correlated(message, payload),
+            )
+            .await?;
+        }
         "agent.fork_context.request" => {
             let mut payload = match manager.fork_context(id, message).await {
                 Ok(mut value) => {

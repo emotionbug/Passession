@@ -720,6 +720,9 @@ impl Default for AsyncAnchorState{
 }
 
 
+// Payload of upstream's unfinished Quest colocation flow: only the
+// `_start_colocation_*` placeholders reference it, so it is never built.
+#[allow(dead_code, reason = "upstream makepad 1.0.0 colocation scaffolding, kept as published")]
 #[derive(SerBin, DeBin)]
 struct AnchorAdvertisement{
     group_uuid: XrUuid,

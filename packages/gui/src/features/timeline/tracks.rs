@@ -2,7 +2,7 @@
 //! the floating track bar over the stream bottom (task progress, subagents,
 //! workspace diff stat) and its panels (popover above the pill on wide
 //! layouts, bottom sheet on compact), with subagent open / archive / detach /
-//! archive-finished actions.
+//! delete-finished actions.
 
 use super::canvas::*;
 use super::i18n::{t, ta};
@@ -107,12 +107,13 @@ impl SubagentRow {
     }
 }
 
-/// use-archive-finished ArchiveFinishedStatus.
+/// Progress of "Delete finished subagents" (formerly use-archive-finished
+/// ArchiveFinishedStatus).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ArchiveFinished {
+pub enum DeleteFinished {
     #[default]
     Idle,
-    Archiving { completed: usize, total: usize },
+    Deleting { completed: usize, total: usize },
     Failed { failed: usize, total: usize },
 }
 
@@ -179,10 +180,10 @@ pub enum TrackPanel {
 pub struct TrackModel<'a> {
     pub tasks: &'a [Value],
     pub rows: &'a [SubagentRow],
-    pub archive: ArchiveFinished,
+    pub delete: DeleteFinished,
     pub additions: i64,
     pub deletions: i64,
-    pub can_archive_finished: bool,
+    pub can_delete_finished: bool,
     pub can_detach: bool,
     pub host_id: &'a str,
     pub providers: &'a [Value],
@@ -190,7 +191,7 @@ pub struct TrackModel<'a> {
 }
 
 pub fn visible(model: &TrackModel) -> bool {
-    model.additions > 0 || model.deletions > 0 || !model.rows.is_empty() || !model.tasks.is_empty() || model.archive != ArchiveFinished::Idle
+    model.additions > 0 || model.deletions > 0 || !model.rows.is_empty() || !model.tasks.is_empty() || model.delete != DeleteFinished::Idle
 }
 
 /// track-presentation.ts buildSubagentPillPresentation.
@@ -278,7 +279,7 @@ pub fn draw_bar(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, model: &Trac
     } else {
         0.0
     };
-    let pills = (!model.tasks.is_empty()) as usize + (!model.rows.is_empty() || model.archive != ArchiveFinished::Idle) as usize;
+    let pills = (!model.tasks.is_empty()) as usize + (!model.rows.is_empty() || model.delete != DeleteFinished::Idle) as usize;
     let avail = (outer - diff_w - 4.0 * pills as f64).max(80.0);
     let each = if pills > 0 { avail / pills as f64 } else { avail };
     if !model.tasks.is_empty() {
@@ -288,7 +289,7 @@ pub fn draw_bar(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, model: &Trac
         out.push((TrackPanel::Tasks, rect_xywh(cursor, y, pw, height)));
         cursor += pw + 4.0;
     }
-    if !model.rows.is_empty() || model.archive != ArchiveFinished::Idle {
+    if !model.rows.is_empty() || model.delete != DeleteFinished::Idle {
         let segments = subagent_segments(model.rows);
         let pw = pill(cx, d, painter, cursor, y, height, each, &segments, open == Some(TrackPanel::Subagents), "track:subagents");
         out.push((TrackPanel::Subagents, rect_xywh(cursor, y, pw, height)));
@@ -335,26 +336,26 @@ fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut Dra
         }
         TrackPanel::Subagents => {
             let finished = model.rows.iter().filter(|r| r.is_finished()).count();
-            if model.can_archive_finished && (finished > 0 || model.archive != ArchiveFinished::Idle) {
-                let archiving = matches!(model.archive, ArchiveFinished::Archiving { .. });
+            if model.can_delete_finished && (finished > 0 || model.delete != DeleteFinished::Idle) {
+                let deleting = matches!(model.delete, DeleteFinished::Deleting { .. });
                 let r = rect_xywh(x + 4.0, cy, w - 8.0, row_h);
-                let hovered = !archiving && d.state.hover_hit.as_deref() == Some("archive-finished");
+                let hovered = !deleting && d.state.hover_hit.as_deref() == Some("delete-finished");
                 if hovered {
                     d.kit.rect(cx, r, p.surface2, 6.0);
                 }
-                d.kit.icon(cx, "archive", rect_xywh(r.pos.x + 8.0, cy, 14.0, row_h), 14.0, if hovered { p.foreground } else { p.muted });
-                let label = t("subagents.archiveFinishedAction");
+                d.kit.icon(cx, "trash-2", rect_xywh(r.pos.x + 8.0, cy, 14.0, row_h), 14.0, if hovered { p.foreground } else { p.muted });
+                let label = t("subagents.deleteFinishedAction");
                 let s = d.kit.label_line(cx, Font::Regular, base, 1.3, p.foreground, dvec2(r.pos.x + 30.0, cy + (row_h - base * 1.3) * 0.5), &label, (r.size.x - 120.0).max(20.0));
-                let trailing = match model.archive {
-                    ArchiveFinished::Archiving { completed, total } => Some(format!("{completed}/{total}")),
-                    ArchiveFinished::Failed { failed, total } => Some(ta("subagents.archiveFinishedRetry", &[("failed", &failed.to_string()), ("total", &total.to_string())])),
-                    ArchiveFinished::Idle => None,
+                let trailing = match model.delete {
+                    DeleteFinished::Deleting { completed, total } => Some(format!("{completed}/{total}")),
+                    DeleteFinished::Failed { failed, total } => Some(ta("subagents.deleteFinishedRetry", &[("failed", &failed.to_string()), ("total", &total.to_string())])),
+                    DeleteFinished::Idle => None,
                 };
                 if let Some(trailing) = trailing {
                     d.kit.label(cx, Font::Regular, small, 1.3, p.muted, dvec2(r.pos.x + 38.0 + s.x, cy + (row_h - small * 1.3) * 0.5), &trailing, None);
                 }
-                if !archiving {
-                    d.canvas.add_hit(r, HitTarget::Chrome("archive-finished".into()));
+                if !deleting {
+                    d.canvas.add_hit(r, HitTarget::Chrome("delete-finished".into()));
                 }
                 cy += row_h;
                 if !model.rows.is_empty() {

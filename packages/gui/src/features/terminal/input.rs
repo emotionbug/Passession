@@ -12,10 +12,14 @@
 //! Windows Terminal, without one it is ^C. The platform layer turns Ctrl/Cmd+V into a paste
 //! `TextInput` before the key arrives, so Ctrl+V pastes too.
 //!
-//! Android edits a hidden editor ([`ImeBridge`]); iOS reports Korean syllable updates as
-//! replacements of the previous input, rubbed out with DEL like the original native input.
+//! Android edits a hidden editor ([`ImeBridge`]); its composing region is shown at the cursor
+//! ([`composing_text`], [`preedit_cells`]) until the input method commits it. iOS reports Korean
+//! syllable updates as replacements of the previous input, rubbed out with DEL like the
+//! original native input.
 
 use makepad_widgets::{KeyCode, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use paseo_terminal::{Key, Modifiers};
 
 /// What one `KeyDown` does in the terminal.
@@ -253,6 +257,20 @@ impl ImeBridge {
     }
 }
 
+/// The composing region of an editor snapshot (`composing` in UTF-16 units): the text an
+/// input method is still composing, such as a Hangul syllable before the next key.
+pub fn composing_text(text: &str, composing: Option<(usize, usize)>) -> &str {
+    match composing.filter(|(start, end)| start < end) {
+        Some((start, end)) => &text[utf16_to_utf8(text, start)..utf16_to_utf8(text, end)],
+        None => "",
+    }
+}
+
+/// The graphemes of composing text with the terminal cells each takes (wide CJK is two).
+pub fn preedit_cells(text: &str) -> Vec<(&str, usize)> {
+    text.graphemes(true).map(|grapheme| (grapheme, grapheme.width().clamp(1, 2))).collect()
+}
+
 /// iOS input: the previous input is replaced (`replace_last`) while a Korean syllable is
 /// composed (`ㅎ` → `하` → `한`); rub it out and send the replacement.
 #[derive(Default)]
@@ -332,6 +350,17 @@ mod tests {
         assert_eq!(ime.apply("", None), ImeEdit { removed: 5, inserted: String::new(), reset: true });
         ime.reset();
         assert_eq!(ime.apply(&format!("{s}ls\n"), None), ImeEdit { removed: 0, inserted: "ls\n".into(), reset: true });
+    }
+
+    #[test]
+    fn android_composition_is_drawn_until_committed() {
+        let s = IME_SENTINEL;
+        assert_eq!(composing_text(&format!("{s}한ㄱ"), Some((2, 3))), "ㄱ");
+        assert_eq!(composing_text(&format!("{s}😀한"), Some((3, 4))), "한");
+        assert_eq!(composing_text(&format!("{s}한"), None), "");
+        assert_eq!(composing_text(&format!("{s}한"), Some((2, 2))), "");
+        assert_eq!(preedit_cells("한a"), vec![("한", 2), ("a", 1)]);
+        assert_eq!(preedit_cells("ㄱ"), vec![("ㄱ", 2)]);
     }
 
     #[test]

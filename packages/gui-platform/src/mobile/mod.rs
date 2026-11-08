@@ -72,9 +72,6 @@ pub(crate) struct MobileShared {
     handled_notifications: Mutex<HashSet<String>>,
 }
 
-#[derive(Default)]
-pub(crate) struct MobileMain {}
-
 impl MobileShared {
     pub fn new() -> Self {
         Self {

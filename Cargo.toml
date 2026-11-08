@@ -18,7 +18,7 @@ exclude = ["packages/gui-platform/vendor", "packages/terminal/vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.13.12"
+version = "0.13.13"
 edition = "2024"
 rust-version = "1.93"
 license = "Apache-2.0"
@@ -30,6 +30,27 @@ strip = "debuginfo"
 
 [profile.dev]
 debug = 1
+
+# xtask runs in the dev profile but hashes (SHA-256) and compresses (ZIP,
+# gzip) the release artifacts several times per job; unoptimized, these crates
+# dominate packaging and verification time. Outputs do not depend on opt-level,
+# and the release profile is unaffected.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.adler2]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.zip]
+opt-level = 3
 
 # Interactive builds keep optimizations without release's whole-program link.
 [profile.dev-fast]

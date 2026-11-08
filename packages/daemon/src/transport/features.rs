@@ -63,6 +63,7 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
         "providerSubagents",
         "projectedSubagentTimeline",
         "providerSubagentNesting",
+        "providerSubagentDelete",
         "workspacePinning",
         "workspaceMarkUnread",
         "hubRelationship",

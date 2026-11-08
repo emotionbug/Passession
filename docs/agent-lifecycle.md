@@ -302,7 +302,9 @@ Claude Code announces subagent lifecycle on its stream (`task_started` / `task_u
 
 Archived Paseo subagents disappear from the track, by design. To remove one from the track without closing its tab, use the **archive button** on the row — it opens a confirm dialog and archives the subagent on confirm. Provider-owned rows have no individual Paseo lifecycle controls.
 
-The **Archive finished** row at the foot of the panel covers every finished row. It archives idle or errored managed Paseo subagents one at a time, and hides completed, failed, or canceled provider-owned rows in the current app session. Native sessions and timelines are untouched. Running and initializing children remain in the track. If a hidden provider child starts running again, the app brings it back to the track.
+The **Delete finished subagents** row at the foot of the panel covers every finished row, after a confirm dialog that states the count. It deletes idle or errored managed Paseo subagents one at a time (`delete_agent_request` on the child's host) and sends the completed, failed, or canceled provider-owned rows to the parent's daemon in one `agent.provider_subagents.delete.request {parentAgentId, subagentIds}`. That daemon (feature `providerSubagentDelete`) removes each child's stored descriptor and timeline under `agent-subagents/{parentId}`, records a per-parent tombstone, answers `agent.provider_subagents.delete.response {parentAgentId, deleted, skipped: [{id, reason}], error}`, and publishes one `agent.provider_subagents.update` `remove` per deleted child so every client drops the row. A child that is running (`running`), not stored (`unknown`) or has unreadable storage (`unavailable`) is skipped and kept. The provider's own native session files are untouched. Running and initializing children remain in the track. Against a daemon without `providerSubagentDelete`, finished provider rows are only hidden for the current app session; a hidden child that starts running again returns to the track.
+
+The tombstone keeps a deleted child deleted: replayed provider history on daemon restart or agent resume, an in-flight child-body read, and later provider events for that child are dropped. Only a live `running` upsert of the same child id — the child genuinely runs again — lifts the tombstone and starts a fresh, empty child.
 
 To keep the agent alive but remove it from the parent's track, use **detach**. The daemon clears the relationship lifecycle labels, emits the normal agent update, and every client reclassifies the agent from subagent to root/sibling from that updated snapshot.
 
@@ -319,7 +321,7 @@ Closing a view must not destroy or hide its underlying conversation:
 
 ### Subagent accumulation under long-lived parents
 
-A parent that spawns many subagents will see the panel's list grow; the pill only counts them. Managed Paseo subagents can be archived individually or with **Archive finished**. That action hides finished provider-owned rows locally; this presentation state resets when the app restarts.
+A parent that spawns many subagents will see the panel's list grow; the pill only counts them. Managed Paseo subagents can be archived individually; finished subagents of both kinds can be deleted with **Delete finished subagents**.
 
 ### Cross-client tab dismissal
 

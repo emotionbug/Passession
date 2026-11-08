@@ -96,6 +96,7 @@ pub fn inbound(operation: &str) -> Option<&'static [&'static str]> {
         | "clear_agent_attention"
         | "create_terminal_request"
         | "delete_agent_request"
+        | "agent.provider_subagents.delete.request"
         | "file.upload.request"
         | "fs.entry.create.request"
         | "fs.entry.delete.request"
@@ -381,6 +382,7 @@ pub fn outbound(operation: &str) -> Option<&'static [&'static str]> {
         | "workspace_setup_status_response"
         | "workspace.setup.subscribe.response" => Some(&["workspace.read"]),
         "agent.detach.response"
+        | "agent.provider_subagents.delete.response"
         | "agent.rewind.response"
         | "agent.timeline.append.response"
         | "browser.host.register.response"

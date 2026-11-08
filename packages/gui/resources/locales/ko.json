@@ -1305,7 +1305,7 @@
       "manageProfiles": "프로필 관리",
       "submit": "실행",
       "promptPlaceholder": "{{name}}에 프롬프트 입력",
-      "commandPlaceholder": "명령을 실행하거나, 비워 두면 빈 터미널을 엽니다"
+      "openTerminal": "터미널 열기"
     }
   },
   "desktop": {
@@ -1781,8 +1781,9 @@
     "detachTooltip": "하위 에이전트 분리",
     "archiveAction": "{{label}} 보관",
     "archiveTooltip": "서브에이전트 보관",
-    "archiveFinishedAction": "완료된 하위 에이전트 보관",
-    "archiveFinishedRetry": "다시 시도 ({{failed}}/{{total}})"
+    "deleteFinishedAction": "완료된 하위 에이전트 삭제",
+    "deleteFinishedConfirm": "완료된 하위 에이전트 {{count}}개를 삭제할까요? 대화 기록도 함께 삭제됩니다.",
+    "deleteFinishedRetry": "다시 시도 ({{failed}}/{{total}})"
   },
   "panels": {
     "draft": { "newAgent": "새 에이전트", "creatingAgent": "에이전트 생성 중" },

@@ -44,7 +44,7 @@ if (releaseRequested && !hasReleaseSigning) {
 
 android {
     namespace = "sh.paseo.sessions"
-    // AGP 9.1.1 resolves the android-37.0 platform only with an explicit minor level.
+    // AGP resolves the android-37.0 platform only with an explicit minor level.
     compileSdk = 37
     compileSdkMinor = 0
     ndkVersion = "28.2.13676358"
@@ -69,10 +69,10 @@ android {
     sourceSets {
         getByName("main") {
             manifest.srcFile(platformDir.resolve("AndroidManifest.xml"))
-            java.srcDirs(rootProject.file("makepad/java"), platformDir.resolve("java"))
-            res.srcDirs(rootProject.file("res"), platformDir.resolve("res"))
-            assets.srcDirs(required("paseoAssets"))
-            jniLibs.srcDirs(required("paseoJniLibs"))
+            java.directories += listOf(rootProject.file("makepad/java").path, platformDir.resolve("java").path)
+            res.directories += listOf(rootProject.file("res").path, platformDir.resolve("res").path)
+            assets.directories += required("paseoAssets")
+            jniLibs.directories += required("paseoJniLibs")
         }
     }
 

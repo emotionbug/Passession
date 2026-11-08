@@ -1,0 +1,67 @@
+name: Set up Zig
+description: >
+  Install the official Zig 0.15.2 release for the runner (SHA-256 checked
+  against https://ziglang.org/download/index.json) and restore Zig's global
+  cache (Ghostty's fetched packages) plus GHOSTTY_CACHE_DIR, where
+  libghostty-vt-sys keeps Zig's local build cache and its Ghostty clone.
+  Replaces mlugg/setup-zig, whose releases still target the deprecated
+  Node.js 20 runtime. Native Release inlines the same steps (it builds older
+  tags); keep both in sync, including cache paths and key formats, so a
+  matching cache-key shares Native Release's entries.
+inputs:
+  cache-key:
+    description: Job-specific component of the Zig and Ghostty cache key.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install Zig 0.15.2
+      shell: bash
+      env:
+        ZIG_VERSION: 0.15.2
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) target=x86_64-linux; ext=tar.xz; sha256=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239 ;;
+          Linux-ARM64) target=aarch64-linux; ext=tar.xz; sha256=958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f ;;
+          macOS-X64) target=x86_64-macos; ext=tar.xz; sha256=375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f ;;
+          macOS-ARM64) target=aarch64-macos; ext=tar.xz; sha256=3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b ;;
+          Windows-X64) target=x86_64-windows; ext=zip; sha256=3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c ;;
+          Windows-ARM64) target=aarch64-windows; ext=zip; sha256=b926465f8872bf983422257cd9ec248bb2b270996fbe8d57872cca13b56fc370 ;;
+          *) echo "No pinned Zig $ZIG_VERSION build for $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+        esac
+        name="zig-$target-$ZIG_VERSION"
+        archive="$RUNNER_TEMP/$name.$ext"
+        curl -fsSL --retry 3 -o "$archive" "https://ziglang.org/download/$ZIG_VERSION/$name.$ext"
+        if command -v sha256sum >/dev/null; then
+          actual=$(sha256sum "$archive" | cut -d' ' -f1)
+        else
+          actual=$(shasum -a 256 "$archive" | cut -d' ' -f1)
+        fi
+        if [[ "$actual" != "$sha256" ]]; then
+          echo "Zig archive SHA-256 mismatch: expected $sha256, got $actual" >&2
+          exit 1
+        fi
+        if [[ "$ext" == zip ]]; then
+          pwsh -NoProfile -Command "Expand-Archive -LiteralPath '$archive' -DestinationPath '$RUNNER_TEMP'"
+        else
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+        fi
+        rm "$archive"
+        echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+        echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global-cache" >> "$GITHUB_ENV"
+        echo "GHOSTTY_CACHE_DIR=$RUNNER_TEMP/ghostty-cache" >> "$GITHUB_ENV"
+        "$RUNNER_TEMP/$name/zig" version
+    - uses: actions/cache@v6
+      with:
+        path: |
+          ${{ runner.temp }}/zig-global-cache
+          ${{ runner.temp }}/ghostty-cache/zig-cache-*
+        key: zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-key }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}
+        restore-keys: |
+          zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-key }}-
+    # Target-independent, so one entry per runner OS serves every workflow.
+    - uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/ghostty-cache/ghostty-src
+        key: ghostty-src-${{ runner.os }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}

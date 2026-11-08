@@ -863,11 +863,16 @@ fn dialog_frame(ui: &mut Ui, cx: &mut Cx2d, window: Rect, width: f64, height: f6
     let title_h = super::chrome::text_line_height(24.0, 14.0);
     let header_h = title_h + 33.0;
     let frame = if compact {
-        let h = (height + header_h + 24.0).min(window.size.y * 0.9);
+        // Like the compact menu sheet: the background runs edge to edge, but the body (and its
+        // buttons) stays above the render surface's remaining system-bar overlap.
+        let insets = crate::shell::platform::safe_insets();
+        let h = (height + header_h + 24.0 + insets.bottom)
+            .min(window.size.y * 0.9)
+            .min((window.size.y - insets.top).max(0.0));
         let r = rect(window.pos.x, window.pos.y + window.size.y - h, window.size.x, h);
         ui.painter.draw_box.paint(cx, rect(r.pos.x, r.pos.y, r.size.x, r.size.y + 16.0), p.surface0, 16.0);
         ui.sheet_handle(cx, r.pos.x + r.size.x * 0.5, r.pos.y - 4.0);
-        rect(r.pos.x, r.pos.y + 16.0, r.size.x, (r.size.y - 16.0).max(0.0))
+        rect(r.pos.x, r.pos.y + 16.0, r.size.x, (r.size.y - 16.0 - insets.bottom).max(0.0))
     } else {
         let w = width.max(0.0).min((window.size.x - 48.0).max(0.0));
         let h = (height + header_h).min(window.size.y * 0.85);

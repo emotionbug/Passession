@@ -33,11 +33,11 @@ fn build_tray() -> Result<Tray, String> {
         menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
         MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
     };
-    let (bytes, template) = if cfg!(target_os = "macos") {
-        (&include_bytes!("../../assets/trayTemplate.png")[..], true)
-    } else {
-        (&include_bytes!("../../assets/tray.png")[..], false)
-    };
+    // macOS draws the menu-bar icon as a template (alpha only, recoloured).
+    #[cfg(target_os = "macos")]
+    let bytes = &include_bytes!("../../assets/trayTemplate.png")[..];
+    #[cfg(not(target_os = "macos"))]
+    let bytes = &include_bytes!("../../assets/tray.png")[..];
     let (width, height, rgba) = crate::image::decode_png_rgba(bytes).map_err(|e| format!("Unable to load tray icon: {e}"))?;
     let icon = tray_icon::Icon::from_rgba(rgba, width, height).map_err(|e| format!("Unable to load tray icon: {e}"))?;
     let menu = Menu::new();
@@ -59,11 +59,12 @@ fn build_tray() -> Result<Tray, String> {
         | TrayIconEvent::DoubleClick { .. } => deliver(NativeSignal::TrayOpen),
         _ => {}
     }));
-    let icon = TrayIconBuilder::new()
-        .with_id(crate::paths::DESKTOP_APP_ID)
-        .with_tooltip("Paseo")
-        .with_icon(icon)
-        .with_icon_as_template(template)
+    let builder = TrayIconBuilder::new().with_id(crate::paths::DESKTOP_APP_ID).with_tooltip("Paseo");
+    #[cfg(target_os = "macos")]
+    let builder = builder.with_icon_templated(icon);
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.with_icon(icon);
+    let icon = builder
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
         .build()

@@ -273,7 +273,7 @@ final class MakepadInputConnection extends BaseInputConnection {
         if (event.isCtrlPressed() || event.isAltPressed() || event.isMetaPressed()) return false;
         int character = event.getUnicodeChar();
         boolean delete = key == KeyEvent.KEYCODE_DEL || key == KeyEvent.KEYCODE_FORWARD_DEL;
-        String multiple = event.getAction() == KeyEvent.ACTION_MULTIPLE ? event.getCharacters() : null;
+        String multiple = multipleCharacters(event);
         if (!delete && (character < 32 || character == 127) && multiple == null) return false;
         if (event.getAction() == KeyEvent.ACTION_UP) return true;
         if (delete) return edit(() -> {
@@ -296,5 +296,14 @@ final class MakepadInputConnection extends BaseInputConnection {
             removeComposingSpans(editable);
             return super.commitText(new String(Character.toChars(character)), 1);
         });
+    }
+    // Committed text from IMEs that call sendKeyEvent with a character string,
+    // and non-Latin hardware input (see MakepadActivity.onKey), arrives only as
+    // one ACTION_MULTIPLE event whose text is in getCharacters(). API 29
+    // deprecated both because the input system no longer creates such events;
+    // apps on the API 24 floor still receive them.
+    @SuppressWarnings("deprecation")
+    private static String multipleCharacters(KeyEvent event) {
+        return event.getAction() == KeyEvent.ACTION_MULTIPLE ? event.getCharacters() : null;
     }
 }

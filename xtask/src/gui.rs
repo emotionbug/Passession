@@ -34,8 +34,8 @@ const ANDROID_NEWER_LIBRARIES: [(&str, u32); 5] = [
     ("libsync.so", 26),
 ];
 const ANDROID_NDK: &str = "28.2.13676358";
-const GRADLE_VERSION: &str = "9.3.1";
-const GRADLE_SHA256: &str = "b266d5ff6b90eada6dc3b20cb090e3731302e553a27c5d3e4df1f0d76beaff06";
+const GRADLE_VERSION: &str = "9.9.0";
+const GRADLE_SHA256: &str = "0b00b0ffe07c4d4789c12d4935a44a7057d55774b7540bd4a3f76f336deb177a";
 const UPDATE_REPOSITORY: &str = "emotionbug/Passession";
 const MACOS_MINIMUM: &str = "13.0";
 

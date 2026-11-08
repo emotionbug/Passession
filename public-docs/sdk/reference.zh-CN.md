@@ -64,7 +64,7 @@ SSH 使用本机 `ssh` 可执行文件、非交互批量认证及指向远端回
 | 轮次 | `send_agent_message`、`wait_for_finish(agent_id, options)`、`cancel_agent`、`rewind_agent` |
 | 配置 | `update_agent`、`set_agent_mode`、`set_agent_model`、`set_agent_feature`、`set_agent_thinking_option`、`apply_agent_config` |
 | 生命周期 | `resume_agent`、`import_agent`、`refresh_agent`、`archive_agent`、`detach_agent`、`delete_agent` |
-| 子 Agent | `list_provider_subagents`、`fetch_provider_subagent_timeline`、`build_agent_fork_context` |
+| 子 Agent | `list_provider_subagents`、`fetch_provider_subagent_timeline`、`delete_provider_subagents`、`build_agent_fork_context` |
 | 项目 | `open_project`、`add_project`、`list_projects`、`rename_project`、`set_project_icon`、`remove_project` |
 | 工作区 | `fetch_workspaces`、`archive_workspace`、`set_workspace_title`、`set_workspace_pinned`、`inspect_workspace_recovery`、`restore_workspace` |
 | 初始化/脚本 | `fetch_workspace_setup_status`、`run_workspace_setup`、`list_workspace_scripts`、`start_workspace_script_with_status`、`stop_workspace_script` |

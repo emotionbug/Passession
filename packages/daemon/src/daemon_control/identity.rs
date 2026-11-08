@@ -1,5 +1,8 @@
 use super::DaemonInstance;
-use anyhow::{Context, Result, bail};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::{Result, bail};
+#[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(windows)]
 use std::time::{SystemTime, UNIX_EPOCH};

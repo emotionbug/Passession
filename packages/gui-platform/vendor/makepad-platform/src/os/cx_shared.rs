@@ -61,6 +61,8 @@ impl Cx {
     }
 
     /// Source-less legacy hosts cannot distinguish two live windows; never guess.
+    /// Only the desktop stdin transports have such a host.
+    #[cfg(any(test, not(any(target_os = "android", target_os = "ios", target_os = "tvos", target_env = "ohos"))))]
     pub(crate) fn call_single_window_event_handler(&mut self, event: &Event) {
         if let Some(window_id) = self.windows.single_created_window() {
             self.call_window_event_handler(window_id, event);

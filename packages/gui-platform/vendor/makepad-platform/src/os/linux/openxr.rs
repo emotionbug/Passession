@@ -12,7 +12,6 @@ use{
                 android::android_jni::*
             }
         },
-        makepad_micro_serde::*,
         draw_shader::CxDrawShaderMapping,
         event::Event,
         pass::{CxPassParent,PassId},
@@ -510,12 +509,6 @@ pub struct CxOpenXrSession{
     // leaked from Frame onto state
     pub depth_swap_chain_index: usize,
     pub frame_state: XrFrameState,
-}
-
-#[derive(SerBin, DeBin)]
-struct AnchorAdvertisement{
-    group_uuid: XrUuid,
-    anchor_uuid: XrUuid,
 }
 
 

@@ -178,6 +178,10 @@ pub struct PanelState {
     pub input_manual_scroll: bool,
     pub input_natural: f64,
     pub input_clip: Rect,
+    /// The host's stationary viewport (dock `ComposerViewport`), set by the host each draw.
+    pub viewport_height: Option<f64>,
+    /// This frame's input height bound from the slot capacity (layout.rs draw_composer).
+    pub input_cap: Option<f64>,
     pub input_focused: bool,
     pub last_cursor: usize,
     pub density: crate::features::composer::controls_model::Density,
@@ -1361,6 +1365,14 @@ impl ComposerPanelRef {
                 inner.hide(cx);
             }
             inner.st.hidden = !visible;
+        }
+    }
+
+    /// The stationary viewport the host shares between its content and this composer
+    /// (dock `ComposerViewport`), with keyboard coverage already removed. Set before drawing.
+    pub fn set_viewport_height(&self, height: f64) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.st.viewport_height = Some(height);
         }
     }
 

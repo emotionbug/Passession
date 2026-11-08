@@ -33,6 +33,7 @@ import android.view.WindowInsets;
 import android.view.Window;
 
 import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 import androidx.core.content.FileProvider;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
@@ -147,8 +148,9 @@ final class PaseoBridge {
                 JSONObject data = new JSONObject();
                 for (String key : extras.keySet()) {
                     if (key.startsWith("google.") || key.startsWith("gcm.") || key.equals("from") || key.equals("collapse_key")) continue;
-                    Object value = extras.get(key);
-                    if (value instanceof String) data.put(key, value);
+                    // FCM data payload values are strings.
+                    String value = extras.getString(key);
+                    if (value != null) data.put(key, value);
                 }
                 JSONObject tap = new JSONObject()
                         .put("id", extras.getString("google.message_id"))
@@ -276,7 +278,7 @@ final class PaseoBridge {
                     return ok(list);
                 }
                 case "displayRotation":
-                    return ok(activity.getWindowManager().getDefaultDisplay().getRotation() * 90);
+                    return ok(ContextCompat.getDisplayOrDefault(activity).getRotation() * 90);
                 case "appearance": {
                     int night = activity.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
                     DisplayMetrics metrics = activity.getResources().getDisplayMetrics();

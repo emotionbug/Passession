@@ -21,13 +21,24 @@ the generated bindings still target Ghostty commit
   which stalled a PTY printing a few thousand lines past a 10-second test timeout;
   `ReleaseSafe` keeps Zig's runtime safety checks. Release profiles stay
   `ReleaseFast`, and `LIBGHOSTTY_VT_SYS_OPTIMIZE` still overrides both.
+- `GHOSTTY_CACHE_DIR` names a persistent directory for the Ghostty clone
+  (`ghostty-src`) and Zig's local cache (`zig-cache-<GHOSTTY_COMMIT>`), which
+  otherwise live in `OUT_DIR` and are lost with every clean target directory.
+  A cached clone is reused only when `HEAD` is the pinned commit and
+  `git status --ignored` reports nothing; otherwise it is recloned. Zig caches
+  for other commits are deleted, and a lock file serialises builds sharing the
+  directory. Zig's cache is content-addressed, so reuse only skips work. The
+  location changes only the absolute paths in the archive's debug info and
+  member names; code and data sections are identical, and a Linux x86_64
+  release-profile binary (debug info stripped) linked against either archive
+  is byte-identical.
 
 The binding generator binary and its optional dependencies are removed.
 
-The build clones Ghostty into Cargo's `OUT_DIR` unless `GHOSTTY_SOURCE_DIR`
-points at a checkout of the pinned commit, and Zig fetches Ghostty's package
-dependencies unless `GHOSTTY_ZIG_SYSTEM_DIR` provides them. Both require network
-access on a cold build.
+The build clones Ghostty into Cargo's `OUT_DIR` (or `GHOSTTY_CACHE_DIR`) unless
+`GHOSTTY_SOURCE_DIR` points at a checkout of the pinned commit, and Zig fetches
+Ghostty's package dependencies unless `GHOSTTY_ZIG_SYSTEM_DIR` provides them.
+Both require network access on a cold build.
 
 To update, replace `src/` with the newer published crate, re-apply the build
 changes above and confirm the Zig version Ghostty's `build.zig.zon` requires.

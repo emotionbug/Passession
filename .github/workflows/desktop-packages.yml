@@ -23,17 +23,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.93.1
       # libghostty-vt-sys builds the Ghostty VT library with Zig 0.15.2; the
-      # action also restores Zig's global cache (Ghostty's fetched packages).
-      - uses: mlugg/setup-zig@v2
+      # action also restores Zig's global cache (Ghostty's fetched packages)
+      # and GHOSTTY_CACHE_DIR (Ghostty clone, Zig local cache).
+      # This job builds the same release-profile Linux x64 graph with the same
+      # toolchain and cache-relevant environment (CARGO_TARGET_DIR only) as the
+      # Native Release linux-x64 job, so both workflows share its cache entries.
+      - uses: ./.github/actions/setup-zig
         with:
-          version: 0.15.2
-          cache-key: native-packages-linux-x64
+          cache-key: native-release-linux-x64
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: native-packages-linux-x64
+          shared-key: native-release-linux-x64
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Install native prerequisites
         run: |
           sudo apt-get update
@@ -60,7 +64,7 @@ jobs:
         run: cargo xtask package-daemon
       - name: Generate manifests from actual packaged artifacts
         run: cargo xtask release manifests
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: native-packages-linux-x64
           path: |

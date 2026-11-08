@@ -70,7 +70,11 @@ pub(crate) enum NativeSignal {
     Activation(Activation),
     SessionEnding,
     SessionEndingCancelled,
+    /// Linux session managers and macOS power-off; Windows ends at `SessionEnding`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     SessionEnded,
+    /// Linux session-manager failures.
+    #[cfg(target_os = "linux")]
     LifecycleError(String),
     /// The app became active (dock click, focus): show the preferred window.
     /// Linux has no such signal; its activations arrive as `Activation`.
@@ -79,9 +83,13 @@ pub(crate) enum NativeSignal {
     NotificationClick(Map<String, Value>),
     TrayOpen,
     TrayQuit,
+    /// Linux SIGTERM and the macOS application quit event.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     QuitRequestedByOs,
     /// The OS lifecycle bridge finished starting (or failed).
     LifecycleStarted(Result<(), PlatformError>),
+    /// Linux StatusNotifier registration; macOS and Windows always host tray icons.
+    #[cfg(target_os = "linux")]
     TrayFailed(String),
 }
 
@@ -358,6 +366,7 @@ fn handle_signal(_cx: &mut Cx, shared: &Arc<Shared>, state: &mut PlatformState, 
                 quit.quitting = false;
             }
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         NativeSignal::SessionEnded => {
             desktop.quit.lock().unwrap().quitting = true;
             request_quit(shared, QuitReason::Shutdown, true);
@@ -372,7 +381,9 @@ fn handle_signal(_cx: &mut Cx, shared: &Arc<Shared>, state: &mut PlatformState, 
             Err(error) if error.code == "logout_unavailable" => desktop.log(&error.message),
             Err(error) => desktop.report(&error.message),
         },
+        #[cfg(target_os = "linux")]
         NativeSignal::TrayFailed(message) => desktop.report(&message),
+        #[cfg(target_os = "linux")]
         NativeSignal::LifecycleError(message) => {
             desktop.lifecycle_ready.store(false, Ordering::SeqCst);
             desktop.report(&message);
@@ -395,7 +406,9 @@ fn handle_signal(_cx: &mut Cx, shared: &Arc<Shared>, state: &mut PlatformState, 
                 show_preferred(state);
             }
         }
-        NativeSignal::TrayQuit | NativeSignal::QuitRequestedByOs => request_quit(shared, QuitReason::Quit, false),
+        NativeSignal::TrayQuit => request_quit(shared, QuitReason::Quit, false),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        NativeSignal::QuitRequestedByOs => request_quit(shared, QuitReason::Quit, false),
     }
 }
 

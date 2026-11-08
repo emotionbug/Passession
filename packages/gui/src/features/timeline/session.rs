@@ -132,7 +132,10 @@ pub enum ActionKind {
     ClearAttention,
     ArchiveSubagent { key: String },
     DetachSubagent { host_id: String, agent_id: String },
-    ArchiveFinished { key: Option<String> },
+    /// "Delete finished subagents": one managed child (`delete_agent_request`).
+    DeleteFinished { key: String },
+    /// "Delete finished subagents": this agent's finished provider children.
+    DeleteProviderSubagents { ids: Vec<String> },
     LookupFile { token: String, target: Value },
     ProbeFolder { generation: u64, target: Value },
 }
@@ -433,6 +436,23 @@ impl ChatSession {
     /// file lookups); the outcome still lands in [completions].
     pub fn host_request(&mut self, io: &mut Io, kind: ActionKind, ty: &str, response: &str, fields: Value) -> RequestId {
         self.send(io, Pending::Action(kind), ty, response, fields)
+    }
+
+    /// `agent.provider_subagents.delete.request` for this agent's children
+    /// (daemon feature `providerSubagentDelete`).
+    pub fn delete_subagents(&mut self, io: &mut Io, ids: Vec<String>) -> RequestId {
+        let fields = json!({"parentAgentId": self.key.agent_id, "subagentIds": ids});
+        self.send(io, Pending::Action(ActionKind::DeleteProviderSubagents { ids }), "agent.provider_subagents.delete.request", "agent.provider_subagents.delete.response", fields)
+    }
+
+    /// Drops deleted children at once; the daemon's `remove` updates that
+    /// follow are then no-ops.
+    pub fn drop_subagents(&mut self, ids: &[String]) {
+        let before = self.subagents.len();
+        self.subagents.retain(|s| !ids.iter().any(|id| get(s, "id") == id.as_str()));
+        if self.subagents.len() != before {
+            self.notify();
+        }
     }
 
     /// [host_request] sent to another host (a managed child that lives on a
@@ -1645,5 +1665,29 @@ mod timer_ownership_tests {
         session.membership_retry = Timer::empty();
         assert!(!session.owns_timer(&tick(41)));
         assert!(session.owns_timer(&tick(42)));
+    }
+}
+
+#[cfg(test)]
+mod provider_subagent_removal_tests {
+    use super::*;
+
+    /// Deleted provider children leave the session's list from the delete
+    /// response and from the daemon's `remove` update alike; others stay.
+    #[test]
+    fn deleted_provider_subagents_leave_the_list() {
+        let key = SessionKey { host_id: "host".into(), agent_id: "parent".into(), subagent_id: None };
+        let mut session = ChatSession::new(key, true);
+        session.subagents = ["a", "b", "c"].iter().map(|id| json!({"id": id, "parentAgentId": "parent", "status": "completed"})).collect();
+        let version = session.version;
+        session.drop_subagents(&["a".to_owned()]);
+        assert!(session.version > version);
+        session.apply_event_inner(None, &json!({"type": "agent.provider_subagents.update",
+            "payload": {"kind": "remove", "parentAgentId": "parent", "subagentId": "b"}}));
+        let ids: Vec<&str> = session.subagents.iter().map(|s| str_of(get(s, "id"))).collect();
+        assert_eq!(ids, ["c"]);
+        let version = session.version;
+        session.drop_subagents(&["a".to_owned()]);
+        assert_eq!(session.version, version, "an already dropped child is a no-op");
     }
 }

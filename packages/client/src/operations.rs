@@ -166,6 +166,7 @@ operations! {
     fetch_agent_timeline => ("fetch_agent_timeline_request", "fetch_agent_timeline_response"),
     list_agent_timeline_prompts => ("agent.timeline.list_prompts.request", "agent.timeline.list_prompts.response"),
     list_provider_subagents => ("agent.provider_subagents.list.request", "agent.provider_subagents.list.response"),
+    delete_provider_subagents => ("agent.provider_subagents.delete.request", "agent.provider_subagents.delete.response"),
     fetch_provider_subagent_timeline => ("agent.provider_subagents.timeline.get.request", "agent.provider_subagents.timeline.get.response"),
     build_agent_fork_context => ("agent.fork_context.request", "agent.fork_context.response"),
     send_agent_message => ("send_agent_message_request", "send_agent_message_response"),

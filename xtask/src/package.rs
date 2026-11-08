@@ -137,10 +137,19 @@ pub fn desktop(args: &[String]) -> Result<()> {
                 "#!/bin/sh\nset -eu\nHERE=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\nexport PATH=\"$HERE/usr/bin:$PATH\"\nexport LD_LIBRARY_PATH=\"$HERE/usr/lib/paseo-dependencies${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\nif [ \"${1-}\" = \"--paseo-cli\" ]; then\n  shift\n  exec \"$HERE/usr/lib/paseo-sessions/runtime/paseo\" \"$@\"\nfi\nexec \"$HERE/usr/lib/paseo-sessions/paseo_sessions\" \"$@\"\n",
                 0o755,
             )?;
+            let entry = desktop_entry("paseo_sessions");
+            text(&appdir.join("sh.paseo.Paseo.desktop"), &entry, 0o644)?;
+            // appimagetool validates the AppStream metadata against the
+            // installed desktop file (`appstreamcli validate-tree`).
             text(
-                &appdir.join("sh.paseo.Paseo.desktop"),
-                desktop_entry("paseo_sessions"),
+                &appdir.join("usr/share/applications/sh.paseo.Paseo.desktop"),
+                &entry,
                 0o644,
+            )?;
+            let metainfo = packaging()?.join("desktop/sh.paseo.Paseo.metainfo.xml");
+            copy_tree(
+                &metainfo,
+                &appdir.join("usr/share/metainfo/sh.paseo.Paseo.appdata.xml"),
             )?;
             let icon = packaging()?.join("desktop/icon.png");
             copy_tree(&icon, &appdir.join("sh.paseo.Paseo.png"))?;
@@ -183,6 +192,13 @@ pub fn desktop(args: &[String]) -> Result<()> {
                 &icon,
                 &deb.join("usr/share/icons/hicolor/512x512/apps/sh.paseo.Paseo.png"),
             )?;
+            copy_tree(
+                &metainfo,
+                &deb.join("usr/share/metainfo/sh.paseo.Paseo.metainfo.xml"),
+            )?;
+            // dpkg-shlibdeps locates the package root (and resolves $ORIGIN
+            // RPATHs) by the DEBIAN directory above each binary.
+            fs::create_dir_all(deb.join("DEBIAN"))?;
             let depends = debian_depends(&deb)?;
             text(
                 &deb.join("DEBIAN/control"),

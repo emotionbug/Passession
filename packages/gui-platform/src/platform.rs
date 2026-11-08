@@ -137,8 +137,6 @@ pub(crate) struct PlatformState {
     pub audio: AudioEngine,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub desktop: crate::desktop::DesktopMain,
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    pub mobile: crate::mobile::MobileMain,
 }
 
 pub struct Platform {
@@ -195,8 +193,6 @@ impl Platform {
             audio,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             desktop: crate::desktop::DesktopMain::default(),
-            #[cfg(any(target_os = "android", target_os = "ios"))]
-            mobile: crate::mobile::MobileMain::default(),
         };
         let _ = HANDLE.set(PlatformHandle(shared.clone()));
         #[cfg(not(any(target_os = "android", target_os = "ios")))]

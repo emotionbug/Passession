@@ -31030,6 +31030,72 @@
               "properties": {
                 "type": {
                   "type": "string",
+                  "const": "agent.provider_subagents.delete.response"
+                },
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "requestId": {
+                      "type": "string"
+                    },
+                    "parentAgentId": {
+                      "type": "string"
+                    },
+                    "deleted": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "skipped": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": "string",
+                            "enum": [
+                              "running",
+                              "unknown",
+                              "unavailable"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "reason"
+                        ]
+                      }
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "requestId",
+                    "parentAgentId",
+                    "deleted",
+                    "skipped",
+                    "error"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
                   "const": "agent.provider_subagents.timeline.get.response"
                 },
                 "payload": {

@@ -52,6 +52,10 @@ fn unavailable(parent: &str, child: Option<&str>, reason: String) -> anyhow::Err
 pub(super) struct Catalog {
     /// Cataloged child ids; `Some` records why the row's descriptor is unreadable.
     children: HashMap<String, Option<String>>,
+    /// Children the user deleted. Replayed history and provider events for
+    /// them are dropped so a deletion survives restarts and agent resumes;
+    /// only a live `running` upsert (the child runs again) lifts it.
+    tombstones: HashSet<String>,
     connection: Option<Connection>,
     used: u64,
 }
@@ -133,7 +137,20 @@ fn open_catalog(path: &Path, parent: &str) -> Result<Connection> {
     ensure!(version == 1 && stored == parent, "Subagent catalog identity mismatch");
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
+    // Additive: catalogs written before deletions existed gain it on open.
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS tombstones(id TEXT PRIMARY KEY)")?;
     Ok(connection)
+}
+/// The child's timeline database and its WAL sidecars; missing files are fine.
+fn remove_timeline_files(root: &Path, parent: &str, id: &str) {
+    let path = timeline_path(root, parent, id);
+    for file in [path.clone(), PathBuf::from(format!("{}-wal", path.display())), PathBuf::from(format!("{}-shm", path.display()))] {
+        if let Err(error) = fs::remove_file(file) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%error, "Failed to remove unreferenced subagent storage");
+            }
+        }
+    }
 }
 
 impl SubagentStore {
@@ -166,10 +183,14 @@ impl SubagentStore {
                 *complete &= event["historyComplete"] == true;
                 timeline.append(event["item"].clone(), event);
             } else if event["type"] == "upsert" {
-                outputs.push(match root {
-                    Some(root) => self.apply_persisted(root, parent, provider, event)?,
+                // Replayed history is never a new run: a deleted child stays deleted.
+                let output = match root {
+                    Some(root) => self.apply_persisted_event(root, parent, provider, event, false)?,
                     None => self.apply(parent, provider, event)?,
-                });
+                };
+                if !output.is_null() {
+                    outputs.push(output);
+                }
             }
         }
         for (id, (provider, mut replacement, complete)) in timelines {
@@ -180,6 +201,9 @@ impl SubagentStore {
             let stored = match root {
                 Some(root) => {
                     self.ensure_parent(root, parent, true)?;
+                    if self.tombstoned(parent, &id) {
+                        continue;
+                    }
                     match self.ensure_child(root, parent, &id) {
                         Ok(stored) => stored,
                         Err(error) => {
@@ -308,9 +332,24 @@ impl SubagentStore {
 
     /// Called on a blocking worker. Parent event commits serialize these changes;
     /// only the touched projected row or descriptor is written, never its siblings.
+    /// A live provider event; `Value::Null` when it targets a deleted child.
     pub fn apply_persisted(&mut self, root: &Path, parent: &str, provider: &str, event: &Value) -> Result<Value> {
+        self.apply_persisted_event(root, parent, provider, event, true)
+    }
+
+    /// `live`: the provider reports this now (not replayed history). Only a
+    /// live `running` upsert of a deleted child is a new run that lifts its
+    /// tombstone; every other event for it is dropped (`Value::Null`).
+    pub fn apply_persisted_event(&mut self, root: &Path, parent: &str, provider: &str, event: &Value, live: bool) -> Result<Value> {
         self.ensure_parent(root, parent, true)?;
         let id = event["id"].as_str().context("Provider subagent event missing id")?;
+        if self.tombstoned(parent, id) {
+            if !(live && event["type"] == "upsert" && event["status"] == "running") {
+                return Ok(Value::Null);
+            }
+            self.catalog(root, parent)?.prepare_cached("DELETE FROM tombstones WHERE id=?1")?.execute([id])?;
+            self.catalogs.get_mut(parent).expect("indexed subagent catalog").tombstones.remove(id);
+        }
         let output = match event["type"].as_str() {
             Some("timeline") => self.append_child(root, parent, provider, id, event),
             Some("upsert") => self.upsert_child(root, parent, provider, id, event),
@@ -319,6 +358,57 @@ impl SubagentStore {
         };
         self.release_excess();
         output
+    }
+
+    fn tombstoned(&self, parent: &str, id: &str) -> bool {
+        self.catalogs.get(parent).is_some_and(|catalog| catalog.tombstones.contains(id))
+    }
+
+    /// User deletion of finished children: each catalog row is replaced by a
+    /// tombstone in one transaction, then the child's history files are
+    /// removed. Running, unknown and unreadable children are skipped with a
+    /// reason (`running`, `unknown`, `unavailable`) and left untouched.
+    pub fn delete_persisted(
+        &mut self, root: &Path, parent: &str, ids: &[String],
+    ) -> Result<(Vec<String>, Vec<(String, String)>)> {
+        let mut deleted = Vec::new();
+        let mut skipped = Vec::new();
+        let indexed = self.ensure_parent(root, parent, false)?;
+        let mut seen = HashSet::new();
+        for id in ids {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            let reason = if !indexed {
+                Some("unknown")
+            } else {
+                match self.cataloged(parent, id) {
+                    Err(_) => Some("unavailable"),
+                    Ok(false) => Some("unknown"),
+                    Ok(true) if self.get(parent, id).is_some_and(|d| d["status"] == "running") => Some("running"),
+                    Ok(true) => None,
+                }
+            };
+            if let Some(reason) = reason {
+                skipped.push((id.clone(), reason.to_owned()));
+                continue;
+            }
+            let transaction = self.catalog(root, parent)?.transaction()?;
+            transaction.execute("DELETE FROM children WHERE id=?1", [id])?;
+            transaction.execute("INSERT INTO tombstones(id) VALUES (?1) ON CONFLICT(id) DO NOTHING", [id])?;
+            transaction.commit()?;
+            let catalog = self.catalogs.get_mut(parent).expect("indexed subagent catalog");
+            catalog.children.remove(id);
+            catalog.tombstones.insert(id.clone());
+            self.descriptors.retain(|d| !(d["parentAgentId"] == parent && d["id"] == id.as_str()));
+            let key = (parent.to_owned(), id.clone());
+            self.residency.evict(&key);
+            self.timelines.remove(&key);
+            remove_timeline_files(root, parent, id);
+            deleted.push(id.clone());
+        }
+        self.release_excess();
+        Ok((deleted, skipped))
     }
 
     /// Appending needs the hydrated child (identity merges, sequence window).
@@ -360,14 +450,7 @@ impl SubagentStore {
         }
         self.residency.evict(&(parent.to_owned(), id.to_owned()));
         let output = self.apply(parent, provider, event)?;
-        let path = timeline_path(root, parent, id);
-        for file in [path.clone(), PathBuf::from(format!("{}-wal", path.display())), PathBuf::from(format!("{}-shm", path.display()))] {
-            if let Err(error) = fs::remove_file(file) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(%error, "Failed to remove unreferenced subagent storage");
-                }
-            }
-        }
+        remove_timeline_files(root, parent, id);
         Ok(output)
     }
 
@@ -461,10 +544,15 @@ impl SubagentStore {
                 }
             }
         }
+        let tombstones = {
+            let mut statement = connection.prepare("SELECT id FROM tombstones")?;
+            let ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+            ids.collect::<rusqlite::Result<HashSet<String>>>()?
+        };
         self.delete_parent(parent);
         self.descriptors.extend(descriptors);
         let used = self.residency.tick();
-        self.catalogs.insert(parent.to_owned(), Catalog { children, connection: Some(connection), used });
+        self.catalogs.insert(parent.to_owned(), Catalog { children, tombstones, connection: Some(connection), used });
         Ok(true)
     }
 

@@ -36,7 +36,7 @@ jobs:
     environment: relay-production
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
       - name: Test native relay
@@ -58,7 +58,7 @@ jobs:
     environment: relay-edge-production
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.93.1
         with:
           targets: wasm32-unknown-unknown

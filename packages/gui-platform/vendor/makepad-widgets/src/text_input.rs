@@ -1343,17 +1343,20 @@ impl TextInput {
                 true,
             );
         } else {
+            let anchor = self.ceil_word_boundary(self.selection.cursor.index);
+            let cursor = self.floor_word_boundary(self.selection.cursor.index);
+            // A press on the empty line after a trailing line break finds no word: the
+            // segment before the end of the text is the break itself. Selecting that
+            // invisible range leaves the text actions nothing to anchor to (no Paste on
+            // the last line), so keep the caret there instead, like a platform editor.
+            if self.text[anchor..cursor].chars().all(|c| c == '\n' || c == '\r') {
+                return;
+            }
             self.set_selection(
                 cx,
                 Selection {
-                    anchor: Cursor {
-                        index: self.ceil_word_boundary(self.selection.cursor.index),
-                        prefer_next_row: true,
-                    },
-                    cursor: Cursor {
-                        index: self.floor_word_boundary(self.selection.cursor.index),
-                        prefer_next_row: false,
-                    }
+                    anchor: Cursor { index: anchor, prefer_next_row: true },
+                    cursor: Cursor { index: cursor, prefer_next_row: false },
                 },
             );
         }
@@ -2458,5 +2461,24 @@ mod touch_focus_tests {
         assert!(input.touch_focus_hit(&hold));
         assert!(!input.touch_focus_hit(&hold));
         assert!(!input.touch_focus_hit(&Hit::FingerUp(up())));
+    }
+
+    #[test]
+    fn word_selection_on_the_empty_last_line_keeps_the_caret() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut input = TextInput::new(&mut cx);
+        let at = |input: &mut TextInput, cx: &mut Cx, text: &str, index: usize| {
+            input.set_text(cx, text);
+            input.set_cursor(cx, Cursor { index, prefer_next_row: false }, false);
+            input.select_word(cx);
+            (input.selection.anchor.index, input.selection.cursor.index)
+        };
+        // The only segment before the end is the trailing break: nothing to select, so the
+        // text actions anchor to the caret and offer Paste.
+        assert_eq!(at(&mut input, &mut cx, "abc\n", 4), (4, 4));
+        assert_eq!(at(&mut input, &mut cx, "abc\r\n", 5), (5, 5));
+        // A word still selects, including the last word of the text.
+        assert_eq!(at(&mut input, &mut cx, "abc", 3), (0, 3));
+        assert_eq!(at(&mut input, &mut cx, "abc def\n", 5), (4, 7));
     }
 }

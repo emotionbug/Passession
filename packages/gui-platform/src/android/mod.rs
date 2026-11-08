@@ -16,7 +16,7 @@ use jni::{
     sys::jlong,
     JNIEnv, JavaVM,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
     sync::{atomic::AtomicI64, LazyLock, Mutex},
@@ -201,8 +201,4 @@ pub(crate) fn object(value: Value) -> Map<String, Value> {
         Value::Object(map) => map,
         _ => Map::new(),
     }
-}
-
-pub(crate) fn args(value: Value) -> Value {
-    if value.is_object() { value } else { json!({}) }
 }

@@ -67,9 +67,22 @@ impl ComposerPanel {
         let draft = self.ctl_ref().draft();
         let blocks = self.blocks(&draft);
         let block_heights: Vec<f64> = blocks.iter().map(|b| self.block_height(cx, look, b, content_width)).collect();
-        let card_height = self.card_height(cx, look, &draft, content_width);
+        self.st.input_cap = None;
+        let (mut card_height, input_visible) = self.card_height(cx, look, &draft, content_width);
         let gaps = blocks.len() as f64 * 12.0;
-        let total = block_heights.iter().sum::<f64>() + gaps + card_height + 16.0;
+        let mut total = block_heights.iter().sum::<f64>() + gaps + card_height + 16.0;
+        // dock/index(.native).tsx ComposerViewportContent bounds the complete composer,
+        // controls included, by the slot capacity. The text input is its one shrinking
+        // child (input.tsx textInput flexShrink 1 down to its minHeight); its text scrolls.
+        if let Some(capacity) = self.slot_capacity(look) {
+            let (min, _, _) = self.input_bounds(cx, look);
+            let cap = (input_visible - (total - capacity)).max(min);
+            if cap < input_visible {
+                self.st.input_cap = Some(cap);
+                card_height -= input_visible - cap;
+                total -= input_visible - cap;
+            }
+        }
         let r = cx.walk_turtle(Walk { height: Size::Fixed(total), ..walk });
         self.draw_bg.draw_abs(cx, r);
 
@@ -393,11 +406,28 @@ impl ComposerPanel {
         if look.native {
             min = min.max(30.0);
         }
-        let max = if look.compact { 160.0 } else { (look.window.y * 0.5).floor().max(160.0) };
+        let mut max = if look.compact { 160.0 } else { (look.window.y * 0.5).floor().max(160.0) };
+        if let Some(cap) = self.st.input_cap {
+            // The slot capacity shrinks the input, never below its minimum.
+            max = max.min(cap).max(min);
+        }
         (min, max, vertical)
     }
 
-    fn card_height(&mut self, cx: &mut Cx2d, look: &Look, draft: &Value, width: f64) -> f64 {
+    /// capacity.ts resolveComposerSlotCapacity: the host's stationary viewport (keyboard
+    /// coverage already removed by the shell) less 5, 60% of it on compact so conversation
+    /// stays visible above; fullscreen takes the whole viewport.
+    fn slot_capacity(&self, look: &Look) -> Option<f64> {
+        let viewport = self.st.viewport_height.filter(|h| h.is_finite() && *h > 0.0)?;
+        if matches!(self.st.overlay(), super::panel::Overlay::Fullscreen) {
+            return Some(viewport);
+        }
+        let capacity = (viewport - 5.0).max(0.0);
+        Some(if look.compact { capacity * 0.6 } else { capacity })
+    }
+
+    /// The card height and the text input's visible height within it.
+    fn card_height(&mut self, cx: &mut Cx2d, look: &Look, draft: &Value, width: f64) -> (f64, f64) {
         let (top, bottom, side) = Self::insets(look);
         let mut h = top;
         if self.has_tray(draft) {
@@ -407,9 +437,10 @@ impl ComposerPanel {
         let (min, max, vertical) = self.input_bounds(cx, look);
         let reserve = if look.compact { 36.0 } else { 0.0 };
         let natural = self.editor_natural(cx, look, width - side * 2.0 - reserve, vertical, min);
-        h += natural.clamp(min, max);
+        let visible = natural.clamp(min, max);
+        h += visible;
         h += 12.0 + 28.0 + bottom;
-        h
+        (h, visible)
     }
 
     fn draw_card(&mut self, cx: &mut Cx2d, ui: &mut UiContext, look: &Look, draft: &Value, r: Rect) {

@@ -5471,6 +5471,33 @@
       "properties": {
         "type": {
           "type": "string",
+          "const": "agent.provider_subagents.delete.request"
+        },
+        "parentAgentId": {
+          "type": "string"
+        },
+        "subagentIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "requestId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "parentAgentId",
+        "subagentIds",
+        "requestId"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
           "const": "agent.provider_subagents.timeline.get.request"
         },
         "parentAgentId": {

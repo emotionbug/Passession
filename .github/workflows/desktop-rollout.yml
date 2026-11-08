@@ -28,7 +28,7 @@ jobs:
       NEW_HOURS: ${{ inputs.rollout_hours }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
       - name: Validate all six feeds and stamp without restarting original ramps

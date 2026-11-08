@@ -24,7 +24,7 @@ use super::permission;
 use super::rows::{self, FindTarget, LiveFooter, RowContext, RowItem, RowKind};
 use super::session::{ActionKind, ChatSession, Completion, Cursor, ExecutionStatus, ForkTarget, Io, SessionKey, SyncStatus};
 use super::store::with_store;
-use super::tracks::{self, ArchiveFinished, SubagentRow, TrackModel, TrackPanel};
+use super::tracks::{self, DeleteFinished, SubagentRow, TrackModel, TrackPanel};
 use crate::common::overlay::{self, MenuEntry, MenuItem, MenuOptions, TapTarget, WindowModal};
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
@@ -310,6 +310,7 @@ enum Ask {
     Rename,
     Confirm(&'static str),
     ArchiveSubagent(SubagentRow),
+    DeleteFinished,
     DetachSubagent(SubagentRow),
     Fork { row: String, entry: Option<Rc<Value>> },
     Rewind { row: String, entry: Rc<Value> },
@@ -335,9 +336,16 @@ enum RevealFor {
     Prompt(i64),
 }
 
+/// One "Delete finished subagents" run: provider children in one daemon
+/// request, managed children one `delete_agent_request` at a time.
 #[derive(Default)]
-struct ArchiveRun {
+struct DeleteRun {
+    /// Managed children still to delete, last first.
     queue: Vec<SubagentRow>,
+    /// A managed child's deletion is awaiting its answer.
+    in_flight: bool,
+    /// The provider batch is awaiting the daemon's answer.
+    provider_pending: bool,
     completed: usize,
     failed: usize,
     total: usize,
@@ -480,13 +488,13 @@ pub struct ChatPanel {
     #[rust]
     track_anchors: Vec<(TrackPanel, Rect)>,
     #[rust]
-    archive_status: ArchiveFinished,
+    delete_status: DeleteFinished,
     #[rust]
-    archive_run: ArchiveRun,
+    delete_run: DeleteRun,
+    /// Managed children archived or deleted from the track, hidden until the
+    /// host's agent list drops them (`serverId:agentId`).
     #[rust]
-    pending_archive: HashSet<String>,
-    #[rust]
-    hidden_provider: HashSet<String>,
+    pending_removal: HashSet<String>,
     #[rust]
     children_requested: bool,
     #[rust]
@@ -620,10 +628,9 @@ impl ChatPanel {
         self.prompts_latest = -1;
         self.prompts_request += 1;
         self.active_prompt = None;
-        self.archive_status = ArchiveFinished::Idle;
-        self.archive_run = ArchiveRun::default();
-        self.pending_archive.clear();
-        self.hidden_provider.clear();
+        self.delete_status = DeleteFinished::Idle;
+        self.delete_run = DeleteRun::default();
+        self.pending_removal.clear();
         self.children_requested = false;
         self.archiving = false;
         self.unarchiving = false;
@@ -833,7 +840,7 @@ impl ChatPanel {
                 if get(labels, "paseo.parent-agent-id") != target.agent_id.as_str()
                     || parent_server != target.host_id
                     || !get(child, "archivedAt").is_null()
-                    || self.pending_archive.contains(&format!("{server_id}:{id}"))
+                    || self.pending_removal.contains(&format!("{server_id}:{id}"))
                 {
                     continue;
                 }
@@ -856,16 +863,16 @@ impl ChatPanel {
             }
         }
         for child in &snap.subagents {
-            let id = str_of(get(child, "id")).to_owned();
+            let id = str_of(get(child, "id"));
             let parent = get(child, "parentSubagentId");
-            // A dismissed subagent that runs again returns to the track.
-            if get(child, "status") == "running" {
-                self.hidden_provider.remove(&id);
-            }
             let skip = if target.is_subagent() { parent.as_str() != target.subagent_id.as_deref() } else { !parent.is_null() && nesting };
-            if self.hidden_provider.contains(&id) || skip {
+            // Hidden by "Delete finished subagents" against a daemon that cannot
+            // delete them (app-wide; a child that runs again is un-hidden by the
+            // store when its `running` descriptor arrives).
+            if skip || with_store(|store| store.subagent_hidden(&target.host_id, &target.agent_id, id)) {
                 continue;
             }
+            let id = id.to_owned();
             rows.push(SubagentRow {
                 paseo: false,
                 id,
@@ -907,7 +914,7 @@ impl ChatPanel {
         let tasks = if subagent { Vec::new() } else { self.latest_tasks() };
         let rows = self.subagent_rows();
         let (a, d) = if subagent { (0, 0) } else { (self.host.additions, self.host.deletions) };
-        a > 0 || d > 0 || !rows.is_empty() || !tasks.is_empty() || self.archive_status != ArchiveFinished::Idle
+        a > 0 || d > 0 || !rows.is_empty() || !tasks.is_empty() || self.delete_status != DeleteFinished::Idle
     }
 
     /// agent-panel.dart `_streamRows` + `_timeline` items, oldest first.
@@ -1652,42 +1659,80 @@ impl ChatPanel {
         self.asks.insert(id, Ask::DetachSubagent(row));
     }
 
-    /// archive-finished.ts: archive idle/errored managed children, dismiss
-    /// finished provider rows, n/m progress, a retry count for failures.
-    fn archive_finished(&mut self, cx: &mut Cx, ui: &mut UiContext) {
-        if matches!(self.archive_status, ArchiveFinished::Archiving { .. }) {
+    /// "Delete finished subagents" (replaces archive-finished.ts): confirm,
+    /// then delete every finished row.
+    fn ask_delete_finished(&mut self, ui: &mut UiContext) {
+        if matches!(self.delete_status, DeleteFinished::Deleting { .. }) {
+            return;
+        }
+        let count = self.subagent_rows().iter().filter(|row| row.is_finished()).count();
+        if count == 0 {
+            return;
+        }
+        let message = ta("subagents.deleteFinishedConfirm", &[("count", &count.to_string())]);
+        let id = overlay::confirm(ui, &t("subagents.deleteFinishedAction"), &message, &t("workspace.fileActions.delete"), true);
+        self.asks.insert(id, Ask::DeleteFinished);
+    }
+
+    /// Finished provider children go to the daemon in one request (it removes
+    /// their stored transcripts and tells every client); a daemon without
+    /// `providerSubagentDelete` cannot delete them, so they are only hidden for
+    /// this app session, as the original archive-finished did. Finished
+    /// managed children are deleted one by one.
+    fn delete_finished(&mut self, cx: &mut Cx, ui: &mut UiContext) {
+        if matches!(self.delete_status, DeleteFinished::Deleting { .. }) {
             return;
         }
         let eligible: Vec<SubagentRow> = self.subagent_rows().into_iter().filter(SubagentRow::is_finished).collect();
         if eligible.is_empty() {
             return;
         }
-        self.archive_run = ArchiveRun { total: eligible.len(), queue: eligible.into_iter().rev().collect(), completed: 0, failed: 0 };
-        self.archive_status = ArchiveFinished::Archiving { completed: 0, total: self.archive_run.total };
-        self.archive_next(cx, ui);
+        let total = eligible.len();
+        let (provider, paseo): (Vec<SubagentRow>, Vec<SubagentRow>) = eligible.into_iter().partition(|row| !row.paseo);
+        let mut run = DeleteRun { total, queue: paseo.into_iter().rev().collect(), ..DeleteRun::default() };
+        if !provider.is_empty() {
+            let ids: Vec<String> = provider.into_iter().map(|row| row.id).collect();
+            if self.feature("providerSubagentDelete") {
+                run.provider_pending = self.with_session(cx, ui, |s, io| s.delete_subagents(io, ids.clone())).is_some();
+                if !run.provider_pending {
+                    run.failed += ids.len();
+                    run.completed += ids.len();
+                }
+            } else if let Some(target) = &self.target {
+                with_store(|store| store.hide_subagents(&target.host_id, &target.agent_id, ids.iter().map(String::as_str)));
+                run.completed += ids.len();
+            }
+        }
+        self.delete_run = run;
+        self.delete_next(cx, ui);
     }
 
-    fn archive_next(&mut self, cx: &mut Cx, ui: &mut UiContext) {
-        while let Some(row) = self.archive_run.queue.pop() {
-            if row.paseo {
-                let key = format!("{}:{}", row.server_id, row.id);
-                let fields = json!({"agentId": row.id});
-                let kind = ActionKind::ArchiveFinished { key: Some(key) };
-                // A child on another host is archived there; its outcome still
-                // counts toward this run (failures become the retry count).
-                self.with_session(cx, ui, |s, io| {
-                    s.request_on_host(io, &row.server_id, kind, "archive_agent_request", "agent_archived", fields)
-                });
-                return;
+    fn delete_next(&mut self, cx: &mut Cx, ui: &mut UiContext) {
+        while !self.delete_run.in_flight
+            && let Some(row) = self.delete_run.queue.pop()
+        {
+            let key = format!("{}:{}", row.server_id, row.id);
+            let fields = json!({"agentId": row.id});
+            let kind = ActionKind::DeleteFinished { key };
+            // A child on another host is deleted there; its outcome still
+            // counts toward this run (failures become the retry count).
+            let sent = self.with_session(cx, ui, |s, io| {
+                s.request_on_host(io, &row.server_id, kind, "delete_agent_request", "agent_deleted", fields)
+            });
+            if sent.is_some() {
+                self.delete_run.in_flight = true;
+            } else {
+                self.delete_run.failed += 1;
+                self.delete_run.completed += 1;
             }
-            self.hidden_provider.insert(row.id.clone());
-            self.archive_run.completed += 1;
-            self.archive_status = ArchiveFinished::Archiving { completed: self.archive_run.completed, total: self.archive_run.total };
         }
-        self.archive_status = if self.archive_run.failed > 0 {
-            ArchiveFinished::Failed { failed: self.archive_run.failed, total: self.archive_run.failed }
+        let run = &self.delete_run;
+        self.delete_status = if run.in_flight || run.provider_pending {
+            DeleteFinished::Deleting { completed: run.completed, total: run.total }
+        } else if run.failed > 0 {
+            DeleteFinished::Failed { failed: run.failed, total: run.failed }
         } else {
-            ArchiveFinished::Idle
+            DeleteFinished::Idle
         };
         self.model_sig = None;
         self.area.redraw(cx);
@@ -1810,7 +1855,7 @@ impl ChatPanel {
             ActionKind::ClearAttention => {}
             ActionKind::ArchiveSubagent { key } => {
                 if let Err(e) = result {
-                    self.pending_archive.remove(&key);
+                    self.pending_removal.remove(&key);
                     self.show_failure(e.message);
                 }
                 self.model_sig = None;
@@ -1819,18 +1864,32 @@ impl ChatPanel {
                 Ok(_) => ui.push(UiEffect::OpenSession { host_id, agent_id }),
                 Err(e) => self.show_failure(e.message),
             },
-            ActionKind::ArchiveFinished { key } => {
+            ActionKind::DeleteFinished { key } => {
                 match result {
                     Ok(_) => {
-                        if let Some(key) = key {
-                            self.pending_archive.insert(key);
-                        }
+                        self.pending_removal.insert(key);
                     }
-                    Err(_) => self.archive_run.failed += 1,
+                    Err(_) => self.delete_run.failed += 1,
                 }
-                self.archive_run.completed += 1;
-                self.archive_status = ArchiveFinished::Archiving { completed: self.archive_run.completed, total: self.archive_run.total };
-                self.archive_next(cx, ui);
+                self.delete_run.in_flight = false;
+                self.delete_run.completed += 1;
+                self.delete_next(cx, ui);
+            }
+            ActionKind::DeleteProviderSubagents { ids } => {
+                let failed = match &result {
+                    Ok(body) => {
+                        let deleted: Vec<String> = list(get(body, "deleted")).iter().map(|id| str_of(id).to_owned()).collect();
+                        self.with_session(cx, ui, |s, _| s.drop_subagents(&deleted));
+                        // Running (it started again) and unknown (already gone)
+                        // children are not failures; unreadable storage is.
+                        list(get(body, "skipped")).iter().filter(|s| get(s, "reason") == "unavailable").count()
+                    }
+                    Err(_) => ids.len(),
+                };
+                self.delete_run.provider_pending = false;
+                self.delete_run.failed += failed;
+                self.delete_run.completed += ids.len();
+                self.delete_next(cx, ui);
             }
             ActionKind::LookupFile { token, target } => {
                 let root = self.target.as_ref().map(|t| t.cwd().to_owned()).unwrap_or_default();
@@ -1946,12 +2005,17 @@ impl ChatPanel {
                     return;
                 }
                 let key = format!("{}:{}", row.server_id, row.id);
-                self.pending_archive.insert(key.clone());
+                self.pending_removal.insert(key.clone());
                 self.model_sig = None;
                 let fields = json!({"agentId": row.id});
                 self.with_session(cx, ui, |s, io| {
                     s.request_on_host(io, &row.server_id, ActionKind::ArchiveSubagent { key }, "archive_agent_request", "agent_archived", fields)
                 });
+            }
+            Ask::DeleteFinished => {
+                if is_true(get(args, "confirmed")) {
+                    self.delete_finished(cx, ui);
+                }
             }
             Ask::DetachSubagent(row) => {
                 if !is_true(get(args, "confirmed")) {
@@ -2122,7 +2186,7 @@ impl ChatPanel {
                 }
             }
             "track-close" => self.close_modal(cx, ui),
-            "archive-finished" => self.archive_finished(cx, ui),
+            "delete-finished" => self.ask_delete_finished(ui),
             "find:next" => {
                 let (epoch, rows) = self.snap.as_ref().map(|s| (s.epoch.clone(), s.timeline.clone())).unwrap_or_default();
                 self.find.next(epoch.as_deref(), &rows);
@@ -2625,6 +2689,8 @@ impl Widget for ChatPanel {
         // shifts what it just drew by the difference in the same frame.
         if self.composer_shown() {
             self.sync_composer(cx);
+            // The pane below its header is the composer dock's stationary viewport.
+            self.composer.as_composer_panel().set_viewport_height(rect.size.y);
             let bottom = rect.pos.y + rect.size.y;
             let walk = Walk { abs_pos: Some(dvec2(rect.pos.x, bottom - self.composer_h)), margin: Margin::default(), width: Size::Fixed(rect.size.x), height: Size::Fit };
             cx.begin_turtle(walk, Layout::flow_down());
@@ -2714,7 +2780,7 @@ impl Widget for ChatPanel {
         let host_labels: HashMap<String, String> = self.host.labels.clone();
         let host_label_fn = move |id: &str| host_labels.get(id).cloned().unwrap_or_else(|| id.to_owned());
         let can_detach = self.feature("agentDetach");
-        let archive_status = self.archive_status;
+        let delete_status = self.delete_status;
         let open_track = match &self.modal {
             Some(Modal::Track(panel)) => Some(*panel),
             _ => None,
@@ -2737,10 +2803,10 @@ impl Widget for ChatPanel {
                 let model = TrackModel {
                     tasks: &tasks,
                     rows: &rows,
-                    archive: archive_status,
+                    delete: delete_status,
                     additions,
                     deletions,
-                    can_archive_finished: !subagent,
+                    can_delete_finished: !subagent,
                     can_detach,
                     host_id: &target.host_id,
                     providers: &self.providers,
@@ -3274,15 +3340,20 @@ impl ChatPanel {
         let mut animating = false;
         match &modal {
             Modal::Track(panel) => {
+                // Deleting (or detaching) the last subagent leaves nothing to show: close the
+                // panel instead of leaving an empty sheet, as a row that left the stream does.
+                if *panel == TrackPanel::Subagents && rows.is_empty() {
+                    return false;
+                }
                 let anchor = self.track_anchors.iter().find(|(p, _)| p == panel).map(|(_, r)| *r).unwrap_or(rect_xywh(rect.pos.x + 16.0, rect.pos.y + rect.size.y - 48.0, 120.0, 32.0));
                 let target = self.target.clone().unwrap_or_default();
                 let model = TrackModel {
                     tasks,
                     rows,
-                    archive: self.archive_status,
+                    delete: self.delete_status,
                     additions: self.host.additions,
                     deletions: self.host.deletions,
-                    can_archive_finished: !target.is_subagent(),
+                    can_delete_finished: !target.is_subagent(),
                     can_detach: self.feature("agentDetach"),
                     host_id: &target.host_id,
                     providers: &self.providers,

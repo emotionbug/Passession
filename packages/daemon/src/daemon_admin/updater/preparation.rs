@@ -331,18 +331,18 @@ impl Stage {
     async fn publish(self, mut identity: RuntimeIdentity) -> Result<RuntimeIdentity> {
         let (from, to) = (self.runtime.clone(), self.destination.clone());
         tokio::task::spawn_blocking(move || rename_new(&from, &to)).await??;
+        #[cfg(unix)]
         sync_parent(&self.destination).await?;
         identity.root = self.destination;
         Ok(identity)
     }
 }
 
+/// Persists the publishing rename. Windows has no directory fsync.
+#[cfg(unix)]
 async fn sync_parent(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let parent = path.parent().context("Missing runtime parent")?.to_owned();
-        tokio::task::spawn_blocking(move || File::open(parent)?.sync_all()).await??;
-    }
+    let parent = path.parent().context("Missing runtime parent")?.to_owned();
+    tokio::task::spawn_blocking(move || File::open(parent)?.sync_all()).await??;
     Ok(())
 }
 

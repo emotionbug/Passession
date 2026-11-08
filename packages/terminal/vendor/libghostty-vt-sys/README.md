@@ -7,6 +7,9 @@ Raw FFI bindings for libghostty-vt.
 - Static linking is the baseline rather than a Cargo feature. Enable the
   additive `link-dynamic` feature to link the shared library instead.
 - Set `GHOSTTY_SOURCE_DIR` to force the build to use a local Ghostty checkout.
+- Set `GHOSTTY_CACHE_DIR` to keep the Ghostty clone and Zig's local build cache
+  in a persistent directory instead of `OUT_DIR`. A cached clone is reused only
+  at the pinned commit with a clean tree.
 - Set `GHOSTTY_ZIG_SYSTEM_DIR` to force Zig package resolution through a
   pre-fetched `zig build --system` directory. This is intended for Nix and other
   sandboxed package managers that cannot fetch during build scripts.

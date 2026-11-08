@@ -47,6 +47,7 @@ sys-locale = "0.3"
 tokio = { version = "1", features = ["sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 unicode-segmentation = "1.11"
+unicode-width = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 

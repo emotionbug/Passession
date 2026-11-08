@@ -67,6 +67,7 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
       epoch: ${{ steps.source.outputs.epoch }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      windows_runners: ${{ steps.windows.outputs.runners }}
       expected: ${{ steps.plan.outputs.expected }}
       recovery: ${{ steps.plan.outputs.recovery }}
       release_tag: ${{ steps.plan.outputs.releaseTag }}
@@ -76,11 +77,16 @@ jobs:
       create_release: ${{ steps.plan.outputs.createRelease }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.CHECKOUT_REF }}
       - uses: dtolnay/rust-toolchain@1.93.1
+      # source and publish only build xtask (dev profile) on the same runner
+      # image and environment, so they share one cache entry.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-xtask
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - id: source
         shell: bash
         run: |
@@ -91,6 +97,12 @@ jobs:
           INPUT_PLATFORM: ${{ github.event.inputs.platform || 'all' }}
         shell: bash
         run: cargo xtask release plan >> "$GITHUB_OUTPUT"
+      - id: windows
+        name: Select Windows runners for the COM smoke test
+        env:
+          MATRIX: ${{ steps.plan.outputs.matrix }}
+        shell: bash
+        run: echo "runners=$(jq -c '[.include[] | select(.platform == "windows") | .runner] | unique' <<< "$MATRIX")" >> "$GITHUB_OUTPUT"
       - name: Validate recovery workflow and complete artifact inventory
         if: env.RECOVERY_RUN_ID != ''
         env:
@@ -117,7 +129,7 @@ jobs:
       PASEO_BUILD_SOURCE_SHA: ${{ needs.source.outputs.sha }}
       TARGET_ID: ${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
       - name: Apply explicitly pinned packaging notice corrections
@@ -138,22 +150,103 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.93.1
         with:
           targets: ${{ matrix.platform == 'android' && 'aarch64-linux-android' || matrix.platform == 'ios' && 'aarch64-apple-ios' || '' }}
-      # libghostty-vt-sys builds the Ghostty VT library with Zig 0.15.2; the
-      # action also restores Zig's global cache (Ghostty's fetched packages).
-      - uses: mlugg/setup-zig@v2
+      # libghostty-vt-sys builds the Ghostty VT library with Zig 0.15.2. This
+      # job builds older tags too, so it cannot rely on the local
+      # .github/actions/setup-zig existing in the checked-out source; keep the
+      # official archive digests (https://ziglang.org/download/index.json) in
+      # sync with that action.
+      - name: Install Zig 0.15.2
+        shell: bash
+        env:
+          ZIG_VERSION: 0.15.2
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) target=x86_64-linux; ext=tar.xz; sha256=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239 ;;
+            Linux-ARM64) target=aarch64-linux; ext=tar.xz; sha256=958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f ;;
+            macOS-X64) target=x86_64-macos; ext=tar.xz; sha256=375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f ;;
+            macOS-ARM64) target=aarch64-macos; ext=tar.xz; sha256=3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b ;;
+            Windows-X64) target=x86_64-windows; ext=zip; sha256=3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c ;;
+            Windows-ARM64) target=aarch64-windows; ext=zip; sha256=b926465f8872bf983422257cd9ec248bb2b270996fbe8d57872cca13b56fc370 ;;
+            *) echo "No pinned Zig $ZIG_VERSION build for $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          name="zig-$target-$ZIG_VERSION"
+          archive="$RUNNER_TEMP/$name.$ext"
+          curl -fsSL --retry 3 -o "$archive" "https://ziglang.org/download/$ZIG_VERSION/$name.$ext"
+          if command -v sha256sum >/dev/null; then
+            actual=$(sha256sum "$archive" | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 "$archive" | cut -d' ' -f1)
+          fi
+          if [[ "$actual" != "$sha256" ]]; then
+            echo "Zig archive SHA-256 mismatch: expected $sha256, got $actual" >&2
+            exit 1
+          fi
+          if [[ "$ext" == zip ]]; then
+            pwsh -NoProfile -Command "Expand-Archive -LiteralPath '$archive' -DestinationPath '$RUNNER_TEMP'"
+          else
+            tar -xJf "$archive" -C "$RUNNER_TEMP"
+          fi
+          rm "$archive"
+          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global-cache" >> "$GITHUB_ENV"
+          echo "GHOSTTY_CACHE_DIR=$RUNNER_TEMP/ghostty-cache" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/$name/zig" version
+      # Zig's global cache holds Ghostty's fetched packages; GHOSTTY_CACHE_DIR
+      # holds Zig's content-addressed local cache for this target
+      # (zig-cache-<GHOSTTY_COMMIT>), so a warm run skips the Zig compile.
+      # build.rs pins GHOSTTY_COMMIT, so its hash covers the commit.
+      - uses: actions/cache@v6
         with:
-          version: 0.15.2
-          cache-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}
+          path: |
+            ${{ runner.temp }}/zig-global-cache
+            ${{ runner.temp }}/ghostty-cache/zig-cache-*
+          key: zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}
+          restore-keys: |
+            zig-0.15.2-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-
+      # The Ghostty clone is target-independent: one entry per runner OS,
+      # shared with CI and Native Desktop Packages. build.rs reuses it only when
+      # HEAD is the pinned GHOSTTY_COMMIT and the tree is clean, else reclones.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/ghostty-cache/ghostty-src
+          key: ghostty-src-${{ runner.os }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}
           cache-on-failure: true
-      - uses: actions/cache@v4
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      # Packaging downloads: the pinned AppImage tools (Linux desktop), the
+      # pinned Gradle distribution and Gradle's dependency cache (Android).
+      # The key covers only the inputs that select that content; xtask
+      # re-verifies cached AppImage tools against their pinned SHA-256 and
+      # uses the unpacked Gradle, so its downloaded archive is not cached.
+      - name: Select packaging cache key
+        id: packaging-cache
+        if: matrix.platform == 'linux' || matrix.platform == 'android'
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          if [[ "$PLATFORM" == linux ]]; then
+            inputs=$(cat xtask/src/assets.rs)
+          else
+            gradle=$(grep -E '^const GRADLE_(VERSION|SHA256):' xtask/src/gui.rs || cat xtask/src/gui.rs)
+            build=$(find packaging/android \( -name '*.kts' -o -name gradle.properties \) -print0 | LC_ALL=C sort -z | xargs -0 cat)
+            inputs="$gradle$build"
+          fi
+          echo "key=$(printf '%s' "$inputs" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        if: steps.packaging-cache.outputs.key != ''
         with:
           path: |
-            ~/.cache/paseo-packaging
+            ~/.cache/paseo-packaging/*
+            !~/.cache/paseo-packaging/gradle-*-bin.zip
             ~/.gradle/caches
-          key: native-packaging-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('xtask/src/**', 'packaging/android/**/*.kts') }}
+          key: native-packaging-${{ runner.os }}-${{ matrix.platform }}-${{ matrix.arch }}-${{ steps.packaging-cache.outputs.key }}
+          restore-keys: |
+            native-packaging-${{ runner.os }}-${{ matrix.platform }}-${{ matrix.arch }}-
       - name: Install Linux native build prerequisites
         if: matrix.platform == 'linux'
         run: |
@@ -168,13 +261,25 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: choco install nsis --version=3.11 --no-progress -y
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         if: matrix.platform == 'android'
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # ubuntu-24.04 ships Android platform android-37.0 (compileSdk 37.0) and
+      # platform-tools; download the pinned NDK only when the image lacks it.
+      - name: Check preinstalled Android SDK packages
+        id: android-sdk
         if: matrix.platform == 'android'
+        shell: bash
+        run: |
+          ndk="$ANDROID_HOME/ndk/28.2.13676358/source.properties"
+          if [[ -f "$ndk" ]] && tr -d ' ' < "$ndk" | grep -qx 'Pkg.Revision=28.2.13676358' &&
+            [[ -x "$ANDROID_HOME/platform-tools/adb" ]]; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: android-actions/setup-android@v4
+        if: matrix.platform == 'android' && steps.android-sdk.outputs.installed != 'true'
         with:
           packages: platform-tools ndk;28.2.13676358
       - name: Select the pinned Android NDK
@@ -198,9 +303,6 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER }}
-      - name: Smoke Windows file-share COM marshalling
-        if: matrix.platform == 'windows'
-        run: cargo test --locked --release -p paseo-gui-platform --lib share_item_resolves_across_apartments
       - name: Inspect native macOS build output
         if: matrix.platform == 'macos'
         shell: bash
@@ -237,7 +339,7 @@ jobs:
         run: cargo xtask release manifests
       - name: Record exact source, run and artifact hashes
         run: cargo xtask release record
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: native-release-${{ env.TARGET_ID }}
           compression-level: 0
@@ -251,9 +353,35 @@ jobs:
             artifacts/native/packages-*.json
             artifacts/native/provenance-*.json
 
+  # The COM smoke test compiles its own release test graph (gui-platform alone
+  # resolves different features than the shipped gui + daemon build), so it
+  # runs beside the Windows builds instead of after them. It produces no
+  # artifacts, and publish still requires it to pass.
+  windows-com-smoke:
+    needs: source
+    if: github.event.inputs.mode != 'publish-only' && needs.source.outputs.windows_runners != '[]'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.source.outputs.windows_runners) }}
+    name: windows-com-smoke (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows-com-smoke
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      - name: Smoke Windows file-share COM marshalling
+        run: cargo test --locked --release -p paseo-gui-platform --lib share_item_resolves_across_apartments
+
   publish:
-    needs: [source, native]
-    if: ${{ !cancelled() && github.repository == 'emotionbug/Passession' && needs.source.result == 'success' && needs.source.outputs.publish == 'true' && (needs.native.result == 'success' || github.event.inputs.mode == 'publish-only') }}
+    needs: [source, native, windows-com-smoke]
+    if: ${{ !cancelled() && github.repository == 'emotionbug/Passession' && needs.source.result == 'success' && needs.source.outputs.publish == 'true' && (needs.native.result == 'success' || github.event.inputs.mode == 'publish-only') && (needs.windows-com-smoke.result == 'success' || needs.windows-com-smoke.result == 'skipped') }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -269,14 +397,17 @@ jobs:
       EXPECTED_TARGETS: ${{ needs.source.outputs.expected }}
       RECOVERY_TARGETS: ${{ needs.source.outputs.recovery }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-xtask
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Download current build artifacts
         if: github.event.inputs.mode != 'publish-only'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: native-release-*
           merge-multiple: true

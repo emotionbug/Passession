@@ -34,6 +34,9 @@ impl Widget for CreationPanel {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // The pane is the composer dock's stationary viewport.
+        let viewport = cx.peek_walk_turtle(walk);
+        self.view.composer_panel(id!(composer)).set_viewport_height(viewport.size.y);
         self.view.draw_walk(cx, scope, walk)
     }
 }

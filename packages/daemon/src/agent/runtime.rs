@@ -723,7 +723,7 @@ impl AgentManager {
             return Ok(());
         }
         if event["type"] == "provider_subagent" {
-            self.apply_subagent_event(id, cell, &event).await?;
+            self.apply_subagent_event(id, cell, &event, !from_history).await?;
             return Ok(());
         }
         let (mut snapshot, ready, owner_ended) = {
@@ -1081,11 +1081,14 @@ impl AgentManager {
         }
         Ok(())
     }
+    /// `live`: reported by the running provider now, not imported history;
+    /// only a live `running` upsert may bring a deleted child back.
     async fn apply_subagent_event(
         &self,
         id: &str,
         cell: &Arc<AgentCell>,
         event: &Value,
+        live: bool,
     ) -> Result<()> {
         let snapshot = cell.data.lock().await.snapshot.clone();
         let store = self.subagent_store.clone();
@@ -1096,7 +1099,7 @@ impl AgentManager {
             let mut store = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?;
             let provider = required(&event, "provider")?;
             match root {
-                Some(root) => store.apply_persisted(&root, &parent, provider, &event["event"]),
+                Some(root) => store.apply_persisted_event(&root, &parent, provider, &event["event"], live),
                 None => store.apply(&parent, provider, &event["event"]),
             }
         }).await??;
@@ -1114,6 +1117,10 @@ impl AgentManager {
     /// without a parent runtime; descriptors leave without their `source` and
     /// with the child's current native-refresh state.
     pub(super) async fn emit_subagent_output(&self, id: &str, internal: bool, mut output: Value) -> Result<()> {
+        // A dropped event (it targeted a deleted child) publishes nothing.
+        if output.is_null() {
+            return Ok(());
+        }
         if let Some(descriptor) = output.get_mut("subagent") {
             *descriptor = timeline::public_subagent(descriptor.take());
             self.overlay_subagent_refresh(descriptor);
@@ -1248,7 +1255,7 @@ impl AgentManager {
                 .into_iter()
                 .filter(|child| child["status"] == "running")
             {
-                self.apply_subagent_event(id,cell,&json!({"provider":child["provider"],"event":{"type":"upsert","id":child["id"],"status":"canceled"}})).await?;
+                self.apply_subagent_event(id,cell,&json!({"provider":child["provider"],"event":{"type":"upsert","id":child["id"],"status":"canceled"}}),true).await?;
             }
             if !internal {
                 let store = self.subagent_store.clone();

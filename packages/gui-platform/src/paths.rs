@@ -22,12 +22,13 @@ pub struct AppPaths {
 }
 
 static PATHS: LazyLock<AppPaths> = LazyLock::new(|| {
-    let mut paths = resolve();
+    let paths = resolve();
     // `cargo xtask dev app` isolates development runs from the installed app.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    if let Some(dev) = std::env::var_os("PASEO_GUI_STATE_DIR").filter(|v| !v.is_empty()) {
-        paths.support_dir = PathBuf::from(dev);
-    }
+    let paths = match std::env::var_os("PASEO_GUI_STATE_DIR").filter(|v| !v.is_empty()) {
+        Some(dev) => AppPaths { support_dir: PathBuf::from(dev), ..paths },
+        None => paths,
+    };
     paths
 });
 

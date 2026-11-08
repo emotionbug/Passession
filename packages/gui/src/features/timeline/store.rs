@@ -11,7 +11,7 @@ use makepad_widgets::{Cx, Event};
 use paseo_gui_core::{CoreEvent, CoreHandle, RequestId, response_error};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 struct HostRecord {
@@ -19,22 +19,24 @@ struct HostRecord {
     server_info: Value,
 }
 
+/// `(host, parent agent, provider subagent)`.
+type SubagentKey = (String, String, String);
+
 pub struct TimelineStore {
     pub sessions: HashMap<SessionKey, ChatSession>,
     hosts: HashMap<String, HostRecord>,
     requests: HashMap<RequestId, RequestRoute>,
     core: Option<CoreHandle>,
     app_visible: bool,
+    /// provider-store.ts `hiddenFromTrack`: finished provider subagents that
+    /// "Delete finished subagents" could only hide, because their daemon lacks
+    /// `providerSubagentDelete`. App-wide for this app session; a later
+    /// `running` descriptor for the child (it ran again) brings it back.
+    hidden_subagents: HashSet<SubagentKey>,
 }
 
 thread_local! {
-    static STORE: RefCell<TimelineStore> = RefCell::new(TimelineStore {
-        sessions: HashMap::new(),
-        hosts: HashMap::new(),
-        requests: HashMap::new(),
-        core: None,
-        app_visible: true,
-    });
+    static STORE: RefCell<TimelineStore> = RefCell::new(TimelineStore::new());
 }
 
 pub fn with_store<R>(f: impl FnOnce(&mut TimelineStore) -> R) -> R {
@@ -61,8 +63,62 @@ fn host_facts(ui: &UiContext, record: Option<&HostRecord>, host_id: &str) -> (bo
 }
 
 impl TimelineStore {
+    fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            hosts: HashMap::new(),
+            requests: HashMap::new(),
+            core: None,
+            app_visible: true,
+            hidden_subagents: HashSet::new(),
+        }
+    }
+
     fn server_info(&self, host_id: &str) -> Value {
         self.hosts.get(host_id).map(|h| h.server_info.clone()).unwrap_or(Value::Null)
+    }
+
+    /// provider-store.ts `hideFromTrack`: a child whose current descriptor is
+    /// running stays on the track.
+    pub fn hide_subagents<'a>(&mut self, host_id: &str, parent_agent_id: &str, ids: impl IntoIterator<Item = &'a str>) {
+        let parent = SessionKey { host_id: host_id.to_owned(), agent_id: parent_agent_id.to_owned(), subagent_id: None };
+        let descriptors = self.sessions.get(&parent).map(|s| s.subagents.as_slice()).unwrap_or_default();
+        for id in ids {
+            let running = descriptors.iter().any(|d| get(d, "id") == id && get(d, "status") == "running");
+            if !running {
+                self.hidden_subagents.insert((host_id.to_owned(), parent_agent_id.to_owned(), id.to_owned()));
+            }
+        }
+    }
+
+    pub fn subagent_hidden(&self, host_id: &str, parent_agent_id: &str, id: &str) -> bool {
+        // Borrowed lookup without building an owned key per row.
+        self.hidden_subagents.iter().any(|(h, p, s)| h == host_id && p == parent_agent_id && s == id)
+    }
+
+    /// provider-store.ts `applyUpdate`: an upsert reporting `running` returns
+    /// a dismissed child to the track.
+    fn note_subagent_update(&mut self, host_id: &str, event: &Value) {
+        let payload = get(event, "payload");
+        if get(payload, "kind") != "upsert" {
+            return;
+        }
+        let child = get(payload, "subagent");
+        self.unhide_if_running(host_id, str_of(get(child, "parentAgentId")), child);
+    }
+
+    /// provider-store.ts `replaceList`: the same rule for a listed child.
+    fn note_subagent_list(&mut self, host_id: &str, parent_agent_id: &str, body: &Value) {
+        for child in list(get(body, "subagents")) {
+            self.unhide_if_running(host_id, parent_agent_id, child);
+        }
+    }
+
+    fn unhide_if_running(&mut self, host_id: &str, parent_agent_id: &str, child: &Value) {
+        if get(child, "status") == "running" && !self.hidden_subagents.is_empty() {
+            let id = str_of(get(child, "id"));
+            self.hidden_subagents.retain(|(h, p, s)| !(h == host_id && p == parent_agent_id && s == id));
+        }
     }
 
     /// Runs `f` with one session and its host plumbing.
@@ -154,6 +210,9 @@ impl TimelineStore {
                     self.remap_host(event);
                     return;
                 }
+                if ty == "agent.provider_subagents.update" {
+                    self.note_subagent_update(host_id, event);
+                }
                 let subscription = ty.starts_with("subscription.");
                 let keys: Vec<_> = self.sessions.iter()
                     .filter(|(key, session)| key.host_id == *host_id && (subscription || session.wants(event)))
@@ -180,6 +239,11 @@ impl TimelineStore {
                     Err(error) => Err(error.clone()),
                 };
                 let key = route.key.clone();
+                if matches!(route.pending, Pending::Subagents)
+                    && let Ok(body) = &result
+                {
+                    self.note_subagent_list(&key.host_id, &key.agent_id, body);
+                }
                 self.with_session(cx, effects, &key, |s, io| match route.pending {
                     Pending::Membership { generation } => s.on_membership_response(io, request_id, generation, result),
                     Pending::Fetch { direction, force_replace, generation } => {
@@ -204,6 +268,12 @@ impl TimelineStore {
         }
         if let Some(record) = self.hosts.remove(previous) {
             self.hosts.insert(next.to_owned(), record);
+        }
+        if self.hidden_subagents.iter().any(|(h, _, _)| h == previous) {
+            self.hidden_subagents = std::mem::take(&mut self.hidden_subagents)
+                .into_iter()
+                .map(|(h, p, s)| (if h == previous { next.to_owned() } else { h }, p, s))
+                .collect();
         }
         let moved: Vec<SessionKey> = self.keys_for_host(previous);
         for key in moved {
@@ -292,4 +362,49 @@ pub fn release_subagent(cx: &mut Cx, _ui: &UiContext, host_id: &str, parent_agen
 
 pub fn server_info(host_id: &str) -> Value {
     with_store(|store| store.server_info(host_id))
+}
+
+#[cfg(test)]
+mod hidden_subagent_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn upsert(parent: &str, id: &str, status: &str) -> Value {
+        json!({"type": "agent.provider_subagents.update", "payload": {"kind": "upsert",
+            "subagent": {"id": id, "parentAgentId": parent, "status": status}}})
+    }
+
+    /// Without daemon deletion, hidden finished children belong to the app,
+    /// not to one panel or session: later descriptor updates and list
+    /// refreshes keep them hidden; only a child that runs again returns.
+    #[test]
+    fn hidden_provider_subagents_stay_hidden_until_they_run_again() {
+        let mut store = TimelineStore::new();
+        store.hide_subagents("host", "parent", ["a", "b"]);
+        assert!(store.subagent_hidden("host", "parent", "a"));
+        assert!(!store.subagent_hidden("host", "other", "a"));
+        assert!(!store.subagent_hidden("other", "parent", "a"));
+
+        store.note_subagent_update("host", &upsert("parent", "a", "completed"));
+        store.note_subagent_update("host", &upsert("parent", "c", "running"));
+        store.note_subagent_list("host", "parent", &json!({"subagents": [
+            {"id": "a", "status": "completed"}, {"id": "b", "status": "failed"}, {"id": "c", "status": "running"},
+        ]}));
+        assert!(store.subagent_hidden("host", "parent", "a"));
+        assert!(store.subagent_hidden("host", "parent", "b"));
+
+        store.note_subagent_update("host", &upsert("parent", "a", "running"));
+        assert!(!store.subagent_hidden("host", "parent", "a"));
+        store.note_subagent_list("host", "parent", &json!({"subagents": [{"id": "b", "status": "running"}]}));
+        assert!(!store.subagent_hidden("host", "parent", "b"));
+    }
+
+    #[test]
+    fn hidden_provider_subagents_follow_a_rekeyed_host() {
+        let mut store = TimelineStore::new();
+        store.hide_subagents("address", "parent", ["a"]);
+        store.remap_host(&json!({"type": "host.identity_changed", "payload": {"previousHostId": "address", "hostId": "server"}}));
+        assert!(store.subagent_hidden("server", "parent", "a"));
+        assert!(!store.subagent_hidden("address", "parent", "a"));
+    }
 }

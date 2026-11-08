@@ -97,6 +97,10 @@ pub struct WaTerminalView {
     /// Republish the editor as [`IME_SENTINEL`] in a new input session on the next draw.
     #[rust]
     ime_reset: bool,
+    /// The input method's composing text (a Hangul syllable being typed): drawn at the
+    /// cursor and sent only once committed.
+    #[rust]
+    preedit: String,
     #[rust]
     replaced: ReplaceTracker,
     /// The `TextInput` of an encoded Ctrl/Alt key press is not sent again.
@@ -402,6 +406,7 @@ impl Widget for WaTerminalView {
             Hit::KeyFocusLost(_) => {
                 self.has_focus = false;
                 self.show_ime = false;
+                self.preedit.clear();
                 self.suppress_text = false;
                 self.selection.clear(cx, area);
                 if let Some(ui) = scope.data.get_mut::<UiContext>() {
@@ -484,6 +489,11 @@ impl Widget for WaTerminalView {
                 self.ime_text = edit.text.clone();
                 self.ime_selection = edit.selection_utf8();
                 cx.update_terminal_text_input(area, self.ime_id, &self.ime_text, self.ime_selection.0, self.ime_selection.1);
+                let preedit = input::composing_text(&edit.text, edit.composing);
+                if preedit != self.preedit {
+                    self.preedit = preedit.to_owned();
+                    self.redraw(cx);
+                }
                 if change.reset {
                     self.ime_reset = true;
                     self.redraw(cx);
@@ -553,7 +563,32 @@ impl Widget for WaTerminalView {
                 let row = history + usize::from(cursor.row);
                 let col = usize::from(cursor.col).min(cols.saturating_sub(1));
                 if (first..first + lines.len()).contains(&row) {
-                    let cell = cell_at(lines[row - first], col);
+                    let line = lines[row - first];
+                    let y = origin.y + row as f64 * height;
+                    // Composing text covers the cells from the cursor, clamped to the row; the
+                    // cell batch paints under glyphs, so covered glyphs are first repainted in
+                    // the background colour, like the block cursor's glyph.
+                    let preedit = if self.has_focus && !exited { input::preedit_cells(&self.preedit) } else { Vec::new() };
+                    let preedit_cells: usize = preedit.iter().map(|(_, cells)| cells).sum();
+                    let mut col = col;
+                    if preedit_cells > 0 {
+                        let start = col.min(cols.saturating_sub(preedit_cells));
+                        let rect = Rect { pos: dvec2(origin.x + start as f64 * width, y), size: dvec2(preedit_cells as f64 * width, height) };
+                        self.grid.fill(cx, rect, palette.surface0);
+                        for covered in start..start + preedit_cells {
+                            if let Some((text, style, _)) = cell_at(line, covered).filter(|(text, _, _)| !text.trim().is_empty()) {
+                                self.grid.draw_glyph(cx, dvec2(origin.x + covered as f64 * width, y), &text, &style, palette.surface0);
+                            }
+                        }
+                        let mut x = rect.pos.x;
+                        for (grapheme, cells) in &preedit {
+                            self.grid.draw_glyph(cx, dvec2(x, y), grapheme, &CellStyle::default(), palette.foreground);
+                            x += *cells as f64 * width;
+                        }
+                        self.grid.fill(cx, Rect { pos: dvec2(rect.pos.x, y + height - 1.0), size: dvec2(rect.size.x, 1.0) }, palette.foreground);
+                        col = (start + preedit_cells).min(cols.saturating_sub(1));
+                    }
+                    let cell = if preedit_cells > 0 { None } else { cell_at(line, col) };
                     let span = cell.as_ref().map(|(_, _, span)| *span).unwrap_or(1);
                     let rect = Rect { pos: origin + dvec2(col as f64 * width, row as f64 * height), size: dvec2(span as f64 * width, height) };
                     caret = Some(rect);

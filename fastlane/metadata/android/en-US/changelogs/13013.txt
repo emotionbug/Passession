@@ -1,0 +1,3 @@
+- Replace Archive finished subagents with Delete finished subagents, behind a confirm dialog that states the count. Finished Paseo subagents are deleted; finished provider subagents are deleted on the daemon through the new agent.provider_subagents.delete.request, which removes their stored descriptor and transcript, tells every client to drop the rows, and keeps them deleted across later updates, reconnects, daemon restarts and...
+
+Full notes: https://github.com/emotionbug/Passession/releases

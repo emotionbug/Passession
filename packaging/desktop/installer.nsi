@@ -109,13 +109,13 @@ Section "Paseo Sessions" SEC_MAIN
   WriteRegStr HKCU "Software\Paseo Sessions" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\Classes\paseo" "" "URL:Paseo agent link"
   WriteRegStr HKCU "Software\Classes\paseo" "URL Protocol" ""
-  WriteRegStr HKCU "Software\Classes\paseo\DefaultIcon" "" '$"$INSTDIR\paseo_sessions.exe$",0'
+  WriteRegStr HKCU "Software\Classes\paseo\DefaultIcon" "" '"$INSTDIR\paseo_sessions.exe",0'
   WriteRegStr HKCU "Software\Classes\AppUserModelId\sh.paseo.sessions.desktop" "DisplayName" "Paseo Sessions"
   WriteRegStr HKCU "Software\Classes\AppUserModelId\sh.paseo.sessions.desktop" "IconUri" "$INSTDIR\paseo_sessions.exe"
-  WriteRegStr HKCU "Software\Classes\paseo\shell\open\command" "" '$"$INSTDIR\paseo_sessions.exe$" $"%1$"'
+  WriteRegStr HKCU "Software\Classes\paseo\shell\open\command" "" '"$INSTDIR\paseo_sessions.exe" "%1"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "DisplayName" "Paseo Sessions"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "UninstallString" '$"$INSTDIR\Uninstall.exe$"'
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "NoRepair" 1
@@ -128,7 +128,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\Paseo Sessions.lnk"
   Delete "$DESKTOP\Paseo Sessions.lnk"
   ReadRegStr $0 HKCU "Software\Classes\paseo\shell\open\command" ""
-  StrCmp $0 '$"$INSTDIR\paseo_sessions.exe$" $"%1$"' 0 +2
+  StrCmp $0 '"$INSTDIR\paseo_sessions.exe" "%1"' 0 +2
   DeleteRegKey HKCU "Software\Classes\paseo"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop"
   DeleteRegKey HKCU "Software\Paseo Sessions"

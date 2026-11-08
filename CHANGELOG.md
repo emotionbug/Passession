@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.13.13 - 2026-11-09
+
+### Changed
+
+- Replace **Archive finished subagents** with **Delete finished subagents**, behind a confirm dialog that states the count. Finished Paseo subagents are deleted; finished provider subagents are deleted on the daemon through the new `agent.provider_subagents.delete.request`, which removes their stored descriptor and transcript, tells every client to drop the rows, and keeps them deleted across later updates, reconnects, daemon restarts and agent resumes (archived provider rows were only hidden in the app and could reappear). A daemon without the new `providerSubagentDelete` feature can only hide finished provider rows until the app restarts; update the daemon to delete them.
+- New session → Launch → **Terminal** now shows a single **Open terminal** button instead of the prompt composer and startup-command field; it opens a plain shell.
+- Native Release runs the Windows COM smoke test in its own job beside the builds (publication still requires it), keeps the Ghostty clone and Zig build cache between runs (`GHOSTTY_CACHE_DIR`), caches Android Gradle downloads on their pinned inputs, skips the Android NDK download when the runner already has it, and builds xtask's hashing and compression crates optimized. Release artifacts, the release profile and provenance checks are unchanged.
+
+### Fixed
+
+- Terminal tabs draw the text an Android keyboard is still composing (for example a Hangul syllable before Space) at the cursor, underlined, instead of showing nothing until it is committed.
+- On phones the chat composer stops growing at 60% of the visible pane, so an attached photo plus several lines (with or without the keyboard open) no longer pushes the conversation and toolbar off screen; the text scrolls inside the composer.
+- The phone New session card uses the in-chat composer's compact spacing and content font, sits at the bottom of the screen, and its round send, `+` and other icon-only buttons centre their icon instead of pushing it past the circle's edge.
+- Phone confirm and prompt dialogs keep their buttons above the system navigation bar.
+- On Android, long-pressing the empty last line of a text field (after a trailing line break) shows the Paste menu again; it used to select the invisible line break, so no menu appeared there.
+- The Windows installer registers the `paseo://` link handler, its icon and the uninstaller with correctly quoted paths; NSIS kept the malformed `$"` escapes literally, so the registered command could not start the app.
+- On Android 9 the text-selection magnifier no longer calls APIs that only exist from Android 10; it is shown on Android 10 and later.
+- Linux packages ship AppStream metadata (`sh.paseo.Paseo`) for software centers.
+
 ## 0.13.12 - 2026-11-09
 
 ### Added

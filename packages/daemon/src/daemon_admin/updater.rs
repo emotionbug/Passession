@@ -507,6 +507,9 @@ fn write_member(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(if mode & 0o111 != 0 { 0o755 } else { 0o644 });
     }
+    // Windows files carry no Unix permission bits.
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut file = options.open(path)?;
     let copied = std::io::copy(&mut reader.take(size + 1), &mut file)?;
     if copied != size {
