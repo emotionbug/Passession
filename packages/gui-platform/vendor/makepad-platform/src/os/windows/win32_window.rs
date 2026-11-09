@@ -70,6 +70,10 @@ use {
                         SetWindowLongPtrW,
                         GetWindowLongPtrW,
                         DefWindowProcW,
+                        WM_IME_STARTCOMPOSITION,
+                        WM_IME_COMPOSITION,
+                        WM_IME_ENDCOMPOSITION,
+                        WM_IME_SETCONTEXT,
                         ShowWindow,
                         PostMessageW,
                         GetWindowRect,
@@ -260,15 +264,37 @@ use {
                         VK_LEFT,
                         VK_RIGHT,
                     },
+                    Input::Ime::{
+                        ImmGetContext,
+                        ImmReleaseContext,
+                        ImmGetCompositionFontW,
+                        ImmGetCompositionStringW,
+                        ImmNotifyIME,
+                        ImmSetCompositionFontW,
+                        ImmSetCompositionWindow,
+                        ImmSetCandidateWindow,
+                        COMPOSITIONFORM,
+                        CANDIDATEFORM,
+                        CFS_POINT,
+                        CFS_EXCLUDE,
+                        CPS_CANCEL,
+                        GCS_COMPSTR,
+                        GCS_CURSORPOS,
+                        GCS_RESULTSTR,
+                        IME_COMPOSITION_STRING,
+                        ISC_SHOWUICOMPOSITIONWINDOW,
+                        NI_COMPOSITIONSTR,
+                    },
                 },
                 Graphics::{
                     Dwm::DwmExtendFrameIntoClientArea,
-                    Gdi::ScreenToClient,
+                    Gdi::{ScreenToClient, LOGFONTW},
                 },
             },
         },
         event::*,
         area::Area,
+        ime_composer::CompositionUpdate,
         os::windows::{
             win32_app::{
                 Win32App,
@@ -303,7 +329,12 @@ pub struct Win32Window {
     
     pub mouse_buttons_down: usize,
     pub last_key_mod: KeyModifiers,
+    /// Caret top-left in logical client coordinates; NaN until a text input applies one.
     pub ime_spot: DVec2,
+    pub ime_caret_height: f64,
+    /// A focused editor composes inline (`ImeComposer`): composition messages become
+    /// `Win32Event::TextComposition` instead of reaching the input method's own window.
+    pub ime_inline: bool,
     pub current_cursor: MouseCursor,
     pub last_mouse_pos: DVec2,
     pub ignore_wmsize: usize,
@@ -363,7 +394,9 @@ impl Win32Window {
             mouse_buttons_down: 0,
             last_window_geom: WindowGeom::default(),
             last_key_mod: KeyModifiers::default(),
-            ime_spot: DVec2::default(),
+            ime_spot: dvec2(f64::NAN, f64::NAN),
+            ime_caret_height: 0.0,
+            ime_inline: false,
             current_cursor: MouseCursor::Default,
             last_mouse_pos: DVec2::default(),
             ignore_wmsize: 0,
@@ -747,6 +780,40 @@ impl Win32Window {
                 }
             },
 
+            // Editors draw the text being composed themselves: keep the input method's own
+            // composition window hidden (candidate lists still show).
+            WM_IME_SETCONTEXT => {
+                let lparam = if wparam.0 != 0 {
+                    LPARAM(lparam.0 & !(ISC_SHOWUICOMPOSITIONWINDOW as isize))
+                } else {
+                    lparam
+                };
+                return DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            // A composition starts from the context's composition form: re-apply the caret
+            // spot (candidate lists follow it) in case the input method reset it.
+            WM_IME_STARTCOMPOSITION => {
+                window.apply_ime_spot();
+                if window.ime_inline {
+                    return LRESULT(0)
+                }
+                return DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            // Handled here, the composition never reaches DefWindowProc, so no WM_IME_CHAR
+            // or WM_CHAR repeats the committed text.
+            WM_IME_COMPOSITION if window.ime_inline => {
+                let update = Self::read_composition(hwnd, lparam.0 as u32);
+                window.do_callback(Win32Event::TextComposition(window.window_id, update));
+                return LRESULT(0)
+            }
+            WM_IME_ENDCOMPOSITION if window.ime_inline => {
+                window.do_callback(Win32Event::TextComposition(window.window_id, CompositionUpdate {
+                    ended: true,
+                    ..Default::default()
+                }));
+                return LRESULT(0)
+            }
+
             _ => {
                 return DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -921,8 +988,111 @@ impl Win32Window {
         with_win32_app(|app| app.time_now())
     }
     
-    pub fn set_ime_spot(&mut self, spot: DVec2) {
+    /// Composition and candidate windows follow the focused caret. Widgets request this
+    /// every frame, so an unchanged spot is not re-applied.
+    pub fn set_ime_spot(&mut self, spot: DVec2, caret_height: f64) {
+        if self.ime_spot == spot && self.ime_caret_height == caret_height {
+            return;
+        }
         self.ime_spot = spot;
+        self.ime_caret_height = caret_height;
+        self.apply_ime_spot();
+    }
+
+    /// Forgets the applied spot, so the next focused input applies its caret again.
+    pub fn clear_ime_spot(&mut self) {
+        self.ime_spot = dvec2(f64::NAN, f64::NAN);
+    }
+
+    /// Without a composition form Windows draws the composing text in the window's top-left
+    /// corner. Put it at the caret, sized to the caret's line, and keep candidate lists off
+    /// that line.
+    pub fn apply_ime_spot(&self) {
+        if !self.ime_spot.x.is_finite() || !self.ime_spot.y.is_finite() {
+            return;
+        }
+        let dpi = self.get_dpi_factor();
+        let x = (self.ime_spot.x * dpi).round() as i32;
+        let y = (self.ime_spot.y * dpi).round() as i32;
+        let line = if self.ime_caret_height > 0.0 { self.ime_caret_height } else { 16.0 };
+        let line = (line * dpi).round().max(1.0) as i32;
+        unsafe {
+            let context = ImmGetContext(self.hwnd);
+            if context.is_invalid() {
+                return;
+            }
+            let caret = POINT { x, y };
+            let _ = ImmSetCompositionWindow(context, &COMPOSITIONFORM {
+                dwStyle: CFS_POINT,
+                ptCurrentPos: caret,
+                rcArea: RECT::default(),
+            });
+            let _ = ImmSetCandidateWindow(context, &CANDIDATEFORM {
+                dwIndex: 0,
+                dwStyle: CFS_EXCLUDE,
+                ptCurrentPos: caret,
+                rcArea: RECT { left: x, top: y, right: x + 1, bottom: y + line },
+            });
+            // Keep the input method's own face (it covers the input language); match only
+            // the height so the composition lines up with the surrounding text.
+            let mut font = LOGFONTW::default();
+            if ImmGetCompositionFontW(context, &mut font).as_bool() {
+                font.lfHeight = line;
+                font.lfWidth = 0;
+                let _ = ImmSetCompositionFontW(context, &font);
+            }
+            let _ = ImmReleaseContext(self.hwnd, context);
+        }
+    }
+
+    /// Discards the input method's composition after the editor moved on; the editor
+    /// keeps the text composed so far.
+    pub fn cancel_ime_composition(&self) {
+        unsafe {
+            let context = ImmGetContext(self.hwnd);
+            if context.is_invalid() {
+                return;
+            }
+            let _ = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+            let _ = ImmReleaseContext(self.hwnd, context);
+        }
+    }
+
+    /// Reads one `WM_IME_COMPOSITION` (`flags` is its lParam): the committed result, the
+    /// new composition and its caret. A message without string flags cleared the
+    /// composition.
+    unsafe fn read_composition(hwnd: HWND, flags: u32) -> CompositionUpdate {
+        let mut update = CompositionUpdate::default();
+        let context = ImmGetContext(hwnd);
+        if context.is_invalid() {
+            return update;
+        }
+        let read = |kind: IME_COMPOSITION_STRING| {
+            let bytes = ImmGetCompositionStringW(context, kind, None, 0);
+            if bytes <= 0 {
+                return String::new();
+            }
+            let mut units = vec![0u16; bytes as usize / 2];
+            let read = ImmGetCompositionStringW(context, kind, Some(units.as_mut_ptr().cast()), bytes as u32);
+            units.truncate(read.max(0) as usize / 2);
+            String::from_utf16_lossy(&units)
+        };
+        if flags & GCS_RESULTSTR.0 != 0 {
+            update.result = Some(read(GCS_RESULTSTR));
+        }
+        if flags & GCS_COMPSTR.0 != 0 {
+            update.composition = Some(read(GCS_COMPSTR));
+            if flags & GCS_CURSORPOS.0 != 0 {
+                let cursor = ImmGetCompositionStringW(context, GCS_CURSORPOS, None, 0);
+                if cursor >= 0 {
+                    update.cursor = Some(cursor as usize);
+                }
+            }
+        } else if update.result.is_none() {
+            update.composition = Some(String::new());
+        }
+        let _ = ImmReleaseContext(hwnd, context);
+        update
     }
     
     pub fn get_position(&self) -> DVec2 {

@@ -1206,7 +1206,8 @@ impl TextInput {
         }
     }
 
-    fn draw_cursor(&mut self, cx: &mut Cx2d, text_rect: Rect) -> DVec2 {
+    /// Draws the caret and returns its absolute rect.
+    fn draw_cursor(&mut self, cx: &mut Cx2d, text_rect: Rect) -> Rect {
         let CursorPosition {
             row_index,
             x_in_lpxs,
@@ -1219,20 +1220,14 @@ impl TextInput {
             .as_ref()
             .expect("layout should not be `None` because we called `layout_text` in `draw_walk`");
         let row = &laidout_text.rows[row_index];
-        let cursor_pos = dvec2(
-            (x_in_lpxs - 1.0 * self.draw_text.font_scale) as f64,
-            ((row.origin_in_lpxs.y - row.ascender_in_lpxs) * self.draw_text.font_scale) as f64,
+        let caret = rect(
+            text_rect.pos.x + (x_in_lpxs - 1.0 * self.draw_text.font_scale) as f64,
+            text_rect.pos.y + ((row.origin_in_lpxs.y - row.ascender_in_lpxs) * self.draw_text.font_scale) as f64,
+            (2.0 * self.draw_text.font_scale) as f64,
+            ((row.ascender_in_lpxs - row.descender_in_lpxs) * self.draw_text.font_scale) as f64,
         );
-        self.draw_cursor.draw_abs(
-            cx,
-            rect(
-                text_rect.pos.x + cursor_pos.x,
-                text_rect.pos.y + cursor_pos.y,
-                (2.0 * self.draw_text.font_scale) as f64,
-                ((row.ascender_in_lpxs - row.descender_in_lpxs) * self.draw_text.font_scale) as f64,
-            )
-        );
-        cursor_pos
+        self.draw_cursor.draw_abs(cx, caret);
+        caret
     }
 
     fn draw_selection(&mut self, cx: &mut Cx2d, text_rect: Rect) {
@@ -1538,7 +1533,7 @@ impl Widget for TextInput {
         self.layout_text(cx);
         let mut handle_viewport = cx.turtle().padded_rect();
         let text_rect = self.draw_text(cx);
-        let cursor_pos = self.draw_cursor(cx, text_rect);
+        let caret = self.draw_cursor(cx, text_rect);
         self.draw_selection(cx, text_rect);
         self.draw_bg.end(cx);
         if !handle_viewport.size.x.is_finite() { handle_viewport.size.x = text_rect.size.x.max(1.0); }
@@ -1547,9 +1542,11 @@ impl Widget for TextInput {
             cx.update_text_input(self.draw_bg.area(), self.widget_uid().0, &self.text,
                 self.selection.anchor.index, self.selection.cursor.index,
                 self.is_password, self.is_numeric_only);
-            cx.show_text_ime(
-                self.draw_bg.area(), 
-                cursor_pos,
+            // Desktop input methods draw the composition at the caret, at its height.
+            let bg = self.draw_bg.area().rect(cx);
+            cx.show_text_ime_caret(
+                self.draw_bg.area(),
+                Rect { pos: caret.pos - bg.pos, size: caret.size },
             );
         }
         let area = self.draw_bg.area();

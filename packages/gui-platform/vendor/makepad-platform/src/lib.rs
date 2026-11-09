@@ -11,6 +11,8 @@ mod live_prims;
 #[macro_use]
 mod cx;
 mod cx_api;
+#[cfg(any(target_os = "windows", test))]
+mod ime_composer;
 
 pub mod action;
 

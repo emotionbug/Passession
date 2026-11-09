@@ -40,6 +40,8 @@ pub enum Win32Event {
     WindowDragQuery(WindowDragQueryEvent),
     WindowCloseRequested(WindowCloseRequestedEvent),
     TextInput(WindowId, TextInputEvent),
+    /// An input-method composition step for the focused editor (`ImeComposer`).
+    TextComposition(WindowId, crate::ime_composer::CompositionUpdate),
     Drag(DragEvent),
     Drop(DropEvent),
     DragEnd,

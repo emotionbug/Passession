@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.14 - 2026-11-09
 
 ### Changed
 
@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- On Windows the app saves its state and chat drafts again: the state lock was opened append-only, which Windows refuses to lock (`Cannot lock …\paseo-native\state.lock: Access is denied (os error 5)`, also shown as "Draft persistence failed").
+- On Windows, Korean and other input-method compositions are typed into the field inline, at the cursor, as on Android: chat and other text fields, the terminal and the file editor show the syllable being composed immediately instead of in a separate input-method window at the top-left corner of the window, and commit it into their own undo history. Candidate lists open at the cursor.
 - Native Release checks the Zig archive digest on Windows runners again: Git Bash's `sha256sum` prefixed the digest with `\` for the backslash `RUNNER_TEMP` path, failing the Windows build before it started.
 
 ## 0.13.13 - 2026-11-09

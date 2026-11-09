@@ -685,7 +685,7 @@ impl SourceEditor {
             cx.add_aligned_rect_area(&mut self.ime_caret_area, caret);
             cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
                 self.buffer.selection.anchor, self.buffer.selection.head, false, false);
-            cx.show_text_ime(self.ime_caret_area, dvec2(0.0, caret.size.y));
+            cx.show_text_ime_caret(self.ime_caret_area, Rect { pos: dvec2(0.0, 0.0), size: caret.size });
         }
         if self.focused && !self.handles.as_ref().is_some_and(TextSelectionHandles::is_dragging)
             && (self.show_actions || (self.owns_selection && cx.text_actions_active(self.ime_area))) {

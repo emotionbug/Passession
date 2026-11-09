@@ -6,8 +6,10 @@ use {
     },
     crate::{
         makepad_live_id::*,
+        area::Area,
         cx::*,
         event::*,
+        ime_composer::ImeComposer,
         thread::SignalToUI,
         os::{
             windows::{
@@ -195,6 +197,15 @@ impl Cx {
             Win32Event::TextInput(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::TextInput(e))
             }
+            Win32Event::TextComposition(window_id, update) => {
+                // Snapshots are built from the published editor's mirror: only that
+                // editor, while it has key focus, may receive them.
+                if self.has_key_focus(self.os.ime.area()) {
+                    for event in self.os.ime.compose(update) {
+                        self.call_window_event_handler(window_id, &Event::TextIme(event));
+                    }
+                }
+            }
             Win32Event::Drag(e) => {
                 self.call_event_handler(&Event::Drag(e));
                 self.drag_drop.cycle_drag();
@@ -301,6 +312,24 @@ impl Cx {
     fn handle_platform_ops(&mut self, d3d11_windows: &mut Vec<D3d11Window>, d3d11_cx: &D3d11Cx) -> EventFlow {
         let mut ret = EventFlow::Poll;
         let mut geom_changes = Vec::new();
+        // Ops pop newest first: only the latest IME request reflects the current caret.
+        let mut ime_applied = false;
+        // Inline composition is on while an editor is mirrored. An interrupted composition
+        // is discarded in the input method (its notifications re-enter while this callback
+        // runs and are dropped) and a still-focused editor learns that it ended.
+        let ime_inline = self.os.ime.has_editor();
+        let ime_cancel = std::mem::take(&mut self.os.ime_cancel);
+        for window in d3d11_windows.iter_mut() {
+            window.win32_window.ime_inline = ime_inline;
+            if ime_cancel {
+                window.win32_window.cancel_ime_composition();
+            }
+        }
+        for event in std::mem::take(&mut self.os.ime_notify) {
+            if self.has_key_focus(self.os.ime.area()) {
+                self.call_event_handler(&Event::TextIme(event));
+            }
+        }
         while let Some(op) = self.platform_ops.pop() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
@@ -404,11 +433,21 @@ impl Cx {
 
                     //todo!("HttpRequest not implemented yet on windows, we'll get there");
                 },
-                CxOsOp::ShowTextIME{..}=>{
-                    
+                CxOsOp::ShowTextIME(area, pos) => {
+                    if !std::mem::replace(&mut ime_applied, true) {
+                        let pos = area.clipped_rect(self).pos + pos;
+                        let caret_height = self.ime_caret_height;
+                        for window in d3d11_windows.iter_mut() {
+                            window.win32_window.set_ime_spot(pos, caret_height);
+                        }
+                    }
                 }
-                CxOsOp::HideTextIME=>{
-                                        
+                CxOsOp::HideTextIME => {
+                    if !std::mem::replace(&mut ime_applied, true) {
+                        for window in d3d11_windows.iter_mut() {
+                            window.win32_window.clear_ime_spot();
+                        }
+                    }
                 }
                 e=>{
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
@@ -453,11 +492,35 @@ impl CxOsApi for Cx {
     }
 }
 
+impl Cx {
+    /// Mirrors the focused editor for inline composition (`ImeComposer`).
+    pub(crate) fn windows_update_text_input(&mut self, area: Area, editor: u64, text: &str, start: usize, end: usize) {
+        if !area.is_valid(self) || !self.has_key_focus(area) {
+            return;
+        }
+        let interruption = self.os.ime.publish(area, editor, text, start, end);
+        self.os.ime_cancel |= interruption.cancel;
+        self.os.ime_notify.extend(interruption.notify);
+    }
+
+    pub(crate) fn windows_clear_text_input(&mut self, area: Area) {
+        if self.os.ime.clear(area) {
+            self.os.ime_cancel = true;
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct CxOs {
     pub (crate) start_time: Option<Instant>,
     pub (crate) media: CxWindowsMedia,
     pub (crate) d3d11_device: Option<ID3D11Device>,
     pub (crate) network_response: NetworkResponseChannel,
+    /// The focused editor mirrored for inline input-method composition.
+    pub (crate) ime: ImeComposer,
+    /// Discard the input method's composition at the next platform-op pass.
+    pub (crate) ime_cancel: bool,
+    /// Snapshots telling a still-focused editor its composition ended.
+    pub (crate) ime_notify: Vec<TextImeEvent>,
     //pub (crate) new_frame_being_rendered: Option<crate::cx_stdin::PresentableDraw>,
 }

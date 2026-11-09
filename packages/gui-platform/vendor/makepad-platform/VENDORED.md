@@ -56,6 +56,45 @@ scoped entry point. Lifecycle and non-input notifications remain broadcasts.
 The adjacent widgets patch applies this scope before navigation and overlays,
 not merely before the window's content view.
 
+## Windows input-method composition
+
+Upstream ignored input-method compositions on Windows: the input method drew the
+text being composed (a Hangul syllable before it is committed) in its own window at
+the window's top-left corner, and the editor received it only as `WM_CHAR` once
+committed. Windows now composes inline through the same full-editor snapshots
+(`TextImeEvent`) that Android uses, so every editor that handles `Hit::TextIme`
+shows the composition in place and groups it in its own undo history.
+
+- `update_text_input`, `update_terminal_text_input` and `clear_text_input` mirror
+  the focused editor in `ime_composer.rs` (`ImeComposer`, Windows and tests only).
+- While an editor is mirrored, `win32_window.rs` handles `WM_IME_COMPOSITION` and
+  `WM_IME_ENDCOMPOSITION` itself (result, composition and its caret through
+  `ImmGetCompositionStringW`), and does not pass them to `DefWindowProc`, so no
+  `WM_IME_CHAR`/`WM_CHAR` repeats committed text. `WM_IME_SETCONTEXT` hides the input
+  method's composition window; candidate lists still show.
+- `windows.rs` turns each step into snapshots of the mirror, delivered only while
+  the mirrored editor has key focus. A republished editor that differs from the
+  mirror while composing (a click, other typing, filtered input, another editor)
+  ends the composition where it stands: the input method's composition is discarded
+  (`ImmNotifyIME` `CPS_CANCEL`; its re-entrant notifications are dropped) and a
+  still-focused editor receives a snapshot without a composing range. Blurring the
+  editor discards the composition the same way; the editor keeps the text.
+- `ime_composer` unit tests cover Hangul syllables committed into the next one,
+  clearing and cancelling, selection replacement in UTF-16 units, and interruptions.
+  They are not evidence that a particular Windows input method works.
+
+Candidate lists follow the caret: `CxOsOp::ShowTextIME` places the composition form
+(`CFS_POINT`) at the caret's top-left, keeps candidates off the caret line
+(`CFS_EXCLUDE`) and sizes the composition font to the caret, keeping the input
+method's own face. The spot is re-applied on `WM_IME_STARTCOMPOSITION`; only the
+newest IME op of a batch is applied, because ops pop newest first, and an unchanged
+spot is not re-sent each frame. `Win32_UI_Input_Ime` and `Win32_Globalization` are
+enabled for these calls.
+
+`Cx::show_text_ime_caret(area, caret)` passes the caret's rect relative to `area`
+and records its height (`Cx::ime_caret_height`); `show_text_ime(area, pos)` clears
+it, so platforms fall back to a 16-pixel line.
+
 ## Android Surface lifetime
 
 `os/linux/android/android.rs` gates drawing and `SurfaceTexture.updateTexImage`

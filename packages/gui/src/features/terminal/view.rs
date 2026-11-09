@@ -653,7 +653,8 @@ impl Widget for WaTerminalView {
             }
             cx.update_terminal_text_input(area, self.ime_id, &self.ime_text, self.ime_selection.0, self.ime_selection.1);
             if !MOBILE || self.show_ime {
-                cx.show_text_ime(self.ime_caret, dvec2(0.0, caret.size.y));
+                // `ime_caret` covers the caret cell: desktop input methods compose over it.
+                cx.show_text_ime_caret(self.ime_caret, Rect { pos: dvec2(0.0, 0.0), size: caret.size });
             }
         }
         self.selection.draw_overlays(cx, area, origin, (width, height), true);

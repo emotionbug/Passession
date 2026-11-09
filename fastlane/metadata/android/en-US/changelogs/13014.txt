@@ -1,0 +1,4 @@
+Changed
+- Native Release installs the pinned Android NDK r28c from Google's archive (SHA-256 checked) when the runner lacks it, instead of through sdkmanager, whose deprecation warning appeared on every Android release build.
+
+Full notes: https://github.com/emotionbug/Passession/releases

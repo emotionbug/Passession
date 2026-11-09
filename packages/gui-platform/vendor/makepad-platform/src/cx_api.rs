@@ -278,6 +278,18 @@ impl Cx {
     }
 
     pub fn show_text_ime(&mut self, area: Area, pos: DVec2) {
+        self.ime_caret_height = 0.0;
+        self.request_text_ime(area, pos);
+    }
+
+    /// `show_text_ime` with the caret's rect relative to `area`: desktop input methods
+    /// draw their composition at the caret's top-left at the caret's height.
+    pub fn show_text_ime_caret(&mut self, area: Area, caret: Rect) {
+        self.ime_caret_height = caret.size.y.max(0.0);
+        self.request_text_ime(area, caret.pos);
+    }
+
+    fn request_text_ime(&mut self, area: Area, pos: DVec2) {
         if !self.keyboard.text_ime_dismissed {
             self.ime_area = area;
             #[cfg(target_os = "android")]
@@ -292,11 +304,14 @@ impl Cx {
         }
     }
 
-    /// Publish the focused native editor. Selection offsets are UTF-8 bytes.
+    /// Publish the focused native editor. Selection offsets are UTF-8 bytes. Android
+    /// mirrors it in the input method; Windows composes into it inline.
     pub fn update_text_input(&mut self, _area: Area, _editor: u64, _text: &str, _start: usize,
         _end: usize, _password: bool, _numeric: bool) {
         #[cfg(target_os = "android")]
         self.android_update_text_input(_area, _editor, _text, _start, _end, _password, _numeric, false);
+        #[cfg(target_os = "windows")]
+        self.windows_update_text_input(_area, _editor, _text, _start, _end);
     }
 
     /// Publish a terminal's hidden editor: Android asks the input method for plain text
@@ -305,12 +320,16 @@ impl Cx {
         _end: usize) {
         #[cfg(target_os = "android")]
         self.android_update_text_input(_area, _editor, _text, _start, _end, false, false, true);
+        #[cfg(target_os = "windows")]
+        self.windows_update_text_input(_area, _editor, _text, _start, _end);
     }
 
     pub fn clear_text_input(&mut self, _area: Area) {
         // Android defers blur hiding until the next editor can publish on draw.
         #[cfg(target_os = "android")]
         self.android_clear_text_input(_area);
+        #[cfg(target_os = "windows")]
+        self.windows_clear_text_input(_area);
     }
 
     pub fn hide_text_ime(&mut self) {

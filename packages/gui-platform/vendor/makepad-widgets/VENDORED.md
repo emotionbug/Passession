@@ -98,6 +98,12 @@ boundary search selected that invisible break, so the toolbar had no drawn
 anchor and the empty last line offered no Paste. `touch_focus_tests` pin both
 the kept caret and ordinary word selection.
 
+`draw_cursor` returns the caret rect it draws, and a focused editable input asks for
+its input method with `Cx::show_text_ime_caret` and that rect relative to the
+background. Upstream passed the caret offset inside the text rect against the
+background area (off by the padding) and no height. Windows uses both to draw the
+composition at the caret at the text's size.
+
 ## Shared touch selection handles
 
 `src/text_selection_handles.rs` paints insertion/range handles and delegates

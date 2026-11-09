@@ -85,6 +85,9 @@ pub struct Cx {
     pub(crate) keyboard_event_window: Option<crate::window::WindowId>,
     pub fingers: CxFingers,
     pub (crate) ime_area: Area,
+    /// Height of the caret in `ime_area`, for platforms that size the input method's
+    /// composition window to the text (Windows); 0 when the caller gave only a point.
+    pub (crate) ime_caret_height: f64,
     pub (crate) drag_drop: CxDragDrop,
     
     pub (crate) platform_ops: Vec<CxOsOp>,
@@ -291,6 +294,7 @@ impl Cx {
             fingers: Default::default(),
             drag_drop: Default::default(),
             ime_area: Default::default(),
+            ime_caret_height: 0.0,
             platform_ops: Default::default(),
             studio_web_socket: None,
             studio_http: "".to_string(),

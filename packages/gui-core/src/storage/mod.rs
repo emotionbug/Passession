@@ -402,6 +402,13 @@ pub(crate) struct Saved {
     pub hosts: Map<String, Value>,
 }
 
+/// The save transaction's lock file. Windows' `LockFileEx` (behind `File::lock`) needs a
+/// handle with read or write access; an append-only handle has neither and fails with
+/// ERROR_ACCESS_DENIED (os error 5), so the lock is opened for reading and writing.
+fn open_lock(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
+}
+
 /// Rust 1.93's File::lock is unsupported on Android. Use the same flock primitive on
 /// Unix, holding the descriptor through the transaction; close releases it even on errors.
 fn lock_exclusive(file: &File) -> std::io::Result<()> {
@@ -427,11 +434,7 @@ fn lock_exclusive(file: &File) -> std::io::Result<()> {
 /// write each changed file.
 pub(crate) fn save(paths: &Paths, job: SaveJob) -> Result<Option<Saved>, CoreError> {
     let lock_path = paths.lock();
-    let lock = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&lock_path)
-        .map_err(|e| io_error("Cannot open", &lock_path, e))?;
+    let lock = open_lock(&lock_path).map_err(|e| io_error("Cannot open", &lock_path, e))?;
     restrict(&lock_path, false)?;
     lock_exclusive(&lock).map_err(|e| io_error("Cannot lock", &lock_path, e))?;
     let saved = match job.state {
@@ -520,8 +523,8 @@ mod tests {
     fn state_lock_excludes_other_handles_until_owner_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.lock");
-        let owner = OpenOptions::new().create(true).append(true).open(&path).unwrap();
-        let other = OpenOptions::new().append(true).open(&path).unwrap();
+        let owner = open_lock(&path).unwrap();
+        let other = open_lock(&path).unwrap();
         lock_exclusive(&owner).unwrap();
         assert_eq!(
             try_lock_exclusive(&other).unwrap_err().kind(),
@@ -554,7 +557,7 @@ mod tests {
         ).err().unwrap();
         assert_eq!(error.code, "STORAGE_NEWER");
         assert_eq!(fs::read(paths.state()).unwrap(), original);
-        let next = OpenOptions::new().append(true).open(paths.lock()).unwrap();
+        let next = open_lock(&paths.lock()).unwrap();
         try_lock_exclusive(&next).unwrap();
     }
 
