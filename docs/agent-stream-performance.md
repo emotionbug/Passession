@@ -72,7 +72,11 @@ progress. This presentation queue does not discard or reorder canonical events.
 coherent source/layout snapshot. Beyond the inline allowance, semantic font-span
 conversion is sliced; native `AsyncLayout` shapes and wraps on an independent
 worker-local loader/shaper with immutable font definitions. Background layout
-hydration and final glyph destruction are sliced.
+hydration and final glyph destruction are sliced. Each preparation pass
+advances every unprepared paragraph it reaches within a soft 4 ms deadline, so
+the time to publish follows the document's work rather than its paragraph
+count; the reveal rule and that pass are defined in
+[Markdown rendering](markdown-renderer.md#streaming-work).
 The app drains retired layouts on an initial signal and then a 1/60-second timer
 while work remains, independent of drawing and row/window lifetime; additional
 signals cannot bypass the timer cadence.

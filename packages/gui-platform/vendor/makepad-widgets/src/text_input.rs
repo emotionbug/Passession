@@ -281,19 +281,12 @@ live_design! {
 
             uniform color: (THEME_COLOR_TEXT_CURSOR)
 
+            // A solid bar; `draw_cursor` places it on whole device pixels. The antialiased
+            // `Sdf2d::box` left a 2px caret at about a third of its colour on 1x displays,
+            // split unevenly over the pixel columns it straddled.
             fn pixel(self) -> vec4 {
-                let sdf = Sdf2d::viewport(self.pos * self.rect_size);
-                sdf.box(
-                    0.0,
-                    0.0,
-                    self.rect_size.x,
-                    self.rect_size.y,
-                    self.border_radius
-                );
-                sdf.fill(
-                    mix(THEME_COLOR_U_HIDDEN, self.color, (1.0-self.blink) * self.focus)
-                );
-                return sdf.result;
+                let color = mix(THEME_COLOR_U_HIDDEN, self.color, (1.0-self.blink) * self.focus);
+                return vec4(color.rgb * color.a, color.a);
             }
         }
 
@@ -1220,11 +1213,17 @@ impl TextInput {
             .as_ref()
             .expect("layout should not be `None` because we called `layout_text` in `draw_walk`");
         let row = &laidout_text.rows[row_index];
+        let scale = self.draw_text.font_scale;
+        // Whole device pixels, at least one wide.
+        let dpi = cx.current_dpi_factor();
+        let snap = |v: f64| (v * dpi).round() / dpi;
+        let left = snap(text_rect.pos.x + (x_in_lpxs - 1.0 * scale) as f64);
+        let top = snap(text_rect.pos.y + ((row.origin_in_lpxs.y - row.ascender_in_lpxs) * scale) as f64);
         let caret = rect(
-            text_rect.pos.x + (x_in_lpxs - 1.0 * self.draw_text.font_scale) as f64,
-            text_rect.pos.y + ((row.origin_in_lpxs.y - row.ascender_in_lpxs) * self.draw_text.font_scale) as f64,
-            (2.0 * self.draw_text.font_scale) as f64,
-            ((row.ascender_in_lpxs - row.descender_in_lpxs) * self.draw_text.font_scale) as f64,
+            left,
+            top,
+            snap((2.0 * scale) as f64).max(1.0 / dpi),
+            snap(((row.ascender_in_lpxs - row.descender_in_lpxs) * scale) as f64),
         );
         self.draw_cursor.draw_abs(cx, caret);
         caret

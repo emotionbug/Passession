@@ -124,6 +124,12 @@ pub const DEFAULT_EXPLORER_WIDTH: f64 = 340.0;
 /// Removed surfaces (browser, executable plugin) that are dropped when a saved layout is restored.
 const REMOVED_KINDS: [&str; 2] = ["browser", "plugin"];
 
+/// Tabs shown on top of the tab they were opened from (the original's compact-sheet and child
+/// targets): compact Back closes them, and closing one returns to its opener.
+pub fn is_detail_kind(kind: &str) -> bool {
+    matches!(kind, "file" | "working_diff" | "commit_diff" | "provider_subagent" | "pull_request" | "execution_log" | "project_settings")
+}
+
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub tabs: Vec<PanelTarget>,
@@ -142,6 +148,8 @@ pub struct Layout {
     /// Bumped on every open/select (`navigationSerial`): pages shown in place of the
     /// conversation close when the user moves on.
     pub navigation_serial: u64,
+    /// Detail tab key → the tab it was opened from (`parentTabIdByTabId`); never cyclic.
+    openers: HashMap<String, String>,
     /// Changes since the last save request.
     pub dirty: bool,
 }
@@ -162,6 +170,7 @@ impl Default for Layout {
             sidebar_visible: true,
             compact_destination: CompactDestination::Agent,
             navigation_serial: 0,
+            openers: HashMap::new(),
             dirty: false,
         }
     }
@@ -238,7 +247,11 @@ impl Layout {
     pub fn open(&mut self, target: PanelTarget, beside: bool) {
         self.navigation_serial += 1;
         let key = target.key();
+        let opener = self.focused().selected.clone().filter(|opener| is_detail_kind(&target.kind) && *opener != key);
         self.upsert(target);
+        if let Some(opener) = opener {
+            self.set_opener(&key, opener);
+        }
         let found = self.tree.panes().iter().find(|pane| pane.tabs.contains(&key)).map(|pane| pane.id.clone());
         if let Some(pane_id) = found {
             if let Some(pane) = self.tree.pane_mut(&pane_id) {
@@ -261,6 +274,28 @@ impl Layout {
         }
         self.compact_destination = CompactDestination::Agent;
         self.changed();
+    }
+
+    /// `attachParentTab`: `key` was opened from `opener`. Reopening a tab from one opened out of
+    /// it moves it to the end of that chain, so closing still unwinds to the first opener.
+    fn set_opener(&mut self, key: &str, opener: String) {
+        let mut at = opener.as_str();
+        let mut below = None;
+        for _ in 0..self.openers.len() {
+            let Some(above) = self.openers.get(at) else { break };
+            if above == key {
+                below = Some(at.to_string());
+                break;
+            }
+            at = above;
+        }
+        if let Some(below) = below {
+            match self.openers.get(key).cloned() {
+                Some(origin) => self.openers.insert(below, origin),
+                None => self.openers.remove(&below),
+            };
+        }
+        self.openers.insert(key.to_string(), opener);
     }
 
     /// `openExplorer(target, focus:)`.
@@ -334,6 +369,14 @@ impl Layout {
             }
             CompactDestination::Sidebar => false,
         }
+    }
+
+    /// The detail tab compact Back closes before `handle_back` leaves the conversation.
+    pub fn compact_back_tab(&self, compact: bool) -> Option<String> {
+        if !compact || self.compact_destination != CompactDestination::Agent {
+            return None;
+        }
+        self.selected().filter(|tab| is_detail_kind(&tab.kind)).map(PanelTarget::key)
     }
 
     pub fn select_tab(&mut self, key: &str) -> bool {
@@ -528,6 +571,16 @@ impl Layout {
             }
         }
         self.tabs.retain(|tab| tab.key() != key);
+        // `transferReplacedTabParent`.
+        let opener = self.openers.remove(key).filter(|opener| *opener != next);
+        let opened: Vec<String> = self.openers.iter().filter(|(tab, from)| *from == key && **tab != next).map(|(tab, _)| tab.clone()).collect();
+        self.openers.retain(|_, from| from != key);
+        if let Some(opener) = opener {
+            self.set_opener(&next, opener);
+        }
+        for tab in opened {
+            self.set_opener(&tab, next.clone());
+        }
         self.navigation_serial += 1;
         self.changed();
     }
@@ -599,8 +652,20 @@ impl Layout {
         }
     }
 
-    /// `_removeTab`: an emptied pane goes away except `main` and the last pane.
+    /// `_removeTab`: an emptied pane goes away except `main` and the last pane. A pane that was
+    /// showing `key` returns to the tab it was opened from (`getCloseSuccessorTabId`).
     fn remove_tab(&mut self, key: &str) {
+        let shown = self.tree.panes().iter().any(|pane| pane.selected.as_deref() == Some(key));
+        let opener = self.openers.remove(key);
+        // Tabs opened from `key` now return to where `key` came from.
+        self.openers.retain(|_, parent| match &opener {
+            _ if parent != key => true,
+            Some(above) => {
+                parent.clone_from(above);
+                true
+            }
+            None => false,
+        });
         let containing: Vec<String> = self
             .tree
             .panes()
@@ -625,6 +690,15 @@ impl Layout {
             self.selected_explorer = self.explorer_tabs.last().cloned();
         }
         self.tabs.retain(|tab| tab.key() != key);
+        if shown
+            && let Some(opener) = opener
+            && let Some(pane_id) = self.pane_of(&opener)
+        {
+            if let Some(pane) = self.tree.pane_mut(&pane_id) {
+                pane.selected = Some(opener);
+            }
+            self.focused_pane = pane_id;
+        }
     }
 
     /// `_remapTargets`: host identity changed or hosts merged.
@@ -661,6 +735,14 @@ impl Layout {
             map(&mut key);
             let server = if server == old_id { new_id.to_string() } else { server };
             self.explorer_focus.insert((server, workspace), key);
+        }
+        let openers: Vec<(String, String)> = self.openers.drain().collect();
+        for (mut key, mut opener) in openers {
+            map(&mut key);
+            map(&mut opener);
+            if key != opener {
+                self.set_opener(&key, opener);
+            }
         }
         self.changed();
     }
@@ -728,6 +810,17 @@ impl Layout {
                 pane.selected = pane.tabs.first().cloned();
             }
         }
+        if let Some(openers) = j::object(saved, "tabOpeners").as_object() {
+            for (key, opener) in openers {
+                if let Some(opener) = opener.as_str()
+                    && key != opener
+                    && layout.target(key).is_some()
+                    && layout.target(opener).is_some()
+                {
+                    layout.set_opener(key, opener.to_string());
+                }
+            }
+        }
         layout.explorer_visible = j::boolean(saved, "explorerVisible", false);
         if let Some(width) = j::number(saved, "explorerWidth") {
             layout.explorer_width = width.clamp(180.0, 1000.0);
@@ -741,9 +834,9 @@ impl Layout {
         layout
     }
 
-    /// Layout v2 JSON (`savePreferences` `layout`).
+    /// Layout v2 JSON (`savePreferences` `layout`); `tabOpeners` only while a detail tab is open.
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut saved = json!({
             "version": 2,
             "tabs": self.tabs.iter().map(PanelTarget::to_json).collect::<Vec<_>>(),
             "tree": self.tree.to_json(),
@@ -754,7 +847,11 @@ impl Layout {
             "explorerWidth": self.explorer_width,
             "sidebarWidth": self.sidebar_width,
             "sidebarVisible": self.sidebar_visible,
-        })
+        });
+        if !self.openers.is_empty() {
+            saved["tabOpeners"] = json!(self.openers);
+        }
+        saved
     }
 
     pub fn snapshot(&self) -> LayoutSnapshot {
@@ -827,6 +924,105 @@ mod tests {
 
     fn agent(id: &str) -> PanelTarget {
         PanelTarget::agent("srv", "ws", "/w", id, "")
+    }
+
+    fn file(path: &str) -> PanelTarget {
+        PanelTarget::new("file", "srv", "ws", "/w").with_id(path)
+    }
+
+    /// Sessions `a`, `b`, `c` as tabs with `a` shown, like a phone that restored its tabs.
+    fn sessions() -> Layout {
+        let mut layout = Layout::default();
+        for id in ["a", "b", "c"] {
+            layout.open(agent(id), false);
+        }
+        layout.select_tab(&agent("a").key());
+        layout
+    }
+
+    fn shown(layout: &Layout) -> Option<String> {
+        layout.selected().map(PanelTarget::key)
+    }
+
+    /// Compact Back as `commands::back` runs it: the detail tab closes, else `handle_back`.
+    fn back(layout: &mut Layout) -> bool {
+        match layout.compact_back_tab(true) {
+            Some(key) => {
+                layout.close_tab(&key);
+                true
+            }
+            None => layout.handle_back(true),
+        }
+    }
+
+    #[test]
+    fn compact_back_from_a_file_opened_in_a_chat_returns_to_that_session_then_to_the_sidebar() {
+        let mut layout = sessions();
+        let readme = file("docs/readme.md");
+        layout.open(readme.clone(), false);
+        assert_eq!(shown(&layout), Some(readme.key()));
+
+        assert!(back(&mut layout));
+        assert!(layout.target(&readme.key()).is_none());
+        assert_eq!(shown(&layout), Some(agent("a").key()));
+        assert_eq!(layout.compact_destination, CompactDestination::Agent);
+
+        assert!(back(&mut layout));
+        assert_eq!(layout.compact_destination, CompactDestination::Sidebar);
+        assert_eq!(shown(&layout), Some(agent("a").key()));
+        assert!(!back(&mut layout));
+    }
+
+    #[test]
+    fn compact_back_unwinds_files_that_link_to_each_other_down_to_the_session() {
+        let mut layout = sessions();
+        let (readme, guide) = (file("docs/readme.md"), file("docs/guide.md"));
+        layout.open(readme.clone(), false);
+        layout.open(guide.clone(), false);
+        // The guide links back to the readme, which is still open.
+        layout.open(readme.clone(), false);
+        assert_eq!(shown(&layout), Some(readme.key()));
+
+        assert!(back(&mut layout));
+        assert_eq!(shown(&layout), Some(guide.key()));
+        assert!(back(&mut layout));
+        assert_eq!(shown(&layout), Some(agent("a").key()));
+    }
+
+    #[test]
+    fn a_file_reopened_from_another_session_returns_to_that_session_after_a_restart() {
+        let mut layout = sessions();
+        let readme = file("docs/readme.md");
+        layout.open(readme.clone(), false);
+        // Left through the sidebar instead of Back, then linked again from session `b`.
+        layout.select_tab(&agent("b").key());
+        layout.open(readme.clone(), false);
+
+        let mut layout = Layout::restore(&layout.to_json());
+        assert_eq!(shown(&layout), Some(readme.key()));
+        assert!(back(&mut layout));
+        assert_eq!(shown(&layout), Some(agent("b").key()));
+        assert!(layout.to_json().get("tabOpeners").is_none());
+    }
+
+    #[test]
+    fn closing_a_file_follows_its_remaining_opener_or_else_its_neighbour() {
+        let mut layout = sessions();
+        let (readme, guide) = (file("docs/readme.md"), file("docs/guide.md"));
+        layout.open(readme.clone(), false);
+        layout.open(guide.clone(), false);
+        // The readme the guide came from closes first: the guide returns to the readme's session.
+        layout.close_tab(&readme.key());
+        assert_eq!(shown(&layout), Some(guide.key()));
+        layout.close_tab(&guide.key());
+        assert_eq!(shown(&layout), Some(agent("a").key()));
+
+        // Without its opener a closed tab hands over to the tab at its index, as before.
+        layout.open(readme.clone(), false);
+        layout.close_tab(&agent("a").key());
+        assert_eq!(shown(&layout), Some(readme.key()));
+        layout.close_tab(&readme.key());
+        assert_eq!(shown(&layout), Some(agent("c").key()));
     }
 
     #[test]

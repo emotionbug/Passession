@@ -1773,10 +1773,10 @@ impl PTextField {
                     color_empty: (hint), color_empty_hover: (hint), color_empty_focus: (hint),
                     text_style: { font_size: (font_size) }
                 }
-                draw_selection: { color: (theme::with_alpha(p.accent, 0.35)) }
                 draw_cursor: { color: (p.foreground) }
             },
         );
+        input.apply_over(cx, &theme::text_selection(theme::with_alpha(p.accent, 0.35)));
         input.redraw(cx);
     }
 }

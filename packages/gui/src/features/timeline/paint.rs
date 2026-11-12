@@ -103,6 +103,14 @@ impl RowState {
     pub fn copied_now(&self, key: &str, now: f64) -> bool {
         self.copied.get(key).is_some_and(|at| now - at < 1.5)
     }
+
+    /// The conversation returns to the screen (tab, pane or app shown again):
+    /// text received meanwhile is shown whole, like a first sight. Only
+    /// growth the reader watches is paced.
+    pub fn release_reveal_backlog(&mut self) {
+        self.markdown_worker.release_backlog();
+        self.reveals.clear();
+    }
 }
 
 /// One draw call's context.

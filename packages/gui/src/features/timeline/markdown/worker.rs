@@ -4,7 +4,7 @@
 
 use super::model::{self, Block, Inline, Style};
 use super::super::links::FileLinkSourceType;
-use super::super::reveal::{clamp_to_safe_reveal_boundary, compute_reveal_step, trim_incomplete_trailing_cluster};
+use super::super::reveal::{TEXT_REVEAL_FRAME_INTERVAL_S, clamp_to_safe_reveal_boundary, compute_reveal_step, trim_incomplete_trailing_cluster};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, LinkedList};
@@ -203,6 +203,7 @@ pub struct MarkdownWorker {
     epoch: u64,
     paced_bytes: usize,
     last_step: Option<f64>,
+    release: bool,
 }
 
 impl MarkdownWorker {
@@ -227,13 +228,15 @@ impl MarkdownWorker {
         }
         let text = entry.get("item").and_then(|item| item.get("text")).and_then(Value::as_str).unwrap_or("");
         let target = text.len();
-        if self.latest.is_none() || !live {
+        let release = std::mem::take(&mut self.release);
+        if self.latest.is_none() || !live || release {
             self.paced_bytes = target;
             self.last_step = None;
         } else {
             self.paced_bytes = self.paced_bytes.min(target);
             if self.paced_bytes < target {
-                let previous = self.last_step.replace(now).unwrap_or(now);
+                // use-revealed-text.ts: the first frame after growth counts as one interval.
+                let previous = self.last_step.replace(now).unwrap_or(now - TEXT_REVEAL_FRAME_INTERVAL_S);
                 self.paced_bytes += compute_reveal_step(target - self.paced_bytes, (now - previous) * 1000.0);
             } else {
                 self.last_step = None;
@@ -299,6 +302,12 @@ impl MarkdownWorker {
             }
         }
         self.is_pending()
+    }
+
+    /// The row returns to the screen after it was hidden: text received
+    /// meanwhile is shown whole on its next update, like a first sight.
+    pub fn release_backlog(&mut self) {
+        self.release = true;
     }
 
     /// The final paint pass must retain preparation demand from the dry pass.
@@ -612,5 +621,80 @@ mod tests {
         ]);
         assert_eq!(&paragraph.text[..paragraph.copy_end], "é漢 ");
         assert_eq!(paragraph.copy_end, code.copy_end);
+    }
+
+    const OWNER: (&str, &str, &str) = ("row", "host", "agent");
+
+    fn message(text: &str) -> Rc<Value> {
+        Rc::new(json!({"item": {"text": text}}))
+    }
+
+    #[test]
+    fn live_backlog_reaches_the_received_text_within_the_horizon_rule() {
+        let mut worker = MarkdownWorker::default();
+        worker.update(OWNER, message("a"), true, None, true, 100.0, None);
+        assert_eq!(worker.paced_bytes, 1, "first sight is whole");
+        let grown = message(&"a".repeat(10_001));
+        let mut now = 100.5;
+        worker.update(OWNER, grown.clone(), true, None, true, now, None);
+        assert_eq!(worker.paced_bytes, 1 + 10_000_usize.div_ceil(9), "growth starts on the frame that sees it");
+        let mut frames = 1;
+        while worker.paced_bytes < 10_001 {
+            now += 1.0 / 60.0;
+            frames += 1;
+            assert!(worker.update(OWNER, grown.clone(), true, None, true, now, None), "held-back text keeps frames scheduled");
+            assert!(frames < 70, "10 kB must not trail the stream for more than about 1.1s");
+        }
+        assert_eq!(worker.latest.as_ref().unwrap().bytes, 10_001);
+    }
+
+    #[test]
+    fn completion_releases_the_backlog_at_once() {
+        let mut worker = MarkdownWorker::default();
+        worker.update(OWNER, message("a"), true, None, true, 0.0, None);
+        let grown = message(&"a".repeat(50_000));
+        worker.update(OWNER, grown.clone(), true, None, true, 1.0, None);
+        assert!(worker.paced_bytes < 50_000);
+        worker.update(OWNER, grown, false, None, true, 1.01, None);
+        let latest = worker.latest.as_ref().unwrap();
+        assert_eq!((latest.bytes, latest.live), (50_000, false));
+    }
+
+    #[test]
+    fn text_received_while_hidden_is_shown_whole_on_return() {
+        let mut worker = MarkdownWorker::default();
+        worker.update(OWNER, message("a"), true, None, true, 0.0, None);
+        // Hidden: no preparation pass ran while the text arrived.
+        worker.release_backlog();
+        worker.update(OWNER, message(&"a".repeat(50_000)), true, None, true, 60.0, None);
+        assert_eq!(worker.latest.as_ref().unwrap().bytes, 50_000);
+        // Growth the reader watches is paced again.
+        worker.update(OWNER, message(&"a".repeat(60_000)), true, None, true, 60.02, None);
+        let bytes = worker.latest.as_ref().unwrap().bytes;
+        assert!(bytes > 50_000 && bytes < 60_000, "{bytes}");
+    }
+
+    #[test]
+    fn background_parse_keeps_frames_scheduled_until_its_result_is_published() {
+        let source = "# Title\n\nparagraph\n\n- item";
+        let complete = message(source);
+        let mut worker = MarkdownWorker::default();
+        // A complete historical message is parsed on the worker pool, never inline.
+        assert!(worker.update(OWNER, complete.clone(), false, None, true, 0.0, None));
+        assert!(worker.active.is_some() && worker.candidate.is_none());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while worker.candidate.is_none() {
+            assert!(worker.is_pending(), "the final paint must schedule a frame while the parse is in flight");
+            assert!(std::time::Instant::now() < deadline, "the parser result never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            // The next frame's preparation pass collects the result; no other event is needed.
+            assert!(worker.update(OWNER, complete.clone(), false, None, true, 0.0, None));
+        }
+        let revision = worker.candidate().unwrap().revision;
+        assert!(worker.is_pending(), "an unpublished candidate still needs its layout passes");
+        assert!(worker.publish(revision));
+        assert!(!worker.is_pending());
+        assert!(!worker.update(OWNER, complete, false, None, true, 0.0, None), "a published document stops scheduling frames");
+        assert_eq!(&*worker.published().unwrap().source, source);
     }
 }

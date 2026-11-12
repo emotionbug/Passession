@@ -4,6 +4,7 @@
 //! come first; additions follow and never change the frozen shapes.
 
 pub mod clock;
+pub mod file_drop;
 pub mod i18n;
 pub mod icons;
 pub mod json;
@@ -26,6 +27,7 @@ pub use paseo_gui_core::RequestId;
 
 pub fn live_design(cx: &mut Cx) {
     paint::live_design(cx);
+    file_drop::live_design(cx);
     widgets::live_design(cx);
     provider_icon::live_design(cx);
 }

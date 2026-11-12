@@ -26,7 +26,9 @@ public class MainActivity extends MakepadActivity {
         bridge = new PaseoBridge(this);
         super.onCreate(savedInstanceState);
         bridge.attachViews();
-        bridge.onIntent(getIntent());
+        // A recreated activity (process killed behind the browser or another app) gets its
+        // first launch intent again: that link or notification tap was already opened.
+        if (savedInstanceState == null) bridge.onIntent(getIntent());
         if (Build.VERSION.SDK_INT >= 33) {
             // DEFAULT leaves the IME's higher-priority dismissal ahead of app navigation.
             backCallback = () -> {

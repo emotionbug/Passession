@@ -446,9 +446,10 @@ fn panel_rows(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut Dra
 }
 
 /// Opens above the pill on wide layouts (12px offset, 280–620px wide, at most
-/// 440 tall) and as a bottom sheet on compact layouts.
+/// 440 tall) and as a bottom sheet on compact layouts, whose rows end
+/// `bottom_inset` (the system navigation inset inside `area`) above its edge.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut DrawIcon, model: &TrackModel, panel: TrackPanel, anchor: Rect, area: Rect) {
+pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut DrawIcon, model: &TrackModel, panel: TrackPanel, anchor: Rect, area: Rect, bottom_inset: f64) {
     let p = d.look.palette;
     let title = t(match panel {
         TrackPanel::Tasks => "message.todo.title",
@@ -462,14 +463,14 @@ pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut
         let content = d.measure(|d| panel_rows(cx, d, painter, icon, model, panel, area.pos.x, 0.0, w));
         let max_h = area.size.y * 0.8;
         let head = 24.0 + 16.0 + d.look.ui(14.0) * 1.3;
-        let h = (head + content + 4.0).min(max_h);
+        let h = (head + content + 4.0 + bottom_inset).min(max_h);
         let top = area.pos.y + area.size.y - h;
         let sheet = rect_xywh(area.pos.x, top, w, h + 12.0);
         d.kit.rect_full(cx, sheet, p.surface0, vec4(12.0, 12.0, 0.0, 0.0), p.border, 1.0);
         d.canvas.add_hit(sheet, HitTarget::Chrome("track-panel".into()));
         d.kit.rect(cx, rect_xywh(area.pos.x + w * 0.5 - 18.0, top + 10.0, 36.0, 4.0), p.surface2, 2.0);
         d.kit.label_line(cx, Font::Medium, d.look.ui(14.0), 1.3, p.foreground, dvec2(area.pos.x + 12.0, top + 28.0), &title, w - 24.0);
-        let body = rect_xywh(area.pos.x, top + head, w, h - head);
+        let body = rect_xywh(area.pos.x, top + head, w, (h - head - bottom_inset).max(0.0));
         let key = "track-panel:y".to_owned();
         let max_y = (content + 4.0 - body.size.y).max(0.0);
         d.state.extent_y.insert(key.clone(), max_y);

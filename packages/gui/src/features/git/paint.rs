@@ -245,6 +245,27 @@ impl GitPaint {
             .x
     }
 
+    /// One run of an unwrapped line that starts at `line_x`, centred like
+    /// [`text_centered`](Self::text_centered) and painted only if it reaches
+    /// `visible_from`; tabs keep the line's tab stops. Returns the x it ends at.
+    #[allow(clippy::too_many_arguments)]
+    pub fn line_run(
+        &mut self,
+        cx: &mut Cx2d,
+        font: Font,
+        size_px: f64,
+        color: Vec4,
+        line_x: f64,
+        x: f64,
+        top: f64,
+        height: f64,
+        text: &str,
+        visible_from: f64,
+    ) -> f64 {
+        self.painter
+            .line_run(cx, Self::spec(font, size_px, color), line_x, x, top, height, text, visible_from)
+    }
+
     /// Height of `text` word-wrapped at `max_width`.
     pub fn measure_wrapped(&mut self, cx: &mut Cx2d, font: Font, size_px: f64, text: &str, max_width: f64) -> f64 {
         if text.is_empty() {

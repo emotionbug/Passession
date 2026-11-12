@@ -17,6 +17,10 @@ different window's sheet or move its keyboard focus. Pointer routing and lifecyc
 broadcasts keep their existing behavior; the platform patch owns native source
 identity and unambiguous headless admission.
 
+The same filter drops `Event::Drag`/`Event::Drop` that the platform addressed to another
+window (`Cx::drag_event_is_for_window`): their position is in that window's coordinates,
+so a second window would otherwise hit-test a file drag meant for the first.
+
 ## Desktop scrollbar visibility
 
 `src/scroll_bar.rs` adds desktop auto-hide, enabled by `fade_when_idle` by
@@ -47,6 +51,13 @@ platforms, blink transitions cut the existing animator track and repaint once
 instead of scheduling opacity-animation frames. The 500 ms blink interval,
 focus handling, selection and editing behavior remain unchanged. This central
 change applies to every TextInput, including feature-owned fields.
+
+The caret is a solid bar on whole device pixels. Upstream filled it through
+`Sdf2d::box`, whose antialiasing leaves a 2px bar at about a third of its colour on
+1x displays (measured 31–39% on a 100%-scale Windows desktop), split unevenly over
+the pixel columns it straddles. `draw_cursor` now snaps the caret's position and
+size to the pass's device pixels (at least one pixel wide) and the shader returns
+the premultiplied colour without the distance field.
 
 ## Android composition
 
@@ -168,6 +179,14 @@ history sentinel and end padding. Replacing rows preserves drag/fling state.
 Two `scroll_anchor_tests` cover sentinel exclusion and unmeasured movement;
 the app's pagination latch is evaluated after layout.
 
+## Distance to the list end
+
+`src/portal_list.rs` adds `end_overflow` and `PortalListRef::end_overflow()`:
+how far the range's last row extends below the viewport at its final position,
+`None` while that row is not laid out. `is_at_end()` is exact, so one pixel
+short of the end read as "not at the end"; Paseo's jump-to-latest button hides
+within the original app's 32px of the newest edge instead. One
+`scroll_anchor_tests` case covers the distance, end padding and the unknown case.
 
 ## Rust 1.93 diagnostics
 

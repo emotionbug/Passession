@@ -324,8 +324,11 @@ impl WindowRef{
 
 impl Widget for Window {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        // Filter before nav, debug views and overlays: all can consume raw keys.
-        if !cx.keyboard_event_is_for_window(event, self.window.window_id()) {
+        // Filter before nav, debug views and overlays: all can consume raw keys. A drag
+        // over another window carries that window's coordinates.
+        if !cx.keyboard_event_is_for_window(event, self.window.window_id())
+            || !cx.drag_event_is_for_window(event, self.window.window_id())
+        {
             return;
         }
         if let Event::Draw(e) = event {

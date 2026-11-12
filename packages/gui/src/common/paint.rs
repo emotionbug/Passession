@@ -216,6 +216,29 @@ impl Painter {
         }
     }
 
+    /// One run of an unwrapped line that starts at `line_x`: the run begins at `x`, is centred
+    /// vertically in the band of `height` below `top`, and is painted only if it reaches
+    /// `visible_from`. A TAB inside the run advances to the tab stop of the line rather than
+    /// of the run, so a line painted run by run (syntax colours) matches the layout of its
+    /// whole text. Returns the x the run ends at.
+    #[allow(clippy::too_many_arguments)]
+    pub fn line_run(&mut self, cx: &mut Cx2d, spec: TextSpec, line_x: f64, x: f64, top: f64, height: f64, text: &str, visible_from: f64) -> f64 {
+        if text.is_empty() {
+            return x;
+        }
+        let line = single_line_text(text);
+        // Only a TAB depends on where the run starts; every other run keeps one cached layout.
+        let indent = if line.contains('\t') { x - line_x } else { 0.0 };
+        let drawer = self.prepare(spec);
+        let laid = drawer.layout(cx, indent as f32, 0.0, None, false, Align::default(), &line);
+        let size = dvec2(laid.size_in_lpxs.width as f64, laid.size_in_lpxs.height as f64);
+        let pos = dvec2(x - indent, top + (height - size.y) * 0.5);
+        if pos.x + size.x >= visible_from {
+            drawer.draw_abs_laidout(cx, pos, &laid);
+        }
+        pos.x + size.x
+    }
+
     /// Wrapped paragraph from `pos` within `max_width`; returns its size.
     pub fn paragraph(&mut self, cx: &mut Cx2d, pos: DVec2, max_width: f64, spec: TextSpec, text: &str) -> DVec2 {
         let laid = self.layout(cx, spec, text, Some(max_width));

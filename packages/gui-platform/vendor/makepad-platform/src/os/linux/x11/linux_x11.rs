@@ -187,14 +187,19 @@ impl Cx {
             XlibEvent::TextInput(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::TextInput(e))
             }
-            XlibEvent::Drag(e) => {
-                self.call_event_handler(&Event::Drag(e))
+            // Paseo: a drag has one target window and its position is in that window's
+            // space; `drag_hits` state cycles after every drag event as on macOS/Windows.
+            XlibEvent::Drag(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::Drag(e));
+                self.drag_drop.cycle_drag();
             }
-            XlibEvent::Drop(e) => {
-                self.call_event_handler(&Event::Drop(e))
+            XlibEvent::Drop(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::Drop(e));
+                self.drag_drop.cycle_drag();
             }
             XlibEvent::DragEnd => {
-                self.call_event_handler(&Event::DragEnd)
+                self.call_event_handler(&Event::DragEnd);
+                self.drag_drop.cycle_drag();
             }
             XlibEvent::KeyDown(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::KeyDown(e))

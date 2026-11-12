@@ -459,32 +459,32 @@ pub fn laidout_size(laidout: &LaidoutText) -> DVec2 {
 
 /// Rects (relative to the text origin) covering bytes `start..end`.
 pub fn range_rects(laidout: &LaidoutText, start: usize, end: usize) -> Vec<Rect> {
-    if end <= start {
-        return Vec::new();
-    }
-    let selection = Selection {
-        anchor: Cursor { index: start.min(laidout.text.len()), prefer_next_row: false },
-        cursor: Cursor { index: end.min(laidout.text.len()), prefer_next_row: false },
-    };
-    laidout
-        .selection_rects_in_lpxs(selection)
-        .into_iter()
-        .map(|r| Rect { pos: dvec2(r.origin.x as f64, r.origin.y as f64), size: dvec2(r.size.width as f64, r.size.height as f64) })
-        .collect()
+    range_rects_between(laidout, start, end, f32::NEG_INFINITY, f32::INFINITY)
 }
 
 /// Paint-only range geometry. Source offsets and hit-testing keep the full layout.
 pub fn range_rects_visible(laidout: &LaidoutText, start: usize, end: usize, pos: DVec2, viewport: Option<Rect>) -> Vec<Rect> {
     let Some(viewport) = viewport else { return range_rects(laidout, start, end) };
+    range_rects_between(laidout, start, end, (viewport.pos.y - pos.y) as f32, (viewport.pos.y + viewport.size.y - pos.y) as f32)
+}
+
+/// A byte range has no caret affinity: at a soft wrap its first byte belongs to
+/// the row that draws it and its end to the row of its last byte. A fragment
+/// without width covers no glyph (a range starting at a row's hanging spaces or
+/// line break), so padded backgrounds must not receive it.
+fn range_rects_between(laidout: &LaidoutText, start: usize, end: usize, top: f32, bottom: f32) -> Vec<Rect> {
+    let start = start.min(laidout.text.len());
+    let end = end.min(laidout.text.len());
     if end <= start {
         return Vec::new();
     }
     let selection = Selection {
-        anchor: Cursor { index: start.min(laidout.text.len()), prefer_next_row: false },
-        cursor: Cursor { index: end.min(laidout.text.len()), prefer_next_row: false },
+        anchor: Cursor { index: start, prefer_next_row: true },
+        cursor: Cursor { index: end, prefer_next_row: false },
     };
-    laidout.selection_rects_in_lpxs_clipped(selection, (viewport.pos.y - pos.y) as f32, (viewport.pos.y + viewport.size.y - pos.y) as f32)
+    laidout.selection_rects_in_lpxs_clipped(selection, top, bottom)
         .into_iter()
+        .filter(|r| r.size.width > 0.0)
         .map(|r| Rect { pos: dvec2(r.origin.x as f64, r.origin.y as f64), size: dvec2(r.size.width as f64, r.size.height as f64) })
         .collect()
 }
@@ -895,5 +895,108 @@ mod selection_handle_tests {
         let mut expected = expected;
         expected.selection = canvas.selection;
         assert_eq!(canvas.selection_source_hash(), expected.selection_source_hash());
+    }
+}
+
+#[cfg(test)]
+mod range_rect_tests {
+    use super::*;
+    use makepad_widgets::makepad_draw::text::font::FontId;
+    use makepad_widgets::makepad_draw::text::layouter::{Layouter, Settings};
+    use makepad_widgets::makepad_draw::text::loader::{FontDefinition, FontFamilyDefinition};
+
+    fn layout(layouter: &mut Layouter, text: &str, width: Option<f32>) -> Rc<LaidoutText> {
+        let family = FontFamilyId::from("paseo-range-rect-test");
+        if !layouter.is_font_family_known(family) {
+            let font = FontId::from("paseo-range-rect-test");
+            layouter.define_font(font, FontDefinition {
+                data: Arc::new(include_bytes!("../../../resources/fonts/Jetendard-Regular.ttf").to_vec()),
+                index: 0,
+                ascender_fudge_in_ems: 0.0,
+                descender_fudge_in_ems: 0.0,
+            });
+            layouter.define_font_family(family, FontFamilyDefinition { font_ids: vec![font] });
+        }
+        layouter.get_or_layout(BorrowedLayoutParams {
+            text,
+            spans: &[Span { style: Style { font_family_id: family, font_size_in_pts: 12.0, color: None }, len: text.len() }],
+            options: LayoutOptions { wrap: width.is_some(), max_width_in_lpxs: width, ..LayoutOptions::default() },
+        })
+    }
+
+    fn row_top(laidout: &LaidoutText, row: usize) -> f64 {
+        (laidout.rows[row].origin_in_lpxs.y - laidout.rows[row].ascender_in_lpxs) as f64
+    }
+
+    /// An inline-code chip pads every rect of its range, so a row the range
+    /// only touches at its wrap boundary must not get one.
+    #[test]
+    fn a_range_moved_to_the_next_row_leaves_no_fragment_behind() {
+        let mut layouter = Layouter::new(Settings::default());
+        let text = "before code after";
+        let width = layout(&mut layouter, "before co", None).size_in_lpxs.width;
+        let laidout = layout(&mut layouter, text, Some(width));
+        let code = text.find("code").unwrap();
+        assert_eq!(laidout.rows[0].text.as_str(), "before ");
+        assert_eq!(laidout.rows[1].text.start_in_parent(), code);
+
+        for rects in [
+            range_rects(&laidout, code, code + 4),
+            range_rects_visible(&laidout, code, code + 4, DVec2::default(), Some(rect_xywh(0.0, 0.0, 1000.0, 1000.0))),
+        ] {
+            assert_eq!(rects.len(), 1, "{rects:?}");
+            assert_eq!(rects[0].pos.y, row_top(&laidout, 1));
+            assert!(rects[0].size.x > 0.0);
+        }
+
+        // A range ending at the wrap stays on its own row.
+        let rects = range_rects(&laidout, 0, code);
+        assert_eq!(rects.len(), 1, "{rects:?}");
+        assert_eq!(rects[0].pos.y, row_top(&laidout, 0));
+
+        // A range crossing the wrap has glyphs on both rows.
+        let rects = range_rects(&laidout, 3, code + 2);
+        assert_eq!(rects.iter().map(|r| r.pos.y).collect::<Vec<_>>(), [row_top(&laidout, 0), row_top(&laidout, 1)]);
+        assert!(rects.iter().all(|r| r.size.x > 0.0));
+    }
+
+    /// A tab-indented file in a Read sheet, code block or diff: each TAB is a blank advance to
+    /// the next four-cell stop (Hangul takes two cells), the CR of a CRLF line takes no room,
+    /// nothing falls back to the missing-glyph box, and selection still copies the source.
+    #[test]
+    fn tab_indented_source_keeps_columns_without_missing_glyphs() {
+        let mut layouter = Layouter::new(Settings::default());
+        let cell = layout(&mut layouter, "0", None).size_in_lpxs.width;
+        let body = "<modelVersion>4.0.0</modelVersion>";
+        let text = format!("<project>\n\t{body}\r\n\t\t<!-- 한\t글 -->");
+        let laidout = layout(&mut layouter, &text, None);
+        assert_eq!(laidout.rows.len(), 3);
+        assert_eq!(laidout.rows[1].text.as_str(), format!("\t{body}\r"));
+        assert!(laidout.rows.iter().all(|row| row.glyphs.iter().all(|glyph| glyph.id != 0)));
+        let column = |row: usize, index: usize| laidout.rows[row].index_to_x_in_lpxs(index) / cell;
+        let near = |actual: f32, expected: f32| (actual - expected).abs() < 0.02;
+
+        // One leading tab: the tag starts at the first stop; the CR adds no width.
+        assert!(near(column(1, 1), 4.0), "{}", column(1, 1));
+        assert!(near(laidout.rows[1].width_in_lpxs / cell, 4.0 + body.len() as f32));
+        // Two leading tabs, then a tab after `<!-- 한` (five cells and a two-cell syllable).
+        let row = laidout.rows[2].text.as_str();
+        assert!(near(column(2, row.find('<').unwrap()), 8.0));
+        assert!(near(column(2, row.find('한').unwrap() + '한'.len_utf8()), 15.0));
+        assert!(near(column(2, row.find('글').unwrap()), 16.0), "{}", column(2, row.find('글').unwrap()));
+
+        // Hit testing and selection geometry follow the stops.
+        assert_eq!(laidout.rows[1].x_in_lpxs_to_index(cell), 0);
+        assert_eq!(laidout.rows[1].x_in_lpxs_to_index(4.0 * cell + 0.1), 1);
+        let tab = text.find('\t').unwrap();
+        let rects = range_rects(&laidout, tab, tab + 1);
+        assert_eq!(rects.len(), 1, "{rects:?}");
+        assert!((rects[0].size.x - 4.0 * cell as f64).abs() < 0.02, "{rects:?}");
+
+        // Copying yields the original characters, TAB and CR included.
+        let mut canvas = Canvas::default();
+        canvas.add_run(laidout.clone(), DVec2::default(), None);
+        canvas.selection = Some((0, canvas.source_len()));
+        assert_eq!(canvas.selected_text().as_deref(), Some(text.as_str()));
     }
 }

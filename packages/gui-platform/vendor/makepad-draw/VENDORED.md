@@ -25,6 +25,25 @@ with trailing spaces; grapheme fitting keeps the upstream estimate.
 positions, and nonbreaking spaces using the adjacent widgets crate's existing
 Liberation Mono fixture. No font resources are added.
 
+## Tabs and control characters
+
+Upstream shapes control characters as themselves. No font maps them, so every
+font of the family returns `.notdef` and the last one draws its box.
+`src/text/shaper.rs` shapes each control character (`char::is_control`: C0, DEL,
+C1) as a space instead, keeping its own cluster, so the shaped text, row
+substrings and glyph count per byte are unchanged for selection, copy and find.
+A TAB keeps the space advance as its unit and is flagged; all other controls
+(the CR of CRLF, form feed, ESC, ...) get a zero advance. The right-to-left
+placeholder reshaping keeps them blank as well.
+
+`src/text/layouter.rs` resolves a TAB's advance when the glyph is placed: the
+distance from its row-local x (including `first_row_indent_in_lpxs`) to the next
+multiple of `TAB_STOP_IN_SPACES` (4) space advances. The word/grapheme fitter
+measures candidates from the row position they would start at, so wrapping sees
+the same widths; trailing tabs hang like other breakable whitespace.
+`paseo_linebreak_tests` covers tab stops with cursor/selection geometry, the
+zero-width controls and wrapping.
+
 ## Retained asynchronous layout
 
 `text::AsyncLayout` runs the existing exact layouter with an independent CPU font

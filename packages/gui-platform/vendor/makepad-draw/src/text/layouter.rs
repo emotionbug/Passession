@@ -226,7 +226,7 @@ impl<'a> LayoutContext<'a> {
             SegmentKind::Word,
         );
         while !fitter.is_empty() {
-            match fitter.fit(self.remaining_width_in_lpxs().unwrap()) {
+            match fitter.fit(self.current_point_in_lpxs.x, self.remaining_width_in_lpxs().unwrap()) {
                 Some(text) => self.append_text(style, &text),
                 None => {
                     if self.current_row_is_empty() && !self.current_row_is_continuation() {
@@ -247,7 +247,7 @@ impl<'a> LayoutContext<'a> {
             SegmentKind::Grapheme,
         );
         while !fitter.is_empty() {
-            match fitter.fit(self.remaining_width_in_lpxs().unwrap()) {
+            match fitter.fit(self.current_point_in_lpxs.x, self.remaining_width_in_lpxs().unwrap()) {
                 Some(text) => self.append_text(style, &text),
                 None => {
                     if self.current_row_is_empty() {
@@ -273,15 +273,16 @@ impl<'a> LayoutContext<'a> {
     fn append_text(&mut self, style: Style, text: &ShapedText) {
         use super::num::Zero;
 
+        let font_size_in_lpxs = style.font_size_in_lpxs();
         for glyph in &text.glyphs {
             let mut glyph = LaidoutGlyph {
                 origin_in_lpxs: Point::ZERO,
                 font: glyph.font.clone(),
-                font_size_in_lpxs: style.font_size_in_lpxs(),
+                font_size_in_lpxs,
                 color: style.color,
                 id: glyph.id,
                 cluster: self.current_row_len() + glyph.cluster,
-                advance_in_ems: glyph.advance_in_ems,
+                advance_in_ems: glyph.advance_in_ems_at(self.current_point_in_lpxs.x, font_size_in_lpxs),
                 offset_in_ems: glyph.offset_in_ems,
                 paint_bounds_in_ems: glyph.font.paint_bounds_in_ems(glyph.id),
             };
@@ -442,14 +443,15 @@ impl Fitter {
         self.text.is_empty()
     }
 
-    fn fit(&mut self, wrap_width_in_lpxs: f32) -> Option<Rc<ShapedText>> {
+    /// `x_in_lpxs` is where the fitted text starts in its row: TAB stops depend on it.
+    fn fit(&mut self, x_in_lpxs: f32, wrap_width_in_lpxs: f32) -> Option<Rc<ShapedText>> {
         // Bracket the next line locally, rather than shaping half the remaining
         // paragraph on every row. As in the original binary search, fitting is
         // monotonic in the ordered Unicode break opportunities.
         let mut min_count = 1;
         let mut max_count = 1;
         let mut best_count = None;
-        while max_count <= self.lens.len() && self.can_fit(max_count, wrap_width_in_lpxs) {
+        while max_count <= self.lens.len() && self.can_fit(max_count, x_in_lpxs, wrap_width_in_lpxs) {
             best_count = Some(max_count);
             min_count = max_count + 1;
             max_count = max_count.saturating_mul(2);
@@ -457,7 +459,7 @@ impl Fitter {
         max_count = max_count.min(self.lens.len() + 1);
         while min_count < max_count {
             let mid_count = min_count + (max_count - min_count) / 2;
-            if self.can_fit(mid_count, wrap_width_in_lpxs) {
+            if self.can_fit(mid_count, x_in_lpxs, wrap_width_in_lpxs) {
                 best_count = Some(mid_count);
                 min_count = mid_count + 1;
             } else {
@@ -478,7 +480,7 @@ impl Fitter {
         }
     }
 
-    fn can_fit(&self, count: usize, wrap_width_in_lpxs: f32) -> bool {
+    fn can_fit(&self, count: usize, x_in_lpxs: f32, wrap_width_in_lpxs: f32) -> bool {
         let len = self.lens.iter().take(count).sum();
         let candidate = self.text.substr(0..len);
         // Fit the ink before trailing breakable whitespace, but return the complete
@@ -501,7 +503,7 @@ impl Fitter {
             }
         }
         let text = self.font_family.get_or_shape(candidate.substr(..measured_len));
-        let actual_width_in_lpxs = text.width_in_ems * self.font_size_in_lpxs;
+        let actual_width_in_lpxs = text.width_in_lpxs_at(x_in_lpxs, self.font_size_in_lpxs);
         if actual_width_in_lpxs > wrap_width_in_lpxs {
             return false;
         }
@@ -990,5 +992,89 @@ mod paseo_linebreak_tests {
         let result = layout(&mut layouter, style, "a b\u{a0}c", Some(width));
         let rows: Vec<_> = result.rows.iter().map(|row| row.text.as_str()).collect();
         assert_eq!(rows, ["a ", "b\u{a0}c"]);
+    }
+
+    fn cell(layouter: &mut Layouter, style: Style) -> f32 {
+        layout(layouter, style, "0", None).size_in_lpxs.width
+    }
+
+    fn near(actual: f32, expected: f32) -> bool {
+        (actual - expected).abs() < 0.01
+    }
+
+    #[test]
+    fn tabs_are_blank_glyphs_advancing_to_column_stops() {
+        let (mut layouter, style) = layouter();
+        let cell = cell(&mut layouter, style);
+        let space = layout(&mut layouter, style, " ", None).rows[0].glyphs[0].id;
+        let text = "\t\tab\tc\n1\t2";
+        let result = layout(&mut layouter, style, text, None);
+        let rows: Vec<_> = result.rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(rows, ["\t\tab\tc", "1\t2"]);
+        assert_eq!(result.text.as_str(), text);
+        for row in &result.rows {
+            for glyph in &row.glyphs {
+                assert_ne!(glyph.id, 0, "missing glyph at byte {} of {:?}", glyph.cluster, row.text.as_str());
+                if row.text.as_bytes()[glyph.cluster] == b'\t' {
+                    assert_eq!(glyph.id, space);
+                }
+            }
+        }
+        // Leading tabs indent by whole stops; a tab after text reaches the next stop.
+        let columns = [0.0, 4.0, 8.0, 9.0, 10.0, 12.0, 13.0];
+        for (index, column) in columns.into_iter().enumerate() {
+            let x = result.rows[0].index_to_x_in_lpxs(index);
+            assert!(near(x / cell, column), "byte {index} at {} cells", x / cell);
+            let cursor = Cursor { index, prefer_next_row: true };
+            assert_eq!(result.position_to_cursor(result.cursor_to_position(cursor)).index, index);
+        }
+        assert!(near(result.rows[1].index_to_x_in_lpxs(2) / cell, 4.0));
+        let first_tab = result.selection_rects_in_lpxs(Selection {
+            anchor: Cursor { index: 0, prefer_next_row: true },
+            cursor: Cursor { index: 1, prefer_next_row: false },
+        });
+        assert!(near(first_tab[0].size.width / cell, 4.0));
+    }
+
+    #[test]
+    fn other_controls_are_blank_and_zero_width() {
+        let (mut layouter, style) = layouter();
+        let cell = cell(&mut layouter, style);
+        let text = "a\r\nb\u{1b}[0m\u{c}\u{7f}\u{85}";
+        let result = layout(&mut layouter, style, text, None);
+        let rows: Vec<_> = result.rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(rows, ["a\r", "b\u{1b}[0m\u{c}\u{7f}\u{85}"]);
+        assert!(result.rows.iter().all(|row| row.glyphs.iter().all(|glyph| glyph.id != 0)));
+        assert!(near(result.rows[0].width_in_lpxs / cell, 1.0));
+        assert!(near(result.rows[1].width_in_lpxs / cell, 4.0));
+    }
+
+    #[test]
+    fn wrapping_measures_tabs_at_their_stops_and_hangs_them() {
+        let (mut layouter, style) = layouter();
+        let cell = cell(&mut layouter, style);
+        let text = "ab\tcd";
+        assert!(near(layout(&mut layouter, style, text, None).size_in_lpxs.width / cell, 6.0));
+        let mut rows = |width: f32| -> Vec<String> {
+            layout(&mut layouter, style, text, Some(width)).rows.iter().map(|row| row.text.as_str().to_owned()).collect()
+        };
+        assert_eq!(rows(6.0 * cell + 0.01), ["ab\tcd"]);
+        // Counting the TAB as one space would claim five cells and overflow this row.
+        assert_eq!(rows(5.0 * cell + 0.01), ["ab\t", "cd"]);
+    }
+
+    #[test]
+    fn a_first_row_indent_continues_the_tab_stops_of_its_line() {
+        let (mut layouter, style) = layouter();
+        let cell = cell(&mut layouter, style);
+        // A run painted two cells into a line: its TAB ends at the line's first stop.
+        let text = "\tc";
+        let result = layouter.get_or_layout(BorrowedLayoutParams {
+            text,
+            spans: &[Span { style, len: text.len() }],
+            options: LayoutOptions { first_row_indent_in_lpxs: 2.0 * cell, ..LayoutOptions::default() },
+        });
+        assert!(near(result.rows[0].index_to_x_in_lpxs(1) / cell, 4.0));
+        assert!(near(result.size_in_lpxs.width / cell, 5.0));
     }
 }

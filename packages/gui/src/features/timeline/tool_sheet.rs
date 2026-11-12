@@ -29,12 +29,16 @@ pub const OPEN_SECS: f64 = 0.25;
 pub type SheetBody<'a> = &'a dyn Fn(&mut Cx2d, &mut Draw, f64, f64, f64, f64) -> f64;
 
 /// Paints the sheet over `rect`; `progress` is the open animation (0..1).
+/// `bottom_inset` is the system navigation inset inside `rect`'s bottom edge:
+/// the sheet's background covers it, the body ends above it.
 /// Registers `Chrome("scrim")`, `Chrome("sheet:body")`, `Chrome("sheet:close")`
 /// and the body's `ScrollY("sheet:y")`. Returns the sheet rect.
+#[allow(clippy::too_many_arguments)]
 pub fn paint_detail_sheet(
     cx: &mut Cx2d,
     d: &mut Draw,
     rect: Rect,
+    bottom_inset: f64,
     header: &SheetHeader,
     progress: f64,
     pin_to_end: bool,
@@ -70,7 +74,7 @@ pub fn paint_detail_sheet(
     d.kit.rect(cx, rect_xywh(sheet.pos.x, header_y + header_height, sheet.size.x, 1.0), p.border, 0.0);
     // The body scrolls inside the visible part of the 95% layout.
     let body_top = header_y + header_height + 1.0;
-    let view = rect_xywh(sheet.pos.x, body_top, sheet.size.x, (rect.pos.y + rect.size.y - body_top).max(1.0));
+    let view = rect_xywh(sheet.pos.x, body_top, sheet.size.x, (rect.pos.y + rect.size.y - bottom_inset - body_top).max(1.0));
     let fill = (full - 24.0 - header_height - 1.0).max(0.0);
     let content = d.measure(|d| body(cx, d, view.pos.x, 0.0, view.size.x, fill));
     let key = "sheet:y".to_owned();
@@ -323,7 +327,9 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
             let detail = sheet.detail.clone();
             let tool_name = sheet.title.clone();
             let mut d = Draw { kit: &mut *kit, canvas: &mut layer.canvas, look, state: &mut sheet.state, now, area: layer.area, animating: false };
-            paint_detail_sheet(cx, &mut d, window, &header, progress, false, &|cx, d, x, y, w, fill| {
+            // An overlay root: it reaches the window's bottom edge and owns the system-bar padding.
+            let bottom_inset = crate::shell::platform::safe_insets().bottom;
+            paint_detail_sheet(cx, &mut d, window, bottom_inset, &header, progress, false, &|cx, d, x, y, w, fill| {
                 let blocks = detail_blocks(&detail, Some(&tool_name), None, &|k| t(k));
                 let skeleton = tools::is_pending_tool_call_detail(&detail, "completed", &Value::Null);
                 draw_details(cx, d, &blocks, detail_is_full_bleed(&detail), skeleton, "standalone:sheet:detail", x, y, w, None, Some(fill))

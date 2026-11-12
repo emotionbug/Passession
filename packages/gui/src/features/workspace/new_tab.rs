@@ -28,6 +28,7 @@ use super::observe::{ObsEvent, Observation};
 use super::rpc::{array_of, new_id, object_of, payload, require_success, str_of, str_or, Pending, RpcError};
 use super::select::{Leading, SelectOption, SelectRequest, WaSelectWidgetExt, WaSelectWidgetRefExt};
 use crate::common::{PanelTarget, TabPlacement, UiContext, UiEffect};
+use crate::common::file_drop::FileDropZone;
 use crate::common::overlay::{self, MenuItem};
 use crate::features::composer::forge::ForgeAutoAttach;
 use crate::features::composer::{agent_form, attachments, controls_model, forge, ops};
@@ -47,6 +48,7 @@ live_design! {
     use crate::theme::*;
     use crate::common::widgets::*;
     use crate::common::paint::PaseoPainter;
+    use crate::common::file_drop::FileDropZone;
     use crate::common::provider_icon::ProviderIcon;
     use crate::features::composer::ui::draw::DrawComposerImage;
     use crate::features::workspace::kit::*;
@@ -81,6 +83,7 @@ live_design! {
 
     pub WaNewTabView = {{WaNewTabView}} {
         width: Fill, height: Fill, flow: Overlay
+        file_drop: <FileDropZone> {}
         wa_root = <Surface> {
             width: Fill, height: Fill, flow: Overlay
             role: Surface0
@@ -440,6 +443,8 @@ enum Req {
     ForgePicker,
     Images,
     Upload,
+    /// Dropped files were inspected off the GUI thread.
+    Dropped,
     /// `create_terminal_request` of a Terminal launch.
     CreateTerminal { workspace_id: String, cwd: String },
 }
@@ -574,6 +579,13 @@ pub struct WaNewTabView {
     attachment_forge_scope: Option<(String, String)>,
     #[rust]
     upload_name: Option<String>,
+    /// new-workspace-screen.tsx `FileDropZone`: the whole screen takes dropped files for
+    /// the composer card.
+    #[live]
+    file_drop: FileDropZone,
+    /// A drop is being inspected (`Req::Dropped`).
+    #[rust]
+    drop_pending: bool,
     #[rust]
     forge_auto: ForgeAutoAttach,
     #[rust]
@@ -1412,6 +1424,14 @@ impl WaNewTabView {
                 Ok(Err(error)) => self.toast_upload_error(ctx, str_of(&error, "message")),
                 Err(error) => self.toast_upload_error(ctx, &error.to_string()),
             },
+            Req::Dropped => {
+                self.drop_pending = false;
+                match result.map(|v| ops::open_envelope(&v)) {
+                    Ok(Ok(body)) => self.attach_dropped(ctx, array_of(&body, "files")),
+                    Ok(Err(error)) => self.toast_upload_error(ctx, str_of(&error, "message")),
+                    Err(error) => self.toast_upload_error(ctx, &error.to_string()),
+                }
+            }
             Req::Upload => {
                 self.upload_name = None;
                 match result.map(|v| ops::open_envelope(&v)) {
@@ -1598,18 +1618,16 @@ impl WaNewTabView {
                     self.pending.track(id, "images", Req::Images);
                 }
                 (PlatformReq::PickFiles, Ok(PlatformValue::Files(files))) if !files.is_empty() => {
-                    if let Err(too_large) = attachments::check_upload_sizes(files.iter().map(|f| (f.name.as_str(), f.size))) {
-                        let message = ta("composer.errors.fileTooLarge", &[("size", "50MB"), ("fileName", &too_large.file_name)]);
-                        ctx.effects.push(UiEffect::Toast { message, is_error: true });
-                        continue;
-                    }
-                    let list: Vec<_> = files
+                    let files = files
                         .iter()
-                        .map(|f| (f.path.clone(), f.name.clone(), f.mime_type.clone().unwrap_or_else(|| attachments::mime_type_for_path(&f.name).to_owned())))
+                        .map(|f| UploadFile {
+                            path: f.path.clone(),
+                            name: f.name.clone(),
+                            mime: f.mime_type.clone().unwrap_or_else(|| attachments::mime_type_for_path(&f.name).to_owned()),
+                            size: f.size,
+                        })
                         .collect();
-                    self.upload_name = files.last().map(|f| f.name.clone());
-                    let id = ctx.core.operation(&self.target.host_id, move |client| ops::upload_files(client, list));
-                    self.pending.track(id, "upload", Req::Upload);
+                    self.upload_files(ctx, files);
                 }
                 (PlatformReq::Paste, Ok(PlatformValue::Clipboard(content))) => {
                     if content.images.is_empty() {
@@ -1631,6 +1649,62 @@ impl WaNewTabView {
                 _ => {}
             }
             self.view.redraw(cx);
+        }
+    }
+
+    /// actions.ts uploadFileAttachments: every file is size-checked before any upload starts.
+    fn upload_files(&mut self, ctx: &mut UiContext, files: Vec<UploadFile>) {
+        if let Err(too_large) = attachments::check_upload_sizes(files.iter().map(|f| (f.name.as_str(), f.size))) {
+            let message = ta("composer.errors.fileTooLarge", &[("size", "50MB"), ("fileName", &too_large.file_name)]);
+            ctx.effects.push(UiEffect::Toast { message, is_error: true });
+            return;
+        }
+        if !self.connected {
+            ctx.effects.push(UiEffect::Toast { message: t("composer.errors.daemonClientDisconnected"), is_error: true });
+            return;
+        }
+        self.upload_name = files.last().map(|f| f.name.clone());
+        let list: Vec<_> = files.into_iter().map(|f| (f.path, f.name, f.mime)).collect();
+        let id = ctx.core.operation(&self.target.host_id, move |client| ops::upload_files(client, list));
+        self.pending.track(id, "upload", Req::Upload);
+    }
+
+    /// Whether the composer card can take dropped files now (composer/index.tsx
+    /// `useFileDrop` `disabled`): it is shown and neither submitting nor uploading.
+    fn accepts_file_drop(&self) -> bool {
+        !self.terminal() && !self.busy && self.intent.is_none() && !self.drop_pending && self.upload_name.is_none()
+    }
+
+    /// Files dropped anywhere on the screen: inspected off the GUI thread, then attached.
+    fn drop_files(&mut self, ctx: &mut UiContext, paths: Vec<std::path::PathBuf>) {
+        self.drop_pending = true;
+        let id = ctx.core.operation(&self.target.host_id, move |_client| async move { Ok(stat_files(paths)) });
+        self.pending.track(id, "dropped", Req::Dropped);
+    }
+
+    /// `useFileDrop`: raster images join the tray (`onFiles`), every other file uploads
+    /// (`onGenericFiles`).
+    fn attach_dropped(&mut self, ctx: &mut UiContext, files: &[Value]) {
+        let mut images = Vec::new();
+        let mut uploads = Vec::new();
+        for file in files {
+            let (path, name) = (std::path::PathBuf::from(str_of(file, "path")), str_of(file, "name"));
+            match attachments::raster_image_mime_type(name) {
+                Some(mime) => images.push((path, mime.to_owned())),
+                None => uploads.push(UploadFile {
+                    path,
+                    name: name.to_owned(),
+                    mime: attachments::mime_type_for_path(name).to_owned(),
+                    size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
+                }),
+            }
+        }
+        if !images.is_empty() {
+            let id = ctx.core.operation(&self.target.host_id, move |_client| async move { Ok(encode_images(images)) });
+            self.pending.track(id, "images", Req::Images);
+        }
+        if !uploads.is_empty() {
+            self.upload_files(ctx, uploads);
         }
     }
 
@@ -2524,6 +2598,28 @@ fn encode_images(files: Vec<(std::path::PathBuf, String)>) -> Value {
     json!({ "ok": true, "payload": { "images": images } })
 }
 
+/// A local file about to upload: its path, name, MIME type and size.
+struct UploadFile {
+    path: std::path::PathBuf,
+    name: String,
+    mime: String,
+    size: u64,
+}
+
+/// Inspects dropped files off the GUI thread (`{"ok", "payload": {"files": [{"path", "name",
+/// "size"}]}}`).
+fn stat_files(paths: Vec<std::path::PathBuf>) -> Value {
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned());
+        match std::fs::metadata(&path) {
+            Ok(metadata) => files.push(json!({ "path": path.to_string_lossy(), "name": name, "size": metadata.len() })),
+            Err(error) => return json!({ "ok": false, "error": { "message": format!("{name}: {error}") } }),
+        }
+    }
+    json!({ "ok": true, "payload": { "files": files } })
+}
+
 /// Forgets a pending timeout; its event is then ignored.
 fn forget_timer(timer: &mut Timer) {
     *timer = Timer::default();
@@ -2541,6 +2637,12 @@ impl Widget for WaNewTabView {
                         self.handle_pick(cx, "attach", value.to_owned(), ctx);
                     }
                 }
+            }
+            // file-drop-zone.tsx: files dropped anywhere on the screen go to the composer card.
+            let drop_ready = self.accepts_file_drop();
+            if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
+                self.drop_files(ctx, paths);
+                self.view.redraw(cx);
             }
             if self.directory_timer.is_event(event).is_some() {
                 self.directory_timer = Timer::default();
@@ -2587,6 +2689,9 @@ impl Widget for WaNewTabView {
                 self.view.wa_input(id!(prompt)).set_key_focus(cx);
             }
         }
+        // The drop backdrop covers the whole screen.
+        let zone = self.view.area().rect(cx);
+        self.file_drop.draw(cx, zone);
         step
     }
 }

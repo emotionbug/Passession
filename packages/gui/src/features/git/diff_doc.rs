@@ -13,6 +13,7 @@ use crate::common::paint::intersect;
 use crate::features::timeline::canvas::{floor_char_boundary, range_rects};
 use makepad_widgets::*;
 use makepad_widgets::makepad_draw::text::layouter::LaidoutText;
+use makepad_widgets::makepad_draw::text::shaper::TAB_STOP_IN_SPACES;
 use paseo_highlight::{ColorScheme, HighlightStyle, SyntaxThemeId, highlight_code, resolve_syntax_colors};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -61,7 +62,8 @@ struct FileModel {
     revision: u64,
     lines: Vec<DiffLine>,
     max_line: i64,
-    max_chars: usize,
+    /// Widest line in display columns (see [`display_columns`]).
+    max_columns: usize,
     expanded: HashSet<usize>,
     rows: Option<(bool, Vec<Row>)>,
     runs: Option<HashMap<usize, Vec<Run>>>,
@@ -78,16 +80,16 @@ impl FileModel {
     fn new(patch: &Value, revision: u64) -> Self {
         let lines = number_diff(patch);
         let mut max_line = 0;
-        let mut max_chars = 0;
+        let mut max_columns = 0;
         for line in &lines {
             max_line = max_line.max(line.old_number.unwrap_or(0)).max(line.new_number.unwrap_or(0));
-            max_chars = max_chars.max(line.content.chars().count());
+            max_columns = max_columns.max(display_columns(&line.content));
         }
         Self {
             revision,
             lines,
             max_line,
-            max_chars,
+            max_columns,
             expanded: HashSet::new(),
             rows: None,
             runs: None,
@@ -176,7 +178,7 @@ impl FileModel {
     fn runs(&mut self, path: &str) -> &HashMap<usize, Vec<Run>> {
         if self.runs.is_none() {
             let mut result = HashMap::new();
-            if self.lines.len() <= HIGHLIGHT_LINE_LIMIT && self.max_chars <= HIGHLIGHT_WIDTH_LIMIT {
+            if self.lines.len() <= HIGHLIGHT_LINE_LIMIT && self.max_columns <= HIGHLIGHT_WIDTH_LIMIT {
                 let mut hunks: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
                 for (index, line) in self.lines.iter().enumerate() {
                     if line.kind == LineKind::Header {
@@ -320,6 +322,13 @@ impl Default for DiffDoc {
 
 fn line_height() -> f64 {
     (typography().code_font_size * 1.5).round()
+}
+
+/// Columns `line` spans in the document: a TAB reaches the next tab stop of the text layout,
+/// every other character counts one.
+fn display_columns(line: &str) -> usize {
+    let stop = TAB_STOP_IN_SPACES as usize;
+    line.chars().fold(0, |column, c| if c == '\t' { column + stop - column % stop } else { column + 1 })
 }
 
 fn char_width() -> f64 {
@@ -704,7 +713,7 @@ impl DiffDoc {
             let path = text(file, "path");
             if let Some(patch) = input.patches.get(path) {
                 let model = self.model(path, patch, input.patch_revision);
-                widest = widest.max(model.max_chars);
+                widest = widest.max(model.max_columns);
                 max_line = max_line.max(model.max_line);
             }
         }
@@ -1078,11 +1087,7 @@ impl DiffDoc {
                             break;
                         }
                         let color = style.map(|s| hex(syntax.color(s))).unwrap_or(foreground);
-                        let width = paint.measure(cx, Font::Mono, code_size, &run).x;
-                        if x + width >= clip.pos.x {
-                            paint.text_centered(cx, Font::Mono, code_size, color, x, cell.pos.y, lh, &run, width + 1.0);
-                        }
-                        x += width;
+                        x = paint.line_run(cx, Font::Mono, code_size, color, text_x, x, cell.pos.y, lh, &run, clip.pos.x);
                     }
                 }
                 None => {
@@ -1142,4 +1147,17 @@ pub fn sorted_paths(files: &[Value]) -> Vec<String> {
     let mut paths: Vec<String> = files.iter().map(|f| text(f, "path").to_owned()).collect();
     paths.sort_by(|a, b| compare_diff_paths(a, b));
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_columns_follow_the_layout_tab_stops() {
+        assert_eq!(display_columns(""), 0);
+        assert_eq!(display_columns("\t\tfoo"), 11);
+        assert_eq!(display_columns("ab\tc"), 5);
+        assert_eq!(display_columns("abcd\t"), 8);
+    }
 }

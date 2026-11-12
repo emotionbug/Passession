@@ -425,23 +425,6 @@ impl Widget for ComposerPanel {
 
             if !modal {
                 self.pointer_event(cx, event, ui, &path, uid);
-                if let DragHit::Drop(drop) = event.drag_hits(cx, self.draw_bg.area()) {
-                    let paths: Vec<std::path::PathBuf> = drop
-                        .items
-                        .iter()
-                        .filter_map(|item| match item {
-                            DragItem::FilePath { path, .. } => Some(std::path::PathBuf::from(path)),
-                            _ => None,
-                        })
-                        .collect();
-                    if self.ctl().initialized {
-                        self.ctl().drop_paths(paths);
-                    }
-                } else if let DragHit::Drag(drag) = event.drag_hits(cx, self.draw_bg.area())
-                    && drag.items.iter().any(|i| matches!(i, DragItem::FilePath { .. }))
-                {
-                    *drag.response.lock().unwrap() = DragResponse::Copy;
-                }
             }
         }
 
@@ -1347,13 +1330,10 @@ impl ComposerPanel {
                         color_empty: (p.surface4), color_empty_hover: (p.surface4), color_empty_focus: (p.surface4),
                         text_style: { font_size: (size) }
                     }
-                    draw_selection: {
-                        color: (selection), color_hover: (selection), color_focus: (selection),
-                        color_down: (selection), color_empty: (selection), color_disabled: (selection)
-                    }
                     draw_cursor: { color: (p.foreground) }
                 },
             );
+            input.apply_over(cx, &crate::theme::text_selection(selection));
         }
     }
 }
@@ -1379,6 +1359,25 @@ impl ComposerPanelRef {
     /// Embedded sheets own input above the timeline, including their dismissal event.
     pub fn captures_input(&self) -> bool {
         self.borrow().is_some_and(|inner| !inner.st.hidden && (inner.st.modal_open() || inner.profile_editor.as_settings_panel().is_open()))
+    }
+
+    /// Whether files dropped on the host's `FileDropZone` can be attached now
+    /// (composer/index.tsx `useFileDrop`: a mounted composer that is not submitting or
+    /// uploading). A sheet over the composer owns the pointer instead.
+    pub fn accepts_file_drop(&self) -> bool {
+        self.borrow().is_some_and(|inner| {
+            !inner.st.hidden && !inner.st.modal_open() && inner.st.ctl.as_ref().is_some_and(Controller::accepts_file_drop)
+        })
+    }
+
+    /// Files dropped on the host's `FileDropZone` (useFileDrop `onFiles`/`onGenericFiles`).
+    pub fn drop_files(&self, cx: &mut Cx, paths: Vec<std::path::PathBuf>) {
+        if let Some(mut inner) = self.borrow_mut()
+            && inner.st.ctl.is_some()
+        {
+            inner.ctl().drop_paths(paths);
+            inner.draw_bg.redraw(cx);
+        }
     }
 
     /// Keyboard-only ownership; autocomplete must not become pointer-modal.

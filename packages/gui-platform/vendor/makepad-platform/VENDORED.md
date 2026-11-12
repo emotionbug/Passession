@@ -95,6 +95,13 @@ enabled for these calls.
 and records its height (`Cx::ime_caret_height`); `show_text_ime(area, pos)` clears
 it, so platforms fall back to a 16-pixel line.
 
+## Windows swap-chain background colour
+
+`os/windows/d3d11.rs` ignores the result of `IDXGISwapChain1::SetBackgroundColor`
+instead of unwrapping it. The colour is cosmetic; Wine's DXGI returns `E_NOTIMPL`,
+and the unwrap aborted window creation there, so the Windows build could not be
+exercised under Wine.
+
 ## Android Surface lifetime
 
 `os/linux/android/android.rs` gates drawing and `SurfaceTexture.updateTexImage`
@@ -309,6 +316,52 @@ platform operations used for saved geometry and compact-window transitions did
 nothing. They now call `XResizeWindow` and `XMoveWindow`, followed by `XFlush`.
 Resize uses logical size × DPI, matching window creation and `get_inner_size`;
 position remains in X11 pixels, matching creation and `get_position`.
+
+## Desktop file drops (X11, Windows)
+
+Dragging files from the desktop onto a window did not work on Linux at all and only
+partly on Windows.
+
+**X11** (`os/linux/x11/xdnd.rs`, replacing the stub `Dnd` in `xlib_window.rs`; `xlib_app.rs`
+dispatch; `x11_sys.rs` gains `XTranslateCoordinates`). Upstream announced `XdndAware`,
+answered every `XdndPosition` with "accepted, `XdndActionPrivate`" and requested the
+selection on `XdndDrop`, but never read it, never sent `XdndFinished` and never produced a
+`Drag`/`Drop` event. The module is now a complete XDND version 5 target:
+
+- the file list (`text/uri-list`) is requested on the first position, so widgets know the
+  files while the pointer moves; until it arrives the drag is accepted provisionally;
+- every position is an `Event::Drag` and the widgets' `DragResponse` is the `XdndStatus`
+  (`XdndActionCopy`/`Move`/`Link`, or refused: the source shows "no drop" and leaves);
+- `XdndDrop` is an `Event::Drop`; `XdndFinished` reports whether a widget handled it;
+- `XdndLeave` and the end of a drop are `Event::DragEnd`;
+- root positions are translated to the target window with `XTranslateCoordinates` and
+  scaled like its mouse events;
+- all three inline types of `XdndEnter` are read (upstream skipped the third);
+- `file_paths_from_uri_list` parses CRLF/LF lists, comments, `file:///`, `file://host/`
+  and `file:/` forms and percent-decodes UTF-8 names (unit-tested).
+
+A list too large for one property (`INCR`) is not read.
+
+**Windows** (`os/windows/droptarget.rs`, `dropfiles.rs`, `win32_window.rs`,
+`windows.rs`). Upstream discarded a drag of more than one file in `DragEnter` (nothing
+was ever delivered), decoded names one UTF-16 unit at a time, unwrapped the data
+object's `EnumFormatEtc`/`GetData` results inside the COM callback, never wrote the drop
+effect back (the source kept showing "allowed" everywhere and received its own allowed
+effects, possibly *move*, as the result), and never sent `Event::DragEnd`. Now:
+
+- `CF_HDROP` is requested directly and read with `DragQueryFileW`: every file, both
+  `DROPFILES` encodings, full UTF-16;
+- `WM_DROPTARGET`'s result is the answer to the drag source: the effect the widgets chose
+  for Enter/Over (`DragResponse::None` until a widget accepts; a copy falls back to a
+  link, never to a move, when the source offers no copy), and whether a widget handled
+  the Drop;
+- `DragLeave` of any drag, and the end of a drop, produce `Event::DragEnd`.
+
+**Both**: a drag has one target window and its position is in that window's
+coordinates, so `Drag`/`Drop` are dispatched through `call_window_event_handler` and
+`Cx::drag_event_is_for_window` (`os/cx_shared.rs`) lets the adjacent widgets patch keep
+other windows from hit-testing them. macOS still broadcasts. X11 now cycles `drag_hits`
+state after each drag event like the other desktops.
 
 ## Build-warning fixes
 

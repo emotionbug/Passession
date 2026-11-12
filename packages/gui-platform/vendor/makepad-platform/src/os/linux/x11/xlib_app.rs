@@ -3,6 +3,7 @@ use {
         collections::HashMap,
         mem,
         rc::Rc,
+        sync::{Arc, Mutex},
         cell::{Cell, RefCell},
         os::raw::{c_char, c_int, c_uint, c_ulong, c_void, c_uchar, c_long},
         ptr,
@@ -11,6 +12,7 @@ use {
         x11_sys,
         xlib_event::XlibEvent,
         xlib_window::*,
+        xdnd::{Dnd, DndStep},
         super::select_timer::SelectTimers,
         super::libc_sys,
     },
@@ -133,8 +135,9 @@ impl XlibApp {
                 },
                 x11_sys::SelectionNotify => {
                     let selection = event.xselection;
-                    if selection.property == self.dnd.atoms.selection {
-                        self.dnd.handle_selection_event(&selection);
+                    if selection.selection == self.dnd.atoms.selection {
+                        let step = self.dnd.handle_selection_event(&selection);
+                        self.dnd_step(step);
                     } else if selection.property != 0 {
                         // Clipboard conversion is asynchronous: its requestor, not
                         // whichever window now has focus, owns the resulting text.
@@ -601,15 +604,18 @@ impl XlibApp {
                             window.close_window();
                         }
                     }
-                    if event.message_type == self.dnd.atoms.enter {
-                        self.dnd.handle_enter_event(&event);
+                    let step = if event.message_type == self.dnd.atoms.enter {
+                        self.dnd.handle_enter_event(&event)
                     } else if event.message_type == self.dnd.atoms.drop {
-                        self.dnd.handle_drop_event(&event);
+                        self.dnd.handle_drop_event(&event)
                     } else if event.message_type == self.dnd.atoms.leave {
-                        self.dnd.handle_leave_event(&event);
+                        self.dnd.handle_leave_event(&event)
                     } else if event.message_type == self.dnd.atoms.position {
-                        self.dnd.handle_position_event(&event);
-                    }
+                        self.dnd.handle_position_event(&event)
+                    } else {
+                        DndStep::None
+                    };
+                    self.dnd_step(step);
                 },
                 x11_sys::Expose => {
                     /* 
@@ -676,6 +682,64 @@ impl XlibApp {
                 }
             }
         }
+    }
+    
+    /// Paseo: hands one XDND step to the application and answers the drag source with
+    /// what the widgets decided (see `xdnd.rs`).
+    unsafe fn dnd_step(&mut self, step: DndStep) {
+        match step {
+            DndStep::None => {}
+            DndStep::End => self.do_callback(XlibEvent::DragEnd),
+            DndStep::Drag {window, root, items} => {
+                let response = Arc::new(Mutex::new(DragResponse::None));
+                if let Some((window_id, abs)) = self.dnd_window_position(window, root) {
+                    self.do_callback(XlibEvent::Drag(window_id, DragEvent {
+                        modifiers: KeyModifiers::default(),
+                        handled: Arc::new(Mutex::new(false)),
+                        abs,
+                        items,
+                        response: response.clone(),
+                    }));
+                }
+                if self.display.is_null() {
+                    return;
+                }
+                let response = *response.lock().unwrap();
+                self.dnd.send_status(response);
+            }
+            DndStep::Drop {window, root, items} => {
+                let handled = Arc::new(Mutex::new(false));
+                if let Some((window_id, abs)) = self.dnd_window_position(window, root) {
+                    self.do_callback(XlibEvent::Drop(window_id, DropEvent {
+                        modifiers: KeyModifiers::default(),
+                        handled: handled.clone(),
+                        abs,
+                        items,
+                    }));
+                }
+                if self.display.is_null() {
+                    return;
+                }
+                let accepted = *handled.lock().unwrap();
+                self.dnd.finish(accepted);
+                self.do_callback(XlibEvent::DragEnd);
+            }
+        }
+    }
+    
+    /// A root position in the logical coordinates of one of our windows, as its mouse
+    /// events report them (the window may sit anywhere inside a reparenting frame).
+    unsafe fn dnd_window_position(&self, window: x11_sys::Window, root: (c_int, c_int)) -> Option<(crate::window::WindowId, DVec2)> {
+        let window_ptr = self.window_map.get(&window)?;
+        let xlib_window = &**window_ptr;
+        let root_window = x11_sys::XRootWindow(self.display, x11_sys::XDefaultScreen(self.display));
+        let (mut x, mut y, mut child) = (0, 0, 0);
+        if x11_sys::XTranslateCoordinates(self.display, root_window, window, root.0, root.1, &mut x, &mut y, &mut child) == 0 {
+            return None;
+        }
+        let dpi_factor = xlib_window.last_window_geom.dpi_factor;
+        let dpi_factor = if dpi_factor > 0.0 { dpi_factor } else { 1.0 };
+        Some((xlib_window.window_id, DVec2 {x: x as f64 / dpi_factor, y: y as f64 / dpi_factor}))
     }
     
     pub fn do_callback(&mut self, event: XlibEvent) {

@@ -206,12 +206,14 @@ impl Cx {
                     }
                 }
             }
-            Win32Event::Drag(e) => {
-                self.call_event_handler(&Event::Drag(e));
+            // Paseo: a drag has one target window and its position is in that window's
+            // space; other windows must not hit-test it.
+            Win32Event::Drag(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::Drag(e));
                 self.drag_drop.cycle_drag();
             },
-            Win32Event::Drop(e) => {
-                self.call_event_handler(&Event::Drop(e));
+            Win32Event::Drop(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::Drop(e));
                 self.drag_drop.cycle_drag();
             },
             Win32Event::DragEnd => {
@@ -225,6 +227,10 @@ impl Cx {
                 }));
                 self.fingers.mouse_up(MouseButton::PRIMARY);
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
+
+                // Paseo: upstream never told the application that a drag ended here.
+                self.call_event_handler(&Event::DragEnd);
+                self.drag_drop.cycle_drag();
             }
             Win32Event::KeyDown(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::KeyDown(e))

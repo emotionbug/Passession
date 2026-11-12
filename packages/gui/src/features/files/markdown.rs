@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use makepad_widgets::makepad_draw::text::layouter::LaidoutText;
-use makepad_widgets::makepad_draw::text::selection::{Cursor as TextCursor, Selection as TextSelection};
+use makepad_widgets::makepad_draw::text::selection::Cursor as TextCursor;
 use makepad_widgets::*;
 use pulldown_cmark::{CodeBlockKind, Event as MdEvent, Options, Parser, Tag, TagEnd};
 use serde_json::Value;
 
+use crate::features::timeline::canvas::range_rects;
 use crate::theme::{Palette, Typography, with_alpha};
 
 use super::images::ImageSlot;
@@ -704,22 +705,6 @@ impl Ctx<'_> {
     }
 }
 
-/// Rects of `a..b` in a laid-out text (relative to its origin).
-pub fn range_rects(laid: &LaidoutText, a: usize, b: usize) -> Vec<Rect> {
-    let a = a.min(laid.text.len());
-    let b = b.min(laid.text.len());
-    if a >= b {
-        return Vec::new();
-    }
-    laid.selection_rects_in_lpxs(TextSelection {
-        anchor: TextCursor { index: a, prefer_next_row: false },
-        cursor: TextCursor { index: b, prefer_next_row: false },
-    })
-    .into_iter()
-    .map(|r| rect(r.origin.x as f64, r.origin.y as f64, r.size.width as f64, r.size.height as f64))
-    .collect()
-}
-
 fn hash_text(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -815,10 +800,7 @@ impl MarkdownPreview {
         image_epoch: u64,
         owner: Area,
     ) {
-        if self.selection_invalidated || self.owner != owner {
-            self.clear_selection(cx);
-        }
-        self.owner = owner;
+        self.set_owner(cx, owner);
         self.layout(cx, kit, look, area.size.x, images, image_epoch);
         self.owner_draw_pos = owner.rect(cx).pos;
         self.area = area;
@@ -888,6 +870,17 @@ impl MarkdownPreview {
                 cx.clear_text_selection(self.owner);
                 cx.claim_text_selection(self.owner);
             }
+        }
+    }
+
+    /// Adopts the host widget's area. Makepad reissues it on every repaint
+    /// (`Cx2d::add_aligned_rect_area` stamps the pass's redraw id) and moves its own references
+    /// along, so a different value is the same panel painted again: gestures and the selection
+    /// carry over. Only a replaced document (`set_text`) ends them.
+    fn set_owner(&mut self, cx: &mut Cx, owner: Area) {
+        self.owner = owner;
+        if self.selection_invalidated {
+            self.clear_selection(cx);
         }
     }
 
@@ -1022,10 +1015,7 @@ impl MarkdownPreview {
     }
 
     pub fn handle_hit(&mut self, cx: &mut Cx, owner: Area, hit: &Hit) -> PreviewEvent {
-        if self.selection_invalidated || self.owner != owner {
-            self.clear_selection(cx);
-        }
-        self.owner = owner;
+        self.set_owner(cx, owner);
         match hit {
             Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
                 self.touch_scroll.reset();
@@ -1036,25 +1026,20 @@ impl MarkdownPreview {
                 }
                 self.touch_scroll.handle_hit(hit);
                 self.dragging = !fe.device.is_touch();
-                let point = self.point_at(fe.abs);
-                if !fe.device.is_touch() {
-                    self.touch_selection = false;
-                    self.selection = point.map(|p| (p, p));
+                if fe.device.is_touch() {
+                    // A press pans and a long press selects, as in the source view and the
+                    // chat: a second swipe from the same spot arrives as a double tap.
+                    return PreviewEvent::None;
                 }
-                if !fe.device.is_touch() && point.is_some() {
+                self.touch_selection = false;
+                self.selection = self.point_at(fe.abs).map(|(run, offset)| {
+                    let (a, b) = if fe.tap_count == 2 { word_bounds(self.runs[run].laid.text.as_str(), offset) } else { (offset, offset) };
+                    ((run, a), (run, b))
+                });
+                if self.selection.is_some() {
                     cx.claim_text_selection(self.owner);
                     self.owns_selection = true;
                 }
-                if fe.tap_count == 2
-                    && let Some((run, offset)) = point {
-                        let text = self.runs[run].laid.text.as_str();
-                        let (a, b) = word_bounds(text, offset);
-                        self.selection = Some(((run, a), (run, b)));
-                        self.dragging = true;
-                        self.touch_scroll.reset();
-                        cx.claim_text_selection(self.owner);
-                        self.owns_selection = true;
-                    }
             }
             Hit::FingerLongPress(fe) => {
                 self.touch_scroll.reset();
@@ -1172,5 +1157,137 @@ mod tests {
         assert!(matches!(&blocks[4], Block::List { items, .. } if items[0].task == Some(true)));
         assert!(matches!(&blocks[5], Block::Code(code) if code == "code"));
         assert_eq!(links, vec!["a.md".to_owned()]);
+    }
+
+    /// The files panel as Makepad runs it: `Cx2d::add_aligned_rect_area` issues the widget a
+    /// new `Area` (stamped with the pass's redraw id) on every repaint, and every finger event
+    /// repaints it (`FileView::hit` reports them all as changes).
+    struct Panel {
+        cx: Cx,
+        list: DrawList,
+        area: Area,
+        preview: MarkdownPreview,
+    }
+
+    impl Panel {
+        fn new(document_height: f64) -> Self {
+            let mut cx = Cx::new(Box::new(|_, _| {}));
+            let list = DrawList::new(&mut cx);
+            let mut preview = MarkdownPreview::default();
+            preview.area = rect(0.0, 96.0, 357.0, 600.0);
+            preview.height = document_height;
+            let mut panel = Panel { cx, list, area: Area::Empty, preview };
+            panel.repaint();
+            panel
+        }
+
+        fn repaint(&mut self) {
+            self.cx.redraw_id += 1;
+            let draw_list_id = self.list.id();
+            self.cx.draw_lists[draw_list_id].redraw_id = self.cx.redraw_id;
+            let area = Area::Rect(RectArea { draw_list_id, rect_id: 0, redraw_id: self.cx.redraw_id });
+            self.cx.update_area_refs(self.area, area);
+            self.area = area;
+            self.preview.set_owner(&mut self.cx, area);
+        }
+
+        fn hit(&mut self, hit: Hit) {
+            self.preview.handle_hit(&mut self.cx, self.area, &hit);
+            self.repaint();
+        }
+    }
+
+    const PRESS: DVec2 = DVec2 { x: 180.0, y: 560.0 };
+
+    fn touch_down(abs: DVec2, time: f64, tap_count: u32) -> Hit {
+        Hit::FingerDown(FingerDownEvent {
+            window_id: WindowId(0, 0), abs, digit_id: live_id_num!(touch, 1).into(),
+            device: DigitDevice::Touch { uid: 1 }, tap_count, modifiers: KeyModifiers::default(),
+            time, rect: rect(0.0, 0.0, 357.0, 760.0),
+        })
+    }
+
+    fn touch_move(start: DVec2, abs: DVec2, time: f64) -> Hit {
+        Hit::FingerMove(FingerMoveEvent {
+            window_id: WindowId(0, 0), abs, abs_start: start, digit_id: live_id_num!(touch, 1).into(),
+            device: DigitDevice::Touch { uid: 1 }, tap_count: 1, modifiers: KeyModifiers::default(),
+            time, rect: rect(0.0, 0.0, 357.0, 760.0), is_over: true,
+        })
+    }
+
+    fn touch_up(start: DVec2, abs: DVec2, time: f64) -> Hit {
+        Hit::FingerUp(FingerUpEvent {
+            window_id: WindowId(0, 0), abs, abs_start: start, capture_time: 0.0, time,
+            digit_id: live_id_num!(touch, 1).into(), device: DigitDevice::Touch { uid: 1 },
+            has_long_press_occurred: false, tap_cancelled: true, tap_count: 1,
+            modifiers: KeyModifiers::default(), rect: rect(0.0, 0.0, 357.0, 760.0), is_over: true, is_sweep: false,
+        })
+    }
+
+    /// Ten 30px upward steps of a finger, one per frame.
+    fn swipe_up(panel: &mut Panel, start: DVec2) -> DVec2 {
+        let mut abs = start;
+        for step in 1..=10 {
+            abs = dvec2(start.x, start.y - 30.0 * step as f64);
+            panel.hit(touch_move(start, abs, 0.016 * step as f64));
+        }
+        abs
+    }
+
+    #[test]
+    fn touch_pan_and_fling_survive_the_repaints_they_cause() {
+        let mut panel = Panel::new(4000.0);
+        panel.hit(touch_down(PRESS, 0.0, 1));
+        let end = swipe_up(&mut panel, PRESS);
+        assert_eq!(panel.preview.scroll_y, 300.0);
+        panel.hit(touch_up(PRESS, end, 0.17));
+        assert!(panel.preview.touch_scroll.is_flinging());
+
+        // A replaced document does end the gesture made on the previous one.
+        panel.hit(touch_down(PRESS, 1.0, 1));
+        panel.preview.set_text("# Other");
+        swipe_up(&mut panel, PRESS);
+        assert_eq!(panel.preview.scroll_y, 300.0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_drag_survives_the_repaints_it_causes() {
+        let mut panel = Panel::new(4000.0);
+        let thumb = dvec2(353.0, 110.0);
+        panel.hit(touch_down(thumb, 0.0, 1));
+        panel.hit(touch_move(thumb, dvec2(353.0, 140.0), 0.016));
+        panel.hit(touch_move(thumb, dvec2(353.0, 170.0), 0.032));
+        assert_eq!(panel.preview.scroll_y, 60.0 * 4000.0 / 600.0);
+    }
+
+    #[test]
+    fn document_with_tables_scrolls_from_a_second_touch_on_the_same_cell() {
+        let mut source = String::from(
+            "# 수집기 부하 TC\n\n`collector.load` 설정은 [문서](guide.md)를 따른다.\n\n## 시나리오\n\n| 항목 | 값 | 근거 |\n|---|---|---|\n",
+        );
+        for row in 0..60 {
+            source.push_str(&format!("| `collector.queue.capacity.{row}` | `{}` | `QueueProperties#capacity` 기본값 |\n", row * 1000));
+        }
+        let mut panel = Panel::new(0.0);
+        let mut kit = Kit::new(&mut panel.cx);
+        let look = MarkdownLook {
+            palette: crate::theme::current_palette(),
+            typography: crate::theme::current_typography(),
+            compact_width: true,
+        };
+        panel.preview.set_text(&source);
+        panel.preview.layout(&mut panel.cx, &mut kit, &look, 357.0, &|_| ImageState::Loading, 0);
+        panel.preview.origin = panel.preview.area.pos;
+        panel.repaint();
+        // The extent the thumb and the scroll limit share reaches the last table row.
+        let last_row = panel.preview.runs.last().unwrap().pos.y;
+        assert!(last_row > panel.preview.area.size.y + 300.0 && panel.preview.height > last_row);
+
+        // A second swipe starting where the previous one did arrives as a double tap; on a
+        // touch screen it pans (a long press selects), it does not select the word under it.
+        panel.hit(touch_down(PRESS, 0.2, 2));
+        swipe_up(&mut panel, PRESS);
+        assert_eq!(panel.preview.scroll_y, 300.0);
+        assert!(panel.preview.selection.is_none());
     }
 }

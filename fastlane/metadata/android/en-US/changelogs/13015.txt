@@ -1,0 +1,4 @@
+Fixed
+- Markdown lists nested under a different kind of list keep their marker beside the item text: a numbered list under a bullet no longer draws its numbers over the first characters of each item. Numbered lists whose numbers are wider than 99. widen their marker column instead of drawing the number outside it.
+
+Full notes: https://github.com/emotionbug/Passession/releases

@@ -1175,23 +1175,16 @@ pub fn handle_shortcut(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, 
     }
 }
 
-/// `_back`: compact detail tabs close, then explorer → agent → sidebar; false lets the
-/// platform background the app (mobile) — the session never stops.
+/// `_back`: compact detail tabs close (back to the tab they were opened from), then explorer →
+/// agent → sidebar; false lets the platform background the app (mobile) — the session never stops.
 pub fn back(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) -> bool {
     if shell.data.page.is_some() {
         close_page(shell, cx);
         return true;
     }
     let compact = shell.data.compact;
-    if let Some(target) = selected(shell)
-        && compact
-        && shell.data.layout.compact_destination == CompactDestination::Agent
-        && matches!(
-            target.kind.as_str(),
-            "file" | "working_diff" | "commit_diff" | "provider_subagent" | "pull_request" | "execution_log" | "project_settings"
-        )
-    {
-        close_tabs(shell, cx, ui, vec![target.key()], true, AfterClose::Nothing);
+    if let Some(key) = shell.data.layout.compact_back_tab(compact) {
+        close_tabs(shell, cx, ui, vec![key], true, AfterClose::Nothing);
         return true;
     }
     if shell.data.layout.handle_back(compact) {

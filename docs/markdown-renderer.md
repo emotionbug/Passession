@@ -11,7 +11,15 @@ Use native theme/text styles and preserve copy/selection, code formatting, lists
 ## Streaming work
 
 Assistant messages retain grapheme-safe paced reveal rather than waiting to
-accumulate a minimum batch. Small live documents (at most 16 KiB of captured
+accumulate a minimum batch. The rule is the original `text-reveal.ts`: a first
+sight shows the text whole; growth while the turn runs releases
+`ceil(backlog × elapsed / 150 ms)` bytes per frame (at least one, the whole
+backlog once 150 ms passed without a frame, the first frame after growth
+counting as 1/60 s), so the backlog decays geometrically and settles in about
+`150 ms × ln(backlog bytes)` plus nine frames (10 kB in about 1.1 s at 60 Hz);
+the end of the turn releases everything. Text that arrived while the
+conversation was off screen (hidden tab or pane, app in the background) is
+released whole when it is shown again. Small live documents (at most 16 KiB of captured
 source) normalize, parse and flatten inline using the same parser as the worker.
 The final update of an inline-published document uses that path too. Preparation
 admits at most 16 KiB of inline layout text per pass, with a soft 4 ms deadline
@@ -32,12 +40,19 @@ Markdown split:
    demand replaces intermediate demands; it cannot continuously cancel the
    revision being prepared. Canonical timeline events are never coalesced here.
 3. `MarkdownPresentation` retains the published document while preparing its
-   successor. Background font-span mapping advances at most 256 segments in one
-   paragraph per preparation pass. `AsyncLayout` shapes and wraps the complete
-   immutable text with a worker-local font loader/shaper and shared immutable
-   font bytes. Inline and worker layout use identical options. Arbitrary
-   byte/word splitting is not used to approximate Unicode shaping.
-4. UI hydration admits at most 4096 glyphs and 128 rows per preparation pass.
+   successor. A preparation pass advances the document's unprepared paragraphs
+   in order until the same soft 4 ms deadline, checked between paragraphs, and
+   always at least one: font-span mapping (at most 256 segments of a paragraph
+   per pass), then non-blocking `AsyncLayout` admission and hydration. A
+   complete message therefore requests all its paragraphs in its first pass
+   and publishes a few frames later. Never limit a pass to one paragraph: a
+   long message then stays blank for two frames per paragraph, list item and
+   table cell, at whatever rate the platform delivers frames. `AsyncLayout` shapes
+   and wraps the complete immutable text with a worker-local font
+   loader/shaper and shared immutable font bytes. Inline and worker layout use
+   identical options. Arbitrary byte/word splitting is not used to approximate
+   Unicode shaping.
+4. UI hydration admits at most 4096 glyphs and 128 rows per paragraph and pass.
    Source, styles, find results, links, copy ranges and all paragraph/code/table
    layouts publish together. Width, typography, appearance and find occurrence
    are part of presentation identity; a recycled row cannot inherit an older

@@ -276,6 +276,20 @@ pub fn fade(color: Vec4, opacity: f32) -> Vec4 {
     Vec4 { w: color.w * opacity, ..color }
 }
 
+/// The selection style of a Makepad `TextInput`, for `apply_over`. Its shader reads a
+/// different colour per state (focused, hovered, pressed, empty, disabled), and Makepad's
+/// defaults for those are faint white tints for its own dark theme: a field that set only
+/// `color` showed no selection while focused on a light surface. Every state gets `color`.
+pub fn text_selection(color: Vec4) -> Vec<LiveNode> {
+    live! {
+        draw_selection: {
+            color: (color), color_hover: (color), color_focus: (color),
+            color_down: (color), color_empty: (color), color_disabled: (color)
+        }
+    }
+    .to_vec()
+}
+
 struct Raw {
     surfaces: [u32; 5],
     sidebar: u32,

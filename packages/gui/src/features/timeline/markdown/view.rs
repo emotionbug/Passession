@@ -107,6 +107,9 @@ struct CachedParagraph {
     pending: Option<PendingParagraph>,
 }
 
+/// Soft allowance of one document preparation pass, checked between paragraphs.
+const PREPARATION_PASS: Duration = Duration::from_millis(4);
+
 #[derive(Default)]
 pub struct ParagraphCache {
     owner: Option<Rc<Vec<Block>>>,
@@ -114,6 +117,7 @@ pub struct ParagraphCache {
     entries: HashMap<(usize, u64, u64, bool), CachedParagraph>,
     pending: bool,
     advance_available: bool,
+    advance_deadline: Option<Instant>,
     frozen: bool,
     inline_remaining: usize,
     inline_deadline: Option<Instant>,
@@ -123,6 +127,18 @@ impl ParagraphCache {
     fn can_layout_inline(&self, bytes: usize) -> bool {
         bytes <= self.inline_remaining
             && self.inline_deadline.is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    /// Admits one paragraph's background advance (span mapping, layout
+    /// admission, hydration). A pass admits its first paragraph even when
+    /// late, then every further one until its deadline: publication time
+    /// follows the work, not two frames for each paragraph of the document.
+    fn take_advance(&mut self, now: Instant) -> bool {
+        let admitted = self.advance_available;
+        if admitted {
+            self.advance_available = self.advance_deadline.is_some_and(|deadline| now < deadline);
+        }
+        admitted
     }
 
     pub(super) fn set_owner(&mut self, owner: Option<Rc<Vec<Block>>>) -> Option<Rc<Vec<Block>>> {
@@ -178,11 +194,13 @@ pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f6
             }
         }
         if let Some(mut preparing) = presentation.preparing.take() {
+            let deadline = Instant::now() + PREPARATION_PASS;
             preparing.cache.pending = false;
             preparing.cache.advance_available = true;
+            preparing.cache.advance_deadline = Some(deadline);
             preparing.cache.frozen = false;
             preparing.cache.inline_remaining = if preparing.snapshot.interactive { INTERACTIVE_SOURCE_BYTES } else { 0 };
-            preparing.cache.inline_deadline = preparing.snapshot.interactive.then(|| Instant::now() + Duration::from_millis(4));
+            preparing.cache.inline_deadline = preparing.snapshot.interactive.then_some(deadline);
             measured(cx, d, opts, |cx, d, opts| draw_document(cx, d, opts, &mut preparing, x, y));
             if !preparing.cache.pending {
                 d.state.markdown_worker.publish(preparing.snapshot.revision);
@@ -289,8 +307,9 @@ fn prepare_semantic(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, key: (usize,
     let inline = entry.pending.as_ref().is_some_and(|pending| {
         !pending.layout.is_pending() && d.state.markdown_paragraphs.can_layout_inline(pending.rich.text.len())
     });
-    if entry.prepared.is_none() && (inline || d.state.markdown_paragraphs.advance_available) {
-        d.state.markdown_paragraphs.advance_available = false;
+    // Evaluated first: an inline paragraph must not end the pass for the
+    // background paragraphs after it.
+    if entry.prepared.is_none() && (d.state.markdown_paragraphs.take_advance(Instant::now()) || inline) {
         let pending = entry.pending.as_mut().expect("unpublished paragraph");
         for _ in 0..256 {
             let Some(span) = pending.rich.spans.get(pending.cursor) else { break };
@@ -635,8 +654,23 @@ enum Marker {
     Task(bool),
 }
 
+/// enriched-markdown `BaseListSpan`, relative to the list's `x` (the enclosing
+/// item's text edge): the marker's right edge and the item text's left edge.
+/// Nesting level d reserves its marker column d × marginLeft (20) from the root
+/// list, and the text starts gapWidth (7) after the item's own column,
+/// truncated like the span's Int leading margin. The app's pinned nightly
+/// indented nested text a fixed 20 from its parent's text instead, which drew
+/// a marker wider than the parent's (a number under a bullet) over the text.
+/// `parent` is the enclosing item's column width and `marker` this item's,
+/// both without `extra`: the whole pixels an ordered list adds to fit numbers
+/// wider than "99.".
+fn list_columns(parent: Option<f64>, marker: f64, extra: f64) -> (f64, f64) {
+    let origin = parent.map_or(0.0, |parent| 20.0 - (parent + 7.0).floor());
+    (origin + marker + extra, origin + (marker + 7.0).floor() + extra)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn draw_block(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, block: &Block, x: f64, y: f64, w: f64, color: Vec4, depth: usize, root: Option<Marker>) -> f64 {
+fn draw_block(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, block: &Block, x: f64, y: f64, w: f64, color: Vec4, depth: usize, parent: Option<f64>) -> f64 {
     let p = d.look.palette;
     let fs = opts.font_size;
     match block {
@@ -684,7 +718,7 @@ fn draw_block(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, block: &Block, x: 
             draw_blocks(cx, d, opts, blocks, x + 23.0, body_y, inner_w, quote_color, false);
             h
         }
-        Block::List { start, items } => list(cx, d, opts, *start, items, x, y, w, color, depth, root),
+        Block::List { start, items } => list(cx, d, opts, *start, items, x, y, w, color, depth, parent),
         Block::Table { aligns, head, rows } => table(cx, d, opts, aligns, head, rows, x, y, w, color),
     }
 }
@@ -701,43 +735,40 @@ pub fn measured<R>(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, f: impl FnOnc
     result
 }
 
-fn marker_width(cx: &mut Cx2d, d: &mut Draw, kind: Marker, fs: f64) -> f64 {
-    match kind {
-        Marker::Bullet => 3.0,
-        Marker::Task(_) => 14.0,
-        Marker::Ordered => d.kit.measure(cx, Font::Medium, fs, 1.4, "99.", None).x,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn list(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, start: Option<u64>, items: &[ListItem], x: f64, y: f64, w: f64, color: Vec4, depth: usize, root: Option<Marker>) -> f64 {
+fn list(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, start: Option<u64>, items: &[ListItem], x: f64, y: f64, w: f64, color: Vec4, depth: usize, parent: Option<f64>) -> f64 {
     let p = d.look.palette;
     let fs = opts.font_size;
     let line = (fs * 1.4).round();
+    // OrderedListSpan: every ordered list reserves the "99." column, widened by
+    // whole pixels when one of its numbers is wider.
+    let ordered = start.map(|first| {
+        let column = d.kit.measure(cx, Font::Medium, fs, 1.4, "99.", None).x;
+        let labels: Vec<(String, f64)> = (0..items.len() as u64).map(|index| {
+            let label = format!("{}.", first + index);
+            let width = d.kit.measure(cx, Font::Medium, fs, 1.4, &label, None).x;
+            (label, width)
+        }).collect();
+        let widest = labels.iter().fold(column, |widest, (_, width)| widest.max(*width));
+        (column, (widest - column).ceil(), labels)
+    });
     let mut cursor = y;
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
             cursor += 4.0;
         }
-        let kind = match item.task {
-            Some(checked) => Marker::Task(checked),
-            None if start.is_some() => Marker::Ordered,
-            None => Marker::Bullet,
+        let (kind, marker, extra) = match (item.task, &ordered) {
+            (Some(checked), _) => (Marker::Task(checked), 14.0, 0.0),
+            (None, Some((column, extra, _))) => (Marker::Ordered, *column, *extra),
+            (None, None) => (Marker::Bullet, 3.0, 0.0),
         };
-        let marker = marker_width(cx, d, kind, fs);
-        let (column, anchor) = if depth == 0 {
-            ((marker + 7.0).floor(), marker)
-        } else {
-            let root_kind = root.unwrap_or(kind);
-            let root_margin = (marker_width(cx, d, root_kind, fs) + 7.0).floor();
-            (20.0, 20.0 + marker - root_margin)
-        };
+        let (anchor, column) = list_columns(parent, marker, extra);
         let center = cursor + line * 0.5;
         match kind {
             Marker::Ordered => {
-                let label = format!("{}.", start.unwrap_or(1) + index as u64);
-                let size = d.kit.measure(cx, Font::Medium, fs, 1.4, &label, None);
-                d.kit.label(cx, Font::Medium, fs, 1.4, p.muted, dvec2(x + anchor - size.x, cursor), &label, None);
+                if let Some((label, width)) = ordered.as_ref().and_then(|(_, _, labels)| labels.get(index)) {
+                    d.kit.label(cx, Font::Medium, fs, 1.4, p.muted, dvec2(x + anchor - width, cursor), label, None);
+                }
             }
             Marker::Bullet => {
                 let r = rect_xywh(x + anchor - 3.0, center - 3.0, 6.0, 6.0);
@@ -759,13 +790,12 @@ fn list(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, start: Option<u64>, item
         }
         // taskList.checkedTextColor: muted text for a checked item.
         let item_color = if kind == Marker::Task(true) { p.muted } else { color };
-        let root_kind = if depth == 0 { Some(kind) } else { root };
         let mut item_y = cursor;
         for (b, block) in item.blocks.iter().enumerate() {
             if b > 0 {
                 item_y += 4.0;
             }
-            item_y += draw_block(cx, d, opts, block, x + column, item_y, (w - column).max(1.0), item_color, depth + 1, root_kind);
+            item_y += draw_block(cx, d, opts, block, x + column, item_y, (w - column).max(1.0), item_color, depth + 1, Some(marker));
         }
         cursor = item_y.max(cursor + line);
     }
@@ -999,5 +1029,86 @@ fn paint_find(cx: &mut Cx2d, d: &mut Draw, laid: &LaidoutText, origin: DVec2, fo
     }
     for r in range_rects_visible(laid, s, e, origin, d.kit.viewport) {
         d.kit.rect(cx, r.translate(origin), d.look.palette.warning, 2.0);
+    }
+}
+
+#[cfg(test)]
+mod list_column_tests {
+    use super::list_columns;
+
+    // Marker column widths: bullet radius, task box, and a "99." number column.
+    const KINDS: [f64; 3] = [3.0, 14.0, 16.7];
+
+    #[test]
+    fn every_nesting_keeps_the_marker_left_of_the_item_text() {
+        for marker in KINDS {
+            let (anchor, text) = list_columns(None, marker, 0.0);
+            assert_eq!((anchor, text), (marker, (marker + 7.0).floor()));
+            for parent in KINDS {
+                let (anchor, text) = list_columns(Some(parent), marker, 0.0);
+                // A bullet is centred on its column edge, so its 3px radius hangs into the gap.
+                assert!(anchor + 3.0 < text, "{marker} under {parent}: marker {anchor}, text {text}");
+                assert!(text - anchor <= 7.0, "{marker} under {parent}: gap {}", text - anchor);
+            }
+        }
+    }
+
+    #[test]
+    fn same_kind_nesting_indents_by_twenty() {
+        for marker in KINDS {
+            let (root_anchor, root_text) = list_columns(None, marker, 0.0);
+            let (anchor, text) = list_columns(Some(marker), marker, 0.0);
+            assert_eq!(text, 20.0);
+            assert!(((text - anchor) - (root_text - root_anchor)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn numbers_wider_than_the_default_column_stay_inside_it() {
+        let (column, widest) = (16.7_f64, 24.3_f64);
+        let extra = (widest - column).ceil();
+        for parent in [None, Some(3.0), Some(column)] {
+            let (anchor, text) = list_columns(parent, column, extra);
+            let (plain_anchor, plain_text) = list_columns(parent, column, 0.0);
+            assert!(anchor - widest >= plain_anchor - column, "the number starts inside its column");
+            assert!(((text - anchor) - (plain_text - plain_anchor)).abs() < 1e-9);
+        }
+    }
+}
+
+#[cfg(test)]
+mod preparation_pass_tests {
+    use super::{PREPARATION_PASS, ParagraphCache};
+    use std::time::{Duration, Instant};
+
+    fn pass(start: Instant) -> ParagraphCache {
+        ParagraphCache { advance_available: true, advance_deadline: Some(start + PREPARATION_PASS), ..Default::default() }
+    }
+
+    #[test]
+    fn one_pass_admits_every_paragraph_inside_its_allowance() {
+        let start = Instant::now();
+        let mut cache = pass(start);
+        // A complete long message: every paragraph is requested by this pass,
+        // not one paragraph for each frame.
+        assert!((0..500).all(|_| cache.take_advance(start + Duration::from_millis(1))));
+        // The paragraph that crosses the deadline is the last one of the pass.
+        assert!(cache.take_advance(start + PREPARATION_PASS));
+        assert!(!cache.take_advance(start + PREPARATION_PASS));
+    }
+
+    #[test]
+    fn a_late_pass_still_advances_one_paragraph() {
+        let start = Instant::now();
+        let mut cache = pass(start);
+        let late = start + Duration::from_secs(1);
+        assert!(cache.take_advance(late));
+        assert!(!cache.take_advance(late));
+    }
+
+    #[test]
+    fn the_published_snapshot_admits_no_advance() {
+        let mut cache = ParagraphCache::default();
+        assert!(!cache.take_advance(Instant::now()));
     }
 }

@@ -1001,9 +1001,21 @@ impl Controller {
         }
     }
 
+    /// composer/index.tsx `useFileDrop(…, { disabled: isSubmitLoadingVisible })`: files
+    /// cannot be dropped while a message is submitting (the submit path clears and restores
+    /// the attachments) or while files are uploading, counting a drop that is still being
+    /// inspected. The host's drop zone refuses the drag then.
+    pub fn accepts_file_drop(&self) -> bool {
+        self.initialized
+            && !self.is_subagent()
+            && !self.sending()
+            && !self.uploading()
+            && !self.blob_tokens.values().any(|dropped| *dropped)
+    }
+
     /// Dropped paths: raster images join the tray, everything else uploads (useFileDrop).
     pub fn drop_paths(&mut self, paths: Vec<std::path::PathBuf>) {
-        if paths.is_empty() || self.sending() || !self.uploading.is_empty() {
+        if paths.is_empty() || !self.accepts_file_drop() {
             return;
         }
         let token = service::with(|svc| svc.stat_paths(self.panel, paths));

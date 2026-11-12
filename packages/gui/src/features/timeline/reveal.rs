@@ -6,8 +6,10 @@ use unicode_segmentation::GraphemeCursor;
 
 /// Backlog is drained over this horizon.
 pub const TEXT_REVEAL_HORIZON_MS: f64 = 150.0;
-/// Reveal steps run at 30Hz.
-pub const TEXT_REVEAL_FRAME_INTERVAL_S: f64 = 1.0 / 30.0;
+/// What the first frame after growth counts as (text-reveal.ts
+/// `nextTextRevealFrame` without a previous frame): one 60Hz interval, so
+/// arriving text starts to show on the frame that first sees it.
+pub const TEXT_REVEAL_FRAME_INTERVAL_S: f64 = 1.0 / 60.0;
 const MAX_ELAPSED_MS: f64 = 250.0;
 
 /// Characters to reveal on this frame: proportional to the backlog, at least one.
@@ -123,7 +125,7 @@ impl Reveal {
     /// Starts the pacing clock (the first frame after growth).
     pub fn arm(&mut self, now: f64) {
         if self.last_step.is_none() {
-            self.last_step = Some(now);
+            self.last_step = Some(now - TEXT_REVEAL_FRAME_INTERVAL_S);
         }
     }
 }
@@ -162,5 +164,53 @@ mod tests {
         assert_eq!(reveal.visible(&extended, true), prefix);
         assert!(!reveal.sync(&extended, false, true));
         assert_eq!(reveal.visible(&extended, false), extended);
+    }
+
+    /// One frame of rows.rs' pacing; returns whether text is still held back.
+    fn frame(reveal: &mut Reveal, text: &str, now: f64) -> bool {
+        if reveal.sync(text, true, true) {
+            reveal.arm(now);
+            reveal.step(now);
+        }
+        !reveal.settled()
+    }
+
+    #[test]
+    fn backlog_drains_geometrically_and_starts_on_its_first_frame() {
+        let grown = "a".repeat(10_001);
+        let mut reveal = Reveal::new("a");
+        let mut now = 100.0;
+        assert!(frame(&mut reveal, &grown, now));
+        // A ninth of the backlog (one 60Hz interval of the 150ms horizon).
+        assert_eq!(reveal.revealed, 1 + 10_000_usize.div_ceil(9));
+        let mut frames = 1;
+        loop {
+            now += 1.0 / 60.0;
+            frames += 1;
+            if !frame(&mut reveal, &grown, now) {
+                break;
+            }
+            assert!(frames < 70, "10 kB must not trail the stream for more than about 1.1s");
+        }
+        assert_eq!(reveal.visible(&grown, true), grown);
+    }
+
+    #[test]
+    fn a_stalled_frame_releases_the_whole_backlog() {
+        let grown = "a".repeat(50_000);
+        let mut reveal = Reveal::new("a");
+        assert!(frame(&mut reveal, &grown, 10.0));
+        // No frame for longer than the horizon (hidden tab, busy UI thread).
+        assert!(!frame(&mut reveal, &grown, 10.0 + 2.0 * TEXT_REVEAL_HORIZON_MS / 1000.0));
+    }
+
+    #[test]
+    fn completion_releases_what_pacing_still_held_back() {
+        let grown = "a".repeat(50_000);
+        let mut reveal = Reveal::new("a");
+        assert!(frame(&mut reveal, &grown, 10.0));
+        assert!(!reveal.sync(&grown, false, true));
+        assert!(reveal.settled());
+        assert_eq!(reveal.visible(&grown, false), grown);
     }
 }

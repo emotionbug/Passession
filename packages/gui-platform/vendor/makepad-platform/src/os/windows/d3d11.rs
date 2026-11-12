@@ -558,12 +558,14 @@ impl D3d11Window {
             let swap_texture = swap_chain.GetBuffer(0).unwrap();
             let mut render_target_view = None;
             d3d11_cx.device.CreateRenderTargetView(&swap_texture, None, Some(&mut render_target_view)).unwrap();
-            swap_chain.SetBackgroundColor(&mut DXGI_RGBA {
+            // Cosmetic (the colour behind an undersized swap chain): Wine's DXGI returns
+            // E_NOTIMPL, which must not abort window creation.
+            let _ = swap_chain.SetBackgroundColor(&mut DXGI_RGBA {
                 r: 0.3,
                 g: 0.3,
                 b: 0.3,
                 a: 1.0
-            }).unwrap();
+            });
             D3d11Window {
                 first_draw: true,
                 is_in_resize: false,

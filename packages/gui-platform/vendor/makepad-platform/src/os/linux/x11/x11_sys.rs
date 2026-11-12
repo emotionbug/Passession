@@ -433,6 +433,17 @@ extern "C" {
         arg6: Time,
     ) -> c_int;
     
+    pub fn XTranslateCoordinates(
+        arg1: *mut Display,
+        arg2: Window,
+        arg3: Window,
+        arg4: c_int,
+        arg5: c_int,
+        arg6: *mut c_int,
+        arg7: *mut c_int,
+        arg8: *mut Window,
+    ) -> c_int;
+    
     pub fn XSetInputFocus(
         arg1: *mut Display,
         arg2: Window,

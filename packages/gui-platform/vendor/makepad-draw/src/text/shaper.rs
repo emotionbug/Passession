@@ -65,6 +65,7 @@ impl Shaper {
         ShapedText {
             text: params.text,
             width_in_ems: glyphs.iter().map(|glyph| glyph.advance_in_ems).sum(),
+            has_tabs: glyphs.iter().any(|glyph| glyph.is_tab),
             glyphs,
         }
     }
@@ -113,26 +114,44 @@ impl Shaper {
         out_glyphs: &mut Vec<ShapedGlyph>,
     ) {
         let mut unicode_buffer = mem::take(&mut self.reusable_unicode_buffer);
+        let mut has_controls = false;
         for (index, grapheme) in text[start..end].grapheme_indices(true) {
             let cluster = start + index;
             for char in grapheme.chars() {
-                unicode_buffer.add(char, cluster as u32);
+                // No font draws a control character: shaped as itself it becomes `.notdef`
+                // in every font of the family. It takes the blank space glyph instead and
+                // keeps its own cluster, so byte-indexed selection, copy and find are unchanged.
+                has_controls |= char.is_control();
+                unicode_buffer.add(if char.is_control() { ' ' } else { char }, cluster as u32);
             }
         }
         let mut glyph_buffer = rustybuzz::shape(font.rustybuzz_face(), &[], unicode_buffer);
         let out_glyph_start = out_glyphs.len();
+        let shaped_glyph = |glyph_info: &rustybuzz::GlyphInfo, glyph_position: &rustybuzz::GlyphPosition| {
+            let cluster = glyph_info.cluster as usize;
+            let control = if has_controls {
+                text[cluster..].chars().next().filter(|char| char.is_control())
+            } else {
+                None
+            };
+            // A TAB keeps the space advance as its tab-stop unit (see `advance_in_ems_at`);
+            // every other control (CR of CRLF, form feed, ESC, ...) is zero-width.
+            let scale = if matches!(control, Some(char) if char != '\t') { 0.0 } else { 1.0 };
+            ShapedGlyph {
+                font: font.clone(),
+                id: glyph_info.glyph_id as u16,
+                cluster,
+                advance_in_ems: scale * glyph_position.x_advance as f32 / font.units_per_em(),
+                offset_in_ems: scale * glyph_position.x_offset as f32 / font.units_per_em(),
+                is_tab: control == Some('\t'),
+            }
+        };
         out_glyphs.extend(
             glyph_buffer
                 .glyph_infos()
                 .iter()
                 .zip(glyph_buffer.glyph_positions())
-                .map(|(glyph_info, glyph_position)| ShapedGlyph {
-                    font: font.clone(),
-                    id: glyph_info.glyph_id as u16,
-                    cluster: glyph_info.cluster as usize,
-                    advance_in_ems: glyph_position.x_advance as f32 / font.units_per_em(),
-                    offset_in_ems: glyph_position.x_offset as f32 / font.units_per_em(),
-                }),
+                .map(|(glyph_info, glyph_position)| shaped_glyph(glyph_info, glyph_position)),
         );
 
         // HACK: We don't support right-to-left scripts yet. When such scripts are used, cluster
@@ -149,9 +168,10 @@ impl Shaper {
         {
             out_glyphs.truncate(out_glyph_start);
             let mut unicode_buffer = glyph_buffer.clear();
-            for (index, _) in text[start..end].grapheme_indices(true) {
+            for (index, grapheme) in text[start..end].grapheme_indices(true) {
                 let cluster = start + index;
-                unicode_buffer.add('□', cluster as u32);
+                let control = grapheme.starts_with(|char: char| char.is_control());
+                unicode_buffer.add(if control { ' ' } else { '□' }, cluster as u32);
             }
             glyph_buffer = rustybuzz::shape(font.rustybuzz_face(), &[], unicode_buffer);
             out_glyphs.extend(
@@ -159,13 +179,7 @@ impl Shaper {
                     .glyph_infos()
                     .iter()
                     .zip(glyph_buffer.glyph_positions())
-                    .map(|(glyph_info, glyph_position)| ShapedGlyph {
-                        font: font.clone(),
-                        id: glyph_info.glyph_id as u16,
-                        cluster: glyph_info.cluster as usize,
-                        advance_in_ems: glyph_position.x_advance as f32 / font.units_per_em(),
-                        offset_in_ems: glyph_position.x_offset as f32 / font.units_per_em(),
-                    }),
+                    .map(|(glyph_info, glyph_position)| shaped_glyph(glyph_info, glyph_position)),
             );
         }
 
@@ -187,8 +201,23 @@ pub struct ShapeParams {
 #[derive(Clone, Debug)]
 pub struct ShapedText {
     pub text: Substr,
+    /// Sum of the shaped advances: every TAB counts as one space. Use
+    /// [`ShapedText::width_in_lpxs_at`] for the width in a row.
     pub width_in_ems: f32,
+    pub has_tabs: bool,
     pub glyphs: Vec<ShapedGlyph>,
+}
+
+impl ShapedText {
+    /// Width of the text when it starts `x_in_lpxs` into its row.
+    pub fn width_in_lpxs_at(&self, x_in_lpxs: f32, font_size_in_lpxs: f32) -> f32 {
+        if !self.has_tabs {
+            return self.width_in_ems * font_size_in_lpxs;
+        }
+        self.glyphs.iter().fold(x_in_lpxs, |x, glyph| {
+            x + glyph.advance_in_ems_at(x, font_size_in_lpxs) * font_size_in_lpxs
+        }) - x_in_lpxs
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -198,4 +227,24 @@ pub struct ShapedGlyph {
     pub cluster: usize,
     pub advance_in_ems: f32,
     pub offset_in_ems: f32,
+    /// A TAB: the blank space glyph, whose advance in a row is the distance to the next stop.
+    pub is_tab: bool,
 }
+
+impl ShapedGlyph {
+    /// Advance of the glyph when its origin is `x_in_lpxs` into its row. A TAB reaches the
+    /// next multiple of [`TAB_STOP_IN_SPACES`] space advances, so text after it lines up in
+    /// columns whatever precedes it; any other glyph keeps its shaped advance.
+    pub fn advance_in_ems_at(&self, x_in_lpxs: f32, font_size_in_lpxs: f32) -> f32 {
+        let stop_in_lpxs = TAB_STOP_IN_SPACES * self.advance_in_ems * font_size_in_lpxs;
+        if !self.is_tab || stop_in_lpxs <= 0.0 {
+            return self.advance_in_ems;
+        }
+        // Summed f32 advances can end a hair short of a stop; that TAB belongs to the next one.
+        let stop = (x_in_lpxs / stop_in_lpxs + 1.0e-3).floor() + 1.0;
+        (stop * stop_in_lpxs - x_in_lpxs) / font_size_in_lpxs
+    }
+}
+
+/// Tab stops repeat every this many space advances.
+pub const TAB_STOP_IN_SPACES: f32 = 4.0;

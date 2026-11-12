@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.13.15 - 2026-11-12
+
+### Fixed
+
+- Markdown lists nested under a different kind of list keep their marker beside the item text: a numbered list under a bullet no longer draws its numbers over the first characters of each item. Numbered lists whose numbers are wider than `99.` widen their marker column instead of drawing the number outside it.
+- Inline code that wraps to the next line whole no longer leaves an empty grey chip at the end of the previous line, in chat messages and in the Markdown file preview.
+- On phones, a chat opened in a sheet (a subagent from the subagents list) ends above the system navigation bar: the last line is fully visible at the end of the conversation. The tool-call detail, tasks, subagents and usage sheets opened from such a sheet, and standalone tool-call sheets, keep their content above the bar too.
+- The jump-to-latest button hides within 32px of the end of the conversation, as in the original app, instead of covering the last lines until the very last pixel is reached.
+- The **Fork session** draft (and every other draft pane) draws its message field and toolbar inside the composer card again. They were left at the top of the pane, outside the card that held only the attachment, and their buttons did not respond where they were drawn.
+- Selected text is visible in every text field while it has focus, on light and dark themes: the New session prompt, dialog and search fields and Settings fields set the selection colour for the unfocused state only, so Shift+arrow, Ctrl+A or mouse selections showed nothing on a light surface.
+- The text cursor is a solid bar on whole pixels. On 100%-scale displays (typical on Windows) it was drawn at about a third of its colour and smeared over two pixel columns.
+- The Windows build no longer aborts at startup when the graphics driver does not implement the swap-chain background colour (Wine).
+- On phones, Back from a file, diff or preview opened from a conversation link returns to that conversation instead of jumping to the last session tab; files that link to each other unwind in the order they were opened. On Android, an app restarted while a browser was in front no longer replays the notification or link it was originally launched from.
+- Markdown file previews scroll by touch again: swiping, dragging the scrollbar and flick inertia no longer stop on the first frame, and selecting text in the preview with the mouse or a long press works again. A quick second swipe from the same spot scrolls instead of selecting a word.
+- Tabs in tool output, code blocks, diffs, file views and messages indent to 4-column tab stops instead of showing missing-glyph boxes, and stray control characters such as carriage returns and escape codes no longer render as boxes. Copied text keeps the original tab characters.
+- Dragging files from the desktop into the app works. On Linux dropped files were never received (the X11 drop target was a stub); on Windows dropping more than one file at once did nothing, and the cursor showed "allowed" even where a drop was ignored. Files can be dropped anywhere on a chat, a draft, the New session screen or a terminal, not only on the message box, and a "Drop files here" overlay shows where they will land. While a message is sending or files are uploading the drag is refused instead of being silently discarded. Files dropped on a terminal paste their quoted path, uploading first when the host is another machine. Names with Korean characters and spaces are handled.
+- Long assistant messages no longer appear late: a finished message shows within a few frames of opening without needing input, streamed text in long replies keeps up and stops trickling out after the turn ends, and text received while a conversation was hidden or the app was in the background is shown at once on return. Message preparation advanced one paragraph per frame, so a long reply stayed blank for seconds.
+
 ## 0.13.14 - 2026-11-09
 
 ### Changed

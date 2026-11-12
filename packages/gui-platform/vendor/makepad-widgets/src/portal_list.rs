@@ -86,6 +86,8 @@ pub struct PortalList {
     
     #[rust(false)] tail_range: bool,
     #[rust(false)] at_end: bool,
+    /// See [`PortalList::end_overflow()`].
+    #[rust] end_overflow: Option<f64>,
     #[rust(true)] not_filling_viewport: bool,
     #[live(false)] reuse_items: bool,
     
@@ -141,6 +143,19 @@ fn final_alignment(
     }
     let shift = viewport_size - last_pos;
     (if measured_tail { shift } else { shift.max(0.0) }, shift >= 0.0 || measured_tail)
+}
+
+/// How far the range's last row extends below the viewport at its final
+/// position (`placed`: index, position, size). `None` while it is not laid out.
+fn end_overflow<T>(
+    items: &[T],
+    range_end: usize,
+    viewport_size: f64,
+    placed: impl Fn(&T) -> (usize, f64, f64),
+) -> Option<f64> {
+    items.iter().rev().map(placed)
+        .find(|(index, ..)| index.checked_add(1) == Some(range_end))
+        .map(|(_, pos, size)| (pos + size - viewport_size).max(0.0))
 }
 
 // Layout keeps measured off-screen neighbors too. Resolve the current offset,
@@ -231,6 +246,7 @@ impl PortalList {
 
         self.at_end = false;
         self.not_filling_viewport = false;
+        self.end_overflow = None;
 
         let vi = self.vec_index;
         let mut visible_items = 0;
@@ -352,6 +368,12 @@ impl PortalList {
                         self.first_scroll = start_pos;
                     }
                 }
+                self.end_overflow = end_overflow(
+                    &self.draw_align_list,
+                    self.range_end,
+                    viewport.size.index(vi),
+                    |item| (item.index, item.shift, item.size.index(vi)),
+                );
                 if !self.scroll_bar.animator_in_state(cx, id!(hover.pressed)){
                     self.update_scroll_bar(cx);
                 }
@@ -830,6 +852,14 @@ impl PortalList {
         self.at_end
     }
 
+    /// How far the last item extends below the viewport in the most recent
+    /// layout: `Some(0.0)` when the end is fully visible, `None` while the last
+    /// item is too far below to be laid out. Unlike [`Self::is_at_end()`] this
+    /// measures the remaining scroll distance near the end.
+    pub fn end_overflow(&self) -> Option<f64> {
+        self.end_overflow
+    }
+
     /// Returns the number of items that are currently visible in the viewport,
     /// including partially visible items.
     pub fn visible_items(&self) -> usize {
@@ -1241,6 +1271,11 @@ impl PortalListRef {
         inner.is_at_end()
     }
 
+    /// See [`PortalList::end_overflow()`].
+    pub fn end_overflow(&self) -> Option<f64> {
+        self.borrow().and_then(|inner| inner.end_overflow())
+    }
+
     /// See [`PortalList::visible_items()`].
     pub fn visible_items(&self) -> usize {
         let Some(inner) = self.borrow() else { return 0 };
@@ -1428,7 +1463,7 @@ impl PortalListSet {
 
 #[cfg(test)]
 mod scroll_anchor_tests {
-    use super::{final_alignment, measured_scroll_anchor};
+    use super::{end_overflow, final_alignment, measured_scroll_anchor};
 
     #[test]
     fn content_anchor_excludes_header_and_keeps_pending_drag_offset() {
@@ -1460,5 +1495,15 @@ mod scroll_anchor_tests {
         assert_eq!(final_alignment(-120.0, Some(180.0), 600.0, true, true), (120.0, false));
         assert_eq!(final_alignment(-120.0, Some(580.0), 600.0, false, false), (20.0, true));
         assert_eq!(final_alignment(0.0, None, 600.0, false, true), (0.0, false));
+    }
+
+    #[test]
+    fn end_overflow_measures_the_last_row_and_ignores_end_padding() {
+        // (index, final position, size) in a 600 high viewport; row 5 is padding past the range.
+        let rows = [(3, -200.0, 500.0), (4, 300.0, 320.0), (5, 620.0, 0.0)];
+        assert_eq!(end_overflow(&rows, 5, 600.0, |r| *r), Some(20.0));
+        assert_eq!(end_overflow(&rows[..2], 5, 640.0, |r| *r), Some(0.0));
+        // The last row is below the laid-out rows: the distance is unknown, not zero.
+        assert_eq!(end_overflow(&rows, 9, 600.0, |r| *r), None);
     }
 }

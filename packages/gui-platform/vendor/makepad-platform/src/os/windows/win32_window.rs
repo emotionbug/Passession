@@ -310,6 +310,20 @@ use {
         cursor::MouseCursor,
     },
 };
+
+/// Paseo: the drop effect answered to a drag source for the widgets' response, limited to
+/// the effects the source allows. Widgets that take files only read them: when the source
+/// offers no copy, a link is still true to that; a move (the source then removes its
+/// files) is answered only when a widget asked for one.
+fn drop_effect(response: DragResponse, allowed: DROPEFFECT) -> DROPEFFECT {
+    let offers = |effect: DROPEFFECT| (allowed & effect) != DROPEFFECT(0);
+    match response {
+        DragResponse::Copy if offers(DROPEFFECT_COPY) => DROPEFFECT_COPY,
+        DragResponse::Copy | DragResponse::Link if offers(DROPEFFECT_LINK) => DROPEFFECT_LINK,
+        DragResponse::Move if offers(DROPEFFECT_MOVE) => DROPEFFECT_MOVE,
+        _ => DROPEFFECT(0),
+    }
+}
 /*
 // Copied from Microsoft so it refers to the right IDropTarget
 #[allow(non_snake_case)]
@@ -386,7 +400,7 @@ impl Win32Window {
         ) };
 
         // create DropTarget object that accesses the same data object, convert to COM and give to Microsoft
-        let drop_target: IDropTarget = DropTarget { drag_item: RefCell::new(None),hwnd, }.into();
+        let drop_target: IDropTarget = DropTarget { drag_items: RefCell::new(Vec::new()),effect: Cell::new(DROPEFFECT(0)),hwnd, }.into();
         unsafe { RegisterDragDrop(hwnd, &drop_target).unwrap() };
 
         Win32Window {
@@ -703,7 +717,9 @@ impl Win32Window {
                 );
             },
 
-            // from DropTarget
+            // from DropTarget. Paseo: the result answers the drag source: the drop effect
+            // the widgets chose for Enter/Over (none: the source shows "no drop" and
+            // never drops), and whether a widget took the files for Drop.
             WM_DROPTARGET => {
 
                 // restore the Box<>
@@ -711,27 +727,28 @@ impl Win32Window {
 
                 match *message {
 
+                    // the drag left the window: widgets showing drop feedback must
+                    // hear that it is over, also for a drag from another application
                     DropTargetMessage::Leave => {
-                        if with_win32_app(|app| app.is_dragging_internal.get()) {
-                            // TODO: cancel DoDragDrop somehow
-                            window.do_callback(Win32Event::DragEnd);
-                        }
+                        window.do_callback(Win32Event::DragEnd);
+                        return LRESULT(0)
                     },
-                    DropTargetMessage::Enter(flags,mut point,effect,drag_item) |
-                    DropTargetMessage::Over(flags,mut point,effect,drag_item) => {
+                    DropTargetMessage::Enter(flags,mut point,allowed,drag_items) |
+                    DropTargetMessage::Over(flags,mut point,allowed,drag_items) => {
                         
                         // decode message
                         let _ = unsafe { ScreenToClient(window.hwnd,&mut point as *mut POINTL as *mut POINT) };
-                        let response = if (effect & DROPEFFECT_LINK) != DROPEFFECT(0) { DragResponse::Link }
-                        else if (effect & DROPEFFECT_MOVE) != DROPEFFECT(0) { DragResponse::Move }
-                        else if (effect & DROPEFFECT_COPY) != DROPEFFECT(0) { DragResponse::Copy }
-                        else { DragResponse::None };
 
                         let dpi_factor = window.get_dpi_factor();
+                        let window_id = window.window_id;
+
+                        // nothing is accepted until a widget under the pointer says so
+                        let response = Arc::new(Mutex::new(DragResponse::None));
 
                         // send to makepad
                         window.do_callback(
                             Win32Event::Drag(
+                                window_id,
                                 DragEvent {
                                     modifiers: KeyModifiers {
                                         shift: (flags & MK_SHIFT) != MODIFIERKEYS_FLAGS(0),
@@ -741,24 +758,30 @@ impl Win32Window {
                                     },
                                     handled: Arc::new(Mutex::new(false)),
                                     abs: DVec2 { x: point.x as f64 / dpi_factor,y: point.y as f64 / dpi_factor, },
-                                    items: Arc::new(vec![drag_item]),
-                                    response: Arc::new(Mutex::new(response)),
+                                    items: Arc::new(drag_items),
+                                    response: response.clone(),
                                 }
                             )
-                        );        
+                        );
+
+                        let response = *response.lock().unwrap();
+                        return LRESULT(drop_effect(response,allowed).0 as isize)
                     }, 
 
-                    DropTargetMessage::Drop(flags,mut point,_effect,drag_item) => {
+                    DropTargetMessage::Drop(flags,mut point,_allowed,drag_items) => {
 
                         // decode message
                         let _ = unsafe { ScreenToClient(window.hwnd,&mut point as *mut POINTL as *mut POINT) };
 
                         //log!("dropping at ({},{}), flags: {:04X}, response: {:?}, drag_item: {:?}",point.x,point.y,flags.0,response,drag_item);
                         let dpi_factor = window.get_dpi_factor();
+                        let window_id = window.window_id;
+                        let handled = Arc::new(Mutex::new(false));
 
                         // send to makepad
                         window.do_callback(
                             Win32Event::Drop(
+                                window_id,
                                 DropEvent {
                                     modifiers: KeyModifiers {
                                         shift: (flags & MK_SHIFT) != MODIFIERKEYS_FLAGS(0),
@@ -766,16 +789,19 @@ impl Win32Window {
                                         alt: false,  // TODO
                                         logo: false,  // Windows doesn't have a logo button
                                     },
-                                    handled: Arc::new(Mutex::new(false)),
+                                    handled: handled.clone(),
                                     abs: DVec2 { x: point.x as f64 / dpi_factor,y: point.y as f64 / dpi_factor, },
-                                    items: Arc::new(vec![drag_item]),
+                                    items: Arc::new(drag_items),
                                 }
                             )
                         );
 
                         window.do_callback(
                             Win32Event::DragEnd
-                        );        
+                        );
+
+                        let handled = *handled.lock().unwrap();
+                        return LRESULT(handled as isize)
                     },
                 }
             },

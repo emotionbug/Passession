@@ -47,6 +47,15 @@ impl Cx {
             .is_some_and(|window_id| self.keyboard_event_is_for_window(event, window_id))
     }
 
+    /// Paseo: a native drag has one target window and reports its position in that
+    /// window's coordinates. Backends that know the window (Windows, X11) dispatch drag
+    /// and drop events through `call_window_event_handler`; other windows must not
+    /// hit-test them. A source-less drag event still reaches every window.
+    pub fn drag_event_is_for_window(&self, event: &Event, window_id: WindowId) -> bool {
+        !matches!(event, Event::Drag(_) | Event::Drop(_))
+            || self.keyboard_event_window.is_none_or(|source| source == window_id)
+    }
+
     /// Dispatch native or explicitly addressed synthetic input without changing wire payloads.
     pub fn call_window_event_handler(&mut self, window_id: WindowId, event: &Event) {
         if !self.windows.is_created(window_id) { return; }

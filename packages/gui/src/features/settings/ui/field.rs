@@ -274,9 +274,9 @@ impl FieldHost {
                             color_empty: (fg), color_empty_hover: (fg), color_empty_focus: (fg),
                             text_style: { font_size: (font) }
                         }
-                        draw_selection: { color: (selection) }
                     },
                 );
+                entry.widget.apply_over(cx, &crate::theme::text_selection(selection));
             }
             entry
                 .widget
@@ -329,9 +329,9 @@ impl FieldHost {
                         text_style: { font_size: (font) }
                     }
                     draw_cursor: { color: (fg) }
-                    draw_selection: { color: (selection) }
                 },
             );
+            entry.widget.apply_over(cx, &crate::theme::text_selection(selection));
         }
         entry
             .widget

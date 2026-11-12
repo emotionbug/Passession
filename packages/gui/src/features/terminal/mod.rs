@@ -4,6 +4,7 @@
 //! daemon-owned shell (tab kind `terminal`); input and resizes go to the daemon as
 //! `terminal_input` session messages.
 
+pub mod drop;
 pub mod grid;
 pub mod input;
 pub mod keybar;

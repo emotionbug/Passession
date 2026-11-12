@@ -4,7 +4,10 @@ use crate::{
     event::DragItem,
     windows::Win32::{
         System::{
-            Com::STGMEDIUM,
+            Com::{
+                STGMEDIUM,
+                TYMED_HGLOBAL,
+            },
             Ole::ReleaseStgMedium,
             Memory::{
                 GlobalAlloc,
@@ -15,109 +18,58 @@ use crate::{
                 GMEM_FIXED,
             },
         },
+        UI::Shell::{
+            DragQueryFileW,
+            HDROP,
+        },
         Foundation::HGLOBAL,
     },
 };
 
 // This is where all binary conversion code goes between makepad DragItem and Windows HGLOBAL/DROPFILES structure
 
-// convert incoming STGMEDIUM from internal or external source to DragItem
-pub fn convert_medium_to_dragitem(medium: STGMEDIUM) -> Option<DragItem> {
+// Paseo: convert an incoming CF_HDROP medium from an internal or external source to one
+// DragItem per file. Upstream decoded the DROPFILES block by hand, one UTF-16 unit per
+// character (names outside the BMP came out wrong), refused the ANSI form, and returned
+// nothing at all when the user dragged more than one file. The shell reads every form.
+pub fn convert_medium_to_dragitems(medium: STGMEDIUM) -> Vec<DragItem> {
 
-    // get size and raw pointer
-    let hglobal_size = unsafe { GlobalSize(medium.u.hGlobal) };
-    let hglobal_raw_ptr = unsafe { GlobalLock(medium.u.hGlobal) };
+    let mut items = Vec::new();
 
-    // debug dump
-    /*
-    let u8_slice = unsafe { std::slice::from_raw_parts_mut(hglobal_raw_ptr as *mut u8,hglobal_size) };
-    for i in 0..(hglobal_size >> 4) {
-        let mut line = String::new();
-        for k in 0..16 {
-            line.push_str(&format!(" {:02X}",u8_slice[(i << 4) + k]));
-        }
-        log!("{:04X}: {}",i << 4,line);
-    }
-    if (hglobal_size & 15) != 0 {
-        let mut line = String::new();
-        for k in 0..(hglobal_size & 15) {
-            line.push_str(&format!(" {:02X}",u8_slice[((hglobal_size >> 4) << 4) + k]));
-        }
-        log!("{:04X}: {}",(hglobal_size >> 4) << 4,line);
-    }
-    */
+    if medium.tymed == TYMED_HGLOBAL.0 as u32 {
+        let hglobal = unsafe { medium.u.hGlobal };
 
-    // read DROPFILES part
-    let u32_slice = unsafe { std::slice::from_raw_parts_mut(hglobal_raw_ptr as *mut u32,7) };
-    let names_offset = u32_slice[0];
-    let has_wide_strings = u32_slice[4];
-    
-    // guard against non-wide strings or unknown objects
-    if has_wide_strings == 0 {
-        log!("drag object should have wide strings");
-        let _ = unsafe { GlobalUnlock(medium.u.hGlobal) };
-        unsafe { ReleaseStgMedium(&medium as *const STGMEDIUM as *mut STGMEDIUM) };
-        return None;
-    }
-
-    if (names_offset != 20) && (names_offset != 28) {
-        log!("unknown drag object");
-        let _ = unsafe { GlobalUnlock(medium.u.hGlobal) };
-        unsafe { ReleaseStgMedium(&medium as *const STGMEDIUM as *mut STGMEDIUM) };
-        return None;
-    }
-
-    let mut internal_id: Option<LiveId> = None;
-    let u16_slice = if names_offset == 20 {
-        // regular DROPFILES from external source
-        unsafe { std::slice::from_raw_parts_mut((hglobal_raw_ptr as *mut u8).offset(20) as *mut u16,(hglobal_size - 20) / 2) }
-    }
-    else {
-        let id = LiveId(((u32_slice[6] as u64)<<32)|(u32_slice[5] as u64));
-        if id.0 != 0{
-            internal_id = Some(id);
-        }
-        // internal DROPFILES with internal ID as well
-        //let u64_slice = unsafe { std::slice::from_raw_parts_mut((hglobal_raw_ptr as *mut u8).offset(20) as *mut u64,1) };
-        //internal_id = Some(LiveId(u64_slice[0]));
-        unsafe { std::slice::from_raw_parts_mut((hglobal_raw_ptr as *mut u8).offset(28) as *mut u16,(hglobal_size - 28) / 2) }            
-    };
-
-    // extract/decode filenames
-    let mut filenames = Vec::<String>::new();
-    let mut filename = String::new();
-    for w in u16_slice {
-        if *w != 0 {
-            let c = match char::from_u32(*w as u32) {
-                Some(c) => c,
-                None => char::REPLACEMENT_CHARACTER,
-            };
-            filename.push(c);
-        }
-        else {
-            if (filename.len() == 0) && (filenames.len() > 0) { 
-                break;
+        // an internal drag carries its LiveId between the DROPFILES header and the names
+        let mut internal_id: Option<LiveId> = None;
+        let hglobal_size = unsafe { GlobalSize(hglobal) };
+        let hglobal_raw_ptr = unsafe { GlobalLock(hglobal) };
+        if !hglobal_raw_ptr.is_null() {
+            if hglobal_size >= 28 {
+                let u32_slice = unsafe { std::slice::from_raw_parts(hglobal_raw_ptr as *const u32,7) };
+                let id = ((u32_slice[6] as u64)<<32)|(u32_slice[5] as u64);
+                if u32_slice[0] == 28 && id != 0 {
+                    internal_id = Some(LiveId(id));
+                }
             }
-            filenames.push(filename);
-            filename = String::new();
+            let _ = unsafe { GlobalUnlock(hglobal) };
+        }
+
+        let hdrop = HDROP(hglobal.0 as isize);
+        let count = unsafe { DragQueryFileW(hdrop,0xFFFF_FFFF,None) };
+        for index in 0..count {
+            let length = unsafe { DragQueryFileW(hdrop,index,None) } as usize;
+            let mut name = vec![0u16;length + 1];
+            let written = unsafe { DragQueryFileW(hdrop,index,Some(&mut name)) } as usize;
+            if written == 0 {
+                continue;
+            }
+            items.push(DragItem::FilePath { path: String::from_utf16_lossy(&name[..written.min(length)]),internal_id, });
         }
     }
 
-    /*
-    for filename in filenames.iter() {
-        log!("    \"{}\"",filename);
-    }*/
-
-    // ready
-    let _ = unsafe { GlobalUnlock(medium.u.hGlobal) };
     unsafe { ReleaseStgMedium(&medium as *const STGMEDIUM as *mut STGMEDIUM) };
 
-    if filenames.len() != 1 {
-        log!("dropping multiple files is not supported");
-        return None;
-    }
-
-    Some(DragItem::FilePath { path: filenames[0].clone(),internal_id, })
+    items
 }
 
 // create new internal DROPFILES structure from DragItem

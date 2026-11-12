@@ -42,8 +42,8 @@ pub enum Win32Event {
     TextInput(WindowId, TextInputEvent),
     /// An input-method composition step for the focused editor (`ImeComposer`).
     TextComposition(WindowId, crate::ime_composer::CompositionUpdate),
-    Drag(DragEvent),
-    Drop(DropEvent),
+    Drag(WindowId, DragEvent),
+    Drop(WindowId, DropEvent),
     DragEnd,
     KeyDown(WindowId, KeyEvent),
     KeyUp(WindowId, KeyEvent),

@@ -25,6 +25,7 @@ use super::rows::{self, FindTarget, LiveFooter, RowContext, RowItem, RowKind};
 use super::session::{ActionKind, ChatSession, Completion, Cursor, ExecutionStatus, ForkTarget, Io, SessionKey, SyncStatus};
 use super::store::with_store;
 use super::tracks::{self, DeleteFinished, SubagentRow, TrackModel, TrackPanel};
+use crate::common::file_drop::FileDropZone;
 use crate::common::overlay::{self, MenuEntry, MenuItem, MenuOptions, TapTarget, WindowModal};
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
@@ -50,6 +51,7 @@ live_design! {
     use crate::features::timeline::canvas::*;
     use crate::features::timeline::chat_row::*;
     use crate::features::composer::ui::panel::ComposerPanel;
+    use crate::common::file_drop::FileDropZone;
 
     pub ChatPanelBase = {{ChatPanel}} {}
 
@@ -75,6 +77,7 @@ live_design! {
             Row = <ChatRow> {}
         }
         composer: <ComposerPanel> {}
+        file_drop: <FileDropZone> {}
         find_field: <PTextField> { width: Fill, height: Fit, focus_scope: "editable" }
     }
 
@@ -374,6 +377,9 @@ pub struct ChatPanel {
     composer: WidgetRef,
     #[live]
     find_field: WidgetRef,
+    /// agent-panel.tsx ChatSurface: the whole pane takes dropped files for its composer.
+    #[live]
+    file_drop: FileDropZone,
     #[live]
     sheet_template: Option<LivePtr>,
 
@@ -644,10 +650,20 @@ impl ChatPanel {
         if self.visible != visible {
             self.visible = visible;
             self.composer.as_composer_panel().set_visible(cx, visible && self.composer_shown());
-            if !visible {
+            if visible {
+                self.release_reveal_backlog();
+            } else {
                 self.dismiss_modal(cx);
             }
             self.area.redraw(cx);
+        }
+    }
+
+    /// Text that arrived while this conversation was off screen (hidden tab or
+    /// pane, app in the background) is shown whole when it returns.
+    fn release_reveal_backlog(&self) {
+        for state in self.row_states.values() {
+            state.borrow_mut().release_reveal_backlog();
         }
     }
 
@@ -2364,6 +2380,9 @@ impl Widget for ChatPanel {
         }
         let modal_open = self.modal.is_some();
         let modal_input = crate::common::is_user_input(event);
+        if matches!(event, Event::Foreground | Event::Resume) {
+            self.release_reveal_backlog();
+        }
         if matches!(event, Event::TextHandle(_) | Event::Pause | Event::AppLostFocus)
             || matches!(event, Event::TouchUpdate(update) if update.cancelled)
         {
@@ -2577,6 +2596,13 @@ impl Widget for ChatPanel {
                 self.detach();
             }
         }
+        // file-drop-zone.tsx: files dropped anywhere on the pane go to its composer. No
+        // composer (archived, archiving, a subagent) or a busy one refuses the drag.
+        let drop_ready = composer_visible && !modal_open && self.non_ready().is_none()
+            && self.composer.as_composer_panel().accepts_file_drop();
+        if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
+            self.composer.as_composer_panel().drop_files(cx, paths);
+        }
         let effects_before = scope.data.get::<UiContext>().map(|ui| ui.effects.len()).unwrap_or(0);
         if !block_pointer || !composer_visible {
             let activity = scope.data.get::<UiContext>().map(|ui| ui.activity);
@@ -2752,7 +2778,9 @@ impl Widget for ChatPanel {
                 // newest edge. Scroll actions arrive before that layout.
                 let at_end = portal.is_at_end();
                 self.sticky = at_end;
-                self.at_bottom = at_end;
+                // strategy-native.tsx isNearBottom: the jump button hides
+                // within 32px of the newest edge, where it would only cover it.
+                self.at_bottom = portal.end_overflow().is_some_and(|overflow| overflow <= 32.0);
                 portal.set_tail_range(at_end);
             }
         }
@@ -2860,6 +2888,9 @@ impl Widget for ChatPanel {
             }
         }
 
+        // ── the file drop backdrop, over the stream and the composer ────
+        self.file_drop.draw(cx, rect);
+
         // ── modal surfaces ──────────────────────────────────────────────
         if self.modal.is_some() {
             self.modal_list.begin_overlay_last(cx);
@@ -2869,11 +2900,14 @@ impl Widget for ChatPanel {
             let full_window = matches!(self.modal, Some(Modal::Subagent { .. }))
                 || self.target.as_ref().is_some_and(|t| t.sheet);
             let bounds = if full_window { Rect { pos: DVec2::default(), size: cx.current_pass_size() } } else { rect };
+            // sheet-tabs.tsx: a sheet that reaches the bottom of the screen owns the system
+            // navigation inset. A panel-sized modal ends above it, with the shell body.
+            let bottom_inset = if full_window { crate::shell::platform::safe_insets().bottom } else { 0.0 };
             self.modal_rect = bounds;
             cx.begin_turtle(Walk::abs_rect(bounds), Layout::default());
             self.modal_kit.begin_layer(cx);
             self.modal_canvas.begin(bounds.pos);
-            animating |= self.draw_modal(cx, scope, look, bounds, &rows, &tasks, &host_label_fn);
+            animating |= self.draw_modal(cx, scope, look, bounds, bottom_inset, &rows, &tasks, &host_label_fn);
             cx.end_turtle_with_area(&mut self.modal_area);
             cx.end_pass_sized_turtle();
             self.modal_list.end(cx);
@@ -3334,7 +3368,7 @@ impl ChatPanel {
     /// Track panels, compact detail sheets, the usage sheet, the image
     /// lightbox and the subagent sheet. Returns whether it animates.
     #[allow(clippy::too_many_arguments)]
-    fn draw_modal(&mut self, cx: &mut Cx2d, scope: &mut Scope, look: Look, rect: Rect, rows: &[SubagentRow], tasks: &[Value], host_label: &dyn Fn(&str) -> String) -> bool {
+    fn draw_modal(&mut self, cx: &mut Cx2d, scope: &mut Scope, look: Look, rect: Rect, bottom_inset: f64, rows: &[SubagentRow], tasks: &[Value], host_label: &dyn Fn(&str) -> String) -> bool {
         let p = look.palette;
         let Some(modal) = self.modal.take() else { return false };
         let mut animating = false;
@@ -3360,7 +3394,7 @@ impl ChatPanel {
                     host_label,
                 };
                 let mut d = Draw { kit: &mut self.modal_kit, canvas: &mut self.modal_canvas, look, state: &mut self.modal_state, now: now_seconds(), area: self.area, animating: false };
-                tracks::draw_panel(cx, &mut d, &mut self.painter, &mut self.provider_icon, &model, *panel, anchor, rect);
+                tracks::draw_panel(cx, &mut d, &mut self.painter, &mut self.provider_icon, &model, *panel, anchor, rect, bottom_inset);
                 animating |= d.animating;
             }
             Modal::Sheet { row, kind, opened } => {
@@ -3373,7 +3407,7 @@ impl ChatPanel {
                 let progress = ((now_seconds() - *opened) / super::tool_sheet::OPEN_SECS).clamp(0.0, 1.0);
                 let mut d = Draw { kit: &mut self.modal_kit, canvas: &mut self.modal_canvas, look, state: &mut self.modal_state, now: now_seconds(), area: self.area, animating: false };
                 let kind_ref = kind.as_str();
-                super::tool_sheet::paint_detail_sheet(cx, &mut d, rect, &header, progress, kind == "group", &|cx, d, x, y, w, fill| {
+                super::tool_sheet::paint_detail_sheet(cx, &mut d, rect, bottom_inset, &header, progress, kind == "group", &|cx, d, x, y, w, fill| {
                     rows::sheet_body(cx, d, &ctx, &item, kind_ref, x, y, w, fill)
                 });
                 animating |= d.animating;
@@ -3381,7 +3415,7 @@ impl ChatPanel {
             Modal::Usage => {
                 let agent = self.snap.as_ref().map(|s| s.agent.clone()).unwrap_or_default();
                 let mut d = Draw { kit: &mut self.modal_kit, canvas: &mut self.modal_canvas, look, state: &mut self.modal_state, now: now_seconds(), area: self.area, animating: false };
-                usage_sheet(cx, &mut d, &agent, rect);
+                usage_sheet(cx, &mut d, &agent, rect, bottom_inset);
                 animating |= d.animating;
             }
             Modal::Lightbox { source, scale, offset } => {
@@ -3434,7 +3468,7 @@ impl ChatPanel {
                     d.canvas.add_hit(r, HitTarget::Chrome(id.into()));
                 }
                 animating |= d.animating;
-                let content = rect_xywh(sheet.pos.x, sheet.pos.y + header_h, sheet.size.x, (sheet.size.y - header_h).max(1.0));
+                let content = rect_xywh(sheet.pos.x, sheet.pos.y + header_h, sheet.size.x, (sheet.size.y - header_h - bottom_inset).max(1.0));
                 self.sheet_content = content;
                 if let Some(panel) = self.sheet_panel.clone() {
                     let walk = Walk { abs_pos: Some(content.pos), margin: Margin::default(), width: Size::Fixed(content.size.x), height: Size::Fixed(content.size.y) };
@@ -3449,7 +3483,7 @@ impl ChatPanel {
 
 /// components/context-window-sheet.tsx: the agent's facts and usage in the
 /// adaptive sheet (bottom sheet on compact, centered dialog elsewhere).
-fn usage_sheet(cx: &mut Cx2d, d: &mut Draw, agent: &Value, rect: Rect) {
+fn usage_sheet(cx: &mut Cx2d, d: &mut Draw, agent: &Value, rect: Rect, bottom_inset: f64) {
     let p = d.look.palette;
     d.kit.rect(cx, rect, rgba(0x73000000), 0.0);
     d.canvas.add_hit(rect, HitTarget::Chrome("scrim".into()));
@@ -3511,19 +3545,21 @@ fn usage_sheet(cx: &mut Cx2d, d: &mut Draw, agent: &Value, rect: Rect) {
         }
         cy + 16.0 - y
     };
-    let h = d.measure(|d| paint(cx, d, 0.0, 0.0)).min(rect.size.y * 0.9);
+    // The compact sheet's background runs to the bottom edge; its content ends above the inset.
+    let content = d.measure(|d| paint(cx, d, 0.0, 0.0));
+    let inset = if compact { bottom_inset } else { 0.0 };
+    let h = (content + inset).min(rect.size.y * 0.9);
     let (x, y) = if compact { (rect.pos.x, rect.pos.y + rect.size.y - h) } else { (rect.pos.x + (rect.size.x - w) * 0.5, rect.pos.y + (rect.size.y - h) * 0.5) };
     let radii = if compact { vec4(16.0, 16.0, 0.0, 0.0) } else { vec4(12.0, 12.0, 12.0, 12.0) };
     d.kit.rect_full(cx, rect_xywh(x, y, w, h), p.surface1, radii, p.border, 1.0);
     d.canvas.add_hit(rect_xywh(x, y, w, h), HitTarget::Chrome("sheet:body".into()));
     let close = rect_xywh(x + w - 44.0, y + 8.0, 32.0, 32.0);
     let key = "usage:y".to_owned();
-    let content = d.measure(|d| paint(cx, d, 0.0, 0.0));
-    let max_y = (content - h).max(0.0);
+    let view = rect_xywh(x, y, w, (h - inset).max(0.0));
+    let max_y = (content - view.size.y).max(0.0);
     d.state.extent_y.insert(key.clone(), max_y);
     let sy = d.state.scroll_y.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_y);
-    let view = rect_xywh(x, y, w, h);
-    cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(h.max(1.0)) }, Layout::default());
+    cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(view.size.y.max(1.0)) }, Layout::default());
     d.canvas.push_clip(view);
     paint(cx, d, x, y - sy);
     d.canvas.pop_clip();

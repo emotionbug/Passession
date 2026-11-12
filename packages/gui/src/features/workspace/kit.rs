@@ -1116,10 +1116,10 @@ impl WaInput {
                     color_empty: (p.muted), color_empty_hover: (p.muted), color_empty_focus: (p.muted),
                     text_style: { font_size: (font_size) }
                 }
-                draw_selection: { color: (with_alpha(p.accent, 0.35)) }
                 draw_cursor: { color: (p.foreground) }
             },
         );
+        input.apply_over(cx, &theme::text_selection(with_alpha(p.accent, 0.35)));
         match self.look {
             WaInputLook::Field => {
                 let pad_v = if self.multiline { 12.0 } else { self.field_pad(md) };

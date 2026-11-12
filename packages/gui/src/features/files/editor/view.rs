@@ -20,7 +20,7 @@ use crate::features::files::highlight::{self, Highlighted};
 use crate::features::files::kit::{Kit, RichFont, RichSpan, rect, spec};
 use makepad_widgets::makepad_draw::event::DigitId;
 
-/// Tab characters display as this many spaces.
+/// Tab stops are this many columns apart, as in the shared text layout (`TAB_STOP_IN_SPACES`).
 const TAB_WIDTH: usize = 4;
 
 /// What drawing needs besides the text.
@@ -109,14 +109,15 @@ pub struct SourceEditor {
     pub content_rect: Rect,
 }
 
-fn char_cols(c: char) -> usize {
+/// Columns `c` takes when it starts at `column` of its row: a tab reaches the next tab stop.
+fn char_cols(c: char, column: usize) -> usize {
     let code = c as u32;
     let wide = matches!(code,
         0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
         | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60
         | 0xFFE0..=0xFFE6 | 0x1F300..=0x1F64F | 0x1F900..=0x1F9FF | 0x20000..=0x3FFFD);
     if c == '\t' {
-        TAB_WIDTH
+        TAB_WIDTH - column % TAB_WIDTH
     } else if wide {
         2
     } else {
@@ -128,7 +129,7 @@ fn line_cols(line: &str) -> usize {
     if line.is_ascii() && !line.contains('\t') {
         return line.len();
     }
-    line.chars().map(char_cols).sum()
+    line.chars().fold(0, |column, c| column + char_cols(c, column))
 }
 
 /// Row starts of `line` wrapped at `cols` columns, breaking after whitespace when possible.
@@ -141,7 +142,7 @@ fn wrap_line(line: &str, cols: usize) -> Vec<usize> {
     let mut last_break: Option<usize> = None;
     let mut row_start = 0;
     for (index, c) in line.char_indices() {
-        let width = char_cols(c);
+        let mut width = char_cols(c, row_cols);
         if row_cols + width > cols && index > row_start {
             let start = match last_break {
                 Some(brk) if brk > row_start => brk,
@@ -151,6 +152,7 @@ fn wrap_line(line: &str, cols: usize) -> Vec<usize> {
             row_start = start;
             row_cols = line_cols(&line[start..index]);
             last_break = None;
+            width = char_cols(c, row_cols);
         }
         row_cols += width;
         if c == ' ' || c == '\t' {
@@ -160,21 +162,25 @@ fn wrap_line(line: &str, cols: usize) -> Vec<usize> {
     starts
 }
 
-/// Display text of a row: tabs expanded. Returns the text and the byte positions in the
-/// display string of each source char boundary (`map[i]` for source byte `i` of the row).
+/// Display text of a row: each tab expanded to its tab stop. Returns the text and the byte
+/// positions in the display string of each source char boundary (`map[i]` for source byte
+/// `i` of the row).
 fn display(row: &str) -> (String, Vec<(usize, usize)>) {
     if !row.contains('\t') {
         return (row.to_owned(), Vec::new());
     }
     let mut text = String::with_capacity(row.len() + 8);
     let mut map = Vec::new();
+    let mut column = 0;
     for (index, c) in row.char_indices() {
         map.push((index, text.len()));
+        let cols = char_cols(c, column);
         if c == '\t' {
-            text.push_str(&" ".repeat(TAB_WIDTH));
+            text.push_str(&" ".repeat(cols));
         } else {
             text.push(c);
         }
+        column += cols;
     }
     map.push((row.len(), text.len()));
     (text, map)
@@ -1286,9 +1292,14 @@ mod tests {
     #[test]
     fn tab_display_mapping() {
         let (text, map) = display("a\tb");
-        assert_eq!(text, "a    b");
-        assert_eq!(to_display(&map, 2), 5);
+        assert_eq!(text, "a   b");
+        assert_eq!(to_display(&map, 2), 4);
         assert_eq!(to_source(&map, 3), 1);
-        assert_eq!(to_source(&map, 5), 2);
+        assert_eq!(to_source(&map, 4), 2);
+        // Tabs reach the next multiple of four columns; Hangul takes two.
+        assert_eq!(display("\t\tx").0, "        x");
+        assert_eq!(display("한\tx").0, "한  x");
+        assert_eq!(line_cols("ab\tc\t"), 8);
+        assert_eq!(wrap_line("abc\tdef", 4), vec![0, 4]);
     }
 }

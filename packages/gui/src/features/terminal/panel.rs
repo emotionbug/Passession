@@ -3,16 +3,23 @@
 //! terminal surface, the attach spinner overlay, the "Host is not connected" state, the
 //! stream error row and, on mobile or compact layouts, the virtual key bar.
 
+use std::collections::VecDeque;
+use std::path::PathBuf;
+
 use makepad_widgets::*;
 use paseo_gui_platform::{PlatformAction, PlatformValue};
+use serde_json::Value;
 
+use super::drop::{self, FILE_TOO_LARGE};
 use super::keybar::{Control, Modifier, WaTerminalKeyBarWidgetExt};
 use super::session::{self, display_title, scrollback_preference};
 use super::stream::Stream;
 use super::view::{WaTerminalViewRef, WaTerminalViewWidgetExt};
+use crate::common::file_drop::FileDropZone;
 use crate::common::{UiContext, UiEffect};
+use crate::features::composer::ops;
 use crate::features::workspace::host;
-use crate::features::workspace::i18n::t;
+use crate::features::workspace::i18n::{t, ta};
 use crate::features::workspace::kit::{ellipsize, WaButtonWidgetExt};
 
 live_design! {
@@ -20,12 +27,14 @@ live_design! {
     use link::shaders::*;
     use link::widgets::*;
     use crate::common::widgets::*;
+    use crate::common::file_drop::FileDropZone;
     use crate::features::workspace::kit::*;
     use crate::features::terminal::view::*;
     use crate::features::terminal::keybar::*;
 
     pub TerminalPanel = {{TerminalPanel}} {
         width: Fill, height: Fill, flow: Down
+        file_drop: <FileDropZone> {}
         wa_root = <Surface> {
             width: Fill, height: Fill, flow: Down
             role: Surface0
@@ -122,6 +131,16 @@ pub struct TerminalPanel {
     /// The key bar's pending clipboard read.
     #[rust]
     paste_request: Option<u64>,
+    /// terminal-pane.tsx `FileDropZone`: the output takes dropped files.
+    #[live]
+    file_drop: FileDropZone,
+    /// Dropped files still to store on a host that cannot read this machine's disk, in
+    /// drop order (`TerminalFilePasteQueue`).
+    #[rust]
+    upload_queue: VecDeque<PathBuf>,
+    /// The upload in flight.
+    #[rust]
+    upload_request: Option<String>,
 }
 
 impl TerminalPanel {
@@ -220,6 +239,79 @@ impl TerminalPanel {
         }
     }
 
+    /// terminal-pane.tsx `handleDroppedFiles` (`routeTerminalDrop`): on the host's own
+    /// machine the files' paths are pasted as one input; any other host is sent the bytes
+    /// and each host path is pasted as its upload finishes.
+    fn drop_files(&mut self, cx: &mut Cx, ctx: &mut UiContext, paths: Vec<PathBuf>) {
+        let Some(target) = self.target.clone() else { return };
+        let output = self.output();
+        if host::host(&ctx.state, &target.host_id).is_some_and(|h| h.is_local()) {
+            if let Some(mut view) = output.borrow_mut() {
+                view.paste(cx, &ctx.core, &drop::prepare_dropped_paths(&paths));
+            }
+        } else {
+            self.upload_queue.extend(paths);
+            self.upload_next(ctx);
+        }
+        // requestTerminalFocus
+        if let Some(mut view) = output.borrow_mut() {
+            view.focus(cx);
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Starts the next queued upload; one file is stored at a time.
+    fn upload_next(&mut self, ctx: &mut UiContext) {
+        if self.upload_request.is_some() {
+            return;
+        }
+        if !self.connected {
+            // The upload that just failed already reported the lost host.
+            self.upload_queue.clear();
+            return;
+        }
+        let (Some(path), Some(target)) = (self.upload_queue.pop_front(), self.target.as_ref()) else { return };
+        self.upload_request = Some(ctx.core.operation(&target.host_id, move |client| drop::upload_dropped_file(client, path)));
+    }
+
+    /// The upload in flight finished: its host path is pasted (`prepareTerminalPath`), a
+    /// failure is reported (`reportFilePasteFailure`), and the next file starts.
+    fn handle_upload(&mut self, cx: &mut Cx, ctx: &mut UiContext) {
+        let Some(result) = self.upload_request.as_deref().and_then(|id| ctx.response(id)) else { return };
+        let outcome: Result<String, String> = match result.as_ref().map(ops::open_envelope) {
+            Ok(Ok(body)) => body
+                .pointer("/files/0/path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| t("composer.errors.uploadFailed")),
+            Ok(Err(error)) => {
+                let message = error.get("message").and_then(Value::as_str).unwrap_or_default();
+                Err(if error.get("code").and_then(Value::as_str) == Some(FILE_TOO_LARGE) {
+                    ta("composer.errors.fileTooLarge", &[("size", "50MB"), ("fileName", message)])
+                } else {
+                    message.to_owned()
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        self.upload_request = None;
+        match outcome {
+            Ok(path) => {
+                if let Some(mut view) = self.output().borrow_mut() {
+                    view.paste(cx, &ctx.core, &drop::prepare_terminal_path(&path));
+                }
+                ctx.effects.push(UiEffect::Toast { message: t("workspace.terminal.fileUploaded"), is_error: false });
+            }
+            Err(reason) => {
+                let message = ta("workspace.terminal.pasteFileFailed", &[("reason", &reason)]);
+                ctx.effects.push(UiEffect::Toast { message, is_error: true });
+            }
+        }
+        self.upload_next(ctx);
+        self.view.redraw(cx);
+    }
+
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, ctx: &mut UiContext) {
         let output = self.output();
         let keybar = self.view.wa_terminal_key_bar(id!(keybar));
@@ -299,6 +391,12 @@ impl Widget for TerminalPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if let Some(ctx) = scope.data.get_mut::<UiContext>() {
             self.handle_core(cx, ctx);
+            self.handle_upload(cx, ctx);
+            // terminal-pane.tsx: the output of a connected terminal takes dropped files.
+            let drop_ready = !self.hidden && self.connected && self.output().borrow().is_some_and(|view| view.session.is_some());
+            if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
+                self.drop_files(cx, ctx, paths);
+            }
         }
         self.view.handle_event(cx, event, scope);
         if let Event::Actions(actions) = event
@@ -354,7 +452,9 @@ impl Widget for TerminalPanel {
             }
         };
         self.view.widget(id!(toolbar.info.title)).set_text(cx, &ellipsize(&facts.title, 80));
-        self.view.widget(id!(toolbar.info.status)).set_text(cx, &facts.status);
+        // `showFileUploading`: a dropped file is on its way to the host.
+        let status = if facts.status.is_empty() && self.upload_request.is_some() { t("workspace.terminal.uploadingFile") } else { facts.status.clone() };
+        self.view.widget(id!(toolbar.info.status)).set_text(cx, &status);
         let copy = self.view.wa_button(id!(copy));
         copy.set_enabled(cx, facts.has_session);
         copy.set_tooltip(cx, &t("workspace.terminal.copy"));
@@ -385,7 +485,11 @@ impl Widget for TerminalPanel {
         if show_keys {
             self.view.wa_terminal_key_bar(id!(keybar)).set_state(cx, facts.sticky, facts.keyboard, self.compact);
         }
-        self.view.draw_walk(cx, scope, walk)
+        let step = self.view.draw_walk(cx, scope, walk);
+        // The drop backdrop covers the output (`styles.outputContainer`).
+        let zone = self.view.widget(id!(body)).area().rect(cx);
+        self.file_drop.draw(cx, zone);
+        step
     }
 }
 
@@ -402,6 +506,9 @@ impl TerminalPanelRef {
         if !same_terminal {
             inner.session_opened = false;
             inner.init_error = None;
+            // Files dropped on the previous terminal are not pasted into this one.
+            inner.upload_queue.clear();
+            inner.upload_request = None;
             if let Some(mut view) = inner.output().borrow_mut() {
                 view.clear_selection(cx);
                 view.session = None;
