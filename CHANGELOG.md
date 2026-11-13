@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.13.19 - 2026-11-14
+## 0.13.20 - 2026-11-14
 
 > System fonts, a clearer project-folder picker, draggable horizontal scrollbars, and improvements to Git Log, terminal search, notifications, settings and keyboard navigation.
 
@@ -45,7 +45,7 @@
 - A refused or timed-out Stop now reports failure without settling the running turn. Manual schedule runs finish under daemon ownership after a client disconnect; canceled targets no longer report success. A failed Claude plan-mode change keeps its approval request available for retry.
 - Terminal clipboard shortcuts no longer race delayed paste delivery. Mouse input uses the application's negotiated encoding and preserves raw bytes; reconnects restore mouse/alternate-screen modes, and final output is not lost at process exit.
 - Concurrent schedule mutations roll back only their own row, backward search wraps correctly, and canceled touch gestures stop held terminal-key repeats.
-- Windows desktop startup no longer allocates a console for its background daemon helper; managed startup probes and background restarts also suppress console allocation while preserving control pipes and foreground CLI behavior.
+- Windows desktop startup no longer opens a console window for its background daemon helper; managed startup probes and background restarts also suppress console windows while preserving control pipes and foreground CLI behavior.
 
 ## 0.13.18 - 2026-11-14
 

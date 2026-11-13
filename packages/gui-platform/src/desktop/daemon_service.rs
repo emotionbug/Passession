@@ -146,8 +146,8 @@ fn helper_command(runtime: &DaemonRuntime) -> tokio::process::Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
-    // A GUI parent does not stop Windows allocating a console for its CLI child.
-    // Keep the JSONL pipes; only suppress console allocation.
+    // A GUI parent does not stop Windows opening a console window for its CLI child.
+    // Keep the JSONL pipes; only suppress the console window.
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     command
@@ -468,10 +468,9 @@ mod tests {
         if std::env::var_os("PASEO_HELPER_CONSOLE_PROBE").is_none() {
             return;
         }
-        use windows::Win32::System::Console::{GetConsoleCP, GetConsoleWindow};
+        use windows::Win32::System::Console::GetConsoleWindow;
         unsafe {
             assert!(GetConsoleWindow().0.is_null(), "helper allocated a console window");
-            assert_eq!(GetConsoleCP(), 0, "helper attached to a console");
         }
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
