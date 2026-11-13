@@ -1,4 +1,4 @@
-//! Paseo Sessions native client (Makepad). See `ui-api.md` for the shell/feature boundary.
+//! Passession native client (Makepad). See `ui-api.md` for the shell/feature boundary.
 
 pub use makepad_widgets;
 

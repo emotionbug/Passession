@@ -34,16 +34,19 @@ fn scrolled(cx: &mut Cx2d, d: &mut Draw, key: &str, x: f64, y: f64, w: f64, cont
     let sx = d.state.scroll_x.get(&kx).copied().unwrap_or(0.0).clamp(0.0, max_x);
     let sy = d.state.scroll_y.get(&ky).copied().unwrap_or(0.0).clamp(0.0, max_y);
     let view = rect_xywh(x, y, w, h);
-    cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(h.max(1.0)) }, Layout::default());
-    d.canvas.push_clip(view);
-    paint(cx, d, dvec2(x + pad.left - sx, y + pad.top - sy));
-    d.canvas.pop_clip();
-    cx.end_turtle();
+    // Enclosing regions register before their content: the deepest one wins.
     if max_x > 0.0 {
         d.canvas.add_hit(view, HitTarget::ScrollX(kx));
     }
     if max_y > 0.0 {
         d.canvas.add_hit(view, HitTarget::ScrollY(ky));
+    }
+    cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(h.max(1.0)) }, Layout::default());
+    d.canvas.push_clip(view);
+    paint(cx, d, dvec2(x + pad.left - sx, y + pad.top - sy));
+    d.canvas.pop_clip();
+    cx.end_turtle();
+    if max_y > 0.0 {
         // Scroll thumb.
         let thumb = (h * h / full_h).max(16.0);
         let ty = y + (h - thumb) * (sy / max_y);

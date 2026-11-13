@@ -21,6 +21,9 @@ pub fn normalize_persisted(mut value: Value) -> Result<Value> {
     remove_at(&mut value, &["features"], "voiceMode");
     // Top-level providers configured retired speech services, not agent providers.
     remove_at(&mut value, &[], "providers");
+    // Account quota is now a built-in source. Retire only its executable
+    // registration, never the OMP profiles, managed login or plugin settings.
+    remove_at(&mut value, &["plugins"], "omp-kiro");
     if let Some(providers) = value.pointer_mut("/agents/providers") {
         migrate_providers(providers)?;
     }
@@ -35,6 +38,7 @@ pub fn normalize_persisted(mut value: Value) -> Result<Value> {
 
 pub fn normalize_patch(mut value: Value) -> Result<Value> {
     remove_at(&mut value, &[], "browserTools");
+    remove_at(&mut value, &["plugins"], "omp-kiro");
     visit(Node::Write(&mut value), Kind::Patch).context("Invalid daemon config patch")?;
     // Internal setters share this normalization path but use the full mutable
     // config's strict skills schema; the public patch schema leaves it unknown.

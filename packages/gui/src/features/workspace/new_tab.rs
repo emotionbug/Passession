@@ -1099,11 +1099,10 @@ impl WaNewTabView {
         ));
     }
 
-    /// `_finish`: once the receipt completed, refresh the host, drop the intent and open the
-    /// created session (or the setup of a workspace created without an agent, or the terminal
-    /// of a Terminal launch).
+    /// Completion replaces this form's tab; opening through the focused pane would leave
+    /// the creation surface behind and could navigate a sibling while its request finishes.
     fn finish(&mut self, ctx: &mut UiContext, result: &Value) {
-        if self.finishing || self.opened {
+        if self.finishing || self.opened || self.intent.is_none() {
             return;
         }
         let receipt = object_of(result, "creation");
@@ -1142,9 +1141,11 @@ impl WaNewTabView {
             let target = PanelTarget::new("setup", &self.target.host_id, &workspace_id, &cwd)
                 .with_title(str_or(&workspace, "name", l("Session")))
                 .with_data(json!({ "repoRoot": str_or(&workspace, "projectRootPath", &cwd) }));
-            ctx.effects.push(UiEffect::OpenTab { target, placement: TabPlacement::Main });
+            ctx.effects.push(UiEffect::ReplaceTab { tab_key: self.target.tab_key.clone(), target });
         } else {
-            ctx.effects.push(UiEffect::OpenSession { host_id: self.target.host_id.clone(), agent_id });
+            let target = PanelTarget::agent(&self.target.host_id, &workspace_id, &cwd, &agent_id, str_of(&agent, "title"))
+                .with_data(json!({ "project": object_of(&agent, "project") }));
+            ctx.effects.push(UiEffect::ReplaceTab { tab_key: self.target.tab_key.clone(), target });
         }
         self.finishing = false;
     }
@@ -1381,6 +1382,11 @@ impl WaNewTabView {
                 self.create_submit(ctx, offered);
             }
             Req::Submit => {
+                // A receipt can complete before the request response. In particular, do
+                // not clear `busy` while the terminal handoff is still pending.
+                if self.intent.is_none() {
+                    return;
+                }
                 self.busy = false;
                 match result {
                     Ok(body) => {
@@ -1444,6 +1450,9 @@ impl WaNewTabView {
                 }
             }
             Req::CreateTerminal { workspace_id, cwd } => {
+                if self.opened && self.terminal_workspace.is_none() {
+                    return;
+                }
                 self.busy = false;
                 // `createTerminal` surfaces `payload.error` with a null terminal (e.g. a missing
                 // shell) instead of treating the create as a no-op success.
@@ -1463,7 +1472,7 @@ impl WaNewTabView {
                 self.opened = true;
                 let target = PanelTarget::new("terminal", &self.target.host_id, str_or(&terminal, "workspaceId", &workspace_id), str_or(&terminal, "cwd", &cwd))
                     .with_id(terminal_id);
-                ctx.effects.push(UiEffect::OpenTab { target, placement: TabPlacement::Main });
+                ctx.effects.push(UiEffect::ReplaceTab { tab_key: self.target.tab_key.clone(), target });
             }
         }
     }
@@ -1588,6 +1597,87 @@ impl WaNewTabView {
 
     fn pick_models(&mut self, cx: &mut Cx) {
         self.view.wa_select(id!(select)).open(cx, "model", self.model_request());
+    }
+
+    fn pick_mode(&mut self, cx: &mut Cx) {
+        let modes = self.entry().map(|e| array_of(e, "modes").to_vec()).unwrap_or_default();
+        let options = modes.iter().map(|m| SelectOption::new(str_of(m, "id"), controls_model::format_agent_mode_label(m))).collect();
+        self.view.wa_select(id!(select)).open(cx, "mode", SelectRequest::new(l("Select mode"), options).selected(Some(str_of(&self.config, "modeId"))));
+    }
+
+    fn pick_thinking(&mut self, cx: &mut Cx) {
+        let options_list = self.current_model().map(|m| array_of(&m, "thinkingOptions").to_vec()).unwrap_or_default();
+        let extra = t("agentControls.thinking.extraHigh");
+        let options = options_list
+            .iter()
+            .map(|o| SelectOption::new(str_of(o, "id"), controls_model::format_thinking_option_label(o, &extra)))
+            .collect();
+        self.view.wa_select(id!(select)).open(cx, "thinking", SelectRequest::new(l("Select thinking"), options).selected(Some(str_of(&self.config, "thinkingOptionId"))));
+    }
+
+    /// A toggle feature flips at once; a select feature opens its options.
+    fn pick_feature(&mut self, cx: &mut Cx, ctx: &mut UiContext, feature: &Value) {
+        let id = str_of(feature, "id").to_owned();
+        if str_of(feature, "type") == "toggle" {
+            let current = model::feature_value(&self.config, feature) == &Value::Bool(true);
+            let next = model::with_feature(&self.config, &id, Value::Bool(!current));
+            self.change_config(ctx, next);
+        } else {
+            let options = array_of(feature, "options").iter().map(|o| SelectOption::new(str_of(o, "id"), str_or(o, "label", str_of(o, "id")))).collect();
+            let selected = model::feature_value(&self.config, feature).as_str().map(str::to_owned);
+            let title = str_or(feature, "label", &id).to_owned();
+            self.view.wa_select(id!(select)).open(cx, &format!("feature:{id}"), SelectRequest::new(title, options).selected(selected.as_deref()));
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Compact agent settings behind the model trigger (the composer's compact
+    /// controls sheet): model, thinking, mode and the provider's features, each
+    /// opening its own picker. `None` when the model is the only setting.
+    fn controls_request(&self) -> Option<SelectRequest> {
+        let mut options = Vec::new();
+        let thinking_options = self.current_model().map(|m| array_of(&m, "thinkingOptions").to_vec()).unwrap_or_default();
+        if !thinking_options.is_empty() {
+            let thinking_id = str_of(&self.config, "thinkingOptionId");
+            let extra = t("agentControls.thinking.extraHigh");
+            let value = thinking_options
+                .iter()
+                .find(|o| str_of(o, "id") == thinking_id)
+                .or(thinking_options.first())
+                .map(|o| controls_model::format_thinking_option_label(o, &extra))
+                .unwrap_or_default();
+            options.push(SelectOption::new("thinking", t("agentControls.thinking.title")).trailing(value).glyph("brain"));
+        }
+        let modes = self.entry().map(|e| array_of(e, "modes").to_vec()).unwrap_or_default();
+        if !modes.is_empty() {
+            let selected = modes.iter().find(|m| str_of(m, "id") == str_of(&self.config, "modeId"));
+            let value = selected.map(controls_model::format_agent_mode_label).unwrap_or_else(|| l("Default mode").to_owned());
+            options.push(SelectOption::new("mode", t("agentControls.mode.title")).trailing(value).glyph(controls_model::mode_icon(selected)));
+        }
+        for feature in self.visible_features() {
+            let current = model::feature_value(&self.config, &feature);
+            let value = if str_of(&feature, "type") == "toggle" {
+                t(if current == &Value::Bool(true) { "agentControls.features.on" } else { "agentControls.features.off" })
+            } else {
+                array_of(&feature, "options")
+                    .iter()
+                    .find(|o| Some(str_of(o, "id")) == current.as_str())
+                    .map(|o| str_or(o, "label", str_of(o, "id")).to_owned())
+                    .unwrap_or_default()
+            };
+            let label = str_or(&feature, "label", str_of(&feature, "id")).to_owned();
+            options.push(SelectOption::new(format!("feature:{}", str_of(&feature, "id")), label).trailing(value).glyph(controls_model::feature_icon(&feature)));
+        }
+        if options.is_empty() {
+            return None;
+        }
+        let model = match self.current_model() {
+            Some(model) => controls_model::model_label(&model),
+            None => t("providerSelection.selectModel"),
+        };
+        options.insert(0, SelectOption::new("model", t("modelSelector.model")).trailing(model).glyph("box"));
+        // The composer's compact controls sheet carries the same title.
+        Some(SelectRequest::new(t("modelSelector.selectModel"), options))
     }
 
     fn entry(&self) -> Option<&Value> {
@@ -1823,36 +1913,21 @@ impl WaNewTabView {
             }));
         }
         if view.surface(id!(model_trigger)).clicked(actions) && !locked {
-            self.pick_models(cx);
+            // Compact hides the thinking, mode and feature buttons: the trigger lists them.
+            match self.compact.then(|| self.controls_request()).flatten() {
+                Some(request) => view.wa_select(id!(select)).open(cx, "controls", request),
+                None => self.pick_models(cx),
+            }
         }
         if view.wa_button(id!(mode)).clicked(actions) && !locked {
-            let modes = self.entry().map(|e| array_of(e, "modes").to_vec()).unwrap_or_default();
-            let options = modes.iter().map(|m| SelectOption::new(str_of(m, "id"), controls_model::format_agent_mode_label(m))).collect();
-            view.wa_select(id!(select)).open(cx, "mode", SelectRequest::new(l("Select mode"), options).selected(Some(str_of(&self.config, "modeId"))));
+            self.pick_mode(cx);
         }
         if view.wa_button(id!(thinking)).clicked(actions) && !locked {
-            let options_list = self.current_model().map(|m| array_of(&m, "thinkingOptions").to_vec()).unwrap_or_default();
-            let extra = t("agentControls.thinking.extraHigh");
-            let options = options_list
-                .iter()
-                .map(|o| SelectOption::new(str_of(o, "id"), controls_model::format_thinking_option_label(o, &extra)))
-                .collect();
-            view.wa_select(id!(select)).open(cx, "thinking", SelectRequest::new(l("Select thinking"), options).selected(Some(str_of(&self.config, "thinkingOptionId"))));
+            self.pick_thinking(cx);
         }
         let features = view.wa_repeat(id!(features));
         if let Some(index) = features.items().iter().position(|item| item.as_wa_button().clicked(actions)) && let Some(feature) = self.visible_features().get(index).cloned() {
-            let id = str_of(&feature, "id").to_owned();
-            if str_of(&feature, "type") == "toggle" {
-                let current = model::feature_value(&self.config, &feature) == &Value::Bool(true);
-                let next = model::with_feature(&self.config, &id, Value::Bool(!current));
-                self.change_config(ctx, next);
-            } else {
-                let options = array_of(&feature, "options").iter().map(|o| SelectOption::new(str_of(o, "id"), str_or(o, "label", str_of(o, "id")))).collect();
-                let selected = model::feature_value(&self.config, &feature).as_str().map(str::to_owned);
-                let title = str_or(&feature, "label", &id).to_owned();
-                view.wa_select(id!(select)).open(cx, &format!("feature:{id}"), SelectRequest::new(title, options).selected(selected.as_deref()));
-            }
-            self.view.redraw(cx);
+            self.pick_feature(cx, ctx, &feature);
         }
         let images = view.wa_repeat(id!(images));
         if let Some(index) = images.items().iter().position(|item| item.as_wa_attachment_pill().removed(actions)) && !locked && index < self.images.len() {
@@ -2066,8 +2141,8 @@ impl WaNewTabView {
             "project" if value == "\u{0}browse" => self.open_browser(cx),
             "project" => self.set_directory(cx, ctx, &value),
             "host" if value == "\u{0}add-host" => ctx.effects.push(UiEffect::OpenHostDialog),
-            "host" if value != self.target.host_id => {
-                // A new host re-opens the form there, carrying the typed draft.
+            "host" if value != self.target.host_id && !self.busy && self.intent.is_none() => {
+                // Replace the owning form, carrying its draft to the newly selected host.
                 let mut data = self.target.data.as_object().cloned().unwrap_or_default();
                 let launch = if self.terminal() { "terminal" } else { "chat" };
                 data.insert(
@@ -2075,7 +2150,7 @@ impl WaNewTabView {
                     json!({ "title": self.title, "prompt": self.prompt, "config": self.config, "launch": launch }),
                 );
                 let target = PanelTarget::new("new_tab", &value, "", "").with_id(new_id()).with_title(t("sessionNavigation.newSession")).with_data(Value::Object(data));
-                ctx.effects.push(UiEffect::OpenTab { target, placement: TabPlacement::Main });
+                ctx.effects.push(UiEffect::ReplaceTab { tab_key: self.target.tab_key.clone(), target });
             }
             "ref" => {
                 let checkout = self.source == "checkout";
@@ -2142,6 +2217,17 @@ impl WaNewTabView {
                 next[key] = value.into();
                 self.change_config(ctx, next);
             }
+            "controls" => match value.as_str() {
+                "model" => self.pick_models(cx),
+                "thinking" => self.pick_thinking(cx),
+                "mode" => self.pick_mode(cx),
+                other => {
+                    let id = other.strip_prefix("feature:").unwrap_or_default();
+                    if let Some(feature) = self.visible_features().into_iter().find(|f| str_of(f, "id") == id) {
+                        self.pick_feature(cx, ctx, &feature);
+                    }
+                }
+            },
             "attach" => match value.as_str() {
                 "image" => self.platform_call(PlatformReq::PickImages, |p| {
                     p.pick_files(PickFilesOptions { multiple: true, images_only: true, title: Some(t("composer.attachments.addImage")) })
@@ -2329,6 +2415,19 @@ impl WaNewTabView {
         launch.set(cx, &t("newWorkspace.launch.title"), &launch_label, &tip("newWorkspace.tooltips.launch"), TriggerLead::Icon(launch_icon));
         launch.set_enabled(cx, !pending_intent && !self.busy);
         view.widget(id!(fields.spacer)).set_visible(cx, !self.compact);
+        if !self.compact && self.column_width > 0.0 {
+            // Launch keeps its badge at the row's end; the selectors share the rest
+            // (16px row insets, 8px between the selectors, spacer and launch).
+            let launch_w = if add_project { 0.0 } else { launch.badge_width(cx).min(240.0) };
+            let selectors = [(&project_trigger, true), (&host_trigger, true), (&branch_trigger, show_branch)];
+            let naturals: Vec<f64> = selectors.iter().filter(|(_, shown)| *shown).map(|(trigger, _)| trigger.badge_width(cx)).collect();
+            let gaps = naturals.len() + usize::from(!add_project);
+            let available = self.column_width - 32.0 - launch_w - 8.0 * gaps as f64;
+            let cap = shared_cap(&naturals, available, 240.0);
+            for (trigger, _) in selectors {
+                trigger.set_max_width(cx, Some(cap));
+            }
+        }
 
         // Composer card (original `inputWrapper`: 16/16/12 insets at ≥720px, else 8/12).
         // A Terminal launch takes no attachments (`NO_TERMINAL_ATTACHMENTS`).
@@ -2625,6 +2724,40 @@ fn forget_timer(timer: &mut Timer) {
     *timer = Timer::default();
 }
 
+/// The per-badge width cap at which badges of `naturals` widths fit
+/// `available` side by side, each also at most `max`: short badges keep their
+/// natural width and the longer ones share what remains equally.
+fn shared_cap(naturals: &[f64], available: f64, max: f64) -> f64 {
+    let mut widths: Vec<f64> = naturals.iter().map(|w| w.min(max)).collect();
+    widths.sort_by(f64::total_cmp);
+    let mut left = available.max(0.0);
+    for (i, width) in widths.iter().enumerate() {
+        let share = left / (widths.len() - i) as f64;
+        if *width > share {
+            return share;
+        }
+        left -= width;
+    }
+    max
+}
+
+#[cfg(test)]
+mod shared_cap_tests {
+    use super::shared_cap;
+
+    #[test]
+    fn fitting_badges_keep_the_maximum() {
+        assert_eq!(shared_cap(&[100.0, 120.0], 400.0, 240.0), 240.0);
+    }
+
+    #[test]
+    fn short_badges_keep_their_width_and_long_ones_share_the_rest() {
+        // 80 fits; the two 240px badges split the remaining 320px.
+        assert_eq!(shared_cap(&[300.0, 80.0, 240.0], 400.0, 240.0), 160.0);
+        assert_eq!(shared_cap(&[200.0, 200.0], -10.0, 240.0), 0.0);
+    }
+}
+
 impl Widget for WaNewTabView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if let Some(ctx) = scope.data.get_mut::<UiContext>() {
@@ -2693,5 +2826,222 @@ impl Widget for WaNewTabView {
         let zone = self.view.area().rect(cx);
         self.file_drop.draw(cx, zone);
         step
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::shell::layout::Layout;
+    use paseo_gui_core::{CoreConfig, GuiCore};
+    use std::{path::PathBuf, sync::Arc};
+
+    struct Harness {
+        cx: Cx,
+        ctx: UiContext,
+        view: WaNewTabView,
+        layout: Layout,
+        owner: String,
+        sibling: String,
+        sibling_pane: String,
+        core: Option<GuiCore>,
+        dir: PathBuf,
+    }
+
+    impl Harness {
+        fn new(agent: bool, terminal: bool) -> Self {
+            let dir = std::env::temp_dir().join(format!("paseo-creation-{}", new_id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let core = GuiCore::start(
+                CoreConfig { state_dir: dir.join("state"), daemon_home: Some(dir.join("daemon")), default_endpoint: None },
+                Arc::new(|| {}),
+            ).unwrap();
+            let mut cx = Cx::new(Box::new(|_, _| {}));
+            let mut view = WaNewTabView::new(&mut cx);
+            let creation = PanelTarget::new("new_tab", "owner-host", "", "/project").with_id("creation");
+            let owner = creation.key();
+            let mut layout = Layout::default();
+            layout.open(creation, false);
+            let sibling = PanelTarget::agent("other-host", "other-workspace", "/other", "existing", "");
+            let sibling_key = sibling.key();
+            layout.open(sibling.clone(), true);
+            let sibling_pane = layout.focused_pane.clone();
+            let mut ctx = UiContext::new(core.handle());
+            ctx.window_id = "creation-window".into();
+            // The retained form must use its own identity, not current selection.
+            ctx.tab_key = Some(sibling_key.clone());
+            ctx.target = Some(sibling);
+            view.target = NewTabTarget { host_id: "owner-host".into(), cwd: "/project".into(), tab_key: owner.clone(), ..Default::default() };
+            view.path = "/project".into();
+            view.prompt = "Keep my prompt".into();
+            view.title = "Keep my title".into();
+            view.config = json!({ "provider": "kiro", "model": "selected-model" });
+            view.intent = Some(json!({
+                "kind": "workspace",
+                "request": { "idempotencyKey": "receipt", "source": { "kind": "directory", "cwd": "/project" } }
+            }));
+            if agent {
+                view.intent.as_mut().unwrap()["request"]["agent"] = json!({ "prompt": view.prompt });
+            }
+            if terminal {
+                view.intent.as_mut().unwrap()["launch"] = json!("terminal");
+            }
+            Self { cx, ctx, view, layout, owner, sibling: sibling_key, sibling_pane, core: Some(core), dir }
+        }
+
+        fn receipt(agent: bool) -> Value {
+            let mut receipt = json!({
+                "idempotencyKey": "receipt", "phase": "completed", "revision": 3,
+                "workspaceId": "created-workspace",
+                "workspace": { "id": "created-workspace", "workspaceDirectory": "/created", "projectRootPath": "/project", "name": "Created workspace" }
+            });
+            if agent {
+                receipt["agentId"] = json!("created-agent");
+                receipt["agent"] = json!({
+                    "id": "created-agent", "workspaceId": "created-workspace", "cwd": "/created",
+                    "title": "Created session", "project": { "projectRootPath": "/project" }
+                });
+            }
+            receipt
+        }
+
+        fn response(receipt: &Value) -> Value {
+            json!({ "creation": receipt, "workspace": receipt["workspace"], "agent": receipt["agent"] })
+        }
+
+        fn apply(&mut self) -> usize {
+            let mut replacements = 0;
+            for effect in std::mem::take(&mut self.ctx.effects) {
+                match effect {
+                    UiEffect::ReplaceTab { tab_key, target } => {
+                        self.layout.replace_tab(&tab_key, target);
+                        replacements += 1;
+                    }
+                    UiEffect::SetPreference { .. } | UiEffect::Toast { .. } => {}
+                    _ => panic!("creation must replace its owner, never open another destination"),
+                }
+            }
+            replacements
+        }
+
+        fn assert_destination(&self, kind: &str) {
+            assert!(self.layout.target(&self.owner).is_none());
+            let pane = self.layout.panes().into_iter().find(|pane| pane.id != self.sibling_pane).unwrap();
+            assert_eq!(pane.tabs.len(), 1);
+            assert_eq!(pane.selected.as_ref(), pane.tabs.first());
+            let destination = self.layout.target(&pane.tabs[0]).unwrap();
+            assert_eq!(destination.kind, kind);
+            assert_eq!(destination.server_id, "owner-host");
+            assert_eq!(destination.workspace_id, "created-workspace");
+            assert_eq!(destination.cwd, "/created");
+            assert_eq!(self.layout.tabs.len(), 2);
+            assert_eq!(self.layout.focused_pane, self.sibling_pane);
+            assert_eq!(self.layout.selected().unwrap().key(), self.sibling);
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            drop(self.core.take());
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn creation_completion_replaces_owner_once_for_receipt_and_response_in_either_order() {
+        for agent in [true, false] {
+            for receipt_first in [true, false] {
+                let mut h = Harness::new(agent, false);
+                let receipt = Harness::receipt(agent);
+                let response = Harness::response(&receipt);
+                let other_window = h.layout.clone();
+                let other_window_before = other_window.to_json();
+                if receipt_first {
+                    h.view.receive(&mut h.ctx, &receipt);
+                }
+                h.view.answer(&mut h.cx, &mut h.ctx, Req::Submit, Ok(response.clone()));
+                h.view.receive(&mut h.ctx, &receipt);
+                h.view.answer(&mut h.cx, &mut h.ctx, Req::Submit, Ok(response));
+                assert_eq!(h.apply(), 1);
+                h.assert_destination(if agent { "agent" } else { "setup" });
+                assert!(h.view.intent.is_none());
+                assert_eq!(other_window.to_json(), other_window_before);
+            }
+        }
+    }
+
+    #[test]
+    fn creation_completion_keeps_pending_failed_and_incomplete_receipts_recoverable() {
+        let mut h = Harness::new(true, false);
+        let before = h.layout.to_json();
+        let intent = h.view.intent.clone();
+        for phase in ["pending", "failed", "completed"] {
+            let mut receipt = Harness::receipt(false);
+            receipt["phase"] = json!(phase);
+            h.view.receive(&mut h.ctx, &receipt);
+            h.view.answer(&mut h.cx, &mut h.ctx, Req::Submit, Ok(Harness::response(&receipt)));
+            assert_eq!(h.apply(), 0);
+            assert_eq!(h.layout.to_json(), before);
+            assert_eq!(h.view.intent, intent);
+            assert_eq!(h.view.prompt, "Keep my prompt");
+            assert_eq!(h.view.title, "Keep my title");
+            assert_eq!(h.view.config["model"], "selected-model");
+        }
+        h.view.answer(&mut h.cx, &mut h.ctx, Req::Submit, Err(RpcError::new("Disconnected")));
+        assert_eq!(h.apply(), 0);
+        assert_eq!(h.view.intent, intent);
+        assert_eq!(h.view.error.as_deref(), Some("Disconnected"));
+        assert!(!h.view.busy);
+        h.view.receive(&mut h.ctx, &Harness::receipt(true));
+        assert_eq!(h.apply(), 1);
+        h.assert_destination("agent");
+    }
+
+    #[test]
+    fn creation_completion_waits_for_terminal_and_preserves_failed_handoff_for_retry() {
+        let mut h = Harness::new(false, true);
+        let receipt = Harness::receipt(false);
+        let response = Harness::response(&receipt);
+        h.view.receive(&mut h.ctx, &receipt);
+        h.view.answer(&mut h.cx, &mut h.ctx, Req::Submit, Ok(response.clone()));
+        assert!(h.view.busy);
+        assert_eq!(h.apply(), 0);
+        assert!(h.layout.target(&h.owner).is_some());
+        let terminal_request = || Req::CreateTerminal { workspace_id: "created-workspace".into(), cwd: "/created".into() };
+        h.view.answer(&mut h.cx, &mut h.ctx, terminal_request(), Err(RpcError::new("Missing shell")));
+        assert!(!h.view.busy);
+        assert!(h.view.terminal_workspace.is_some());
+        assert_eq!(h.view.prompt, "Keep my prompt");
+        h.view.answer(&mut h.cx, &mut h.ctx, Req::Submit, Ok(response));
+        assert_eq!(h.apply(), 0);
+        assert!(!h.view.busy);
+        h.view.create_terminal(&h.ctx, "created-workspace".into(), "/created".into());
+        assert!(h.view.busy);
+        let terminal = json!({ "terminal": { "id": "terminal", "workspaceId": "created-workspace", "cwd": "/created" } });
+        h.view.answer(&mut h.cx, &mut h.ctx, terminal_request(), Ok(terminal.clone()));
+        h.view.answer(&mut h.cx, &mut h.ctx, terminal_request(), Ok(terminal));
+        assert_eq!(h.apply(), 1);
+        h.assert_destination("terminal");
+    }
+
+    #[test]
+    fn creation_completion_host_switch_replaces_only_owner_and_carries_draft() {
+        let mut h = Harness::new(false, false);
+        h.view.handle_pick(&mut h.cx, "host", "chosen-host".into(), &mut h.ctx);
+        assert_eq!(h.apply(), 0);
+        assert!(h.layout.target(&h.owner).is_some());
+        h.view.intent = None;
+        h.view.handle_pick(&mut h.cx, "host", "chosen-host".into(), &mut h.ctx);
+        assert_eq!(h.apply(), 1);
+        let pane = h.layout.panes().into_iter().find(|pane| pane.id != h.sibling_pane).unwrap();
+        let target = h.layout.target(pane.selected.as_deref().unwrap()).unwrap();
+        assert_eq!(target.kind, "new_tab");
+        assert_eq!(target.server_id, "chosen-host");
+        assert_eq!(target.data["creationDraft"]["prompt"], "Keep my prompt");
+        assert_eq!(target.data["creationDraft"]["title"], "Keep my title");
+        assert_eq!(target.data["creationDraft"]["config"]["model"], "selected-model");
+        assert_eq!(h.layout.tabs.len(), 2);
+        assert!(h.layout.target(&h.owner).is_none());
+        assert_eq!(h.layout.selected().unwrap().key(), h.sibling);
     }
 }

@@ -45,6 +45,7 @@ pub fn for_tab_kind(kind: &str) -> &'static str {
         "file" => "file",
         "changes_tree" | "working_diff" => "file-diff",
         "commit_diff" => "git-commit-horizontal",
+        "git_log" => "git-graph",
         "pull_request" => "git-pull-request",
         "execution_log" => "scroll-text",
         "setup" | "terminal" => "square-terminal",

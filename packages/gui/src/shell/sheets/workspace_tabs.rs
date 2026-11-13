@@ -100,8 +100,10 @@ impl Sheet for WorkspaceTabsSheet {
             chrome::tab_icon(ui, cx, &self.state, &row.target, rect(body.pos.x + 8.0 + 1.0, body.pos.y + (body.size.y - 14.0) * 0.5, 14.0, 14.0), icon_color);
             let spec = ui.spec(Font::Regular, 14.0, p.foreground);
             ui.text(cx, rect(body.pos.x + 8.0 + 16.0 + 8.0, body.pos.y, (body.size.x - 40.0).max(0.0), body.size.y), spec, &row.title);
+            // The whole row (dirty dot, check and gaps included) opens the tab; the ⋯ button
+            // is registered after it so it wins inside its own rect.
             if interactive {
-                ui.hit(body, id);
+                ui.hit(outer, id);
             }
             let menu_id = format!("tabmenu:{i}");
             if interactive && ui.is_pressed(&menu_id) {

@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>Paseo Sessions</string>
+	<string>Passession</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
@@ -13,9 +13,9 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Paseo Sessions</string>
+	<string>Passession</string>
 	<key>CFBundleDisplayName</key>
-	<string>Paseo Sessions</string>
+	<string>Passession</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -40,7 +40,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Paseo Sessions connects to your local daemon and development servers.</string>
+	<string>Passession connects to your local daemon and development servers.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 sh.paseo. All rights reserved.</string>
 	<key>NSPrincipalClass</key>

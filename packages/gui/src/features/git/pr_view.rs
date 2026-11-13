@@ -69,6 +69,8 @@ pub struct PrView {
     checks_scroll: f64,
     checks_area: Rect,
     checks_content: f64,
+    /// The checks list's unclipped viewport height (`checks_area` is its visible part).
+    checks_height: f64,
     hits: Hits<PrHit>,
     /// Entry regions for reveal-on-hover kebabs.
     regions: Vec<(Rect, String)>,
@@ -137,6 +139,7 @@ impl PrView {
             checks_scroll: 0.0,
             checks_area: Rect::default(),
             checks_content: 0.0,
+            checks_height: 0.0,
             hits: Hits::default(),
             regions: Vec::new(),
             hovered: None,
@@ -448,8 +451,10 @@ impl PrView {
     }
 
     fn scroll_at(&mut self, point: DVec2, delta: f64, wheel: bool) -> bool {
-        if self.checks_area.contains(point) && self.checks_content > self.checks_area.size.y {
-            let max = self.checks_content - self.checks_area.size.y;
+        // The bound is the list's own viewport, not its (possibly view-clipped) pointer region,
+        // matching the draw clamp so a wheel at either end reaches the outer scroll.
+        let max = (self.checks_content - self.checks_height).max(0.0);
+        if self.checks_area.contains(point) && max > 0.0 {
             let changed = self.touch_scroll.apply_delta(&mut self.checks_scroll, delta, max);
             if changed || !wheel {
                 return changed;
@@ -908,6 +913,7 @@ impl PrView {
         let list = rect(c.left, c.y, c.width, list_height);
         let clip = crate::common::paint::intersect(list, c.view);
         self.checks_area = clip;
+        self.checks_height = list_height;
         self.checks_content = inner;
         self.checks_scroll = self.checks_scroll.clamp(0.0, (inner - list_height).max(0.0));
         paint.begin_clip(cx, clip);

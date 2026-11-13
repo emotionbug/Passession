@@ -6,6 +6,7 @@ mod copilot;
 mod cursor;
 mod grok;
 mod kimi;
+mod kiro;
 mod minimax;
 mod muse;
 mod opencode_go;
@@ -110,6 +111,7 @@ sources! {
     Cursor => (cursor,"cursor","Cursor","../../../plugins/cursor-usage-source/icon.svg"),
     Grok => (grok,"grok","Grok","../../../plugins/grok-usage-source/icon.svg"),
     Kimi => (kimi,"kimi","Kimi","../../../plugins/kimi-usage-source/icon.svg"),
+    Kiro => (kiro,"kiro","Kiro HTTP","../../../plugins/kiro-usage-source/icon.svg"),
     MiniMax => (minimax,"minimax","MiniMax","../../../plugins/minimax-usage-source/icon.svg"),
     Muse => (muse,"muse","Muse Code","../../../plugins/muse-provider/icon.svg"),
     OpenCodeGo => (opencode_go,"opencode-go","OpenCode Go","../../../plugins/opencode-go-usage-source/icon.svg"),

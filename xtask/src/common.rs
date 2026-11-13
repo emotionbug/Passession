@@ -108,7 +108,7 @@ pub fn packaging() -> Result<PathBuf> {
     Ok(root()?.join("packaging"))
 }
 pub fn artifact_stem(target: &str, cpu: &str) -> Result<String> {
-    Ok(format!("Paseo-Sessions-{}-{target}-{cpu}", version()?))
+    Ok(format!("Passession-{}-{target}-{cpu}", version()?))
 }
 pub fn cargo() -> std::ffi::OsString {
     env::var_os("CARGO").unwrap_or_else(|| "cargo".into())

@@ -231,11 +231,12 @@ fn popover_shadow(ui: &mut Ui, rect: Rect, color: Vec4, blur: f64) {
     }
 }
 
-/// Compact bottom-sheet surface shared by both menu styles: the 55% barrier,
-/// the top-rounded surface0 panel and its 1px rule; returns the panel rect.
-fn bottom_sheet(ui: &mut Ui, screen: Rect, h: f64, radius: f64, border: bool) -> Rect {
+/// Compact bottom-sheet surface shared by both menu styles: the 55% barrier
+/// over `screen`, the top-rounded surface0 panel at the bottom of `view` and
+/// its 1px rule; returns the panel rect.
+fn bottom_sheet(ui: &mut Ui, screen: Rect, view: Rect, h: f64, radius: f64, border: bool) -> Rect {
     let pal = ui.pal;
-    let rect = Rect { pos: dvec2(screen.pos.x, screen.pos.y + screen.size.y - h), size: dvec2(screen.size.x, h) };
+    let rect = Rect { pos: dvec2(view.pos.x, view.pos.y + view.size.y - h), size: dvec2(view.size.x, h) };
     ui.rect(screen, vec4(0.0, 0.0, 0.0, 0x73 as f32 / 255.0), None, 0.0);
     if border {
         ui.rect_top(rect, pal.border, radius);
@@ -244,16 +245,31 @@ fn bottom_sheet(ui: &mut Ui, screen: Rect, h: f64, radius: f64, border: bool) ->
     } else {
         ui.rect_top(rect, pal.surface0, radius);
     }
+    surface_below(ui, rect, screen, pal.surface0);
     rect
 }
 
-/// Draws the open menu over everything else; returns the scrollable list rect
-/// and its content height.
-pub fn draw_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
+/// Continues a bottom-anchored surface under the keyboard and system bars
+/// below the viewport, so that strip shows the sheet rather than the barrier
+/// and taps on it stay with the sheet.
+fn surface_below(ui: &mut Ui, rect: Rect, screen: Rect, color: Vec4) {
+    let top = rect.pos.y + rect.size.y;
+    let gap = screen.pos.y + screen.size.y - top;
+    if gap > 0.0 {
+        let below = Rect { pos: dvec2(rect.pos.x, top), size: dvec2(rect.size.x, gap) };
+        ui.rect(below, color, None, 0.0);
+        ui.zone("sheet.below", below, Some(handler(|_, _| {})));
+    }
+}
+
+/// Draws the open menu over everything else, laid out inside `view` (the
+/// window less safe areas and the keyboard); returns the scrollable list
+/// rect and its content height.
+pub fn draw_menu(ui: &mut Ui, menu: &Menu, screen: Rect, view: Rect) -> (Rect, f64) {
     ui.zone(&format!("menu.{}.backdrop", menu.id), screen, Some(close_menu()));
     match menu.style {
-        MenuStyle::Menu => draw_paseo_menu(ui, menu, screen),
-        MenuStyle::Select => draw_select(ui, menu, screen),
+        MenuStyle::Menu => draw_paseo_menu(ui, menu, screen, view),
+        MenuStyle::Select => draw_select(ui, menu, screen, view),
     }
 }
 
@@ -264,11 +280,11 @@ pub fn draw_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
 /// 18px line (two lines at most), trailing muted hint and a 16px check.
 /// Compact layouts with `compact_sheet` get a bottom sheet with a drag
 /// handle and the title header instead.
-fn draw_paseo_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
+fn draw_paseo_menu(ui: &mut Ui, menu: &Menu, screen: Rect, view: Rect) -> (Rect, f64) {
     let pal = ui.pal;
     let sheet = menu.compact_sheet && ui.compact;
     let row_min = if ui.compact { 40.0 } else { 28.0 };
-    let width = if sheet { screen.size.x } else { menu.width.min(screen.size.x - 16.0) };
+    let width = if sheet { view.size.x } else { menu.width.min(view.size.x - 16.0) };
     let (visible, _) = visible_items(ui, menu);
     // Row geometry: 4px margin + 8px padding on each side.
     let content_x = 4.0 + 8.0;
@@ -287,9 +303,9 @@ fn draw_paseo_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
     let list_h: f64 = 8.0 + visible.iter().zip(&rows).map(|(&i, (h, ..))| h + if menu.items[i].separator_before { 9.0 } else { 0.0 }).sum::<f64>();
     let header_h = if sheet { 24.0 + if menu.title.is_empty() { 0.0 } else { 16.0 + ui.measure(Font::Medium, 14.0, &menu.title, None).y } } else { 0.0 };
     let (rect, list) = if sheet {
-        let max_h = screen.size.y * 0.8;
+        let max_h = view.size.y * 0.8;
         let total = (header_h + list_h + 4.0).min(max_h);
-        let rect = bottom_sheet(ui, screen, total, 12.0, true);
+        let rect = bottom_sheet(ui, screen, view, total, 12.0, true);
         // Drag handle: 36x4 surface2, 10px above and below.
         ui.rect(Rect { pos: dvec2(rect.pos.x + (rect.size.x - 36.0) / 2.0, rect.pos.y + 10.0), size: dvec2(36.0, 4.0) }, pal.surface2, None, 2.0);
         if !menu.title.is_empty() {
@@ -298,13 +314,13 @@ fn draw_paseo_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
         let list = Rect { pos: dvec2(rect.pos.x, rect.pos.y + header_h), size: dvec2(rect.size.x, (total - header_h - 4.0).max(0.0)) };
         (rect, list)
     } else {
-        let total = list_h.min(screen.size.y - 16.0);
+        let total = list_h.min(view.size.y - 16.0);
         let a = menu.anchor;
         let x = if menu.align_end { a.pos.x + a.size.x - width } else { a.pos.x };
         let below = a.pos.y + a.size.y + 4.0;
-        let y = if below + total <= screen.pos.y + screen.size.y - 8.0 { below } else { a.pos.y - 4.0 - total };
-        let x = x.clamp(screen.pos.x + 8.0, (screen.pos.x + screen.size.x - width - 8.0).max(screen.pos.x + 8.0));
-        let y = y.clamp(screen.pos.y + 8.0, (screen.pos.y + screen.size.y - total - 8.0).max(screen.pos.y + 8.0));
+        let y = if below + total <= view.pos.y + view.size.y - 8.0 { below } else { a.pos.y - 4.0 - total };
+        let x = x.clamp(view.pos.x + 8.0, (view.pos.x + view.size.x - width - 8.0).max(view.pos.x + 8.0));
+        let y = y.clamp(view.pos.y + 8.0, (view.pos.y + view.size.y - total - 8.0).max(view.pos.y + 8.0));
         let rect = Rect { pos: dvec2(x, y), size: dvec2(width, total) };
         let (shadow, blur) = if pal.dark { (0x33, 8.0) } else { (0x0a, 16.0) };
         popover_shadow(ui, rect, vec4(0.0, 0.0, 0.0, shadow as f32 / 255.0), blur);
@@ -374,12 +390,12 @@ fn draw_paseo_menu(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
 /// 14px label and the muted 12px description on one ellipsized line, a 16px
 /// check, 55% opacity when disabled. Compact layouts get a bottom sheet with
 /// the Material drag handle and the medium title.
-fn draw_select(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
+fn draw_select(ui: &mut Ui, menu: &Menu, screen: Rect, view: Rect) -> (Rect, f64) {
     let pal = ui.pal;
     let sheet = ui.compact;
     let (visible, searching) = visible_items(ui, menu);
     let a = menu.anchor;
-    let width = if sheet { screen.size.x } else { a.size.x.max(220.0).min(screen.size.x - 16.0) };
+    let width = if sheet { view.size.x } else { a.size.x.max(220.0).min(view.size.x - 16.0) };
     let separators = |i: usize| menu.items[i].separator_before && !searching;
     let row_h = visible.iter().map(|&i| ui.measure(Font::Regular, 14.0, &menu.items[i].label, None).y + 12.0).fold(36.0_f64, f64::max);
     let rows_h: f64 = visible.iter().map(|&i| row_h + if sheet { 4.0 } else { 0.0 } + if separators(i) { 9.0 } else { 0.0 }).sum();
@@ -389,17 +405,20 @@ fn draw_select(ui: &mut Ui, menu: &Menu, screen: Rect) -> (Rect, f64) {
     let (rect, top) = if sheet {
         // Material drag handle area (48px) then the title (8px below).
         let title_h = ui.measure(Font::Medium, 14.0, &menu.title, None).y + 8.0;
-        let total = (48.0 + title_h + search_h + list_h).min(screen.size.y * 0.9);
-        let rect = bottom_sheet(ui, screen, total, 16.0, false);
+        let total = (48.0 + title_h + search_h + list_h).min(view.size.y * 0.9);
+        let rect = bottom_sheet(ui, screen, view, total, 16.0, false);
         ui.rect(Rect { pos: dvec2(rect.pos.x + (rect.size.x - 32.0) / 2.0, rect.pos.y + 22.0), size: dvec2(32.0, 4.0) }, super::theme::alpha(pal.muted, 0.4), None, 2.0);
         ui.text_line(Font::Medium, 14.0, pal.foreground, dvec2(rect.pos.x + 24.0, rect.pos.y + 48.0), rect.size.x - 48.0, &menu.title);
         (rect, rect.pos.y + 48.0 + title_h)
     } else {
-        let below = screen.pos.y + screen.size.y - (a.pos.y + a.size.y) - 8.0;
-        let open_up = below < 240.0 && a.pos.y > below;
-        let max_h = (if open_up { a.pos.y - 12.0 } else { below - 4.0 }).clamp(120.0, 400.0);
+        let below = view.pos.y + view.size.y - (a.pos.y + a.size.y) - 8.0;
+        let above = a.pos.y - view.pos.y;
+        let open_up = below < 240.0 && above > below;
+        // At least 120px when the viewport has it; never past its edge.
+        let room = if open_up { above - 12.0 } else { below - 4.0 };
+        let max_h = room.clamp(120.0_f64.min(room.max(0.0)), 400.0);
         let total = (search_h + list_h).min(max_h);
-        let left = if a.pos.x + width > screen.pos.x + screen.size.x - 8.0 { (screen.pos.x + screen.size.x - 8.0 - width).max(8.0) } else { a.pos.x };
+        let left = if a.pos.x + width > view.pos.x + view.size.x - 8.0 { (view.pos.x + view.size.x - 8.0 - width).max(view.pos.x + 8.0) } else { a.pos.x };
         let y = if open_up { a.pos.y - 4.0 - total } else { a.pos.y + a.size.y + 4.0 };
         let rect = Rect { pos: dvec2(left, y), size: dvec2(width, total) };
         popover_shadow(ui, rect, vec4(0.0, 0.0, 0.0, 0x33 as f32 / 255.0), 8.0);
@@ -517,7 +536,10 @@ fn header_actions_size(ui: &mut Ui, head: &SheetHead) -> DVec2 {
 /// (wrapped to its measured height), header actions and a 32px muted close glyph, a
 /// surface2 rule below. Footer: a surface2 rule, 24/12 insets, actions
 /// 8px apart at the end (or sharing the row).
-pub fn sheet_frame(ui: &mut Ui, screen: Rect, id: u64, max_w: f64, head: &SheetHead, content_h: f64, busy_close: bool) -> (Rect, Rect) {
+/// The barrier covers `screen`; the sheet lies inside `view` (the window less
+/// safe areas and the keyboard). The body yields height before the header and
+/// footer; a view too short for even those keeps the footer's actions on screen.
+pub fn sheet_frame(ui: &mut Ui, screen: Rect, view: Rect, id: u64, max_w: f64, head: &SheetHead, content_h: f64, busy_close: bool) -> (Rect, Rect) {
     let pal = ui.pal;
     let compact = ui.compact;
     let barrier = if compact { 0x8a000000 } else { 0x8c000000 };
@@ -528,7 +550,7 @@ pub fn sheet_frame(ui: &mut Ui, screen: Rect, id: u64, max_w: f64, head: &SheetH
         Some(handler(|_, _| {}))
     };
     ui.zone(&format!("sheet.{id}.backdrop"), screen, dismiss);
-    let width = if compact { screen.size.x } else { max_w.min(screen.size.x - 48.0) };
+    let width = if compact { view.size.x } else { max_w.min(view.size.x - 48.0) };
     // Material bottom-sheet drag handle area.
     let handle_h = if compact { 48.0 } else { 0.0 };
     let header_actions = header_actions_size(ui, head);
@@ -539,18 +561,23 @@ pub fn sheet_frame(ui: &mut Ui, screen: Rect, id: u64, max_w: f64, head: &SheetH
     let search_h = if head.search.is_some() { search_field_h + 16.0 + 12.0 } else { 0.0 };
     let header_h = handle_h + 16.0 + row_h + 16.0 + search_h + 1.0;
     let actions_h = footer_h(ui, head);
-    let max_h = if compact { screen.size.y * 0.9 } else { (screen.size.y * 0.85).min(screen.size.y - 48.0) };
-    // `content_h` already includes the 24px body padding on both sides.
-    let body_h = content_h.min((max_h - header_h - actions_h).max(80.0));
+    let max_h = if compact { view.size.y * 0.9 } else { (view.size.y * 0.85).min(view.size.y - 48.0) };
+    // `content_h` already includes the 24px body padding on both sides. The
+    // body keeps up to 80px only while the view has room for it.
+    let room = (view.size.y - header_h - actions_h).max(0.0);
+    let body_h = content_h.min((max_h - header_h - actions_h).max(room.min(80.0)));
     let total = header_h + body_h + actions_h;
     let pos = if compact {
-        dvec2(screen.pos.x, screen.pos.y + screen.size.y - total)
+        dvec2(view.pos.x, view.pos.y + view.size.y - total)
     } else {
-        dvec2(screen.pos.x + (screen.size.x - width) / 2.0, screen.pos.y + ((screen.size.y - total) / 2.0).max(24.0))
+        // Centred; an overflowing sheet aligns its footer with the view's bottom.
+        let slack = view.size.y - total;
+        dvec2(view.pos.x + (view.size.x - width) / 2.0, view.pos.y + slack.min(slack / 2.0))
     };
     let rect = Rect { pos, size: dvec2(width, total) };
     if compact {
         ui.rect_top(rect, pal.surface0, 16.0);
+        surface_below(ui, rect, screen, pal.surface0);
         ui.rect(Rect { pos: dvec2(pos.x + (width - 32.0) / 2.0, pos.y + 22.0), size: dvec2(32.0, 4.0) }, super::theme::alpha(pal.muted, 0.4), None, 2.0);
     } else {
         ui.rect(rect, pal.surface1, Some(pal.surface2), 12.0);
@@ -869,8 +896,9 @@ pub fn draw_tip(ui: &mut Ui, tip: &Tip, screen: Rect) {
 }
 
 /// Flutter `confirmAction`: `showAdaptiveDialog` + `AlertDialog.adaptive`
-/// over the default 54% barrier, dismissible by a barrier tap.
-pub fn draw_alert(ui: &mut Ui, screen: Rect, id: u64, confirm: &Confirm) {
+/// over the default 54% barrier, dismissible by a barrier tap. The barrier
+/// covers `screen`; the dialog centres in `view`.
+pub fn draw_alert(ui: &mut Ui, screen: Rect, view: Rect, id: u64, confirm: &Confirm) {
     ui.rect(screen, super::theme::argb(0x8a000000), None, 0.0);
     ui.zone(&format!("sheet.{id}.backdrop"), screen, Some(handler(move |s, env| s.close_sheet(env, id))));
     let cancel_label = t("common.actions.cancel");
@@ -887,9 +915,9 @@ pub fn draw_alert(ui: &mut Ui, screen: Rect, id: u64, confirm: &Confirm) {
     let cancel = handler(move |s, env| s.close_sheet(env, id));
     let actions = AlertActions { cancel: (cancel_label, cancel), confirm: (confirm_label, run) };
     if cfg!(any(target_os = "macos", target_os = "ios")) {
-        draw_cupertino_alert(ui, screen, id, confirm, actions);
+        draw_cupertino_alert(ui, view, id, confirm, actions);
     } else {
-        draw_material_alert(ui, screen, id, confirm, actions);
+        draw_material_alert(ui, view, id, confirm, actions);
     }
 }
 

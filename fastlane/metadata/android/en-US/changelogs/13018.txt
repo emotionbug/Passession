@@ -1,0 +1,3 @@
+Adds an IntelliJ-style Git Log: branches, every branch's history with a graph, filters and commit details, shown as a log and a commit screen on phones. The app is now Passession with a new icon on every platform, Windows and macOS use the system title bar, and many layout and touch problems on narrow and phone screens are fixed.
+
+Full notes: https://github.com/emotionbug/Passession/releases

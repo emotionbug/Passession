@@ -80,6 +80,17 @@ pub fn get_macos_class_global() -> &'static MacosClasses {
     }
 }
 
+/// Paseo: the native title bars, menus and system panels follow the app's light/dark theme
+/// rather than only the system setting (`Cx::set_window_dark_appearance`).
+pub fn set_dark_appearance(dark: bool) {
+    unsafe {
+        let name = str_to_nsstring(if dark {"NSAppearanceNameDarkAqua"} else {"NSAppearanceNameAqua"});
+        let appearance: ObjcId = msg_send![class!(NSAppearance), appearanceNamed: name];
+        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+        let () = msg_send![ns_app, setAppearance: appearance];
+    }
+}
+
 #[derive(Clone)]
 pub struct CocoaTimer {
     timer_id: u64,

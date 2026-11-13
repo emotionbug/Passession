@@ -79,6 +79,8 @@ impl ComposerPanel {
             Overlay::None => {
                 if self.suggestions_visible() {
                     self.draw_suggestions(cx, look);
+                } else {
+                    self.st.suggest_revealed = None;
                 }
                 // One popover at a time owns the overlay hit area.
                 if self.st.meter_hover && !look.compact && self.st.meter_rect.size.x > 0.0 && self.st.overlay_rect.is_none() {
@@ -89,7 +91,10 @@ impl ComposerPanel {
                     self.draw_tooltip(cx, look, &text, anchor);
                 }
             }
-            Overlay::Sheet(_) => self.draw_sheet(cx, ui, look),
+            Overlay::Sheet(_) => {
+                self.st.suggest_revealed = None;
+                self.draw_sheet(cx, ui, look)
+            }
             Overlay::Forge => self.draw_forge(cx, look, size),
             Overlay::Preview(image) => self.draw_preview(cx, look, size, &image),
             Overlay::Fullscreen => self.draw_fullscreen(cx, look, size),
@@ -133,6 +138,7 @@ impl ComposerPanel {
         if let Some(message) = message {
             self.st.suggest_scroll_max = 0.0;
             self.st.suggest_scroll = 0.0;
+            self.st.suggest_revealed = None;
             let h = (self.painter.paragraph_height(cx, wrapper.size.x - 24.0, muted, &message) + 24.0).min(max_h);
             let r = rect(wrapper.pos.x, wrapper.pos.y - 12.0 - h, wrapper.size.x, h);
             self.card(cx, look, r, p.surface1);
@@ -149,20 +155,25 @@ impl ComposerPanel {
         let row_h = (line + 16.0).max(36.0);
         let list_h = (options.len() as f64 * row_h + 8.0).min(max_h);
         let list = rect(wrapper.pos.x, wrapper.pos.y - 12.0 - list_h, wrapper.size.x, list_h);
-        // Pin to the bottom; keep the keyboard selection visible.
+        // Pinned to the bottom; the selection is revealed when it moves or the list is rebuilt,
+        // and a manual scroll otherwise stays.
         let content = options.len() as f64 * row_h + 8.0;
         let max_scroll = (content - list_h).max(0.0);
         self.st.suggest_scroll_max = max_scroll;
         let mut scroll = (max_scroll - self.st.suggest_scroll).clamp(0.0, max_scroll);
-        if let Some(index) = selected {
-            let top = 4.0 + index as f64 * row_h;
-            if top < scroll {
-                scroll = top - 4.0;
-            } else if top + row_h > scroll + list_h {
-                scroll = top + row_h + 4.0 - list_h;
+        let reveal = self.st.suggest_revealed.as_ref().is_none_or(|(index, shown)| *index != selected || *shown != options);
+        if reveal {
+            if let Some(index) = selected {
+                let top = 4.0 + index as f64 * row_h;
+                if top < scroll {
+                    scroll = (top - 4.0).max(0.0);
+                } else if top + row_h > scroll + list_h {
+                    scroll = (top + row_h + 4.0 - list_h).min(max_scroll);
+                }
             }
-            self.st.suggest_scroll = max_scroll - scroll.clamp(0.0, max_scroll);
+            self.st.suggest_revealed = Some((selected, options.clone()));
         }
+        self.st.suggest_scroll = max_scroll - scroll;
         let mut whole = list;
         // Detail card for a selected command with a description.
         if let Some(active) = selected.and_then(|i| options.get(i)) {
@@ -479,6 +490,8 @@ impl ComposerPanel {
     fn search_row(&mut self, cx: &mut Cx2d, look: &Look, r: Rect, placeholder: &str) {
         let p = look.p;
         self.painter.fill(cx, r, p.surface1, 0.0);
+        // The whole row (icon and padding included) focuses the editor, which is one text line tall.
+        self.st.ohits.push(r, OItem::Search);
         self.painter.hline(cx, r.pos.x, r.pos.y + r.size.y - 1.0, r.size.x, p.border);
         self.painter.icon(cx, rect(r.pos.x + 12.0, r.pos.y, 16.0, r.size.y), "search", 16.0, p.muted);
         if self.search.empty_text() != placeholder {
@@ -716,11 +729,16 @@ impl ComposerPanel {
         let search_h = 44.0_f64.max(body_h + 16.0);
         let list_h = if items.is_empty() || error.is_some() { 40.0_f64.max(body_h + 16.0) } else { items.len() as f64 * row_h + 8.0 };
         let anchor = self.st.attach_rect;
+        // `frame` is the body under the header; the whole sheet or card blocks the scrim
+        // before the header's controls register above it.
         let frame = if look.compact {
             let h = (header_h + search_h + list_h).min(size.y * 0.8);
-            let r = rect(0.0, size.y - h, size.x, h);
+            // Inside the safe area like the model sheet: clear of notches and the status bar.
+            let r = fit_in_viewport(rect(0.0, size.y - h, size.x, h), overlay_viewport(cx.current_pass_size()), 0.0);
+            let h = r.size.y;
             self.painter.fill(cx, rect(0.0, 0.0, size.x, size.y), p.scrim, 0.0);
             self.painter.outline(cx, r, p.surface0, p.border, 1.0, 16.0);
+            self.st.ohits.push(r, OItem::Panel);
             self.sheet_header(cx, look, r, Header::plain(&t(&format!("composer.github.title{suffix}"))));
             rect(r.pos.x, r.pos.y + header_h, r.size.x, h - header_h)
         } else {
@@ -730,9 +748,9 @@ impl ComposerPanel {
             let x = anchor.pos.x.clamp(8.0, (size.x - w - 8.0).max(8.0));
             let r = fit_in_viewport(rect(x, anchor.pos.y - 8.0 - h, w, h), overlay_viewport(cx.current_pass_size()), 8.0);
             self.card(cx, look, r, p.surface0);
+            self.st.ohits.push(r, OItem::Panel);
             r
         };
-        self.st.ohits.push(frame, OItem::Panel);
         self.search_row(cx, look, rect(frame.pos.x, frame.pos.y, frame.size.x, search_h), &t(&format!("composer.github.searchPlaceholder{suffix}")));
         let list = rect(frame.pos.x, frame.pos.y + search_h, frame.size.x, (frame.size.y - search_h).max(0.0));
         self.st.sheet_viewport = list;
@@ -819,8 +837,11 @@ impl ComposerPanel {
         self.overlay_bg.draw_abs(cx, full);
         self.st.ohits.push(full, OItem::Panel);
         let glyph = look.glyph();
+        // Controls, editor and errors sit in the safe viewport; the fill covers the window.
+        let vp = overlay_viewport(cx.current_pass_size());
+        let (left, top, width) = (vp.pos.x + 16.0, vp.pos.y + 16.0, (vp.size.x - 32.0).max(0.0));
         let rail = (28.0 - glyph) / 2.0 + 5.0 * glyph / 24.0 - ((28.0 - 16.0) / 2.0 + 3.0 * 16.0 / 24.0);
-        let minimize = rect(size.x - 16.0 - 28.0 - rail, 16.0, 28.0, 28.0);
+        let minimize = rect(left + width - 28.0 - rail, top, 28.0, 28.0);
         if self.st.ohover == Some(OItem::Close) {
             self.painter.fill(cx, minimize, p.surface2, 14.0);
         }
@@ -828,19 +849,17 @@ impl ComposerPanel {
         self.st.ohits.push(minimize, OItem::Close);
         let error = get(&self.ctl_ref().draft(), "sendError").as_str().map(str::to_owned);
         let error_h = match &error {
-            Some(text) => self.painter.paragraph_height(cx, size.x - 32.0, TextSpec::new(Font::Regular, look.body(), look.red500()), text) + 12.0,
+            Some(text) => self.painter.paragraph_height(cx, width, TextSpec::new(Font::Regular, look.body(), look.red500()), text) + 12.0,
             None => 0.0,
         };
         let bottom = 16.0 + 28.0 + 12.0 + error_h;
-        let editor = fit_in_viewport(
-            rect(16.0, 16.0 + 28.0 + 12.0, (size.x - 32.0).max(0.0), (size.y - 16.0 - 28.0 - 12.0 - bottom).max(0.0)),
-            overlay_viewport(cx.current_pass_size()), 0.0,
-        );
+        let editor_top = top + 28.0 + 12.0;
+        let editor = rect(left, editor_top, width, (vp.pos.y + vp.size.y - bottom - editor_top).max(0.0));
         self.draw_input(cx, look, editor, 0.0, 0.0, editor.size.y);
         if let Some(text) = error {
-            self.painter.paragraph(cx, dvec2(16.0, editor.pos.y + editor.size.y + 12.0), size.x - 32.0, TextSpec::new(Font::Regular, look.body(), look.red500()), &text);
+            self.painter.paragraph(cx, dvec2(left, editor.pos.y + editor.size.y + 12.0), width, TextSpec::new(Font::Regular, look.body(), look.red500()), &text);
         }
-        let send = rect(size.x - 16.0 - 28.0, size.y - 16.0 - 28.0, 28.0, 28.0);
+        let send = rect(left + width - 28.0, vp.pos.y + vp.size.y - 16.0 - 28.0, 28.0, 28.0);
         let ctl = self.ctl_ref();
         let empty = ctl.editor_text.trim().is_empty()
             && !non_empty_list(get(&ctl.draft(), "attachments"))
@@ -966,6 +985,11 @@ impl ComposerPanel {
                 }
             }
             OItem::Panel => {}
+            OItem::Search => {
+                if !self.st.hidden {
+                    self.search.set_key_focus(cx);
+                }
+            }
             OItem::Back => {
                 if let Some(Overlay::Sheet(state)) = self.st.overlay.as_mut() {
                     state.pop();

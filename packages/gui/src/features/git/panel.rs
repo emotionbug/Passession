@@ -1,8 +1,9 @@
-//! `GitPanel`: the root of the `changes_tree`, `working_diff`, `commit_diff`
-//! and `pull_request` tabs. One instance per tab; each binds its own view to
+//! `GitPanel`: the root of the `changes_tree`, `working_diff`, `commit_diff`,
+//! `pull_request` and `git_log` tabs. One instance per tab; each binds its own view to
 //! the shared window git store and releases it when dropped or retargeted.
 
 use super::changes::{ChangesView, OverlayParts};
+use super::log_view::{LogInputs, LogView};
 use super::paint::GitPaint;
 use super::pr_view::PrView;
 use super::store::{GitStoreChanged, with_store};
@@ -14,6 +15,7 @@ use makepad_widgets::*;
 enum View {
     Changes(Box<ChangesView>),
     Pr(Box<PrView>),
+    Log(Box<LogView>),
 }
 
 impl View {
@@ -21,6 +23,7 @@ impl View {
         match self {
             View::Changes(view) => view.dispose(store),
             View::Pr(view) => view.dispose(store),
+            View::Log(view) => view.dispose(store),
         }
     }
 }
@@ -38,6 +41,11 @@ pub struct GitPanel {
     overlay_bg: DrawBox,
     #[live]
     input: TextInput,
+    /// The Git Log's message search and branches-panel search fields.
+    #[live]
+    search_input: TextInput,
+    #[live]
+    branch_input: TextInput,
     /// Draw primitives of the native Markdown painter (pull request bodies).
     #[live]
     chat_kit: ChatKit,
@@ -77,6 +85,8 @@ impl GitPanel {
         let view = with_store(|store| {
             if target.kind == "pull_request" {
                 View::Pr(Box::new(PrView::new(cx, ui, store, target)))
+            } else if target.kind == "git_log" {
+                View::Log(Box::new(LogView::new(cx, ui, store, target)))
             } else {
                 View::Changes(Box::new(ChangesView::new(cx, ui, store, target)))
             }
@@ -91,6 +101,7 @@ impl GitPanel {
             match &mut view {
                 View::Changes(changes) => changes.close_overlay(cx),
                 View::Pr(pr) => pr.close_overlay(cx),
+                View::Log(log) => log.close_overlay(cx),
             }
             with_store(|store| view.dispose(store));
         }
@@ -123,6 +134,7 @@ impl Widget for GitPanel {
             let pending = match &self.view {
                 Some(View::Changes(changes)) => changes.icons_pending,
                 Some(View::Pr(pr)) => pr.images_pending,
+                Some(View::Log(log)) => log.icons_pending,
                 None => false,
             };
             if pending {
@@ -133,7 +145,7 @@ impl Widget for GitPanel {
         let visible = self.visible;
         let process = processes(event, ui) || self.applied_visible != Some(visible);
         self.applied_visible = Some(visible);
-        let Self { view, overlay_list, overlay_bg, input, area, .. } = self;
+        let Self { view, overlay_list, overlay_bg, input, search_input, branch_input, area, .. } = self;
         let Some(view) = view.as_mut() else { return };
         let area = *area;
         let mut parts = OverlayParts { list: overlay_list, bg: overlay_bg, input };
@@ -157,6 +169,18 @@ impl Widget for GitPanel {
                 }
                 redraw
             }
+            View::Log(log) => {
+                let mut inputs = LogInputs { search: search_input, branch: branch_input };
+                let mut redraw = process && log.process(cx, event, ui, store, visible);
+                redraw |= log.handle_overlay(ui);
+                if visible {
+                    redraw |= log.handle_inputs(cx, event, ui, &mut inputs);
+                    redraw |= log.handle_pointer(cx, event, area, ui, &mut inputs);
+                }
+                // Menus and selects opened above go to the shell.
+                log.flush_overlay(ui);
+                redraw
+            }
         });
         // Processing a timer/signal is not itself a visual change.
         if redraw {
@@ -171,7 +195,7 @@ impl Widget for GitPanel {
         self.ensure_view(cx, ui);
         let rect = cx.walk_turtle_with_area(&mut self.area, walk);
         let compact = is_compact_layout(cx);
-        let Self { view, overlay_list, overlay_bg, input, paint, chat_kit, .. } = self;
+        let Self { view, overlay_list, overlay_bg, input, search_input, branch_input, paint, chat_kit, .. } = self;
         let Some(view) = view.as_mut() else { return DrawStep::done() };
         let mut parts = OverlayParts { list: overlay_list, bg: overlay_bg, input };
         paint.begin_clip(cx, rect);
@@ -183,6 +207,11 @@ impl Widget for GitPanel {
             View::Pr(pr) => {
                 pr.draw(cx, ui, store, paint, rect, chat_kit);
                 pr.spinning
+            }
+            View::Log(log) => {
+                let mut inputs = LogInputs { search: search_input, branch: branch_input };
+                log.draw(cx, ui, paint, &mut inputs, rect, compact);
+                log.spinning
             }
         });
         paint.end_clip(cx);
@@ -238,6 +267,7 @@ impl GitPanelRef {
                 match inner.view.as_mut() {
                     Some(View::Changes(changes)) => changes.close_overlay(cx),
                     Some(View::Pr(pr)) => pr.close_overlay(cx),
+                    Some(View::Log(log)) => log.close_overlay(cx),
                     None => {}
                 }
             }

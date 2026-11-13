@@ -168,10 +168,8 @@ impl LiveHook for Window {
         }
         match cx.os_type() {
             OsType::Windows => {
-                if !cx.in_makepad_studio(){
-                    self.view(id!(caption_bar)).set_visible(cx, true);
-                    self.view(id!(windows_buttons)).set_visible(cx, true);
-                }
+                // Paseo: Windows keeps its native caption (makepad-platform win32_window.rs);
+                // the drawn caption bar and its buttons stay hidden.
             }
             OsType::Macos => {
                 //self.view(id!(caption_bar)).set_visible(true);

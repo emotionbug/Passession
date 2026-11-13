@@ -58448,6 +58448,530 @@
               "properties": {
                 "type": {
                   "type": "string",
+                  "const": "checkout.log.response"
+                },
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "cwd": {
+                      "type": "string"
+                    },
+                    "head": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "commits": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "sha": {
+                            "type": "string"
+                          },
+                          "shortSha": {
+                            "type": "string"
+                          },
+                          "parents": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "authorName": {
+                            "type": "string"
+                          },
+                          "authorEmail": {
+                            "type": "string"
+                          },
+                          "authorDate": {
+                            "type": "string"
+                          },
+                          "committerDate": {
+                            "type": "string"
+                          },
+                          "subject": {
+                            "type": "string"
+                          },
+                          "refs": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "name": {
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "type": "string",
+                                  "enum": [
+                                    "local",
+                                    "remote",
+                                    "tag",
+                                    "head"
+                                  ]
+                                },
+                                "isHead": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "name",
+                                "kind",
+                                "isHead"
+                              ]
+                            }
+                          }
+                        },
+                        "required": [
+                          "sha",
+                          "shortSha",
+                          "parents",
+                          "authorName",
+                          "authorEmail",
+                          "authorDate",
+                          "committerDate",
+                          "subject",
+                          "refs"
+                        ]
+                      }
+                    },
+                    "hasMore": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "enum": [
+                                "NOT_GIT_REPO",
+                                "NOT_ALLOWED",
+                                "MERGE_CONFLICT",
+                                "UNKNOWN",
+                                "invalid_revision"
+                              ]
+                            },
+                            "message": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "code",
+                            "message"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "requestId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "cwd",
+                    "head",
+                    "commits",
+                    "hasMore",
+                    "error",
+                    "requestId"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "checkout.refs.response"
+                },
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "cwd": {
+                      "type": "string"
+                    },
+                    "head": {
+                      "type": "object",
+                      "properties": {
+                        "sha": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "branch": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "detached": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "sha",
+                        "branch",
+                        "detached"
+                      ]
+                    },
+                    "local": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "sha": {
+                            "type": "string"
+                          },
+                          "upstream": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "ahead": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "behind": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "gone": {
+                            "type": "boolean"
+                          },
+                          "isCurrent": {
+                            "type": "boolean"
+                          },
+                          "committerDate": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "sha",
+                          "upstream",
+                          "ahead",
+                          "behind",
+                          "gone",
+                          "isCurrent",
+                          "committerDate"
+                        ]
+                      }
+                    },
+                    "remote": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "remote": {
+                            "type": "string"
+                          },
+                          "branch": {
+                            "type": "string"
+                          },
+                          "sha": {
+                            "type": "string"
+                          },
+                          "committerDate": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "remote",
+                          "branch",
+                          "sha",
+                          "committerDate"
+                        ]
+                      }
+                    },
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string"
+                          },
+                          "sha": {
+                            "type": "string"
+                          },
+                          "committerDate": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "sha",
+                          "committerDate"
+                        ]
+                      }
+                    },
+                    "error": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "enum": [
+                                "NOT_GIT_REPO",
+                                "NOT_ALLOWED",
+                                "MERGE_CONFLICT",
+                                "UNKNOWN"
+                              ]
+                            },
+                            "message": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "code",
+                            "message"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "requestId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "cwd",
+                    "head",
+                    "local",
+                    "remote",
+                    "tags",
+                    "error",
+                    "requestId"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "checkout.commit.get.response"
+                },
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "cwd": {
+                      "type": "string"
+                    },
+                    "commit": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "sha": {
+                              "type": "string"
+                            },
+                            "shortSha": {
+                              "type": "string"
+                            },
+                            "parents": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "authorName": {
+                              "type": "string"
+                            },
+                            "authorEmail": {
+                              "type": "string"
+                            },
+                            "authorDate": {
+                              "type": "string"
+                            },
+                            "committerName": {
+                              "type": "string"
+                            },
+                            "committerEmail": {
+                              "type": "string"
+                            },
+                            "committerDate": {
+                              "type": "string"
+                            },
+                            "subject": {
+                              "type": "string"
+                            },
+                            "body": {
+                              "type": "string"
+                            },
+                            "refs": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "name": {
+                                    "type": "string"
+                                  },
+                                  "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                      "local",
+                                      "remote",
+                                      "tag",
+                                      "head"
+                                    ]
+                                  },
+                                  "isHead": {
+                                    "type": "boolean"
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "kind",
+                                  "isHead"
+                                ]
+                              }
+                            },
+                            "files": {
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "path": {
+                                    "type": "string"
+                                  },
+                                  "oldPath": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "additions": {
+                                    "type": "number"
+                                  },
+                                  "deletions": {
+                                    "type": "number"
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "added",
+                                      "modified",
+                                      "deleted",
+                                      "renamed"
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "path",
+                                  "oldPath",
+                                  "additions",
+                                  "deletions",
+                                  "status"
+                                ]
+                              }
+                            }
+                          },
+                          "required": [
+                            "sha",
+                            "shortSha",
+                            "parents",
+                            "authorName",
+                            "authorEmail",
+                            "authorDate",
+                            "committerName",
+                            "committerEmail",
+                            "committerDate",
+                            "subject",
+                            "body",
+                            "refs",
+                            "files"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "error": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "enum": [
+                                "NOT_GIT_REPO",
+                                "NOT_ALLOWED",
+                                "MERGE_CONFLICT",
+                                "UNKNOWN"
+                              ]
+                            },
+                            "message": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "code",
+                            "message"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "requestId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "cwd",
+                    "commit",
+                    "error",
+                    "requestId"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "payload"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
                   "const": "checkout.forge.get_check_details.response"
                 },
                 "payload": {

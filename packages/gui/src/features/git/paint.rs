@@ -13,17 +13,49 @@ pub use crate::common::paint::Font;
 // Defined next to the struct: Makepad resolves a `#[live]` field's DSL class in the module
 // that defines its Rust type.
 live_design! {
+    use link::shaders::*;
     use crate::common::paint::PaseoPainter;
     use crate::features::files::kit::DrawFilesImage;
+
+    // An anti-aliased line from `a` to `b` (local to its rect) with round caps;
+    // `a == b` paints a filled circle of diameter `width`.
+    pub DrawSegment = {{DrawSegment}} {
+        fn pixel(self) -> vec4 {
+            let p = self.pos * self.rect_size;
+            let pa = p - self.a;
+            let ba = self.b - self.a;
+            let h = clamp(dot(pa, ba) / max(dot(ba, ba), 0.0001), 0.0, 1.0);
+            let d = length(pa - ba * h) - self.width * 0.5;
+            let coverage = clamp(0.5 - d, 0.0, 1.0);
+            return vec4(self.color.rgb * self.color.a, self.color.a) * coverage;
+        }
+    }
 
     pub GitPaint = {{GitPaint}} {
         painter: <PaseoPainter> {}
         file_icon: <DrawFilesImage> {}
+        segment: <DrawSegment> {}
         // Original `_manualGearPath` (pull_request_panel.dart, 15-unit viewBox at -0.5).
         manual_gear: {
             svg_path: "M10.5 7.63V6.37l-.787-.13c-.044-.175-.132-.349-.263-.61l.481-.652-.918-.913-.657.478a2.346 2.346 0 0 0-.612-.26L7.656 3.5H6.388l-.132.783c-.219.043-.394.13-.612.26l-.657-.478-.918.913.437.652c-.131.218-.175.392-.262.61l-.744.086v1.261l.787.13c.044.218.132.392.263.61l-.438.651.92.913.655-.434c.175.086.394.173.613.26l.131.783h1.313l.131-.783c.219-.043.394-.13.613-.26l.656.478.918-.913-.48-.652c.13-.218.218-.435.262-.61l.656-.13zM7 8.283a1.285 1.285 0 0 1-1.313-1.305c0-.739.57-1.304 1.313-1.304.744 0 1.313.565 1.313 1.304 0 .74-.57 1.305-1.313 1.305z"
         }
     }
+}
+
+/// Lane graph strokes and nodes (the Git Log graph).
+#[derive(Live, LiveHook, LiveRegister)]
+#[repr(C)]
+pub struct DrawSegment {
+    #[deref]
+    pub draw_super: DrawQuad,
+    #[live]
+    pub color: Vec4,
+    #[live]
+    pub a: Vec2,
+    #[live]
+    pub b: Vec2,
+    #[live(1.5)]
+    pub width: f32,
 }
 
 /// The draw primitives of one git widget.
@@ -34,6 +66,8 @@ pub struct GitPaint {
     /// Material file icons (the Files feature's `FileIcon` textures).
     #[live]
     pub file_icon: DrawFilesImage,
+    #[live]
+    pub segment: DrawSegment,
     #[live]
     pub manual_gear: DrawIcon,
 }
@@ -86,7 +120,29 @@ impl GitPaint {
     pub fn new_layer(&mut self, cx: &mut Cx2d) {
         let group = self.painter.new_layer(cx);
         self.file_icon.draw_vars.set_draw_call_group(group);
+        self.segment.draw_vars.set_draw_call_group(group);
         self.manual_gear.draw_vars.set_draw_call_group(group);
+    }
+
+    /// An anti-aliased line of `width` from `a` to `b` with round caps.
+    pub fn segment(&mut self, cx: &mut Cx2d, a: DVec2, b: DVec2, width: f64, color: Vec4) {
+        if color.w <= 0.0 || width <= 0.0 {
+            return;
+        }
+        let pad = width / 2.0 + 1.0;
+        let origin = dvec2(a.x.min(b.x) - pad, a.y.min(b.y) - pad);
+        let size = dvec2((a.x - b.x).abs() + pad * 2.0, (a.y - b.y).abs() + pad * 2.0);
+        self.segment.color = color;
+        self.segment.width = width as f32;
+        self.segment.a = (a - origin).into_vec2();
+        self.segment.b = (b - origin).into_vec2();
+        self.segment.draw_abs(cx, Rect { pos: origin, size });
+    }
+
+    /// A filled anti-aliased circle of `radius` drawn with the segment primitive, so graph
+    /// nodes stack with the lines of their row.
+    pub fn disc(&mut self, cx: &mut Cx2d, center: DVec2, radius: f64, color: Vec4) {
+        self.segment(cx, center, center, radius * 2.0, color);
     }
 
     /// The material icon of `file_name` in `area`; false while it is still

@@ -475,24 +475,30 @@ pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut
         let max_y = (content + 4.0 - body.size.y).max(0.0);
         d.state.extent_y.insert(key.clone(), max_y);
         let sy = d.state.scroll_y.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_y);
+        if max_y > 0.0 {
+            d.canvas.add_hit(body, HitTarget::ScrollY(key));
+        }
         cx.begin_turtle(Walk { abs_pos: Some(body.pos), margin: Margin::default(), width: Size::Fixed(body.size.x), height: Size::Fixed(body.size.y.max(1.0)) }, Layout::default());
         d.canvas.push_clip(body);
         panel_rows(cx, d, painter, icon, model, panel, area.pos.x, body.pos.y - sy, w);
         d.canvas.pop_clip();
         cx.end_turtle();
-        if max_y > 0.0 {
-            d.canvas.add_hit(body, HitTarget::ScrollY(key));
-        }
         return;
     }
     let max_w = (area.size.x - 16.0).clamp(0.0, 620.0);
     let w = 280.0f64.min(max_w).max(max_w.min(420.0));
     let content = d.measure(|d| panel_rows(cx, d, painter, icon, model, panel, 0.0, 0.0, w));
-    let h = (content + 8.0).min((area.size.y - 16.0).clamp(0.0, 440.0));
-    let mut y = anchor.pos.y - 12.0 - h;
-    if y < area.pos.y + 8.0 {
-        y = anchor.pos.y + anchor.size.y + 12.0;
-    }
+    // Above the pill unless the space below is larger and the content does
+    // not fit above; either way bounded by the chosen side's space.
+    let wanted = (content + 8.0).min(440.0);
+    let above = (anchor.pos.y - 12.0 - (area.pos.y + 8.0)).max(0.0);
+    let below = (area.pos.y + area.size.y - 8.0 - (anchor.pos.y + anchor.size.y + 12.0)).max(0.0);
+    let (h, y) = if wanted <= above || above >= below {
+        let h = wanted.min(above);
+        (h, anchor.pos.y - 12.0 - h)
+    } else {
+        (wanted.min(below), anchor.pos.y + anchor.size.y + 12.0)
+    };
     let x = anchor.pos.x.clamp(area.pos.x + 8.0, (area.pos.x + area.size.x - w - 8.0).max(area.pos.x + 8.0));
     let r = rect_xywh(x, y, w, h);
     let shadow = if d.look.dark() { rgba(0x33000000) } else { rgba(0x0a000000) };
@@ -503,14 +509,14 @@ pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut
     let max_y = (content + 8.0 - h).max(0.0);
     d.state.extent_y.insert(key.clone(), max_y);
     let sy = d.state.scroll_y.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_y);
+    if max_y > 0.0 {
+        d.canvas.add_hit(r, HitTarget::ScrollY(key));
+    }
     cx.begin_turtle(Walk { abs_pos: Some(r.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(h.max(1.0)) }, Layout::default());
     d.canvas.push_clip(r);
     panel_rows(cx, d, painter, icon, model, panel, x, y + 4.0 - sy, w);
     d.canvas.pop_clip();
     cx.end_turtle();
-    if max_y > 0.0 {
-        d.canvas.add_hit(r, HitTarget::ScrollY(key));
-    }
 }
 
 #[cfg(test)]

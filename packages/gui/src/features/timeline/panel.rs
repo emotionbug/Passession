@@ -100,6 +100,8 @@ struct MenuFacts {
     expanded_tools: bool,
     archived: bool,
     outline_enabled: bool,
+    /// Only a Paseo child agent has a parent to detach from.
+    detachable: bool,
 }
 
 /// agent-panel.tsx conversation actions offered by the agent tab menu.
@@ -120,7 +122,9 @@ pub fn conversation_actions(host_id: &str, agent_id: &str) -> Vec<(String, Strin
     out.push(item("fork", "agentPanel.menu.fork"));
     out.push(item("refresh", if facts.archived { "agentPanel.archived.unarchive" } else { "workspace.tabs.menu.reloadAgent" }));
     out.push(item("usage", "sidebar.footer.usage"));
-    out.push(item("detach", "subagents.detachTooltip"));
+    if facts.detachable {
+        out.push(item("detach", "subagents.detachTooltip"));
+    }
     out.push(item("archive", "agentList.archiveSheet.archive"));
     out.push(item("delete", "workspace.fileActions.delete"));
     out
@@ -467,6 +471,10 @@ pub struct ChatPanel {
     find_timers: Vec<(Timer, u64, bool)>,
     #[rust]
     find_scroll: Option<(String, u32)>,
+    /// A row whose top edge is brought on screen after the next layout if it
+    /// lies above the stream (a question card that switched questions).
+    #[rust]
+    reveal_top: Option<String>,
     #[rust]
     last_shift: bool,
     /// The reader scrolled the stream (wheel or touch drag) since it last
@@ -1351,6 +1359,9 @@ impl ChatPanel {
                 self.asks.insert(id, Ask::Rename);
             }
             "refresh" => {
+                if !snap.archived {
+                    ui.toast(t("workspace.tabs.toasts.reloadingAgent"), false);
+                }
                 self.with_session(cx, ui, |s, io| s.action(io, ActionKind::Refresh, "refresh_agent_request", "status", json!({})));
             }
             "fork" => self.fork(cx, ui, None, ForkTarget::Tab),
@@ -1432,6 +1443,10 @@ impl ChatPanel {
         let request_id = get(request, "id").clone();
         let state = self.row_state(&format!("perm:{key}"));
         if let Some(card) = state.borrow_mut().permission.as_mut() {
+            // One response per card until it resolves or fails.
+            if card.pending {
+                return;
+            }
             card.pending = true;
             card.failed = false;
             card.responding_action = Some(action.to_owned());
@@ -1768,8 +1783,17 @@ impl ChatPanel {
                     }
                 }
             }
-            ActionKind::Rename | ActionKind::Detach | ActionKind::Cancel | ActionKind::Refresh => match result {
+            ActionKind::Rename | ActionKind::Detach | ActionKind::Cancel => match result {
                 Ok(_) => {
+                    self.with_session(cx, ui, |s, io| s.reload(io));
+                }
+                Err(e) => self.show_failure(e.message),
+            },
+            ActionKind::Refresh => match result {
+                Ok(_) => {
+                    if !self.snap.as_ref().is_some_and(|s| s.archived) {
+                        ui.toast(t("workspace.tabs.toasts.reloadedAgent"), false);
+                    }
                     self.with_session(cx, ui, |s, io| s.reload(io));
                 }
                 Err(e) => self.show_failure(e.message),
@@ -2102,6 +2126,9 @@ impl ChatPanel {
                     }
                     self.list.as_portal_list().scroll_selection(cx, delta);
                 }
+            }
+            RowEventKind::RevealTop => {
+                self.reveal_top = Some(row);
             }
             RowEventKind::Answer { key, dismiss } => {
                 let Some(snap) = &self.snap else { return };
@@ -2492,8 +2519,15 @@ impl Widget for ChatPanel {
                 self.detach();
             }
         }
+        // The find field sits on the find card above the stream: it claims the
+        // pointer before the card's chrome hit or any row underneath.
+        let block_pointer = modal_open && modal_input;
+        if self.find_open && !block_pointer {
+            self.find_field.handle_event(cx, event, scope);
+        }
         // Chrome over the stream and modal surfaces claim pointer events
         // only where they have a target (or everywhere while a modal shows).
+        let find_field_rect = if self.find_open { self.find_field_rect } else { None };
         let overlay_rects: Vec<Rect> = self.overlay_canvas.hits.iter().map(|(r, _)| r.translate(self.overlay_canvas.origin)).collect();
         let modal_block = match &self.modal {
             None => None,
@@ -2505,7 +2539,7 @@ impl Widget for ChatPanel {
         let hit = event.hits_with_test(cx, area, move |abs, _, _| match modal_block {
             Some(Some(content)) => panel_rect.contains(abs) && !content.contains(abs),
             Some(None) => panel_rect.contains(abs),
-            None => overlay_rects.iter().any(|r| r.contains(abs)),
+            None => !find_field_rect.is_some_and(|f| f.contains(abs)) && overlay_rects.iter().any(|r| r.contains(abs)),
         });
         if !modal_open || matches!(self.modal, Some(Modal::Lightbox { .. })) {
             self.modal_touch_scroll.reset();
@@ -2570,6 +2604,13 @@ impl Widget for ChatPanel {
                         self.modal_state.copied.insert(key, now_seconds());
                     } else if let HitTarget::Toggle(key) = target {
                         self.modal_state.toggle(&key);
+                    } else if let HitTarget::OpenFile(path) = target {
+                        // The row tap path opens it once the UiContext is at hand.
+                        let row = match &self.modal {
+                            Some(Modal::Sheet { row, .. }) => row.clone(),
+                            _ => String::new(),
+                        };
+                        cx.action(ChatRowEvent { panel: self.uid, row, kind: RowEventKind::Tap { target: HitTarget::OpenFile(path), rect: Rect::default() } });
                     }
                     self.area.redraw(cx);
                 }
@@ -2582,8 +2623,7 @@ impl Widget for ChatPanel {
             }
             _ => {}
         }
-        // Children: the stream, the composer and the find field.
-        let block_pointer = modal_open && modal_input;
+        // Children: the stream and the composer.
         if !swallow_scroll && !block_pointer {
             let list = self.list.as_portal_list();
             let previous_scroll = list.scroll_position();
@@ -2613,9 +2653,6 @@ impl Widget for ChatPanel {
             if let (Some(activity), Some(ui)) = (activity, scope.data.get_mut::<UiContext>()) {
                 ui.activity = activity;
             }
-        }
-        if self.find_open && !block_pointer {
-            self.find_field.handle_event(cx, event, scope);
         }
         let Some(ui) = scope.data.get_mut::<UiContext>() else { return };
         // composer/index.tsx handleFocusChange → onAttentionInputFocus.
@@ -2929,7 +2966,15 @@ impl Widget for ChatPanel {
             MENUS.with(|m| {
                 m.borrow_mut().insert(
                     (target.host_id.clone(), target.agent_id.clone()),
-                    MenuFacts { expanded_tools: self.expanded_tools, archived, outline_enabled: self.outline_enabled() },
+                    MenuFacts {
+                        expanded_tools: self.expanded_tools,
+                        archived,
+                        outline_enabled: self.outline_enabled(),
+                        detachable: self
+                            .snap
+                            .as_ref()
+                            .is_some_and(|s| get(get(&s.agent, "labels"), "paseo.parent-agent-id").as_str().is_some_and(|p| !p.trim().is_empty())),
+                    },
                 )
             });
         }
@@ -3080,18 +3125,19 @@ impl ChatPanel {
             return true;
         }
         let rel = abs - self.modal_canvas.origin;
-        if let Some(key) = self.modal_canvas.scroll_region_at(rel, delta.x.abs() <= delta.y.abs()).map(str::to_owned) {
-            let vertical = delta.x.abs() <= delta.y.abs();
+        let vertical = delta.x.abs() <= delta.y.abs();
+        let amount = if vertical { delta.y } else { delta.x };
+        // The deepest region that can still move takes the delta.
+        for key in self.modal_canvas.scroll_regions_at(rel, vertical) {
             let (offsets, extents) = if vertical { (&mut self.modal_state.scroll_y, &self.modal_state.extent_y) } else { (&mut self.modal_state.scroll_x, &self.modal_state.extent_x) };
-            let max = extents.get(&key).copied().unwrap_or(0.0);
-            let current = offsets.get(&key).copied().unwrap_or(0.0);
-            let detach = key == "sheet:y";
-            let next = (current + if vertical { delta.y } else { delta.x }).clamp(0.0, max);
+            let max = extents.get(key).copied().unwrap_or(0.0);
+            let current = offsets.get(key).copied().unwrap_or(0.0);
+            let next = (current + amount).clamp(0.0, max);
             if next == current {
-                return false;
+                continue;
             }
-            offsets.insert(key, next);
-            if detach {
+            offsets.insert(key.to_owned(), next);
+            if key == "sheet:y" {
                 // An overview sheet stays pinned to its newest call until scrolled.
                 self.modal_state.expanded.insert("sheet:detached".into(), true);
             }
@@ -3332,7 +3378,8 @@ impl ChatPanel {
         self.older.observe(at_start, list.not_filling_viewport(), available)
     }
 
-    /// Post-layout bookkeeping: the active prompt and find match position.
+    /// Post-layout bookkeeping: the active prompt, the find match position
+    /// and a pending row-top reveal.
     fn after_draw(&mut self, cx: &mut Cx2d) {
         let list = self.list.as_portal_list();
         let first = list.first_id();
@@ -3362,6 +3409,13 @@ impl ChatPanel {
                 }
                 _ => self.find_scroll = None,
             }
+        }
+        if let Some(row) = self.reveal_top.take()
+            && let Some(index) = self.items.iter().position(|i| i.id == row)
+            && let Some((_, widget)) = list.get_item(index)
+            && widget.as_chat_row().rect(cx).pos.y < self.stream_rect.pos.y - 0.5
+        {
+            self.scroll_to_row(cx, &row, 0.0);
         }
     }
 
@@ -3559,14 +3613,14 @@ fn usage_sheet(cx: &mut Cx2d, d: &mut Draw, agent: &Value, rect: Rect, bottom_in
     let max_y = (content - view.size.y).max(0.0);
     d.state.extent_y.insert(key.clone(), max_y);
     let sy = d.state.scroll_y.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_y);
+    if max_y > 0.0 {
+        d.canvas.add_hit(view, HitTarget::ScrollY(key));
+    }
     cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(view.size.y.max(1.0)) }, Layout::default());
     d.canvas.push_clip(view);
     paint(cx, d, x, y - sy);
     d.canvas.pop_clip();
     cx.end_turtle();
-    if max_y > 0.0 {
-        d.canvas.add_hit(view, HitTarget::ScrollY(key));
-    }
     d.kit.icon(cx, "x", close, 18.0, p.muted);
     d.canvas.add_hit(close, HitTarget::Chrome("sheet:close".into()));
 }

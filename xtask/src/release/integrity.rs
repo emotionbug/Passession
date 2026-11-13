@@ -41,7 +41,7 @@ pub(super) fn names(id: &Identity, runtime: &str) -> Result<Vec<String>> {
             },
         ),
         CLIENT => (
-            "Paseo-Sessions",
+            "Passession",
             match t.platform {
                 "linux" => vec!["AppImage", "deb"],
                 "macos" => vec!["zip"],
@@ -286,7 +286,7 @@ fn inventory(dir: &Path, id: &Identity) -> Result<Vec<String>> {
                 && metadata["sourceSha"] == id.sha,
             "Android package metadata identity mismatch"
         );
-        let stem = format!("Paseo-Sessions-{}-android-{}", id.version, t.arch);
+        let stem = format!("Passession-{}-android-{}", id.version, t.arch);
         let allowed = [
             format!("{stem}.{}", t.format),
             format!("{stem}-debug-signed.{}", t.format),
@@ -309,7 +309,7 @@ fn inventory(dir: &Path, id: &Identity) -> Result<Vec<String>> {
         validate_android(&dir.join(&actual[0]), t.arch, t.format)?;
         Ok(vec![actual[0].clone(), metadata_name])
     } else {
-        let stem = format!("Paseo-Sessions-{}-{}", id.version, id.target);
+        let stem = format!("Passession-{}-{}", id.version, id.target);
         let allowed = [format!("{stem}.ipa"), format!("{stem}-unsigned.app.zip")];
         let actual: Vec<_> = fs::read_dir(dir)?
             .map(|e| Ok(e?.file_name().to_string_lossy().into_owned()))
@@ -517,7 +517,7 @@ mod tests {
     fn android_fixture(dir: &Path, id: &Identity, debug_signed: bool) -> PathBuf {
         let t = target(&id.target).unwrap();
         let label = if debug_signed { "-debug-signed" } else { "" };
-        let name = format!("Paseo-Sessions-{}-android-{}{label}.{}", id.version, t.arch, t.format);
+        let name = format!("Passession-{}-android-{}{label}.{}", id.version, t.arch, t.format);
         let path = dir.join(&name);
         let mut archive = zip::ZipWriter::new(File::create(&path).unwrap());
         let required: &[&str] = if t.format == "apk" {
@@ -568,7 +568,7 @@ mod tests {
     }
     /// Installed clients accept only this exact feed identity.
     fn manifest() -> Value {
-        json!({"schemaVersion":1,"runtime":"flutter","appId":"sh.paseo.sessions.desktop","platform":"windows","arch":"x64","version":"0.13.1","channel":"stable","sourceSha":"a".repeat(40),"releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36,"artifact":{"name":"Paseo-Sessions-0.13.1-windows-x64.exe","size":42,"format":"exe","sha512":STANDARD.encode([0_u8;64])}})
+        json!({"schemaVersion":1,"runtime":"flutter","appId":"sh.paseo.sessions.desktop","platform":"windows","arch":"x64","version":"0.13.1","channel":"stable","sourceSha":"a".repeat(40),"releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36,"artifact":{"name":"Passession-0.13.1-windows-x64.exe","size":42,"format":"exe","sha512":STANDARD.encode([0_u8;64])}})
     }
     #[test]
     fn manifest_identity_and_hashes_are_strict() {
@@ -647,7 +647,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut id = identity();
             id.target = target.into();
-            let stem = format!("Paseo-Sessions-{}-{target}", id.version);
+            let stem = format!("Passession-{}-{target}", id.version);
             for suffix in suffixes {
                 let name = format!("{stem}{suffix}");
                 fs::write(dir.path().join(&name), b"mobile artifact").unwrap();

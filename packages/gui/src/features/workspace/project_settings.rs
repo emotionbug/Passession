@@ -87,7 +87,8 @@ live_design! {
                         width: Fill, height: Fit, flow: Right, spacing: 12., align: { y: 0.5 }
                         padding: { top: 8., bottom: 16. }
                         icon = <WaProjectIcon> { width: 28., height: 28. }
-                        name = <WaMedium> { width: Fit }
+                        // Long names ellipsize so the trailing edit button stays on screen.
+                        name = <WaMedium> { width: Fill, ellipsis: true }
                         edit_project = <WaGlyphButton> { icon: "pencil" }
                     }
                     host_gone = <View> { width: Fill, height: Fit, padding: 16., visible: false, text = <WaMuted> {} }

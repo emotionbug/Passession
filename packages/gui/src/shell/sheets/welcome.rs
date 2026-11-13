@@ -4,16 +4,23 @@
 //! button and the app version. Each method opens the matching connection flow; the screen
 //! disappears by itself once a host is saved.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use makepad_widgets::scroll_bars::TouchScroll;
 use makepad_widgets::*;
 
 use crate::common::paint::{Font, rect};
 use crate::common::{UiContext, tr};
 use crate::shell::chrome::make_ui;
 use crate::shell::ui::Variant;
-use crate::shell::{PaseoShell, platform};
+use crate::shell::{Page, PaseoShell, hosts, platform};
 use crate::theme::{ControlSize, MOBILE};
 
-const LOGO_SVG: &str = include_str!("../../../resources/icons/paseo-logo.svg");
+const LOGO_SVG: &str = include_str!("../../../resources/icons/passession-logo.svg");
+/// Width over height of the logo's path bounds (its viewBox). `DrawIcon` scales uniformly
+/// and anchors the path at the rect's top-left, so the rect must share this aspect to centre.
+const LOGO_ASPECT: f64 = 524.0 / 799.2;
 
 struct Action {
     id: &'static str,
@@ -51,8 +58,62 @@ fn version_text() -> String {
     }
 }
 
+/// Per-window scroll of the welcome body: it scrolls only when it is taller than the area.
+#[derive(Default)]
+struct WelcomeScroll {
+    scroll: f64,
+    max: f64,
+    viewport: Rect,
+    touch: TouchScroll,
+}
+
+thread_local! {
+    static SCROLL: RefCell<HashMap<String, WelcomeScroll>> = RefCell::new(HashMap::new());
+}
+
+/// Wheel and touch scrolling of the welcome body (shell window events). Only while the welcome
+/// screen is what the content area shows and no shell modal covers it.
+pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, state: &serde_json::Value) {
+    let shown = hosts::hosts(state).is_empty()
+        && !matches!(shell.data.page, Some(Page::Settings { .. }))
+        && !shell.data.overlays.is_modal();
+    let window = shell.data.window_id.clone();
+    let hit = if shown && matches!(event, Event::TouchUpdate(_) | Event::LongPress(_)) { event.hits(cx, shell.data.bg_area) } else { Hit::Nothing };
+    let moved = SCROLL.with(|scroll| {
+        let mut scroll = scroll.borrow_mut();
+        let Some(s) = scroll.get_mut(&window) else { return false };
+        if !shown {
+            s.touch.reset();
+            return false;
+        }
+        let mut moved = false;
+        if let Hit::FingerDown(e) = &hit
+            && !s.viewport.contains(e.abs)
+        {
+            s.touch.reset();
+        } else if let Some(dy) = s.touch.handle_event(cx, event, &hit) {
+            moved = s.touch.apply_delta(&mut s.scroll, dy, s.max);
+        }
+        if let Event::Scroll(e) = event
+            && s.viewport.contains(e.abs)
+            && s.max > 0.0
+        {
+            s.touch.reset();
+            s.scroll = (s.scroll + e.scroll.y).clamp(0.0, s.max);
+            moved = true;
+        }
+        moved
+    });
+    if moved {
+        // A drag that scrolled is not a tap on the button it started on.
+        shell.data.pointer.pressed = None;
+        shell.redraw(cx);
+    }
+}
+
 pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     let actions = actions();
+    let window = shell.data.window_id.clone();
     let mut ui = make_ui(shell);
     let p = ui.p;
     ui.fill(cx, area, p.surface0, 0.0);
@@ -72,14 +133,28 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     let version_spec = ui.spec(Font::Regular, 12.0, p.muted);
     let version_h = 24.0 + ui.painter.paragraph_height(cx, inner.size.x, version_spec, "Ag");
     let available = inner.size.y - version_h;
-    let mut y = inner.pos.y + ((available - content_h) * 0.5).max(0.0);
+    // Centred while everything fits; otherwise the body scrolls inside the clipped area.
+    let max = (content_h + version_h - inner.size.y).max(0.0);
+    let scroll = SCROLL.with(|scroll| {
+        let mut scroll = scroll.borrow_mut();
+        let s = scroll.entry(window).or_default();
+        s.viewport = area;
+        s.max = max;
+        s.scroll = s.scroll.clamp(0.0, max);
+        s.scroll
+    });
+    let mut y = if max > 0.0 { inner.pos.y - scroll } else { inner.pos.y + ((available - content_h) * 0.5).max(0.0) };
     let center = inner.pos.x + inner.size.x * 0.5;
+    cx.begin_turtle(Walk::abs_rect(area), Layout { clip_x: true, clip_y: true, ..Layout::default() });
+    ui.hits.set_clip(Some(area));
 
-    // Logo: the 700×700 Paseo mark in the foreground colour.
+    // Logo: the Passession mark in the foreground colour.
     if let Some(path) = crate::common::provider_icon::icon_path(LOGO_SVG) {
         ui.draw_icon.svg_path = ArcStringMut::Arc(path);
         ui.draw_icon.color = p.foreground;
-        ui.draw_icon.draw_walk(cx, Walk::abs_rect(rect(center - 48.0, y, 96.0, 96.0)));
+        // The mark fills its bounds, so it sits 80px tall in the 96px slot, clear of the title.
+        let (h, w) = (80.0, 80.0 * LOGO_ASPECT);
+        ui.draw_icon.draw_walk(cx, Walk::abs_rect(rect(center - w * 0.5, y + 4.0, w, h)));
     }
     y += 96.0;
 
@@ -129,6 +204,8 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     let vw = ui.painter.measure(cx, version_spec, &version).x;
     let vy = (inner.pos.y + inner.size.y - version_h + 24.0).max(y + 32.0 + 24.0);
     ui.text(cx, rect(center - vw * 0.5, vy, vw, version_h - 24.0), version_spec, &version);
+    ui.hits.set_clip(None);
+    cx.end_turtle();
 }
 
 pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) {

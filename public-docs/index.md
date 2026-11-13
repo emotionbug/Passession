@@ -8,7 +8,7 @@ category: Getting started
 
 # Getting started
 
-Paseo Sessions is a native Rust client on **Linux, macOS, Windows, Android and iOS**, with a **Rust daemon and CLI**. Desktop/server hosts run agents; Android and iOS connect remotely. The client includes Markdown, source editing, summary-first diffs, remote folder browsing, interactive terminals and read-only script/setup logs, organized as host → directory → session.
+Passession is a native Rust client on **Linux, macOS, Windows, Android and iOS**, with a **Rust daemon and CLI**. Desktop/server hosts run agents; Android and iOS connect remotely. The client includes Markdown, source editing, summary-first diffs, remote folder browsing, interactive terminals and read-only script/setup logs, organized as host → directory → session.
 
 Use [this repository's releases](https://github.com/emotionbug/Passession/releases) for native build artifacts; upstream downloads and store listings are separate products. Source builds and redistribution requirements are documented in the repository's `docs/release.md`.
 

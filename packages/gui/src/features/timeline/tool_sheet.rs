@@ -83,14 +83,15 @@ pub fn paint_detail_sheet(
     let pinned = pin_to_end && d.state.expanded.get("sheet:detached").copied() != Some(true);
     let sy = if pinned { max_y } else { d.state.scroll_y.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_y) };
     d.state.scroll_y.insert(key.clone(), sy);
+    // Enclosing regions register before their content: the deepest one wins.
+    if max_y > 0.0 {
+        d.canvas.add_hit(view, HitTarget::ScrollY(key));
+    }
     cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(view.size.x), height: Size::Fixed(view.size.y) }, Layout::default());
     d.canvas.push_clip(view);
     body(cx, d, view.pos.x, view.pos.y - sy, view.size.x, fill);
     d.canvas.pop_clip();
     cx.end_turtle();
-    if max_y > 0.0 {
-        d.canvas.add_hit(view, HitTarget::ScrollY(key));
-    }
     if progress < 1.0 {
         d.animating = true;
     }
@@ -100,18 +101,21 @@ pub fn paint_detail_sheet(
 /// Scrolls the sheet body; returns true when it moved.
 pub fn scroll_sheet(state: &mut RowState, canvas: &Canvas, abs: DVec2, delta: DVec2) -> bool {
     let rel = abs - canvas.origin;
-    let Some(key) = canvas.scroll_region_at(rel, true).map(str::to_owned) else { return false };
-    let max = state.extent_y.get(&key).copied().unwrap_or(0.0);
-    let current = state.scroll_y.get(&key).copied().unwrap_or(0.0);
-    let next = (current + delta.y).clamp(0.0, max);
-    if (next - current).abs() < 0.01 {
-        return false;
+    // The deepest region that can still move takes the delta.
+    for key in canvas.scroll_regions_at(rel, true) {
+        let max = state.extent_y.get(key).copied().unwrap_or(0.0);
+        let current = state.scroll_y.get(key).copied().unwrap_or(0.0);
+        let next = (current + delta.y).clamp(0.0, max);
+        if (next - current).abs() < 0.01 {
+            continue;
+        }
+        state.scroll_y.insert(key.to_owned(), next);
+        if key == "sheet:y" {
+            state.expanded.insert("sheet:detached".into(), true);
+        }
+        return true;
     }
-    state.scroll_y.insert(key.clone(), next);
-    if key == "sheet:y" {
-        state.expanded.insert("sheet:detached".into(), true);
-    }
-    true
+    false
 }
 
 // ── Standalone window-level sheets ──────────────────────────────────────

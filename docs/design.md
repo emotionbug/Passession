@@ -26,9 +26,13 @@ Design the compact case explicitly. The sidebar, session and supporting file vie
 
 Hover is a convenience, never the only access to an action. Provide pointer, keyboard and touch paths with clear focus and semantic labels. Align visible content while keeping sufficiently large hit targets. Long paths and provider/model labels must remain distinguishable without expanding every row uncontrollably.
 
+Hit maps resolve the last registered target first. A row or card registers its own hit before its controls, so it never swallows its switch, menu or remove button, and a nested button never leaves a dead strip beside it. Painting and hits come from one fitted layout: when a width cannot hold a control group, reflow, shrink or move the rest behind an overflow control (the tab strip shows `+N`) rather than dropping controls or letting one overlap its neighbor's hit. Pane focus follows any press inside the pane, including content that captures the press itself; touch focus waits for a tap released in the same pane.
+
 ## Content surfaces
 
 Markdown and source editing are native. Diffs are summary-first and load bodies lazily; do not block opening the entire Changes view on every patch. Preserve drafts and selection through transient errors. Interactive terminals are native terminal tabs; display script/setup output as read-only logs, with real lifecycle state and exit errors. The app does not contain a browser.
+
+The Git Log tab (`git_log`, IntelliJ's Git Log) follows the same tiers. From 900px a pane shows the ref tree (HEAD, local branches with ahead/behind, remotes grouped by remote, tags), the commit table (lane graph, ref pills, author, date, hash) and the selected commit's changed files above its message, author, hash and parents; the details move under the table below 1100px. Between 600px and 900px the ref tree folds into the Branch filter and the author column drops. Phones get the stacked flow in [compact panels](mobile-panels.md). The graph is laid out client-side from `parents` in `--date-order`, so appending a page never changes earlier rows; with text or author filters only commit dots are drawn, because a filtered list has gaps in its parent chains. A changed file opens the existing commit diff tab. History comes from the daemon's `checkout.log`, `checkout.refs` and `checkout.commit.get` requests behind the `gitLog` feature; an older daemon shows an update notice instead of an empty log.
 
 Loading, empty, unavailable, failed, pending and successful states are separate. A disconnected host must not look like an empty host. A failed save must not look like a completed save. A permission request must not disappear merely because a different pane is selected.
 

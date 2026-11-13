@@ -84,13 +84,9 @@ use {
                         GWL_EXSTYLE,
                         HWND_TOPMOST,
                         HWND_NOTOPMOST,
-                        WS_SIZEBOX,
-                        WS_MAXIMIZEBOX,
-                        WS_MINIMIZEBOX,
-                        WS_POPUP,
+                        WS_OVERLAPPEDWINDOW,
                         WS_CLIPSIBLINGS,
                         WS_CLIPCHILDREN,
-                        WS_SYSMENU,
                         WS_EX_WINDOWEDGE,
                         WS_EX_APPWINDOW,
                         WS_EX_ACCEPTFILES,
@@ -106,10 +102,11 @@ use {
                         SW_MINIMIZE,
                         SWP_NOMOVE,
                         SWP_NOSIZE,
+                        SWP_NOZORDER,
+                        SWP_NOACTIVATE,
                         WM_SETFOCUS,
                         WM_KILLFOCUS,
-                        WM_NCCALCSIZE,
-                        WM_NCHITTEST,
+                        WM_SETCURSOR,
                         WM_ERASEBKGND,
                         WM_MOUSEMOVE,
                         WM_MOUSEWHEEL,
@@ -132,22 +129,9 @@ use {
                         WM_SIZE,
                         WM_DPICHANGED,
                         WM_DESTROY,
-                        HTTOPLEFT,
-                        HTBOTTOMLEFT,
-                        HTLEFT,
-                        HTTOPRIGHT,
-                        HTBOTTOMRIGHT,
-                        HTRIGHT,
-                        HTTOP,
-                        HTBOTTOM,
                         HTCLIENT,
-                        HTCAPTION,
-                        HTSYSMENU
                     },
-                    Controls::{
-                        MARGINS,
-                        WM_MOUSELEAVE
-                    },
+                    Controls::WM_MOUSELEAVE,
                     Input::KeyboardAndMouse::{
                         VIRTUAL_KEY,
                         ReleaseCapture,
@@ -285,10 +269,7 @@ use {
                         NI_COMPOSITIONSTR,
                     },
                 },
-                Graphics::{
-                    Dwm::DwmExtendFrameIntoClientArea,
-                    Gdi::{ScreenToClient, LOGFONTW},
-                },
+                Graphics::Gdi::{ScreenToClient, LOGFONTW},
             },
         },
         event::*,
@@ -425,13 +406,11 @@ impl Win32Window {
 
         let title = encode_wide(title);
         
-        let style = WS_SIZEBOX
-            | WS_MAXIMIZEBOX
-            | WS_MINIMIZEBOX
-            | WS_POPUP
+        // Paseo: the standard overlapped frame: the OS draws the caption, its buttons, the
+        // resize borders and Snap. Upstream used a borderless popup and a drawn caption bar.
+        let style = WS_OVERLAPPEDWINDOW
             | WS_CLIPSIBLINGS
-            | WS_CLIPCHILDREN
-            | WS_SYSMENU;
+            | WS_CLIPCHILDREN;
         
         let style_ex = WS_EX_WINDOWEDGE
             | WS_EX_APPWINDOW
@@ -458,7 +437,8 @@ impl Win32Window {
             GetModuleHandleW(None).unwrap(),
             None,
         ) };
-
+        // The caption takes the app's light/dark theme before the window is first shown.
+        super::win32_app::apply_dark_caption(hwnd);
         // create DropTarget object that accesses the same data object, convert to COM and give to Microsoft
         let drop_target: IDropTarget = DropTarget { drag_items: RefCell::new(Vec::new()),effect: Cell::new(DROPEFFECT(0)),hwnd, }.into();
         unsafe { RegisterDragDrop(hwnd, &drop_target).unwrap() };
@@ -487,7 +467,7 @@ impl Win32Window {
         with_win32_app(|app| app.dpi_functions.enable_non_client_dpi_scaling(self.hwnd));
         with_win32_app(|app| app.all_windows.push(self.hwnd));
 
-        self.set_outer_size(size);
+        self.set_inner_size(size);
     }
     
     pub unsafe extern "system" fn window_class_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,) -> LRESULT {
@@ -507,88 +487,14 @@ impl Win32Window {
                 window.send_focus_lost_event();
                 return LRESULT(0)
             },
-            WM_NCCALCSIZE => {
-                // check if we are maximised
-                if window.get_is_maximized() {
-                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+            WM_SETCURSOR => {
+                // The native frame sets its own resize cursors; back over the client area the
+                // app's cursor applies again (its cache would otherwise skip re-setting it).
+                if (lparam.0 & 0xffff) as u32 == HTCLIENT {
+                    with_win32_app(|app| app.reapply_mouse_cursor());
+                    return LRESULT(1)
                 }
-                if wparam == WPARAM(1) {
-                    let margins = MARGINS {
-                        cxLeftWidth: 0,
-                        cxRightWidth: 0,
-                        cyTopHeight: 0,
-                        cyBottomHeight: 1
-                    };
-                    DwmExtendFrameIntoClientArea(hwnd, &margins).unwrap();
-                    return LRESULT(0)
-                }
-            },
-            WM_NCHITTEST => {
-                //let ycoord = (lparam.0 >> 16) as u16 as i16 as i32;
-                //let xcoord = (lparam.0 & 0xffff) as u16 as i16 as i32;
-                let abs = window.get_mouse_pos_from_lparam(lparam);
-                let mut rect = RECT {left: 0, top: 0, bottom: 0, right: 0};
-                const EDGE: f64 = 4.0; 
-                let dpi = window.get_dpi_factor();
-                GetWindowRect(hwnd, &mut rect).unwrap();
-                let rect = Rect{pos:dvec2(rect.left as f64 / dpi, rect.top as f64 / dpi),
-                size:dvec2( (rect.right-rect.left) as f64 / dpi,  (rect.bottom-rect.top) as f64/ dpi) 
-                }; 
-                if abs.x < rect.pos.x + EDGE {
-                    if abs.y < rect.pos.y  + EDGE {
-                        with_win32_app(|app| app.set_mouse_cursor(MouseCursor::NwseResize));
-                        return LRESULT(HTTOPLEFT as isize);
-                    }
-                    if abs.y > rect.pos.y + rect.size.y - EDGE {
-                        with_win32_app(|app| app.set_mouse_cursor(MouseCursor::NeswResize));
-                        return LRESULT(HTBOTTOMLEFT as isize);
-                    }
-                    with_win32_app(|app| app.set_mouse_cursor(MouseCursor::EwResize));
-                    return LRESULT(HTLEFT as isize);
-                }
-                if abs.x > rect.pos.x+rect.size.x - EDGE {
-                    if abs.y < rect.pos.y  + EDGE {
-                        with_win32_app(|app| app.set_mouse_cursor(MouseCursor::NeswResize));
-                        return LRESULT(HTTOPRIGHT as isize);
-                    }
-                    if abs.y > rect.pos.y + rect.size.y - EDGE {
-                        with_win32_app(|app| app.set_mouse_cursor(MouseCursor::NwseResize));
-                        return LRESULT(HTBOTTOMRIGHT as isize);
-                    }
-                    with_win32_app(|app| app.set_mouse_cursor(MouseCursor::EwResize));
-                    return LRESULT(HTRIGHT as isize);
-                }
-                if abs.y < rect.pos.y + EDGE {
-                    with_win32_app(|app| app.set_mouse_cursor(MouseCursor::NsResize));
-                    return LRESULT(HTTOP as isize);
-                }
-                if abs.y > rect.pos.y+rect.size.y - EDGE {
-                    with_win32_app(|app| app.set_mouse_cursor(MouseCursor::NsResize));
-                    return LRESULT(HTBOTTOM as isize);
-                }
-                let response = Rc::new(Cell::new(WindowDragQueryResponse::NoAnswer));
-                window.do_callback(
-                    Win32Event::WindowDragQuery(WindowDragQueryEvent {
-                        window_id: window.window_id,
-                        abs: window.get_mouse_pos_from_lparam(lparam)- rect.pos,
-                        response: response.clone()
-                    })
-                );
-                match response.get() {
-                    WindowDragQueryResponse::Client => {
-                        return LRESULT(HTCLIENT as isize);
-                    }
-                    WindowDragQueryResponse::Caption => {
-                        with_win32_app(|app| app.set_mouse_cursor(MouseCursor::Default));
-                        return LRESULT(HTCAPTION as isize);
-                    },
-                    WindowDragQueryResponse::SysMenu => {
-                        with_win32_app(|app| app.set_mouse_cursor(MouseCursor::Default));
-                        return LRESULT(HTSYSMENU as isize);
-                    }
-                    _ => ()
-                }
-                return LRESULT(HTCLIENT as isize);
+                return DefWindowProcW(hwnd, msg, wparam, lparam)
             },
             WM_ERASEBKGND => {
                 return LRESULT(1)
@@ -740,8 +646,24 @@ impl Win32Window {
                 with_win32_app(|app| app.stop_resize());
                 window.do_callback(Win32Event::WindowResizeLoopStop(window.window_id));
             },
-            WM_SIZE | WM_DPICHANGED => {
+            WM_SIZE => {
                 window.send_change_event();
+            },
+            WM_DPICHANGED => {
+                // Moving to a monitor with another scale: take the size Windows suggests, so
+                // the frame and the content keep their logical size.
+                let suggested = *(lparam.0 as *const RECT);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND(0),
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                window.send_change_event();
+                return LRESULT(0)
             },
             WM_CLOSE => { // close requested
                 let accept_close = Rc::new(Cell::new(true));
@@ -1021,7 +943,7 @@ impl Win32Window {
             can_fullscreen: false,
             is_topmost: self.get_is_topmost(),
             is_fullscreen: self.get_is_maximized(),
-            inner_size: if self.get_is_maximized(){self.get_outer_size()}else{self.get_inner_size()},
+            inner_size: self.get_inner_size(),
             outer_size: self.get_outer_size(),
             dpi_factor: self.get_dpi_factor(),
             position: self.get_position()
@@ -1178,15 +1100,16 @@ impl Win32Window {
         }
     }
     
+    /// Physical pixels, like `get_position` and window creation. Upstream scaled by the DPI
+    /// factor here, so a restored window moved further on every launch above 100% scaling.
     pub fn set_position(&mut self, pos: DVec2) {
         unsafe {
             let mut window_rect = RECT {left: 0, top: 0, bottom: 0, right: 0};
             GetWindowRect(self.hwnd, &mut window_rect).unwrap();
-            let dpi = self.get_dpi_factor();
             MoveWindow(
                 self.hwnd,
-                (pos.x * dpi) as i32,
-                (pos.y * dpi) as i32,
+                pos.x as i32,
+                pos.y as i32,
                 window_rect.right - window_rect.left,
                 window_rect.bottom - window_rect.top,
                 FALSE

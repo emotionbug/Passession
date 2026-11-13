@@ -1,8 +1,8 @@
-# Paseo Sessions
+# Passession
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-Paseo Sessions는 코딩 에이전트 작업을 실행하고 검토하는 네이티브 환경입니다. **Linux, macOS, Windows, Android, iOS** 클라이언트는 네이티브 Rust(Makepad), 데몬과 `paseo` CLI도 Rust로 구현됩니다. 데스크톱은 로컬 데몬을 관리할 수 있으며, 모바일은 다른 컴퓨터의 데몬에 원격으로 연결하는 전용 클라이언트입니다.
+Passession은 코딩 에이전트 작업을 실행하고 검토하는 네이티브 환경입니다. **Linux, macOS, Windows, Android, iOS** 클라이언트는 네이티브 Rust(Makepad), 데몬과 `paseo` CLI도 Rust로 구현됩니다. 데스크톱은 로컬 데몬을 관리할 수 있으며, 모바일은 다른 컴퓨터의 데몬에 원격으로 연결하는 전용 클라이언트입니다.
 
 현재 체크아웃 버전은 **0.13.6**입니다. 배포 산출물은 [이 저장소의 릴리스](https://github.com/emotionbug/Passession/releases)를 사용하세요. 업스트림 다운로드는 이 저장소의 빌드가 아닙니다. 직접 빌드하거나 바이너리를 배포할 때는 [출시 요구 사항](docs/release.md)을 확인하세요.
 
@@ -52,7 +52,7 @@ cargo xtask build-gui android --arch arm64
 cargo xtask build-gui ios
 ```
 
-데스크톱은 대상 OS에서 빌드해야 하며 iOS는 macOS/Xcode가 필요합니다. 산출물과 빌드 설명은 `artifacts/native/`에 저장됩니다. Android/iOS에는 데몬이 없습니다. Android 앱 이름은 **Paseo Sessions**, 패키지는 `sh.paseo.sessions`입니다. 디버그 서명 APK나 서명되지 않은 iOS 앱 아카이브는 스토어 출시용 산출물이 아닙니다. [Android](docs/android.md)와 [출시 가이드](docs/release.md)를 참고하세요.
+데스크톱은 대상 OS에서 빌드해야 하며 iOS는 macOS/Xcode가 필요합니다. 산출물과 빌드 설명은 `artifacts/native/`에 저장됩니다. Android/iOS에는 데몬이 없습니다. Android 앱 이름은 **Passession**, 패키지는 `sh.paseo.sessions`입니다. 디버그 서명 APK나 서명되지 않은 iOS 앱 아카이브는 스토어 출시용 산출물이 아닙니다. [Android](docs/android.md)와 [출시 가이드](docs/release.md)를 참고하세요.
 
 헤드리스 호스트에서는 생성된 `target/debug/paseo`(Windows에서는 `paseo.exe`)를 사용합니다. `CARGO_TARGET_DIR`를 설정했다면 해당 디렉터리를 사용하고, 생성된 런타임 자산을 실행 파일 옆에 유지하세요.
 

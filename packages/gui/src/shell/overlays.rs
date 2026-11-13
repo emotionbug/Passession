@@ -571,7 +571,7 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
     let content_h = entries_height(&entries, compact);
     let mut ui = overlay_ui(shell);
     let p = ui.p;
-    let surface = if sheet {
+    let (outer, surface) = if sheet {
         // Keep the background edge-to-edge, but reserve the render surface's remaining
         // system-bar overlap below the menu content (already-consumed insets are zero).
         let insets = crate::shell::platform::safe_insets();
@@ -581,17 +581,19 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
         let r = rect(window.pos.x, window.pos.y + window.size.y - h, window.size.x, h);
         ui.painter.draw_box.paint_bordered(cx, rect(r.pos.x, r.pos.y, r.size.x, r.size.y + 12.0), p.surface0, p.border, 1.0, 12.0);
         ui.sheet_handle(cx, r.pos.x + r.size.x * 0.5, r.pos.y);
-        rect(r.pos.x, r.pos.y + 24.0, r.size.x, (r.size.y - 24.0 - insets.bottom).max(0.0))
+        (r, rect(r.pos.x, r.pos.y + 24.0, r.size.x, (r.size.y - 24.0 - insets.bottom).max(0.0)))
     } else {
         let r = menu_rect(menu, window, content_h + header_h);
         // md shadow then the surface1 popover with a borderAccent rule.
         let shadow = if p.is_dark { theme::argb(0x33000000) } else { theme::argb(0x0a000000) };
         ui.fill(cx, rect(r.pos.x - 2.0, r.pos.y + 2.0, r.size.x + 4.0, r.size.y + 6.0), shadow, 10.0);
         ui.painter.outline(cx, r, p.surface1, p.border_accent, 1.0, 8.0);
-        r
+        (r, r)
     };
+    // Compact sheets register their whole painted frame (handle band and bottom inset included)
+    // so a tap anywhere on the sheet never falls through to the backdrop.
     if top {
-        ui.hit(surface, "menu:surface");
+        ui.hit(outer, "menu:surface");
     }
     let mut y = surface.pos.y;
     if header {
@@ -862,7 +864,7 @@ fn dialog_frame(ui: &mut Ui, cx: &mut Cx2d, window: Rect, width: f64, height: f6
     let p = ui.p;
     let title_h = super::chrome::text_line_height(24.0, 14.0);
     let header_h = title_h + 33.0;
-    let frame = if compact {
+    let (outer, frame) = if compact {
         // Like the compact menu sheet: the background runs edge to edge, but the body (and its
         // buttons) stays above the render surface's remaining system-bar overlap.
         let insets = crate::shell::platform::safe_insets();
@@ -872,16 +874,18 @@ fn dialog_frame(ui: &mut Ui, cx: &mut Cx2d, window: Rect, width: f64, height: f6
         let r = rect(window.pos.x, window.pos.y + window.size.y - h, window.size.x, h);
         ui.painter.draw_box.paint(cx, rect(r.pos.x, r.pos.y, r.size.x, r.size.y + 16.0), p.surface0, 16.0);
         ui.sheet_handle(cx, r.pos.x + r.size.x * 0.5, r.pos.y - 4.0);
-        rect(r.pos.x, r.pos.y + 16.0, r.size.x, (r.size.y - 16.0 - insets.bottom).max(0.0))
+        (r, rect(r.pos.x, r.pos.y + 16.0, r.size.x, (r.size.y - 16.0 - insets.bottom).max(0.0)))
     } else {
         let w = width.max(0.0).min((window.size.x - 48.0).max(0.0));
         let h = (height + header_h).min(window.size.y * 0.85);
         let r = rect(window.pos.x + (window.size.x - w) * 0.5, window.pos.y + (window.size.y - h) * 0.5, w, h);
         ui.painter.outline(cx, r, p.surface1, p.surface2, 1.0, 12.0);
-        r
+        (r, r)
     };
+    // The whole painted surface (the compact handle band and bottom inset included) is inert;
+    // only the scrim around it dismisses.
     if top {
-        ui.hit(frame, "dialog:surface");
+        ui.hit(outer, "dialog:surface");
     }
     let spec = ui.spec(Font::Medium, 14.0, p.foreground);
     let mut title_x = frame.pos.x + 24.0;
@@ -953,13 +957,25 @@ fn draw_prompt(
         };
         let button_h = theme::control_height(ControlSize::Sm);
         let body = dialog_frame(&mut ui, cx, window, 480.0, message_h + 16.0 + field_h + 4.0 + 40.0 + button_h, title, compact, top, false);
-        let mut y = body.pos.y + 16.0;
-        if let Some(message) = message {
-            ui.painter.paragraph(cx, dvec2(body.pos.x + 24.0, y), body.size.x - 48.0, spec, message);
-            y += message_h;
-        }
-        let field_rect = rect(body.pos.x + 24.0, y, body.size.x - 48.0, field_h);
+        // The action row is reserved first; the message and then the field share what is
+        // left above it, so the field (which takes input before the overlay's hit map) never
+        // draws or receives taps over the buttons.
         let by = body.pos.y + body.size.y - 16.0 - button_h;
+        let limit = by - 12.0;
+        let mut y = body.pos.y + 16.0;
+        let single_h = 20.0 + super::chrome::text_line_height(20.0, 14.0);
+        let message_vis = message_h.min((limit - y - field_h.min(single_h)).max(0.0));
+        if let Some(message) = message {
+            let clip = rect(body.pos.x + 24.0, y, body.size.x - 48.0, message_vis);
+            cx.begin_turtle(Walk::abs_rect(clip), Layout { clip_x: true, clip_y: true, ..Layout::default() });
+            ui.painter.paragraph(cx, dvec2(body.pos.x + 24.0, y), body.size.x - 48.0, spec, message);
+            cx.end_turtle();
+            y += message_vis;
+        }
+        let field_vis = field_h.min((limit - y).max(0.0));
+        // A shortened multiline field keeps its end (where typing happens) in view.
+        let scroll = if multiline { scroll + (field_h - field_vis) } else { scroll };
+        let field_rect = rect(body.pos.x + 24.0, y, body.size.x - 48.0, field_vis);
         let cancel = tr("common.actions.cancel");
         let cw = ui.button_width(cx, &cancel, None, ControlSize::Sm);
         let ow = ui.button_width(cx, confirm_label, None, ControlSize::Sm);
@@ -968,7 +984,7 @@ fn draw_prompt(
         ui.button(cx, rect(right - ow - 8.0 - cw, by, cw, button_h), if top { "prompt:cancel" } else { "" }, &cancel, None, Variant::Ghost, ControlSize::Sm, top);
         (field_rect, scroll)
     };
-    cx.begin_turtle(Walk::abs_rect(field_rect), Layout { scroll: dvec2(0.0, scroll), ..Layout::default() });
+    cx.begin_turtle(Walk::abs_rect(field_rect), Layout { scroll: dvec2(0.0, scroll), clip_x: true, clip_y: true, ..Layout::default() });
     field.draw_all(cx, scope);
     cx.end_turtle();
 }
@@ -1006,11 +1022,21 @@ fn draw_sheet(
     let width = sheet.max_width();
     let back = sheet.can_go_back();
     let estimated = if *content_height > 0.0 { *content_height } else { 240.0 };
-    let body = {
+    // A sheet footer stays pinned below the scrolling body here too (divider, 12px padding).
+    let footer_h = sheet.footer_height();
+    let footer_band = if footer_h > 0.0 { 1.0 + 12.0 + footer_h + 12.0 } else { 0.0 };
+    let inner = {
         let mut ui = overlay_ui(shell);
-        dialog_frame(&mut ui, cx, window, width, estimated + 48.0, &title, compact, top, back)
+        let body = dialog_frame(&mut ui, cx, window, width, estimated + 48.0 + footer_band, &title, compact, top, back);
+        let inner = rect(body.pos.x, body.pos.y, body.size.x, (body.size.y - footer_band).max(0.0));
+        if footer_h > 0.0 {
+            let bottom = inner.pos.y + inner.size.y;
+            let p = ui.p;
+            ui.painter.hline(cx, body.pos.x, bottom, body.size.x, p.border);
+            sheet.draw_footer(cx, &mut ui, body.pos.x + 24.0, bottom + 1.0 + 12.0, body.size.x - 48.0, top);
+        }
+        inner
     };
-    let inner = rect(body.pos.x, body.pos.y, body.size.x, body.size.y);
     *viewport = inner;
     let max = (*content_height + 48.0 - inner.size.y).max(0.0);
     *scroll = scroll.clamp(0.0, max);
@@ -1372,7 +1398,17 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     }
     match press {
         Some(Press::Click(id, _)) => click(shell, cx, scope, &id),
-        Some(Press::Secondary(..)) | None => {}
+        // Only the compact Explorer rail (no shell modal open) has secondary actions here,
+        // e.g. the `tab:explorer:…` tab menu.
+        Some(Press::Secondary(id, abs)) => {
+            if shell.data.overlays.stack.is_empty()
+                && id != "compact:backdrop"
+                && let Some(ui) = scope.data.get_mut::<UiContext>()
+            {
+                crate::shell::commands::secondary(shell, cx, ui, &id, abs);
+            }
+        }
+        None => {}
     }
     // While open, the explorer overlay passes events to its own roots via dispatch.
     shell.data.overlays.is_modal()

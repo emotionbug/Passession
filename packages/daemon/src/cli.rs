@@ -412,14 +412,18 @@ fn desktop_application() -> Result<PathBuf> {
                 return Ok(bundle.to_owned());
             }
         }
-        let installed = PathBuf::from("/Applications/Paseo Sessions.app");
-        if installed.is_dir() {
-            return Ok(installed);
-        }
-        if let Some(home) = dirs::home_dir() {
-            let installed = home.join("Applications/Paseo Sessions.app");
+        // Bundles installed before the Passession rename keep their old name.
+        let home = dirs::home_dir();
+        for name in ["Passession.app", "Paseo Sessions.app"] {
+            let installed = PathBuf::from("/Applications").join(name);
             if installed.is_dir() {
                 return Ok(installed);
+            }
+            if let Some(home) = &home {
+                let installed = home.join("Applications").join(name);
+                if installed.is_dir() {
+                    return Ok(installed);
+                }
             }
         }
     }
@@ -471,13 +475,16 @@ fn desktop_application() -> Result<PathBuf> {
         }
         #[cfg(windows)]
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            let installed = PathBuf::from(local).join("Programs/Paseo Sessions/paseo_sessions.exe");
-            if installed.is_file() {
-                return Ok(installed);
+            // Upgrades keep the pre-rename "Paseo Sessions" folder; new installs use Passession.
+            for folder in ["Passession", "Paseo Sessions"] {
+                let installed = PathBuf::from(&local).join("Programs").join(folder).join("paseo_sessions.exe");
+                if installed.is_file() {
+                    return Ok(installed);
+                }
             }
         }
     }
-    bail!("Paseo desktop app not found. Install the native Paseo Sessions desktop application.")
+    bail!("Passession desktop app not found. Install the native Passession desktop application.")
 }
 
 pub(super) async fn open_agent_desktop(server: &str, agent: &str) -> Result<()> {

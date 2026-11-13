@@ -14,7 +14,7 @@ use walkdir::WalkDir;
 /// Makepad sets WM_CLASS from argv[0]'s basename, the installed executable name.
 fn desktop_entry(command: &str) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nName=Paseo Sessions\nComment=Native client for local AI coding agents\nExec={command} %U\nIcon=sh.paseo.Paseo\nTerminal=false\nCategories=Development;\nMimeType=x-scheme-handler/paseo;\nStartupWMClass={}\n",
+        "[Desktop Entry]\nType=Application\nName=Passession\nComment=Native client for local AI coding agents\nExec={command} %U\nIcon=sh.paseo.Paseo\nTerminal=false\nCategories=Development;\nMimeType=x-scheme-handler/paseo;\nStartupWMClass={}\n",
         gui::desktop_executable("linux")
     )
 }
@@ -128,7 +128,7 @@ pub fn desktop(args: &[String]) -> Result<()> {
     let mut artifacts = Vec::new();
     match platform()? {
         "linux" => {
-            let appdir = stage.path().join("Paseo-Sessions.AppDir");
+            let appdir = stage.path().join("Passession.AppDir");
             copy_tree(&input, &appdir.join("usr/lib/paseo-sessions"))?;
             libraries::appimage(&appdir)?;
             build::refresh_runtime_hash(&appdir.join("usr/lib/paseo-sessions/runtime"))?;
@@ -203,7 +203,7 @@ pub fn desktop(args: &[String]) -> Result<()> {
             text(
                 &deb.join("DEBIAN/control"),
                 format!(
-                    "Package: paseo-sessions\nVersion: {}\nArchitecture: {}\nMaintainer: Paseo contributors <hello@moboudra.com>\nSection: devel\nPriority: optional\nDepends: {depends}\nRecommends: {DEBIAN_RECOMMENDS}\nDescription: Paseo Sessions native client\n",
+                    "Package: paseo-sessions\nVersion: {}\nArchitecture: {}\nMaintainer: Paseo contributors <hello@moboudra.com>\nSection: devel\nPriority: optional\nDepends: {depends}\nRecommends: {DEBIAN_RECOMMENDS}\nDescription: Passession native client\n",
                     version()?,
                     if arch()? == "x64" { "amd64" } else { "arm64" }
                 ),

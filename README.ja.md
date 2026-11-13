@@ -1,8 +1,8 @@
-# Paseo Sessions
+# Passession
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-Paseo Sessions は、コーディングエージェントの作業を実行・レビューするためのネイティブ環境です。**Linux、macOS、Windows、Android、iOS** 向けのクライアントはネイティブ Rust（Makepad）、デーモンと `paseo` CLI も Rust で実装されています。デスクトップはローカルデーモンを管理でき、モバイルは別のマシンのデーモンへの接続専用です。
+Passession は、コーディングエージェントの作業を実行・レビューするためのネイティブ環境です。**Linux、macOS、Windows、Android、iOS** 向けのクライアントはネイティブ Rust（Makepad）、デーモンと `paseo` CLI も Rust で実装されています。デスクトップはローカルデーモンを管理でき、モバイルは別のマシンのデーモンへの接続専用です。
 
 このチェックアウトのバージョンは **0.13.6** です。配布成果物は[このリポジトリのリリース](https://github.com/emotionbug/Passession/releases)を使用してください。上流のダウンロードはこのリポジトリのビルドではありません。自分でビルド・配布する場合は[リリース要件](docs/release.md)を確認してください。
 
@@ -52,7 +52,7 @@ cargo xtask build-gui android --arch arm64
 cargo xtask build-gui ios
 ```
 
-デスクトップは対象 OS 上でビルドし、iOS には macOS/Xcode が必要です。成果物とビルド記述は `artifacts/native/` に出力されます。Android/iOS にデーモンは含まれません。Android の名称は **Paseo Sessions**、パッケージ名は `sh.paseo.sessions` です。デバッグ署名 APK や未署名 iOS アプリアーカイブはストア公開用リリースではありません。[Android](docs/android.md)と[リリース](docs/release.md)を参照してください。
+デスクトップは対象 OS 上でビルドし、iOS には macOS/Xcode が必要です。成果物とビルド記述は `artifacts/native/` に出力されます。Android/iOS にデーモンは含まれません。Android の名称は **Passession**、パッケージ名は `sh.paseo.sessions` です。デバッグ署名 APK や未署名 iOS アプリアーカイブはストア公開用リリースではありません。[Android](docs/android.md)と[リリース](docs/release.md)を参照してください。
 
 ヘッドレスホストでは生成された `target/debug/paseo`（Windows は `paseo.exe`）を使います。`CARGO_TARGET_DIR` 設定時は対応するディレクトリを使い、生成されたランタイム資産を実行ファイルの隣に保持してください。
 

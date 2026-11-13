@@ -88,8 +88,9 @@ pub struct CommandCenterPanel {
     /// Files state revision (material file icons decode off the GUI thread).
     #[rust]
     files_revision: u64,
+    /// Last applied (sheet, pass size, safe insets top/right/bottom-occlusion/left).
     #[rust]
-    panel_bounds: Option<(bool, DVec2)>,
+    panel_bounds: Option<(bool, DVec2, [f64; 4])>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -548,6 +549,7 @@ impl CommandCenterPanel {
         }
         if is_git {
             out.push(item("tab:open:changes", 4, open("workspace.tabs.actions.changes"), "git-compare-arrows", kw(&["open", "changes", "tab", "supporting"]), command("workspace.tab.target.changes", Value::Null), true, ""));
+            out.push(item("tab:open:git-log", 3, t("workspace.git.log.open"), "git-graph", kw(&["open", "git", "log", "history", "graph", "branches", "commits", "dashboard"]), command("workspace.tab.target.gitLog", Value::Null), false, ""));
         }
         out.push(item("tab:open:files", 5, open("workspace.tabs.actions.files"), "files", kw(&["open", "files", "tab", "supporting"]), command("workspace.tab.target.files", Value::Null), true, ""));
         if !tab_keys.is_empty() {
@@ -558,6 +560,18 @@ impl CommandCenterPanel {
                 let key = if target.kind == "agent" { "workspace.tabs.menu.copyAgentId" } else { "workspace.tabs.menu.copyTerminalId" };
                 let effect = UiEffect::CopyText { text: target.id.clone().unwrap_or_default(), toast: Some(copied.clone()) };
                 out.push(item("tab:copy-id", 34, t(key), "copy", kw(&["tab", "copy", "id"]), Run::Effect(effect), true, ""));
+            }
+            if target.kind == "agent" && target.id.as_deref().is_some_and(|id| !id.is_empty()) {
+                out.push(item(
+                    "tab:reload-current",
+                    35,
+                    t("workspace.tabs.menu.reloadAgent"),
+                    "rotate-cw",
+                    kw(&["tab", "agent", "reload", "restart", "rerun"]),
+                    command("workspace.tab.reload-current", Value::Null),
+                    true,
+                    "",
+                ));
             }
             if target.kind == "file" {
                 let file = str_or(&target.data, "path", target.id.as_deref().unwrap_or("")).to_owned();
@@ -1057,17 +1071,23 @@ impl Widget for CommandCenterPanel {
         });
         let size = cx.current_pass_size();
         let sheet = host::is_mobile() && compact.unwrap_or(false);
-        if self.panel_bounds != Some((sheet, size)) {
-            self.panel_bounds = Some((sheet, size));
+        // The panel lies in the safe area above the keyboard; the backdrop still fills the pass.
+        let insets = crate::shell::platform::safe_insets();
+        let inset = [insets.top, insets.right, insets.bottom_occlusion(), insets.left];
+        if self.panel_bounds != Some((sheet, size, inset)) {
+            self.panel_bounds = Some((sheet, size, inset));
+            let [top_inset, right_inset, bottom_inset, left_inset] = inset;
+            let available = dvec2((size.x - left_inset - right_inset).max(0.0), (size.y - top_inset - bottom_inset).max(0.0));
             let (align_y, top, width, height) = if sheet {
-                (1.0, 0.0, size.x, size.y * 0.6)
+                (1.0, top_inset, available.x, (size.y * 0.6).min(available.y))
             } else {
                 // Flutter's desktop container has a fixed height, not a content-sized maximum.
-                (0.0, 48.0, 640.0_f64.min(size.x * 0.92), 560.0_f64.min(size.y * 0.8))
+                (0.0, top_inset + 48.0, 640.0_f64.min(available.x * 0.92), 560.0_f64.min(available.y * 0.8).min((available.y - 48.0).max(0.0)))
             };
             self.view.widget(id!(modal)).apply_over(cx, live! { align: { y: (align_y) } });
             self.view.widget(id!(panel)).apply_over(cx, live! {
-                width: (width), height: (height), margin: { top: (top) }
+                width: (width), height: (height),
+                margin: { top: (top), right: (right_inset), bottom: (bottom_inset), left: (left_inset) }
             });
         }
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {

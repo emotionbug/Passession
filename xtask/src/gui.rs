@@ -15,8 +15,8 @@ use walkdir::WalkDir;
 
 pub const DESKTOP_APP_ID: &str = "sh.paseo.sessions.desktop";
 pub const MOBILE_APP_ID: &str = "sh.paseo.sessions";
-pub const MACOS_BUNDLE: &str = "Paseo Sessions.app";
-const IOS_BUNDLE: &str = "Paseo Sessions.app";
+pub const MACOS_BUNDLE: &str = "Passession.app";
+const IOS_BUNDLE: &str = "Passession.app";
 const IOS_EXECUTABLE: &str = "paseo-sessions";
 const CARGO_BIN: &str = "paseo-sessions";
 /// Supported Android floor (Android 7.0), the same as the Flutter client.
@@ -43,7 +43,7 @@ const MACOS_MINIMUM: &str = "13.0";
 /// CLI (`paseo open`), shortcuts and the updater locate the client by these names.
 pub fn desktop_executable(platform: &str) -> &'static str {
     match platform {
-        "macos" => "Contents/MacOS/Paseo Sessions",
+        "macos" => "Contents/MacOS/Passession",
         "windows" => "paseo_sessions.exe",
         _ => "paseo_sessions",
     }
@@ -1046,7 +1046,7 @@ fn android_device(adb: &Path, device: Option<&str>) -> Result<(String, &'static 
         .iter()
         .find(|abi| abi.abi == reported)
         .with_context(|| {
-            format!("Unsupported Android ABI {reported} on {serial}; Paseo Sessions builds 64-bit arm64-v8a and x86_64 only")
+            format!("Unsupported Android ABI {reported} on {serial}; Passession builds 64-bit arm64-v8a and x86_64 only")
         })?;
     Ok((serial.clone(), abi))
 }

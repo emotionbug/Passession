@@ -10,9 +10,9 @@
 		<string>ko</string>
 	</array>
 	<key>CFBundleDisplayName</key>
-	<string>Paseo Sessions</string>
+	<string>Passession</string>
 	<key>CFBundleName</key>
-	<string>Paseo Sessions</string>
+	<string>Passession</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -61,7 +61,7 @@
 		</dict>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>Allow Paseo Sessions to use your camera to scan pairing QR codes.</string>
+	<string>Allow Passession to use your camera to scan pairing QR codes.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to your Paseo daemon on your local network.</string>
 	<key>NSAppTransportSecurity</key>

@@ -68,7 +68,7 @@ jobs:
         with:
           name: native-packages-linux-x64
           path: |
-            artifacts/native/Paseo-Sessions-*
+            artifacts/native/Passession-*
             artifacts/native/Paseo-Daemon-*
             artifacts/native/daemon-*.json
             artifacts/native/flutter-*.json

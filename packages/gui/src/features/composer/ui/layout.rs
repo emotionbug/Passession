@@ -18,6 +18,10 @@ use makepad_widgets::*;
 use serde_json::Value;
 
 pub const OVERHANG: f64 = 8.0;
+/// One tray row: a 48px pill below its disc overhang.
+const TRAY_ROW: f64 = 48.0 + OVERHANG;
+/// The model trigger's narrowest width beside the other agent controls.
+const MODEL_MIN_WIDTH: f64 = 40.0;
 
 /// One block of the column above the card.
 enum Block {
@@ -29,8 +33,9 @@ enum Block {
 }
 
 impl ComposerPanel {
+    /// A clipped-away control (zero-area rect) has no tooltip.
     fn tip(&mut self, r: Rect, text: String) {
-        if !text.is_empty() {
+        if !text.is_empty() && r.size.x > 0.0 && r.size.y > 0.0 {
             self.st.tips.push((r, text));
         }
     }
@@ -68,6 +73,7 @@ impl ComposerPanel {
         let blocks = self.blocks(&draft);
         let block_heights: Vec<f64> = blocks.iter().map(|b| self.block_height(cx, look, b, content_width)).collect();
         self.st.input_cap = None;
+        self.st.tray_cap = None;
         let (mut card_height, input_visible) = self.card_height(cx, look, &draft, content_width);
         let gaps = blocks.len() as f64 * 12.0;
         let mut total = block_heights.iter().sum::<f64>() + gaps + card_height + 16.0;
@@ -81,6 +87,16 @@ impl ComposerPanel {
                 self.st.input_cap = Some(cap);
                 card_height -= input_visible - cap;
                 total -= input_visible - cap;
+            }
+            // Past the input's minimum the attachment tray yields too, down to one row, and scrolls.
+            if total > capacity && self.has_tray(&draft) {
+                let full = self.tray_visible(cx, look, &draft, content_width).0;
+                let visible = (full - (total - capacity)).max(TRAY_ROW.min(full));
+                if visible < full {
+                    self.st.tray_cap = Some(visible);
+                    card_height -= full - visible;
+                    total -= full - visible;
+                }
             }
         }
         let r = cx.walk_turtle(Walk { height: Size::Fixed(total), ..walk });
@@ -354,7 +370,12 @@ impl ComposerPanel {
         non_empty_list(get(draft, "images")) || non_empty_list(get(draft, "attachments")) || self.ctl_ref().uploading()
     }
 
-    /// The tray's wrapped height at `width`.
+    /// The tray's width inside a card `card_width` wide (its frames carry the disc overhang).
+    fn tray_width(look: &Look, card_width: f64) -> f64 {
+        card_width - Self::insets(look).2 * 2.0 + OVERHANG
+    }
+
+    /// The tray's wrapped content height at `width`, from its overhang top to the last row's bottom.
     fn tray_height(&mut self, cx: &mut Cx2d, look: &Look, draft: &Value, width: f64) -> f64 {
         let widths = self.pill_widths(cx, look, draft);
         let mut x = 0.0;
@@ -367,7 +388,7 @@ impl ComposerPanel {
             }
             x += w;
         }
-        rows * (48.0 + OVERHANG)
+        rows * TRAY_ROW
     }
 
     fn pill_widths(&mut self, cx: &mut Cx2d, look: &Look, draft: &Value) -> Vec<f64> {
@@ -431,8 +452,8 @@ impl ComposerPanel {
         let (top, bottom, side) = Self::insets(look);
         let mut h = top;
         if self.has_tray(draft) {
-            h += self.tray_height(cx, look, draft, width - side * 2.0 + OVERHANG) - OVERHANG + 12.0;
-            h -= OVERHANG;
+            // The tray starts in the top inset (its disc overhang) and keeps a 12px gap.
+            h += self.tray_visible(cx, look, draft, width).1 - OVERHANG + 12.0;
         }
         let (min, max, vertical) = self.input_bounds(cx, look);
         let reserve = if look.compact { 36.0 } else { 0.0 };
@@ -441,6 +462,12 @@ impl ComposerPanel {
         h += visible;
         h += 12.0 + 28.0 + bottom;
         (h, visible)
+    }
+
+    /// The tray's (content, visible) heights in a card `card_width` wide.
+    fn tray_visible(&mut self, cx: &mut Cx2d, look: &Look, draft: &Value, card_width: f64) -> (f64, f64) {
+        let full = self.tray_height(cx, look, draft, Self::tray_width(look, card_width));
+        (full, self.st.tray_cap.map_or(full, |cap| cap.min(full)))
     }
 
     fn draw_card(&mut self, cx: &mut Cx2d, ui: &mut UiContext, look: &Look, draft: &Value, r: Rect) {
@@ -457,8 +484,14 @@ impl ComposerPanel {
         let mut y = r.pos.y + top;
         if self.has_tray(draft) {
             let tray_top = y - OVERHANG;
-            let h = self.draw_tray(cx, look, draft, rect(r.pos.x + side - OVERHANG, tray_top, r.size.x - side * 2.0 + OVERHANG, 0.0));
-            y = tray_top + h + 12.0;
+            let (full, visible) = self.tray_visible(cx, look, draft, r.size.x);
+            let viewport = rect(r.pos.x + side - OVERHANG, tray_top, Self::tray_width(look, r.size.x), visible);
+            self.draw_tray(cx, look, draft, viewport, full);
+            y = tray_top + visible + 12.0;
+        } else {
+            self.st.tray_clip = Rect::default();
+            self.st.tray_scroll = 0.0;
+            self.st.tray_scroll_max = 0.0;
         }
         // Text surface.
         let compact = look.compact;
@@ -524,7 +557,10 @@ impl ComposerPanel {
                 .with_padding_top(vertical)
                 .with_padding_bottom(vertical),
         );
-        let walk = Walk { abs_pos: None, margin: Margin::default(), width: Size::Fill, height: Size::Fit };
+        // Text that fits fills the viewport so its blank lines also focus the editor and
+        // place the caret; longer text keeps its own height and the viewport scrolls it.
+        let height = if natural <= viewport.size.y + 0.5 { Size::Fixed((viewport.size.y - vertical * 2.0).max(0.0)) } else { Size::Fit };
+        let walk = Walk { abs_pos: None, margin: Margin::default(), width: Size::Fill, height };
         let _ = self.input.draw_walk(cx, &mut Scope::empty(), walk);
         cx.end_turtle();
     }
@@ -560,11 +596,22 @@ impl ComposerPanel {
         let text = t_args("composer.input.focusHint", &[("shortcut", first.as_str())]);
         let spec = TextSpec::new(Font::Regular, look.small(), fade(look.p.muted, 0.5));
         let w = self.painter.measure(cx, spec, &text).x;
+        // The hint shares the placeholder's first line; a pane too narrow for both keeps the placeholder.
+        let placeholder = self.input.empty_text().to_owned();
+        if !placeholder.is_empty() {
+            self.caret_text.text_style.font_size = crate::theme::Typography::pt(look.content());
+            let laid = self.caret_text.layout(cx, 0.0, 0.0, None, false, Align::default(), &placeholder);
+            let placeholder_w = laid.size_in_lpxs.width as f64 * self.caret_text.font_scale as f64;
+            if placeholder_w + 16.0 + w > r.size.x {
+                return;
+            }
+        }
         self.painter.text(cx, dvec2(r.pos.x + r.size.x - w, r.pos.y), spec, &text);
     }
 
-    /// index.tsx attachmentTray: removable pills carry their 8px disc overhang.
-    fn draw_tray(&mut self, cx: &mut Cx2d, look: &Look, draft: &Value, r: Rect) -> f64 {
+    /// index.tsx attachmentTray: removable pills carry their 8px disc overhang. `r` is the
+    /// tray viewport; past it the `full`-high rows scroll, and drawing, hits and tips clip to it.
+    fn draw_tray(&mut self, cx: &mut Cx2d, look: &Look, draft: &Value, r: Rect, full: f64) {
         let p = look.p;
         let sending = self.ctl_ref().sending();
         let show_remove_always = look.native || look.compact;
@@ -572,8 +619,13 @@ impl ComposerPanel {
         let images = maps(get(draft, "images"));
         let attachments = maps(get(draft, "attachments"));
         let uploading = self.ctl_ref().uploading.clone();
+        self.st.tray_clip = r;
+        self.st.tray_scroll_max = (full - r.size.y).max(0.0);
+        self.st.tray_scroll = self.st.tray_scroll.clamp(0.0, self.st.tray_scroll_max);
+        cx.begin_turtle(Walk::abs_rect(r), Layout::flow_down().with_clip(true, true));
+        self.st.hits.set_clip(Some(r));
         let mut x = r.pos.x;
-        let mut y = r.pos.y;
+        let mut y = r.pos.y - self.st.tray_scroll;
         let mut index = 0usize;
         let total = widths.len();
         // Remove discs overhang the frames (and thumbnails): paint them afterwards, above.
@@ -605,7 +657,7 @@ impl ComposerPanel {
                     Ok(None) => self.spinner(cx, rect(frame.pos.x + 15.0, frame.pos.y + 15.0, 18.0, 18.0), p.muted),
                     Err(_) => self.painter.icon(cx, frame, "image", 16.0, p.muted),
                 }
-                self.tip(frame, t("composer.attachments.openImage"));
+                self.tip(crate::common::paint::intersect(frame, r), t("composer.attachments.openImage"));
             } else if index < images.len() + attachments.len() {
                 let attachment = attachments[index - images.len()].clone();
                 let (title, subtitle, glyph) = describe(&attachment);
@@ -636,7 +688,7 @@ impl ComposerPanel {
                     Item::ImageRemove(_) => t("composer.attachments.removeImage"),
                     _ => t("composer.attachments.removeFile"),
                 };
-                self.tip(disc, label);
+                self.tip(crate::common::paint::intersect(disc, r), label);
             }
             x += w;
             index += 1;
@@ -649,7 +701,8 @@ impl ComposerPanel {
             }
             self.layer(cx);
         }
-        y + 48.0 + OVERHANG - r.pos.y
+        self.st.hits.set_clip(None);
+        cx.end_turtle();
     }
 
     /// AttachmentLabel: 18px glyph slot, title over the small muted subtitle.
@@ -828,6 +881,7 @@ impl ComposerPanel {
         let presentation = presentation(presentation_density);
         let mut x = r.pos.x;
         let max_x = r.pos.x + r.size.x;
+        let room = (max_x - x).max(0.0);
         let caret = presentation.show_carets && !look.compact;
         // Model trigger.
         let icon_w = if provider.trim().is_empty() { 0.0 } else { glyph + 4.0 };
@@ -851,37 +905,67 @@ impl ComposerPanel {
                 };
             }
         }
-        let model_w = (8.0 + icon_w + text_w + suffix_w + caret_w + 8.0).min((max_x - x - reserved_right).max(40.0));
-        let trigger = rect(x, r.pos.y, model_w, 28.0);
-        self.trigger_bg(cx, look, trigger, Item::Model, disabled);
-        let mut tx = trigger.pos.x + 8.0;
-        if icon_w > 0.0 {
-            let icon = rect(tx, trigger.pos.y + (28.0 - glyph) * 0.5, glyph, glyph);
-            crate::common::provider_icon::ProviderIcon::paint(
-                &mut self.painter,
-                &mut self.draw_icon,
-                cx,
-                icon,
-                &provider,
-                (!provider_svg.is_empty()).then_some(provider_svg.as_str()),
-                fade(p.muted, alpha),
-            );
-            tx += icon_w;
+        // The whole group stays inside its slot (the meter and Send sit right of it). When this
+        // density's controls leave the model trigger under its floor, thinking, mode and features
+        // fold into the controls trigger (its sheet lists them all); below that the model
+        // trigger yields to it as well.
+        let model_natural = 8.0 + icon_w + text_w + suffix_w + caret_w + 8.0;
+        let model_floor = MODEL_MIN_WIDTH.min(model_natural);
+        let collapsed = reserved_right > 0.0 && model_floor + reserved_right > room;
+        if collapsed {
+            reserved_right = 4.0 + 28.0;
         }
-        let avail = (trigger.pos.x + model_w - 8.0 - caret_w - suffix_w - tx).max(0.0);
-        let drawn = self.painter.text_in(cx, rect(tx, trigger.pos.y, avail, 28.0), body, &model_text, 0.0);
-        tx = drawn.pos.x + drawn.size.x + 4.0;
-        if thinking_suffix {
-            let extra_spec = TextSpec::new(Font::Regular, look.body(), fade(p.extra_muted, alpha));
-            self.painter.text_in(cx, rect(tx, trigger.pos.y, suffix_w, 28.0), extra_spec, &thinking_text, 0.0);
+        let model_w = if model_floor + reserved_right <= room {
+            model_natural.min(room - reserved_right)
+        } else if reserved_right == 0.0 && room >= 28.0 {
+            room
+        } else {
+            0.0
+        };
+        if model_w > 0.0 {
+            let trigger = rect(x, r.pos.y, model_w, 28.0);
+            self.trigger_bg(cx, look, trigger, Item::Model, disabled);
+            let caret_w = if model_w >= MODEL_MIN_WIDTH { caret_w } else { 0.0 };
+            // Glyph, name, suffix and caret all stay inside the trigger (its hit area).
+            let end = trigger.pos.x + model_w - 8.0 - caret_w;
+            let mut tx = trigger.pos.x + 8.0;
+            if icon_w > 0.0 && tx + glyph <= end {
+                let icon = rect(tx, trigger.pos.y + (28.0 - glyph) * 0.5, glyph, glyph);
+                crate::common::provider_icon::ProviderIcon::paint(
+                    &mut self.painter,
+                    &mut self.draw_icon,
+                    cx,
+                    icon,
+                    &provider,
+                    (!provider_svg.is_empty()).then_some(provider_svg.as_str()),
+                    fade(p.muted, alpha),
+                );
+                tx += icon_w;
+            }
+            // The compact thinking suffix shows only beside some of the model name.
+            let suffix_w = if end - tx + 0.5 >= suffix_w + text_w.min(24.0) { suffix_w } else { 0.0 };
+            let drawn = self.painter.text_in(cx, rect(tx, trigger.pos.y, (end - suffix_w - tx).max(0.0), 28.0), body, &model_text, 0.0);
+            if suffix_w > 0.0 {
+                let sx = drawn.pos.x + drawn.size.x + 4.0;
+                let extra_spec = TextSpec::new(Font::Regular, look.body(), fade(p.extra_muted, alpha));
+                self.painter.text_in(cx, rect(sx, trigger.pos.y, (end - sx).max(0.0), 28.0), extra_spec, &thinking_text, 0.0);
+            }
+            if caret_w > 0.0 {
+                self.painter.icon(cx, rect(trigger.pos.x + model_w - 8.0 - 14.0, trigger.pos.y + 7.0, 14.0, 14.0), "chevron-down", 14.0, fade(p.muted, alpha));
+            }
+            let model_label = model.selected_model_label(&labels);
+            self.tip(trigger, t_args("modelSelector.selectedModel", &[("model", model_label.as_str())]));
+            x += model_w + 4.0;
         }
-        if caret {
-            self.painter.icon(cx, rect(trigger.pos.x + model_w - 8.0 - 14.0, trigger.pos.y + 7.0, 14.0, 14.0), "chevron-down", 14.0, fade(p.muted, alpha));
-        }
-        let model_label = model.selected_model_label(&labels);
-        self.tip(trigger, t_args("modelSelector.selectedModel", &[("model", model_label.as_str())]));
-        x += model_w + 4.0;
         if look.compact {
+            return;
+        }
+        if collapsed {
+            if x + 28.0 <= max_x + 0.5 {
+                let fr = rect(x, r.pos.y, 28.0, 28.0);
+                self.icon_trigger(cx, look, fr, Trigger { icon: "settings-2", tint: None, label: None, caret: false }, Item::Features, disabled);
+                self.tip(fr, t("agentControls.features.open"));
+            }
             return;
         }
         if !thinking.is_empty() {

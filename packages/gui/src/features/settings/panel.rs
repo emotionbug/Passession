@@ -194,6 +194,9 @@ pub struct SettingsPanel {
     window_modal: Option<WindowModal>,
     #[rust]
     touch_scroll: TouchScroll,
+    /// The region the current touch gesture started on.
+    #[rust]
+    touch_region: Option<Region>,
     /// Requested only while a spinner was drawn last frame.
     #[rust]
     next_frame: NextFrame,
@@ -297,8 +300,33 @@ impl SettingsPanel {
         self.zones.iter().rev().find(|z| z.layer == layer && z.rect.contains(pos))
     }
 
-    fn scroll_region(&mut self, pos: DVec2, dy: f64) {
-        let Some((region, rect)) = self.regions.iter().rev().find(|(_, r)| r.contains(pos)).copied() else {
+    /// Whether `region` takes scrolling now: the open menu over everything,
+    /// else the top sheet, else the page's columns.
+    fn scrolls(&self, region: Region) -> bool {
+        if self.st.menu.is_some() {
+            return region == Region::Menu;
+        }
+        if let Some(top) = self.st.sheets.last() {
+            return region == Region::Sheet(top.id);
+        }
+        matches!(region, Region::Sidebar | Region::Content)
+    }
+
+    /// The scrollable region under `pos` that takes scrolling now.
+    fn region_at(&self, pos: DVec2) -> Option<(Region, Rect)> {
+        self.regions.iter().rev().find(|(region, rect)| self.scrolls(*region) && rect.contains(pos)).copied()
+    }
+
+    /// Scrolls the region under `pos`. A touch gesture stays with the region it
+    /// started on: once a menu or sheet takes over, its pan and inertia stop.
+    fn scroll_region(&mut self, pos: DVec2, dy: f64, touch: bool) {
+        let found = self.region_at(pos);
+        if touch && found.map(|(region, _)| region) != self.touch_region {
+            self.touch_region = None;
+            self.touch_scroll.reset();
+            return;
+        }
+        let Some((region, rect)) = found else {
             self.touch_scroll.reset();
             return;
         };
@@ -556,7 +584,7 @@ impl Widget for SettingsPanel {
             self.touch_scroll.reset();
         }
         if let Some(dy) = self.touch_scroll.handle_event(cx, event, &hit) {
-            self.scroll_region(self.touch_scroll.origin(), dy);
+            self.scroll_region(self.touch_scroll.origin(), dy, true);
             self.pressed = None;
             dirty = true;
         }
@@ -616,6 +644,7 @@ impl Widget for SettingsPanel {
                 cx.stop_timer(self.tip_show_timer);
                 self.tip_pending = None;
                 self.pressed = self.zone_at(e.abs).map(|z| z.key);
+                self.touch_region = self.region_at(e.abs).map(|(region, _)| region);
                 // Any press dismisses a tooltip (a tap on its own glyph shows it again).
                 if self.st.tip.take().is_some() {
                     cx.stop_timer(self.tip_timer);
@@ -640,7 +669,7 @@ impl Widget for SettingsPanel {
                 dirty = true;
             }
             Hit::FingerScroll(e) => {
-                self.scroll_region(e.abs, e.scroll.y);
+                self.scroll_region(e.abs, e.scroll.y, false);
                 dirty = true;
             }
             Hit::KeyDown(_) => {}
@@ -783,6 +812,13 @@ impl Widget for SettingsPanel {
             }
             let size = cx.current_pass_size();
             let screen = Rect { pos: dvec2(0.0, 0.0), size };
+            // Sheets, menus and tips lie inside the safe area above the keyboard;
+            // barriers still cover the whole window.
+            let insets = crate::shell::platform::safe_insets();
+            let viewport = Rect {
+                pos: dvec2(insets.left, insets.top),
+                size: dvec2((size.x - insets.left - insets.right).max(0.0), (size.y - insets.top - insets.bottom_occlusion()).max(0.0)),
+            };
             let mut remeasure = false;
             for (index, layer) in layers.into_iter().enumerate() {
                 let list = &mut self.layer_lists[index];
@@ -799,12 +835,12 @@ impl Widget for SettingsPanel {
                         if let Some(sheet) = self.st.sheets.iter().find(|s| s.id == id) {
                             // Flutter `confirmAction` is an adaptive alert dialog, not a sheet.
                             if let SheetKind::Confirm(confirm) = &sheet.kind {
-                                overlay::draw_alert(&mut kit, screen, id, confirm);
+                                overlay::draw_alert(&mut kit, screen, viewport, id, confirm);
                             } else {
                                 let head = pages::sheet_head(&self.st, &view, sheet);
                                 let measured = self.sheet_heights.get(&id).copied().unwrap_or(200.0);
                                 let busy = pages::sheet_busy(sheet);
-                                let (frame, body) = overlay::sheet_frame(&mut kit, screen, id, sheet.max_w, &head, measured, busy);
+                                let (frame, body) = overlay::sheet_frame(&mut kit, screen, viewport, id, sheet.max_w, &head, measured, busy);
                                 let scroll = sheet.scroll;
                                 let h = scrolled(&mut kit, body, scroll, 24.0, |kit| pages::sheet_body(kit, &self.st, &view, sheet));
                                 // The frame is sized from last frame's content height: draw
@@ -819,14 +855,14 @@ impl Widget for SettingsPanel {
                     }
                     OverlayLayer::Menu => {
                         if let Some(menu) = &self.st.menu {
-                            let (list, h) = overlay::draw_menu(&mut kit, menu, screen);
+                            let (list, h) = overlay::draw_menu(&mut kit, menu, screen, viewport);
                             self.regions.push((Region::Menu, list));
                             self.menu_height = (h, list.size.y);
                         }
                     }
                     OverlayLayer::Tip => {
                         if let Some(tip) = &self.st.tip {
-                            overlay::draw_tip(&mut kit, tip, screen);
+                            overlay::draw_tip(&mut kit, tip, viewport);
                         }
                     }
                 }

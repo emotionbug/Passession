@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.13.18 - 2026-11-14
+
+> Adds an IntelliJ-style Git Log: branches, every branch's history with a graph, filters and commit details, shown as a log and a commit screen on phones. The app is now Passession with a new icon on every platform, Windows and macOS use the system title bar, and many layout and touch problems on narrow and phone screens are fixed.
+
+### Added
+
+- Git Log tab, modeled on IntelliJ's Git Log: a branch tree (HEAD, local branches with ahead/behind, remotes grouped by remote, tags), the history of every branch with a branch graph and ref labels, branch, author and message filters, and the selected commit's changed files, message, author, hash and parents. A changed file opens its commit diff, and a branch's menu checks it out (offering to stash uncommitted changes first), shows only that branch or copies its name. Open it from the header `⋯`, the Git actions menu or the command center. Narrower panes fold the branch tree into the Branch filter; phones show the log and a commit screen one at a time, with branches in a sheet.
+- The daemon serves repository history with parents and ref decorations (`checkout.log`, paged and filterable by revision, message, author and path), every local branch, remote branch and tag with tracking state (`checkout.refs`), and single commits with their changed files (`checkout.commit.get`), advertised as the `gitLog` feature. A commit diff opened for a commit outside the workspace's own history now lists its files.
+- Restart agent (formerly Reload agent) is reachable from every session menu: the header `⋯` on desktop and phones, the sidebar session menu (right click / long press), the tab menu and the command center. It restarts the agent process with the same configuration and conversation; it does not resend any message. Restarting shows progress and completion notices.
+- The header `⋯` lists the selected session's actions before the workspace actions; conversation menu entries carry icons.
+
+### Changed
+
+- Kiro account credits are a built-in daemon usage source instead of an external `omp-kiro` native plugin. Monthly, trial, bonus and purchased pools, precise balances and reset/expiry dates retain their existing report identities and read-only authentication behavior. External plugin enablement is not required.
+- The obsolete `plugins.omp-kiro` execution registration is retired on configuration load and save, without removing OMP profiles, managed authentication, plugin settings or conversation history. The OMP model extension and its login and `/kiro-usage` commands remain separate.
+- Sidebar sessions show what they need before what they are doing: “Needs input” for pending questions and approvals, “Failed”, “Working” or “Ready to review”, with the matching status badge on the session icon.
+- Detach subagent is offered only for agents that have a parent.
+- Desktop windows use the operating system's own title bar. Windows shows the standard caption with its minimize, maximize and close buttons, resize borders and Snap instead of a drawn bar; macOS uses a standard title bar instead of placing the traffic lights over the app's header; Linux keeps the window manager's title bar. The title bar follows the app's light or dark theme.
+- The app is now named **Passession**. Window titles, the tray, menus, notifications, shortcuts, the Windows installer and Add/Remove Programs entry, the macOS bundle (`Passession.app`), the Android launcher, the store listing and release files (`Passession-<version>-…`) use the new name. Executable and package names, app IDs and data folders are unchanged, so updates install over the existing app and keep its settings; a Windows upgrade stays in its current folder and replaces the old “Paseo Sessions” shortcuts.
+- New app icon on every platform: the Windows title bar, taskbar and installer, Linux, macOS, iOS, Android, the tray and notifications, plus the welcome screen logo. Android ships an adaptive launcher icon with a round variant and an Android 13 themed icon instead of a square picture that launchers shrink into a white frame, and the Windows and Linux tray icon stays visible on light taskbars.
+
+### Fixed
+
+- Completing New Session replaces its originating creation tab in the same pane/window instead of leaving the form behind or opening in whichever pane is focused. Agent, workspace-only, terminal and host-switch flows share this ownership rule; duplicate completion events cannot reopen a closed form, and terminal failures retain the retry action.
+- Compact detail views (file, diff, subagent, log) show a visible Back control in the header instead of the sidebar button.
+- Opening a session from the compact sidebar no longer hides the desktop sidebar after the window is widened.
+- On Linux, stopping one pending timer no longer makes later timers fire early. A notice replaced within its lifetime, such as Restart agent's progress then completion, no longer disappears at once; debounces and hover delays keep their intervals.
+- The empty composer hides the focus shortcut hint when the pane is too narrow for it and the placeholder, instead of overlapping them.
+- Windows shows the app icon in the title bar, taskbar and Alt+Tab instead of the Windows logo.
+- On Windows above 100% display scaling, a restored window no longer moves on every launch, and moving a window to a monitor with a different scale keeps its size.
+- Tabs that do not fit a narrow pane no longer vanish: other tabs shrink first, then the rest move behind a `+N` button that lists them. The selected tab, the overflow button, a pane's new-session button and the Explorer's `+` and close never overlap; chips too narrow for their menu and close keep icon and title (right click still opens the menu), and dragging a tab keeps the order of hidden tabs.
+- Pressing anywhere in a pane, including a terminal, editor or conversation, focuses that pane, so pane commands act on what you just clicked; touch focuses on a tap, not a drag.
+- Saved sidebar and Explorer widths give way when the window is narrow, keeping the conversation usable, and resize drags start from the width on screen.
+- Clicking the right edge or the space around the `+`/rename buttons of a sidebar host, directory or session row now acts on the row instead of doing nothing.
+- In Settings, a row's own switch, menu or remove button takes its click instead of opening the row. Font fields on narrow screens move below their label instead of squeezing it into single syllables.
+- The main area says to pick a session from the sidebar when sessions exist, instead of claiming there are none.
+- Opening Settings or History on a phone closes the Explorer slide-over instead of leaving it above the page; a long git action label in the header keeps its menu caret.
+- Conversation: the find field takes clicks, touch scrolls code blocks and tables vertically as well as sideways, a nested scroll area scrolls before the one around it, and tool cards open their file on phones. The open-file glyph no longer disappears on hover, Tasks and Subagents popovers open on the side with room, a scrolled overview group stays where you left it, permission buttons ignore taps while an answer is being sent and shorten labels that do not fit, the diagram copy button shows on touch screens, and the next question of a multi-question card scrolls into view.
+- Files and changes: the find popup no longer passes clicks to the editor and keeps its fields and buttons apart on narrow panes (replace buttons get their own row); floating “Jump to file” and feedback buttons that do not fit move into the Options menu; the file tree rail gives way to the jump picker when the diff would get narrower than 320px; editor settings scroll instead of clipping their controls; a diff line's `⋯` stays on screen on long lines; the expanded commit list leaves room for the diff; and the PR checks list hands the wheel back to the page at its end.
+- Composer: model, thinking, mode and feature controls fold into one settings menu before they would cover Send or Stop; the thinking label stays inside the model button; blank space in the editor focuses it; the attachment tray shrinks and scrolls instead of pushing the composer off screen; the suggestion list stays where you scroll it; the whole search row of a picker focuses its field; and fullscreen editing keeps Minimize clear of the status bar.
+- Sheets and dialogs: the welcome screen scrolls when it does not fit; a prompt's text field never covers its buttons; the QR scanner keeps “Scan again” visible on short screens; tapping a sheet's handle no longer closes it; the new-agent sheet shows its footer on wide windows; History keeps titles readable by dropping branch, host and project columns first, moves the host filter below search when narrow, and lists import providers in the standard menu; and the tab switcher's `⋯` and rows each take their own clicks.
+- New Session on a phone reaches thinking, mode and feature settings from the model button. On medium-width windows the project, host and branch pickers share the row so Launch stays visible, and a long project name keeps its edit button.
+- Settings sheets, menus and the Command Center stay above the on-screen keyboard and inside the safe area, Save stays reachable on short windows, and scrolling over an open sheet or menu no longer scrolls the page behind it.
+- A header or tab-strip button no longer stays highlighted after the menu it opened closes, and the pull request/issue picker on phones stays inside the safe area.
+
 ## 0.13.17 - 2026-11-14
 
 ### Changed

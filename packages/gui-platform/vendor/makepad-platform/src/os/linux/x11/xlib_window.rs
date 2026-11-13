@@ -146,6 +146,7 @@ impl XlibWindow {
             // The title should be set prior to mapping the window.
             let title_bytes = format!("{}\0", title);
             x11_sys::XStoreName(display, window, title_bytes.as_bytes().as_ptr() as *const c_char);
+            super::xlib_app::apply_theme_variant(display, window);
 
             // Set the WM_CLASS before mapping the window.
             // Based on <https://www.x.org/releases/X11R7.5/doc/man/man3/XSetWMProperties.3.html>

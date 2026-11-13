@@ -411,7 +411,7 @@ pub(crate) async fn show_notification(notification: &DesktopNotification) -> Res
         let server_id: u32 = proxy
             .call(
                 "Notify",
-                &("Paseo Sessions", replaces, DESKTOP_ENTRY, title.as_str(), body.as_str(), vec!["default", "Open Paseo"], hints, -1i32),
+                &("Passession", replaces, DESKTOP_ENTRY, title.as_str(), body.as_str(), vec!["default", "Open Passession"], hints, -1i32),
             )
             .await
             .map_err(dbus_error)?;
@@ -778,7 +778,7 @@ impl ksni::Tray for TrayModel {
         crate::paths::DESKTOP_APP_ID.into()
     }
     fn title(&self) -> String {
-        "Paseo".into()
+        "Passession".into()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         match crate::image::decode_png_rgba(include_bytes!("../../assets/tray.png")) {
@@ -792,7 +792,7 @@ impl ksni::Tray for TrayModel {
         }
     }
     fn tool_tip(&self) -> ksni::ToolTip {
-        ksni::ToolTip { title: "Paseo".into(), ..Default::default() }
+        ksni::ToolTip { title: "Passession".into(), ..Default::default() }
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         deliver(NativeSignal::TrayOpen);
@@ -800,14 +800,14 @@ impl ksni::Tray for TrayModel {
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         vec![
             ksni::menu::StandardItem {
-                label: "Open Paseo".into(),
+                label: "Open Passession".into(),
                 activate: Box::new(|_: &mut Self| deliver(NativeSignal::TrayOpen)),
                 ..Default::default()
             }
             .into(),
             ksni::MenuItem::Separator,
             ksni::menu::StandardItem {
-                label: "Quit Paseo".into(),
+                label: "Quit Passession".into(),
                 activate: Box::new(|_: &mut Self| deliver(NativeSignal::TrayQuit)),
                 ..Default::default()
             }

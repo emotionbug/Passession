@@ -14,7 +14,7 @@ and excludes this directory from the workspace members.
 
 ## Why
 
-Paseo Sessions supports Android 7.0 (API 24) and later, the floor of the client
+Passession supports Android 7.0 (API 24) and later, the floor of the client
 it replaces. makepad-platform 1.0.0 links NDK libraries that the API 24 sysroot
 does not provide, so the Android library could not link with `minSdk 24`:
 
@@ -318,6 +318,42 @@ Upstream, an idle window kept the GUI thread at ~90–97% CPU. There were two ca
   readable, so `select` returned at once. Only the X connection fd is selected now.
 
 Timers, signals and input wake the loop as before. Idle CPU measured on Xvfb: 1–2%.
+
+## Linux timer cancellation (GuiShell)
+
+`SelectTimers` in `os/linux/select_timer.rs` keeps pending timers as a delta list: each
+entry waits relative to the one before it. Upstream `stop_timer` assumed only the head is
+ever stopped and dropped the entry, so stopping any other pending timer moved every later
+timer earlier by its delay. A toast replaced within its lifetime, a restarted debounce or a
+cancelled hover timer could therefore fire almost at once. A stopped timer now hands its
+delay to its successor; a fired head is popped without that hand-off because its delay is
+already consumed. A unit test in the same file pins the deadlines after stops.
+
+## Native window chrome (GuiShell)
+
+Desktop windows use each OS's own title bar instead of Makepad's drawn chrome.
+
+- Windows (`os/windows/win32_window.rs`, `win32_app.rs`): windows use
+  `WS_OVERLAPPEDWINDOW`. The `WM_NCCALCSIZE`/`WM_NCHITTEST` overrides that hid the
+  frame and hit-tested a drawn caption are gone, so the OS draws the caption, buttons,
+  resize borders and Snap. `WM_SETCURSOR` over the client area re-applies the app's
+  cursor after a border showed a resize cursor; only the shape changes, not the show
+  count. Creation sizes the client area (`set_inner_size`), and `WindowGeom.inner_size`
+  is the client size even when maximized. `WM_DPICHANGED` applies Windows' suggested
+  rectangle. `set_position` takes physical pixels like `get_position` and creation;
+  upstream scaled it again, so restored windows drifted above 100% scaling.
+- Windows window class: the icon is the executable's icon resource 1 (large and small),
+  falling back to the stock logo. Upstream always used `IDI_WINLOGO`, so the caption,
+  taskbar and Alt+Tab showed the Windows logo.
+- macOS (`os/apple/macos/macos_window.rs`): a standard titled window. Upstream used a
+  full-size content view under a transparent, untitled bar, so the traffic lights sat
+  on top of the app's header.
+- `Cx::set_window_dark_appearance(dark)` makes the chrome follow the app's own theme:
+  `DWMWA_USE_IMMERSIVE_DARK_MODE` on every Windows caption (new windows at creation;
+  existing ones redraw their frame), `NSApp.appearance` (Aqua/DarkAqua) on macOS, and
+  `_GTK_THEME_VARIANT` on X11 windows for GTK-based window managers. X11 already kept
+  server-side decorations (`custom_window_chrome: false`). Before the first call each
+  OS keeps its default.
 
 ## X11 window geometry
 

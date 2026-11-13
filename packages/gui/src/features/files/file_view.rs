@@ -39,6 +39,8 @@ const RED_300: Vec4 = theme::argb(0xfffca5a5);
 /// The code font size range of the appearance settings.
 const MIN_CODE_FONT: f64 = 9.0;
 const MAX_CODE_FONT: f64 = 22.0;
+/// Narrowest Find/Replace field before the find card drops or wraps its buttons.
+const FIND_FIELD_MIN_WIDTH: f64 = 96.0;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Hot {
@@ -74,6 +76,13 @@ enum Hot {
     Scrim,
     /// A dialog surface: blocks what is under it.
     Card,
+}
+
+impl Hot {
+    /// Targets of the editor settings card (where a wheel or pan scrolls its rows).
+    fn is_settings_card(&self) -> bool {
+        matches!(self, Hot::Card | Hot::SetWrap | Hot::SetHighlight | Hot::FontMinus | Hot::FontPlus | Hot::SettingsClose)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +146,11 @@ pub struct FileView {
     html: Option<HtmlPreview>,
     overlays: HashMap<u64, Pending>,
     settings_open: bool,
+    /// Scroll offset (and its bound, from the last draw) of the editor settings rows
+    /// when the card is shorter than its content.
+    settings_scroll: f64,
+    settings_scroll_max: f64,
+    settings_touch: makepad_widgets::scroll_bars::TouchScroll,
     hits: HitMap<Hot>,
     hovered: Option<Hot>,
     pressed: Option<Hot>,
@@ -193,6 +207,9 @@ impl FileView {
             html: None,
             overlays: HashMap::new(),
             settings_open: false,
+            settings_scroll: 0.0,
+            settings_scroll_max: 0.0,
+            settings_touch: Default::default(),
             hits: HitMap::default(),
             hovered: None,
             pressed: None,
@@ -739,7 +756,10 @@ impl FileView {
     fn run_more(&mut self, cx: &mut Cx, ui: &mut UiContext, action: &str) {
         match action {
             "find" => self.open_find(cx),
-            "settings" => self.settings_open = true,
+            "settings" => {
+                self.settings_open = true;
+                self.settings_scroll = 0.0;
+            }
             "html" => {
                 self.clear_text_selection(cx);
                 let owner = self.owner.clone();
@@ -1049,7 +1069,14 @@ impl FileView {
             }
             Hit::FingerHoverOut(_) => self.hovered.take().is_some(),
             Hit::FingerScroll(fe) => {
-                match self.hits.at(fe.abs) {
+                let hot = self.hits.at(fe.abs);
+                if self.settings_open && hot.as_ref().is_some_and(Hot::is_settings_card) {
+                    let next = (self.settings_scroll + fe.scroll.y).clamp(0.0, self.settings_scroll_max);
+                    let changed = next != self.settings_scroll;
+                    self.settings_scroll = next;
+                    return changed;
+                }
+                match hot {
                     Some(Hot::Editor) => {
                         if let Some(editor) = self.editor.as_mut() {
                             editor.handle_hit(cx, kit, &look, hit);
@@ -1074,6 +1101,10 @@ impl FileView {
                 self.pressed = hot.clone();
                 self.editor_drag = false;
                 self.preview_drag = false;
+                self.settings_touch.reset();
+                if self.settings_open && hot.as_ref().is_some_and(Hot::is_settings_card) {
+                    self.settings_touch.begin(fe.abs, fe.time, fe.device.is_touch());
+                }
                 match hot {
                     Some(Hot::Editor) => {
                         if !fe.device.is_touch() {
@@ -1132,6 +1163,11 @@ impl FileView {
                     self.query.handle_hit(cx, kit, hit);
                 } else if self.pressed == Some(Hot::ReplaceField) {
                     self.replacement.handle_hit(cx, kit, hit);
+                } else if let Some(dy) = self.settings_touch.move_to(fe.abs, fe.time) {
+                    // A pan over the settings card scrolls its rows instead of pressing one.
+                    self.pressed = None;
+                    let max = self.settings_scroll_max;
+                    self.settings_touch.apply_delta(&mut self.settings_scroll, dy, max);
                 }
                 true
             }
@@ -1203,6 +1239,7 @@ impl FileView {
                 self.editor_drag = false;
                 self.preview_drag = false;
                 self.zoom.drag = None;
+                self.settings_touch.reset();
                 let pressed = self.pressed.take();
                 if fe.is_over && fe.was_tap() {
                     let hot = self.hits.at(fe.abs);
@@ -1818,30 +1855,47 @@ impl FileView {
         let can_replace = self.editor.as_ref().is_some_and(|e| !e.read_only);
         let button = ui::toolbar_button_size(compact);
         let row_h = button.max(28.0).max(ty.ui_size(14.0) * 1.4 + 8.0);
-        let rows = if can_replace && self.replace_expanded { 2.0 } else { 1.0 };
         let width = (content.size.x - 16.0).min(340.0);
-        let card = rect(content.pos.x + content.size.x - 8.0 - width, content.pos.y + 8.0, width, 12.0 + rows * row_h + (rows - 1.0) * 4.0);
-        ui::card(cx, kit, card, p, 8.0);
-        let mut x = card.pos.x + 6.0;
-        let y = card.pos.y + 6.0;
-        if can_replace {
-            let r = rect(x, y + (row_h - button) / 2.0, button, button);
-            let icon = if self.replace_expanded { "chevron-down" } else { "chevron-right" };
-            ui::icon_button(cx, kit, r, icon, self.state_of(&Hot::ToggleReplace, true), compact, p);
-            self.hits.push(r, Hot::ToggleReplace);
-            x += button + 4.0;
-        }
-        let right = card.pos.x + card.size.x - 6.0;
+        let left = content.pos.x + content.size.x - 8.0 - width + 6.0;
+        let right = left + width - 12.0;
+        let x = if can_replace { left + button + 4.0 } else { left };
         let can_navigate = self.match_count > 0;
-        // Trailing buttons of the first row.
-        let buttons: [(Hot, &str, bool, bool); 4] = [
+        // Trailing buttons of the first row; below the field's minimum width the
+        // keyboard-reachable ones (Enter / Shift+Enter navigate) go first.
+        let mut buttons: Vec<(Hot, &str, bool, bool)> = vec![
             (Hot::MatchCase, "case-sensitive", true, self.match_case),
             (Hot::FindPrev, "arrow-up", can_navigate, false),
             (Hot::FindNext, "arrow-down", can_navigate, false),
             (Hot::FindClose, "x", true, false),
         ];
-        let mut bx = right - (button * 4.0 + 12.0);
-        let field_right = bx - 4.0;
+        let trailing_w = |n: usize| n as f64 * (button + 4.0);
+        for hidden in [Hot::FindPrev, Hot::FindNext, Hot::MatchCase] {
+            if right - trailing_w(buttons.len()) - x >= FIND_FIELD_MIN_WIDTH {
+                break;
+            }
+            buttons.retain(|(hot, ..)| *hot != hidden);
+        }
+        let field_right = right - trailing_w(buttons.len());
+        let replace_open = can_replace && self.replace_expanded;
+        let size = if compact { ButtonSize::Sm } else { ButtonSize::Xs };
+        let labels = [t("paneFind.replace"), t("paneFind.replaceAll")];
+        let widths: Vec<f64> = if replace_open { labels.iter().map(|label| ui::button_width(cx, kit, label, None, size, ty)).collect() } else { Vec::new() };
+        let replace_buttons_w = widths.iter().sum::<f64>() + 4.0;
+        // Replace buttons share the replacement row when the field keeps its minimum width, else get their own row.
+        let replace_inline = right - replace_buttons_w - 4.0 - x >= FIND_FIELD_MIN_WIDTH;
+        let rows = if !replace_open { 1.0 } else if replace_inline { 2.0 } else { 3.0 };
+        let card = rect(left - 6.0, content.pos.y + 8.0, width, 12.0 + rows * row_h + (rows - 1.0) * 4.0);
+        ui::card(cx, kit, card, p, 8.0);
+        // Blocks the editor below the card's padding and disabled buttons.
+        self.hits.push(card, Hot::Card);
+        let y = card.pos.y + 6.0;
+        if can_replace {
+            let r = rect(left, y + (row_h - button) / 2.0, button, button);
+            let icon = if self.replace_expanded { "chevron-down" } else { "chevron-right" };
+            ui::icon_button(cx, kit, r, icon, self.state_of(&Hot::ToggleReplace, true), compact, p);
+            self.hits.push(r, Hot::ToggleReplace);
+        }
+        let mut bx = field_right + 4.0;
         for (hot, icon, enabled, selected) in buttons {
             let r = rect(bx, y + (row_h - button) / 2.0, button, button);
             let mut st = self.state_of(&hot, enabled);
@@ -1861,23 +1915,22 @@ impl FileView {
         } else {
             ta("paneFind.total", &[("total", &self.match_count.to_string())])
         };
-        let field = rect(x, y, (field_right - x).max(40.0), row_h);
+        let field = rect(x, y, field_right - x, row_h);
         self.query.focused = self.focus == Focus::Find;
         self.query.draw(cx, kit, field, &t("paneFind.placeholder"), Some(status.as_str()), ty.ui_size(14.0), p, widget_area);
         self.hits.push(field, Hot::FindField);
-        if can_replace && self.replace_expanded {
+        if replace_open {
             let y2 = y + row_h + 4.0;
-            let size = if compact { ButtonSize::Sm } else { ButtonSize::Xs };
-            let labels = [t("paneFind.replace"), t("paneFind.replaceAll")];
-            let widths: Vec<f64> = labels.iter().map(|label| ui::button_width(cx, kit, label, None, size, ty)).collect();
-            let mut rx = right - widths.iter().sum::<f64>() - 4.0;
-            let field = rect(x, y2, (rx - 4.0 - x).max(40.0), row_h);
+            let field_right = if replace_inline { right - replace_buttons_w - 4.0 } else { right };
+            let field = rect(x, y2, field_right - x, row_h);
             self.replacement.focused = self.focus == Focus::Replace;
             self.replacement.draw(cx, kit, field, &t("paneFind.replaceWith"), None, ty.ui_size(14.0), p, widget_area);
             self.hits.push(field, Hot::ReplaceField);
+            let by = if replace_inline { y2 } else { y2 + row_h + 4.0 };
+            let mut rx = (right - replace_buttons_w).max(left);
             for ((label, w), hot) in labels.iter().zip(widths).zip([Hot::ReplaceOne, Hot::ReplaceAll]) {
                 let height = size.height() + (ty.ui_size(12.0) - 12.0).max(0.0) * 1.4;
-                let r = rect(rx, y2 + (row_h - height) / 2.0, w, height);
+                let r = rect(rx, by + (row_h - height) / 2.0, w, height);
                 let st = self.state_of(&hot, can_navigate);
                 ui::button(cx, kit, r, label, None, ButtonVariant::Ghost, size, st, p, ty);
                 if can_navigate {
@@ -1898,7 +1951,9 @@ impl FileView {
         let rows = 3.0;
         let row_h = 44.0_f64.max(base * 1.4 + 12.0);
         let header_h = 56.0_f64.max(ty.ui_size(16.0) * 1.4 + 24.0);
-        let h = header_h + rows * row_h + (rows - 1.0) * 16.0 + 24.0;
+        let content_h = rows * row_h + (rows - 1.0) * 16.0 + 24.0;
+        // The card fits the pane (16px margins); rows scroll under the header when it is short.
+        let h = (header_h + content_h).min((area.size.y - 32.0).max(header_h));
         let card = rect(area.pos.x + (area.size.x - width) / 2.0, area.pos.y + ((area.size.y - h) / 2.0).max(16.0), width, h);
         kit.outline(cx, card, p.dialog, p.border, 1.0, 12.0);
         self.hits.push(card, Hot::Card);
@@ -1906,7 +1961,12 @@ impl FileView {
         let close = rect(card.pos.x + width - 40.0, card.pos.y + 16.0, 24.0, 24.0);
         ui::icon_button(cx, kit, close, "x", self.state_of(&Hot::SettingsClose, true), false, p);
         self.hits.push(close, Hot::SettingsClose);
-        let mut y = card.pos.y + header_h;
+        let body = rect(card.pos.x, card.pos.y + header_h, width, h - header_h);
+        self.settings_scroll_max = (content_h - body.size.y).max(0.0);
+        self.settings_scroll = self.settings_scroll.clamp(0.0, self.settings_scroll_max);
+        cx.begin_turtle(Walk::abs_rect(body), Layout::default());
+        self.hits.set_clip(Some(body));
+        let mut y = body.pos.y - self.settings_scroll;
         let switches = [(l("Word wrap"), self.wrap, Hot::SetWrap), (l("Syntax highlighting"), self.highlighting, Hot::SetHighlight)];
         for (label, on, hot) in switches {
             let text_w = width - 40.0 - 52.0;
@@ -1936,6 +1996,8 @@ impl FileView {
         if plus_enabled {
             self.hits.push(plus, Hot::FontPlus);
         }
+        self.hits.set_clip(None);
+        cx.end_turtle();
     }
 
     /// The download progress dialog (Flutter `saveRemoteFile` modal).

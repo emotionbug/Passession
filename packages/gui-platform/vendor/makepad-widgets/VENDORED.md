@@ -21,6 +21,13 @@ The same filter drops `Event::Drag`/`Event::Drop` that the platform addressed to
 window (`Cx::drag_event_is_for_window`): their position is in that window's coordinates,
 so a second window would otherwise hit-test a file drag meant for the first.
 
+## Native window caption
+
+`src/window.rs` no longer shows the drawn `caption_bar` and `windows_buttons` on
+Windows. The platform patch gives Windows the standard overlapped frame, so the OS
+draws the caption, its buttons and Snap; see makepad-platform's "Native window chrome".
+The caption bar stays defined for consumers that enable it explicitly.
+
 ## Desktop scrollbar visibility
 
 `src/scroll_bar.rs` adds desktop auto-hide, enabled by `fade_when_idle` by

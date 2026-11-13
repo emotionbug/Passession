@@ -1,6 +1,6 @@
 [package]
 name = "paseo-gui-platform"
-description = "Desktop and mobile OS integration for the native Paseo Sessions client"
+description = "Desktop and mobile OS integration for the native Passession client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

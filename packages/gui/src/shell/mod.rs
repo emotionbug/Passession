@@ -58,12 +58,12 @@ live_design! {
 
     pub PaseoWindow = <Window> {
         pass: { clear_color: (PASEO_DARK_SURFACE1) }
-        window: { title: "Paseo Sessions", inner_size: vec2(1280, 820) }
-        caption_bar = { caption_label = { label = { text: "Paseo Sessions" } } }
+        window: { title: "Passession", inner_size: vec2(1280, 820) }
+        caption_bar = { caption_label = { label = { text: "Passession" } } }
         window_menu = {
             main = Main { items: [app, file] }
-            app = Sub { name: "Paseo", items: [paseo_quit] }
-            paseo_quit = Item { name: "Quit Paseo", shift: false, key: KeyQ, enabled: true }
+            app = Sub { name: "Passession", items: [paseo_quit] }
+            paseo_quit = Item { name: "Quit Passession", shift: false, key: KeyQ, enabled: true }
             file = Sub { name: "File", items: [new_window] }
             new_window = Item { name: "New Window", shift: true, key: KeyN, enabled: true }
         }
@@ -618,6 +618,9 @@ impl Widget for PaseoShell {
             {
                 key_consumed = commands::handle_shortcut(self, cx, ui, key);
             }
+        }
+        if !modal && !locked {
+            chrome::observe_pane_focus(self, event);
         }
         if !key_consumed && !locked && !explorer_input {
             self.dispatch_panels(cx, event, scope, window_modal);
