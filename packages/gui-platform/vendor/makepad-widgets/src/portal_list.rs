@@ -1130,10 +1130,7 @@ impl Widget for PortalList {
                     _ => ()
                 }
                 Hit::FingerDown(fe) => {
-                    // We allow other mouse buttons to grab key focus and stop the tail range behavior,
-                    // but we only want the primary button (or touch) to actually scroll via dragging.
-
-                    //log!("Finger down {} {}", e.time, e.abs);
+                    // Mouse presses stop existing motion, but only touch pans content.
                     if self.grab_key_focus {
                         cx.set_key_focus(self.area);
                     }
@@ -1148,9 +1145,10 @@ impl Widget for PortalList {
                     }
                 }
                 Hit::FingerMove(e) => {
-                    cx.set_cursor(MouseCursor::Default);
+                    // Mouse drags belong to child text selection, including its cursor.
                     let point = match vi { Vec2Index::X => dvec2(e.abs.y, e.abs.x), Vec2Index::Y => e.abs };
                     if let Some(delta) = self.touch_scroll.move_to(point, e.time) {
+                        cx.set_cursor(MouseCursor::Default);
                         if let Event::TouchUpdate(update) = event {
                             for touch in &update.touches {
                                 if matches!(touch.state, TouchState::Move) {

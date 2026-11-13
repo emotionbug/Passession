@@ -1,0 +1,4 @@
+Fixed
+- Text fields rebuild invalidated text layout before vertical cursor navigation, including immediately after typing, pasting, undo or redo. Arrow Down no longer aborts when another input event arrives before the next paint, and navigation uses the edited text instead of stale rows.
+
+Full notes: https://github.com/emotionbug/Passession/releases

@@ -56,6 +56,16 @@ scoped entry point. Lifecycle and non-input notifications remain broadcasts.
 The adjacent widgets patch applies this scope before navigation and overlays,
 not merely before the window's content view.
 
+## Windows clipboard ownership
+
+`win32_window.rs` opens the clipboard with a real window owner and closes it on
+every exit. Published UTF-16 uses `GMEM_MOVEABLE`; Windows takes ownership only
+after `SetClipboardData` succeeds. Failed publication frees the allocation.
+Reads stop at the first UTF-16 NUL, not at the global allocation's padded end.
+Missing text formats and failed locks do not dereference null or unwind through
+the window procedure. `GlobalUnlock` returning zero on the final successful
+unlock is not a Rust error to unwrap.
+
 ## Windows input-method composition
 
 Upstream ignored input-method compositions on Windows: the input method drew the

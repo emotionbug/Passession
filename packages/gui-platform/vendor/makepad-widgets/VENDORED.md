@@ -93,6 +93,11 @@ width, wrapping and alignment. Live system-font changes and width reflow do not
 reuse stale glyph metrics or replace the editor's text, selection or history;
 color-only animation keeps the cached layout.
 
+Cursor navigation and pointer placement rebuild an invalidated layout using the
+last viewport before resolving rows. Input events may arrive between an edit
+(including paste/undo/redo) and its paint; Arrow Down previously unwrapped the
+missing layout, while Arrow Up discarded the movement.
+
 Touch focus is acquired on a valid release inside the input, not on pointer
 down. Leaving the field, panning, cancellation, focus/model replacement or
 geometry changes invalidate the pending tap. Long press remains a distinct
@@ -150,6 +155,10 @@ selection and horizontal child drags retain their gesture ownership. Sticky tap
 qualification prevents a pan ending over its original control from becoming a
 click. Eighteen `touch_scroll_tests` cover slop, subdivision, reversal, bounds,
 interruption, frame-rate/clock independence, release velocity and selection.
+
+`TouchScroll::begin` rejects non-touch gestures even for direct callers such as
+`PortalList`. Mouse drags remain text selection instead of panning/flinging the
+list, and an idle list no longer overrides the child's selection cursor.
 
 Release velocity uses a fixed-size 32-sample history over the last 100 ms,
 including interpolation at the window boundary. Equal-timestamp moves retain

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.16 - 2026-11-13
+
+### Fixed
+
+- Text fields rebuild invalidated text layout before vertical cursor navigation, including immediately after typing, pasting, undo or redo. Arrow Down no longer aborts when another input event arrives before the next paint, and navigation uses the edited text instead of stale rows.
+- Windows Copy/Cut/Paste no longer abort on an empty or non-text clipboard or on the normal final `GlobalUnlock` result. Clipboard writes use a window owner and movable memory, failed writes release their memory, and pasted UTF-16 text ends at its terminator rather than including allocation padding.
+- Dragging conversation content with the mouse no longer pans or flings the timeline or overwrites the text-selection cursor. Touch panning, the mouse wheel and scrollbar dragging remain available.
+- The client request-timeout regression no longer assumes an expiring request must reach the server before its ID is reused. Removed an upstream font-rasterization demo mislabeled as a test: it had no assertions, referenced an unregistered font and wrote PNGs to its author's Desktop.
+
 ## 0.13.15 - 2026-11-12
 
 ### Fixed

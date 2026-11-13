@@ -148,9 +148,13 @@ impl TouchScroll {
 
     pub fn begin(&mut self, abs: DVec2, time: f64, is_touch: bool) {
         self.reset();
+        // Direct consumers must obey the same touch-only boundary as handle_hit.
+        if !is_touch {
+            return;
+        }
         self.origin = abs;
         self.velocity.reset(abs.y, time);
-        self.motion = TouchMotion::Drag { start: abs, last: abs, panning: !is_touch };
+        self.motion = TouchMotion::Drag { start: abs, last: abs, panning: false };
     }
 
     pub fn origin(&self) -> DVec2 {
@@ -342,6 +346,20 @@ mod touch_scroll_tests {
         let mut scroll = TouchScroll::default();
         scroll.handle_hit(&down(DigitDevice::Mouse { button: MouseButton::PRIMARY }));
         assert_eq!(scroll.handle_hit(&moved(50.0, DigitDevice::Mouse { button: MouseButton::PRIMARY })), None);
+    }
+
+    #[test]
+    fn direct_mouse_drag_cancels_motion_without_starting_a_pan_or_fling() {
+        let mut scroll = TouchScroll::default();
+        scroll.begin(dvec2(20.0, 100.0), 0.0, true);
+        assert_eq!(scroll.move_to(dvec2(20.0, 50.0), 0.05), Some(50.0));
+        scroll.release(0.05);
+        assert!(scroll.is_flinging());
+        // PortalList uses begin directly, rather than handle_hit.
+        scroll.begin(dvec2(20.0, 100.0), 0.1, false);
+        assert_eq!(scroll.move_to(dvec2(20.0, 20.0), 0.15), None);
+        assert!(!scroll.release(0.15));
+        assert!(!scroll.is_flinging());
     }
 
     #[test]

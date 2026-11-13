@@ -9,14 +9,12 @@ use {
         sync::Arc,
         sync::Mutex,
         rc::Rc,
-        ffi::OsStr,
-        os::windows::ffi::OsStrExt,
         mem,
     },
 
     crate::{
         windows::{
-            core::PCWSTR,
+            core::{PCWSTR, Error, Result as WinResult},
             //core::IntoParam,
             //core::Result as coreResult,
             //core::HRESULT,
@@ -26,6 +24,7 @@ use {
                     HANDLE,
                     HGLOBAL,
                     WPARAM,
+                    GlobalFree,
                     LPARAM,
                     LRESULT,
                     RECT,
@@ -38,7 +37,7 @@ use {
                         GlobalAlloc,
                         GlobalSize,
                         GlobalUnlock,
-                        GLOBAL_ALLOC_FLAGS,
+                        GMEM_MOVEABLE,
                     },
                     Ole::{
                         CF_UNICODETEXT,
@@ -54,7 +53,6 @@ use {
                         MK_CONTROL,
                         MK_SHIFT,
                     },
-                    WindowsProgramming::GMEM_DDESHARE,
                     DataExchange::{
                         OpenClipboard,
                         EmptyClipboard,
@@ -156,6 +154,7 @@ use {
                         SetCapture,
                         TrackMouseEvent,
                         GetKeyState,
+                        GetActiveWindow,
                         TRACKMOUSEEVENT,
                         TME_LEAVE,
                         VK_CONTROL,
@@ -310,6 +309,67 @@ use {
         cursor::MouseCursor,
     },
 };
+
+// The clipboard must close on every path, including missing text formats and
+// failed allocations. Its memory belongs to Windows only after SetClipboardData.
+struct Clipboard;
+
+impl Clipboard {
+    fn open(hwnd: HWND) -> WinResult<Self> {
+        unsafe { OpenClipboard(hwnd)?; }
+        Ok(Self)
+    }
+
+    fn read_text(&self) -> Option<String> {
+        unsafe {
+            let handle = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
+            let memory = HGLOBAL(handle.0 as *mut _);
+            let len = GlobalSize(memory) / mem::size_of::<u16>();
+            if len == 0 {
+                return None;
+            }
+            let ptr = GlobalLock(memory).cast::<u16>();
+            if ptr.is_null() {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(ptr, len);
+            let end = units.iter().position(|unit| *unit == 0).unwrap_or(len);
+            let text = String::from_utf16_lossy(&units[..end]);
+            // A zero return also means the final lock was successfully released;
+            // the windows crate maps that normal result to Err.
+            let _ = GlobalUnlock(memory);
+            Some(text)
+        }
+    }
+
+    fn write_text(&self, text: &str) -> WinResult<()> {
+        let data: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let memory = GlobalAlloc(GMEM_MOVEABLE, data.len() * mem::size_of::<u16>())?;
+            let result = (|| {
+                let ptr = GlobalLock(memory).cast::<u16>();
+                if ptr.is_null() {
+                    return Err(Error::from_win32());
+                }
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+                let _ = GlobalUnlock(memory);
+                EmptyClipboard()?;
+                SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(memory.0 as isize))?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = GlobalFree(memory);
+            }
+            result
+        }
+    }
+}
+
+impl Drop for Clipboard {
+    fn drop(&mut self) {
+        unsafe { let _ = CloseClipboard(); }
+    }
+}
 
 /// Paseo: the drop effect answered to a drag source for the widgets' response, limited to
 /// the effects the source allows. Widgets that take files only read them: when the source
@@ -601,30 +661,14 @@ impl Win32Window {
                 if modifiers.control || modifiers.logo {
                     match key_code {
                         KeyCode::KeyV => { // paste
-                            if let Ok(()) = OpenClipboard(None) {
-                                let mut data: Vec<u16> = Vec::new();
-                                let h_clipboard_data = GetClipboardData(CF_UNICODETEXT.0 as u32).unwrap();
-                                let h_clipboard_ptr = GlobalLock(std::mem::transmute::<_,HGLOBAL>(h_clipboard_data)) as *mut u16;
-                                let clipboard_size = GlobalSize(std::mem::transmute::<_,HGLOBAL>(h_clipboard_data));
-                                if clipboard_size > 2 {
-                                    data.resize((clipboard_size >> 1) - 1, 0);
-                                    std::ptr::copy_nonoverlapping(h_clipboard_ptr, data.as_mut_ptr(), data.len());
-                                    GlobalUnlock(std::mem::transmute::<_,HGLOBAL>(h_clipboard_data)).unwrap();
-                                    CloseClipboard().unwrap();
-                                    if let Ok(utf8) = String::from_utf16(&data) {
-                                        window.do_callback(
-                                            Win32Event::TextInput(window.window_id, TextInputEvent {
-                                                input: utf8,
-                                                was_paste: true,
-                                                replace_last: false
-                                            })
-                                        );
-                                    }
-                                }
-                                else {
-                                    GlobalUnlock(std::mem::transmute::<_,HGLOBAL>(h_clipboard_data)).unwrap();
-                                    CloseClipboard().unwrap();
-                                }
+                            if let Some(input) = Clipboard::open(window.hwnd).ok().and_then(|clipboard| clipboard.read_text()) {
+                                window.do_callback(
+                                    Win32Event::TextInput(window.window_id, TextInputEvent {
+                                        input,
+                                        was_paste: true,
+                                        replace_last: false
+                                    })
+                                );
                             }
                         }
                         KeyCode::KeyC => {
@@ -852,22 +896,9 @@ impl Win32Window {
     }
 
     pub unsafe fn copy_to_clipboard(text: &String) {
-        // plug it into the windows clipboard
-        // make utf16 dta
-        if let Ok(()) = OpenClipboard(None) {
-            EmptyClipboard().unwrap();
-
-            let data: Vec<u16> = OsStr::new(text).encode_wide().chain(Some(0).into_iter()).collect();
-
-            let h_clipboard_data = GlobalAlloc(GLOBAL_ALLOC_FLAGS(GMEM_DDESHARE), 2 * data.len()).expect("GlobalAlloc for clipboard failed");
-
-            let h_clipboard_ptr = GlobalLock(h_clipboard_data) as *mut u16;
-
-            std::ptr::copy_nonoverlapping(data.as_ptr(), h_clipboard_ptr, data.len());
-
-            GlobalUnlock(h_clipboard_data).unwrap();
-            SetClipboardData(CF_UNICODETEXT.0 as u32, std::mem::transmute::<_,HANDLE>(h_clipboard_data)).unwrap();
-            CloseClipboard().unwrap();
+        // A null clipboard owner cannot publish data after EmptyClipboard.
+        if let Err(error) = Clipboard::open(GetActiveWindow()).and_then(|clipboard| clipboard.write_text(text)) {
+            crate::error!("Cannot copy text to the Windows clipboard: {}", error);
         }
     }
     

@@ -25,6 +25,10 @@ with trailing spaces; grapheme fitting keeps the upstream estimate.
 positions, and nonbreaking spaces using the adjacent widgets crate's existing
 Liberation Mono fixture. No font resources are added.
 
+The upstream `text::tests::test` rasterization demo is removed. It registered no
+`Sans` font, asserted no behavior, and saved PNGs to `/Users/ejpbruel/Desktop`.
+The portable layout and atlas regression tests retain their bundled fixtures.
+
 ## Tabs and control characters
 
 Upstream shapes control characters as themselves. No font maps them, so every

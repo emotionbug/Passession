@@ -149,16 +149,23 @@ async fn cancelled_and_expired_requests_release_correlation_without_closing_conn
         let cancelled = receive(&mut socket).await?["message"].clone();
         assert_eq!(cancelled["requestId"], "reuse-after-cancel");
         server_cancel.cancel();
-        let expired = receive(&mut socket).await?["message"].clone();
-        assert_eq!(expired["requestId"], "reuse-after-timeout");
-        for _ in 0..2 {
+        let mut answered = 0;
+        while answered < 2 {
             let request = receive(&mut socket).await?["message"].clone();
+            // A deadline covers submission too: on a busy runner the expiring
+            // request may never reach the peer. Do not mistake its reused ID
+            // for the request to withhold.
+            if request["expire"] == true {
+                assert_eq!(request["requestId"], "reuse-after-timeout");
+                continue;
+            }
             reply(
                 &mut socket,
                 "test.response",
                 json!({"requestId":request["requestId"],"ok":true}),
             )
             .await?;
+            answered += 1;
         }
         let _ = held.await;
         Ok::<_, anyhow::Error>(())
@@ -176,7 +183,7 @@ async fn cancelled_and_expired_requests_release_correlation_without_closing_conn
     assert_eq!(code(&error), "DAEMON_REQUEST_CANCELLED");
     let error = client
         .request(
-            json!({"type":"test.request","requestId":"reuse-after-timeout"}),
+            json!({"type":"test.request","requestId":"reuse-after-timeout","expire":true}),
             "test.response",
             Duration::from_millis(30),
         )

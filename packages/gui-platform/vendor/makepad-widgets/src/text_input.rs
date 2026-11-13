@@ -1120,6 +1120,20 @@ impl TextInput {
             return;
         }
         self.layout_metrics = Some(metrics);
+        self.rebuild_text_layout(cx, max_width_in_lpxs, wrap);
+    }
+
+    // Editing invalidates layout before the next paint. Navigation must resolve
+    // the new text with the last viewport instead of using stale rows or dropping keys.
+    fn ensure_text_layout(&mut self, cx: &mut Cx) -> Result<(), ()> {
+        if self.laidout_text.is_none() {
+            let metrics = self.layout_metrics.as_ref().ok_or(())?;
+            self.rebuild_text_layout(cx, metrics.max_width, metrics.wrap);
+        }
+        Ok(())
+    }
+
+    fn rebuild_text_layout(&mut self, cx: &mut Cx, max_width_in_lpxs: Option<f32>, wrap: bool) {
         let text = if self.is_password {
             self.password_text.clear();
             for grapheme in self.text.graphemes(true) {
@@ -1273,6 +1287,7 @@ impl TextInput {
     }
 
     pub fn move_cursor_up(&mut self, cx: &mut Cx, keep_selection: bool) -> Result<(), ()> {
+        self.ensure_text_layout(cx)?;
         let position = self.cursor_to_position(self.selection.cursor)?;
         self.set_cursor(
             cx,
@@ -1290,7 +1305,8 @@ impl TextInput {
     }
 
     pub fn move_cursor_down(&mut self, cx: &mut Cx, keep_selection: bool) -> Result<(), ()> {
-        let laidout_text = self.laidout_text.as_ref().unwrap();
+        self.ensure_text_layout(cx)?;
+        let laidout_text = self.laidout_text.as_ref().ok_or(())?;
         let position = self.cursor_to_position(self.selection.cursor)?;
         self.set_cursor(
             cx,
@@ -1462,6 +1478,9 @@ impl TextInput {
     }
 
     fn place_pointer_cursor(&mut self, cx: &mut Cx, abs: DVec2, tap_count: u32, keep_selection: bool) {
+        if self.ensure_text_layout(cx).is_err() {
+            return;
+        }
         let rel = abs - self.text_area.rect(cx).pos;
         let Ok(cursor) = self.point_in_lpxs_to_cursor(Point::new(rel.x as f32, rel.y as f32)) else {
             warning!("can't move cursor because layout was invalidated by earlier event");
@@ -2476,5 +2495,51 @@ mod touch_focus_tests {
         // A word still selects, including the last word of the text.
         assert_eq!(at(&mut input, &mut cx, "abc", 3), (0, 3));
         assert_eq!(at(&mut input, &mut cx, "abc def\n", 5), (4, 7));
+    }
+}
+
+#[cfg(test)]
+mod keyboard_edit_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use crate::makepad_draw::{
+        text::{font::FontId, fonts::Fonts, loader::{FontDefinition, FontFamilyDefinition}},
+    };
+
+    #[test]
+    fn vertical_navigation_after_edit_uses_new_rows_before_paint() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fonts = Fonts::new(&mut cx, Default::default());
+        let font = FontId::from("keyboard-edit-test");
+        fonts.define_font(font, FontDefinition {
+            data: std::sync::Arc::new(include_bytes!("../resources/LiberationMono-Regular.ttf").to_vec()),
+            index: 0, ascender_fudge_in_ems: 0.0, descender_fudge_in_ems: 0.0,
+        });
+        fonts.define_font_family(0.into(), FontFamilyDefinition { font_ids: vec![font] });
+        cx.set_global(Rc::new(RefCell::new(fonts)));
+        let mut input = TextInput::new(&mut cx);
+        input.draw_text.text_style.font_size = 12.0;
+        input.draw_text.font_scale = 1.0;
+        input.layout_metrics = Some(TextInputLayoutMetrics {
+            font_family: input.draw_text.text_style.font_family.clone(),
+            font_size: 12.0, line_spacing: input.draw_text.text_style.line_spacing,
+            font_scale: 1.0, max_width: None, wrap: false, align_x: 0.0, align_y: 0.0,
+        });
+        input.set_text(&mut cx, "ab\ncd");
+        input.set_cursor(&mut cx, Cursor { index: 1, prefer_next_row: false }, false);
+        input.create_or_extend_edit_group(EditKind::Other);
+        input.apply_edit(&mut cx, Edit { start: 1, end: 1, replace_with: "x\ny".into() });
+        input.move_cursor_down(&mut cx, false).unwrap();
+        assert_eq!((input.selection.anchor.index, input.selection.cursor.index), (7, 7));
+        input.move_cursor_up(&mut cx, true).unwrap();
+        assert_eq!(input.selected_text(), "b\nc");
+        assert_eq!(input.text, "ax\nyb\ncd");
+
+        assert!(input.undo(&mut cx));
+        input.move_cursor_down(&mut cx, false).unwrap();
+        assert_eq!((input.text.as_str(), input.selection.cursor.index), ("ab\ncd", 4));
+        assert!(input.redo(&mut cx));
+        input.move_cursor_up(&mut cx, false).unwrap();
+        assert_eq!((input.text.as_str(), input.selection.cursor.index), ("ax\nyb\ncd", 1));
     }
 }
