@@ -279,7 +279,7 @@ pub fn resolve_with_options(
         "autoArchiveAfterMerge": defaulted(persisted, "/daemon/autoArchiveAfterMerge", json!(false)),
         "enableTerminalAgentHooks": defaulted(persisted, "/daemon/enableTerminalAgentHooks", json!(false)),
         "appendSystemPrompt": defaulted(persisted, "/daemon/appendSystemPrompt", json!("")),
-        "pluginsEnabled": defaulted(persisted, "/pluginsEnabled", json!(false)),
+        "pluginsEnabled": defaulted(persisted, "/pluginsEnabled", json!(true)),
         "mcpDebug": ev(env, "MCP_DEBUG") == Some("1"),
         "isDev": ev(env, "PASEO_NODE_ENV") == Some("development"),
         "agentStoragePath": home.join("agents"),
@@ -568,7 +568,7 @@ pub fn mutable(resolved: &Value) -> Value {
         "autoArchiveAfterMerge":defaulted(resolved,"/autoArchiveAfterMerge",json!(false)),
         "enableTerminalAgentHooks":defaulted(resolved,"/enableTerminalAgentHooks",json!(false)),
         "appendSystemPrompt":defaulted(resolved,"/appendSystemPrompt",json!("")),
-        "pluginsEnabled":defaulted(resolved,"/pluginsEnabled",json!(false)),
+        "pluginsEnabled":defaulted(resolved,"/pluginsEnabled",json!(true)),
         "plugins":defaulted(resolved,"/plugins",json!({})),
         "skills":{},
     });

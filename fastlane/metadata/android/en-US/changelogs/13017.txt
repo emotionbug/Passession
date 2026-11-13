@@ -1,0 +1,7 @@
+Changed
+- External plugins are enabled by default when pluginsEnabled is omitted. Explicit global disablement and disabled individual installations remain respected.
+
+Fixed
+- OMP sessions using native openai-codex/... models now select the Codex usage account from their own OMP credential store. openai/... API-key models no longer show an unrelated ChatGPT subscription's quota.
+
+Full notes: https://github.com/emotionbug/Passession/releases

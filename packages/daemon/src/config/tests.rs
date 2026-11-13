@@ -85,6 +85,35 @@ fn retired_service_settings_migrate_without_changing_agent_providers() {
 }
 
 #[test]
+fn plugin_opt_out_survives_config_updates_and_reload() {
+    let home = tempfile::tempdir().unwrap();
+    let environment = std::collections::BTreeMap::new();
+    let initial = json!({"plugins":{"held":{"source":"directory","path":"/plugins/held","enabled":false}}});
+    let resolve = |persisted: &serde_json::Value| {
+        super::resolve::resolve(home.path(), home.path(), persisted, &environment).unwrap()
+    };
+    assert_eq!(resolve(&initial)["pluginsEnabled"], true);
+    let disabled =
+        transactions::persist_patch(&initial, &json!({"pluginsEnabled":false}), &[]).unwrap();
+    let updated = transactions::persist_patch(
+        &disabled,
+        &json!({"appendSystemPrompt":"Keep plugin opt-out"}),
+        &[],
+    )
+    .unwrap();
+    storage::save(home.path(), &updated).unwrap();
+    let reloaded = storage::read(home.path(), false, false).unwrap();
+    let resolved = resolve(&reloaded);
+    assert_eq!(resolved["pluginsEnabled"], false);
+    assert_eq!(super::resolve::mutable(&resolved)["pluginsEnabled"], false);
+    let enabled =
+        transactions::persist_patch(&reloaded, &json!({"pluginsEnabled":true}), &[]).unwrap();
+    let resolved = resolve(&enabled);
+    assert_eq!(resolved["pluginsEnabled"], true);
+    assert_eq!(resolved["plugins"]["held"]["enabled"], false);
+}
+
+#[test]
 fn reload_diff_distinguishes_missing_and_explicit_null() {
     let mut paths = Vec::new();
     transactions::diff(

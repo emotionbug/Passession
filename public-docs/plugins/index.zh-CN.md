@@ -43,7 +43,7 @@ paseo plugin ls workspace-plugin
 paseo plugin logs workspace-plugin
 ```
 
-daemon 根设置 `pluginsEnabled` 和安装条目的启用状态都必须允许执行。修改 `config.json` 的根设置后使用 `paseo reload --json`；`paseo plugin enable workspace-plugin` 仅启用该安装。`running` 只表示激活成功，不证明所有 RPC/Provider 路径正确，也不代表兼容旧插件 UI。
+daemon 根设置 `pluginsEnabled` 省略时默认为 `true`；设为 `false` 可禁用所有外部插件。安装条目的启用状态也必须允许执行。显式的全局或单个安装禁用设置保持不变。修改 `config.json` 的根设置后使用 `paseo reload --json`；`paseo plugin enable workspace-plugin` 仅启用该安装。`running` 只表示激活成功，不证明所有 RPC/Provider 路径正确，也不代表兼容旧插件 UI。
 
 远程管理时，把 `--host <url>` 放在管理命令之前，使用 **daemon 主机上的绝对路径**。CLI 不上传本地文件；`plugin init` 在本地创建文件。
 

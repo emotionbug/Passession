@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.17 - 2026-11-14
+
+### Changed
+
+- External plugins are enabled by default when `pluginsEnabled` is omitted. Explicit global disablement and disabled individual installations remain respected.
+
+### Fixed
+
+- OMP sessions using native `openai-codex/...` models now select the Codex usage account from their own OMP credential store. `openai/...` API-key models no longer show an unrelated ChatGPT subscription's quota.
+
 ## 0.13.16 - 2026-11-13
 
 ### Fixed

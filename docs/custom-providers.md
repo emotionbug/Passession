@@ -435,11 +435,16 @@ Custom OMP profiles should extend `omp`. They inherit the OMP adapter's `rpc-ui`
 
 `options.sessionDir` is used only for importing sessions that were started outside Paseo. If `command` or XDG env vars move OMP's state directory, set `options.sessionDir` to the resulting OMP JSONL session directory; launching and resuming still go through the configured command. OMP waits 20 seconds for its initial `ready` frame and 60 seconds for later control-plane RPCs by default. `options.rpcTimeoutMs` overrides both deadlines.
 
-#### Kiro CLI through OMP
+OMP account usage follows the selected model's native provider and session
+credential store. `anthropic/...` uses the Claude account source and
+`openai-codex/...` uses the Codex subscription source. `openai/...` API-key models
+do not borrow a ChatGPT subscription's quota.
 
-The standalone [omp-kiro plugin](https://github.com/emotionbug/omp-kiro) uses your Kiro CLI login as an OMP model provider. Paseo still runs OMP: its tool loop, permissions, host tools, and subagents remain in control.
+#### Kiro through OMP
 
-Install the plugin and its optional Paseo profile:
+The standalone [omp-kiro plugin](https://github.com/emotionbug/omp-kiro) provides Kiro CLI ACP and direct HTTP model transports for OMP. Paseo still runs OMP: its tool loop, permissions, host tools, and subagents remain in control.
+
+Install the ACP integration and its optional Paseo profile:
 
 ```bash
 kiro-cli login
@@ -449,6 +454,25 @@ paseo daemon reload --home "$HOME/.paseo"
 ```
 
 Select **Kiro (OMP)** and a discovered model for a new agent. Setup preserves existing defaults and other providers, and does not restart the daemon. The plugin works without Paseo; see its [installation guide and limitations](https://github.com/emotionbug/omp-kiro#readme).
+
+##### Account usage
+
+The native `omp-kiro` plugin contributes Kiro credits to the standard Usage panel;
+it does not replace OMP as the coding-agent harness. From that plugin's checkout:
+
+```bash
+npm run setup:paseo -- --usage-only --enable-plugins --paseo-home "$HOME/.paseo"
+paseo usage ls --refresh --home "$HOME/.paseo"
+```
+
+This uses the plugin's managed HTTP login, not Kiro CLI's ACP credentials.
+`kiro-http/...` OMP sessions use their own authentication-store environment;
+global reports use the daemon's environment. An expired login is reported as
+expired, not zero remaining credits. Usage reads never refresh tokens, rewrite
+credentials, purchase credits or change billing. See the plugin's
+[authentication and usage guide](https://github.com/emotionbug/omp-kiro#passession)
+for login and custom-store alignment.
+
 
 #### Other Pi-compatible forks
 

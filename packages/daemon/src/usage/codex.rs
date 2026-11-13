@@ -46,19 +46,16 @@ pub(super) async fn discover(rt: &UsageRuntime, scope: &UsageScope) -> Result<Ve
                 return Ok(Vec::new());
             }
             vec![codex_route(selected_codex)]
-        } else if scope
-            .model
-            .as_deref()
-            .is_some_and(|s| s.starts_with("openai/"))
-        {
+        } else {
+            let model = scope.model.as_deref().unwrap_or("");
             match provider {
-                "pi" => vec![pi()],
-                "omp" => stores::discover_omp(&home, env, "openai-codex").await?,
-                "opencode" => vec![opencode()],
+                "omp" if model.starts_with("openai-codex/") => {
+                    stores::discover_omp(&home, env, "openai-codex").await?
+                }
+                "pi" if model.starts_with("openai/") => vec![pi()],
+                "opencode" if model.starts_with("openai/") => vec![opencode()],
                 _ => Vec::new(),
             }
-        } else {
-            Vec::new()
         }
     } else {
         let mut routes = vec![codex_route(selected_codex.clone())];
@@ -310,6 +307,45 @@ fn project(usage: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn omp_codex_quota_follows_the_session_store_not_openai_api_models() {
+        let home = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(session.path().join("agent.db")).unwrap();
+        db.execute_batch("CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT, credential_type TEXT, data TEXT, disabled_cause TEXT)").unwrap();
+        db.execute(
+            "INSERT INTO auth_credentials VALUES (1, 'openai-codex', 'oauth', ?1, NULL)",
+            [r#"{"access":"fixture","accountId":"session-account"}"#],
+        )
+        .unwrap();
+        let runtime = UsageRuntime {
+            home: home.path().into(),
+            env: Default::default(),
+            http: reqwest::Client::new(),
+            cancel: Default::default(),
+            endpoints: Default::default(),
+            muse_providers: Vec::new(),
+            plugins: None,
+        };
+        let mut scope = UsageScope {
+            provider: Some("omp".into()),
+            model: Some("openai-codex/gpt-test".into()),
+            env: std::collections::BTreeMap::from([(
+                "PI_CODING_AGENT_DIR".into(),
+                session.path().to_str().unwrap().into(),
+            )]),
+        };
+        let accounts = discover(&runtime, &scope).await.unwrap();
+        assert_eq!(accounts.iter().map(|account| account.key.as_str()).collect::<Vec<_>>(), ["session-account"]);
+        for model in ["openai/gpt-test", "anthropic/claude-test", "kiro-http/auto"] {
+            scope.model = Some(model.into());
+            assert!(discover(&runtime, &scope).await.unwrap().is_empty(), "{model}");
+        }
+        scope.model = Some("openai-codex/gpt-test".into());
+        scope.env.clear();
+        assert!(discover(&runtime, &scope).await.unwrap().is_empty());
+    }
     #[test]
     fn projection_uses_duration_not_slot_and_keeps_named_pools() {
         let report = project(&json!({"rate_limit":{"primary_window":{"used_percent":"96","limit_window_seconds":604800}},

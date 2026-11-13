@@ -1,6 +1,6 @@
 # Backend extensions
 
-Paseo's daemon, built-in providers and usage integrations are Rust. Third-party backend plugins are **standalone native executables** using bounded JSONL IPC, not Rust dynamic libraries, JavaScript workers or interpreted shims. The Rust client does not execute plugin UI. This describes the source contract, not publication or deployment evidence. Kiro remains disabled and untouched.
+Paseo's daemon, built-in providers and usage integrations are Rust. Third-party backend plugins are **standalone native executables** using bounded JSONL IPC, not Rust dynamic libraries, JavaScript workers or interpreted shims. The Rust client does not execute plugin UI. This describes the source contract, not publication or deployment evidence. Kiro coding-agent provider enablement is separate from the optional `omp-kiro` account-usage source.
 
 ## Runtime and source ownership
 
@@ -32,7 +32,7 @@ Without `--sdk-path`, the generated SDK dependency uses the Paseo Git repository
 
 Directory, Git, Cargo crate, checksum-pinned HTTPS release and compatible registry sources remain host-side. See the [source/CLI reference](../public-docs/plugins/reference.md#plugin-sources) for exact selectors, preparation, update proposal approval and artifact identities. Remote paths must exist on the selected daemon host; CLI installation does not upload local files.
 
-The root `pluginsEnabled` setting and per-installation enabled flag both gate execution. Directory reload starts a freshly built executable; it does not compile Rust. `plugin logs` returns a recent snapshot, not a live follower. Installation status is not proof of end-to-end behavior.
+The root `pluginsEnabled` setting defaults to `true` when omitted; an explicit `false` still disables all external plugins. Each installation's enabled flag also gates execution, so a disabled installation stays disabled. Directory reload starts a freshly built executable; it does not compile Rust. `plugin logs` returns a recent snapshot, not a live follower. Installation status is not proof of end-to-end behavior.
 
 ## Contributions retained
 

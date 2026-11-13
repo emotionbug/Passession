@@ -45,7 +45,7 @@ paseo plugin ls workspace-plugin
 paseo plugin logs workspace-plugin
 ```
 
-Both the daemon-wide `pluginsEnabled` setting and the installation's enabled flag must allow execution. After changing the root setting in `config.json`, use `paseo reload --json`; `paseo plugin enable workspace-plugin` changes only that installation. A `running` status means activation succeeded, not that every RPC/provider path works or that an old plugin UI is supported.
+The daemon-wide `pluginsEnabled` setting defaults to `true` when omitted; set it to `false` to disable all external plugins. Each installation's enabled flag must also allow execution. Explicit global and per-installation opt-outs are preserved. After changing the root setting in `config.json`, use `paseo reload --json`; `paseo plugin enable workspace-plugin` changes only that installation. A `running` status means activation succeeded, not that every RPC/provider path works or that an old plugin UI is supported.
 
 For a remote daemon, put `--host <url>` before the management command and use an absolute plugin path **on that host**. The CLI does not upload your local files. `plugin init` creates files locally.
 
