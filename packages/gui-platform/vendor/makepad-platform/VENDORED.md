@@ -56,6 +56,19 @@ scoped entry point. Lifecycle and non-input notifications remain broadcasts.
 The adjacent widgets patch applies this scope before navigation and overlays,
 not merely before the window's content view.
 
+Desktop clipboard producers (`xlib_app.rs`, `macos_app.rs`, `win32_window.rs`)
+ask the focused widget through the window-scoped `TextPasteShortcut` event
+before requesting keyboard-shortcut paste. Terminals veto plain Ctrl+V at that
+source; it remains PTY input even when X11 clipboard replies arrive after later
+keys. Ordinary editors allow it by default. Menu, native text-action and IME
+paste delivery does not use this veto; serialized `TextInputEvent` is unchanged.
+
+### Horizontal mouse wheel
+
+X11 button 4/5 and Windows `WM_MOUSEWHEEL` become horizontal scrolling while
+Shift is held. Native horizontal input remains horizontal: X11 button 6/7 and
+Windows `WM_MOUSEHWHEEL` preserve their own direction and modifier state.
+
 ## Windows clipboard ownership
 
 `win32_window.rs` opens the clipboard with a real window owner and closes it on

@@ -188,6 +188,7 @@ pub enum Event {
     KeyDown(KeyEvent),
     KeyUp(KeyEvent),
     TextInput(TextInputEvent),
+    TextPasteShortcut(TextPasteShortcutEvent),
     TextIme(TextImeEvent),
     TextHandle(super::TextHandleEvent),
     TextCopy(TextClipboardEvent),
@@ -232,7 +233,7 @@ impl Event{
     /// Source identity lives in the Cx dispatch scope, not the serialized payload.
     pub fn is_keyboard_input(&self) -> bool {
         matches!(self, Self::KeyDown(_) | Self::KeyUp(_) | Self::TextInput(_)
-            | Self::TextIme(_) | Self::TextCopy(_) | Self::TextCut(_) | Self::TextSelectAll)
+            | Self::TextIme(_) | Self::TextCopy(_) | Self::TextCut(_) | Self::TextSelectAll | Self::TextPasteShortcut(_))
     }
 
     pub fn name(&self)->&'static str{
@@ -311,6 +312,7 @@ impl Event{
             55=>"TextIme",
             56=>"TextSelectAll",
             57=>"TextHandle",
+            58=>"TextPasteShortcut",
             _=>panic!()
         }
     }
@@ -362,6 +364,7 @@ impl Event{
             Self::TextCut(_)=>35,
             Self::TextSelectAll=>56,
             Self::TextHandle(_)=>57,
+            Self::TextPasteShortcut(_)=>58,
 
             Self::Drag(_)=>36,
             Self::Drop(_)=>37,
@@ -414,6 +417,7 @@ pub enum Hit{
     KeyUp(KeyEvent),
     Trigger(TriggerHitEvent),
     TextInput(TextInputEvent),
+    TextPasteShortcut(TextPasteShortcutEvent),
     TextIme(TextImeEvent),
     TextCopy(TextClipboardEvent),
     TextCut(TextClipboardEvent),

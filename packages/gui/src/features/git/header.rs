@@ -7,6 +7,7 @@
 use super::actions::{ArchiveConfirm, Checkout, menu_entries};
 use super::chrome::{palette, ui as ui_px};
 use super::forge_url::{forge_from_remote_url, forge_web_url};
+use super::host;
 use super::json::{flag, text};
 use super::overlay::{MenuEntry, MenuItem, Overlay, OverlayHost, OverlayKind, OverlayResult};
 use super::paint::{Font, GitPaint, rect, with_alpha};
@@ -133,8 +134,7 @@ impl Widget for GitActionsButton {
                 OverlayResult::Chose(ActionsPurpose::Menu, id) => {
                     let confirm = with_store(|store| {
                         let actions = checkout.build(ui, store);
-                        let action = actions.secondary.iter().find(|a| a.id == id).cloned()?;
-                        checkout.run(cx, ui, store, &action)
+                        checkout.run_menu(cx, ui, store, &actions, &id)
                     });
                     if let Some(confirm) = confirm {
                         self.open_confirm(ui, confirm);
@@ -152,15 +152,24 @@ impl Widget for GitActionsButton {
         };
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
-                let part = point_part(e.abs, self.area.rect(cx), self.primary_width);
+                let area = self.area.rect(cx);
+                let part = point_part(e.abs, area, self.primary_width);
                 if self.hovered != Some(part) {
                     self.hovered = Some(part);
                     cx.set_cursor(MouseCursor::Hand);
+                    // The last failure's full message while it is kept.
+                    let failure = with_store(|store| {
+                        store
+                            .last_failure(&self.checkout.host, &self.checkout.cwd)
+                            .map(|f| tr("workspace.git.actions.failure.tooltip", &[("title", f.title.clone()), ("message", f.message.clone())]))
+                    });
+                    tooltip_at(ui, failure.as_deref(), area, 0.3);
                     self.redraw(cx);
                 }
             }
             Hit::FingerHoverOut(_) => {
                 self.hovered = None;
+                tooltip_at(ui, None, Rect::default(), 0.3);
                 self.redraw(cx);
             }
             Hit::FingerDown(e) if e.is_primary_hit() => {
@@ -184,15 +193,29 @@ impl Widget for GitActionsButton {
                         }
                     }
                     Some(Part::Caret) => {
+                        let log = host::supports(ui, &checkout.host, super::log::FEATURE);
                         let entries = with_store(|store| {
                             let actions = checkout.build(ui, store);
-                            let mut entries = menu_entries(&checkout, store, &actions.secondary);
-                            if !entries.is_empty() {
-                                entries.push(MenuEntry::Separator);
+                            let (mut entries, direct) = checkout.menu_extras(ui, store, &actions);
+                            for group in [menu_entries(&checkout, store, &actions.secondary), direct] {
+                                if !group.is_empty() && !entries.is_empty() {
+                                    entries.push(MenuEntry::Separator);
+                                }
+                                entries.extend(group);
                             }
-                            entries.push(MenuEntry::Item(MenuItem::new(GIT_LOG_ITEM, t("workspace.git.log.open")).icon("git-graph")));
+                            // An older daemon has no Git Log: no entry that opens only an update hint.
+                            if log {
+                                if !entries.is_empty() {
+                                    entries.push(MenuEntry::Separator);
+                                }
+                                entries.push(MenuEntry::Item(MenuItem::new(GIT_LOG_ITEM, t("workspace.git.log.open")).icon("git-graph")));
+                            }
                             entries
                         });
+                        if entries.is_empty() {
+                            self.redraw(cx);
+                            return;
+                        }
                         self.overlay.open(Overlay {
                             purpose: ActionsPurpose::Menu,
                             kind: OverlayKind::Menu {
@@ -219,14 +242,19 @@ impl Widget for GitActionsButton {
         };
         self.ensure_bound(cx, ui);
         let checkout = self.checkout.clone();
-        // The caret menu always has at least the Git Log entry.
+        // The caret menu holds the last failure, the secondary actions, the
+        // review-less Commit / Create PR and, on hosts with it, the Git Log entry.
+        let log = host::supports(ui, &checkout.host, super::log::FEATURE);
         let built = with_store(|store| {
             let actions = checkout.build(ui, store);
             let primary = actions.primary.clone()?;
-            Some((checkout.label(store, &primary), primary, true))
+            let failed = store.last_failure(&checkout.host, &checkout.cwd).is_some();
+            let (failure, direct) = checkout.menu_extras(ui, store, &actions);
+            let has_secondary = log || !failure.is_empty() || !direct.is_empty() || !menu_entries(&checkout, store, &actions.secondary).is_empty();
+            Some((checkout.label(store, &primary), primary, has_secondary, failed))
         });
         // Nothing outside a git checkout or without a primary action.
-        let Some((label, primary, has_secondary)) = built else {
+        let Some((label, primary, has_secondary, failed)) = built else {
             // A zero-size absolute rect keeps a redrawable area (no layout spacing):
             // with `Area::Empty` the store's change notification could never redraw it.
             let origin = cx.turtle().pos();
@@ -259,19 +287,22 @@ impl Widget for GitActionsButton {
             self.next_frame = cx.new_next_frame();
         } else {
             let mut x = primary_rect.pos.x + if compact { 12.0 } else { 8.0 };
-            self.paint.icon(cx, Checkout::icon(&primary), 16.0, with_alpha(colors.muted, alpha), dvec2(x + 8.0, center_y));
+            // The last action failed: an alert in place of the action's icon until a success.
+            let (icon, icon_color) = if failed { ("circle-alert", colors.danger) } else { (Checkout::icon(&primary), with_alpha(colors.muted, alpha)) };
+            self.paint.icon(cx, icon, 16.0, icon_color, dvec2(x + 8.0, center_y));
             x += 16.0 + if compact { 8.0 } else { 4.0 };
             self.paint.text_centered(cx, Font::Regular, size, with_alpha(colors.foreground, alpha), x, frame.pos.y, height, &label, primary_width);
         }
+        let border = if failed { with_alpha(colors.danger, 0.7) } else { colors.border_accent };
         if has_secondary {
             let caret = rect(frame.pos.x + primary_width, frame.pos.y, height, height);
             if self.hovered == Some(Part::Caret) || self.overlay.is_open() {
                 self.paint.fill(cx, caret, colors.surface2);
             }
-            self.paint.fill(cx, rect(caret.pos.x, caret.pos.y, 1.0, height), colors.border_accent);
-            self.paint.icon(cx, "chevron-down", 16.0, colors.extra_muted, caret.center());
+            self.paint.fill(cx, rect(caret.pos.x, caret.pos.y, 1.0, height), border);
+            self.paint.icon(cx, "chevron-down", 16.0, colors.muted, caret.center());
         }
-        self.paint.rounded(cx, frame, vec4(0.0, 0.0, 0.0, 0.0), 6.0, Some((colors.border_accent, 1.0)));
+        self.paint.rounded(cx, frame, vec4(0.0, 0.0, 0.0, 0.0), 6.0, Some((border, 1.0)));
         DrawStep::done()
     }
 }
@@ -677,7 +708,7 @@ impl Widget for OpenInButton {
                 self.paint.fill(cx, caret, colors.surface2);
             }
             self.paint.fill(cx, rect(caret.pos.x, caret.pos.y, 1.0, size), colors.border_accent);
-            self.paint.icon(cx, "chevron-down", 16.0, colors.extra_muted, caret.center());
+            self.paint.icon(cx, "chevron-down", 16.0, colors.muted, caret.center());
         }
         self.paint.rounded(cx, frame, vec4(0.0, 0.0, 0.0, 0.0), 6.0, Some((colors.border_accent, 1.0)));
         DrawStep::done()

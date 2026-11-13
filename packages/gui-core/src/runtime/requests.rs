@@ -715,6 +715,28 @@ pub(crate) fn notify(core: &Rc<Core>, host_id: String, message: Value) {
     });
 }
 
+pub(crate) fn terminal_input(core: &Rc<Core>, host_id: String, subscription_id: String, data: Vec<u8>) {
+    let Some(host) = core.host_for(&host_id) else {
+        core.error(Some(&host_id), crate::error::host_unknown(&host_id));
+        return;
+    };
+    let Some(conn) = host.conn().filter(|conn| !conn.closed.get()) else {
+        core.error(Some(&host_id), not_connected());
+        return;
+    };
+    let slot = conn.subscriptions.borrow().get(&subscription_id).and_then(|id| {
+        core.observations.borrow().get(id).and_then(|observation| observation.terminal_slot)
+    });
+    let Some(slot) = slot else {
+        core.error(Some(&host_id), invalid_request("Terminal observation is no longer attached"));
+        return;
+    };
+    let frame = paseo_protocol::binary_frames::encode_terminal_frame(TerminalOpcode::Input, slot, &data);
+    if conn.control.send(Control::TerminalInput(frame.into())).is_err() {
+        core.error(Some(&host_id), not_connected());
+    }
+}
+
 pub(crate) fn cancel(core: &Rc<Core>, request_id: &str) {
     let token = core.requests.borrow().get(request_id).cloned();
     if let Some(token) = token {
@@ -742,6 +764,7 @@ pub(crate) struct Observation {
     /// Fields actually sent, including legacy adjustments.
     pub sent_fields: Value,
     pub subscription_id: Option<String>,
+    terminal_slot: Option<u8>,
     starting: bool,
     has_snapshot: bool,
     pub internal: Option<Internal>,
@@ -752,6 +775,7 @@ impl Observation {
     pub fn reassign(&mut self, host_key: u64) {
         self.host_key = host_key;
         self.subscription_id = None;
+        self.terminal_slot = None;
         self.starting = false;
     }
 
@@ -768,6 +792,7 @@ impl Observation {
             sent_fields: message.clone(),
             fields: message,
             subscription_id: None,
+            terminal_slot: None,
             starting: false,
             has_snapshot: false,
             internal,
@@ -966,6 +991,9 @@ pub(crate) async fn start_observation(core: &Rc<Core>, id: &str, restored: bool)
             let found = match core.observations.borrow_mut().get_mut(&id) {
                 Some(observation) => {
                     observation.subscription_id = Some(subscription.clone());
+                    observation.terminal_slot = (request_type == "subscribe_terminal_request")
+                        .then(|| body["slot"].as_u64().and_then(|slot| u8::try_from(slot).ok()))
+                        .flatten();
                     true
                 }
                 None => false,
@@ -1124,6 +1152,7 @@ pub(crate) fn observations_lost(core: &Rc<Core>, host: &Rc<Host>, error: &CoreEr
         for id in ids {
             let observation = observations.get_mut(&id).expect("listed");
             observation.subscription_id = None;
+            observation.terminal_slot = None;
             observation.starting = false;
             if !observation.has_snapshot {
                 let removed = observations.remove(&id).expect("listed");

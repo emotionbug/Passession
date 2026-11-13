@@ -15,15 +15,17 @@ use super::host;
 use super::json::{array, error_message, flag, object, text};
 use super::model::normalize_compare;
 use super::store::GitStore;
+use super::text::t;
 use super::wire::{self, Failure};
 use crate::common::{PanelTarget, UiContext};
 use paseo_gui_core::{CoreError, CoreEvent, RequestId};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
-const PATCH_UNAVAILABLE: &str = "This file changed since the summary. Refresh to load its current patch.";
-const HOST_DISCONNECTED: &str = "Host disconnected. Repository state is cached until reconnection.";
-const UPDATE_FOR_ALL: &str = "Update the host to view All changes";
+/// Catalog keys of the controller's own messages.
+const PATCH_UNAVAILABLE: &str = "workspace.git.diff.patchUnavailable";
+const HOST_DISCONNECTED: &str = "workspace.git.diff.hostDisconnectedCached";
+const UPDATE_FOR_ALL: &str = "workspace.git.diff.updateForAll";
 
 #[derive(Clone, Copy, Debug)]
 enum StatusPurpose {
@@ -395,7 +397,7 @@ impl DiffController {
                     self.release_observation(ui);
                     self.summary(&json!({
                         "files": [],
-                        "error": { "code": "UNKNOWN", "message": UPDATE_FOR_ALL },
+                        "error": { "code": "UNKNOWN", "message": t(UPDATE_FOR_ALL) },
                     }));
                     self.finish_refresh(ui);
                 } else {
@@ -635,7 +637,7 @@ impl DiffController {
                     Ok(()) => {
                         if !self.too_large && !self.patches.contains_key(path) {
                             // The host omitted this file: it changed after the summary.
-                            self.patch_errors.insert(path.to_owned(), PATCH_UNAVAILABLE.to_owned());
+                            self.patch_errors.insert(path.to_owned(), t(PATCH_UNAVAILABLE));
                         }
                     }
                     Err(message) => {
@@ -713,7 +715,7 @@ impl DiffController {
                     self.patches.clear();
                     self.loading = false;
                     self.patch_loading = false;
-                    self.error = Some(HOST_DISCONNECTED.to_owned());
+                    self.error = Some(t(HOST_DISCONNECTED));
                     self.dirty = true;
                 }
                 CoreEvent::HostEvent { host_id, event } if *host_id == self.host => {

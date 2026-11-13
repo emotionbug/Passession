@@ -70,7 +70,8 @@ fn install(s: &mut Settings, _env: &mut Env) {
             }
         });
     });
-    s.confirm(t("settings.about.updates.installTitle"), t("settings.about.updates.installMessage"), None, false, go);
+    let message = format!("{}\n{}", t("settings.about.updates.installMessage"), t("desktop.updates.callout.restartWarning"));
+    s.confirm(t("settings.about.updates.installTitle"), message, t("settings.about.updates.installConfirm"), false, go);
 }
 
 pub fn draw_about(ui: &mut Ui, s: &Settings, v: &View) {

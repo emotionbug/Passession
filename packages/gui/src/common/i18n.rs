@@ -65,6 +65,16 @@ pub fn locale_tag() -> &'static str {
     }
 }
 
+/// A short calendar date without the year in the active language: "Jan 5" / "1월 5일".
+/// `month0` is 0-based (chrono `month0`).
+pub fn month_day(month0: u32, day: u32) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    match LANG.with(Cell::get) {
+        Lang::Ko => format!("{}월 {day}일", month0 + 1),
+        Lang::En => format!("{} {day}", MONTHS[month0 as usize % 12]),
+    }
+}
+
 fn lookup<'a>(catalog: &'a Value, key: &str) -> Option<&'a str> {
     let mut current = catalog;
     for part in key.split('.') {

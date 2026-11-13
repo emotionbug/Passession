@@ -38,11 +38,20 @@ pub fn message_timestamp(millis: i64) -> String {
         };
         return format!("{name} {time}");
     }
+    let date = date_label(local.year(), local.month(), local.day(), local.weekday().num_days_from_monday() as usize, local.year() == Local::now().year(), ko);
+    if ko { format!("{date} {time}") } else { format!("{date}, {time}") }
+}
+
+/// The date of an older message: Korean `11월 14일 (금)` (with `2025년` outside the current
+/// year), English `Nov 14, 2025`.
+fn date_label(year: i32, month: u32, day: u32, weekday: usize, this_year: bool, ko: bool) -> String {
     if ko {
-        format!("{}. {}. {}., {time}", local.year(), local.month(), local.day())
+        let short = ["월", "화", "수", "목", "금", "토", "일"][weekday % 7];
+        let date = format!("{month}월 {day}일 ({short})");
+        if this_year { date } else { format!("{year}년 {date}") }
     } else {
-        let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][local.month0() as usize];
-        format!("{month} {}, {}, {time}", local.day(), local.year())
+        let name = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(month as usize).saturating_sub(1) % 12];
+        format!("{name} {day}, {year}")
     }
 }
 
@@ -105,5 +114,19 @@ pub fn compaction_label(status: &str, trigger: Option<&str>, pre_tokens: Option<
             Some(tokens) if tokens != 0.0 => ta("message.compaction.withTokens", &[("tokens", &((tokens / 1000.0).round() as i64).to_string())]),
             _ => t("message.compaction.completed"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::date_label;
+
+    #[test]
+    fn older_dates_follow_the_locale() {
+        // 2026-11-14 is a Saturday (index 5 from Monday).
+        assert_eq!(date_label(2026, 11, 14, 5, true, true), "11월 14일 (토)");
+        assert_eq!(date_label(2025, 11, 14, 4, false, true), "2025년 11월 14일 (금)");
+        assert_eq!(date_label(2025, 1, 3, 4, false, false), "Jan 3, 2025");
+        assert_eq!(date_label(2026, 12, 31, 3, true, false), "Dec 31, 2026");
     }
 }

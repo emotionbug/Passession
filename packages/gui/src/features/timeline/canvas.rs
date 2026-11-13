@@ -9,7 +9,6 @@
 use crate::features::files::kit::DrawFilesImage;
 use crate::theme::DrawBox;
 use makepad_widgets::makepad_draw::cx_draw::CxDraw;
-use makepad_widgets::makepad_draw::shader::draw_text::FontFamily as DrawTextFontFamily;
 use makepad_widgets::makepad_draw::text::color::Color as TextColor;
 use makepad_widgets::makepad_draw::text::font_family::FontFamilyId;
 use makepad_widgets::makepad_draw::text::fonts::Fonts;
@@ -103,17 +102,9 @@ pub struct RichSpan {
     pub color: Vec4,
 }
 
-/// The font family a DrawText's text style resolved to. Makepad 1.0.0 keeps
-/// `FontFamily::id` private while `Fonts::get_or_layout` needs it for
-/// multi-span layout; `FontFamily` is a single `LiveId` (u64) field, which the
-/// compile-time size check below pins for the pinned version.
+/// The font family a DrawText's text style resolved to (multi-span layout needs it).
 fn family_id(dt: &DrawText) -> FontFamilyId {
-    const _: () = assert!(std::mem::size_of::<DrawTextFontFamily>() == std::mem::size_of::<u64>());
-    // SAFETY: `FontFamily` (makepad-draw 1.0.0, shader/draw_text.rs) is
-    // `struct FontFamily { #[rust] id: LiveId }` with `LiveId(pub u64)`: one
-    // 8-byte field, so its bytes are exactly the id.
-    let raw: u64 = unsafe { std::mem::transmute_copy(&dt.text_style.font_family) };
-    raw.into()
+    dt.text_style.font_family.font_family_id()
 }
 
 fn text_color(color: Vec4) -> TextColor {
@@ -153,6 +144,9 @@ pub struct ChatKit {
     /// Only set by final-position painting, never preliminary PortalList layout.
     #[rust]
     pub viewport: Option<Rect>,
+    /// The draw-call group `begin_layer` opened (rects return to it after `rects_on_top`).
+    #[rust]
+    layer_group: LiveId,
 }
 
 pub fn rgba(hex: u32) -> Vec4 {
@@ -263,6 +257,7 @@ impl ChatKit {
     /// background before text. A new rect call alone is not a layer barrier.
     pub fn begin_layer(&mut self, cx: &mut Cx2d) {
         let group = LiveId::unique();
+        self.layer_group = group;
         for vars in [
             &mut self.rect.draw_vars,
             &mut self.image.draw_vars,
@@ -280,6 +275,18 @@ impl ChatKit {
             vars.set_draw_call_group(group);
         }
         self.rect.new_draw_call(cx);
+    }
+
+    /// Draws `paint`'s rects above everything drawn so far in this layer (scroll bars, edge
+    /// fades over text), then returns rects to the layer's background batch.
+    pub fn rects_on_top(&mut self, cx: &mut Cx2d, paint: impl FnOnce(&mut Self, &mut Cx2d)) {
+        if self.dry {
+            return;
+        }
+        self.rect.draw_vars.set_draw_call_group(LiveId::unique());
+        self.rect.new_draw_call(cx);
+        paint(self, cx);
+        self.rect.draw_vars.set_draw_call_group(self.layer_group);
     }
 
     pub fn draw_laidout(&mut self, cx: &mut Cx2d, font: Font, color: Vec4, pos: DVec2, laidout: &LaidoutText) {
@@ -511,6 +518,8 @@ pub enum HitTarget {
     ScrollX(String),
     /// Vertically capped detail region.
     ScrollY(String),
+    /// A region's scroll bar strip along one axis (thumb drag, track paging).
+    ScrollBar { key: String, vertical: bool, track: super::scrollbar::Track },
     /// Panel chrome.
     Chrome(String),
 }
@@ -921,6 +930,7 @@ mod range_rect_tests {
                 index: 0,
                 ascender_fudge_in_ems: 0.0,
                 descender_fudge_in_ems: 0.0,
+                variations: Vec::new(),
             });
             layouter.define_font_family(family, FontFamilyDefinition { font_ids: vec![font] });
         }

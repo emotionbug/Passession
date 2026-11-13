@@ -418,14 +418,16 @@ impl XlibApp {
                             // completely arbitrary scroll acceleration curve.
                             let speed = 1200.0 * (0.2 - 2. * (self.last_scroll_time - last_scroll_time)).max(0.01);
                             
+                            let modifiers = self.xkeystate_to_modifiers(button.state);
+                            let vertical = if button.button == 4 {-speed} else if button.button == 5 {speed} else {0.};
+                            let horizontal = if button.button == 6 {-speed} else if button.button == 7 {speed} else {0.};
+                            // Shift + wheel scrolls sideways, as in GTK and browsers.
+                            let (x, y) = if modifiers.shift && horizontal == 0.0 { (vertical, 0.0) } else { (horizontal, vertical) };
                             self.do_callback(XlibEvent::Scroll(ScrollEvent {
                                 window_id: window.window_id,
-                                scroll: DVec2 {
-                                    x: if button.button == 6 {-speed} else if button.button == 7 {speed} else {0.},
-                                    y: if button.button == 4 {-speed} else if button.button == 5 {speed} else {0.}
-                                },
+                                scroll: DVec2 { x, y },
                                 abs: window.last_mouse_pos,
-                                modifiers: self.xkeystate_to_modifiers(button.state),
+                                modifiers,
                                 is_mouse: true,
                                 handled_x: Cell::new(false),
                                 handled_y: Cell::new(false),
@@ -509,24 +511,18 @@ impl XlibApp {
                             if modifiers.control || modifiers.logo {
                                 match key_code {
                                     KeyCode::KeyV => { // paste
-                                        // request the pasteable text from the other side
-                                        x11_sys::XConvertSelection(
-                                            self.display,
-                                            self.atoms.clipboard,
-                                            self.atoms.utf8_string,
-                                            self.atoms.clipboard,
-                                            window.window.unwrap(),
-                                            event.xkey.time
-                                        );
-                                        /*
-                                        self.do_callback(&mut vec![
-                                            Event::TextInput(TextInputEvent {
-                                                input: String::new(),
-                                                was_paste: true,
-                                                replace_last: false
-                                            })
-                                        ]);
-                                        */
+                                        let request = crate::event::TextPasteShortcutEvent::new(modifiers);
+                                        self.do_callback(XlibEvent::TextPasteShortcut(window.window_id, request.clone()));
+                                        if request.allowed.get() {
+                                            x11_sys::XConvertSelection(
+                                                self.display,
+                                                self.atoms.clipboard,
+                                                self.atoms.utf8_string,
+                                                self.atoms.clipboard,
+                                                window.window.unwrap(),
+                                                event.xkey.time
+                                            );
+                                        }
                                     }
                                     KeyCode::KeyC => {
                                         let response = Rc::new(RefCell::new(None));

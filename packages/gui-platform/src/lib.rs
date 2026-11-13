@@ -12,6 +12,7 @@ pub mod legacy_prefs;
 pub mod notification_policy;
 pub mod paths;
 mod facade;
+mod fonts;
 mod platform;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub(crate) mod prefs;
@@ -37,6 +38,10 @@ pub(crate) mod android;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) mod apple;
+/// CoreText font discovery shared by macOS and iOS.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[path = "apple/fonts.rs"]
+pub(crate) mod apple_fonts;
 
 #[cfg(target_os = "ios")]
 pub(crate) mod ios;

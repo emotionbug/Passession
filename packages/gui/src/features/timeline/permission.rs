@@ -545,12 +545,12 @@ fn question_option(cx: &mut Cx2d, d: &mut Draw, key: &str, option: &Value, j: us
     }
     let control = rect_xywh(x + 12.0, y + 10.0, 18.0, 18.0);
     if multi {
-        d.kit.bordered(cx, control, if selected { p.accent } else { TRANSPARENT }, 4.0, if selected { p.accent } else { p.extra_muted }, 1.0);
+        d.kit.bordered(cx, control, if selected { p.accent } else { TRANSPARENT }, 4.0, if selected { p.accent } else { p.muted }, 1.0);
         if selected {
             d.kit.icon(cx, "check", control, 12.0, p.on_tertiary);
         }
     } else {
-        d.kit.bordered(cx, control, TRANSPARENT, 9.0, if selected { p.accent } else { p.extra_muted }, 1.0);
+        d.kit.bordered(cx, control, TRANSPARENT, 9.0, if selected { p.accent } else { p.muted }, 1.0);
         if selected {
             d.kit.rect(cx, rect_xywh(control.pos.x + 5.0, control.pos.y + 5.0, 8.0, 8.0), p.accent, 4.0);
         }

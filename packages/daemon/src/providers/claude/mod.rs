@@ -1215,14 +1215,6 @@ impl AgentSession for ClaudeSession {
         };
         let request = permission.request;
         let native_response = projection::permission_response(&request, &response)?;
-        self.state
-            .lock()
-            .unwrap()
-            .permissions
-            .remove(request_id)
-            .ok_or_else(|| {
-                anyhow!("Permission request '{request_id}' was already resolved or canceled")
-            })?;
         if request["kind"] == "plan" && response["behavior"] == "allow" {
             let prior = resume
                 .as_deref()
@@ -1234,6 +1226,14 @@ impl AgentSession for ClaudeSession {
             };
             self.set_mode(mode).await?;
         }
+        self.state
+            .lock()
+            .unwrap()
+            .permissions
+            .remove(request_id)
+            .ok_or_else(|| {
+                anyhow!("Permission request '{request_id}' was already resolved or canceled")
+            })?;
         runtime
             .reply(&permission.native_id, Ok(native_response))
             .await?;
@@ -1635,5 +1635,88 @@ impl ClaudeSession {
             }
         }
         Err(failure)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_plan_mode_change_keeps_permission_pending_for_retry() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let cancel = CancellationToken::new();
+        let (sink, mut events) = EventSink::channel(16, cancel.child_token());
+        let provider = ClaudeProvider::new(ProviderSpec {
+            id: "claude".into(),
+            family: "claude".into(),
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            options: json!({}),
+            defaults: json!({}),
+            runtime_settings: json!({}),
+            configured_models: Vec::new(),
+        });
+        let session = provider.session(
+            json!({"cwd":root.path(),"modeId":"plan"}),
+            LaunchContext {
+                agent_id: "permission-test".into(),
+                home: root.path().into(),
+                executable: std::env::current_exe()?,
+                env: BTreeMap::new(),
+                mcp_servers: json!({}),
+                tool_catalog: json!([]),
+                tool_manifest: json!([]),
+                tool_executor: None,
+                cancel: cancel.child_token(),
+            },
+            json!({}),
+            None,
+            sink,
+        ).await?;
+        // Reject the real control-channel mode request before any approval reply.
+        let script = r#"
+while IFS= read -r line; do
+    case "$line" in
+        *'"type":"control_request"'*)
+            id=${line#*'"request_id":"'}
+            id=${id%%'"'*}
+            printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Mode change rejected"}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+        let (runtime, _incoming) = Transport::spawn(
+            CommandSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                cwd: Some(root.path().into()),
+                env: BTreeMap::new(),
+                clear_env: true,
+            },
+            cancel.child_token(),
+        ).await?;
+        let request = json!({"id":"plan","kind":"plan","name":"ExitPlanMode","input":{"plan":"Plan"}});
+        {
+            let mut state = session.state.lock().unwrap();
+            state.runtime = Some(runtime.clone());
+            state.permissions.insert("plan".into(), Permission {
+                request: request.clone(),
+                native_id: "native-plan".into(),
+            });
+        }
+        for _ in 0..2 {
+            let error = session.respond_to_permission("plan", json!({"behavior":"allow"}))
+                .await.unwrap_err();
+            assert_eq!(error.to_string(), "Mode change rejected");
+            assert_eq!(session.pending_permissions(), vec![request.clone()]);
+            assert!(events.try_recv().is_err());
+        }
+        session.respond_to_permission("plan", json!({"behavior":"deny"})).await?;
+        assert!(session.pending_permissions().is_empty());
+        assert_eq!(events.recv().await.unwrap()["type"], "timeline");
+        assert_eq!(events.recv().await.unwrap()["type"], "permission_resolved");
+        runtime.close().await?;
+        Ok(())
     }
 }

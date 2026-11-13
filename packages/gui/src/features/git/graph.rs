@@ -36,15 +36,18 @@ struct Lane {
     color: usize,
 }
 
-/// The rows of `commits` (sha, parents) in response order.
-pub fn build<'a, I>(commits: I) -> Vec<GraphRow>
-where
-    I: IntoIterator<Item = (&'a str, &'a [String])>,
-{
-    let mut lanes: Vec<Option<Lane>> = Vec::new();
-    let mut next_color = 0usize;
-    let mut rows = Vec::new();
-    for (sha, parents) in commits {
+/// The lane state after the rows built so far; [`push`](Self::push) appends
+/// one row. Earlier rows never change, so pages extend the graph in place.
+#[derive(Clone, Debug, Default)]
+pub struct Builder {
+    lanes: Vec<Option<Lane>>,
+    next_color: usize,
+}
+
+impl Builder {
+    /// The row of the next commit in response order.
+    pub fn push(&mut self, sha: &str, parents: &[String]) -> GraphRow {
+        let Self { lanes, next_color } = self;
         let waiting: Vec<usize> = lanes
             .iter()
             .enumerate()
@@ -54,8 +57,8 @@ where
         let (lane, color) = match waiting.first() {
             Some(&index) => (index, lanes[index].as_ref().map_or(0, |l| l.color)),
             None => {
-                let color = next_color;
-                next_color += 1;
+                let color = *next_color;
+                *next_color += 1;
                 let index = lanes.iter().position(Option::is_none).unwrap_or(lanes.len());
                 (index, color)
             }
@@ -93,8 +96,8 @@ where
             match existing {
                 Some((index, lane_color)) => bottom.push(Edge { from: lane, to: index, color: lane_color }),
                 None => {
-                    let merge_color = next_color;
-                    next_color += 1;
+                    let merge_color = *next_color;
+                    *next_color += 1;
                     let index = lanes.iter().position(Option::is_none).unwrap_or(lanes.len());
                     if index == lanes.len() {
                         lanes.push(None);
@@ -118,9 +121,18 @@ where
             lanes.pop();
         }
         let width = top_width.max(lanes.len()).max(lane + 1);
-        rows.push(GraphRow { lane, color, top, bottom, lanes: width });
+        GraphRow { lane, color, top, bottom, lanes: width }
     }
-    rows
+}
+
+/// The rows of `commits` (sha, parents) in response order.
+#[cfg(test)]
+pub fn build<'a, I>(commits: I) -> Vec<GraphRow>
+where
+    I: IntoIterator<Item = (&'a str, &'a [String])>,
+{
+    let mut builder = Builder::default();
+    commits.into_iter().map(|(sha, parents)| builder.push(sha, parents)).collect()
 }
 
 #[cfg(test)]
@@ -250,5 +262,15 @@ mod tests {
             let prefix = graph(&full[..split]);
             assert_eq!(prefix, all[..split].to_vec(), "prefix of {split} rows");
         }
+    }
+
+    #[test]
+    fn builder_continues_across_pages() {
+        let full = commits(&[("m", &["b", "f"]), ("f", &["a"]), ("b", &["a"]), ("x", &["a"]), ("a", &[])]);
+        let all = graph(&full);
+        let mut builder = Builder::default();
+        let mut rows: Vec<GraphRow> = full[..2].iter().map(|(sha, parents)| builder.push(sha, parents)).collect();
+        rows.extend(full[2..].iter().map(|(sha, parents)| builder.push(sha, parents)));
+        assert_eq!(rows, all);
     }
 }

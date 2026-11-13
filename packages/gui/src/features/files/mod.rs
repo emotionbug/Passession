@@ -288,7 +288,7 @@ impl Widget for FilesPanel {
         let mut changed = false;
         if let Some(explorer) = self.explorer.as_mut() {
             explorer.hit_shift = shift;
-            changed |= explorer.handle_event(cx, &mut self.kit, event, ui, area);
+            changed |= explorer.handle_event(cx, event, ui, area);
         }
         if let Some(file) = self.file.as_mut()
             && !self.target.as_ref().is_some_and(|t| t.cwd.is_empty()) {

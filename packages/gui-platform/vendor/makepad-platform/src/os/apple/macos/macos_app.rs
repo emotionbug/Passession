@@ -440,18 +440,21 @@ impl MacosApp {
                     #[cfg(target_os = "macos")]
                     match key_code {
                         KeyCode::KeyV => if modifiers.logo || modifiers.control {
-                            // was a paste
-                            let pasteboard: ObjcId = with_macos_app(|app| app.pasteboard);
-                            let nsstring: ObjcId = msg_send![pasteboard, stringForType: NSStringPboardType];
-                            if nsstring != std::ptr::null_mut() {
-                                let string = nsstring_to_string(nsstring);
-                                MacosApp::do_callback(
-                                    MacosEvent::TextInput(window_id, TextInputEvent {
-                                        input: string,
-                                        was_paste: true,
-                                        replace_last: false
-                                    })
-                                );
+                            let request = crate::event::TextPasteShortcutEvent::new(modifiers);
+                            MacosApp::do_callback(MacosEvent::TextPasteShortcut(window_id, request.clone()));
+                            if request.allowed.get() {
+                                let pasteboard: ObjcId = with_macos_app(|app| app.pasteboard);
+                                let nsstring: ObjcId = msg_send![pasteboard, stringForType: NSStringPboardType];
+                                if nsstring != std::ptr::null_mut() {
+                                    let string = nsstring_to_string(nsstring);
+                                    MacosApp::do_callback(
+                                        MacosEvent::TextInput(window_id, TextInputEvent {
+                                            input: string,
+                                            was_paste: true,
+                                            replace_last: false
+                                        })
+                                    );
+                                }
                             }
                         },
                         KeyCode::KeyC => if modifiers.logo || modifiers.control {

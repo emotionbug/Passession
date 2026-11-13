@@ -358,6 +358,14 @@ impl PlatformHandle {
         id
     }
 
+    /// The current notification permission, without prompting.
+    pub fn notification_permission_status(&self) -> PlatformRequestId {
+        let done = self.0.completion();
+        let id = done.id();
+        native::notification_permission_status(self.shared(), done);
+        id
+    }
+
     pub fn set_badge_count(&self, count: u32) -> PlatformRequestId {
         let done = self.0.completion();
         let id = done.id();

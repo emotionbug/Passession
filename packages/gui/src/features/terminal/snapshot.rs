@@ -17,6 +17,9 @@ pub fn render_terminal_snapshot(state: &Value) -> String {
     let has_wraps = wraps.len() == rows.len();
     let cols = int_of(state, "cols").max(0) as usize;
     let mut out = String::new();
+    if flag(state, "alternateScreen") {
+        out.push_str("\x1b[?1049h");
+    }
     if !has_wraps {
         out.push_str("\x1b[?7l");
     }
@@ -153,5 +156,18 @@ mod tests {
         assert!(text.contains("\x1b[0;91mx"));
         assert!(text.contains("\x1b[0;48;2;16;32;48my"));
         assert!(text.ends_with("\x1b[?25l\x1b[?7h"));
+    }
+
+    #[test]
+    fn alternate_snapshot_enters_buffer_before_drawing_its_cells() {
+        let state = json!({
+            "rows": 2, "cols": 10, "alternateScreen": true,
+            "grid": [[{"char":"x"}], []], "scrollback": [],
+            "cursor": {"row":0, "col":1}
+        });
+        let mut screen = crate::features::terminal::screen::Screen::new(100).unwrap();
+        screen.replace(&render_terminal_snapshot(&state), Some((2, 10)), None).unwrap();
+        assert!(screen.modes().alternate_screen);
+        assert_eq!(screen.read(0, 1)[0].text, "x");
     }
 }

@@ -138,9 +138,9 @@ pub(crate) fn handle_event(cx: &mut Cx, shared: &Arc<Shared>, state: &mut Platfo
             MobileSignal::Link(url) => shared.mobile.receive_link(url),
             MobileSignal::NotificationTap(id, data) => receive_tap(shared, id, data),
             MobileSignal::Resumed => {
-                // Original didChangeAppLifecycleState(resumed).
+                // Original didChangeAppLifecycleState(resumed). The badge is not reset here:
+                // the shell re-sends the count of sessions still waiting once it is visible.
                 request_notifications(shared, false, None);
-                crate::native::set_badge_count(shared, 0, shared.completion());
             }
             MobileSignal::Insets(insets) => {
                 *shared.insets.lock().unwrap() = insets;
@@ -159,8 +159,8 @@ fn receive_tap(shared: &Arc<Shared>, id: String, data: Map<String, Value>) {
         return;
     }
     if let Some(route) = PlatformRoute::from_notification_data(&data) {
+        // Other sessions may still wait: the shell keeps the badge at their count.
         shared.mobile.route(PlatformEvent::Route(route));
-        crate::native::set_badge_count(shared, 0, shared.completion());
     }
 }
 

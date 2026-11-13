@@ -929,7 +929,7 @@ impl WaProjectSettingsView {
                             title: Some(t("settings.project.edit.chooseImage")),
                         }));
                     }
-                    None => self.project_sheet.icon_error = Some("Platform services are unavailable".into()),
+                    None => self.project_sheet.icon_error = Some(t("settings.project.edit.platformUnavailable")),
                 }
             }
             if view.wa_button(id!(use_automatic)).clicked(actions) && !self.project_sheet.saving {

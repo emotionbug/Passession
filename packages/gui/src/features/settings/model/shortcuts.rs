@@ -245,7 +245,7 @@ pub fn format_step(step: &str) -> String {
             "mod" | "ctrl" => "Ctrl".to_string(),
             "alt" => "Alt".to_string(),
             "shift" => "Shift".to_string(),
-            "meta" => "Win".to_string(),
+            "meta" => if cfg!(target_os = "windows") { "Win" } else { "Super" }.to_string(),
             other => other.to_string(),
         })
         .collect();

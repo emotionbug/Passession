@@ -64,8 +64,26 @@ impl Layouter {
         self.loader.define_font(id, definition);
     }
 
+    /// Replaces a family's font list and forgets every cached layout, since any
+    /// of them may have shaped text with the previous list.
+    pub fn redefine_font_family(&mut self, id: FontFamilyId, definition: FontFamilyDefinition) {
+        self.loader.redefine_font_family(id, definition);
+        self.cached_params.clear();
+        self.cached_results.clear();
+    }
+
+    /// Loads a font that a layout worker already placed glyphs from. The worker
+    /// parsed the same immutable definition bytes, so loading cannot fail here.
     pub(super) fn load_font(&mut self, id: FontId) -> Rc<Font> {
-        self.loader.get_or_load_font(id).clone()
+        self.loader
+            .get_or_load_font(id)
+            .expect("font placed by the layout worker must load")
+            .clone()
+    }
+
+    /// Loads a defined font; `None` when its face does not parse.
+    pub fn try_load_font(&mut self, id: FontId) -> Option<Rc<Font>> {
+        self.loader.get_or_load_font(id).cloned()
     }
 
     /// Uncached authoritative layout for the worker; never hashes or copies the source.
@@ -944,6 +962,7 @@ mod paseo_linebreak_tests {
         layouter.define_font(font_id, FontDefinition {
             data: std::sync::Arc::new(data.to_vec()),
             index: 0,
+            variations: Vec::new(),
             ascender_fudge_in_ems: 0.0,
             descender_fudge_in_ems: 0.0,
         });

@@ -172,6 +172,9 @@ impl State {
             "scrollback": scrollback.iter().map(row_json).collect::<Vec<_>>(),
             "cursor": self.cursor_json(),
         });
+        if self.emulator.modes().alternate_screen {
+            state["alternateScreen"] = json!(true);
+        }
         if let Some(title) = &self.title {
             state["title"] = json!(title);
         }
@@ -228,6 +231,7 @@ impl State {
         if modes.bracketed_paste {
             result.push_str("\x1b[?2004h");
         }
+        result.push_str(&self.emulator.mouse_mode_preamble());
         result
     }
 
@@ -242,6 +246,9 @@ impl State {
             extent.history
         };
         let mut output = String::new();
+        if self.emulator.modes().alternate_screen {
+            output.push_str("\x1b[?1049h");
+        }
         let last = extent.total() - 1;
         for physical in extent.history - history..=last {
             let row = self.emulator.row(physical);

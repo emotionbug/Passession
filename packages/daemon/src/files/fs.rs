@@ -312,7 +312,9 @@ pub fn list(root: &str, path: &str, home: &Path, cancel: &CancellationToken) -> 
                 )
             })
     });
-    Ok(json!({"path":scope.relative,"entries":entries}))
+    // The expanded, normalized requested directory (not the canonical symlink target), so
+    // clients can show and navigate the user's own path.
+    Ok(json!({"path":scope.relative,"absolutePath":scope.requested.to_string_lossy(),"entries":entries}))
 }
 pub fn read(
     root: &str,
@@ -969,6 +971,21 @@ mod tests {
             &CancellationToken::new(),
         );
         assert_eq!(result["error"], "File is too large to edit");
+    }
+    #[test]
+    fn listing_reports_the_expanded_absolute_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(home.join("work/src")).unwrap();
+        let cancel = CancellationToken::new();
+        let listed = list("~", ".", &home, &cancel).unwrap();
+        assert_eq!(listed["path"], ".");
+        assert_eq!(listed["absolutePath"], home.to_string_lossy().as_ref());
+        let nested = list("~", "work/./src/..", &home, &cancel).unwrap();
+        assert_eq!(nested["absolutePath"], home.join("work").to_string_lossy().as_ref());
+        let absolute = home.join("work/src");
+        let listed = list("~", &absolute.to_string_lossy(), &home, &cancel).unwrap();
+        assert_eq!(listed["absolutePath"], absolute.to_string_lossy().as_ref());
     }
     #[test]
     fn external_paths_roundtrip_reads_lists_and_versioned_writes() {

@@ -9,6 +9,8 @@ pub mod appearance {
         time::{Duration, Instant},
     };
 
+    pub use crate::fonts::{parse_family_list, system_fonts, FontFace, FontRequest, RoleSet, SystemFonts};
+
     /// Android's SP-to-DP curve, sampled at its nonlinear font-scaling knots.
     /// Display density is removed on the Java side; these are text metrics only.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,6 +33,31 @@ pub mod appearance {
             assert!(dp[0] == 0.0 && dp.iter().all(|value| value.is_finite()));
             assert!(dp.windows(2).all(|pair| pair[1] > pair[0]));
             Self { dp }
+        }
+
+        /// `from_dp` for OS-provided samples: `None` unless they start at 0
+        /// and strictly increase.
+        #[cfg_attr(not(any(target_os = "android", target_os = "ios", test)), allow(dead_code))]
+        pub(crate) fn checked(dp: [f64; 10]) -> Option<Self> {
+            let valid = dp[0] == 0.0 && dp.iter().all(|value| value.is_finite()) && dp.windows(2).all(|pair| pair[1] > pair[0]);
+            valid.then_some(Self { dp })
+        }
+
+        /// Samples an OS scaling function (iOS Dynamic Type) at the SP knots;
+        /// the identity when it is not a valid curve.
+        #[cfg_attr(not(any(target_os = "ios", test)), allow(dead_code))]
+        pub(crate) fn from_curve(scale: impl Fn(f64) -> f64) -> Self {
+            Self::checked(Self::SP.map(|sp| if sp == 0.0 { 0.0 } else { scale(sp) })).unwrap_or_default()
+        }
+
+        /// A uniform OS text-scale factor (GNOME `text-scaling-factor`,
+        /// Windows `TextScaleFactor` / 100). Non-positive or non-finite
+        /// factors are the identity.
+        pub fn from_factor(factor: f64) -> Self {
+            if !factor.is_finite() || factor <= 0.0 {
+                return Self::default();
+            }
+            Self { dp: Self::SP.map(|sp| sp * factor) }
         }
 
         pub fn logical_size(&self, sp: f64) -> f64 {
@@ -65,6 +92,19 @@ pub mod appearance {
             assert_eq!(nonlinear.logical_size(24.0), 40.0);
             assert_eq!(nonlinear.logical_size(200.0), 232.0);
         }
+
+        #[test]
+        fn text_scale_from_factor() {
+            assert_eq!(TextScale::from_factor(1.0), TextScale::default());
+            assert_eq!(TextScale::from_factor(1.25).logical_size(14.0), 17.5);
+            assert_eq!(TextScale::from_factor(2.25).logical_size(100.0), 225.0);
+            assert_eq!(TextScale::from_factor(0.0), TextScale::default());
+            assert_eq!(TextScale::from_factor(f64::NAN), TextScale::default());
+            assert_eq!(TextScale::checked([0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]), None);
+            assert!(TextScale::checked(TextScale::SP).is_some());
+            assert_eq!(TextScale::from_curve(|sp| sp * 2.0).logical_size(14.0), 28.0);
+            assert_eq!(TextScale::from_curve(|_| 17.0), TextScale::default());
+        }
     }
 
     struct Cached {
@@ -82,11 +122,17 @@ pub mod appearance {
         if stale {
             #[cfg(target_os = "android")]
             let (dark, language, text_scale) = crate::native::system_appearance();
-            #[cfg(not(target_os = "android"))]
+            #[cfg(target_os = "ios")]
             let (dark, language, text_scale) = (
                 crate::native::system_prefers_dark(),
                 crate::native::system_language(),
-                TextScale::default(),
+                crate::native::system_text_scale(),
+            );
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let (dark, language, text_scale) = (
+                crate::native::system_prefers_dark(),
+                crate::native::system_language(),
+                crate::desktop::os::system_text_scale(),
             );
             *cache = Some(Cached {
                 at: Instant::now(),
@@ -180,6 +226,39 @@ pub mod desktop {
         {
             let _ = (command, args);
             Err("Mobile clients never manage a local daemon.".to_owned())
+        }
+    }
+
+    /// The built-in daemon as the first-run screen shows it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum LocalDaemon {
+        /// Not a desktop host, or the platform layer did not start.
+        Unavailable,
+        /// Not being started (management off) and no failure recorded.
+        Idle,
+        /// Auto-start or a start command is waiting for the daemon's listen address.
+        Starting,
+        /// The daemon listens; its host connects through the core.
+        Running,
+        /// The last start failed with this message.
+        Failed(String),
+    }
+
+    /// Current built-in daemon state; cheap, safe to call while drawing.
+    pub fn local_daemon() -> LocalDaemon {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let Some(handle) = crate::platform() else { return LocalDaemon::Unavailable };
+            match handle.0.desktop.local_daemon() {
+                (true, _, _) => LocalDaemon::Starting,
+                (false, Some(failure), _) => LocalDaemon::Failed(failure),
+                (false, None, true) => LocalDaemon::Running,
+                (false, None, false) => LocalDaemon::Idle,
+            }
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            LocalDaemon::Unavailable
         }
     }
 }

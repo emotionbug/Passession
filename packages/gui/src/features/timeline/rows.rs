@@ -210,7 +210,7 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
             let badge = Badge {
                 key: format!("thinking:{id}"),
                 glyph: ToolGlyph::Brain,
-                label: "Thinking".into(),
+                label: t("agentControls.thinking.title"),
                 secondary: None,
                 loading: streaming,
                 error: false,
@@ -293,11 +293,11 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
         "error" | "notification" => {
             let (cx0, cw) = content_box(&look, x, w, false);
             let (level, message) = if kind == "error" {
-                ("error", str_or(get(item, "message"), "Unknown error").to_owned())
+                ("error", str_of(get(item, "message")).to_owned())
             } else {
                 (str_or(get(item, "level"), "info"), str_of(get(item, "message")).to_owned())
             };
-            let message = if kind == "error" && message.is_empty() { "Unknown error".to_owned() } else { message };
+            let message = if kind == "error" && message.is_empty() { t("agentStream.unknownError") } else { message };
             notification(cx, d, level, &message, cx0, y, cw) + gap_below
         }
         _ => {
@@ -468,9 +468,10 @@ fn user_message(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, entry: 
             }
             if let Some(ms) = parse_time(get(entry, "timestamp")) {
                 let stamp = format::message_timestamp(ms);
-                let size = d.kit.measure(cx, Font::Regular, STREAM_METADATA_SIZE, 1.3, &stamp, None);
+                let meta = look.ui(STREAM_METADATA_SIZE);
+                let size = d.kit.measure(cx, Font::Regular, meta, 1.3, &stamp, None);
                 rx -= 8.0 + size.x;
-                d.kit.label(cx, Font::Regular, STREAM_METADATA_SIZE, 1.3, p.muted, dvec2(rx, ry + (24.0 - size.y) * 0.5), &stamp, None);
+                d.kit.label(cx, Font::Regular, meta, 1.3, p.muted, dvec2(rx, ry + (24.0 - size.y) * 0.5), &stamp, None);
             }
         }
         h += 8.0 + 24.0;
@@ -516,11 +517,12 @@ fn speak(cx: &mut Cx2d, d: &mut Draw, message: &str, x: f64, y: f64, w: f64) -> 
 /// in a 20px rail, base 14/20 text.
 pub fn notification(cx: &mut Cx2d, d: &mut Draw, level: &str, message: &str, x: f64, y: f64, w: f64) -> f64 {
     let p = d.look.palette;
-    let (bg, icon, color) = match level {
-        "warning" => (rgba(0x1af59e0b), "triangle-alert", rgba(0xfff59e0b)),
-        "error" => (rgba(0x1aef4444), "circle-x", p.destructive),
-        _ => (rgba(0x1a93c5fd), "info", rgba(0xff93c5fd)),
+    let (icon, color) = match level {
+        "warning" => ("triangle-alert", p.warning),
+        "error" => ("circle-x", p.danger),
+        _ => ("info", p.running),
     };
+    let bg = with_alpha(color, 0.1);
     let size = d.look.ui(14.0);
     let laid = d.kit.layout(cx, Font::Regular, size, d.look.typo.system_size(20.0) / size, message, Some((w - 52.0).max(1.0)), 0.0);
     let h = laidout_size(&laid).y.max(20.0) + 20.0;
@@ -536,7 +538,8 @@ fn compaction(cx: &mut Cx2d, d: &mut Draw, item: &Value, x: f64, y: f64, w: f64)
     let p = d.look.palette;
     let status = str_or(get(item, "status"), "completed");
     let label = format::compaction_label(status, get(item, "trigger").as_str(), get(item, "preTokens").as_f64());
-    let size = d.kit.measure(cx, Font::Regular, 13.0, 1.3, &label, None);
+    let text_size = d.look.ui(13.0);
+    let size = d.kit.measure(cx, Font::Regular, text_size, 1.3, &label, None);
     let glyph = 16.0;
     let mid_w = glyph + 8.0 + size.x;
     let row_h = size.y.max(16.0);
@@ -545,14 +548,14 @@ fn compaction(cx: &mut Cx2d, d: &mut Draw, item: &Value, x: f64, y: f64, w: f64)
     let line_y = cy + row_h * 0.5;
     d.kit.rect(cx, rect_xywh(x + 16.0, line_y, (mx - 8.0 - x - 16.0).max(0.0), 1.0), p.border, 0.0);
     d.kit.rect(cx, rect_xywh(mx + mid_w + 8.0, line_y, (x + w - 16.0 - mx - mid_w - 8.0).max(0.0), 1.0), p.border, 0.0);
-    let glyph_color = rgba(0xffa1a1aa);
+    let glyph_color = p.muted;
     if status == "loading" {
         d.kit.spinner(cx, rect_xywh(mx, cy + (row_h - 16.0) * 0.5, 16.0, 16.0), glyph_color, super::paint::now_seconds() % 1.0);
         d.animating = true;
     } else {
         d.kit.icon(cx, "scissors", rect_xywh(mx, cy, glyph, row_h), 12.0, glyph_color);
     }
-    d.kit.label(cx, Font::Regular, 13.0, 1.3, p.muted, dvec2(mx + glyph + 8.0, cy + (row_h - size.y) * 0.5), &label, None);
+    d.kit.label(cx, Font::Regular, text_size, 1.3, p.muted, dvec2(mx + glyph + 8.0, cy + (row_h - size.y) * 0.5), &label, None);
     row_h + 24.0
 }
 
@@ -619,7 +622,7 @@ pub fn task_rows(cx: &mut Cx2d, d: &mut Draw, tasks: &[Value], x: f64, y: f64, w
         let running = status == "in_progress";
         let completed = status == "completed";
         let text = if running && !str_of(get(task, "activeForm")).is_empty() { str_of(get(task, "activeForm")) } else { str_of(get(task, "text")) };
-        let color = if completed { p.extra_muted } else if running { p.foreground } else { p.muted };
+        let color = if running { p.foreground } else { p.muted };
         let tx = x + 24.0;
         let avail = (w - 24.0).max(1.0);
         let laid = d.kit.layout(cx, Font::Regular, base, 1.4, text, Some(avail), 0.0);
@@ -627,7 +630,7 @@ pub fn task_rows(cx: &mut Cx2d, d: &mut Draw, tasks: &[Value], x: f64, y: f64, w
         let row_h = size.y.max(16.0);
         let first_line = (base * 1.4).clamp(16.0, row_h);
         let icon = if completed { "circle-check" } else if running { "circle-dot" } else { "circle" };
-        d.kit.icon(cx, icon, rect_xywh(x, cy, 16.0, first_line), 16.0, if running { p.running } else { p.extra_muted });
+        d.kit.icon(cx, icon, rect_xywh(x, cy, 16.0, first_line), 16.0, if running { p.running } else { p.muted });
         let ty = cy + (row_h - size.y) * 0.5;
         cx.begin_turtle(Walk { abs_pos: Some(dvec2(tx, cy)), margin: Margin::default(), width: Size::Fixed(avail), height: Size::Fixed(row_h) }, Layout::default());
         d.kit.draw_laidout(cx, Font::Regular, color, dvec2(tx, ty), &laid);
@@ -765,7 +768,7 @@ pub fn draw_badge(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, badge: &Badge, 
     if interactive && active {
         d.kit.icon(cx, if expanded { "chevron-down" } else { "chevron-right" }, Rect { pos: rail.pos - dvec2(2.0, 0.0), ..rail }, 15.6, p.foreground);
     } else if badge.error {
-        d.kit.icon(cx, "triangle-alert", rail, 12.0, with_alpha(p.destructive, 0.8));
+        d.kit.icon(cx, "triangle-alert", rail, 12.0, with_alpha(p.danger, 0.8));
     } else {
         draw_glyph(cx, d, badge.glyph, Rect { pos: rail.pos - dvec2(0.5, 0.0), ..rail }, 12.0, if active { p.foreground } else { p.muted });
     }
@@ -857,13 +860,14 @@ fn overview_group(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, calls
         let view = rect_xywh(x, y, w, h);
         // Registered before the calls so their own detail regions win.
         if max_y > 0.0 {
-            d.canvas.add_hit(view, HitTarget::ScrollY(key));
+            d.canvas.add_hit(view, HitTarget::ScrollY(key.clone()));
         }
         cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(h.max(1.0)) }, Layout::default());
         d.canvas.push_clip(view);
         embedded_calls(cx, d, ctx, id, &calls, x, y + 4.0 - sy, w);
         d.canvas.pop_clip();
         cx.end_turtle();
+        super::scrollbar::draw(cx, d, view, None, None, Some(super::scrollbar::Axis { key: &key, offset: sy, max: max_y }));
         h
     })
 }
@@ -961,7 +965,7 @@ fn footer(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, rows: &Rc<Vec
             if let (true, Some(start)) = (f.live, f.started_ms) {
                 let now = crate::common::clock::now_ms() as i64;
                 let text = format::duration(now - start);
-                let s = d.kit.label(cx, Font::Regular, 13.0, 1.3, p.muted, dvec2(cursor, top + 4.0), &text, None);
+                let s = d.kit.label(cx, Font::Regular, look.ui(13.0), 1.3, p.muted, dvec2(cursor, top + 4.0), &text, None);
                 cursor += s.x + 12.0;
                 d.animating = true;
             }
@@ -1005,7 +1009,7 @@ fn footer(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, rows: &Rc<Vec
                 let swap = !duration.is_empty() && !stamp.is_empty();
                 let show_stamp = swap && (d.state.hover_hit.as_deref() == Some(reveal_key.as_str()) || d.state.copied_now(&reveal_key, d.now - 1.5));
                 let text = if show_stamp { stamp } else { primary };
-                let s = d.kit.label(cx, Font::Regular, 13.0, 1.3, p.muted, dvec2(cursor, top + 4.0), &text, Some((fx + fw - cursor).max(1.0)));
+                let s = d.kit.label(cx, Font::Regular, look.ui(13.0), 1.3, p.muted, dvec2(cursor, top + 4.0), &text, Some((fx + fw - cursor).max(1.0)));
                 if swap {
                     d.canvas.add_hit(rect_xywh(cursor, top, s.x, slot), HitTarget::Toggle(reveal_key));
                 }
@@ -1038,7 +1042,7 @@ pub fn sheet_header(ctx: &RowContext, item: &RowItem, kind: &str) -> Option<Shee
     let row = rows.get(*index)?;
     let entry_item = get(&row.entry, "item");
     match kind {
-        "thinking" => Some(SheetHeader { glyph: ToolGlyph::Brain, title: "Thinking".into(), max_lines: 1, semibold: true }),
+        "thinking" => Some(SheetHeader { glyph: ToolGlyph::Brain, title: t("agentControls.thinking.title"), max_lines: 1, semibold: true }),
         "group" => {
             let calls = row.group.as_deref()?;
             let (summary, _) = tools::build_overview_summary(calls);

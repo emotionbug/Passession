@@ -112,3 +112,52 @@ async fn update_and_upsert_preserve_timezone_and_clear_nullable_launch_fields() 
     assert!(updated["target"]["config"].get("model").is_none());
     assert_eq!(updated["nextRunAt"], "2026-10-01T14:00:00.000Z");
 }
+
+#[tokio::test]
+async fn manual_run_outlives_its_request_and_commits_its_outcome() {
+    let root = tempfile::tempdir().unwrap();
+    let app = AppState::new(
+        root.path().join("home"),
+        root.path().into(),
+        std::env::current_exe().unwrap(),
+    );
+    let service = app.automation.clone();
+    assert!(
+        service
+            .store
+            .set(Store::open(app.home.join("schedules")).await.unwrap())
+            .is_ok()
+    );
+    app.agents.storage.get_or_init(|| async {
+        crate::agent::storage::AgentStorage::new(app.home.clone())
+    }).await;
+    let schedule = service.create(&input()).await.unwrap();
+    let id = schedule["id"].as_str().unwrap().to_owned();
+    let writer = service.store().unwrap().writer.lock().await;
+    let requester = {
+        let service = service.clone();
+        let id = id.clone();
+        tokio::spawn(async move { service.run_once(&id).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !service.running.lock().unwrap().contains(&id) {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    requester.abort();
+    assert!(requester.await.unwrap_err().is_cancelled());
+    drop(writer);
+    let runs = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let runs = service.logs(&id).await.unwrap();
+            if runs.first().is_some_and(|run| run["status"] == "failed") {
+                return runs;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0]["endedAt"].is_string());
+    assert!(runs[0]["error"].as_str().unwrap().contains("no longer exists"));
+    assert_eq!(service.inspect(&id).await.unwrap()["status"], "completed");
+}

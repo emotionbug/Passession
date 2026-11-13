@@ -110,6 +110,7 @@ use {
                         WM_ERASEBKGND,
                         WM_MOUSEMOVE,
                         WM_MOUSEWHEEL,
+                        WM_MOUSEHWHEEL,
                         WM_LBUTTONDOWN,
                         WM_LBUTTONUP,
                         WM_RBUTTONDOWN,
@@ -531,7 +532,15 @@ impl Win32Window {
             },
             WM_MOUSEWHEEL => {
                 let delta = (wparam.0 >> 16) as u16 as i16 as f64;
-                window.send_scroll(DVec2 {x: 0.0, y: -delta}, Self::get_key_modifiers(), true);
+                let modifiers = Self::get_key_modifiers();
+                // Shift + wheel scrolls sideways, as in other Windows applications.
+                let scroll = if modifiers.shift { DVec2 {x: -delta, y: 0.0} } else { DVec2 {x: 0.0, y: -delta} };
+                window.send_scroll(scroll, modifiers, true);
+            },
+            WM_MOUSEHWHEEL => {
+                // Tilt wheels and precision touchpads: positive is to the right.
+                let delta = (wparam.0 >> 16) as u16 as i16 as f64;
+                window.send_scroll(DVec2 {x: delta, y: 0.0}, Self::get_key_modifiers(), true);
             },
             WM_LBUTTONDOWN => {
                 // hack for drag/drop: save which window was last clicked on in win32_app
@@ -567,14 +576,18 @@ impl Win32Window {
                 if modifiers.control || modifiers.logo {
                     match key_code {
                         KeyCode::KeyV => { // paste
-                            if let Some(input) = Clipboard::open(window.hwnd).ok().and_then(|clipboard| clipboard.read_text()) {
-                                window.do_callback(
-                                    Win32Event::TextInput(window.window_id, TextInputEvent {
-                                        input,
-                                        was_paste: true,
-                                        replace_last: false
-                                    })
-                                );
+                            let request = crate::event::TextPasteShortcutEvent::new(modifiers);
+                            window.do_callback(Win32Event::TextPasteShortcut(window.window_id, request.clone()));
+                            if request.allowed.get() {
+                                if let Some(input) = Clipboard::open(window.hwnd).ok().and_then(|clipboard| clipboard.read_text()) {
+                                    window.do_callback(
+                                        Win32Event::TextInput(window.window_id, TextInputEvent {
+                                            input,
+                                            was_paste: true,
+                                            replace_last: false
+                                        })
+                                    );
+                                }
                             }
                         }
                         KeyCode::KeyC => {

@@ -16,7 +16,7 @@ use crate::common::provider_icon::ProviderIconWidgetRefExt;
 use crate::common::{UiContext, UiEffect};
 use crate::features::workspace::dialog::WaDialogWidgetRefExt;
 use crate::features::workspace::host::{self, Connection};
-use crate::features::workspace::i18n::{l, lf, t};
+use crate::features::workspace::i18n::{l, lf, t, ta};
 use crate::common::widgets::{PLabelWidgetRefExt, PSegmentedWidgetRefExt, Segment, SurfaceWidgetRefExt};
 use crate::features::workspace::kit::{
     clicked_in, set_badge, set_optional, sync_input, BadgeVariant, WaButtonWidgetRefExt, WaInputWidgetRefExt, WaRepeatWidgetRefExt,
@@ -32,7 +32,7 @@ type RowPending = HashMap<String, HashSet<String>>;
 #[derive(Clone, Debug)]
 enum Req {
     List { generation: u64, host_id: String, label: String },
-    Action { key: String, action: String, previous: Vec<Value> },
+    Action { key: String, action: String, previous: Value },
     Logs { key: String },
 }
 
@@ -97,6 +97,32 @@ fn row_key(schedule: &Value) -> String {
     format!("{}:{}", str_of(schedule, "_serverId"), schedule.get("id").map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_default())
 }
 
+/// Roll back only this row: another schedule may have a concurrent optimistic mutation.
+fn restore_row(rows: &mut Vec<Value>, key: &str, previous: Value) {
+    if let Some(row) = rows.iter_mut().find(|row| row_key(row) == key) {
+        *row = previous;
+    } else {
+        rows.push(previous);
+        rows.sort_by(|a, b| str_of(b, "createdAt").cmp(str_of(a, "createdAt")));
+    }
+}
+
+fn apply_pending(rows: &mut Vec<Value>, pending: &RowPending) {
+    let now = Utc::now();
+    rows.retain_mut(|row| {
+        let Some(actions) = pending.get(&row_key(row)) else { return true };
+        if actions.contains("delete") {
+            return false;
+        }
+        for action in ["pause", "resume"] {
+            if actions.contains(action) {
+                *row = model::optimistic_status(row, action, now);
+            }
+        }
+        true
+    });
+}
+
 impl SchedulesPanel {
     /// The content root as a handle (the deref `View` is not `Clone`).
     fn root(&self) -> WidgetRef {
@@ -128,6 +154,7 @@ impl SchedulesPanel {
     fn complete_load(&mut self) {
         let mut rows = std::mem::take(&mut self.rows_in_flight);
         rows.sort_by(|a, b| str_of(b, "createdAt").cmp(str_of(a, "createdAt")));
+        apply_pending(&mut rows, &self.row_pending);
         let failures = std::mem::take(&mut self.failures_in_flight);
         let failed = self.connected_count > 0 && rows.is_empty() && failures.len() == self.connected_count;
         self.loading = false;
@@ -182,29 +209,54 @@ impl SchedulesPanel {
                     }
                 }
                 Req::Action { key, action, previous } => {
-                    // Rolled back silently on failure, as the original does.
-                    if result.is_err() && action != "run-once" {
-                        self.schedules = previous;
-                    }
-                    if let Some(actions) = self.row_pending.get_mut(&key) {
-                        actions.remove(&action);
-                        if actions.is_empty() {
-                            self.row_pending.remove(&key);
+                    match &result {
+                        // A failed pause, resume or delete rolls back and says why.
+                        Err(error) => {
+                            if action != "run-once" {
+                                restore_row(&mut self.schedules, &key, previous);
+                            }
+                            let key = match action.as_str() {
+                                "pause" => "workspace.schedules.errors.pause",
+                                "resume" => "workspace.schedules.errors.resume",
+                                "delete" => "workspace.schedules.errors.delete",
+                                _ => "workspace.schedules.errors.runOnce",
+                            };
+                            ctx.effects.push(UiEffect::Toast { message: ta(key, &[("reason", &error.to_string())]), is_error: true });
                         }
+                        Ok(_) if action == "run-once" => {
+                            ctx.effects.push(UiEffect::Toast { message: t("workspace.schedules.runStarted"), is_error: false });
+                        }
+                        Ok(_) => {}
                     }
+                    self.finish_row_action(&key, &action);
                     self.load(ctx);
                 }
-                Req::Logs { key } => match result {
-                    Ok(body) => {
-                        let Some(schedule) = self.schedules.iter().find(|s| row_key(s) == key).cloned() else { continue };
-                        let mut runs = array_of(&body, "runs").to_vec();
-                        runs.sort_by(|a, b| str_of(b, "startedAt").cmp(str_of(a, "startedAt")));
-                        self.runs = runs;
-                        self.runs_schedule = Some(schedule);
-                        self.view.wa_modal(id!(runs_modal)).open(cx);
+                Req::Logs { key } => {
+                    self.finish_row_action(&key, "runs");
+                    match result {
+                        Ok(body) => {
+                            let Some(schedule) = self.schedules.iter().find(|s| row_key(s) == key).cloned() else { continue };
+                            let mut runs = array_of(&body, "runs").to_vec();
+                            runs.sort_by(|a, b| str_of(b, "startedAt").cmp(str_of(a, "startedAt")));
+                            self.runs = runs;
+                            self.runs_schedule = Some(schedule);
+                            self.view.wa_modal(id!(runs_modal)).open(cx);
+                        }
+                        Err(error) => {
+                            let message = ta("workspace.schedules.errors.runHistory", &[("reason", &error.to_string())]);
+                            ctx.effects.push(UiEffect::Toast { message, is_error: true });
+                        }
                     }
-                    Err(error) => ctx.effects.push(UiEffect::Toast { message: error.to_string(), is_error: true }),
-                },
+                }
+            }
+        }
+    }
+
+    fn finish_row_action(&mut self, key: &str, action: &str) {
+        if let Some(actions) = self.row_pending.get_mut(key) {
+            actions.remove(action);
+            if actions.is_empty() {
+                self.row_pending.remove(key);
             }
         }
     }
@@ -213,7 +265,13 @@ impl SchedulesPanel {
     /// the row, each rolls back on failure and every action refetches when it settles.
     fn act(&mut self, ctx: &UiContext, schedule: &Value, action: &str) {
         let key = row_key(schedule);
-        let previous = self.schedules.clone();
+        if !matches!(action, "pause" | "resume" | "delete" | "run-once")
+            || self.row_pending.get(&key).is_some_and(|actions| actions.iter().any(|action| action != "runs"))
+            || !host::host(&ctx.state, str_of(schedule, "_serverId")).is_some_and(|h| h.connected() && h.has_permission("automation.manage"))
+        {
+            return;
+        }
+        let previous = schedule.clone();
         // `cancelQueries` before the optimistic write: an in-flight load must not overwrite it.
         self.generation += 1;
         self.loading = false;
@@ -255,7 +313,9 @@ impl SchedulesPanel {
         let product = model::product_name(schedule);
         let lower = model::product_name_lower(schedule);
         let target_type = str_of(object_of(schedule, "target"), "type");
-        let can_run = target_type == "new-agent" && state.runnable();
+        // Without `automation.manage` (or while offline) only reading actions stay available.
+        let can_manage = host::host(&ctx.state, str_of(schedule, "_serverId")).is_some_and(|h| h.connected() && h.has_permission("automation.manage"));
+        let can_run = target_type == "new-agent" && state.runnable() && can_manage;
         let busy = self.row_pending.get(&row_key(schedule)).cloned().unwrap_or_default();
         let mut options = vec![SelectOption::new("edit", lf("Edit {product}", &[("product", lower)])).glyph("pencil")];
         if target_type != "agent" {
@@ -270,9 +330,10 @@ impl SchedulesPanel {
             let label = if busy.contains("run-once") { l("Starting...") } else { l("Run now") };
             options.push(SelectOption::new("run-once", label).glyph("rotate-cw").enabled(can_run && !busy.contains("run-once")));
         }
-        options.push(SelectOption::new("runs", l("Run history")).glyph("history"));
+        let runs = if busy.contains("runs") { t("common.states.loading") } else { l("Run history").to_owned() };
+        options.push(SelectOption::new("runs", runs).glyph("history").enabled(!busy.contains("runs")));
         let delete = if busy.contains("delete") { l("Deleting...").to_owned() } else { lf("Delete {product}", &[("product", lower)]) };
-        options.push(SelectOption::new("delete", delete).glyph("trash-2").destructive().separated(true).enabled(!busy.contains("delete")));
+        options.push(SelectOption::new("delete", delete).glyph("trash-2").destructive().separated(true).enabled(can_manage && !busy.contains("delete")));
         let title = lf("{product} actions", &[("product", product)]);
         self.view.wa_select(id!(select)).open(cx, &format!("row:{}", row_key(schedule)), SelectRequest::new(title, options));
     }
@@ -320,12 +381,14 @@ impl SchedulesPanel {
                 match value.as_str() {
                     "edit" => self.open_editor(cx, ctx, Some(schedule)),
                     "runs" => {
+                        // The row's menu button spins until the history arrives.
+                        self.row_pending.entry(key.to_owned()).or_default().insert("runs".to_owned());
                         let req = Req::Logs { key: key.to_owned() };
                         self.pending.send_typed(&ctx.core, str_of(&schedule, "_serverId"), "schedule/logs", json!({ "scheduleId": schedule["id"] }), "schedule/logs/response", req);
                     }
                     "delete" => {
                         let product = model::product_name(&schedule).to_lowercase();
-                        let title = format!("{} {product}", l("Delete"));
+                        let title = lf("Delete {product}", &[("product", &product)]);
                         let message = lf("Delete \"{title}\"? This cannot be undone.", &[("title", &model::schedule_title(&schedule))]);
                         view.wa_dialog(id!(dialog)).confirm(cx, &format!("delete:{key}"), &title, &message, l("Delete"), true);
                     }
@@ -418,28 +481,58 @@ impl SchedulesPanel {
             .filter(|s| self.state(ctx, s).runnable() == (self.status_filter == "runnable"))
             .cloned()
             .collect();
-        let empty_all = ready && self.schedules.is_empty();
-        view.widget(id!(filters)).set_visible(cx, ready && !empty_all);
+        // Every host offline is its own state, not "no schedules".
+        let offline_state = ready && self.connected_count == 0 && !self.settling;
+        let offline = view.widget(id!(offline_state));
+        offline.set_visible(cx, offline_state);
+        if offline_state {
+            offline.widget(id!(title)).set_text(cx, &t("workspace.schedules.noConnectedHosts"));
+            offline.widget(id!(description)).set_text(cx, &t("workspace.schedules.noConnectedHostsDescription"));
+        }
+        // Hosts that are not connected have their schedules hidden; say which.
+        let offline_text = if ready && !offline_state {
+            hosts
+                .iter()
+                .filter(|h| !h.connected())
+                .map(|h| {
+                    let key = if h.status() == Connection::Connecting { "workspace.schedules.hostConnecting" } else { "workspace.schedules.hostOffline" };
+                    ta(key, &[("host", &h.label())])
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+        set_optional(cx, &view.widget(id!(offline_banner)), &offline_text);
+        let empty_all = ready && !offline_state && self.schedules.is_empty();
+        view.widget(id!(filters)).set_visible(cx, ready && !offline_state && !empty_all);
         set_optional(cx, &view.widget(id!(banner)), if ready { &banner_text } else { "" });
-        let empty_state = ready && (empty_all || (rows.is_empty() && self.status_filter == "runnable"));
+        let empty_state = ready && !offline_state && (empty_all || (rows.is_empty() && self.status_filter == "runnable"));
         let empty = view.widget(id!(empty_state));
         empty.set_visible(cx, empty_state);
         empty.widget(id!(title)).set_text(cx, l("No active schedules"));
         empty.widget(id!(description)).set_text(cx, l("Schedules run agents on a cadence."));
         view.wa_button(id!(docs)).set_text(cx, l("See docs"));
         view.wa_button(id!(empty_new)).set_text(cx, l("New schedule"));
+        // The text column is at most 420px, narrower on phones.
+        let body_width = view.widget(id!(body)).area().rect(cx).size.x;
+        let inset = if self.compact { 24.0 } else { 48.0 };
+        let texts_width = if body_width > 0.0 { (body_width - inset).clamp(0.0, 420.0) } else { 420.0 };
+        for path in [id!(empty_state.texts), id!(offline_state.texts)] {
+            view.widget(path).apply_over(cx, live! { width: (texts_width) });
+        }
         let ended = view.widget(id!(ended_empty));
-        let ended_state = ready && !empty_all && rows.is_empty() && self.status_filter == "ended";
+        let ended_state = ready && !offline_state && !empty_all && rows.is_empty() && self.status_filter == "ended";
         ended.set_visible(cx, ended_state);
         // Original `_centered` / `SliverFillRemaining`: empty states sit centred in the body.
-        let centred = empty_state || ended_state;
+        let centred = empty_state || ended_state || offline_state;
         if self.body_centred != Some(centred) {
             self.body_centred = Some(centred);
             let align_y = if centred { 0.5 } else { 0.0 };
             view.widget(id!(body)).apply_over(cx, live! { align: { x: 0.5, y: (align_y) } });
         }
         ended.widget(id!(text)).set_text(cx, l("No ended schedules"));
-        if ready && !empty_all {
+        if ready && !offline_state && !empty_all {
             let host_filter = view.wa_button(id!(host_filter));
             host_filter.set_visible(cx, !single_host);
             let label = hosts.iter().find(|h| h.id() == selected_host).map(|h| h.label()).unwrap_or_else(|| l("All hosts").to_owned());
@@ -479,6 +572,8 @@ impl SchedulesPanel {
                     ScheduleState::TargetGone => (l("Target gone"), BadgeVariant::Error),
                 };
                 set_badge(cx, &item.widget(id!(badge)), label, variant);
+                // An action or run-history request in flight spins the row's menu button.
+                item.wa_button(id!(kebab)).set_busy(cx, self.row_pending.get(&row_key(schedule)).is_some_and(|busy| !busy.is_empty()));
             }
         }
         self.visible_rows = rows;
@@ -541,5 +636,30 @@ impl Widget for SchedulesPanel {
             self.present(cx, ctx);
         }
         self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_schedule_mutations_keep_their_own_optimistic_state() {
+        let first = json!({"id": "a", "_serverId": "h", "status": "active"});
+        let second = json!({"id": "b", "_serverId": "h", "status": "active"});
+        let mut rows = vec![first.clone(), second.clone()];
+        let pending = HashMap::from([
+            (row_key(&first), HashSet::from(["pause".to_owned()])),
+            (row_key(&second), HashSet::from(["delete".to_owned()])),
+        ]);
+        apply_pending(&mut rows, &pending);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "paused");
+        restore_row(&mut rows, &row_key(&first), first);
+        assert_eq!(rows.len(), 1, "rolling back a pause must not resurrect another deletion");
+        assert_eq!(rows[0]["status"], "active");
+        let mut refreshed = vec![second];
+        apply_pending(&mut refreshed, &pending);
+        assert!(refreshed.is_empty(), "refreshes must retain pending deletions");
     }
 }

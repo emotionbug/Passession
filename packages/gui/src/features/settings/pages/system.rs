@@ -25,7 +25,10 @@ pub struct LocalDaemonState {
 #[derive(Default)]
 pub struct NotificationsState {
     pub settings: Value,
-    pub granted: Option<bool>,
+    /// `granted` / `denied` / `notDetermined`; `None` until known.
+    pub permission: Option<String>,
+    /// The non-prompting status query is in flight.
+    pub checking: bool,
     pub test_sent: bool,
     pub test_error: Option<String>,
     pub busy: bool,
@@ -147,7 +150,7 @@ pub fn draw_local_daemon(ui: &mut Ui, s: &Settings) {
         handler(move |s, env| {
             if manage {
                 let confirmed = patch_daemon(json!({"manageBuiltInDaemon": false}));
-                s.confirm(t("desktop.daemon.management.pauseTitle"), t("desktop.daemon.management.pauseMessage"), None, true, confirmed);
+                s.confirm(t("desktop.daemon.management.pauseTitle"), t("desktop.daemon.management.pauseMessage"), t("desktop.daemon.management.pauseAndStop"), true, confirmed);
             } else {
                 patch_daemon(json!({"manageBuiltInDaemon": true}))(s, env);
             }
@@ -184,18 +187,15 @@ pub fn draw_local_daemon(ui: &mut Ui, s: &Settings) {
         let start = (!busy).then(|| handler(|s, env| run_local(s, env, "start_desktop_daemon", json!({}), true)));
         buttons.push(button("local.start", t("settingsNative.startDaemon"), start).ctl());
     }
+    // Restart lives once, in the host's danger zone (`restart.confirmTitle`).
     if running && owned {
-        let restart = (!busy).then(|| {
-            handler(|s, _| {
-                let go = handler(|s, env| run_local(s, env, "restart_desktop_daemon", json!({"reason": "settings"}), true));
-                s.confirm(t("settings.host.daemon.restart.title"), t("settings.host.daemon.restart.hint"), None, false, go);
-            })
-        });
-        buttons.push(button("local.restart", t("settings.host.daemon.restart.title"), restart).ctl());
+        let ownership = t("desktop.daemon.lifecycle.ownedMessage");
+        let home = state.daemon.get("home").filter(|v| !v.is_null()).map(scalar_text).unwrap_or_else(|| "—".into());
+        let message = ta("desktop.daemon.lifecycle.stopMessage", &[("ownership", &ownership), ("home", &home), ("pid", pid.as_deref().unwrap_or("—"))]);
         let stop = (!busy).then(|| {
-            handler(|s, _| {
+            handler(move |s, _| {
                 let go = handler(|s, env| run_local(s, env, "stop_desktop_daemon", json!({"reason": "settings"}), true));
-                s.confirm(t("desktop.daemon.lifecycle.stopTitle"), t("desktop.daemon.lifecycle.ownedMessage"), None, true, go);
+                s.confirm(t("desktop.daemon.lifecycle.stopTitle"), message.clone(), t("desktop.daemon.lifecycle.stop"), true, go);
             })
         });
         buttons.push(button("local.stop", t("desktop.daemon.lifecycle.stop"), stop).ctl());
@@ -225,6 +225,33 @@ pub fn ensure_notifications(s: &mut Settings, env: &mut Env) {
     }
     s.notifications.loaded = true;
     load_notifications(s, env);
+    refresh_notification_permission(s, env);
+}
+
+/// OS settings can change permission while this retained page is in the background.
+pub fn refresh_notification_permission(s: &mut Settings, env: &mut Env) {
+    if !DESKTOP || !s.notifications.loaded || s.notifications.checking || s.notifications.busy {
+        return;
+    }
+    s.notifications.checking = true;
+    let token = env.bridge.notification_permission_status();
+    s.bridge_job(token, |s, _, result| {
+        s.notifications.checking = false;
+        match result {
+            Ok(state) => s.notifications.permission = permission_of(&state),
+            Err(error) => s.notifications.error = Some(error.text()),
+        }
+    });
+}
+
+/// A bridge permission result (`granted`/`denied`/`notDetermined`, or a bare bool).
+fn permission_of(value: &Value) -> Option<String> {
+    match value {
+        Value::String(state) => Some(state.clone()),
+        Value::Bool(true) => Some("granted".into()),
+        Value::Bool(false) => Some("denied".into()),
+        _ => None,
+    }
 }
 
 fn load_notifications(s: &mut Settings, env: &mut Env) {
@@ -238,17 +265,20 @@ pub fn draw_notifications(ui: &mut Ui, s: &Settings) {
     let state = &s.notifications;
     let busy = state.busy;
     let available = platform::desktop_available();
+    let permission = state.permission.as_deref();
+    let granted = permission == Some("granted");
+    let denied = permission == Some("denied");
     ui.section_title(&t("settings.notifications.title"), None, None);
     ui.card_begin();
-    let request = (!busy && available).then(|| {
+    let request = (!busy && available && !state.checking).then(|| {
         handler(|s, env| {
             s.notifications.busy = true;
             let token = env.bridge.request_notification_permission();
             s.bridge_job(token, |s, _, result| {
                 s.notifications.busy = false;
                 match result {
-                    Ok(granted) => {
-                        s.notifications.granted = granted.as_bool();
+                    Ok(state) => {
+                        s.notifications.permission = permission_of(&state);
                         s.notifications.error = None;
                     }
                     Err(error) => s.notifications.error = Some(error.text()),
@@ -256,12 +286,25 @@ pub fn draw_notifications(ui: &mut Ui, s: &Settings) {
             });
         })
     });
-    let granted_hint = (state.granted == Some(true)).then(|| t("settings.permissions.actions.granted"));
-    ui.row(
-        row(t("settings.notifications.permission"))
-            .hint_opt(granted_hint)
-            .control(button("notifications.request", t("settings.permissions.actions.request"), request).icon(Icon::RotateCw).ctl()),
-    );
+    let status_hint = if state.checking {
+        t("common.states.loading")
+    } else {
+        match permission {
+            Some("granted") => t("desktop.permissions.notifications.allowed"),
+            Some("denied") => t("desktop.permissions.notifications.denied"),
+            _ => t("desktop.permissions.notifications.notGranted"),
+        }
+    };
+    // Granted needs nothing; denied can only change in the OS settings.
+    let control = if granted {
+        Ctl::Badge { label: t("settings.permissions.actions.granted"), tone: Some(ui.pal.success), xs: false, dot: None, icon: None }
+    } else if denied {
+        Ctl::Badge { label: t("settingsNative.permissionDenied"), tone: Some(ui.pal.danger), xs: false, dot: None, icon: None }
+    } else {
+        let label = if busy { t("settings.permissions.actions.requesting") } else { t("settings.permissions.actions.request") };
+        button("notifications.request", label, request).icon(Icon::Bell).ctl()
+    };
+    ui.row(row(t("settings.notifications.permission")).hint(status_hint).control(control));
     let play_sound = get(&state.settings, "notifications").get("playSound").and_then(Value::as_bool) != Some(false);
     let toggle = (!busy && state.settings.is_object()).then(|| {
         handler(move |s, env| {
@@ -279,7 +322,7 @@ pub fn draw_notifications(ui: &mut Ui, s: &Settings) {
         })
     });
     ui.row(row(t("settings.notifications.playSound")).hint(t("settings.notifications.playSoundHint")).control(switch("notifications.sound", play_sound, toggle)));
-    let send = (!busy && available && state.granted != Some(false)).then(|| {
+    let send = (!busy && available && !denied).then(|| {
         handler(|s, env| {
             s.notifications.busy = true;
             s.notifications.test_sent = false;
@@ -296,7 +339,7 @@ pub fn draw_notifications(ui: &mut Ui, s: &Settings) {
             });
         })
     });
-    let hint = if state.granted == Some(false) { t("settings.notifications.permissionRequired") } else { t("settings.notifications.testHint") };
+    let hint = if denied { t("settings.notifications.permissionRequired") } else { t("settings.notifications.testHint") };
     let label = if busy { t("settings.notifications.sending") } else { t("settings.notifications.send") };
     ui.row(row(t("settings.notifications.test")).hint(hint).error(state.error.clone()).control(button("notifications.send", label, send).ctl()));
     ui.card_end();

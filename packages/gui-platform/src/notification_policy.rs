@@ -40,9 +40,28 @@ fn text<'a>(map: &'a Value, key: &str) -> &'a str {
     map.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+/// Localized titles for attention events whose payload carries none.
+#[derive(Debug, Clone)]
+pub struct NotificationLabels {
+    pub approval_requested: String,
+    pub session_finished: String,
+    pub session_failed: String,
+}
+
+impl Default for NotificationLabels {
+    fn default() -> Self {
+        Self {
+            approval_requested: "Approval requested".into(),
+            session_finished: "Session finished".into(),
+            session_failed: "Session failed".into(),
+        }
+    }
+}
+
 /// Maps an `agent_attention_required` / `terminal_attention_required` host
-/// event to a notification, or `None` when it must not notify.
-pub fn attention_notification(server_id: &str, event: &Value, view: &AttentionView) -> Option<NotificationRequest> {
+/// event to a notification, or `None` when it must not notify. A failed session notifies
+/// too (the attention badge already counts it), with its error as the body.
+pub fn attention_notification(server_id: &str, event: &Value, view: &AttentionView, labels: &NotificationLabels) -> Option<NotificationRequest> {
     let kind = text(event, "type");
     let payload = event.get("payload").filter(|p| p.is_object())?;
     if payload.get("shouldNotify") != Some(&Value::Bool(true)) {
@@ -53,17 +72,31 @@ pub fn attention_notification(server_id: &str, event: &Value, view: &AttentionVi
         "agent_attention_required" => {
             let agent_id = text(payload, "agentId");
             let reason = payload.get("reason").cloned().unwrap_or(Value::Null);
-            if reason == "error" || view.shows(server_id, "agent", agent_id) {
+            if view.shows(server_id, "agent", agent_id) {
                 return None;
             }
             let notification = payload.get("notification").filter(|n| n.is_object()).unwrap_or(&empty);
-            let fallback = if reason == "permission" { "Approval requested" } else { "Session finished" };
+            let fallback = if reason == "permission" {
+                &labels.approval_requested
+            } else if reason == "error" {
+                &labels.session_failed
+            } else {
+                &labels.session_finished
+            };
             let title = notification
                 .get("title")
                 .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
                 .unwrap_or(fallback)
                 .to_owned();
-            let body = text(notification, "body").to_owned();
+            let mut body = text(notification, "body").to_owned();
+            if body.is_empty() && reason == "error" {
+                body = [text(payload, "lastError"), text(payload, "error"), text(payload, "message")]
+                    .into_iter()
+                    .find(|t| !t.trim().is_empty())
+                    .unwrap_or("")
+                    .to_owned();
+            }
             let mut data = Map::new();
             data.insert("serverId".into(), server_id.into());
             data.insert("agentId".into(), agent_id.into());
@@ -135,21 +168,24 @@ mod tests {
     #[test]
     fn agent_attention_matches_original_payload() {
         let event = json!({"type":"agent_attention_required","payload":{"shouldNotify":true,"agentId":"a","reason":"permission","timestamp":"t","notification":{"body":"b","data":{"x":1}}}});
-        let request = attention_notification("s", &event, &AttentionView::default()).unwrap();
+        let request = attention_notification("s", &event, &AttentionView::default(), &NotificationLabels::default()).unwrap();
         assert_eq!(request.title, "Approval requested");
         assert_eq!(request.body.as_deref(), Some("b"));
         assert_eq!(request.data["x"], 1);
         assert_eq!(request.event_key.as_deref(), Some(r#"["s","a","permission","t"]"#));
         let focused = AttentionView { visible: true, server_id: Some("s".into()), kind: Some("agent".into()), id: Some("a".into()) };
-        assert!(attention_notification("s", &event, &focused).is_none());
+        assert!(attention_notification("s", &event, &focused, &NotificationLabels::default()).is_none());
     }
 
     #[test]
-    fn errors_and_unflagged_events_do_not_notify() {
-        let error = json!({"type":"agent_attention_required","payload":{"shouldNotify":true,"agentId":"a","reason":"error"}});
-        assert!(attention_notification("s", &error, &AttentionView::default()).is_none());
+    fn failed_sessions_notify_with_their_error_and_unflagged_events_do_not() {
+        let labels = NotificationLabels { session_failed: "세션 실패".into(), ..NotificationLabels::default() };
+        let error = json!({"type":"agent_attention_required","payload":{"shouldNotify":true,"agentId":"a","reason":"error","lastError":"boom"}});
+        let request = attention_notification("s", &error, &AttentionView::default(), &labels).unwrap();
+        assert_eq!(request.title, "세션 실패");
+        assert_eq!(request.body.as_deref(), Some("boom"));
         let quiet = json!({"type":"terminal_attention_required","payload":{"shouldNotify":false}});
-        assert!(attention_notification("s", &quiet, &AttentionView::default()).is_none());
+        assert!(attention_notification("s", &quiet, &AttentionView::default(), &labels).is_none());
     }
 
     #[test]

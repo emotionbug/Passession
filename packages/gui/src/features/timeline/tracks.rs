@@ -476,13 +476,14 @@ pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut
         d.state.extent_y.insert(key.clone(), max_y);
         let sy = d.state.scroll_y.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_y);
         if max_y > 0.0 {
-            d.canvas.add_hit(body, HitTarget::ScrollY(key));
+            d.canvas.add_hit(body, HitTarget::ScrollY(key.clone()));
         }
         cx.begin_turtle(Walk { abs_pos: Some(body.pos), margin: Margin::default(), width: Size::Fixed(body.size.x), height: Size::Fixed(body.size.y.max(1.0)) }, Layout::default());
         d.canvas.push_clip(body);
         panel_rows(cx, d, painter, icon, model, panel, area.pos.x, body.pos.y - sy, w);
         d.canvas.pop_clip();
         cx.end_turtle();
+        super::scrollbar::draw(cx, d, body, None, None, Some(super::scrollbar::Axis { key: &key, offset: sy, max: max_y }));
         return;
     }
     let max_w = (area.size.x - 16.0).clamp(0.0, 620.0);
@@ -510,13 +511,14 @@ pub fn draw_panel(cx: &mut Cx2d, d: &mut Draw, painter: &mut Painter, icon: &mut
     d.state.extent_y.insert(key.clone(), max_y);
     let sy = d.state.scroll_y.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_y);
     if max_y > 0.0 {
-        d.canvas.add_hit(r, HitTarget::ScrollY(key));
+        d.canvas.add_hit(r, HitTarget::ScrollY(key.clone()));
     }
     cx.begin_turtle(Walk { abs_pos: Some(r.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(h.max(1.0)) }, Layout::default());
     d.canvas.push_clip(r);
     panel_rows(cx, d, painter, icon, model, panel, x, y + 4.0 - sy, w);
     d.canvas.pop_clip();
     cx.end_turtle();
+    super::scrollbar::draw(cx, d, r, None, None, Some(super::scrollbar::Axis { key: &key, offset: sy, max: max_y }));
 }
 
 #[cfg(test)]

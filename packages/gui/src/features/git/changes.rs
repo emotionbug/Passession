@@ -8,7 +8,7 @@ use super::actions::{ArchiveConfirm, Checkout, ahead_count, menu_entries};
 use super::chrome::{
     ButtonSize, ButtonVariant, TOOLBAR_HEIGHT, button, button_height, diff_stat, label_trigger,
     measure_button, measure_diff_stat, palette, toolbar_band, toolbar_button, toolbar_button_size, ui as ui_px,
-    TREE_ROW_HEIGHT, file_tree_row, tree_row_metrics,
+    file_tree_row, tree_row_height, tree_row_metrics,
 };
 use super::controller::DiffController;
 use super::diff_doc::{DiffDoc, DocHit, DocInput, LineTarget};
@@ -86,6 +86,8 @@ enum Hit {
     TreeToggle,
     Refresh,
     Options,
+    /// A commit diff's "Show in Git Log".
+    ShowInLog,
     Toggle(&'static str),
     Folder(String),
     File(String),
@@ -736,9 +738,10 @@ impl ChangesView {
         );
     }
 
-    /// Original `readRecipients`: the agent tabs open in this workspace.
+    /// Original `readRecipients`: the agent tabs open in this workspace, then
+    /// the workspace's other top-level agents from host state (no tab needed).
     fn recipients(&self, ui: &UiContext) -> Vec<(String, String)> {
-        host::tabs(ui)
+        let mut recipients: Vec<(String, String)> = host::tabs(ui)
             .iter()
             .filter(|tab| {
                 tab.kind == "agent"
@@ -754,7 +757,14 @@ impl ChangesView {
                     .unwrap_or_default();
                 (id, label)
             })
-            .collect()
+            .collect();
+        for (id, label) in host::workspace_agents(ui, self.host(), &self.target.workspace_id) {
+            if !recipients.iter().any(|(listed, _)| *listed == id) {
+                let label = if label.trim().is_empty() { t("sessionNavigation.untitled") } else { label };
+                recipients.push((id, label));
+            }
+        }
+        recipients
     }
 
     /// Original `ReviewFeedbackAction._send`.
@@ -828,10 +838,16 @@ impl ChangesView {
                 let actions = checkout.build(ui, store);
                 let mut list: Vec<_> = actions.primary.iter().cloned().collect();
                 list.extend(actions.without_primary());
-                if list.is_empty() {
+                let (mut entries, direct) = checkout.menu_extras(ui, store, &actions);
+                for group in [menu_entries(&checkout, store, &list), direct] {
+                    if !group.is_empty() && !entries.is_empty() {
+                        entries.push(MenuEntry::Separator);
+                    }
+                    entries.extend(group);
+                }
+                if entries.is_empty() {
                     return;
                 }
-                let entries = menu_entries(&checkout, store, &list);
                 self.open_overlay(Purpose::GitActionsMenu, OverlayKind::Menu {
                     title: Some(t("workspace.header.actions.workspaceActions")),
                     anchor,
@@ -858,6 +874,12 @@ impl ChangesView {
             Hit::TreeToggle => self.tree_visible = !self.tree_visible,
             Hit::Refresh => self.refresh_checkout(cx, store),
             Hit::Options => self.options_menu(ui, anchor, compact),
+            Hit::ShowInLog => {
+                // The log limited to this commit's history, with it selected.
+                let target = PanelTarget::new("git_log", self.host(), &self.target.workspace_id, self.cwd())
+                    .with_data(json!({ "revision": self.controller.sha, "requestId": now_ms() }));
+                Self::open_target(ui, target);
+            }
             Hit::Toggle(which) => match which {
                 "collapse" => self.toggle_collapse_all(),
                 "split" => {
@@ -1102,10 +1124,7 @@ impl ChangesView {
             OverlayResult::Chose(Purpose::GitActionsMenu, id) => {
                 let checkout = self.checkout();
                 let actions = checkout.build(ui, store);
-                let action = actions.primary.iter().chain(actions.secondary.iter()).find(|a| a.id == id).cloned();
-                if let Some(action) = action
-                    && let Some(ArchiveConfirm { title, message, confirm, workspace_id }) = checkout.run(cx, ui, store, &action)
-                {
+                if let Some(ArchiveConfirm { title, message, confirm, workspace_id }) = checkout.run_menu(cx, ui, store, &actions, &id) {
                     self.open_overlay(Purpose::ArchiveConfirm(workspace_id), OverlayKind::Confirm { title, message, confirm, destructive: true });
                 }
             }
@@ -1174,8 +1193,9 @@ impl ChangesView {
                 }
             }
             OverlayResult::Chose(Purpose::Recipient, agent_id) => {
-                let label = self.recipients(ui).into_iter().find(|(id, _)| *id == agent_id).map(|(_, l)| l).unwrap_or_default();
-                self.send_feedback(cx, ui, store, &agent_id, &label);
+                if let Some((_, label)) = self.recipients(ui).into_iter().find(|(id, _)| *id == agent_id) {
+                    self.send_feedback(cx, ui, store, &agent_id, &label);
+                }
             }
             OverlayResult::Chose(Purpose::Jump, path) => self.select_file(ui, compact, &path),
             _ => {}
@@ -1196,6 +1216,7 @@ impl ChangesView {
             Hit::TreeToggle => t(if self.tree_visible { "workspace.tree.hideFolderTree" } else { "workspace.tree.showFolderTree" }),
             Hit::Refresh => t(if self.refreshing(store) { "workspace.git.diff.refreshing" } else { "workspace.git.diff.refresh" }),
             Hit::Options => t("workspace.git.diff.options"),
+            Hit::ShowInLog => t("workspace.git.log.showInLog"),
             Hit::Toggle("collapse") => {
                 t(if self.all_files_collapsed() { "workspace.git.diff.expandAllFiles" } else { "workspace.git.diff.collapseAllFiles" })
             }
@@ -1266,6 +1287,22 @@ impl ChangesView {
         }
         match hit {
             Pointer::FingerHoverIn(e) | Pointer::FingerHoverOver(e) => {
+                // The document's scrollbars sit over its edges.
+                let bar = self.doc.bar_at(e.abs);
+                if bar.is_some() {
+                    cx.set_cursor(MouseCursor::Default);
+                }
+                if bar != self.doc.bar_hovered {
+                    self.doc.bar_hovered = bar;
+                    if bar.is_some() && self.hovered.take().is_some() {
+                        tooltip_at(ui, None, Rect::default(), 0.3);
+                        self.doc.hovered = None;
+                    }
+                    return true;
+                }
+                if bar.is_some() {
+                    return false;
+                }
                 let (anchor, hovered) = self.hits.find(e.abs).map(|(anchor, hit)| (anchor, Some(hit))).unwrap_or_default();
                 let doc_hovered = match &hovered {
                     Some(Hit::Doc(doc)) => Some(doc.clone()),
@@ -1288,14 +1325,19 @@ impl ChangesView {
                 }
             }
             Pointer::FingerHoverOut(_) => {
+                let left_bar = self.doc.bar_hovered.take().is_some();
                 if self.hovered.take().is_some() {
                     tooltip_at(ui, None, Rect::default(), 0.3);
                     self.doc.hovered = None;
                     return true;
                 }
+                if left_bar {
+                    return true;
+                }
             }
             Pointer::FingerScroll(e) => {
-                let delta = if e.modifiers.shift { dvec2(e.scroll.y, e.scroll.x) } else { e.scroll };
+                // The platform already turns Shift+wheel into horizontal scroll.
+                let delta = e.scroll;
                 if self.tree_area.contains(e.abs) {
                     let max = (self.tree_content - self.tree_area.size.y).max(0.0);
                     self.tree_scroll = (self.tree_scroll + delta.y).clamp(0.0, max);
@@ -1313,6 +1355,11 @@ impl ChangesView {
             Pointer::FingerDown(e) => {
                 // Original Tooltip hides when its control is pressed.
                 tooltip_at(ui, None, Rect::default(), 0.3);
+                // A mouse press on a scrollbar drags its thumb or pages its track.
+                if !e.device.is_touch() && e.is_primary_hit() && self.doc.press_bar(e.abs) {
+                    self.pressed = None;
+                    return true;
+                }
                 self.pressed = self.hits.find(e.abs).map(|(_, hit)| hit);
                 // The document is one `SelectionArea`: a mouse press starts a
                 // selection (double click a word, triple click the whole text).
@@ -1350,6 +1397,7 @@ impl ChangesView {
                     return true;
                 }
             }
+            Pointer::FingerMove(e) if self.doc.drag_bar(e.abs) => return true,
             Pointer::FingerMove(e) if self.doc.drag_pointer.is_some() => {
                 // A drag extends the selection; leaving the viewport auto-scrolls.
                 if e.move_distance() > 4.0 {
@@ -1367,6 +1415,9 @@ impl ChangesView {
                 return true;
             }
             Pointer::FingerUp(e) => {
+                if self.doc.end_bar_drag() {
+                    return true;
+                }
                 self.doc.drag_pointer = None;
                 let pressed = self.pressed.take();
                 if !e.is_over || e.has_long_press_occurred || (e.device.is_touch() && !e.was_tap()) {
@@ -1455,18 +1506,22 @@ impl ChangesView {
         let payload = store.checkout(self.host(), self.cwd()).and_then(|s| s.pr_payload.as_ref());
         let hint = select_pr_hint(payload);
         // Wide layouts carry the git actions in the workspace header.
+        let failed = store.last_failure(self.host(), self.cwd()).is_some();
         let show_actions = compact && {
             let actions = self.checkout().build(ui, store);
-            actions.primary.is_some() || !actions.without_primary().is_empty()
+            failed || actions.primary.is_some() || !actions.without_primary().is_empty()
         };
         let mut right = band.pos.x + band.size.x - super::chrome::toolbar_trailing_padding(compact, show_actions);
         if show_actions {
             let (w, h) = if compact { (48.0, 28.0) } else { (42.0, 26.0) };
             let trigger = rect(right - w, center_y - h / 2.0, w, h);
             let hovered = self.is_hovered(&Hit::GitActions) || matches!(self.overlay.purpose(), Some(Purpose::GitActionsMenu));
-            paint.rounded(cx, trigger, if hovered { colors.surface2 } else { vec4(0.0, 0.0, 0.0, 0.0) }, 6.0, Some((colors.border_accent, 1.0)));
-            paint.icon(cx, "git-branch", 16.0, colors.muted, dvec2(trigger.pos.x + w / 2.0 - 8.0, center_y));
-            paint.icon(cx, "chevron-down", 12.0, colors.extra_muted, dvec2(trigger.pos.x + w / 2.0 + 8.0, center_y));
+            // The last action failed: an alert until an action succeeds (its menu has Retry).
+            let border = if failed { with_alpha(colors.danger, 0.7) } else { colors.border_accent };
+            paint.rounded(cx, trigger, if hovered { colors.surface2 } else { vec4(0.0, 0.0, 0.0, 0.0) }, 6.0, Some((border, 1.0)));
+            let (icon, color) = if failed { ("circle-alert", colors.danger) } else { ("git-branch", colors.muted) };
+            paint.icon(cx, icon, 16.0, color, dvec2(trigger.pos.x + w / 2.0 - 8.0, center_y));
+            paint.icon(cx, "chevron-down", 12.0, colors.muted, dvec2(trigger.pos.x + w / 2.0 + 8.0, center_y));
             self.push_hit(trigger, Hit::GitActions);
             right = trigger.pos.x - 4.0;
         }
@@ -1546,6 +1601,9 @@ impl ChangesView {
             let icon = if self.all_files_collapsed() { "list-chevrons-up-down" } else { "list-chevrons-down-up" };
             right = self.toolbar_icon(cx, paint, compact, right, center_y, Some(icon), false, Hit::Toggle("collapse"));
         }
+        if self.controller.is_commit && host::supports(ui, self.host(), super::log::FEATURE) {
+            right = self.toolbar_icon(cx, paint, compact, right, center_y, Some("git-graph"), false, Hit::ShowInLog);
+        }
         if host::supports(ui, self.host(), "checkoutRefresh") {
             right = self.refresh_button(cx, paint, store, compact, right, center_y);
         }
@@ -1564,6 +1622,7 @@ impl ChangesView {
     /// (destructive for errors) under an optional 32px spinner.
     #[allow(clippy::too_many_arguments)]
     fn state(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, body: Rect, message: Option<&str>, spinner: bool, error: bool, action: Option<(&str, &'static str)>) {
+        self.doc.hide();
         let colors = palette();
         let mut y = body.pos.y + 64.0;
         let inner = body.size.x - 48.0;
@@ -1575,7 +1634,7 @@ impl ChangesView {
         if let Some(message) = message {
             let size = ui_px(14.0);
             let width = paint.measure(cx, Font::Regular, size, message).x.min(inner);
-            let height = paint.text_wrapped(cx, Font::Regular, size, if error { colors.destructive } else { colors.muted }, dvec2(body.pos.x + (body.size.x - width) / 2.0, y), message, inner);
+            let height = paint.text_wrapped(cx, Font::Regular, size, if error { colors.danger } else { colors.muted }, dvec2(body.pos.x + (body.size.x - width) / 2.0, y), message, inner);
             y += height + 8.0;
         }
         if let Some((label, mode)) = action {
@@ -1591,6 +1650,7 @@ impl ChangesView {
 
     /// Original `DiffTooLargeState`.
     fn too_large_state(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, body: Rect) {
+        self.doc.hide();
         let colors = palette();
         let center_x = body.pos.x + body.size.x / 2.0;
         let mut y = body.pos.y + 64.0;
@@ -1626,7 +1686,7 @@ impl ChangesView {
     fn draw_tree(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect, bottom_padding: f64) {
         let rows = changed_tree_rows(&self.controller.files, &self.collapsed_folders);
         let metrics = tree_row_metrics(cx, paint);
-        let row_height = metrics.height(TREE_ROW_HEIGHT, 4.0, 16.0);
+        let row_height = metrics.height(tree_row_height(crate::common::is_compact_layout(cx)), 4.0, 16.0);
         self.tree_area = area;
         self.tree_content = rows.len() as f64 * row_height + bottom_padding;
         self.tree_scroll = self.tree_scroll.clamp(0.0, (self.tree_content - area.size.y).max(0.0));
@@ -1746,7 +1806,7 @@ impl ChangesView {
             }
             let center_y = top + row_h / 2.0;
             // Original `CommitGraphNode`: rail, ring, filled once pushed.
-            let rail = if flag(commit, "isOnBase") { colors.muted } else { colors.accent };
+            let rail = if flag(commit, "isOnBase") { colors.muted } else { colors.accent_bright };
             let node_x = band.pos.x + 8.0 + 4.0;
             if count > 1 {
                 if index > 0 {
@@ -1940,7 +2000,7 @@ impl ChangesView {
         }
         for message in errors {
             let size = ui_px(12.0);
-            let height = paint.text_wrapped(cx, Font::Regular, size, colors.destructive, dvec2(area.pos.x + 12.0, y), &message, area.size.x - 24.0);
+            let height = paint.text_wrapped(cx, Font::Regular, size, colors.danger, dvec2(area.pos.x + 12.0, y), &message, area.size.x - 24.0);
             y += height + 4.0;
         }
         let remaining = (area.pos.y + area.size.y - y).max(0.0);
@@ -2002,6 +2062,7 @@ impl ChangesView {
         }
         match presentation {
             Presentation::Tree => {
+                self.doc.hide();
                 paint.fill(cx, body, palette().sidebar);
                 self.draw_tree(cx, paint, body, 32.0);
             }

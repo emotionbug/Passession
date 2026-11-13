@@ -22,7 +22,7 @@ use paseo_gui_core::{CoreError, CoreEvent, CoreHandle};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 
-pub use i18n::{locale_tag, tr, tr_args, tr_count};
+pub use i18n::{locale_tag, month_day, tr, tr_args, tr_count};
 pub use paseo_gui_core::RequestId;
 
 pub fn live_design(cx: &mut Cx) {
@@ -287,6 +287,8 @@ pub enum UiEffect {
     RunCommand { action: String, args: Value },
     CopyText { text: String, toast: Option<String> },
     OpenHostDialog,
+    /// Host dialog seeded with a connection: an existing one edits it, a fresh id adds one to that host.
+    OpenHostConnectionDialog { connection: serde_json::Value },
     OpenHostPairing { host_id: String },
     CloseSettings,
     /// Flutter `removeHost`: closes the host's tabs through their close guards, revokes its push
@@ -441,4 +443,17 @@ pub fn error_message(error: &CoreError) -> String {
 /// overrides applied (Flutter `shortcutLabel`).
 pub fn shortcut_label(ui: &UiContext, help_id: &str) -> Option<String> {
     crate::shell::shortcuts::label_for_help_id(ui.preferences(), help_id)
+}
+
+/// ComposerTooltip text: the label followed by its shortcut combo, when there is one.
+pub fn with_combo(label: String, combo: Option<String>) -> String {
+    match combo.filter(|c| !c.is_empty()) {
+        Some(combo) => format!("{label}  {combo}"),
+        None => label,
+    }
+}
+
+/// A tooltip naming the shortcut bound to keyboard.json `help_id` (user overrides applied).
+pub fn tooltip_with_shortcut(label: &str, help_id: &str) -> String {
+    with_combo(label.to_string(), crate::shell::shortcuts::current_label_for_help_id(help_id))
 }

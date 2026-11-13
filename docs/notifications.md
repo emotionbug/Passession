@@ -10,6 +10,8 @@ The native mobile implementation uses Firebase messaging on Android and APNs dir
 
 OS-rendered background notifications and locally presented foreground notifications have different ownership. Avoid duplicate alerts. Background handler errors must remain available to the foreground UI rather than being silently discarded. Notification permission is a user choice, not a daemon requirement.
 
+Recheck the OS permission when the app returns to the foreground; a cached result may predate a grant or revocation in system settings. Reading that status must not request permission again.
+
 ## Configuration and privacy
 
 Android/iOS credentials are optional and must match the Sessions application identity. Source builds do not include production push credentials or store provisioning. Do not claim push delivery works solely because a client compiles or a token is stored. Tokens and notification payloads may expose private host/session data; keep diagnostics scoped and redact credentials.

@@ -66,10 +66,8 @@ const HOST_SECTIONS: &[(&str, &str, Icon)] = &[
     ("host", "settings.hostSections.host", Icon::Server),
     ("projects", "settings.hostSections.projects", Icon::FolderGit),
     ("connections", "settings.hostSections.connections", Icon::Network),
-    ("pair-device", "openProject.tiles.pairDevice.title", Icon::Smartphone),
     ("agents", "settings.hostSections.agents", Icon::Bot),
     ("metadata", "settings.hostSections.metadata", Icon::Sparkles),
-    ("workspaces", "settings.hostSections.workspaces", Icon::FolderGit),
     ("providers", "settings.hostSections.providers", Icon::Boxes),
     ("usage", "settings.hostSections.usage", Icon::Gauge),
     ("terminals", "settings.hostSections.terminals", Icon::SquareTerminal),
@@ -483,6 +481,10 @@ impl Widget for SettingsPanel {
         }
         for (token, result) in replies {
             self.with_env(cx, ui, |s, env| s.on_bridge(env, token, result));
+        }
+        if matches!(event, Event::Foreground | Event::Resume | Event::AppGotFocus) {
+            self.with_env(cx, ui, pages::system::refresh_notification_permission);
+            dirty |= self.st.notifications.checking;
         }
         if self.with_env(cx, ui, |s, env| s.on_timer(env, event)) {
             dirty = true;

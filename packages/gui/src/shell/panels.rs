@@ -262,6 +262,13 @@ pub fn run_conversation_action(cx: &mut Cx, panel: &Panel, action: &str) {
     }
 }
 
+/// Notification route: the chat root scrolls to its pending permission/question on next draw.
+pub fn reveal_attention(cx: &mut Cx, panel: &Panel) {
+    if panel.kind == RootKind::Chat {
+        panel.widget.as_chat_panel().reveal_attention(cx);
+    }
+}
+
 /// `files::close_requested` flow for dirty `file` tabs.
 pub fn file_close_requested(tab_key: &str) -> bool {
     matches!(files::close_requested(tab_key), files::CloseCheck::Dirty)

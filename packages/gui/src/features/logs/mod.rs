@@ -3,7 +3,6 @@
 //! process; the target carries the daemon terminal id. The stream, emulator and cell grid
 //! are the interactive terminal's (`features::terminal`).
 
-pub mod find;
 pub mod panel;
 pub mod session;
 pub mod view;

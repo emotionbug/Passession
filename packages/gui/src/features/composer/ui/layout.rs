@@ -7,7 +7,7 @@
 use super::look::Look;
 use super::panel::{ComposerPanel, Item};
 use crate::common::paint::{rect, Font, TextSpec};
-use crate::common::UiContext;
+use crate::common::{with_combo, UiContext};
 use crate::features::composer::attachments::{describe, file_type_label, AttachmentGlyph};
 use crate::features::composer::controls_model::*;
 use crate::features::composer::i18n::{t, t_args};
@@ -125,7 +125,7 @@ impl ComposerPanel {
             blocks.push(Block::Error(error.clone(), true));
         }
         if let Some(error) = service::with(|svc| svc.persistence_error()) {
-            blocks.push(Block::Error(format!("Draft persistence failed: {error}"), false));
+            blocks.push(Block::Error(t_args("composer.errors.draftPersistenceFailed", &[("error", error.as_str())]), false));
         }
         if ctl.not_ready_notice && ctl.execution_blocked() {
             blocks.push(Block::Muted(t("composer.delivery.agentNotReady")));
@@ -947,7 +947,7 @@ impl ComposerPanel {
             let drawn = self.painter.text_in(cx, rect(tx, trigger.pos.y, (end - suffix_w - tx).max(0.0), 28.0), body, &model_text, 0.0);
             if suffix_w > 0.0 {
                 let sx = drawn.pos.x + drawn.size.x + 4.0;
-                let extra_spec = TextSpec::new(Font::Regular, look.body(), fade(p.extra_muted, alpha));
+                let extra_spec = TextSpec::new(Font::Regular, look.body(), fade(p.muted, alpha));
                 self.painter.text_in(cx, rect(sx, trigger.pos.y, (end - sx).max(0.0), 28.0), extra_spec, &thinking_text, 0.0);
             }
             if caret_w > 0.0 {
@@ -1068,14 +1068,6 @@ impl ComposerPanel {
                 }
             }
         }
-    }
-}
-
-/// ComposerTooltip: the label followed by its shortcut combo.
-fn with_combo(label: String, combo: Option<String>) -> String {
-    match combo.filter(|c| !c.is_empty()) {
-        Some(combo) => format!("{label}  {combo}"),
-        None => label,
     }
 }
 

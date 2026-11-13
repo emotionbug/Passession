@@ -390,7 +390,7 @@ impl ComposerPanel {
             for message in messages {
                 y += 4.0;
                 y += if draw {
-                    self.painter.paragraph(cx, dvec2(pos.x, y), width, TextSpec::new(Font::Regular, look.small(), p.destructive), &message).y
+                    self.painter.paragraph(cx, dvec2(pos.x, y), width, TextSpec::new(Font::Regular, look.small(), p.danger), &message).y
                 } else {
                     self.painter.paragraph_height(cx, width, detail, &message)
                 };
@@ -606,6 +606,8 @@ impl ComposerPanel {
             self.painter.text_in(cx, rect(list.pos.x + 24.0, ry + 36.0, list.size.x - 48.0, body_h.max(20.0)), TextSpec::new(Font::Regular, look.body(), p.muted), text, 0.5);
             ry += empty_h;
         }
+        // The hovered row action's label, drawn over the list once it is painted.
+        let mut action_tip: Option<(String, Rect)> = None;
         for (index, (row, h)) in rows.iter().zip(heights.iter()).enumerate() {
             let r = rect(list.pos.x, ry, list.size.x, *h);
             ry += h;
@@ -620,9 +622,11 @@ impl ComposerPanel {
                 self.painter.text_in(cx, rect(r.pos.x + inset, r.pos.y + 8.0, r.size.x - inset * 2.0, small_h.max(16.0)), small, &row.label, 0.0);
                 if let Some((icon, _, label)) = &row.secondary {
                     let b = rect(r.pos.x + r.size.x - inset - 24.0, r.pos.y + 2.0, 24.0, 24.0);
-                    self.painter.icon(cx, b, icon, 12.0, p.extra_muted);
+                    self.painter.icon(cx, b, icon, 12.0, p.muted);
                     self.st.ohits.push(b, OItem::RowAction(index));
-                    let _ = label;
+                    if top && self.st.ohover == Some(OItem::RowAction(index)) {
+                        action_tip = Some((label.clone(), b));
+                    }
                 }
                 continue;
             }
@@ -657,10 +661,13 @@ impl ComposerPanel {
                 self.painter.icon(cx, rect(right - 16.0, mid - 8.0, 16.0, 16.0), "check", 16.0, p.foreground);
                 right -= 20.0;
             }
-            if let Some((icon, _, _)) = &row.secondary {
+            if let Some((icon, _, label)) = &row.secondary {
                 let b = rect(right - 28.0, mid - 14.0, 28.0, 28.0);
                 self.painter.icon(cx, b, icon, 12.0, p.muted);
                 self.st.ohits.push(b, OItem::RowAction(index));
+                if top && self.st.ohover == Some(OItem::RowAction(index)) {
+                    action_tip = Some((label.clone(), b));
+                }
                 right -= 32.0;
             }
             if !row.value.is_empty() {
@@ -688,11 +695,15 @@ impl ComposerPanel {
             }
         }
         if let Some(error) = error {
-            let spec = TextSpec::new(Font::Regular, look.small(), p.destructive);
+            let spec = TextSpec::new(Font::Regular, look.small(), p.danger);
             self.painter.paragraph(cx, dvec2(list.pos.x + 16.0, ry + 8.0), list.size.x - 32.0, spec, &error);
         }
         self.st.ohits.set_clip(None);
         cx.end_turtle();
+        if let Some((label, anchor)) = action_tip.filter(|(label, anchor)| !label.is_empty() && anchor.pos.y >= list.pos.y && anchor.pos.y + anchor.size.y <= list.pos.y + list.size.y) {
+            self.layer(cx);
+            self.draw_tooltip(cx, look, &label, anchor);
+        }
     }
 
     fn sheet_feature_error(&self) -> Option<String> {

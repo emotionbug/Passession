@@ -12,8 +12,15 @@ use makepad_widgets::*;
 use serde_json::Value;
 use std::collections::HashSet;
 
-/// Height of a `ChangedFilesTree` row.
-pub const TREE_ROW_HEIGHT: f64 = 28.0;
+/// Height of a `ChangedFilesTree` row (desktop).
+const TREE_ROW_HEIGHT: f64 = 28.0;
+/// Touch layouts keep tree rows at the 44px minimum tap target.
+const COMPACT_TREE_ROW_HEIGHT: f64 = 44.0;
+
+/// The minimum height of a `ChangedFilesTree` row.
+pub fn tree_row_height(compact: bool) -> f64 {
+    if compact { COMPACT_TREE_ROW_HEIGHT } else { TREE_ROW_HEIGHT }
+}
 
 pub fn tree_row_metrics(cx: &mut Cx2d, paint: &mut GitPaint) -> RowMetrics {
     RowMetrics::measure(&mut paint.painter, cx, TextSpec::new(Font::Regular, ui(14.0), palette().foreground), None, 0.0)
@@ -68,7 +75,7 @@ pub fn file_tree_row(
         match row {
             TreeRow::Folder { path, .. } => {
                 let chevron = if collapsed.contains(path) { "chevron-right" } else { "chevron-down" };
-                paint.painter.icon(cx, slots.leading, chevron, 16.0, colors.extra_muted);
+                paint.painter.icon(cx, slots.leading, chevron, 16.0, colors.muted);
             }
             TreeRow::File { .. } => {
                 icon_ready = paint.file_icon(cx, rect(slots.leading.pos.x, center_y - 8.0, 16.0, 16.0), label);
@@ -150,7 +157,7 @@ pub fn toolbar_button(
         paint.rounded(cx, area, colors.interaction_highlight, 6.0, None);
     }
     if let Some(icon) = icon {
-        let color = if enabled { colors.extra_muted } else { with_alpha(colors.extra_muted, 0.5) };
+        let color = if enabled { colors.muted } else { with_alpha(colors.extra_muted, 0.5) };
         paint.icon(cx, icon, toolbar_icon_size(compact), color, area.center());
     }
     area
@@ -193,7 +200,7 @@ pub fn label_trigger(
     paint.text_centered(cx, Font::Regular, size, color, cursor, area.pos.y, height, &fitted, text_max + 1.0);
     cursor += text_width;
     if chevron {
-        paint.icon(cx, "chevron-down", 12.0, colors.extra_muted, dvec2(cursor + 4.0 + 6.0, center_y));
+        paint.icon(cx, "chevron-down", 12.0, colors.muted, dvec2(cursor + 4.0 + 6.0, center_y));
     }
     area
 }

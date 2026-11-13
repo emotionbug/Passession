@@ -427,11 +427,11 @@ impl ComposerService {
     /// (Flutter `await drafts.flush()`).
     pub(super) fn flush_then(&mut self, then: AfterFlush) {
         let Some(core) = self.core.clone() else {
-            self.flush_failed(then, "Composer storage is not ready.".into());
+            self.flush_failed(then, t("composer.errors.storageNotReady"));
             return;
         };
         if !self.drafts.is_loaded() {
-            self.flush_failed(then, "Conversation drafts are still loading.".into());
+            self.flush_failed(then, t("composer.errors.draftsLoading"));
             return;
         }
         let payload = self.drafts.take_save().unwrap_or_else(|| self.full_payload());

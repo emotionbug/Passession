@@ -1,18 +1,23 @@
 //! `WaTerminalView`: the interactive terminal surface (original `TerminalEmulator` of
 //! `terminal-pane.tsx`): the shared cell grid sized to the viewport, the cursor, scrollback
-//! with follow-bottom on output and input, selection with copy, and keyboard, paste and
-//! input-method input written to the daemon terminal.
+//! with follow-bottom on output and input, selection with copy, find highlights, links,
+//! and keyboard, paste, wheel and input-method input written to the daemon terminal.
 //!
 //! The grid size fits the viewport; changes are debounced 100ms, then the local emulator
 //! reflows and the size is sent: the focused pane `claim`s the PTY size, other visible
 //! panes send `update`, which applies only while they own it (`terminal-pane-focus-claim.ts`).
+//!
+//! Over a full-screen program (alternate screen or mouse tracking) the wheel and touch
+//! swipes go to the program instead of the local scrollback ([`input::wheel_route`]).
 
 use makepad_widgets::*;
 use paseo_gui_core::CoreHandle;
 use paseo_terminal::{CellStyle, CursorShape, Key, Line, Modifiers};
 
+use super::find::{FindHits, FindMatch, SearchMode};
 use super::grid::{grapheme_column, selected_text, CellGrid, CellPos, GridPaint, GridSelection};
-use super::input::{self, ImeBridge, KeyCommand, ReplaceTracker, IME_SENTINEL};
+use super::input::{self, ImeBridge, KeyCommand, ReplaceTracker, WheelRoute, IME_SENTINEL};
+use super::links;
 use super::stream::Stream;
 use crate::common::{UiContext, UiEffect};
 use crate::theme;
@@ -43,6 +48,8 @@ pub enum WaTerminalViewAction {
     None,
     /// Sticky key-bar modifiers were consumed by typed input.
     ModifiersConsumed,
+    /// Ctrl+Shift+F / Cmd+F: open the pane's find card.
+    FindRequested,
 }
 
 #[derive(Live, LiveHook, Widget)]
@@ -117,6 +124,20 @@ pub struct WaTerminalView {
     sent: Option<(u16, u16, bool)>,
     #[rust]
     resize_timer: Timer,
+    /// Find matches painted over the rows.
+    #[rust]
+    pub find: FindHits,
+    /// A match to scroll into view on the next draw.
+    #[rust]
+    reveal: Option<FindMatch>,
+    #[rust]
+    find_pending: bool,
+    /// Fractional rows of wheel scrolling not yet sent to a full-screen program.
+    #[rust]
+    wheel_carry: f64,
+    /// A touch swipe sent to a full-screen program: the last finger y and the carried rows.
+    #[rust]
+    touch_pan: Option<(f64, f64)>,
 }
 
 fn core_of(scope: &mut Scope) -> Option<CoreHandle> {
@@ -373,7 +394,87 @@ impl WaTerminalView {
                 self.select_all(cx);
                 false
             }
-            KeyCommand::Find | KeyCommand::Ignore => false,
+            KeyCommand::Find => {
+                self.find_pending = true;
+                false
+            }
+            KeyCommand::Ignore => false,
+        }
+    }
+
+    /// The cell under `abs` without snapping: (presented row, column).
+    fn raw_cell(&self, cx: &Cx, abs: DVec2) -> Option<(usize, usize)> {
+        let (width, height) = self.grid.cell()?;
+        let local = abs - self.draw_hit.area().rect(cx).pos + self.hit_origin;
+        if local.x < 0.0 || local.y < 0.0 {
+            return None;
+        }
+        Some(((local.y / height).floor() as usize, (local.x / width).floor() as usize))
+    }
+
+    fn link_at(&mut self, cx: &Cx, abs: DVec2) -> Option<String> {
+        let (row, col) = self.raw_cell(cx, abs)?;
+        links::link_at(self.session.as_mut()?, row, col)
+    }
+
+    /// Where wheel and swipes go now: a live full-screen program, else the scrollback.
+    fn wheel_route(&self) -> WheelRoute {
+        match self.session.as_ref() {
+            Some(session) if self.connected && session.live(true) => input::wheel_route(session.screen.modes()),
+            _ => WheelRoute::Scrollback,
+        }
+    }
+
+    /// Sends `rows` of scrolling (negative = up) at `abs` to a full-screen program.
+    fn scroll_program(&mut self, cx: &Cx, core: &CoreHandle, route: WheelRoute, rows: i64, abs: DVec2, mods: Modifiers) {
+        if rows == 0 {
+            return;
+        }
+        let up = rows < 0;
+        let count = rows.unsigned_abs().min(64) as usize;
+        let cell = self.raw_cell(cx, abs);
+        let Some(session) = self.session.as_mut() else { return };
+        let bytes = match route {
+            WheelRoute::Mouse => {
+                let history = session.screen.history();
+                let (row, col) = cell.unwrap_or((history, 0));
+                let row = row.saturating_sub(history).min(usize::from(session.screen.rows().saturating_sub(1)));
+                let col = col.min(session.cols().saturating_sub(1));
+                session.screen.encode_mouse_wheel(up, col as u16, row as u16, mods, count)
+            }
+            WheelRoute::Arrows => session.screen.encode_key(if up { Key::Up } else { Key::Down }, Modifiers::default()).repeat(count),
+            WheelRoute::Scrollback => return,
+        };
+        session.send_input(core, &bytes);
+    }
+
+    /// Searches the output for the panel's find card and reveals the chosen match.
+    pub fn run_find(&mut self, cx: &mut Cx, query: &str, mode: SearchMode) {
+        match self.session.as_ref() {
+            Some(session) => {
+                if let Some(target) = self.find.search(session, query, mode) {
+                    self.follow = false;
+                    self.reveal = Some(target);
+                }
+            }
+            None => self.find.clear(),
+        }
+        self.redraw(cx);
+    }
+
+    pub fn clear_find(&mut self, cx: &mut Cx) {
+        self.find.clear();
+        self.redraw(cx);
+    }
+}
+
+/// Touch moves this surface consumed are not panned by enclosing scroll views.
+fn claim_touch_moves(event: &Event, area: Area) {
+    if let Event::TouchUpdate(update) = event {
+        for touch in &update.touches {
+            if matches!(touch.state, makepad_widgets::makepad_draw::event::TouchState::Move) {
+                touch.handled.set(area);
+            }
         }
     }
 }
@@ -414,10 +515,23 @@ impl Widget for WaTerminalView {
                 }
                 self.redraw(cx);
             }
+            Hit::FingerHoverIn(hover) | Hit::FingerHoverOver(hover) => {
+                let primary = if APPLE { hover.modifiers.logo } else { hover.modifiers.control };
+                if primary && self.link_at(cx, hover.abs).is_some() {
+                    cx.set_cursor(MouseCursor::Hand);
+                }
+            }
             Hit::FingerDown(down) => {
                 cx.set_key_focus(area);
                 self.selection.dragging = false;
-                if !down.device.is_touch() && down.device.is_primary_hit() && let Some(pos) = self.pos_to_cell(cx, down.abs) {
+                let primary = if APPLE { down.modifiers.logo } else { down.modifiers.control };
+                self.touch_pan = (down.device.is_touch() && self.wheel_route() != WheelRoute::Scrollback).then_some((down.abs.y, 0.0));
+                if !down.device.is_touch() && down.device.is_primary_hit() && primary && let Some(url) = self.link_at(cx, down.abs) {
+                    // Ctrl/Cmd+click opens a link instead of starting a selection.
+                    if let Some(ui) = scope.data.get_mut::<UiContext>() {
+                        ui.push(UiEffect::OpenExternal { url });
+                    }
+                } else if !down.device.is_touch() && down.device.is_primary_hit() && let Some(pos) = self.pos_to_cell(cx, down.abs) {
                     self.selection.touch = false;
                     self.selection.set(pos, pos);
                     self.selection.dragging = true;
@@ -436,23 +550,36 @@ impl Widget for WaTerminalView {
             }
             Hit::FingerMove(moved) => {
                 if self.selection.dragging && let (Some(pos), Some((anchor, _))) = (self.pos_to_cell(cx, moved.abs), self.selection.range()) {
-                    if let Event::TouchUpdate(update) = event {
-                        for touch in &update.touches {
-                            if matches!(touch.state, makepad_widgets::makepad_draw::event::TouchState::Move) {
-                                touch.handled.set(area);
-                            }
-                        }
-                    }
+                    claim_touch_moves(event, area);
                     self.follow = false;
                     self.selection.set(anchor, pos);
                     self.redraw(cx);
+                } else if moved.device.is_touch() && let Some((last, carry)) = self.touch_pan {
+                    // A swipe over a full-screen program scrolls the program (`less`, `vim`).
+                    let route = self.wheel_route();
+                    if route != WheelRoute::Scrollback && let Some(core) = core_of(scope) {
+                        claim_touch_moves(event, area);
+                        self.scroll_bars.cancel_touch_scroll();
+                        let height = self.grid.cell().map(|(_, height)| height).unwrap_or(0.0);
+                        let (rows, carry) = input::wheel_rows(carry, last - moved.abs.y, height);
+                        self.touch_pan = Some((moved.abs.y, carry));
+                        self.scroll_program(cx, &core, route, rows, moved.abs, Modifiers::default());
+                    }
                 }
             }
             Hit::FingerUp(up) => {
+                self.touch_pan = None;
                 if up.device.is_touch() && up.was_tap() && !self.selection.dragging {
-                    // Tapping the grid shows the soft keyboard (original `showKeyboard`).
                     self.selection.clear(cx, area);
-                    self.show_keyboard(cx);
+                    if let Some(url) = self.link_at(cx, up.abs) {
+                        // Tapping a link opens it (phones have no Ctrl/Cmd+click).
+                        if let Some(ui) = scope.data.get_mut::<UiContext>() {
+                            ui.push(UiEffect::OpenExternal { url });
+                        }
+                    } else {
+                        // Tapping the grid shows the soft keyboard (original `showKeyboard`).
+                        self.show_keyboard(cx);
+                    }
                 }
                 if cfg!(target_os = "android") && up.device.is_touch() && self.selection.dragging {
                     self.selection.show_actions = self.selection.has_text();
@@ -463,7 +590,16 @@ impl Widget for WaTerminalView {
                     self.clear_selection(cx);
                 }
             }
-            Hit::KeyDown(key) => consumed = self.key_down(cx, core_of(scope).as_ref(), &key),
+            Hit::TextPasteShortcut(request) => {
+                request.allowed.set(input::paste_shortcut(request.modifiers, APPLE));
+            }
+            Hit::KeyDown(key) => {
+                let core = core_of(scope);
+                consumed = self.key_down(cx, core.as_ref(), &key);
+                if std::mem::take(&mut self.find_pending) {
+                    cx.widget_action(uid, &scope.path, WaTerminalViewAction::FindRequested);
+                }
+            }
             Hit::KeyUp(_) => self.suppress_text = false,
             Hit::TextInput(text) => {
                 if let Some(core) = core_of(scope).as_ref() {
@@ -509,6 +645,20 @@ impl Widget for WaTerminalView {
         }
         if consumed {
             cx.widget_action(uid, &scope.path, WaTerminalViewAction::ModifiersConsumed);
+        }
+        if let Event::Scroll(scroll) = event
+            && !scroll.handled_y.get()
+            && area.clipped_rect(cx).contains(scroll.abs)
+        {
+            // The wheel over a full-screen program scrolls the program, not the scrollback.
+            let route = self.wheel_route();
+            if route != WheelRoute::Scrollback && let Some(core) = core_of(scope) {
+                scroll.handled_y.set(true);
+                let height = self.grid.cell().map(|(_, height)| height).unwrap_or(0.0);
+                let (rows, carry) = input::wheel_rows(self.wheel_carry, scroll.scroll.y, height);
+                self.wheel_carry = carry;
+                self.scroll_program(cx, &core, route, rows, scroll.abs, input::modifiers(scroll.modifiers));
+            }
         }
         self.scroll_bars.handle_scroll_event(cx, event, scope, &mut Vec::new());
         let after = self.scroll_bars.get_scroll_pos();
@@ -556,7 +706,8 @@ impl Widget for WaTerminalView {
                     let row = first + index;
                     let cells: usize = line.runs.iter().map(|run| run.cells).sum();
                     let span = self.selection.span(row, cells);
-                    if let Some(rect) = self.grid.draw_line(cx, origin, row, line, &paint, &[], span) {
+                    let highlights = self.find.row(row, line.columns.len());
+                    if let Some(rect) = self.grid.draw_line(cx, origin, row, line, &paint, &highlights, span) {
                         self.selection.painted(rect, hit_rect);
                     }
                 }
@@ -631,7 +782,12 @@ impl Widget for WaTerminalView {
         if viewport.y > 0.0 {
             self.viewport = viewport;
             self.max_scroll = (content.y - viewport.y).max(0.0);
-            if self.follow {
+            if let Some(target) = self.reveal.take() {
+                // A find match: its row a third down the viewport, its column in view.
+                let y = (target.start_row as f64 * height - viewport.y / 3.0).clamp(0.0, self.max_scroll);
+                let x = (target.start_offset as f64 * width - viewport.x / 2.0).clamp(0.0, (content.x - viewport.x).max(0.0));
+                self.scroll_bars.set_scroll_pos(cx, dvec2(x, y));
+            } else if self.follow {
                 let x = self.scroll_bars.get_scroll_pos().x;
                 self.scroll_bars.set_scroll_pos(cx, dvec2(x, self.max_scroll));
             }
@@ -672,6 +828,12 @@ impl WaTerminalViewRef {
         actions
             .filter_widget_actions(self.widget_uid())
             .any(|action| matches!(action.cast(), WaTerminalViewAction::ModifiersConsumed))
+    }
+
+    pub fn find_requested(&self, actions: &Actions) -> bool {
+        actions
+            .filter_widget_actions(self.widget_uid())
+            .any(|action| matches!(action.cast(), WaTerminalViewAction::FindRequested))
     }
 }
 

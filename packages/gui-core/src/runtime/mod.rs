@@ -199,6 +199,7 @@ async fn handle(core: &Rc<Core>, command: Command) {
         } => requests::gui_operation(core, host_id, request_id, run),
         Command::Cancel { request_id } => requests::cancel(core, &request_id),
         Command::Notify { host_id, message } => requests::notify(core, host_id, message),
+        Command::TerminalInput { host_id, subscription_id, data } => requests::terminal_input(core, host_id, subscription_id, data),
         Command::ConnectHost { config } => hosts::connect_host(core, config).await,
         Command::DisconnectHost { host_id } => hosts::disconnect_host(core, &host_id).await,
         Command::RemoveHost { host_id } => hosts::remove_host(core, &host_id).await,

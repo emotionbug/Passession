@@ -1,13 +1,19 @@
 //! `WaLogView`: the read-only execution output surface (Flutter `_output` of
 //! `execution_log_panel.dart`): the shared terminal cell grid with only the rows inside the
-//! viewport read and painted, horizontal and vertical scrolling, follow-output, find
-//! highlights and drag selection with copy.
+//! viewport read and painted, horizontal and vertical scrolling, follow-output (resumed by
+//! scrolling back to the end), find highlights, links (Ctrl/Cmd+click, tap) and drag
+//! selection with copy.
 
 use makepad_widgets::*;
 
 use super::session::LogSession;
+use crate::common::{UiContext, UiEffect};
+use crate::features::terminal::find::{FindHits, FindMatch, SearchMode};
 use crate::features::terminal::grid::{grapheme_column, selected_text, CellGrid, CellPos, GridPaint, GridSelection};
+use crate::features::terminal::links;
 use crate::theme;
+
+const APPLE: bool = cfg!(target_vendor = "apple");
 
 live_design! {
     use link::theme::*;
@@ -24,19 +30,10 @@ live_design! {
     }
 }
 
-/// A find match in presented row/char offsets (`_LogMatch`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LogMatch {
-    pub start_row: usize,
-    pub start_offset: usize,
-    pub end_row: usize,
-    pub end_offset: usize,
-}
-
 #[derive(Clone, Debug, DefaultNone)]
 pub enum WaLogViewAction {
     None,
-    /// The user scrolled the output (pauses following).
+    /// The user scrolled the output: following stops, or resumes at the end.
     UserScrolled,
     /// Ctrl/Cmd+F while the output has focus.
     FindRequested,
@@ -59,37 +56,19 @@ pub struct WaLogView {
     pub session: Option<LogSession>,
     #[rust]
     pub follow: bool,
+    /// Find matches painted over the rows.
     #[rust]
-    pub matches: Vec<LogMatch>,
+    pub find: FindHits,
     #[rust]
-    pub active_match: Option<usize>,
-    #[rust]
-    pub matches_revision: u64,
-    #[rust]
-    reveal: Option<LogMatch>,
+    reveal: Option<FindMatch>,
     #[rust(GridSelection::new(cx))]
     selection: GridSelection,
     #[rust]
     hit_origin: DVec2,
     #[rust]
     viewport: DVec2,
-}
-
-/// Highlight ranges of `row` (`_rowHighlights`): every match and the active one.
-fn row_highlights(matches: &[LogMatch], active: Option<usize>, row: usize, length: usize) -> Vec<(usize, usize, bool)> {
-    let first = matches.partition_point(|m| m.end_row < row);
-    let mut out = Vec::new();
-    for (index, m) in matches.iter().enumerate().skip(first) {
-        if m.start_row > row {
-            break;
-        }
-        let start = if row == m.start_row { m.start_offset } else { 0 }.min(length);
-        let end = if row == m.end_row { m.end_offset } else { length }.clamp(start, length);
-        if end > start {
-            out.push((start, end, Some(index) == active));
-        }
-    }
-    out
+    #[rust]
+    max_scroll: f64,
 }
 
 impl WaLogView {
@@ -141,9 +120,44 @@ impl WaLogView {
         selected_text(&lines, start, end)
     }
 
-    pub fn reveal(&mut self, cx: &mut Cx, target: LogMatch) {
-        self.reveal = Some(target);
+    /// Searches the output for the panel's find card and reveals the chosen match.
+    pub fn run_find(&mut self, cx: &mut Cx, query: &str, mode: SearchMode) {
+        match self.session.as_ref() {
+            Some(session) => {
+                if let Some(target) = self.find.search(session, query, mode) {
+                    self.follow = false;
+                    self.reveal = Some(target);
+                }
+            }
+            None => self.find.clear(),
+        }
         self.redraw(cx);
+    }
+
+    pub fn clear_find(&mut self, cx: &mut Cx) {
+        self.find.clear();
+        self.redraw(cx);
+    }
+
+    /// The link under `abs`, following the row's soft wraps.
+    fn link_at(&mut self, cx: &Cx, abs: DVec2) -> Option<String> {
+        let (width, height) = self.grid.cell()?;
+        let local = abs - self.draw_hit.area().rect(cx).pos + self.hit_origin;
+        if local.x < 0.0 || local.y < 0.0 {
+            return None;
+        }
+        let row = (local.y / height).floor() as usize;
+        let session = self.session.as_mut()?;
+        if row >= session.line_count() {
+            return None;
+        }
+        links::link_at(session, row, (local.x / width).floor() as usize)
+    }
+
+    fn open_link(scope: &mut Scope, url: String) {
+        if let Some(ui) = scope.data.get_mut::<UiContext>() {
+            ui.push(UiEffect::OpenExternal { url });
+        }
     }
 
     pub fn clear_selection(&mut self, cx: &mut Cx) {
@@ -162,10 +176,20 @@ impl Widget for WaLogView {
         let before = self.scroll_bars.get_scroll_pos();
         self.scroll_bars.handle_main_event(cx, event, scope, &mut Vec::new());
         match event.hits(cx, area) {
+            Hit::FingerHoverIn(hover) | Hit::FingerHoverOver(hover) => {
+                let primary = if APPLE { hover.modifiers.logo } else { hover.modifiers.control };
+                if primary && self.link_at(cx, hover.abs).is_some() {
+                    cx.set_cursor(MouseCursor::Hand);
+                }
+            }
             Hit::FingerDown(down) => {
                 cx.claim_text_selection(area);
                 self.selection.dragging = false;
-                if !down.device.is_touch() && let Some(pos) = self.pos_to_cell(cx, down.abs) {
+                let primary = if APPLE { down.modifiers.logo } else { down.modifiers.control };
+                if !down.device.is_touch() && down.device.is_primary_hit() && primary && let Some(url) = self.link_at(cx, down.abs) {
+                    // Ctrl/Cmd+click opens a link instead of starting a selection.
+                    Self::open_link(scope, url);
+                } else if !down.device.is_touch() && down.device.is_primary_hit() && let Some(pos) = self.pos_to_cell(cx, down.abs) {
                     self.selection.touch = false;
                     self.selection.set(pos, pos);
                     self.selection.dragging = true;
@@ -198,6 +222,10 @@ impl Widget for WaLogView {
             Hit::FingerUp(up) => {
                 if up.device.is_touch() && up.was_tap() && !self.selection.dragging {
                     self.clear_selection(cx);
+                    // Tapping a link opens it (phones have no Ctrl/Cmd+click).
+                    if let Some(url) = self.link_at(cx, up.abs) {
+                        Self::open_link(scope, url);
+                    }
                 }
                 if cfg!(target_os = "android") && up.device.is_touch() && self.selection.dragging {
                     self.selection.show_actions = self.selection.has_text();
@@ -234,6 +262,8 @@ impl Widget for WaLogView {
         self.scroll_bars.handle_scroll_event(cx, event, scope, &mut Vec::new());
         let after = self.scroll_bars.get_scroll_pos();
         if (after.y - before.y).abs() > 0.5 && !matches!(event, Event::NextFrame(_)) {
+            // Scrolling away pauses following; scrolling back to the end resumes it.
+            self.follow = after.y >= self.max_scroll - 1.0;
             cx.widget_action(uid, &scope.path, WaLogViewAction::UserScrolled);
         }
     }
@@ -244,9 +274,9 @@ impl Widget for WaLogView {
         let paint = GridPaint::new(&palette);
         self.scroll_bars.begin(cx, walk, self.layout);
         let origin = cx.turtle().pos();
-        let (rows, cols, revision) = match self.session.as_ref() {
-            Some(session) => (session.line_count(), session.cols(), session.revision()),
-            None => (0, 0, 0),
+        let (rows, cols) = match self.session.as_ref() {
+            Some(session) => (session.line_count(), session.cols()),
+            None => (0, 0),
         };
         let content = dvec2(cols as f64 * width, rows as f64 * height);
         let viewport = self.viewport;
@@ -261,12 +291,11 @@ impl Widget for WaLogView {
         let hit_rect = area.rect(cx);
         self.grid.begin(cx, origin);
         self.selection.begin_frame();
-        let matches: &[LogMatch] = if self.matches_revision == revision { &self.matches } else { &[] };
         if let Some(session) = self.session.as_mut() && first < rows {
             let lines = session.read(first, count.min(rows - first));
             for (index, line) in lines.iter().enumerate() {
                 let row = first + index;
-                let highlights = row_highlights(matches, self.active_match, row, line.columns.len());
+                let highlights = self.find.row(row, line.columns.len());
                 let cells: usize = line.runs.iter().map(|run| run.cells).sum();
                 let span = self.selection.span(row, cells);
                 if let Some(rect) = self.grid.draw_line(cx, origin, row, line, &paint, &highlights, span) {
@@ -280,15 +309,16 @@ impl Widget for WaLogView {
         let resized = viewport != self.viewport && viewport.y > 0.0;
         if viewport.y > 0.0 {
             self.viewport = viewport;
+            self.max_scroll = (content.y - viewport.y).max(0.0);
             // `end` measures the current content and viewport. Before it, scroll
             // setters clamp against the previous frame (zero on the initial draw).
             if let Some(target) = self.reveal.take() {
-                let y = (target.start_row as f64 * height).min((content.y - viewport.y).max(0.0));
-                let x = (target.start_offset as f64 * width).min((content.x - viewport.x).max(0.0));
-                self.scroll_bars.set_scroll_pos(cx, dvec2(x.max(0.0), y.max(0.0)));
+                let y = (target.start_row as f64 * height - viewport.y / 3.0).clamp(0.0, self.max_scroll);
+                let x = (target.start_offset as f64 * width - viewport.x / 2.0).clamp(0.0, (content.x - viewport.x).max(0.0));
+                self.scroll_bars.set_scroll_pos(cx, dvec2(x, y));
             } else if self.follow {
                 let x = self.scroll_bars.get_scroll_pos().x;
-                self.scroll_bars.set_scroll_pos(cx, dvec2(x, (content.y - viewport.y).max(0.0)));
+                self.scroll_bars.set_scroll_pos(cx, dvec2(x, self.max_scroll));
             }
         }
         self.selection.draw_overlays(cx, area, origin, (width, height), false);
@@ -315,21 +345,5 @@ impl WaLogViewRef {
         actions
             .filter_widget_actions(self.widget_uid())
             .any(|action| matches!(action.cast(), WaLogViewAction::FindRequested))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn highlights_cover_matches_crossing_rows() {
-        let matches = [
-            LogMatch { start_row: 0, start_offset: 2, end_row: 1, end_offset: 3 },
-            LogMatch { start_row: 1, start_offset: 5, end_row: 1, end_offset: 7 },
-        ];
-        assert_eq!(row_highlights(&matches, Some(1), 0, 4), vec![(2, 4, false)]);
-        assert_eq!(row_highlights(&matches, Some(1), 1, 10), vec![(0, 3, false), (5, 7, true)]);
-        assert!(row_highlights(&matches, None, 2, 10).is_empty());
     }
 }

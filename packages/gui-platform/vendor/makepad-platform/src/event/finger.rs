@@ -886,6 +886,11 @@ impl Event {
                     return Hit::KeyUp(ku.clone())
                 }
             },
+            Event::TextPasteShortcut(request) => {
+                if cx.keyboard.has_key_focus(area) {
+                    return Hit::TextPasteShortcut(request.clone());
+                }
+            },
             Event::TextInput(ti) => {
                 if cx.keyboard.has_key_focus(area) {
                     return Hit::TextInput(ti.clone())

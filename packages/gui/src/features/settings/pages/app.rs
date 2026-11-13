@@ -101,6 +101,7 @@ fn draw_general(ui: &mut Ui, v: &View) {
         let ctl = select_ctl("pref.sendBehavior", t("settings.general.defaultSend.label"), &send, options, 220.0, true, pref_pick("sendBehavior"));
         ui.row(row(t("settings.general.defaultSend.label")).hint(t(&format!("settings.general.defaultSend.descriptions.{send}"))).control(ctl));
     });
+    card_section(ui, &t("settings.sections.terminal"), |ui| draw_scrollback(ui, v));
     if DESKTOP {
         let open = v.prefs.get("openInSidePane").cloned().unwrap_or_else(|| json!({}));
         let destinations = vec![
@@ -131,6 +132,41 @@ fn draw_general(ui: &mut Ui, v: &View) {
             ui.row(row(label).control(ctl));
         });
     }
+}
+
+/// Scrollback presets; a stored value outside them stays selectable.
+const SCROLLBACK_PRESETS: [usize; 6] = [1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000];
+
+/// `1000000` → `1,000,000`.
+fn grouped(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `settings.terminalScrollbackLines` (read like the terminal does).
+fn draw_scrollback(ui: &mut Ui, v: &View) {
+    let current = crate::features::terminal::session::scrollback_preference(&v.prefs);
+    let mut values = SCROLLBACK_PRESETS.to_vec();
+    if !values.contains(&current) {
+        values.push(current);
+        values.sort_unstable();
+    }
+    let options = values.iter().map(|n| (n.to_string(), ta("settingsNative.scrollbackLines", &[("count", &grouped(*n))]))).collect();
+    let pick: Pick = Rc::new(|s, env, picked| {
+        if let Ok(lines) = picked.parse::<u64>() {
+            s.save_pref(env, "terminalScrollbackLines", Some(Value::from(lines)));
+        }
+    });
+    let label = t("settings.general.terminalScrollback.label");
+    let ctl = select_ctl("pref.terminalScrollbackLines", label.clone(), &current.to_string(), options, 220.0, true, pick);
+    ui.row(row(label).hint(t("settings.general.terminalScrollback.description")).control(ctl));
 }
 
 fn draw_chat(ui: &mut Ui, v: &View) {
@@ -321,4 +357,18 @@ fn draw_files(ui: &mut Ui, v: &View) {
             ui.row(row(label).control(Ctl::Row(vec![dropdown, again], 8.0)));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grouped;
+
+    #[test]
+    fn groups_thousands() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1_000), "1,000");
+        assert_eq!(grouped(50_000), "50,000");
+        assert_eq!(grouped(1_000_000), "1,000,000");
+    }
 }

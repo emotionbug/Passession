@@ -372,9 +372,9 @@ async fn subscribe_to_finished_script(service: &TerminalService, terminal_id: &s
                         }
                         Some("terminal_stream_exit") => {
                             assert!(acknowledged && restored);
+                            assert!(message["payload"]["error"].is_null(), "{message}");
                             break;
                         }
-                        Some("terminal_stream_error") => panic!("{message}"),
                         _ => {}
                     }
                 }

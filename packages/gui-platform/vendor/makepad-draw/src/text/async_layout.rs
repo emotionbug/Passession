@@ -180,6 +180,24 @@ struct Queue {
     stopped: bool,
 }
 
+/// Brings a worker layouter's families in line with `catalog`: new families
+/// are defined, families whose font list changed are redefined (dropping the
+/// stale loaded family), unchanged ones are left loaded.
+fn apply_catalog_families(
+    layouter: &mut Layouter,
+    applied: &mut HashMap<FontFamilyId, FontFamilyDefinition>,
+    catalog: &FontCatalog,
+) {
+    for (&id, definition) in &catalog.families {
+        match applied.get(&id) {
+            Some(current) if current == definition => continue,
+            Some(_) => layouter.redefine_font_family(id, definition.clone()),
+            None => layouter.define_font_family(id, definition.clone()),
+        }
+        applied.insert(id, definition.clone());
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Service {
     state: Arc<(Mutex<Queue>, Condvar)>,
@@ -194,6 +212,9 @@ impl Service {
         settings.loader.rasterizer.color_atlas_size = Size::new(1, 1);
         std::thread::Builder::new().name("makepad-exact-layout".into()).spawn(move || {
             let mut layouter = Layouter::new(settings);
+            // The family lists this worker's layouter was given, to notice
+            // `Fonts::redefine_font_family` in a newer catalog.
+            let mut applied_families: HashMap<FontFamilyId, FontFamilyDefinition> = HashMap::new();
             loop {
                 let (job, garbage) = {
                     let (lock, wake) = &*worker_state;
@@ -213,9 +234,7 @@ impl Service {
                 for (&id, definition) in &job.catalog.fonts {
                     if !layouter.is_font_known(id) { layouter.define_font(id, definition.clone()); }
                 }
-                for (&id, definition) in &job.catalog.families {
-                    if !layouter.is_font_family_known(id) { layouter.define_font_family(id, definition.clone()); }
-                }
+                apply_catalog_families(&mut layouter, &mut applied_families, &job.catalog);
                 // Finish admitted work even when producers continuously update.
                 // At most one latest waiting request exists for each owner.
                 let text = layouter.layout_shared(job.text.into(), &job.spans, job.key.options);
@@ -457,6 +476,7 @@ mod tests {
         layouter.define_font(id, FontDefinition {
             data: Arc::new(include_bytes!("../../../makepad-widgets/resources/LiberationMono-Regular.ttf").to_vec()),
             index: 0,
+            variations: Vec::new(),
             ascender_fudge_in_ems: 0.125,
             descender_fudge_in_ems: -0.0625,
         });
@@ -464,6 +484,7 @@ mod tests {
         layouter.define_font(fallback, FontDefinition {
             data: Arc::new(include_bytes!("../../../makepad-widgets/resources/fa-solid-900.ttf").to_vec()),
             index: 0,
+            variations: Vec::new(),
             ascender_fudge_in_ems: 0.0,
             descender_fudge_in_ems: 0.0,
         });
@@ -623,5 +644,47 @@ mod tests {
         changed = original;
         changed.fonts += 1;
         assert_ne!(original, changed);
+    }
+
+    #[test]
+    fn a_family_redefinition_withholds_the_stale_result_and_relayouts_with_new_fonts() {
+        let mut cx = makepad_platform::Cx::new(Box::new(|_, _| {}));
+        let mut fonts = Fonts::new(&mut cx, Settings::default());
+        let definition = |data: &[u8]| FontDefinition {
+            data: Arc::new(data.to_vec()),
+            index: 0,
+            variations: Vec::new(),
+            ascender_fudge_in_ems: 0.0,
+            descender_fudge_in_ems: 0.0,
+        };
+        let (mono, sans, family) = (FontId::from(921), FontId::from(922), FontFamilyId::from(923));
+        fonts.define_font(mono, definition(include_bytes!("../../../makepad-widgets/resources/LiberationMono-Regular.ttf")));
+        fonts.define_font(sans, definition(include_bytes!("../../../makepad-widgets/resources/NotoSans-Regular.ttf")));
+        fonts.define_font_family(family, FontFamilyDefinition { font_ids: vec![mono] });
+        let text: Arc<str> = "Illuminate".into();
+        let spans = Arc::new(vec![Span { style: Style { font_family_id: family, font_size_in_pts: 12.0, color: None }, len: text.len() }]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let mut layout = AsyncLayout::new();
+        layout.request(&mut fonts, 1, text.clone(), spans.clone(), LayoutOptions::default());
+        while layout.mailbox.result.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "worker never produced a layout");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        fonts.redefine_font_family(family, FontFamilyDefinition { font_ids: vec![sans, mono] });
+        assert!(!layout.poll(&mut fonts, usize::MAX, usize::MAX), "stale catalog revision was published");
+        assert!(layout.completed().is_none());
+
+        // The same source revision under the new catalog reaches the worker,
+        // which must rebuild the family it already loaded.
+        layout.request(&mut fonts, 1, text, spans, LayoutOptions::default());
+        while !layout.poll(&mut fonts, usize::MAX, usize::MAX) {
+            assert!(std::time::Instant::now() < deadline, "worker never relaid out the redefined family");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let completed = layout.completed().unwrap();
+        let glyphs: Vec<_> = completed.rows.iter().flat_map(|row| &row.glyphs).collect();
+        assert_eq!(glyphs.len(), "Illuminate".len());
+        assert!(glyphs.iter().all(|glyph| glyph.font.id() == sans));
     }
 }

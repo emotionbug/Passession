@@ -981,11 +981,8 @@ impl SourceEditor {
             }
             Hit::FingerScroll(fe) => {
                 self.touch_scroll.reset();
-                let mut delta = fe.scroll;
-                if fe.modifiers.shift && delta.x == 0.0 {
-                    delta = dvec2(delta.y, 0.0);
-                }
-                self.scroll_by(look, delta);
+                // Shift+wheel already arrives as `delta.x` from the platform layer.
+                self.scroll_by(look, fe.scroll);
             }
             Hit::KeyDown(ke) => {
                 if ke.key_code != KeyCode::KeyA || !ke.modifiers.is_primary() {

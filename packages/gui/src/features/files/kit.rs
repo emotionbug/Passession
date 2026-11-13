@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use makepad_widgets::makepad_draw::cx_draw::CxDraw;
-use makepad_widgets::makepad_draw::shader::draw_text::FontFamily as DrawTextFontFamily;
 use makepad_widgets::makepad_draw::text::color::Color as TextColor;
 use makepad_widgets::makepad_draw::text::font_family::FontFamilyId;
 use makepad_widgets::makepad_draw::text::fonts::Fonts;
@@ -108,16 +107,9 @@ pub struct Kit {
     pub text_bold_italic: DrawText,
 }
 
-/// The font family a DrawText's style resolved to. Makepad 1.0.0 keeps `FontFamily::id`
-/// private while `Fonts::get_or_layout` needs it for multi-span layout; `FontFamily` is one
-/// `LiveId` (u64) field, which the size check pins for the pinned version (same technique as the
-/// timeline canvas).
+/// The font family a DrawText's style resolved to (multi-span layout needs it).
 fn family_id(dt: &DrawText) -> FontFamilyId {
-    const _: () = assert!(std::mem::size_of::<DrawTextFontFamily>() == std::mem::size_of::<u64>());
-    // SAFETY: `FontFamily` (makepad-draw 1.0.0 shader/draw_text.rs) is
-    // `struct FontFamily { #[rust] id: LiveId }` with `LiveId(pub u64)`.
-    let raw: u64 = unsafe { std::mem::transmute_copy(&dt.text_style.font_family) };
-    raw.into()
+    dt.text_style.font_family.font_family_id()
 }
 
 fn text_color(color: Vec4) -> TextColor {

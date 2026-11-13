@@ -1,6 +1,6 @@
 # Release
 
-The checkout version is **0.13.18**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
+The checkout version is **0.13.19**. Normal CI runs tests on one Ubuntu x64 runner. Building, packaging and publishing artifacts require an explicit manual workflow dispatch; commit and tag pushes do not start those operations.
 
 ## Distribution requirements
 
@@ -62,7 +62,7 @@ The Visual C++ ARM64 redistributable directory can also contain x64-view DLLs fo
 
 The product is named Passession (window titles, shortcuts, installer, Add/Remove Programs, notifications, `Passession.app`). Executable names, package names and IDs keep the previous client's values, so `paseo open`, `paseo://` handlers, saved state and in-place updates keep working: `paseo_sessions` (Linux bundle, `/opt/paseo-sessions`, `/usr/bin/paseo-sessions`, Debian package `paseo-sessions`), `paseo_sessions.exe`, bundle ID `sh.paseo.sessions.desktop`, Android package `sh.paseo.sessions`, and the Windows data folder `%APPDATA%\Paseo\Paseo Sessions`. New Windows installs go to `%LOCALAPPDATA%\Programs\Passession`; an upgrade stays in the folder recorded under `HKCU\Software\Paseo Sessions` and replaces the old `Paseo Sessions` shortcuts. A macOS update keeps the installed bundle's path. The cargo binary `paseo-sessions` is renamed when bundled.
 
-Linux packages also cover libraries the client opens at runtime, which `ldd` and `dpkg-shlibdeps` cannot see: Makepad's `libEGL`, `libX11` (idle time and close-to-tray), and the optional `libXss` (X11 idle time) and `libSM`/`libICE` (session logout without a GNOME SessionManager). The AppImage bundles all four X11/XSMP libraries with their closure (`libraries::LINUX_DLOPENED`; the packaging host must have them installed); the Debian package depends on `libegl1`, `libx11-6` and `xdg-utils` and recommends `libxss1`, `libsm6` and `libice6`. Add any new `dlopen` library to both lists.
+Linux packages also cover libraries the client opens at runtime, which `ldd` and `dpkg-shlibdeps` cannot see: Makepad's `libEGL`, `libX11` (idle time and close-to-tray), and the optional `libXss` (X11 idle time), `libSM`/`libICE` (session logout without a GNOME SessionManager), and `libfontconfig` (system-font discovery). The AppImage bundles these X11/XSMP/fontconfig libraries with their closure (`libraries::LINUX_DLOPENED`; the packaging host must have them installed); the Debian package depends on `libegl1`, `libx11-6` and `xdg-utils` and recommends `libxss1`, `libsm6`, `libice6` and `libfontconfig1`. Add any new `dlopen` library to both lists.
 
 The desktop client feed keeps its exact wire identity: asset `flutter-<channel>-<platform>-<arch>.json` with `runtime: "flutter"` and `appId: "sh.paseo.sessions.desktop"`. Installed clients — including every Flutter-era build — discover updates only by that identity; renaming it would strand them. Artifact names are read from the manifest, so they changed freely. The daemon feed `daemon-<channel>-<platform>-<arch>.json` is unchanged.
 

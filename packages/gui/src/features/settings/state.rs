@@ -24,6 +24,7 @@ pub enum SheetKind {
     Profile(Box<profiles::ProfileSheet>),
     UsageOptions { host: String },
     PluginLogs(plugins::LogsSheet),
+    ConfigReload(daemon::ConfigReloadSheet),
 }
 
 pub struct Sheet {
@@ -275,14 +276,14 @@ impl Settings {
         self.open_sheet(SheetKind::Report { title, text: super::json::pretty(value) }, 760.0);
     }
 
-    /// Flutter `confirmAction`.
-    pub fn confirm(&mut self, title: String, message: String, confirm_label: Option<String>, destructive: bool, on_confirm: Handler) {
+    /// Flutter `confirmAction`. The confirm button names the action.
+    pub fn confirm(&mut self, title: String, message: String, confirm_label: String, destructive: bool, on_confirm: Handler) {
         self.open_sheet(SheetKind::Confirm(Confirm { title, message, confirm_label, destructive, on_confirm, on_decline: None }), 420.0);
     }
 
     /// [`Settings::confirm`] that also runs `on_decline` when the dialog is
     /// dismissed without confirming (original `if (!confirmed) return …`).
-    pub fn confirm_or(&mut self, title: String, message: String, confirm_label: Option<String>, destructive: bool, on_confirm: Handler, on_decline: Handler) {
+    pub fn confirm_or(&mut self, title: String, message: String, confirm_label: String, destructive: bool, on_confirm: Handler, on_decline: Handler) {
         self.open_sheet(SheetKind::Confirm(Confirm { title, message, confirm_label, destructive, on_confirm, on_decline: Some(on_decline) }), 420.0);
     }
 

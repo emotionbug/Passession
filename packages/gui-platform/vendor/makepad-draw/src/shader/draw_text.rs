@@ -694,6 +694,13 @@ impl FontFamily {
     fn to_font_family_id(&self) -> FontFamilyId {
         (self.id.0).into()
     }
+
+    /// The layout family this style resolves to: a hash of its DSL font list.
+    /// Valid once the style has been applied; pass it to `Style::font_family_id`
+    /// or `Fonts::redefine_font_family`.
+    pub fn font_family_id(&self) -> FontFamilyId {
+        self.to_font_family_id()
+    }
 }
 
 impl LiveHook for FontFamily {
@@ -744,6 +751,7 @@ impl LiveHook for FontFamily {
                             FontDefinition {
                                 data,
                                 index: 0,
+                                variations: Vec::new(),
                                 ascender_fudge_in_ems: font.ascender_fudge,
                                 descender_fudge_in_ems: font.descender_fudge,
                             },

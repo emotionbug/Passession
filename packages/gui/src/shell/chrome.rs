@@ -70,26 +70,31 @@ pub fn title(state: &Value, target: &PanelTarget) -> String {
             return title.to_string();
         }
     }
-    if let Some(title) = target.title.as_deref().filter(|t| !t.is_empty()) {
+    // Tabs saved by older builds stored the English default; show the localized one instead.
+    let legacy_default = matches!(target.kind.as_str(), "draft" | "new_tab")
+        && matches!(target.title.as_deref(), Some("Add project" | "New session" | "New Session"));
+    if let Some(title) = target.title.as_deref().filter(|t| !t.is_empty() && !legacy_default) {
         return title.to_string();
     }
     match target.kind.as_str() {
         "agent" => tr("sessionNavigation.untitled"),
+        "new_tab" if target.data.get("addProject") == Some(&Value::Bool(true)) => tr("sidebar.actions.addProject"),
         "draft" | "new_tab" => tr("sessionNavigation.newSession"),
         "files" => tr("workspace.tabs.actions.files"),
         "changes_tree" => tr("workspace.tabs.actions.changes"),
         "file" => {
-            let path = j::text_or(&target.data, "path", target.id.as_deref().unwrap_or("File"));
+            let fallback = tr("shell.tabs.file");
+            let path = j::text_or(&target.data, "path", target.id.as_deref().unwrap_or(&fallback));
             path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
         }
-        "working_diff" | "commit_diff" => "Diff".to_string(),
-        "pull_request" => "Pull request".to_string(),
+        "working_diff" | "commit_diff" => tr("panels.diff.diffLabel"),
+        "pull_request" => tr("panels.pullRequest.label"),
         "git_log" => tr("workspace.git.log.title"),
-        "execution_log" => "Execution log".to_string(),
+        "execution_log" => tr("shell.tabs.executionLog"),
         "terminal" => tr("workspace.tabs.fallback.terminal"),
-        "setup" => "Workspace setup".to_string(),
-        "project_settings" => "Project settings".to_string(),
-        "provider_subagent" => "Subagent".to_string(),
+        "setup" => tr("workspace.tabs.fallback.workspaceSetup"),
+        "project_settings" => tr("shell.tabs.projectSettings"),
+        "provider_subagent" => tr("shell.tabs.subagent"),
         other => other.to_string(),
     }
 }
@@ -271,8 +276,8 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
 
 fn draw_startup_error(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect, p: &Palette) {
     let t = theme::current_typography();
-    let message = crate::shell::startup_error().unwrap_or_else(|| "Connecting to Paseo…".to_string());
-    let spec = TextSpec::new(Font::Regular, t.ui_size(14.0), p.destructive);
+    let message = crate::shell::startup_error().unwrap_or_else(|| tr("shell.chrome.connecting"));
+    let spec = TextSpec::new(Font::Regular, t.ui_size(14.0), p.danger);
     let w = (r.size.x - 48.0).min(560.0);
     let h = shell.painter.paragraph_height(cx, w, spec, &message);
     shell.painter.paragraph(cx, dvec2(r.pos.x + (r.size.x - w) * 0.5, r.pos.y + (r.size.y - h) * 0.5), w, spec, &message);
@@ -338,12 +343,22 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
     let mut right_widgets: Option<Rect> = None;
     // A compact detail view (file, diff, subagent…) leads with Back to the tab it came from.
     let detail_back = shell.data.layout.compact_back_tab(compact).is_some();
+    let shell_sidebar_visible = shell.data.layout.sidebar_visible;
     {
         let mut ui = make_ui(shell);
         let p = ui.p;
         let extent = if compact { 32.0 } else { 26.0 };
         // Sidebar toggle (MobileMenuIcon on compact, PanelLeft on wide).
-        let (toggle_id, toggle_tip) = if detail_back { ("hdr:back", tr("common.actions.back")) } else { ("hdr:sidebar", tr("shell.menu.toggleSidebar")) };
+        // Another session waiting on the user shows a dot on ☰ / the sidebar toggle while the
+        // sidebar is out of sight.
+        let sidebar_hidden = compact || !shell_sidebar_visible;
+        let waiting_elsewhere = !detail_back && sidebar_hidden && crate::shell::sidebar::others_need_input(state, target.as_ref());
+        let (toggle_id, toggle_tip) = if detail_back {
+            ("hdr:back", tr("common.actions.back"))
+        } else {
+            let tip = crate::common::tooltip_with_shortcut(&tr("shell.menu.toggleSidebar"), "toggle-left-sidebar");
+            ("hdr:sidebar", if waiting_elsewhere { format!("{tip} · {}", tr("shell.chrome.othersNeedInput")) } else { tip })
+        };
         let toggle = island(&mut ui, cx, dvec2(row.pos.x + extent * 0.5, mid), toggle_id, &toggle_tip, compact);
         if detail_back {
             ui.icon(cx, toggle, "arrow-left", 18.0, p.muted);
@@ -356,6 +371,12 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
         } else {
             ui.icon(cx, toggle, "panel-left", 16.0, p.muted);
         }
+        if waiting_elsewhere {
+            let color = crate::common::widgets::status_dot_color(&p, StatusBucket::NeedsInput, false).unwrap_or(p.warning);
+            let center = dvec2(toggle.pos.x + toggle.size.x - 5.0, toggle.pos.y + 5.0);
+            ui.dot(cx, center, 9.0, p.background);
+            ui.dot(cx, center, 7.0, color);
+        }
         let mut x = toggle.pos.x + extent + 8.0;
         let mut right = row.pos.x + row.size.x;
         if new_workspace {
@@ -367,8 +388,9 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
             }
         } else {
             // Right island: explorer toggle, git widgets (wide), scripts (wide), menu, tabs (compact).
-            let explorer = island(&mut ui, cx, dvec2(right - extent * 0.5, mid), "hdr:explorer", &tr("workspace.tabs.explorerSidebar.toggle"), compact);
-            ui.icon(cx, explorer, "panel-right", 16.0, if compact { p.muted } else { p.extra_muted });
+            let explorer_tip = crate::common::tooltip_with_shortcut(&tr("workspace.tabs.explorerSidebar.toggle"), "toggle-right-sidebar");
+            let explorer = island(&mut ui, cx, dvec2(right - extent * 0.5, mid), "hdr:explorer", &explorer_tip, compact);
+            ui.icon(cx, explorer, "panel-right", 16.0, p.muted);
             right = explorer.pos.x;
             if header_git {
                 // Git actions split button + open-in, laid out by their own widgets.
@@ -383,11 +405,11 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
             }
             if !compact && has_scripts {
                 let scripts = island(&mut ui, cx, dvec2(right - extent * 0.5, mid), "hdr:scripts", &tr("workspace.scripts.title"), false);
-                ui.icon(cx, scripts, "play", 16.0, p.extra_muted);
+                ui.icon(cx, scripts, "play", 16.0, p.muted);
                 right = scripts.pos.x;
             }
             let menu = island(&mut ui, cx, dvec2(right - extent * 0.5, mid), "hdr:menu", &tr("workspace.header.actions.workspaceActions"), compact);
-            ui.icon(cx, menu, "ellipsis", 16.0, p.extra_muted);
+            ui.icon(cx, menu, "ellipsis", 16.0, p.muted);
             right = menu.pos.x;
             if compact && target.is_some() {
                 let count = tabs_count.to_string();
@@ -430,15 +452,27 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
     }
 }
 
-/// `_headerSubtitle`: project · server glyph + host label in the host colour (local hosts hide it).
+/// `_headerSubtitle`: project · server glyph + host label in the host colour (local hosts hide
+/// it). A host that is not connected always shows, tinted, with its connection state.
 fn header_subtitle(ui: &mut Ui, cx: &mut Cx2d, r: Rect, project: &str, host: Host<'_>) {
     let p = ui.p;
     let small = ui.spec(Font::Regular, 12.0, p.muted);
-    let show_badge = !host.is_local();
-    let badge_color = crate::shell::sheets::labels::label_color(&p, host.color());
+    let status = host.status();
+    let offline = status != hosts::Status::Connected;
+    let show_badge = !host.is_local() || offline;
+    let badge_color = match status {
+        hosts::Status::Connected => crate::shell::sheets::labels::label_color(&p, host.color()),
+        hosts::Status::Connecting => p.warning,
+        hosts::Status::Disconnected | hosts::Status::Error => p.danger,
+    };
     let mut x = r.pos.x;
-    let label = host.display_label();
-    let reserved = if show_badge { 12.0 + 3.0 + ui.measure(cx, small, &label).min(120.0) + if project.is_empty() { 0.0 } else { 18.0 } } else { 0.0 };
+    let label = match status {
+        hosts::Status::Connected => host.display_label(),
+        hosts::Status::Connecting => tr_args("shell.chrome.hostConnecting", &[("host", &host.display_label())]),
+        hosts::Status::Disconnected | hosts::Status::Error => tr_args("shell.chrome.hostDisconnected", &[("host", &host.display_label())]),
+    };
+    let label_cap = if offline { r.size.x * 0.6 } else { 120.0 };
+    let reserved = if show_badge { 12.0 + 3.0 + ui.measure(cx, small, &label).min(label_cap) + if project.is_empty() { 0.0 } else { 18.0 } } else { 0.0 };
     if !project.is_empty() {
         let w = (r.size.x - reserved).max(0.0);
         let drawn = ui.text(cx, rect(x, r.pos.y, w, r.size.y), small, project);
@@ -446,11 +480,11 @@ fn header_subtitle(ui: &mut Ui, cx: &mut Cx2d, r: Rect, project: &str, host: Hos
     }
     if show_badge {
         if !project.is_empty() {
-            let sep = ui.spec(Font::Regular, 12.0, p.extra_muted);
+            let sep = ui.spec(Font::Regular, 12.0, p.muted);
             ui.text(cx, rect(x + 6.0, r.pos.y, 8.0, r.size.y), sep, "·");
             x += 18.0;
         }
-        ui.icon(cx, rect(x, r.pos.y + 2.0, 12.0, 12.0), "server", 12.0, badge_color);
+        ui.icon(cx, rect(x, r.pos.y + 2.0, 12.0, 12.0), if offline { "cloud-off" } else { "server" }, 12.0, badge_color);
         x += 15.0;
         let spec = ui.spec(Font::Regular, 12.0, badge_color);
         ui.text(cx, rect(x, r.pos.y, (r.pos.x + r.size.x - x).max(0.0), r.size.y), spec, &label);
@@ -614,6 +648,11 @@ pub fn draw_root(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, key: 
     let focused = focused_tab(shell).as_deref() == Some(key);
     let Some(panel) = shell.data.panels.get_mut(key) else { return };
     panels::set_activity(cx, panel, true, focused);
+    // A notification route asked to show what this session waits on.
+    if shell.data.reveal_attention.as_deref() == Some(key) {
+        shell.data.reveal_attention = None;
+        panels::reveal_attention(cx, panel);
+    }
     let widget = panel.widget.clone();
     let target = panel.target.clone();
     if let Some(ui) = scope.data.get_mut::<UiContext>() {
@@ -644,7 +683,7 @@ pub fn sync_hidden(shell: &mut PaseoShell, cx: &mut Cx) {
 fn draw_error(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect, message: &str) {
     let p = theme::current_palette();
     let t = theme::current_typography();
-    let spec = TextSpec::new(Font::Regular, t.ui_size(14.0), p.destructive);
+    let spec = TextSpec::new(Font::Regular, t.ui_size(14.0), p.danger);
     let w = (r.size.x - 32.0).max(40.0);
     shell.painter.paragraph(cx, dvec2(r.pos.x + 16.0, r.pos.y + 16.0), w, spec, message);
 }
@@ -760,7 +799,8 @@ fn draw_tab_strip(
                 let menu = rect(chip.pos.x + chip.size.x - 58.0, chip.pos.y + (chip.size.y - 28.0) * 0.5, 28.0, 28.0);
                 ui.icon_button(cx, menu, &format!("tabmenu:{pane_id}:{key}"), "ellipsis", 14.0, 14.0, &tr_args("workspace.tabs.menu.openFor", &[("label", &label)]));
                 let close = rect(chip.pos.x + chip.size.x - 30.0, chip.pos.y + (chip.size.y - 28.0) * 0.5, 28.0, 28.0);
-                ui.icon_button(cx, close, &format!("tabclose:{pane_id}:{key}"), "x", 14.0, 14.0, &tr("common.actions.close"));
+                let close_tip = if active { crate::common::tooltip_with_shortcut(&tr("common.actions.close"), "workspace-tab-close-current") } else { tr("common.actions.close") };
+                ui.icon_button(cx, close, &format!("tabclose:{pane_id}:{key}"), "x", 14.0, 14.0, &close_tip);
             }
             tab_rects.push((pane_id.to_string(), key.clone(), chip));
             x = chip.pos.x + chip.size.x + gap;
@@ -790,7 +830,7 @@ fn draw_tab_strip(
             }
         } else {
             let plus = rect(bar.pos.x + bar.size.x - 38.0, bar.pos.y + 2.0, 34.0, 34.0);
-            ui.icon_button(cx, plus, &format!("panenew:{pane_id}"), "plus", 18.0, 17.0, &tr("sessionNavigation.newSession"));
+            ui.icon_button(cx, plus, &format!("panenew:{pane_id}"), "plus", 18.0, 17.0, &crate::common::tooltip_with_shortcut(&tr("sessionNavigation.newSession"), "workspace-tab-target-agent"));
         }
     }
     shell.data.chrome.tab_rects.extend(tab_rects);

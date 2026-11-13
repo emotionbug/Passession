@@ -9,6 +9,7 @@ use super::canvas::*;
 use super::paint::{Draw, RowState, now_seconds};
 use super::permission;
 use super::rows::{RowContext, RowItem, RowKind, draw_row};
+use super::scrollbar;
 use crate::common::widgets::PTextFieldWidgetRefExt;
 use crate::common::{UiContext, UiEffect};
 use makepad_widgets::*;
@@ -71,6 +72,8 @@ enum Drag {
     ScrollX,
     /// Touch drag of a vertically capped region that could move that way.
     ScrollY,
+    /// Mouse or touch drag of a scroll bar thumb (`bar_drag`).
+    Bar,
 }
 
 #[derive(Live, LiveHook, Widget)]
@@ -122,6 +125,8 @@ pub struct ChatRow {
     touch_selection: bool,
     #[rust]
     handle_endpoint: Option<TextHandleEndpoint>,
+    #[rust]
+    bar_drag: Option<scrollbar::BarDrag>,
 }
 
 /// An overview group stays pinned to its newest call until the reader
@@ -139,6 +144,7 @@ pub fn hover_key(target: &HitTarget) -> String {
         HitTarget::Toggle(key) if key.starts_with("stamp:") => key.clone(),
         HitTarget::RewindMenu => "rewind".into(),
         HitTarget::Chrome(id) => id.clone(),
+        HitTarget::ScrollBar { key, .. } => scrollbar::hover_key(key),
         other => permission::hit_key(other),
     }
 }
@@ -195,7 +201,7 @@ impl ChatRow {
         let state = &mut *state;
         let (extents, offsets) = if self.drag_vertical { (&state.extent_y, &mut state.scroll_y) } else { (&state.extent_x, &mut state.scroll_x) };
         let max = extents.get(&self.drag_key).copied().unwrap_or(0.0);
-        let mut position = offsets.get(&self.drag_key).copied().unwrap_or(0.0);
+        let mut position = offsets.get(&self.drag_key).copied().unwrap_or(0.0).clamp(0.0, max);
         if !self.touch_scroll.apply_delta(&mut position, delta, max) {
             return false;
         }
@@ -217,7 +223,7 @@ impl ChatRow {
         let state = model.state.borrow();
         self.canvas.scroll_regions_at(rel, true).find(|key| {
             let max = state.extent_y.get(*key).copied().unwrap_or(0.0);
-            let current = state.scroll_y.get(*key).copied().unwrap_or(0.0);
+            let current = state.scroll_y.get(*key).copied().unwrap_or(0.0).clamp(0.0, max);
             if delta > 0.0 { current < max - 0.01 } else { current > 0.01 }
         }).map(str::to_owned)
     }
@@ -267,7 +273,7 @@ impl ChatRow {
         for key in self.canvas.scroll_regions_at(rel, vertical) {
             let (extents, offsets) = if vertical { (&state.extent_y, &mut state.scroll_y) } else { (&state.extent_x, &mut state.scroll_x) };
             let max = extents.get(key).copied().unwrap_or(0.0);
-            let current = offsets.get(key).copied().unwrap_or(0.0);
+            let current = offsets.get(key).copied().unwrap_or(0.0).clamp(0.0, max);
             let next = (current + amount).clamp(0.0, max);
             if (next - current).abs() > 0.01 {
                 offsets.insert(key.to_owned(), next);
@@ -367,7 +373,7 @@ impl ChatRow {
                 self.post(cx, RowEventKind::Answer { key: key.clone(), dismiss: true });
                 true
             }
-            HitTarget::ScrollX(_) | HitTarget::ScrollY(_) => true,
+            HitTarget::ScrollX(_) | HitTarget::ScrollY(_) | HitTarget::ScrollBar { .. } => true,
             _ => false,
         }
     }
@@ -405,6 +411,11 @@ impl ChatRow {
         self.show_actions = false;
         self.touch_scroll.reset();
         self.drag = Drag::None;
+        if self.bar_drag.take().is_some()
+            && let Some(model) = &self.model
+        {
+            model.state.borrow_mut().dragging_bar = None;
+        }
         self.pressed = None;
         self.set_selection(cx, None);
     }
@@ -530,6 +541,19 @@ impl Widget for ChatRow {
                 self.drag = Drag::None;
                 self.pressed = None;
                 if let Some(target) = self.canvas.hit_at(rel).cloned() {
+                    // A scroll bar: grab its thumb (or page its track) and drag it.
+                    if let Some(model) = self.model.clone() {
+                        let mut state = model.state.borrow_mut();
+                        if let Some(drag) = scrollbar::BarDrag::press(&target, rel, &mut state) {
+                            if drag.vertical {
+                                detach_group(&mut state, &drag.key);
+                            }
+                            self.bar_drag = Some(drag);
+                            self.drag = Drag::Bar;
+                            self.area.redraw(cx);
+                            return;
+                        }
+                    }
                     let rect = self
                         .canvas
                         .hits
@@ -611,6 +635,19 @@ impl Widget for ChatRow {
                     }
                 }
                 Drag::ScrollX | Drag::ScrollY => self.drag_inner(cx, event, e.abs, e.time),
+                Drag::Bar => {
+                    if let (DigitDevice::Touch { uid }, Event::TouchUpdate(update)) = (e.device, event)
+                        && let Some(touch) = update.touches.iter().find(|touch| touch.uid == uid)
+                    {
+                        touch.handled.set(self.area);
+                    }
+                    let rel = self.rel(cx, e.abs);
+                    if let (Some(drag), Some(model)) = (&self.bar_drag, &self.model)
+                        && drag.drag_to(rel, &mut model.state.borrow_mut())
+                    {
+                        self.area.redraw(cx);
+                    }
+                }
                 Drag::None => {}
             },
             Hit::FingerUp(e) => {
@@ -630,6 +667,12 @@ impl Widget for ChatRow {
                     self.area.redraw(cx);
                 } else if e.device.is_touch() && e.was_tap() {
                     self.clear_selection(cx);
+                }
+                if self.bar_drag.take().is_some() {
+                    if let Some(model) = &self.model {
+                        model.state.borrow_mut().dragging_bar = None;
+                    }
+                    self.area.redraw(cx);
                 }
                 self.drag = Drag::None;
             }

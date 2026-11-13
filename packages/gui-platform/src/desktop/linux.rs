@@ -432,6 +432,10 @@ pub(crate) fn request_notification_permission(_shared: &Arc<Shared>, done: Compl
     done.ok(PlatformValue::Permission(PermissionState::Granted));
 }
 
+pub(crate) fn notification_permission_status(shared: &Arc<Shared>, done: Completion) {
+    request_notification_permission(shared, done);
+}
+
 /// com.canonical.Unity.LauncherEntry (Unity, KDE and several GNOME docks).
 /// Delivery is not a guarantee that the shell shows badges.
 pub(crate) fn set_badge_count(_shared: &Arc<Shared>, count: u32, done: Completion) {
@@ -999,3 +1003,424 @@ pub(crate) fn locale() -> String {
 
 #[allow(dead_code)]
 fn _assert_types(_: c_uint) {}
+
+// ----- fonts and text scale -----
+
+/// One XDG portal `Settings.Read` value, unwrapped from its variant nesting
+/// (`v(v(x))` on older portals, `v(x)` on newer ones) and converted by `extract`.
+fn portal_setting<T: Send + 'static>(namespace: &'static str, key: &'static str, extract: fn(ZValue<'_>) -> Option<T>) -> Option<T> {
+    bus_wait(async move {
+        let connection = session().await?;
+        let reply = tokio::time::timeout(
+            Duration::from_millis(500),
+            connection.call_method(
+                Some("org.freedesktop.portal.Desktop"),
+                "/org/freedesktop/portal/desktop",
+                Some("org.freedesktop.portal.Settings"),
+                "Read",
+                &(namespace, key),
+            ),
+        )
+        .await
+        .map_err(|_| PlatformError::native("portal timeout"))?
+        .map_err(dbus_error)?;
+        let outer: OwnedValue = reply.body().deserialize().map_err(dbus_error)?;
+        let mut value: ZValue<'_> = outer.into();
+        while let ZValue::Value(inner) = value {
+            value = *inner;
+        }
+        Ok(extract(value))
+    })
+    .ok()
+    .flatten()
+}
+
+/// GNOME `org.gnome.desktop.interface text-scaling-factor` through the portal.
+/// KDE has no separate factor (users change the font size), so it stays 1.
+pub(crate) fn system_text_scale() -> crate::appearance::TextScale {
+    portal_setting("org.gnome.desktop.interface", "text-scaling-factor", |value| match value {
+        ZValue::F64(factor) => Some(factor),
+        _ => None,
+    })
+    .map(crate::appearance::TextScale::from_factor)
+    .unwrap_or_default()
+}
+
+/// The desktop's UI font family: KDE `kdeglobals [General] font` (portal, then
+/// the file), otherwise GNOME `font-name` through the portal.
+fn os_ui_family() -> Option<String> {
+    fn string(value: ZValue<'_>) -> Option<String> {
+        match value {
+            ZValue::Str(text) => Some(text.as_str().to_owned()),
+            _ => None,
+        }
+    }
+    let kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| desktop.split(':').any(|part| part.eq_ignore_ascii_case("KDE")));
+    if kde {
+        portal_setting("org.kde.kdeglobals.General", "font", string)
+            .as_deref()
+            .and_then(crate::fonts::qt_family)
+            .or_else(kdeglobals_font)
+    } else {
+        portal_setting("org.gnome.desktop.interface", "font-name", string).as_deref().and_then(crate::fonts::pango_family)
+    }
+}
+
+fn kdeglobals_font() -> Option<String> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    let text = std::fs::read_to_string(config.join("kdeglobals")).ok()?;
+    let mut in_general = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_general = line == "[General]";
+        } else if in_general {
+            if let Some(value) = line.strip_prefix("font=") {
+                return crate::fonts::qt_family(value);
+            }
+        }
+    }
+    None
+}
+
+/// fontconfig (dlopened `libfontconfig.so.1`) font discovery.
+pub(crate) mod fonts {
+    use crate::fonts::{bcp47, finish_face, resolve, Backend, Family, FileCache, FontFace, FontRequest, Role, SystemFonts, HANGUL_PROBE, LATIN_PROBE};
+    use std::{
+        ffi::{c_char, c_int, c_void, CStr, CString},
+        sync::{Arc, LazyLock},
+    };
+
+    type FcBool = c_int;
+    const FC_RESULT_MATCH: c_int = 0;
+    const FC_MATCH_PATTERN: c_int = 0;
+    /// `FC_WEIGHT_REGULAR` / `FC_WEIGHT_DEMIBOLD`, `FC_SLANT_ROMAN` / `FC_SLANT_ITALIC`.
+    const FC_WEIGHT_REGULAR: c_int = 80;
+    const FC_WEIGHT_DEMIBOLD: c_int = 180;
+    const FC_SLANT_ROMAN: c_int = 0;
+    const FC_SLANT_ITALIC: c_int = 100;
+    /// Bounds the files read while scanning a sorted Hangul candidate list.
+    const MAX_HANGUL_CANDIDATES: usize = 64;
+
+    #[repr(C)]
+    struct FcFontSet {
+        nfont: c_int,
+        sfont: c_int,
+        fonts: *mut *mut c_void,
+    }
+
+    struct Fc {
+        init: unsafe extern "C" fn() -> *mut c_void,
+        config_destroy: unsafe extern "C" fn(*mut c_void),
+        name_parse: unsafe extern "C" fn(*const c_char) -> *mut c_void,
+        pattern_destroy: unsafe extern "C" fn(*mut c_void),
+        config_substitute: unsafe extern "C" fn(*mut c_void, *mut c_void, c_int) -> FcBool,
+        default_substitute: unsafe extern "C" fn(*mut c_void),
+        font_match: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_int) -> *mut c_void,
+        font_sort: unsafe extern "C" fn(*mut c_void, *mut c_void, FcBool, *mut *mut c_void, *mut c_int) -> *mut FcFontSet,
+        font_set_destroy: unsafe extern "C" fn(*mut FcFontSet),
+        get_string: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut *mut u8) -> c_int,
+        get_integer: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_int) -> c_int,
+        get_double: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut f64) -> c_int,
+        get_charset: unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut *mut c_void) -> c_int,
+        charset_has_char: unsafe extern "C" fn(*mut c_void, u32) -> FcBool,
+        /// fontconfig ≥ 2.12.92; older libraries report no axis values.
+        weight_to_open_type: Option<unsafe extern "C" fn(f64) -> f64>,
+        _library: libloading::Library,
+    }
+
+    impl Fc {
+        fn load() -> Result<Self, String> {
+            unsafe {
+                let library = libloading::Library::new("libfontconfig.so.1").map_err(|e| e.to_string())?;
+                macro_rules! symbol {
+                    ($name:literal) => {
+                        *library.get($name).map_err(|e| e.to_string())?
+                    };
+                }
+                Ok(Self {
+                    init: symbol!(b"FcInitLoadConfigAndFonts\0"),
+                    config_destroy: symbol!(b"FcConfigDestroy\0"),
+                    name_parse: symbol!(b"FcNameParse\0"),
+                    pattern_destroy: symbol!(b"FcPatternDestroy\0"),
+                    config_substitute: symbol!(b"FcConfigSubstitute\0"),
+                    default_substitute: symbol!(b"FcDefaultSubstitute\0"),
+                    font_match: symbol!(b"FcFontMatch\0"),
+                    font_sort: symbol!(b"FcFontSort\0"),
+                    font_set_destroy: symbol!(b"FcFontSetDestroy\0"),
+                    get_string: symbol!(b"FcPatternGetString\0"),
+                    get_integer: symbol!(b"FcPatternGetInteger\0"),
+                    get_double: symbol!(b"FcPatternGetDouble\0"),
+                    get_charset: symbol!(b"FcPatternGetCharSet\0"),
+                    charset_has_char: symbol!(b"FcCharSetHasChar\0"),
+                    weight_to_open_type: library.get(b"FcWeightToOpenTypeDouble\0").ok().map(|symbol| *symbol),
+                    _library: library,
+                })
+            }
+        }
+    }
+
+    static FC: LazyLock<Result<Fc, String>> = LazyLock::new(Fc::load);
+
+    /// Escapes a family for `FcNameParse` (`\`, `-`, `:` and `,` are syntax).
+    pub(crate) fn escape(family: &str) -> String {
+        let mut out = String::with_capacity(family.len());
+        for ch in family.chars() {
+            if matches!(ch, '\\' | '-' | ':' | ',') {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    /// CSS generics fontconfig resolves by alias; any matched family is accepted.
+    fn is_generic(name: &str) -> bool {
+        ["serif", "sans-serif", "monospace", "cursive", "fantasy", "system-ui", "emoji", "math"].iter().any(|g| g.eq_ignore_ascii_case(name))
+    }
+
+    /// A family name marking a Korean regional face (`Noto Sans CJK KR`, `Source Han Sans K`).
+    pub(crate) fn is_korean_family(family: &str) -> bool {
+        let family = family.trim();
+        family.ends_with(" KR") || family.ends_with(" K") || family.contains("Korean")
+    }
+
+    /// An owned `FcPattern`.
+    struct Pattern<'a>(&'a Fc, *mut c_void);
+
+    impl Drop for Pattern<'_> {
+        fn drop(&mut self) {
+            unsafe { (self.0.pattern_destroy)(self.1) }
+        }
+    }
+
+    impl Pattern<'_> {
+        fn string(&self, object: &CStr, n: c_int) -> Option<String> {
+            string_at(self.0, self.1, object, n)
+        }
+    }
+
+    fn string_at(fc: &Fc, pattern: *mut c_void, object: &CStr, n: c_int) -> Option<String> {
+        let mut value: *mut u8 = std::ptr::null_mut();
+        let found = unsafe { (fc.get_string)(pattern, object.as_ptr(), n, &mut value) } == FC_RESULT_MATCH;
+        (found && !value.is_null()).then(|| unsafe { CStr::from_ptr(value.cast()) }.to_string_lossy().into_owned())
+    }
+
+    struct Fontconfig<'a> {
+        fc: &'a Fc,
+        config: *mut c_void,
+        files: FileCache,
+        lang: String,
+        os_family: Option<Option<String>>,
+    }
+
+    impl Drop for Fontconfig<'_> {
+        fn drop(&mut self) {
+            unsafe { (self.fc.config_destroy)(self.config) }
+        }
+    }
+
+    impl<'a> Fontconfig<'a> {
+        fn pattern(&self, family: Option<&str>, role: Role, lang: &str) -> Option<Pattern<'a>> {
+            let mut name = family.map(escape).unwrap_or_default();
+            let weight = if role.weight() >= 600 { FC_WEIGHT_DEMIBOLD } else { FC_WEIGHT_REGULAR };
+            let slant = if role.italic() { FC_SLANT_ITALIC } else { FC_SLANT_ROMAN };
+            name.push_str(&format!(":weight={weight}:slant={slant}"));
+            if !lang.is_empty() {
+                name.push_str(&format!(":lang={}", escape(lang)));
+            }
+            let name = CString::new(name).ok()?;
+            let pattern = unsafe { (self.fc.name_parse)(name.as_ptr()) };
+            if pattern.is_null() {
+                return None;
+            }
+            let pattern = Pattern(self.fc, pattern);
+            unsafe {
+                (self.fc.config_substitute)(self.config, pattern.1, FC_MATCH_PATTERN);
+                (self.fc.default_substitute)(pattern.1);
+            }
+            Some(pattern)
+        }
+
+        /// A matched font pattern → validated face.
+        fn load(&mut self, pattern: *mut c_void, role: Role, probe: char) -> Option<FontFace> {
+            let fc = self.fc;
+            let file = string_at(fc, pattern, c"file", 0)?;
+            let mut index: c_int = 0;
+            unsafe { (fc.get_integer)(pattern, c"index".as_ptr(), 0, &mut index) };
+            let mut variations = Vec::new();
+            if let Some(to_open_type) = fc.weight_to_open_type {
+                let mut weight = 0.0f64;
+                // Variable-font default patterns carry a weight range, which GetDouble rejects.
+                if unsafe { (fc.get_double)(pattern, c"weight".as_ptr(), 0, &mut weight) } == FC_RESULT_MATCH {
+                    variations.push((*b"wght", unsafe { to_open_type(weight) } as f32));
+                }
+            }
+            let mut width = 0.0f64;
+            if unsafe { (fc.get_double)(pattern, c"width".as_ptr(), 0, &mut width) } == FC_RESULT_MATCH {
+                variations.push((*b"wdth", width as f32));
+            }
+            let data: Arc<Vec<u8>> = self.files.read(&file)?;
+            // The upper 16 bits select a named instance; its coordinates are the weight/width above.
+            let face_index = (index as u32) & 0xffff;
+            finish_face(data, face_index, &variations, role, probe, format!("{file}#{face_index}"))
+        }
+
+        fn matched(&mut self, family: &str, role: Role, exact: bool) -> Option<(FontFace, String)> {
+            let lang = self.lang.clone();
+            let pattern = self.pattern(Some(family), role, &lang)?;
+            let mut result: c_int = 0;
+            let found = unsafe { (self.fc.font_match)(self.config, pattern.1, &mut result) };
+            if found.is_null() {
+                return None;
+            }
+            let found = Pattern(self.fc, found);
+            let names: Vec<String> = (0..).map_while(|n| found.string(c"family", n)).collect();
+            if exact && !names.iter().any(|name| name.eq_ignore_ascii_case(family)) {
+                return None;
+            }
+            let face = self.load(found.1, role, LATIN_PROBE)?;
+            Some((face, names.into_iter().next().unwrap_or_else(|| family.to_owned())))
+        }
+
+        fn os_family(&mut self) -> Option<String> {
+            self.os_family.get_or_insert_with(super::os_ui_family).clone()
+        }
+    }
+
+    impl Backend for Fontconfig<'_> {
+        fn face(&mut self, family: Family<'_>, role: Role) -> Option<(FontFace, String)> {
+            match family {
+                Family::SystemUi => {
+                    if let Some(os_family) = self.os_family() {
+                        if let Some(found) = self.matched(&os_family, role, true) {
+                            return Some(found);
+                        }
+                    }
+                    self.matched("system-ui", role, false)
+                }
+                Family::SystemMono => self.matched("monospace", role, false),
+                Family::Named(name) => self.matched(name, role, !is_generic(name)),
+            }
+        }
+
+        fn hangul(&mut self, ui_family: Option<&str>, role: Role) -> Option<FontFace> {
+            let pattern = self.pattern(Some(ui_family.unwrap_or("sans-serif")), role, "ko")?;
+            let mut result: c_int = 0;
+            // Untrimmed, so every face of a CJK collection stays in the list.
+            let set = unsafe { (self.fc.font_sort)(self.config, pattern.1, 0, std::ptr::null_mut(), &mut result) };
+            if set.is_null() {
+                return None;
+            }
+            let fonts: Vec<*mut c_void> = unsafe {
+                let set = &*set;
+                if set.fonts.is_null() || set.nfont <= 0 {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(set.fonts, set.nfont as usize).to_vec()
+                }
+            };
+            let fc = self.fc;
+            let covering: Vec<*mut c_void> = fonts
+                .into_iter()
+                .filter(|font| {
+                    let mut charset: *mut c_void = std::ptr::null_mut();
+                    let has_charset = unsafe { (fc.get_charset)(*font, c"charset".as_ptr(), 0, &mut charset) } == FC_RESULT_MATCH;
+                    has_charset && !charset.is_null() && unsafe { (fc.charset_has_char)(charset, HANGUL_PROBE as u32) } != 0
+                })
+                .take(MAX_HANGUL_CANDIDATES)
+                .collect();
+            // Every face of a CJK collection (Noto Sans CJK JP/KR/SC/…) claims `ko`,
+            // and distro preferences often rank JP first; within the chosen file,
+            // take its Korean regional face so Han characters use Korean forms.
+            let korean_sibling = covering.first().and_then(|first| {
+                let file = string_at(fc, *first, c"file", 0)?;
+                covering.iter().copied().find(|font| {
+                    string_at(fc, *font, c"file", 0).as_deref() == Some(file.as_str())
+                        && (0..).map_while(|n| string_at(fc, *font, c"family", n)).any(|family| is_korean_family(&family))
+                })
+            });
+            let face = korean_sibling
+                .into_iter()
+                .chain(covering.iter().copied())
+                .find_map(|font| self.load(font, role, HANGUL_PROBE));
+            unsafe { (self.fc.font_set_destroy)(set) };
+            face
+        }
+    }
+
+    /// fontconfig resolution: the desktop's font family (portal / kdeglobals),
+    /// else `system-ui`; Hangul from `<ui family>:lang=ko` sorted by fontconfig
+    /// and filtered by U+D55C coverage; mono by name or `monospace`.
+    /// Without libfontconfig nothing resolves and the bundled chain stays.
+    pub(crate) fn system_fonts(request: &FontRequest) -> SystemFonts {
+        let Ok(fc) = &*FC else { return SystemFonts::default() };
+        let config = unsafe { (fc.init)() };
+        if config.is_null() {
+            return SystemFonts::default();
+        }
+        let lang = bcp47(&request.locale);
+        let mut backend = Fontconfig { fc, config, files: FileCache::default(), lang, os_family: None };
+        resolve(&mut backend, request)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn family_names_are_escaped_for_fc_name_parse() {
+            assert_eq!(escape("Noto Sans CJK KR"), "Noto Sans CJK KR");
+            assert_eq!(escape("system-ui"), "system\\-ui");
+            assert_eq!(escape("A:B,C\\D"), "A\\:B\\,C\\\\D");
+        }
+
+        #[test]
+        fn korean_regional_faces_are_recognized() {
+            assert!(is_korean_family("Noto Sans CJK KR"));
+            assert!(is_korean_family("Source Han Sans K"));
+            assert!(!is_korean_family("Noto Sans CJK JP"));
+            assert!(!is_korean_family("Noto Sans KR Kurdish"));
+        }
+
+        #[test]
+        fn resolves_ui_and_hangul_faces_on_this_machine() {
+            if FC.is_err() {
+                eprintln!("skipped: libfontconfig.so.1 is not installed");
+                return;
+            }
+            let fonts = crate::appearance::system_fonts(&FontRequest::from_css("", "monospace", "ko_KR.UTF-8"));
+            let regular = fonts.ui.regular.as_ref().expect("a UI regular face");
+            eprintln!("ui {:?}: {} {:?}", fonts.ui_family_name, regular.source, regular.variations);
+            assert!(fonts.ui.semibold.is_some());
+            // An explicit refresh must read the OS/files again, not reuse a
+            // process-lifetime request cache after the desktop font changes.
+            let again = crate::appearance::system_fonts(&FontRequest::from_css("", "monospace", "ko_KR.UTF-8"));
+            assert!(!Arc::ptr_eq(&again.ui.regular.unwrap().data, &regular.data));
+            let Some(hangul) = fonts.hangul.regular.as_ref() else {
+                eprintln!("skipped Hangul: no font covering U+D55C is installed");
+                return;
+            };
+            eprintln!("hangul: {} {:?}", hangul.source, hangul.variations);
+            let parsed = makepad_widgets::makepad_draw::text::font_face::FontFace::from_data_and_index(hangul.data.clone(), hangul.index).unwrap();
+            assert!(parsed.as_ttf_parser_face().glyph_index(HANGUL_PROBE).is_some());
+            if let Some(semibold) = &fonts.ui.semibold {
+                if let Some((_, wght)) = semibold.variations.iter().find(|(tag, _)| tag == b"wght") {
+                    assert!(*wght > 400.0, "semibold variable face uses a heavier wght, got {wght}");
+                }
+            }
+        }
+
+        #[test]
+        fn missing_named_family_does_not_substitute() {
+            if FC.is_err() {
+                eprintln!("skipped: libfontconfig.so.1 is not installed");
+                return;
+            }
+            let fonts = crate::appearance::system_fonts(&FontRequest::from_css("'No Such Family 7f3a'", "'No Such Mono 7f3a'", "en_US"));
+            assert!(fonts.ui.regular.is_none());
+            assert!(fonts.mono.is_none());
+        }
+    }
+}

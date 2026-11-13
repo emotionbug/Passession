@@ -37,8 +37,9 @@ struct FuzzyPolicy {
     transpositions_only: bool,
 }
 
+/// Letters and digits of any script: Hangul inside a word is not a boundary.
 fn is_word_char(c: char) -> bool {
-    c.is_ascii_lowercase() || c.is_ascii_digit()
+    c.is_alphanumeric()
 }
 
 fn is_boundary(c: Option<char>) -> bool {
@@ -332,5 +333,16 @@ mod tests {
     fn highlights_merge() {
         assert_eq!(highlight_ranges("new work", "New workspace", false), vec![(0, 3), (4, 4)]);
         assert_eq!(highlight_ranges("mn", "main", false), vec![(0, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn hangul_word_boundaries() {
+        assert_eq!(score_match("스페", "워크스페이스", None).unwrap().tier, TIER_SUBSTRING);
+        assert_eq!(score_match("워크", "워크스페이스", None).unwrap().tier, TIER_PREFIX);
+        assert_eq!(score_match("설정", "앱 설정", None).unwrap().tier, TIER_WHOLE_WORD);
+        assert_eq!(score_match("열기", "설정 열기창", None).unwrap().tier, TIER_WORD_START);
+        let whole = score_text_fields("설정", &["설정 열기"], false).unwrap();
+        let inner = score_text_fields("설정", &["환경설정"], false).unwrap();
+        assert!(compare_scores(&whole, &inner).is_lt());
     }
 }

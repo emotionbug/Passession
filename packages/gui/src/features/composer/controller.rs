@@ -728,7 +728,7 @@ impl Controller {
     pub fn cycle_mode(&mut self, ui: &mut UiContext) -> Outputs {
         let modes = self.modes();
         if modes.is_empty() {
-            self.fail("This provider has no available modes.");
+            self.fail(t("composer.errors.noModes"));
             return Outputs { redraw: true, ..Default::default() };
         }
         let config = self.config();
@@ -992,7 +992,7 @@ impl Controller {
     pub fn open_url(&mut self, url: &str) {
         let valid = url.starts_with("https://") || url.starts_with("http://");
         if !valid {
-            self.fail("Could not open the attachment URL.");
+            self.fail(t("composer.errors.attachmentUrl"));
             return;
         }
         if let Some(platform) = paseo_gui_platform::platform() {
@@ -1059,7 +1059,7 @@ impl Controller {
             return;
         }
         if !self.connected() {
-            ui.toast("Host is disconnected", true);
+            ui.toast(t("composer.errors.hostDisconnected"), true);
             return;
         }
         self.upload_key = self.key.clone();
@@ -1207,13 +1207,13 @@ impl Controller {
         }
         if provider.is_empty() {
             service::with(|svc| {
-                svc.drafts.fail_send(&self.key, &message, "Select a provider before creating a session.", true);
+                svc.drafts.fail_send(&self.key, &message, &t("composer.errors.selectProvider"), true);
                 svc.after_mutation();
             });
             return;
         }
         self.remember_preferences(ui, remember_submitted_selection(&preferences, &config, &self.providers));
-        let title = "New session".to_owned();
+        let title = t("sessionNavigation.newSession");
         let host = self.target.host_id.clone();
         let key = self.key.clone();
         let cwd = self.target.cwd.clone();
@@ -1646,7 +1646,7 @@ impl Controller {
                             workspace_id: self.target.workspace_id.clone(),
                             cwd: self.target.cwd.clone(),
                             draft_id,
-                            title: "New session".to_owned(),
+                            title: t("sessionNavigation.newSession"),
                             data: json!({"config": config}),
                         });
                     }
@@ -1693,7 +1693,7 @@ impl Controller {
             Tag::Usage { refresh: None, .. } => match checked {
                 Ok(payload) => {
                     if get(&payload, "complete") == &Value::Bool(false) {
-                        self.usage_error = Some("Some usage data is unavailable; received reports remain visible.".into());
+                        self.usage_error = Some(t("composer.errors.usagePartial"));
                         return;
                     }
                     if let Some(finished) = payload.get("reports").and_then(Value::as_array) {

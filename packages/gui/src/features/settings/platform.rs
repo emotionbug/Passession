@@ -41,7 +41,14 @@ fn to_value(value: &PlatformValue) -> Value {
         PlatformValue::Bool(flag) => Value::Bool(*flag),
         PlatformValue::Text(text) => text.clone().map(Value::String).unwrap_or(Value::Null),
         PlatformValue::Json(json) => json.clone(),
-        PlatformValue::Permission(state) => Value::Bool(matches!(state, PermissionState::Granted | PermissionState::Provisional)),
+        PlatformValue::Permission(state) => Value::String(
+            match state {
+                PermissionState::Granted | PermissionState::Provisional => "granted",
+                PermissionState::Denied => "denied",
+                PermissionState::NotDetermined => "notDetermined",
+            }
+            .into(),
+        ),
         _ => Value::Null,
     }
 }
@@ -78,6 +85,15 @@ impl Bridge {
     pub fn request_notification_permission(&mut self) -> PlatformRequestId {
         match platform() {
             Some(handle) => handle.request_notification_permission(),
+            None => self.local_failure(unavailable()),
+        }
+    }
+
+    /// Current notification permission without prompting (`granted` /
+    /// `denied` / `notDetermined`).
+    pub fn notification_permission_status(&mut self) -> PlatformRequestId {
+        match platform() {
+            Some(handle) => handle.notification_permission_status(),
             None => self.local_failure(unavailable()),
         }
     }

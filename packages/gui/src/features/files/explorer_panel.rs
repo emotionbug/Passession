@@ -124,17 +124,10 @@ impl ExplorerPanel {
         Some(target)
     }
 
-    pub fn handle_event(&mut self, cx: &mut Cx, kit: &mut Kit, event: &Event, ui: &mut UiContext, area: Area) -> bool {
-        self.view.location.observe_event(event);
+    pub fn handle_event(&mut self, cx: &mut Cx, event: &Event, ui: &mut UiContext, area: Area) -> bool {
         let Some(target) = self.ensure(ui) else { return false };
         let mut changed = self.handle_commands(cx, ui, &target);
-        changed |= self.view.location.blink.handle_event(event);
         let scroll_enabled = area.is_valid(cx) && !self.transfer_hits_active();
-        if !scroll_enabled {
-            self.view.location.cancel_selection_handles(cx);
-        } else if self.view.handle_selection_handles(cx, kit, event) {
-            return true;
-        }
         changed |= store::with(|s| {
             s.explorer_mut(&self.owner).is_some_and(|state| self.view.animate_scroll(cx, event, state, scroll_enabled))
         });
@@ -149,8 +142,7 @@ impl ExplorerPanel {
             });
             return changed;
         }
-        if matches!(&hit, Hit::FingerDown(fe) if !fe.device.is_touch())
-            || self.view.wants_touch_focus(&hit) {
+        if matches!(&hit, Hit::FingerDown(fe) if !fe.device.is_touch()) {
             cx.set_key_focus(area);
         }
         // The download dialog takes input first.
@@ -165,15 +157,13 @@ impl ExplorerPanel {
             typography: theme::current_typography(),
             compact: ui.compact,
             actions: &actions,
-            navigation_menu: false,
-            picker: false,
             busy,
         };
         let owner = self.owner.clone();
         let mut view_changed = false;
         let event = store::with(|s| {
             let state = s.explorer_mut(&owner)?;
-            Some(self.view.handle_hit(cx, kit, &hit, state, &look, &mut view_changed))
+            Some(self.view.handle_hit(cx, &hit, state, &look, &mut view_changed))
         });
         changed |= view_changed;
         if let Some(event) = event {
@@ -233,7 +223,6 @@ impl ExplorerPanel {
                 self.opened_in.insert(id, target.cwd.clone());
                 true
             }
-            ExplorerEvent::DirectorySelected(_) => false,
         }
     }
 
@@ -475,13 +464,10 @@ impl ExplorerPanel {
         let actions = self.actions(ui, &target);
         let owner = self.owner.clone();
         let busy = store::with(|s| s.is_busy(&owner));
-        let look = ExplorerLook { palette: p, typography: ty, compact: ui.compact, actions: &actions, navigation_menu: false, picker: false, busy };
-        // IME positions are relative to the drawn origin; the area applies any later shift.
-        let origin = area.pos;
+        let look = ExplorerLook { palette: p, typography: ty, compact: ui.compact, actions: &actions, busy };
         let drawn = store::with(|s| {
             if let Some(state) = s.explorer_mut(&owner) {
-                self.view.sync_location(state);
-                self.view.draw(cx, kit, area, state, &look, (widget_area, origin));
+                self.view.draw(cx, kit, area, state, &look, widget_area);
                 true
             } else {
                 false

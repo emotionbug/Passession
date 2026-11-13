@@ -126,7 +126,7 @@ pub(crate) struct DaemonService {
     runtime: DaemonRuntime,
     app_version: Option<String>,
     settings: Arc<dyn Fn() -> DaemonSettings + Send + Sync>,
-    helper: OnceCell<Result<Arc<Helper>, PlatformError>>,
+    helper: OnceCell<Arc<Helper>>,
     next_id: AtomicU64,
     reject_new: AtomicBool,
     closed: AtomicBool,
@@ -167,7 +167,12 @@ impl DaemonService {
         if self.closed.load(Ordering::SeqCst) || self.reject_new.load(Ordering::SeqCst) {
             return Err(helper_error("DAEMON_SERVICE_CLOSED", "Desktop daemon service is closed."));
         }
-        self.helper.get_or_init(|| self.open()).await.clone()
+        self.helper.get_or_try_init(|| async {
+            if self.closed.load(Ordering::SeqCst) || self.reject_new.load(Ordering::SeqCst) {
+                return Err(helper_error("DAEMON_SERVICE_CLOSED", "Desktop daemon service is closed."));
+            }
+            self.open().await
+        }).await.cloned()
     }
 
     async fn open(&self) -> Result<Arc<Helper>, PlatformError> {
@@ -361,15 +366,14 @@ impl DaemonService {
         }
         self.reject_new.store(true, Ordering::SeqCst);
         let result = async {
-            // An open still in flight finishes first; a service that never opened
-            // is sealed. Initialization errors were already reported and launched
-            // no daemon.
+            // Wait for an in-flight open, but never start a helper during shutdown.
+            // Failed initialization owns no daemon and must remain retryable.
             let helper = self
                 .helper
-                .get_or_init(|| async { Err(helper_error("DAEMON_SERVICE_CLOSED", "Desktop daemon service is closed.")) })
+                .get_or_try_init(|| async { Err(helper_error("DAEMON_SERVICE_CLOSED", "Desktop daemon service is closed.")) })
                 .await
-                .clone()
-                .ok();
+                .ok()
+                .cloned();
             if let Some(helper) = helper.filter(|h| h.alive.load(Ordering::SeqCst)) {
                 let keep = keep_running.unwrap_or((self.settings)().keep_running_after_quit);
                 self.send(&helper, "close", json!({"keepRunning": keep})).await?;
@@ -418,5 +422,33 @@ fn fail_pending(pending: &Pending, error: PlatformError) {
     let senders: Vec<_> = pending.lock().unwrap().drain().map(|(_, sender)| sender).collect();
     for sender in senders {
         let _ = sender.send(Err(error.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_helper_initialization_remains_retryable_until_close() {
+        let directory = std::env::temp_dir().join(format!("paseo-missing-runtime-{}", uuid::Uuid::new_v4()));
+        let service = DaemonService::new(
+            DaemonRuntime {
+                executable: directory.join("paseo"),
+                cli_shim_path: directory.join("paseo"),
+                working_directory: directory,
+                environment: HashMap::new(),
+            },
+            None,
+            Arc::new(|| DaemonSettings { managed: true, keep_running_after_quit: false }),
+        );
+        for _ in 0..2 {
+            let error = service.ensure_open().await.err().unwrap();
+            assert_eq!(error.code, "RUNTIME_MISSING");
+            assert!(service.helper.get().is_none());
+        }
+        service.close(None).await.unwrap();
+        let error = service.ensure_open().await.err().unwrap();
+        assert_eq!(error.code, "DAEMON_SERVICE_CLOSED");
     }
 }

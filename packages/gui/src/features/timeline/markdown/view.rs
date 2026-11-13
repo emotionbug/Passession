@@ -860,8 +860,10 @@ fn table(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, aligns: &[Alignment], h
         return 0.0;
     }
     let table_h: f64 = row_heights.iter().sum();
-    let clip = Rect { size: dvec2(w, table_h), ..view };
-    cx.begin_turtle(Walk { abs_pos: Some(clip.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(table_h) }, Layout::default());
+    // A table wider than the column reserves the scroll bar's strip below it.
+    let bar_h = if max_scroll > 0.0 { super::super::scrollbar::BAR } else { 0.0 };
+    let clip = Rect { size: dvec2(w, table_h + bar_h), ..view };
+    cx.begin_turtle(Walk { abs_pos: Some(clip.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(clip.size.y) }, Layout::default());
     d.canvas.push_clip(clip);
     let tx = x - scroll;
     d.kit.rect(cx, rect_xywh(tx, y, total, table_h), p.surface0, 6.0);
@@ -899,9 +901,10 @@ fn table(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, aligns: &[Alignment], h
     d.canvas.pop_clip();
     cx.end_turtle();
     if max_scroll > 0.0 {
-        d.canvas.add_hit(clip, HitTarget::ScrollX(key));
+        d.canvas.add_hit(clip, HitTarget::ScrollX(key.clone()));
     }
-    table_h
+    super::super::scrollbar::draw(cx, d, clip, Some(p.surface0), Some(super::super::scrollbar::Axis { key: &key, offset: scroll, max: max_scroll }), None);
+    table_h + bar_h
 }
 
 /// Code text colored by syntax ranges, as one rich text.
@@ -975,8 +978,12 @@ fn code_block(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, lang: &str, text: 
         let header = inset + (label * 1.171875).ceil();
         let divider = header + inset / 2.0 - 1.5;
         let size = laidout_size(&laid);
+        let pane_w = w - 2.0;
+        let max_scroll = (size.x + 2.0 * (inset - 1.0) - pane_w).max(0.0);
+        // A pane that scrolls sideways keeps the scroll bar's strip below its last line.
+        let bar_h = if max_scroll > 0.0 { super::super::scrollbar::BAR } else { 0.0 };
         let pane_top = y + divider + 1.0 + (header + inset - 1.0 - divider - 1.0);
-        let h = (pane_top - y) + size.y + inset;
+        let h = (pane_top - y) + size.y + inset.max(bar_h);
         d.kit.bordered(cx, rect_xywh(x, y, w, h), p.surface2, 8.0, p.border, 1.0);
         let secondary = with_alpha(p.foreground, 0x99 as f32 / 255.0);
         d.kit.label(cx, Font::Medium, label, 1.171875, secondary, dvec2(x + inset - 1.0, y + (divider - label * 1.17) * 0.5), &highlight::display_language_name(lang), Some((w - 2.0 * inset - header).max(1.0)));
@@ -984,8 +991,7 @@ fn code_block(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, lang: &str, text: 
         d.kit.icon(cx, if copied { "check" } else { "copy" }, copy, (code_size * 1.08).ceil(), secondary);
         d.canvas.add_hit(copy, HitTarget::Copy { key: key.clone(), text: copy_text });
         d.kit.rect(cx, rect_xywh(x + 1.0, y + divider, w - 2.0, 1.0), with_alpha(p.foreground, 0x33 as f32 / 255.0), 0.0);
-        let pane = rect_xywh(x + 1.0, y + divider + 1.0, w - 2.0, h - divider - 2.0);
-        let max_scroll = (size.x + 2.0 * (inset - 1.0) - pane.size.x).max(0.0);
+        let pane = rect_xywh(x + 1.0, y + divider + 1.0, pane_w, h - divider - 2.0);
         d.state.extent_x.insert(key.clone(), max_scroll);
         let scroll = d.state.scroll_x.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_scroll);
         cx.begin_turtle(Walk { abs_pos: Some(pane.pos), margin: Margin::default(), width: Size::Fixed(pane.size.x), height: Size::Fixed(pane.size.y) }, Layout::default());
@@ -997,8 +1003,9 @@ fn code_block(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, lang: &str, text: 
         d.canvas.pop_clip();
         cx.end_turtle();
         if max_scroll > 0.0 {
-            d.canvas.add_hit(pane, HitTarget::ScrollX(key));
+            d.canvas.add_hit(pane, HitTarget::ScrollX(key.clone()));
         }
+        super::super::scrollbar::draw(cx, d, pane, Some(p.surface2), Some(super::super::scrollbar::Axis { key: &key, offset: scroll, max: max_scroll }), None);
         return h;
     }
     // components/highlighted-code-block.tsx: surface2, 8px radius, 12 padding,

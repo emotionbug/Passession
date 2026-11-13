@@ -528,7 +528,7 @@ pub fn row_trailing(r: Rect) -> Rect {
 /// Small hint text (`_hint`): 12/6 padding, muted or destructive; returns its height.
 pub fn hint(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, text: &str, error: bool) -> f64 {
     use crate::common::paint::Font;
-    let color = if error { ui.p.destructive } else { ui.p.muted };
+    let color = if error { ui.p.danger } else { ui.p.muted };
     let spec = ui.spec(Font::Regular, 12.0, color);
     let h = ui.painter.paragraph_height(cx, w - 24.0, spec, text);
     ui.painter.paragraph(cx, dvec2(x + 12.0, y + 6.0), w - 24.0, spec, text);

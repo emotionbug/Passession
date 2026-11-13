@@ -8,7 +8,7 @@ Navigation belongs to the Rust shell in `packages/gui/src/shell`. This filename 
 
 The primary tree is **host → directory → session**. A path is only meaningful together with its host. Preserve independent host and directory collapse state, including empty directories. Search can reveal matching ancestors without overwriting the saved collapse choices.
 
-Workspaces remain durable daemon entities and Command Center targets, but they are not sidebar grouping rows. Closing a chat tab is navigation, not archive. Reopening a session must select its actual host and current persisted identity instead of inventing a new session.
+Workspaces remain durable daemon entities and Command Center targets, but they are not sidebar grouping rows. Closing a chat tab is navigation, not archive. Reopening a session must select its actual host and current persisted identity instead of inventing a new session. Attention navigation also retains the `(host, session)` pair through command selection; session IDs alone can collide across hosts.
 
 Feature dispatch receives the owning panel's `UiContext.route`, `target`, `tab_key`, activity and window ID. Never resolve a split pane's action through the focused pane of another window. Moving or resizing a panel changes presentation, not its remote identity. Persist window layout through the core storage boundary described in [data model](data-model.md#client-side-stores).
 

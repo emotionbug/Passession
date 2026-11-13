@@ -33,9 +33,6 @@ use super::store::{self, Asset, OwnerEvent};
 use super::transfer::TransferMode;
 use super::ui::{self, ButtonSize, ButtonVariant, Interaction, TOOLBAR_HEIGHT};
 
-/// Original `palette.amber[500]` (conflict alert) and `palette.red[300]` ("Save failed").
-const AMBER_500: Vec4 = theme::argb(0xfff59e0b);
-const RED_300: Vec4 = theme::argb(0xfffca5a5);
 /// The code font size range of the appearance settings.
 const MIN_CODE_FONT: f64 = 9.0;
 const MAX_CODE_FONT: f64 = 22.0;
@@ -1530,10 +1527,10 @@ impl FileView {
                 let mut items: Vec<(String, Vec4)> = Vec::new();
                 if !show_preview {
                     let (line, column) = self.location();
-                    items.push((format!("Ln {line}, Col {column}"), p.extra_muted));
+                    items.push((ta("panels.file.editor.cursor", &[("line", &line.to_string()), ("column", &column.to_string())]), p.muted));
                 }
                 match model_status {
-                    FileEditorStatus::Error => items.push((t("panels.file.editor.saveFailed"), RED_300)),
+                    FileEditorStatus::Error => items.push((t("panels.file.editor.saveFailed"), p.danger)),
                     FileEditorStatus::Saving => items.push((t("panels.file.editor.saving"), p.muted)),
                     _ => {}
                 }
@@ -1549,7 +1546,7 @@ impl FileView {
                     right -= 14.0 + 8.0;
                 }
                 if *model_status == FileEditorStatus::Dirty {
-                    kit.dot(cx, dvec2(right - 3.0, bar.pos.y + toolbar_h / 2.0), 6.0, p.extra_muted);
+                    kit.dot(cx, dvec2(right - 3.0, bar.pos.y + toolbar_h / 2.0), 6.0, p.muted);
                     right -= 6.0 + 8.0;
                 }
                 right -= 4.0;
@@ -1563,13 +1560,13 @@ impl FileView {
         } else {
             format!("{}   {file_size}", remote_basename(&target.path, Some(&target.cwd)))
         };
-        kit.text_in(cx, rect(bar.pos.x + 12.0, bar.pos.y, meta_w, toolbar_h), spec(Font::Regular, small, p.extra_muted), &meta, 0.0);
+        kit.text_in(cx, rect(bar.pos.x + 12.0, bar.pos.y, meta_w, toolbar_h), spec(Font::Regular, small, p.muted), &meta, 0.0);
         let mut top = bar.pos.y + toolbar_h;
         // Alerts.
         if let Some((model_status, conflict, modified, _)) = &model
             && *model_status == FileEditorStatus::Conflict {
                 top = match conflict {
-                    Some(Conflict::Deleted) => self.draw_alert(cx, kit, area, top, &t("panels.file.editor.deletedTitle"), Some(&t("panels.file.editor.preservedDescription")), AMBER_500, true, &[], &p, &ty),
+                    Some(Conflict::Deleted) => self.draw_alert(cx, kit, area, top, &t("panels.file.editor.deletedTitle"), Some(&t("panels.file.editor.preservedDescription")), p.warning, true, &[], &p, &ty),
                     _ => {
                         let mut actions: Vec<(Hot, String)> = Vec::new();
                         if *modified {
@@ -1577,7 +1574,7 @@ impl FileView {
                         }
                         actions.push((Hot::AlertReload, t("panels.file.editor.reload")));
                         let description = modified.then(|| t("panels.file.editor.conflictDescription"));
-                        self.draw_alert(cx, kit, area, top, &t("panels.file.editor.changedOnDisk"), description.as_deref(), AMBER_500, true, &actions, &p, &ty)
+                        self.draw_alert(cx, kit, area, top, &t("panels.file.editor.changedOnDisk"), description.as_deref(), p.warning, true, &actions, &p, &ty)
                     }
                 };
             }

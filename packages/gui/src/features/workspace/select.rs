@@ -395,7 +395,7 @@ impl Widget for WaSelect {
                         let color = if !option.enabled {
                             p.extra_muted
                         } else if option.destructive {
-                            p.destructive
+                            p.danger
                         } else {
                             p.foreground
                         };

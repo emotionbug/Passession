@@ -48,6 +48,53 @@ fn is_auth_failure(message: &str) -> bool {
         || lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|word| word == "401")
 }
 
+/// The pairing-link / relay / QR failure copy key for a raw core error.
+fn link_failure_key(raw: &str) -> &'static str {
+    let lower = raw.to_lowercase();
+    let any = |words: &[&str]| words.iter().any(|w| lower.contains(w));
+    if any(&["expired", "invalid offer", "offer is invalid", "invalid pairing", "malformed", "decode", "base64", "unsupported offer", "parse"]) {
+        "pairing.link.errors.offerInvalid"
+    } else if any(&["timed out", "timeout", "unreachable", "offline", "relay", "refused", "closed", "no route", "not connected"]) {
+        "pairing.link.errors.relayUnreachable"
+    } else {
+        "pairing.link.errors.unableToPair"
+    }
+}
+
+fn link_failure_detail(raw: &str) -> String {
+    tr(link_failure_key(raw))
+}
+
+/// SSH authentication and host-key failures point at checking `ssh <target>` by hand.
+fn ssh_failure_key(raw: &str) -> Option<&'static str> {
+    let lower = raw.to_lowercase();
+    let any = |words: &[&str]| words.iter().any(|w| lower.contains(w));
+    if any(&["host key", "known_hosts", "known hosts", "hostkey", "remote host identification"]) {
+        Some("pairing.remoteSsh.errors.hostKey")
+    } else if any(&["permission denied", "authentication", "publickey", "auth fail", "no supported authentication"]) {
+        Some("pairing.remoteSsh.errors.auth")
+    } else {
+        None
+    }
+}
+
+fn ssh_failure_detail(raw: &str, target: &str) -> String {
+    match ssh_failure_key(raw) {
+        Some(key) => tr_args(key, &[("target", target)]),
+        None if raw.is_empty() => tr("pairing.remoteSsh.errors.unknown"),
+        None => tr("pairing.direct.errors.unableToConnect"),
+    }
+}
+
+/// `message` plus the raw error under "Details" when it adds anything.
+fn with_details(message: &str, raw: &str) -> String {
+    if raw.is_empty() || raw == message {
+        message.to_string()
+    } else {
+        format!("{message}\n{}", tr_args("pairing.direct.errors.details", &[("detail", raw)]))
+    }
+}
+
 /// Original `formatDaemonKeyFingerprint`: groups of four; keys longer than 16 characters
 /// show their first and last 8.
 fn key_fingerprint(key: &str) -> String {
@@ -535,24 +582,22 @@ impl ConnectionSheet {
         tr(key)
     }
 
-    /// Original failure copy: SSH wraps the detail, pairing links show the error itself, and
-    /// direct connections use `buildConnectionFailureCopy`.
+    /// Original failure copy: direct connections use `buildConnectionFailureCopy`; pairing
+    /// links, relay and SSH map the raw error to an action, keeping it under "Details".
     fn failure_message(&self, endpoint: &str, raw: &str, relay: bool) -> String {
         let raw = raw.trim();
         match self.method.as_str() {
-            "ssh" => tr_args("pairing.remoteSsh.errors.failedToConnect", &[("detail", raw)]),
-            "link" => {
-                if raw.is_empty() {
-                    tr("pairing.link.errors.unableToPair")
-                } else {
-                    raw.to_string()
-                }
+            "ssh" => {
+                let target = self.ssh_target.text().trim().trim_start_matches("ssh://").to_string();
+                let detail = ssh_failure_detail(raw, &target);
+                with_details(&tr_args("pairing.remoteSsh.errors.failedToConnect", &[("detail", &detail)]), raw)
             }
+            "link" => with_details(&link_failure_detail(raw), raw),
             _ if relay => {
                 if raw.is_empty() {
                     tr("pairing.direct.errors.invalidConnection")
                 } else {
-                    raw.to_string()
+                    with_details(&link_failure_detail(raw), raw)
                 }
             }
             _ => {
@@ -581,7 +626,7 @@ impl ConnectionSheet {
         let color = self.color.text().trim().to_string();
         let valid_color = color.is_empty() || (color.len() == 7 && color.starts_with('#') && color[1..].chars().all(|c| c.is_ascii_hexdigit()));
         if !valid_color {
-            self.error = Some("Badge color must use #RRGGBB".into());
+            self.error = Some(tr("pairing.hostDetails.invalidColor"));
             return SheetFlow::Stay;
         }
         self.error = None;
@@ -647,7 +692,7 @@ impl ConnectionSheet {
         let mut y = y;
         let fh = field_h(ui);
         let enabled = interactive && !self.busy;
-        let error_color = p.destructive;
+        let error_color = p.danger;
         match self.method.as_str() {
             "ssh" => {
                 y += field_label(ui, cx, x, y, w, &tr("pairing.remoteSsh.fields.target"), false);
@@ -735,9 +780,10 @@ impl ConnectionSheet {
         }
         if self.editing {
             y += 16.0;
-            y += toggle_row(ui, cx, x, y, "details", self.details, "Host details", interactive);
+            y += toggle_row(ui, cx, x, y, "details", self.details, &tr("pairing.hostDetails.title"), interactive);
             if self.details {
-                for (label, field) in [("Host name", &mut self.label), ("Expected server ID", &mut self.identity), ("Badge color", &mut self.color)] {
+                let labels = [tr("pairing.hostDetails.name"), tr("pairing.hostDetails.expectedServerId"), tr("pairing.hostDetails.badgeColor")];
+                for (label, field) in [(&labels[0], &mut self.label), (&labels[1], &mut self.identity), (&labels[2], &mut self.color)] {
                     y += 8.0;
                     y += field_label(ui, cx, x, y, w, label, true);
                     field.set_read_only(cx, self.busy);
@@ -752,7 +798,7 @@ impl ConnectionSheet {
 
 impl Sheet for ConnectionSheet {
     fn title(&self) -> String {
-        if self.editing { "Edit connection".to_string() } else { tr(&format!("{}.title", self.scope())) }
+        if self.editing { tr("pairing.hostDetails.editConnection") } else { tr(&format!("{}.title", self.scope())) }
     }
 
     fn sync(&mut self, _shell: &PaseoShell, state: &Value) {
@@ -910,7 +956,7 @@ enum AlertKind {
 #[allow(clippy::too_many_arguments)]
 fn alert(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, kind: AlertKind, text: &str, action: Option<(&str, &str, &str)>, interactive: bool) -> f64 {
     let p = ui.p;
-    let accent = if kind == AlertKind::Warning { argb(0xfff59e0b) } else { p.destructive };
+    let accent = if kind == AlertKind::Warning { p.warning } else { p.danger };
     let spec = ui.spec(Font::Regular, 14.0, p.muted);
     let tx = x + 16.0 + 14.0 + 12.0;
     let tw = w - (tx - x) - 16.0;
@@ -1530,7 +1576,7 @@ impl Sheet for ScanSheet {
                     }
                     return SheetFlow::Replace(Box::new(ConnectionSheet::password_prompt(link, j::text(&config, "id").to_string())));
                 }
-                self.failed(message)
+                self.failed(with_details(&link_failure_detail(&message), message.trim()))
             }
         }
     }
@@ -1539,5 +1585,25 @@ impl Sheet for ScanSheet {
         if let Some(view) = &self.view {
             view.as_qr_scan_view().stop(cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{link_failure_key, ssh_failure_key};
+
+    #[test]
+    fn link_failures_map_to_actions() {
+        assert_eq!(link_failure_key("Pairing offer expired"), "pairing.link.errors.offerInvalid");
+        assert_eq!(link_failure_key("failed to decode offer"), "pairing.link.errors.offerInvalid");
+        assert_eq!(link_failure_key("Relay connection timed out"), "pairing.link.errors.relayUnreachable");
+        assert_eq!(link_failure_key("something odd"), "pairing.link.errors.unableToPair");
+    }
+
+    #[test]
+    fn ssh_failures_point_at_ssh() {
+        assert_eq!(ssh_failure_key("Permission denied (publickey)."), Some("pairing.remoteSsh.errors.auth"));
+        assert_eq!(ssh_failure_key("Host key verification failed."), Some("pairing.remoteSsh.errors.hostKey"));
+        assert_eq!(ssh_failure_key("connection reset"), None);
     }
 }

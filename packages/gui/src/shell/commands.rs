@@ -244,7 +244,7 @@ pub fn navigation_agent_target(server_id: &str, agent: &Value, project: Option<&
     let cwd = if cwd.is_empty() { j::text(j::object(&placement, "checkout"), "cwd").to_string() } else { cwd.to_string() };
     PanelTarget::new("agent", server_id, j::text(agent, "workspaceId"), &cwd)
         .with_id(j::text(agent, "id"))
-        .with_title(j::text_or(agent, "title", "Session"))
+        .with_title(j::text(agent, "title"))
         .with_data(json!({ "project": placement }))
 }
 
@@ -338,6 +338,8 @@ fn choose_any_host(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, purp
     if connected_only == Some(true) {
         candidates.retain(|id| hosts::host(&ui.state, id).is_some_and(|h| h.connected()));
     }
+    // Connected hosts lead (local first within each group): those can act right away.
+    candidates.sort_by_key(|id| !hosts::host(&ui.state, id).is_some_and(|h| h.connected()));
     match candidates.len() {
         0 => {
             if matches!(purpose, HostPurpose::NewSession { .. } | HostPurpose::AddProject) {
@@ -348,7 +350,7 @@ fn choose_any_host(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, purp
         _ => {
             let title = match purpose {
                 HostPurpose::ManageLabels => tr("workspaceLabels.manage.title"),
-                _ => "Choose host".to_string(),
+                _ => tr("shell.commands.chooseHost"),
             };
             shell.data.overlays.open_sheet(Box::new(host_connections::ChooserSheet::new(title, candidates, purpose)));
             shell.redraw(cx);
@@ -366,15 +368,14 @@ pub fn host_chosen(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, purp
                 if new_workspace { "" } else { current.as_ref().map_or("", |t| t.workspace_id.as_str()) },
                 current.as_ref().map_or("", |t| t.cwd.as_str()),
             )
-            .with_id(new_id())
-            .with_title(tr("sessionNavigation.newSession"));
+            .with_id(new_id());
             if worktree {
                 target.data = json!({ "source": "branch-off" });
             }
             open_tab(shell, cx, ui, target, TabPlacement::Main);
         }
         HostPurpose::AddProject => {
-            let target = PanelTarget::new("new_tab", &host_id, "", "").with_title("Add project").with_data(json!({ "addProject": true }));
+            let target = PanelTarget::new("new_tab", &host_id, "", "").with_data(json!({ "addProject": true }));
             open_tab(shell, cx, ui, target, TabPlacement::Main);
         }
         HostPurpose::Usage => show_page(shell, cx, Page::Settings { host_id: Some(host_id), page: "host/usage".into() }),
@@ -404,7 +405,7 @@ pub(crate) fn new_session(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContex
 /// `_openWorkspacePanel`.
 fn open_workspace_panel(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, kind: &str, explorer: bool) {
     let Some(target) = selected(shell).filter(|t| !t.workspace_id.is_empty()) else {
-        toast(shell, cx, "Open a session or workspace first.", true);
+        toast(shell, cx, tr("shell.commands.openSessionFirst"), true);
         return;
     };
     let next = PanelTarget::new(kind, &target.server_id, &target.workspace_id, &target.cwd);
@@ -449,8 +450,7 @@ fn split_with_launcher(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, axis
     shell.data.layout.split_pane(&focused, axis);
     if let Some(source) = source {
         let target = PanelTarget::new("new_tab", &source.server_id, &source.workspace_id, &source.cwd)
-            .with_id(new_id())
-            .with_title(tr("sessionNavigation.newSession"));
+            .with_id(new_id());
         open_tab(shell, cx, ui, target, TabPlacement::Main);
     }
     shell.redraw(cx);
@@ -584,7 +584,7 @@ fn advance_closing(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
                 }
             } else if matches!(target.kind.as_str(), "agent" | "draft" | "provider_subagent") {
                 // Agent panel guard: a send or upload in flight refuses the close.
-                toast(shell, cx, "Wait for the current send or upload to finish before closing this session.", true);
+                toast(shell, cx, tr("shell.commands.waitForSend"), true);
                 abort_closing(shell);
                 return;
             } else {
@@ -957,7 +957,14 @@ pub fn execute(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, action: 
         "workspace.tab.menu.open" | "workspace.tab.target.agent" => new_session(shell, cx, ui, false, false),
         "workspace.terminal.new" => new_terminal(shell, cx, ui, TabPlacement::Main),
         "workspace.tab.target.changes" => open_workspace_panel(shell, cx, ui, "changes_tree", true),
-        "workspace.tab.target.gitLog" => open_workspace_panel(shell, cx, ui, "git_log", false),
+        "workspace.tab.target.gitLog" => {
+            let supported = target.as_ref().and_then(|t| hosts::host(&ui.state, &t.server_id)).is_some_and(|h| h.supports(crate::features::git::log::FEATURE));
+            if supported {
+                open_workspace_panel(shell, cx, ui, "git_log", false);
+            } else {
+                toast(shell, cx, tr("workspace.git.log.states.unsupported"), true);
+            }
+        }
         "workspace.tab.target.files" => open_workspace_panel(shell, cx, ui, "files", true),
         // Closing a view must not change the session's lifecycle.
         "workspace.tab.close.current" => {
@@ -1096,6 +1103,7 @@ pub fn execute(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, action: 
             );
         }
         "workspace.navigate.index" | "workspace.navigate.relative" => navigate_session(shell, cx, ui, action, args),
+        "session.next-attention" => next_attention(shell, cx, ui),
         "agent.interrupt" => {
             if let Some(target) = target.filter(|t| t.kind == "agent" && t.id.is_some()) {
                 request(
@@ -1116,7 +1124,7 @@ pub fn execute(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, action: 
             if action.starts_with("conversation") {
                 return;
             }
-            toast(shell, cx, format!("Command is unavailable in this view: {action}"), true);
+            toast(shell, cx, tr_args("shell.commands.unavailable", &[("action", action)]), true);
         }
     }
     shell.redraw(cx);
@@ -1128,17 +1136,13 @@ fn request_new_window() {
     }
 }
 
-/// `_navigateSession`.
+/// `_navigateSession`, in the order the sidebar lists sessions (host order, project order,
+/// filters, collapse and search), so Ctrl+1 is the first row shown.
 fn navigate_session(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, action: &str, args: &Value) {
     let state = ui.state.clone();
-    let mut sessions: Vec<(String, Value)> = Vec::new();
-    for host in hosts::hosts(&state) {
-        for agent in host.agents() {
-            if !hosts::is_archived(agent) && j::is_null_or_missing(agent, "parentAgentId") && !j::text(agent, "workspaceId").is_empty() {
-                sessions.push((host.server_id().to_string(), agent.clone()));
-            }
-        }
-    }
+    let holding = sidebar::pointer_on_tree(shell.data.pointer.hover.as_deref());
+    let query = shell.data.sidebar.query.trim().to_lowercase();
+    let sessions = sidebar::navigation_sessions(&state, &query, holding.then_some(&shell.data.sidebar.held), false);
     if sessions.is_empty() {
         return;
     }
@@ -1156,6 +1160,29 @@ fn navigate_session(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, act
     if index >= 0 && index < len {
         let (sid, agent) = sessions[index as usize].clone();
         open_navigation_agent(shell, cx, ui, &sid, &agent, None);
+    }
+}
+
+/// `session.next-attention`: the next session (sidebar order, collapsed groups included) that
+/// waits on the user, after the one shown.
+fn next_attention(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
+    let state = ui.state.clone();
+    let sessions = sidebar::navigation_sessions(&state, "", None, true);
+    let current = selected(shell);
+    let is_current = |sid: &str, agent: &Value| current.as_ref().is_some_and(|c| c.kind == "agent" && c.server_id == sid && c.id.as_deref() == Some(j::text(agent, "id")));
+    let start = sessions.iter().position(|(sid, agent)| is_current(sid, agent)).map_or(0, |i| i + 1);
+    let next = (0..sessions.len())
+        .map(|offset| &sessions[(start + offset) % sessions.len()])
+        .find(|(sid, agent)| !is_current(sid, agent) && sidebar::needs_input(agent))
+        .cloned();
+    match next {
+        Some((sid, agent)) => {
+            open_navigation_agent(shell, cx, ui, &sid, &agent, None);
+            if shell.data.compact {
+                shell.data.layout.show_sidebar(true, false);
+            }
+        }
+        None => toast(shell, cx, tr("shell.commands.noAttention"), false),
     }
 }
 
@@ -1223,7 +1250,7 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
         UiEffect::Toast { message, is_error } => toast(shell, cx, message, is_error),
         UiEffect::OpenExternal { url } => {
             if platform::open_external(&url).is_none() {
-                toast(shell, cx, "Could not open the link in the system browser.", true);
+                toast(shell, cx, tr("shell.commands.openLinkFailed"), true);
             }
         }
         UiEffect::OpenFile { host_id, workspace_id, path } => open_file(shell, cx, ui, &host_id, &workspace_id, &path, false),
@@ -1266,6 +1293,7 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
             toast(shell, cx, message, false);
         }
         UiEffect::OpenHostDialog => host_dialog::open_flow(shell, cx, None, None, None),
+        UiEffect::OpenHostConnectionDialog { connection } => host_dialog::open_flow(shell, cx, None, Some(connection), None),
         UiEffect::OpenHostPairing { host_id } => {
             shell.data.overlays.open_sheet(Box::new(host_dialog::PairingSheet::new(host_id)));
         }
@@ -1313,7 +1341,6 @@ fn navigate(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, route: Rout
             let parent = hosts::host(&state, &host_id).and_then(|h| h.agent(&parent_agent_id).cloned()).unwrap_or(Value::Null);
             let target = PanelTarget::new("provider_subagent", &host_id, j::text(&parent, "workspaceId"), j::text(&parent, "cwd"))
                 .with_id(subagent_id)
-                .with_title("Subagent")
                 .with_data(json!({ "parentAgentId": parent_agent_id }));
             open_tab(shell, cx, ui, target, TabPlacement::Main);
         }
@@ -1398,7 +1425,8 @@ pub fn on_response(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, _req
             };
             let agent = j::object(payload, "agent");
             if agent.as_object().is_none_or(Map::is_empty) {
-                let message = j::text_or(payload, "error", "Session no longer exists.").to_string();
+                let fallback = tr("shell.commands.sessionGone");
+                let message = j::text_or(payload, "error", &fallback).to_string();
                 return toast(shell, cx, message, true);
             }
             let workspace_id = j::text(agent, "workspaceId").to_string();
@@ -1413,11 +1441,25 @@ pub fn on_response(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, _req
                 .with_id(j::text(agent, "id"))
                 .with_title(j::text(agent, "title"))
                 .with_data(data);
+            let reveal = shell.data.reveal_agent.as_ref().is_some_and(|(sid, id)| {
+                (sid == &host_id || hosts::host(&ui.state, sid).is_some_and(|h| h.server_id() == host_id)) && target.id.as_deref() == Some(id.as_str())
+            });
+            if reveal {
+                shell.data.reveal_agent = None;
+                shell.data.reveal_attention = Some(target.key());
+            }
             open_tab(shell, cx, ui, target, placement);
         }
         Pending::Refresh { host_id } => match response_message(result) {
             Some(message) => toast(shell, cx, message, true),
             None => ui.core.refresh_host(&host_id),
+        },
+        Pending::ArchiveSession { host_id, agent_id } => match response_message(result) {
+            Some(message) => toast(shell, cx, message, true),
+            None => {
+                history::mark_archived(shell, &host_id, &agent_id);
+                ui.core.refresh_host(&host_id);
+            }
         },
         Pending::ArchiveWorkspace { host_id, workspace_id } => match response_message(result) {
             Some(message) => toast(shell, cx, message, true),
@@ -1492,11 +1534,20 @@ pub fn on_response(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, _req
             }
             let state = result.as_ref().map(|p| j::object(p, "state").clone()).unwrap_or(Value::Null);
             if j::text(&state, "kind") != "recoverable" {
-                let message = j::text_or(&state, "message", "This workspace cannot be restored.").to_string();
+                let fallback = tr("shell.commands.restoreUnavailable");
+                let message = j::text_or(&state, "message", &fallback).to_string();
                 return toast(shell, cx, message, true);
             }
             let message = format!("{}\n{}\n{}", j::text(&state, "workspaceName"), j::text(&state, "action"), j::text(&state, "branch"));
-            confirm(shell, cx, "Restore workspace?", &message, "Restore", false, ShellOverlay::RestoreWorkspace { host_id, workspace_id });
+            confirm(
+                shell,
+                cx,
+                &tr("shell.commands.restoreTitle"),
+                &message,
+                &tr("workspace.route.recovery.restoreAction"),
+                false,
+                ShellOverlay::RestoreWorkspace { host_id, workspace_id },
+            );
         }
         Pending::LabelCatalog => {
             if let Ok(payload) = result {
@@ -1591,6 +1642,15 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str, 
         "nav:close" => shell.data.layout.show_sidebar(compact, false),
         "side:display" => display_menu(shell, cx, ui, anchor_of(shell, id)),
         "side:addhost" => host_dialog::open_flow(shell, cx, None, None, None),
+        // Empty sidebar search: the same query over the whole History (archived included).
+        "side:searchhistory" => {
+            let query = shell.data.search.as_ref().map(|field| field.text()).unwrap_or_default().trim().to_string();
+            let host = selected(shell).map(|t| t.server_id).or_else(|| hosts::hosts(&state).first().map(|h| h.server_id().to_string()));
+            if let Some(host) = host {
+                show_sessions(shell, cx, &host, true, "", "");
+                history::search(shell, cx, &query);
+            }
+        }
         "foot:addproject" => choose_host(shell, cx, ui, HostPurpose::AddProject),
         "foot:usage" => choose_host(shell, cx, ui, HostPurpose::Usage),
         "foot:hosts" => host_picker(shell, cx, &state, anchor_of(shell, id)),
@@ -1684,7 +1744,7 @@ pub fn secondary(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &s
         }
     } else if let Some(rest) = id.strip_prefix("session:").or_else(|| id.strip_prefix("sessionedit:")) {
         if let Some((sid, agent)) = find_session(&state, rest) {
-            session_menu(shell, cx, &state, &sid, agent, point(abs));
+            session_menu(shell, cx, &state, &sid, agent, point(abs), false);
         }
     } else if id.starts_with("hist:row:") {
         history::secondary(shell, cx, ui, id);
@@ -2001,11 +2061,9 @@ fn explorer_new_tab_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, 
         return;
     }
     let Some(target) = selected(shell).filter(|t| !t.workspace_id.is_empty()) else {
-        return toast(shell, cx, "Open a session or workspace first.", true);
+        return toast(shell, cx, tr("shell.commands.openSessionFirst"), true);
     };
-    let draft = PanelTarget::new("new_tab", &target.server_id, &target.workspace_id, &target.cwd)
-        .with_id(new_id())
-        .with_title(tr("sessionNavigation.newSession"));
+    let draft = PanelTarget::new("new_tab", &target.server_id, &target.workspace_id, &target.cwd).with_id(new_id());
     open_tab(shell, cx, ui, draft, TabPlacement::Explorer);
 }
 
@@ -2013,7 +2071,7 @@ fn explorer_new_tab_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, 
 /// the focused workspace, opened as its terminal tab once the daemon created it.
 fn new_terminal(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, placement: TabPlacement) {
     let Some(target) = selected(shell).filter(|t| !t.workspace_id.is_empty()) else {
-        return toast(shell, cx, "Open a session or workspace first.", true);
+        return toast(shell, cx, tr("shell.commands.openSessionFirst"), true);
     };
     let Some(host) = hosts::host(&ui.state, &target.server_id) else { return };
     if !host.connected() {
@@ -2068,7 +2126,9 @@ fn header_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, anchor: Rect)
     if shell.data.compact && workspace.as_ref().is_some_and(|w| !j::array(w, "scripts").is_empty()) {
         entries.push(item("scripts", tr("workspace.scripts.title"), "play"));
     }
-    if is_git {
+    // Git Log needs the host's `gitLog` feature (older daemons cannot list history).
+    let git_log = target.as_ref().and_then(|t| hosts::host(state, &t.server_id)).is_some_and(|h| h.supports(crate::features::git::log::FEATURE));
+    if is_git && git_log {
         entries.push(item("gitLog", tr("workspace.git.log.open"), "git-graph"));
     }
     entries.push(MenuItem::new("copyPath", tr("workspace.header.actions.copyPath")).icon("copy").enabled(!directory.is_empty()).entry());
@@ -2204,7 +2264,7 @@ fn scripts_menu_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, 
             let url = script_url(&script);
             let valid = url.starts_with("http://") || url.starts_with("https://");
             if !valid || platform::open_external(&url).is_none() {
-                toast(shell, cx, "Could not open service URL in the system browser.", true);
+                toast(shell, cx, tr("shell.commands.openServiceFailed"), true);
             }
         }
         _ => {
@@ -2253,37 +2313,52 @@ fn help_menu_result(shell: &mut PaseoShell, cx: &mut Cx, value: &str) {
     }
 }
 
-/// Original sidebar `HostPicker`: hosts (status dot, active connection), "Add host".
+/// Original sidebar `HostPicker`: hosts in sidebar order (status dot, active connection), then
+/// "Add host" and the host settings. Picking a host shows it in the sidebar.
 fn host_picker(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, anchor: Rect) {
-    let all = hosts::hosts(state);
-    if all.len() > 10 {
+    let order = sidebar_host_order(state);
+    if order.len() > 10 {
         // Searchable above ten hosts.
-        let ids = all.iter().map(|h| h.server_id().to_string()).collect();
-        shell.data.overlays.open_sheet(Box::new(host_connections::ChooserSheet::picker(ids)));
+        shell.data.overlays.open_sheet(Box::new(host_connections::ChooserSheet::picker(order)));
         return;
     }
     let p = crate::theme::current_palette();
-    let mut entries: Vec<MenuEntry> = all
+    let mut entries: Vec<MenuEntry> = order
         .iter()
+        .filter_map(|id| hosts::host(state, id))
         .map(|host| {
             MenuItem::new(host.server_id(), host.display_label())
-                .dot(sidebar::status_color(&p, host))
+                .dot(sidebar::status_color(&p, &host))
                 .hint(host_connections::active_connection_label(host.config()))
                 .entry()
         })
         .collect();
-    entries.push(item("add", "Add host", "plus"));
-    menu(shell, cx, anchor, Some("Host".into()), entries, MenuOptions { width: 280.0, ..MenuOptions::default() }, ShellOverlay::HostPicker);
+    entries.push(MenuEntry::Separator);
+    entries.push(item("add", tr("settings.addHost"), "plus"));
+    let settings_host = selected(shell).map(|t| t.server_id).or_else(|| order.first().cloned()).unwrap_or_default();
+    entries.push(item(&format!("settings:{settings_host}"), tr("shell.hostPicker.settings"), "settings"));
+    menu(shell, cx, anchor, Some(tr("shell.hostPicker.title")), entries, MenuOptions { width: 280.0, ..MenuOptions::default() }, ShellOverlay::HostPicker);
 }
 
-/// `_openHost`: add host, or that host's settings.
+/// `_openHost`: add host, a host's settings (`settings:<id>`), or reveal the host in the
+/// sidebar (expanded and scrolled to).
 pub fn open_host(shell: &mut PaseoShell, cx: &mut Cx, value: &str) {
     if value == "add" {
         host_dialog::open_flow(shell, cx, None, None, None);
         return;
     }
-    let id = value.strip_prefix("settings:").unwrap_or(value).to_string();
-    open_settings(shell, cx, Some(id), "host/host");
+    if let Some(id) = value.strip_prefix("settings:") {
+        open_settings(shell, cx, (!id.is_empty()).then(|| id.to_string()), "host/host");
+        return;
+    }
+    if shell.data.page.is_some() {
+        close_page(shell, cx);
+    }
+    let compact = shell.data.compact;
+    shell.data.layout.show_sidebar(compact, true);
+    shell.data.sidebar.expand_host = Some(value.to_string());
+    shell.data.sidebar.reveal_host = Some(value.to_string());
+    shell.redraw(cx);
 }
 
 fn host_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, host_id: &str, anchor: Rect) {
@@ -2320,7 +2395,7 @@ fn host_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_id:
     let Some(host) = hosts::host(&state, host_id) else { return };
     match action {
         "new" => {
-            let target = PanelTarget::new("new_tab", host_id, "", "").with_title("New session");
+            let target = PanelTarget::new("new_tab", host_id, "", "");
             open_tab(shell, cx, ui, target, TabPlacement::Main);
         }
         "project" => host_chosen(shell, cx, ui, HostPurpose::AddProject, host_id.to_string()),
@@ -2341,9 +2416,9 @@ fn host_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_id:
         "remove" => confirm(
             shell,
             cx,
-            &format!("Remove {}?", host.label()),
-            "Remove this saved host, all its connections and credentials from this device? Sessions on the daemon are not deleted.",
-            "Remove",
+            &tr_args("shell.commands.removeHostTitle", &[("host", &host.label())]),
+            &tr("shell.commands.removeHostMessage"),
+            &tr("sidebar.project.confirmations.removeConfirm"),
             true,
             ShellOverlay::RemoveHost { host_id: host_id.to_string() },
         ),
@@ -2358,6 +2433,7 @@ fn project_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, host_id: &st
     let order: Vec<String> = sidebar::ordered_projects(&host, &stored).iter().map(|p| sidebar::project_key(&host, p)).collect();
     let entries = [
         ("new", "sessionNavigation.newSession"),
+        ("worktree", "shell.commands.newWorktreeSession"),
         ("history", "sessions.title"),
         ("import", "importSession.title"),
         ("rename", "sidebar.project.actions.rename"),
@@ -2371,7 +2447,13 @@ fn project_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, host_id: &st
         ("remove", "sidebar.project.actions.remove"),
     ]
     .iter()
-    .map(|(value, key)| MenuItem::new(*value, tr(key)).entry())
+    .map(|(value, key)| {
+        let label = tr(key);
+        match *value {
+            "worktree" => MenuItem::new(*value, label).hint(crate::shell::shortcuts::current_label_for_help_id("new-worktree").unwrap_or_default()).entry(),
+            _ => MenuItem::new(*value, label).entry(),
+        }
+    })
     .collect();
     menu(shell, cx, anchor, None, entries, MenuOptions::default(), ShellOverlay::ProjectMenu { host_id: host_id.to_string(), project, order });
 }
@@ -2402,7 +2484,12 @@ fn project_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
     let key = sidebar::project_key(&host, project);
     match action {
         "new" => {
-            let target = PanelTarget::new("new_tab", host_id, "", &root).with_title("New session").with_data(json!({ "project": project }));
+            let target = PanelTarget::new("new_tab", host_id, "", &root).with_data(json!({ "project": project }));
+            open_tab(shell, cx, ui, target, TabPlacement::Main);
+        }
+        // `worktree.new` for this project: the new-session form starts on "New worktree".
+        "worktree" => {
+            let target = PanelTarget::new("new_tab", host_id, "", &root).with_id(new_id()).with_data(json!({ "project": project, "source": "branch-off" }));
             open_tab(shell, cx, ui, target, TabPlacement::Main);
         }
         "history" => {
@@ -2414,7 +2501,10 @@ fn project_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
         }
         "settings" => {
             let name = j::text(project, "projectDisplayName");
-            let target = PanelTarget::new("project_settings", host_id, "", &root).with_title(format!("{name} settings")).with_data(json!({ "project": project }));
+            let mut target = PanelTarget::new("project_settings", host_id, "", &root).with_data(json!({ "project": project }));
+            if !name.is_empty() {
+                target.title = Some(tr_args("shell.tabs.projectSettingsFor", &[("name", name)]));
+            }
             open_tab(shell, cx, ui, target, TabPlacement::Main);
         }
         "up" => sidebar::move_in_order(ui, "projectOrder", order, &key, -1),
@@ -2437,7 +2527,7 @@ fn project_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
         "rename" => prompt(
             shell,
             cx,
-            "Rename project",
+            &tr("sidebar.project.actions.rename"),
             j::text(project, "projectDisplayName"),
             ShellOverlay::RenameProject { host_id: host_id.to_string(), project_id },
         ),
@@ -2458,9 +2548,9 @@ fn project_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
             confirm(
                 shell,
                 cx,
-                &format!("Remove project from {}?", host.label()),
-                &format!("{root}\n{count} active workspaces are affected on this host. Other hosts are unchanged."),
-                "Remove",
+                &tr_args("shell.commands.removeProjectTitle", &[("host", &host.label())]),
+                &tr_args("shell.commands.removeProjectMessage", &[("path", &root), ("count", &count.to_string())]),
+                &tr("sidebar.project.confirmations.removeConfirm"),
                 true,
                 ShellOverlay::RemoveProject { host_id: host_id.to_string(), project: project.clone() },
             );
@@ -2469,9 +2559,14 @@ fn project_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
     }
 }
 
-fn session_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, host_id: &str, agent: Value, anchor: Rect) {
+/// The sidebar session row's menu; History rows (`with_open`) lead with "Open".
+pub(crate) fn session_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, host_id: &str, agent: Value, anchor: Rect, with_open: bool) {
     let pinned = workspace_value(state, host_id, j::text(&agent, "workspaceId")).is_some_and(|w| !j::is_null_or_missing(&w, "pinnedAt"));
-    let mut entries = vec![MenuItem::new("rename", tr("workspace.tabs.menu.renameAgent")).entry()];
+    let mut entries = Vec::new();
+    if with_open {
+        entries.push(MenuItem::new("open", tr("sessions.actions.open")).entry());
+    }
+    entries.push(MenuItem::new("rename", tr("workspace.tabs.menu.renameAgent")).entry());
     if j::is_null_or_missing(&agent, "archivedAt") {
         entries.push(MenuItem::new("reload", tr("workspace.tabs.menu.reloadAgent")).entry());
     }
@@ -2501,7 +2596,7 @@ fn session_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
             Some(workspace) => {
                 shell.data.overlays.open_sheet(Box::new(labels::LabelsSheet::new(host_id.to_string(), Some(workspace))));
             }
-            None => toast(shell, cx, "The workspace is unavailable. Refresh this host.", true),
+            None => toast(shell, cx, tr("shell.commands.workspaceUnavailable"), true),
         },
         "recover" => recover_workspace(shell, ui, host_id, &workspace_id),
         "archiveWorkspace" => {
@@ -2527,9 +2622,18 @@ fn session_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
             "workspace.mark_unread.response",
             refresh,
         ),
-        "rename" => prompt(shell, cx, "Rename session", &title, ShellOverlay::RenameSession { host_id: host_id.to_string(), agent_id }),
+        "open" => open_agent(shell, ui, host_id, &agent_id, None, TabPlacement::Main),
+        "rename" => prompt(shell, cx, &tr("workspace.tabs.menu.renameAgent"), &title, ShellOverlay::RenameSession { host_id: host_id.to_string(), agent_id }),
         "reload" => reload_agent(shell, cx, ui, &navigation_agent_target(host_id, agent, None)),
-        "archive" => confirm(shell, cx, "Archive session?", &title, "Archive", false, ShellOverlay::ArchiveSession { host_id: host_id.to_string(), agent_id }),
+        "archive" => confirm(
+            shell,
+            cx,
+            &tr("shell.commands.archiveSessionTitle"),
+            &title,
+            &tr("agentList.archiveSheet.archive"),
+            false,
+            ShellOverlay::ArchiveSession { host_id: host_id.to_string(), agent_id },
+        ),
         _ => {}
     }
 }
@@ -2822,7 +2926,7 @@ pub fn shell_overlay_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiCont
                     &host_id,
                     json!({ "type": "archive_agent_request", "agentId": agent_id }),
                     "agent_archived",
-                    Pending::Refresh { host_id: host_id.clone() },
+                    Pending::ArchiveSession { host_id: host_id.clone(), agent_id: agent_id.clone() },
                 );
             }
         }
@@ -2962,7 +3066,14 @@ pub fn handle_platform_actions(shell: &mut PaseoShell, cx: &mut Cx, event: &Even
                 PlatformEvent::QuitCancelled => {}
                 PlatformEvent::ShowWindow if main => crate::shell::set_tray_hidden(false),
                 PlatformEvent::OpenWindow { route } if main => crate::shell::request_window(WindowRequest { route }),
-                PlatformEvent::LocalDaemonStatus { .. } if main => ui.core.discover_local_daemon(),
+                PlatformEvent::LocalDaemonStatus { status } if main => {
+                    if matches!(status.get("status").and_then(Value::as_str), Some("running" | "starting"))
+                        && status.get("listen").and_then(Value::as_str).is_some_and(|listen| !listen.is_empty())
+                    {
+                        ui.core.discover_local_daemon();
+                    }
+                    shell.redraw(cx);
+                }
                 PlatformEvent::HostError { message } if main => toast(shell, cx, message, true),
                 PlatformEvent::Insets(_) => shell.redraw(cx),
                 _ => {}
@@ -3046,6 +3157,16 @@ fn open_route(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, route: &P
             if hosts::host(&ui.state, server_id).is_none() {
                 return false;
             }
+            // Show the session itself: pages (Settings included) and open sheets/menus close,
+            // and the chat scrolls to what it waits on once its tab is drawn.
+            overlays::dismiss_all(shell, cx, ui);
+            if shell.data.page.is_some() {
+                close_page(shell, cx);
+            }
+            if shell.data.compact {
+                shell.data.layout.show_sidebar(true, false);
+            }
+            shell.data.reveal_agent = Some((server_id.clone(), agent_id.clone()));
             open_agent(shell, ui, server_id, agent_id, None, TabPlacement::Main);
             true
         }

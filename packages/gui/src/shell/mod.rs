@@ -26,7 +26,7 @@ use serde_json::Value;
 use crate::common::overlay::{self as overlay_api, OVERLAY_ACTION, OverlayRequest, SHELL_OWNER};
 use crate::common::paint::{HitMap, Painter};
 use crate::common::{
-    MAIN_WINDOW_ID, PanelActivity, Route, UiCommand, UiContext, json as j, set_compact_layout,
+    MAIN_WINDOW_ID, PanelActivity, Route, UiCommand, UiContext, json as j, set_compact_layout, tr,
 };
 use crate::theme;
 
@@ -196,6 +196,8 @@ pub enum Pending {
     Refresh { host_id: String },
     /// `archive_workspace_request`: close that workspace's tabs, refresh.
     ArchiveWorkspace { host_id: String, workspace_id: String },
+    /// `archive_agent_request`: mark History archived only after the daemon confirms.
+    ArchiveSession { host_id: String, agent_id: String },
     /// `project.remove.request`: close tabs of the removed workspaces.
     RemoveProject { host_id: String },
     /// `refresh_agent_request`, then `conversation.sync` to the tab (`_reloadAgent`).
@@ -277,6 +279,10 @@ pub struct Data {
     pub close_approved: bool,
     /// Window lost focus or the app went to the background (Flutter not `resumed`).
     pub app_inactive: bool,
+    /// A notification asked to open this agent (server, agent id) showing what it waits on.
+    pub reveal_agent: Option<(String, String)>,
+    /// The agent tab whose chat root reveals its pending permission/question on next draw.
+    pub reveal_attention: Option<String>,
 }
 
 #[derive(Live, LiveHook, Widget)]
@@ -575,6 +581,9 @@ impl Widget for PaseoShell {
         commands::handle_platform_actions(self, cx, event, ui);
         commands::handle_window_events(self, cx, event, ui);
         overlays::handle_timers(&mut self.data.overlays, cx, event);
+        if sidebar::track_modifier(&mut self.data.sidebar, event) {
+            self.redraw(cx);
+        }
 
         // Standalone tool-call sheets (timeline, drawn above the shell overlays) take input first;
         // while one is open the shell overlays, shortcuts, chrome and panels get no input events.
@@ -648,6 +657,9 @@ impl Widget for PaseoShell {
         }
         if let Some(ui) = Self::ui(scope) {
             sidebar::handle_actions(self, cx, event, ui);
+            if let Some(host_id) = self.data.sidebar.expand_host.take() {
+                sidebar::expand(ui, &format!("host:{host_id}"));
+            }
             self.apply_effects(cx, ui);
             self.schedule_save(cx);
             let target = chrome::focused_target(self).cloned();
@@ -748,7 +760,7 @@ pub fn response_message(result: &Result<Value, CoreError>) -> Option<String> {
             rejected.then(|| match payload.get("error") {
                 Some(Value::String(error)) if !error.is_empty() => error.clone(),
                 Some(error @ Value::Object(_)) => hosts::error_text(error),
-                _ => "The host rejected this action.".to_string(),
+                _ => tr("shell.commands.hostRejected"),
             })
         }
     }

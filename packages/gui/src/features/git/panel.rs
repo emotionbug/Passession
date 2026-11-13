@@ -253,6 +253,11 @@ impl GitPanelRef {
                 changes.pending_focus = Some(path.to_owned());
             }
             changes.target.data = target.data.clone();
+        } else if let Some(View::Log(log)) = inner.view.as_mut()
+            && log.target.data != target.data
+        {
+            // Show in Git Log / Show history on an open log: apply its filters.
+            log.retarget(target.clone());
         }
         inner.target = Some(target);
         inner.redraw(cx);

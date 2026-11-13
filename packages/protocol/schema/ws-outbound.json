@@ -61663,6 +61663,9 @@
                             "path": {
                               "type": "string"
                             },
+                            "absolutePath": {
+                              "type": "string"
+                            },
                             "entries": {
                               "type": "array",
                               "items": {
@@ -65384,6 +65387,9 @@
                     },
                     "error": {
                       "type": "string"
+                    },
+                    "exitCode": {
+                      "type": "integer"
                     }
                   },
                   "required": [

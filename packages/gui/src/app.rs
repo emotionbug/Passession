@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::common::{self, UiContext, i18n};
 use crate::shell::{self, PaseoShellWidgetRefExt, platform as shell_platform};
+use crate::fonts::{self, FontRoles, SystemFontState};
 use crate::theme;
 
 live_design! {
@@ -22,12 +23,14 @@ live_design! {
     // Manual editors construct handles lazily; wildcard imports prune unused Live types.
     use makepad_widgets::text_selection_handles::DrawTextSelectionHandle;
     use crate::shell::PaseoWindow;
+    use crate::fonts::PaseoFontRoles;
 
     App = {{App}} {
         ui: <Root> {
             main_window = <PaseoWindow> {}
         }
         window_template: <PaseoWindow> {}
+        font_roles: <PaseoFontRoles> {}
     }
 }
 
@@ -79,6 +82,8 @@ struct Runtime {
     system_dark: bool,
     theme_key: String,
     window_ready: bool,
+    /// The language the native application menu was last built in.
+    menu_locale: &'static str,
     core_batch_timer: Timer,
 }
 
@@ -94,6 +99,10 @@ pub struct App {
     startup_error: Option<String>,
     #[rust]
     layout_retirement_timer: Timer,
+    #[live]
+    font_roles: FontRoles,
+    #[rust]
+    system_fonts: SystemFontState,
 }
 
 impl LiveRegister for App {
@@ -104,6 +113,7 @@ impl LiveRegister for App {
         cx.link(live_id!(theme), live_id!(paseo_makepad_theme));
         paseo_gui_platform::live_design(cx);
         theme::live_design(cx);
+        fonts::live_design(cx);
         common::live_design(cx);
         crate::features::live_design(cx);
         shell::panels::live_design(cx);
@@ -149,6 +159,7 @@ impl App {
             system_dark,
             theme_key: String::new(),
             window_ready: false,
+            menu_locale: "",
             core_batch_timer: Timer::default(),
         });
         self.ui.widget(id!(main_window.shell)).as_paseo_shell().set_window(cx, common::MAIN_WINDOW_ID);
@@ -183,6 +194,10 @@ impl App {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         cx.set_window_dark_appearance(theme::current_palette().is_dark);
         let localized = i18n::set_language(preferences.get("language"));
+        if runtime.menu_locale != i18n::locale_tag() {
+            runtime.menu_locale = i18n::locale_tag();
+            update_native_menu(cx);
+        }
         if themed || localized {
             cx.redraw_all();
         }
@@ -229,6 +244,8 @@ impl App {
         shell.route(cx, request.route);
         shell::register_window(&id);
         runtime.windows.push((id, window));
+        // Each new window's `window_menu` rebuilds the native menu from its English DSL names.
+        update_native_menu(cx);
     }
 
     /// The shell of window `id` (`main` or a secondary window).
@@ -248,6 +265,28 @@ impl App {
         let shell_of = |id: &str| self.shell_of(id);
         crate::smoke::handle_event(cx, event, &crate::smoke::Ctx { state: &runtime.ui.state, shell: &shell_of });
     }
+}
+
+/// The macOS application menu (`PaseoWindow`'s `window_menu`: app ▸ Quit, File ▸ New Window)
+/// in the active language, with the same commands and keys.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn native_menu() -> MacosMenu {
+    let item = |name: String, command: LiveId, shift: bool, key: KeyCode| MacosMenu::Item { name, command, shift, key, enabled: true };
+    MacosMenu::Main {
+        items: vec![
+            MacosMenu::Sub { name: "Passession".into(), items: vec![item(common::tr("shell.menu.quitApp"), live_id!(paseo_quit), false, KeyCode::KeyQ)] },
+            MacosMenu::Sub { name: common::tr("shell.menu.file"), items: vec![item(common::tr("shell.menu.newWindow"), live_id!(new_window), true, KeyCode::KeyN)] },
+        ],
+    }
+}
+
+/// Rebuilds the native application menu in the active language (macOS; other platforms have
+/// no native menu).
+fn update_native_menu(cx: &mut Cx) {
+    #[cfg(target_os = "macos")]
+    cx.update_macos_menu(native_menu());
+    #[cfg(not(target_os = "macos"))]
+    let _ = cx;
 }
 
 impl AppMain for App {
@@ -302,6 +341,17 @@ impl AppMain for App {
         }
         if appearance {
             Self::appearance(runtime, cx);
+            // `uiFontFamily`/`monoFontFamily` or the OS fonts may have changed;
+            // an unchanged request is a no-op.
+            let preferences = runtime.ui.state.get("preferences").unwrap_or(&Value::Null);
+            self.system_fonts.request(preferences, refresh_appearance);
+        }
+        // The first frame waits briefly for system fonts; a slower worker
+        // result arrives with a later signal (one relayout).
+        if matches!(event, Event::Startup) {
+            self.system_fonts.settle(cx, &self.font_roles, fonts::STARTUP_BUDGET);
+        } else if matches!(event, Event::Signal) {
+            self.system_fonts.poll(cx, &self.font_roles);
         }
         let batch = !runtime.ui.events.is_empty();
         if batch {

@@ -63,7 +63,7 @@ pub fn git_result(result: &Result<Value, CoreError>) -> Result<Value, Failure> {
     if payload.get("success") == Some(&Value::Bool(false))
         || payload.get("accepted") == Some(&Value::Bool(false))
     {
-        return Err(Failure::message("The host did not accept this operation."));
+        return Err(Failure::message(super::text::t("workspace.git.toasts.notAccepted")));
     }
     Ok(payload)
 }

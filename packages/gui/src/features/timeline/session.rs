@@ -1068,7 +1068,7 @@ impl ChatSession {
         self.preparation_retry = false;
         self.pending = false;
         self.error = Some(if failure.is_empty() {
-            "Conversation synchronization failed".to_owned()
+            super::i18n::t("agentPanel.states.timelineSyncFailed")
         } else {
             failure
         });

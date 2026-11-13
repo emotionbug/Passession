@@ -131,17 +131,20 @@ pub struct CellGrid {
     draw_text_italic: DrawText,
     #[live]
     draw_cell: DrawColor,
-    /// Cell size for the code font size it was measured at.
+    /// Cell size for the code font size and theme epoch (font changes) it was measured at.
     #[rust]
-    cell: Option<(f64, f64, f64)>,
+    cell: Option<(f64, f64, f64, u64)>,
 }
 
 impl CellGrid {
-    /// The cell size of the code font size preference (12px default).
+    /// The cell size of the code font size preference (12px default); a theme change (the
+    /// code font itself) measures again.
     pub fn measure(&mut self, cx: &mut Cx2d) -> (f64, f64) {
         let px = theme::current_typography().code_font_size;
-        if let Some((width, height, size)) = self.cell
+        let epoch = theme::epoch();
+        if let Some((width, height, size, measured)) = self.cell
             && size == px
+            && measured == epoch
         {
             return (width, height);
         }
@@ -152,13 +155,13 @@ impl CellGrid {
         let width = (f64::from(laid.size_in_lpxs.width) / 10.0).max(4.0);
         // xterm `lineHeight: 1.0`: rows are exactly one cell tall.
         let height = f64::from(laid.size_in_lpxs.height).ceil().max(8.0);
-        self.cell = Some((width, height, px));
+        self.cell = Some((width, height, px, epoch));
         (width, height)
     }
 
     /// The last measured cell size.
     pub fn cell(&self) -> Option<(f64, f64)> {
-        self.cell.map(|(width, height, _)| (width, height))
+        self.cell.map(|(width, height, _, _)| (width, height))
     }
 
     /// Makepad batches later instances into the first draw call. Start the cell batch before

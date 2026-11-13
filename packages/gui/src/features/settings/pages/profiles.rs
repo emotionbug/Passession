@@ -134,7 +134,7 @@ pub fn draw_profiles(ui: &mut Ui, s: &Settings, _v: &View, host: &HostView) {
             let host = remove_host.clone();
             let remaining = remaining.clone();
             let go = handler(move |s, env| save_profiles(s, env, &host, remaining.clone()));
-            s.confirm(ap("removeConfirmTitle"), ta("settings.host.agentProfiles.removeConfirmMessage", &[("name", &name)]), Some(ap("remove")), true, go);
+            s.confirm(ap("removeConfirmTitle"), ta("settings.host.agentProfiles.removeConfirmMessage", &[("name", &name)]), ap("remove"), true, go);
         });
         let mut actions = vec![
             icon_button(format!("profiles.{id}.{pid}.up"), Icon::ArrowUp, up).tipped(ap("moveUp")),
@@ -462,8 +462,8 @@ fn select(ui: &mut Ui, id: u64, enabled: bool, field: SelectField) {
                 })
                 .collect();
             let searchable = items.len() > 6;
-            // Flutter passes no `searchPlaceholder`: the select default "Search…".
-            let menu = Menu::new(s, title.clone(), items).select().searchable(searchable, "Search…".to_string()).empty(empty_text.clone());
+            // Flutter passes no `searchPlaceholder`: the select default search hint.
+            let menu = Menu::new(s, title.clone(), items).select().searchable(searchable, t("common.placeholders.search")).empty(empty_text.clone());
             s.open_menu(menu);
         })
     });
@@ -505,7 +505,7 @@ fn pick_appearance(s: &mut Settings, id: u64) {
                 .selected(current == *name),
         );
     }
-    let menu = Menu::new(s, ap("iconLabel"), items).select().searchable(true, "Search…".to_string());
+    let menu = Menu::new(s, ap("iconLabel"), items).select().searchable(true, t("common.placeholders.search"));
     s.open_menu(menu);
 }
 

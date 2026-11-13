@@ -11,10 +11,10 @@
 //! [`GitStoreChanged`], so every root re-syncs in the follow-up dispatch.
 
 use super::host;
-use super::json::{error_message, flag, object, text};
+use super::json::{array, error_message, flag, object, text};
 use super::policy::{ActionStatus, normalize_pr_status_payload};
 use super::review::{ReviewDraft, storage_key};
-use super::text::t;
+use super::text::{t, tr};
 use super::wire::{self, Failure};
 use crate::common::{UiContext, UiEffect};
 use makepad_widgets::*;
@@ -132,6 +132,7 @@ struct ActionRun {
     host: String,
     cwd: String,
     action_id: String,
+    /// The in-flight step stays at the front until its response succeeds.
     steps: VecDeque<(String, Value)>,
     check: ActionCheck,
     failure: String,
@@ -139,11 +140,78 @@ struct ActionRun {
     follow_up: ActionFollowUp,
 }
 
+impl ActionRun {
+    fn accept_response(&mut self, result: &Result<Value, paseo_gui_core::CoreError>) -> Result<(), Failure> {
+        let outcome = match self.check {
+            ActionCheck::Git => wire::git_result(result).map(|_| ()),
+            ActionCheck::RequireSuccess => match wire::checkout_result(result) {
+                Ok(payload) if payload.get("success") == Some(&Value::Bool(true)) => Ok(()),
+                Ok(payload) => Err(Failure::message(error_message(&payload).unwrap_or_else(|| self.failure.clone()))),
+                Err(failure) => Err(failure),
+            },
+        };
+        if outcome.is_ok() {
+            self.steps.pop_front();
+        }
+        outcome
+    }
+}
+
+/// A checkout's last failed action, kept until an action there succeeds or
+/// the user dismisses it.
+#[derive(Clone)]
+pub struct ActionFailure {
+    pub action_id: String,
+    /// The action's failure copy ("Failed to push").
+    pub title: String,
+    /// The host's message (or the title when it gave none).
+    pub message: String,
+    /// A lost response is not evidence that a mutation did not run.
+    pub retryable: bool,
+    steps: Vec<(String, Value)>,
+    check: ActionCheck,
+    success_label: Option<String>,
+    follow_up: ActionFollowUp,
+}
+
+/// Owner of the review prompts the store opens.
+const REVIEW_OWNER: &str = "widget:git-review";
+
+/// What a reviewed Commit or Create PR runs once confirmed.
+#[derive(Clone, Debug)]
+pub struct ReviewPlan {
+    pub host: String,
+    pub cwd: String,
+    pub success_label: Option<String>,
+}
+
+/// A Commit / Create PR review in progress (one per window).
+enum Review {
+    /// Listing the files the commit includes.
+    CommitFiles { plan: ReviewPlan, generation: u64 },
+    /// The commit message prompt (empty lets the host write it).
+    CommitMessage { plan: ReviewPlan, prompt: u64 },
+    /// Title (first line) and description of the pull request.
+    PrText { plan: ReviewPlan, base: String, prompt: u64 },
+    /// The base branch, prefilled.
+    PrBase { plan: ReviewPlan, title: String, body: String, prompt: u64 },
+}
+
+impl Review {
+    fn prompt(&self) -> Option<u64> {
+        match self {
+            Review::CommitFiles { .. } => None,
+            Review::CommitMessage { prompt, .. } | Review::PrText { prompt, .. } | Review::PrBase { prompt, .. } => Some(*prompt),
+        }
+    }
+}
+
 enum Pending {
     StatusRead { key: CheckoutKey, seq: u64 },
     PrStatus { key: CheckoutKey, generation: u64 },
     Action(ActionRun),
     Archive { key: CheckoutKey, workspace_id: String, failure: String },
+    ReviewFiles { generation: u64 },
 }
 
 enum StoreTimer {
@@ -169,6 +237,9 @@ pub struct GitStore {
     unsupported_timelines: HashSet<String>,
     pending: HashMap<RequestId, Pending>,
     timers: Vec<(Timer, StoreTimer)>,
+    failures: HashMap<CheckoutKey, ActionFailure>,
+    review: Option<Review>,
+    review_generation: u64,
 }
 
 impl GitStore {
@@ -204,6 +275,11 @@ impl GitStore {
                         self.changed(cx);
                     }
                 }
+            }
+        }
+        if self.review.as_ref().and_then(Review::prompt).is_some() {
+            for (id, args) in crate::common::overlay::take_answers(REVIEW_OWNER) {
+                self.on_review_answer(cx, ui, id, &args);
             }
         }
         if ui.events.is_empty() || self.processed_event == cx.event_id() {
@@ -470,6 +546,7 @@ impl GitStore {
                 self.changed(cx);
             }
             Pending::Action(run) => self.continue_action(cx, ui, run, result),
+            Pending::ReviewFiles { generation } => self.on_review_files(cx, ui, generation, result),
             Pending::Archive {
                 key: checkout,
                 workspace_id,
@@ -611,6 +688,23 @@ impl GitStore {
         success_label: Option<String>,
         follow_up: ActionFollowUp,
     ) {
+        let steps = steps.into_iter().map(|(kind, fields)| (kind.to_owned(), fields)).collect();
+        self.start_run(cx, host_id, cwd, action_id, steps, check, t(failure_key), success_label, follow_up);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_run(
+        &mut self,
+        cx: &mut Cx,
+        host_id: &str,
+        cwd: &str,
+        action_id: &str,
+        steps: Vec<(String, Value)>,
+        check: ActionCheck,
+        failure: String,
+        success_label: Option<String>,
+        follow_up: ActionFollowUp,
+    ) {
         let checkout = key(host_id, cwd);
         if self.action_status(host_id, cwd, action_id) == ActionStatus::Pending {
             return;
@@ -622,12 +716,9 @@ impl GitStore {
             host: host_id.to_owned(),
             cwd: cwd.to_owned(),
             action_id: action_id.to_owned(),
-            steps: steps
-                .into_iter()
-                .map(|(kind, fields)| (kind.to_owned(), fields))
-                .collect(),
+            steps: steps.into(),
             check,
-            failure: t(failure_key),
+            failure,
             success_label,
             follow_up,
         };
@@ -635,15 +726,16 @@ impl GitStore {
         self.send_next_step(run);
     }
 
-    fn send_next_step(&mut self, mut run: ActionRun) {
-        let Some(core) = self.core.clone() else { return };
-        let Some((kind, mut fields)) = run.steps.pop_front() else {
+    fn send_next_step(&mut self, run: ActionRun) {
+        let Some(core) = self.core.as_ref() else { return };
+        let Some((kind, fields)) = run.steps.front() else {
             return;
         };
+        let mut fields = fields.clone();
         if fields.get("cwd").is_none() {
             fields["cwd"] = json!(run.cwd);
         }
-        let request = wire::send(&core, &run.host, &kind, fields);
+        let request = wire::send(core, &run.host, kind, fields);
         self.pending.insert(request, Pending::Action(run));
     }
 
@@ -651,23 +743,16 @@ impl GitStore {
         &mut self,
         cx: &mut Cx,
         ui: &mut UiContext,
-        run: ActionRun,
+        mut run: ActionRun,
         result: &Result<Value, paseo_gui_core::CoreError>,
     ) {
         let checkout = key(&run.host, &run.cwd);
-        let outcome = match run.check {
-            ActionCheck::Git => wire::git_result(result).map(|_| ()),
-            ActionCheck::RequireSuccess => match wire::checkout_result(result) {
-                Ok(payload) if payload.get("success") == Some(&Value::Bool(true)) => Ok(()),
-                Ok(payload) => Err(Failure::message(
-                    error_message(&payload).unwrap_or_else(|| run.failure.clone()),
-                )),
-                Err(failure) => Err(failure),
-            },
-        };
+        let outcome = run.accept_response(result);
         match outcome {
             Ok(()) if !run.steps.is_empty() => self.send_next_step(run),
             Ok(()) => {
+                // A success clears the checkout's last failure.
+                self.failures.remove(&checkout);
                 self.invalidate(cx, &run.host, &run.cwd);
                 self.set_action_status(cx, &checkout, &run.action_id, ActionStatus::Success);
                 let timer = cx.start_timeout(1.0);
@@ -688,8 +773,188 @@ impl GitStore {
                 }
             }
             Err(failure) => {
+                let message = wire::message_or(&failure, run.failure.clone());
+                ui.toast(message.clone(), true);
+                // Kept on the git actions button until a success or a dismiss.
+                self.failures.insert(
+                    checkout.clone(),
+                    ActionFailure {
+                        action_id: run.action_id.clone(),
+                        title: run.failure,
+                        message,
+                        retryable: action_retryable(result),
+                        steps: run.steps.into(),
+                        check: run.check,
+                        success_label: run.success_label,
+                        follow_up: run.follow_up,
+                    },
+                );
                 self.set_action_status(cx, &checkout, &run.action_id, ActionStatus::Idle);
-                ui.toast(wire::message_or(&failure, run.failure.clone()), true);
+                // Earlier steps or a lost response may already have changed Git.
+                self.invalidate(cx, &run.host, &run.cwd);
+                self.changed(cx);
+            }
+        }
+    }
+
+    /// The checkout's last failed action, until a success or a dismiss.
+    pub fn last_failure(&self, host_id: &str, cwd: &str) -> Option<&ActionFailure> {
+        self.failures.get(&key(host_id, cwd))
+    }
+
+    pub fn dismiss_failure(&mut self, cx: &mut Cx, host_id: &str, cwd: &str) {
+        if self.failures.remove(&key(host_id, cwd)).is_some() {
+            self.changed(cx);
+        }
+    }
+
+    /// Retries only unfinished steps, and never an operation with an unknown outcome.
+    pub fn retry_failure(&mut self, cx: &mut Cx, host_id: &str, cwd: &str) {
+        let Some(failure) = self.last_failure(host_id, cwd) else { return };
+        if !failure.retryable || self.action_status(host_id, cwd, &failure.action_id) == ActionStatus::Pending {
+            return;
+        }
+        let ActionFailure { action_id, title, steps, check, success_label, follow_up, .. } = failure.clone();
+        self.start_run(cx, host_id, cwd, &action_id, steps, check, title, success_label, follow_up);
+    }
+
+    // -----------------------------------------------------------------------
+    // Commit / Create PR review.
+
+    fn open_review_prompt(ui: &mut UiContext, title: &str, message: &str, initial: &str, placeholder: &str, confirm: &str, multiline: bool) -> u64 {
+        use crate::common::overlay as shared;
+        shared::with_owner(ui, REVIEW_OWNER, |ui| {
+            if multiline {
+                shared::prompt_multiline(ui, title, Some(message), initial, placeholder, confirm)
+            } else {
+                shared::prompt_text(ui, title, Some(message), initial, placeholder, confirm)
+            }
+        })
+    }
+
+    /// Commit through a review: lists the files it includes, then asks for
+    /// the message (empty lets the host write one) before committing.
+    pub fn review_commit(&mut self, cx: &mut Cx, plan: ReviewPlan) {
+        if self.review.is_some() || self.action_status(&plan.host, &plan.cwd, "commit") == ActionStatus::Pending {
+            return;
+        }
+        let Some(core) = self.core.clone() else { return };
+        self.review_generation += 1;
+        let generation = self.review_generation;
+        let compare = super::model::normalize_compare("uncommitted", "", false, Some("summary"));
+        let request = wire::send(&core, &plan.host, "checkout.diff.get.request", json!({ "cwd": plan.cwd, "compare": compare }));
+        self.pending.insert(request, Pending::ReviewFiles { generation });
+        self.review = Some(Review::CommitFiles { plan, generation });
+        self.changed(cx);
+    }
+
+    fn take_review_files(&mut self, generation: u64) -> Option<ReviewPlan> {
+        if !matches!(self.review.as_ref(), Some(Review::CommitFiles { generation: current, .. }) if *current == generation) {
+            return None;
+        }
+        match self.review.take() {
+            Some(Review::CommitFiles { plan, .. }) => Some(plan),
+            _ => None,
+        }
+    }
+
+    fn on_review_files(&mut self, cx: &mut Cx, ui: &mut UiContext, generation: u64, result: &Result<Value, paseo_gui_core::CoreError>) {
+        let Some(plan) = self.take_review_files(generation) else { return };
+        let listed = wire::checkout_result(result).and_then(|payload| match error_message(&payload) {
+            Some(message) => Err(Failure::message(message)),
+            None => Ok(array(&payload, "files").iter().map(|f| text(f, "path").to_owned()).collect::<Vec<_>>()),
+        });
+        let message = match listed {
+            Ok(paths) => commit_files_message(&paths),
+            Err(failure) => tr("workspace.git.actions.review.filesUnavailable", &[("error", failure.message)]),
+        };
+        let prompt = Self::open_review_prompt(
+            ui,
+            &t("workspace.git.actions.review.commitTitle"),
+            &message,
+            "",
+            &t("workspace.git.actions.review.commitPlaceholder"),
+            &t("workspace.git.actions.review.commit"),
+            true,
+        );
+        self.review = Some(Review::CommitMessage { plan, prompt });
+        self.changed(cx);
+    }
+
+    /// Create PR through a review: title and description (empty lets the
+    /// host write them), then the base branch, prefilled.
+    pub fn review_pr(&mut self, cx: &mut Cx, ui: &mut UiContext, plan: ReviewPlan, base: String, branch: String) {
+        if self.review.is_some() || self.action_status(&plan.host, &plan.cwd, "create-pr") == ActionStatus::Pending {
+            return;
+        }
+        let message = tr("workspace.git.actions.review.prMessage", &[("base", base.clone()), ("branch", branch)]);
+        let prompt = Self::open_review_prompt(
+            ui,
+            &t("workspace.git.actions.review.prTitle"),
+            &message,
+            "",
+            &t("workspace.git.actions.review.prPlaceholder"),
+            &t("workspace.git.actions.review.next"),
+            true,
+        );
+        self.review = Some(Review::PrText { plan, base, prompt });
+        self.changed(cx);
+    }
+
+    fn take_review_answer(&mut self, id: u64, args: &Value) -> Option<(Review, Option<String>)> {
+        if self.review.as_ref().and_then(Review::prompt) != Some(id) {
+            return None;
+        }
+        let review = self.review.take()?;
+        let answer = if flag(args, "cancelled") { None } else { args.get("text").and_then(Value::as_str).map(str::to_owned) };
+        Some((review, answer))
+    }
+
+    fn on_review_answer(&mut self, cx: &mut Cx, ui: &mut UiContext, id: u64, args: &Value) {
+        let Some((review, answer)) = self.take_review_answer(id, args) else { return };
+        self.changed(cx);
+        // Cancel (or a dismissed prompt) ends the review without running anything.
+        let Some(answer) = answer else { return };
+        match review {
+            Review::CommitFiles { .. } => {}
+            Review::CommitMessage { plan, .. } => {
+                let mut fields = json!({ "addAll": true });
+                let message = answer.trim();
+                if !message.is_empty() {
+                    fields["message"] = json!(message);
+                }
+                let steps = vec![("checkout_commit_request".to_owned(), fields)];
+                let failure = t("workspace.git.actions.toasts.failedCommit");
+                self.start_run(cx, &plan.host, &plan.cwd, "commit", steps, ActionCheck::Git, failure, plan.success_label, ActionFollowUp::None);
+            }
+            Review::PrText { plan, base, .. } => {
+                let (title, body) = split_title_body(&answer);
+                let prompt = Self::open_review_prompt(
+                    ui,
+                    &t("workspace.git.actions.review.baseTitle"),
+                    &t("workspace.git.actions.review.baseMessage"),
+                    &base,
+                    &t("workspace.git.actions.review.basePlaceholder"),
+                    &t("workspace.git.actions.review.createPr"),
+                    false,
+                );
+                self.review = Some(Review::PrBase { plan, title, body, prompt });
+            }
+            Review::PrBase { plan, title, body, .. } => {
+                let mut fields = json!({});
+                if !title.is_empty() {
+                    fields["title"] = json!(title);
+                }
+                if !body.is_empty() {
+                    fields["body"] = json!(body);
+                }
+                let base = answer.trim();
+                if !base.is_empty() {
+                    fields["baseRef"] = json!(base);
+                }
+                let steps = vec![("checkout_pr_create_request".to_owned(), fields)];
+                let failure = t("workspace.git.actions.toasts.failedCreatePr");
+                self.start_run(cx, &plan.host, &plan.cwd, "create-pr", steps, ActionCheck::Git, failure, plan.success_label, ActionFollowUp::None);
             }
         }
     }
@@ -837,5 +1102,117 @@ pub fn pr_status(state: Option<&CheckoutState>) -> &Value {
     match state.and_then(|s| s.pr_payload.as_ref()) {
         Some(payload) => object(payload, "status"),
         None => &NULL,
+    }
+}
+
+fn action_retryable(result: &Result<Value, paseo_gui_core::CoreError>) -> bool {
+    match result {
+        Err(error) => !error.outcome_unknown,
+        Ok(payload) => paseo_gui_core::response_error(payload, "git action").is_none_or(|error| !error.outcome_unknown),
+    }
+}
+
+/// Files listed in the commit review (the rest counted).
+const REVIEW_FILES_SHOWN: usize = 12;
+
+/// The commit review's body: how many files the commit includes and their paths.
+fn commit_files_message(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return t("workspace.git.actions.review.noFiles");
+    }
+    let mut lines = vec![tr("workspace.git.actions.review.files", &[("count", paths.len().to_string())])];
+    lines.extend(paths.iter().take(REVIEW_FILES_SHOWN).map(|path| format!("• {path}")));
+    if paths.len() > REVIEW_FILES_SHOWN {
+        lines.push(tr("workspace.git.actions.review.moreFiles", &[("count", (paths.len() - REVIEW_FILES_SHOWN).to_string())]));
+    }
+    lines.join("\n")
+}
+
+/// A pull request's title (the first non-empty line) and description (the rest).
+fn split_title_body(text: &str) -> (String, String) {
+    let text = text.trim();
+    match text.split_once('\n') {
+        Some((title, body)) => (title.trim().to_owned(), body.trim().to_owned()),
+        None => (text.to_owned(), String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review_plan() -> ReviewPlan {
+        ReviewPlan { host: "host".into(), cwd: "/repo".into(), success_label: None }
+    }
+
+    #[test]
+    fn cancelled_review_never_submits_and_empty_confirm_is_distinct() {
+        let mut store = GitStore::default();
+        for review in [
+            Review::CommitMessage { plan: review_plan(), prompt: 7 },
+            Review::PrText { plan: review_plan(), base: "main".into(), prompt: 7 },
+            Review::PrBase { plan: review_plan(), title: "Title".into(), body: String::new(), prompt: 7 },
+        ] {
+            store.review = Some(review);
+            let (_, answer) = store.take_review_answer(7, &json!({ "cancelled": true, "text": "" })).unwrap();
+            assert!(answer.is_none());
+            assert!(store.review.is_none());
+            assert!(store.take_review_answer(7, &json!({ "text": "duplicate" })).is_none());
+        }
+        store.review = Some(Review::CommitMessage { plan: review_plan(), prompt: 8 });
+        assert!(store.take_review_answer(7, &json!({ "text": "stale" })).is_none());
+        let (_, answer) = store.take_review_answer(8, &json!({ "text": "" })).unwrap();
+        assert_eq!(answer.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn stale_file_list_keeps_the_current_review() {
+        let mut store = GitStore::default();
+        store.review = Some(Review::PrText { plan: review_plan(), base: "main".into(), prompt: 7 });
+        assert!(store.take_review_files(1).is_none());
+        assert_eq!(store.review.as_ref().and_then(Review::prompt), Some(7));
+        store.review = Some(Review::CommitFiles { plan: review_plan(), generation: 2 });
+        assert!(store.take_review_files(1).is_none());
+        assert!(store.take_review_files(2).is_some());
+        assert!(store.review.is_none());
+    }
+
+    #[test]
+    fn failed_action_retains_only_unfinished_steps() {
+        let mut run = ActionRun {
+            host: "host".into(),
+            cwd: "/repo".into(),
+            action_id: "pull-and-push".into(),
+            steps: VecDeque::from([
+                ("checkout_pull_request".into(), json!({})),
+                ("checkout_push_request".into(), json!({})),
+            ]),
+            check: ActionCheck::Git,
+            failure: "Failed".into(),
+            success_label: None,
+            follow_up: ActionFollowUp::None,
+        };
+        assert!(run.accept_response(&Ok(json!({ "success": true }))).is_ok());
+        assert!(run.accept_response(&Ok(json!({ "error": { "message": "Push rejected" } }))).is_err());
+        assert_eq!(run.steps.len(), 1);
+        assert_eq!(run.steps.front().unwrap().0, "checkout_push_request");
+        assert!(run.accept_response(&Ok(json!({ "success": true }))).is_ok());
+        assert!(run.steps.is_empty());
+    }
+
+    #[test]
+    fn retry_refuses_unknown_transport_and_server_outcomes() {
+        let error = paseo_gui_core::CoreError { code: "DAEMON_REQUEST_TIMEOUT".into(), message: "Timed out".into(), outcome_unknown: true };
+        assert!(!action_retryable(&Err(error.clone())));
+        assert!(action_retryable(&Err(paseo_gui_core::CoreError { outcome_unknown: false, ..error })));
+        assert!(!action_retryable(&Ok(json!({ "success": false, "outcomeUnknown": true }))));
+        assert!(action_retryable(&Ok(json!({ "success": false }))));
+    }
+
+    #[test]
+    fn pull_request_text_splits_title_and_body() {
+        assert_eq!(split_title_body("  Fix login\n\nThe form now validates.\nTwo lines. "), ("Fix login".to_owned(), "The form now validates.\nTwo lines.".to_owned()));
+        assert_eq!(split_title_body("Only a title"), ("Only a title".to_owned(), String::new()));
+        assert_eq!(split_title_body("  \n "), (String::new(), String::new()));
     }
 }

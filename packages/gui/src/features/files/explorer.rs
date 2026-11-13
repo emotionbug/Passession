@@ -1,10 +1,11 @@
 //! The explorer tree (Flutter `remote_directory_browser.dart` state): listings, expansion,
 //! restoring persisted expanded folders, sorting, hidden files, reveal, rename remapping and
-//! directory-picker navigation. Sans-IO: listings and preference writes are emitted as
-//! [`ExplorerCmd`]s and results return through [`ExplorerState::on_listed`].
+//! the folder picker's flat, history-navigated directory listing. Sans-IO: listings and
+//! preference writes are emitted as [`ExplorerCmd`]s and results return through
+//! [`ExplorerState::on_listed`].
 
 use crate::features::files::path::{
-    is_explorer_path_within, is_hidden_explorer_path, remote_absolute, remote_parent,
+    Style, is_explorer_path_within, is_hidden_explorer_path, remote_absolute,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -120,11 +121,54 @@ pub fn reconcile_restored_expanded_paths(
     reconciled
 }
 
+/// The parent of a picker directory, or `None` at a root (`/`, `C:\`, `\\server\share\`) and
+/// at the top of a text path the host has not resolved yet (`~`, `.`).
+pub fn parent_directory(path: &str) -> Option<String> {
+    let style = Style::of(path);
+    let normalized = style.normalize(path);
+    if !style.is_absolute(&normalized) && (normalized == "." || normalized == "~" || normalized.starts_with("..")) {
+        return None;
+    }
+    let parent = style.dirname(&normalized);
+    (parent != normalized).then_some(parent)
+}
+
+/// The host home directory implied by a `~` path (`~`, `~/work`) and the absolute directory the
+/// host listed for it.
+fn home_of(requested: &str, absolute: &str) -> Option<String> {
+    if requested == "~" {
+        return Some(absolute.to_owned());
+    }
+    let rest = Style::Posix.normalize(requested.strip_prefix("~/")?);
+    if rest == "." {
+        return Some(absolute.to_owned());
+    }
+    let style = Style::of(absolute);
+    let mut home = absolute.to_owned();
+    for _ in rest.split('/') {
+        let parent = style.dirname(&home);
+        if parent == home {
+            return None;
+        }
+        home = parent;
+    }
+    let suffix = style.relative(absolute, &home);
+    (suffix.replace('\\', "/") == rest).then_some(home)
+}
+
 /// One visible row of the flattened tree.
 #[derive(Clone, Debug)]
 pub struct Row {
     pub entry: Entry,
     pub depth: usize,
+}
+
+/// One successful `file_explorer_response` list result.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Listing {
+    pub entries: Vec<Value>,
+    /// `directory.absolutePath`: the expanded, normalized listed directory (newer hosts).
+    pub absolute: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,7 +216,9 @@ pub struct ExplorerPreferences {
 pub struct ExplorerState {
     pub cwd: String,
     pub initial_path: String,
-    pub directories_only: bool,
+    /// The remote folder picker: directories only, one flat level, navigated by absolute path
+    /// once the host reports it (`directory.absolutePath`).
+    pub picker: bool,
     pub preferences: Option<ExplorerPreferences>,
     directories: HashMap<String, Vec<Entry>>,
     expanded: BTreeSet<String>,
@@ -187,8 +233,8 @@ pub struct ExplorerState {
     sort: Sort,
     refresh_waiting: HashSet<String>,
     pub selected: Option<String>,
-    pub show_location: bool,
-    pub location_text: String,
+    /// The host's home directory, once a listing of `~` reported its absolute path.
+    home: Option<String>,
     rows: Vec<Row>,
     restore: Option<Restore>,
     reveal: Option<Reveal>,
@@ -199,18 +245,18 @@ pub struct ExplorerState {
 }
 
 impl ExplorerState {
-    /// A workspace explorer (with persisted preferences) or a directory picker (without).
+    /// A workspace explorer (with persisted preferences) or the folder picker (without).
     pub fn new(
         cwd: &str,
         initial_path: &str,
-        directories_only: bool,
+        picker: bool,
         preferences: Option<ExplorerPreferences>,
         stored: &Value,
     ) -> ExplorerState {
         let mut state = ExplorerState {
             cwd: cwd.to_owned(),
             initial_path: initial_path.to_owned(),
-            directories_only,
+            picker,
             preferences,
             directories: HashMap::new(),
             expanded: BTreeSet::new(),
@@ -225,8 +271,7 @@ impl ExplorerState {
             sort: Sort::Name,
             refresh_waiting: HashSet::new(),
             selected: None,
-            show_location: false,
-            location_text: initial_path.to_owned(),
+            home: None,
             rows: Vec::new(),
             restore: None,
             reveal: None,
@@ -420,14 +465,15 @@ impl ExplorerState {
         ancestors.push(path.to_owned());
         if let Some(entries) = self.directories.get(path) {
             for entry in entries {
-                if self.directories_only && !entry.is_directory() {
+                if self.picker && !entry.is_directory() {
                     continue;
                 }
                 if !self.hidden && entry.name.starts_with('.') {
                     continue;
                 }
                 rows.push(Row { entry: entry.clone(), depth });
-                if self.expanded.contains(&entry.path) {
+                // The picker lists one level: rows open their folder instead of expanding.
+                if !self.picker && self.expanded.contains(&entry.path) {
                     self.visit(&entry.path, depth + 1, ancestors, rows);
                 }
             }
@@ -472,19 +518,22 @@ impl ExplorerState {
         self.load(path);
     }
 
-    /// A listing finished: entries, or the failure message.
-    pub fn on_listed(&mut self, path: &str, generation: u64, result: Result<Vec<Value>, String>) {
+    /// A listing finished: entries (with the host's absolute directory), or the failure message.
+    pub fn on_listed(&mut self, path: &str, generation: u64, result: Result<Listing, String>) {
         if generation != self.generation {
             return;
         }
         self.inflight.remove(path);
         self.loading.remove(path);
         let listed = match result {
-            Ok(rows) => {
-                let mut entries: Vec<Entry> = rows.iter().map(Entry::from_json).collect();
+            Ok(listing) => {
+                let mut entries: Vec<Entry> = listing.entries.iter().map(Entry::from_json).collect();
                 let sort = self.sort;
                 entries.sort_by(|a, b| compare(sort, a, b));
                 self.directories.insert(path.to_owned(), entries.clone());
+                if self.picker && let Some(absolute) = listing.absolute.filter(|absolute| !absolute.is_empty()) {
+                    self.adopt_absolute(path, absolute);
+                }
                 self.flatten();
                 Some(entries)
             }
@@ -497,6 +546,30 @@ impl ExplorerState {
         self.refresh_waiting.remove(path);
         self.advance_restore(path, listed.clone());
         self.advance_reveal(path, listed.is_some());
+    }
+
+    /// The picker: the host reported the absolute directory of `path`. The shown directory (and
+    /// its history entry) continues by that absolute path, and a listing under `~` reveals home.
+    fn adopt_absolute(&mut self, path: &str, absolute: String) {
+        let requested = if path == "." { self.cwd.as_str() } else { path };
+        if self.home.is_none()
+            && let Some(home) = home_of(requested, &absolute)
+        {
+            self.home = Some(home);
+        }
+        if path != self.path || absolute == path {
+            return;
+        }
+        if let Some(entries) = self.directories.remove(path) {
+            self.directories.insert(absolute.clone(), entries);
+        }
+        if let Some(index) = self.history_index
+            && let Some(entry) = self.history.get_mut(index)
+            && entry == path
+        {
+            *entry = absolute.clone();
+        }
+        self.path = absolute;
     }
 
     fn advance_restore(&mut self, path: &str, listed: Option<Vec<Entry>>) {
@@ -593,7 +666,6 @@ impl ExplorerState {
             return;
         }
         self.path = path.to_owned();
-        self.location_text = path.to_owned();
         self.selected = None;
         if record_history {
             let same = self.history_index.and_then(|index| self.history.get(index)).is_some_and(|last| last == path);
@@ -625,18 +697,63 @@ impl ExplorerState {
         }
     }
 
+    /// The picker's "Up": the parent of the shown directory (none at a root).
     pub fn parent(&mut self) {
-        let parent = remote_parent(&remote_absolute(&self.cwd, &self.path));
-        self.navigate(&parent, true);
+        if let Some(parent) = self.parent_directory() {
+            self.navigate(&parent, true);
+        }
     }
 
-    /// The absolute remote directory currently shown (the picker's selection).
-    pub fn absolute_path(&self) -> String {
-        remote_absolute(&self.cwd, &self.path)
+    pub fn can_go_up(&self) -> bool {
+        self.parent_directory().is_some()
     }
 
-    pub fn absolute(&self, path: &str) -> String {
-        remote_absolute(&self.cwd, path)
+    pub fn parent_directory(&self) -> Option<String> {
+        parent_directory(&self.current_directory())
+    }
+
+    /// The remote directory currently shown (the picker's selection): absolute once the host
+    /// reported it, otherwise the cwd-resolved text path (`~/work` on older hosts).
+    pub fn current_directory(&self) -> String {
+        let style = Style::of(&self.path);
+        if style.is_absolute(&self.path) || self.path == "~" || self.path.starts_with("~/") {
+            style.normalize(&self.path)
+        } else {
+            remote_absolute(&self.cwd, &self.path)
+        }
+    }
+
+    /// The host's home directory, when known.
+    pub fn home(&self) -> Option<&str> {
+        self.home.as_deref()
+    }
+
+    /// The picker: the directory a listed row opens.
+    pub fn child_directory(&self, entry: &Entry) -> String {
+        let current = self.current_directory();
+        let style = Style::of(&current);
+        if style.is_absolute(&current) {
+            style.normalize(&style.join(&current, &entry.name))
+        } else {
+            remote_absolute(&self.cwd, &entry.path)
+        }
+    }
+
+    /// The picker: opens a typed location. Absolute and `~` paths stand alone; anything else is
+    /// relative to the shown directory.
+    pub fn go_to(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let current = self.current_directory();
+        let style = Style::of(if Style::of(text) == Style::Windows { text } else { &current });
+        let target = if style.is_absolute(text) || text == "~" || text.starts_with("~/") {
+            style.normalize(text)
+        } else {
+            style.normalize(&style.join(&current, text))
+        };
+        self.navigate(&target, true);
     }
 
     /// Original `refreshExplorerDirectories`: re-lists the root and every visible expanded
@@ -806,7 +923,7 @@ mod tests {
             for (path, generation) in lists {
                 listed.push(path.clone());
                 let result = tree.get(path.as_str()).cloned().ok_or_else(|| "missing".to_owned());
-                state.on_listed(&path, generation, result);
+                state.on_listed(&path, generation, result.map(|entries| Listing { entries, absolute: None }));
             }
         }
     }
@@ -890,10 +1007,95 @@ mod tests {
         assert!(state.can_go_back());
         state.back();
         assert_eq!(state.path(), ".");
+        assert_eq!(state.current_directory(), "/home/me");
         assert!(state.can_go_forward());
         state.forward();
         assert_eq!(state.path(), "/srv");
         state.parent();
         assert_eq!(state.path(), "/");
+        assert!(!state.can_go_up());
+        state.parent();
+        assert_eq!(state.path(), "/");
+        state.back();
+        assert_eq!(state.path(), "/srv");
+    }
+
+    /// Answers the picker's pending listings as a host reporting `absolutePath`.
+    fn answer_absolute(state: &mut ExplorerState, absolute: &dyn Fn(&str) -> String, rows: Vec<Value>) {
+        for cmd in std::mem::take(&mut state.cmds) {
+            if let ExplorerCmd::List { path, generation } = cmd {
+                let listing = Listing { entries: rows.clone(), absolute: Some(absolute(&path)) };
+                state.on_listed(&path, generation, Ok(listing));
+            }
+        }
+    }
+
+    #[test]
+    fn picker_adopts_the_reported_absolute_path_and_lists_one_flat_level() {
+        let mut state = ExplorerState::new("~", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        let home = |path: &str| if path == "." { "/home/me".to_owned() } else { path.to_owned() };
+        answer_absolute(&mut state, &home, vec![
+            entry("work", "work", "directory"),
+            entry("notes.md", "notes.md", "file"),
+            entry(".config", ".config", "directory"),
+        ]);
+        assert_eq!(state.path(), "/home/me");
+        assert_eq!(state.home(), Some("/home/me"));
+        let names: Vec<&str> = state.rows().iter().map(|row| row.entry.name.as_str()).collect();
+        assert_eq!(names, vec![".config", "work"]);
+        let work = state.rows()[1].entry.clone();
+        assert_eq!(state.child_directory(&work), "/home/me/work");
+        state.navigate(&state.child_directory(&work), true);
+        // A nested listing stays flat: opening never expands rows.
+        answer_absolute(&mut state, &home, vec![entry("src", "work/src", "directory")]);
+        assert_eq!(state.rows().len(), 1);
+        assert_eq!(state.parent_directory().as_deref(), Some("/home/me"));
+        state.back();
+        assert_eq!(state.path(), "/home/me");
+        state.go_to("work/../work/src");
+        assert_eq!(state.path(), "/home/me/work/src");
+        state.go_to("~/x");
+        assert_eq!(state.path(), "~/x");
+    }
+
+    #[test]
+    fn picker_falls_back_to_text_paths_on_older_hosts() {
+        let mut state = ExplorerState::new("~", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        run(&mut state, &HashMap::from([(".", vec![entry("work", "work", "directory")])]));
+        assert_eq!(state.current_directory(), "~");
+        assert!(!state.can_go_up());
+        let work = state.rows()[0].entry.clone();
+        assert_eq!(state.child_directory(&work), "~/work");
+        state.navigate("~/work", true);
+        assert_eq!(state.parent_directory().as_deref(), Some("~"));
+    }
+
+    #[test]
+    fn picker_learns_home_from_tilde_paths() {
+        assert_eq!(home_of("~", "/home/me").as_deref(), Some("/home/me"));
+        assert_eq!(home_of("~/work/x", "/home/me/work/x").as_deref(), Some("/home/me"));
+        assert_eq!(home_of("~/work/", "C:\\Users\\me\\work").as_deref(), Some("C:\\Users\\me"));
+        assert_eq!(home_of("~/work", "/srv/elsewhere"), None);
+        assert_eq!(home_of("/srv", "/srv"), None);
+        let mut state = ExplorerState::new("~/work", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        answer_absolute(&mut state, &|_: &str| "/home/me/work".to_owned(), Vec::new());
+        assert_eq!(state.home(), Some("/home/me"));
+        assert_eq!(state.path(), "/home/me/work");
+    }
+
+    #[test]
+    fn parent_of_roots_is_disabled() {
+        assert_eq!(parent_directory("/"), None);
+        assert_eq!(parent_directory("/srv"), Some("/".to_owned()));
+        assert_eq!(parent_directory("/srv/app/"), Some("/srv".to_owned()));
+        assert_eq!(parent_directory("C:\\"), None);
+        assert_eq!(parent_directory("C:\\Users\\me"), Some("C:\\Users".to_owned()));
+        assert_eq!(parent_directory("C:\\Users"), Some("C:\\".to_owned()));
+        assert_eq!(parent_directory("\\\\server\\share\\"), None);
+        assert_eq!(parent_directory("~"), None);
+        assert_eq!(parent_directory("."), None);
     }
 }

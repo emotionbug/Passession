@@ -404,6 +404,10 @@ pub(crate) fn request_notification_permission(_shared: &Arc<Shared>, done: Compl
     done.ok(PlatformValue::Permission(PermissionState::Granted));
 }
 
+pub(crate) fn notification_permission_status(shared: &Arc<Shared>, done: Completion) {
+    request_notification_permission(shared, done);
+}
+
 /// Small opaque red badge icon (the taskbar copies it before it is freed).
 unsafe fn badge_icon(count: u32) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
     const SIZE: i32 = 32;
@@ -753,6 +757,195 @@ pub(crate) fn system_prefers_dark() -> bool {
         )
     };
     status.is_ok() && value == 0
+}
+
+// ----- fonts and text scale -----
+
+/// Settings ▸ Accessibility ▸ Text size: `HKCU\Software\Microsoft\Accessibility
+/// TextScaleFactor` (percent, 100–225; absent = 100).
+pub(crate) fn system_text_scale() -> crate::appearance::TextScale {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    let mut value = 100u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Accessibility"),
+            w!("TextScaleFactor"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast()),
+            Some(&mut size),
+        )
+    };
+    if status.is_ok() && (100..=225).contains(&value) {
+        crate::appearance::TextScale::from_factor(f64::from(value) / 100.0)
+    } else {
+        crate::appearance::TextScale::default()
+    }
+}
+
+/// DirectWrite font discovery.
+pub(crate) mod fonts {
+    use crate::fonts::{finish_face, resolve, Backend, Family, FileCache, FontFace, FontRequest, Role, SystemFonts, HANGUL_PROBE, LATIN_PROBE};
+    use windows::{
+        core::{Interface, BOOL, PCWSTR},
+        Win32::{
+            Graphics::DirectWrite::{
+                DWriteCreateFactory, IDWriteFactory, IDWriteFont, IDWriteFontCollection, IDWriteFontFace5, IDWriteFontFamily,
+                IDWriteLocalFontFileLoader, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_AXIS_VALUE, DWRITE_FONT_STRETCH_NORMAL,
+                DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+            },
+            UI::WindowsAndMessaging::{SystemParametersInfoW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS},
+        },
+    };
+
+    /// Windows' default monospace family (`monospace` / `ui-monospace`).
+    const SYSTEM_MONO: &str = "Consolas";
+    /// The UI family when the message font cannot be read.
+    const SYSTEM_UI: &str = "Segoe UI";
+    /// The Korean UI font shipped with Windows 7–11.
+    const HANGUL_FAMILIES: [&str; 1] = ["Malgun Gothic"];
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// `NONCLIENTMETRICS.lfMessageFont`: the font Windows uses for dialog and message text.
+    fn message_font_family() -> Option<String> {
+        let mut metrics = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
+        unsafe {
+            SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, metrics.cbSize, Some((&raw mut metrics).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))
+        }
+        .ok()?;
+        let name = &metrics.lfMessageFont.lfFaceName;
+        let length = name.iter().position(|unit| *unit == 0).unwrap_or(name.len());
+        let family = String::from_utf16_lossy(&name[..length]);
+        (!family.is_empty()).then_some(family)
+    }
+
+    struct DirectWrite {
+        collection: IDWriteFontCollection,
+        files: FileCache,
+        ui_family: Option<String>,
+    }
+
+    impl DirectWrite {
+        fn family(&self, name: &str) -> Option<IDWriteFontFamily> {
+            let name = wide(name);
+            let mut index = 0u32;
+            let mut exists = BOOL(0);
+            unsafe { self.collection.FindFamilyName(PCWSTR(name.as_ptr()), &mut index, &mut exists) }.ok()?;
+            if !exists.as_bool() {
+                return None;
+            }
+            unsafe { self.collection.GetFontFamily(index) }.ok()
+        }
+
+        fn font(family: &IDWriteFontFamily, role: Role) -> Option<IDWriteFont> {
+            let style = if role.italic() { DWRITE_FONT_STYLE_ITALIC } else { DWRITE_FONT_STYLE_NORMAL };
+            unsafe { family.GetFirstMatchingFont(DWRITE_FONT_WEIGHT(i32::from(role.weight())), DWRITE_FONT_STRETCH_NORMAL, style) }.ok()
+        }
+
+        fn family_name(family: &IDWriteFontFamily) -> Option<String> {
+            let names = unsafe { family.GetFamilyNames() }.ok()?;
+            let english = wide("en-us");
+            let mut index = 0u32;
+            let mut exists = BOOL(0);
+            let found = unsafe { names.FindLocaleName(PCWSTR(english.as_ptr()), &mut index, &mut exists) }.is_ok() && exists.as_bool();
+            if !found {
+                index = 0;
+            }
+            let length = unsafe { names.GetStringLength(index) }.ok()? as usize;
+            let mut buffer = vec![0u16; length + 1];
+            unsafe { names.GetString(index, &mut buffer) }.ok()?;
+            Some(String::from_utf16_lossy(&buffer[..length]))
+        }
+
+        /// The font's local file, collection index and (Windows 10 1809+) axis values.
+        fn load(&mut self, font: &IDWriteFont, role: Role, probe: char) -> Option<FontFace> {
+            let face = unsafe { font.CreateFontFace() }.ok()?;
+            let mut count = 0u32;
+            unsafe { face.GetFiles(&mut count, None) }.ok()?;
+            // Multi-file faces are Type 1 (`.pfm` + `.pfb`), which is not sfnt.
+            if count != 1 {
+                return None;
+            }
+            let mut files = [None];
+            unsafe { face.GetFiles(&mut count, Some(files.as_mut_ptr())) }.ok()?;
+            let file = files[0].take()?;
+            let mut key = std::ptr::null_mut();
+            let mut key_size = 0u32;
+            unsafe { file.GetReferenceKey(&mut key, &mut key_size) }.ok()?;
+            // Only local files have a path; remote/downloadable fonts are skipped.
+            let loader: IDWriteLocalFontFileLoader = unsafe { file.GetLoader() }.ok()?.cast().ok()?;
+            let length = unsafe { loader.GetFilePathLengthFromKey(key, key_size) }.ok()? as usize;
+            let mut path = vec![0u16; length + 1];
+            unsafe { loader.GetFilePathFromKey(key, key_size, &mut path) }.ok()?;
+            let path = String::from_utf16_lossy(&path[..length]);
+            let index = unsafe { face.GetIndex() };
+            let mut variations = Vec::new();
+            if let Ok(face) = face.cast::<IDWriteFontFace5>() {
+                let mut values = vec![DWRITE_FONT_AXIS_VALUE::default(); unsafe { face.GetFontAxisValueCount() } as usize];
+                if !values.is_empty() && unsafe { face.GetFontAxisValues(&mut values) }.is_ok() {
+                    // DWRITE_MAKE_FONT_AXIS_TAG packs the first character in the low byte.
+                    variations = values.iter().map(|value| (value.axisTag.0.to_le_bytes(), value.value)).collect();
+                }
+            }
+            let data = self.files.read(&path)?;
+            finish_face(data, index, &variations, role, probe, format!("{path}#{index}"))
+        }
+
+        fn named(&mut self, name: &str, role: Role) -> Option<(FontFace, String)> {
+            let family = self.family(name)?;
+            let font = Self::font(&family, role)?;
+            let face = self.load(&font, role, LATIN_PROBE)?;
+            Some((face, Self::family_name(&family).unwrap_or_else(|| name.to_owned())))
+        }
+    }
+
+    impl Backend for DirectWrite {
+        fn face(&mut self, family: Family<'_>, role: Role) -> Option<(FontFace, String)> {
+            match family {
+                Family::SystemUi => {
+                    let ui_family = self.ui_family.get_or_insert_with(|| message_font_family().unwrap_or_else(|| SYSTEM_UI.to_owned())).clone();
+                    self.named(&ui_family, role).or_else(|| self.named(SYSTEM_UI, role))
+                }
+                Family::SystemMono => self.named(SYSTEM_MONO, role),
+                // DirectWrite has no CSS generic aliases; other generics resolve only if installed by that name.
+                Family::Named(name) => self.named(name, role),
+            }
+        }
+
+        fn hangul(&mut self, ui_family: Option<&str>, role: Role) -> Option<FontFace> {
+            for name in HANGUL_FAMILIES.into_iter().chain(ui_family) {
+                let Some(family) = self.family(name) else { continue };
+                let Some(font) = Self::font(&family, role) else { continue };
+                if !unsafe { font.HasCharacter(HANGUL_PROBE as u32) }.is_ok_and(|has| has.as_bool()) {
+                    continue;
+                }
+                if let Some(face) = self.load(&font, role, HANGUL_PROBE) {
+                    return Some(face);
+                }
+            }
+            None
+        }
+    }
+
+    /// DirectWrite resolution: the message font (`SPI_GETNONCLIENTMETRICS`, Segoe UI)
+    /// through the system collection to its local file, index and axis values;
+    /// Hangul from Malgun Gothic (then the UI family) when it maps U+D55C.
+    pub(crate) fn system_fonts(request: &FontRequest) -> SystemFonts {
+        let Ok(factory) = (unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) }) else {
+            return SystemFonts::default();
+        };
+        let mut collection = None;
+        if unsafe { factory.GetSystemFontCollection(&mut collection, true) }.is_err() {
+            return SystemFonts::default();
+        }
+        let Some(collection) = collection else { return SystemFonts::default() };
+        resolve(&mut DirectWrite { collection, files: FileCache::default(), ui_family: None }, request)
+    }
 }
 
 #[cfg(test)]

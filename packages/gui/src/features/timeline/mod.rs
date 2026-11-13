@@ -30,6 +30,7 @@ pub mod panel;
 pub mod permission;
 pub mod reveal;
 pub mod rows;
+pub mod scrollbar;
 pub mod session;
 pub mod store;
 pub mod tools;

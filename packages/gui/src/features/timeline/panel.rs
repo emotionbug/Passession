@@ -475,6 +475,12 @@ pub struct ChatPanel {
     /// lies above the stream (a question card that switched questions).
     #[rust]
     reveal_top: Option<String>,
+    /// `reveal_attention` was requested: applied on the next draw with a stream.
+    #[rust]
+    reveal_attention: bool,
+    /// The first pending permission row to bring on screen after the next layout.
+    #[rust]
+    attention_row: Option<String>,
     #[rust]
     last_shift: bool,
     /// The reader scrolled the stream (wheel or touch drag) since it last
@@ -557,6 +563,9 @@ pub struct ChatPanel {
     composer_version: Option<u64>,
     #[rust]
     lightbox_drag: Option<DVec2>,
+    /// A scroll bar thumb drag on the modal (true) or chrome canvas.
+    #[rust]
+    bar_drag: Option<(super::scrollbar::BarDrag, bool)>,
     #[rust]
     modal_touch_scroll: TouchScroll,
     #[rust]
@@ -726,6 +735,16 @@ impl ChatPanel {
     /// The tab menu picked a conversation action; runs with the next event.
     pub fn run_conversation_action(&mut self, cx: &mut Cx, action: &str) {
         self.pending_actions.push(action.to_owned());
+        self.area.redraw(cx);
+    }
+
+    /// A notification opened this session: on the next draw the first pending permission or
+    /// question card is brought on screen (else the newest edge), whatever the reader's
+    /// earlier scroll position.
+    pub fn reveal_attention(&mut self, cx: &mut Cx) {
+        self.reveal_attention = true;
+        self.pending_jump = None;
+        self.reveal_top = None;
         self.area.redraw(cx);
     }
 
@@ -1355,7 +1374,7 @@ impl ChatPanel {
         let Some(snap) = self.snap.clone() else { return };
         match action {
             "rename" => {
-                let id = overlay::prompt_text(ui, "Rename session", None, str_of(get(&snap.agent, "title")), "", &t("common.actions.save"));
+                let id = overlay::prompt_text(ui, &t("agentPanel.conversation.renameTitle"), None, str_of(get(&snap.agent, "title")), "", &t("common.actions.save"));
                 self.asks.insert(id, Ask::Rename);
             }
             "refresh" => {
@@ -1366,11 +1385,11 @@ impl ChatPanel {
             }
             "fork" => self.fork(cx, ui, None, ForkTarget::Tab),
             "archive" => {
-                let id = overlay::confirm(ui, "Archive session?", "Archive this session and stop active work?", &t("agentList.archiveSheet.archive"), true);
+                let id = overlay::confirm(ui, &t("agentPanel.conversation.archiveTitle"), &t("agentPanel.conversation.archiveBody"), &t("agentList.archiveSheet.archive"), true);
                 self.asks.insert(id, Ask::Confirm("archive"));
             }
             "delete" => {
-                let id = overlay::confirm(ui, "Delete session?", "Permanently delete this session?", &t("workspace.fileActions.delete"), true);
+                let id = overlay::confirm(ui, &t("agentPanel.conversation.deleteTitle"), &t("agentPanel.conversation.deleteBody"), &t("workspace.fileActions.delete"), true);
                 self.asks.insert(id, Ask::Confirm("delete"));
             }
             "detach" => {
@@ -1490,8 +1509,9 @@ impl ChatPanel {
         if snap.archived {
             return None;
         }
+        // A dropped host shows the Disconnected callout instead (with Retry).
         if !self.host.connected {
-            return Some(Toast { id: "reconnecting".into(), message: t("agentPanel.states.reconnecting"), variant: ToastVariant::Normal, spinner: true, duration: None });
+            return None;
         }
         if snap.sync == SyncStatus::Pending && snap.hydrated && !snap.create_handoff {
             return Some(Toast { id: "updating".into(), message: t("agentPanel.states.updating"), variant: ToastVariant::Normal, spinner: true, duration: None });
@@ -1594,7 +1614,7 @@ impl ChatPanel {
 
     fn subagent_target(&self, row: &SubagentRow) -> PanelTarget {
         let chat = self.target.clone().unwrap_or_default();
-        let title = row.label().unwrap_or_else(|| "Subagent".into());
+        let title = row.label().unwrap_or_else(|| t("agentPanel.conversation.subagent"));
         if row.paseo {
             PanelTarget::new("agent", &row.server_id, row.workspace_id.as_deref().unwrap_or(&chat.workspace_id), row.cwd.as_deref().unwrap_or(chat.cwd()))
                 .with_id(row.id.clone())
@@ -1676,17 +1696,23 @@ impl ChatPanel {
         let label = tracks::row_label(row.title.as_deref()).unwrap_or_else(|| "this subagent".into());
         let running = row.status.as_deref() == Some("running");
         let (title, message) = if running {
-            ("Archive running subagent?", format!("{label} is still running. Archiving it will stop the subagent and remove it from the track."))
+            (t("agentPanel.conversation.archiveRunningSubagentTitle"), ta("agentPanel.conversation.archiveRunningSubagentBody", &[("label", &label)]))
         } else {
-            ("Archive subagent?", format!("Remove {label} from the track. The subagent will be archived."))
+            (t("agentPanel.conversation.archiveSubagentTitle"), ta("agentPanel.conversation.archiveSubagentBody", &[("label", &label)]))
         };
-        let id = overlay::confirm(ui, title, &message, "Archive", true);
+        let id = overlay::confirm(ui, &title, &message, &t("agentList.archiveSheet.archive"), true);
         self.asks.insert(id, Ask::ArchiveSubagent(row));
     }
 
     fn ask_detach_subagent(&mut self, ui: &mut UiContext, row: SubagentRow) {
-        let label = tracks::row_label(row.title.as_deref()).unwrap_or_else(|| "This subagent".into());
-        let id = overlay::confirm(ui, "Detach subagent?", &format!("{label} will leave this track and continue as a standalone agent."), "Detach", false);
+        let label = tracks::row_label(row.title.as_deref()).unwrap_or_else(|| t("agentPanel.conversation.thisSubagent"));
+        let id = overlay::confirm(
+            ui,
+            &t("agentPanel.conversation.detachSubagentTitle"),
+            &ta("agentPanel.conversation.detachSubagentBody", &[("label", &label)]),
+            &t("agentPanel.conversation.detach"),
+            false,
+        );
         self.asks.insert(id, Ask::DetachSubagent(row));
     }
 
@@ -1832,7 +1858,7 @@ impl ChatPanel {
                             workspace_id: if target == ForkTarget::Workspace { String::new() } else { chat.workspace_id.clone() },
                             cwd: chat.cwd().to_owned(),
                             draft_id: uuid::Uuid::new_v4().to_string(),
-                            title: "Fork session".into(),
+                            title: t("agentPanel.conversation.forkTitle"),
                             data: json!({
                                 "config": self.config(),
                                 "attachments": [get(&body, "attachment")],
@@ -2022,7 +2048,7 @@ impl ChatPanel {
                 let Some(name) = get(args, "text").as_str() else { return };
                 let name = name.trim();
                 if name.is_empty() || name.chars().count() > 200 {
-                    self.show_failure("Session title must contain 1–200 characters.");
+                    self.show_failure(t("agentPanel.conversation.titleLength"));
                     return;
                 }
                 let name = name.to_owned();
@@ -2221,6 +2247,11 @@ impl ChatPanel {
                 self.with_session(cx, ui, |s, io| s.action(io, ActionKind::Unarchive, "refresh_agent_request", "status", json!({})));
             }
             "jump-latest" => self.jump_to_latest(cx),
+            "retry-connection" => {
+                if let Some(target) = &self.target {
+                    ui.core.refresh_host(&target.host_id);
+                }
+            }
             "track:tasks" => self.open_track(cx, ui, TrackPanel::Tasks),
             "track:subagents" => self.open_track(cx, ui, TrackPanel::Subagents),
             "track:diff" => {
@@ -2541,7 +2572,7 @@ impl Widget for ChatPanel {
             Some(None) => panel_rect.contains(abs),
             None => !find_field_rect.is_some_and(|f| f.contains(abs)) && overlay_rects.iter().any(|r| r.contains(abs)),
         });
-        if !modal_open || matches!(self.modal, Some(Modal::Lightbox { .. })) {
+        if !modal_open || matches!(self.modal, Some(Modal::Lightbox { .. })) || self.bar_drag.is_some() {
             self.modal_touch_scroll.reset();
             self.modal_horizontal_scroll.reset();
         } else {
@@ -2566,16 +2597,38 @@ impl Widget for ChatPanel {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => self.chrome_hover(cx, Some(e.abs)),
             Hit::FingerHoverOut(_) => self.chrome_hover(cx, None),
             Hit::FingerDown(e) => {
+                self.bar_drag = None;
                 let target = self.chrome_hit(e.abs);
-                if let Some(Modal::Lightbox { .. }) = &self.modal
-                    && (target.is_none() || matches!(&target, Some(HitTarget::Chrome(id)) if id == "lightbox:image"))
-                {
-                    self.lightbox_drag = Some(e.abs);
+                if let Some(target) = &target {
+                    let modal = self.modal.is_some();
+                    let (canvas, state) = if modal { (&self.modal_canvas, &mut self.modal_state) } else { (&self.overlay_canvas, &mut self.chrome_state) };
+                    if let Some(drag) = super::scrollbar::BarDrag::press(target, e.abs - canvas.origin, state) {
+                        if drag.vertical && drag.key == "sheet:y" {
+                            state.expanded.insert("sheet:detached".into(), true);
+                        }
+                        self.bar_drag = Some((drag, modal));
+                        self.area.redraw(cx);
+                    }
                 }
-                let target = self.modal_tap_target(e.abs);
-                self.pressed.press(target);
+                if self.bar_drag.is_some() {
+                    self.pressed.cancel();
+                } else {
+                    if let Some(Modal::Lightbox { .. }) = &self.modal
+                        && (target.is_none() || matches!(&target, Some(HitTarget::Chrome(id)) if id == "lightbox:image"))
+                    {
+                        self.lightbox_drag = Some(e.abs);
+                    }
+                    let target = self.modal_tap_target(e.abs);
+                    self.pressed.press(target);
+                }
             }
             Hit::FingerMove(e) => {
+                if let Some((drag, modal)) = &self.bar_drag {
+                    let (canvas, state) = if *modal { (&self.modal_canvas, &mut self.modal_state) } else { (&self.overlay_canvas, &mut self.chrome_state) };
+                    if drag.drag_to(e.abs - canvas.origin, state) {
+                        self.area.redraw(cx);
+                    }
+                }
                 if let (Some(last), Some(Modal::Lightbox { offset, scale, .. })) = (self.lightbox_drag, &mut self.modal)
                     && *scale > 1.0
                 {
@@ -2586,6 +2639,11 @@ impl Widget for ChatPanel {
             }
             Hit::FingerLongPress(_) => self.pressed.cancel(),
             Hit::FingerUp(e) => {
+                if let Some((_, modal)) = self.bar_drag.take() {
+                    let state = if modal { &mut self.modal_state } else { &mut self.chrome_state };
+                    state.dragging_bar = None;
+                    self.area.redraw(cx);
+                }
                 let dragged = self.lightbox_drag.take().is_some_and(|start| (e.abs - e.abs_start).length() > 4.0 && start != e.abs_start);
                 let target = self.modal_tap_target(e.abs);
                 let valid = e.is_over && !dragged && !e.has_long_press_occurred && (!e.device.is_touch() || e.was_tap());
@@ -2710,6 +2768,12 @@ impl Widget for ChatPanel {
                 }
             }
         }
+        if self.reveal_attention && self.snap.is_some() {
+            self.reveal_attention = false;
+            self.find_scroll = None;
+            self.attention_row = self.items.iter().find(|i| matches!(i.kind, RowKind::Permission { .. })).map(|i| i.id.clone());
+            self.jump_to_latest(cx);
+        }
         let snap = self.snap.clone();
         let core = scope.data.get::<UiContext>().map(|ui| ui.core.clone()).or_else(|| self.core.clone());
         if let Some(core) = &core {
@@ -2723,6 +2787,9 @@ impl Widget for ChatPanel {
         let facts = if target.sheet && !subagent { snap.as_ref().and_then(|s| tracks::facts_line(&self.providers, &s.agent)) } else { None };
         let mut callouts = Vec::new();
         if let Some(s) = &snap {
+            if !connected {
+                callouts.push(Callout::Disconnected { host: self.host.label.clone() });
+            }
             if connected && !archived && matches!(s.sync, SyncStatus::Error | SyncStatus::Retrying) {
                 callouts.push(Callout::SyncError { retrying: s.sync == SyncStatus::Retrying });
             }
@@ -2851,6 +2918,7 @@ impl Widget for ChatPanel {
             _ => None,
         };
         let jump_visible = !self.at_bottom && !empty;
+        let approval_pending = !subagent && snap.as_ref().is_some_and(|s| !s.permissions.is_empty());
         let mut find_field_rect = None;
         let mut track_anchors = Vec::new();
         {
@@ -2882,7 +2950,7 @@ impl Widget for ChatPanel {
             if jump_visible {
                 let clearance = if tracks_visible { tracks::control_clearance(compact, track_height) } else { 0.0 };
                 let bottom = stream_rect.pos.y + stream_rect.size.y - clearance.max(16.0);
-                chrome::jump_button(cx, &mut d, stream_rect.center().x, bottom);
+                chrome::jump_button(cx, &mut d, stream_rect.center().x, bottom, stream_rect.size.x - 32.0, approval_pending);
             }
             if find_open {
                 let (field, card_h) = find_card(cx, &mut d, stream_rect, &find_status, find_can_navigate, find_failure);
@@ -3131,7 +3199,7 @@ impl ChatPanel {
         for key in self.modal_canvas.scroll_regions_at(rel, vertical) {
             let (offsets, extents) = if vertical { (&mut self.modal_state.scroll_y, &self.modal_state.extent_y) } else { (&mut self.modal_state.scroll_x, &self.modal_state.extent_x) };
             let max = extents.get(key).copied().unwrap_or(0.0);
-            let current = offsets.get(key).copied().unwrap_or(0.0);
+            let current = offsets.get(key).copied().unwrap_or(0.0).clamp(0.0, max);
             let next = (current + amount).clamp(0.0, max);
             if next == current {
                 continue;
@@ -3417,6 +3485,18 @@ impl ChatPanel {
         {
             self.scroll_to_row(cx, &row, 0.0);
         }
+        // reveal_attention: the newest edge is shown; when the pending cards below the first
+        // one fill the stream, its top is brought on screen instead.
+        if let Some(row) = self.attention_row.take()
+            && let Some(index) = self.items.iter().position(|i| i.id == row)
+        {
+            let first = list.first_id();
+            let above = index < first
+                || (index == first && list.get_item(index).is_some_and(|(_, w)| w.as_chat_row().rect(cx).pos.y < self.stream_rect.pos.y - 0.5));
+            if above {
+                self.scroll_to_row(cx, &row, 0.0);
+            }
+        }
     }
 
     /// Track panels, compact detail sheets, the usage sheet, the image
@@ -3542,26 +3622,28 @@ fn usage_sheet(cx: &mut Cx2d, d: &mut Draw, agent: &Value, rect: Rect, bottom_in
     d.kit.rect(cx, rect, rgba(0x73000000), 0.0);
     d.canvas.add_hit(rect, HitTarget::Chrome("scrim".into()));
     let usage = get(agent, "lastUsage");
-    let pairs: Vec<(&str, &Value)> = vec![
-        ("Provider", get(agent, "provider")),
-        ("Model", get(agent, "model")),
-        ("Status", get(agent, "status")),
-        ("Created", get(agent, "createdAt")),
-        ("Updated", get(agent, "updatedAt")),
-        ("Last prompt", get(agent, "lastUserMessageAt")),
-        ("Input tokens", get(usage, "inputTokens")),
-        ("Cached input", get(usage, "cachedInputTokens")),
-        ("Output tokens", get(usage, "outputTokens")),
-        ("Context used", get(usage, "contextWindowUsedTokens")),
-        ("Context maximum", get(usage, "contextWindowMaxTokens")),
-        ("Cost (USD)", get(usage, "totalCostUsd")),
+    let pairs: Vec<(String, &Value)> = vec![
+        (t("agentPanel.usage.provider"), get(agent, "provider")),
+        (t("agentPanel.usage.model"), get(agent, "model")),
+        (t("agentPanel.usage.status"), get(agent, "status")),
+        (t("agentPanel.usage.created"), get(agent, "createdAt")),
+        (t("agentPanel.usage.updated"), get(agent, "updatedAt")),
+        (t("agentPanel.usage.lastPrompt"), get(agent, "lastUserMessageAt")),
+        (t("agentPanel.usage.inputTokens"), get(usage, "inputTokens")),
+        (t("agentPanel.usage.cachedInput"), get(usage, "cachedInputTokens")),
+        (t("agentPanel.usage.outputTokens"), get(usage, "outputTokens")),
+        (t("agentPanel.usage.contextUsed"), get(usage, "contextWindowUsedTokens")),
+        (t("agentPanel.usage.contextMaximum"), get(usage, "contextWindowMaxTokens")),
+        (t("agentPanel.usage.cost"), get(usage, "totalCostUsd")),
     ];
+    let title = t("agentPanel.usage.title");
+    let runtime_label = t("agentPanel.usage.runtimeDetails");
     let compact = d.look.compact;
     let w = if compact { rect.size.x } else { rect.size.x.min(480.0) - 32.0 };
     let base = d.look.ui(14.0);
     let paint = |cx: &mut Cx2d, d: &mut Draw, x: f64, y: f64| -> f64 {
         let mut cy = y + 16.0;
-        d.kit.label(cx, Font::Semibold, d.look.ui(16.0), 1.3, p.foreground, dvec2(x + 16.0, cy), "Session activity and usage", Some(w - 64.0));
+        d.kit.label(cx, Font::Semibold, d.look.ui(16.0), 1.3, p.foreground, dvec2(x + 16.0, cy), &title, Some(w - 64.0));
         cy += d.look.ui(16.0) * 1.3 + 16.0;
         for (label, value) in &pairs {
             if value.is_null() {
@@ -3589,7 +3671,7 @@ fn usage_sheet(cx: &mut Cx2d, d: &mut Draw, agent: &Value, rect: Rect, bottom_in
         // Runtime details (ExpansionTile with JsonDetails).
         let expanded = d.state.is_expanded("usage:runtime", false);
         let header = rect_xywh(x + 16.0, cy, w - 32.0, 40.0);
-        d.kit.label(cx, Font::Regular, base, 1.4, p.foreground, dvec2(header.pos.x, cy + 10.0), "Runtime details", None);
+        d.kit.label(cx, Font::Regular, base, 1.4, p.foreground, dvec2(header.pos.x, cy + 10.0), &runtime_label, None);
         d.kit.icon(cx, if expanded { "chevron-up" } else { "chevron-down" }, rect_xywh(header.pos.x + header.size.x - 20.0, cy, 20.0, 40.0), 16.0, p.muted);
         d.canvas.add_hit(header, HitTarget::Toggle("usage:runtime".into()));
         cy += 40.0;
@@ -3614,13 +3696,14 @@ fn usage_sheet(cx: &mut Cx2d, d: &mut Draw, agent: &Value, rect: Rect, bottom_in
     d.state.extent_y.insert(key.clone(), max_y);
     let sy = d.state.scroll_y.get(&key).copied().unwrap_or(0.0).clamp(0.0, max_y);
     if max_y > 0.0 {
-        d.canvas.add_hit(view, HitTarget::ScrollY(key));
+        d.canvas.add_hit(view, HitTarget::ScrollY(key.clone()));
     }
     cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(view.size.y.max(1.0)) }, Layout::default());
     d.canvas.push_clip(view);
     paint(cx, d, x, y - sy);
     d.canvas.pop_clip();
     cx.end_turtle();
+    super::scrollbar::draw(cx, d, view, None, None, Some(super::scrollbar::Axis { key: &key, offset: sy, max: max_y }));
     d.kit.icon(cx, "x", close, 18.0, p.muted);
     d.canvas.add_hit(close, HitTarget::Chrome("sheet:close".into()));
 }
@@ -3695,6 +3778,12 @@ impl ChatPanelRef {
     pub fn run_conversation_action(&self, cx: &mut Cx, action: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.run_conversation_action(cx, action);
+        }
+    }
+
+    pub fn reveal_attention(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.reveal_attention(cx);
         }
     }
 }

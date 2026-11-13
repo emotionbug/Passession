@@ -72,6 +72,8 @@ pub(crate) enum RouteIn {
 pub(crate) enum Control {
     /// Sends one envelope `ping`; the reply fires on the next `pong`.
     Ping(oneshot::Sender<()>),
+    /// Ordered PTY input; binary bytes must never pass through a UTF-8 string.
+    TerminalInput(Bytes),
 }
 
 /// Inbound traffic since the last unanswered heartbeat (Flutter `_livenessFailures`).
@@ -307,6 +309,11 @@ impl Pump {
                             // One probe at a time; a newer probe replaces an abandoned one.
                             ping = Some(reply);
                             if let Err(error) = self.raw.send(HostFrame::Text("{\"type\":\"ping\"}".into())).await {
+                                break Err(transport_error(&error));
+                            }
+                        }
+                        Some(Control::TerminalInput(bytes)) => {
+                            if let Err(error) = self.raw.send(HostFrame::Binary(bytes)).await {
                                 break Err(transport_error(&error));
                             }
                         }

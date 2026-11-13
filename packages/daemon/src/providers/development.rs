@@ -452,6 +452,9 @@ impl AgentSession for Session {
         Ok(None)
     }
     async fn interrupt(&self) -> Result<()> {
+        if let Some(error) = self.inner.features["mockInterruptError"].as_str() {
+            bail!("{error}");
+        }
         let _gate = self.inner.gate.lock().await;
         let turn = self.inner.state.lock().unwrap().active.take();
         if let Some(t) = turn {

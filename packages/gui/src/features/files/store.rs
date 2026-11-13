@@ -20,7 +20,7 @@ use paseo_gui_core::CoreEvent;
 use paseo_gui_platform::{PlatformAction, PlatformValue};
 use serde_json::{Value, json};
 
-use super::explorer::{Entry, ExplorerCmd, ExplorerPreferences, ExplorerState};
+use super::explorer::{Entry, ExplorerCmd, ExplorerPreferences, ExplorerState, Listing};
 use super::handle::{FileVersion, HandleCmd};
 use super::host;
 use super::i18n::{l, lf, t};
@@ -76,7 +76,7 @@ enum Pending {
     Write(u64, u64),
     List { owner: String, path: String, generation: u64 },
     Entry { owner: String, cwd: String, action: EntryAction },
-    Asset { owner: String, key: String, ticket: u64 },
+    Asset { owner: String, key: String, ticket: u64, active: bool },
     Transfer(u64),
 }
 
@@ -186,6 +186,21 @@ pub fn release(owner: &str) {
                 entry.session.release(&Value::Null);
             }
         s.explorers.remove(owner);
+        // Reopening a picker reuses its owner and restarts its state generation.
+        // Old replies must not populate that new browser (possibly on another host).
+        s.pending.retain(|_, pending| !matches!(pending,
+            Pending::List { owner: pending_owner, .. } | Pending::Entry { owner: pending_owner, .. }
+                if pending_owner == owner
+        ));
+        // Keep binary requests until completion so their stashed payload is drained,
+        // but never publish an old asset into a newly mounted owner.
+        for pending in s.pending.values_mut() {
+            if let Pending::Asset { owner: pending_owner, active, .. } = pending
+                && pending_owner == owner
+            {
+                *active = false;
+            }
+        }
         s.busy.remove(owner);
         s.owner_events.remove(owner);
         let prefix = format!("{owner}\u{0}");
@@ -451,7 +466,7 @@ impl Store {
         owner: &str,
         cwd: &str,
         initial: &str,
-        directories_only: bool,
+        picker: bool,
         workspace_key: Option<String>,
     ) -> &mut ExplorerState {
         // Existing explorers are the hot path (including pointer moves and caret
@@ -460,7 +475,7 @@ impl Store {
             let state = ExplorerState::new(
                 cwd,
                 initial,
-                directories_only,
+                picker,
                 workspace_key.map(|workspace_key| ExplorerPreferences { workspace_key }),
                 host::preferences(&ui.state),
             );
@@ -606,7 +621,7 @@ impl Store {
             return Asset::Loading;
         }
         let (request, ticket) = service::read(&ui.core, &self.stash, host_id, cwd, path, service::PREVIEW_MAX_BYTES);
-        self.pending.insert(request, Pending::Asset { owner: owner.to_owned(), key: key.clone(), ticket });
+        self.pending.insert(request, Pending::Asset { owner: owner.to_owned(), key: key.clone(), ticket, active: true });
         self.assets.insert(key, Asset::Loading);
         Asset::Loading
     }
@@ -1029,19 +1044,22 @@ impl Store {
                         return Err(error.to_owned());
                     }
                     let directory = payload.get("directory").filter(|d| d.is_object()).ok_or_else(|| l("Directory listing unavailable").to_owned())?;
-                    Ok(directory.get("entries").and_then(Value::as_array).cloned().unwrap_or_default())
+                    Ok(Listing {
+                        entries: directory.get("entries").and_then(Value::as_array).cloned().unwrap_or_default(),
+                        absolute: directory.get("absolutePath").and_then(Value::as_str).map(str::to_owned),
+                    })
                 });
                 state.on_listed(&path, generation, listed);
             }
             Pending::Entry { owner, cwd, action } => self.on_entry(ui, &owner, &cwd, action, result),
-            Pending::Asset { owner, key, ticket } => {
+            Pending::Asset { owner, key, ticket, active } => {
                 let asset = match result.and_then(|_| self.stash.take(ticket).ok_or_else(|| "File payload unavailable".to_owned())) {
                     Ok(contents) => Asset::Ready { bytes: contents.bytes, mime: contents.mime_type },
                     Err(error) => Asset::Failed(error),
                 };
                 self.stash.discard(ticket);
                 // A released owner's late asset is dropped.
-                if self.owners.contains_key(&owner) || self.explorers.contains_key(&owner) || self.assets.contains_key(&key) {
+                if active && (self.owners.contains_key(&owner) || self.explorers.contains_key(&owner) || self.assets.contains_key(&key)) {
                     self.assets.insert(key, asset);
                 }
             }
@@ -1097,4 +1115,27 @@ pub fn register_picker(owner: &str, host_id: &str) {
 /// Explorer entry parent (re-exported for the view).
 pub fn parent_of(path: &str) -> String {
     parent_explorer_path(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn released_owner_cannot_receive_old_directory_or_asset_responses() {
+        let owner = "picker:release-test";
+        with(|s| {
+            s.pending.insert("old-list".into(), Pending::List { owner: owner.into(), path: ".".into(), generation: 0 });
+            s.pending.insert("other-list".into(), Pending::List { owner: "other".into(), path: ".".into(), generation: 0 });
+            s.pending.insert("old-asset".into(), Pending::Asset { owner: owner.into(), key: asset_key(owner, "image.png"), ticket: 1, active: true });
+        });
+        release(owner);
+        with(|s| {
+            assert!(!s.pending.contains_key("old-list"));
+            assert!(s.pending.contains_key("other-list"));
+            assert!(matches!(s.pending.get("old-asset"), Some(Pending::Asset { active: false, .. })));
+            s.pending.remove("other-list");
+            s.pending.remove("old-asset");
+        });
+    }
 }

@@ -74,6 +74,8 @@ impl Activity {
         }
         if self.visible != visible {
             self.visibility_changed = SystemTime::now();
+            // Platforms reset or replace the app badge while the app was away; resend it.
+            self.badge = None;
         }
         self.visible = visible;
         self.target = target.cloned();
@@ -118,10 +120,9 @@ impl Activity {
         self.update_badge(ui);
     }
 
+    /// The app badge on every platform: sessions requiring attention, kept current so a tap on
+    /// one notification never clears the count of others still waiting.
     fn update_badge(&mut self, ui: &UiContext) {
-        if !crate::shell::platform::desktop_host() {
-            return;
-        }
         let agents = hosts::hosts(&ui.state).into_iter().flat_map(|host| host.agents().collect::<Vec<_>>());
         let count = paseo_gui_platform::notification_policy::attention_badge_count(agents);
         if self.badge == Some(count) {
@@ -179,6 +180,10 @@ impl Activity {
                 _ => {}
             }
         }
+        // Agent rows changed: the badge follows (it is not re-sent unless the count moved).
+        if !ui.events.is_empty() {
+            self.update_badge(ui);
+        }
     }
 
     fn notify(&self, server_id: &str, event: &Value) {
@@ -188,7 +193,12 @@ impl Activity {
             kind: self.target.as_ref().map(|t| t.kind.clone()),
             id: self.target.as_ref().and_then(|t| t.id.clone()),
         };
-        if let Some(request) = paseo_gui_platform::notification_policy::attention_notification(server_id, event, &view)
+        let labels = paseo_gui_platform::notification_policy::NotificationLabels {
+            approval_requested: crate::common::tr("shell.notifications.approvalRequested"),
+            session_finished: crate::common::tr("shell.notifications.sessionFinished"),
+            session_failed: crate::common::tr("shell.notifications.sessionFailed"),
+        };
+        if let Some(request) = paseo_gui_platform::notification_policy::attention_notification(server_id, event, &view, &labels)
             && let Some(platform) = paseo_gui_platform::platform()
         {
             platform.notify(request);

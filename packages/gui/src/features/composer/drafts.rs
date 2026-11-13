@@ -14,7 +14,10 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const DRAFTS_STORAGE_KEY: &str = "paseo.chat.drafts.v1";
-const UNCONFIRMED: &str = "Delivery is unconfirmed. Check the exact message status before retrying.";
+/// A send that was in flight when the drafts were last saved (`sending` on load).
+fn unconfirmed() -> String {
+    super::i18n::t("composer.errors.deliveryUnconfirmed")
+}
 
 /// `ChatDrafts.key`: `jsonEncode([serverId, workspaceId, id])`.
 pub fn draft_key(server_id: &str, workspace_id: &str, id: &str) -> String {
@@ -167,7 +170,7 @@ impl DraftStore {
                         let mut queued = obj(item);
                         if queued.get("state").and_then(Value::as_str) == Some("sending") {
                             queued.insert("state".into(), json!("unacknowledged"));
-                            queued.insert("error".into(), json!(UNCONFIRMED));
+                            queued.insert("error".into(), json!(unconfirmed()));
                         }
                         Value::Object(queued)
                     })

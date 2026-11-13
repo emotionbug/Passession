@@ -3,6 +3,7 @@
 //! subscription plus exact-ID queries; client queues drain FIFO into an idle agent.
 
 use super::drafts::*;
+use super::i18n::t;
 use super::json::*;
 use super::service::{ComposerService, Pending, PanelNotice, SendJob, SendOrigin};
 use paseo_gui_core::CoreError;
@@ -145,7 +146,7 @@ impl ComposerService {
                 PanelNotice::CheckFinished {
                     key: key.to_owned(),
                     message_id: id.to_owned(),
-                    error: Some("This host cannot report or cancel message delivery.".into()),
+                    error: Some(t("composer.errors.deliveryUnsupported")),
                 },
             );
             return;
@@ -196,7 +197,7 @@ impl ComposerService {
                 }
                 self.drafts.apply_receipt(key, &receipt);
                 if dismiss && !self.drafts.is_dismissed(key, id) {
-                    Some("The host has not confirmed dismissal.".to_owned())
+                    Some(t("composer.errors.dismissalUnconfirmed"))
                 } else {
                     None
                 }
@@ -300,7 +301,7 @@ impl ComposerService {
         };
         let agent = get(&payload, "agent").clone();
         if !non_empty_obj(&agent) {
-            return self.block_queue(host, key, "The queued session no longer exists.".into());
+            return self.block_queue(host, key, t("composer.errors.queuedSessionMissing"));
         }
         let release = |service: &mut ComposerService| {
             if let Some(delivery) = service.delivery.get_mut(host) {

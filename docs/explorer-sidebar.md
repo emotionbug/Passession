@@ -8,11 +8,15 @@ Every target carries its host identity. File and Git facts are directory-backed:
 
 Preserve unsaved editor text when changing width, theme, tabs or supporting-view presentation. The file store binds an editing session to its owner/tab; shell close guards ask that owner before closing or retargeting. Closing a chat tab is not archive; closing a script log view is not stopping a script.
 
+Serialize writes for an editor. A save acknowledgement belongs to the submitted text, not whatever the user has typed or undone since submission. Releasing a file/picker owner retires its pending requests; late replies must not populate a newly opened owner with the same ID.
+
 ## Explorer sidebar
 
 The main navigation tree is host → directory → session. The file Explorer is a supporting surface, not a replacement workspace grouping tree. Add Project uses `features/files/picker.rs` (`RemoteFolderPicker`) to list/select a directory on the chosen host; an OS picker on the client cannot select a remote checkout.
 
 Files are read/written through the daemon. Markdown and source editing share the same remote identity and revision. The Changes view loads summary/file-tree information first and patch bodies on demand, so a large repository does not require every diff body before navigation is usable. Its tree pane and compact jump-to-file sheet share one row renderer and measured extent; follow the [shared row contract](design.md#reuse-and-hierarchy) without changing indentation, file statistics or selection identity.
+
+Git action retry resumes the unfinished steps only. Refresh repository state after failure; when the daemon reports an unknown mutation outcome, require inspection of that state rather than automatically resubmitting an operation that may already have succeeded.
 
 ## Compact views and sheets
 

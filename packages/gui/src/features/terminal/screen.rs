@@ -135,6 +135,10 @@ impl Screen {
         self.emulator.encode_key(key, modifiers)
     }
 
+    pub fn encode_mouse_wheel(&mut self, up: bool, col: u16, row: u16, modifiers: Modifiers, count: usize) -> Vec<u8> {
+        self.emulator.encode_mouse_wheel(up, col, row, modifiers, count)
+    }
+
     pub fn encode_paste(&self, text: &str) -> Vec<u8> {
         self.emulator.encode_paste(text)
     }

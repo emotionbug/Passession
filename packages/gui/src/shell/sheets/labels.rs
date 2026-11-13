@@ -285,7 +285,7 @@ impl Sheet for LabelsSheet {
                 y += h;
                 if edit {
                     let id = act("delete", !self.offline && !self.busy);
-                    let (_, h) = row(ui, cx, x, y, w, id.as_deref(), &tr("workspaceLabels.manage.delete"), Some(p.destructive));
+                    let (_, h) = row(ui, cx, x, y, w, id.as_deref(), &tr("workspaceLabels.manage.delete"), Some(p.danger));
                     y += h;
                 }
             }

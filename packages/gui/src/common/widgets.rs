@@ -355,7 +355,7 @@ impl TextRole {
             Self::Body | Self::Title | Self::Small | Self::Mono => p.foreground,
             Self::Muted | Self::SmallMuted => p.muted,
             Self::ExtraMuted => p.extra_muted,
-            Self::Danger => p.destructive,
+            Self::Danger => p.danger,
             Self::Success => p.success,
             Self::Warning => p.warning,
             Self::Accent => p.accent_bright,
@@ -1758,8 +1758,9 @@ impl PTextField {
             let border = if self.focused { p.muted } else { p.border };
             (p.sidebar, border, border, p.muted, hint)
         } else {
-            let border = if self.focused { p.border_accent } else { clear };
-            (p.surface2, border, p.border_accent, p.border_accent, p.muted)
+            // The focus ring is `muted` (≥3:1 on surface2); `border_accent` stays the hover hint.
+            let border = if self.focused { p.muted } else { clear };
+            (p.surface2, border, if self.focused { p.muted } else { p.border_accent }, p.muted, p.muted)
         };
         let font_size = t.ui_pt(14.0) as f64;
         input.apply_over(

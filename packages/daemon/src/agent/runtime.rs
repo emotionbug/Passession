@@ -1487,6 +1487,14 @@ pub(super) mod tests {
     }
 
     pub(in crate::agent) async fn staged_cell(app: &Arc<AppState>, id: &str) -> Arc<AgentCell> {
+        staged_cell_with_config(app, id, json!({})).await
+    }
+
+    pub(in crate::agent) async fn staged_cell_with_config(
+        app: &Arc<AppState>,
+        id: &str,
+        config: Value,
+    ) -> Arc<AgentCell> {
         let manager = &app.agents;
         let snapshot = json!({
             "id":id,"provider":"mock","internal":true,
@@ -1495,7 +1503,7 @@ pub(super) mod tests {
         let (cell, receiver) = manager.make_cell(id, snapshot, true).await.unwrap();
         let session = crate::providers::development::DevelopmentProvider::new("mock").unwrap()
             .create_session(
-                json!({}),
+                config,
                 LaunchContext {
                     agent_id: id.into(),
                     home: app.home.clone(),

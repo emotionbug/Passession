@@ -206,6 +206,10 @@ pub(crate) fn request_notification_permission(shared: &Arc<Shared>, done: Comple
     os::request_notification_permission(shared, done);
 }
 
+pub(crate) fn notification_permission_status(shared: &Arc<Shared>, done: Completion) {
+    os::notification_permission_status(shared, done);
+}
+
 pub(crate) fn set_badge_count(shared: &Arc<Shared>, count: u32, done: Completion) {
     os::set_badge_count(shared, count, done);
 }

@@ -9,6 +9,19 @@ pub struct FontFace(Pin<Box<FontFaceInner>>);
 
 impl FontFace {
     pub fn from_data_and_index(data: Arc<Vec<u8>>, index: u32) -> Option<Self> {
+        Self::from_data_index_and_variations(data, index, &[])
+    }
+
+    /// Parses face `index` of an sfnt or collection and selects a variable-font
+    /// instance. Each `(tag, value)` is a user-space axis coordinate (e.g.
+    /// `(*b"wght", 600.0)`); axes the face lacks are ignored, and a static face
+    /// ignores them all. Outlines, metrics, advances and shaping all observe
+    /// the selected instance because rustybuzz is built from the varied face.
+    pub fn from_data_index_and_variations(
+        data: Arc<Vec<u8>>,
+        index: u32,
+        variations: &[([u8; 4], f32)],
+    ) -> Option<Self> {
         let mut inner = Box::pin(FontFaceInner {
             data,
             ttf_parser_face: None,
@@ -17,7 +30,12 @@ impl FontFace {
         });
         unsafe {
             let data: &'static [u8] = mem::transmute(&**inner.data);
-            let ttf_parser_face = ttf_parser::Face::parse(data, index).ok()?;
+            let mut ttf_parser_face = ttf_parser::Face::parse(data, index).ok()?;
+            if ttf_parser_face.is_variable() {
+                for &(tag, value) in variations {
+                    let _ = ttf_parser_face.set_variation(ttf_parser::Tag::from_bytes(&tag), value);
+                }
+            }
             let rustybuzz_face = rustybuzz::Face::from_face(ttf_parser_face.clone());
             let inner_ref = Pin::as_mut(&mut inner).get_unchecked_mut();
             inner_ref.ttf_parser_face = Some(ttf_parser_face);

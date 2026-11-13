@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use makepad_widgets::*;
 use paseo_gui_core::{CoreError, RequestId};
 use serde_json::{Value, json};
@@ -21,10 +21,10 @@ use crate::features::command_center::matching::highlight_ranges;
 use crate::shell::chrome::{make_ui, text_line_height};
 use crate::shell::commands::{self, ShellOverlay};
 use crate::shell::hosts::{self, Host, Status};
-use crate::shell::sheets::{Field, FieldEvent, Sheet, SheetFlow, SheetOps, SheetStyle, spinner};
+use crate::shell::sheets::{Field, FieldEvent, Sheet, SheetFlow, SheetOps, spinner};
 use crate::shell::ui::{Ui, Variant};
 use crate::shell::{PaseoShell, Pending, response_message, sidebar};
-use crate::theme::{ControlSize, argb, with_alpha};
+use crate::theme::{ControlSize, with_alpha};
 
 /// Pseudo sheet id the page's requests are registered under: no sheet carries it, so
 /// `sheets::route_response` hands them to [`on_response`].
@@ -33,31 +33,14 @@ const PAGE_SHEET: u64 = 0;
 const HISTORY_PAGE_LIMIT: i64 = 200;
 /// Long enough that a typed word is one request, short enough to feel live.
 const SEARCH_DEBOUNCE: f64 = 0.2;
-/// Original palette red-300: the host-errors banner text.
-const RED_300: u32 = 0xfffca5a5;
 
 fn parse_ms(text: &str) -> Option<i64> {
     (!text.is_empty()).then(|| DateTime::parse_from_rfc3339(text).ok().map(|t| t.timestamp_millis())).flatten()
 }
 
-/// Original `describeTimeAgo`: never sub-minute, then the date itself once a week old.
+/// Original `describeTimeAgo` (the command center's localized copy).
 fn time_ago(at: Option<i64>) -> String {
-    let Some(at) = at else { return String::new() };
-    let elapsed = Utc::now().timestamp_millis() - at;
-    if elapsed < 60_000 {
-        return "just now".into();
-    }
-    if elapsed < 3_600_000 {
-        return format!("{}m ago", elapsed / 60_000);
-    }
-    if elapsed < 86_400_000 {
-        return format!("{}h ago", elapsed / 3_600_000);
-    }
-    if elapsed < 7 * 86_400_000 {
-        return format!("{}d ago", elapsed / 86_400_000);
-    }
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    Local.timestamp_millis_opt(at).single().map(|t| format!("{} {}", MONTHS[t.month0() as usize], t.day())).unwrap_or_default()
+    crate::features::command_center::time_ago(at, Utc::now())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,7 +124,10 @@ pub struct HistoryPage {
     clock: Timer,
     agents: Vec<HistoryAgent>,
     cursors: HashMap<String, String>,
+    /// Reachable hosts whose history request failed.
     host_errors: Vec<(String, String)>,
+    /// Target hosts that are not connected (not a failure: nothing was asked).
+    offline_hosts: Vec<(String, String)>,
     initial_load: bool,
     loading_more: bool,
     is_error: bool,
@@ -172,6 +158,7 @@ impl HistoryPage {
             agents: Vec::new(),
             cursors: HashMap::new(),
             host_errors: Vec::new(),
+            offline_hosts: Vec::new(),
             initial_load: true,
             loading_more: false,
             is_error: false,
@@ -254,7 +241,8 @@ impl HistoryPage {
                 self.is_error = false;
                 self.agents.clear();
                 self.cursors.clear();
-                self.host_errors = unreachable;
+                self.host_errors.clear();
+                self.offline_hosts = unreachable;
             }
             self.batch = None;
             return;
@@ -305,6 +293,7 @@ impl HistoryPage {
         let batch = self.batch.take().unwrap();
         let failed: Vec<(String, String)> = batch.results.iter().filter(|(_, _, p)| p.as_ref().is_some_and(Value::is_null)).map(|(id, label, _)| (id.clone(), label.clone())).collect();
         let loaded: Vec<(String, Value)> = batch.results.into_iter().filter_map(|(id, _, p)| p.filter(|p| !p.is_null()).map(|p| (id, p))).collect();
+        // Failures of reachable hosts only; an append keeps the earlier pages' failures.
         let merge_errors = |base: &[(String, String)]| -> Vec<(String, String)> {
             let mut errors: Vec<(String, String)> = Vec::new();
             for error in base.iter().chain(failed.iter()) {
@@ -317,13 +306,14 @@ impl HistoryPage {
         };
         self.initial_load = false;
         self.loading_more = false;
+        self.offline_hosts = batch.unreachable.clone();
         if loaded.is_empty() {
             // "No connected hosts could load agent history": the query errors.
             if !batch.append {
                 self.agents.clear();
                 self.cursors.clear();
                 self.is_error = true;
-                self.host_errors = merge_errors(&batch.unreachable);
+                self.host_errors = merge_errors(&[]);
             } else {
                 self.host_errors = merge_errors(&self.host_errors.clone());
             }
@@ -362,7 +352,7 @@ impl HistoryPage {
         self.cursors = next;
         self.is_error = false;
         self.search_truncated = !batch.search.is_empty() && ((batch.append && self.search_truncated) || truncated);
-        let base = if batch.append { self.host_errors.clone() } else { batch.unreachable.clone() };
+        let base = if batch.append { self.host_errors.clone() } else { Vec::new() };
         self.host_errors = merge_errors(&base);
     }
 }
@@ -475,24 +465,38 @@ fn is_input(event: &Event) -> bool {
 /// Responses routed to the page (requests registered under [`PAGE_SHEET`]).
 pub fn on_response(shell: &mut PaseoShell, cx: &mut Cx, tag: &str, result: &Result<Value, CoreError>, _ops: &mut SheetOps) {
     let Some(page) = shell.data.history.as_mut() else { return };
-    if let Some(rest) = tag.strip_prefix("hist:") {
-        if let Some((generation, server_id)) = rest.split_once(':')
-            && let Ok(generation) = generation.parse::<u64>()
-        {
-            page.host_page(generation, server_id, result);
-        }
-    } else if let Some(rest) = tag.strip_prefix("archive:") {
-        // Timeout errors are swallowed — the daemon still processes the archive.
-        if response_message(result).is_none()
-            && let Some((server_id, agent_id)) = rest.split_once(':')
-        {
-            let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            for row in page.agents.iter_mut().filter(|a| a.server_id == server_id && j::text(&a.agent, "id") == agent_id) {
-                row.agent["archivedAt"] = Value::from(now.clone());
-            }
-        }
+    if let Some(rest) = tag.strip_prefix("hist:")
+        && let Some((generation, server_id)) = rest.split_once(':')
+        && let Ok(generation) = generation.parse::<u64>()
+    {
+        page.host_page(generation, server_id, result);
     }
     shell.redraw(cx);
+}
+
+/// Opens the open History page on `query` (the sidebar's "Search all history"); a no-op
+/// without a History page.
+pub fn search(shell: &mut PaseoShell, cx: &mut Cx, query: &str) {
+    let query = query.trim();
+    with_page(shell, |page| {
+        page.search_field.set_text(cx, query);
+        if page.search != query {
+            page.search = query.to_string();
+            page.reset();
+        }
+    });
+    shell.redraw(cx);
+}
+
+/// A session archived from the session menu: its History row shows the archived badge
+/// without a refetch.
+pub fn mark_archived(shell: &mut PaseoShell, server_id: &str, agent_id: &str) {
+    with_page(shell, |page| {
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        for row in page.agents.iter_mut().filter(|a| a.server_id == server_id && j::text(&a.agent, "id") == agent_id) {
+            row.agent["archivedAt"] = Value::from(now.clone());
+        }
+    });
 }
 
 fn with_page(shell: &mut PaseoShell, f: impl FnOnce(&mut HistoryPage)) {
@@ -524,6 +528,19 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) 
             }
         }),
         "retry" => with_page(shell, |page| page.fetch = Some(false)),
+        // Every target host that is not connected tries again (`updateHost` with its config).
+        "reconnect" => {
+            let offline: Vec<Value> = shell
+                .data
+                .history
+                .as_ref()
+                .map(|page| page.target_hosts(&state).into_iter().filter(|h| h.status() != Status::Connected).map(|h| h.config().clone()).collect())
+                .unwrap_or_default();
+            for config in offline {
+                ui.core.connect_host(config);
+            }
+        }
+        "addhost" => crate::shell::sheets::host_dialog::open_flow(shell, cx, None, None, None),
         "more" => with_page(shell, |page| {
             if !page.cursors.is_empty() && !page.loading_more {
                 page.fetch = Some(true);
@@ -542,11 +559,11 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) 
             let p = crate::theme::current_palette();
             let anchor = shell.data.hits.rect_of(&id.to_string()).unwrap_or_default();
             let selected = shell.data.history.as_ref().map(|p| p.selected_host.clone()).unwrap_or_default();
-            let mut options = vec![SelectOption::new("", "All hosts").icon_sized("server", 14.0)];
+            let mut options = vec![SelectOption::new("", tr("sessions.filter.allHosts")).icon_sized("server", 14.0)];
             for host in hosts::hosts(&state) {
                 options.push(SelectOption::new(host.server_id(), host.display_label()).dot(sidebar::status_color(&p, &host)));
             }
-            commands::shell_select(shell, cx, anchor, SelectRequest::new("Filter by host", options).value(selected), ShellOverlay::HistoryHost);
+            commands::shell_select(shell, cx, anchor, SelectRequest::new(tr("sessions.filter.byHost"), options).value(selected), ShellOverlay::HistoryHost);
         }
         _ => {
             if let Some(index) = rest.strip_prefix("row:").and_then(|i| i.parse::<usize>().ok()) {
@@ -571,82 +588,15 @@ pub fn select_host(shell: &mut PaseoShell, cx: &mut Cx, server_id: &str) {
     shell.redraw(cx);
 }
 
-/// Original long-press: a running agent, or one whose host is offline, asks first; anything
-/// else is archived straight away.
+/// Right-click / long-press: the sidebar's session menu (Open, Rename, Archive with its
+/// confirmation, …) for that row.
 pub fn secondary(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) {
     let Some(index) = id.strip_prefix("hist:row:").and_then(|i| i.parse::<usize>().ok()) else { return };
     let Some(row) = shell.data.history.as_ref().and_then(|p| p.agents.get(index).cloned()) else { return };
-    let connected = hosts::host(&ui.state, &row.server_id).is_some_and(|h| h.connected());
-    if j::text(&row.agent, "status") == "running" || !connected {
-        shell.data.overlays.open_sheet(Box::new(ArchiveSheet { server_id: row.server_id, agent_id: j::text(&row.agent, "id").to_string(), host_offline: !connected }));
-        shell.redraw(cx);
-        return;
-    }
-    archive(shell, ui, &row.server_id, j::text(&row.agent, "id"));
-}
-
-fn archive(shell: &mut PaseoShell, ui: &UiContext, server_id: &str, agent_id: &str) {
-    let id = ui.core.request(server_id, json!({ "type": "archive_agent_request", "agentId": agent_id }), "agent_archived");
-    shell.data.pending.insert(id, Pending::Sheet { sheet: PAGE_SHEET, tag: format!("archive:{server_id}:{agent_id}") });
-}
-
-/// The original running/offline archive sheet (`_showArchiveSheet`, a fading bottom panel):
-/// a centred semibold title, then Cancel / Archive (16px tall padding, 8px radius); Archive is
-/// disabled while the host is offline.
-struct ArchiveSheet {
-    server_id: String,
-    agent_id: String,
-    host_offline: bool,
-}
-
-impl Sheet for ArchiveSheet {
-    fn title(&self) -> String {
-        tr(if self.host_offline { "agentList.archiveSheet.hostOffline" } else { "agentList.archiveSheet.runningAgent" })
-    }
-
-    fn style(&self) -> SheetStyle {
-        SheetStyle::FadeBottom
-    }
-
-    fn draw(&mut self, cx: &mut Cx2d, ui: &mut Ui, _scope: &mut Scope, x: f64, y: f64, w: f64, interactive: bool) -> f64 {
-        let p = ui.p;
-        let title = ui.spec(Font::Medium, 14.0, p.foreground);
-        let title_h = ui.painter.paragraph_height(cx, w, title, &self.title());
-        let title_w = ui.painter.measure(cx, title, &self.title()).x.min(w);
-        ui.painter.paragraph(cx, dvec2(x + (w - title_w) * 0.5, y), title_w, title, &self.title());
-        let by = y + title_h + 16.0;
-        let bw = (w - 12.0) * 0.5;
-        let button_h = text_line_height(20.0, 14.0) + 32.0;
-        let buttons = [
-            ("cancel", tr("common.actions.cancel"), p.surface1, p.foreground, true),
-            ("archive", tr("agentList.archiveSheet.archive"), p.primary, p.on_primary, !self.host_offline),
-        ];
-        for (i, (id, label, fill, text, enabled)) in buttons.into_iter().enumerate() {
-            let r = rect(x + i as f64 * (bw + 12.0), by, bw, button_h);
-            ui.fill(cx, r, fill, 8.0);
-            if interactive && enabled {
-                if ui.is_hover(id) || ui.is_pressed(id) {
-                    ui.fill(cx, r, with_alpha(p.foreground, if ui.is_pressed(id) { 0.1 } else { 0.08 }), 8.0);
-                }
-                ui.hit(r, id);
-            }
-            let spec = ui.spec(Font::Medium, 14.0, with_alpha(text, if enabled { text.w } else { text.w * 0.5 }));
-            ui.text_centered(cx, r, spec, &label);
-        }
-        title_h + 16.0 + button_h
-    }
-
-    fn click(&mut self, _cx: &mut Cx, id: &str, ops: &mut SheetOps) -> SheetFlow {
-        match id {
-            "archive" => {
-                let (server_id, agent_id) = (self.server_id.clone(), self.agent_id.clone());
-                ops.run(move |shell, _, ui| archive(shell, ui, &server_id, &agent_id));
-                SheetFlow::Close
-            }
-            "cancel" => SheetFlow::Close,
-            _ => SheetFlow::Stay,
-        }
-    }
+    let anchor = shell.data.hits.rect_of(&id.to_string()).unwrap_or_default();
+    let state = ui.state.clone();
+    commands::session_menu(shell, cx, &state, &row.server_id, row.agent, anchor, true);
+    shell.redraw(cx);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -760,7 +710,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
         // a short label beside a 160px search field does not fit it moves to its own row.
         let host_filter = (host_count > 1).then(|| {
             let host = hosts::host(&state, &page.selected_host).filter(|_| !page.selected_host.is_empty());
-            let label = host.as_ref().map(|h| h.display_label()).unwrap_or_else(|| "All hosts".to_string());
+            let label = host.as_ref().map(|h| h.display_label()).unwrap_or_else(|| tr("sessions.filter.allHosts"));
             (host, label)
         });
         let host_spec = ui.spec(Font::Medium, 14.0, p.foreground);
@@ -811,14 +761,21 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
         }
         y += field_h + 2.0;
     }
-    if !page.host_errors.is_empty() {
+    // Failed hosts (danger) and offline hosts (muted, not a failure). With no reachable host
+    // at all the empty state below says so instead.
+    let reachable = !page.reachable_hosts(&state).is_empty();
+    let mut notices: Vec<(String, Vec4)> = page.host_errors.iter().map(|(_, label)| (tr_args("sessions.hostLoadFailed", &[("host", label)]), p.danger)).collect();
+    if reachable {
+        notices.extend(page.offline_hosts.iter().map(|(_, label)| (tr_args("sessions.hostOffline", &[("host", label)]), p.muted)));
+    }
+    if !notices.is_empty() {
         y += 12.0;
-        let spec = ui.spec(Font::Regular, 12.0, argb(RED_300));
-        let lines: Vec<String> = page.host_errors.iter().map(|(_, label)| tr_args("sessions.hostLoadFailed", &[("host", label)])).collect();
-        let h = 24.0 + lines.len() as f64 * small_h + (lines.len().saturating_sub(1)) as f64 * 4.0;
+        let h = 24.0 + notices.len() as f64 * small_h + (notices.len().saturating_sub(1)) as f64 * 4.0;
         ui.painter.outline(cx, rect(x, y, w, h), Vec4::default(), p.border, 1.0, 8.0);
-        for (i, line) in lines.iter().enumerate() {
-            ui.text(cx, rect(x + 12.0, y + 12.0 + i as f64 * (small_h + 4.0), w - 24.0, small_h), spec, line);
+        for (i, (line, color)) in notices.iter().enumerate() {
+            let spec = ui.spec(Font::Regular, 12.0, *color);
+            let fitted = ui.painter.fit(cx, spec, line, w - 24.0);
+            ui.text(cx, rect(x + 12.0, y + 12.0 + i as f64 * (small_h + 4.0), w - 24.0, small_h), spec, &fitted);
         }
         y += h;
     }
@@ -845,17 +802,25 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
         // Pages animate through the shell's own redraw (no sheet overlay frame driver).
         crate::shell::sheets::take_spinning();
         ui.painter.draw_box.area().redraw(cx);
+    } else if host_count == 0 {
+        let add = tr("settings.addHost");
+        empty_state(&mut ui, cx, &tr("sessions.noHosts"), &[("hist:addhost", add.as_str(), Some("plus"))]);
+    } else if !reachable {
+        let reconnect = tr("sessions.actions.reconnect");
+        let back = tr("common.actions.back");
+        empty_state(&mut ui, cx, &tr("sessions.noConnectedHost"), &[("hist:reconnect", reconnect.as_str(), Some("rotate-cw")), ("hist:back", back.as_str(), Some("chevron-left"))]);
     } else if page.is_error && page.agents.is_empty() {
-        empty_state(&mut ui, cx, "Unable to load sessions", &[("hist:retry", "Try again", None)]);
+        let retry = tr("common.actions.retry");
+        empty_state(&mut ui, cx, &tr("sessions.loadFailed"), &[("hist:retry", retry.as_str(), Some("rotate-cw"))]);
     } else if page.agents.is_empty() {
         let text = if searching {
             tr("sessions.noMatches")
         } else if page.selected_host.is_empty() {
             tr("sessions.empty")
         } else {
-            "No sessions for this host".to_string()
+            tr("sessions.emptyHost")
         };
-        let first = if searching { ("hist:clear", tr("sessions.actions.clearSearch"), None) } else { ("hist:back", "Back".to_string(), Some("chevron-left")) };
+        let first = if searching { ("hist:clear", tr("sessions.actions.clearSearch"), None) } else { ("hist:back", tr("common.actions.back"), Some("chevron-left")) };
         let import = tr("importSession.title");
         empty_state(&mut ui, cx, &text, &[(first.0, first.1.as_str(), first.2), ("hist:import", import.as_str(), Some("import"))]);
     } else {
@@ -894,7 +859,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             ry += line_h + 16.0;
         } else if !page.cursors.is_empty() {
             ry += 16.0;
-            let label = if page.loading_more { "Loading...".to_string() } else { tr("sessions.actions.loadMore") };
+            let label = if page.loading_more { tr("common.states.loading") } else { tr("sessions.actions.loadMore") };
             let bw = ui.button_width(cx, &label, None, ControlSize::Sm);
             ui.button(cx, rect(lx + (lw - bw) * 0.5, ry, bw, field_h), "hist:more", &label, None, Variant::Ghost, ControlSize::Sm, !page.loading_more);
             ry += field_h + 16.0;
@@ -1168,7 +1133,7 @@ impl Sheet for ImportSheet {
         ui.text(cx, rect(x, y, sw, small_h + 8.0), small, &scope_text);
         if !self.scope_cwd.is_empty() {
             let label = tr("importSession.actions.showAll");
-            let spec = ui.spec(Font::Medium, 12.0, p.accent);
+            let spec = ui.spec(Font::Medium, 12.0, p.accent_bright);
             let lw = ui.measure(cx, spec, &label) + 16.0;
             let r = rect(x + sw + 8.0, y + 2.0, lw, small_h + 4.0);
             ui.text_centered(cx, r, spec, &label);
@@ -1204,7 +1169,7 @@ impl Sheet for ImportSheet {
             ui.text(cx, rect(r.pos.x + 32.0, r.pos.y, lw, r.size.y), spec, &label);
             ui.icon(cx, rect(r.pos.x + 32.0 + lw + 6.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "chevron-down", 14.0, p.muted);
             if interactive {
-                ui.hit_tip(r, "provider", "Filter by provider");
+                ui.hit_tip(r, "provider", &tr("sessions.filter.byProvider"));
             }
             self.filter_rect = r;
             y += button_h + 8.0;
@@ -1318,7 +1283,7 @@ impl Sheet for ImportSheet {
                     if j::text(&row, "cwd").is_empty() {
                         self.busy = false;
                         self.importing = None;
-                        self.error = Some("Provider session has no working directory.".into());
+                        self.error = Some(tr("sessions.import.noWorkingDirectory"));
                         return SheetFlow::Stay;
                     }
                     ops.request(
@@ -1369,7 +1334,7 @@ impl Sheet for ImportSheet {
             if generation == self.generation {
                 match failure {
                     Some(error) => {
-                        self.catalog_error = Some(format!("Provider list: {error}"));
+                        self.catalog_error = Some(tr_args("sessions.import.providerListFailed", &[("message", &error.to_string())]));
                         self.notice = Some(self.notices(&Value::Null));
                     }
                     None => {
@@ -1451,7 +1416,7 @@ impl ImportSheet {
         }));
         let (owner, anchor) = (self.owner.clone(), self.filter_rect);
         ops.run(move |_, _, ui| {
-            overlay_api::with_owner(ui, &owner, |ui| overlay_api::open_menu(ui, anchor, Some("Filter by provider".to_string()), entries));
+            overlay_api::with_owner(ui, &owner, |ui| overlay_api::open_menu(ui, anchor, Some(tr("sessions.filter.byProvider")), entries));
         });
     }
 

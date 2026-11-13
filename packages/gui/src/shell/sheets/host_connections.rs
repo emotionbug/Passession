@@ -13,7 +13,7 @@ use crate::shell::hosts::{self, Host};
 use crate::shell::sheets::{ConfirmSheet, Field, FieldEvent, Sheet, SheetFlow, SheetOps, SheetStyle, host_dialog};
 use crate::shell::ui::{Ui, Variant};
 use crate::shell::{PaseoShell, sidebar};
-use crate::theme::ControlSize;
+use crate::theme::{ControlSize, with_alpha};
 
 /// Original `formatHostConnectionLabel`: "TCP (endpoint)", "Relay (…)", "Local (path)",
 /// "Remote SSH (host)".
@@ -34,7 +34,7 @@ pub fn connection_label(config: &Value) -> String {
                 format!("TCP ({endpoint})")
             }
         }
-        Err(_) => "Invalid endpoint — edit this connection".to_string(),
+        Err(_) => tr("pairing.hosts.invalidEndpoint"),
     }
 }
 
@@ -42,7 +42,7 @@ pub fn connection_label(config: &Value) -> String {
 /// are dropped from the address.
 pub fn active_connection_label(config: &Value) -> String {
     match inspect_host_config(config) {
-        Ok(info) if info.scheme == "unix" || info.scheme == "pipe" => "Local".to_string(),
+        Ok(info) if info.scheme == "unix" || info.scheme == "pipe" => tr("settings.hostPicker.local"),
         Ok(info) => match info.port {
             Some(port) if port != 443 && port != 80 => format!("{}:{port}", info.host),
             _ => info.host,
@@ -86,7 +86,7 @@ impl ChooserSheet {
             ids,
             purpose: Some(purpose),
             mode: Mode::Chooser,
-            search: Field::new("", "Search hosts...").autofocus(),
+            search: Field::new("", &tr("pairing.hosts.search")).autofocus(),
             query: String::new(),
             active: 0,
             state: std::sync::Arc::new(Value::Null),
@@ -96,11 +96,11 @@ impl ChooserSheet {
 
     pub fn picker(ids: Vec<String>) -> Self {
         Self {
-            title: "Host".to_string(),
+            title: tr("settings.groups.host"),
             ids,
             purpose: None,
             mode: Mode::Picker,
-            search: Field::new("", "Search hosts"),
+            search: Field::new("", &tr("pairing.hosts.search")),
             query: String::new(),
             active: 0,
             state: std::sync::Arc::new(Value::Null),
@@ -171,7 +171,7 @@ impl Sheet for ChooserSheet {
         let options = self.options();
         if options.is_empty() {
             let spec = ui.spec(Font::Regular, 14.0, p.muted);
-            ui.text(cx, rect(x + 16.0 - 24.0 + 12.0, y + 12.0, w, 20.0), spec, "No matching hosts");
+            ui.text(cx, rect(x + 16.0 - 24.0 + 12.0, y + 12.0, w, 20.0), spec, &tr("pairing.hosts.noMatches"));
             y += 44.0;
         }
         let active = self.active.min(options.len().saturating_sub(1));
@@ -223,7 +223,7 @@ impl Sheet for ChooserSheet {
                     if interactive {
                         ui.hit(r, row_id);
                     }
-                    let tip = format!("Open {label} settings");
+                    let tip = tr_args("pairing.hosts.openSettings", &[("name", &label)]);
                     let gear_id = if interactive { format!("gear:{index}") } else { String::new() };
                     ui.icon_button(cx, gear, &gear_id, "settings", 16.0, 6.0, &tip);
                     y += 36.0;
@@ -237,8 +237,7 @@ impl Sheet for ChooserSheet {
             }
             ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + 10.0, 16.0, 16.0), "plus", 16.0, p.muted);
             let spec = ui.spec(Font::Regular, 14.0, p.foreground);
-            // Original SYSTEM_HOST_PICKER_OPTION_LABELS.add is an untranslated literal.
-            ui.text(cx, rect(r.pos.x + 12.0 + 16.0 + 8.0, r.pos.y, r.size.x - 48.0, 36.0), spec, "Add host");
+            ui.text(cx, rect(r.pos.x + 12.0 + 16.0 + 8.0, r.pos.y, r.size.x - 48.0, 36.0), spec, &tr("settings.addHost"));
             if interactive {
                 ui.hit(r, "add");
             }
@@ -341,7 +340,7 @@ impl Sheet for ConnectionsSheet {
             y += 8.0;
         }
         if let Some(error) = &self.error {
-            let spec = ui.spec(Font::Regular, 14.0, p.destructive);
+            let spec = ui.spec(Font::Regular, 14.0, p.danger);
             let h = ui.painter.paragraph_height(cx, w, spec, error);
             ui.painter.paragraph(cx, dvec2(x, y), w, spec, error);
             y += h + 16.0;
@@ -359,13 +358,14 @@ impl Sheet for ConnectionsSheet {
             }
             let is_active = j::text(connection, "id") == active;
             let remove_label = tr("settings.host.connections.removeAction");
-            let remove_spec = ui.spec(Font::Medium, 14.0, p.destructive);
+            let remove_spec = ui.spec(Font::Medium, 14.0, p.danger);
             let rw = ui.measure(cx, remove_spec, &remove_label) + 16.0;
             let remove = rect(r.pos.x + r.size.x - 8.0 - rw, r.pos.y + 12.0, rw, 32.0);
             let mut right = remove.pos.x - 8.0;
+            let use_label = tr("pairing.hosts.use");
             let use_rect = if !is_active {
-                let spec = ui.spec(Font::Medium, 14.0, p.accent);
-                let uw = ui.measure(cx, spec, "Use") + 16.0;
+                let spec = ui.spec(Font::Medium, 14.0, p.accent_bright);
+                let uw = ui.measure(cx, spec, &use_label) + 16.0;
                 let ur = rect(right - uw, r.pos.y + 12.0, uw, 32.0);
                 right = ur.pos.x - 8.0;
                 Some((ur, spec))
@@ -380,28 +380,31 @@ impl Sheet for ConnectionsSheet {
                 ui.hit(r, row_id);
             }
             let label_spec = ui.spec(Font::Regular, 14.0, p.foreground);
-            let tw = right - (r.pos.x + 16.0);
+            let tw = (right - (r.pos.x + 16.0)).max(0.0);
             if is_active {
                 ui.text(cx, rect(r.pos.x + 16.0, r.pos.y + 10.0, tw, 20.0), label_spec, &connection_label(connection));
                 let spec = ui.spec(Font::Regular, 12.0, p.muted);
-                ui.text(cx, rect(r.pos.x + 16.0, r.pos.y + 30.0, tw, 16.0), spec, "Active");
+                ui.text(cx, rect(r.pos.x + 16.0, r.pos.y + 30.0, tw, 16.0), spec, &tr("pairing.hosts.active"));
             } else {
                 ui.text(cx, rect(r.pos.x + 16.0, r.pos.y, tw, row_h), label_spec, &connection_label(connection));
             }
+            // Inner buttons sit on the row's hover fill: a distinct highlight, darker when pressed.
+            let button_fill = |ui: &mut Ui, cx: &mut Cx2d, id: &str, r: Rect| {
+                if enabled && (ui.is_hover(id) || ui.is_pressed(id)) {
+                    let fill = if ui.is_pressed(id) { with_alpha(p.foreground, 0.12) } else { p.interaction_highlight };
+                    ui.fill(cx, r, fill, 8.0);
+                }
+            };
             if let Some((ur, spec)) = use_rect {
                 let id = format!("use:{index}");
-                if enabled && ui.is_hover(&id) {
-                    ui.fill(cx, ur, p.surface2, 8.0);
-                }
-                ui.text_centered(cx, ur, spec, "Use");
+                button_fill(ui, cx, &id, ur);
+                ui.text_centered(cx, ur, spec, &use_label);
                 if enabled {
                     ui.hit(ur, id);
                 }
             }
             let id = format!("remove:{index}");
-            if enabled && ui.is_hover(&id) {
-                ui.fill(cx, remove, p.surface2, 8.0);
-            }
+            button_fill(ui, cx, &id, remove);
             ui.text_centered(cx, remove, remove_spec, &remove_label);
             if enabled {
                 ui.hit(remove, id);
@@ -447,16 +450,19 @@ impl Sheet for ConnectionsSheet {
             // `updateHost` with that connection makes it active.
             ops.core.connect_host(connection);
         } else if let Some(connection) = at("remove:") {
-            let message = tr_args("settings.host.connections.removeMessage", &[("name", &connection_label(&connection))]);
+            // The last connection removes the whole host; say so.
+            let (title, message, action) = if connections.len() <= 1 {
+                let label = hosts::host(&self.state, &self.host_id).map(|h| h.display_label()).unwrap_or_default();
+                (tr("settings.host.daemon.remove.title"), tr_args("settings.host.daemon.remove.confirmMessage", &[("name", &label)]), tr("settings.host.daemon.remove.title"))
+            } else {
+                (
+                    tr("settings.host.connections.removeTitle"),
+                    tr_args("settings.host.connections.removeMessage", &[("name", &connection_label(&connection))]),
+                    tr("settings.host.connections.removeAction"),
+                )
+            };
             self.pending_remove = Some(connection);
-            let confirm = ConfirmSheet::new(
-                ops,
-                &tr("settings.host.connections.removeTitle"),
-                &message,
-                &tr("settings.host.connections.removeAction"),
-                true,
-                "remove",
-            );
+            let confirm = ConfirmSheet::new(ops, &title, &message, &action, true, "remove");
             return SheetFlow::Push(Box::new(confirm));
         }
         SheetFlow::Stay

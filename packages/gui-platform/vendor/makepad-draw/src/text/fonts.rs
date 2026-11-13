@@ -100,6 +100,30 @@ impl Fonts {
         self.layouter.define_font_family(id, definition);
     }
 
+    /// Replaces the font list of an existing (or new) family at runtime. The
+    /// UI layouter drops the family and its layout cache; the catalog revision
+    /// advances so asynchronous layouts requested against the old list are not
+    /// published and the worker rebuilds the family for the next request.
+    /// Callers redraw afterwards; retained `Rc<LaidoutText>` values outside
+    /// the layouter keep the old fonts until they are laid out again.
+    pub fn redefine_font_family(&mut self, id: FontFamilyId, definition: FontFamilyDefinition) {
+        let catalog = Arc::make_mut(&mut self.catalog);
+        catalog.revision += 1;
+        catalog.families.insert(id, definition.clone());
+        self.layouter.redefine_font_family(id, definition);
+    }
+
+    /// The current font list of a family, as last defined or redefined.
+    pub fn font_family_definition(&self, id: FontFamilyId) -> Option<&FontFamilyDefinition> {
+        self.catalog.families.get(&id)
+    }
+
+    /// Loads a defined font on the UI layouter (e.g. to read its metrics).
+    /// `None` when the font is undefined or its face does not parse.
+    pub fn get_or_load_font(&mut self, id: FontId) -> Option<Rc<super::font::Font>> {
+        self.layouter.try_load_font(id)
+    }
+
     pub fn define_font(&mut self, id: FontId, definition: FontDefinition) {
         let catalog = Arc::make_mut(&mut self.catalog);
         catalog.revision += 1;

@@ -194,6 +194,9 @@ impl Cx {
             Win32Event::WindowCloseRequested(e) => {
                 self.call_event_handler(&Event::WindowCloseRequested(e))
             }
+            Win32Event::TextPasteShortcut(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextPasteShortcut(e))
+            }
             Win32Event::TextInput(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::TextInput(e))
             }

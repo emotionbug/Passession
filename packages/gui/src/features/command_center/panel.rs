@@ -16,7 +16,7 @@ use crate::common::widgets::{agent_status_bucket, StatusBucket, StatusMarkWidget
 use crate::features::files::kit::DrawFilesImage;
 use crate::common::{PanelTarget, TabPlacement, UiContext, UiEffect};
 use crate::features::workspace::host::{self, agent_of};
-use crate::features::workspace::i18n::{l, t, ta};
+use crate::features::workspace::i18n::{t, ta};
 use crate::features::workspace::identity::project_view_key;
 use crate::features::workspace::kit::{set_optional, set_project_icon, WaButtonWidgetRefExt, WaIconWidgetRefExt, WaInputWidgetExt, WaInputWidgetRefExt};
 use crate::features::workspace::rpc::{array_of, new_id, object_of, str_of, str_or, Pending};
@@ -447,26 +447,48 @@ impl CommandCenterPanel {
         let command = |action: &str, args: Value| Run::Command(action.to_owned(), args);
         let mut out = Vec::new();
         if let Some(host_id) = &host_id {
-            let target = PanelTarget::new("new_tab", host_id, "", "").with_id(new_id()).with_title(l("Add project")).with_data(json!({ "addProject": true }));
+            let target = PanelTarget::new("new_tab", host_id, "", "").with_id(new_id()).with_data(json!({ "addProject": true }));
             out.push(root(
                 "add-project",
                 0,
                 t("shell.commandCenter.addProject"),
                 "folder-plus",
-                &["open", "project", "folder", "workspace", "repo"],
+                &["open", "project", "folder", "workspace", "repo", "프로젝트", "폴더", "열기", "저장소"],
                 Run::Effect(UiEffect::OpenTab { target, placement: TabPlacement::Main }),
                 true,
                 "new-agent",
             ));
         }
-        out.push(root("new-workspace", 1, t("sidebar.actions.newWorkspace"), "plus", &["new", "workspace", "worktree", "branch"], command("workspace.new", Value::Null), false, "new-workspace"));
+        out.push(root("new-workspace", 1, t("sidebar.actions.newWorkspace"), "plus", &["new", "workspace", "worktree", "branch", "새", "워크스페이스", "세션"], command("workspace.new", Value::Null), false, "new-workspace"));
+        out.push(root(
+            "new-worktree",
+            1,
+            t("shell.commandCenter.newWorktreeSession"),
+            "git-branch-plus",
+            &["new", "worktree", "branch", "session", "새", "워크트리", "브랜치", "세션"],
+            command("worktree.new", Value::Null),
+            false,
+            "new-worktree",
+        ));
+        if let Some(effect) = next_attention(ctx, selected.as_ref()) {
+            out.push(root(
+                "next-attention",
+                3,
+                t("shell.commandCenter.nextAttention"),
+                "bell-ring",
+                &["next", "attention", "input", "permission", "waiting", "needs", "다음", "입력", "권한", "대기", "확인"],
+                Run::Effect(effect),
+                false,
+                "next-attention",
+            ));
+        }
         if let Some(host_id) = &host_id {
             out.push(root(
                 "import-session",
                 2,
                 t("importSession.title"),
                 "import",
-                &["import", "session", "terminal"],
+                &["import", "session", "terminal", "가져오기", "세션", "터미널"],
                 command("session.import", json!({ "serverId": host_id })),
                 false,
                 "",
@@ -476,7 +498,7 @@ impl CommandCenterPanel {
                 4,
                 t("sidebar.sections.sessions"),
                 "history",
-                &["history", "sessions", "recent"],
+                &["history", "sessions", "recent", "기록", "세션", "최근"],
                 Run::Effect(UiEffect::Navigate(crate::common::Route::Sessions { host_id: None })),
                 false,
                 "",
@@ -487,21 +509,38 @@ impl CommandCenterPanel {
             5,
             t("sidebar.sections.schedules"),
             "calendar-clock",
-            &["schedules", "scheduled", "automation", "recurring"],
+            &["schedules", "scheduled", "automation", "recurring", "일정", "예약", "자동화", "반복"],
             Run::Effect(UiEffect::Navigate(crate::common::Route::Schedules { host_id: host_id.clone().unwrap_or_default() })),
             false,
             "",
         ));
-        out.push(root("settings", 6, t("sidebar.actions.settings"), "settings", &["settings", "preferences", "config", "configuration"], command("settings.toggle", Value::Null), false, "toggle-settings"));
+        out.push(root("settings", 6, t("sidebar.actions.settings"), "settings", &["settings", "preferences", "config", "configuration", "설정", "환경설정", "구성"], command("settings.toggle", Value::Null), false, "toggle-settings"));
         if shortcuts {
-            out.push(root("keyboard-shortcuts", 7, t("sidebar.help.shortcuts"), "keyboard", &["keyboard", "shortcuts", "keys", "hotkeys"], command("shortcuts.dialog.toggle", Value::Null), false, "show-shortcuts"));
+            out.push(root("keyboard-shortcuts", 7, t("sidebar.help.shortcuts"), "keyboard", &["keyboard", "shortcuts", "keys", "hotkeys", "단축키", "키보드"], command("shortcuts.dialog.toggle", Value::Null), false, "show-shortcuts"));
         }
+        out.push(root("cycle-theme", 9, t("settings.shortcuts.help.cycleTheme"), "sun-moon", &["theme", "dark", "light", "appearance", "mode", "테마", "다크", "라이트", "모양"], command("theme.cycle", Value::Null), false, "cycle-theme"));
+        out.push(root("add-host", 10, t("settings.addHost"), "server", &["add", "host", "connect", "daemon", "connection", "호스트", "추가", "연결", "데몬"], Run::Effect(UiEffect::OpenHostDialog), false, ""));
+        if !host::is_mobile()
+            && let Some(host_id) = &host_id
+        {
+            out.push(root(
+                "pair-device",
+                11,
+                t("openProject.tiles.pairDevice.title"),
+                "smartphone",
+                &["pair", "device", "phone", "mobile", "qr", "페어링", "기기", "휴대폰", "모바일"],
+                Run::Effect(UiEffect::OpenHostPairing { host_id: host_id.clone() }),
+                false,
+                "",
+            ));
+        }
+        out.extend(settings_pages(host_id.as_deref()));
         out.push(root(
             "toggle-left-sidebar",
             8,
             t("settings.shortcuts.help.toggleLeftSidebar"),
             "panel-left",
-            &["toggle", "sidebar", "left", "panel", "workspaces"],
+            &["toggle", "sidebar", "left", "panel", "workspaces", "사이드바", "토글"],
             command("sidebar.toggle.left", Value::Null),
             true,
             "toggle-left-sidebar",
@@ -549,7 +588,9 @@ impl CommandCenterPanel {
         }
         if is_git {
             out.push(item("tab:open:changes", 4, open("workspace.tabs.actions.changes"), "git-compare-arrows", kw(&["open", "changes", "tab", "supporting"]), command("workspace.tab.target.changes", Value::Null), true, ""));
-            out.push(item("tab:open:git-log", 3, t("workspace.git.log.open"), "git-graph", kw(&["open", "git", "log", "history", "graph", "branches", "commits", "dashboard"]), command("workspace.tab.target.gitLog", Value::Null), false, ""));
+            if host.is_some_and(|h| h.supports("gitLog")) {
+                out.push(item("tab:open:git-log", 3, t("workspace.git.log.open"), "git-graph", kw(&["open", "git", "log", "history", "graph", "branches", "commits", "dashboard", "깃", "로그", "커밋", "브랜치", "그래프"]), command("workspace.tab.target.gitLog", Value::Null), false, ""));
+            }
         }
         out.push(item("tab:open:files", 5, open("workspace.tabs.actions.files"), "files", kw(&["open", "files", "tab", "supporting"]), command("workspace.tab.target.files", Value::Null), true, ""));
         if !tab_keys.is_empty() {
@@ -629,6 +670,10 @@ impl CommandCenterPanel {
         } else {
             Run::Effect(UiEffect::CopyText { text: path.clone(), toast: Some(t("sidebar.workspace.toasts.pathCopied")) })
         };
+        if workspace.is_some() {
+            // Query-only: archiving is never one stray Enter away.
+            out.push(item("workspace:archive", 21, t("settings.shortcuts.help.archiveWorkspace"), "archive", kw(&["archive", "workspace", "close", "remove", "보관", "워크스페이스", "닫기"]), command("workspace.archive", Value::Null), true, "archive-workspace"));
+        }
         out.push(item("workspace:copy-path", 22, t("workspace.header.actions.copyPath"), "copy", kw(&["copy", "path", "directory", "folder", "cwd"]), copy_path, true, ""));
         if !branch.is_empty() {
             let mut words = kw(&["copy", "branch", "git"]);
@@ -828,6 +873,19 @@ impl CommandCenterPanel {
         set_optional(cx, &view.widget(id!(file_error)), &error);
         let empty = self.projection.as_ref().is_some_and(|p| p.rows.is_empty()) && !self.file_loading && self.file_error.is_none();
         set_optional(cx, &view.widget(id!(no_matches)), if empty { t("shell.commandCenter.noMatches") } else { String::new() }.as_str());
+        // Key-hint footer: desktop layouts only (phones and compact windows have no keys to hint).
+        let footer = if host::is_mobile() || self.compact {
+            String::new()
+        } else {
+            let mut text = t("shell.commandCenter.keyHints");
+            let files = Self::shortcut(ctx, "search-files");
+            if !self.files_scope && !files.is_empty() {
+                text = format!("{text} · {}", ta("shell.commandCenter.filesHint", &[("shortcut", &files)]));
+            }
+            text
+        };
+        view.widget(id!(footer_rule)).set_visible(cx, !footer.is_empty());
+        set_optional(cx, &view.widget(id!(footer)), &footer);
         // Reveal the active row once per user command.
         if self.reveal_pending {
             if let (Some(projection), Some(active)) = (&self.projection, &self.active_id) && let Some(index) = projection.rows.iter().position(|r| row_id(r).as_deref() == Some(active.as_str())) {
@@ -949,6 +1007,83 @@ fn row_id(row: &ListRow) -> Option<String> {
     }
 }
 
+/// "Next session needing input": across hosts, the top-level session that needs attention
+/// most (permission, error, finished; oldest first), skipping the session already shown.
+fn next_attention(ctx: &UiContext, selected: Option<&PanelTarget>) -> Option<UiEffect> {
+    let current = selected.filter(|t| t.kind == "agent").and_then(|t| t.id.clone().map(|id| (t.server_id.clone(), id)));
+    let mut candidates: Vec<(String, &Value)> = Vec::new();
+    let hosts = host::hosts(&ctx.state);
+    for h in &hosts {
+        for entry in h.agents() {
+            let agent = agent_of(entry);
+            if !listed_agent(agent) || !str_of(object_of(agent, "labels"), "paseo.parent-agent-id").trim().is_empty() {
+                continue;
+            }
+            if current.as_ref().is_some_and(|(server, id)| server == h.id() && id == str_of(agent, "id")) {
+                continue;
+            }
+            candidates.push((h.id().to_owned(), agent));
+        }
+    }
+    let chosen = results::pick_attention_agent(candidates.iter().map(|(_, agent)| *agent))?;
+    let (host_id, agent) = candidates.iter().find(|(_, agent)| std::ptr::eq(*agent, chosen))?;
+    let target = crate::shell::commands::navigation_agent_target(host_id, agent, None);
+    Some(UiEffect::OpenTab { target, placement: TabPlacement::Main })
+}
+
+/// Settings pages as query-only rows: (route page, label key, icon, English + Korean keywords).
+const SETTINGS_PAGES: &[(&str, &str, &str, &[&str])] = &[
+    ("general", "settings.sections.general", "settings", &["general", "language", "send", "terminal", "scrollback", "일반", "언어", "전송", "터미널", "스크롤백"]),
+    ("appearance", "settings.sections.appearance", "palette", &["appearance", "theme", "dark", "light", "font", "모양", "테마", "다크", "라이트", "글꼴"]),
+    ("sidebar", "settings.sections.sidebar", "panel-left", &["sidebar", "navigation", "사이드바", "탐색"]),
+    ("chat", "settings.sections.chat", "message-square", &["chat", "reasoning", "outline", "tool", "채팅", "추론", "개요", "도구"]),
+    ("files", "settings.sections.files", "files", &["files", "file", "panels", "markdown", "파일", "패널"]),
+    ("shortcuts", "settings.sections.shortcuts", "keyboard", &["shortcuts", "keys", "keybindings", "hotkeys", "단축키", "키보드"]),
+    ("notifications", "settings.sections.notifications", "bell", &["notifications", "sound", "alerts", "permission", "알림", "소리", "권한"]),
+    ("diagnostics", "settings.sections.diagnostics", "stethoscope", &["diagnostics", "debug", "logs", "진단", "디버그", "로그"]),
+    ("about", "settings.sections.about", "info", &["about", "version", "update", "정보", "버전", "업데이트"]),
+    ("host/host", "settings.hostSections.host", "server", &["host", "overview", "daemon", "restart", "relay", "호스트", "개요", "데몬", "재시작", "릴레이"]),
+    ("host/projects", "settings.hostSections.projects", "folder-git-2", &["projects", "workspaces", "archive", "프로젝트", "워크스페이스", "보관"]),
+    ("host/connections", "settings.hostSections.connections", "network", &["connections", "pair", "qr", "device", "ssh", "relay", "연결", "페어링", "기기", "휴대폰"]),
+    ("host/agents", "settings.hostSections.agents", "bot", &["agents", "skills", "prompt", "profiles", "mcp", "에이전트", "스킬", "프롬프트", "프로필"]),
+    ("host/metadata", "settings.hostSections.metadata", "sparkles", &["metadata", "titles", "generation", "메타데이터", "제목", "생성"]),
+    ("host/providers", "settings.hostSections.providers", "boxes", &["providers", "models", "claude", "codex", "프로바이더", "모델"]),
+    ("host/usage", "settings.hostSections.usage", "gauge", &["usage", "limits", "tokens", "cost", "사용량", "한도", "토큰", "비용"]),
+    ("host/terminals", "settings.hostSections.terminals", "square-terminal", &["terminals", "profiles", "hooks", "터미널", "프로필", "훅"]),
+    ("host/plugins", "settings.hostSections.plugins", "plug", &["plugins", "extensions", "플러그인", "확장"]),
+];
+
+/// One query-only row per settings page; host pages need a host and open on `host_id`.
+fn settings_pages(host_id: Option<&str>) -> Vec<Contribution> {
+    const DESKTOP_ONLY: [&str; 2] = ["shortcuts", "notifications"];
+    let section = t("sidebar.actions.settings");
+    let mut out = Vec::new();
+    for (index, &(page, label, icon, keywords)) in SETTINGS_PAGES.iter().enumerate() {
+        let host_page = page.starts_with("host/");
+        if (host::is_mobile() && DESKTOP_ONLY.contains(&page)) || (host_page && host_id.is_none()) {
+            continue;
+        }
+        let title = ta(if host_page { "shell.commandCenter.hostSettingsPage" } else { "shell.commandCenter.settingsPage" }, &[("name", &t(label))]);
+        let mut words: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+        words.extend(["settings", "설정"].map(String::from));
+        let route = crate::common::Route::Settings { host_id: if host_page { host_id.map(str::to_owned) } else { None }, page: page.to_owned() };
+        out.push(Contribution {
+            id: format!("settings:{page}"),
+            group: "settings".into(),
+            group_rank: 1,
+            rank: index as i64,
+            keywords: words,
+            query_only: true,
+            title,
+            section_title: section.clone(),
+            icon,
+            shortcut: String::new(),
+            run: Run::Effect(UiEffect::Navigate(route)),
+        });
+    }
+    out
+}
+
 /// `navigateToWorkspace` without a target: the workspace agent that needs attention most
 /// opens first; otherwise its most recently active session, or a new session tab.
 fn open_workspace(ctx: &UiContext, host_id: &str, workspace: &Value) -> UiEffect {
@@ -957,7 +1092,7 @@ fn open_workspace(ctx: &UiContext, host_id: &str, workspace: &Value) -> UiEffect
         .map(|h| h.agents().iter().map(agent_of).filter(|a| str_of(a, "workspaceId") == id).collect())
         .unwrap_or_default();
     let top_level = agents.iter().copied().filter(|a| str_of(object_of(a, "labels"), "paseo.parent-agent-id").trim().is_empty());
-    if let Some(agent_id) = results::pick_attention_agent(top_level) && let Some(agent) = agents.iter().find(|a| str_of(a, "id") == agent_id) {
+    if let Some(agent) = results::pick_attention_agent(top_level) {
         let target = crate::shell::commands::navigation_agent_target(host_id, agent, None);
         return UiEffect::OpenTab { target, placement: TabPlacement::Main };
     }
@@ -972,7 +1107,7 @@ fn open_workspace(ctx: &UiContext, host_id: &str, workspace: &Value) -> UiEffect
         let target = crate::shell::commands::navigation_agent_target(host_id, agent, None);
         return UiEffect::OpenTab { target, placement: TabPlacement::Main };
     }
-    let target = PanelTarget::new("new_tab", host_id, id, str_of(workspace, "workspaceDirectory")).with_id(new_id()).with_title(l("New session"));
+    let target = PanelTarget::new("new_tab", host_id, id, str_of(workspace, "workspaceDirectory")).with_id(new_id());
     UiEffect::OpenTab { target, placement: TabPlacement::Main }
 }
 

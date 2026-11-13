@@ -142,6 +142,36 @@ fn full_schema_catalog_retains_extensions_and_rejects_nested_errors() {
 }
 
 #[test]
+fn terminal_and_listing_metadata_remain_optional_and_lossless() {
+    let old_exit = json!({"type":"terminal_stream_exit","payload":{"terminalId":"t"}});
+    let mut new_exit = old_exit.clone();
+    new_exit["payload"]["exitCode"] = json!(7);
+    let old_listing = json!({"type":"file_explorer_response","payload":{
+        "cwd":"/work","path":".","mode":"list","directory":{"path":".","entries":[]},
+        "file":null,"error":null,"requestId":"r"
+    }});
+    let mut new_listing = old_listing.clone();
+    new_listing["payload"]["directory"]["absolutePath"] = json!("/work");
+    for value in [old_exit, new_exit.clone(), old_listing, new_listing.clone()] {
+        let message = SessionMessage::parse(value.clone(), Direction::Outbound).unwrap();
+        assert_eq!(message.clone().into_value(), value);
+        let envelope = message.into_envelope();
+        let bytes = encode_envelope(&envelope, Direction::Outbound).unwrap();
+        assert_eq!(parse_envelope(&bytes, Direction::Outbound).unwrap(), envelope);
+    }
+    new_exit["payload"]["exitCode"] = json!("7");
+    assert!(validate_session(&new_exit, Direction::Outbound).is_err());
+    new_listing["payload"]["directory"]["absolutePath"] = json!(false);
+    assert!(validate_session(&new_listing, Direction::Outbound).is_err());
+    let mut snapshot = json!({"rows":1,"cols":1,"grid":[[]],"scrollback":[],"cursor":{"row":0,"col":0}});
+    assert!(validate_terminal_snapshot(&snapshot).is_ok());
+    snapshot["alternateScreen"] = json!(true);
+    assert!(validate_terminal_snapshot(&snapshot).is_ok());
+    snapshot["alternateScreen"] = json!("true");
+    assert!(validate_terminal_snapshot(&snapshot).is_err());
+}
+
+#[test]
 fn native_plugin_review_targets_are_complete_and_npm_writes_are_rejected() {
     let identity = json!({"kind":"cargo","crateName":"paseo-demo","pluginPath":""});
     let target = json!({"kind":"cargo","version":"1.2.3","checksum":"a".repeat(64),"resolved":"https://static.crates.io/crates/paseo-demo/paseo-demo-1.2.3.crate"});

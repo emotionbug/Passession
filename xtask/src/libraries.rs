@@ -254,9 +254,9 @@ pub fn native(runtime: &Path) -> Result<()> {
 
 /// Libraries the desktop client opens with `dlopen` (paseo-gui-platform): X11
 /// idle time and close-to-tray withdraw (`libX11`, `libXss`) and XSMP logout
-/// without a GNOME SessionManager (`libSM`, `libICE`). The Debian package
-/// declares the same set in `package.rs`.
-pub const LINUX_DLOPENED: [&str; 4] = ["libX11.so.6", "libXss.so.1", "libSM.so.6", "libICE.so.6"];
+/// without a GNOME SessionManager (`libSM`, `libICE`), plus system-font discovery
+/// (`libfontconfig`). The Debian package declares the same set in `package.rs`.
+pub const LINUX_DLOPENED: [&str; 5] = ["libX11.so.6", "libXss.so.1", "libSM.so.6", "libICE.so.6", "libfontconfig.so.1"];
 
 /// Host path of a system soname for the build architecture, from the
 /// dynamic linker cache.

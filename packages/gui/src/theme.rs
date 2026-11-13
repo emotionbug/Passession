@@ -299,7 +299,20 @@ struct Raw {
     accent: u32,
     accent_bright: u32,
     destructive: u32,
+    status: Status,
 }
+
+/// Status text colours: diff removal, danger, warning and success. They are text on every
+/// surface, so a palette with lighter surfaces (ghostty) lifts them to keep 4.5:1.
+struct Status {
+    removed: u32,
+    danger: u32,
+    warning: u32,
+    success: u32,
+}
+
+const DARK_STATUS: Status = Status { removed: 0xfff87171, danger: 0xffd8847b, warning: 0xffc09664, success: 0xff6cb17b };
+const LIGHT_STATUS: Status = Status { removed: 0xffb91c1c, danger: 0xff9d433b, warning: 0xff7b5d39, success: 0xff3e704a };
 
 fn dark_raw(name: &str) -> (Raw, u32) {
     match name {
@@ -313,6 +326,7 @@ fn dark_raw(name: &str) -> (Raw, u32) {
                 accent: 0xffe4e4e7,
                 accent_bright: 0xfffafafa,
                 destructive: 0xffc44a4a,
+                status: DARK_STATUS,
             },
             0xff303036,
         ),
@@ -321,11 +335,12 @@ fn dark_raw(name: &str) -> (Raw, u32) {
                 surfaces: [0xff161820, 0xff1c1e27, 0xff252731, 0xff3c3e4c, 0xff535564],
                 sidebar: 0xff121420,
                 muted: 0xff9a9db0,
-                extra_muted: 0xff6b6e82,
+                extra_muted: 0xff71748a,
                 border: 0xff242636,
                 accent: 0xff3b6fcf,
                 accent_bright: 0xff7eaaeb,
                 destructive: 0xffc44a52,
+                status: DARK_STATUS,
             },
             0xff2e3040,
         ),
@@ -334,11 +349,12 @@ fn dark_raw(name: &str) -> (Raw, u32) {
                 surfaces: [0xff1f1f1e, 0xff262523, 0xff2f2d2b, 0xff4a4745, 0xff605d5b],
                 sidebar: 0xff1a1918,
                 muted: 0xffada9a5,
-                extra_muted: 0xff78746f,
+                extra_muted: 0xff7e7a75,
                 border: 0xff2c2a27,
                 accent: 0xffd97757,
                 accent_bright: 0xffe89a7f,
-                destructive: 0xffcf513e,
+                destructive: 0xffbd4636,
+                status: DARK_STATUS,
             },
             0xff36332f,
         ),
@@ -352,6 +368,7 @@ fn dark_raw(name: &str) -> (Raw, u32) {
                 accent: 0xff89b4fa,
                 accent_bright: 0xffb4d0fc,
                 destructive: 0xffc44a55,
+                status: Status { removed: 0xfffa9090, danger: 0xffe2968e, warning: 0xffcca474, success: 0xff7cc08a },
             },
             0xff3f4454,
         ),
@@ -365,6 +382,7 @@ fn dark_raw(name: &str) -> (Raw, u32) {
                 accent: 0xff20744a,
                 accent_bright: 0xff7ccba0,
                 destructive: 0xffc44a4a,
+                status: DARK_STATUS,
             },
             0xff242424,
         ),
@@ -378,6 +396,7 @@ fn dark_raw(name: &str) -> (Raw, u32) {
                 accent: 0xff20744a,
                 accent_bright: 0xff7ccba0,
                 destructive: 0xffc64f43,
+                status: DARK_STATUS,
             },
             0xff2f3534,
         ),
@@ -387,12 +406,13 @@ fn dark_raw(name: &str) -> (Raw, u32) {
 const LIGHT: Raw = Raw {
     surfaces: [0xffffffff, 0xfffafafa, 0xfff4f4f5, 0xffe4e4e7, 0xffd4d4d8],
     sidebar: 0xfff4f4f5,
-    muted: 0xff71717a,
-    extra_muted: 0xffa1a1aa,
+    muted: 0xff6b6b74,
+    extra_muted: 0xff8a8a92,
     border: 0xffe4e4e7,
     accent: 0xff20744a,
-    accent_bright: 0xff239956,
+    accent_bright: 0xff1b7a45,
     destructive: 0xffb04138,
+    status: LIGHT_STATUS,
 };
 
 /// Original THEME_OPTIONS literals: stored names to the built-in palette key.
@@ -425,12 +445,26 @@ pub fn theme_mode(preferences: &Value) -> Option<bool> {
     None
 }
 
+/// WCAG 2.x relative luminance of an opaque colour.
+pub fn luminance(color: Vec4) -> f32 {
+    fn channel(c: f32) -> f32 {
+        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    }
+    0.2126 * channel(color.x) + 0.7152 * channel(color.y) + 0.0722 * channel(color.z)
+}
+
+/// WCAG 2.x contrast ratio between two opaque colours (1.0..=21.0).
+pub fn contrast(a: Vec4, b: Vec4) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
 /// `paseoTheme(brightness:, preferences:)` colours.
 pub fn palette_for(preferences: &Value, dark: bool) -> Palette {
     let name = palette_name(preferences.get("theme").and_then(Value::as_str).unwrap_or(""));
     let (raw, border_accent) = if dark { dark_raw(name) } else { (LIGHT, 0xffececf1) };
-    let zinc_dark = dark && name == "zinc";
     let foreground = if dark { argb(0xfffafafa) } else { argb(0xff1a1a1e) };
+    let accent = argb(raw.accent);
     let surface0 = argb(raw.surfaces[0]);
     let surface1 = argb(raw.surfaces[1]);
     let surface2 = argb(raw.surfaces[2]);
@@ -448,23 +482,24 @@ pub fn palette_for(preferences: &Value, dark: bool) -> Palette {
         selected: if dark { surface2 } else { surface4 },
         muted: argb(raw.muted),
         extra_muted: argb(raw.extra_muted),
-        accent: argb(raw.accent),
+        accent,
         accent_bright: argb(raw.accent_bright),
         added: if dark { argb(0xff4ade80) } else { argb(0xff15803d) },
-        removed: if dark { argb(0xffef4444) } else { argb(0xffb91c1c) },
-        success: if dark { argb(0xff6cb17b) } else { argb(0xff3e704a) },
-        danger: if dark { argb(0xffd8847b) } else { argb(0xff9d433b) },
-        warning: if dark { argb(0xffc09664) } else { argb(0xff7b5d39) },
+        removed: argb(raw.status.removed),
+        success: argb(raw.status.success),
+        danger: argb(raw.status.danger),
+        warning: argb(raw.status.warning),
         running: if dark { argb(0xff5caaf6) } else { argb(0xff268ae0) },
         border: argb(raw.border),
         border_accent: argb(border_accent),
         foreground,
         primary: if dark { foreground } else { argb(0xff18181b) },
         on_primary: if dark { surface0 } else { argb(0xfffafafa) },
-        on_tertiary: if zinc_dark { surface0 } else { argb(0xffffffff) },
+        // Text on accent fills: white, unless the accent is light (zinc, ghostty, claude).
+        on_tertiary: if contrast(argb(0xffffffff), accent) >= contrast(surface0, accent) { argb(0xffffffff) } else { surface0 },
         destructive: argb(raw.destructive),
         interaction_highlight: if dark { argb(0x14ffffff) } else { argb(0x0f000000) },
-        field_error: argb(0xfffca5a5),
+        field_error: if dark { argb(0xfffca5a5) } else { argb(0xffb91c1c) },
         scrim: argb(0x73000000),
         merged: if dark { argb(0xffa78bfa) } else { argb(0xff7c3aed) },
         background: if dark { surface1 } else { surface0 },
@@ -567,6 +602,12 @@ pub fn epoch() -> u64 {
     CURRENT.with(|current| current.borrow().epoch)
 }
 
+/// Invalidates epoch-keyed caches (layout keys, measured fields) without a palette/typography
+/// change, e.g. after fonts are redefined.
+pub fn bump_epoch() {
+    CURRENT.with(|current| current.borrow_mut().epoch += 1);
+}
+
 /// Runs `apply` (typically `widget.apply_over(cx, live!{…})`) once per theme change.
 pub fn apply_if_changed(
     seen_epoch: &mut u64,
@@ -619,5 +660,55 @@ mod tests {
         assert!(update_with_text_scale(&preferences, false, TextScale::default()));
         assert_eq!(current_typography(), normal);
         assert_eq!(control_height(ControlSize::Sm), original_height);
+    }
+
+    /// WCAG minimums for the text and icon tokens on every surface they are drawn on: 4.5:1
+    /// for text, 3:1 for icons and focus borders.
+    #[test]
+    fn every_palette_meets_text_and_icon_contrast() {
+        let themes = ["dark", "dark-zinc", "dark-midnight", "dark-claude", "dark-ghostty", "dark-pure-black", "light"];
+        let mut failures = Vec::new();
+        for theme in themes {
+            let p = palette_for(&json!({ "theme": theme }), theme != "light");
+            let backgrounds = [("surface0", p.surface0), ("surface1", p.surface1), ("surface2", p.surface2), ("sidebar", p.sidebar), ("dialog", p.dialog)];
+            let text = [
+                ("foreground", p.foreground),
+                ("muted", p.muted),
+                ("accent_bright", p.accent_bright),
+                ("danger", p.danger),
+                ("warning", p.warning),
+                ("success", p.success),
+                ("field_error", p.field_error),
+                ("removed", p.removed),
+                ("added", p.added),
+            ];
+            let icons = [("extra_muted", p.extra_muted), ("running", p.running), ("merged", p.merged)];
+            for (bg_name, bg) in backgrounds {
+                for (name, color) in text {
+                    let ratio = contrast(color, bg);
+                    if ratio < 4.5 {
+                        failures.push(format!("{theme}: {name} on {bg_name} = {ratio:.2}"));
+                    }
+                }
+                for (name, color) in icons {
+                    let ratio = contrast(color, bg);
+                    if ratio < 3.0 {
+                        failures.push(format!("{theme}: {name} on {bg_name} = {ratio:.2}"));
+                    }
+                }
+            }
+            for (name, fg, bg, min) in [
+                ("on_tertiary on accent", p.on_tertiary, p.accent, 4.5),
+                ("white on destructive", argb(0xffffffff), p.destructive, 4.5),
+                ("on_primary on primary", p.on_primary, p.primary, 4.5),
+                ("focus border (muted) on surface2", p.muted, p.surface2, 3.0),
+            ] {
+                let ratio = contrast(fg, bg);
+                if ratio < min {
+                    failures.push(format!("{theme}: {name} = {ratio:.2}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "contrast below WCAG minimums:\n{}", failures.join("\n"));
     }
 }

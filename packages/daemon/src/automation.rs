@@ -452,8 +452,16 @@ impl AutomationService {
         Ok(completed)
     }
     pub async fn run_once(&self, id: &str) -> Result<Value> {
-        self.run(id, true, self.now()).await?;
-        self.inspect(id).await
+        let service = self.app()?.automation.clone();
+        let id = id.to_owned();
+        // A socket only owns the reply; it must not abandon an admitted run's
+        // durable outcome and workspace cleanup when it disconnects.
+        tokio::spawn(async move {
+            service.run(&id, true, service.now()).await?;
+            service.inspect(&id).await
+        })
+        .await
+        .map_err(|error| anyhow!("Scheduled run operation terminated: {error}"))?
     }
     pub async fn tick(&self) -> Result<()> {
         let now = self.now();

@@ -204,10 +204,10 @@ impl<'a> Ui<'a> {
         }
         let muted = muted && enabled;
         let opacity = if !enabled { 0.5 } else if muted { 0.72 } else { 1.0 };
-        let fg = fade(if muted { p.muted } else if destructive { p.destructive } else { p.foreground }, opacity);
+        let fg = fade(if muted { p.muted } else if destructive { p.danger } else { p.foreground }, opacity);
         let mut x = body.pos.x + 8.0;
         let mid = body.pos.y + body.size.y * 0.5;
-        let glyph_color = fade(if destructive { p.destructive } else { p.muted }, opacity);
+        let glyph_color = fade(if destructive { p.danger } else { p.muted }, opacity);
         match lead {
             RowLead::None => {}
             RowLead::Dot(color) => {

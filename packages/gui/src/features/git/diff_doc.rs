@@ -292,6 +292,61 @@ pub struct DiffDoc {
     /// A mouse drag is extending the selection; the pointer drives
     /// edge auto-scroll while it is outside the viewport.
     pub drag_pointer: Option<DVec2>,
+    /// Scrollbar tracks (pointer zones) and thumbs of the last draw; empty
+    /// while that axis does not scroll.
+    bars: [ScrollBar; 2],
+    /// A dragged thumb: its axis, the pointer coordinate and scroll at the press.
+    bar_drag: Option<(Axis, f64, f64)>,
+    /// The track under the pointer (its thumb widens).
+    pub bar_hovered: Option<Axis>,
+}
+
+/// A scrollbar direction of the document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    Vertical,
+    Horizontal,
+}
+
+impl Axis {
+    fn index(self) -> usize {
+        match self {
+            Axis::Vertical => 0,
+            Axis::Horizontal => 1,
+        }
+    }
+
+    /// The coordinate of `point` along this axis.
+    fn along(self, point: DVec2) -> f64 {
+        match self {
+            Axis::Vertical => point.y,
+            Axis::Horizontal => point.x,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScrollBar {
+    track: Rect,
+    thumb: Rect,
+}
+
+/// Scrollbar geometry: the pointer zone along an edge, the drawn thumb's
+/// thickness (wider while hovered or dragged), and the shortest thumb.
+const BAR_ZONE: f64 = 12.0;
+const BAR_THICKNESS: f64 = 6.0;
+const BAR_ACTIVE_THICKNESS: f64 = 9.0;
+const BAR_MIN_THUMB: f64 = 24.0;
+
+/// A thumb's offset and length along a `track` long track for `scroll` of
+/// `max` over content `view + max` long.
+fn thumb_span(track: f64, view: f64, max: f64, scroll: f64) -> (f64, f64) {
+    if track <= 0.0 || max <= 0.0 {
+        return (0.0, track.max(0.0));
+    }
+    let length = (view / (view + max) * track).clamp(BAR_MIN_THUMB.min(track), track);
+    let offset = (scroll / max).clamp(0.0, 1.0) * (track - length);
+    (offset, length)
 }
 
 impl Default for DiffDoc {
@@ -316,6 +371,9 @@ impl Default for DiffDoc {
             collapsed: HashSet::new(),
             selection: None,
             drag_pointer: None,
+            bars: [ScrollBar::default(); 2],
+            bar_drag: None,
+            bar_hovered: None,
         }
     }
 }
@@ -341,7 +399,7 @@ fn gutter_width(max_line: i64) -> f64 {
 
 /// A hidden-context row's label (selectable text of the expand row).
 fn hidden_label(start: usize, end: usize) -> String {
-    format!("Expand {} unchanged lines", end - start - 6)
+    super::text::tr("workspace.git.diff.expandUnchanged", &[("count", (end - start - 6).to_string())])
 }
 
 /// The gutter number a cell shows.
@@ -372,6 +430,19 @@ impl DiffDoc {
 
     pub fn viewport(&self) -> Rect {
         self.viewport
+    }
+
+    /// Hidden documents must not retain pointer targets over a replacement state.
+    pub fn hide(&mut self) {
+        self.viewport = Rect::default();
+        self.bars = [ScrollBar::default(); 2];
+        self.bar_drag = None;
+        self.bar_hovered = None;
+        self.drag_pointer = None;
+        self.hovered = None;
+        self.selection = None;
+        self.pieces.clear();
+        self.hits.clear();
     }
 
     /// The selection in reading order, when it covers any text.
@@ -529,6 +600,109 @@ impl DiffDoc {
             self.scroll_x = 0.0;
         }
         before != (self.scroll_x, self.scroll_y)
+    }
+
+    fn max_scroll(&self, axis: Axis) -> f64 {
+        match axis {
+            Axis::Vertical => (self.content_height - self.viewport.size.y).max(0.0),
+            Axis::Horizontal => (self.content_width - self.viewport.size.x).max(0.0),
+        }
+    }
+
+    fn scroll_of(&mut self, axis: Axis) -> &mut f64 {
+        match axis {
+            Axis::Vertical => &mut self.scroll_y,
+            Axis::Horizontal => &mut self.scroll_x,
+        }
+    }
+
+    /// The scrollbar track under `point`.
+    pub fn bar_at(&self, point: DVec2) -> Option<Axis> {
+        [Axis::Vertical, Axis::Horizontal].into_iter().find(|axis| {
+            let track = self.bars[axis.index()].track;
+            track.size.x > 0.0 && track.size.y > 0.0 && track.contains(point)
+        })
+    }
+
+    /// A press on a scrollbar: on the thumb it starts a drag, elsewhere on the
+    /// track it pages toward the pointer. Returns false off the scrollbars.
+    pub fn press_bar(&mut self, point: DVec2) -> bool {
+        let Some(axis) = self.bar_at(point) else { return false };
+        let bar = self.bars[axis.index()];
+        let start = *self.scroll_of(axis);
+        if bar.thumb.contains(point) {
+            self.bar_drag = Some((axis, axis.along(point), start));
+            return true;
+        }
+        let view = match axis {
+            Axis::Vertical => self.viewport.size.y,
+            Axis::Horizontal => self.viewport.size.x,
+        };
+        let page = (view * 0.9).max(1.0);
+        let before = axis.along(bar.thumb.pos) > axis.along(point);
+        let max = self.max_scroll(axis);
+        let scroll = self.scroll_of(axis);
+        *scroll = (*scroll + if before { -page } else { page }).clamp(0.0, max);
+        true
+    }
+
+    /// Moves the dragged thumb with the pointer; returns true while dragging.
+    pub fn drag_bar(&mut self, point: DVec2) -> bool {
+        let Some((axis, origin, start)) = self.bar_drag else { return false };
+        let bar = self.bars[axis.index()];
+        let (track, thumb) = match axis {
+            Axis::Vertical => (bar.track.size.y, bar.thumb.size.y),
+            Axis::Horizontal => (bar.track.size.x, bar.thumb.size.x),
+        };
+        let travel = track - thumb;
+        let max = self.max_scroll(axis);
+        if travel > 0.0 {
+            *self.scroll_of(axis) = (start + (axis.along(point) - origin) * max / travel).clamp(0.0, max);
+        }
+        true
+    }
+
+    /// Ends a thumb drag; returns true when one was running.
+    pub fn end_bar_drag(&mut self) -> bool {
+        self.bar_drag.take().is_some()
+    }
+
+    /// The vertical and (unwrapped, wider than the view) horizontal
+    /// scrollbars over the viewport's right and bottom edges.
+    fn draw_scrollbars(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect, wrap: bool) {
+        let colors = palette();
+        let max_y = (self.content_height - area.size.y).max(0.0);
+        let max_x = if wrap { 0.0 } else { (self.content_width - area.size.x).max(0.0) };
+        let (show_v, show_h) = (max_y > 0.5, max_x > 0.5);
+        // Each track leaves the shared corner to the other.
+        let corner = |other: bool| if other { BAR_ZONE } else { 0.0 };
+        self.bars = [ScrollBar::default(); 2];
+        if show_v {
+            let track = rect(area.pos.x + area.size.x - BAR_ZONE, area.pos.y, BAR_ZONE, area.size.y - corner(show_h));
+            let (offset, length) = thumb_span(track.size.y, area.size.y, max_y, self.scroll_y);
+            self.bars[0] = ScrollBar { track, thumb: rect(track.pos.x, track.pos.y + offset, BAR_ZONE, length) };
+        }
+        if show_h {
+            let track = rect(area.pos.x, area.pos.y + area.size.y - BAR_ZONE, area.size.x - corner(show_v), BAR_ZONE);
+            let (offset, length) = thumb_span(track.size.x, area.size.x, max_x, self.scroll_x);
+            self.bars[1] = ScrollBar { track, thumb: rect(track.pos.x + offset, track.pos.y, length, BAR_ZONE) };
+        }
+        for axis in [Axis::Vertical, Axis::Horizontal] {
+            let bar = self.bars[axis.index()];
+            if bar.track.size.x <= 0.0 || bar.track.size.y <= 0.0 {
+                continue;
+            }
+            let active = self.bar_hovered == Some(axis) || self.bar_drag.is_some_and(|(dragged, _, _)| dragged == axis);
+            let thickness = if active { BAR_ACTIVE_THICKNESS } else { BAR_THICKNESS };
+            if active {
+                paint.fill(cx, bar.track, with_alpha(colors.muted, 0.08));
+            }
+            let thumb = match axis {
+                Axis::Vertical => rect(bar.thumb.pos.x + BAR_ZONE - 2.0 - thickness, bar.thumb.pos.y + 2.0, thickness, bar.thumb.size.y - 4.0),
+                Axis::Horizontal => rect(bar.thumb.pos.x + 2.0, bar.thumb.pos.y + BAR_ZONE - 2.0 - thickness, bar.thumb.size.x - 4.0, thickness),
+            };
+            paint.rounded(cx, thumb, with_alpha(colors.muted, if active { 0.6 } else { 0.35 }), thickness / 2.0, None);
+        }
     }
 
     pub fn toggle_expand(&mut self, path: &str, start: usize) {
@@ -816,6 +990,7 @@ impl DiffDoc {
             self.draw_header(cx, paint, file_index, file, path, rect(area.pos.x, pinned, area.size.x, HEADER_HEIGHT), area);
         }
         self.draw_selection(cx, paint, true);
+        self.draw_scrollbars(cx, paint, area, input.wrap);
         paint.end_clip(cx);
         if autoscroll {
             // The held pointer keeps extending the selection over newly scrolled text.
@@ -1109,7 +1284,7 @@ impl DiffDoc {
             if self.hovered.as_ref() == Some(&hit) {
                 paint.rounded(cx, button, colors.surface2, 4.0, None);
             }
-            paint.icon(cx, "ellipsis", 14.0, colors.extra_muted, button.center());
+            paint.icon(cx, "ellipsis", 14.0, colors.muted, button.center());
             self.hits.push_clipped(button, clip, hit);
         }
         if bodies.is_empty() {
@@ -1146,7 +1321,7 @@ impl DiffDoc {
 
     /// Whether `point` is inside the drawn document.
     pub fn contains(&self, point: DVec2) -> bool {
-        self.viewport.contains(point)
+        self.viewport.size.x > 0.0 && self.viewport.size.y > 0.0 && self.viewport.contains(point)
     }
 }
 
@@ -1160,6 +1335,26 @@ pub fn sorted_paths(files: &[Value]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_document_releases_scrollbars_and_selection() {
+        let viewport = rect(10.0, 20.0, 100.0, 100.0);
+        let track = rect(98.0, 20.0, 12.0, 100.0);
+        let point = dvec2(104.0, 30.0);
+        let mut doc = DiffDoc {
+            viewport,
+            bars: [ScrollBar { track, thumb: rect(98.0, 20.0, 12.0, 24.0) }, ScrollBar::default()],
+            ..DiffDoc::default()
+        };
+        assert!(doc.contains(point));
+        assert!(doc.press_bar(point));
+        doc.select_all();
+        doc.hide();
+        assert!(!doc.contains(point));
+        assert_eq!(doc.bar_at(point), None);
+        assert!(!doc.drag_bar(point));
+        assert!(doc.selection.is_none());
+    }
 
     #[test]
     fn display_columns_follow_the_layout_tab_stops() {

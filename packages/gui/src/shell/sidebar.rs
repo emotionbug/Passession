@@ -29,6 +29,15 @@ pub struct SidebarState {
     pub busy: usize,
     /// Live terminal streams of the workspaces the sidebar shows.
     pub terminals: TerminalDirectories,
+    /// Session order per project key as last drawn; kept while the pointer is over the tree
+    /// so rows do not move under it.
+    pub held: HashMap<String, Vec<String>>,
+    /// The session-switch modifier (Ctrl, ⌘ on macOS) is held alone: rows show 1–9 hints.
+    pub modifier_held: bool,
+    /// A host the footer's host picker chose: the next frame scrolls its row to the top.
+    pub reveal_host: Option<String>,
+    /// A host to expand (`navigation.collapsed`) once a `UiContext` is at hand.
+    pub expand_host: Option<String>,
     motion: makepad_widgets::scroll_bars::TouchScroll,
 }
 
@@ -213,8 +222,13 @@ fn top_level(agent: &Value) -> bool {
     !hosts::is_archived(agent) && !j::text(agent, "workspaceId").is_empty() && parent_agent_id(agent).is_empty()
 }
 
-/// `_sessions`: a project's non-archived top-level agents in workspaces the filters keep,
-/// newest activity, then newest created, then id.
+/// A session waiting on the user (a permission or question).
+pub fn needs_input(agent: &Value) -> bool {
+    agent_live_status_bucket(agent) == StatusBucket::NeedsInput
+}
+
+/// `_sessions`: a project's non-archived top-level agents in workspaces the filters keep;
+/// sessions waiting on the user first, then newest activity, newest created, id.
 pub fn sessions<'a>(host: &Host<'a>, project: &Value, prefs: &Value) -> Vec<&'a Value> {
     let project_id = j::text(project, "projectId");
     let labels = label_filters(prefs);
@@ -236,12 +250,138 @@ pub fn sessions<'a>(host: &Host<'a>, project: &Value, prefs: &Value) -> Vec<&'a 
         })
         .collect();
     out.sort_by(|a, b| {
-        time_ms(b, "updatedAt")
-            .cmp(&time_ms(a, "updatedAt"))
+        needs_input(b)
+            .cmp(&needs_input(a))
+            .then_with(|| time_ms(b, "updatedAt").cmp(&time_ms(a, "updatedAt")))
             .then_with(|| time_ms(b, "createdAt").cmp(&time_ms(a, "createdAt")))
             .then_with(|| j::text(a, "id").cmp(j::text(b, "id")))
     });
     out
+}
+
+/// Keeps `rows` in the previously drawn order `held`; sessions that were not drawn then lead in
+/// their own order.
+pub fn hold_order(rows: &mut [&Value], held: &[String]) {
+    rows.sort_by_key(|agent| held.iter().position(|id| id == j::text(agent, "id")).map_or(0, |at| at + 1));
+}
+
+/// One project of the session tree as the sidebar lists it.
+pub struct ProjectGroup<'a> {
+    pub project: Value,
+    pub key: String,
+    pub collapsed: bool,
+    /// The search matches the project's name or path.
+    pub matches: bool,
+    /// Sessions the search keeps, in display order.
+    pub sessions: Vec<&'a Value>,
+    /// Sessions waiting on the user, search aside (the collapsed row's badge).
+    pub waiting: usize,
+}
+
+/// One host of the session tree, in sidebar order with the host/project filters applied.
+pub struct HostGroup<'a> {
+    pub host: Host<'a>,
+    pub collapsed: bool,
+    pub matches: bool,
+    /// The host lists any project (else the tree offers "Add project").
+    pub has_projects: bool,
+    pub projects: Vec<ProjectGroup<'a>>,
+}
+
+impl HostGroup<'_> {
+    pub fn waiting(&self) -> usize {
+        self.projects.iter().map(|p| p.waiting).sum()
+    }
+}
+
+/// Whether a session row matches the sidebar search: title, provider, workspace name or branch.
+fn session_matches(host: &Host<'_>, agent: &Value, query: &str) -> bool {
+    let workspace = host.workspace(j::text(agent, "workspaceId"));
+    let name = workspace.map_or("", |w| j::text(w, "name"));
+    let branch = workspace.map_or("", |w| j::text(j::object(w, "gitRuntime"), "currentBranch"));
+    format!("{} {} {name} {branch}", j::text(agent, "title"), j::text(agent, "provider")).to_lowercase().contains(query)
+}
+
+/// The sidebar's session tree: hosts in `hostOrder`, `ordered_projects`, `sessions`, with the
+/// host/project/label filters and the (lowercased) search applied. `held` keeps each project's
+/// drawn order. Search ignores collapse; terminal rows are the caller's.
+pub fn session_tree<'a>(state: &'a Value, query: &str, held: Option<&HashMap<String, Vec<String>>>) -> Vec<HostGroup<'a>> {
+    let prefs = nav_prefs(state);
+    let collapsed = strings(&prefs, "collapsed");
+    let host_order = strings(&prefs, "hostOrder");
+    let project_order = strings(&prefs, "projectOrder");
+    let hf = host_filters(state, &prefs);
+    let pf = project_filters(state, &prefs);
+    let mut all = hosts::hosts(state);
+    all.sort_by_key(|h| host_order.iter().position(|id| id == h.server_id()).unwrap_or(host_order.len()));
+    let mut out = Vec::new();
+    for host in all {
+        let sid = host.server_id();
+        if !hf.is_empty() && !hf.iter().any(|h| h == sid) {
+            continue;
+        }
+        let label = host.display_label();
+        let host_matches = label.to_lowercase().contains(query);
+        let ordered = ordered_projects(&host, &project_order);
+        let mut projects = Vec::new();
+        for project in &ordered {
+            let key = project_key(&host, project);
+            if !pf.is_empty() && !pf.contains(&key) {
+                continue;
+            }
+            let matches = format!("{} {}", j::text(project, "projectDisplayName"), j::text(project, "projectRootPath")).to_lowercase().contains(query);
+            let all_rows = sessions(&host, project, &prefs);
+            let waiting = all_rows.iter().filter(|a| needs_input(a)).count();
+            let mut rows: Vec<&Value> = all_rows
+                .into_iter()
+                .filter(|agent| query.is_empty() || host_matches || matches || session_matches(&host, agent, query))
+                .collect();
+            if let Some(order) = held.and_then(|held| held.get(&key)) {
+                hold_order(&mut rows, order);
+            }
+            let collapsed = query.is_empty() && collapsed.contains(&key);
+            projects.push(ProjectGroup { project: project.clone(), key, collapsed, matches, sessions: rows, waiting });
+        }
+        let collapsed = query.is_empty() && collapsed.iter().any(|c| *c == format!("host:{sid}"));
+        out.push(HostGroup { host, collapsed, matches: host_matches, has_projects: !ordered.is_empty(), projects });
+    }
+    out
+}
+
+/// Sessions in the order the sidebar shows them (session switching, Ctrl+1–9): rows inside a
+/// collapsed host or project are skipped unless `include_collapsed`.
+pub fn navigation_sessions(state: &Value, query: &str, held: Option<&HashMap<String, Vec<String>>>, include_collapsed: bool) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    for group in session_tree(state, query, held) {
+        if group.collapsed && !include_collapsed {
+            continue;
+        }
+        for project in &group.projects {
+            if project.collapsed && !include_collapsed {
+                continue;
+            }
+            out.extend(project.sessions.iter().map(|agent| (group.host.server_id().to_string(), (*agent).clone())));
+        }
+    }
+    out
+}
+
+/// Whether the pointer rests on the session tree (its rows must not reorder under it).
+pub fn pointer_on_tree(hover: Option<&str>) -> bool {
+    hover.is_some_and(|id| {
+        ["session:", "sessionedit:", "sideterm:", "project:", "projplus:", "host:", "hostplus:"].iter().any(|prefix| id.starts_with(prefix))
+    })
+}
+
+/// Whether a top-level session other than `focused` waits on the user (the header's ☰ dot).
+pub fn others_need_input(state: &Value, focused: Option<&PanelTarget>) -> bool {
+    hosts::hosts(state).iter().any(|host| {
+        host.agents().any(|agent| {
+            top_level(agent)
+                && needs_input(agent)
+                && !focused.is_some_and(|t| t.kind == "agent" && t.server_id == host.server_id() && t.id.as_deref() == Some(j::text(agent, "id")))
+        })
+    })
 }
 
 /// One shown workspace's `subscribe_terminals_request {cwd, workspaceId}` stream. Dropping it
@@ -439,26 +579,25 @@ fn terminal_status(activity: &Value) -> String {
     }
 }
 
-/// `formatCompactTimeAgo`.
+/// `formatCompactTimeAgo`, localized.
 pub fn compact_time_ago(iso: &str) -> String {
     let Ok(date) = DateTime::parse_from_rfc3339(iso) else { return String::new() };
     let date = date.with_timezone(&Utc);
     let elapsed = Utc::now().signed_duration_since(date);
     if elapsed.num_minutes() < 1 {
-        return "now".into();
+        return tr("shell.time.now");
     }
     if elapsed.num_hours() < 1 {
-        return format!("{}m", elapsed.num_minutes());
+        return tr_args("shell.time.minutes", &[("count", &elapsed.num_minutes().to_string())]);
     }
     if elapsed.num_days() < 1 {
-        return format!("{}h", elapsed.num_hours());
+        return tr_args("shell.time.hours", &[("count", &elapsed.num_hours().to_string())]);
     }
     if elapsed.num_days() < 7 {
-        return format!("{}d", elapsed.num_days());
+        return tr_args("shell.time.days", &[("count", &elapsed.num_days().to_string())]);
     }
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let local = date.with_timezone(&Local);
-    format!("{} {}", MONTHS[local.month0() as usize], local.day())
+    crate::common::month_day(local.month0(), local.day())
 }
 
 pub fn status_color(p: &theme::Palette, host: &Host<'_>) -> Vec4 {
@@ -601,21 +740,45 @@ fn toolbar_button(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, id: &str, icon: &s
     ui.icon_button(cx, r, id, icon, 14.0, 6.0, tooltip);
 }
 
+/// Pill counting sessions that wait on the user, drawn right-aligned ending at `right`.
+fn waiting_badge(ui: &mut Ui, cx: &mut Cx2d, right: f64, mid: f64, count: usize) {
+    let p = ui.p;
+    let text = count.to_string();
+    let spec = ui.spec(Font::Medium, 11.0, p.warning);
+    let w = waiting_badge_width(ui, cx, count);
+    let r = rect(right - w, mid - 8.0, w, 16.0);
+    ui.fill(cx, r, theme::with_alpha(p.warning, 0.16), 8.0);
+    ui.text_centered(cx, r, spec, &text);
+}
+
+fn waiting_badge_width(ui: &mut Ui, cx: &mut Cx2d, count: usize) -> f64 {
+    let spec = ui.spec(Font::Medium, 11.0, ui.p.warning);
+    (ui.measure(cx, spec, &count.to_string()) + 10.0).max(18.0)
+}
+
+/// The 1–9 keycap a held Ctrl/⌘ shows on the first sessions (`workspace.navigate.index`).
+fn index_hint(ui: &mut Ui, cx: &mut Cx2d, slot: Rect, index: usize) {
+    let p = ui.p;
+    let r = rect(slot.pos.x + slot.size.x - 18.0, slot.pos.y + (slot.size.y - 18.0) * 0.5, 18.0, 18.0);
+    ui.painter.outline(cx, r, p.surface2, p.muted, 1.0, 4.0);
+    let spec = ui.spec(Font::Medium, 11.0, p.foreground);
+    ui.text_centered(cx, r, spec, &(index + 1).to_string());
+}
+
 fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
     let query = shell.data.sidebar.query.trim().to_lowercase();
-    let prefs = nav_prefs(state);
-    let collapsed = strings(&prefs, "collapsed");
-    let host_order = strings(&prefs, "hostOrder");
-    let project_order = strings(&prefs, "projectOrder");
     let trailing_diff = j::text(j::object(state, "preferences"), "sidebarWorkspaceTrailing") == "diff";
-    let mut all = hosts::hosts(state);
-    let order_index = |id: &str| host_order.iter().position(|h| h == id).unwrap_or(host_order.len());
-    all.sort_by_key(|h| order_index(h.server_id()));
-    let hf = host_filters(state, &prefs);
-    let pf = project_filters(state, &prefs);
+    let host_count = hosts::hosts(state).len();
+    // While the pointer rests on the tree, rows keep the order they were drawn in.
+    let holding = pointer_on_tree(shell.data.pointer.hover.as_deref());
+    let held = std::mem::take(&mut shell.data.sidebar.held);
+    let tree = session_tree(state, &query, holding.then_some(&held));
+    let mut drawn_order: HashMap<String, Vec<String>> = HashMap::new();
     let selected = shell.data.layout.selected().cloned();
     let scroll = shell.data.sidebar.scroll;
-    let compact = shell.data.compact;
+    let hints = shell.data.sidebar.modifier_held && !shell.data.compact;
+    let reveal = shell.data.sidebar.reveal_host.take();
+    let mut reveal_offset: Option<f64> = None;
     // The rows read the streams while `ui` borrows the shell; they go back after drawing.
     let terminals = std::mem::take(&mut shell.data.sidebar.terminals);
 
@@ -638,39 +801,27 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
     let session_h = session_metrics.height(0.0, 7.0, 14.0);
     let button_h = theme::control_height(ControlSize::Sm);
     let mut any = false;
-    for host in &all {
-        if !hf.is_empty() && !hf.iter().any(|h| h == host.server_id()) {
-            continue;
-        }
+    // Position in the session-switch order (Ctrl+1–9), counted like `navigation_sessions`.
+    let mut nav_index = 0usize;
+    for host_group in &tree {
+        let host = &host_group.host;
         let sid = host.server_id();
         let label = host.display_label();
-        let host_matches = label.to_lowercase().contains(&query);
-        let host_collapsed = query.is_empty() && collapsed.iter().any(|c| *c == format!("host:{sid}"));
-        let projects = ordered_projects(host, &project_order);
-        // Build visible project blocks first (search may hide the host).
-        let mut blocks: Vec<(Value, String, bool, Vec<&Value>, Vec<TerminalRow>)> = Vec::new();
-        for project in &projects {
-            let key = project_key(host, project);
-            if !pf.is_empty() && !pf.contains(&key) {
+        let host_matches = host_group.matches;
+        let host_collapsed = host_group.collapsed;
+        // Visible project blocks first (search may hide the host); live terminals follow the
+        // directory's sessions and search matches their label.
+        let mut blocks: Vec<(&ProjectGroup, Vec<TerminalRow>)> = Vec::new();
+        for project in &host_group.projects {
+            let terms: Vec<TerminalRow> = terminal_rows(&terminals, host, j::text(&project.project, "projectId"))
+                .into_iter()
+                .filter(|row| query.is_empty() || host_matches || project.matches || row.label.to_lowercase().contains(&query))
+                .collect();
+            if !query.is_empty() && !host_matches && !project.matches && project.sessions.is_empty() && terms.is_empty() {
                 continue;
             }
-            let project_matches = format!("{} {}", j::text(project, "projectDisplayName"), j::text(project, "projectRootPath")).to_lowercase().contains(&query);
-            let rows: Vec<&Value> = sessions(host, project, &prefs)
-                .into_iter()
-                .filter(|agent| {
-                    query.is_empty() || host_matches || project_matches || format!("{} {}", j::text(agent, "title"), j::text(agent, "provider")).to_lowercase().contains(&query)
-                })
-                .collect();
-            // Live terminals follow the directory's sessions; search matches their label.
-            let terms: Vec<TerminalRow> = terminal_rows(&terminals, host, j::text(project, "projectId"))
-                .into_iter()
-                .filter(|row| query.is_empty() || host_matches || project_matches || row.label.to_lowercase().contains(&query))
-                .collect();
-            if !query.is_empty() && !host_matches && !project_matches && rows.is_empty() && terms.is_empty() {
-                continue;
-            }
-            let project_collapsed = query.is_empty() && collapsed.contains(&key);
-            blocks.push((project.clone(), key, project_collapsed, rows, terms));
+            drawn_order.insert(project.key.clone(), project.sessions.iter().map(|a| j::text(a, "id").to_string()).collect());
+            blocks.push((project, terms));
         }
         if !query.is_empty() && !host_matches && blocks.is_empty() {
             continue;
@@ -678,15 +829,25 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
         any = true;
         // Host row.
         y += 8.0;
+        if reveal.as_deref() == Some(sid) {
+            reveal_offset = Some((y - 8.0 + scroll - list.pos.y).max(0.0));
+        }
         let row = rect(x0 + 8.0, y, w - 16.0, group_h);
-        let slots = group_metrics.layout(row, 0.0, 26.0, 20.0, 4.0);
+        // A collapsed host still says how many of its sessions wait on the user.
+        let waiting = if host_collapsed { host_group.waiting() } else { 0 };
+        let badge_w = if waiting > 0 { waiting_badge_width(&mut ui, cx, waiting) + 4.0 } else { 0.0 };
+        let slots = group_metrics.layout(row, 0.0, 26.0, 20.0 + badge_w, 4.0);
         let mid = row.pos.y + row.size.y * 0.5;
+        let plus_x = slots.trailing.pos.x + slots.trailing.size.x - 20.0;
         ui.icon(cx, rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0), if host_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
         ui.dot(cx, dvec2(slots.leading.pos.x + 22.0, mid), 8.0, status_color(&p, host));
         ui.text(cx, slots.title, group, &label);
+        if waiting > 0 {
+            waiting_badge(&mut ui, cx, plus_x - 4.0, mid, waiting);
+        }
         // The whole row toggles; the trailing button, registered after it, wins its own square.
         ui.hit(row, format!("host:{sid}"));
-        toolbar_button(&mut ui, cx, slots.trailing.pos.x, mid - 10.0, &format!("hostplus:{sid}"), "plus", &tr("sessionNavigation.newSession"));
+        toolbar_button(&mut ui, cx, plus_x, mid - 10.0, &format!("hostplus:{sid}"), "plus", &tr("sessionNavigation.newSession"));
         y += group_h;
         if host_collapsed {
             continue;
@@ -706,7 +867,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
         let errors = host.list_errors();
         for (kind, error) in &errors {
             let text = tr_args("sidebar.refresh.failed", &[("list", &tr(&format!("sidebar.refresh.{kind}"))), ("error", error)]);
-            let spec = ui.spec(Font::Regular, 12.0, p.destructive);
+            let spec = ui.spec(Font::Regular, 12.0, p.danger);
             ui.text(cx, rect(x0 + 32.0, y + 4.0, w - 40.0, small_h), spec, &text);
             y += small_h + 8.0;
         }
@@ -717,7 +878,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
             y += button_h + 4.0;
         }
         if let Some(error) = host.error() {
-            let spec = ui.spec(Font::Regular, 12.0, p.destructive);
+            let spec = ui.spec(Font::Regular, 12.0, p.danger);
             let tw = w - 40.0;
             let clipped: String = error.lines().take(3).collect::<Vec<_>>().join("\n");
             let h = ui.painter.paragraph_height(cx, tw, spec, &clipped);
@@ -726,27 +887,36 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
             let retry = tr("common.actions.retry");
             let rw = ui.button_width(cx, &retry, None, ControlSize::Sm);
             ui.button(cx, rect(x0 + 24.0, y, rw, button_h), &format!("hostretry:{sid}"), &retry, None, Variant::Ghost, ControlSize::Sm, true);
-            let auth = "Authentication / connection";
-            let aw = ui.button_width(cx, auth, None, ControlSize::Sm);
-            ui.button(cx, rect(x0 + 24.0 + rw + 4.0, y, aw, button_h), &format!("hostauth:{sid}"), auth, None, Variant::Ghost, ControlSize::Sm, true);
+            let auth = tr("shell.sidebar.authConnection");
+            let aw = ui.button_width(cx, &auth, None, ControlSize::Sm).min((w - 24.0 - rw - 4.0 - 8.0).max(0.0));
+            ui.button(cx, rect(x0 + 24.0 + rw + 4.0, y, aw, button_h), &format!("hostauth:{sid}"), &auth, None, Variant::Ghost, ControlSize::Sm, true);
             y += button_h + 4.0;
         }
-        for (project, key, project_collapsed, rows, terms) in &blocks {
-            let name = j::text_or(project, "projectDisplayName", j::text(project, "projectRootPath"));
-            let name = if name.is_empty() { j::text(project, "projectRootPath") } else { name };
+        for (project, terms) in &blocks {
+            let key = &project.key;
+            let name = j::text_or(&project.project, "projectDisplayName", j::text(&project.project, "projectRootPath"));
+            let name = if name.is_empty() { j::text(&project.project, "projectRootPath") } else { name };
             let row = rect(x0 + 24.0, y, w - 32.0, group_h);
-            let slots = group_metrics.layout(row, 0.0, 32.0, 20.0, 4.0);
+            let waiting = if project.collapsed { project.waiting } else { 0 };
+            let badge_w = if waiting > 0 { waiting_badge_width(&mut ui, cx, waiting) + 4.0 } else { 0.0 };
+            let slots = group_metrics.layout(row, 0.0, 32.0, 20.0 + badge_w, 4.0);
             let mid = row.pos.y + row.size.y * 0.5;
-            ui.icon(cx, rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0), if *project_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
+            let plus_x = slots.trailing.pos.x + slots.trailing.size.x - 20.0;
+            ui.icon(cx, rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0), if project.collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
             ui.icon(cx, rect(slots.leading.pos.x + 18.0, mid - 7.0, 14.0, 14.0), "folder", 14.0, p.muted);
             ui.text(cx, slots.title, group, name);
+            if waiting > 0 {
+                waiting_badge(&mut ui, cx, plus_x - 4.0, mid, waiting);
+            }
             ui.hit(row, format!("project:{key}"));
-            toolbar_button(&mut ui, cx, slots.trailing.pos.x, mid - 10.0, &format!("projplus:{key}"), "plus", &tr("sessionNavigation.newSession"));
+            toolbar_button(&mut ui, cx, plus_x, mid - 10.0, &format!("projplus:{key}"), "plus", &tr("sessionNavigation.newSession"));
             y += group_h;
-            if *project_collapsed {
+            if project.collapsed {
                 continue;
             }
-            for agent in rows {
+            for agent in &project.sessions {
+                let index = nav_index;
+                nav_index += 1;
                 let row = rect(x0 + 48.0, y, w - 56.0, session_h);
                 y += row.size.y;
                 // Clipping alone still shapes and paints every off-screen row
@@ -764,8 +934,9 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                 let attention = j::boolean(agent, "requiresAttention", false);
                 let title = j::text(agent, "title");
                 let title = if title.is_empty() { tr("sessionNavigation.untitled") } else { title.to_string() };
-                let trailing = if trailing_diff { String::new() } else { compact_time_ago(j::text_or(agent, "updatedAt", j::text(agent, "createdAt"))) };
-                let trailing_w = if hovered { 32.0 } else if trailing.is_empty() { 12.0 } else { ui.measure(cx, ui.spec(Font::Regular, 12.0, p.extra_muted), &trailing) + 16.0 };
+                let hint = hints && index < 9;
+                let trailing = if trailing_diff || hint { String::new() } else { compact_time_ago(j::text_or(agent, "updatedAt", j::text(agent, "createdAt"))) };
+                let trailing_w = if hovered { 32.0 } else if hint { 30.0 } else if trailing.is_empty() { 12.0 } else { ui.measure(cx, ui.spec(Font::Regular, 12.0, p.muted), &trailing) + 16.0 };
                 let slots = session_metrics.layout(row, 12.0, 14.0, (trailing_w - 12.0).max(0.0), 8.0);
                 ui.icon(cx, slots.leading, "message-square", 14.0, if attention { p.foreground } else { p.muted });
                 let bucket = agent_live_status_bucket(agent);
@@ -782,8 +953,10 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                 ui.hit(row, id.clone());
                 if hovered {
                     toolbar_button(&mut ui, cx, slots.trailing.pos.x, row.pos.y + (row.size.y - 20.0) * 0.5, &format!("sessionedit:{sid}:{agent_id}"), "pencil", &tr("workspace.tabs.menu.renameAgent"));
+                } else if hint {
+                    index_hint(&mut ui, cx, slots.trailing, index);
                 } else if !trailing.is_empty() {
-                    let spec = ui.spec(Font::Regular, 12.0, p.extra_muted);
+                    let spec = ui.spec(Font::Regular, 12.0, p.muted);
                     ui.text_right(cx, slots.trailing, spec, &trailing);
                 }
             }
@@ -808,7 +981,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
             }
         }
         let project_list_loading = host.loading() || loading.contains(&"project") || errors.iter().any(|(k, _)| *k == "project");
-        if projects.is_empty() && !project_list_loading && query.is_empty() {
+        if !host_group.has_projects && !project_list_loading && query.is_empty() {
             let row = rect(x0 + 24.0, y, w - 32.0, group_h);
             let slots = group_metrics.layout(row, 0.0, 32.0, 0.0, 4.0);
             let mid = row.pos.y + row.size.y * 0.5;
@@ -821,26 +994,41 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
     }
     if !any {
         let spec = ui.spec(Font::Regular, 14.0, p.muted);
-        let message = if all.is_empty() { "Connect to a Paseo host to see your sessions.".to_string() } else { tr("sessionNavigation.empty") };
-        ui.text(cx, rect(x0 + 16.0, y + 16.0, w - 32.0, title_h), spec, &message);
-        y += title_h + 24.0;
-        let (id, label, variant) = if all.is_empty() {
+        let message = if host_count == 0 {
+            tr("shell.sidebar.connectHost")
+        } else if !query.is_empty() {
+            tr("shell.sidebar.noMatches")
+        } else {
+            tr("sessionNavigation.empty")
+        };
+        let text_w = w - 32.0;
+        let text_h = ui.painter.paragraph_height(cx, text_w, spec, &message).max(title_h);
+        ui.painter.paragraph(cx, dvec2(x0 + 16.0, y + 16.0), text_w, spec, &message);
+        y += text_h + 24.0;
+        // Archived sessions and older history are not in the tree: offer the History search.
+        let (id, label, variant) = if host_count == 0 {
             ("side:addhost", tr("settings.addHost"), Variant::Outline)
+        } else if !query.is_empty() {
+            let raw: String = query.chars().take(40).collect();
+            ("side:searchhistory", tr_args("shell.sidebar.searchHistory", &[("query", &raw)]), Variant::Outline)
         } else {
             ("side:display", tr("sidebar.display.trigger"), Variant::Ghost)
         };
-        let bw = ui.button_width(cx, &label, None, ControlSize::Sm);
+        let bw = ui.button_width(cx, &label, None, ControlSize::Sm).min(text_w);
         ui.button(cx, rect(x0 + 16.0, y + 8.0, bw, button_h), id, &label, None, variant, ControlSize::Sm, true);
         y += button_h + 16.0;
     }
     y += 8.0;
     ui.hits.set_clip(None);
-    let _ = compact;
     cx.end_turtle();
+    shell.data.sidebar.held = drawn_order;
     shell.data.sidebar.terminals = terminals;
     shell.data.sidebar.content_height = y + scroll - list.pos.y;
     let max = (shell.data.sidebar.content_height - list.size.y).max(0.0);
-    if shell.data.sidebar.scroll > max {
+    if let Some(offset) = reveal_offset {
+        shell.data.sidebar.scroll = offset.min(max);
+        shell.redraw(cx);
+    } else if shell.data.sidebar.scroll > max {
         shell.data.sidebar.scroll = max;
     }
 }
@@ -871,7 +1059,7 @@ fn draw_footer(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect) {
     x += extent;
     button(&mut ui, cx, x, "foot:hosts", "server", icon - 1.0, &tr("sidebar.actions.hosts"));
     let right = r.pos.x + r.size.x - 8.0;
-    button(&mut ui, cx, right - extent, "foot:settings", "settings", icon, &tr("sidebar.actions.settings"));
+    button(&mut ui, cx, right - extent, "foot:settings", "settings", icon, &crate::common::tooltip_with_shortcut(&tr("sidebar.actions.settings"), "toggle-settings"));
     button(&mut ui, cx, right - extent * 2.0, "foot:help", "circle-help", icon, &tr("sidebar.help.trigger"));
 }
 
@@ -909,6 +1097,33 @@ pub fn handle_actions(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, _ui: &
         shell.data.sidebar.scroll = 0.0;
         shell.redraw(cx);
     }
+}
+
+/// Expands a host (`host:<id>`) or project key if it is collapsed.
+pub fn expand(ui: &mut UiContext, key: &str) {
+    let mut prefs = nav_prefs(&ui.state);
+    let mut collapsed = strings(&prefs, "collapsed");
+    let before = collapsed.len();
+    collapsed.retain(|c| c != key);
+    if collapsed.len() != before {
+        set_nav(ui, &mut prefs, "collapsed", json!(collapsed));
+    }
+}
+
+/// Tracks the session-switch modifier (Ctrl; ⌘ on macOS) held on its own, for the 1–9 row
+/// hints. Returns true when the state changed.
+pub fn track_modifier(state: &mut SidebarState, event: &Event) -> bool {
+    let modifier = if cfg!(target_os = "macos") { KeyCode::Logo } else { KeyCode::Control };
+    let held = match event {
+        Event::KeyDown(key) => key.key_code == modifier && !key.modifiers.shift && !key.modifiers.alt,
+        Event::KeyUp(_) | Event::AppLostFocus | Event::Pause | Event::Background | Event::MouseDown(_) => false,
+        _ => return false,
+    };
+    if held == state.modifier_held {
+        return false;
+    }
+    state.modifier_held = held;
+    true
 }
 
 /// `_toggle`: collapse/expand a host (`host:<id>`) or project key in `navigation.collapsed`.
@@ -1018,5 +1233,69 @@ mod tests {
         assert_eq!(label(json!({"status": "idle", "activeTurn": {"id": "t"}})), tr("sidebar.statusBucket.working"));
         assert_eq!(label(json!({"status": "idle", "requiresAttention": true, "attentionReason": "finished"})), tr("sidebar.statusBucket.readyToReview"));
         assert_eq!(label(json!({"status": "idle"})), tr("agentList.status.idle"));
+    }
+
+    fn tree_state(navigation: Value) -> Value {
+        let agent = |id: &str, ws: &str, updated: &str, extra: Value| {
+            let mut a = json!({"id": id, "workspaceId": ws, "updatedAt": updated, "status": "idle"});
+            a.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
+            a
+        };
+        json!({
+            "hosts": [
+                {"serverId": "b", "status": "connected",
+                 "projects": [{"projectId": "p", "projectDisplayName": "Zeta"}, {"projectId": "q", "projectDisplayName": "Alpha"}],
+                 "workspaces": [{"id": "wp", "projectId": "p"}, {"id": "wq", "projectId": "q"}],
+                 "agents": [
+                    agent("old", "wp", "2026-01-01T00:00:00Z", json!({})),
+                    agent("new", "wp", "2026-03-01T00:00:00Z", json!({})),
+                    agent("asks", "wp", "2025-01-01T00:00:00Z", json!({"pendingPermissions": [{"id": "x"}]})),
+                    agent("alpha", "wq", "2026-01-01T00:00:00Z", json!({})),
+                 ]},
+                {"serverId": "a", "status": "connected", "projects": [{"projectId": "r", "projectDisplayName": "R"}],
+                 "workspaces": [{"id": "wr", "projectId": "r"}],
+                 "agents": [agent("first", "wr", "2026-01-01T00:00:00Z", json!({}))]},
+            ],
+            "preferences": {"navigation": navigation},
+        })
+    }
+
+    fn ids(list: &[(String, Value)]) -> Vec<String> {
+        list.iter().map(|(_, a)| j::text(a, "id").to_string()).collect()
+    }
+
+    #[test]
+    fn navigation_follows_sidebar_order_filters_and_collapse() {
+        let state = tree_state(json!({"hostOrder": ["a", "b"]}));
+        // Host order, project name order, waiting sessions pinned, then newest first.
+        assert_eq!(ids(&navigation_sessions(&state, "", None, false)), ["first", "alpha", "asks", "new", "old"]);
+        let collapsed = tree_state(json!({"hostOrder": ["a", "b"], "collapsed": ["host:a", "project:b:q"]}));
+        assert_eq!(ids(&navigation_sessions(&collapsed, "", None, false)), ["asks", "new", "old"]);
+        assert_eq!(ids(&navigation_sessions(&collapsed, "", None, true)).len(), 5);
+        let filtered = tree_state(json!({"hostFilters": ["b"], "projectFilters": ["project:b:p"]}));
+        assert_eq!(ids(&navigation_sessions(&filtered, "", None, false)), ["asks", "new", "old"]);
+        assert_eq!(ids(&navigation_sessions(&state, "alp", None, false)), ["alpha"]);
+    }
+
+    #[test]
+    fn held_order_keeps_drawn_rows_and_puts_new_ones_first() {
+        let state = tree_state(json!({}));
+        let mut held = HashMap::new();
+        held.insert("project:b:p".to_string(), vec!["old".to_string(), "asks".to_string()]);
+        let order = ids(&navigation_sessions(&state, "", Some(&held), false));
+        let p: Vec<&str> = order.iter().map(String::as_str).filter(|id| ["old", "new", "asks"].contains(id)).collect();
+        assert_eq!(p, ["new", "old", "asks"]);
+    }
+
+    #[test]
+    fn collapsed_groups_count_waiting_sessions() {
+        let state = tree_state(json!({"collapsed": ["host:b"]}));
+        let tree = session_tree(&state, "", None);
+        let b = tree.iter().find(|g| g.host.server_id() == "b").unwrap();
+        assert!(b.collapsed);
+        assert_eq!(b.waiting(), 1);
+        assert!(others_need_input(&state, None));
+        let focused = PanelTarget::new("agent", "b", "wp", "").with_id("asks");
+        assert!(!others_need_input(&state, Some(&focused)));
     }
 }

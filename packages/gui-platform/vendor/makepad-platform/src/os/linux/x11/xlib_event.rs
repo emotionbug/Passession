@@ -36,6 +36,7 @@ pub enum XlibEvent {
     WindowDragQuery(WindowDragQueryEvent),
     WindowCloseRequested(WindowCloseRequestedEvent),
     TextInput(WindowId, TextInputEvent),
+    TextPasteShortcut(WindowId, crate::event::TextPasteShortcutEvent),
     Drag(WindowId, DragEvent),
     Drop(WindowId, DropEvent),
     DragEnd,

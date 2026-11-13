@@ -181,6 +181,9 @@ pub struct WaScheduleEditor {
     pending: Pending<Req>,
     #[rust]
     load_catalog_pending: bool,
+    /// Save was pressed with required fields missing: their hints show.
+    #[rust]
+    attempted: bool,
 }
 
 impl WaScheduleEditor {
@@ -445,12 +448,42 @@ impl WaScheduleEditor {
         self.model_valid(ctx)
     }
 
+    /// Save stays pressable while only required fields are missing, so pressing it can say
+    /// which; it is disabled while saving, without permission or with nothing to save.
+    fn can_press_save(&self, ctx: &UiContext) -> bool {
+        !self.saving && self.can_manage(ctx) && self.cadence_error().is_none() && (!self.heartbeat || self.cadence_changed)
+    }
+
+    /// The required-field hint of each new-agent field still missing after a Save attempt.
+    fn required_hint(&self, ctx: &UiContext, field: &str) -> String {
+        if !self.attempted || self.heartbeat {
+            return String::new();
+        }
+        let missing = match field {
+            "prompt" => self.prompt.trim().is_empty(),
+            "host" => self.server_id.is_none(),
+            "project" => self.server_id.is_some() && ((!self.editing && self.project(ctx).is_none()) || !self.has_project()),
+            "model" => self.has_project() && !self.model_valid(ctx),
+            _ => false,
+        };
+        if !missing {
+            return String::new();
+        }
+        t(match field {
+            "prompt" => "workspace.schedules.required.prompt",
+            "host" => "workspace.schedules.required.host",
+            "project" => "workspace.schedules.required.project",
+            _ => "workspace.schedules.required.model",
+        })
+    }
+
     fn cadence(&self) -> Value {
         json!({ "type": "cron", "expression": self.cron.trim(), "timezone": self.timezone })
     }
 
     fn save(&mut self, ctx: &UiContext) {
         if !self.can_submit(ctx) {
+            self.attempted = true;
             return;
         }
         self.error = None;
@@ -458,6 +491,10 @@ impl WaScheduleEditor {
             self.error = Some(t("common.errors.daemonClientUnavailable"));
             return;
         };
+        if !host::host(&ctx.state, &server).is_some_and(|h| h.connected()) {
+            self.error = Some(t("workspace.schedules.hostOfflineSave"));
+            return;
+        }
         let max = model::parse_max_runs(&self.max_runs);
         let lifecycle = self.multiplicity(ctx);
         let name = self.name.trim().to_owned();
@@ -793,11 +830,19 @@ impl WaScheduleEditor {
         }
         field(id!(name_field), l("Name"), !heartbeat, cx);
         view.wa_input(id!(name)).set_empty_text(cx, l("Optional").into());
-        field(id!(prompt_field), l("Prompt"), !heartbeat, cx);
+        // Required fields left empty say so once Save was pressed.
+        let error_color = crate::theme::current_palette().field_error;
+        let show_hint = |field: &WidgetRef, text: &str, error: bool, cx: &mut Cx| {
+            set_optional(cx, &field.widget(id!(hint)), text);
+            field.plabel(id!(hint.text)).set_color(cx, error.then_some(error_color));
+        };
+        let prompt_field = field(id!(prompt_field), l("Prompt"), !heartbeat, cx);
+        show_hint(&prompt_field, &self.required_hint(ctx, "prompt"), true, cx);
         view.wa_input(id!(prompt)).set_empty_text(cx, l("What should the agent do each run?").into());
         let hosts = host::hosts(&ctx.state);
         let show_host = !heartbeat && (self.editing || hosts.len() > 1);
-        field(id!(host_field), l("Host"), show_host, cx);
+        let host_field = field(id!(host_field), l("Host"), show_host, cx);
+        show_hint(&host_field, &self.required_hint(ctx, "host"), true, cx);
         if show_host {
             let label = self.host(ctx).map(|h| h.label()).or(self.server_id.clone());
             let button = view.wa_button(id!(host));
@@ -815,10 +860,14 @@ impl WaScheduleEditor {
             let button = view.wa_button(id!(project));
             set_field(cx, &button, display.as_deref(), l("Select project"));
             button.set_enabled(cx, self.server_id.is_some());
-            set_optional(cx, &project_field.widget(id!(hint)), if self.server_id.is_none() { l("Choose a host first.") } else { "" });
+            match self.server_id {
+                None => show_hint(&project_field, l("Choose a host first."), false, cx),
+                Some(_) => show_hint(&project_field, &self.required_hint(ctx, "project"), true, cx),
+            }
         }
         let has_project = !heartbeat && self.has_project();
-        field(id!(model_field), l("Model"), has_project, cx);
+        let model_field = field(id!(model_field), l("Model"), has_project, cx);
+        show_hint(&model_field, &self.required_hint(ctx, "model"), true, cx);
         if has_project {
             let label = if self.model.trim().is_empty() {
                 self.selected_model_label(ctx)
@@ -888,7 +937,7 @@ impl WaScheduleEditor {
         let save = view.wa_button(id!(save));
         save.set_text(cx, if self.editing { l("Save changes") } else { l("Create schedule") });
         save.set_busy(cx, self.saving);
-        save.set_enabled(cx, self.can_submit(ctx));
+        save.set_enabled(cx, self.can_press_save(ctx));
     }
 }
 
@@ -960,6 +1009,7 @@ impl WaScheduleEditorRef {
         next.cadence_changed = false;
         next.saving = false;
         next.error = None;
+        next.attempted = false;
         next.load_catalog_pending = !next.heartbeat && next.server_id.is_some() && !next.cwd.trim().is_empty();
         next.catalog_loading = next.load_catalog_pending;
         let view = inner.root();

@@ -468,6 +468,10 @@ pub(crate) fn request_notification_permission(_shared: &Arc<Shared>, done: Compl
     user_notifications::request_authorization(move |result| done.finish(result.map(PlatformValue::Permission)));
 }
 
+pub(crate) fn notification_permission_status(_shared: &Arc<Shared>, done: Completion) {
+    user_notifications::authorization_status(move |state| done.ok(PlatformValue::Permission(state)));
+}
+
 pub(crate) fn set_badge_count(_shared: &Arc<Shared>, count: u32, done: Completion) {
     apple::on_main_queue(move || unsafe {
         let center = user_notifications::center();
@@ -530,6 +534,18 @@ pub(crate) fn system_prefers_dark() -> bool {
 
 pub(crate) fn system_language() -> String {
     apple::preferred_language()
+}
+
+/// Dynamic Type: `[[UIFontMetrics defaultMetrics] scaledValueForValue:]` at
+/// each SP knot (identity at the default "Large" content size).
+pub(crate) fn system_text_scale() -> crate::appearance::TextScale {
+    unsafe {
+        let metrics: Id = msg_send![class!(UIFontMetrics), defaultMetrics];
+        if metrics.is_null() {
+            return crate::appearance::TextScale::default();
+        }
+        crate::appearance::TextScale::from_curve(|sp| msg_send![metrics, scaledValueForValue: sp])
+    }
 }
 
 // ----- push -----

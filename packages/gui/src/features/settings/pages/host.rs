@@ -15,11 +15,11 @@ use crate::features::settings::i18n::{t, ta};
 use crate::features::settings::json::{get, str_of};
 use crate::features::settings::model::daemon_update::{self as du, Outcome};
 use crate::features::settings::model::forms::{FormSave, FormSheet, SettingField};
-use crate::features::settings::platform::{self, DESKTOP};
+use crate::features::settings::platform::{self, DESKTOP, MOBILE};
 use crate::features::settings::rpc::{Env, ReqError, handler};
 use crate::features::settings::state::{Settings, SheetKind};
 use crate::features::settings::ui::draw::{Font, Icon};
-use crate::features::settings::ui::kit::{BSize, Ctl, Lead, Ui, Variant, button, row};
+use crate::features::settings::ui::kit::{BSize, Ctl, Lead, Ui, Variant, button, icon_button, row};
 use crate::features::settings::ui::theme::{IDENTITY_COLORS, identity_fill};
 
 // ------------------------------------------------------------ no host / pairing
@@ -33,7 +33,8 @@ pub fn draw_no_host(ui: &mut Ui) {
     ui.gap(24.0);
 }
 
-pub fn draw_pair_device(ui: &mut Ui, host: &HostView) {
+/// Pairing row on the Connections page (desktop only: a phone shows the QR to nobody).
+fn draw_pair_device(ui: &mut Ui, host: &HostView) {
     ui.section_title(&t("settings.host.pairDevices.title"), None, None);
     ui.card_begin();
     let id = host.server_id.clone();
@@ -41,7 +42,7 @@ pub fn draw_pair_device(ui: &mut Ui, host: &HostView) {
     ui.row(
         row(t("settings.host.pairDevices.rowTitle"))
             .hint(t("settings.host.pairDevices.rowHint"))
-            .control(button("pair.open", t("settings.host.pairDevices.rowTitle"), Some(pair)).ctl()),
+            .control(button("pair.open", t("settingsNative.showQrCode"), Some(pair)).icon(Icon::Smartphone).ctl()),
     );
     ui.card_end();
     ui.gap(24.0);
@@ -212,36 +213,65 @@ pub fn draw_connections_page(ui: &mut Ui, s: &Settings, _v: &View, host: &HostVi
     draw_connection_error(ui, host);
     ui.section_title(&t("settings.host.connections.title"), None, None);
     ui.card_begin();
+    let active = str_of(&host.config, "id").to_string();
+    let last = host.connections.len() <= 1;
     for (i, connection) in host.connections.iter().enumerate() {
         let label = connection_label(connection);
         let server = host.server_id.clone();
         let connection_id = str_of(connection, "id").to_string();
-        let last = host.connections.len() <= 1;
-        let remove = handler(move |s, _| {
-            let server = server.clone();
-            let connection_id = connection_id.clone();
-            // The last connection removes the host (Flutter `removeConnection` → `removeHost`,
-            // tab close guards first).
-            let go = handler(move |_, env| {
-                if last {
-                    env.ctx.effects.push(UiEffect::RemoveHost { host_id: server.clone() });
-                } else {
-                    host::remove_connection(&env.ctx.core, &server, &connection_id);
-                }
-            });
-            s.confirm(
-                t("settings.host.connections.removeTitle"),
-                ta("settings.host.connections.removeMessage", &[("name", &label)]),
-                None,
-                true,
-                go,
-            );
-        });
-        let action = button(format!("conn.{}.{i}.remove", host.server_id), t("settings.host.connections.removeAction"), Some(remove)).variant(Variant::Ghost).danger_text().ctl();
-        ui.row(row(connection_label(connection)).one_line().inline().control(action));
+        let is_active = !connection_id.is_empty() && connection_id == active;
+        let key = format!("conn.{}.{i}", host.server_id);
+        let mut controls = Vec::new();
+        if !is_active {
+            let chosen = connection.clone();
+            let use_it = handler(move |_, env| host::update_host_config(&env.ctx.core, chosen.clone()));
+            controls.push(button(format!("{key}.use"), t("settingsNative.useConnection"), Some(use_it)).variant(Variant::Ghost).ctl());
+        }
+        let edited = connection.clone();
+        let edit = handler(move |_, env| env.ctx.effects.push(UiEffect::OpenHostConnectionDialog { connection: edited.clone() }));
+        controls.push(icon_button(format!("{key}.edit"), Icon::Pencil, Some(edit)).tipped(t("settingsNative.editConnection")));
+        let remove = if last {
+            // The last connection removes the whole host: say so (`remove.*`).
+            remove_host_handler(host)
+        } else {
+            handler(move |s, _| {
+                let server = server.clone();
+                let connection_id = connection_id.clone();
+                let go = handler(move |_, env| host::remove_connection(&env.ctx.core, &server, &connection_id));
+                s.confirm(
+                    t("settings.host.connections.removeTitle"),
+                    ta("settings.host.connections.removeMessage", &[("name", &label)]),
+                    t("settings.host.connections.removeAction"),
+                    true,
+                    go,
+                );
+            })
+        };
+        controls.push(button(format!("{key}.remove"), t("settings.host.connections.removeAction"), Some(remove)).variant(Variant::Ghost).danger_text().ctl());
+        let hint = is_active.then(|| t("settingsNative.activeConnection"));
+        ui.row(row(connection_label(connection)).one_line().hint_opt(hint).inline().control(Ctl::Row(controls, 4.0)));
     }
+    if host.connections.is_empty() {
+        ui.row(row(t("settingsNative.noConnections")).one_line());
+    }
+    let (seed_label, seed_server, seed_color) = (host.label.clone(), host.server_id.clone(), host.config.get("color").cloned().unwrap_or(Value::Null));
+    let add = handler(move |_, env| {
+        // Shell `ConnectionsSheet` seed: a fresh connection id expecting this server.
+        let connection = json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "label": seed_label,
+            "endpoint": "",
+            "expectedServerId": seed_server,
+            "color": seed_color,
+        });
+        env.ctx.effects.push(UiEffect::OpenHostConnectionDialog { connection });
+    });
+    ui.row(row(t("settingsNative.addConnection")).hint(t("settingsNative.addConnectionHint")).control(button(format!("conn.{}.add", host.server_id), t("settingsNative.addConnection"), Some(add)).icon(Icon::Plus).ctl()));
     ui.card_end();
     ui.gap(24.0);
+    if !MOBILE {
+        draw_pair_device(ui, host);
+    }
     if host.connected() {
         if host.feature("connectedHosts") {
             super::daemon::draw_connected_hosts(ui, s, host);
@@ -252,20 +282,13 @@ pub fn draw_connections_page(ui: &mut Ui, s: &Settings, _v: &View, host: &HostVi
 
 // ------------------------------------------------------------ danger zone
 
-fn draw_danger_zone(ui: &mut Ui, s: &Settings, host: &HostView) {
-    ui.section_title(&t("settings.host.daemon.dangerZone"), None, None);
-    draw_restart_card(ui, s, host);
-    ui.gap(12.0);
-    ui.card_begin();
+/// Remove-host confirmation (`settings.host.daemon.remove.*`); the local host
+/// also stops managing the built-in daemon first.
+fn remove_host_handler(host: &HostView) -> crate::features::settings::rpc::Handler {
     let local = host.local;
-    let (title, hint) = if local {
-        ("settings.host.daemon.remove.localTitle", "settings.host.daemon.remove.localHint")
-    } else {
-        ("settings.host.daemon.remove.title", "settings.host.daemon.remove.hint")
-    };
     let id = host.server_id.clone();
     let label = host.label.clone();
-    let remove = handler(move |s, _| {
+    handler(move |s, _| {
         let id = id.clone();
         let go = handler(move |s, env| {
             let id = id.clone();
@@ -283,13 +306,26 @@ fn draw_danger_zone(ui: &mut Ui, s: &Settings, host: &HostView) {
                 finish(s, env);
             }
         });
-        let (title, message) = if local {
-            (t("settings.host.daemon.remove.localConfirmTitle"), t("settings.host.daemon.remove.localConfirmMessage"))
+        let (title, message, action) = if local {
+            (t("settings.host.daemon.remove.localConfirmTitle"), t("settings.host.daemon.remove.localConfirmMessage"), t("settings.host.daemon.remove.localTitle"))
         } else {
-            (t("settings.host.daemon.remove.title"), ta("settings.host.daemon.remove.confirmMessage", &[("name", &label)]))
+            (t("settings.host.daemon.remove.title"), ta("settings.host.daemon.remove.confirmMessage", &[("name", &label)]), t("settings.host.daemon.remove.title"))
         };
-        s.confirm(title, message, None, true, go);
-    });
+        s.confirm(title, message, action, true, go);
+    })
+}
+
+fn draw_danger_zone(ui: &mut Ui, s: &Settings, host: &HostView) {
+    ui.section_title(&t("settings.host.daemon.dangerZone"), None, None);
+    draw_restart_card(ui, s, host);
+    ui.gap(12.0);
+    ui.card_begin();
+    let (title, hint) = if host.local {
+        ("settings.host.daemon.remove.localTitle", "settings.host.daemon.remove.localHint")
+    } else {
+        ("settings.host.daemon.remove.title", "settings.host.daemon.remove.hint")
+    };
+    let remove = remove_host_handler(host);
     ui.row(row(t(title)).hint(t(hint)).control(button(format!("host.{}.remove", host.server_id), t("settings.host.connections.removeAction"), Some(remove)).ctl()));
     ui.card_end();
     ui.gap(24.0);
@@ -333,7 +369,7 @@ fn observe_replacement(s: &mut Settings, env: &mut Env, server_id: String, previ
     });
 }
 
-fn restart(s: &mut Settings, env: &mut Env, server_id: String) {
+pub(super) fn restart(s: &mut Settings, env: &mut Env, server_id: String) {
     let rt = |k: &str| t(&format!("settings.host.daemon.restart.{k}"));
     if !env.host(&server_id).map(|h| h.connected()).unwrap_or(false) {
         env.toast(rt("offlineMessage"), true);
@@ -383,7 +419,7 @@ fn draw_restart_card(ui: &mut Ui, s: &Settings, host: &HostView) {
         handler(move |s, _| {
             let id = id.clone();
             let go = handler(move |s, env| restart(s, env, id.clone()));
-            s.confirm(ta("settings.host.daemon.restart.confirmTitle", &[("name", &label)]), rt("confirmMessage"), Some(rt("confirm")), true, go);
+            s.confirm(ta("settings.host.daemon.restart.confirmTitle", &[("name", &label)]), rt("confirmMessage"), rt("confirm"), true, go);
         })
     });
     ui.card_begin();
@@ -697,7 +733,7 @@ fn draw_update_card(ui: &mut Ui, s: &Settings, _v: &View, host: &HostView) {
         handler(move |s, _| {
             let id = id.clone();
             let go = handler(move |s, env| start_update(s, env, id.clone()));
-            s.confirm(uta("confirmTitle", &[("name", &label)]), ut("confirmMessage"), Some(ut("confirm")), false, go);
+            s.confirm(uta("confirmTitle", &[("name", &label)]), ut("confirmMessage"), ut("confirm"), false, go);
         })
     });
     ui.card_begin();

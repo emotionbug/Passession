@@ -4,6 +4,7 @@ use std::cell::{Cell as Flag, RefCell};
 use std::rc::Rc;
 
 use libghostty_vt::key::{self, Mods};
+use libghostty_vt::mouse;
 use libghostty_vt::render::{CursorVisualStyle, RenderState};
 use libghostty_vt::screen::{CellContentTag, CellWide, GridRef, Screen};
 use libghostty_vt::style::{RgbColor, StyleColor, Underline};
@@ -71,6 +72,8 @@ pub struct Emulator {
     render: RenderState<'static>,
     keys: key::Encoder<'static>,
     key_event: key::Event<'static>,
+    mouse: mouse::Encoder<'static>,
+    mouse_event: mouse::Event<'static>,
     effects: Rc<Effects>,
     scrollback: usize,
 }
@@ -109,6 +112,8 @@ impl Emulator {
             render: RenderState::new()?,
             keys: key::Encoder::new()?,
             key_event: key::Event::new()?,
+            mouse: mouse::Encoder::new()?,
+            mouse_event: mouse::Event::new()?,
             effects,
             scrollback: options.scrollback,
         })
@@ -199,6 +204,26 @@ impl Emulator {
         }
     }
 
+    /// Restores negotiated mouse modes after a screen snapshot.
+    pub fn mouse_mode_preamble(&self) -> String {
+        let mut out = String::new();
+        for (mode, sequence) in [
+            (Mode::X10_MOUSE, "\x1b[?9h"),
+            (Mode::NORMAL_MOUSE, "\x1b[?1000h"),
+            (Mode::BUTTON_MOUSE, "\x1b[?1002h"),
+            (Mode::ANY_MOUSE, "\x1b[?1003h"),
+            (Mode::UTF8_MOUSE, "\x1b[?1005h"),
+            (Mode::SGR_MOUSE, "\x1b[?1006h"),
+            (Mode::URXVT_MOUSE, "\x1b[?1015h"),
+            (Mode::SGR_PIXELS_MOUSE, "\x1b[?1016h"),
+        ] {
+            if self.terminal.mode(mode).unwrap_or(false) {
+                out.push_str(sequence);
+            }
+        }
+        out
+    }
+
     /// Row `index` of presented scrollback plus screen (0 is the oldest
     /// presented row). Rows past the end read as empty.
     pub fn row(&self, index: usize) -> Row {
@@ -248,6 +273,44 @@ impl Emulator {
         let mut bytes = Vec::new();
         if self.keys.set_options_from_terminal(&self.terminal).encode_to_vec(&self.key_event, &mut bytes).is_err() {
             bytes.clear();
+        }
+        bytes
+    }
+
+    /// Encodes wheel presses using the application's negotiated mouse format, including
+    /// legacy X10's raw coordinate bytes. Pixel reports use the geometry reported to the PTY.
+    pub fn encode_mouse_wheel(&mut self, up: bool, col: u16, row: u16, modifiers: Modifiers, count: usize) -> Vec<u8> {
+        let mut mods = Mods::empty();
+        mods.set(Mods::SHIFT, modifiers.shift);
+        mods.set(Mods::CTRL, modifiers.control);
+        mods.set(Mods::ALT, modifiers.alt);
+        mods.set(Mods::SUPER, modifiers.logo);
+        self.mouse_event
+            .set_action(mouse::Action::Press)
+            .set_button(Some(if up { mouse::Button::Four } else { mouse::Button::Five }))
+            .set_mods(mods)
+            .set_position(mouse::Position {
+                x: f32::from(col) * CELL_WIDTH_PX as f32,
+                y: f32::from(row) * CELL_HEIGHT_PX as f32,
+            });
+        let screen_width = u32::from(self.cols()) * CELL_WIDTH_PX;
+        let screen_height = u32::from(self.rows()) * CELL_HEIGHT_PX;
+        self.mouse.set_options_from_terminal(&self.terminal).set_size(mouse::EncoderSize {
+            screen_width,
+            screen_height,
+            cell_width: CELL_WIDTH_PX,
+            cell_height: CELL_HEIGHT_PX,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_left: 0,
+            padding_right: 0,
+        });
+        let mut bytes = Vec::with_capacity(count * 32);
+        for _ in 0..count {
+            if self.mouse.encode_to_vec(&self.mouse_event, &mut bytes).is_err() {
+                bytes.clear();
+                break;
+            }
         }
         bytes
     }
@@ -416,5 +479,18 @@ mod tests {
         let modes = term.modes();
         assert!(modes.application_cursor && modes.bracketed_paste);
         assert_eq!(term.encode_paste("ls"), b"\x1b[200~ls\x1b[201~");
+    }
+
+    #[test]
+    fn mouse_wheel_follows_negotiated_format_without_utf8_conversion() {
+        let mut term = emulator(24, 160);
+        assert!(term.encode_mouse_wheel(true, 0, 4, Modifiers::default(), 1).is_empty());
+        term.write(b"\x1b[?1000h");
+        assert_eq!(term.encode_mouse_wheel(true, 100, 4, Modifiers::default(), 1), [27, b'[', b'M', 96, 133, 37]);
+        term.write(b"\x1b[?1006h");
+        assert_eq!(term.encode_mouse_wheel(true, 0, 4, Modifiers::default(), 2), b"\x1b[<64;1;5M\x1b[<64;1;5M");
+        assert_eq!(term.encode_mouse_wheel(false, 9, 0, Modifiers { control: true, ..Modifiers::default() }, 1), b"\x1b[<81;10;1M");
+        term.write(b"\x1b[?1006l");
+        assert_eq!(term.encode_mouse_wheel(false, 0, 0, Modifiers::default(), 1), b"\x1b[Ma!!");
     }
 }

@@ -147,7 +147,7 @@ impl Menu {
 pub struct Confirm {
     pub title: String,
     pub message: String,
-    pub confirm_label: Option<String>,
+    pub confirm_label: String,
     pub destructive: bool,
     pub on_confirm: Handler,
     /// Runs when the dialog closes without confirming (cancel, scrim, close, Escape).
@@ -454,7 +454,7 @@ fn draw_select(ui: &mut Ui, menu: &Menu, screen: Rect, view: Rect) -> (Rect, f64
     let scroll = menu.scroll.clamp(0.0, (list_h - list.size.y).max(0.0));
     let mut y = y - scroll;
     if visible.is_empty() {
-        let text = if menu.empty_text.is_empty() { "No options".to_string() } else { menu.empty_text.clone() };
+        let text = if menu.empty_text.is_empty() { t("common.empty.noOptions") } else { menu.empty_text.clone() };
         ui.text(Font::Regular, 14.0, pal.muted, dvec2(list.pos.x + 12.0, y + 8.0), Some(list.size.x - 24.0), &text);
     } else {
         // ListView padding: 4px on top (sheet and popover alike).
@@ -595,7 +595,7 @@ pub fn sheet_frame(ui: &mut Ui, screen: Rect, view: Rect, id: u64, max_w: f64, h
     ui.icon(Icon::X, close_rect.pos + dvec2(8.0, 8.0), 16.0, pal.muted);
     let close: Handler = if busy_close { handler(|_, _| {}) } else { handler(move |s, env| s.close_sheet(env, id)) };
     ui.zone(&close_key, close_rect, Some(close));
-    ui.set_last_tip_pub(&close_key, "Close".to_string());
+    ui.set_last_tip_pub(&close_key, t("common.actions.close"));
     if let Some((field, placeholder)) = &head.search {
         let y = row_top + row_h + 16.0;
         ui.icon(Icon::Search, dvec2(pos.x + 24.0, y + search_field_h / 2.0), 16.0, pal.muted);
@@ -902,7 +902,7 @@ pub fn draw_alert(ui: &mut Ui, screen: Rect, view: Rect, id: u64, confirm: &Conf
     ui.rect(screen, super::theme::argb(0x8a000000), None, 0.0);
     ui.zone(&format!("sheet.{id}.backdrop"), screen, Some(handler(move |s, env| s.close_sheet(env, id))));
     let cancel_label = t("common.actions.cancel");
-    let confirm_label = confirm.confirm_label.clone().unwrap_or_else(|| "Confirm".to_string());
+    let confirm_label = confirm.confirm_label.clone();
     let on = confirm.on_confirm.clone();
     let run = handler(move |s, env| {
         // Confirming is not declining.

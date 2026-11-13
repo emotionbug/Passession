@@ -130,7 +130,7 @@ fn plugin_action(s: &mut Settings, env: &mut Env, host: &str, action: &'static s
         let kept = handler(move |s, _| {
             s.plugins.entry(kept_host.clone()).or_default().feedback = Some((true, ta("settings.plugins.feedback.kept", &[("id", &kept_id)])));
         });
-        s.confirm_or(ta("settings.plugins.removeConfirmTitle", &[("id", &id)]), pt("removeConfirmMessage"), Some(pt("actions.remove")), true, go, kept);
+        s.confirm_or(ta("settings.plugins.removeConfirmTitle", &[("id", &id)]), pt("removeConfirmMessage"), pt("actions.remove"), true, go, kept);
         return;
     }
     if !begin(s, host, action, Some(id.clone())) {

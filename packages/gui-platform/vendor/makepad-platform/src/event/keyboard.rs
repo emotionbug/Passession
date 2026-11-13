@@ -327,6 +327,20 @@ pub struct TextInputEvent {
     pub was_paste: bool
 }
 
+/// Synchronous veto before a native keyboard shortcut requests clipboard text.
+/// Menu, context-menu and input-method paste routes are not shortcut requests.
+#[derive(Clone, Debug)]
+pub struct TextPasteShortcutEvent {
+    pub modifiers: KeyModifiers,
+    pub allowed: Rc<std::cell::Cell<bool>>,
+}
+
+impl TextPasteShortcutEvent {
+    pub fn new(modifiers: KeyModifiers) -> Self {
+        Self { modifiers, allowed: Rc::new(std::cell::Cell::new(true)) }
+    }
+}
+
 /// Android full-editor snapshot. Offsets are UTF-16 code units.
 #[derive(Clone, Debug)]
 pub struct TextImeEvent {

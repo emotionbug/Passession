@@ -15,6 +15,8 @@ pub mod image;
 pub mod intern;
 pub mod layouter;
 pub mod loader;
+#[cfg(test)]
+mod paseo_font_tests;
 pub mod num;
 pub mod rasterizer;
 pub mod sdfer;

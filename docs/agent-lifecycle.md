@@ -52,7 +52,9 @@ After an acknowledged interrupt, the manager settles the captured run even when 
 arrives or the run was still waiting for its provider turn id. The captured run token prevents an
 older cancellation from settling a newer turn. If interruption is rejected or times out, the agent
 keeps its active foreground turn and replacement, reload, rewind, and Stop report the failure.
-Accepting new work after an ambiguous interruption would create a split-brain session.
+Stop's request must fail too; a successful RPC with an ignored refusal result hides that the
+provider may still be working. Accepting new work after an ambiguous interruption would create a
+split-brain session.
 
 ## Relationships
 
@@ -129,6 +131,9 @@ so that callback can repeat after restart. This is an at-least-once wakeup, with
 Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
 The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.
 A watched child that closes before its finish event also notifies the caller so delegated work cannot disappear silently during archive or workspace teardown.
+
+A plan approval may require a provider mode change before the approval can be sent. Keep the
+permission pending if that prerequisite fails, so the user can retry or deny the same request.
 
 ## Provider-managed child agents
 

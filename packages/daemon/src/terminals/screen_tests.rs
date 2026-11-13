@@ -130,6 +130,10 @@ fn replay_preamble_reflects_current_input_modes() {
     assert_eq!(screen.replay_preamble(), "");
     screen.process(b"\x1b[>3u\x1b[?9001h\x1b[?1h\x1bc");
     assert_eq!(screen.replay_preamble(), "");
+    screen.process(b"\x1b[?1002;1006h");
+    assert_eq!(screen.replay_preamble(), "\x1b[?1002h\x1b[?1006h");
+    screen.process(b"\x1b[?1002;1006l");
+    assert_eq!(screen.replay_preamble(), "");
 }
 
 #[test]
@@ -257,6 +261,17 @@ fn restore_roundtrips_styles_wide_characters_wraps_and_cursor() {
     assert!(text.ends_with("\x1b[?25l\x1b[?1h\x1b[?2004h"), "{text:?}");
     let mut restored = screen(3, 8);
     restored.process(&restore);
+    assert_eq!(restored.snapshot(true), source.snapshot(true));
+    assert_eq!(restored.replay_preamble(), source.replay_preamble());
+}
+
+#[test]
+fn restore_keeps_alternate_buffer_and_mouse_modes() {
+    let mut source = screen(3, 8);
+    source.process(b"\x1b[?1049h\x1b[?1000;1006happlication");
+    assert_eq!(source.snapshot(true)["alternateScreen"], true);
+    let mut restored = screen(3, 8);
+    restored.process(&source.restore("full-snapshot", 0));
     assert_eq!(restored.snapshot(true), source.snapshot(true));
     assert_eq!(restored.replay_preamble(), source.replay_preamble());
 }

@@ -26,6 +26,7 @@ import android.provider.OpenableColumns;
 import android.util.Log;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
+import android.util.Xml;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
@@ -41,8 +42,10 @@ import androidx.core.view.WindowInsetsControllerCompat;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.xmlpull.v1.XmlPullParser;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -309,6 +312,9 @@ final class PaseoBridge {
                 case "moveTaskToBack":
                     main.post(() -> activity.moveTaskToBack(true));
                     return ok(null);
+                case "systemFonts":
+                    // Android 7–9 have no AFontMatcher (API 29); Rust reads this instead.
+                    return ok(systemFonts());
                 case "takeBackgroundError": {
                     SharedPreferences preferences = activity.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE);
                     String value = preferences.getString("backgroundError", null);
@@ -320,6 +326,106 @@ final class PaseoBridge {
             }
         } catch (Exception e) {
             return error("native", e.getMessage());
+        }
+    }
+
+    /**
+     * The font families declared in {@code /system/etc/fonts.xml}: named families
+     * with their faces, aliases, and the faces of Korean ({@code lang="ko"}) fallback
+     * families. Paths are absolute; weights, italic flags, collection indices and
+     * {@code <axis>} values are copied as declared.
+     */
+    static JSONObject systemFonts() throws Exception {
+        JSONObject families = new JSONObject();
+        JSONObject aliases = new JSONObject();
+        JSONArray hangul = new JSONArray();
+        try (InputStream input = new FileInputStream("/system/etc/fonts.xml")) {
+            XmlPullParser parser = Xml.newPullParser();
+            parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false);
+            parser.setInput(input, null);
+            String familyName = null;
+            boolean korean = false;
+            JSONArray fonts = null;
+            JSONObject font = null;
+            StringBuilder file = null;
+            for (int event = parser.getEventType(); event != XmlPullParser.END_DOCUMENT; event = parser.next()) {
+                if (event == XmlPullParser.START_TAG) {
+                    switch (parser.getName()) {
+                        case "family":
+                            familyName = parser.getAttributeValue(null, "name");
+                            korean = isKoreanLang(parser.getAttributeValue(null, "lang"));
+                            fonts = new JSONArray();
+                            break;
+                        case "font":
+                            if (fonts == null) break;
+                            font = new JSONObject()
+                                    .put("weight", parseIntOr(parser.getAttributeValue(null, "weight"), 400))
+                                    .put("italic", "italic".equals(parser.getAttributeValue(null, "style")))
+                                    .put("index", parseIntOr(parser.getAttributeValue(null, "index"), 0))
+                                    .put("axes", new JSONArray());
+                            file = new StringBuilder();
+                            break;
+                        case "axis":
+                            String tag = parser.getAttributeValue(null, "tag");
+                            String value = parser.getAttributeValue(null, "stylevalue");
+                            if (font != null && tag != null && value != null) {
+                                try {
+                                    font.getJSONArray("axes").put(new JSONObject().put("tag", tag).put("value", Double.parseDouble(value)));
+                                } catch (NumberFormatException ignored) {
+                                }
+                            }
+                            break;
+                        case "alias":
+                            String name = parser.getAttributeValue(null, "name");
+                            String to = parser.getAttributeValue(null, "to");
+                            if (name != null && to != null) {
+                                aliases.put(name, new JSONObject()
+                                        .put("to", to)
+                                        .put("weight", parseIntOr(parser.getAttributeValue(null, "weight"), 0)));
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                } else if (event == XmlPullParser.TEXT && file != null) {
+                    file.append(parser.getText());
+                } else if (event == XmlPullParser.END_TAG) {
+                    if ("font".equals(parser.getName()) && font != null && fonts != null) {
+                        String path = file.toString().trim();
+                        if (!path.isEmpty()) {
+                            fonts.put(font.put("path", path.startsWith("/") ? path : "/system/fonts/" + path));
+                        }
+                        font = null;
+                        file = null;
+                    } else if ("family".equals(parser.getName()) && fonts != null) {
+                        if (familyName != null && !families.has(familyName)) families.put(familyName, fonts);
+                        if (korean) {
+                            for (int i = 0; i < fonts.length(); i++) hangul.put(fonts.get(i));
+                        }
+                        familyName = null;
+                        korean = false;
+                        fonts = null;
+                    }
+                }
+            }
+        }
+        return new JSONObject().put("families", families).put("aliases", aliases).put("hangul", hangul);
+    }
+
+    static boolean isKoreanLang(String lang) {
+        if (lang == null) return false;
+        for (String tag : lang.split("[ ,]+")) {
+            if (tag.equals("ko") || tag.startsWith("ko-") || tag.equals("und-Kore") || tag.equals("und-Hang")) return true;
+        }
+        return false;
+    }
+
+    static int parseIntOr(String text, int fallback) {
+        if (text == null) return fallback;
+        try {
+            return Integer.parseInt(text.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
         }
     }
 

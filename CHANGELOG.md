@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.13.19 - 2026-11-14
+
+> System fonts, a clearer project-folder picker, draggable horizontal scrollbars, and improvements to Git Log, terminal search, notifications, settings and keyboard navigation.
+
+### Added
+
+- Choosing a project folder works like a system folder picker: Back, Forward and Up buttons, a clickable path from your home folder (or `/`), an editable path (Ctrl+L), a plain list of subfolders that opens on click, and a footer showing the folder you will choose. The daemon now reports each listed folder's absolute path.
+- The interface uses your operating system's own font (and its Korean font) by default, with the bundled fonts as fallback; a font typed in Settings › Appearance is used first. System text-size settings (GNOME text scaling, Windows “Make text bigger”, iOS Dynamic Type, Android font size) enlarge the interface text. Code and terminal text keep the built-in code font unless you choose another.
+- Long lines in conversation tool details, code blocks, tables and diffs can be scrolled sideways: Shift + mouse wheel now scrolls horizontally on Linux and Windows, Windows tilt wheels and touchpads scroll sideways, and wide content shows a draggable horizontal scrollbar.
+- New Session can start in a new worktree from the normal form (Local or New worktree, with base and branch name), from a project's `⋯` menu, the command center, or Ctrl/Cmd+Alt+N.
+- Ctrl/Cmd+Shift+J and a command-center entry jump to the next session waiting for your input; collapsed hosts and projects show how many sessions are waiting, waiting sessions are pinned to the top of their project, and the sidebar button shows a dot when one is waiting out of view.
+- Tapping a notification closes whatever was open, opens the session and scrolls to its question or approval; the jump button reads “Approval pending ↓” while one is waiting. A failed session now sends a notification.
+- Terminal: find (Ctrl+Shift+F / Cmd+F), mouse wheel and swipes in full-screen programs (vim, less, htop), clickable links (Ctrl/Cmd+click, tap on phones), a key bar that repeats held arrows, Ctrl+V sends ^V (Ctrl+Shift+V pastes), and a neutral “Terminal exited” row with New terminal. Logs show whether a command succeeded and its exit code.
+- Git Log: branches on narrow panes and phones (drawer and row menu), file history (Path filter and “Show history”), go to a pasted commit hash, “Show in Git Log” from a commit diff, resizable panes, active filters you can clear in one click, keyboard navigation (Ctrl/Cmd+F, Tab between list and files), and a reload that keeps your place and selection when an agent commits.
+- Commit first shows the files it will include and lets you write the message (empty still generates one); Create PR asks for the title and description, then the base branch. “Commit without review” and “Create PR without review” keep the one-click path. The last git failure stays on the Git button with Retry, Copy and Dismiss, and review comments can go to the workspace's agents even when no agent tab is open.
+- Settings › Connections can add, edit and switch connections and shows the pairing QR code; the command center opens any settings page and lists theme, add host, pair device and archive workspace commands with a key-hint footer; a terminal scrollback setting is in General.
+
+### Changed
+
+- Colours meet contrast targets in every theme: error text, links, secondary text, icons and text-field focus borders are easier to read, and buttons pick the more readable text colour.
+- Menus, selects and confirm dialogs work from the keyboard. Toasts stay longer for longer messages, pause on hover, can be dismissed, and an error is no longer replaced by an info message.
+- Ctrl+1–9 and Ctrl+[ / ] follow the sidebar's order (including filters and collapsed groups), with number hints while Ctrl/Cmd is held; Linux and Windows get the pane shortcuts macOS had.
+- The Korean interface no longer shows English in tab titles, dialogs, History, shortcuts, tool names, schedules and settings; dates use the interface language.
+
+### Fixed
+
+- A session that asks a question or waits for an approval shows “Needs input” in the sidebar as soon as it asks, instead of only after the app reconnects.
+- Dangerous settings actions name what they do instead of “Confirm”, stopping the daemon warns that running agents are interrupted, turning off the relay asks first, and reloading the configuration lists the changes that need a restart with a Restart button.
+- History no longer archives a session on a long press without asking, shows offline hosts as offline instead of failed, and sidebar search offers to search all of History when nothing matches.
+- Schedules report Run now, failures and offline hosts, explain why Save is unavailable, and fit narrow screens.
+- The conversation shows when the host is disconnected, with Retry.
+- Pairing-link, relay and SSH errors say what to do next.
+- On first launch the welcome screen shows the built-in daemon starting, or why it failed with Retry and View logs, instead of only offering remote connections.
+- In a dialog, Escape first leaves a focused text field (for example the folder path) and only a second Escape closes the dialog.
+- Files and Changes tree rows are at least 44px tall on phones; the macOS menu bar uses the interface language.
+- File saves no longer overlap or discard edits made while an earlier save is pending; late replies from a closed file or folder picker cannot update a reopened view.
+- Scrollbars retain valid positions after resizing or shrinking content, and the two new-worktree branch inputs stay synchronized.
+- System-font changes refresh without restarting; Windows font discovery refreshes installed families, Android accepts system aliases, and Apple font loading handles unavailable faces and validates rebuilt font checksums.
+- Linux AppImages include the runtime fontconfig dependency; Debian packages recommend it.
+- Attention commands preserve host identity when session IDs collide. History waits for successful archive acknowledgement, notification permissions refresh after OS settings changes, and failed desktop-daemon initialization remains retryable.
+- Home and End edit the query in searchable selects rather than moving the selected result.
+- Git retries resume unfinished steps without repeating successful mutations, and unknown outcomes cannot be blindly resubmitted. Git Log preserves detail failures for retry, rejects stale pages and supports SHA-256 commit lookup; hidden diffs no longer retain active hit targets.
+- A refused or timed-out Stop now reports failure without settling the running turn. Manual schedule runs finish under daemon ownership after a client disconnect; canceled targets no longer report success. A failed Claude plan-mode change keeps its approval request available for retry.
+- Terminal clipboard shortcuts no longer race delayed paste delivery. Mouse input uses the application's negotiated encoding and preserves raw bytes; reconnects restore mouse/alternate-screen modes, and final output is not lost at process exit.
+- Concurrent schedule mutations roll back only their own row, backward search wraps correctly, and canceled touch gestures stop held terminal-key repeats.
+
 ## 0.13.18 - 2026-11-14
 
 > Adds an IntelliJ-style Git Log: branches, every branch's history with a graph, filters and commit details, shown as a log and a commit screen on phones. The app is now Passession with a new icon on every platform, Windows and macOS use the system title bar, and many layout and touch problems on narrow and phone screens are fixed.

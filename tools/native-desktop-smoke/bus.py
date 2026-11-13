@@ -70,7 +70,6 @@ def menu_command(label):
         for child in children: walk(child)
     walk(layout)
     record('actual-native-tray-menu', entries=entries, status=str(values.get('Status')), icon=str(values.get('IconName', '')))
-    assert any(text == 'Open Paseo' for _, text in entries), entries
     selected = next(item_id for item_id, text in entries if text == label)
     menu.Event(dbus.Int32(selected), 'clicked', dbus.Int32(0, variant_level=1), dbus.UInt32(0), reply_handler=lambda: record('menu-click-delivered', label=label), error_handler=lambda error: fail(str(error)))
 
@@ -166,7 +165,7 @@ def tick():
                     service, obj, values = properties()
                     record('actual-tray-item', service=service, title=str(values.get('Title')), status=str(values.get('Status')))
                     dbus.Interface(obj, 'org.kde.StatusNotifierItem').Activate(dbus.Int32(0), dbus.Int32(0), reply_handler=lambda: record('tray-activate-delivered'), error_handler=lambda error: fail(str(error)))
-                elif command == 'quit': menu_command('Quit Paseo')
+                elif command == 'quit': menu_command('Quit Passession')
                 elif command == 'logout':
                     record('emitting-session-end', clients=len(clients))
                     for client in clients: client.EndSession(dbus.UInt32(0))

@@ -41,9 +41,8 @@ pub fn time_ago(at: Option<i64>, now: DateTime<Utc>) -> String {
     if elapsed < 7 * 86_400_000 {
         return lf("{n}d ago", &[("n", &(elapsed / 86_400_000).to_string())]);
     }
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let local = DateTime::from_timestamp_millis(at).map(|t| t.with_timezone(&Local));
-    local.map(|t| { use chrono::Datelike; format!("{} {}", MONTHS[t.month0() as usize], t.day()) }).unwrap_or_default()
+    local.map(|t| { use chrono::Datelike; crate::common::month_day(t.month0(), t.day()) }).unwrap_or_default()
 }
 
 /// `shortenPath`: the home directory as `~`.
@@ -171,6 +170,13 @@ live_design! {
                             ActionRow = <WaActionRow> {}
                             TwoLineRow = <WaTwoLineRow> {}
                             FileRow = <WaFileRow> {}
+                        }
+                        // Desktop key hints (hidden on phones and compact layouts).
+                        footer_rule = <WaRule> { visible: false }
+                        footer = <View> {
+                            width: Fill, height: Fit, visible: false
+                            padding: { left: 16., right: 16., top: 8., bottom: 8. }
+                            text = <WaSmallLine> {}
                         }
                     }
                 }

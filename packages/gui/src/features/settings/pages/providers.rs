@@ -76,7 +76,7 @@ fn remove(s: &mut Settings, host: &str, id: String, label: String) {
     s.confirm(
         ta("settings.providers.remove.confirmTitle", &[("name", &label)]),
         pt("remove.confirmMessage"),
-        Some(pt("remove.confirm")),
+        pt("remove.confirm"),
         true,
         go,
     );

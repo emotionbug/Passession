@@ -50,12 +50,13 @@ pub fn draw_section(ui: &mut Ui, s: &Settings, v: &View, section: &str) {
         };
         match host_section {
             "host" => host::draw_overview_page(ui, s, v, host),
-            "projects" => host::draw_projects(ui, s, host),
+            "projects" => {
+                host::draw_projects(ui, s, host);
+                daemon::draw_workspace_options(ui, s, host);
+            }
             "connections" => host::draw_connections_page(ui, s, v, host),
-            "pair-device" => host::draw_pair_device(ui, host),
             "agents" => daemon::draw_agents(ui, s, v, host),
             "metadata" => profiles::draw_metadata_page(ui, s, host),
-            "workspaces" => daemon::draw_workspaces(ui, s, host),
             "providers" => providers::draw_providers(ui, s, v, host),
             "usage" => usage::draw_usage(ui, s, v, host),
             "terminals" => daemon::draw_terminals(ui, s, host),
@@ -101,7 +102,7 @@ pub fn ensure(s: &mut Settings, env: &mut Env, v: &View) {
                 daemon::ensure_daemon(s, env, &host);
                 profiles::ensure_metadata(s, env, &host);
             }
-            "workspaces" | "terminals" | "providers" => daemon::ensure_daemon(s, env, &host),
+            "projects" | "terminals" | "providers" => daemon::ensure_daemon(s, env, &host),
             "usage" => usage::ensure_usage(s, env, &host),
             "plugins" => {
                 daemon::ensure_daemon(s, env, &host);
@@ -149,6 +150,7 @@ pub fn sheet_head(s: &Settings, v: &View, sheet: &Sheet) -> SheetHead {
         SheetKind::Diagnostic(p) => providers::diagnostic_head(sheet.id, p),
         SheetKind::Profile(p) => profiles::profile_head(sheet.id, p),
         SheetKind::UsageOptions { .. } => SheetHead::new(super::i18n::t("providerUsage.options")),
+        SheetKind::ConfigReload(p) => daemon::config_reload_head(sheet.id, p),
         SheetKind::PluginLogs(p) => plugins::logs_head(sheet.id, p),
     }
 }
@@ -166,6 +168,7 @@ pub fn sheet_body(ui: &mut Ui, s: &Settings, v: &View, sheet: &Sheet) {
         SheetKind::Diagnostic(p) => providers::diagnostic_body(ui, p),
         SheetKind::Profile(p) => profiles::profile_body(ui, sheet.id, p),
         SheetKind::UsageOptions { host } => usage::options_body(ui, s, v, host),
+        SheetKind::ConfigReload(p) => daemon::config_reload_body(ui, p),
         SheetKind::PluginLogs(p) => plugins::logs_body(ui, p),
     }
 }

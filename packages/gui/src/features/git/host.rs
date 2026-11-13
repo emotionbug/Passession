@@ -84,6 +84,37 @@ pub fn agent_label(ui: &UiContext, host_id: &str, agent_id: &str) -> String {
     String::new()
 }
 
+/// The workspace's live top-level agents (not archived, no parent) as
+/// `(id, title or name)`, in host order.
+pub fn workspace_agents(ui: &UiContext, host_id: &str, workspace_id: &str) -> Vec<(String, String)> {
+    let Some(host) = host(ui, host_id) else {
+        return Vec::new();
+    };
+    if workspace_id.is_empty() {
+        return Vec::new();
+    }
+    array(host, "agents")
+        .iter()
+        .map(|row| match row.get("agent") {
+            Some(agent @ Value::Object(_)) => agent,
+            _ => row,
+        })
+        .filter(|agent| {
+            let labels = agent.get("labels").unwrap_or(&Value::Null);
+            text(agent, "workspaceId") == workspace_id
+                && !text(agent, "id").is_empty()
+                && agent.get("archivedAt").is_none_or(Value::is_null)
+                && text(agent, "parentAgentId").is_empty()
+                && text(labels, "paseo.parent-agent-id").trim().is_empty()
+        })
+        .map(|agent| {
+            let title = text(agent, "title");
+            let label = if title.is_empty() { text(agent, "name") } else { title };
+            (text(agent, "id").to_owned(), label.to_owned())
+        })
+        .collect()
+}
+
 pub fn is_mobile_platform() -> bool {
     cfg!(any(target_os = "android", target_os = "ios"))
 }

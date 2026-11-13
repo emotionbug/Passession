@@ -64,6 +64,8 @@ pub struct RowState {
     pub hovered: bool,
     pub hover_link: Option<std::sync::Arc<str>>,
     pub hover_hit: Option<String>,
+    /// The scroll bar key whose thumb is being dragged (drawn active).
+    pub dragging_bar: Option<String>,
     /// Paced reveal of streaming text by key.
     pub reveals: HashMap<String, Reveal>,
     /// Parsed Markdown keyed by source text hash.

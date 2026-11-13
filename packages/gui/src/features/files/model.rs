@@ -166,7 +166,10 @@ impl FileEditorModel {
         if self.disposed || !self.is_loaded() || content == self.content {
             return;
         }
-        let modified = content != self.persisted;
+        // Until the in-flight write settles, reverting to the old disk text still
+        // needs a save: that write may replace it with a different buffer.
+        let modified = content != self.persisted
+            || self.saving_content.as_ref().is_some_and(|(_, pending)| *pending != content);
         let mut status = if modified { FileEditorStatus::Dirty } else { FileEditorStatus::Clean };
         if self.status == FileEditorStatus::Conflict {
             status = FileEditorStatus::Conflict;
@@ -289,7 +292,7 @@ impl FileEditorModel {
     }
 
     fn write(&mut self, force: bool, io: &mut dyn ModelIo) {
-        if self.disposed {
+        if self.disposed || self.saving {
             return;
         }
         io.cancel_autosave();
@@ -307,11 +310,10 @@ impl FileEditorModel {
 
     /// A write the model asked for finished.
     pub fn on_write(&mut self, seq: u64, result: Result<(), WriteFailure>, io: &mut dyn ModelIo) {
-        let saved = self.saving_content.take_if(|(sequence, _)| *sequence == seq);
         if self.disposed || seq != self.save_sequence {
-            self.saving = false;
             return;
         }
+        let saved = self.saving_content.take_if(|(sequence, _)| *sequence == seq);
         self.saving = false;
         match result {
             Err(WriteFailure::Conflict) => self.enter_conflict(Conflict::Changed, io),
@@ -342,6 +344,9 @@ impl FileEditorModel {
     fn apply_file(&mut self, raw: &str, io: &mut dyn ModelIo) {
         io.cancel_autosave();
         self.save_sequence += 1;
+        self.saving = false;
+        self.saving_content = None;
+        self.event_during_save = None;
         self.line_separator = detect_line_separator(raw);
         let content = normalize(raw);
         self.persisted = content.clone();
@@ -527,6 +532,55 @@ mod tests {
         model.autosave(&mut io);
         run(&mut model, &mut io);
         assert_eq!(io.disk, "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn edits_during_save_wait_for_the_inflight_write() {
+        let (mut model, mut io) = open("a");
+        model.edit("b".into(), &mut io);
+        model.save(&mut io);
+        let first = model.save_sequence;
+        model.edit("c".into(), &mut io);
+        model.autosave(&mut io);
+        assert_eq!(io.writes.len(), 1);
+        assert_eq!(model.save_sequence, first);
+        run(&mut model, &mut io);
+        assert_eq!(io.disk, "b");
+        assert_eq!(model.content(), "c");
+        assert!(model.modified() && io.autosave);
+        model.autosave(&mut io);
+        run(&mut model, &mut io);
+        assert_eq!(io.disk, "c");
+        assert_eq!(model.status(), FileEditorStatus::Clean);
+    }
+
+    #[test]
+    fn reverting_during_save_stays_modified_until_saved_again() {
+        let (mut model, mut io) = open("a");
+        model.edit("b".into(), &mut io);
+        model.save(&mut io);
+        model.edit("a".into(), &mut io);
+        assert!(model.modified());
+        run(&mut model, &mut io);
+        assert_eq!(io.disk, "b");
+        assert!(model.modified() && io.autosave);
+        model.autosave(&mut io);
+        run(&mut model, &mut io);
+        assert_eq!(io.disk, "a");
+        assert!(!model.modified());
+    }
+
+    #[test]
+    fn stale_write_completion_does_not_clear_active_save() {
+        let (mut model, mut io) = open("a");
+        model.edit("b".into(), &mut io);
+        model.save(&mut io);
+        let active = model.save_sequence;
+        model.on_write(active - 1, Ok(()), &mut io);
+        assert!(model.saving);
+        assert_eq!(model.saving_content.as_ref().map(|(seq, _)| *seq), Some(active));
+        run(&mut model, &mut io);
+        assert_eq!(model.status(), FileEditorStatus::Clean);
     }
 
     #[test]

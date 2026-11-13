@@ -99,6 +99,7 @@ pub fn draw_shortcuts(ui: &mut Ui, s: &Settings, v: &View) {
         for binding in rows {
             ui.card_row_separator();
             let capturing = s.shortcuts.capturing.as_deref() == Some(binding.id.as_str());
+            let name = crate::shell::shortcuts::help_label(&binding.help_id, &binding.label);
             let combo = shortcuts::effective_combo(&overrides, binding);
             let has_override = overrides.contains_key(&binding.id);
             let complete = shortcuts::capture_complete(binding, &s.shortcuts.steps);
@@ -134,7 +135,7 @@ pub fn draw_shortcuts(ui: &mut Ui, s: &Settings, v: &View) {
                 actions.push(button(format!("shortcut.{id}.cancel"), t("settings.shortcuts.actions.cancel"), Some(handler(|s, _| cancel_capture(s)))).variant(Variant::Ghost).ctl());
             } else {
                 let has_default = !binding.combo.is_empty();
-                let label = binding.label.clone();
+                let label = name.clone();
                 let empty_combo = combo.is_empty();
                 let menu = handler(move |s, _| {
                     let bind_id = id.clone();
@@ -166,13 +167,13 @@ pub fn draw_shortcuts(ui: &mut Ui, s: &Settings, v: &View) {
             let action_ctl = Ctl::Row(actions, 4.0);
             let action_size = ui.measure_ctl(&action_ctl);
             let label_w = (ui.w - 24.0 - key_size.x - action_size.x - 16.0).max(80.0);
-            let label_size = ui.measure(Font::Regular, 14.0, &binding.label, Some(label_w));
+            let label_size = ui.measure(Font::Regular, 14.0, &name, Some(label_w));
             let h = label_size.y.max(key_size.y).max(action_size.y) + 24.0;
             let (x, y, w) = (ui.x, ui.y, ui.w);
             if capturing {
                 ui.rect(Rect { pos: dvec2(x, y), size: dvec2(w, h) }, pal.surface2, None, 0.0);
             }
-            ui.text(Font::Regular, 14.0, pal.foreground, dvec2(x + 12.0, y + (h - label_size.y) / 2.0), Some(label_w), &binding.label);
+            ui.text(Font::Regular, 14.0, pal.foreground, dvec2(x + 12.0, y + (h - label_size.y) / 2.0), Some(label_w), &name);
             let ax = x + w - 12.0 - action_size.x;
             ui.draw_ctl(action_ctl, dvec2(ax, y + (h - action_size.y) / 2.0));
             ui.draw_ctl(key_ctl, dvec2(ax - 8.0 - key_size.x, y + (h - key_size.y) / 2.0));

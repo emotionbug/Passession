@@ -1,7 +1,7 @@
 //! The explorer tree view (Flutter `RemoteDirectoryBrowser.build`): the 36px sidebar toolbar
-//! (sort trigger, owner actions, hidden-files toggle, refresh, optional navigation menu), the
-//! optional remote location field and "Use this directory" button (picker), the stale-error
-//! line, and the lazily drawn flattened rows (only rows in the viewport are laid out).
+//! (sort trigger, owner actions, hidden-files toggle, refresh), the stale-error line, and the
+//! lazily drawn flattened rows (only rows in the viewport are laid out). The remote folder
+//! picker has its own view (`picker.rs`).
 
 use makepad_widgets::*;
 
@@ -9,9 +9,8 @@ use crate::common::clock;
 use crate::common::paint::{Font, HitMap};
 use crate::theme::{Palette, Typography, fade, with_alpha};
 
-use super::editor::field::{FieldEvent, TextField};
 use super::explorer::{Entry, ExplorerState};
-use super::i18n::{l, t};
+use super::i18n::t;
 use super::images;
 use super::kit::{Kit, rect, spec};
 use super::ui::{self, Interaction, TOOLBAR_HEIGHT};
@@ -31,14 +30,10 @@ enum Hot {
     Action(&'static str),
     Hidden,
     Refresh,
-    Navigation,
-    UseDirectory,
-    Location,
     Row(usize),
     Back,
     Retry,
     Background,
-    NavItem(&'static str),
 }
 
 /// What the owner handles.
@@ -50,7 +45,6 @@ pub enum ExplorerEvent {
     /// Right click (with the window position) or long press (None) on a row.
     EntryMenu { entry: Entry, at: Option<DVec2>, row: Rect },
     BackgroundMenu { at: Option<DVec2>, anchor: Rect },
-    DirectorySelected(String),
 }
 
 pub struct ExplorerView {
@@ -62,14 +56,8 @@ pub struct ExplorerView {
     row_height: f64,
     thumb_drag: Option<(f64, f64)>,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
-    pub location: TextField,
-    pub location_focused: bool,
-    /// The picker's in-view navigation menu (Back / Forward / Parent / Go to directory).
-    nav_open: bool,
-    nav_anchor: Rect,
     /// Visible row rects by index, for anchoring menus.
     row_rects: Vec<(usize, Rect)>,
-    pub sidebar: bool,
 }
 
 impl Default for ExplorerView {
@@ -83,12 +71,7 @@ impl Default for ExplorerView {
             row_height: 28.0,
             thumb_drag: None,
             touch_scroll: Default::default(),
-            location: TextField::new("."),
-            location_focused: false,
-            nav_open: false,
-            nav_anchor: Rect::default(),
             row_rects: Vec::new(),
-            sidebar: true,
         }
     }
 }
@@ -98,26 +81,10 @@ pub struct ExplorerLook<'a> {
     pub typography: Typography,
     pub compact: bool,
     pub actions: &'a [ToolbarAction],
-    pub navigation_menu: bool,
-    pub picker: bool,
     pub busy: bool,
 }
 
 impl ExplorerView {
-    pub fn handle_selection_handles(&mut self, cx: &mut Cx, kit: &mut Kit, event: &Event) -> bool {
-        if !self.location_focused || self.nav_open {
-            self.location.cancel_selection_handles(cx);
-            return false;
-        }
-        if !self.location.handle_selection_handles(cx, kit, event) {
-            return false;
-        }
-        self.touch_scroll.reset();
-        self.thumb_drag = None;
-        self.pressed = None;
-        true
-    }
-
     fn state_of(&self, hot: &Hot, enabled: bool, selected: bool) -> Interaction {
         Interaction {
             hovered: self.hovered.as_ref() == Some(hot),
@@ -127,17 +94,17 @@ impl ExplorerView {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, state: &ExplorerState, look: &ExplorerLook, ime: (Area, DVec2)) {
+    /// Draws into `area`; `widget` is the owner's area (animation clock registration).
+    pub fn draw(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, state: &ExplorerState, look: &ExplorerLook, widget: Area) {
         let p = &look.palette;
         let ty = &look.typography;
         self.hits.clear();
         self.row_rects.clear();
-        kit.fill(cx, area, if self.sidebar { p.sidebar } else { p.surface0 }, 0.0);
+        kit.fill(cx, area, p.sidebar, 0.0);
         // Toolbar.
         let toolbar_h = TOOLBAR_HEIGHT.max(ty.ui_size(12.0) * 1.4 + 12.0);
         let bar = rect(area.pos.x, area.pos.y, area.size.x, toolbar_h);
-        ui::toolbar(cx, kit, bar, self.sidebar, p);
+        ui::toolbar(cx, kit, bar, true, p);
         let small = ty.ui_size(12.0);
         let sort_label = t(&format!("workspace.fileExplorer.sort.{}", state.sort().id()));
         let sort_w = kit.measure(cx, spec(Font::Regular, small, p.muted), &sort_label).x + 4.0 + 12.0 + 8.0;
@@ -160,17 +127,10 @@ impl ExplorerView {
             *x -= 1.0;
             r
         };
-        if look.navigation_menu {
-            let r = place(&mut x);
-            let st = self.state_of(&Hot::Navigation, true, self.nav_open);
-            ui::icon_button(cx, kit, r, "ellipsis", st, look.compact, p);
-            self.hits.push(r, Hot::Navigation);
-            self.nav_anchor = r;
-        }
         let refresh = place(&mut x);
         if state.refreshing() {
             ui::spinner(cx, kit, refresh, ui::toolbar_icon_size(look.compact), p.extra_muted, clock::phase(900));
-            clock::register(cx, ime.0);
+            clock::register(cx, widget);
         } else {
             let st = self.state_of(&Hot::Refresh, true, false);
             ui::icon_button(cx, kit, refresh, "rotate-cw", st, look.compact, p);
@@ -188,25 +148,6 @@ impl ExplorerView {
             self.hits.push(r, hot);
         }
         let mut top = bar.pos.y + toolbar_h;
-        // Remote location field (picker, or the navigation menu's "Go to directory…").
-        if state.show_location || state.directories_only {
-            let h = ui::ButtonSize::Sm.height().max(small * 1.4 + 12.0);
-            let r = rect(area.pos.x + 8.0, top + 8.0, area.size.x - 16.0, h);
-            self.location.focused = self.location_focused;
-            self.location.draw(cx, kit, r, l("Remote directory"), None, ty.ui_size(12.0), p, ime.0);
-            self.hits.push(r, Hot::Location);
-            top += 8.0 + h;
-        }
-        if look.picker {
-            let label = l("Use this directory");
-            let h = ui::ButtonSize::Sm.height().max(small * 1.4 + 12.0);
-            let w = ui::button_width(cx, kit, label, Some("check"), ui::ButtonSize::Sm, ty);
-            let r = rect(area.pos.x + 8.0, top + 8.0, w, h);
-            let st = self.state_of(&Hot::UseDirectory, true, false);
-            ui::button(cx, kit, r, label, Some("check"), ui::ButtonVariant::Outline, ui::ButtonSize::Sm, st, p, ty);
-            self.hits.push(r, Hot::UseDirectory);
-            top += 8.0 + h;
-        }
         if let Some(error) = state.stale_root_error() {
             let width = area.size.x - 24.0;
             let h = kit.paragraph_height(cx, width, spec(Font::Regular, small, p.destructive), error);
@@ -247,16 +188,13 @@ impl ExplorerView {
             let label = t("workspace.fileExplorer.states.loading");
             let cy = list.pos.y + list.size.y / 2.0;
             ui::spinner(cx, kit, rect(list.pos.x + list.size.x / 2.0 - 10.0, cy - 24.0, 20.0, 20.0), 20.0, p.muted, clock::phase(900));
-            clock::register(cx, ime.0);
+            clock::register(cx, widget);
             kit.text_in(cx, rect(list.pos.x, cy + 4.0, list.size.x, base * 1.4), muted, &label, 0.5);
         } else if state.rows().is_empty() {
             let label = t(if state.show_hidden() { "workspace.fileExplorer.empty.noFiles" } else { "workspace.fileExplorer.empty.noVisibleFiles" });
             kit.text_in(cx, rect(list.pos.x, list.pos.y + list.size.y / 2.0 - base, list.size.x, base * 2.0), muted, &label, 0.5);
         } else {
-            self.draw_rows(cx, kit, list, state, look, ime.0);
-        }
-        if self.nav_open {
-            self.draw_nav_menu(cx, kit, state, look);
+            self.draw_rows(cx, kit, list, state, look, widget);
         }
     }
 
@@ -264,7 +202,7 @@ impl ExplorerView {
         let p = &look.palette;
         let ty = &look.typography;
         let base = ty.ui_size(14.0);
-        let row_h = (base * 1.2 + 12.0).max(28.0).round();
+        let row_h = tree_row_height(base, crate::common::is_compact_layout(cx));
         self.row_height = row_h;
         let rows = state.rows();
         let content_h = 8.0 + rows.len() as f64 * row_h + 16.0;
@@ -316,50 +254,12 @@ impl ExplorerView {
         cx.end_turtle();
     }
 
-    /// The picker's navigation popover (200px, under the "…" button, aligned to its end).
-    fn draw_nav_menu(&mut self, cx: &mut Cx2d, kit: &mut Kit, state: &ExplorerState, look: &ExplorerLook) {
-        let p = &look.palette;
-        let ty = &look.typography;
-        let items: [(&'static str, &'static str, &str, bool); 4] = [
-            ("back", "arrow-left", l("Back"), state.can_go_back()),
-            ("forward", "arrow-right", l("Forward"), state.can_go_forward()),
-            ("parent", "corner-left-up", l("Parent directory"), true),
-            ("location", "folder-search", l("Go to directory…"), true),
-        ];
-        let item_h = 32.0_f64.max(ty.ui_size(14.0) * 1.4 + 12.0);
-        let w = 200.0;
-        let h = item_h * 4.0 + 9.0 + 8.0;
-        let x = self.nav_anchor.pos.x + self.nav_anchor.size.x - w;
-        let y = self.nav_anchor.pos.y + self.nav_anchor.size.y + 4.0;
-        let card = rect(x, y, w, h);
-        ui::card(cx, kit, card, p, 8.0);
-        let mut iy = y + 4.0;
-        for (index, (id, icon, label, enabled)) in items.into_iter().enumerate() {
-            if index == 3 {
-                kit.hline(cx, x + 1.0, iy + 4.0, w - 2.0, p.border);
-                iy += 9.0;
-            }
-            let r = rect(x + 4.0, iy, w - 8.0, item_h);
-            let hot = Hot::NavItem(id);
-            if enabled && self.hovered.as_ref() == Some(&hot) {
-                kit.fill(cx, r, p.interaction_highlight, 6.0);
-            }
-            let color = if enabled { p.foreground } else { fade(p.foreground, 0.5) };
-            kit.icon(cx, rect(r.pos.x + 8.0, r.pos.y, 16.0, item_h), icon, 16.0, if enabled { p.muted } else { fade(p.muted, 0.5) });
-            kit.text_in(cx, rect(r.pos.x + 32.0, r.pos.y, r.size.x - 40.0, item_h), spec(Font::Regular, ty.ui_size(14.0), color), label, 0.0);
-            if enabled {
-                self.hits.push(r, hot);
-            }
-            iy += item_h;
-        }
-    }
-
     pub fn row_rect(&self, index: usize) -> Option<Rect> {
         self.row_rects.iter().find(|(i, _)| *i == index).map(|(_, r)| *r)
     }
 
     pub fn animate_scroll(&mut self, cx: &mut Cx, event: &Event, state: &ExplorerState, enabled: bool) -> bool {
-        if !enabled || self.nav_open {
+        if !enabled {
             self.touch_scroll.reset();
             return false;
         }
@@ -368,18 +268,8 @@ impl ExplorerView {
         self.touch_scroll.apply_delta(&mut self.scroll_y, delta, max)
     }
 
-    pub fn wants_touch_focus(&self, hit: &Hit) -> bool {
-        let abs = match hit {
-            Hit::FingerUp(fe) => fe.abs,
-            Hit::FingerLongPress(fe) => fe.abs,
-            _ => return false,
-        };
-        self.pressed == Some(Hot::Location) && self.hits.at(abs) == Some(Hot::Location)
-            && self.location.wants_touch_focus(hit)
-    }
-
-    /// Pointer and keyboard input on the owner's area. `changed` tells the owner to redraw.
-    pub fn handle_hit(&mut self, cx: &mut Cx, kit: &mut Kit, hit: &Hit, state: &mut ExplorerState, look: &ExplorerLook, changed: &mut bool) -> ExplorerEvent {
+    /// Pointer input on the owner's area. `changed` tells the owner to redraw.
+    pub fn handle_hit(&mut self, cx: &mut Cx, hit: &Hit, state: &mut ExplorerState, look: &ExplorerLook, changed: &mut bool) -> ExplorerEvent {
         match hit {
             Hit::FingerHoverIn(fe) | Hit::FingerHoverOver(fe) => {
                 let hot = self.hits.at(fe.abs);
@@ -387,8 +277,8 @@ impl ExplorerView {
                     self.hovered = hot;
                     *changed = true;
                 }
-                let hand = matches!(self.hovered, Some(Hot::Row(_) | Hot::Sort | Hot::Action(_) | Hot::Hidden | Hot::Refresh | Hot::Navigation | Hot::UseDirectory | Hot::Back | Hot::Retry | Hot::NavItem(_)));
-                cx.set_cursor(if hand { MouseCursor::Hand } else if self.hovered == Some(Hot::Location) { MouseCursor::Text } else { MouseCursor::Default });
+                let hand = matches!(self.hovered, Some(Hot::Row(_) | Hot::Sort | Hot::Action(_) | Hot::Hidden | Hot::Refresh | Hot::Back | Hot::Retry));
+                cx.set_cursor(if hand { MouseCursor::Hand } else { MouseCursor::Default });
             }
             Hit::FingerHoverOut(_) => {
                 if self.hovered.take().is_some() {
@@ -405,28 +295,8 @@ impl ExplorerView {
             Hit::FingerDown(fe) => {
                 self.touch_scroll.reset();
                 let hot = self.hits.at(fe.abs);
-                if self.nav_open && !matches!(hot, Some(Hot::NavItem(_) | Hot::Navigation)) {
-                    self.nav_open = false;
-                    *changed = true;
-                    return ExplorerEvent::None;
-                }
                 let secondary = fe.device.mouse_button().is_some_and(|b| b.is_secondary());
                 self.pressed = hot.clone();
-                if fe.device.is_touch() && hot == Some(Hot::Location) {
-                    self.location.handle_hit(cx, kit, hit);
-                    return ExplorerEvent::None;
-                }
-                if self.location_focused && hot != Some(Hot::Location) {
-                    self.location.clear_selection(cx);
-                }
-                self.location_focused = hot == Some(Hot::Location);
-                self.location.focused = self.location_focused;
-                if self.location_focused {
-                    let event = self.location.handle_hit(cx, kit, hit);
-                    *changed = true;
-                    let _ = event;
-                    return ExplorerEvent::None;
-                }
                 if secondary {
                     if let Some(Hot::Row(index)) = hot
                         && let Some(entry) = state.rows().get(index).map(|row| row.entry.clone()) {
@@ -464,36 +334,19 @@ impl ExplorerView {
                         self.pressed = None;
                         *changed = true;
                     }
-                } else if self.pressed == Some(Hot::Location) {
-                    self.location.handle_hit(cx, kit, hit);
-                    *changed = true;
                 }
             }
             Hit::FingerLongPress(fe) => {
                 self.touch_scroll.reset();
                 let hot = self.hits.at(fe.abs);
-                let pressed = self.pressed.clone();
                 *changed = true;
                 match hot {
-                    Some(Hot::Location) if pressed == Some(Hot::Location) && self.wants_touch_focus(hit) => {
-                        self.location_focused = true;
-                        self.location.focused = true;
-                        self.location.handle_hit(cx, kit, hit);
-                        return ExplorerEvent::None;
-                    }
                     Some(Hot::Row(index)) => {
                         let Some(row) = state.rows().get(index).cloned() else { return ExplorerEvent::None };
                         state.selected = Some(row.entry.path.clone());
-                        if look.picker {
-                            // Long press selects a directory in the picker.
-                            if row.entry.is_directory() {
-                                return ExplorerEvent::DirectorySelected(state.absolute(&row.entry.path));
-                            }
-                            return ExplorerEvent::None;
-                        }
                         return ExplorerEvent::EntryMenu { entry: row.entry, at: None, row: self.row_rect(index).unwrap_or_default() };
                     }
-                    Some(Hot::Background) if !look.picker => {
+                    Some(Hot::Background) => {
                         return ExplorerEvent::BackgroundMenu { at: None, anchor: rect(fe.abs.x, fe.abs.y, 0.0, 0.0) };
                     }
                     _ => {}
@@ -505,17 +358,6 @@ impl ExplorerView {
                 self.thumb_drag = None;
                 let pressed = self.pressed.take();
                 *changed = true;
-                if pressed == Some(Hot::Location) {
-                    if self.hits.at(fe.abs) != Some(Hot::Location) {
-                        self.location.cancel_touch_focus();
-                    }
-                    if self.hits.at(fe.abs) == Some(Hot::Location) && self.location.wants_touch_focus(hit) {
-                        self.location_focused = true;
-                        self.location.focused = true;
-                    }
-                    self.location.handle_hit(cx, kit, hit);
-                    return ExplorerEvent::None;
-                }
                 if !(fe.is_over && fe.was_tap()) || fe.has_long_press_occurred {
                     return ExplorerEvent::None;
                 }
@@ -524,29 +366,6 @@ impl ExplorerView {
                     return ExplorerEvent::None;
                 }
                 return self.activate(hot, state, look);
-            }
-            Hit::KeyDown(_) | Hit::TextInput(_) | Hit::TextIme(_) | Hit::TextCopy(_) | Hit::TextCut(_) if self.location_focused => {
-                *changed = true;
-                match self.location.handle_hit(cx, kit, hit) {
-                    FieldEvent::Submitted { .. } => {
-                        let path = self.location.text().trim().to_owned();
-                        state.navigate(&path, true);
-                    }
-                    FieldEvent::Escaped => {
-                        self.location.clear_selection(cx);
-                        self.location.focused = false;
-                        self.location_focused = false;
-                    }
-                    _ => {}
-                }
-            }
-            Hit::KeyFocusLost(_) => {
-                self.location.clear_selection(cx);
-                self.location.focused = false;
-                if self.location_focused {
-                    self.location_focused = false;
-                    *changed = true;
-                }
             }
             _ => {}
         }
@@ -563,20 +382,6 @@ impl ExplorerView {
                     return ExplorerEvent::Action(id);
                 }
             }
-            Some(Hot::Navigation) => self.nav_open = !self.nav_open,
-            Some(Hot::NavItem(id)) => {
-                self.nav_open = false;
-                match id {
-                    "back" => state.back(),
-                    "forward" => state.forward(),
-                    "parent" => state.parent(),
-                    _ => {
-                        state.show_location = !state.show_location;
-                        self.location.set_text(state.path());
-                    }
-                }
-            }
-            Some(Hot::UseDirectory) => return ExplorerEvent::DirectorySelected(state.absolute_path()),
             Some(Hot::Back) => state.back(),
             Some(Hot::Retry) => {
                 let path = state.path().to_owned();
@@ -595,11 +400,22 @@ impl ExplorerView {
         }
         ExplorerEvent::None
     }
+}
 
-    /// Keeps the location field in step with navigation.
-    pub fn sync_location(&mut self, state: &ExplorerState) {
-        if !self.location_focused && self.location.text() != state.location_text {
-            self.location.set_text(&state.location_text);
-        }
+/// Tree row height for a `base` UI font size: 28px minimum, 44px touch targets on compact.
+fn tree_row_height(base: f64, compact: bool) -> f64 {
+    (base * 1.2 + 12.0).max(if compact { 44.0 } else { 28.0 }).round()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tree_row_height;
+
+    #[test]
+    fn compact_tree_rows_are_touch_targets() {
+        assert_eq!(tree_row_height(14.0, false), 29.0);
+        assert_eq!(tree_row_height(14.0, true), 44.0);
+        // Large text still grows the row past the minimum.
+        assert_eq!(tree_row_height(30.0, true), 48.0);
     }
 }

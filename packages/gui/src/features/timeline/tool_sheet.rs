@@ -85,13 +85,14 @@ pub fn paint_detail_sheet(
     d.state.scroll_y.insert(key.clone(), sy);
     // Enclosing regions register before their content: the deepest one wins.
     if max_y > 0.0 {
-        d.canvas.add_hit(view, HitTarget::ScrollY(key));
+        d.canvas.add_hit(view, HitTarget::ScrollY(key.clone()));
     }
     cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(view.size.x), height: Size::Fixed(view.size.y) }, Layout::default());
     d.canvas.push_clip(view);
     body(cx, d, view.pos.x, view.pos.y - sy, view.size.x, fill);
     d.canvas.pop_clip();
     cx.end_turtle();
+    super::scrollbar::draw(cx, d, view, None, None, Some(super::scrollbar::Axis { key: &key, offset: sy, max: max_y }));
     if progress < 1.0 {
         d.animating = true;
     }

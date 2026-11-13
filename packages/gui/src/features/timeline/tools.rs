@@ -2,6 +2,7 @@
 //! paseo-tool-presentation/*, tool-call icon/file-path utils,
 //! tool-calls/presentation.ts) and the data side of `tool_call_details.dart`.
 
+use super::i18n::{t, ta};
 use super::json::*;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -87,7 +88,6 @@ enum Context {
 }
 
 struct PaseoEntry {
-    label: &'static str,
     context: Context,
     prompt_field: Option<&'static str>,
     input_order: &'static [&'static str],
@@ -100,79 +100,80 @@ const AUTOMATION_FIELDS: &[&str] = &["name", "id", "cron", "timezone", "provider
 const BROWSER_FIELDS: &[&str] = &["browserId", "url", "ref", "sourceRef", "targetRef", "value", "text", "key", "button", "doubleClick", "modifiers", "filePaths", "fullPage", "maxEntries", "timeoutMs", "deltaX", "deltaY", "width", "height", "function"];
 const AUTOMATION_OUTPUT: &[&str] = &["id", "status", "nextRunAt", "expiresAt"];
 
-const fn entry(label: &'static str, context: Context, prompt_field: Option<&'static str>, input_order: &'static [&'static str], output_fields: Option<&'static [&'static str]>) -> PaseoEntry {
-    PaseoEntry { label, context, prompt_field, input_order, output_fields }
+/// A catalogued Paseo tool; its title is `agentStream.paseoTools.<leaf>`.
+const fn entry(context: Context, prompt_field: Option<&'static str>, input_order: &'static [&'static str], output_fields: Option<&'static [&'static str]>) -> PaseoEntry {
+    PaseoEntry { context, prompt_field, input_order, output_fields }
 }
 
-const fn browser(label: &'static str, context: Context) -> PaseoEntry {
-    entry(label, context, None, BROWSER_FIELDS, None)
+const fn browser(context: Context) -> PaseoEntry {
+    entry(context, None, BROWSER_FIELDS, None)
 }
 
 fn paseo_catalog(leaf: &str) -> Option<PaseoEntry> {
     use Context::*;
     Some(match leaf {
-        "create_agent" => entry("Create agent", Field(&["title", "initialPrompt"]), Some("initialPrompt"), AGENT_FIELDS, Some(&["agentId", "status", "currentModeId", "cwd"])),
-        "send_agent_prompt" => entry("Send message", Field(&["prompt"]), Some("prompt"), AGENT_FIELDS, Some(&["status", "lastMessage", "permission"])),
-        "get_agent_status" => entry("Check agent", TargetAgent, Option::None, &["agentId"], Option::None),
-        "get_agent_activity" => entry("Read agent activity", TargetAgent, Option::None, &["agentId", "limit"], Option::None),
-        "list_agents" => entry("List agents", None, Option::None, &["cwd", "statuses", "sinceHours", "limit", "includeArchived"], Option::None),
-        "update_agent" => entry("Update agent", FieldOrTargetAgent("name"), Option::None, AGENT_FIELDS, Option::None),
-        "set_agent_mode" => entry("Set agent mode", Field(&["modeId"]), Option::None, &["agentId", "modeId"], Option::None),
-        "cancel_agent" => entry("Cancel agent", TargetAgent, Option::None, &["agentId"], Option::None),
-        "archive_agent" => entry("Archive agent", TargetAgent, Option::None, &["agentId"], Option::None),
-        "kill_agent" => entry("Kill agent", TargetAgent, Option::None, &["agentId"], Option::None),
-        "list_pending_permissions" => entry("List permissions", None, Option::None, &[], Option::None),
-        "respond_to_permission" => entry("Respond to permission", TargetAgent, Option::None, &["agentId", "requestId", "response"], Option::None),
-        "create_workspace" => entry("Create workspace", Workspace, Option::None, WORKSPACE_FIELDS, Some(&["workspaceId", "projectId"])),
-        "list_hosts" => entry("List hosts", None, Option::None, &[], Option::None),
-        "list_workspaces" => entry("List workspaces", None, Option::None, &[], Option::None),
-        "rename_workspace" => entry("Rename workspace", Field(&["title"]), Option::None, &["title", "workspaceId"], Option::None),
-        "archive_workspace" => entry("Archive workspace", Field(&["workspaceId"]), Option::None, &["workspaceId"], Some(&["workspaceId", "archivedAgentIds", "removedDirectory"])),
-        "list_workspace_scripts" => entry("List scripts", None, Option::None, &["workspaceId"], Option::None),
-        "start_workspace_script" => entry("Start script", Field(&["scriptName"]), Option::None, &["workspaceId", "scriptName"], Option::None),
-        "stop_workspace_script" => entry("Stop script", Field(&["scriptName"]), Option::None, &["workspaceId", "scriptName"], Option::None),
-        "create_terminal" => entry("Create terminal", Field(&["name", "command"]), Option::None, &["cwd", "workspaceId", "name", "command"], Option::None),
-        "list_terminals" => entry("List terminals", None, Option::None, &["cwd", "all"], Option::None),
-        "capture_terminal" => entry("Read terminal", Field(&["terminalId"]), Option::None, &["terminalId", "lines"], Option::None),
-        "send_terminal_keys" => entry("Send keys", Field(&["keys"]), Option::None, &["terminalId", "keys", "literal"], Option::None),
-        "kill_terminal" => entry("Kill terminal", Field(&["terminalId"]), Option::None, &["terminalId"], Option::None),
-        "create_schedule" => entry("Create schedule", Field(&["name", "cron"]), Some("prompt"), AUTOMATION_FIELDS, Some(AUTOMATION_OUTPUT)),
-        "create_heartbeat" => entry("Create heartbeat", Field(&["name", "cron"]), Some("prompt"), AUTOMATION_FIELDS, Some(AUTOMATION_OUTPUT)),
-        "update_schedule" => entry("Update schedule", Field(&["name", "id"]), Some("prompt"), AUTOMATION_FIELDS, Option::None),
-        "list_schedules" => entry("List schedules", None, Option::None, &[], Option::None),
-        "inspect_schedule" => entry("Inspect schedule", Field(&["id"]), Option::None, &["id"], Option::None),
-        "schedule_logs" => entry("Read schedule logs", Field(&["id"]), Option::None, &["id"], Option::None),
-        "run_schedule_once" => entry("Run schedule", Field(&["id"]), Option::None, &["id"], Option::None),
-        "pause_schedule" => entry("Pause schedule", Field(&["id"]), Option::None, &["id"], Option::None),
-        "resume_schedule" => entry("Resume schedule", Field(&["id"]), Option::None, &["id"], Option::None),
-        "delete_schedule" => entry("Delete schedule", Field(&["id"]), Option::None, &["id"], Option::None),
-        "delete_heartbeat" => entry("Delete heartbeat", Field(&["id"]), Option::None, &["id"], Option::None),
-        "list_providers" => entry("List providers", None, Option::None, &[], Option::None),
-        "list_models" => entry("List models", Field(&["provider"]), Option::None, &["provider"], Option::None),
-        "list_profiles" => entry("List profiles", None, Option::None, &[], Option::None),
-        "inspect_provider" => entry("Inspect provider", Field(&["provider"]), Option::None, &["provider", "cwd", "settings"], Option::None),
-        "browser_list_tabs" => browser("List browser tabs", None),
-        "browser_new_tab" => browser("Open browser tab", Field(&["url"])),
-        "browser_close_tab" => browser("Close browser tab", Field(&["browserId"])),
-        "browser_navigate" => browser("Navigate", Field(&["url"])),
-        "browser_back" => browser("Go back", None),
-        "browser_forward" => browser("Go forward", None),
-        "browser_reload" => browser("Reload page", None),
-        "browser_snapshot" => browser("Snapshot page", None),
-        "browser_screenshot" => browser("Take screenshot", None),
-        "browser_click" => browser("Click element", Field(&["ref"])),
-        "browser_hover" => browser("Hover element", Field(&["ref"])),
-        "browser_drag" => browser("Drag element", Field(&["sourceRef"])),
-        "browser_fill" => browser("Fill field", Field(&["ref"])),
-        "browser_select" => browser("Select option", Field(&["value", "ref"])),
-        "browser_type" => browser("Type text", Field(&["text"])),
-        "browser_keypress" => browser("Press key", Field(&["key"])),
-        "browser_upload" => browser("Upload files", Field(&["filePaths"])),
-        "browser_wait" => browser("Wait for page", Field(&["text", "url"])),
-        "browser_scroll" => browser("Scroll page", None),
-        "browser_resize" => browser("Resize browser", Viewport),
-        "browser_logs" => browser("Read browser logs", None),
-        "browser_evaluate" => browser("Run JavaScript", Field(&["function"])),
+        "create_agent" => entry(Field(&["title", "initialPrompt"]), Some("initialPrompt"), AGENT_FIELDS, Some(&["agentId", "status", "currentModeId", "cwd"])),
+        "send_agent_prompt" => entry(Field(&["prompt"]), Some("prompt"), AGENT_FIELDS, Some(&["status", "lastMessage", "permission"])),
+        "get_agent_status" => entry(TargetAgent, Option::None, &["agentId"], Option::None),
+        "get_agent_activity" => entry(TargetAgent, Option::None, &["agentId", "limit"], Option::None),
+        "list_agents" => entry(None, Option::None, &["cwd", "statuses", "sinceHours", "limit", "includeArchived"], Option::None),
+        "update_agent" => entry(FieldOrTargetAgent("name"), Option::None, AGENT_FIELDS, Option::None),
+        "set_agent_mode" => entry(Field(&["modeId"]), Option::None, &["agentId", "modeId"], Option::None),
+        "cancel_agent" => entry(TargetAgent, Option::None, &["agentId"], Option::None),
+        "archive_agent" => entry(TargetAgent, Option::None, &["agentId"], Option::None),
+        "kill_agent" => entry(TargetAgent, Option::None, &["agentId"], Option::None),
+        "list_pending_permissions" => entry(None, Option::None, &[], Option::None),
+        "respond_to_permission" => entry(TargetAgent, Option::None, &["agentId", "requestId", "response"], Option::None),
+        "create_workspace" => entry(Workspace, Option::None, WORKSPACE_FIELDS, Some(&["workspaceId", "projectId"])),
+        "list_hosts" => entry(None, Option::None, &[], Option::None),
+        "list_workspaces" => entry(None, Option::None, &[], Option::None),
+        "rename_workspace" => entry(Field(&["title"]), Option::None, &["title", "workspaceId"], Option::None),
+        "archive_workspace" => entry(Field(&["workspaceId"]), Option::None, &["workspaceId"], Some(&["workspaceId", "archivedAgentIds", "removedDirectory"])),
+        "list_workspace_scripts" => entry(None, Option::None, &["workspaceId"], Option::None),
+        "start_workspace_script" => entry(Field(&["scriptName"]), Option::None, &["workspaceId", "scriptName"], Option::None),
+        "stop_workspace_script" => entry(Field(&["scriptName"]), Option::None, &["workspaceId", "scriptName"], Option::None),
+        "create_terminal" => entry(Field(&["name", "command"]), Option::None, &["cwd", "workspaceId", "name", "command"], Option::None),
+        "list_terminals" => entry(None, Option::None, &["cwd", "all"], Option::None),
+        "capture_terminal" => entry(Field(&["terminalId"]), Option::None, &["terminalId", "lines"], Option::None),
+        "send_terminal_keys" => entry(Field(&["keys"]), Option::None, &["terminalId", "keys", "literal"], Option::None),
+        "kill_terminal" => entry(Field(&["terminalId"]), Option::None, &["terminalId"], Option::None),
+        "create_schedule" => entry(Field(&["name", "cron"]), Some("prompt"), AUTOMATION_FIELDS, Some(AUTOMATION_OUTPUT)),
+        "create_heartbeat" => entry(Field(&["name", "cron"]), Some("prompt"), AUTOMATION_FIELDS, Some(AUTOMATION_OUTPUT)),
+        "update_schedule" => entry(Field(&["name", "id"]), Some("prompt"), AUTOMATION_FIELDS, Option::None),
+        "list_schedules" => entry(None, Option::None, &[], Option::None),
+        "inspect_schedule" => entry(Field(&["id"]), Option::None, &["id"], Option::None),
+        "schedule_logs" => entry(Field(&["id"]), Option::None, &["id"], Option::None),
+        "run_schedule_once" => entry(Field(&["id"]), Option::None, &["id"], Option::None),
+        "pause_schedule" => entry(Field(&["id"]), Option::None, &["id"], Option::None),
+        "resume_schedule" => entry(Field(&["id"]), Option::None, &["id"], Option::None),
+        "delete_schedule" => entry(Field(&["id"]), Option::None, &["id"], Option::None),
+        "delete_heartbeat" => entry(Field(&["id"]), Option::None, &["id"], Option::None),
+        "list_providers" => entry(None, Option::None, &[], Option::None),
+        "list_models" => entry(Field(&["provider"]), Option::None, &["provider"], Option::None),
+        "list_profiles" => entry(None, Option::None, &[], Option::None),
+        "inspect_provider" => entry(Field(&["provider"]), Option::None, &["provider", "cwd", "settings"], Option::None),
+        "browser_list_tabs" => browser(None),
+        "browser_new_tab" => browser(Field(&["url"])),
+        "browser_close_tab" => browser(Field(&["browserId"])),
+        "browser_navigate" => browser(Field(&["url"])),
+        "browser_back" => browser(None),
+        "browser_forward" => browser(None),
+        "browser_reload" => browser(None),
+        "browser_snapshot" => browser(None),
+        "browser_screenshot" => browser(None),
+        "browser_click" => browser(Field(&["ref"])),
+        "browser_hover" => browser(Field(&["ref"])),
+        "browser_drag" => browser(Field(&["sourceRef"])),
+        "browser_fill" => browser(Field(&["ref"])),
+        "browser_select" => browser(Field(&["value", "ref"])),
+        "browser_type" => browser(Field(&["text"])),
+        "browser_keypress" => browser(Field(&["key"])),
+        "browser_upload" => browser(Field(&["filePaths"])),
+        "browser_wait" => browser(Field(&["text", "url"])),
+        "browser_scroll" => browser(None),
+        "browser_resize" => browser(Viewport),
+        "browser_logs" => browser(None),
+        "browser_evaluate" => browser(Field(&["function"])),
         _ => return Option::None,
     })
 }
@@ -282,7 +283,7 @@ fn paseo_tool_display(tool_name: &str, detail: &Value, target_agent_title: Optio
     let input = read_tool_input(detail);
     let target = target_agent_title.map(str::to_owned).or_else(|| read_string(get(&input, "agentId")));
     let context = apply_context(entry.context, &input, target.as_deref());
-    Some((entry.label.to_owned(), format_context(&context)))
+    Some((t(&format!("agentStream.paseoTools.{leaf}")), format_context(&context)))
 }
 
 // ---- paseo-tool-presentation/agent-message.ts ----
@@ -290,21 +291,21 @@ fn paseo_tool_display(tool_name: &str, detail: &Value, target_agent_title: Optio
 pub fn build_agent_message_display(message: &Value) -> (String, Option<String>, Value) {
     let sender = get(message, "sender");
     let sender_id = str_of(get(sender, "id"));
-    let display = match str_of(get(message, "event")) {
-        "message" => "Message received",
-        "finished" => "Agent finished",
-        "errored" => "Agent errored",
-        "permission-required" => "Agent needs permission",
-        "closed" => "Agent closed",
-        _ => "Message received",
+    let event = match str_of(get(message, "event")) {
+        "finished" => "finished",
+        "errored" => "errored",
+        "permission-required" => "permissionRequired",
+        "closed" => "closed",
+        _ => "message",
     };
+    let display = t(&format!("agentStream.agentMessage.{event}"));
     let title = str_or(get(sender, "title"), sender_id);
     (
-        display.to_owned(),
+        display,
         to_summary_text(title),
         json!({
             "type": "plain_text",
-            "text": format!("From agent: {sender_id}\n\n{}", str_of(get(message, "text"))),
+            "text": format!("{}\n\n{}", ta("agentStream.agentMessage.from", &[("agent", sender_id)]), str_of(get(message, "text"))),
         }),
     )
 }
@@ -318,55 +319,57 @@ pub struct PaseoDetailSection {
     pub fields: Vec<(String, String)>,
 }
 
-fn field_label(key: &str) -> Option<&'static str> {
-    Some(match key {
-        "agentId" => "Agent",
-        "archivedAgentIds" => "Archived agents",
-        "baseBranch" => "Base branch",
-        "branchName" => "New branch",
-        "browserId" => "Browser tab",
-        "clearExpires" => "Clear expiry",
-        "currentModeId" => "Current mode",
-        "cwd" => "Working directory",
-        "deltaX" => "Horizontal delta",
-        "deltaY" => "Vertical delta",
-        "doubleClick" => "Double click",
-        "expiresIn" => "Expires in",
-        "expiresAt" => "Expires",
-        "filePaths" => "Files",
-        "fullPage" => "Full page",
-        "initialPrompt" => "Prompt",
-        "id" => "ID",
-        "lastMessage" => "Last message",
-        "maxEntries" => "Maximum entries",
-        "maxRuns" => "Maximum runs",
-        "modeId" => "Mode",
-        "newMode" => "New mode",
-        "nextRunAt" => "Next run",
-        "notifyOnFinish" => "Notify on finish",
-        "internal" => "Internal",
-        "prNumber" => "Change request",
-        "projectId" => "Project",
-        "removedDirectory" => "Removed directory",
-        "requestId" => "Request",
-        "scriptName" => "Script",
-        "sessionMode" => "Session mode",
-        "sinceHours" => "Since (hours)",
-        "sourceRef" => "Source",
-        "targetRef" => "Target",
-        "terminalId" => "Terminal",
-        "thinkingOptionId" => "Thinking",
-        "timeoutMs" => "Timeout (ms)",
-        "updateCount" => "Updates",
-        "workspaceId" => "Workspace",
-        "worktreeSlug" => "Worktree",
-        _ => return None,
-    })
+/// Field names with a catalogued label (`agentStream.toolFields.<name>`).
+const LABELLED_FIELDS: &[&str] = &[
+    "agentId",
+    "archivedAgentIds",
+    "baseBranch",
+    "branchName",
+    "browserId",
+    "clearExpires",
+    "currentModeId",
+    "cwd",
+    "deltaX",
+    "deltaY",
+    "doubleClick",
+    "expiresIn",
+    "expiresAt",
+    "filePaths",
+    "fullPage",
+    "initialPrompt",
+    "id",
+    "lastMessage",
+    "maxEntries",
+    "maxRuns",
+    "modeId",
+    "newMode",
+    "nextRunAt",
+    "notifyOnFinish",
+    "internal",
+    "prNumber",
+    "projectId",
+    "removedDirectory",
+    "requestId",
+    "scriptName",
+    "sessionMode",
+    "sinceHours",
+    "sourceRef",
+    "targetRef",
+    "terminalId",
+    "thinkingOptionId",
+    "timeoutMs",
+    "updateCount",
+    "workspaceId",
+    "worktreeSlug",
+];
+
+fn field_label(key: &str) -> Option<String> {
+    LABELLED_FIELDS.contains(&key).then(|| t(&format!("agentStream.toolFields.{key}")))
 }
 
 fn humanize_key(key: &str) -> String {
     if let Some(known) = field_label(key) {
-        return known.to_owned();
+        return known;
     }
     let mut spaced = String::with_capacity(key.len() + 4);
     let chars: Vec<char> = key.chars().collect();
@@ -391,19 +394,19 @@ fn indent(value: &str, spaces: usize) -> String {
 
 fn format_value(value: &Value) -> String {
     match value {
-        Value::Null => "None".into(),
-        Value::Bool(b) => if *b { "Yes" } else { "No" }.into(),
+        Value::Null => t("agentStream.toolValues.none"),
+        Value::Bool(b) => t(if *b { "agentStream.toolValues.yes" } else { "agentStream.toolValues.no" }),
         Value::String(s) => s.clone(),
         Value::Number(n) => num_text(n),
         Value::Array(items) => {
             if items.is_empty() {
-                return "None".into();
+                return t("agentStream.toolValues.none");
             }
             items.iter().map(|item| format!("• {}", indent(&format_value(item), 2))).collect::<Vec<_>>().join("\n")
         }
         Value::Object(map) => {
             if map.is_empty() {
-                return "None".into();
+                return t("agentStream.toolValues.none");
             }
             map.iter()
                 .map(|(k, v)| format!("{}: {}", humanize_key(k), indent(&format_value(v), 2)))
@@ -419,7 +422,7 @@ fn fields_from_value(value: &Value, order: &[&str], omitted: Option<&str>, inclu
     }
     let Some(object) = value.as_object() else {
         let formatted = format_value(value);
-        return if formatted.is_empty() { Vec::new() } else { vec![("Value".into(), formatted)] };
+        return if formatted.is_empty() { Vec::new() } else { vec![(t("agentStream.toolValues.value"), formatted)] };
     };
     let mut keys: Vec<&String> = object
         .keys()
@@ -463,16 +466,16 @@ pub fn build_paseo_tool_detail_sections(tool_name: &str, input: &Value, output: 
     if let (Some(field), true) = (prompt_field, input.is_object())
         && let Some(prompt) = non_empty_str(get(input, field))
     {
-        sections.push(PaseoDetailSection { title: "Prompt".into(), text: Some(prompt.to_owned()), fields: Vec::new() });
+        sections.push(PaseoDetailSection { title: t("agentStream.toolSections.prompt"), text: Some(prompt.to_owned()), fields: Vec::new() });
     }
     let input_fields = fields_from_value(input, spec.as_ref().map(|s| s.input_order).unwrap_or(&[]), prompt_field, None);
     if !input_fields.is_empty() {
-        sections.push(PaseoDetailSection { title: "Details".into(), text: None, fields: input_fields });
+        sections.push(PaseoDetailSection { title: t("agentStream.toolSections.details"), text: None, fields: input_fields });
     }
     let outputs = spec.as_ref().and_then(|s| s.output_fields);
     let output_fields = fields_from_value(&unwrap_mcp_result(output), outputs.unwrap_or(&[]), None, outputs);
     if !output_fields.is_empty() {
-        sections.push(PaseoDetailSection { title: "Result".into(), text: None, fields: output_fields });
+        sections.push(PaseoDetailSection { title: t("agentStream.toolSections.result"), text: None, fields: output_fields });
     }
     Some(sections)
 }
@@ -1109,4 +1112,37 @@ pub fn detail_blocks(detail: &Value, tool_name: Option<&str>, error_text: Option
 /// Full-bleed detail types sit 8 apart, the rest 16.
 pub fn detail_is_full_bleed(detail: &Value) -> bool {
     matches!(str_of(get(detail, "type")), "edit" | "shell" | "write")
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    fn catalogs() -> [Value; 2] {
+        [
+            serde_json::from_str(include_str!("../../../resources/locales/en.json")).unwrap(),
+            serde_json::from_str(include_str!("../../../resources/locales/ko.json")).unwrap(),
+        ]
+    }
+
+    #[test]
+    fn every_labelled_field_and_paseo_tool_has_both_translations() {
+        for catalog in catalogs() {
+            let stream = &catalog["agentStream"];
+            for field in LABELLED_FIELDS {
+                assert!(stream["toolFields"][field].is_string(), "agentStream.toolFields.{field}");
+            }
+            let tools = stream["paseoTools"].as_object().unwrap();
+            for leaf in tools.keys() {
+                assert!(paseo_catalog(leaf).is_some(), "agentStream.paseoTools.{leaf} has no catalog entry");
+            }
+            for key in ["agentMessage", "toolSections", "toolValues"] {
+                assert!(stream[key].is_object(), "agentStream.{key}");
+            }
+        }
+        let [en, ko] = catalogs();
+        let keys = |c: &Value| c["agentStream"]["paseoTools"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&en), keys(&ko));
+        assert_eq!(keys(&en).len(), 62);
+    }
 }

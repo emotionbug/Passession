@@ -6,7 +6,7 @@
 //! compact jump-to-file tree (`_jumpToFile`) — are drawn here with the
 //! original `AdaptiveModalSheet` + `SheetContents` chrome.
 
-use super::chrome::{ButtonSize, ButtonVariant, TREE_ROW_HEIGHT, button, button_height, file_tree_row, tree_row_metrics, measure_button, palette, ui};
+use super::chrome::{ButtonSize, ButtonVariant, button, button_height, file_tree_row, tree_row_height, tree_row_metrics, measure_button, palette, ui};
 use super::json::text;
 use super::model::{TreeRow, changed_tree_rows};
 use super::paint::{Font, GitPaint, Hits, rect, with_alpha};
@@ -199,6 +199,9 @@ enum SheetHit {
     Row(usize),
     Confirm,
     Cancel,
+    /// The discard question's "Keep editing" and "Discard".
+    KeepEditing,
+    Discard,
 }
 
 enum SheetKind {
@@ -237,6 +240,10 @@ pub struct OverlayHost<P> {
     pressed: Option<SheetHit>,
     text: String,
     focus_pending: bool,
+    /// The comment's text when the sheet opened (unchanged text closes without asking).
+    initial: String,
+    /// A dismissal of an edited comment asks before discarding it.
+    confirm_discard: bool,
     scroll: f64,
     list_rect: Rect,
     content_height: f64,
@@ -259,6 +266,8 @@ impl<P> Default for OverlayHost<P> {
             pressed: None,
             text: String::new(),
             focus_pending: false,
+            initial: String::new(),
+            confirm_discard: false,
             scroll: 0.0,
             list_rect: Rect::default(),
             content_height: 0.0,
@@ -350,7 +359,9 @@ impl<P> OverlayHost<P> {
                 );
                 input.set_text(cx, &initial);
                 input.set_empty_text(cx, placeholder);
-                self.text = initial;
+                self.text = initial.clone();
+                self.initial = initial;
+                self.confirm_discard = false;
                 self.focus_pending = true;
                 SheetKind::Comment { title, subtitle }
             }
@@ -425,6 +436,11 @@ impl<P> OverlayHost<P> {
         }
         let area = self.locked;
         let is_comment = matches!(self.sheet.as_ref()?.kind, SheetKind::Comment { .. });
+        // Claimed before the field sees it: a held (repeating) Escape or a
+        // handled Back never closes the sheet, and only one dismissal acts.
+        if shared::take_dismissal(event) {
+            return self.request_dismiss(cx);
+        }
         if is_comment {
             cx.sweep_unlock(area);
             let actions = cx.capture_actions(|cx| input.handle_event(cx, event, &mut Scope::empty()));
@@ -434,11 +450,11 @@ impl<P> OverlayHost<P> {
                 match action.action.downcast_ref::<TextInputAction>() {
                     Some(TextInputAction::Changed(text)) => {
                         self.text = text.clone();
+                        self.confirm_discard = false;
                         cx.redraw_all();
                     }
-                    Some(TextInputAction::Escaped) => {
-                        return self.finish(cx, OverlayResult::Dismissed);
-                    }
+                    // Escape already went through `take_dismissal` above.
+                    Some(TextInputAction::Escaped) => {}
                     // Flutter's multiline TextField: Enter inserts a line break
                     // (makepad only does that for Shift+Enter).
                     Some(TextInputAction::Returned(text, _)) => {
@@ -458,14 +474,7 @@ impl<P> OverlayHost<P> {
                 }
             }
         }
-        if let Event::KeyDown(key) = event
-            && key.key_code == KeyCode::Escape
-        {
-            return self.finish(cx, OverlayResult::Dismissed);
-        }
-        if event.back_pressed() {
-            return self.finish(cx, OverlayResult::Dismissed);
-        }
+        // A tap on the backdrop or a Cancel / close glyph dismisses below.
         let hit = event.hits_with_sweep_area(cx, area, area);
         if !area.is_valid(cx) {
             self.touch_scroll.reset();
@@ -499,8 +508,14 @@ impl<P> OverlayHost<P> {
                 }
                 match released {
                     Some(SheetHit::Backdrop) | Some(SheetHit::Cancel) | Some(SheetHit::Close) => {
-                        return self.finish(cx, OverlayResult::Dismissed);
+                        return self.request_dismiss(cx);
                     }
+                    Some(SheetHit::KeepEditing) => {
+                        self.confirm_discard = false;
+                        self.focus_pending = true;
+                        cx.redraw_all();
+                    }
+                    Some(SheetHit::Discard) => return self.finish(cx, OverlayResult::Dismissed),
                     Some(SheetHit::Confirm) => {
                         if self.text.trim().is_empty() {
                             return None;
@@ -515,6 +530,22 @@ impl<P> OverlayHost<P> {
             _ => {}
         }
         None
+    }
+
+    fn comment_edited(&self) -> bool {
+        matches!(self.sheet.as_ref().map(|s| &s.kind), Some(SheetKind::Comment { .. }))
+            && self.text != self.initial
+    }
+
+    /// Closes the sheet, except that a comment with unsaved text asks first
+    /// (a second request while asking returns to editing).
+    fn request_dismiss(&mut self, cx: &mut Cx) -> Option<OverlayResult<P>> {
+        if self.comment_edited() {
+            self.confirm_discard = !self.confirm_discard;
+            cx.redraw_all();
+            return None;
+        }
+        self.finish(cx, OverlayResult::Dismissed)
     }
 
     fn scroll_list(&mut self, cx: &mut Cx, point: DVec2, delta: f64) {
@@ -659,7 +690,11 @@ impl<P> OverlayHost<P> {
         let field = rect(card.pos.x + 24.0, top + header + 24.0, field_width, field_height);
         // paseoInputDecoration: surface2 fill, 8px radius, borderAccent while hovered or focused.
         let focused = cx.has_key_focus(input.area());
-        let border = (focused || self.hovered == Some(SheetHit::Field)).then_some((colors.border_accent, 1.0));
+        let border = if focused {
+            Some((colors.muted, 1.0))
+        } else {
+            (self.hovered == Some(SheetHit::Field)).then_some((colors.border_accent, 1.0))
+        };
         paint.rounded(cx, field, colors.surface2, 8.0, border);
         self.hits.push(field, SheetHit::Field);
         let walk = Walk {
@@ -675,11 +710,28 @@ impl<P> OverlayHost<P> {
         let footer_top = field.pos.y + field.size.y + 24.0;
         paint.fill(cx, rect(card.pos.x, footer_top, card.size.x, 1.0), colors.surface2);
         let y = footer_top + 1.0 + 12.0;
+        let right = card.pos.x + card.size.x - 24.0;
+        if self.confirm_discard {
+            // Unsaved text: ask before it is lost.
+            let keep = t("workspace.git.review.keepEditing");
+            let discard = t("workspace.git.review.discard");
+            let discard_width = measure_button(cx, paint, &discard, false, ButtonSize::Md, compact);
+            let keep_width = measure_button(cx, paint, &keep, false, ButtonSize::Md, compact);
+            let discard_rect = rect(right - discard_width, y, discard_width, buttons);
+            let keep_rect = rect(discard_rect.pos.x - 8.0 - keep_width, y, keep_width, buttons);
+            let question = t("workspace.git.review.discardQuestion");
+            let left = card.pos.x + 24.0;
+            paint.text_centered(cx, Font::Regular, ui(13.0), colors.danger, left, y, buttons, &question, (keep_rect.pos.x - 8.0 - left).max(0.0));
+            button(cx, paint, keep_rect, &keep, None, ButtonVariant::Secondary, ButtonSize::Md, compact, true, self.hovered == Some(SheetHit::KeepEditing));
+            button(cx, paint, discard_rect, &discard, None, ButtonVariant::Destructive, ButtonSize::Md, compact, true, self.hovered == Some(SheetHit::Discard));
+            self.hits.push(keep_rect, SheetHit::KeepEditing);
+            self.hits.push(discard_rect, SheetHit::Discard);
+            return;
+        }
         let cancel = t("review.comment.cancel");
         let save = t("review.comment.save");
         let save_width = measure_button(cx, paint, &save, false, ButtonSize::Md, compact);
         let cancel_width = measure_button(cx, paint, &cancel, false, ButtonSize::Md, compact);
-        let right = card.pos.x + card.size.x - 24.0;
         let save_rect = rect(right - save_width, y, save_width, buttons);
         let cancel_rect = rect(save_rect.pos.x - 8.0 - cancel_width, y, cancel_width, buttons);
         let enabled = !self.text.trim().is_empty();
@@ -705,7 +757,7 @@ impl<P> OverlayHost<P> {
         let rows = changed_tree_rows(&files, &collapsed);
         self.list_rect = list;
         let metrics = tree_row_metrics(cx, paint);
-        let row_height = metrics.height(TREE_ROW_HEIGHT, 4.0, 16.0);
+        let row_height = metrics.height(tree_row_height(compact), 4.0, 16.0);
         self.content_height = 8.0 + rows.len() as f64 * row_height + 32.0;
         self.scroll = self.scroll.clamp(0.0, (self.content_height - list.size.y).max(0.0));
         paint.begin_clip(cx, list);
@@ -728,5 +780,23 @@ impl<P> OverlayHost<P> {
         }
         paint.end_clip(cx);
         pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleting_comment_text_still_requires_discard_confirmation() {
+        let mut overlay = OverlayHost::<()>::default();
+        overlay.sheet = Some(Sheet { purpose: (), kind: SheetKind::Comment { title: String::new(), subtitle: String::new() } });
+        overlay.initial = "Keep this note".into();
+        overlay.text = overlay.initial.clone();
+        assert!(!overlay.comment_edited());
+        overlay.text.clear();
+        assert!(overlay.comment_edited());
+        overlay.initial.clear();
+        assert!(!overlay.comment_edited());
     }
 }

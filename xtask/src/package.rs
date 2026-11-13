@@ -109,8 +109,8 @@ fn debian_depends(payload: &Path) -> Result<String> {
     Ok(fields.join(", "))
 }
 
-/// libXss.so.1, libSM.so.6, libICE.so.6: features degrade without them.
-const DEBIAN_RECOMMENDS: &str = "libxss1, libsm6, libice6";
+/// Optional idle-time, XSMP logout and system-font discovery libraries.
+const DEBIAN_RECOMMENDS: &str = "libxss1, libsm6, libice6, libfontconfig1";
 
 pub fn desktop(args: &[String]) -> Result<()> {
     ensure!(

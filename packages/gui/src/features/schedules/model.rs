@@ -5,7 +5,7 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use serde_json::{json, Value};
 
 use crate::features::workspace::host::Host;
-use crate::features::workspace::i18n::{l, lf};
+use crate::features::workspace::i18n::{l, lf, t, ta};
 use crate::features::workspace::rpc::{object_of, str_of};
 
 const MS_PER_MINUTE: i64 = 60_000;
@@ -144,10 +144,15 @@ pub fn validate_cron(expression: &str) -> Option<String> {
     if parts.len() != 5 {
         return Some(l("Cron expressions must have 5 fields").to_owned());
     }
-    const BOUNDS: [(u32, u32, &str); 5] =
-        [(0, 59, "minute"), (0, 23, "hour"), (1, 31, "day-of-month"), (1, 12, "month"), (0, 6, "day-of-week")];
-    for (part, (min, max, name)) in parts.iter().zip(BOUNDS) {
-        if let Some(error) = cron_field_error(part, min, max, name) {
+    const BOUNDS: [(u32, u32, &str); 5] = [
+        (0, 59, "workspace.schedules.cronFields.minute"),
+        (0, 23, "workspace.schedules.cronFields.hour"),
+        (1, 31, "workspace.schedules.cronFields.dayOfMonth"),
+        (1, 12, "workspace.schedules.cronFields.month"),
+        (0, 6, "workspace.schedules.cronFields.dayOfWeek"),
+    ];
+    for (part, (min, max, field)) in parts.iter().zip(BOUNDS) {
+        if let Some(error) = cron_field_error(part, min, max, &t(field)) {
             return Some(error);
         }
     }
@@ -214,7 +219,8 @@ pub fn format_next_run(iso: Option<&Value>, now: DateTime<Utc>) -> String {
     }
 }
 
-/// `describeTimeAgo`: "just now", "5m ago", "2h ago", "3d ago", then "Jan 15".
+/// `describeTimeAgo`: "just now", "5m ago", "2h ago", "3d ago", then the local date
+/// ("Jan 15", "1월 15일").
 pub fn time_ago(iso: Option<&Value>, now: DateTime<Utc>) -> String {
     let Some(time) = parse_time(iso) else { return String::new() };
     let elapsed = (now - time).num_milliseconds();
@@ -232,7 +238,8 @@ pub fn time_ago(iso: Option<&Value>, now: DateTime<Utc>) -> String {
     }
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let local = time.with_timezone(&Local);
-    format!("{} {}", MONTHS[local.month0() as usize], local.day())
+    let (month, number, day) = (MONTHS[local.month0() as usize], local.month().to_string(), local.day().to_string());
+    ta("workspace.schedules.monthDay", &[("month", month), ("monthNumber", &number), ("day", &day)])
 }
 
 /// Cadence presets (`schedule-cadence-options.ts`): (id, English label, expression).
@@ -412,9 +419,12 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-01-10T12:00:00Z").unwrap().with_timezone(&Utc);
         assert_eq!(describe_cron("0 9 * * 1-5", Some("UTC")).as_deref(), Some("평일 09:00 UTC"));
         assert_eq!(time_ago(Some(&json!("2026-01-10T11:58:00Z")), now), "2분 전");
-        assert_eq!(validate_cron("60 * * * *").as_deref(), Some("잘못된 minute 값"));
+        assert_eq!(validate_cron("60 * * * *").as_deref(), Some("잘못된 분 값"));
+        assert_eq!(validate_cron("0 9 * 13 *").as_deref(), Some("잘못된 월 값"));
+        assert_eq!(time_ago(Some(&json!("2025-12-01T12:00:00Z")), now), "12월 1일");
         pin("en");
         assert_eq!(time_ago(Some(&json!("2026-01-10T11:58:00Z")), now), "2m ago");
+        assert_eq!(time_ago(Some(&json!("2025-12-01T12:00:00Z")), now), "Dec 1");
     }
 
     #[test]

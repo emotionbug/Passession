@@ -240,11 +240,21 @@ struct ConfigSwitch {
     key: &'static str,
     /// Shown when the config has no value.
     fallback: bool,
+    /// Confirms before switching to this value (it can cut connections).
+    confirm: Option<SwitchConfirm>,
+}
+
+/// A destructive confirmation for one direction of a [`ConfigSwitch`].
+struct SwitchConfirm {
+    when: bool,
+    title: String,
+    message: String,
+    action: String,
 }
 
 /// Flutter `toggle`: a switch row writing `{group: {key: v}}` or `{key: v}`.
 fn toggle(ui: &mut Ui, s: &Settings, host: &HostView, switch_of: ConfigSwitch, label: String, hint: Option<String>) {
-    let ConfigSwitch { group, key, fallback } = switch_of;
+    let ConfigSwitch { group, key, fallback, confirm } = switch_of;
     let d = data(s, &host.server_id);
     let config = d.map(|d| &d.config).cloned().unwrap_or(Value::Null);
     let values = match group {
@@ -254,13 +264,21 @@ fn toggle(ui: &mut Ui, s: &Settings, host: &HostView, switch_of: ConfigSwitch, l
     let on = values.get(key).and_then(Value::as_bool).unwrap_or(fallback);
     let enabled = !d.map(|d| d.busy).unwrap_or(false) && host.can_manage();
     let id = host.server_id.clone();
+    let confirm = confirm.filter(|c| c.when == !on).map(|c| (c.title, c.message, c.action));
     let act = enabled.then(|| {
         handler(move |s, env| {
             let value = match group {
                 Some(g) => json!({ g: { key: !on } }),
                 None => json!({ key: !on }),
             };
-            run_patch(s, env, &id, value);
+            match &confirm {
+                Some((title, message, action)) => {
+                    let id = id.clone();
+                    let go = handler(move |s, env| run_patch(s, env, &id, value.clone()));
+                    s.confirm(title.clone(), message.clone(), action.clone(), true, go);
+                }
+                None => run_patch(s, env, &id, value),
+            }
         })
     });
     ui.row(row(label).hint_opt(hint).control(switch(format!("daemon.{}.{}.{key}", host.server_id, group.unwrap_or("")), on, act)));
@@ -279,7 +297,7 @@ pub fn draw_agents(ui: &mut Ui, s: &Settings, v: &super::View, host: &HostView) 
     } else {
         ui.section_title(&t("settings.hostSections.agents"), None, None);
         ui.card_begin();
-        toggle(ui, s, host, ConfigSwitch { group: Some("mcp"), key: "injectIntoAgents", fallback: true }, t("settings.host.orchestration.enableTools.title"), Some(t("settings.host.orchestration.enableTools.hint")));
+        toggle(ui, s, host, ConfigSwitch { group: Some("mcp"), key: "injectIntoAgents", fallback: true, confirm: None }, t("settings.host.orchestration.enableTools.title"), Some(t("settings.host.orchestration.enableTools.hint")));
         ui.card_end();
         ui.gap(12.0);
         ui.card_begin();
@@ -305,17 +323,17 @@ pub fn draw_agents(ui: &mut Ui, s: &Settings, v: &super::View, host: &HostView) 
     }
 }
 
-pub fn draw_workspaces(ui: &mut Ui, s: &Settings, host: &HostView) {
-    if !host.connected() {
-        ui.empty_card(&t("settings.host.workspaces.unavailable"), None, false);
-        return;
-    }
-    if draw_state(ui, s, host) {
+/// The archive-merged option at the end of the Projects page.
+pub fn draw_workspace_options(ui: &mut Ui, s: &Settings, host: &HostView) {
+    // Secondary to the project list: it shows once the config is loaded; a
+    // disconnected host or failed load is already explained above it.
+    let ready = data(s, &host.server_id).is_some_and(|d| !d.loading && d.error.is_none());
+    if !host.connected() || !ready {
         return;
     }
     ui.section_title(&t("settings.hostSections.workspaces"), None, None);
     ui.card_begin();
-    toggle(ui, s, host, ConfigSwitch { group: None, key: "autoArchiveAfterMerge", fallback: false }, t("settingsNative.archiveMerged"), Some(t("settingsNative.archiveMergedHint")));
+    toggle(ui, s, host, ConfigSwitch { group: None, key: "autoArchiveAfterMerge", fallback: false, confirm: None }, t("settingsNative.archiveMerged"), Some(t("settingsNative.archiveMergedHint")));
     ui.card_end();
     ui.gap(24.0);
 }
@@ -379,9 +397,11 @@ pub fn draw_host_config(ui: &mut Ui, s: &Settings, host: &HostView) {
     let status_id = id.clone();
     let status = (!busy).then(|| handler(move |s, env| report_request(s, env, &status_id, "daemon.get_status.request", "daemon.get_status.response", t("desktop.daemon.fullStatus.modalTitle"), None)));
     ui.row(row(t("desktop.daemon.fullStatus.modalTitle")).control(button(format!("daemon.{id}.status"), t("desktop.daemon.fullStatus.view"), status).ctl()));
-    toggle(ui, s, host, ConfigSwitch { group: Some("relay"), key: "enabled", fallback: false }, t("settingsNative.relayEnabled"), None);
+    let relay_off = SwitchConfirm { when: false, title: t("settingsNative.relayOffTitle"), message: t("settingsNative.relayOffMessage"), action: t("settingsNative.relayOffAction") };
+    toggle(ui, s, host, ConfigSwitch { group: Some("relay"), key: "enabled", fallback: false, confirm: Some(relay_off) }, t("settingsNative.relayEnabled"), Some(t("settingsNative.relayEnabledHint")));
     if obj(&d.config, "relay").contains_key("requireProtectedSecurity") {
-        toggle(ui, s, host, ConfigSwitch { group: Some("relay"), key: "requireProtectedSecurity", fallback: false }, t("settingsNative.requireProtectedRelay"), None);
+        let protect_on = SwitchConfirm { when: true, title: t("settingsNative.requireProtectedTitle"), message: t("settingsNative.requireProtectedMessage"), action: t("settingsNative.requireProtectedAction") };
+        toggle(ui, s, host, ConfigSwitch { group: Some("relay"), key: "requireProtectedSecurity", fallback: false, confirm: Some(protect_on) }, t("settingsNative.requireProtectedRelay"), Some(t("settingsNative.requireProtectedRelayHint")));
     }
     let limits_id = id.clone();
     let limits = (manage && !busy).then(|| handler(move |s, env| edit_network_limits(s, env, &limits_id)));
@@ -403,7 +423,8 @@ pub fn draw_host_config(ui: &mut Ui, s: &Settings, host: &HostView) {
                 }
                 match result {
                     Ok(report) => {
-                        s.report(t("settingsNative.configReload"), &report);
+                        let sheet = s.next_id();
+                        s.push_sheet(sheet, SheetKind::ConfigReload(ConfigReloadSheet::new(&host_id, &report)), 560.0);
                         if let Some(host) = env.host(&host_id) {
                             load(s, env, &host);
                         }
@@ -420,6 +441,66 @@ pub fn draw_host_config(ui: &mut Ui, s: &Settings, host: &HostView) {
     );
     ui.card_end();
     ui.gap(24.0);
+}
+
+/// `daemon.config.reload.response` shown as the CLI's three lists, with a
+/// Restart action when changes wait for a daemon restart.
+pub struct ConfigReloadSheet {
+    pub host: String,
+    pub applied: Vec<String>,
+    pub restart: Vec<String>,
+    pub overrides: Vec<String>,
+}
+
+impl ConfigReloadSheet {
+    fn new(host: &str, report: &Value) -> Self {
+        let paths = |key: &str| arr(report, key).iter().map(scalar_text).filter(|p| !p.is_empty()).collect::<Vec<_>>();
+        Self { host: host.to_string(), applied: paths("appliedPaths"), restart: paths("restartRequiredPaths"), overrides: paths("overrideControlledPaths") }
+    }
+}
+
+pub fn config_reload_head(id: u64, p: &ConfigReloadSheet) -> SheetHead {
+    let mut head = SheetHead::new(t("settingsNative.configReload"));
+    if !p.restart.is_empty() {
+        let host = p.host.clone();
+        let restart = handler(move |s, env| {
+            s.close_sheet(env, id);
+            super::host::restart(s, env, host.clone());
+        });
+        head.actions.push(button(format!("sheet.{id}.restart"), t("settings.host.daemon.restart.title"), Some(restart)).icon(Icon::RotateCw).ctl());
+    }
+    head.actions.push(button(format!("sheet.{id}.closebtn"), t("common.actions.close"), Some(handler(move |s, env| s.close_sheet(env, id)))).variant(Variant::Secondary).ctl());
+    head
+}
+
+pub fn config_reload_body(ui: &mut Ui, p: &ConfigReloadSheet) {
+    let pal = ui.pal;
+    if p.applied.is_empty() && p.restart.is_empty() && p.overrides.is_empty() {
+        let size = ui.text(Font::Regular, 14.0, pal.muted, makepad_widgets::dvec2(ui.x, ui.y), Some(ui.w), &t("settingsNative.reloadNoChanges"));
+        ui.y += size.y;
+        return;
+    }
+    let groups = [
+        ("settingsNative.reloadRestartRequired", &p.restart, pal.warning),
+        ("settingsNative.reloadOverrides", &p.overrides, pal.muted),
+        ("settingsNative.reloadApplied", &p.applied, pal.success),
+    ];
+    let mut first = true;
+    for (title, paths, tone) in groups {
+        if paths.is_empty() {
+            continue;
+        }
+        if !first {
+            ui.y += 16.0;
+        }
+        first = false;
+        let size = ui.text(Font::Medium, 14.0, tone, makepad_widgets::dvec2(ui.x, ui.y), Some(ui.w), &t(title));
+        ui.y += size.y + 6.0;
+        for path in paths {
+            let size = ui.text(Font::Code, 12.0, pal.foreground, makepad_widgets::dvec2(ui.x + 8.0, ui.y), Some(ui.w - 8.0), path);
+            ui.y += size.y + 4.0;
+        }
+    }
 }
 
 fn wildcard_text(value: &Value) -> String {
@@ -609,7 +690,7 @@ pub fn draw_terminals(ui: &mut Ui, s: &Settings, host: &HostView) {
     ui.section_title(&t("settingsNative.terminalAgents"), None, None);
     if !disconnected {
         ui.card_begin();
-        toggle(ui, s, host, ConfigSwitch { group: None, key: "enableTerminalAgentHooks", fallback: false }, t("settingsNative.terminalHooks"), Some(t("settingsNative.terminalHooksHint")));
+        toggle(ui, s, host, ConfigSwitch { group: None, key: "enableTerminalAgentHooks", fallback: false, confirm: None }, t("settingsNative.terminalHooks"), Some(t("settingsNative.terminalHooksHint")));
         ui.card_end();
     }
     ui.gap(24.0);
@@ -663,7 +744,7 @@ pub fn draw_terminals(ui: &mut Ui, s: &Settings, host: &HostView) {
                 let remaining = remaining.clone();
                 let go = handler(move |s, env| save_terminal_profiles(s, env, &host_id, remaining.clone()));
                 let tp = |k: &str| t(&format!("settings.host.terminalProfiles.{k}"));
-                s.confirm(tp("removeConfirmTitle"), ta("settings.host.terminalProfiles.removeConfirmMessage", &[("name", &name)]), Some(tp("remove")), true, go);
+                s.confirm(tp("removeConfirmTitle"), ta("settings.host.terminalProfiles.removeConfirmMessage", &[("name", &name)]), tp("remove"), true, go);
             })
         });
         let command = std::iter::once(str_of(profile, "command").to_string()).chain(arr(profile, "args").iter().map(scalar_text)).collect::<Vec<_>>().join(" ");
@@ -916,7 +997,7 @@ pub fn draw_connected_hosts(ui: &mut Ui, s: &Settings, host: &HostView) {
                             Err(error) => env.error(&error),
                         });
                     });
-                    s.confirm(t("settingsNative.removeConnectedHostTitle"), t("settingsNative.removeConnectedHostMessage"), Some(t("settings.host.connections.removeAction")), true, go);
+                    s.confirm(t("settingsNative.removeConnectedHostTitle"), t("settingsNative.removeConnectedHostMessage"), t("settings.host.connections.removeAction"), true, go);
                 });
                 ui.row(
                     row(label)
@@ -1027,7 +1108,7 @@ pub fn draw_hub(ui: &mut Ui, s: &Settings, host: &HostView) {
         handler(move |s, _| {
             let host = disconnect_id.clone();
             let go = handler(move |s, env| hub_request(s, env, &host, "disconnect", json!({}), None));
-            s.confirm(t("settingsNative.disconnectHubTitle"), t("settingsNative.disconnectHubMessage"), Some(t("settingsNative.disconnect")), true, go);
+            s.confirm(t("settingsNative.disconnectHubTitle"), t("settingsNative.disconnectHubMessage"), t("settingsNative.disconnect"), true, go);
         })
     });
     let controls = Ctl::Row(
@@ -1167,7 +1248,7 @@ pub fn draw_skills(ui: &mut Ui, s: &Settings, host: &HostView) {
     let uninstall = handler(move |s, _| {
         let host = uninstall_id.clone();
         let go = handler(move |s, env| mutate_skills(s, env, &host, "uninstall", "uninstallFailed"));
-        s.confirm(sk("uninstallTitle"), sk("uninstallMessage"), Some(sk("actions.uninstall")), true, go);
+        s.confirm(sk("uninstallTitle"), sk("uninstallMessage"), sk("actions.uninstall"), true, go);
     });
     if has_selected {
         match skill_state.as_str() {
@@ -1194,7 +1275,7 @@ pub fn draw_skills(ui: &mut Ui, s: &Settings, host: &HostView) {
                     };
                     let host = reconcile_id.clone();
                     let go = handler(move |s, env| mutate_skills(s, env, &host, "reconcile", "updateFailed"));
-                    s.confirm(sk("updateTitle"), message, Some(sk("actions.update")), false, go);
+                    s.confirm(sk("updateTitle"), message, sk("actions.update"), false, go);
                 });
                 actions.push(outline("update", sk(if working { "actions.working" } else { "actions.update" }), reconcile));
                 actions.push(outline("uninstall", sk("actions.uninstall"), uninstall));
@@ -1260,7 +1341,7 @@ fn save_skills(s: &mut Settings, env: &mut Env, id: u64, removals: Vec<Value>, r
                         }
                         let names = removals.iter().map(scalar_text).collect::<Vec<_>>().join(", ");
                         let go = handler(move |s, env| save_skills(s, env, id, removals.clone(), true));
-                        s.confirm(sk("removeTitle"), ta("settings.host.skills.removeMessage", &[("skills", &names)]), Some(sk("actions.remove")), true, go);
+                        s.confirm(sk("removeTitle"), ta("settings.host.skills.removeMessage", &[("skills", &names)]), sk("actions.remove"), true, go);
                     }
                 }
             }

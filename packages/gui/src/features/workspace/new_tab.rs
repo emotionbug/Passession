@@ -113,9 +113,15 @@ live_design! {
                         padding: { left: 16., right: 16., bottom: 16. }
                         project_field = <WaTrigger> {}
                         host_field = <WaTrigger> {}
+                        isolation_field = <WaTrigger> {}
                         branch_field = <WaTrigger> {}
                         spacer = <View> { width: Fill, height: 1. }
                         launch_field = <WaTrigger> {}
+                    }
+                    // New worktree isolation: the branch the worktree creates.
+                    worktree = <View> {
+                        width: Fill, height: Fit, visible: false, padding: { left: 16., right: 16., bottom: 16. }
+                        worktree_branch = <WaOptionField> { worktree_branch_input = <WaInput> {} }
                     }
                     composer = <View> {
                         width: Fill, height: Fit, padding: { left: 16., right: 16., bottom: 16. }
@@ -157,7 +163,7 @@ live_design! {
                                         role: Transparent, hover_role: Surface2, radius: 14., interactive: true
                                         provider_box = <View> { width: Fit, height: Fit, provider = <ProviderIcon> { width: 16., height: 16. } }
                                         label = <WaText> { width: Fit, role: Muted }
-                                        thinking_inline = <View> { width: Fit, height: Fit, visible: false, text = <WaText> { width: Fit, role: ExtraMuted } }
+                                        thinking_inline = <View> { width: Fit, height: Fit, visible: false, text = <WaText> { width: Fit, role: Muted } }
                                         caret = <WaIcon> { size: 14., icon: "chevron-down" }
                                     }
                                     thinking = <WaToolbarButton> { icon: "brain" }
@@ -216,8 +222,10 @@ live_design! {
             folder_modal = <WaModal> {
                 content: {
                     sheet = <WaSheet> {
-                        width: 720.
-                        body = <View> { width: Fill, height: 520., padding: { left: 16., right: 16., bottom: 16. }, picker = <RemoteFolderPicker> {} }
+                        // About 640×560 on wide windows (the modal clamps it to the window);
+                        // `open_browser` makes it a full-height sheet on compact layouts.
+                        width: 640.
+                        body = <View> { width: Fill, height: 495., picker = <RemoteFolderPicker> {} }
                     }
                 }
             }
@@ -702,6 +710,11 @@ impl WaNewTabView {
         self.target.data.get("addProject") == Some(&Value::Bool(true))
     }
 
+    /// The submission creates a new worktree (branch off, existing branch or pull request).
+    fn worktree(&self) -> bool {
+        !self.existing && matches!(self.source.as_str(), "branch-off" | "checkout" | "pr")
+    }
+
     /// Terminal is the launch choice (never for Add project, which has no launch field).
     fn terminal(&self) -> bool {
         self.launch_terminal && !self.add_project()
@@ -792,6 +805,7 @@ impl WaNewTabView {
         self.ref_name.clear();
         self.ref_label = None;
         sync_input(cx, &self.view.wa_input(id!(path)), directory);
+        sync_input(cx, &self.view.wa_input(id!(ref_field.row.input_box)), &self.ref_name);
         self.load_default_ref(ctx);
         self.load_providers(ctx);
         self.sync_forge(cx, ctx);
@@ -1811,7 +1825,7 @@ impl WaNewTabView {
         let pending_intent = self.intent.is_some();
         let locked = self.busy || pending_intent;
         // Text fields.
-        let text_fields: [(&[LiveId], TextField); 9] = [
+        let text_fields: [(&[LiveId], TextField); 10] = [
             (id!(ref_field.row.input_box), |s| &mut s.ref_name),
             (id!(branch_input), |s| &mut s.branch),
             (id!(pr_input), |s| &mut s.pr),
@@ -1821,10 +1835,17 @@ impl WaNewTabView {
             (id!(dirname_input), |s| &mut s.directory_name),
             (id!(title_input), |s| &mut s.title),
             (id!(path), |s| &mut s.path),
+            (id!(worktree_branch_input), |s| &mut s.branch),
         ];
         for (index, (path, field)) in text_fields.into_iter().enumerate() {
             if let Some(text) = view.wa_input(path).changed(actions) {
                 *field(self) = text;
+                // The inline worktree field and advanced options edit one branch.
+                if index == 1 {
+                    sync_input(cx, &view.wa_input(id!(worktree_branch_input)), &self.branch);
+                } else if index == 9 {
+                    sync_input(cx, &view.wa_input(id!(branch_input)), &self.branch);
+                }
                 // 0: the ref field, 8: the directory.
                 if index == 0 {
                     self.ref_label = None;
@@ -1873,6 +1894,15 @@ impl WaNewTabView {
             options.push(SelectOption::new("\u{0}add-host", l("Add host")).glyph("plus"));
             let request = SelectRequest::new(t("newWorkspace.fields.host"), options).selected(Some(&self.target.host_id));
             view.wa_select(id!(select)).open(cx, "host", request);
+        }
+        if view.wa_trigger(id!(isolation_field)).clicked(actions) && !pending_intent && !self.busy {
+            let options = vec![
+                SelectOption::new("directory", t("newWorkspace.isolation.local")).glyph("folder"),
+                SelectOption::new("branch-off", t("newWorkspace.isolation.worktree")).glyph("git-branch"),
+            ];
+            let selected = if self.worktree() { "branch-off" } else { "directory" };
+            let request = SelectRequest::new(t("newWorkspace.isolation.label"), options).selected(Some(selected));
+            view.wa_select(id!(select)).open(cx, "isolation", request);
         }
         if view.wa_trigger(id!(branch_field)).clicked(actions) && !pending_intent && !self.path.trim().is_empty() {
             self.request_branches(ctx);
@@ -1975,10 +2005,10 @@ impl WaNewTabView {
             view.wa_select(id!(select)).open(cx, "source", SelectRequest::new(t("newWorkspace.isolation.label"), options).selected(Some(&self.source)));
         }
         if view.wa_button(id!(browse)).clicked(actions) && !self.existing {
-            self.open_browser(cx);
+            self.open_browser(cx, ctx.compact);
         }
         if view.wa_button(id!(inspect_prepared)).clicked(actions) {
-            self.open_browser(cx);
+            self.open_browser(cx, ctx.compact);
         }
         if view.wa_button(id!(repo_field.search)).clicked(actions) && !locked {
             self.busy = true;
@@ -2075,9 +2105,12 @@ impl WaNewTabView {
         self.view.wa_select(id!(select)).open(cx, "project", request);
     }
 
-    fn open_browser(&mut self, cx: &mut Cx) {
+    fn open_browser(&mut self, cx: &mut Cx, compact: bool) {
         let cwd = if self.path.trim().is_empty() { "~".to_owned() } else { self.path.trim().to_owned() };
-        self.view.widget(id!(folder_modal.sheet.header.title)).set_text(cx, l("Choose a remote directory"));
+        self.view.widget(id!(folder_modal.sheet.header.title)).set_text(cx, &t("workspace.folderPicker.title"));
+        // The modal clamps the body to the window: an oversized body fills a phone's height.
+        let body_height = if compact { 10_000.0 } else { 495.0 };
+        self.view.widget(id!(folder_modal.sheet.body)).apply_over(cx, live! { height: (body_height) });
         self.view.remote_folder_picker(id!(picker)).open(cx, &self.target.host_id, &cwd);
         self.view.wa_modal(id!(folder_modal)).open(cx);
     }
@@ -2138,7 +2171,7 @@ impl WaNewTabView {
 
     fn handle_pick(&mut self, cx: &mut Cx, token: &str, value: String, ctx: &mut UiContext) {
         match token {
-            "project" if value == "\u{0}browse" => self.open_browser(cx),
+            "project" if value == "\u{0}browse" => self.open_browser(cx, ctx.compact),
             "project" => self.set_directory(cx, ctx, &value),
             "host" if value == "\u{0}add-host" => ctx.effects.push(UiEffect::OpenHostDialog),
             "host" if value != self.target.host_id && !self.busy && self.intent.is_none() => {
@@ -2176,8 +2209,24 @@ impl WaNewTabView {
                 if value != self.source {
                     self.ref_name.clear();
                     self.ref_label = None;
+                    sync_input(cx, &self.view.wa_input(id!(ref_field.row.input_box)), &self.ref_name);
                 }
                 self.source = value;
+            }
+            // The new-session row's Local / New worktree choice. Local keeps the tab's
+            // workspace when it has one; New worktree branches off into a new workspace.
+            "isolation" => {
+                let worktree = value == "branch-off";
+                if worktree != self.worktree() {
+                    self.ref_name.clear();
+                    self.ref_label = None;
+                    sync_input(cx, &self.view.wa_input(id!(ref_field.row.input_box)), &self.ref_name);
+                }
+                self.existing = !worktree && !self.target.workspace_id.is_empty();
+                self.source = if worktree { "branch-off" } else { "directory" }.into();
+                if self.existing {
+                    self.with_agent = true;
+                }
             }
             "profile" if value.is_empty() => self.profile_id = Some(String::new()),
             "profile" => {
@@ -2369,7 +2418,8 @@ impl WaNewTabView {
             ""
         };
         set_optional(cx, &view.widget(id!(notice)), notice);
-        let heading = if self.compact { String::new() } else if add_project { t("sidebar.actions.addProject") } else { t("sessionNavigation.newSession") };
+        // Compact shows the New session title in the header; Add project names itself here.
+        let heading = if add_project { t("sidebar.actions.addProject") } else if self.compact { String::new() } else { t("sessionNavigation.newSession") };
         set_optional(cx, &view.widget(id!(heading)), &heading);
 
         // Field triggers.
@@ -2389,6 +2439,10 @@ impl WaNewTabView {
             None => TriggerLead::Icon("folder"),
         };
         let project_trigger = view.wa_trigger(id!(project_field));
+        // Add project's options carry the remote directory field; a second selector for the
+        // same directory only shows while those options are collapsed.
+        let show_project = !(add_project && self.options_open);
+        project_trigger.set_visible(cx, show_project);
         project_trigger.set(cx, &t("newWorkspace.fields.project"), &project_name, &tip("newWorkspace.tooltips.project"), project_lead);
         project_trigger.set_enabled(cx, !self.existing && !pending_intent);
         let host_status = host.map(|h| h.status()).unwrap_or(Connection::Disconnected);
@@ -2396,6 +2450,24 @@ impl WaNewTabView {
         let host_label = host.map(|h| h.label()).unwrap_or_else(|| l("Host").to_owned());
         host_trigger.set(cx, &t("newWorkspace.fields.host"), &host_label, &tip("newWorkspace.tooltips.host"), TriggerLead::Status(host_status));
         host_trigger.set_enabled(cx, !self.existing && !pending_intent);
+        // New session: Local or New worktree, next to Branch (Add project picks its source
+        // among all of them in the options).
+        let worktree = self.worktree();
+        let isolation_trigger = view.wa_trigger(id!(isolation_field));
+        isolation_trigger.set_visible(cx, !add_project);
+        let (isolation_label, isolation_icon) =
+            if worktree { (t("newWorkspace.isolation.worktree"), "git-branch") } else { (t("newWorkspace.isolation.local"), "folder") };
+        isolation_trigger.set(cx, &t("newWorkspace.isolation.label"), &isolation_label, &tip("newWorkspace.tooltips.isolation"), TriggerLead::Icon(isolation_icon));
+        isolation_trigger.set_enabled(cx, !pending_intent && !self.busy);
+        let worktree_row = view.widget(id!(worktree));
+        let show_worktree_name = !add_project && worktree && self.source == "branch-off";
+        worktree_row.set_visible(cx, show_worktree_name);
+        if show_worktree_name {
+            let field = worktree_row.widget(id!(worktree_branch));
+            field.widget(id!(label)).set_text(cx, l("New branch name"));
+            set_optional(cx, &field.widget(id!(hint)), l("Automatic if empty"));
+            view.wa_input(id!(worktree_branch_input)).set_is_read_only(cx, pending_intent || self.busy);
+        }
         let show_branch = !self.existing && matches!(self.source.as_str(), "branch-off" | "checkout");
         let branch_trigger = view.wa_trigger(id!(branch_field));
         branch_trigger.set_visible(cx, show_branch);
@@ -2419,7 +2491,7 @@ impl WaNewTabView {
             // Launch keeps its badge at the row's end; the selectors share the rest
             // (16px row insets, 8px between the selectors, spacer and launch).
             let launch_w = if add_project { 0.0 } else { launch.badge_width(cx).min(240.0) };
-            let selectors = [(&project_trigger, true), (&host_trigger, true), (&branch_trigger, show_branch)];
+            let selectors = [(&project_trigger, show_project), (&host_trigger, true), (&isolation_trigger, !add_project), (&branch_trigger, show_branch)];
             let naturals: Vec<f64> = selectors.iter().filter(|(_, shown)| *shown).map(|(trigger, _)| trigger.badge_width(cx)).collect();
             let gaps = naturals.len() + usize::from(!add_project);
             let available = self.column_width - 32.0 - launch_w - 8.0 * gaps as f64;

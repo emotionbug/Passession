@@ -387,6 +387,9 @@ impl Cx {
             MacosEvent::WindowCloseRequested(e) => {
                 self.call_event_handler(&Event::WindowCloseRequested(e))
             }
+            MacosEvent::TextPasteShortcut(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextPasteShortcut(e))
+            }
             MacosEvent::TextInput(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::TextInput(e))
             }

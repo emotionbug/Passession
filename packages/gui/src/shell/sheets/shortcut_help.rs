@@ -48,7 +48,7 @@ impl Sheet for ShortcutHelpSheet {
         let sections = help_rows(&self.preferences, &self.query);
         if sections.is_empty() {
             let spec = ui.spec(Font::Regular, 14.0, p.muted);
-            ui.text_centered(cx, rect(x, y + 24.0, w, 20.0), spec, "No results");
+            ui.text_centered(cx, rect(x, y + 24.0, w, 20.0), spec, &tr("common.empty.noResults"));
             return y + 24.0 + 20.0 + 24.0 - start;
         }
         let label_spec = ui.spec(Font::Regular, 14.0, p.foreground);

@@ -352,6 +352,11 @@ Legacy top-level `providers` speech settings and `features.dictation`/`features.
 
 One file per schedule. ID is 8 hex characters.
 
+Manual runs belong to the daemon once admitted, not to the requesting socket. A disconnected
+caller must not strand a durable `running` claim or skip its workspace cleanup. Cancellation is
+a failed run for both existing-agent and new-agent targets; an earlier assistant reply is not a
+successful result for the canceled work.
+
 | Field       | Type                                  | Description                      |
 | ----------- | ------------------------------------- | -------------------------------- |
 | `id`        | `string`                              | 8-char hex ID                    |

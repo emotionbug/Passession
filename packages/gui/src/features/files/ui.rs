@@ -63,7 +63,7 @@ pub fn icon_button(cx: &mut Cx2d, kit: &mut Kit, frame: Rect, icon: &str, state:
     if highlighted {
         kit.fill(cx, frame, p.interaction_highlight, 6.0);
     }
-    let color = if state.enabled { p.extra_muted } else { fade(p.extra_muted, 0.5) };
+    let color = if state.enabled { p.muted } else { fade(p.muted, 0.5) };
     kit.icon(cx, frame, icon, toolbar_icon_size(compact), color);
 }
 
@@ -224,7 +224,7 @@ pub fn sidebar_hover(p: &Palette) -> Vec4 {
 
 /// A rotating disclosure chevron (original `TreeChevron`).
 pub fn chevron(cx: &mut Cx2d, kit: &mut Kit, slot: Rect, expanded: bool, p: &Palette) {
-    kit.icon(cx, slot, if expanded { "chevron-down" } else { "chevron-right" }, 16.0, p.extra_muted);
+    kit.icon(cx, slot, if expanded { "chevron-down" } else { "chevron-right" }, 16.0, p.muted);
 }
 
 /// A translucent scrim over `area` (dialogs drawn inside a panel).

@@ -120,6 +120,8 @@ pub fn history_overlay(cx: &mut Cx2d, d: &mut Draw, rect: Rect) {
 pub enum Callout {
     SyncError { retrying: bool },
     Preparation { subagent: bool, failed: bool, error: Option<String>, retrying: bool },
+    /// The host link is down; the client reconnects on its own, Retry reconnects now.
+    Disconnected { host: String },
 }
 
 /// A callout's trailing button: label, enabled, chrome hit id.
@@ -150,6 +152,13 @@ pub fn callout(cx: &mut Cx2d, d: &mut Draw, callout: &Callout, x: f64, y: f64, w
             let button = failed.then(|| (t(if *retrying { "agentPanel.states.timelineSyncRetrying" } else { "common.actions.retry" }), !*retrying, if *subagent { "retry-child" } else { "retry-preparation" }));
             (if *failed { p.danger } else { p.border_accent }, t(key), detail, !*failed, button)
         }
+        Callout::Disconnected { host } => (
+            p.warning,
+            ta("agentPanel.states.disconnected", &[("host", host)]),
+            None,
+            true,
+            Some((t("common.actions.retry"), true, "retry-connection")),
+        ),
     };
     let button_w = button.as_ref().map(|(label, _, _)| small_button_width(cx, d, label) + 12.0).unwrap_or(0.0);
     let spin_w = if spin { 28.0 } else { 0.0 };
@@ -233,11 +242,25 @@ pub fn empty_state(cx: &mut Cx2d, d: &mut Draw, x: f64, bottom: f64, w: f64) {
     d.kit.draw_laidout(cx, Font::Regular, p.muted, dvec2(x + (w - s.x) * 0.5, bottom - 48.0 - s.y), &l);
 }
 
-/// scrollToBottomButton: a 48px surface2 circle with a 24px ChevronDown.
-pub fn jump_button(cx: &mut Cx2d, d: &mut Draw, center_x: f64, bottom: f64) {
+/// scrollToBottomButton: a 48px surface2 circle with a 24px ChevronDown. With
+/// pending permissions it becomes a pill naming them ("Approval pending ↓").
+pub fn jump_button(cx: &mut Cx2d, d: &mut Draw, center_x: f64, bottom: f64, max_w: f64, approval_pending: bool) {
     let p = d.look.palette;
-    let r = rect_xywh(center_x - 24.0, bottom - 48.0, 48.0, 48.0);
     let shadow = if d.look.dark() { rgba(0x40000000) } else { rgba(0x14000000) };
+    if approval_pending {
+        let size = base(d);
+        let label = t("agentStream.approvalPending");
+        let text_w = d.kit.measure(cx, Font::Medium, size, 1.3, &label, None).x;
+        let w = (text_w + 40.0).min(max_w.max(48.0));
+        let r = rect_xywh(center_x - w * 0.5, bottom - 40.0, w, 40.0);
+        d.kit.rect(cx, r.translate(dvec2(0.0, 2.0)), shadow, 20.0);
+        d.kit.bordered(cx, r, p.surface2, 20.0, p.warning, 1.0);
+        d.kit.rect(cx, rect_xywh(r.pos.x + 14.0, r.pos.y + 17.0, 6.0, 6.0), p.warning, 3.0);
+        d.kit.label(cx, Font::Medium, size, 1.3, p.foreground, dvec2(r.pos.x + 26.0, r.pos.y + (40.0 - size * 1.3) * 0.5), &label, Some((w - 40.0).max(1.0)));
+        d.canvas.add_hit(r, HitTarget::Chrome("jump-latest".into()));
+        return;
+    }
+    let r = rect_xywh(center_x - 24.0, bottom - 48.0, 48.0, 48.0);
     d.kit.rect(cx, r.translate(dvec2(0.0, 2.0)), shadow, 24.0);
     d.kit.rect(cx, r, p.surface2, 24.0);
     d.kit.icon(cx, "chevron-down", r, 24.0, p.foreground);
@@ -274,14 +297,14 @@ pub fn toast(cx: &mut Cx2d, d: &mut Draw, toast: &Toast, rect: Rect) -> Rect {
     let r = rect_xywh(rect.pos.x + (rect.size.x - w) * 0.5, rect.pos.y + 12.0, w, h);
     let shadow = if d.look.dark() { rgba(0x33000000) } else { rgba(0x0a000000) };
     d.kit.rect(cx, r.translate(dvec2(0.0, 4.0)), shadow, 16.0);
-    let border = if toast.variant == ToastVariant::Error { p.destructive } else { p.border };
+    let border = if toast.variant == ToastVariant::Error { p.danger } else { p.border };
     d.kit.bordered(cx, r, p.surface0, 16.0, border, 1.0);
     let mut tx = r.pos.x + 12.0;
     if toast.spinner {
         spinner(cx, d, dvec2(tx + 9.0, r.center().y), 18.0, p.foreground);
         tx += icon_w;
     } else if toast.variant == ToastVariant::Error {
-        d.kit.icon(cx, "triangle-alert", rect_xywh(tx, r.pos.y, 18.0, h), 18.0, p.destructive);
+        d.kit.icon(cx, "triangle-alert", rect_xywh(tx, r.pos.y, 18.0, h), 18.0, p.danger);
         tx += icon_w;
     }
     let pos = dvec2(tx, r.pos.y + (h - s.y) * 0.5);
@@ -310,8 +333,8 @@ pub fn error_alert(cx: &mut Cx2d, d: &mut Draw, message: &str, x: f64, y: f64, w
     let l = d.kit.layout(cx, Font::Regular, base(d), 1.4, message, Some((w - 58.0).max(1.0)), 0.0);
     let s = laidout_size(&l);
     let h = s.y + 24.0;
-    d.kit.bordered(cx, rect_xywh(x, y, w, h), TRANSPARENT, 16.0, with_alpha(p.destructive, 0.5), 1.0);
-    d.kit.icon(cx, "circle-x", rect_xywh(x + 16.0, y, 14.0, h), 14.0, p.destructive);
+    d.kit.bordered(cx, rect_xywh(x, y, w, h), TRANSPARENT, 16.0, with_alpha(p.danger, 0.5), 1.0);
+    d.kit.icon(cx, "circle-x", rect_xywh(x + 16.0, y, 14.0, h), 14.0, p.danger);
     d.kit.draw_laidout(cx, Font::Regular, p.muted, dvec2(x + 42.0, y + 12.0), &l);
     h
 }

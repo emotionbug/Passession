@@ -28,6 +28,8 @@ pub struct OpenMenu {
     pub scroll: f64,
     max_scroll: f64,
     viewport: Rect,
+    /// Keyboard-highlighted entry of the current page (↑/↓, Enter).
+    pub active: Option<usize>,
 }
 
 /// An open `showPaseoSelect` (original `Combobox`).
@@ -48,6 +50,8 @@ pub struct OpenSelect {
     max_scroll: f64,
     viewport: Rect,
     pub focused: bool,
+    /// Keyboard-highlighted option index (↑/↓, Enter).
+    pub active: Option<usize>,
 }
 
 impl OpenSelect {
@@ -60,7 +64,9 @@ impl OpenSelect {
 pub enum Modal {
     Menu(OpenMenu),
     Select(OpenSelect),
-    Confirm { id: u64, owner: String, title: String, message: String, confirm_label: String, destructive: bool },
+    /// `ok_focused`: the button Enter activates (←/→/Tab move it). Destructive confirms start
+    /// on Cancel.
+    Confirm { id: u64, owner: String, title: String, message: String, confirm_label: String, destructive: bool, ok_focused: bool },
     Prompt {
         id: u64,
         owner: String,
@@ -140,6 +146,13 @@ pub struct Toast {
     pub message: String,
     pub error: bool,
     pub timer: Timer,
+    /// Seconds the toast still shows once its timer (re)started at `started`.
+    remaining: f64,
+    started: f64,
+    /// The pointer is over it: the timer is stopped until it leaves.
+    paused: bool,
+    /// Where it was last drawn (dismiss and hover target).
+    rect: Rect,
 }
 
 #[derive(Default)]
@@ -150,6 +163,8 @@ pub struct Overlays {
     pub area: Area,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     pub toast: Option<Toast>,
+    /// An info toast that arrived while an error toast was showing; it follows the error.
+    queued_toast: Option<String>,
     pub tooltip: Option<Tip>,
     pub tooltip_pending: Option<Tip>,
     pub tooltip_timer: Timer,
@@ -221,9 +236,10 @@ impl Overlays {
                 scroll: 0.0,
                 max_scroll: 0.0,
                 viewport: Rect::default(),
+                active: None,
             }),
             OverlayKind::Confirm { title, message, confirm_label, destructive } => {
-                Modal::Confirm { id: request.id, owner: request.owner, title, message, confirm_label, destructive }
+                Modal::Confirm { id: request.id, owner: request.owner, title, message, confirm_label, ok_focused: !destructive, destructive }
             }
             OverlayKind::Prompt { title, message, initial, placeholder, confirm_label, multiline } => {
                 let field = WidgetRef::new_from_ptr(cx, field_ptr);
@@ -238,9 +254,10 @@ impl Overlays {
                     let field = WidgetRef::new_from_ptr(cx, field_ptr);
                     let text = field.as_ptext_field();
                     text.set_plain(cx);
-                    text.set_placeholder(cx, search_placeholder.as_deref().unwrap_or("Search…"));
+                    text.set_placeholder(cx, &search_placeholder.clone().unwrap_or_else(|| tr("common.actions.search")));
                     field
                 });
+                let active = value.as_ref().and_then(|v| options.iter().position(|o| &o.value == v && o.enabled));
                 Modal::Select(OpenSelect {
                     id: request.id,
                     owner: request.owner,
@@ -256,6 +273,7 @@ impl Overlays {
                     max_scroll: 0.0,
                     viewport: Rect::default(),
                     focused: false,
+                    active,
                 })
             }
         };
@@ -329,18 +347,91 @@ impl Overlays {
     }
 }
 
+/// How long a toast stays: about 3s plus 60ms per character, so two-line messages can be read;
+/// errors start at 4s and may stay up to 10s.
+pub fn toast_duration(text: &str, error: bool) -> f64 {
+    let chars = text.chars().count() as f64;
+    let (base, cap) = if error { (4.0, 10.0) } else { (3.0, 8.0) };
+    (base + 0.06 * chars).min(cap)
+}
+
+/// Whether a new toast may take the slot: an unexpired error is never replaced by an info toast.
+fn toast_replaces(current: Option<&Toast>, error: bool) -> bool {
+    error || !current.is_some_and(|t| t.error)
+}
+
 pub fn toast(overlays: &mut Overlays, cx: &mut Cx, message: String, error: bool) {
     let text = message.trim().to_string();
     if text.is_empty() {
         return;
     }
+    if !toast_replaces(overlays.toast.as_ref(), error) {
+        overlays.queued_toast = Some(text);
+        return;
+    }
+    show_toast(overlays, cx, text, error);
+}
+
+fn show_toast(overlays: &mut Overlays, cx: &mut Cx, text: String, error: bool) {
     if let Some(previous) = overlays.toast.take() {
         cx.stop_timer(previous.timer);
     }
-    // Original durations: 2200ms, errors 3200ms.
-    let timer = cx.start_timeout(if error { 3.2 } else { 2.2 });
-    overlays.toast = Some(Toast { message: text, error, timer });
+    let remaining = toast_duration(&text, error);
+    let timer = cx.start_timeout(remaining);
+    let started = cx.seconds_since_app_start();
+    overlays.toast = Some(Toast { message: text, error, timer, remaining, started, paused: false, rect: Rect::default() });
     cx.redraw_all();
+}
+
+/// Removes the toast; a queued info toast takes its place.
+fn dismiss_toast(overlays: &mut Overlays, cx: &mut Cx) {
+    if let Some(toast) = overlays.toast.take() {
+        cx.stop_timer(toast.timer);
+    }
+    match overlays.queued_toast.take() {
+        Some(next) => show_toast(overlays, cx, next, false),
+        None => cx.redraw_all(),
+    }
+}
+
+/// Pointer input on the toast: hovering pauses its timer, a click or tap dismisses it. Returns
+/// true when the event was the dismissing press (it must not reach the content below).
+fn toast_input(overlays: &mut Overlays, cx: &mut Cx, event: &Event) -> bool {
+    let Some(toast) = overlays.toast.as_mut() else { return false };
+    let (inside, press) = match event {
+        Event::MouseMove(e) => (toast.rect.contains(e.abs), false),
+        Event::MouseLeave(_) => (false, false),
+        Event::MouseDown(e) => (toast.rect.contains(e.abs), true),
+        Event::TouchUpdate(e) => {
+            let started = e.touches.iter().find(|t| matches!(t.state, makepad_widgets::event::TouchState::Start));
+            match started {
+                Some(touch) => (toast.rect.contains(touch.abs), true),
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    if press {
+        if !inside {
+            return false;
+        }
+        dismiss_toast(overlays, cx);
+        cx.sweep_lock(overlays.area);
+        return true;
+    }
+    let now = cx.seconds_since_app_start();
+    if inside && !toast.paused {
+        cx.stop_timer(toast.timer);
+        toast.remaining = (toast.remaining - (now - toast.started)).max(0.0);
+        toast.paused = true;
+    } else if !inside && toast.paused {
+        // Leaving a hovered toast gives the reader at least another second and a half.
+        toast.remaining = toast.remaining.max(1.5);
+        toast.timer = cx.start_timeout(toast.remaining);
+        toast.started = now;
+        toast.paused = false;
+    }
+    false
 }
 
 pub fn handle_timers(overlays: &mut Overlays, cx: &mut Cx, event: &Event) {
@@ -364,8 +455,7 @@ pub fn handle_timers(overlays: &mut Overlays, cx: &mut Cx, event: &Event) {
     if let Some(toast) = &overlays.toast
         && toast.timer.is_event(event).is_some()
     {
-        overlays.toast = None;
-        cx.redraw_all();
+        dismiss_toast(overlays, cx);
     }
     if overlays.tooltip_timer.is_event(event).is_some() {
         overlays.tooltip = overlays.tooltip_pending.take();
@@ -517,12 +607,13 @@ fn draw_modal(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, index: u
         message: String::new(),
         confirm_label: String::new(),
         destructive: false,
+        ok_focused: true,
     });
     crate::shell::sheets::set_fields_active(top);
     match &mut modal {
         Modal::Menu(menu) => draw_menu(shell, cx, menu, window, compact, top),
-        Modal::Confirm { title, message, confirm_label, destructive, .. } => {
-            draw_confirm(shell, cx, window, title, message, confirm_label, *destructive, top);
+        Modal::Confirm { title, message, confirm_label, destructive, ok_focused, .. } => {
+            draw_confirm(shell, cx, window, title, message, confirm_label, *destructive, *ok_focused, top);
         }
         Modal::Prompt { title, message, field, confirm_label, focused, multiline, .. } => {
             draw_prompt(shell, cx, scope, window, title, message.as_deref(), field, confirm_label, *multiline, top);
@@ -652,7 +743,7 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
                     item.muted,
                     item.destructive,
                     item.checked,
-                    false,
+                    top && menu.active == Some(i),
                 );
                 if let Some(description) = &item.description {
                     let spec = ui.spec(Font::Regular, 12.0, p.muted);
@@ -667,12 +758,12 @@ fn draw_menu(shell: &mut PaseoShell, cx: &mut Cx2d, menu: &mut OpenMenu, window:
                 let r = rect(surface.pos.x, y, surface.size.x, row_h);
                 let id = format!("menu:sub:{i}");
                 let lead = icon.as_deref().map_or(RowLead::None, RowLead::Glyph);
-                ui.menu_row(cx, r, &id, label, lead, None, top, false, false, false, false);
+                ui.menu_row(cx, r, &id, label, lead, None, top, false, false, false, top && menu.active == Some(i));
                 let mut right = r.pos.x + r.size.x - 12.0;
                 ui.icon(cx, rect(right - 14.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "chevron-right", 14.0, p.muted);
                 right -= 20.0;
                 if *indicator {
-                    ui.dot(cx, dvec2(right - 3.0, r.pos.y + r.size.y * 0.5), 6.0, p.accent);
+                    ui.dot(cx, dvec2(right - 3.0, r.pos.y + r.size.y * 0.5), 6.0, p.accent_bright);
                     right -= 12.0;
                 }
                 if let Some(value) = value {
@@ -789,7 +880,8 @@ fn draw_select(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, select:
                 }
                 let r = rect(viewport.pos.x + mx, ry, viewport.size.x - mx * 2.0, select_row_height());
                 let id = format!("select:item:{i}");
-                draw_select_row(&mut ui, cx, r, &id, option, select.value.as_deref() == Some(option.value.as_str()));
+                let selected = select.value.as_deref() == Some(option.value.as_str());
+                draw_select_row(&mut ui, cx, r, &id, option, selected, top && select.active == Some(i));
                 if top && option.enabled {
                     let clipped = clip_rect(r, viewport);
                     if clipped.size.y > 0.0 {
@@ -812,10 +904,10 @@ fn draw_select(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, select:
 /// `_SelectItem`: 12/8 padding, surface1 while hovered or pressed, 16px leading slot, 14px
 /// label with a muted 12px description after it, trailing slot and a muted check when chosen,
 /// 55% opacity when disabled.
-fn draw_select_row(ui: &mut Ui, cx: &mut Cx2d, r: Rect, id: &str, option: &SelectOption, selected: bool) {
+fn draw_select_row(ui: &mut Ui, cx: &mut Cx2d, r: Rect, id: &str, option: &SelectOption, selected: bool, active: bool) {
     let p = ui.p;
     let alpha = if option.enabled { 1.0 } else { 0.55 };
-    if option.enabled && (ui.is_hover(id) || ui.is_pressed(id)) {
+    if option.enabled && (ui.is_hover(id) || ui.is_pressed(id) || active) {
         ui.fill(cx, r, p.surface1, 0.0);
     }
     let mut x = r.pos.x + 12.0;
@@ -891,18 +983,18 @@ fn dialog_frame(ui: &mut Ui, cx: &mut Cx2d, window: Rect, width: f64, height: f6
     let mut title_x = frame.pos.x + 24.0;
     if back {
         let r = rect(frame.pos.x + 12.0, frame.pos.y + 12.0, 32.0, 32.0);
-        ui.icon_button(cx, r, if top { "sheet:back" } else { "" }, "chevron-left", 16.0, 8.0, if compact { "" } else { "Back" });
+        ui.icon_button(cx, r, if top { "sheet:back" } else { "" }, "chevron-left", 16.0, 8.0, &if compact { String::new() } else { tr("common.actions.back") });
         title_x = r.pos.x + 32.0 + 4.0;
     }
     ui.text(cx, rect(title_x, frame.pos.y + 16.0, frame.pos.x + frame.size.x - 56.0 - title_x, title_h), spec, title);
     let close = rect(frame.pos.x + frame.size.x - 16.0 - 32.0, frame.pos.y + 12.0, 32.0, 32.0);
-    ui.icon_button(cx, close, if top { "dialog:close" } else { "" }, "x", 16.0, 8.0, if compact { "" } else { "Close" });
+    ui.icon_button(cx, close, if top { "dialog:close" } else { "" }, "x", 16.0, 8.0, &if compact { String::new() } else { tr("common.actions.close") });
     ui.painter.hline(cx, frame.pos.x, frame.pos.y + header_h - 1.0, frame.size.x, p.surface2);
     rect(frame.pos.x, frame.pos.y + header_h, frame.size.x, (frame.size.y - header_h).max(0.0))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_confirm(shell: &mut PaseoShell, cx: &mut Cx2d, window: Rect, title: &str, message: &str, confirm_label: &str, destructive: bool, top: bool) {
+fn draw_confirm(shell: &mut PaseoShell, cx: &mut Cx2d, window: Rect, title: &str, message: &str, confirm_label: &str, destructive: bool, ok_focused: bool, top: bool) {
     let compact = shell.data.compact;
     let mut ui = overlay_ui(shell);
     let p = ui.p;
@@ -918,8 +1010,16 @@ fn draw_confirm(shell: &mut PaseoShell, cx: &mut Cx2d, window: Rect, title: &str
     let cw = ui.button_width(cx, &cancel, None, ControlSize::Sm);
     let ow = ui.button_width(cx, confirm_label, None, ControlSize::Sm);
     let right = body.pos.x + body.size.x - 24.0;
-    ui.button(cx, rect(right - ow, y, ow, button_h), if top { "confirm:ok" } else { "" }, confirm_label, None, if destructive { Variant::Destructive } else { Variant::Primary }, ControlSize::Sm, top);
-    ui.button(cx, rect(right - ow - 8.0 - cw, y, cw, button_h), if top { "confirm:cancel" } else { "" }, &cancel, None, Variant::Ghost, ControlSize::Sm, top);
+    let ok = rect(right - ow, y, ow, button_h);
+    let cancel_rect = rect(right - ow - 8.0 - cw, y, cw, button_h);
+    ui.button(cx, ok, if top { "confirm:ok" } else { "" }, confirm_label, None, if destructive { Variant::Destructive } else { Variant::Primary }, ControlSize::Sm, top);
+    ui.button(cx, cancel_rect, if top { "confirm:cancel" } else { "" }, &cancel, None, Variant::Ghost, ControlSize::Sm, top);
+    // Desktop keyboard focus (Enter activates it; ←/→/Tab move it).
+    if top && !compact {
+        let focused = if ok_focused { ok } else { cancel_rect };
+        let ring = rect(focused.pos.x - 2.0, focused.pos.y - 2.0, focused.size.x + 4.0, focused.size.y + 4.0);
+        ui.painter.outline(cx, ring, Vec4::default(), p.muted, 1.5, (button_h * 0.5 + 2.0).min(14.0));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1241,20 +1341,26 @@ fn draw_full_screen_sheet(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Sco
 
 fn draw_toast(shell: &mut PaseoShell, cx: &mut Cx2d, window: Rect) {
     let Some((message, error)) = shell.data.overlays.toast.as_ref().map(|t| (t.message.clone(), t.error)) else { return };
+    let insets = crate::shell::platform::safe_insets();
     let mut ui = overlay_ui(shell);
     let p = ui.p;
     let spec = ui.spec(Font::Regular, 14.0, p.foreground);
-    // Original toast-host pill: 92% wide up to 480, under the header, surface0 + border.
+    // Original toast-host pill: 92% wide up to 480, under the header (below the status bar
+    // and notch on phones), surface0 + border, a dismiss glyph at the end.
     let w = (window.size.x * 0.92).min(480.0);
-    let text_w = w - 24.0 - 28.0;
+    let text_w = (w - 36.0 - 36.0).max(40.0);
     let h = ui.painter.paragraph_height(cx, text_w, spec, &message).max(20.0) + 20.0;
-    let top = window.pos.y + if ui.compact { 72.0 } else { 44.0 };
+    let top = window.pos.y + insets.top + if ui.compact { 72.0 } else { 44.0 };
     let r = rect(window.pos.x + (window.size.x - w) * 0.5, top, w, h);
-    let border = if error { p.destructive } else { p.border };
+    let border = if error { p.danger } else { p.border };
     ui.painter.outline(cx, r, p.surface0, border, 1.0, 16.0);
     let icon = if error { "circle-alert" } else { "info" };
-    ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + (h - 16.0) * 0.5, 16.0, 16.0), icon, 16.0, if error { p.destructive } else { p.muted });
+    ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + (h - 16.0) * 0.5, 16.0, 16.0), icon, 16.0, if error { p.danger } else { p.muted });
     ui.painter.paragraph(cx, dvec2(r.pos.x + 36.0, r.pos.y + 10.0), text_w, spec, &message);
+    ui.icon(cx, rect(r.pos.x + r.size.x - 28.0, r.pos.y + (h - 16.0) * 0.5, 16.0, 16.0), "x", 14.0, p.muted);
+    if let Some(toast) = shell.data.overlays.toast.as_mut() {
+        toast.rect = r;
+    }
 }
 
 fn draw_tooltip(shell: &mut PaseoShell, cx: &mut Cx2d, window: Rect) {
@@ -1289,6 +1395,9 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     if stale != area {
         cx.sweep_unlock(stale);
     }
+    if toast_input(&mut shell.data.overlays, cx, event) {
+        return true;
+    }
     let explorer_open = shell.data.compact && shell.data.chrome.explorer_position > 0.0;
     if !shell.data.overlays.is_modal() && !explorer_open {
         shell.data.overlays.touch_scroll.reset();
@@ -1308,6 +1417,11 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
         return true;
     }
     if matches!(event, Event::BackPressed { .. } | Event::KeyDown(KeyEvent { key_code: KeyCode::Escape, .. })) {
+        return true;
+    }
+    if let Event::KeyDown(key) = event
+        && modal_key(shell, cx, scope, key)
+    {
         return true;
     }
     if let Some(top) = shell.data.overlays.stack.len().checked_sub(1) {
@@ -1481,6 +1595,150 @@ fn drag_sheet(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, hit: &Hit)
     false
 }
 
+/// The next keyboard target among `candidates` (in display order) from `current`: ↓/Tab
+/// forward, ↑/Shift+Tab back (both wrap), Home/End to the ends. `None` when the key does not move.
+fn step_active(candidates: &[usize], current: Option<usize>, key: &KeyEvent) -> Option<usize> {
+    let (first, last) = (*candidates.first()?, *candidates.last()?);
+    let at = current.and_then(|c| candidates.iter().position(|&i| i == c));
+    let forward = match key.key_code {
+        KeyCode::ArrowDown => true,
+        KeyCode::ArrowUp => false,
+        KeyCode::Tab => !key.modifiers.shift,
+        KeyCode::Home => return Some(first),
+        KeyCode::End => return Some(last),
+        _ => return None,
+    };
+    Some(match (at, forward) {
+        (None, true) => first,
+        (None, false) => last,
+        (Some(at), true) => candidates[(at + 1) % candidates.len()],
+        (Some(at), false) => candidates[(at + candidates.len() - 1) % candidates.len()],
+    })
+}
+
+/// The scroll that keeps `[top, bottom)` (content coordinates) inside a viewport of `height`.
+fn scroll_into_view(scroll: f64, max: f64, height: f64, top: f64, bottom: f64) -> f64 {
+    let next = if top < scroll { top } else if bottom > scroll + height { bottom - height } else { scroll };
+    next.clamp(0.0, max.max(0.0))
+}
+
+fn menu_selectable(entries: &[MenuEntry]) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| match e {
+            MenuEntry::Item(item) => item.enabled,
+            MenuEntry::Submenu { .. } => true,
+            _ => false,
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Content offset (top, bottom) of menu entry `index`, matching [`draw_menu`].
+fn menu_entry_span(entries: &[MenuEntry], index: usize, compact: bool) -> (f64, f64) {
+    let top = 4.0 + entries_height(&entries[..index], compact) - 8.0;
+    (top, top + entries_height(&entries[index..=index], compact) - 8.0)
+}
+
+/// Content offset (top, bottom) of option `index` in a select list, matching [`draw_select`].
+fn select_option_span(select: &OpenSelect, visible: &[usize], index: usize, sheet: bool) -> Option<(f64, f64)> {
+    let mut y = 4.0;
+    let gap = if sheet { 4.0 } else { 0.0 };
+    for &i in visible {
+        if select.options[i].separator_before && select.query.is_empty() {
+            y += 9.0;
+        }
+        if i == index {
+            return Some((y, y + select_row_height()));
+        }
+        y += select_row_height() + gap;
+    }
+    None
+}
+
+/// Keyboard for the top menu, select and confirm dialog: ↑/↓ (Tab) move the highlight, Enter
+/// (Space outside a search field) picks it, →/← open and leave submenus, ←/→/Tab switch the
+/// confirm buttons. Returns true when the key was used.
+fn modal_key(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, key: &KeyEvent) -> bool {
+    let m = key.modifiers;
+    if m.control || m.alt || m.logo {
+        return false;
+    }
+    let compact = shell.data.compact;
+    let Some(top) = shell.data.overlays.stack.last_mut() else { return false };
+    let pick = match top {
+        Modal::Menu(menu) => {
+            let depth = menu.pages.len();
+            let entries = &menu.pages[depth - 1].1;
+            let selectable = menu_selectable(entries);
+            let active = menu.active.filter(|a| selectable.contains(a));
+            if let Some(next) = step_active(&selectable, active, key) {
+                menu.active = Some(next);
+                let (top_y, bottom_y) = menu_entry_span(entries, next, compact);
+                menu.scroll = scroll_into_view(menu.scroll, menu.max_scroll, menu.viewport.size.y, top_y, bottom_y);
+                shell.redraw(cx);
+                return true;
+            }
+            match (key.key_code, active) {
+                (KeyCode::ReturnKey | KeyCode::Space, Some(i)) | (KeyCode::ArrowRight, Some(i)) => match &entries[i] {
+                    MenuEntry::Submenu { .. } => format!("menu:sub:{i}"),
+                    _ if key.key_code == KeyCode::ArrowRight => return false,
+                    _ => format!("menu:item:{i}"),
+                },
+                (KeyCode::ArrowLeft | KeyCode::Backspace, _) if depth > 1 => "menu:back".to_string(),
+                _ => return false,
+            }
+        }
+        Modal::Select(select) => {
+            let visible: Vec<usize> = select.visible();
+            let enabled: Vec<usize> = visible.iter().copied().filter(|&i| select.options[i].enabled).collect();
+            let active = select.active.filter(|a| enabled.contains(a));
+            let edits_query = select.search.is_some() && matches!(key.key_code, KeyCode::Home | KeyCode::End);
+            if key.key_code != KeyCode::Tab && !edits_query
+                && let Some(next) = step_active(&enabled, active, key)
+            {
+                select.active = Some(next);
+                if let Some((top_y, bottom_y)) = select_option_span(select, &visible, next, compact) {
+                    select.scroll = scroll_into_view(select.scroll, select.max_scroll, select.viewport.size.y, top_y, bottom_y);
+                }
+                shell.redraw(cx);
+                return true;
+            }
+            match (key.key_code, active) {
+                (KeyCode::ReturnKey, Some(i)) => format!("select:item:{i}"),
+                (KeyCode::Space, Some(i)) if select.search.is_none() => format!("select:item:{i}"),
+                _ => return false,
+            }
+        }
+        Modal::Confirm { ok_focused, .. } => match key.key_code {
+            KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::Tab => {
+                *ok_focused = !*ok_focused;
+                shell.redraw(cx);
+                return true;
+            }
+            KeyCode::ReturnKey | KeyCode::Space => (if *ok_focused { "confirm:ok" } else { "confirm:cancel" }).to_string(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let menu_depth = |shell: &PaseoShell| match shell.data.overlays.stack.last() {
+        Some(Modal::Menu(menu)) => Some((menu.id, menu.pages.len())),
+        _ => None,
+    };
+    let before = menu_depth(shell);
+    click(shell, cx, scope, &pick);
+    // A submenu opened or closed from the keyboard highlights its first entry.
+    if let (Some((id, depth)), Some((after_id, after_depth))) = (before, menu_depth(shell))
+        && id == after_id
+        && depth != after_depth
+        && let Some(Modal::Menu(menu)) = shell.data.overlays.stack.last_mut()
+    {
+        menu.active = menu_selectable(&menu.pages[after_depth - 1].1).first().copied();
+    }
+    true
+}
+
 fn scroll_viewport(shell: &PaseoShell) -> Rect {
     match shell.data.overlays.stack.last() {
         Some(Modal::Menu(menu)) => menu.viewport,
@@ -1510,6 +1768,29 @@ fn scroll_top(shell: &mut PaseoShell, delta: f64) {
 fn answer(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, owner: &str, id: u64, args: Value) {
     if let Some(ui) = scope.data.get_mut::<UiContext>() {
         shell.overlay_answer(cx, ui, owner, id, args);
+    }
+    shell.redraw(cx);
+}
+
+/// Closes every shell menu, dialog and sheet as if dismissed (owners get their cancel answer;
+/// sheets run `closed`). Used when a notification takes the user to a session.
+pub fn dismiss_all(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
+    shell.data.overlays.touch_scroll.reset();
+    shell.data.overlays.pointer = Pointer::default();
+    // An answer may open a follow-up (a close guard's next step); stop after a bounded number.
+    for _ in 0..64 {
+        let Some(modal) = shell.data.overlays.pop(cx) else { break };
+        match modal {
+            Modal::Menu(menu) => shell.overlay_answer(cx, ui, &menu.owner, menu.id, json!({ "cancelled": true })),
+            Modal::Select(select) => shell.overlay_answer(cx, ui, &select.owner, select.id, json!({ "cancelled": true })),
+            Modal::Confirm { id, owner, .. } => shell.overlay_answer(cx, ui, &owner, id, json!({ "confirmed": false })),
+            Modal::Prompt { id, owner, .. } => shell.overlay_answer(cx, ui, &owner, id, json!({ "cancelled": true })),
+            Modal::Sheet { mut sheet, .. } => {
+                let mut ops = SheetOps::new(ui);
+                sheet.closed(cx, &mut ops);
+                crate::shell::sheets::apply_ops(shell, cx, ui, ops, None);
+            }
+        }
     }
     shell.redraw(cx);
 }
@@ -1566,6 +1847,7 @@ fn click(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, id: &str) {
                 if menu.pages.len() > 1 {
                     menu.pages.pop();
                     menu.scroll = 0.0;
+                    menu.active = None;
                 }
                 shell.redraw(cx);
                 return;
@@ -1575,6 +1857,7 @@ fn click(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, id: &str) {
                 if let Some(MenuEntry::Submenu { label, entries, .. }) = entries.get(index) {
                     menu.pages.push((Some(label.clone()), entries.clone()));
                     menu.scroll = 0.0;
+                    menu.active = None;
                 }
                 shell.redraw(cx);
                 return;
@@ -1673,4 +1956,52 @@ pub fn padded(r: Rect, d: f64) -> Rect {
 /// Text spec helper for sheet bodies.
 pub fn body_spec(ui: &Ui) -> TextSpec {
     ui.spec(Font::Regular, 14.0, ui.p.foreground)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, shift: bool) -> KeyEvent {
+        KeyEvent { key_code: code, is_repeat: false, modifiers: KeyModifiers { shift, ..KeyModifiers::default() }, time: 0.0 }
+    }
+
+    #[test]
+    fn toast_duration_grows_with_length_and_is_capped() {
+        assert_eq!(toast_duration("Copied", false), 3.0 + 0.06 * 6.0);
+        assert!(toast_duration(&"x".repeat(60), false) > toast_duration("short", false));
+        assert_eq!(toast_duration(&"x".repeat(500), false), 8.0);
+        assert_eq!(toast_duration(&"x".repeat(500), true), 10.0);
+        assert!(toast_duration("Push failed", true) > toast_duration("Push failed", false));
+    }
+
+    #[test]
+    fn info_toasts_never_replace_a_showing_error() {
+        let toast = |error: bool| Toast { message: "m".into(), error, timer: Timer::empty(), remaining: 1.0, started: 0.0, paused: false, rect: Rect::default() };
+        let (error, info) = (toast(true), toast(false));
+        assert!(!toast_replaces(Some(&error), false));
+        assert!(toast_replaces(Some(&error), true));
+        assert!(toast_replaces(Some(&info), false));
+        assert!(toast_replaces(None, false));
+    }
+
+    #[test]
+    fn keyboard_steps_wrap_over_enabled_rows() {
+        let rows = [1, 3, 4];
+        assert_eq!(step_active(&rows, None, &key(KeyCode::ArrowDown, false)), Some(1));
+        assert_eq!(step_active(&rows, None, &key(KeyCode::ArrowUp, false)), Some(4));
+        assert_eq!(step_active(&rows, Some(4), &key(KeyCode::ArrowDown, false)), Some(1));
+        assert_eq!(step_active(&rows, Some(1), &key(KeyCode::Tab, true)), Some(4));
+        assert_eq!(step_active(&rows, Some(3), &key(KeyCode::End, false)), Some(4));
+        assert_eq!(step_active(&rows, Some(3), &key(KeyCode::ReturnKey, false)), None);
+        assert_eq!(step_active(&[], None, &key(KeyCode::ArrowDown, false)), None);
+    }
+
+    #[test]
+    fn scroll_into_view_reveals_rows_above_and_below() {
+        assert_eq!(scroll_into_view(0.0, 500.0, 100.0, 20.0, 40.0), 0.0);
+        assert_eq!(scroll_into_view(0.0, 500.0, 100.0, 150.0, 180.0), 80.0);
+        assert_eq!(scroll_into_view(200.0, 500.0, 100.0, 120.0, 140.0), 120.0);
+        assert_eq!(scroll_into_view(0.0, 50.0, 100.0, 150.0, 180.0), 50.0);
+    }
 }

@@ -118,7 +118,8 @@ impl TextField {
             }
         }
         self.handles_revision = self.buffer.revision;
-        let border = if self.focused { p.border_accent } else { p.surface2 };
+        // Focus shows on the surface2 fill (border_accent is ~1.1:1 against it).
+        let border = if self.focused { p.muted } else { p.surface2 };
         kit.outline(cx, frame, p.surface2, border, 1.0, 6.0);
         let trailing_w = match trailing {
             Some(text) if !text.is_empty() => kit.measure(cx, spec(Font::Regular, font_size - 2.0, p.muted), text).x + 8.0,

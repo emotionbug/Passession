@@ -547,16 +547,8 @@ impl AgentManager {
                 self.interrupt_cell(id, cell).await
             }
             .await;
-            let refused = replaced
-                .as_ref()
-                .is_ok_and(|result| result["status"] == "refused");
-            if refused || replaced.is_err() {
+            if replaced.is_err() {
                 cell.data.lock().await.pending_replacement = false;
-            }
-            if refused {
-                bail!(
-                    "Cannot replace agent {id} because its active run cancellation was not acknowledged"
-                );
             }
             replaced?;
         }
@@ -884,10 +876,10 @@ impl AgentManager {
             .clone()
             .ok_or_else(|| anyhow!("Agent has no session"))?;
         let mut events = self.subscribe_events();
-        let acknowledged = matches!(
-            tokio::time::timeout(Duration::from_secs(2), session.interrupt()).await,
-            Ok(Ok(()))
-        );
+        let interruption = match tokio::time::timeout(Duration::from_secs(2), session.interrupt()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("Provider interruption timed out")),
+        };
         self.drain_events(cell).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let mut settled = false;
@@ -898,8 +890,14 @@ impl AgentManager {
             }
             tokio::select! {_=tokio::time::sleep_until(deadline)=>break,event=events.recv()=>match event{Ok(_)|Err(broadcast::error::RecvError::Lagged(_))=>{},Err(_)=>break}}
         }
-        if !acknowledged {
-            return Ok(json!({"status":if settled {"settled"} else {"refused"}}));
+        if let Err(error) = interruption {
+            if settled {
+                return Ok(json!({"status":"settled"}));
+            }
+            let message = format!(
+                "Cannot cancel agent {id}: its active run cancellation was not acknowledged: {error}"
+            );
+            return Err(error.context(message));
         }
         if !settled {
             self.apply_event(id,cell,json!({"type":"turn_canceled","provider":snapshot["provider"],"reason":"interrupted","turnId":snapshot["activeTurnId"]}),false).await?;
@@ -1112,12 +1110,7 @@ impl AgentManager {
         self.authorize(actor, id).await?;
         if matches!(action, "reload" | "refresh" | "resume") {
             if let Ok(cell) = self.cell(id).await {
-                let result = self.interrupt_cell(id, &cell).await?;
-                if result["status"] == "refused" {
-                    bail!(
-                        "Cannot reload agent {id} because its active run cancellation was not acknowledged"
-                    );
-                }
+                self.interrupt_cell(id, &cell).await?;
             }
             let overrides = input.get("overrides").cloned().unwrap_or(json!({}));
             let snapshot = if action == "resume" {
@@ -1477,12 +1470,7 @@ impl AgentManager {
                 if session.capabilities()[capability] != true {
                     bail!("Agent {id} does not support {mode} rewind for this session");
                 }
-                let settled = self.interrupt_cell(id, &cell).await?;
-                if settled["status"] == "refused" {
-                    bail!(
-                        "Cannot rewind agent {id} because its active run cancellation was not acknowledged"
-                    );
-                }
+                self.interrupt_cell(id, &cell).await?;
                 session.rewind(target, &provider_id).await?;
                 if mode != "files" {
                     self.hydrate_history_for(id, &cell, true, text(&input, "_initiatingSourceId"), true)
@@ -1690,6 +1678,62 @@ fn validate_send_identity(snapshot: &Value, input: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_request_reports_provider_refusal_without_settling_the_turn() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = AppState::new(
+            root.path().join("home"),
+            root.path().into(),
+            std::env::current_exe()?,
+        );
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000051";
+        let cell = runtime::tests::staged_cell_with_config(
+            &app,
+            id,
+            json!({"featureValues":{"mockInterruptError":"Provider refused interruption"}}),
+        )
+        .await;
+        manager.release_event_stage(&cell).await?;
+        let (source, mut output) = crate::transport::RequestContext::attach(
+            "cancel-source".into(),
+            "cancel-session".into(),
+            "cancel-client".into(),
+            json!({"owned_subscriptions":true}),
+            json!({"id":"owner","kind":"owner"}),
+            Arc::new(std::sync::RwLock::new(
+                ["workspace.write".to_owned()].into_iter().collect(),
+            )),
+            false,
+            None,
+            CancellationToken::new(),
+        );
+        let message = json!({"type":"cancel_agent_request","requestId":"cancel","agentId":id});
+        let request = source.for_request(message.clone());
+        assert!(manager.handle(&request, &message).await?);
+        let frame = output.recv().await.unwrap();
+        let crate::transport::OutboundFrame::Text(text) = &frame.frame else {
+            panic!("expected cancellation response");
+        };
+        let response: Value = serde_json::from_str(text)?;
+        assert_eq!(response["message"]["type"], "cancel_agent_response");
+        assert!(
+            response["message"]["payload"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("Provider refused interruption")
+        );
+        {
+            let data = cell.data.lock().await;
+            assert_eq!(data.snapshot["lifecycle"], "running");
+            assert_eq!(data.snapshot["activeTurnId"], "live-turn");
+        }
+        source.detach();
+        cell.cancel.cancel();
+        cell.task.lock().await.take().unwrap().await?;
+        Ok(())
+    }
 
     #[test]
     fn continuation_identity_refuses_archived_and_replaced_provider_sessions() {

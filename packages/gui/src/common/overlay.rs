@@ -610,7 +610,7 @@ impl SelectRequest {
             value: None,
             searchable: false,
             search_placeholder: None,
-            empty_text: "No options".to_string(),
+            empty_text: crate::common::tr("common.empty.noOptions"),
             min_width: 220.0,
         }
     }

@@ -341,7 +341,7 @@ impl PrPane {
         let outcome = wire::checkout_result(result).and_then(|payload| {
             if payload.get("success") == Some(&Value::Bool(false)) {
                 Err(Failure::message(
-                    wire::payload_error(&payload).unwrap_or_else(|| "Could not load pipeline jobs".to_owned()),
+                    wire::payload_error(&payload).unwrap_or_else(|| super::text::t("panels.pullRequest.pipelineJobsFailed")),
                 ))
             } else {
                 Ok(payload)

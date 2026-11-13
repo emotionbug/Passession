@@ -237,6 +237,10 @@ pub(crate) fn request_notification_permission(_shared: &Arc<Shared>, done: Compl
     user_notifications::request_authorization(move |result| done.finish(result.map(PlatformValue::Permission)));
 }
 
+pub(crate) fn notification_permission_status(_shared: &Arc<Shared>, done: Completion) {
+    user_notifications::authorization_status(move |state| done.ok(PlatformValue::Permission(state)));
+}
+
 pub(crate) fn set_badge_count(_shared: &Arc<Shared>, count: u32, done: Completion) {
     apple::on_main_queue(move || unsafe {
         let app: Id = msg_send![class!(NSApplication), sharedApplication];
@@ -412,6 +416,12 @@ pub(crate) fn os_version() -> String {
 
 pub(crate) fn locale() -> String {
     apple::preferred_language()
+}
+
+/// macOS has no system-wide text-size setting for AppKit apps (only per-app
+/// and Accessibility zoom), so text keeps the identity scale.
+pub(crate) fn system_text_scale() -> crate::appearance::TextScale {
+    crate::appearance::TextScale::default()
 }
 
 pub(crate) fn system_prefers_dark() -> bool {

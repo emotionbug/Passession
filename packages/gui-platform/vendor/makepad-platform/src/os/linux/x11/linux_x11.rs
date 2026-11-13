@@ -184,6 +184,9 @@ impl Cx {
             XlibEvent::WindowCloseRequested(e) => {
                 self.call_event_handler(&Event::WindowCloseRequested(e))
             }
+            XlibEvent::TextPasteShortcut(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::TextPasteShortcut(e))
+            }
             XlibEvent::TextInput(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::TextInput(e))
             }

@@ -96,8 +96,8 @@ fn numeric_field(id: &'static str, value: i64, width: f64, commit: crate::featur
     )
 }
 
-fn family_field(id: &'static str, value: &str, commit: crate::features::settings::rpc::Handler) -> Ctl {
-    let spec = FieldSpec::new(id, value).placeholder(t("settings.appearance.fonts.systemDefault")).on_submit(commit.clone()).on_blur(commit);
+fn family_field(id: &'static str, value: &str, placeholder: String, commit: crate::features::settings::rpc::Handler) -> Ctl {
+    let spec = FieldSpec::new(id, value).placeholder(placeholder).on_submit(commit.clone()).on_blur(commit);
     Ctl::Field { spec, w: 220.0, h: 36.0 }
 }
 
@@ -128,14 +128,14 @@ pub fn draw_appearance(ui: &mut Ui, _s: &Settings, v: &View) {
     ui.section_title(&t("settings.appearance.fonts.title"), None, None);
     ui.card_begin();
     if !MOBILE {
-        let ctl = family_field(UI_FONT, str_of(prefs, "uiFontFamily"), commit_family(UI_FONT, "uiFontFamily"));
+        let ctl = family_field(UI_FONT, str_of(prefs, "uiFontFamily"), t("settings.appearance.fonts.systemDefault"), commit_family(UI_FONT, "uiFontFamily"));
         ui.row(row(t("settings.appearance.fonts.interfaceFont")).hint(t("settings.appearance.fonts.interfaceFontHint")).inline().control(ctl));
     }
     let ctl = numeric_field(UI_SIZE, ui_base(prefs), 64.0, commit_size(UI_SIZE, "uiBaseFontSize", MIN_UI_FONT, MAX_UI_FONT, ui_base), muted);
     ui.row(row(t("settings.appearance.fonts.interfaceSize")).hint(t("settings.appearance.fonts.interfaceSizeHint")).control(ctl));
     let ctl = numeric_field(CONTENT_SIZE, content_size(prefs), 64.0, commit_size(CONTENT_SIZE, "contentFontSize", MIN_CONTENT_FONT, MAX_CONTENT_FONT, content_size), muted);
     ui.row(row(t("settings.appearance.fonts.contentSize")).hint(t("settings.appearance.fonts.contentSizeHint")).control(ctl));
-    let ctl = family_field(MONO_FONT, str_of(prefs, "monoFontFamily"), commit_family(MONO_FONT, "monoFontFamily"));
+    let ctl = family_field(MONO_FONT, str_of(prefs, "monoFontFamily"), t("settings.appearance.fonts.builtInCodeFont"), commit_family(MONO_FONT, "monoFontFamily"));
     ui.row(row(t("settings.appearance.fonts.codeFont")).hint(t("settings.appearance.fonts.codeFontHint")).inline().control(ctl));
     let ctl = numeric_field(CODE_SIZE, code_size(prefs), 64.0, commit_size(CODE_SIZE, "codeFontSize", MIN_CODE_FONT, MAX_CODE_FONT, code_size), muted);
     ui.row(row(t("settings.appearance.fonts.codeSize")).hint(t("settings.appearance.fonts.codeSizeHint")).control(ctl));

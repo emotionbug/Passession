@@ -1,8 +1,8 @@
 //! Painting of the Git Log tab ([`LogView`]): the desktop toolbar, branches
-//! panel, commit table and details, and the phone log and commit screens.
-//! Hits follow the feature rule: a row registers before its inner buttons,
-//! scrolled hits are clipped to their region, text that does not fit is
-//! ellipsized.
+//! panel (or drawer), commit table and details, and the phone log and commit
+//! screens. Hits follow the feature rule: a row registers before its inner
+//! buttons, scrolled hits are clipped to their region, text that does not fit
+//! is ellipsized.
 
 use super::chrome::{
     ButtonSize, ButtonVariant, TOOLBAR_HEIGHT, button, button_height, diff_stat, label_trigger, measure_button, palette,
@@ -10,8 +10,8 @@ use super::chrome::{
 };
 use super::graph::GraphRow;
 use super::json::{int, text};
-use super::log::{Availability, CommitDetail, Detail, RefFilter, RefKind, RefLabel, Refs};
-use super::log_view::{Focus, LogHit, LogInputs, LogView, Screen, ahead_behind, basename, dirname};
+use super::log::{Availability, CommitDetail, Detail, RefFilter, RefKind, RefLabel, Refs, is_hash_query};
+use super::log_view::{Focus, LogHit, LogInputs, LogView, Screen, Split, ahead_behind, basename, dirname};
 use super::model::now_ms;
 use super::paint::{Font, GitPaint, hex, rect, with_alpha};
 use super::text::{t, tr};
@@ -20,16 +20,20 @@ use crate::theme::Typography;
 use chrono::{Local, TimeZone};
 use makepad_widgets::*;
 use serde_json::Value;
+use std::collections::HashSet;
 
 /// Desktop commit table: lane width and the widest graph drawn.
 const LANE_WIDTH: f64 = 14.0;
 const MAX_LANES: usize = 24;
+/// The desktop graph takes at most this share of the subject column.
+const GRAPH_SHARE: f64 = 0.35;
 /// Phone rows: a narrow graph capped at six lanes.
 const PHONE_LANE_WIDTH: f64 = 10.0;
 const PHONE_MAX_LANES: usize = 6;
 const PHONE_ROW_HEIGHT: f64 = 56.0;
 const PHONE_FILE_ROW_HEIGHT: f64 = 48.0;
 const BRANCHES_WIDTH: f64 = 240.0;
+const BRANCHES_MIN_WIDTH: f64 = 160.0;
 
 /// Lane colours by colour index.
 fn lane_color(index: usize) -> Vec4 {
@@ -55,11 +59,12 @@ pub(super) fn relative_time(ms: i64, now: i64) -> String {
     }
 }
 
-fn local_time(ms: i64, format: &str) -> String {
+pub(super) fn local_time(ms: i64, format: &str) -> String {
     Local.timestamp_millis_opt(ms).single().map(|time| time.format(format).to_string()).unwrap_or_default()
 }
 
-fn short(sha: &str) -> String {
+/// The 8-digit abbreviation every hash column and title uses.
+pub(super) fn short(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
 
@@ -70,7 +75,7 @@ fn ref_colors(label: &RefLabel) -> (Vec4, Vec4) {
         RefKind::Head => colors.merged,
         _ if label.is_head => colors.merged,
         RefKind::Local => colors.success,
-        RefKind::Remote => colors.accent,
+        RefKind::Remote => colors.accent_bright,
         RefKind::Tag => colors.warning,
     };
     (with_alpha(tint, 0.16), tint)
@@ -82,7 +87,7 @@ fn status_letter(file: &Value) -> (&'static str, Vec4) {
     match text(file, "status") {
         "added" => ("A", colors.success),
         "deleted" => ("D", colors.danger),
-        "renamed" => ("R", colors.accent),
+        "renamed" => ("R", colors.accent_bright),
         _ => ("M", colors.warning),
     }
 }
@@ -137,38 +142,168 @@ fn more_chip(cx: &mut Cx2d, paint: &mut GitPaint, x: f64, center_y: f64, count: 
     width
 }
 
+/// A toolbar filter trigger: the plain label trigger while inactive; an
+/// accent-tinted chip with an inline × while a filter is set. Returns the
+/// trigger and the × rect.
+#[allow(clippy::too_many_arguments)]
+fn filter_chip(
+    cx: &mut Cx2d,
+    paint: &mut GitPaint,
+    x: f64,
+    center_y: f64,
+    max_width: f64,
+    label: &str,
+    icon: &'static str,
+    active: bool,
+    highlighted: bool,
+    clear_hovered: bool,
+) -> (Rect, Option<Rect>) {
+    let colors = palette();
+    if !active {
+        return (label_trigger(cx, paint, x, center_y, max_width, label, Some((icon, colors.muted)), true, highlighted), None);
+    }
+    let size = ui_px(12.0);
+    let clear_width = 18.0;
+    let text_max = (max_width - 4.0 - 18.0 - 2.0 - clear_width).max(0.0);
+    let fitted = paint.ellipsize(cx, Font::Regular, size, label, text_max);
+    let text_width = paint.measure(cx, Font::Regular, size, &fitted).x;
+    let height = paint.measure(cx, Font::Regular, size, "Ag").y + 8.0;
+    let width = 4.0 + 18.0 + text_width + 2.0 + clear_width;
+    let area = rect(x, center_y - height / 2.0, width, height);
+    // Accent fill; text and glyphs in the readable accent.
+    let (accent, ink) = (colors.accent, colors.accent_bright);
+    paint.rounded(cx, area, with_alpha(accent, if highlighted { 0.22 } else { 0.14 }), 6.0, Some((with_alpha(ink, 0.45), 1.0)));
+    paint.icon(cx, icon, 14.0, ink, dvec2(x + 4.0 + 7.0, center_y));
+    paint.text_centered(cx, Font::Regular, size, ink, x + 22.0, area.pos.y, height, &fitted, text_max + 1.0);
+    let clear = rect(x + width - clear_width - 1.0, center_y - 8.0, 16.0, 16.0);
+    if clear_hovered {
+        paint.rounded(cx, clear, colors.interaction_highlight, 4.0, None);
+    }
+    paint.icon(cx, "x", 11.0, ink, clear.center());
+    (area, Some(clear))
+}
+
 /// Lanes of one row from `left`: top and bottom edges, then the node.
-/// Without a graph row (filtered lists) only the node is drawn. Returns the lanes used.
+/// Without a graph row (filtered lists) only the node is drawn. A row with
+/// more lanes than `cap` folds the hidden ones into the last column: their
+/// edges fade there and a commit on a hidden lane gets a hollow node.
+/// Returns the lanes used.
 #[allow(clippy::too_many_arguments)]
 fn draw_graph(cx: &mut Cx2d, paint: &mut GitPaint, row: Option<&GraphRow>, left: f64, top: f64, height: f64, lane_width: f64, cap: usize, head: bool, background: Vec4) -> usize {
+    let cap = cap.max(1);
     let x = |lane: usize| left + lane_width * (lane as f64 + 0.5);
     let (y0, yc, y1) = (top, top + height / 2.0, top + height);
     let stroke = if lane_width >= LANE_WIDTH { 1.6 } else { 1.4 };
     let radius = if lane_width >= LANE_WIDTH { 3.5 } else { 3.0 };
-    let (lane, color, used) = match row {
-        Some(row) => {
-            for edge in &row.top {
-                if edge.from < cap && edge.to < cap {
-                    paint.segment(cx, dvec2(x(edge.from), y0), dvec2(x(edge.to), yc), stroke, lane_color(edge.color));
-                }
-            }
-            for edge in &row.bottom {
-                if edge.from < cap && edge.to < cap {
-                    paint.segment(cx, dvec2(x(edge.from), yc), dvec2(x(edge.to), y1), stroke, lane_color(edge.color));
-                }
-            }
-            (row.lane.min(cap - 1), lane_color(row.color), row.lanes.clamp(1, cap))
-        }
-        None => (0, palette().muted, 1),
+    let Some(row) = row else {
+        let center = dvec2(x(0), yc);
+        paint.disc(cx, center, radius, palette().muted);
+        return 1;
     };
-    let center = dvec2(x(lane), yc);
+    let overflow = row.lanes > cap;
+    let last = cap - 1;
+    let hidden = |lane: usize| overflow && lane >= last;
+    let column = |lane: usize| if overflow { lane.min(last) } else { lane };
+    let edge_color = |from: usize, to: usize, color: usize| {
+        let color = lane_color(color);
+        if hidden(from) || hidden(to) { with_alpha(color, 0.35) } else { color }
+    };
+    for edge in &row.top {
+        paint.segment(cx, dvec2(x(column(edge.from)), y0), dvec2(x(column(edge.to)), yc), stroke, edge_color(edge.from, edge.to, edge.color));
+    }
+    for edge in &row.bottom {
+        paint.segment(cx, dvec2(x(column(edge.from)), yc), dvec2(x(column(edge.to)), y1), stroke, edge_color(edge.from, edge.to, edge.color));
+    }
+    let color = lane_color(row.color);
+    let center = dvec2(x(column(row.lane)), yc);
     if head {
         paint.disc(cx, center, radius + 1.5, color);
         paint.disc(cx, center, radius - 0.5, background);
+    } else if hidden(row.lane) {
+        paint.disc(cx, center, radius, color);
+        paint.disc(cx, center, radius - 1.3, background);
     } else {
         paint.disc(cx, center, radius, color);
     }
-    used
+    row.lanes.clamp(1, cap)
+}
+
+/// A branches-panel row (built once per refs / query / collapse change).
+pub(super) enum RefRow {
+    Section { key: &'static str, count: Option<usize>, open: bool },
+    Head,
+    Local(usize),
+    Group { remote: String, count: usize, open: bool },
+    Remote(usize),
+    Tag(usize),
+}
+
+fn head_label(refs: &Refs) -> String {
+    match (&refs.head_branch, &refs.head_sha) {
+        (Some(branch), _) if !refs.detached => format!("HEAD ({branch})"),
+        (_, Some(sha)) => tr("workspace.git.log.branches.detached", &[("sha", short(sha))]),
+        _ => "HEAD".to_owned(),
+    }
+}
+
+/// HEAD, Local, Remote (per remote) and Tags rows matching `query` (lowercase).
+fn ref_rows(refs: &Refs, query: &str, collapsed: &HashSet<String>) -> Vec<RefRow> {
+    let searching = !query.is_empty();
+    let matches = |name: &str| !searching || name.to_lowercase().contains(query);
+    let expanded = |key: &str| searching || !collapsed.contains(key);
+    let mut rows = Vec::new();
+    if matches(&head_label(refs)) {
+        let open = expanded("head");
+        rows.push(RefRow::Section { key: "head", count: None, open });
+        if open {
+            rows.push(RefRow::Head);
+        }
+    }
+    let local: Vec<usize> = (0..refs.local.len()).filter(|&i| matches(&refs.local[i].name)).collect();
+    if !local.is_empty() || !searching {
+        let open = expanded("local");
+        rows.push(RefRow::Section { key: "local", count: Some(local.len()), open });
+        if open {
+            rows.extend(local.into_iter().map(RefRow::Local));
+        }
+    }
+    let remote: Vec<usize> = (0..refs.remote.len()).filter(|&i| matches(&refs.remote[i].name)).collect();
+    if !remote.is_empty() || !searching {
+        let open = expanded("remote");
+        rows.push(RefRow::Section { key: "remote", count: Some(remote.len()), open });
+        if open {
+            // The host sorts remote branches grouped per remote.
+            let mut index = 0;
+            while index < remote.len() {
+                let name = refs.remote[remote[index]].remote.clone();
+                let end = remote[index..].iter().position(|&i| refs.remote[i].remote != name).map_or(remote.len(), |n| index + n);
+                let open = expanded(&format!("remote:{name}"));
+                rows.push(RefRow::Group { remote: name, count: end - index, open });
+                if open {
+                    rows.extend(remote[index..end].iter().copied().map(RefRow::Remote));
+                }
+                index = end;
+            }
+        }
+    }
+    let tags: Vec<usize> = (0..refs.tags.len()).filter(|&i| matches(&refs.tags[i])).collect();
+    if !tags.is_empty() || !searching {
+        let open = expanded("tags");
+        rows.push(RefRow::Section { key: "tags", count: Some(tags.len()), open });
+        if open {
+            rows.extend(tags.into_iter().map(RefRow::Tag));
+        }
+    }
+    rows
+}
+
+fn section_label(key: &str) -> String {
+    t(match key {
+        "head" => "workspace.git.log.branches.head",
+        "local" => "workspace.git.log.branches.local",
+        "remote" => "workspace.git.log.branches.remote",
+        _ => "workspace.git.log.branches.tags",
+    })
 }
 
 impl LogView {
@@ -204,7 +339,6 @@ impl LogView {
         self.hits.clear();
         self.spinning = false;
         self.icons_pending = false;
-        self.listed_files.clear();
         for scroller in [&mut self.list, &mut self.branches, &mut self.files, &mut self.info, &mut self.sheet] {
             scroller.area = Rect::default();
         }
@@ -221,7 +355,7 @@ impl LogView {
             Availability::Ready => None,
         };
         if let Some((icon, key)) = state {
-            self.message(cx, paint, area, Some(icon), &t(key), false, None, false);
+            self.message(cx, paint, area, Some(icon), &t(key), false, Vec::new(), false);
             return;
         }
         if self.phone {
@@ -234,9 +368,9 @@ impl LogView {
         }
     }
 
-    /// A centred state: optional icon or spinner, wrapped copy, optional retry button.
+    /// A centred state: optional icon or spinner, wrapped copy, action buttons side by side.
     #[allow(clippy::too_many_arguments)]
-    fn message(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect, icon: Option<&str>, copy: &str, error: bool, retry: Option<LogHit>, spinner: bool) {
+    fn message(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect, icon: Option<&str>, copy: &str, error: bool, actions: Vec<(String, LogHit)>, spinner: bool) {
         let colors = palette();
         let center_x = area.pos.x + area.size.x / 2.0;
         let mut y = area.pos.y + (area.size.y * 0.2).min(64.0);
@@ -252,19 +386,35 @@ impl LogView {
         if !copy.is_empty() && inner > 0.0 {
             let size = ui_px(13.0);
             let width = paint.measure(cx, Font::Regular, size, copy).x.min(inner);
-            let color = if error { colors.destructive } else { colors.muted };
+            let color = if error { colors.danger } else { colors.muted };
             y += paint.text_wrapped(cx, Font::Regular, size, color, dvec2(center_x - width / 2.0, y), copy, width + 1.0) + 12.0;
         }
-        if let Some(hit) = retry {
-            let label = t("workspace.git.log.states.retry");
-            let compact = self.phone;
-            let width = measure_button(cx, paint, &label, false, ButtonSize::Xs, compact);
-            let height = button_height(ButtonSize::Xs, compact);
-            let frame = rect(center_x - width / 2.0, y, width, height);
-            if frame.pos.y + height <= area.pos.y + area.size.y {
-                let hovered = self.is_hovered(&hit);
-                button(cx, paint, frame, &label, None, ButtonVariant::Secondary, ButtonSize::Xs, compact, true, hovered);
-                self.hits.push(frame, hit);
+        if actions.is_empty() {
+            return;
+        }
+        let compact = self.phone;
+        let height = button_height(ButtonSize::Xs, compact);
+        if y + height > area.pos.y + area.size.y {
+            return;
+        }
+        let gap = 8.0;
+        let widths: Vec<f64> = actions.iter().map(|(label, _)| measure_button(cx, paint, label, false, ButtonSize::Xs, compact)).collect();
+        let total = widths.iter().sum::<f64>() + gap * (widths.len() - 1) as f64;
+        // Buttons that do not fit side by side stack.
+        let stacked = total > inner.max(1.0);
+        let mut x = center_x - total / 2.0;
+        for ((label, hit), width) in actions.into_iter().zip(widths) {
+            let frame = if stacked { rect(center_x - width / 2.0, y, width, height) } else { rect(x, y, width, height) };
+            if frame.pos.y + height > area.pos.y + area.size.y {
+                break;
+            }
+            let hovered = self.is_hovered(&hit);
+            button(cx, paint, frame, &label, None, ButtonVariant::Secondary, ButtonSize::Xs, compact, true, hovered);
+            self.hits.push(frame, hit);
+            if stacked {
+                y += height + gap;
+            } else {
+                x += width + gap;
             }
         }
     }
@@ -274,7 +424,7 @@ impl LogView {
     fn search_field(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, input: &mut TextInput, frame: Rect, has_text: bool, clear: LogHit, focus: bool) {
         let colors = palette();
         let focused = cx.has_key_focus(input.area());
-        paint.rounded(cx, frame, colors.surface2, 6.0, focused.then_some((colors.border_accent, 1.0)));
+        paint.rounded(cx, frame, colors.surface2, 6.0, focused.then_some((colors.muted, 1.0)));
         let center_y = frame.pos.y + frame.size.y / 2.0;
         paint.icon(cx, "search", 12.0, colors.muted, dvec2(frame.pos.x + 13.0, center_y));
         let left = frame.pos.x + 26.0;
@@ -305,13 +455,15 @@ impl LogView {
     fn branch_label(&self) -> String {
         match &self.state.filters.revision {
             None => t("workspace.git.log.filters.allBranches"),
+            Some(RefFilter { name, kind: None }) if is_hash_query(name) => short(name),
             Some(RefFilter { name, .. }) => name.clone(),
         }
     }
 
     fn refresh_button(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, compact: bool, right: f64, center_y: f64) -> f64 {
         let size = toolbar_button_size(compact);
-        if self.state.page_loading {
+        // A pending page or Checkout spins in place of the refresh button.
+        if self.state.page_loading || self.switching.is_some() {
             let colors = palette();
             paint.spinner(cx, dvec2(right - size / 2.0, center_y), toolbar_icon_size(compact), colors.extra_muted, cx.seconds_since_app_start());
             self.spinning = true;
@@ -323,6 +475,56 @@ impl LogView {
         button.pos.x - 4.0
     }
 
+    /// The size of a split this frame: the dragged size (else `default`)
+    /// within `min..=max`, remembered as the next drag's origin.
+    fn split_size(&mut self, split: Split, default: f64, min: f64, max: f64) -> f64 {
+        let value = self.sizes.get(split).unwrap_or(default).clamp(min, max.max(min));
+        *self.shown_sizes.slot(split) = Some(value);
+        value
+    }
+
+    /// A slim error banner under a toolbar when a refresh or the refs failed
+    /// while rows stay shown; returns the area below it.
+    fn draw_banner(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect) -> Rect {
+        let message = if self.state.refresh_failed() {
+            self.state.page_error.clone().map(|error| tr("workspace.git.log.states.refreshFailed", &[("error", error)]))
+        } else if self.state.loaded {
+            self.state.refs_error.clone().map(|error| tr("workspace.git.log.states.refsFailed", &[("error", error)]))
+        } else {
+            None
+        };
+        let Some(message) = message else { return area };
+        let colors = palette();
+        let size = ui_px(12.0);
+        let height = (paint.measure(cx, Font::Regular, size, "Ag").y + 12.0).max(28.0).min(area.size.y);
+        let band = rect(area.pos.x, area.pos.y, area.size.x, height);
+        paint.fill(cx, band, with_alpha(colors.danger, 0.10));
+        paint.fill(cx, rect(band.pos.x, band.pos.y + height - 1.0, band.size.x, 1.0), colors.border);
+        let center_y = band.pos.y + height / 2.0;
+        paint.icon(cx, "circle-alert", 12.0, colors.danger, dvec2(band.pos.x + 14.0, center_y));
+        let mut right = band.pos.x + band.size.x - 6.0;
+        let mut actions = vec![(t("workspace.git.log.states.retry"), LogHit::PageRetry)];
+        if self.state.refresh_failed() && self.state.filters.revision.is_some() {
+            actions.push((t("workspace.git.log.states.showAllBranches"), LogHit::ShowAllBranches));
+        }
+        for (label, hit) in actions {
+            let width = paint.measure(cx, Font::Medium, size, &label).x + 16.0;
+            if right - width < band.pos.x + 80.0 {
+                break;
+            }
+            let frame = rect(right - width, center_y - 11.0, width, 22.0);
+            if self.is_hovered(&hit) {
+                paint.rounded(cx, frame, colors.interaction_highlight, 4.0, None);
+            }
+            paint.text_centered(cx, Font::Medium, size, colors.accent_bright, frame.pos.x + 8.0, frame.pos.y, frame.size.y, &label, width - 15.0);
+            self.hits.push(frame, hit);
+            right = frame.pos.x - 4.0;
+        }
+        let x = band.pos.x + 26.0;
+        paint.text_centered(cx, Font::Regular, size, colors.danger, x, band.pos.y, height, &message, (right - 6.0 - x).max(0.0));
+        rect(area.pos.x, area.pos.y + height, area.size.x, (area.size.y - height).max(0.0))
+    }
+
     // -----------------------------------------------------------------------
     // Desktop.
 
@@ -330,75 +532,139 @@ impl LogView {
         let colors = palette();
         let toolbar_h = TOOLBAR_HEIGHT.max(ui_px(14.0) * 1.4 + 12.0);
         let wide = area.size.x >= 900.0;
+        self.wide = wide;
+        if wide {
+            self.drawer_open = false;
+        }
         self.draw_toolbar(cx, paint, inputs.search, rect(area.pos.x, area.pos.y, area.size.x, toolbar_h), wide);
         let body = rect(area.pos.x, area.pos.y + toolbar_h, area.size.x, (area.size.y - toolbar_h).max(0.0));
+        let body = self.draw_banner(cx, paint, body);
         let mut rest = body;
+        let mut splitters = Vec::new();
         if wide && self.branches_open {
-            let panel = rect(body.pos.x, body.pos.y, BRANCHES_WIDTH, body.size.y);
+            let width = self.split_size(Split::Branches, BRANCHES_WIDTH, BRANCHES_MIN_WIDTH, (body.size.x * 0.4).min(480.0));
+            let panel = rect(body.pos.x, body.pos.y, width, body.size.y);
             self.draw_branches(cx, paint, inputs.branch, panel);
-            paint.fill(cx, rect(body.pos.x + BRANCHES_WIDTH, body.pos.y, 1.0, body.size.y), colors.border);
-            rest = rect(body.pos.x + BRANCHES_WIDTH + 1.0, body.pos.y, body.size.x - BRANCHES_WIDTH - 1.0, body.size.y);
+            paint.fill(cx, rect(body.pos.x + width, body.pos.y, 1.0, body.size.y), colors.border);
+            splitters.push((rect(body.pos.x + width - 3.0, body.pos.y, 7.0, body.size.y), Split::Branches, false));
+            rest = rect(body.pos.x + width + 1.0, body.pos.y, body.size.x - width - 1.0, body.size.y);
         }
         let side = if wide { area.size.x >= 1100.0 } else { area.size.x >= 700.0 };
         if side {
             let (target, min) = if wide { (360.0, 280.0) } else { (300.0, 240.0) };
-            let width = target.min(rest.size.x - 360.0).max(min);
+            let width = self.split_size(Split::Side, target.min(rest.size.x - 360.0).max(min), min, rest.size.x - 300.0);
             let list = rect(rest.pos.x, rest.pos.y, rest.size.x - width - 1.0, rest.size.y);
             self.draw_table(cx, ui, paint, list);
             paint.fill(cx, rect(list.pos.x + list.size.x, rest.pos.y, 1.0, rest.size.y), colors.border);
             self.draw_details(cx, ui, paint, rect(list.pos.x + list.size.x + 1.0, rest.pos.y, width, rest.size.y), true);
+            splitters.push((rect(list.pos.x + list.size.x - 3.0, rest.pos.y, 7.0, rest.size.y), Split::Side, false));
         } else {
-            let height = (rest.size.y * 0.42).clamp(160.0_f64.min(rest.size.y), (rest.size.y - 120.0).max(160.0_f64.min(rest.size.y)));
+            let min = 160.0_f64.min(rest.size.y);
+            let height = self.split_size(Split::Stacked, rest.size.y * 0.42, min, rest.size.y - 120.0);
             let list = rect(rest.pos.x, rest.pos.y, rest.size.x, rest.size.y - height - 1.0);
             self.draw_table(cx, ui, paint, list);
             paint.fill(cx, rect(rest.pos.x, list.pos.y + list.size.y, rest.size.x, 1.0), colors.border);
             self.draw_details(cx, ui, paint, rect(rest.pos.x, list.pos.y + list.size.y + 1.0, rest.size.x, height), false);
+            splitters.push((rect(rest.pos.x, list.pos.y + list.size.y - 3.0, rest.size.x, 7.0), Split::Stacked, true));
+        }
+        // Dividers sit over the edges of the regions they separate.
+        for (frame, split, horizontal) in splitters {
+            let hit = LogHit::Splitter(split);
+            if self.is_hovered(&hit) || self.dragging() == Some(split) {
+                let line = if horizontal {
+                    rect(frame.pos.x, frame.pos.y + 2.5, frame.size.x, 2.0)
+                } else {
+                    rect(frame.pos.x + 2.5, frame.pos.y, 2.0, frame.size.y)
+                };
+                paint.fill(cx, line, colors.border_accent);
+            }
+            self.hits.push(frame, hit);
+        }
+        if !wide && self.drawer_open {
+            self.draw_drawer(cx, paint, inputs.branch, body);
         }
     }
 
-    /// One row: branches toggle, search, Branch and User filters, refresh.
-    fn draw_toolbar(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, search: &mut TextInput, band: Rect, wide: bool) {
+    /// The branches panel as a drawer over the narrow layout's body.
+    fn draw_drawer(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, input: &mut TextInput, body: Rect) {
         let colors = palette();
+        paint.fill(cx, body, vec4(0.0, 0.0, 0.0, 0.22));
+        self.hits.push(body, LogHit::DrawerBackdrop);
+        let width = self.sizes.get(Split::Branches).unwrap_or(BRANCHES_WIDTH).clamp(BRANCHES_MIN_WIDTH, 480.0).min((body.size.x - 48.0).max(0.0));
+        let panel = rect(body.pos.x, body.pos.y, width, body.size.y);
+        self.hits.push(panel, LogHit::Drawer);
+        self.draw_branches(cx, paint, input, panel);
+        paint.fill(cx, rect(panel.pos.x + width, panel.pos.y, 1.0, panel.size.y), colors.border);
+    }
+
+    /// One row: branches toggle, search, Branch / User / Path filters, refresh.
+    fn draw_toolbar(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, search: &mut TextInput, band: Rect, wide: bool) {
         toolbar_band(cx, paint, band, false);
         let center_y = band.pos.y + (band.size.y - 1.0) / 2.0;
         let mut x = band.pos.x + 8.0;
-        if wide {
-            let hovered = self.is_hovered(&LogHit::BranchesToggle);
-            let icon = if self.branches_open { "panel-left-close" } else { "panel-left-open" };
-            let button = toolbar_button(cx, paint, false, x + toolbar_button_size(false), center_y, Some(icon), self.branches_open, true, hovered);
-            self.hits.push(button, LogHit::BranchesToggle);
-            x = button.pos.x + button.size.x + 8.0;
-        }
+        let hovered = self.is_hovered(&LogHit::BranchesToggle);
+        let open = if wide { self.branches_open } else { self.drawer_open };
+        let icon = if open { "panel-left-close" } else { "panel-left-open" };
+        let button = toolbar_button(cx, paint, false, x + toolbar_button_size(false), center_y, Some(icon), open, true, hovered);
+        self.hits.push(button, LogHit::BranchesToggle);
+        x = button.pos.x + button.size.x + 8.0;
         let right = self.refresh_button(cx, paint, false, band.pos.x + band.size.x - toolbar_trailing_padding(false, false), center_y);
         let available = (right - 8.0 - x).max(0.0);
         let field_width = (available * 0.4).clamp(120.0_f64.min(available), 260.0_f64.min(available));
+        let focus = std::mem::take(&mut self.focus_search);
         if field_width >= 60.0 {
             let has_text = !self.search_text.is_empty();
             let field = rect(x, center_y - 12.0, field_width, 24.0);
-            self.search_field(cx, paint, search, field, has_text, LogHit::SearchClear, false);
+            self.search_field(cx, paint, search, field, has_text, LogHit::SearchClear, focus);
             x += field_width + 8.0;
         }
-        let chips = (right - 8.0 - x).max(0.0);
+        let path = self.state.filters.path.clone();
+        let mut remaining = (right - 8.0 - x).max(0.0);
         let branch = tr("workspace.git.log.filters.branch", &[("name", self.branch_label())]);
-        if chips * 0.55 < 48.0 {
-            return;
-        }
-        let open = matches!(self.overlay.purpose(), Some(super::log_view::Purpose::Branch));
-        let trigger = label_trigger(cx, paint, x, center_y, chips * 0.55, &branch, Some(("git-branch", colors.muted)), true, open || self.is_hovered(&LogHit::BranchChip));
-        self.hits.push(trigger, LogHit::BranchChip);
-        x = trigger.pos.x + trigger.size.x + 4.0;
-        let author = self.state.filters.author.clone().unwrap_or_else(|| t("workspace.git.log.filters.allUsers"));
-        let user = tr("workspace.git.log.filters.user", &[("name", author)]);
-        let open = matches!(self.overlay.purpose(), Some(super::log_view::Purpose::Author));
-        let max = (right - 8.0 - x).max(0.0);
+        let share = if path.is_some() { 0.4 } else { 0.55 };
+        let max = remaining * share;
         if max >= 48.0 {
-            let trigger = label_trigger(cx, paint, x, center_y, max, &user, Some(("user", colors.muted)), true, open || self.is_hovered(&LogHit::AuthorChip));
+            let open = matches!(self.overlay.purpose(), Some(super::log_view::Purpose::Branch));
+            let highlighted = open || self.is_hovered(&LogHit::BranchChip);
+            let active = self.state.filters.revision.is_some();
+            let (trigger, clear) = filter_chip(cx, paint, x, center_y, max, &branch, "git-branch", active, highlighted, self.is_hovered(&LogHit::ClearBranch));
+            self.hits.push(trigger, LogHit::BranchChip);
+            if let Some(clear) = clear {
+                self.hits.push(clear, LogHit::ClearBranch);
+            }
+            x = trigger.pos.x + trigger.size.x + 4.0;
+            remaining = (right - 8.0 - x).max(0.0);
+        }
+        let author = self.state.filters.author.clone();
+        let user = tr("workspace.git.log.filters.user", &[("name", author.clone().unwrap_or_else(|| t("workspace.git.log.filters.allUsers")))]);
+        let max = if path.is_some() { remaining * 0.6 } else { remaining };
+        if max >= 48.0 {
+            let open = matches!(self.overlay.purpose(), Some(super::log_view::Purpose::Author));
+            let highlighted = open || self.is_hovered(&LogHit::AuthorChip);
+            let (trigger, clear) = filter_chip(cx, paint, x, center_y, max, &user, "user", author.is_some(), highlighted, self.is_hovered(&LogHit::ClearAuthor));
             self.hits.push(trigger, LogHit::AuthorChip);
+            if let Some(clear) = clear {
+                self.hits.push(clear, LogHit::ClearAuthor);
+            }
+            x = trigger.pos.x + trigger.size.x + 4.0;
+            remaining = (right - 8.0 - x).max(0.0);
+        }
+        if let Some(path) = path
+            && remaining >= 48.0
+        {
+            let label = tr("workspace.git.log.filters.path", &[("name", path.clone())]);
+            let hit = LogHit::PathChip(path);
+            let highlighted = self.is_hovered(&hit);
+            let (trigger, clear) = filter_chip(cx, paint, x, center_y, remaining, &label, "file-clock", true, highlighted, self.is_hovered(&LogHit::ClearPath));
+            self.hits.push(trigger, hit);
+            if let Some(clear) = clear {
+                self.hits.push(clear, LogHit::ClearPath);
+            }
         }
     }
 
     /// Whether `filter` selects this branches-panel row.
-    fn ref_selected(&self, kind: RefKind, name: &str) -> bool {
+    pub(super) fn ref_selected(&self, kind: RefKind, name: &str) -> bool {
         self.state
             .filters
             .revision
@@ -406,7 +672,7 @@ impl LogView {
             .is_some_and(|f| f.name == name && f.kind.is_none_or(|k| k == kind))
     }
 
-    /// The left branches panel: search, then HEAD, Local, Remote (per remote) and Tags.
+    /// The branches panel: search, then HEAD, Local, Remote (per remote) and Tags.
     fn draw_branches(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, input: &mut TextInput, area: Rect) {
         let colors = palette();
         paint.fill(cx, area, colors.sidebar);
@@ -417,8 +683,12 @@ impl LogView {
         // Moved out while drawing (no per-frame copy of every ref).
         let Some(refs) = self.state.refs.take() else {
             match self.state.refs_error.clone() {
-                Some(error) => self.message(cx, paint, list, None, &error, true, None, false),
-                None => self.message(cx, paint, list, None, "", false, None, true),
+                Some(error) => {
+                    let copy = tr("workspace.git.log.states.refsFailed", &[("error", error)]);
+                    let retry = vec![(t("workspace.git.log.states.retry"), LogHit::PageRetry)];
+                    self.message(cx, paint, list, Some("circle-alert"), &copy, true, retry, false);
+                }
+                None => self.message(cx, paint, list, None, "", false, Vec::new(), true),
             }
             return;
         };
@@ -429,148 +699,104 @@ impl LogView {
     fn draw_ref_rows(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, refs: &Refs, list: Rect) {
         let colors = palette();
         let query = self.branch_query.trim().to_lowercase();
-        let searching = !query.is_empty();
-        let matches = |name: &str| !searching || name.to_lowercase().contains(&query);
-        let expanded = |key: &str| searching || !self.collapsed.contains(key);
-        enum Row {
-            Section { key: &'static str, label: String, count: Option<usize>, open: bool },
-            Head(String),
-            Local(usize),
-            Group { remote: String, count: usize, open: bool },
-            Remote(usize),
-            Tag(usize),
+        let version = self.state.refs_version;
+        let stale = self
+            .ref_rows_key
+            .as_ref()
+            .is_none_or(|(refs_version, built_query, collapsed)| *refs_version != version || *built_query != query || *collapsed != self.collapsed_version);
+        if stale {
+            self.ref_rows = ref_rows(refs, &query, &self.collapsed);
+            self.ref_rows_key = Some((version, query, self.collapsed_version));
         }
-        let mut rows = Vec::new();
-        let head = match (&refs.head_branch, &refs.head_sha) {
-            (Some(branch), _) if !refs.detached => format!("HEAD ({branch})"),
-            (_, Some(sha)) => tr("workspace.git.log.branches.detached", &[("sha", short(sha))]),
-            _ => "HEAD".to_owned(),
-        };
-        if matches(&head) {
-            let open = expanded("head");
-            rows.push(Row::Section { key: "head", label: t("workspace.git.log.branches.head"), count: None, open });
-            if open {
-                rows.push(Row::Head(head));
-            }
-        }
-        let local: Vec<usize> = (0..refs.local.len()).filter(|&i| matches(&refs.local[i].name)).collect();
-        if !local.is_empty() || !searching {
-            let open = expanded("local");
-            rows.push(Row::Section { key: "local", label: t("workspace.git.log.branches.local"), count: Some(local.len()), open });
-            if open {
-                rows.extend(local.into_iter().map(Row::Local));
-            }
-        }
-        let remote: Vec<usize> = (0..refs.remote.len()).filter(|&i| matches(&refs.remote[i].name)).collect();
-        if !remote.is_empty() || !searching {
-            let open = expanded("remote");
-            rows.push(Row::Section { key: "remote", label: t("workspace.git.log.branches.remote"), count: Some(remote.len()), open });
-            if open {
-                // The host sorts remote branches grouped per remote.
-                let mut index = 0;
-                while index < remote.len() {
-                    let name = refs.remote[remote[index]].remote.clone();
-                    let end = remote[index..].iter().position(|&i| refs.remote[i].remote != name).map_or(remote.len(), |n| index + n);
-                    let open = expanded(&format!("remote:{name}"));
-                    rows.push(Row::Group { remote: name, count: end - index, open });
-                    if open {
-                        rows.extend(remote[index..end].iter().copied().map(Row::Remote));
-                    }
-                    index = end;
-                }
-            }
-        }
-        let tags: Vec<usize> = (0..refs.tags.len()).filter(|&i| matches(&refs.tags[i])).collect();
-        if !tags.is_empty() || !searching {
-            let open = expanded("tags");
-            rows.push(Row::Section { key: "tags", label: t("workspace.git.log.branches.tags"), count: Some(tags.len()), open });
-            if open {
-                rows.extend(tags.into_iter().map(Row::Tag));
-            }
-        }
-        if rows.is_empty() {
-            self.message(cx, paint, list, None, &t("workspace.git.log.branches.empty"), false, None, false);
+        if self.ref_rows.is_empty() {
+            self.message(cx, paint, list, None, &t("workspace.git.log.branches.empty"), false, Vec::new(), false);
             return;
         }
         let size = ui_px(13.0);
         let row_h = (paint.measure(cx, Font::Regular, size, "Ag").y + 8.0).max(24.0);
-        self.branches.set(list, rows.len() as f64 * row_h + 8.0);
+        self.branches.set(list, self.ref_rows.len() as f64 * row_h + 8.0);
         let offset = self.branches.offset;
+        // Moved out while drawing (rows borrow nothing from `self`).
+        let rows = std::mem::take(&mut self.ref_rows);
+        let first = ((offset / row_h).floor() as usize).min(rows.len());
         paint.begin_clip(cx, list);
-        for (index, row) in rows.iter().enumerate() {
+        for (index, row) in rows.iter().enumerate().skip(first) {
             let top = list.pos.y + index as f64 * row_h - offset;
-            if top + row_h < list.pos.y {
-                continue;
-            }
             if top > list.pos.y + list.size.y {
                 break;
             }
             let band = rect(list.pos.x, top, list.size.x, row_h);
             let center_y = top + row_h / 2.0;
             match row {
-                Row::Section { key, label, count, open } => {
+                RefRow::Section { key, count, open } => {
                     let hit = LogHit::Section((*key).to_owned());
                     self.hits.push_clipped(band, list, hit.clone());
                     if self.is_hovered(&hit) {
                         paint.fill(cx, band, colors.sidebar_hover);
                     }
                     let chevron = if *open { "chevron-down" } else { "chevron-right" };
-                    paint.icon(cx, chevron, 12.0, colors.extra_muted, dvec2(band.pos.x + 14.0, center_y));
-                    let used = paint.text_centered(cx, Font::Medium, ui_px(12.0), colors.muted, band.pos.x + 24.0, top, row_h, label, band.size.x - 64.0);
+                    paint.icon(cx, chevron, 12.0, colors.muted, dvec2(band.pos.x + 14.0, center_y));
+                    let label = section_label(key);
+                    let used = paint.text_centered(cx, Font::Medium, ui_px(12.0), colors.muted, band.pos.x + 24.0, top, row_h, &label, band.size.x - 64.0);
                     if let Some(count) = count {
-                        paint.text_centered(cx, Font::Regular, ui_px(11.0), colors.extra_muted, band.pos.x + 24.0 + used + 6.0, top, row_h, &count.to_string(), 40.0);
+                        paint.text_centered(cx, Font::Regular, ui_px(11.0), colors.muted, band.pos.x + 24.0 + used + 6.0, top, row_h, &count.to_string(), 40.0);
                     }
                 }
-                Row::Head(label) => {
+                RefRow::Head => {
                     let selected = self.ref_selected(RefKind::Head, "HEAD");
                     let hit = LogHit::Ref { kind: RefKind::Head, name: "HEAD".to_owned() };
-                    self.branch_row(cx, paint, band, list, hit, selected, 24.0, "crosshair", colors.muted, label, Font::Regular, None, None);
+                    let label = head_label(refs);
+                    self.branch_row(cx, paint, band, list, hit, selected, 24.0, "crosshair", colors.muted, &label, Font::Regular, None, None, false);
                 }
-                Row::Local(i) => {
+                RefRow::Local(i) => {
                     let branch = &refs.local[*i];
                     let selected = self.ref_selected(RefKind::Local, &branch.name);
                     let hit = LogHit::Ref { kind: RefKind::Local, name: branch.name.clone() };
                     let menu = LogHit::RefMenu { kind: RefKind::Local, name: branch.name.clone() };
-                    let (icon, color, font) = if branch.current { ("circle-dot", colors.accent, Font::Medium) } else { ("git-branch", colors.muted, Font::Regular) };
+                    let (icon, color, font) = if branch.current { ("circle-dot", colors.accent_bright, Font::Medium) } else { ("git-branch", colors.muted, Font::Regular) };
                     let trailing = if branch.gone {
                         Some((t("workspace.git.log.branches.gone"), colors.danger))
                     } else {
                         ahead_behind(branch.ahead, branch.behind).map(|label| (label, colors.muted))
                     };
-                    self.branch_row(cx, paint, band, list, hit, selected, 24.0, icon, color, &branch.name, font, trailing, Some(menu));
+                    let busy = self.switching.as_deref() == Some(branch.name.as_str());
+                    self.branch_row(cx, paint, band, list, hit, selected, 24.0, icon, color, &branch.name, font, trailing, Some(menu), busy);
                 }
-                Row::Group { remote, count, open } => {
+                RefRow::Group { remote, count, open } => {
                     let hit = LogHit::Section(format!("remote:{remote}"));
                     self.hits.push_clipped(band, list, hit.clone());
                     if self.is_hovered(&hit) {
                         paint.fill(cx, band, colors.sidebar_hover);
                     }
                     let chevron = if *open { "chevron-down" } else { "chevron-right" };
-                    paint.icon(cx, chevron, 12.0, colors.extra_muted, dvec2(band.pos.x + 28.0, center_y));
+                    paint.icon(cx, chevron, 12.0, colors.muted, dvec2(band.pos.x + 28.0, center_y));
                     paint.icon(cx, "cloud", 13.0, colors.muted, dvec2(band.pos.x + 44.0, center_y));
                     let used = paint.text_centered(cx, Font::Regular, size, colors.foreground, band.pos.x + 54.0, top, row_h, remote, band.size.x - 94.0);
-                    paint.text_centered(cx, Font::Regular, ui_px(11.0), colors.extra_muted, band.pos.x + 54.0 + used + 6.0, top, row_h, &count.to_string(), 36.0);
+                    paint.text_centered(cx, Font::Regular, ui_px(11.0), colors.muted, band.pos.x + 54.0 + used + 6.0, top, row_h, &count.to_string(), 36.0);
                 }
-                Row::Remote(i) => {
+                RefRow::Remote(i) => {
                     let branch = &refs.remote[*i];
                     let selected = self.ref_selected(RefKind::Remote, &branch.name);
                     let hit = LogHit::Ref { kind: RefKind::Remote, name: branch.name.clone() };
                     let menu = LogHit::RefMenu { kind: RefKind::Remote, name: branch.name.clone() };
-                    self.branch_row(cx, paint, band, list, hit, selected, 52.0, "git-branch", colors.muted, &branch.branch, Font::Regular, None, Some(menu));
+                    let busy = self.switching.as_deref() == Some(branch.branch.as_str()) && !refs.local.iter().any(|b| b.name == branch.branch);
+                    self.branch_row(cx, paint, band, list, hit, selected, 52.0, "git-branch", colors.muted, &branch.branch, Font::Regular, None, Some(menu), busy);
                 }
-                Row::Tag(i) => {
+                RefRow::Tag(i) => {
                     let tag = &refs.tags[*i];
                     let selected = self.ref_selected(RefKind::Tag, tag);
                     let hit = LogHit::Ref { kind: RefKind::Tag, name: tag.clone() };
-                    self.branch_row(cx, paint, band, list, hit, selected, 24.0, "tag", colors.muted, tag, Font::Regular, None, None);
+                    self.branch_row(cx, paint, band, list, hit, selected, 24.0, "tag", colors.muted, tag, Font::Regular, None, None, false);
                 }
             }
         }
         paint.end_clip(cx);
+        self.ref_rows = rows;
     }
 
-    /// One ref row: highlight, icon, name, trailing note and the ⋯ menu button
-    /// (shown while hovered or selected), registered after the row.
+    /// One ref row: highlight, icon, name, trailing note (a spinner while a
+    /// Checkout to it runs) and the ⋯ menu button (shown while hovered or
+    /// selected), registered after the row.
     #[allow(clippy::too_many_arguments)]
     fn branch_row(
         &mut self,
@@ -587,6 +813,7 @@ impl LogView {
         font: Font,
         trailing: Option<(String, Vec4)>,
         menu: Option<LogHit>,
+        busy: bool,
     ) {
         let colors = palette();
         let center_y = band.pos.y + band.size.y / 2.0;
@@ -608,7 +835,11 @@ impl LogView {
             self.hits.push_clipped(button, clip, menu);
             right = button.pos.x - 4.0;
         }
-        if let Some((note, color)) = trailing {
+        if busy {
+            paint.spinner(cx, dvec2(right - 6.0, center_y), 12.0, colors.muted, cx.seconds_since_app_start());
+            self.spinning = true;
+            right -= 18.0;
+        } else if let Some((note, color)) = trailing {
             let size = ui_px(11.0);
             let width = paint.measure(cx, Font::Regular, size, &note).x;
             if right - width > band.pos.x + indent + 60.0 {
@@ -624,7 +855,12 @@ impl LogView {
     fn list_state(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, body: Rect, row_h: f64) -> bool {
         if !self.state.loaded {
             if let Some(error) = self.state.page_error.clone() {
-                self.message(cx, paint, body, Some("circle-alert"), &error, true, Some(LogHit::PageRetry), false);
+                let mut actions = vec![(t("workspace.git.log.states.retry"), LogHit::PageRetry)];
+                // A deleted branch or an unborn HEAD fails every retry.
+                if self.state.filters.revision.is_some() {
+                    actions.push((t("workspace.git.log.states.showAllBranches"), LogHit::ShowAllBranches));
+                }
+                self.message(cx, paint, body, Some("circle-alert"), &error, true, actions, false);
             } else {
                 // Skeleton rows while the first page loads.
                 let colors = palette();
@@ -641,31 +877,40 @@ impl LogView {
             return true;
         }
         if self.state.commits.is_empty() {
-            let key = if self.state.filters.breaks_graph() || self.state.filters.revision.is_some() {
-                "workspace.git.log.states.noMatches"
+            if self.state.filters.is_active() {
+                let actions = vec![(t("workspace.git.log.filters.clearAll"), LogHit::ClearFilters)];
+                self.message(cx, paint, body, Some("git-commit-horizontal"), &t("workspace.git.log.states.noMatches"), false, actions, false);
             } else {
-                "workspace.git.log.states.empty"
-            };
-            self.message(cx, paint, body, Some("git-commit-horizontal"), &t(key), false, None, false);
+                self.message(cx, paint, body, Some("git-commit-horizontal"), &t("workspace.git.log.states.empty"), false, Vec::new(), false);
+            }
             return true;
         }
         false
+    }
+
+    /// The footer height after the last row: paging spinner, later-page error, or more to load.
+    fn footer_height(&self, phone: bool) -> f64 {
+        if self.state.page_loading || self.state.page_error_at_end() || self.state.has_more {
+            if phone { 48.0 } else { 32.0 }
+        } else {
+            0.0
+        }
     }
 
     /// The page row after the last commit: a spinner or the error with retry.
     fn draw_footer(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, band: Rect, clip: Rect) {
         let colors = palette();
         let center_y = band.pos.y + band.size.y / 2.0;
-        if let Some(error) = self.state.page_error.clone() {
+        if let Some(error) = self.state.page_error.clone().filter(|_| self.state.page_error_at_end()) {
             let label = t("workspace.git.log.states.retry");
             let size = ui_px(12.0);
             let label_w = paint.measure(cx, Font::Medium, size, &label).x + 16.0;
             let retry = rect(band.pos.x + band.size.x - 8.0 - label_w, center_y - 11.0, label_w, 22.0);
-            paint.text_centered(cx, Font::Regular, size, colors.destructive, band.pos.x + 12.0, band.pos.y, band.size.y, &error, (retry.pos.x - band.pos.x - 20.0).max(0.0));
+            paint.text_centered(cx, Font::Regular, size, colors.danger, band.pos.x + 12.0, band.pos.y, band.size.y, &error, (retry.pos.x - band.pos.x - 20.0).max(0.0));
             if self.is_hovered(&LogHit::PageRetry) {
                 paint.rounded(cx, retry, colors.interaction_highlight, 4.0, None);
             }
-            paint.text_centered(cx, Font::Medium, size, colors.accent, retry.pos.x + 8.0, retry.pos.y, retry.size.y, &label, label_w - 15.0);
+            paint.text_centered(cx, Font::Medium, size, colors.accent_bright, retry.pos.x + 8.0, retry.pos.y, retry.size.y, &label, label_w - 15.0);
             self.hits.push_clipped(retry, clip, LogHit::PageRetry);
         } else if self.state.page_loading {
             paint.spinner(cx, dvec2(band.pos.x + band.size.x / 2.0, center_y), 16.0, colors.muted, cx.seconds_since_app_start());
@@ -693,6 +938,7 @@ impl LogView {
         let date_w = if area.size.x >= 420.0 { (paint.measure(cx, Font::Regular, small, "0000-00-00").x + 24.0).max(96.0) } else { 0.0 };
         let author_w = if area.size.x >= 560.0 { (area.size.x * 0.18).clamp(100.0, 180.0) } else { 0.0 };
         let subject_w = (area.size.x - hash_w - date_w - author_w).max(0.0);
+        let lane_cap = ((subject_w * GRAPH_SHARE / LANE_WIDTH).floor() as usize).clamp(2, MAX_LANES);
         let header = rect(area.pos.x, area.pos.y, area.size.x, header_h);
         paint.fill(cx, rect(header.pos.x, header.pos.y + header_h - 1.0, header.size.x, 1.0), colors.border);
         let columns = [
@@ -712,7 +958,7 @@ impl LogView {
             return;
         }
         let count = self.state.commits.len();
-        let footer = if self.state.page_loading || self.state.page_error.is_some() || self.state.has_more { 32.0 } else { 0.0 };
+        let footer = self.footer_height(false);
         let content = count as f64 * row_h + footer;
         self.list.set(body, content);
         let offset = self.list.offset;
@@ -728,10 +974,15 @@ impl LogView {
             let band = rect(body.pos.x, top, body.size.x, row_h);
             self.hits.push_clipped(band, body, LogHit::Row(index));
             let commit = &self.state.commits[index];
+            let date_cell = rect(band.pos.x + subject_w + author_w, top, date_w, row_h);
+            if date_w > 0.0 && commit.author_ms.is_some() {
+                self.hits.push_clipped(date_cell, body, LogHit::Date(index));
+            }
             let selected = self.state.selected.as_deref() == Some(commit.sha.as_str());
+            let hovered = self.is_hovered(&LogHit::Row(index)) || self.is_hovered(&LogHit::Date(index));
             let background = if selected {
                 colors.selected
-            } else if self.is_hovered(&LogHit::Row(index)) {
+            } else if hovered {
                 colors.sidebar_hover
             } else {
                 colors.surface0
@@ -742,7 +993,7 @@ impl LogView {
             let center_y = top + row_h / 2.0;
             let is_head = head.as_deref() == Some(commit.sha.as_str());
             let graph_left = band.pos.x + 6.0;
-            let lanes = draw_graph(cx, paint, self.state.rows.get(index), graph_left, top, row_h, LANE_WIDTH, MAX_LANES, is_head, background);
+            let lanes = draw_graph(cx, paint, self.state.rows.get(index), graph_left, top, row_h, LANE_WIDTH, lane_cap, is_head, background);
             let mut x = graph_left + lanes as f64 * LANE_WIDTH + 6.0;
             let subject_right = band.pos.x + subject_w - 8.0;
             let chips_limit = x + ((subject_right - x) * 0.5).max(0.0);
@@ -769,9 +1020,11 @@ impl LogView {
             }
             if date_w > 0.0 {
                 let date = commit.author_ms.map(|ms| relative_time(ms, now)).unwrap_or_default();
-                paint.text_centered(cx, Font::Regular, small, colors.muted, band.pos.x + subject_w + author_w, top, row_h, &date, date_w - 8.0);
+                paint.text_centered(cx, Font::Regular, small, colors.muted, date_cell.pos.x, top, row_h, &date, date_w - 8.0);
             }
-            paint.text_centered(cx, Font::Mono, small, colors.muted, band.pos.x + subject_w + author_w + date_w, top, row_h, &commit.short_sha, hash_w - 8.0);
+            // Always 8 digits: the column is measured for them (git's `%h` grows in big repositories).
+            let hash = commit.sha.get(..8).unwrap_or(&commit.sha);
+            paint.text_centered(cx, Font::Mono, small, colors.muted, band.pos.x + subject_w + author_w + date_w, top, row_h, hash, hash_w - 8.0);
         }
         if footer > 0.0 {
             let top = body.pos.y + count as f64 * row_h - offset;
@@ -788,17 +1041,26 @@ impl LogView {
     fn draw_details(&mut self, cx: &mut Cx2d, ui: &mut UiContext, paint: &mut GitPaint, area: Rect, side: bool) {
         let Some(sha) = self.state.selected.clone() else {
             if !self.state.commits.is_empty() {
-                self.message(cx, paint, area, Some("git-commit-horizontal"), &t("workspace.git.log.details.select"), false, None, false);
+                self.message(cx, paint, area, Some("git-commit-horizontal"), &t("workspace.git.log.details.select"), false, Vec::new(), false);
             }
             return;
         };
-        self.state.ensure_detail(ui, &sha);
+        // A keyboard selection asks once its pause ends.
+        if !self.detail_waiting {
+            self.state.ensure_detail(ui, &sha);
+        }
         // Moved out while drawing (no per-frame copy of the file list).
-        let Some(detail) = self.state.details.remove(&sha) else { return };
+        let Some(detail) = self.state.details.remove(&sha) else {
+            self.message(cx, paint, area, None, "", false, Vec::new(), true);
+            return;
+        };
         match &detail {
-            Detail::Loading => self.message(cx, paint, area, None, "", false, None, true),
-            Detail::Failed(error) => self.message(cx, paint, area, Some("circle-alert"), error, true, Some(LogHit::DetailRetry(sha.clone())), false),
-            Detail::Missing => self.message(cx, paint, area, Some("circle-alert"), &t("workspace.git.log.details.missing"), false, None, false),
+            Detail::Loading => self.message(cx, paint, area, None, "", false, Vec::new(), true),
+            Detail::Failed(error) => {
+                let retry = vec![(t("workspace.git.log.states.retry"), LogHit::DetailRetry(sha.clone()))];
+                self.message(cx, paint, area, Some("circle-alert"), error, true, retry, false);
+            }
+            Detail::Missing => self.message(cx, paint, area, Some("circle-alert"), &t("workspace.git.log.details.missing"), false, Vec::new(), false),
             Detail::Ready(commit) => {
                 let colors = palette();
                 if side {
@@ -817,6 +1079,14 @@ impl LogView {
         self.state.details.insert(sha, detail);
     }
 
+    /// Lists `commit`'s file paths for keyboard moves (once per commit).
+    fn list_files(&mut self, commit: &CommitDetail) {
+        if self.listed_for.as_deref() != Some(commit.sha.as_str()) {
+            self.listed_files = commit.files.iter().map(|f| text(f, "path").to_owned()).collect();
+            self.listed_for = Some(commit.sha.clone());
+        }
+    }
+
     /// "Changed files (n)" and the 24px file rows.
     fn draw_files(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, commit: &CommitDetail, area: Rect) {
         let colors = palette();
@@ -827,7 +1097,7 @@ impl LogView {
         let list = rect(area.pos.x, area.pos.y + header_h, area.size.x, (area.size.y - header_h).max(0.0));
         let row_h = (paint.measure(cx, Font::Regular, ui_px(13.0), "Ag").y + 6.0).max(24.0);
         self.file_row_height = row_h;
-        self.listed_files = commit.files.iter().map(|f| text(f, "path").to_owned()).collect();
+        self.list_files(commit);
         if commit.files.is_empty() {
             paint.text_centered(cx, Font::Regular, small, colors.muted, list.pos.x + 12.0, list.pos.y, row_h, &t("workspace.git.log.details.noFiles"), list.size.x - 24.0);
             self.files.set(list, 0.0);
@@ -835,12 +1105,10 @@ impl LogView {
         }
         self.files.set(list, commit.files.len() as f64 * row_h + 8.0);
         let offset = self.files.offset;
+        let first = (offset / row_h).floor() as usize;
         paint.begin_clip(cx, list);
-        for (index, file) in commit.files.iter().enumerate() {
+        for (index, file) in commit.files.iter().enumerate().skip(first) {
             let top = list.pos.y + index as f64 * row_h - offset;
-            if top + row_h < list.pos.y {
-                continue;
-            }
             if top > list.pos.y + list.size.y {
                 break;
             }
@@ -848,10 +1116,10 @@ impl LogView {
             let band = rect(list.pos.x, top, list.size.x, row_h);
             let hit = LogHit::File(path.to_owned());
             self.hits.push_clipped(band, list, hit.clone());
-            let selected = self.focus == Focus::Files && self.selected_file.as_deref() == Some(path);
-            if selected {
+            let selected = self.selected_file.as_deref() == Some(path);
+            if selected && self.focus == Focus::Files {
                 paint.fill(cx, band, colors.selected);
-            } else if self.is_hovered(&hit) {
+            } else if selected || self.is_hovered(&hit) {
                 paint.fill(cx, band, colors.sidebar_hover);
             }
             self.file_line(cx, paint, band, file, band.pos.x + 10.0);
@@ -951,7 +1219,7 @@ impl LogView {
                 if loaded && self.is_hovered(&hit) {
                     paint.rounded(cx, frame, colors.interaction_highlight, 4.0, None);
                 }
-                paint.text_centered(cx, Font::Mono, meta, if loaded { colors.accent } else { colors.muted }, cursor, y, row_h, &label, label_w + 1.0);
+                paint.text_centered(cx, Font::Mono, meta, if loaded { colors.accent_bright } else { colors.muted }, cursor, y, row_h, &label, label_w + 1.0);
                 if loaded {
                     let target = if phone { rect(frame.pos.x, y, frame.size.x, row_h) } else { frame };
                     self.hits.push_clipped(target, area, hit);
@@ -960,12 +1228,15 @@ impl LogView {
             }
             y += row_h + 4.0;
         }
-        // Refs, wrapped.
-        let refs = self.state.commit(&commit.sha).map(|c| c.refs.clone()).unwrap_or_else(|| commit.refs.clone());
+        // Refs, wrapped (the listed row's are newer than the cached details').
+        let refs: &[RefLabel] = match self.state.commit(&commit.sha) {
+            Some(listed) => &listed.refs,
+            None => &commit.refs,
+        };
         if !refs.is_empty() {
             let chip_h = chip_height() + 4.0;
             let mut cursor = x;
-            for label in &refs {
+            for label in refs {
                 let w = chip_width(cx, paint, &label.name).min(width);
                 if cursor > x && cursor + w > x + width {
                     cursor = x;
@@ -981,7 +1252,44 @@ impl LogView {
     // -----------------------------------------------------------------------
     // Phone.
 
-    /// The top bar (Branch chip or the expanded search, search toggle, refresh) and 56px rows.
+    /// The filters the phone top bar does not show (message text while the
+    /// search is closed, user, path) as one line with a clear-all button;
+    /// returns the area below it.
+    fn draw_filter_summary(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, area: Rect) -> Rect {
+        let filters = &self.state.filters;
+        let mut parts = Vec::new();
+        if !self.search_open && !filters.text.is_empty() {
+            parts.push(tr("workspace.git.log.filters.text", &[("query", filters.text.clone())]));
+        }
+        if let Some(author) = &filters.author {
+            parts.push(tr("workspace.git.log.filters.user", &[("name", author.clone())]));
+        }
+        if let Some(path) = &filters.path {
+            parts.push(tr("workspace.git.log.filters.path", &[("name", path.clone())]));
+        }
+        if parts.is_empty() {
+            return area;
+        }
+        let colors = palette();
+        let height = 36.0_f64.min(area.size.y);
+        let band = rect(area.pos.x, area.pos.y, area.size.x, height);
+        paint.fill(cx, band, with_alpha(colors.accent, 0.08));
+        paint.fill(cx, rect(band.pos.x, band.pos.y + height - 1.0, band.size.x, 1.0), colors.border);
+        let center_y = band.pos.y + height / 2.0;
+        paint.icon(cx, "list-filter", 14.0, colors.accent_bright, dvec2(band.pos.x + 18.0, center_y));
+        let clear = rect(band.pos.x + band.size.x - 6.0 - 32.0, center_y - 16.0, 32.0, 32.0);
+        if self.pressed.as_ref() == Some(&LogHit::ClearFilters) {
+            paint.rounded(cx, clear, colors.interaction_highlight, 6.0, None);
+        }
+        paint.icon(cx, "x", 16.0, colors.muted, clear.center());
+        let x = band.pos.x + 32.0;
+        paint.text_centered(cx, Font::Regular, ui_px(13.0), colors.foreground, x, band.pos.y, height - 1.0, &parts.join(" · "), (clear.pos.x - 4.0 - x).max(0.0));
+        self.hits.push(clear, LogHit::ClearFilters);
+        rect(area.pos.x, area.pos.y + height, area.size.x, (area.size.y - height).max(0.0))
+    }
+
+    /// The top bar (Branch chip or the expanded search, user filter, search toggle,
+    /// refresh), the filter summary and 56px rows.
     fn draw_phone_log(&mut self, cx: &mut Cx2d, ui: &mut UiContext, paint: &mut GitPaint, inputs: &mut LogInputs<'_>, area: Rect) {
         let colors = palette();
         let bar_h = 48.0;
@@ -994,21 +1302,33 @@ impl LogView {
         let toggle = toolbar_button(cx, paint, true, right, center_y, Some(icon), self.search_open, true, hovered);
         self.hits.push(toggle, LogHit::SearchToggle);
         right = toggle.pos.x - 4.0;
+        let open = matches!(self.overlay.purpose(), Some(super::log_view::Purpose::Author));
+        let user = toolbar_button(cx, paint, true, right, center_y, Some("user"), open || self.state.filters.author.is_some(), true, false);
+        self.hits.push(user, LogHit::AuthorChip);
+        right = user.pos.x - 4.0;
         let left = bar.pos.x + 8.0;
         if self.search_open {
             let focus = std::mem::take(&mut self.focus_search);
             let field = rect(left, center_y - 16.0, (right - 4.0 - left).max(0.0), 32.0);
-            let has_text = !self.search_text.is_empty();
-            self.search_field(cx, paint, inputs.search, field, has_text, LogHit::SearchClear, focus);
+            // The bar's × closes and clears; no second × inside the field.
+            self.search_field(cx, paint, inputs.search, field, false, LogHit::SearchClear, focus);
         } else {
-            let label = self.branch_label();
+            let label = tr("workspace.git.log.filters.branch", &[("name", self.branch_label())]);
             let open = matches!(self.overlay.purpose(), Some(super::log_view::Purpose::Branch));
-            let trigger = label_trigger(cx, paint, left, center_y, (right - 8.0 - left).max(0.0), &label, Some(("git-branch", colors.muted)), true, open);
-            // A tall tap target around the compact chip.
+            let active = self.state.filters.revision.is_some();
+            let pressed_clear = self.pressed.as_ref() == Some(&LogHit::ClearBranch);
+            let (trigger, clear) = filter_chip(cx, paint, left, center_y, (right - 8.0 - left).max(0.0), &label, "git-branch", active, open, pressed_clear);
+            // A tall tap target around the compact chip; its × registers last.
             let target = rect(trigger.pos.x, bar.pos.y + 4.0, trigger.size.x, bar_h - 9.0);
             self.hits.push(target, LogHit::BranchChip);
+            if let Some(clear) = clear {
+                let target = rect(clear.pos.x - 6.0, bar.pos.y + 4.0, clear.size.x + 10.0, bar_h - 9.0);
+                self.hits.push(target, LogHit::ClearBranch);
+            }
         }
-        let body = rect(area.pos.x, area.pos.y + bar_h, area.size.x, (area.size.y - bar_h).max(0.0));
+        let below = rect(area.pos.x, area.pos.y + bar_h, area.size.x, (area.size.y - bar_h).max(0.0));
+        let below = self.draw_filter_summary(cx, paint, below);
+        let body = self.draw_banner(cx, paint, below);
         let row_h = PHONE_ROW_HEIGHT.max(paint.measure(cx, Font::Regular, ui_px(14.0), "Ag").y + paint.measure(cx, Font::Regular, ui_px(12.0), "Ag").y + 20.0);
         self.row_height = row_h;
         if self.list_state(cx, paint, body, row_h) {
@@ -1016,7 +1336,7 @@ impl LogView {
             return;
         }
         let count = self.state.commits.len();
-        let footer = if self.state.page_loading || self.state.page_error.is_some() || self.state.has_more { 48.0 } else { 0.0 };
+        let footer = self.footer_height(true);
         let content = count as f64 * row_h + footer;
         self.list.set(body, content);
         let offset = self.list.offset;
@@ -1062,7 +1382,7 @@ impl LogView {
             }
             paint.text_centered(cx, Font::Regular, title, colors.foreground, x, line1, title_h, &commit.subject, (right - x).max(0.0));
             let date = commit.author_ms.map(|ms| relative_time(ms, now)).unwrap_or_default();
-            let meta_line = format!("{} · {} · {}", commit.author_name, date, commit.short_sha);
+            let meta_line = format!("{} · {} · {}", commit.author_name, date, short(&commit.sha));
             paint.text_centered(cx, Font::Regular, meta, colors.muted, x0, line2, meta_h, &meta_line, (right - x0).max(0.0));
             paint.fill(cx, rect(x0, top + row_h - 1.0, band.size.x - (x0 - band.pos.x), 1.0), with_alpha(colors.border, 0.6));
         }
@@ -1086,16 +1406,22 @@ impl LogView {
         let hovered = self.is_hovered(&LogHit::Back);
         let back = toolbar_button(cx, paint, true, bar.pos.x + 6.0 + toolbar_button_size(true), center_y, Some("arrow-left"), false, true, hovered);
         self.hits.push(back, LogHit::Back);
-        let title = self.state.commit(sha).map(|c| c.short_sha.clone()).unwrap_or_else(|| short(sha));
+        let title = short(sha);
         let x = back.pos.x + back.size.x + 8.0;
         paint.text_centered(cx, Font::Mono, ui_px(15.0), colors.foreground, x, bar.pos.y, bar_h - 1.0, &title, (bar.pos.x + bar.size.x - 12.0 - x).max(0.0));
         let body = rect(area.pos.x, area.pos.y + bar_h, area.size.x, (area.size.y - bar_h).max(0.0));
         self.state.ensure_detail(ui, sha);
-        let Some(detail) = self.state.details.remove(sha) else { return };
+        let Some(detail) = self.state.details.remove(sha) else {
+            self.message(cx, paint, body, None, "", false, Vec::new(), true);
+            return;
+        };
         match &detail {
-            Detail::Loading => self.message(cx, paint, body, None, "", false, None, true),
-            Detail::Failed(error) => self.message(cx, paint, body, Some("circle-alert"), error, true, Some(LogHit::DetailRetry(sha.to_owned())), false),
-            Detail::Missing => self.message(cx, paint, body, Some("circle-alert"), &t("workspace.git.log.details.missing"), false, None, false),
+            Detail::Loading => self.message(cx, paint, body, None, "", false, Vec::new(), true),
+            Detail::Failed(error) => {
+                let retry = vec![(t("workspace.git.log.states.retry"), LogHit::DetailRetry(sha.to_owned()))];
+                self.message(cx, paint, body, Some("circle-alert"), error, true, retry, false);
+            }
+            Detail::Missing => self.message(cx, paint, body, Some("circle-alert"), &t("workspace.git.log.details.missing"), false, Vec::new(), false),
             Detail::Ready(commit) => {
                 let offset = self.sheet.offset;
                 paint.begin_clip(cx, body);
@@ -1107,26 +1433,29 @@ impl LogView {
                 let header = tr("workspace.git.log.details.changedFiles", &[("count", commit.files.len().to_string())]);
                 paint.text_centered(cx, Font::Medium, ui_px(13.0), colors.muted, body.pos.x + 16.0, y, header_h, &header, body.size.x - 32.0);
                 y += header_h;
-                self.listed_files = commit.files.iter().map(|f| text(f, "path").to_owned()).collect();
+                self.list_files(commit);
                 self.file_row_height = PHONE_FILE_ROW_HEIGHT;
                 if commit.files.is_empty() {
                     paint.text_centered(cx, Font::Regular, ui_px(13.0), colors.muted, body.pos.x + 16.0, y, PHONE_FILE_ROW_HEIGHT, &t("workspace.git.log.details.noFiles"), body.size.x - 32.0);
                     y += PHONE_FILE_ROW_HEIGHT;
                 }
-                for file in &commit.files {
-                    let band = rect(body.pos.x, y, body.size.x, PHONE_FILE_ROW_HEIGHT);
-                    if y + PHONE_FILE_ROW_HEIGHT >= body.pos.y && y <= body.pos.y + body.size.y {
-                        let path = text(file, "path");
-                        let hit = LogHit::File(path.to_owned());
-                        self.hits.push_clipped(band, body, hit.clone());
-                        if self.pressed.as_ref() == Some(&hit) {
-                            paint.fill(cx, band, colors.selected);
-                        }
-                        self.file_line(cx, paint, band, file, band.pos.x + 16.0);
+                let start = y;
+                let first = ((((body.pos.y - start) / PHONE_FILE_ROW_HEIGHT).floor()).max(0.0) as usize).min(commit.files.len());
+                for (index, file) in commit.files.iter().enumerate().skip(first) {
+                    let top = start + index as f64 * PHONE_FILE_ROW_HEIGHT;
+                    if top > body.pos.y + body.size.y {
+                        break;
                     }
-                    y += PHONE_FILE_ROW_HEIGHT;
+                    let band = rect(body.pos.x, top, body.size.x, PHONE_FILE_ROW_HEIGHT);
+                    let path = text(file, "path");
+                    let hit = LogHit::File(path.to_owned());
+                    self.hits.push_clipped(band, body, hit.clone());
+                    if self.pressed.as_ref() == Some(&hit) {
+                        paint.fill(cx, band, colors.selected);
+                    }
+                    self.file_line(cx, paint, band, file, band.pos.x + 16.0);
                 }
-                y += 16.0;
+                y = start + commit.files.len() as f64 * PHONE_FILE_ROW_HEIGHT + 16.0;
                 paint.end_clip(cx);
                 self.sheet.set(body, y + offset - body.pos.y);
             }

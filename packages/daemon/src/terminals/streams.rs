@@ -79,7 +79,7 @@ pub(super) async fn subscribe(
         let runner_owner=owner.clone();let runner_terminal=terminal.clone();
         tokio::spawn(async move {
             let result=run_stream(&runner_terminal,&runner_owner,slot,receiver,mode,scrollback,wrapped).await;
-            if let Err(error)=result{if !runner_owner.cancellation().is_cancelled(){let _=runner_owner.emit(json!({"type":"terminal_stream_error","payload":{"terminalId":runner_terminal.id,"error":error.to_string()}})).await;}}
+            if let Err(error)=result{if !runner_owner.cancellation().is_cancelled(){let _=runner_owner.emit(json!({"type":"terminal_stream_exit","payload":{"terminalId":runner_terminal.id,"error":error.to_string()}})).await;}}
             cleanup(&registrations,&runner_owner,slot);
             let _=runner_owner.release().await;
         });
@@ -143,10 +143,8 @@ async fn run_stream(
     let mut revision =
         snapshot(terminal, owner, slot, mode.as_deref(), scrollback, wrapped).await?;
     if terminal.is_exited() && receiver.is_empty() {
-        terminal.wait().await?;
-        owner
-            .emit(json!({"type":"terminal_stream_exit","payload":{"terminalId":terminal.id}}))
-            .await?;
+        let code = terminal.wait().await?;
+        owner.emit(exit_event(terminal, code)).await?;
         return Ok(());
     }
     let mut pending = BytesMut::new();
@@ -159,7 +157,7 @@ async fn run_stream(
             _=cancel.cancelled()=>return Ok(()),
             event=receiver.recv()=>match event {
                 Ok(TerminalEvent::Output{revision:next,data})=>{if next>revision{produced=produced.saturating_add(data.len());pending.extend_from_slice(&data);}},
-                Ok(TerminalEvent::Exit(_))=>{flush(owner,slot,&mut pending).await?;owner.emit(json!({"type":"terminal_stream_exit","payload":{"terminalId":terminal.id}})).await?;return Ok(());},
+                Ok(TerminalEvent::Exit(code))=>{flush(owner,slot,&mut pending).await?;owner.emit(exit_event(terminal,code)).await?;return Ok(());},
                 Ok(TerminalEvent::Error(error))=>return Err(anyhow!(error)),
                 Ok(_)=>{},
                 Err(broadcast::error::RecvError::Lagged(_))=>{
@@ -188,13 +186,15 @@ async fn run_stream(
         }
         if terminal.is_exited() && receiver.is_empty() {
             flush(owner, slot, &mut pending).await?;
-            terminal.wait().await?;
-            owner
-                .emit(json!({"type":"terminal_stream_exit","payload":{"terminalId":terminal.id}}))
-                .await?;
+            let code = terminal.wait().await?;
+            owner.emit(exit_event(terminal, code)).await?;
             return Ok(());
         }
     }
+}
+/// The stream's end: the process exited with `exitCode` (additive; older clients ignore it).
+fn exit_event(terminal: &Terminal, code: i32) -> Value {
+    json!({"type":"terminal_stream_exit","payload":{"terminalId":terminal.id,"exitCode":code}})
 }
 async fn flush(owner: &OwnedSubscription, slot: u8, pending: &mut BytesMut) -> Result<()> {
     if !pending.is_empty() {

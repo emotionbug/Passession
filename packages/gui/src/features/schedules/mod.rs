@@ -124,15 +124,22 @@ live_design! {
                         role: Transparent, border_role: Border, radius: 8.
                         text = <WaError> {}
                     }
+                    // Hosts whose schedules are hidden because they are not connected.
+                    offline_banner = <Surface> {
+                        width: Fill, height: Fit, padding: 12., visible: false
+                        role: Transparent, border_role: Border, radius: 8.
+                        text = <WaSmall> {}
+                    }
                     card = <WaCard> { rows = <WaRepeat> { template: <WaScheduleRow> {} } }
                     empty_state = <View> {
                         width: Fill, height: Fit, flow: Down, spacing: 16., align: { x: 0.5 }, visible: false
                         padding: { top: 24., bottom: 24. }
                         <WaIcon> { size: 20., icon: "calendar-clock" }
                         texts = <View> {
-                            width: 420., height: Fit, flow: Down, spacing: 8., align: { x: 0.5 }
-                            title = <WaText> { width: Fit }
-                            description = <WaMuted> { width: Fit }
+                            // The panel caps the column at 420px, narrower on phones.
+                            width: Fill, height: Fit, flow: Down, spacing: 8., align: { x: 0.5 }
+                            title = <WaText> { align: { x: 0.5 } }
+                            description = <WaMuted> { align: { x: 0.5 } }
                             docs = <WaLinkButton> { trailing: "arrow-up-right", height: 30. }
                         }
                         empty_new = <WaButtonOutline> { size: Md, icon: "plus" }
@@ -142,6 +149,17 @@ live_design! {
                         padding: { top: 24., bottom: 24. }
                         <WaIcon> { size: 20., icon: "calendar-clock" }
                         text = <WaText> { width: Fit }
+                    }
+                    // Every host offline: nothing can be listed or created.
+                    offline_state = <View> {
+                        width: Fill, height: Fit, flow: Down, spacing: 16., align: { x: 0.5 }, visible: false
+                        padding: { top: 24., bottom: 24. }
+                        <WaIcon> { size: 20., icon: "server-off" }
+                        texts = <View> {
+                            width: Fill, height: Fit, flow: Down, spacing: 8., align: { x: 0.5 }
+                            title = <WaText> { align: { x: 0.5 } }
+                            description = <WaMuted> { align: { x: 0.5 } }
+                        }
                     }
                 }
             }

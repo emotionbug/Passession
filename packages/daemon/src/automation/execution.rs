@@ -35,10 +35,8 @@ fn title(config: &Value, prompt: &str) -> String {
         .trim()
         .to_owned()
 }
-/// service.ts executeSchedule outcome checks. Existing-agent runs only inspect the wait
-/// result; new-agent runs also observe the run itself (cancel, turn failure, timeline).
 fn output(result: &Value, agent_id: &str, new_agent: bool) -> Result<Option<String>> {
-    if new_agent && result["canceled"] == true {
+    if result["canceled"] == true {
         bail!("Scheduled agent {agent_id} was canceled");
     }
     if result
@@ -208,10 +206,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn existing_agent_runs_ignore_cancel_and_trim_the_reply() {
-        let result = json!({"status":"idle","canceled":true,"lastMessage":"  done  ","timeline":[{"type":"assistant_message","text":"older"}]});
+    fn canceled_runs_fail_for_existing_and_new_agents() {
+        let result = json!({"status":"idle","canceled":true,"lastMessage":"  older reply  "});
+        for new_agent in [false, true] {
+            assert_eq!(
+                output(&result, "a", new_agent).unwrap_err().to_string(),
+                "Scheduled agent a was canceled"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_agent_runs_trim_the_reply_without_replaying_old_timeline() {
+        let result = json!({"status":"idle","lastMessage":"  done  "});
         assert_eq!(output(&result, "a", false).unwrap().as_deref(), Some("done"));
-        assert!(output(&result, "a", true).is_err());
         let blank = json!({"status":"idle","lastMessage":" ","timeline":[{"type":"assistant_message","text":"older"}]});
         assert_eq!(output(&blank, "a", false).unwrap(), None);
     }

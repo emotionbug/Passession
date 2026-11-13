@@ -4,12 +4,14 @@
 //! when wide (≥660px outside compact layout) or four rows of three below 300px. Keys are
 //! 34px surface1 cells with a border and a 6px radius in a surface0 band with a top border,
 //! centred at most 880px wide; an active modifier takes the primary border.
+//!
+//! A key is sent when the finger lifts over the key it went down on, however long it was
+//! held; held arrows repeat like a hardware keyboard.
 
 use makepad_widgets::*;
 use paseo_terminal::Key;
 
 use crate::common::paint::{Font, HitMap, Painter, TextSpec, rect};
-use crate::features::workspace::i18n::t;
 use crate::theme;
 
 live_design! {
@@ -30,6 +32,9 @@ const PADDING: f64 = 8.0;
 const MAX_WIDTH: f64 = 880.0;
 const SINGLE_ROW_MIN_WIDTH: f64 = 660.0;
 const THREE_COLUMN_MAX_WIDTH: f64 = 300.0;
+/// Hold before a held key starts repeating, and the repeat interval.
+const REPEAT_DELAY: f64 = 0.4;
+const REPEAT_INTERVAL: f64 = 0.06;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modifier {
@@ -103,6 +108,11 @@ fn label(control: Control) -> &'static str {
     }
 }
 
+/// Keys that repeat while held.
+pub fn repeats(control: Control) -> bool {
+    matches!(control, K(Key::Up | Key::Down | Key::Left | Key::Right | Key::Backspace | Key::Enter))
+}
+
 #[derive(Clone, Debug, DefaultNone)]
 pub enum KeyBarAction {
     None,
@@ -136,6 +146,11 @@ pub struct WaTerminalKeyBar {
     pub keyboard_visible: bool,
     #[rust]
     pub compact: bool,
+    #[rust]
+    repeat_timer: Timer,
+    /// The held key already repeated: lifting the finger sends nothing more.
+    #[rust]
+    repeated: bool,
 }
 
 impl WaTerminalKeyBar {
@@ -152,12 +167,34 @@ impl WaTerminalKeyBar {
     /// parent can move the bar after it draws (the panel lays the output out above it),
     /// so draw-time absolute rects would miss the pointer.
     fn key_at(&self, cx: &Cx, abs: DVec2) -> Option<usize> {
+        if !self.area.clipped_rect(cx).contains(abs) {
+            return None;
+        }
         self.hits.at(abs - self.area.rect(cx).pos)
+    }
+
+    fn stop_repeat(&mut self, cx: &mut Cx) {
+        cx.stop_timer(self.repeat_timer);
+        self.repeat_timer = Timer::default();
     }
 }
 
 impl Widget for WaTerminalKeyBar {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::TouchUpdate(update) if update.cancelled) {
+            self.pressed = None;
+            self.stop_repeat(cx);
+            self.redraw(cx);
+            return;
+        }
+        if self.repeat_timer.is_event(event).is_some() {
+            self.repeat_timer = Timer::default();
+            if let Some(control) = self.pressed.and_then(|index| self.controls.get(index).copied()).filter(|c| repeats(*c)) {
+                self.repeated = true;
+                self.repeat_timer = cx.start_timeout(REPEAT_INTERVAL);
+                cx.widget_action(self.widget_uid(), &scope.path, KeyBarAction::Pressed(control));
+            }
+        }
         match event.hits(cx, self.area) {
             Hit::FingerHoverIn(fe) | Hit::FingerHoverOver(fe) => {
                 let hovered = self.key_at(cx, fe.abs);
@@ -173,14 +210,29 @@ impl Widget for WaTerminalKeyBar {
             }
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
                 self.pressed = self.key_at(cx, fe.abs);
+                self.repeated = false;
+                self.stop_repeat(cx);
+                if self.pressed.and_then(|index| self.controls.get(index).copied()).is_some_and(repeats) {
+                    self.repeat_timer = cx.start_timeout(REPEAT_DELAY);
+                }
                 self.redraw(cx);
             }
+            Hit::FingerMove(fe) => {
+                // Sliding off the key cancels it, and its repeat.
+                if self.pressed.is_some() && self.key_at(cx, fe.abs) != self.pressed {
+                    self.pressed = None;
+                    self.stop_repeat(cx);
+                    self.redraw(cx);
+                }
+            }
             Hit::FingerUp(fe) => {
+                self.stop_repeat(cx);
                 let pressed = self.pressed.take();
+                // Held or slightly moved presses count: only lifting off the key cancels.
                 if let Some(index) = pressed
+                    && !std::mem::take(&mut self.repeated)
                     && fe.is_over
                     && self.key_at(cx, fe.abs) == Some(index)
-                    && (!fe.device.is_touch() || fe.was_tap())
                     && let Some(control) = self.controls.get(index).copied()
                 {
                     cx.widget_action(self.widget_uid(), &scope.path, KeyBarAction::Pressed(control));
@@ -226,7 +278,8 @@ impl Widget for WaTerminalKeyBar {
                         self.painter.icon(cx, key, icon, 16.0, p.muted);
                     }
                     Paste => {
-                        self.painter.text_in(cx, key, TextSpec { color, ..spec }, &t("workspace.terminal.keys.paste"), 0.5);
+                        // An icon: the label does not fit six keys a row on phones.
+                        self.painter.icon(cx, key, "clipboard-paste", 16.0, color);
                     }
                     _ => {
                         self.painter.text_in(cx, key, TextSpec { color, ..spec }, label(*control), 0.5);
@@ -274,5 +327,7 @@ mod tests {
         assert_eq!(rows_for(false, 400.0).len(), 2);
         assert_eq!(rows_for(true, 280.0).len(), 4);
         assert!(rows_for(false, 0.0).iter().all(|row| row.len() == 6));
+        assert!(repeats(K(Key::Left)) && repeats(K(Key::Enter)));
+        assert!(!repeats(K(Key::Escape)) && !repeats(Paste) && !repeats(M(Modifier::Ctrl)));
     }
 }

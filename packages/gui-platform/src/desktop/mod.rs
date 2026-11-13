@@ -27,7 +27,7 @@ pub(crate) use self::windows as os;
 #[cfg(windows)]
 pub(crate) mod windows_util;
 
-pub use crate::facade::desktop::{available, invoke};
+pub use crate::facade::desktop::{available, invoke, local_daemon, LocalDaemon};
 
 use crate::{
     action::*,
@@ -127,6 +127,9 @@ pub(crate) struct DesktopShared {
     pub settings: OnceCell<Arc<DesktopSettings>>,
     daemon: tokio::sync::Mutex<Option<Arc<DaemonService>>>,
     daemon_failure: Mutex<Option<String>>,
+    /// The built-in daemon is being started (auto-start or a start/restart command) and has
+    /// not reported a listen address or failed yet.
+    daemon_starting: AtomicBool,
     updater: updater::Updater,
     pub geometry: geometry::GeometryStore,
     quit: Mutex<QuitState>,
@@ -167,6 +170,7 @@ impl DesktopShared {
             settings: OnceCell::new(),
             daemon: tokio::sync::Mutex::new(None),
             daemon_failure: Mutex::new(None),
+            daemon_starting: AtomicBool::new(false),
             updater: updater::Updater::new(config.app_version.clone()),
             geometry: geometry::GeometryStore::load(),
             quit: Mutex::new(QuitState::default()),
@@ -243,6 +247,29 @@ impl DesktopShared {
         post_event(PlatformEvent::HostError { message: message.to_owned() });
     }
 
+    /// The built-in daemon as onboarding shows it: (starting, last start failure, listening).
+    pub fn local_daemon(&self) -> (bool, Option<String>, bool) {
+        (
+            self.daemon_starting.load(Ordering::SeqCst),
+            self.daemon_failure.lock().unwrap().clone(),
+            self.local_daemon_listening.load(Ordering::SeqCst),
+        )
+    }
+
+    fn start_pending(&self) {
+        self.daemon_starting.store(true, Ordering::SeqCst);
+        self.local_daemon_listening.store(false, Ordering::SeqCst);
+        *self.daemon_failure.lock().unwrap() = None;
+        post_event(PlatformEvent::LocalDaemonStatus { status: json!({"status": "starting"}) });
+    }
+
+    fn start_failed(&self, message: &str) {
+        self.daemon_starting.store(false, Ordering::SeqCst);
+        self.local_daemon_listening.store(false, Ordering::SeqCst);
+        *self.daemon_failure.lock().unwrap() = Some(message.to_owned());
+        self.report(message);
+    }
+
     async fn daemon(&self) -> Result<Arc<DaemonService>, PlatformError> {
         let mut daemon = self.daemon.lock().await;
         if let Some(existing) = daemon.as_ref() {
@@ -282,21 +309,44 @@ impl DesktopShared {
             && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let Ok(daemon) = self.daemon().await else { return };
+            let daemon = match self.daemon().await {
+                Ok(daemon) => daemon,
+                Err(error) => {
+                    self.start_failed(&error.message);
+                    return;
+                }
+            };
             match daemon.status().await {
                 Ok(status) => current = status,
                 Err(error) => {
-                    self.report(&error.message);
+                    self.start_failed(&error.message);
                     return;
                 }
             }
         }
         let state = current.get("status").and_then(Value::as_str);
-        if !matches!(state, Some("running" | "starting")) || !listen(&current) {
+        self.daemon_starting.store(false, Ordering::SeqCst);
+        let listening = matches!(state, Some("running" | "starting")) && listen(&current);
+        self.local_daemon_listening.store(listening, Ordering::SeqCst);
+        if self.quitting() {
             return;
         }
-        self.local_daemon_listening.store(true, Ordering::SeqCst);
+        if let Some(message) = daemon_start_error(&current) {
+            self.start_failed(message);
+            return;
+        }
+        *self.daemon_failure.lock().unwrap() = None;
         post_event(PlatformEvent::LocalDaemonStatus { status: current });
+    }
+}
+
+fn daemon_start_error(status: &Value) -> Option<&str> {
+    match status.get("status").and_then(Value::as_str) {
+        Some("errored") => Some(status.get("error").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("Daemon status failed.")),
+        Some("starting") if status.get("listen").and_then(Value::as_str).is_none_or(str::is_empty) => {
+            Some("The built-in daemon did not report a listen address within 60 seconds.")
+        }
+        _ => None,
     }
 }
 
@@ -321,6 +371,7 @@ pub(crate) fn start(cx: &mut Cx, shared: &Arc<Shared>, state: &mut PlatformState
 
     // The daemon helper: waiting for a still-starting daemon never holds the window.
     let task_shared = shared.clone();
+    shared.desktop.start_pending();
     shared.spawn(async move {
         let desktop = &task_shared.desktop;
         let result = async {
@@ -333,10 +384,7 @@ pub(crate) fn start(cx: &mut Cx, shared: &Arc<Shared>, state: &mut PlatformState
         .await;
         match result {
             Ok(status) => desktop.register_local_host(status).await,
-            Err(error) => {
-                *desktop.daemon_failure.lock().unwrap() = Some(error.message.clone());
-                desktop.report(&error.message);
-            }
+            Err(error) => desktop.start_failed(&error.message),
         }
     });
 }
@@ -618,11 +666,18 @@ async fn invoke_inner(shared: &Arc<Shared>, command: &str, args: &Value) -> Resu
                 .map_err(|e| PlatformError::native(e.to_string()))??;
             if was_managed && !settings.managed()
                 && let Some(daemon) = desktop.daemon.lock().await.clone() {
-                    daemon.stop("settings", None, None).await?;
+                    let status = daemon.stop("settings", None, None).await?;
+                    desktop.register_local_host(status).await;
                 }
             if !was_managed && settings.managed() {
-                let status = desktop.daemon().await?.start().await?;
-                desktop.register_local_host(status).await;
+                desktop.start_pending();
+                match async { desktop.daemon().await?.start().await }.await {
+                    Ok(status) => desktop.register_local_host(status).await,
+                    Err(error) => {
+                        desktop.start_failed(&error.message);
+                        return Err(error);
+                    }
+                }
             }
             Ok(Value::Object(result))
         }
@@ -641,12 +696,25 @@ async fn invoke_inner(shared: &Arc<Shared>, command: &str, args: &Value) -> Resu
         }
         "install_app_update" => install_update(shared, args).await,
         _ => {
-            let daemon = desktop.daemon().await?;
-            let result = daemon.invoke(command, args).await?;
-            if command == "start_desktop_daemon" || command == "restart_desktop_daemon" {
-                desktop.register_local_host(result.clone()).await;
+            let starting = command == "start_desktop_daemon" || command == "restart_desktop_daemon";
+            if starting {
+                desktop.start_pending();
             }
-            Ok(result)
+            let result = async { desktop.daemon().await?.invoke(command, args).await }.await;
+            match result {
+                Ok(result) => {
+                    if starting || command == "stop_desktop_daemon" {
+                        desktop.register_local_host(result.clone()).await;
+                    }
+                    Ok(result)
+                }
+                Err(error) => {
+                    if starting {
+                        desktop.start_failed(&error.message);
+                    }
+                    Err(error)
+                }
+            }
         }
     }
 }
@@ -700,6 +768,7 @@ async fn recover_failed_update(shared: &Arc<Shared>) {
     }
     post_event(PlatformEvent::QuitCancelled);
     *desktop.daemon.lock().await = None;
+    desktop.start_pending();
     let result = async {
         let daemon = desktop.daemon().await?;
         daemon.initialize().await?;
@@ -708,7 +777,7 @@ async fn recover_failed_update(shared: &Arc<Shared>) {
     .await;
     match result {
         Ok(status) => desktop.register_local_host(status).await,
-        Err(error) => desktop.report(&error.message),
+        Err(error) => desktop.start_failed(&error.message),
     }
 }
 
@@ -818,4 +887,18 @@ pub(crate) fn notification_clicked(payload: &str, notification_id: Option<i64>, 
     data.insert("notificationId".into(), notification_id.map(Value::from).unwrap_or(Value::Null));
     data.insert("actionId".into(), action_id.map(Value::from).unwrap_or(Value::Null));
     deliver(NativeSignal::NotificationClick(data));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_start_reports_status_errors_and_missing_listen_timeout() {
+        assert_eq!(daemon_start_error(&json!({"status": "errored", "error": "permission denied"})), Some("permission denied"));
+        assert!(daemon_start_error(&json!({"status": "starting", "listen": null})).is_some());
+        assert!(daemon_start_error(&json!({"status": "starting", "listen": ""})).is_some());
+        assert_eq!(daemon_start_error(&json!({"status": "starting", "listen": "127.0.0.1:6768"})), None);
+        assert_eq!(daemon_start_error(&json!({"status": "stopped"})), None);
+    }
 }

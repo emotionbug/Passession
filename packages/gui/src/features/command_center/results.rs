@@ -320,9 +320,9 @@ pub fn agent_label(title: &str) -> Option<String> {
 
 /// `pickAttentionAgent`: the top-level attention agent with the most urgent reason
 /// (permission, error, finished), oldest first; the first listed wins a tie.
-pub fn pick_attention_agent<'a>(agents: impl Iterator<Item = &'a Value>) -> Option<String> {
+pub fn pick_attention_agent<'a>(agents: impl Iterator<Item = &'a Value>) -> Option<&'a Value> {
     use crate::features::workspace::rpc::str_of;
-    let mut selected: Option<(i64, i64, String)> = None;
+    let mut selected: Option<(i64, i64, &'a Value)> = None;
     for agent in agents {
         if agent.get("requiresAttention") != Some(&Value::Bool(true)) || !str_of(agent, "parentAgentId").is_empty() {
             continue;
@@ -335,10 +335,10 @@ pub fn pick_attention_agent<'a>(agents: impl Iterator<Item = &'a Value>) -> Opti
         };
         let timestamp = super::parse_ms(agent.get("attentionTimestamp")).unwrap_or(i64::MAX);
         if selected.as_ref().is_none_or(|(p, t, _)| priority < *p || (priority == *p && timestamp < *t)) {
-            selected = Some((priority, timestamp, str_of(agent, "id").to_owned()));
+            selected = Some((priority, timestamp, agent));
         }
     }
-    selected.map(|(_, _, id)| id)
+    selected.map(|(_, _, agent)| agent)
 }
 
 #[cfg(test)]
@@ -377,6 +377,16 @@ mod tests {
             serde_json::json!({"id": "e2", "requiresAttention": true, "attentionReason": "error", "attentionTimestamp": "2026-01-02T00:00:00Z"}),
             serde_json::json!({"id": "e1", "requiresAttention": true, "attentionReason": "error", "attentionTimestamp": "2026-01-01T00:00:00Z"}),
         ];
-        assert_eq!(pick_attention_agent(agents.iter()).as_deref(), Some("e1"));
+        assert_eq!(pick_attention_agent(agents.iter()), Some(&agents[2]));
+    }
+
+    #[test]
+    fn attention_selection_preserves_identity_when_ids_collide() {
+        let agents = [
+            serde_json::json!({"id": "same", "requiresAttention": true, "attentionReason": "finished"}),
+            serde_json::json!({"id": "same", "requiresAttention": true, "attentionReason": "permission"}),
+        ];
+        let chosen = pick_attention_agent(agents.iter()).unwrap();
+        assert!(std::ptr::eq(chosen, &agents[1]));
     }
 }

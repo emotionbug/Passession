@@ -9,7 +9,12 @@ use {
         shaper,
         shaper::Shaper,
     },
-    std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc},
+    std::{
+        cell::RefCell,
+        collections::{HashMap, HashSet},
+        rc::Rc,
+        sync::Arc,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -20,6 +25,9 @@ pub struct Loader {
     font_definitions: HashMap<FontId, FontDefinition>,
     font_family_cache: HashMap<FontFamilyId, Rc<FontFamily>>,
     font_cache: HashMap<FontId, Rc<Font>>,
+    /// Definitions whose bytes did not parse at their face index. They are
+    /// skipped by every family that lists them instead of aborting the app.
+    failed_fonts: HashSet<FontId>,
 }
 
 impl Loader {
@@ -31,6 +39,7 @@ impl Loader {
             font_definitions: HashMap::new(),
             font_family_cache: HashMap::new(),
             font_cache: HashMap::new(),
+            failed_fonts: HashSet::new(),
         };
         //builtins::define(&mut loader);
         loader
@@ -57,7 +66,7 @@ impl Loader {
         if self.font_cache.contains_key(&id) {
             return true;
         }
-        false
+        self.failed_fonts.contains(&id)
     }
 
     pub fn define_font_family(&mut self, id: FontFamilyId, definition: FontFamilyDefinition) {
@@ -65,6 +74,15 @@ impl Loader {
             !self.is_font_family_known(id),
             "can't redefine a font family that is already known"
         );
+        self.font_family_definitions.insert(id, definition);
+    }
+
+    /// Replaces the font list of a family, known or not. The loaded family is
+    /// dropped so the next lookup rebuilds it from the new list; fonts stay
+    /// cached by id, so faces shared with the old list are not reparsed.
+    /// Layouts that already hold the old family keep it until they are dropped.
+    pub fn redefine_font_family(&mut self, id: FontFamilyId, definition: FontFamilyDefinition) {
+        self.font_family_cache.remove(&id);
         self.font_family_definitions.insert(id, definition);
     }
 
@@ -95,32 +113,52 @@ impl Loader {
             definition
                 .font_ids
                 .into_iter()
-                .map(|font_id| self.get_or_load_font(font_id).clone())
+                .filter_map(|font_id| self.get_or_load_font(font_id).cloned())
                 .collect(),
         )
     }
 
-    pub fn get_or_load_font(&mut self, id: FontId) -> &Rc<Font> {
+    /// `None` when the font is not defined, or when its bytes do not parse at
+    /// its face index (logged once and remembered).
+    pub fn get_or_load_font(&mut self, id: FontId) -> Option<&Rc<Font>> {
         if !self.font_cache.contains_key(&id) {
-            let font = self.load_font(id);
-            self.font_cache.insert(id, Rc::new(font));
+            if self.failed_fonts.contains(&id) || !self.font_definitions.contains_key(&id) {
+                return None;
+            }
+            match self.load_font(id) {
+                Some(font) => {
+                    self.font_cache.insert(id, Rc::new(font));
+                }
+                None => {
+                    self.failed_fonts.insert(id);
+                    return None;
+                }
+            }
         }
-        self.font_cache.get(&id).unwrap()
+        self.font_cache.get(&id)
     }
 
-    fn load_font(&mut self, id: FontId) -> Font {
-        let definition = self
-            .font_definitions
-            .remove(&id)
-            .expect("font is not defined");
-        Font::new(
+    fn load_font(&mut self, id: FontId) -> Option<Font> {
+        let definition = self.font_definitions.remove(&id)?;
+        let Some(face) = FontFace::from_data_index_and_variations(
+            definition.data,
+            definition.index,
+            &definition.variations,
+        ) else {
+            makepad_platform::error!(
+                "skipping font {:?}: face {} does not parse",
+                id,
+                definition.index
+            );
+            return None;
+        };
+        Some(Font::new(
             id.clone(),
             self.rasterizer.clone(),
-            FontFace::from_data_and_index(definition.data, definition.index)
-                .expect("failed to load font from definition"),
+            face,
             definition.ascender_fudge_in_ems,
             definition.descender_fudge_in_ems,
-        )
+        ))
     }
 }
 
@@ -130,7 +168,7 @@ pub struct Settings {
     pub rasterizer: rasterizer::Settings,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FontFamilyDefinition {
     pub font_ids: Vec<FontId>,
 }
@@ -138,7 +176,11 @@ pub struct FontFamilyDefinition {
 #[derive(Clone, Debug)]
 pub struct FontDefinition {
     pub data: Arc<Vec<u8>>,
+    /// Face index inside a collection (`.ttc`/`.otc`); 0 for a single font.
     pub index: u32,
+    /// Variable-font instance as user-space axis coordinates, e.g.
+    /// `(*b"wght", 600.0)`. Empty selects the default instance.
+    pub variations: Vec<([u8; 4], f32)>,
     pub ascender_fudge_in_ems: f32,
     pub descender_fudge_in_ems: f32,
 }

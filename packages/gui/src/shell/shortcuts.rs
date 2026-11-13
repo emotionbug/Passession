@@ -16,6 +16,9 @@ thread_local! {
         let raw: Value = serde_json::from_str(CATALOG).expect("bundled keyboard.json is valid JSON");
         raw.as_array().cloned().unwrap_or_default().into_iter().filter(matches_platform).collect()
     };
+    /// `preferences.keyboardShortcuts` as last seen by a window's router, for tooltips drawn
+    /// without a `UiContext` at hand.
+    static OVERRIDES: std::cell::RefCell<Value> = const { std::cell::RefCell::new(Value::Null) };
 }
 
 fn matches_platform(binding: &Value) -> bool {
@@ -133,6 +136,7 @@ impl Router {
         }
         self.overrides_key = key;
         self.bindings = bindings(&overrides);
+        OVERRIDES.with(|current| *current.borrow_mut() = json!({ "keyboardShortcuts": overrides }));
         self.reset_state();
     }
 
@@ -426,7 +430,8 @@ pub fn format_step(step: &str) -> String {
             "mod" | "ctrl" => "Ctrl".to_string(),
             "alt" => "Alt".to_string(),
             "shift" => "Shift".to_string(),
-            "meta" => "Win".to_string(),
+            // The Super key is "Win" only on Windows; Linux desktops call it Super.
+            "meta" => if cfg!(target_os = "windows") { "Win".to_string() } else { "Super".to_string() },
             other => other.to_string(),
         })
         .collect();
@@ -450,6 +455,68 @@ pub fn label_for_help_id(preferences: &Value, help_id: &str) -> Option<String> {
             .unwrap_or(j::text(binding, "combo"));
         (!combo.is_empty()).then(|| format_combo(combo))
     })
+}
+
+/// [`label_for_help_id`] with the overrides the routers last applied.
+pub fn current_label_for_help_id(help_id: &str) -> Option<String> {
+    OVERRIDES.with(|preferences| label_for_help_id(&preferences.borrow(), help_id))
+}
+
+/// `settings.shortcuts.help.*` locale key of a keyboard.json `help.id`.
+pub fn help_locale_key(help_id: &str) -> Option<&'static str> {
+    Some(match help_id {
+        "new-agent" => "newSession",
+        "new-workspace" => "newWorkspace",
+        "new-worktree" => "newWorktree",
+        "next-attention" => "nextAttention",
+        "search-files" => "searchFiles",
+        "archive-workspace" => "archiveWorkspace",
+        "pin-workspace" => "pinWorkspace",
+        "workspace-tab-new" => "newTab",
+        "workspace-tab-target-agent" => "newAgentTab",
+        "workspace-tab-target-changes" => "openChanges",
+        "workspace-tab-target-files" => "openFiles",
+        "workspace-tab-close-current" => "closeCurrentTab",
+        "workspace-jump-index" => "jumpToWorkspace",
+        "workspace-tab-jump-index" => "jumpToTab",
+        "workspace-prev" => "previousWorkspace",
+        "workspace-next" => "nextWorkspace",
+        "workspace-tab-prev" => "previousTab",
+        "workspace-tab-next" => "nextTab",
+        "workspace-pane-split-right" => "splitPaneRight",
+        "workspace-pane-split-down" => "splitPaneDown",
+        "workspace-pane-focus-left" => "focusPaneLeft",
+        "workspace-pane-focus-right" => "focusPaneRight",
+        "workspace-pane-focus-up" => "focusPaneUp",
+        "workspace-pane-focus-down" => "focusPaneDown",
+        "workspace-pane-move-tab-left" => "moveTabLeft",
+        "workspace-pane-move-tab-right" => "moveTabRight",
+        "workspace-pane-move-tab-up" => "moveTabUp",
+        "workspace-pane-move-tab-down" => "moveTabDown",
+        "workspace-pane-close" => "closePane",
+        "workspace-terminal-new" => "newTerminal",
+        "toggle-command-center" => "toggleCommandCenter",
+        "show-shortcuts" => "showKeyboardShortcuts",
+        "toggle-left-sidebar" => "toggleLeftSidebar",
+        "toggle-right-sidebar" => "toggleRightSidebar",
+        "toggle-both-sidebars" => "toggleBothSidebars",
+        "toggle-settings" => "toggleSettings",
+        "toggle-focus" => "toggleFocusMode",
+        "cycle-theme" => "cycleTheme",
+        "focus-message-input" => "focusMessageInput",
+        "cycle-agent-mode" => "cycleAgentMode",
+        "agent-interrupt" => "interruptAgent",
+        _ => return None,
+    })
+}
+
+/// Localized name of a shortcut: its `settings.shortcuts.help.*` text, else the catalog's
+/// English `help.label` (`fallback`).
+pub fn help_label(help_id: &str, fallback: &str) -> String {
+    match help_locale_key(help_id) {
+        Some(key) => crate::common::tr(&format!("settings.shortcuts.help.{key}")),
+        None => fallback.to_string(),
+    }
 }
 
 /// Shortcut help sections (`_shortcutSections`): (catalog section, locale key).
@@ -481,8 +548,13 @@ pub fn help_rows(preferences: &Value, query: &str) -> Vec<(String, Vec<(String, 
                     continue;
                 }
                 seen.push(help_id);
-                let label = j::text_or(help, "label", j::text(binding, "action"));
-                if !query.is_empty() && !label.to_lowercase().contains(&query) && !title.to_lowercase().contains(&query) {
+                let english = j::text_or(help, "label", j::text(binding, "action"));
+                let label = help_label(help_id, english);
+                if !query.is_empty()
+                    && !label.to_lowercase().contains(&query)
+                    && !english.to_lowercase().contains(&query)
+                    && !title.to_lowercase().contains(&query)
+                {
                     continue;
                 }
                 let combo = overrides
@@ -490,7 +562,7 @@ pub fn help_rows(preferences: &Value, query: &str) -> Vec<(String, Vec<(String, 
                     .and_then(Value::as_str)
                     .unwrap_or(j::text(binding, "combo"))
                     .to_string();
-                rows.push((label.to_string(), combo));
+                rows.push((label, combo));
             }
             if !rows.is_empty() {
                 sections.push((title, rows));
@@ -558,5 +630,44 @@ mod tests {
             assert_eq!(formatted, "Ctrl+Shift+K");
         }
         assert!(format_step("Backspace").ends_with('⌫'));
+    }
+
+    /// Every shortcut the help dialog lists has a translated name in both catalogs.
+    #[test]
+    fn every_help_id_has_a_localized_label() {
+        let raw: Value = serde_json::from_str(CATALOG).unwrap();
+        let catalogs: Vec<Value> = [include_str!("../../resources/locales/en.json"), include_str!("../../resources/locales/ko.json")]
+            .iter()
+            .map(|text| serde_json::from_str(text).unwrap())
+            .collect();
+        for binding in raw.as_array().unwrap() {
+            let id = j::text(j::object(binding, "help"), "id");
+            if id.is_empty() {
+                continue;
+            }
+            let key = help_locale_key(id).unwrap_or_else(|| panic!("help id {id} has no locale key"));
+            for catalog in &catalogs {
+                assert!(catalog["settings"]["shortcuts"]["help"][key].is_string(), "settings.shortcuts.help.{key} missing for {id}");
+            }
+        }
+    }
+
+    /// Linux/Windows have pane, worktree and next-attention shortcuts, with distinct chords.
+    #[test]
+    fn non_mac_bindings_cover_panes_and_do_not_collide() {
+        let raw: Value = serde_json::from_str(CATALOG).unwrap();
+        let non_mac: Vec<&Value> = raw.as_array().unwrap().iter().filter(|b| j::object(b, "when").get("mac") == Some(&Value::Bool(false))).collect();
+        for action in ["workspace.pane.split.right", "workspace.pane.split.down", "workspace.pane.focus.left", "workspace.pane.move-tab.down", "workspace.pane.close", "worktree.new", "session.next-attention"] {
+            assert!(non_mac.iter().any(|b| j::text(b, "action") == action), "no non-mac binding for {action}");
+        }
+        let mut seen = std::collections::HashMap::new();
+        for binding in raw.as_array().unwrap() {
+            let when = j::object(binding, "when");
+            let platform = (when.get("mac").and_then(Value::as_bool), when.get("desktop").and_then(Value::as_bool), when.get("focusScope").cloned());
+            let key = (format!("{platform:?}"), j::text(binding, "combo").to_string());
+            if let Some(previous) = seen.insert(key.clone(), j::text(binding, "action").to_string()) {
+                assert_eq!(previous, j::text(binding, "action"), "{key:?} bound twice");
+            }
+        }
     }
 }

@@ -5,6 +5,7 @@
 //! Only an intentional close of the host ends a creation without an outcome.
 
 use super::attachments::wire_attachment;
+use super::i18n::t;
 use super::json::*;
 use super::service::{AfterFlush, ComposerService, Pending, PanelNotice};
 use crate::common::{PanelTarget, TabPlacement, UiEffect};
@@ -396,7 +397,7 @@ impl ComposerService {
                 if s(get(receipt, "kind")) != kind.name() || s(get(receipt, "idempotencyKey")) != key {
                     return self.run_finished(
                         draft_key,
-                        Outcome::Failed(unknown("Creation failure carried a mismatched receipt.")),
+                        Outcome::Failed(unknown(t("composer.errors.creationMismatchedReceipt"))),
                     );
                 }
                 details.clone()
@@ -414,7 +415,7 @@ impl ComposerService {
         };
         let creation = get(&payload, "creation").clone();
         if get(&creation, "outcomeUnknown") == &Value::Bool(true) {
-            let message = s_or(get(&creation, "error"), "Creation outcome is unknown. Recover this same intent.").to_owned();
+            let message = s_or(get(&creation, "error"), &t("composer.errors.creationOutcomeUnknown")).to_owned();
             return self.run_finished(draft_key, Outcome::Failed(unknown(message)));
         }
         if s(get(&creation, "phase")) == "failed" && s(get(&creation, "failedStage")) == "prompt" && get(&creation, "agent").is_object() {
@@ -429,7 +430,7 @@ impl ComposerService {
             || get(&payload, "ok") == &Value::Bool(false)
             || get(&payload, "success") == &Value::Bool(false)
         {
-            let message = s_or(get(&payload, "error"), "The daemon rejected this operation").to_owned();
+            let message = s_or(get(&payload, "error"), &t("composer.errors.daemonRejected")).to_owned();
             return self.run_finished(draft_key, Outcome::Failed(rejected(message)));
         }
         self.run_finished(draft_key, Outcome::Complete(payload));
@@ -448,7 +449,7 @@ impl ComposerService {
         run.revision = revision;
         match s(get(receipt, "phase")) {
             "failed" => {
-                let text = s_or(get(receipt, "error"), "Creation failed").to_owned();
+                let text = s_or(get(receipt, "error"), &t("composer.errors.creationFailed")).to_owned();
                 if get(receipt, "outcomeUnknown") != &Value::Bool(true)
                     && s(get(receipt, "failedStage")) == "prompt"
                     && get(receipt, "agent").is_object()
@@ -491,7 +492,7 @@ impl ComposerService {
             } else if kind_name == "subscription.restored" {
                 self.receipt_snapshot(&draft_key, get(payload, "snapshot"));
             } else if kind_name == "subscription.error" {
-                let message = s_or(get(payload, "error"), "Creation subscription failed").to_owned();
+                let message = s_or(get(payload, "error"), &t("composer.errors.creationSubscriptionFailed")).to_owned();
                 self.run_finished(&draft_key, Outcome::Failed(unknown(message)));
             }
         }
@@ -503,7 +504,7 @@ impl ComposerService {
             if closed {
                 // CreationClient.close: closing the client fails every unsettled creation.
                 if self.creations.get(&draft_key).is_some_and(|c| c.run.is_some()) {
-                    self.run_finished(&draft_key, Outcome::Failed(unknown("Daemon client closed")));
+                    self.run_finished(&draft_key, Outcome::Failed(unknown(t("composer.errors.daemonClientClosed"))));
                 }
                 continue;
             }
@@ -530,7 +531,7 @@ impl ComposerService {
             (RunKind::Workspace, Outcome::Complete(result)) => {
                 let workspace_id = owned(get(get(&result, "workspace"), "id"));
                 if workspace_id.is_empty() {
-                    return self.creation_failed(draft_key, &rejected("Workspace creation returned no workspace identity."));
+                    return self.creation_failed(draft_key, &rejected(t("composer.errors.workspaceIdentityMissing")));
                 }
                 if let Some(creation) = self.creations.get_mut(draft_key) {
                     creation.workspace_id = workspace_id.clone();
@@ -551,14 +552,14 @@ impl ComposerService {
             self.creations.insert(draft_key.to_owned(), creation);
             return self.creation_failed(
                 draft_key,
-                &json!({"message": "Creation has not returned an agent yet. Retry recovers the same creation intent.", "outcomeUnknown": true}),
+                &json!({"message": t("composer.errors.agentNotReturned"), "outcomeUnknown": true}),
             );
         }
         let message = creation.message.clone();
         self.remember_sent(&agent_id, &message);
         let workspace_id = s_or(get(&agent, "workspaceId"), &creation.workspace_id).to_owned();
         let cwd = s_or(get(&agent, "cwd"), &creation.cwd).to_owned();
-        let title = s_or(get(&agent, "title"), "New session").to_owned();
+        let title = s_or(get(&agent, "title"), &t("sessionNavigation.newSession")).to_owned();
         let prompt_error = get(&response, "promptError").clone();
         let mut data = json!({});
         if !prompt_error.is_null() {

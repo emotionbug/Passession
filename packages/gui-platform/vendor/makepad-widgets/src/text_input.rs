@@ -2513,7 +2513,7 @@ mod keyboard_edit_tests {
         let font = FontId::from("keyboard-edit-test");
         fonts.define_font(font, FontDefinition {
             data: std::sync::Arc::new(include_bytes!("../resources/LiberationMono-Regular.ttf").to_vec()),
-            index: 0, ascender_fudge_in_ems: 0.0, descender_fudge_in_ems: 0.0,
+            index: 0, variations: Vec::new(), ascender_fudge_in_ems: 0.0, descender_fudge_in_ems: 0.0,
         });
         fonts.define_font_family(0.into(), FontFamilyDefinition { font_ids: vec![font] });
         cx.set_global(Rc::new(RefCell::new(fonts)));

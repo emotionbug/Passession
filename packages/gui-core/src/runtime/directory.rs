@@ -511,7 +511,7 @@ pub(crate) fn on_message(core: &Rc<Core>, host: &Rc<Host>, _conn: &Rc<Conn>, mes
             core.touch();
         }
         "agent_update" | "workspace_update" | "project.update" | "script_status_update"
-        | "agent_status" => directory_event(core, host, message),
+        | "agent_status" | "agent_permission_request" | "agent_permission_resolved" => directory_event(core, host, message),
         _ => {}
     }
 }
@@ -631,6 +631,16 @@ fn directory_event(core: &Rc<Core>, host: &Rc<Host>, message: &Value) {
                     upsert(&mut dir.projects, payload["project"].clone(), "projectId")
                 }
             }
+            // The list rows carry `pendingPermissions` (sidebar status, attention, badges); the
+            // daemon announces requests and resolutions separately from agent snapshots.
+            "agent_permission_request" => match dir.agents.iter_mut().find(|a| a["id"] == payload["agentId"]) {
+                Some(agent) => add_permission(agent, &payload["request"]),
+                None => false,
+            },
+            "agent_permission_resolved" => match dir.agents.iter_mut().find(|a| a["id"] == payload["agentId"]) {
+                Some(agent) => remove_permission(agent, &payload["requestId"]),
+                None => false,
+            },
             "script_status_update" => {
                 let mut changed = false;
                 for workspace in dir.workspaces.iter_mut() {
@@ -657,6 +667,30 @@ fn remove(rows: &mut Vec<Value>, test: impl Fn(&Value) -> bool) -> bool {
     let before = rows.len();
     rows.retain(|row| !test(row));
     rows.len() != before
+}
+
+/// Adds a live permission request to an agent row; false when it is already pending.
+fn add_permission(agent: &mut Value, request: &Value) -> bool {
+    if !request.is_object() {
+        return false;
+    }
+    if !agent["pendingPermissions"].is_array() {
+        agent["pendingPermissions"] = json!([]);
+    }
+    let Some(pending) = agent["pendingPermissions"].as_array_mut() else { return false };
+    if !request["id"].is_null() && pending.iter().any(|p| p["id"] == request["id"]) {
+        return false;
+    }
+    pending.push(request.clone());
+    true
+}
+
+/// Drops a resolved request from an agent row; false when it was not pending.
+fn remove_permission(agent: &mut Value, request_id: &Value) -> bool {
+    let Some(pending) = agent["pendingPermissions"].as_array_mut() else { return false };
+    let before = pending.len();
+    pending.retain(|p| p["id"] != *request_id);
+    pending.len() != before
 }
 
 /// Inserts or replaces `row`; false when an equal row is already there.
@@ -784,5 +818,18 @@ mod tests {
     fn agent_rows_carry_project_and_sync_sequence() {
         let row = agent_row(&json!({"agent":{"id":"a"},"project":{"p":1},"syncSeq":4}));
         assert_eq!(row, json!({"id":"a","project":{"p":1},"syncSeq":4}));
+    }
+
+    #[test]
+    fn live_permission_events_keep_the_pending_list_current() {
+        let mut agent = json!({"id":"a","status":"running"});
+        let request = json!({"id":"r1","kind":"question"});
+        assert!(add_permission(&mut agent, &request));
+        assert!(!add_permission(&mut agent, &request), "a repeated announcement is not a second request");
+        assert!(add_permission(&mut agent, &json!({"id":"r2"})));
+        assert!(!add_permission(&mut agent, &Value::Null));
+        assert!(remove_permission(&mut agent, &json!("r1")));
+        assert!(!remove_permission(&mut agent, &json!("r1")));
+        assert_eq!(agent["pendingPermissions"], json!([{"id":"r2"}]));
     }
 }

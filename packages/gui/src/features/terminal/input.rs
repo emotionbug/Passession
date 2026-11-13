@@ -9,8 +9,12 @@
 //!
 //! Clipboard shortcuts follow terminal conventions: Ctrl+Shift+C/V on Linux and Windows,
 //! Cmd+C/V on Apple platforms; Ctrl+C with a selection on Linux and Windows copies it like
-//! Windows Terminal, without one it is ^C. The platform layer turns Ctrl/Cmd+V into a paste
-//! `TextInput` before the key arrives, so Ctrl+V pastes too.
+//! Windows Terminal, without one it is ^C. A plain Ctrl+V is ^V (Vim block selection, the
+//! shell's quoted insert); the native shortcut request is vetoed before the clipboard is
+//! read, independently of key/paste delivery order.
+//!
+//! Wheel and touch scrolling over a full-screen program ([`wheel_route`]) are sent to it:
+//! negotiated mouse wheel reports while it tracks the mouse, else arrow keys (alternate scroll).
 //!
 //! Android edits a hidden editor ([`ImeBridge`]); its composing region is shown at the cursor
 //! ([`composing_text`], [`preedit_cells`]) until the input method commits it. iOS reports Korean
@@ -20,7 +24,7 @@
 use makepad_widgets::{KeyCode, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use paseo_terminal::{Key, Modifiers};
+use paseo_terminal::{Key, Modes, Modifiers};
 
 /// What one `KeyDown` does in the terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,8 +148,8 @@ pub fn key_command(code: KeyCode, m: KeyModifiers, has_selection: bool, apple: b
         };
     }
     if m.control && !m.alt && code == KeyCode::KeyV {
-        // The platform already pasted (`TextInput { was_paste }`).
-        return KeyCommand::Ignore;
+        // Only the platform's terminal paste shortcut was consumed by the clipboard.
+        return if paste_shortcut(m, apple) { KeyCommand::Ignore } else { KeyCommand::Send(Key::Char('v'), mods) };
     }
     if !apple && m.control && !m.alt {
         match code {
@@ -162,6 +166,44 @@ pub fn key_command(code: KeyCode, m: KeyModifiers, has_selection: bool, apple: b
         Some(key) if m.control || m.alt || (m.logo && !apple) => KeyCommand::Send(key, mods),
         _ => KeyCommand::Ignore,
     }
+}
+
+/// Whether the native clipboard shortcut belongs to the terminal rather than the PTY.
+pub fn paste_shortcut(m: KeyModifiers, apple: bool) -> bool {
+    !m.alt && if apple { m.logo && !m.control } else { m.control && m.shift && !m.logo }
+}
+
+/// Where wheel and touch scrolling go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelRoute {
+    /// The local scrollback.
+    Scrollback,
+    /// Arrow keys, one per row (the alternate screen has no scrollback).
+    Arrows,
+    /// Negotiated mouse wheel reports to the program tracking the mouse.
+    Mouse,
+}
+
+pub fn wheel_route(modes: Modes) -> WheelRoute {
+    if modes.mouse_tracking {
+        WheelRoute::Mouse
+    } else if modes.alternate_screen {
+        WheelRoute::Arrows
+    } else {
+        WheelRoute::Scrollback
+    }
+}
+
+
+/// Whole rows scrolled by `delta` pixels plus the carried remainder, which keeps slow
+/// trackpad scrolling from being lost: (rows, negative = up; the new remainder).
+pub fn wheel_rows(carry: f64, delta: f64, row_height: f64) -> (i64, f64) {
+    if row_height <= 0.0 {
+        return (0, 0.0);
+    }
+    let total = carry + delta / row_height;
+    let rows = total.trunc();
+    (rows as i64, total - rows)
 }
 
 /// Committed text as terminal input: a typed newline is Enter (CR).
@@ -321,7 +363,11 @@ mod tests {
         assert!(matches!(key_command(KeyCode::KeyC, ctrl, true, true, false), KeyCommand::Send(Key::Char('c'), _)));
         assert_eq!(key_command(KeyCode::KeyC, m(false, false, false, true), true, true, false), KeyCommand::Copy);
         assert_eq!(key_command(KeyCode::KeyW, m(false, false, false, true), false, true, false), KeyCommand::Ignore);
-        assert_eq!(key_command(KeyCode::KeyV, ctrl, false, false, false), KeyCommand::Ignore);
+        assert!(matches!(key_command(KeyCode::KeyV, ctrl, false, false, false), KeyCommand::Send(Key::Char('v'), _)));
+        assert!(matches!(key_command(KeyCode::KeyV, ctrl, false, true, false), KeyCommand::Send(Key::Char('v'), _)));
+        assert_eq!(key_command(KeyCode::KeyV, m(true, true, false, false), false, false, false), KeyCommand::Ignore);
+        assert_eq!(key_command(KeyCode::KeyV, m(false, false, false, true), false, true, false), KeyCommand::Ignore);
+        assert!(matches!(key_command(KeyCode::KeyV, m(true, true, false, false), false, true, false), KeyCommand::Send(Key::Char('v'), _)));
         assert_eq!(key_command(KeyCode::KeyA, ctrl, false, false, true), KeyCommand::SelectAll);
     }
 
@@ -370,5 +416,28 @@ mod tests {
         assert_eq!(tracker.apply("하", true), 1);
         assert_eq!(tracker.apply("한", true), 1);
         assert_eq!(tracker.apply("a", false), 0);
+    }
+
+    #[test]
+    fn terminal_clipboard_shortcuts_are_explicit() {
+        assert!(!paste_shortcut(m(true, false, false, false), false));
+        assert!(!paste_shortcut(m(true, false, false, false), true));
+        assert!(paste_shortcut(m(true, true, false, false), false));
+        assert!(paste_shortcut(m(false, false, false, true), true));
+        assert!(!paste_shortcut(m(true, true, true, false), false));
+    }
+
+    #[test]
+    fn wheel_goes_to_full_screen_programs() {
+        let modes = |alternate_screen, mouse_tracking| Modes { alternate_screen, mouse_tracking, ..Modes::default() };
+        assert_eq!(wheel_route(modes(false, false)), WheelRoute::Scrollback);
+        assert_eq!(wheel_route(modes(true, false)), WheelRoute::Arrows);
+        assert_eq!(wheel_route(modes(true, true)), WheelRoute::Mouse);
+        assert_eq!(wheel_route(modes(false, true)), WheelRoute::Mouse);
+        let (rows, carry) = wheel_rows(0.0, 30.0, 16.0);
+        assert_eq!(rows, 1);
+        assert_eq!(wheel_rows(carry, 4.0, 16.0).0, 1);
+        assert_eq!(wheel_rows(0.0, -40.0, 16.0).0, -2);
+        assert_eq!(wheel_rows(0.3, 5.0, 0.0), (0, 0.0));
     }
 }

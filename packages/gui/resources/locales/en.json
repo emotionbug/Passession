@@ -66,7 +66,8 @@
     "placeholders": { "search": "Search..." },
     "empty": {
       "noResults": "No results found",
-      "noOptionsMatchSearch": "No options match your search."
+      "noOptionsMatchSearch": "No options match your search.",
+      "noOptions": "No options"
     },
     "states": {
       "loading": "Loading...",
@@ -96,7 +97,61 @@
     }
   },
   "shell": {
-    "menu": { "toggleSidebar": "Toggle sidebar", "open": "Open menu", "close": "Close menu" },
+    "menu": {
+      "toggleSidebar": "Toggle sidebar",
+      "open": "Open menu",
+      "close": "Close menu",
+      "quitApp": "Quit Passession",
+      "file": "File",
+      "newWindow": "New Window"
+    },
+    "tabs": {
+      "file": "File",
+      "executionLog": "Execution log",
+      "projectSettings": "Project settings",
+      "projectSettingsFor": "{{name}} settings",
+      "subagent": "Subagent"
+    },
+    "chrome": {
+      "connecting": "Connecting to the Paseo daemon…",
+      "hostConnecting": "{{host}} · reconnecting…",
+      "hostDisconnected": "{{host}} · disconnected",
+      "othersNeedInput": "Another session needs your input"
+    },
+    "commands": {
+      "chooseHost": "Choose host",
+      "openSessionFirst": "Open a session or workspace first.",
+      "waitForSend": "Wait for the current send or upload to finish before closing this session.",
+      "unavailable": "This command is unavailable here: {{action}}",
+      "openLinkFailed": "Could not open the link in the system browser.",
+      "openServiceFailed": "Could not open the service URL in the system browser.",
+      "sessionGone": "This session no longer exists.",
+      "restoreUnavailable": "This workspace cannot be restored.",
+      "restoreTitle": "Restore workspace?",
+      "removeHostTitle": "Remove {{host}}?",
+      "removeHostMessage": "Remove this saved host, all its connections and credentials from this device? Sessions on the daemon are not deleted.",
+      "removeProjectTitle": "Remove project from {{host}}?",
+      "removeProjectMessage_one": "{{path}}\n1 active workspace is affected on this host. Other hosts are unchanged.",
+      "removeProjectMessage": "{{path}}\n{{count}} active workspaces are affected on this host. Other hosts are unchanged.",
+      "newWorktreeSession": "New worktree session",
+      "workspaceUnavailable": "The workspace is unavailable. Refresh this host.",
+      "archiveSessionTitle": "Archive session?",
+      "noAttention": "No other session needs your input.",
+      "hostRejected": "The host rejected this action."
+    },
+    "hostPicker": { "title": "Hosts", "settings": "Host settings" },
+    "sidebar": {
+      "authConnection": "Authentication / connection",
+      "connectHost": "Connect to a Paseo host to see your sessions.",
+      "noMatches": "No matching sessions.",
+      "searchHistory": "Search all history for “{{query}}”"
+    },
+    "time": { "now": "now", "minutes": "{{count}}m", "hours": "{{count}}h", "days": "{{count}}d" },
+    "notifications": {
+      "approvalRequested": "Approval requested",
+      "sessionFinished": "Session finished",
+      "sessionFailed": "Session failed"
+    },
     "commandCenter": {
       "placeholder": "Search commands, files, workspaces, and agents...",
       "filePlaceholder": "Search files...",
@@ -125,7 +180,13 @@
       "fastModeGroupLabel": "Fast",
       "fastModeSearchKeywords": "fast speed low latency",
       "settingOn": "On",
-      "settingOff": "Off"
+      "settingOff": "Off",
+      "newWorktreeSession": "New worktree session",
+      "nextAttention": "Next session needing input",
+      "settingsPage": "Settings: {{name}}",
+      "hostSettingsPage": "Host settings: {{name}}",
+      "keyHints": "Up/Down Move · Enter Open · Esc Close",
+      "filesHint": "{{shortcut}} Files"
     }
   },
   "composer": {
@@ -218,7 +279,27 @@
       "uploadFailed": "Failed to upload file",
       "noClipboardImage": "No image in the current clipboard. Try pasting from your keyboard.",
       "pasteImageFailed": "Failed to paste image",
-      "fileTooLarge": "{{fileName}} is too large (max {{size}})"
+      "fileTooLarge": "{{fileName}} is too large (max {{size}})",
+      "draftPersistenceFailed": "Draft persistence failed: {{error}}",
+      "noModes": "This provider has no available modes.",
+      "attachmentUrl": "Could not open the attachment URL.",
+      "hostDisconnected": "Host is disconnected",
+      "selectProvider": "Select a provider before creating a session.",
+      "usagePartial": "Some usage data is unavailable; received reports remain visible.",
+      "creationMismatchedReceipt": "Creation failure carried a mismatched receipt.",
+      "creationOutcomeUnknown": "Creation outcome is unknown. Recover this same intent.",
+      "daemonRejected": "The daemon rejected this operation",
+      "creationFailed": "Creation failed",
+      "creationSubscriptionFailed": "Creation subscription failed",
+      "daemonClientClosed": "Daemon client closed",
+      "workspaceIdentityMissing": "Workspace creation returned no workspace identity.",
+      "agentNotReturned": "Creation has not returned an agent yet. Retry recovers the same creation intent.",
+      "deliveryUnsupported": "This host cannot report or cancel message delivery.",
+      "dismissalUnconfirmed": "The host has not confirmed dismissal.",
+      "queuedSessionMissing": "The queued session no longer exists.",
+      "deliveryUnconfirmed": "Delivery is unconfirmed. Check the exact message status before retrying.",
+      "storageNotReady": "Composer storage is not ready.",
+      "draftsLoading": "Conversation drafts are still loading."
     },
     "clientCommands": {
       "archiveAgent": "Archive the current agent",
@@ -267,6 +348,133 @@
       "implement": "Implement",
       "question": "How would you like to proceed?",
       "proposedPlan": "Proposed plan"
+    },
+    "approvalPending": "Approval pending ↓",
+    "unknownError": "Unknown error",
+    "agentMessage": {
+      "message": "Message received",
+      "finished": "Agent finished",
+      "errored": "Agent errored",
+      "permissionRequired": "Agent needs permission",
+      "closed": "Agent closed",
+      "from": "From agent: {{agent}}"
+    },
+    "toolSections": {
+      "prompt": "Prompt",
+      "details": "Details",
+      "result": "Result"
+    },
+    "toolValues": {
+      "none": "None",
+      "yes": "Yes",
+      "no": "No",
+      "value": "Value"
+    },
+    "toolFields": {
+      "agentId": "Agent",
+      "archivedAgentIds": "Archived agents",
+      "baseBranch": "Base branch",
+      "branchName": "New branch",
+      "browserId": "Browser tab",
+      "clearExpires": "Clear expiry",
+      "currentModeId": "Current mode",
+      "cwd": "Working directory",
+      "deltaX": "Horizontal delta",
+      "deltaY": "Vertical delta",
+      "doubleClick": "Double click",
+      "expiresIn": "Expires in",
+      "expiresAt": "Expires",
+      "filePaths": "Files",
+      "fullPage": "Full page",
+      "initialPrompt": "Prompt",
+      "id": "ID",
+      "lastMessage": "Last message",
+      "maxEntries": "Maximum entries",
+      "maxRuns": "Maximum runs",
+      "modeId": "Mode",
+      "newMode": "New mode",
+      "nextRunAt": "Next run",
+      "notifyOnFinish": "Notify on finish",
+      "internal": "Internal",
+      "prNumber": "Change request",
+      "projectId": "Project",
+      "removedDirectory": "Removed directory",
+      "requestId": "Request",
+      "scriptName": "Script",
+      "sessionMode": "Session mode",
+      "sinceHours": "Since (hours)",
+      "sourceRef": "Source",
+      "targetRef": "Target",
+      "terminalId": "Terminal",
+      "thinkingOptionId": "Thinking",
+      "timeoutMs": "Timeout (ms)",
+      "updateCount": "Updates",
+      "workspaceId": "Workspace",
+      "worktreeSlug": "Worktree"
+    },
+    "paseoTools": {
+      "create_agent": "Create agent",
+      "send_agent_prompt": "Send message",
+      "get_agent_status": "Check agent",
+      "get_agent_activity": "Read agent activity",
+      "list_agents": "List agents",
+      "update_agent": "Update agent",
+      "set_agent_mode": "Set agent mode",
+      "cancel_agent": "Cancel agent",
+      "archive_agent": "Archive agent",
+      "kill_agent": "Kill agent",
+      "list_pending_permissions": "List permissions",
+      "respond_to_permission": "Respond to permission",
+      "create_workspace": "Create workspace",
+      "list_hosts": "List hosts",
+      "list_workspaces": "List workspaces",
+      "rename_workspace": "Rename workspace",
+      "archive_workspace": "Archive workspace",
+      "list_workspace_scripts": "List scripts",
+      "start_workspace_script": "Start script",
+      "stop_workspace_script": "Stop script",
+      "create_terminal": "Create terminal",
+      "list_terminals": "List terminals",
+      "capture_terminal": "Read terminal",
+      "send_terminal_keys": "Send keys",
+      "kill_terminal": "Kill terminal",
+      "create_schedule": "Create schedule",
+      "create_heartbeat": "Create heartbeat",
+      "update_schedule": "Update schedule",
+      "list_schedules": "List schedules",
+      "inspect_schedule": "Inspect schedule",
+      "schedule_logs": "Read schedule logs",
+      "run_schedule_once": "Run schedule",
+      "pause_schedule": "Pause schedule",
+      "resume_schedule": "Resume schedule",
+      "delete_schedule": "Delete schedule",
+      "delete_heartbeat": "Delete heartbeat",
+      "list_providers": "List providers",
+      "list_models": "List models",
+      "list_profiles": "List profiles",
+      "inspect_provider": "Inspect provider",
+      "browser_list_tabs": "List browser tabs",
+      "browser_new_tab": "Open browser tab",
+      "browser_close_tab": "Close browser tab",
+      "browser_navigate": "Navigate",
+      "browser_back": "Go back",
+      "browser_forward": "Go forward",
+      "browser_reload": "Reload page",
+      "browser_snapshot": "Snapshot page",
+      "browser_screenshot": "Take screenshot",
+      "browser_click": "Click element",
+      "browser_hover": "Hover element",
+      "browser_drag": "Drag element",
+      "browser_fill": "Fill field",
+      "browser_select": "Select option",
+      "browser_type": "Type text",
+      "browser_keypress": "Press key",
+      "browser_upload": "Upload files",
+      "browser_wait": "Wait for page",
+      "browser_scroll": "Scroll page",
+      "browser_resize": "Resize browser",
+      "browser_logs": "Read browser logs",
+      "browser_evaluate": "Run JavaScript"
     }
   },
   "agentPanel": {
@@ -283,7 +491,42 @@
       "subagentRefreshing": "Refreshing this subagent's transcript. Saved messages stay readable.",
       "subagentRefreshFailed": "Couldn't refresh this subagent's transcript. Saved messages stay readable.",
       "archivingTitle": "Archiving agent...",
-      "archivingSubtitle": "Please wait while we archive this agent."
+      "archivingSubtitle": "Please wait while we archive this agent.",
+      "disconnected": "Disconnected from {{host}} — reconnecting…"
+    },
+    "conversation": {
+      "renameTitle": "Rename session",
+      "archiveTitle": "Archive session?",
+      "archiveBody": "Archive this session and stop active work?",
+      "deleteTitle": "Delete session?",
+      "deleteBody": "Permanently delete this session?",
+      "titleLength": "Session title must contain 1–200 characters.",
+      "forkTitle": "Fork session",
+      "subagent": "Subagent",
+      "thisSubagent": "This subagent",
+      "archiveRunningSubagentTitle": "Archive running subagent?",
+      "archiveRunningSubagentBody": "{{label}} is still running. Archiving it will stop the subagent and remove it from the track.",
+      "archiveSubagentTitle": "Archive subagent?",
+      "archiveSubagentBody": "Remove {{label}} from the track. The subagent will be archived.",
+      "detachSubagentTitle": "Detach subagent?",
+      "detachSubagentBody": "{{label}} will leave this track and continue as a standalone agent.",
+      "detach": "Detach"
+    },
+    "usage": {
+      "title": "Session activity and usage",
+      "runtimeDetails": "Runtime details",
+      "provider": "Provider",
+      "model": "Model",
+      "status": "Status",
+      "created": "Created",
+      "updated": "Updated",
+      "lastPrompt": "Last prompt",
+      "inputTokens": "Input tokens",
+      "cachedInput": "Cached input",
+      "outputTokens": "Output tokens",
+      "contextUsed": "Context used",
+      "contextMaximum": "Context maximum",
+      "cost": "Cost (USD)"
     },
     "unavailable": {
       "selectedHost": "Selected host",
@@ -313,7 +556,17 @@
     "tooManyMatches": "Too many matches — narrow your search",
     "hostLoadFailed": "{{host}}: Could not load history",
     "searchPlaceholder": "Search history",
-    "actions": { "loadMore": "Load more", "clearSearch": "Clear search" }
+    "hostOffline": "{{host}}: Offline — its sessions are not listed",
+    "loadFailed": "Unable to load sessions",
+    "emptyHost": "No sessions for this host",
+    "noHosts": "Add a host to see your session history.",
+    "noConnectedHost": "No connected host. History loads from connected hosts.",
+    "filter": { "allHosts": "All hosts", "byHost": "Filter by host", "byProvider": "Filter by provider" },
+    "import": {
+      "noWorkingDirectory": "This provider session has no working directory.",
+      "providerListFailed": "Could not load providers: {{message}}"
+    },
+    "actions": { "loadMore": "Load more", "clearSearch": "Clear search", "reconnect": "Reconnect", "open": "Open" }
   },
   "agentList": {
     "fallbackTitle": "New session",
@@ -440,6 +693,30 @@
     "row": { "importing": "Importing..." }
   },
   "workspace": {
+    "errors": {
+      "hostRejected": "The host rejected the operation",
+      "daemonRejected": "Daemon rejected {{request}}"
+    },
+    "folderPicker": {
+      "title": "Choose remote folder",
+      "back": "Back",
+      "forward": "Forward",
+      "up": "Parent folder",
+      "editPath": "Edit path",
+      "pathPlaceholder": "Type a folder path and press Enter",
+      "showHidden": "Show hidden folders",
+      "hideHidden": "Hide hidden folders",
+      "refresh": "Refresh",
+      "moreAncestors": "Parent folders",
+      "loading": "Loading folders…",
+      "emptyTitle": "No subfolders",
+      "emptyHiddenTitle": "No visible subfolders",
+      "emptyHint": "You can still choose this folder.",
+      "errorTitle": "Couldn't open this folder",
+      "retry": "Retry",
+      "cancel": "Cancel",
+      "choose": "Choose this folder"
+    },
     "route": {
       "loading": "Loading workspace",
       "connecting": "Connecting",
@@ -601,7 +878,42 @@
       "restoreFailed": "Terminal stream could not be restored",
       "invalidSnapshot": "Invalid terminal snapshot",
       "copy": "Copy selection or all output",
-      "keys": { "paste": "Paste" }
+      "exitedWithCode": "Terminal exited with code {{code}}",
+      "newTerminal": "New terminal",
+      "createFailed": "Couldn't start a new terminal: {{reason}}"
+    },
+    "executionLog": {
+      "succeeded": "Finished successfully",
+      "failed": "Failed (exit code {{code}})"
+    },
+    "schedules": {
+      "runStarted": "Run started",
+      "errors": {
+        "pause": "Couldn't pause the schedule: {{reason}}",
+        "resume": "Couldn't resume the schedule: {{reason}}",
+        "delete": "Couldn't delete the schedule: {{reason}}",
+        "runOnce": "Couldn't start the run: {{reason}}",
+        "runHistory": "Couldn't load the run history: {{reason}}"
+      },
+      "noConnectedHosts": "No connected hosts",
+      "noConnectedHostsDescription": "Schedules appear once a host is connected.",
+      "hostOffline": "{{host}}: offline — schedules hidden",
+      "hostConnecting": "{{host}}: connecting — schedules hidden",
+      "hostOfflineSave": "This host is offline. Reconnect it to save.",
+      "required": {
+        "prompt": "Required",
+        "host": "Choose a host",
+        "project": "Choose a project",
+        "model": "Choose an available model"
+      },
+      "cronFields": {
+        "minute": "minute",
+        "hour": "hour",
+        "dayOfMonth": "day-of-month",
+        "month": "month",
+        "dayOfWeek": "day-of-week"
+      },
+      "monthDay": "{{month}} {{day}}"
     },
     "sheet": { "openAsTab": "Open as tab" },
     "tabs": {
@@ -757,8 +1069,42 @@
     },
     "tree": { "showFolderTree": "Show folder tree", "hideFolderTree": "Hide folder tree" },
     "git": {
+      "toasts": { "notAccepted": "The host did not accept this operation." },
+      "review": {
+        "keepEditing": "Keep editing",
+        "discard": "Discard",
+        "discardQuestion": "Discard this comment?"
+      },
       "actions": {
         "moreOptions": "More options",
+        "review": {
+          "commitTitle": "Commit changes",
+          "commitPlaceholder": "Commit message (leave empty to write one automatically)",
+          "commit": "Commit",
+          "commitDirect": "Commit without review",
+          "files": "{{count}} files will be committed:",
+          "files_one": "1 file will be committed:",
+          "moreFiles": "…and {{count}} more",
+          "noFiles": "No uncommitted changes were found. The commit may be empty.",
+          "filesUnavailable": "Couldn't list the files to commit: {{error}}",
+          "prTitle": "Create pull request",
+          "prMessage": "From {{branch}} into {{base}}. The first line is the title and the rest is the description. Leave empty to write both automatically.",
+          "prPlaceholder": "Title\n\nDescription",
+          "next": "Next",
+          "baseTitle": "Base branch",
+          "baseMessage": "The branch the pull request merges into.",
+          "basePlaceholder": "main",
+          "createPr": "Create pull request",
+          "prDirect": "Create PR without review",
+          "prDirect_mr": "Create MR without review"
+        },
+        "failure": {
+          "tooltip": "{{title}}: {{message}}",
+          "retry": "Retry",
+          "copy": "Copy error",
+          "copied": "Error copied",
+          "dismiss": "Dismiss"
+        },
         "moreActions": "More actions",
         "commit": { "label": "Commit", "pending": "Committing...", "success": "Committed" },
         "pull": { "label": "Pull", "pending": "Pulling...", "success": "Pulled" },
@@ -854,7 +1200,8 @@
           "failedDisableAutoMerge": "Failed to disable auto-merge",
           "baseRefUnavailable": "Base ref unavailable",
           "failedMerge": "Failed to merge",
-          "failedMergeFromBase": "Failed to merge from base"
+          "failedMergeFromBase": "Failed to merge from base",
+          "autoMergeUnsupported": "Update the host to use auto-merge actions."
         },
         "archiveWarning": {
           "title": "Archive \"{{workspaceName}}\"?",
@@ -871,6 +1218,11 @@
         }
       },
       "diff": {
+        "patchUnavailable": "This file changed since the summary. Refresh to load its current patch.",
+        "hostDisconnectedCached": "Host disconnected. Repository state is cached until reconnection.",
+        "updateForAll": "Update the host to view All changes",
+        "expandUnchanged": "Expand {{count}} unchanged lines",
+        "expandUnchanged_one": "Expand 1 unchanged line",
         "openChangesTab": "Open Changes tab",
         "openDiffTab": "Open Diff tab",
         "closeChangesTab": "Close Changes tab",
@@ -1038,6 +1390,7 @@
       "log": {
         "title": "Git Log",
         "open": "Open Git Log",
+        "showInLog": "Show in Git Log",
         "checkedOut": "Checked out {{name}}",
         "checkoutFailed": "Failed to check out the branch",
         "search": { "placeholder": "Search commit messages" },
@@ -1058,7 +1411,11 @@
           "branchTitle": "Branch",
           "userTitle": "User",
           "userSearch": "Search users",
-          "userEmpty": "No users"
+          "userEmpty": "No users",
+          "path": "Path: {{name}}",
+          "text": "Message: {{query}}",
+          "clear": "Clear filter",
+          "clearAll": "Clear filters"
         },
         "branches": {
           "head": "HEAD",
@@ -1083,12 +1440,18 @@
           "copyRevision": "Copy revision number",
           "copySubject": "Copy subject",
           "openDiff": "Open diff",
-          "more": "More actions"
+          "more": "More actions",
+          "checkoutRef": "Checkout {{name}}",
+          "showOnlyRef": "Show only {{name}}",
+          "copyRefName": "Copy {{name}}",
+          "showHistory": "Show history",
+          "copyPath": "Copy path"
         },
         "toasts": {
           "nameCopied": "Name copied",
           "revisionCopied": "Revision number copied",
-          "subjectCopied": "Subject copied"
+          "subjectCopied": "Subject copied",
+          "pathCopied": "Path copied"
         },
         "details": {
           "select": "Select a commit to see its changes",
@@ -1106,7 +1469,10 @@
           "unsupported": "Update this host's daemon to use the Git Log.",
           "empty": "No commits yet",
           "noMatches": "No commits match the filters",
-          "retry": "Retry"
+          "retry": "Retry",
+          "showAllBranches": "Show all branches",
+          "refreshFailed": "Couldn't refresh the log: {{error}}",
+          "refsFailed": "Couldn't load branches: {{error}}"
         },
         "time": {
           "justNow": "just now",
@@ -1393,10 +1759,10 @@
     "daemon": {
       "title": "Daemon",
       "lifecycle": {
-        "owned": "Launched by this Desktop session",
+        "owned": "Launched by Passession",
         "attached": "Attached to an existing daemon",
-        "ownedMessage": "This daemon was launched by this Desktop session.",
-        "attachedMessage": "This daemon was not launched by this Desktop session.",
+        "ownedMessage": "This daemon was started by Passession.",
+        "attachedMessage": "This daemon was not started by Passession.",
         "stopTitle": "Stop local daemon?",
         "stopMessage": "{{ownership}}\nHome: {{home}}\nSupervisor PID: {{pid}}\nRunning agent work will be interrupted.",
         "stop": "Stop daemon",
@@ -1631,6 +1997,12 @@
     }
   },
   "onboarding": {
+    "daemonDocs": "Paseo daemon docs",
+    "daemon": {
+      "starting": "Starting built-in daemon…",
+      "failed": "Built-in daemon failed: {{reason}}",
+      "viewLogs": "View logs"
+    },
     "title": "Welcome to Passession",
     "subtitle": "Connect your computer to get started",
     "actions": { "settings": "Settings" }
@@ -1697,6 +2069,14 @@
     }
   },
   "pairing": {
+    "hosts": {
+      "search": "Search hosts",
+      "noMatches": "No matching hosts",
+      "openSettings": "Open {{name}} settings",
+      "use": "Use",
+      "active": "Active",
+      "invalidEndpoint": "Invalid endpoint — edit this connection"
+    },
     "hostPassword": { "title": "Password for {{host}}", "label": "Host password" },
     "hostConfirmation": {
       "title": "Connect to this host?",
@@ -1756,8 +2136,19 @@
       "errors": {
         "targetRequired": "SSH host is required",
         "invalidTarget": "Enter a valid ssh:// host",
-        "failedToConnect": "Unable to connect over SSH. {{detail}}"
+        "failedToConnect": "Unable to connect over SSH. {{detail}}",
+        "auth": "SSH authentication failed. Check that `ssh {{target}}` works in a terminal.",
+        "hostKey": "The SSH host key could not be verified. Run `ssh {{target}}` in a terminal and accept or fix the host key.",
+        "unknown": "No details were reported."
       }
+    },
+    "hostDetails": {
+      "title": "Host details",
+      "name": "Host name",
+      "expectedServerId": "Expected server ID",
+      "badgeColor": "Badge color",
+      "invalidColor": "Badge color must use #RRGGBB",
+      "editConnection": "Edit connection"
     },
     "link": {
       "title": "Paste pairing link",
@@ -1768,7 +2159,9 @@
         "missingOffer": "Link must include #offer=...",
         "emptyOffer": "Offer payload is empty",
         "invalid": "Invalid pairing link",
-        "unableToPair": "Unable to pair host"
+        "unableToPair": "Unable to pair host",
+        "offerInvalid": "This pairing link is expired or invalid. Generate a new link on the host.",
+        "relayUnreachable": "The host could not be reached through the relay. The daemon may be offline or have relay disabled."
       },
       "alert": { "failedTitle": "Pairing failed" },
       "actions": { "cancel": "Cancel", "pair": "Pair", "pairing": "Pairing..." }
@@ -1872,7 +2265,7 @@
         "alwaysUseFilename": "Always use for {{filename}}",
         "option": "{{title}} — {{owner}}",
         "builtin": {
-          "owner": "Paseo",
+          "owner": "Passession",
           "markdown": "Markdown",
           "html": "HTML",
           "image": "Image",
@@ -1917,6 +2310,7 @@
     },
     "pullRequest": {
       "label": "Pull request",
+      "pipelineJobsFailed": "Could not load pipeline jobs",
       "subtitle": "Pull request details",
       "emptyTitle": "No pull request yet",
       "emptyDescription": "Create a pull request for this checkout to see its details here."
@@ -2349,6 +2743,7 @@
       "fonts": {
         "title": "Fonts",
         "systemDefault": "System default",
+        "builtInCodeFont": "Built-in code font",
         "interfaceFont": "Interface font",
         "interfaceFontHint": "Used across the app. Leave empty for the system default",
         "interfaceFontAccessibility": "Interface font family",
@@ -2359,7 +2754,7 @@
         "contentSizeHint": "Used for chat text and rendered Markdown",
         "contentSizeAccessibility": "Content font size",
         "codeFont": "Code font",
-        "codeFontHint": "Used in code, diffs, and the terminal output. Leave empty for the system default",
+        "codeFontHint": "Used for code, diffs and terminal output. Leave empty for the built-in code font.",
         "codeFontAccessibility": "Code font family",
         "codeSize": "Code size",
         "codeSizeHint": "Used for code, diffs, and terminal output",
@@ -2409,14 +2804,20 @@
       "help": {
         "openProject": "Open project",
         "newWorkspace": "New workspace",
-        "newWorktree": "New worktree",
+        "newWorktree": "New worktree session",
+        "newSession": "New session",
+        "nextAttention": "Next session needing input",
+        "pinWorkspace": "Pin chat",
+        "newAgentTab": "New agent",
+        "openChanges": "Changes",
+        "openFiles": "Files",
         "archiveWorkspace": "Archive workspace",
         "newTab": "New tab",
         "closeCurrentTab": "Close current tab",
-        "jumpToWorkspace": "Jump to workspace",
+        "jumpToWorkspace": "Jump to session",
         "jumpToTab": "Jump to tab",
-        "previousWorkspace": "Previous workspace",
-        "nextWorkspace": "Next workspace",
+        "previousWorkspace": "Previous session",
+        "nextWorkspace": "Next session",
         "previousTab": "Previous tab",
         "nextTab": "Next tab",
         "splitPaneRight": "Split pane right",
@@ -2789,6 +3190,7 @@
         "nameLabel": "Project name",
         "icon": "Icon",
         "chooseImage": "Choose image",
+        "platformUnavailable": "Platform services are unavailable",
         "useAutomatic": "Use automatic",
         "imageUrl": "Image or website URL",
         "save": "Save changes",

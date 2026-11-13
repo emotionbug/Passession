@@ -101,3 +101,34 @@ reshaping it, keeping selection hit testing and rendered text on the same layout
 their owner's final alignment while escaping nested text-content clips.
 Draw-list/window clipping still applies; a clipped caret hides its decoration.
 The widget layer shares this mechanism across editable and read-only owners.
+
+## Runtime font families
+
+Applications can replace a font family's list after it was defined (system
+fonts, user font preferences). `Fonts::redefine_font_family` (with
+`Layouter::redefine_font_family` and `Loader::redefine_font_family`) installs
+the new list, drops the loaded family and every cached UI layout, and advances
+the font catalog revision. `AsyncLayout` already withholds completions for an
+older catalog revision; the layout worker now remembers the family lists it was
+given and redefines any family whose list changed in a newer catalog, instead
+of only defining unseen families. `Fonts::font_family_definition` returns the
+current list and `Fonts::get_or_load_font` exposes a font's metrics.
+`FontFamily::font_family_id()` makes a DSL text style's family id public.
+
+`FontDefinition::variations` selects a variable-font instance with user-space
+axis values (`(*b"wght", 600.0)`); `FontFace::from_data_index_and_variations`
+applies them to the ttf-parser face before the rustybuzz face is built, so
+outlines, metrics, advances and shaping all use that instance.
+`from_data_and_index` keeps its signature (default instance). DSL fonts use no
+variations. Collection faces (`index` > 0) were already supported.
+
+A definition whose bytes do not parse at its face index, or an undefined font
+id, no longer panics: `Loader::get_or_load_font` returns `None`, logs the
+failure once and families skip that face (an all-failed family shapes nothing,
+as an empty family did before). `paseo_font_tests` and the async-layout test
+`a_family_redefinition_withholds_the_stale_result_and_relayouts_with_new_fonts`
+cover redefinition, stale results and skipped faces with the existing widgets
+fixtures. The variation and `.ttc` tests read system fonts named by
+`MAKEPAD_TEST_VARIABLE_FONT` / `MAKEPAD_TEST_FONT_COLLECTION` (default: the
+Ubuntu Sans variable font and Noto Sans CJK collection paths of Ubuntu) and
+skip when the file is absent; no font resources are added.

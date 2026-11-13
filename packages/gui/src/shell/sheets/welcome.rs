@@ -1,6 +1,6 @@
 //! Port of `features/navigation/welcome_screen.dart` (original `components/welcome-screen.tsx`),
-//! drawn in the content area while no host is saved: the Paseo logo, onboarding title and
-//! subtitle (plus the paseo.sh link on mobile), the connection method buttons, a ghost Settings
+//! drawn in the content area while no host is saved: the Passession logo, onboarding title and
+//! subtitle (plus the Paseo daemon docs link on mobile), the connection method buttons, a ghost Settings
 //! button and the app version. Each method opens the matching connection flow; the screen
 //! disappears by itself once a host is saved.
 
@@ -11,7 +11,8 @@ use makepad_widgets::scroll_bars::TouchScroll;
 use makepad_widgets::*;
 
 use crate::common::paint::{Font, rect};
-use crate::common::{UiContext, tr};
+use crate::common::{UiContext, tr, tr_args};
+use paseo_gui_platform::desktop::LocalDaemon;
 use crate::shell::chrome::make_ui;
 use crate::shell::ui::Variant;
 use crate::shell::{Page, PaseoShell, hosts, platform};
@@ -56,6 +57,24 @@ fn version_text() -> String {
     } else {
         format!("v{value}")
     }
+}
+
+/// Desktop: the built-in daemon's start, shown above the connection methods while it is
+/// starting or after it failed (once it listens, its host appears and Welcome goes away).
+fn local_daemon() -> Option<LocalDaemon> {
+    if MOBILE || !platform::desktop_host() {
+        return None;
+    }
+    match paseo_gui_platform::desktop::local_daemon() {
+        state @ (LocalDaemon::Starting | LocalDaemon::Failed(_)) => Some(state),
+        _ => None,
+    }
+}
+
+/// The failure text, at most three lines of the daemon's message.
+fn failure_text(reason: &str) -> String {
+    let reason: String = reason.trim().lines().take(3).collect::<Vec<_>>().join("\n");
+    tr_args("onboarding.daemon.failed", &[("reason", &reason)])
 }
 
 /// Per-window scroll of the welcome body: it scrolls only when it is taller than the area.
@@ -113,6 +132,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, state: &
 
 pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     let actions = actions();
+    let daemon = local_daemon();
     let window = shell.data.window_id.clone();
     let mut ui = make_ui(shell);
     let p = ui.p;
@@ -129,7 +149,19 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     let link_h = if MOBILE { line + 8.0 } else { 0.0 };
     let button_h = 16.0 + line + 16.0;
     let buttons_h = actions.len() as f64 * button_h + (actions.len().saturating_sub(1)) as f64 * 12.0;
-    let content_h = 96.0 + title_h + 8.0 + subtitle_h + link_h + 48.0 + buttons_h + 24.0 + 32.0;
+    // The daemon card: 16px padding around its text, plus the Retry / View logs row on failure.
+    let card_w = inner.size.x.min(420.0);
+    let card_text_w = (card_w - 32.0 - 24.0).max(40.0);
+    let daemon_text = match &daemon {
+        Some(LocalDaemon::Starting) => tr("onboarding.daemon.starting"),
+        Some(LocalDaemon::Failed(reason)) => failure_text(reason),
+        _ => String::new(),
+    };
+    let daemon_spec = ui.spec(Font::Regular, 14.0, if matches!(daemon, Some(LocalDaemon::Failed(_))) { p.danger } else { p.foreground });
+    let daemon_text_h = if daemon.is_some() { ui.painter.paragraph_height(cx, card_text_w, daemon_spec, &daemon_text).max(line) } else { 0.0 };
+    let daemon_buttons_h = if matches!(daemon, Some(LocalDaemon::Failed(_))) { 12.0 + 32.0 } else { 0.0 };
+    let daemon_h = if daemon.is_some() { 16.0 + daemon_text_h + daemon_buttons_h + 16.0 + 16.0 } else { 0.0 };
+    let content_h = 96.0 + title_h + 8.0 + subtitle_h + link_h + 48.0 + daemon_h + buttons_h + 24.0 + 32.0;
     let version_spec = ui.spec(Font::Regular, 12.0, p.muted);
     let version_h = 24.0 + ui.painter.paragraph_height(cx, inner.size.x, version_spec, "Ag");
     let available = inner.size.y - version_h;
@@ -166,12 +198,14 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     y += subtitle_h;
     if MOBILE {
         y += 8.0;
-        let spec = ui.spec(Font::Medium, 14.0, p.accent);
-        let w = ui.measure(cx, spec, "paseo.sh");
+        // The daemon the app connects to is Paseo: the link is its docs, labeled as such.
+        let spec = ui.spec(Font::Medium, 14.0, p.accent_bright);
+        let label = tr("onboarding.daemonDocs");
+        let w = ui.measure(cx, spec, &label).min(inner.size.x - 20.0);
         let total = w + 6.0 + 14.0;
         let x = center - total * 0.5;
-        ui.text(cx, rect(x, y, w, line), spec, "paseo.sh");
-        ui.icon(cx, rect(x + w + 6.0, y + (line - 14.0) * 0.5, 14.0, 14.0), "external-link", 14.0, p.accent);
+        ui.text(cx, rect(x, y, w, line), spec, &label);
+        ui.icon(cx, rect(x + w + 6.0, y + (line - 14.0) * 0.5, 14.0, 14.0), "external-link", 14.0, p.accent_bright);
         ui.hit(rect(x, y, total, line), "welcome:website");
         y += line;
     }
@@ -179,6 +213,32 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
 
     let width = inner.size.x.min(420.0);
     let left = center - width * 0.5;
+    if let Some(state) = &daemon {
+        let card = rect(left, y, card_w, daemon_h - 16.0);
+        ui.painter.outline(cx, card, p.surface1, if matches!(state, LocalDaemon::Failed(_)) { p.danger } else { p.border }, 1.0, 12.0);
+        let glyph = rect(card.pos.x + 16.0, card.pos.y + 16.0 + (line - 16.0) * 0.5, 16.0, 16.0);
+        match state {
+            LocalDaemon::Starting => {
+                crate::shell::sheets::spinner(&mut ui, cx, glyph, p.muted);
+                // Welcome is a page, not a sheet: it keeps its own spinner frames going.
+                crate::shell::sheets::take_spinning();
+                ui.painter.draw_box.area().redraw(cx);
+            }
+            _ => ui.icon(cx, glyph, "circle-alert", 16.0, p.danger),
+        }
+        ui.painter.paragraph(cx, dvec2(card.pos.x + 16.0 + 24.0, card.pos.y + 16.0), card_text_w, daemon_spec, &daemon_text);
+        if matches!(state, LocalDaemon::Failed(_)) {
+            let by = card.pos.y + 16.0 + daemon_text_h + 12.0;
+            let retry = tr("common.actions.retry");
+            let rw = ui.button_width(cx, &retry, Some("rotate-cw"), ControlSize::Sm);
+            let bx = card.pos.x + 16.0 + 24.0;
+            ui.button(cx, rect(bx, by, rw, 32.0), "welcome:daemonretry", &retry, Some("rotate-cw"), Variant::Primary, ControlSize::Sm, true);
+            let logs = tr("onboarding.daemon.viewLogs");
+            let lw = ui.button_width(cx, &logs, Some("file-text"), ControlSize::Sm).min((card.pos.x + card.size.x - 16.0 - (bx + rw + 8.0)).max(0.0));
+            ui.button(cx, rect(bx + rw + 8.0, by, lw, 32.0), "welcome:daemonlogs", &logs, Some("file-text"), Variant::Ghost, ControlSize::Sm, true);
+        }
+        y += daemon_h;
+    }
     for action in &actions {
         let r = rect(left, y, width, button_h);
         let id = format!("welcome:{}", action.id);
@@ -215,6 +275,14 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) 
             platform::open_external("https://paseo.sh");
         }
         "settings" => crate::shell::commands::open_settings(shell, cx, None, ""),
+        // Start the built-in daemon again; the card follows its state.
+        "daemonretry" => {
+            if let Some(handle) = paseo_gui_platform::platform() {
+                handle.desktop_invoke("start_desktop_daemon", serde_json::json!({}));
+            }
+        }
+        // The local daemon settings page holds its log viewer.
+        "daemonlogs" => crate::shell::commands::open_settings(shell, cx, None, "local-daemon"),
         "scan" | "direct" | "ssh" | "link" => {
             // One connection flow at a time (Flutter `_busy`).
             if shell.data.overlays.stack.is_empty() {

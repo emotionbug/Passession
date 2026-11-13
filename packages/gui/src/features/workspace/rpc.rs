@@ -74,7 +74,7 @@ pub fn require_success(response: &Value) -> Result<(), RpcError> {
         }
         Some(Value::String(message)) => RpcError::new(message.clone()),
         Some(other) => RpcError::new(other.to_string()),
-        None => RpcError::new("The host rejected the operation"),
+        None => RpcError::new(super::i18n::t("workspace.errors.hostRejected")),
     })
 }
 
@@ -97,7 +97,7 @@ pub fn domain_error(body: &Value, request_type: &str) -> Option<RpcError> {
         _ => None,
     }
     .or_else(|| result.and_then(|r| r.get("error")).map(value_text))
-    .unwrap_or_else(|| format!("Daemon rejected {request_type}"));
+    .unwrap_or_else(|| super::i18n::ta("workspace.errors.daemonRejected", &[("request", request_type)]));
     let code = body
         .get("errorCode")
         .map(value_text)

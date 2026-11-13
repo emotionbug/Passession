@@ -105,6 +105,11 @@ pub(crate) enum Command {
         host_id: String,
         message: Value,
     },
+    TerminalInput {
+        host_id: String,
+        subscription_id: String,
+        data: Vec<u8>,
+    },
     ConnectHost {
         config: Value,
     },
@@ -205,6 +210,16 @@ impl CoreHandle {
         self.send(Command::Notify {
             host_id: host_id.to_owned(),
             message,
+        });
+    }
+
+    /// Sends raw PTY bytes in order, bound to the currently acknowledged observation.
+    /// A reconnect must not reuse an old stream's slot for pending input.
+    pub fn terminal_input(&self, host_id: &str, subscription_id: &str, data: &[u8]) {
+        self.send(Command::TerminalInput {
+            host_id: host_id.to_owned(),
+            subscription_id: subscription_id.to_owned(),
+            data: data.to_vec(),
         });
     }
 
@@ -372,5 +387,26 @@ impl Drop for GuiCore {
             && let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
+    }
+}
+
+#[cfg(test)]
+mod terminal_input_tests {
+    use super::*;
+
+    #[test]
+    fn raw_terminal_input_keeps_bytes_and_enqueue_order() {
+        let (commands, mut receiver) = mpsc::unbounded_channel();
+        let handle = CoreHandle { commands, state_dir: Arc::new(PathBuf::new()) };
+        handle.terminal_input("host", "subscription", &[27, b'[', b'M', 96, 133, 37]);
+        handle.terminal_input("host", "subscription", b"next");
+        for expected in [&[27, b'[', b'M', 96, 133, 37][..], &b"next"[..]] {
+            let Command::TerminalInput { host_id, subscription_id, data } = receiver.try_recv().unwrap() else {
+                panic!("expected terminal input");
+            };
+            assert_eq!(host_id, "host");
+            assert_eq!(subscription_id, "subscription");
+            assert_eq!(data, expected);
+        }
     }
 }

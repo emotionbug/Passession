@@ -30,6 +30,8 @@ pub struct Stream {
     pub error: Option<String>,
     pub attaching: bool,
     pub exited: bool,
+    /// The process's exit status, when the daemon reports it (`terminal_stream_exit.exitCode`).
+    pub exit_code: Option<i64>,
     visible: bool,
     slot: Option<u8>,
     subscription_id: Option<String>,
@@ -51,6 +53,7 @@ impl Stream {
             error: None,
             attaching: false,
             exited: false,
+            exit_code: None,
             visible: false,
             slot: None,
             subscription_id: None,
@@ -126,6 +129,7 @@ impl Stream {
     pub fn retry(&mut self, core: &CoreHandle, host_connected: bool) {
         self.release();
         self.exited = false;
+        self.exit_code = None;
         self.attach(core, host_connected);
     }
 
@@ -172,18 +176,19 @@ impl Stream {
                 }
                 _ => {}
             }
-        }
-        let Some(observation) = self.observation.as_mut() else { return changed };
-        let items = observation.take(events);
-        for item in items {
-            changed |= self.receive(item);
-        }
-        // Terminal stream frames are routed by slot, in wire order with the text messages.
-        if self.observation.is_some() {
-            for event in events {
-                if let CoreEvent::HostEvent { host_id, event } = event && *host_id == self.host_id && str_of(event, "type") == "terminal.frame" {
-                    changed |= self.frame(payload(event));
+            // Process observation messages and binary frames in the same pass. In
+            // particular, the final output must be consumed before Exit releases its slot.
+            if let Some(observation) = self.observation.as_mut() {
+                for item in observation.take(std::slice::from_ref(event)) {
+                    changed |= self.receive(item);
                 }
+            }
+            if self.observation.is_some()
+                && let CoreEvent::HostEvent { host_id, event } = event
+                && *host_id == self.host_id
+                && str_of(event, "type") == "terminal.frame"
+            {
+                changed |= self.frame(payload(event));
             }
         }
         changed
@@ -235,6 +240,7 @@ impl Stream {
             Some(error) => self.fail(value_message(error)),
             None => {
                 self.exited = true;
+                self.exit_code = body.get("exitCode").and_then(Value::as_i64);
                 self.attaching = false;
                 self.slot = None;
                 self.publish();
@@ -330,20 +336,14 @@ impl Stream {
         self.screen.rendered_text(self.screen.line_count())
     }
 
-    /// The host write path of an attached interactive terminal: `terminal_input` session
-    /// messages, as the original app sends them (not binary frames).
+    /// Input is binary: legacy mouse coordinates are arbitrary bytes, not UTF-8.
+    /// The core resolves the slot from this subscription, fencing reconnects.
     pub fn send_input(&self, core: &CoreHandle, data: &[u8]) {
-        if data.is_empty() || self.exited {
+        if data.is_empty() || self.exited || !self.visible {
             return;
         }
-        core.notify(
-            &self.host_id,
-            json!({
-                "type": "terminal_input",
-                "terminalId": self.terminal_id,
-                "message": { "type": "input", "data": String::from_utf8_lossy(data) },
-            }),
-        );
+        let Some(subscription) = self.subscription_id.as_deref() else { return };
+        core.terminal_input(&self.host_id, subscription, data);
     }
 
     /// Requests the PTY size: `claim` takes size ownership (the focused pane), `update`
@@ -402,8 +402,14 @@ mod tests {
         stream.receive(ObsEvent::Event(json!({"type": "terminal_stream_exit", "payload": {"terminalId": "t", "error": "gone"}})));
         assert!(!stream.exited);
         assert_eq!(stream.error.as_deref(), Some("gone"));
+        stream.receive(ObsEvent::Event(json!({"type": "terminal_stream_exit", "payload": {"terminalId": "t", "exitCode": 2}})));
+        assert!(stream.exited);
+        assert_eq!(stream.exit_code, Some(2));
+        // Older daemons send no code.
+        let mut stream = self::stream();
         stream.receive(ObsEvent::Event(json!({"type": "terminal_stream_exit", "payload": {"terminalId": "t"}})));
         assert!(stream.exited);
+        assert_eq!(stream.exit_code, None);
     }
 
     #[test]
@@ -432,5 +438,43 @@ mod tests {
         stream.receive(ObsEvent::Event(json!({"type": "subscribe_terminal_response", "payload": {"terminalId": "t", "slot": 0}})));
         stream.frame(&json!({"slot": 0, "opcode": "restore", "text": "x"}));
         assert_eq!(stream.error.as_deref(), Some("no size"));
+    }
+
+    #[test]
+    fn batched_final_output_precedes_stream_exit() {
+        use paseo_gui_core::{CoreConfig, GuiCore};
+        use std::sync::Arc;
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("paseo-terminal-order-{}-{unique}", std::process::id()));
+        let core = GuiCore::start(
+            CoreConfig { state_dir: dir.join("state"), daemon_home: Some(dir.join("daemon")), default_endpoint: None },
+            Arc::new(|| {}),
+        ).unwrap();
+        let handle = core.handle();
+        let mut stream = stream();
+        stream.attach(&handle, true);
+        let request_id = stream.observation.as_ref().unwrap().id.clone();
+        let events = [
+            CoreEvent::Response {
+                host_id: "h".into(), request_id: request_id.clone(),
+                result: Ok(json!({"terminalId":"t","slot":3,"subscriptionId":"sub"})),
+            },
+            CoreEvent::HostEvent {
+                host_id: "h".into(),
+                event: json!({"type":"terminal.frame","payload":{"slot":3,"opcode":"output","text":"last output"}}),
+            },
+            CoreEvent::HostEvent {
+                host_id: "h".into(),
+                event: json!({"type":"terminal_stream_exit","observations":[request_id],"payload":{"terminalId":"t","exitCode":7,"subscriptionId":"sub"}}),
+            },
+        ];
+        stream.pump(&handle, &events);
+        assert_eq!(stream.rendered_text(), "last output");
+        assert!(stream.exited);
+        assert_eq!(stream.exit_code, Some(7));
+        drop(stream);
+        drop(handle);
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -9,11 +9,19 @@ use super::policy::{
     ActionRuntime, ActionStatus, ActionsContext, GitAction, GitActions, actions_input_from, build_git_actions,
     forge_presentation, normalize_forge, resolve_risk_reasons, worktree_archive_risk_reasons, action_label_keys,
 };
-use super::store::{ActionFollowUp, GitStore, pr_status};
+use super::overlay::{MenuEntry, MenuItem};
+use super::store::{ActionFollowUp, GitStore, ReviewPlan, pr_status};
 use super::text::{msg, t, tr, tr_forge};
 use crate::common::{UiContext, UiEffect};
 use makepad_widgets::Cx;
 use serde_json::{Map, Value, json};
+
+/// Git actions menu values of the last failure's controls.
+const FAILURE_RETRY: &str = "failure-retry";
+const FAILURE_COPY: &str = "failure-copy";
+const FAILURE_DISMISS: &str = "failure-dismiss";
+/// Menu value suffix of an action run without its review (Commit, Create PR).
+const DIRECT_SUFFIX: &str = ":direct";
 
 /// One checkout's identity.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -220,9 +228,66 @@ impl Checkout {
         }
     }
 
-    /// Original `useGitActionRunner` + `_handle`. A worktree archive returns
-    /// the risk confirmation to show first (none when the worktree is safe).
+    /// Runs a git actions menu answer: the last failure's Retry / Copy /
+    /// Dismiss, an action without its review (`…:direct`), or an action.
+    pub fn run_menu(&self, cx: &mut Cx, ui: &mut UiContext, store: &mut GitStore, actions: &GitActions, id: &str) -> Option<ArchiveConfirm> {
+        match id {
+            FAILURE_RETRY => store.retry_failure(cx, &self.host, &self.cwd),
+            FAILURE_COPY => {
+                if let Some(failure) = store.last_failure(&self.host, &self.cwd) {
+                    let text = failure.message.clone();
+                    ui.push(UiEffect::CopyText { text, toast: Some(t("workspace.git.actions.failure.copied")) });
+                }
+            }
+            FAILURE_DISMISS => store.dismiss_failure(cx, &self.host, &self.cwd),
+            _ => {
+                let (action_id, review) = match id.strip_suffix(DIRECT_SUFFIX) {
+                    Some(action_id) => (action_id, false),
+                    None => (id, true),
+                };
+                let action = actions.primary.iter().chain(actions.secondary.iter()).find(|a| a.id == action_id)?.clone();
+                return self.run_with(cx, ui, store, &action, review);
+            }
+        }
+        None
+    }
+
+    /// Menu entries besides the actions: the last failure (title with the
+    /// host's message, Retry, Copy, Dismiss) first, and Commit / Create PR
+    /// without their review.
+    pub fn menu_extras(&self, ui: &UiContext, store: &GitStore, actions: &GitActions) -> (Vec<MenuEntry>, Vec<MenuEntry>) {
+        let mut failure_entries = Vec::new();
+        if let Some(failure) = store.last_failure(&self.host, &self.cwd) {
+            let pending = store.action_status(&self.host, &self.cwd, &failure.action_id) == ActionStatus::Pending;
+            failure_entries.push(MenuEntry::Item(
+                MenuItem::new("failure-message", format!("{}: {}", failure.title, failure.message)).icon("circle-alert").enabled(false),
+            ));
+            failure_entries.push(MenuEntry::Item(MenuItem::new(FAILURE_RETRY, t("workspace.git.actions.failure.retry")).icon("rotate-cw").enabled(failure.retryable && !pending && host::connected(ui, &self.host))));
+            failure_entries.push(MenuEntry::Item(MenuItem::new(FAILURE_COPY, t("workspace.git.actions.failure.copy")).icon("copy")));
+            failure_entries.push(MenuEntry::Item(MenuItem::new(FAILURE_DISMISS, t("workspace.git.actions.failure.dismiss")).icon("x")));
+        }
+        let mut direct = Vec::new();
+        let all = || actions.primary.iter().chain(actions.secondary.iter());
+        let ready = |id: &str| all().any(|a| a.id == id && !a.disabled && a.unavailable.is_none() && a.status == ActionStatus::Idle);
+        if ready("commit") {
+            direct.push(MenuEntry::Item(
+                MenuItem::new(format!("commit{DIRECT_SUFFIX}"), t("workspace.git.actions.review.commitDirect")).icon("git-commit-horizontal"),
+            ));
+        }
+        if ready("pr") && !self.has_pull_request(store) {
+            direct.push(MenuEntry::Item(MenuItem::new(format!("pr{DIRECT_SUFFIX}"), self.forge_label(store, "workspace.git.actions.review.prDirect")).icon("git-pull-request")));
+        }
+        (failure_entries, direct)
+    }
+
+    /// Original `useGitActionRunner` + `_handle`. Commit and Create PR open
+    /// their review first. A worktree archive returns the risk confirmation
+    /// to show first (none when the worktree is safe).
     pub fn run(&self, cx: &mut Cx, ui: &mut UiContext, store: &mut GitStore, action: &GitAction) -> Option<ArchiveConfirm> {
+        self.run_with(cx, ui, store, action, true)
+    }
+
+    fn run_with(&self, cx: &mut Cx, ui: &mut UiContext, store: &mut GitStore, action: &GitAction, review: bool) -> Option<ArchiveConfirm> {
         if action.disabled {
             return None;
         }
@@ -233,7 +298,12 @@ impl Checkout {
         let base_ref = self.status(store).map(|s| text(s, "baseRef").to_owned()).unwrap_or_default();
         let (host, cwd) = (self.host.clone(), self.cwd.clone());
         let success = |store: &GitStore, key: &str| Some(self.forge_label(store, key));
+        let plan = |success_label| ReviewPlan { host: host.clone(), cwd: cwd.clone(), success_label };
         match action.id {
+            "commit" if review => {
+                let label = success(store, "workspace.git.actions.commit.success");
+                store.review_commit(cx, plan(label));
+            }
             "commit" => {
                 let label = success(store, "workspace.git.actions.commit.success");
                 store.run_action(cx, &host, &cwd, "commit", vec![("checkout_commit_request", json!({ "addAll": true }))], "workspace.git.actions.toasts.failedCommit", label, ActionFollowUp::None);
@@ -267,11 +337,16 @@ impl Checkout {
                 }
                 self.persist_ship_default(ui, store, "pr");
                 let label = success(store, "workspace.git.actions.createPr.success");
-                store.run_action(cx, &host, &cwd, "create-pr", vec![("checkout_pr_create_request", json!({}))], "workspace.git.actions.toasts.failedCreatePr", label, ActionFollowUp::None);
+                if review {
+                    let branch = self.status(store).map(|s| text(s, "currentBranch").to_owned()).unwrap_or_default();
+                    store.review_pr(cx, ui, plan(label), base_ref, branch);
+                } else {
+                    store.run_action(cx, &host, &cwd, "create-pr", vec![("checkout_pr_create_request", json!({}))], "workspace.git.actions.toasts.failedCreatePr", label, ActionFollowUp::None);
+                }
             }
             "disable-pr-auto-merge" => {
                 let Some(rpc) = self.auto_merge_rpc(ui) else {
-                    ui.toast("Update the host to use auto-merge actions.", true);
+                    ui.toast(t("workspace.git.actions.toasts.autoMergeUnsupported"), true);
                     return None;
                 };
                 let label = success(store, "workspace.git.actions.autoMerge.disabled");
@@ -332,7 +407,7 @@ impl Checkout {
                 let method = &id["enable-pr-auto-merge-".len()..];
                 self.persist_ship_default(ui, store, "pr");
                 let Some(rpc) = self.auto_merge_rpc(ui) else {
-                    ui.toast("Update the host to use auto-merge actions.", true);
+                    ui.toast(t("workspace.git.actions.toasts.autoMergeUnsupported"), true);
                     return None;
                 };
                 let label = success(store, "workspace.git.actions.autoMerge.enabled");
@@ -388,8 +463,7 @@ impl Checkout {
 
 /// Original `gitActionMenuEntries`: separators before group starters (never
 /// first); unavailable actions muted; a pending or succeeded row disabled.
-pub fn menu_entries(checkout: &Checkout, store: &GitStore, actions: &[GitAction]) -> Vec<super::overlay::MenuEntry> {
-    use super::overlay::{MenuEntry, MenuItem};
+pub fn menu_entries(checkout: &Checkout, store: &GitStore, actions: &[GitAction]) -> Vec<MenuEntry> {
     let mut entries = Vec::new();
     for (index, action) in actions.iter().enumerate() {
         if action.starts_group && index > 0 {

@@ -440,7 +440,7 @@ impl WaButton {
             WaButtonKind::Outline => (clear, p.border_accent, p.foreground),
             WaButtonKind::Ghost => (clear, clear, if lit { p.foreground } else { p.muted }),
             WaButtonKind::Danger => (p.destructive, p.destructive, if p.is_dark { vec4(1.0, 1.0, 1.0, 1.0) } else { p.surface0 }),
-            WaButtonKind::Field => (p.surface2, if lit { p.border_accent } else { clear }, p.foreground),
+            WaButtonKind::Field => (p.surface2, if lit { p.muted } else { clear }, p.foreground),
             WaButtonKind::Badge => (if lit { p.surface2 } else { clear }, clear, if lit { p.foreground } else { p.muted }),
             WaButtonKind::Link => (clear, clear, if lit { p.foreground } else { p.muted }),
             WaButtonKind::Glyph => (clear, clear, p.muted),
@@ -886,7 +886,7 @@ impl Widget for WaTrigger {
         let r = cx.walk_turtle(walk);
         self.area = self.painter.capture_box(cx, r, fade(fill, opacity), Vec4::default(), 0.0, radius);
         let chevron = rect(r.pos.x + r.size.x - pad - 14.0, r.pos.y + (r.size.y - 14.0) * 0.5 + 1.0, 14.0, 14.0);
-        self.painter.icon(cx, chevron, "chevron-down", 14.0, fade(p.extra_muted, opacity));
+        self.painter.icon(cx, chevron, "chevron-down", 14.0, fade(p.muted, opacity));
         let (row_y, value_x_gap) = if field {
             let label_spec = TextSpec::new(Font::Regular, t.ui_size(12.0), fade(p.muted, opacity));
             let label_h = self.painter.line_height(cx, label_spec);
@@ -1121,7 +1121,8 @@ impl WaInput {
         let clear = Vec4::default();
         // `Sdf2d::box` (the TextInput shader) draws twice the radius it is given.
         let (fill, border, active, radius) = match self.look {
-            WaInputLook::Field => (p.surface2, clear, p.border_accent, if md { 8.0 } else { 6.0 }),
+            // Focus border on the surface2 fill: muted (border_accent is ~1.1:1 against it).
+            WaInputLook::Field => (p.surface2, clear, p.muted, if md { 8.0 } else { 6.0 }),
             WaInputLook::Area => (p.surface1, p.border, p.border, 8.0),
             WaInputLook::Bare => (clear, clear, clear, 0.0),
         };
@@ -1327,7 +1328,7 @@ pub fn text_color(p: &Palette, role: TextRole) -> Vec4 {
         TextRole::Body | TextRole::Title | TextRole::Small | TextRole::Mono => p.foreground,
         TextRole::Muted | TextRole::SmallMuted => p.muted,
         TextRole::ExtraMuted => p.extra_muted,
-        TextRole::Danger => p.destructive,
+        TextRole::Danger => p.danger,
         TextRole::Success => p.success,
         TextRole::Warning => p.warning,
         TextRole::Accent => p.accent_bright,
@@ -1652,6 +1653,9 @@ pub struct WaModal {
     sheet_chrome_height: Option<f64>,
     #[rust]
     applied_body_height: Option<f64>,
+    /// A text field inside the content holds key focus: Escape ends its edit first.
+    #[rust]
+    field_focus: bool,
 }
 
 impl LiveHook for WaModal {
@@ -1666,6 +1670,10 @@ impl Widget for WaModal {
         // Focus transitions and their actions synchronize retained fields even when
         // their modal is closed or covered; they are not interactive input.
         if matches!(event, Event::KeyFocus(_) | Event::KeyFocusLost(_) | Event::Actions(_)) {
+            if let Event::KeyFocus(focus) | Event::KeyFocusLost(focus) = event {
+                let content = self.content.area().rect(cx);
+                self.field_focus = self.opened && focus.focus != Area::Empty && content.contains(focus.focus.rect(cx).pos);
+            }
             self.content.handle_event(cx, event, scope);
             return;
         }
@@ -1683,8 +1691,16 @@ impl Widget for WaModal {
             && key.key_code == KeyCode::Escape
         {
             if MODAL_STACK.with(|stack| stack.borrow_mut().claim_escape(self.window_id.as_deref(), event)) {
-                cx.widget_action(self.content.widget_uid(), &scope.path, ModalAction::Dismissed);
-                self.close(cx);
+                if self.field_focus {
+                    // The focused field gets this Escape (cancelling its edit); the next
+                    // one dismisses the modal.
+                    self.field_focus = false;
+                    self.content.handle_event(cx, event, scope);
+                    cx.set_key_focus(Area::Empty);
+                } else {
+                    cx.widget_action(self.content.widget_uid(), &scope.path, ModalAction::Dismissed);
+                    self.close(cx);
+                }
             }
             return;
         }
@@ -1874,6 +1890,7 @@ impl WaModal {
 
     pub fn close(&mut self, cx: &mut Cx) {
         self.clear_content_focus(cx);
+        self.field_focus = false;
         self.window_modal = None;
         self.content.handle_event(cx, &Event::Actions(vec![Box::new(ModalAction::Dismissed)]), &mut Scope::empty());
         let uid = self.widget_uid();
