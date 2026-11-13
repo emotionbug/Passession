@@ -92,7 +92,7 @@ pub fn root_kind(kind: &str) -> Option<RootKind> {
         "agent" | "provider_subagent" => RootKind::Chat,
         "draft" => RootKind::Creation,
         "files" | "file" => RootKind::Files,
-        "changes_tree" | "working_diff" | "commit_diff" | "pull_request" => RootKind::Git,
+        "changes_tree" | "working_diff" | "commit_diff" | "pull_request" | "git_log" => RootKind::Git,
         "execution_log" => RootKind::Logs,
         "terminal" => RootKind::Terminal,
         "new_tab" | "setup" | "project_settings" => RootKind::Workspace,

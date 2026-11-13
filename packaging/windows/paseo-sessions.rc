@@ -27,12 +27,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "Paseo\0"
-            VALUE "FileDescription", "Paseo Sessions\0"
+            VALUE "FileDescription", "Passession\0"
             VALUE "FileVersion", PASEO_STRINGIFY(PASEO_VERSION) "\0"
             VALUE "InternalName", "sh.paseo.sessions.desktop\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 sh.paseo. All rights reserved.\0"
             VALUE "OriginalFilename", "paseo_sessions.exe\0"
-            VALUE "ProductName", "Paseo Sessions\0"
+            VALUE "ProductName", "Passession\0"
             VALUE "ProductVersion", PASEO_STRINGIFY(PASEO_VERSION) "\0"
         END
     END

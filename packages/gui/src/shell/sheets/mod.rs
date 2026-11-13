@@ -284,8 +284,9 @@ pub trait Sheet {
         SheetStyle::Adaptive
     }
 
-    /// Draggable sheets: the height of a footer pinned below the scrolling body (inside a
-    /// top divider and 24/12/24/12+inset padding), drawn by [`Sheet::draw_footer`].
+    /// The height of a footer pinned below the scrolling body (inside a top divider and
+    /// 24/12/24/12 padding, plus the bottom inset on compact draggable sheets), drawn by
+    /// [`Sheet::draw_footer`] on every non-full-screen presentation except `FadeBottom`.
     fn footer_height(&self) -> f64 {
         0.0
     }

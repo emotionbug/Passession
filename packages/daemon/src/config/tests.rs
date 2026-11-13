@@ -114,6 +114,45 @@ fn plugin_opt_out_survives_config_updates_and_reload() {
 }
 
 #[test]
+fn retired_kiro_plugin_registration_preserves_profiles_and_private_state() {
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join("plugin-settings/omp-kiro/state.json");
+    let auth = home.path().join("managed-auth.sqlite3");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, b"retained-plugin-settings").unwrap();
+    std::fs::write(&auth, b"retained-managed-login").unwrap();
+    let original = json!({
+        "pluginsEnabled":false,
+        "plugins":{
+            "omp-kiro":{"source":"directory","path":"/old/omp-kiro","enabled":true},
+            "other":{"source":"directory","path":"/other","enabled":false}
+        },
+        "agents":{"providers":{"kiro-omp-http":{
+            "extends":"omp","label":"Kiro HTTP (OMP)","enabled":true,
+            "env":{"OMP_KIRO_AUTH_FILE":auth}
+        }}}
+    });
+    std::fs::write(home.path().join("config.json"), original.to_string()).unwrap();
+    let loaded = storage::read(home.path(), false, false).unwrap();
+    assert!(loaded["plugins"].get("omp-kiro").is_none());
+    assert_eq!(loaded["plugins"]["other"], original["plugins"]["other"]);
+    assert_eq!(loaded["agents"], original["agents"]);
+    assert_eq!(loaded["pluginsEnabled"], false);
+    let patch = transactions::supported_patch(
+        json!({"plugins":original["plugins"],"pluginsEnabled":false}), false,
+    )
+    .unwrap();
+    let next = transactions::persist_patch(&loaded, &patch, &[]).unwrap();
+    storage::save(home.path(), &next).unwrap();
+    let saved = storage::read(home.path(), false, false).unwrap();
+    assert!(saved["plugins"].get("omp-kiro").is_none());
+    assert_eq!(saved["plugins"]["other"], original["plugins"]["other"]);
+    assert_eq!(saved["agents"], original["agents"]);
+    assert_eq!(std::fs::read(settings).unwrap(), b"retained-plugin-settings");
+    assert_eq!(std::fs::read(auth).unwrap(), b"retained-managed-login");
+}
+
+#[test]
 fn reload_diff_distinguishes_missing_and_explicit_null() {
     let mut paths = Vec::new();
     transactions::diff(

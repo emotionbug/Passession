@@ -63,6 +63,7 @@ pub enum HostPurpose {
 #[derive(Clone, Debug)]
 pub enum ShellOverlay {
     TabMenu { target: PanelTarget, pane_id: String, explorer: bool },
+    TabOverflow { pane_id: String },
     WorkspaceTabMenu { tab: PanelTarget, workspace: PanelTarget },
     HostMenu { host_id: String, order: Vec<String> },
     ProjectMenu { host_id: String, project: Value, order: Vec<String> },
@@ -126,6 +127,9 @@ fn open_shell_overlay(shell: &mut PaseoShell, cx: &mut Cx, kind: OverlayKind, ov
     let id = overlay_api::next_id();
     shell.data.menus.insert(id, overlay);
     let request = OverlayRequest { id, owner: SHELL_OWNER.to_string(), window: shell.data.window_id.clone(), kind };
+    // The overlay takes the pointer, so the chrome never sees it leave the button that opened
+    // it; drop that hover now instead of leaving the button highlighted after the overlay closes.
+    shell.data.pointer.hover = None;
     shell.open_overlay(cx, request);
     id
 }
@@ -882,6 +886,11 @@ pub fn show_page(shell: &mut PaseoShell, cx: &mut Cx, page: Page) {
     }
     shell.data.page_serial = shell.data.layout.navigation_serial;
     shell.data.page = Some(page);
+    // A page takes the whole compact screen; the transient Explorer slide-over closes rather
+    // than staying drawn above it without input.
+    if shell.data.compact && shell.data.layout.compact_destination == CompactDestination::Explorer {
+        shell.data.layout.show_compact_explorer(false);
+    }
     shell.redraw(cx);
 }
 
@@ -948,11 +957,17 @@ pub fn execute(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, action: 
         "workspace.tab.menu.open" | "workspace.tab.target.agent" => new_session(shell, cx, ui, false, false),
         "workspace.terminal.new" => new_terminal(shell, cx, ui, TabPlacement::Main),
         "workspace.tab.target.changes" => open_workspace_panel(shell, cx, ui, "changes_tree", true),
+        "workspace.tab.target.gitLog" => open_workspace_panel(shell, cx, ui, "git_log", false),
         "workspace.tab.target.files" => open_workspace_panel(shell, cx, ui, "files", true),
         // Closing a view must not change the session's lifecycle.
         "workspace.tab.close.current" => {
             if let Some(target) = target {
                 close_tabs(shell, cx, ui, vec![target.key()], true, AfterClose::Nothing);
+            }
+        }
+        "workspace.tab.reload-current" => {
+            if let Some(target) = target.filter(|t| t.kind == "agent") {
+                reload_agent(shell, cx, ui, &target);
             }
         }
         "workspace.tab.close-left" | "workspace.tab.close-right" | "workspace.tab.close-others" => {
@@ -1010,7 +1025,7 @@ pub fn execute(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, action: 
             } else {
                 !shell.data.layout.sidebar_visible
             };
-            shell.data.layout.show_sidebar(show);
+            shell.data.layout.show_sidebar(compact, show);
             if compact && show && shell.data.page.is_some() {
                 close_page(shell, cx);
             }
@@ -1027,8 +1042,8 @@ pub fn execute(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, action: 
         }
         "sidebar.toggle.both" => {
             let layout = &shell.data.layout;
-            let show = !layout.sidebar_visible || !layout.explorer_visible;
-            shell.data.layout.show_sidebar(show);
+            let show = if compact { layout.compact_destination != CompactDestination::Sidebar } else { !layout.sidebar_visible || !layout.explorer_visible };
+            shell.data.layout.show_sidebar(compact, show);
             if !compact {
                 shell.data.layout.show_explorer(show);
             }
@@ -1225,6 +1240,9 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
             open_tab(shell, cx, ui, target, TabPlacement::Main);
         }
         UiEffect::ReplaceTab { tab_key, target } => {
+            if shell.data.layout.target(&tab_key).is_none() {
+                return;
+            }
             if let Some(panel) = shell.data.panels.remove(&tab_key) {
                 panels::release(cx, ui, &panel);
             }
@@ -1513,7 +1531,10 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str, 
         "banner:settings" => open_settings(shell, cx, None, ""),
         "hdr:sidebar" => {
             let visible = shell.data.layout.sidebar_visible;
-            shell.data.layout.show_sidebar(if compact { true } else { !visible });
+            shell.data.layout.show_sidebar(compact, if compact { true } else { !visible });
+        }
+        "hdr:back" => {
+            back(shell, cx, ui);
         }
         "hdr:import" => {
             if let Some(target) = selected(shell) {
@@ -1567,7 +1588,7 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str, 
             let host = selected(shell).map(|t| t.server_id).or_else(|| hosts::hosts(&state).first().map(|h| h.server_id().to_string())).unwrap_or_default();
             show_page(shell, cx, Page::Schedules { host_id: host });
         }
-        "nav:close" => shell.data.layout.show_sidebar(false),
+        "nav:close" => shell.data.layout.show_sidebar(compact, false),
         "side:display" => display_menu(shell, cx, ui, anchor_of(shell, id)),
         "side:addhost" => host_dialog::open_flow(shell, cx, None, None, None),
         "foot:addproject" => choose_host(shell, cx, ui, HostPurpose::AddProject),
@@ -1598,6 +1619,8 @@ fn click_prefixed(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, state
         {
             tab_menu(shell, cx, target, pane, anchor_of(shell, id), pane == "explorer", false);
         }
+    } else if let Some(pane) = id.strip_prefix("taboverflow:") {
+        tab_overflow_menu(shell, cx, state, pane, anchor_of(shell, id));
     } else if let Some(rest) = id.strip_prefix("tabclose:") {
         if let Some((_, key)) = rest.split_once(':') {
             close_tabs(shell, cx, ui, vec![key.to_string()], true, AfterClose::Nothing);
@@ -1627,14 +1650,14 @@ fn click_prefixed(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, state
         if let Some((sid, agent)) = find_session(state, rest) {
             open_navigation_agent(shell, cx, ui, &sid, &agent, None);
             if shell.data.compact {
-                shell.data.layout.show_sidebar(false);
+                shell.data.layout.show_sidebar(true, false);
             }
         }
     } else if let Some(rest) = id.strip_prefix("sideterm:") {
         if let Some(row) = sidebar::find_terminal(&shell.data.sidebar.terminals, state, rest) {
             open_tab(shell, cx, ui, row.target(), TabPlacement::Main);
             if shell.data.compact {
-                shell.data.layout.show_sidebar(false);
+                shell.data.layout.show_sidebar(true, false);
             }
         }
     } else if let Some(rest) = id.strip_prefix("sessionedit:")
@@ -1717,7 +1740,7 @@ fn tab_menu(shell: &mut PaseoShell, cx: &mut Cx, target: PanelTarget, pane_id: &
     if !conversation.is_empty() {
         entries.push(MenuEntry::Separator);
         for (value, label) in &conversation {
-            entries.push(MenuItem::new(format!("conversation:{value}"), label.clone()).entry());
+            entries.push(MenuItem::new(format!("conversation:{value}"), label.clone()).icon(conversation_icon(value)).entry());
         }
     }
     entries.push(MenuEntry::Separator);
@@ -1750,6 +1773,17 @@ fn tab_menu(shell: &mut PaseoShell, cx: &mut Cx, target: PanelTarget, pane_id: &
     let title = chrome::kind_label(&target);
     let options = MenuOptions { align_end: !from_pointer, ..MenuOptions::default() };
     menu(shell, cx, anchor, Some(title), entries, options, ShellOverlay::TabMenu { target, pane_id: pane_id.to_string(), explorer });
+}
+
+/// Tabs a narrow strip could not show, listed in strip order.
+fn tab_overflow_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, pane_id: &str, anchor: Rect) {
+    let Some((_, hidden)) = shell.data.chrome.tab_overflow.iter().find(|(pane, _)| pane == pane_id).cloned() else { return };
+    let entries = hidden
+        .iter()
+        .filter_map(|key| shell.data.layout.target(key).map(|target| item(key, chrome::title(state, target), crate::common::icons::for_tab_kind(&target.kind))))
+        .collect();
+    let options = MenuOptions { align_end: true, ..MenuOptions::default() };
+    menu(shell, cx, anchor, Some(tr("workspace.tabs.overflowTitle")), entries, options, ShellOverlay::TabOverflow { pane_id: pane_id.to_string() });
 }
 
 fn tab_menu_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, target: PanelTarget, pane_id: &str, explorer: bool, value: &str) {
@@ -1829,6 +1863,24 @@ fn copy_resume_command(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, targ
         return toast(shell, cx, tr("workspace.tabs.toasts.resumeCommandUnavailable"), true);
     };
     copy(shell, cx, &template.replace("{sessionId}", &session), "workspace.tabs.toasts.resumeCommandCopiedLabel");
+}
+
+/// Icons for the chat panel's conversation actions wherever a menu lists them.
+fn conversation_icon(action: &str) -> &'static str {
+    match action {
+        "find" => "search",
+        "outline" => "list-tree",
+        "tools" => "chevrons-up-down",
+        "sync" => "refresh-cw",
+        "rename" => "pencil",
+        "fork" => "split",
+        "refresh" => "rotate-cw",
+        "usage" => "chart-column",
+        "detach" => "unlink",
+        "archive" => "archive",
+        "delete" => "trash-2",
+        _ => "",
+    }
 }
 
 /// `_reloadAgent`.
@@ -1978,7 +2030,8 @@ fn new_terminal(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, placement: 
     request(shell, ui, &target.server_id, message, "create_terminal_response", pending);
 }
 
-/// `WorkspaceHeaderMenu` (copy path/branch, import session, show setup; compact scripts first).
+/// `WorkspaceHeaderMenu` (copy path/branch, import session, show setup; compact scripts first),
+/// led by the selected session's actions so the header `⋯` reaches them on every layout.
 fn header_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, anchor: Rect) {
     let target = selected(shell);
     let workspace = target.as_ref().and_then(|t| workspace_value(state, &t.server_id, &t.workspace_id));
@@ -1988,13 +2041,35 @@ fn header_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, anchor: Rect)
         .unwrap_or_else(|| target.as_ref().map(|t| t.cwd.clone()).unwrap_or_default());
     let branch = workspace.as_ref().map(|w| j::text(j::object(w, "gitRuntime"), "currentBranch").trim().to_string()).unwrap_or_default();
     let has_branch = !branch.is_empty() && branch != "HEAD";
+    let is_git = workspace.as_ref().is_some_and(|w| !j::is_null_or_missing(w, "gitRuntime") || j::text(w, "projectKind") == "git");
     let show_setup = workspace.as_ref().is_some_and(|w| {
         !j::is_null_or_missing(w, "setupStatus")
             || !target.as_ref().and_then(|t| hosts::host(state, &t.server_id)).is_some_and(|h| h.supports("workspaceSetupObservation"))
     });
     let mut entries = Vec::new();
+    let session_title = target.as_ref().filter(|t| t.kind == "agent").map(|agent| chrome::title(state, agent));
+    if let Some(agent) = target.as_ref().filter(|t| t.kind == "agent") {
+        // Compact sheets show the menu title; desktop popovers have none, so the section is labelled.
+        if !shell.data.compact {
+            entries.push(MenuEntry::Label(session_title.clone().unwrap_or_default()));
+        }
+        let conversation = if shell.data.panels.contains_key(&agent.key()) { panels::conversation_actions(agent) } else { Vec::new() };
+        if conversation.is_empty() {
+            entries.push(item("rename", tr("workspace.tabs.menu.renameAgent"), "pencil"));
+            entries.push(item("reload", tr("workspace.tabs.menu.reloadAgent"), "rotate-cw"));
+        } else {
+            for (value, label) in &conversation {
+                entries.push(MenuItem::new(format!("conversation:{value}"), label.clone()).icon(conversation_icon(value)).entry());
+            }
+        }
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::Label(tr("workspace.header.actions.workspaceActions")));
+    }
     if shell.data.compact && workspace.as_ref().is_some_and(|w| !j::array(w, "scripts").is_empty()) {
         entries.push(item("scripts", tr("workspace.scripts.title"), "play"));
+    }
+    if is_git {
+        entries.push(item("gitLog", tr("workspace.git.log.open"), "git-graph"));
     }
     entries.push(MenuItem::new("copyPath", tr("workspace.header.actions.copyPath")).icon("copy").enabled(!directory.is_empty()).entry());
     if has_branch {
@@ -2005,7 +2080,8 @@ fn header_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, anchor: Rect)
         entries.push(MenuEntry::Separator);
         entries.push(item("setup", tr("workspace.header.actions.showSetup"), "settings"));
     }
-    menu(shell, cx, anchor, Some(tr("workspace.header.actions.workspaceActions")), entries, MenuOptions::default(), ShellOverlay::HeaderMenu { target });
+    let title = Some(session_title.unwrap_or_else(|| tr("workspace.header.actions.workspaceActions")));
+    menu(shell, cx, anchor, title, entries, MenuOptions::default(), ShellOverlay::HeaderMenu { target });
 }
 
 fn header_menu_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, target: Option<PanelTarget>, value: &str) {
@@ -2015,7 +2091,23 @@ fn header_menu_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, t
         .as_ref()
         .map(|w| j::text_or(w, "workspaceDirectory", target.as_ref().map_or("", |t| t.cwd.as_str())).to_string())
         .unwrap_or_else(|| target.as_ref().map(|t| t.cwd.clone()).unwrap_or_default());
+    if let (Some(action), Some(target)) = (value.strip_prefix("conversation:"), target.as_ref()) {
+        if let Some(panel) = shell.data.panels.get(&target.key()) {
+            panels::run_conversation_action(cx, panel, action);
+        }
+        return;
+    }
     match value {
+        "rename" => {
+            if let Some(target) = target {
+                rename_tab(shell, cx, ui, target);
+            }
+        }
+        "reload" => {
+            if let Some(target) = target {
+                reload_agent(shell, cx, ui, &target);
+            }
+        }
         "copyPath" => copy(shell, cx, &directory, "workspace.header.toasts.workspacePathCopiedLabel"),
         "copyBranch" => {
             let branch = workspace.as_ref().map(|w| j::text(j::object(w, "gitRuntime"), "currentBranch").trim().to_string()).unwrap_or_default();
@@ -2024,6 +2116,12 @@ fn header_menu_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, t
         "import" => {
             if let Some(target) = target {
                 shell.data.overlays.open_sheet(Box::new(history::ImportSheet::new(&target.server_id, &directory)));
+            }
+        }
+        "gitLog" => {
+            if let Some(target) = target {
+                let next = PanelTarget::new("git_log", &target.server_id, &target.workspace_id, &directory);
+                open_tab(shell, cx, ui, next, TabPlacement::Main);
             }
         }
         "setup" | "scripts" => {
@@ -2373,15 +2471,18 @@ fn project_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
 
 fn session_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, host_id: &str, agent: Value, anchor: Rect) {
     let pinned = workspace_value(state, host_id, j::text(&agent, "workspaceId")).is_some_and(|w| !j::is_null_or_missing(&w, "pinnedAt"));
-    let entries = vec![
-        MenuItem::new("rename", tr("workspace.tabs.menu.renameAgent")).entry(),
+    let mut entries = vec![MenuItem::new("rename", tr("workspace.tabs.menu.renameAgent")).entry()];
+    if j::is_null_or_missing(&agent, "archivedAt") {
+        entries.push(MenuItem::new("reload", tr("workspace.tabs.menu.reloadAgent")).entry());
+    }
+    entries.extend([
         MenuItem::new("archive", tr("agentList.archiveSheet.archive")).entry(),
         MenuItem::new("labels", tr("workspaceLabels.manage.open")).entry(),
         MenuItem::new("pin", tr(if pinned { "sidebar.workspace.actions.unpin" } else { "sidebar.workspace.actions.pin" })).entry(),
         MenuItem::new("unread", tr("sidebar.workspace.actions.markUnread")).entry(),
         MenuItem::new("recover", tr("sidebar.workspace.actions.recover")).entry(),
         MenuItem::new("archiveWorkspace", tr("workspace.git.actions.archive.label")).entry(),
-    ];
+    ]);
     menu(shell, cx, anchor, None, entries, MenuOptions::default(), ShellOverlay::SessionMenu { host_id: host_id.to_string(), agent });
 }
 
@@ -2427,6 +2528,7 @@ fn session_action(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, host_
             refresh,
         ),
         "rename" => prompt(shell, cx, "Rename session", &title, ShellOverlay::RenameSession { host_id: host_id.to_string(), agent_id }),
+        "reload" => reload_agent(shell, cx, ui, &navigation_agent_target(host_id, agent, None)),
         "archive" => confirm(shell, cx, "Archive session?", &title, "Archive", false, ShellOverlay::ArchiveSession { host_id: host_id.to_string(), agent_id }),
         _ => {}
     }
@@ -2642,6 +2744,16 @@ pub fn shell_overlay_result(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiCont
             _ => {}
         },
         ShellOverlay::TabMenu { target, pane_id, explorer } => tab_menu_result(shell, cx, ui, target, &pane_id, explorer, &value),
+        ShellOverlay::TabOverflow { pane_id } => {
+            if pane_id == "explorer" {
+                shell.data.layout.select_explorer_tab(&value);
+            } else {
+                shell.data.layout.select_tab(&value);
+                if let Some(target) = shell.data.layout.target(&value).cloned() {
+                    mark_child_tab_open(shell, ui, &target);
+                }
+            }
+        }
         ShellOverlay::WorkspaceTabMenu { tab, workspace } => workspace_tab_menu_result(shell, cx, ui, tab, workspace, &value),
         ShellOverlay::HostMenu { host_id, order } => host_action(shell, cx, ui, &host_id, &value, &order),
         ShellOverlay::ProjectMenu { host_id, project, order } => project_action(shell, cx, ui, &host_id, &project, &value, &order),
@@ -3007,6 +3119,8 @@ pub fn handle_window_events(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, 
     }
     // Hosts removed elsewhere drop their history page scope; the page tracks reconnects.
     history::tick(shell, cx, event, ui);
+    let state = ui.state.clone();
+    sheets::welcome::handle_event(shell, cx, event, &state);
 }
 
 fn geometry_key(shell: &PaseoShell) -> String {

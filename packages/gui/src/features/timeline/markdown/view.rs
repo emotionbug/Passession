@@ -1010,7 +1010,8 @@ fn code_block(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, lang: &str, text: 
     paint_find(cx, d, &laid, origin, found);
     d.kit.draw_rich(cx, origin, &laid);
     d.canvas.add_run(laid, origin, Some('\n'));
-    let visible = d.look.compact || d.state.hovered;
+    // Touch layouts cannot hover to reveal it.
+    let visible = d.look.compact || d.look.mobile || d.state.hovered;
     let copy = rect_xywh(x + w - 30.0, y + 8.0, 22.0, 22.0);
     if visible {
         let hovered = d.state.hover_hit.as_deref() == Some(key.as_str());

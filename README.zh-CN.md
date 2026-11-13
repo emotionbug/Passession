@@ -1,8 +1,8 @@
-# Paseo Sessions
+# Passession
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-Paseo Sessions 是运行和审阅编程智能体工作的原生环境。原生 Rust（Makepad）客户端面向 **Linux、macOS、Windows、Android 和 iOS**；守护进程与 `paseo` CLI 同样使用 Rust。桌面客户端可以管理本地守护进程，移动客户端仅连接其他机器上的守护进程。
+Passession 是运行和审阅编程智能体工作的原生环境。原生 Rust（Makepad）客户端面向 **Linux、macOS、Windows、Android 和 iOS**；守护进程与 `paseo` CLI 同样使用 Rust。桌面客户端可以管理本地守护进程，移动客户端仅连接其他机器上的守护进程。
 
 当前检出版本为 **0.13.6**。请使用[本仓库的发布产物](https://github.com/emotionbug/Passession/releases)；上游下载不是本仓库的构建。自行构建或分发时，请阅读[发布要求](docs/release.md)。
 
@@ -52,7 +52,7 @@ cargo xtask build-gui android --arch arm64
 cargo xtask build-gui ios
 ```
 
-桌面构建须在对应操作系统上执行，iOS 需要 macOS/Xcode。产物和构建描述写入 `artifacts/native/`。Android/iOS 不含守护进程；Android 名称为 **Paseo Sessions**，包名 `sh.paseo.sessions`。调试签名 APK 或未签名 iOS 应用归档不等于可上架版本，参见 [Android](docs/android.md) 与[发布指南](docs/release.md)。
+桌面构建须在对应操作系统上执行，iOS 需要 macOS/Xcode。产物和构建描述写入 `artifacts/native/`。Android/iOS 不含守护进程；Android 名称为 **Passession**，包名 `sh.paseo.sessions`。调试签名 APK 或未签名 iOS 应用归档不等于可上架版本，参见 [Android](docs/android.md) 与[发布指南](docs/release.md)。
 
 无头主机可使用生成的 `target/debug/paseo`（Windows 为 `paseo.exe`）；设置 `CARGO_TARGET_DIR` 时使用对应目录。必须保留相邻生成的运行时资源：
 

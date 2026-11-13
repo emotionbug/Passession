@@ -127,7 +127,7 @@ const REMOVED_KINDS: [&str; 2] = ["browser", "plugin"];
 /// Tabs shown on top of the tab they were opened from (the original's compact-sheet and child
 /// targets): compact Back closes them, and closing one returns to its opener.
 pub fn is_detail_kind(kind: &str) -> bool {
-    matches!(kind, "file" | "working_diff" | "commit_diff" | "provider_subagent" | "pull_request" | "execution_log" | "project_settings")
+    matches!(kind, "file" | "working_diff" | "commit_diff" | "provider_subagent" | "pull_request" | "execution_log" | "project_settings" | "git_log")
 }
 
 #[derive(Clone, Debug)]
@@ -347,8 +347,12 @@ impl Layout {
         self.changed();
     }
 
-    pub fn show_sidebar(&mut self, visible: bool) {
-        self.sidebar_visible = visible;
+    /// Compact taps only move between destinations; the wide sidebar's persisted visibility
+    /// changes only from the wide layout, so widening a phone-sized window keeps it.
+    pub fn show_sidebar(&mut self, compact: bool, visible: bool) {
+        if !compact {
+            self.sidebar_visible = visible;
+        }
         self.compact_destination = if visible { CompactDestination::Sidebar } else { CompactDestination::Agent };
         self.changed();
     }
@@ -545,6 +549,11 @@ impl Layout {
     /// `UiEffect::ReplaceTab`: `target` takes `key`'s position (pane slot or explorer slot)
     /// and selection; the old tab leaves the layout.
     pub fn replace_tab(&mut self, key: &str, target: PanelTarget) {
+        // A late completion for a closed/replaced owner must not remove its destination
+        // from another slot or insert an unplaced tab.
+        if self.target(key).is_none() {
+            return;
+        }
         let next = target.key();
         if next == key {
             self.upsert(target);
@@ -974,6 +983,20 @@ mod tests {
     }
 
     #[test]
+    fn compact_sidebar_navigation_keeps_the_wide_sidebar_choice() {
+        let mut layout = sessions();
+        layout.show_sidebar(true, true);
+        assert_eq!(layout.compact_destination, CompactDestination::Sidebar);
+        layout.show_sidebar(true, false);
+        assert_eq!(layout.compact_destination, CompactDestination::Agent);
+        assert!(layout.sidebar_visible);
+        assert_ne!(layout.to_json()["sidebarVisible"], json!(false));
+
+        layout.show_sidebar(false, false);
+        assert!(!layout.sidebar_visible);
+    }
+
+    #[test]
     fn compact_back_unwinds_files_that_link_to_each_other_down_to_the_session() {
         let mut layout = sessions();
         let (readme, guide) = (file("docs/readme.md"), file("docs/guide.md"));
@@ -1088,6 +1111,42 @@ mod tests {
         let key = PanelTarget::agent("srv2", "ws", "/w", "a", "").key();
         assert_eq!(layout.focused().selected, Some(key.clone()));
         assert!(layout.target(&key).is_some());
+    }
+
+    #[test]
+    fn creation_completion_replacement_ignores_late_or_closed_owner_without_unplacing_destination() {
+        let mut layout = sessions();
+        let creation = PanelTarget::new("new_tab", "srv", "ws", "/w").with_id("creation");
+        let owner = creation.key();
+        layout.open(creation, true);
+        let pane_id = layout.focused_pane.clone();
+        let destination = agent("created");
+        layout.replace_tab(&owner, destination.clone());
+        assert!(layout.target(&owner).is_none());
+        assert_eq!(layout.tree.pane(&pane_id).unwrap().tabs, vec![destination.key()]);
+        assert_eq!(layout.tree.pane(&pane_id).unwrap().selected, Some(destination.key()));
+        let serial = layout.navigation_serial;
+        let before = layout.to_json();
+        layout.replace_tab(&owner, destination);
+        layout.replace_tab(&owner, agent("must-not-open"));
+        assert_eq!(layout.to_json(), before);
+        assert_eq!(layout.navigation_serial, serial);
+    }
+
+    #[test]
+    fn creation_completion_replacement_preserves_explorer_slot_and_focused_session() {
+        let mut layout = sessions();
+        let creation = PanelTarget::new("new_tab", "srv", "ws", "/w").with_id("creation");
+        let owner = creation.key();
+        layout.open_explorer(creation, true);
+        let destination = PanelTarget::new("terminal", "srv", "ws", "/w").with_id("created");
+        layout.replace_tab(&owner, destination.clone());
+        assert_eq!(layout.explorer_tabs, vec![destination.key()]);
+        assert_eq!(layout.selected_explorer, Some(destination.key()));
+        assert_eq!(layout.compact_destination, CompactDestination::Explorer);
+        assert_eq!(shown(&layout), Some(agent("a").key()));
+        assert_eq!(layout.explorer_focus_for(&agent("a")), Some(destination.key()));
+        assert!(layout.target(&owner).is_none());
     }
 
     #[test]

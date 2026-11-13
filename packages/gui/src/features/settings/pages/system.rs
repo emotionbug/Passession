@@ -286,7 +286,7 @@ pub fn draw_notifications(ui: &mut Ui, s: &Settings) {
             s.notifications.test_error = None;
             let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
             let id = (millis & 0x7fff_ffff) as i32;
-            let token = env.bridge.notify(id, "Paseo".into(), t("settings.notifications.testHint"));
+            let token = env.bridge.notify(id, "Passession".into(), t("settings.notifications.testHint"));
             s.bridge_job(token, |s, _, result| {
                 s.notifications.busy = false;
                 match result {

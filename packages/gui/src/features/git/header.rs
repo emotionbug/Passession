@@ -16,7 +16,7 @@ use super::text::{t, tr};
 use crate::common::icons::forge_brand_svg;
 use crate::common::overlay::tooltip_at;
 use crate::common::provider_icon::icon_path;
-use crate::common::{UiContext, UiEffect, is_compact_layout};
+use crate::common::{PanelTarget, TabPlacement, UiContext, UiEffect, is_compact_layout};
 use makepad_widgets::*;
 use paseo_gui_platform::{PlatformAction, PlatformValue, platform};
 use serde_json::{Value, json};
@@ -26,6 +26,9 @@ enum Part {
     Primary,
     Caret,
 }
+
+/// The Git actions menu entry that opens the Git Log tab (not a checkout action).
+const GIT_LOG_ITEM: &str = "git-log";
 
 #[derive(Debug)]
 enum ActionsPurpose {
@@ -123,6 +126,10 @@ impl Widget for GitActionsButton {
         if let Some(result) = self.overlay.poll() {
             let checkout = self.checkout.clone();
             match result {
+                OverlayResult::Chose(ActionsPurpose::Menu, id) if id == GIT_LOG_ITEM => {
+                    let target = PanelTarget::new("git_log", &checkout.host, &checkout.workspace_id, &checkout.cwd);
+                    ui.push(UiEffect::OpenTab { target, placement: TabPlacement::Main });
+                }
                 OverlayResult::Chose(ActionsPurpose::Menu, id) => {
                     let confirm = with_store(|store| {
                         let actions = checkout.build(ui, store);
@@ -179,7 +186,12 @@ impl Widget for GitActionsButton {
                     Some(Part::Caret) => {
                         let entries = with_store(|store| {
                             let actions = checkout.build(ui, store);
-                            menu_entries(&checkout, store, &actions.secondary)
+                            let mut entries = menu_entries(&checkout, store, &actions.secondary);
+                            if !entries.is_empty() {
+                                entries.push(MenuEntry::Separator);
+                            }
+                            entries.push(MenuEntry::Item(MenuItem::new(GIT_LOG_ITEM, t("workspace.git.log.open")).icon("git-graph")));
+                            entries
                         });
                         self.overlay.open(Overlay {
                             purpose: ActionsPurpose::Menu,
@@ -207,10 +219,11 @@ impl Widget for GitActionsButton {
         };
         self.ensure_bound(cx, ui);
         let checkout = self.checkout.clone();
+        // The caret menu always has at least the Git Log entry.
         let built = with_store(|store| {
             let actions = checkout.build(ui, store);
             let primary = actions.primary.clone()?;
-            Some((checkout.label(store, &primary), primary, !actions.secondary.is_empty()))
+            Some((checkout.label(store, &primary), primary, true))
         });
         // Nothing outside a git checkout or without a primary action.
         let Some((label, primary, has_secondary)) = built else {

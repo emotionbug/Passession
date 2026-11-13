@@ -93,11 +93,13 @@ impl MacosWindow {
             };
             let ns_size = NSSize {width: size.x as f64, height: size.y as f64};
             let window_frame = NSRect {origin: left_top, size: ns_size};
+            // Paseo: a standard titled window; the content view starts below the native title
+            // bar. Upstream extended the content under a transparent, untitled bar, so the
+            // traffic lights covered the app's own header.
             let window_masks = NSWindowStyleMask::NSClosableWindowMask as u64
                 | NSWindowStyleMask::NSMiniaturizableWindowMask as u64
                 | NSWindowStyleMask::NSResizableWindowMask as u64
-                | NSWindowStyleMask::NSTitledWindowMask as u64
-                | NSWindowStyleMask::NSFullSizeContentViewWindowMask as u64;
+                | NSWindowStyleMask::NSTitledWindowMask as u64;
             
             let () = msg_send![
                 self.window,
@@ -112,8 +114,6 @@ impl MacosWindow {
             let title = str_to_nsstring(title);
             let () = msg_send![self.window, setReleasedWhenClosed: NO];
             let () = msg_send![self.window, setTitle: title];
-            let () = msg_send![self.window, setTitleVisibility: NSWindowTitleVisibility::NSWindowTitleHidden];
-            let () = msg_send![self.window, setTitlebarAppearsTransparent: YES];
             
             //let subviews:id = msg_send![self.window, getSubviews];
             //println!("{}", subviews as u64);

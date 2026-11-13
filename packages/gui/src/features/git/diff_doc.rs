@@ -1095,9 +1095,17 @@ impl DiffDoc {
                 }
             }
         }
-        if !header {
-            let button = rect(cell.pos.x + cell.size.x - 4.0 - 24.0, cell.pos.y, 24.0, lh);
+        if !header && piece_clip.size.x > 0.0 {
+            // Anchored to the visible end of the cell: with long unwrapped lines the cell
+            // reaches past the viewport, and the button stays on screen with the line.
+            let right = (piece_clip.pos.x + piece_clip.size.x).min(cell.pos.x + cell.size.x);
+            let button = rect((right - 4.0 - 24.0).max(cell.pos.x + gutter + 1.0), cell.pos.y, 24.0, lh);
             let hit = DocHit::LineMenu { path: path.to_owned(), line: index };
+            if !input.wrap {
+                // Unwrapped code runs under the button; mask it.
+                paint.fill(cx, button, colors.surface0);
+                paint.fill(cx, button, background);
+            }
             if self.hovered.as_ref() == Some(&hit) {
                 paint.rounded(cx, button, colors.surface2, 4.0, None);
             }

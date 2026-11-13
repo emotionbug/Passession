@@ -1,6 +1,6 @@
 [package]
 name = "paseo-gui"
-description = "Paseo Sessions native client (Makepad)"
+description = "Passession native client (Makepad)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

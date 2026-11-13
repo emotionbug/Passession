@@ -11,10 +11,12 @@ use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 mod history;
+mod log;
 mod parse;
 #[cfg(test)]
 mod tests;
 pub use history::list_commits;
+pub use log::{InvalidRevision, LogQuery, commit, log, refs};
 
 const FILE_LIMIT: usize = 1024 * 1024;
 const TOTAL_LIMIT: usize = 2 * FILE_LIMIT;

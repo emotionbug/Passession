@@ -1,4 +1,4 @@
-//! Desktop and mobile OS integration for the native Paseo Sessions client.
+//! Desktop and mobile OS integration for the native Passession client.
 //!
 //! See `platform-api.md` in the migration state directory for the contract.
 //! Android and iOS are remote-only: no daemon, desktop-host, tray or updater

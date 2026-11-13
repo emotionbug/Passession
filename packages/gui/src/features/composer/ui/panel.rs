@@ -113,6 +113,8 @@ pub enum OItem {
     Forge(usize),
     FullscreenSend,
     UsageRefresh(usize),
+    /// The whole search row of a sheet or the forge picker: focuses the search editor.
+    Search,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +184,12 @@ pub struct PanelState {
     pub viewport_height: Option<f64>,
     /// This frame's input height bound from the slot capacity (layout.rs draw_composer).
     pub input_cap: Option<f64>,
+    /// This frame's attachment tray height bound from the slot capacity; past it the tray scrolls.
+    pub tray_cap: Option<f64>,
+    pub tray_scroll: f64,
+    pub tray_scroll_max: f64,
+    /// The tray viewport: drawing, scrolling and hits share it.
+    pub tray_clip: Rect,
     pub input_focused: bool,
     pub last_cursor: usize,
     pub density: crate::features::composer::controls_model::Density,
@@ -197,6 +205,9 @@ pub struct PanelState {
     pub applied_placeholder: String,
     pub guard: Option<(String, bool)>,
     pub suggest_scroll: f64,
+    /// The selection and options the suggestions list last revealed; it re-reveals only
+    /// when either changes (keyboard navigation, a rebuilt list), so manual scrolls stay.
+    pub suggest_revealed: Option<(Option<usize>, Vec<crate::features::composer::autocomplete::AutocompleteOption>)>,
     pub sheet_scroll: f64,
     pub suggest_scroll_max: f64,
     pub sheet_scroll_max: f64,
@@ -973,6 +984,9 @@ impl ComposerPanel {
             } else if self.suggestions_rect().is_some_and(|r| r.contains(scroll.abs)) {
                 self.st.suggest_scroll = (self.st.suggest_scroll - scroll.scroll.y).max(0.0);
                 self.draw_bg.redraw(cx);
+            } else if self.st.tray_clip.contains(scroll.abs) && self.st.tray_scroll_max > 0.0 {
+                self.st.tray_scroll = (self.st.tray_scroll + scroll.scroll.y).clamp(0.0, self.st.tray_scroll_max);
+                self.draw_bg.redraw(cx);
             }
         }
         if self.popup_event(cx, event, ui, path, uid) {
@@ -989,6 +1003,9 @@ impl ComposerPanel {
                 self.draw_bg.redraw(cx);
             } else if self.suggestions_rect().is_some_and(|r| r.contains(origin)) {
                 self.st.touch_scroll.apply_delta(&mut self.st.suggest_scroll, -dy, self.st.suggest_scroll_max);
+                self.draw_bg.redraw(cx);
+            } else if self.st.tray_clip.contains(origin) && self.st.tray_scroll_max > 0.0 {
+                self.st.touch_scroll.apply_delta(&mut self.st.tray_scroll, dy, self.st.tray_scroll_max);
                 self.draw_bg.redraw(cx);
             } else {
                 self.st.touch_scroll.reset();

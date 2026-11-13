@@ -1,6 +1,6 @@
-Paseo is a client for AI coding agents that run on your own machine. Your dev environment, in your pocket.
+Passession is a client for AI coding agents that run on your own machine. Your dev environment, in your pocket.
 
-Paseo runs a local server called the daemon on your computer. It manages your coding agents and streams their output in real time. This app connects to that daemon, so your code never leaves your machine and there is no cloud service in between.
+The Paseo daemon runs on your computer as a local server. It manages your coding agents and streams their output in real time. This app connects to that daemon, so your code never leaves your machine and there is no cloud service in between.
 
 <b>Supported agents</b>
 
@@ -12,7 +12,7 @@ Paseo runs a local server called the daemon on your computer. It manages your co
 <li>Pi</li>
 </ul>
 
-You bring your own provider credentials and use your existing subscriptions. Paseo adds no markup and no inference costs of its own.
+You bring your own provider credentials and use your existing subscriptions. Passession adds no markup and no inference costs of its own.
 
 <b>What you can do</b>
 

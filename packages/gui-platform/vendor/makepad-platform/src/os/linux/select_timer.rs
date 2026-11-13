@@ -78,11 +78,9 @@ impl SelectTimers {
                 break;
             }
             
-            let timer = *self.timers.front().unwrap();
+            let timer = self.timers.pop_front().unwrap();
+            // The fired head's delay is consumed; its successor's delta already counts from it.
             select_time_used -= timer.delta_timeout;
-            
-            // Stop the timer to remove it from the list.
-            self.stop_timer(timer.id);
             // If the timer is repeating, simply start it again.
             if timer.repeats {
                 self.start_timer(timer.id, timer.timeout, timer.repeats);
@@ -142,19 +140,44 @@ impl SelectTimers {
     }
     
     pub fn stop_timer(&mut self, id: u64) {
-        //println!("STOPPING TIMER {:?}", id);
-        
-        // Since we are stopping an existing timer, our first step is to find where in the list this
-        // timer should be removed.
-        let index = if let Some(index) = self.timers.iter().position( | timer | timer.id == id) {
-            index
-        } else {
+        let Some(index) = self.timers.iter().position(|timer| timer.id == id) else {
             return;
         };
-        
-        // Remove the timer from the list. 
-        // The timer being removed is always the first one in the queue, so it can just be removed directly.
-        self.timers.remove(index);
+        // Paseo: upstream assumed only the head is ever stopped and dropped the timer. A
+        // pending timer stopped anywhere else took its delay with it, so every later timer
+        // fired early (a replaced toast vanished at once). Its successor inherits the delay.
+        let removed = self.timers.remove(index).unwrap();
+        if let Some(next) = self.timers.get_mut(index) {
+            next.delta_timeout += removed.delta_timeout;
+        }
     }
     
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `(id, absolute due time in µs)` for every pending timer.
+    fn due(timers: &SelectTimers) -> Vec<(u64, i64)> {
+        let mut at = 0.0;
+        timers.timers.iter().map(|timer| {
+            at += timer.delta_timeout;
+            (timer.id, (at * 1_000_000.0).round() as i64)
+        }).collect()
+    }
+
+    #[test]
+    fn stopping_a_pending_timer_keeps_every_other_deadline() {
+        let mut timers = SelectTimers::new();
+        timers.start_timer(1, 1.0, false);
+        timers.start_timer(2, 2.2, false);
+        timers.start_timer(3, 3.0, false);
+        timers.stop_timer(2);
+        assert_eq!(due(&timers), vec![(1, 1_000_000), (3, 3_000_000)]);
+        timers.stop_timer(1);
+        assert_eq!(due(&timers), vec![(3, 3_000_000)]);
+        timers.start_timer(4, 2.2, false);
+        assert_eq!(due(&timers), vec![(4, 2_200_000), (3, 3_000_000)]);
+    }
 }

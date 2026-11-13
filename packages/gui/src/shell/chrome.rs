@@ -5,11 +5,12 @@
 use std::collections::HashSet;
 
 use makepad_widgets::*;
+use makepad_widgets::event::TouchState;
 use serde_json::Value;
 
 use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::provider_icon::ProviderIcon;
-use crate::common::widgets::{agent_status_bucket, paint_status_badge, StatusBucket};
+use crate::common::widgets::{agent_live_status_bucket, paint_status_badge, StatusBucket};
 use crate::common::{PanelTarget, Route, UiContext, clock, icons, json as j, tr, tr_args};
 use crate::shell::hosts::{self, Host};
 use crate::shell::layout::{Axis, CompactDestination, Node};
@@ -25,6 +26,8 @@ pub struct ChromeState {
     pub pane_rects: Vec<(String, Rect)>,
     pub tab_bars: Vec<(String, Rect)>,
     pub tab_rects: Vec<(String, String, Rect)>,
+    /// Tabs of each pane that did not fit its strip this frame (overflow menu).
+    pub tab_overflow: Vec<(String, Vec<String>)>,
     pub sidebar_rect: Rect,
     pub explorer_rect: Rect,
     pub content_rect: Rect,
@@ -37,6 +40,8 @@ pub struct ChromeState {
     pub explorer_anim_start: Option<(f64, f64, f64)>,
     pub edge_start: Option<DVec2>,
     pub drop_pane: Option<String>,
+    /// A touch that started in a pane: (touch id, pane, start) until it lifts as a tap.
+    pub touch_focus: Option<(u64, String, DVec2)>,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +84,7 @@ pub fn title(state: &Value, target: &PanelTarget) -> String {
         }
         "working_diff" | "commit_diff" => "Diff".to_string(),
         "pull_request" => "Pull request".to_string(),
+        "git_log" => tr("workspace.git.log.title"),
         "execution_log" => "Execution log".to_string(),
         "terminal" => tr("workspace.tabs.fallback.terminal"),
         "setup" => "Workspace setup".to_string(),
@@ -112,6 +118,7 @@ pub fn kind_label(target: &PanelTarget) -> String {
         "working_diff" | "changes_tree" => tr("panels.diff.changesLabel"),
         "files" => tr("panels.files.label"),
         "pull_request" => tr("panels.pullRequest.label"),
+        "git_log" => tr("workspace.git.log.title"),
         "commit_diff" => target.id.as_deref().map(|id| id.chars().take(7).collect()).unwrap_or_default(),
         _ => tr("workspace.tabs.fallback.agent"),
     }
@@ -214,6 +221,7 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
     shell.data.chrome.pane_rects.clear();
     shell.data.chrome.tab_bars.clear();
     shell.data.chrome.tab_rects.clear();
+    shell.data.chrome.tab_overflow.clear();
     shell.data.chrome.sidebar_rect = Rect::default();
     shell.data.sidebar.viewport = Rect::default();
 
@@ -328,13 +336,18 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
     let has_scripts = workspace.as_ref().is_some_and(|w| !j::array(w, "scripts").is_empty());
     let header_git = !compact && target.as_ref().is_some_and(|t| !t.cwd.is_empty());
     let mut right_widgets: Option<Rect> = None;
+    // A compact detail view (file, diff, subagent…) leads with Back to the tab it came from.
+    let detail_back = shell.data.layout.compact_back_tab(compact).is_some();
     {
         let mut ui = make_ui(shell);
         let p = ui.p;
         let extent = if compact { 32.0 } else { 26.0 };
         // Sidebar toggle (MobileMenuIcon on compact, PanelLeft on wide).
-        let toggle = island(&mut ui, cx, dvec2(row.pos.x + extent * 0.5, mid), "hdr:sidebar", &tr("shell.menu.toggleSidebar"), compact);
-        if compact {
+        let (toggle_id, toggle_tip) = if detail_back { ("hdr:back", tr("common.actions.back")) } else { ("hdr:sidebar", tr("shell.menu.toggleSidebar")) };
+        let toggle = island(&mut ui, cx, dvec2(row.pos.x + extent * 0.5, mid), toggle_id, &toggle_tip, compact);
+        if detail_back {
+            ui.icon(cx, toggle, "arrow-left", 18.0, p.muted);
+        } else if compact {
             let x = toggle.pos.x + (extent - 16.0) * 0.5;
             let y0 = toggle.pos.y + (extent - 12.0) * 0.5;
             for (i, w) in [16.0, 16.0, 8.0].iter().enumerate() {
@@ -359,7 +372,9 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
             right = explorer.pos.x;
             if header_git {
                 // Git actions split button + open-in, laid out by their own widgets.
-                let w = 220.0_f64.min((right - x - 120.0).max(0.0));
+                // Up to 300px: Open In plus a long primary label ("Update from <base>") and
+                // its menu caret; the title keeps at least 120px.
+                let w = 300.0_f64.min((right - x - 120.0).max(0.0));
                 if w > 0.0 {
                     let h = theme::control_height(ControlSize::Xs);
                     right_widgets = Some(rect(right - w, mid - h * 0.5, w, h));
@@ -387,7 +402,7 @@ fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: 
             }
             // Title group.
             right -= 8.0;
-            let title_text = target.as_ref().map(|t| header_title(state, t)).unwrap_or_else(|| "Paseo".to_string());
+            let title_text = target.as_ref().map(|t| header_title(state, t)).unwrap_or_else(|| "Passession".to_string());
             let subtitle = compact && host.is_some();
             let w = (right - x).max(0.0);
             if subtitle {
@@ -459,9 +474,22 @@ fn draw_header_git(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, slo
 fn draw_wide(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Value, content: Rect, page_shown: bool) {
     let p = theme::current_palette();
     let layout = &shell.data.layout;
-    let sidebar_w = if layout.sidebar_visible { layout.sidebar_width } else { 0.0 };
     let explorer_visible = layout.explorer_visible && !page_shown;
-    let explorer_w = if explorer_visible { layout.explorer_width.min((content.size.x - sidebar_w - 200.0).max(180.0)) } else { 0.0 };
+    // Saved side-panel widths apply when they fit; otherwise the Explorer gives way down to
+    // 180px, then the sidebar down to 200px, so the conversation keeps a usable width.
+    const MIN_MAIN: f64 = 320.0;
+    let mut sidebar_w = if layout.sidebar_visible { layout.sidebar_width } else { 0.0 };
+    let mut explorer_w = if explorer_visible { layout.explorer_width } else { 0.0 };
+    let dividers = if sidebar_w > 0.0 { 5.0 } else { 0.0 } + if explorer_visible { 5.0 } else { 0.0 };
+    let mut over = sidebar_w + explorer_w + dividers + MIN_MAIN - content.size.x;
+    if over > 0.0 && explorer_visible {
+        let cut = over.min(explorer_w - 180.0).max(0.0);
+        explorer_w -= cut;
+        over -= cut;
+    }
+    if over > 0.0 && sidebar_w > 0.0 {
+        sidebar_w -= over.min(sidebar_w - 200.0).max(0.0);
+    }
     let mut x = content.pos.x;
     if sidebar_w > 0.0 {
         let side = rect(x, content.pos.y, sidebar_w, content.size.y);
@@ -562,7 +590,8 @@ fn draw_pane(
         shell.painter.outline(cx, r, Vec4::default(), p.primary, 1.0, 0.0);
     }
     let Some(key) = selected.map(str::to_string).filter(|_| !keys.is_empty()) else {
-        draw_empty(shell, cx, content);
+        let has_sessions = hosts::hosts(state).iter().any(|host| host.agents().next().is_some());
+        draw_empty(shell, cx, content, has_sessions);
         return;
     };
     draw_root(shell, cx, scope, &key, content);
@@ -620,8 +649,9 @@ fn draw_error(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect, message: &str) {
     shell.painter.paragraph(cx, dvec2(r.pos.x + 16.0, r.pos.y + 16.0), w, spec, message);
 }
 
-/// `_welcome`: EmptyState "Paseo Sessions" + new session button.
-fn draw_empty(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect) {
+/// `_welcome`: EmptyState "Passession" + new session button. With sessions on a host the
+/// message points to them instead of claiming there are none.
+fn draw_empty(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect, has_sessions: bool) {
     let mut ui = make_ui(shell);
     let p = ui.p;
     let title = ui.spec(Font::Medium, 18.0, p.foreground);
@@ -629,8 +659,9 @@ fn draw_empty(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect) {
     let cy = r.pos.y + r.size.y * 0.5;
     let title_h = text_line_height(24.0, 18.0);
     let message_h = text_line_height(20.0, 14.0);
-    ui.text_centered(cx, rect(r.pos.x, cy - 12.0 - message_h - title_h, r.size.x, title_h), title, "Paseo Sessions");
-    ui.text_centered(cx, rect(r.pos.x + 16.0, cy - 8.0 - message_h, r.size.x - 32.0, message_h), message, &tr("sessionNavigation.empty"));
+    ui.text_centered(cx, rect(r.pos.x, cy - 12.0 - message_h - title_h, r.size.x, title_h), title, "Passession");
+    let hint = tr(if has_sessions { "sessionNavigation.pick" } else { "sessionNavigation.empty" });
+    ui.text_centered(cx, rect(r.pos.x + 16.0, cy - 8.0 - message_h, r.size.x - 32.0, message_h), message, &hint);
     let label = tr("sessionNavigation.newSession");
     let w = ui.button_width(cx, &label, Some("plus"), ControlSize::Sm);
     ui.button(cx, rect(r.pos.x + (r.size.x - w) * 0.5, cy + 4.0, w, theme::control_height(ControlSize::Sm)), "empty:new", &label, Some("plus"), Variant::Primary, ControlSize::Sm, true);
@@ -668,34 +699,32 @@ fn draw_tab_strip(
         Some((target.clone(), key.clone(), active, title(state, target), spec, shell.data.dirty.contains(key), 0.0))
     }).collect();
     let mut tab_rects = Vec::new();
+    let mut shell_overflow: Option<Vec<String>> = None;
     {
         let mut ui = make_ui(shell);
         let p = ui.p;
-        let trailing = if explorer { if compact { 40.0 } else { 36.0 } } else { 40.0 };
+        // Reserved trailing slots: the pane's new-session button, or the Explorer's "+" and close.
+        let trailing = if explorer { 72.0 } else { 40.0 };
         let mut x = bar.pos.x;
         let limit = bar.pos.x + bar.size.x - trailing;
-        // Keep the selected tab in the visible strip when a narrow pane cannot
-        // fit every tab (including a portrait-to-landscape transition).
         let available = (limit - bar.pos.x).max(0.0);
         let chrome_w = if pill { 10.0 + 14.0 + 6.0 + 10.0 } else { 10.0 + 15.0 + 7.0 + 2.0 + 28.0 * 2.0 };
+        let gap = if pill { 2.0 } else { 0.0 };
         for (_, _, _, label, spec, modified, width) in &mut tabs {
             let text_w = ui.measure(cx, *spec, label);
             *width = (chrome_w + text_w + if *modified { 12.0 } else { 0.0 }).min(240.0).min(available);
         }
-        let mut first = tabs.iter().position(|tab| tab.2).unwrap_or(0);
-        if let Some(tab) = tabs.get(first) {
-            let mut occupied = tab.6;
-            while first > 0 {
-                let previous = tabs[first - 1].6 + if pill { 4.0 } else { 0.0 };
-                if occupied + previous > available { break; }
-                occupied += previous;
-                first -= 1;
-            }
+        let natural: Vec<f64> = tabs.iter().map(|t| t.6).collect();
+        let active = tabs.iter().position(|tab| tab.2).unwrap_or(0);
+        let fit = fit_tabs(&natural, active, available, gap, (chrome_w + 48.0).min(available), 36.0);
+        for (tab, width) in tabs.iter_mut().zip(&fit.widths) {
+            tab.6 = *width;
         }
-        for (target, key, active, label, label_spec, modified, w) in tabs.into_iter().skip(first) {
-            if x + w > limit && x > bar.pos.x {
-                break;
-            }
+        let overflow_w = 36.0;
+        let (first, end) = (fit.first, fit.end);
+        let hidden: Vec<String> = tabs.iter().enumerate().filter(|(i, _)| *i < first || *i >= end).map(|(_, t)| t.1.clone()).collect();
+        let shown = end.saturating_sub(first);
+        for (target, key, active, label, label_spec, modified, w) in tabs.into_iter().skip(first).take(shown) {
             let chip = if pill { rect(x + 2.0, bar.pos.y + 5.0, w, bar.size.y - 10.0) } else { rect(x, bar.pos.y, w, bar.size.y) };
             let tab_id = format!("tab:{pane_id}:{key}");
             let fade = if dragging.as_deref() == Some(key.as_str()) { 0.5 } else { 1.0 };
@@ -715,7 +744,10 @@ fn draw_tab_strip(
             let icon_rect = rect(cx_x, chip.pos.y + (chip.size.y - icon_size) * 0.5, icon_size, icon_size);
             tab_icon(&mut ui, cx, state, &target, icon_rect, fg);
             cx_x += icon_size + if pill { 6.0 } else { 7.0 };
-            let buttons_w = if pill { 10.0 } else { 2.0 + 56.0 };
+            // Tab menu and close need their 58px plus a little title; a narrower chip keeps
+            // only icon and title (its menu stays on right-click) so no action lands outside it.
+            let actions = !pill && chip.size.x >= 10.0 + 15.0 + 7.0 + 58.0 + 24.0;
+            let buttons_w = if actions { 2.0 + 56.0 } else { 10.0 };
             let dot_w = if modified { 12.0 } else { 0.0 };
             let text_rect = rect(cx_x, chip.pos.y, (chip.pos.x + chip.size.x - buttons_w - dot_w - cx_x).max(0.0), chip.size.y);
             let drawn = ui.text(cx, text_rect, crate::common::paint::TextSpec { color: fg, ..label_spec }, &label);
@@ -724,14 +756,26 @@ fn draw_tab_strip(
                 ui.dot(cx, dvec2(dot_x, chip.pos.y + chip.size.y * 0.5), 8.0, p.muted);
             }
             ui.hit(chip, tab_id);
-            if !pill {
+            if actions {
                 let menu = rect(chip.pos.x + chip.size.x - 58.0, chip.pos.y + (chip.size.y - 28.0) * 0.5, 28.0, 28.0);
                 ui.icon_button(cx, menu, &format!("tabmenu:{pane_id}:{key}"), "ellipsis", 14.0, 14.0, &tr_args("workspace.tabs.menu.openFor", &[("label", &label)]));
                 let close = rect(chip.pos.x + chip.size.x - 30.0, chip.pos.y + (chip.size.y - 28.0) * 0.5, 28.0, 28.0);
                 ui.icon_button(cx, close, &format!("tabclose:{pane_id}:{key}"), "x", 14.0, 14.0, &tr("common.actions.close"));
             }
             tab_rects.push((pane_id.to_string(), key.clone(), chip));
-            x = chip.pos.x + chip.size.x + if pill { 2.0 } else { 0.0 };
+            x = chip.pos.x + chip.size.x + gap;
+        }
+        if !hidden.is_empty() {
+            let id = format!("taboverflow:{pane_id}");
+            let button = rect(x + 4.0, bar.pos.y + (bar.size.y - 28.0) * 0.5, overflow_w - 8.0, 28.0);
+            if ui.is_hover(&id) {
+                ui.fill(cx, button, p.interaction_highlight, 6.0);
+            }
+            let spec = ui.spec(Font::Medium, 12.0, p.muted);
+            ui.text_centered(cx, button, spec, &format!("+{}", hidden.len()));
+            ui.hit_tip(button, &id, &tr_args("workspace.tabs.overflow", &[("count", &hidden.len().to_string())]));
+            x = button.pos.x + button.size.x;
+            shell_overflow = Some(hidden);
         }
         // Trailing controls.
         if explorer {
@@ -750,6 +794,9 @@ fn draw_tab_strip(
         }
     }
     shell.data.chrome.tab_rects.extend(tab_rects);
+    if let Some(hidden) = shell_overflow {
+        shell.data.chrome.tab_overflow.push((pane_id.to_string(), hidden));
+    }
 }
 
 /// `_tabIcon`: agent tabs show the provider glyph with the agent's status badge.
@@ -761,16 +808,7 @@ pub fn tab_icon(ui: &mut Ui, cx: &mut Cx2d, state: &Value, target: &PanelTarget,
         if !provider.is_empty() {
             // Flutter `_tabIcon` passes no host snapshot SVG: built-in, then catalog, then bot.
             ProviderIcon::paint(ui.painter, ui.draw_icon, cx, r, provider, None, color);
-            let running = agent.get("activeTurn").is_some_and(|v| !v.is_null()) || j::text(j::object(agent, "turn"), "phase") == "open";
-            let bucket = if agent.get("status").and_then(Value::as_str).is_some() {
-                let mut row = agent.clone();
-                if running {
-                    row["status"] = Value::from("running");
-                }
-                Some(agent_status_bucket(&row))
-            } else {
-                None
-            };
+            let bucket = agent.get("status").and_then(Value::as_str).is_some().then(|| agent_live_status_bucket(agent));
             let p = ui.p;
             if paint_status_badge(ui.painter, cx, r, bucket.filter(|b| *b != StatusBucket::Done), &p, p.surface0) {
                 let area = ui.painter.draw_box.area();
@@ -910,13 +948,6 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 }
                 return;
             }
-            // Mouse focus follows press; a touch drag must not retarget the pane.
-            shell.data.pointer.down_pos = Some(fe.abs);
-            if !fe.device.is_touch()
-                && let Some((pane, _)) = shell.data.chrome.pane_rects.iter().find(|(id, r)| id != "explorer" && r.contains(fe.abs)).cloned()
-            {
-                shell.data.layout.focus_pane(&pane);
-            }
             if shell.data.compact && (fe.abs.x < 24.0 || shell.data.layout.compact_destination == CompactDestination::Sidebar) {
                 shell.data.chrome.edge_start = Some(fe.abs);
             }
@@ -955,7 +986,6 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 shell.data.chrome.edge_start = None;
             }
             let pressed = shell.data.pointer.pressed.take();
-            let down = shell.data.pointer.down_pos.take();
             let dragged = finish_drag(shell, cx, fe.abs);
             let edge = shell.data.chrome.edge_start.take();
             if let (Some(start), false) = (edge, dragged) {
@@ -963,9 +993,9 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 if delta.x.abs() >= 80.0 && delta.x.abs() >= delta.y.abs() * 2.0 {
                     let layout = &mut shell.data.layout;
                     if delta.x > 0.0 && layout.compact_destination == CompactDestination::Agent {
-                        layout.show_sidebar(true);
+                        layout.show_sidebar(true, true);
                     } else if delta.x < 0.0 && layout.compact_destination == CompactDestination::Sidebar {
-                        layout.show_sidebar(false);
+                        layout.show_sidebar(true, false);
                     }
                     shell.redraw(cx);
                     return;
@@ -974,13 +1004,6 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             if dragged {
                 shell.redraw(cx);
                 return;
-            }
-            if fe.device.is_touch() && fe.is_over && fe.was_tap() && !fe.has_long_press_occurred
-                && let Some(start) = down
-                && let Some((pane, _)) = shell.data.chrome.pane_rects.iter()
-                    .find(|(id, r)| id != "explorer" && r.contains(start) && r.contains(fe.abs)).cloned()
-            {
-                shell.data.layout.focus_pane(&pane);
             }
             if let Some(id) = pressed
                 && fe.is_over
@@ -1012,8 +1035,10 @@ fn start_drag(shell: &mut PaseoShell, id: Option<&str>, abs: DVec2) {
             let split = &id["split:".len()..];
             chrome.splits.iter().find(|(sid, _, _)| sid == split).map(|(sid, axis, r)| Drag::Split { id: sid.clone(), axis: *axis, rect: *r })
         }
-        Some("resize:sidebar") => Some(Drag::Sidebar { start_x: abs.x, start_width: shell.data.layout.sidebar_width }),
-        Some("resize:explorer") => Some(Drag::Explorer { start_x: abs.x, start_width: shell.data.layout.explorer_width }),
+        // Drags start from the width on screen (the saved width may be clamped to fit), so
+        // the divider follows the pointer from the first pixel.
+        Some("resize:sidebar") => Some(Drag::Sidebar { start_x: abs.x, start_width: chrome.sidebar_rect.size.x.max(1.0) }),
+        Some("resize:explorer") => Some(Drag::Explorer { start_x: abs.x, start_width: chrome.explorer_rect.size.x.max(1.0) }),
         Some(id) if id.starts_with("tab:") && !id.starts_with("tab:explorer:") => {
             let rest = &id["tab:".len()..];
             rest.split_once(':').map(|(pane, key)| Drag::Tab { key: key.to_string(), from_pane: pane.to_string(), start: abs, moving: false })
@@ -1043,7 +1068,7 @@ fn update_drag(shell: &mut PaseoShell, _cx: &mut Cx, abs: DVec2, _time: f64) -> 
             true
         }
         Drag::Explorer { start_x, start_width } => {
-            shell.data.layout.set_explorer_width((start_width - (abs.x - start_x)).clamp(260.0, 720.0));
+            shell.data.layout.set_explorer_width(start_width - (abs.x - start_x));
             true
         }
         Drag::Tab { key, from_pane, start, moving } => {
@@ -1077,14 +1102,23 @@ fn finish_drag(shell: &mut PaseoShell, cx: &mut Cx, abs: DVec2) -> bool {
                 .find(|(id, r)| id != "explorer" && r.contains(abs))
                 .map(|(id, _)| id.clone());
             if let Some(pane) = target_pane {
-                // Drop index: before the first tab whose centre is right of the pointer.
-                let index = shell
+                // Drop index: before the first visible tab whose centre is right of the pointer,
+                // else after the last visible one. Strip positions map back to the pane's full
+                // tab order, so tabs hidden behind the overflow button keep their places.
+                let visible: Vec<(String, bool)> = shell
                     .data
                     .chrome
                     .tab_rects
                     .iter()
                     .filter(|(p, k, _)| *p == pane && *k != key)
-                    .position(|(_, _, r)| abs.x < r.pos.x + r.size.x * 0.5);
+                    .map(|(_, k, r)| (k.clone(), abs.x < r.pos.x + r.size.x * 0.5))
+                    .collect();
+                let others: Vec<String> = shell.data.layout.tree.pane(&pane).map(|p| p.tabs.iter().filter(|k| **k != key).cloned().collect()).unwrap_or_default();
+                let position = |k: &str| others.iter().position(|t| t == k);
+                let index = match visible.iter().find(|(_, before)| *before) {
+                    Some((k, _)) => position(k),
+                    None => visible.last().and_then(|(k, _)| position(k)).map(|i| i + 1),
+                };
                 if pane == from_pane {
                     if let Some(old) = shell.data.layout.pane_of(&key).and_then(|id| shell.data.layout.tree.pane(&id).map(|p| p.tabs.iter().position(|k| *k == key))).flatten() {
                         let count = shell.data.layout.tree.pane(&pane).map_or(0, |p| p.tabs.len());
@@ -1154,4 +1188,124 @@ fn cubic_ease(t: f64) -> f64 {
         if bezier(x1, x2, mid) < t { lo = mid } else { hi = mid }
     }
     bezier(y1, y2, (lo + hi) * 0.5)
+}
+
+fn pane_at(shell: &PaseoShell, abs: DVec2) -> Option<String> {
+    shell.data.chrome.pane_rects.iter().find(|(id, r)| id != "explorer" && r.contains(abs)).map(|(id, _)| id.clone())
+}
+
+/// Pane focus follows a press anywhere in a pane, including content that captures the press
+/// itself (terminal, editor, chat). Runs before panels see the event. A mouse focuses on press;
+/// a touch only on a tap released in the pane it started in, so drags never retarget the pane.
+pub(crate) fn observe_pane_focus(shell: &mut PaseoShell, event: &Event) {
+    const TAP_SLOP: f64 = 12.0;
+    let window = shell.data.os_window;
+    match event {
+        Event::MouseDown(e) if Some(e.window_id) == window && !e.button.is_secondary() => {
+            if let Some(pane) = pane_at(shell, e.abs) {
+                shell.data.layout.focus_pane(&pane);
+            }
+        }
+        Event::TouchUpdate(e) if Some(e.window_id) == window => {
+            if e.cancelled {
+                shell.data.chrome.touch_focus = None;
+                return;
+            }
+            for touch in &e.touches {
+                match touch.state {
+                    TouchState::Start => {
+                        shell.data.chrome.touch_focus = pane_at(shell, touch.abs).map(|pane| (touch.uid, pane, touch.abs));
+                    }
+                    TouchState::Move => {
+                        if shell.data.chrome.touch_focus.as_ref().is_some_and(|(uid, _, start)| *uid == touch.uid && (touch.abs - *start).length() > TAP_SLOP) {
+                            shell.data.chrome.touch_focus = None;
+                        }
+                    }
+                    TouchState::Stop => {
+                        if let Some((uid, pane, start)) = shell.data.chrome.touch_focus.take()
+                            && uid == touch.uid
+                            && (touch.abs - start).length() <= TAP_SLOP
+                            && pane_at(shell, touch.abs).as_deref() == Some(pane.as_str())
+                        {
+                            shell.data.layout.focus_pane(&pane);
+                        }
+                    }
+                    TouchState::Stable => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Tab strip fit: chip widths and the visible run `[first, end)`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TabFit {
+    pub widths: Vec<f64>,
+    pub first: usize,
+    pub end: usize,
+}
+
+/// Fits chips of `natural` widths (each already ≤ `available`) into a strip: when they do not
+/// fit, the other tabs shrink toward `min_w`; tabs that still do not fit stay out of the
+/// visible run and `overflow_w` is reserved for the `+N` button. The selected tab is always
+/// visible (clamped to the remaining room), with as many tabs before it, then after it, as fit.
+pub(crate) fn fit_tabs(natural: &[f64], active: usize, available: f64, gap: f64, min_w: f64, overflow_w: f64) -> TabFit {
+    let mut widths = natural.to_vec();
+    let total = |widths: &[f64]| widths.iter().map(|w| w + gap).sum::<f64>();
+    if total(&widths) > available && widths.len() > 1 {
+        let active_w = widths.get(active).map_or(0.0, |w| w + gap);
+        let others = (widths.len() - 1).max(1) as f64;
+        let share = ((available - active_w) / others - gap).max(min_w);
+        for (i, width) in widths.iter_mut().enumerate() {
+            if i != active {
+                *width = width.min(share);
+            }
+        }
+    }
+    let room = if total(&widths) > available { (available - overflow_w).max(0.0) } else { available };
+    let Some(selected) = widths.get_mut(active) else {
+        return TabFit { widths, first: 0, end: 0 };
+    };
+    *selected = selected.min(room);
+    let (mut first, mut end) = (active, active + 1);
+    let mut occupied = widths[active] + gap;
+    while first > 0 && occupied + widths[first - 1] + gap <= room {
+        occupied += widths[first - 1] + gap;
+        first -= 1;
+    }
+    while end < widths.len() && occupied + widths[end] + gap <= room {
+        occupied += widths[end] + gap;
+        end += 1;
+    }
+    TabFit { widths, first, end }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tabs_that_fit_keep_their_widths() {
+        let fit = fit_tabs(&[120.0, 150.0], 1, 400.0, 0.0, 138.0, 36.0);
+        assert_eq!(fit, TabFit { widths: vec![120.0, 150.0], first: 0, end: 2 });
+    }
+
+    #[test]
+    fn other_tabs_shrink_before_any_tab_is_hidden() {
+        let fit = fit_tabs(&[240.0, 240.0, 200.0], 2, 500.0, 0.0, 138.0, 36.0);
+        assert_eq!(fit, TabFit { widths: vec![150.0, 150.0, 200.0], first: 0, end: 3 });
+    }
+
+    #[test]
+    fn tabs_beyond_the_minimum_overflow_while_the_selected_one_stays_visible() {
+        // 275px strip: the selected 240px tab is clamped so the +N button has its slot.
+        let fit = fit_tabs(&[240.0, 240.0, 240.0, 240.0], 2, 275.0, 0.0, 138.0, 36.0);
+        assert_eq!((fit.first, fit.end), (2, 3));
+        assert_eq!(fit.widths[2], 239.0);
+        // Room for the selected tab plus one more: earlier tabs come first.
+        let fit = fit_tabs(&[200.0, 200.0, 200.0, 200.0], 2, 400.0, 0.0, 138.0, 36.0);
+        assert_eq!((fit.first, fit.end), (1, 3));
+        assert!(fit.widths[1] + fit.widths[2] <= 400.0 - 36.0);
+    }
 }

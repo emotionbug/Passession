@@ -10,8 +10,8 @@ use makepad_widgets::*;
 use serde_json::{Value, json};
 
 use crate::common::paint::{Font, rect};
-use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics};
-use crate::common::{PanelTarget, UiContext, UiEffect, json as j, tr, tr_args};
+use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics, StatusBucket, agent_live_status_bucket, paint_status_badge};
+use crate::common::{PanelTarget, UiContext, UiEffect, clock, json as j, tr, tr_args};
 use crate::features::workspace::observe::{ObsEvent, Observation};
 use crate::shell::chrome::make_ui;
 use crate::shell::hosts::{self, Host, Status, parent_agent_id};
@@ -412,6 +412,23 @@ pub fn find_terminal(terminals: &TerminalDirectories, state: &Value, rest: &str)
     terminal_rows(terminals, &host, project_id).into_iter().find(|row| row.id == terminal_id)
 }
 
+/// Session row subtitle: what the session needs from the user outranks what it is doing; a
+/// settled session keeps the daemon's own status word.
+fn agent_status_label(agent: &Value, bucket: StatusBucket) -> String {
+    match bucket {
+        StatusBucket::NeedsInput => tr("sidebar.statusBucket.needsInput"),
+        StatusBucket::Failed => tr("sidebar.statusBucket.failed"),
+        StatusBucket::Running => tr("sidebar.statusBucket.working"),
+        StatusBucket::Attention => tr("sidebar.statusBucket.readyToReview"),
+        StatusBucket::Done => {
+            let status = j::text(agent, "status");
+            let key = format!("agentList.status.{status}");
+            let label = tr(&key);
+            if label == key { status.to_string() } else { label }
+        }
+    }
+}
+
 /// `deriveTerminalActivityStatusBucket` as the row subtitle's status.
 fn terminal_status(activity: &Value) -> String {
     match (j::text(activity, "attentionReason"), j::text(activity, "state")) {
@@ -667,7 +684,8 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
         ui.icon(cx, rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0), if host_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
         ui.dot(cx, dvec2(slots.leading.pos.x + 22.0, mid), 8.0, status_color(&p, host));
         ui.text(cx, slots.title, group, &label);
-        ui.hit(rect(row.pos.x, row.pos.y, row.size.x - 24.0, row.size.y), format!("host:{sid}"));
+        // The whole row toggles; the trailing button, registered after it, wins its own square.
+        ui.hit(row, format!("host:{sid}"));
         toolbar_button(&mut ui, cx, slots.trailing.pos.x, mid - 10.0, &format!("hostplus:{sid}"), "plus", &tr("sessionNavigation.newSession"));
         y += group_h;
         if host_collapsed {
@@ -722,7 +740,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
             ui.icon(cx, rect(slots.leading.pos.x, mid - 7.0, 14.0, 14.0), if *project_collapsed { "chevron-right" } else { "chevron-down" }, 14.0, p.muted);
             ui.icon(cx, rect(slots.leading.pos.x + 18.0, mid - 7.0, 14.0, 14.0), "folder", 14.0, p.muted);
             ui.text(cx, slots.title, group, name);
-            ui.hit(rect(row.pos.x, row.pos.y, row.size.x - 24.0, row.size.y), format!("project:{key}"));
+            ui.hit(row, format!("project:{key}"));
             toolbar_button(&mut ui, cx, slots.trailing.pos.x, mid - 10.0, &format!("projplus:{key}"), "plus", &tr("sessionNavigation.newSession"));
             y += group_h;
             if *project_collapsed {
@@ -750,15 +768,18 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
                 let trailing_w = if hovered { 32.0 } else if trailing.is_empty() { 12.0 } else { ui.measure(cx, ui.spec(Font::Regular, 12.0, p.extra_muted), &trailing) + 16.0 };
                 let slots = session_metrics.layout(row, 12.0, 14.0, (trailing_w - 12.0).max(0.0), 8.0);
                 ui.icon(cx, slots.leading, "message-square", 14.0, if attention { p.foreground } else { p.muted });
+                let bucket = agent_live_status_bucket(agent);
+                let backdrop = if is_selected { p.border } else { p.sidebar };
+                let glyph = rect(slots.leading.pos.x, slots.leading.pos.y + (slots.leading.size.y - 14.0) * 0.5, 14.0, 14.0);
+                if paint_status_badge(ui.painter, cx, glyph, Some(bucket).filter(|b| *b != StatusBucket::Done), &p, backdrop) {
+                    let area = ui.painter.draw_box.area();
+                    clock::register(cx, area);
+                }
                 let title_spec = ui.spec(if attention { Font::Medium } else { Font::Regular }, 14.0, p.foreground);
                 ui.text(cx, slots.title, title_spec, &title);
-                let status = j::text(agent, "status");
-                let status_key = format!("agentList.status.{status}");
-                let status_label = tr(&status_key);
-                let status_label = if status_label == status_key { status.to_string() } else { status_label };
                 let sub = ui.spec(Font::Regular, 12.0, p.muted);
-                ui.text(cx, slots.subtitle, sub, &format!("{} · {}", j::text(agent, "provider"), status_label));
-                ui.hit(rect(row.pos.x, row.pos.y, row.size.x - if hovered { 32.0 } else { 0.0 }, row.size.y), id.clone());
+                ui.text(cx, slots.subtitle, sub, &format!("{} · {}", j::text(agent, "provider"), agent_status_label(agent, bucket)));
+                ui.hit(row, id.clone());
                 if hovered {
                     toolbar_button(&mut ui, cx, slots.trailing.pos.x, row.pos.y + (row.size.y - 20.0) * 0.5, &format!("sessionedit:{sid}:{agent_id}"), "pencil", &tr("workspace.tabs.menu.renameAgent"));
                 } else if !trailing.is_empty() {
@@ -987,5 +1008,15 @@ mod tests {
         assert_eq!(terminal_label(&json!({"title": " vim ", "name": "dev"})), "vim");
         assert_eq!(terminal_label(&json!({"name": "dev"})), "dev");
         assert_eq!(terminal_label(&json!({"name": "Terminal"})), tr("workspace.tabs.fallback.terminal"));
+    }
+
+    #[test]
+    fn session_status_puts_needed_input_before_activity() {
+        let label = |agent: Value| agent_status_label(&agent, agent_live_status_bucket(&agent));
+        assert_eq!(label(json!({"status": "running", "pendingPermissions": [{"id": "q"}]})), tr("sidebar.statusBucket.needsInput"));
+        assert_eq!(label(json!({"status": "error", "requiresAttention": true, "attentionReason": "error"})), tr("sidebar.statusBucket.failed"));
+        assert_eq!(label(json!({"status": "idle", "activeTurn": {"id": "t"}})), tr("sidebar.statusBucket.working"));
+        assert_eq!(label(json!({"status": "idle", "requiresAttention": true, "attentionReason": "finished"})), tr("sidebar.statusBucket.readyToReview"));
+        assert_eq!(label(json!({"status": "idle"})), tr("agentList.status.idle"));
     }
 }

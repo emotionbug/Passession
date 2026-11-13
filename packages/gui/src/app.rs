@@ -179,6 +179,9 @@ impl App {
                 | (color.z * 255.0).round() as u32;
             paseo_gui_platform::appearance::set_system_bars(palette.is_dark, background);
         }
+        // Desktop title bars (Windows caption, macOS title bar, X11 frame) match the palette.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        cx.set_window_dark_appearance(theme::current_palette().is_dark);
         let localized = i18n::set_language(preferences.get("language"));
         if themed || localized {
             cx.redraw_all();

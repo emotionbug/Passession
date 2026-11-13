@@ -795,6 +795,21 @@ pub struct WaTrigger {
     hovered: bool,
     #[rust]
     pressed: bool,
+    /// Cap of a Fit desktop badge below [`TRIGGER_MAX_W`], so a row can share its width.
+    #[rust]
+    max_width: Option<f64>,
+}
+
+/// Widest a Fit desktop trigger badge grows for a long value.
+const TRIGGER_MAX_W: f64 = 240.0;
+
+impl WaTrigger {
+    /// Width the desktop badge wants for its value, before any cap: 8px
+    /// insets, the 16px lead, 4px gaps, the value and the 14px chevron.
+    fn badge_width(&mut self, cx: &mut Cx) -> f64 {
+        let spec = TextSpec::new(Font::Regular, theme::current_typography().ui_size(14.0), Vec4::default());
+        8.0 * 2.0 + 16.0 + 4.0 + self.painter.measure(cx, spec, &self.value).x + 4.0 + 14.0
+    }
 }
 
 impl Widget for WaTrigger {
@@ -861,9 +876,8 @@ impl Widget for WaTrigger {
             rest
         };
         let value_spec = TextSpec::new(Font::Regular, t.ui_size(14.0), fade(if field { p.foreground } else { p.muted }, opacity));
-        let value_w = self.painter.measure(cx, value_spec, &self.value).x;
         let (height, pad, radius, gap) = if field { (56.0, 12.0, 12.0, 8.0) } else { (28.0, 8.0, 16.0, 4.0) };
-        let natural = (pad * 2.0 + 16.0 + gap + value_w + gap + 14.0).min(240.0);
+        let natural = self.badge_width(cx).min(self.max_width.unwrap_or(TRIGGER_MAX_W).min(TRIGGER_MAX_W));
         let walk = Walk {
             width: if field { Size::Fill } else if matches!(walk.width, Size::Fit) { Size::Fixed(natural) } else { walk.width },
             height: Size::Fixed(height),
@@ -929,6 +943,21 @@ impl WaTriggerRef {
             && b.enabled != enabled
         {
             b.enabled = enabled;
+            b.redraw(cx);
+        }
+    }
+
+    /// Width the desktop badge wants for its current value, before any cap.
+    pub fn badge_width(&self, cx: &mut Cx) -> f64 {
+        self.borrow_mut().map(|mut b| b.badge_width(cx)).unwrap_or(0.0)
+    }
+
+    /// Caps a Fit desktop badge below its 240px maximum; `None` restores it.
+    pub fn set_max_width(&self, cx: &mut Cx, max_width: Option<f64>) {
+        if let Some(mut b) = self.borrow_mut()
+            && b.max_width != max_width
+        {
+            b.max_width = max_width;
             b.redraw(cx);
         }
     }

@@ -1341,20 +1341,26 @@ impl ScanSheet {
     }
 
     /// Original `permissionCard`: surface2, 12 radius, 24 padding, 16 gap, blue pill action.
+    /// Within `avail` (the full-screen body height, 0 when unknown) the body text is clipped
+    /// first so the action stays reachable.
     #[allow(clippy::too_many_arguments)]
-    fn card(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, title: &str, body: &str, action: &str, interactive: bool) -> f64 {
+    fn card(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, avail: f64, title: &str, body: &str, action: &str, interactive: bool) -> f64 {
         let p = ui.p;
         let title_spec = ui.spec(Font::Medium, 14.0, p.foreground);
         let body_spec = ui.spec(Font::Regular, 14.0, p.muted);
         let th = ui.painter.paragraph_height(cx, w - 48.0, title_spec, title);
+        let chrome = 24.0 + 24.0 + th + 16.0 + 16.0 + 44.0 + 24.0;
         let bh = ui.painter.paragraph_height(cx, w - 48.0, body_spec, body);
+        let bh = if avail > 0.0 { bh.min((avail - chrome).max(0.0)) } else { bh };
         let action_spec = ui.spec(Font::Medium, 14.0, argb(0xffffffff));
         let aw = ui.measure(cx, action_spec, action) + 48.0;
         let h = 24.0 + th + 16.0 + bh + 16.0 + 44.0 + 24.0;
         let top = y + 24.0;
         ui.fill(cx, rect(x, top, w, h), p.surface2, 12.0);
         ui.painter.paragraph(cx, dvec2(x + 24.0, top + 24.0), w - 48.0, title_spec, title);
+        cx.begin_turtle(Walk::abs_rect(rect(x + 24.0, top + 24.0 + th + 16.0, w - 48.0, bh)), Layout { clip_x: true, clip_y: true, ..Layout::default() });
         ui.painter.paragraph(cx, dvec2(x + 24.0, top + 24.0 + th + 16.0), w - 48.0, body_spec, body);
+        cx.end_turtle();
         let button = rect(x + 24.0, top + 24.0 + th + 16.0 + bh + 16.0, aw, 44.0);
         ui.fill(cx, button, argb(0xff3b82f6), 8.0);
         ui.text_centered(cx, button, action_spec, action);
@@ -1389,13 +1395,13 @@ impl Sheet for ScanSheet {
         let state = view.as_qr_scan_view().state();
         match state {
             QrScanState::Unavailable => {
-                return Self::card(ui, cx, x, y, w, &tr("pairing.scan.webUnavailableTitle"), &tr("pairing.scan.webUnavailableBody"), &tr("pairing.scan.backToSettings"), interactive);
+                return Self::card(ui, cx, x, y, w, self.body_height, &tr("pairing.scan.webUnavailableTitle"), &tr("pairing.scan.webUnavailableBody"), &tr("pairing.scan.backToSettings"), interactive);
             }
             QrScanState::PermissionDenied => {
-                return Self::card(ui, cx, x, y, w, &tr("pairing.scan.cameraPermissionTitle"), &tr("pairing.scan.cameraPermissionBody"), &tr("pairing.scan.grantPermission"), interactive);
+                return Self::card(ui, cx, x, y, w, self.body_height, &tr("pairing.scan.cameraPermissionTitle"), &tr("pairing.scan.cameraPermissionBody"), &tr("pairing.scan.grantPermission"), interactive);
             }
             QrScanState::Failed(error) => {
-                return Self::card(ui, cx, x, y, w, &tr("pairing.scan.errorTitle"), &error, &tr("common.actions.retry"), interactive);
+                return Self::card(ui, cx, x, y, w, self.body_height, &tr("pairing.scan.errorTitle"), &error, &tr("common.actions.retry"), interactive);
             }
             _ => {}
         }
@@ -1404,15 +1410,22 @@ impl Sheet for ScanSheet {
         let area = rect(x, y, w, h);
         ui.fill(cx, area, p.surface2, 12.0);
         draw_widget(cx, scope, &view, area);
-        let side = 260.0_f64.min(w - 16.0);
-        let mut content_h = side;
-        if self.status != ScanStatus::Scanning {
-            content_h += 24.0 + 20.0;
-        }
-        if self.status == ScanStatus::Stopped {
-            content_h += 24.0 + 40.0;
-        }
-        let fy = y + (h - content_h) * 0.5;
+        let helper = ui.spec(Font::Regular, 14.0, p.foreground);
+        // Below the frame: the pairing line, or the error and the scan-again button. In a short
+        // body the frame shrinks (down to 96px), then the error text is clipped, so the button
+        // always stays inside the body.
+        const MIN_SIDE: f64 = 96.0;
+        let error = self.error.clone().filter(|_| self.status == ScanStatus::Stopped);
+        let eh = error.as_ref().map_or(0.0, |error| ui.painter.paragraph_height(cx, w - 32.0, helper, error));
+        let below = |eh: f64| match self.status {
+            ScanStatus::Scanning => 0.0,
+            ScanStatus::Stopped => 24.0 + if error.is_some() { eh + 24.0 } else { 0.0 } + BUTTON_H,
+            _ => 24.0 + 20.0,
+        };
+        let eh = eh.min((eh + h - 16.0 - MIN_SIDE - below(eh)).max(0.0));
+        let side = 260.0_f64.min(w - 16.0).min(h - 16.0 - below(eh)).max(0.0);
+        let content_h = side + below(eh);
+        let fy = y + ((h - content_h) * 0.5).max(0.0);
         let frame = rect(x + (w - side) * 0.5, fy, side, side);
         let (l, t, r, b) = (frame.pos.x, frame.pos.y, frame.pos.x + side, frame.pos.y + side);
         for (cxp, cyp, dx, dy) in [(l, t, 1.0, 1.0), (r, t, -1.0, 1.0), (l, b, 1.0, -1.0), (r, b, -1.0, -1.0)] {
@@ -1422,15 +1435,15 @@ impl Sheet for ScanSheet {
             ui.fill(cx, rect(if dx > 0.0 { cxp } else { cxp - 4.0 }, vy, 4.0, 36.0), p.accent, 2.0);
         }
         let mut ty = frame.pos.y + side + 24.0;
-        let helper = ui.spec(Font::Regular, 14.0, p.foreground);
         if self.status == ScanStatus::Pairing {
             ui.text_centered(cx, rect(x, ty, w, 20.0), helper, &tr("pairing.scan.pairing"));
         }
         if self.status == ScanStatus::Stopped {
-            if let Some(error) = self.error.clone() {
-                let eh = ui.painter.paragraph_height(cx, w - 32.0, helper, &error);
+            if let Some(error) = error {
                 let ew = ui.painter.measure(cx, helper, &error).x.min(w - 32.0);
+                cx.begin_turtle(Walk::abs_rect(rect(x, ty, w, eh)), Layout { clip_x: true, clip_y: true, ..Layout::default() });
                 ui.painter.paragraph(cx, dvec2(x + (w - ew) * 0.5, ty), ew, helper, &error);
+                cx.end_turtle();
                 ty += eh + 24.0;
             }
             let label = tr("pairing.connectionMethods.scanQr.title");

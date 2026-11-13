@@ -670,8 +670,15 @@ impl Canvas {
         self.hits.iter().rev().find(|(r, t)| r.contains(rel) && !t.is_scroll_region()).map(|(_, t)| t)
     }
 
+    /// The deepest scroll region at `rel` along the axis.
     pub fn scroll_region_at(&self, rel: DVec2, vertical: bool) -> Option<&str> {
-        self.hits.iter().rev().find_map(|(r, t)| match t {
+        self.scroll_regions_at(rel, vertical).next()
+    }
+
+    /// Scroll regions at `rel` along the axis, deepest first (enclosing
+    /// regions register before their content).
+    pub fn scroll_regions_at(&self, rel: DVec2, vertical: bool) -> impl Iterator<Item = &str> {
+        self.hits.iter().rev().filter_map(move |(r, t)| match t {
             HitTarget::ScrollX(key) if !vertical && r.contains(rel) => Some(key.as_str()),
             HitTarget::ScrollY(key) if vertical && r.contains(rel) => Some(key.as_str()),
             _ => None,

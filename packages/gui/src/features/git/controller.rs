@@ -6,6 +6,8 @@
 //! working diff shares one `checkout.diff.get.request` (`detail: full`) per
 //! patch revision, a commit asks `checkout.commits.file_diff.request` per
 //! file. `generation` and `patch_revision` reject stale results.
+//! A commit outside the workspace's commit list (opened from the Git Log)
+//! reads its files from `checkout.commit.get.request` when the host has `gitLog`.
 //! Successful checkout actions also invalidate working patches: a changed
 //! body can keep the same summary counts and produce no subscription update.
 
@@ -74,6 +76,8 @@ enum Pending {
     FileDiff { path: String, generation: u64, revision: u64, kind: PatchWaiter },
     FullDiff,
     Observe { generation: u64 },
+    /// The commit's files when it is not in `checkout.commits.list`.
+    CommitGet { generation: u64, resume: bool },
 }
 
 pub struct DiffController {
@@ -82,6 +86,8 @@ pub struct DiffController {
     pub cwd: String,
     pub is_commit: bool,
     pub sha: String,
+    /// The commit's subject once its files loaded (commit views).
+    pub subject: Option<String>,
     active: bool,
     stale: bool,
     patch_loads_deferred: bool,
@@ -142,6 +148,7 @@ impl DiffController {
             cwd: target.cwd.clone(),
             is_commit,
             sha,
+            subject: None,
             active: true,
             stale: false,
             patch_loads_deferred: false,
@@ -510,19 +517,40 @@ impl DiffController {
                     self.loading = false;
                     return;
                 }
-                let commit = self.commits.iter().find(|c| text(c, "sha") == self.sha);
-                self.files = commit.map(|c| array(c, "files").to_vec()).unwrap_or_default();
-                if self.files.is_empty() && !self.selected_path.is_empty() {
-                    self.files = vec![json!({ "path": self.selected_path })];
-                }
-                // A commit's patches never change; placeholders left by
-                // interrupted loads request again.
-                if resume {
-                    self.patch_revision += 1;
-                }
-                self.finish_refresh(ui);
+                let Some(commit) = self.commits.iter().find(|c| text(c, "sha") == self.sha) else {
+                    if host::supports(ui, &self.host, "gitLog") {
+                        let request = wire::send(
+                            &ui.core,
+                            &self.host,
+                            "checkout.commit.get.request",
+                            json!({ "cwd": self.cwd, "sha": self.sha }),
+                        );
+                        self.pending.insert(request, Pending::CommitGet { generation, resume });
+                    } else {
+                        self.finish_commit(ui, None, Vec::new(), resume);
+                    }
+                    return;
+                };
+                let subject = Some(text(commit, "subject").to_owned());
+                let files = array(commit, "files").to_vec();
+                self.finish_commit(ui, subject, files, resume);
             }
         }
+    }
+
+    /// A commit view's files arrived (from the commit list or `checkout.commit.get`).
+    fn finish_commit(&mut self, ui: &UiContext, subject: Option<String>, files: Vec<Value>, resume: bool) {
+        self.subject = subject.filter(|s| !s.is_empty());
+        self.files = files;
+        if self.files.is_empty() && !self.selected_path.is_empty() {
+            self.files = vec![json!({ "path": self.selected_path })];
+        }
+        // A commit's patches never change; placeholders left by
+        // interrupted loads request again.
+        if resume {
+            self.patch_revision += 1;
+        }
+        self.finish_refresh(ui);
     }
 
     /// Original `selectFile`.
@@ -829,6 +857,21 @@ impl DiffController {
                     Err(failure) => Err(failure.message),
                 };
                 self.finish_patch(&path, kind, outcome);
+            }
+            Pending::CommitGet { generation, resume } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.dirty = true;
+                // A failed read keeps the original fallback (the focused path only).
+                let (subject, files) = match wire::git_result(result) {
+                    Ok(payload) => {
+                        let commit = object(&payload, "commit");
+                        (Some(text(commit, "subject").to_owned()), array(commit, "files").to_vec())
+                    }
+                    Err(_) => (None, Vec::new()),
+                };
+                self.finish_commit(ui, subject, files, resume);
             }
             Pending::FullDiff => {
                 if self.full_request.as_ref() != Some(request_id) {

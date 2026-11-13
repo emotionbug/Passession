@@ -28,6 +28,9 @@ impl GitService {
             "branch_suggestions_request" => "branch_suggestions_response",
             "checkout.commits.list.request" => "checkout.commits.list.response",
             "checkout.commits.file_diff.request" => "checkout.commits.file_diff.response",
+            "checkout.log.request" => "checkout.log.response",
+            "checkout.refs.request" => "checkout.refs.response",
+            "checkout.commit.get.request" => "checkout.commit.get.response",
             "checkout.diff.get.request" => "checkout.diff.get.response",
             "subscribe_checkout_diff_request" => "subscribe_checkout_diff_response",
             "checkout_switch_branch_request" => "checkout_switch_branch_response",
@@ -124,6 +127,16 @@ impl GitService {
                     "checkout.commits.file_diff.request" => {
                         json!({"sha":message["sha"],"path":message["path"],"file":null})
                     }
+                    "checkout.log.request" => {
+                        json!({"head":null,"commits":[],"hasMore":false})
+                    }
+                    "checkout.refs.request" => json!({
+                        "head":{"sha":null,"branch":null,"detached":false},
+                        "local":[],
+                        "remote":[],
+                        "tags":[],
+                    }),
+                    "checkout.commit.get.request" => json!({"commit":null}),
                     "checkout.diff.get.request" => json!({"files":[]}),
                     "stash_list_request" => json!({"entries":[]}),
                     "checkout_switch_branch_request" => {
@@ -184,6 +197,31 @@ impl GitService {
                 return Ok(
                     json!({"sha":sha,"path":path,"file":super::diff::commit_file(cwd,sha,path,&env,cancel).await?,"error":null}),
                 );
+            }
+            "checkout.log.request" => {
+                let text = |key: &str| message[key].as_str().filter(|s| !s.is_empty());
+                let query = super::diff::LogQuery {
+                    revision: text("revision"),
+                    skip: message["skip"].as_u64(),
+                    limit: message["limit"].as_u64(),
+                    text: text("text"),
+                    author: text("author"),
+                    path: text("path"),
+                };
+                let mut value = super::diff::log(cwd, &query, &env, cancel).await?;
+                value["error"] = Value::Null;
+                return Ok(value);
+            }
+            "checkout.refs.request" => {
+                let mut value = super::diff::refs(cwd, &env, cancel).await?;
+                value["error"] = Value::Null;
+                return Ok(value);
+            }
+            "checkout.commit.get.request" => {
+                let mut value =
+                    super::diff::commit(cwd, string(message, "sha")?, &env, cancel).await?;
+                value["error"] = Value::Null;
+                return Ok(value);
             }
             "validate_branch_request" => {
                 let name = string(message, "branchName")?;

@@ -20,7 +20,8 @@
     "newSession": "새 세션",
     "untitled": "제목 없는 세션",
     "search": "세션 검색",
-    "empty": "세션이 없습니다. 새 세션을 만들거나 기존 세션을 가져오세요."
+    "empty": "세션이 없습니다. 새 세션을 만들거나 기존 세션을 가져오세요.",
+    "pick": "사이드바에서 세션을 선택하거나 새 세션을 시작하세요."
   },
   "paneFind": {
     "connectionFailure": "이 채팅을 검색할 수 없습니다. 호스트 연결을 확인하고 다시 시도하세요.",
@@ -608,6 +609,8 @@
     "sheet": { "openAsTab": "탭으로 열기" },
     "tabs": {
       "loading": "불러오는 중...",
+      "overflow": "탭 {{count}}개 더 보기",
+      "overflowTitle": "다른 탭",
       "modified": "저장되지 않은 변경사항",
       "loadingAgentTitle": "에이전트 제목 불러오는 중",
       "fallback": {
@@ -637,8 +640,8 @@
         "closeRight": "오른쪽 탭 닫기",
         "closeOthers": "다른 탭 닫기",
         "moveToMain": "기본 패널로 이동",
-        "reloadAgent": "에이전트 다시 로드",
-        "reloadAgentTooltip": "스킬, MCP 또는 로그인 상태를 업데이트하려면 에이전트를 다시 로드하세요.",
+        "reloadAgent": "에이전트 재실행",
+        "reloadAgentTooltip": "스킬, MCP 또는 로그인 상태를 반영하려면 에이전트를 재실행하세요.",
         "close": "닫기",
         "renameTerminal": "터미널 이름 변경",
         "renameAgent": "에이전트 이름 변경"
@@ -677,9 +680,9 @@
         "filePathCopiedLabel": "파일 경로",
         "resumeIdUnavailable": "재개 ID를 사용할 수 없습니다",
         "resumeCommandUnavailable": "재개 명령을 사용할 수 없습니다",
-        "reloadingAgent": "에이전트 다시 로드 중...",
-        "reloadedAgent": "에이전트를 다시 로드했습니다",
-        "failedToReloadAgent": "에이전트를 다시 로드하지 못했습니다",
+        "reloadingAgent": "에이전트 재실행 중...",
+        "reloadedAgent": "에이전트를 재실행했습니다",
+        "failedToReloadAgent": "에이전트를 재실행하지 못했습니다",
         "failedToCloseAgent": "에이전트를 닫지 못했습니다"
       },
       "confirmations": {
@@ -1034,6 +1037,86 @@
         "installCli": "{{brand}} 기능을 사용하려면 {{cli}} CLI를 설치하세요.",
         "signIn": "{{brand}} 기능을 사용하려면 {{command}}를 실행하세요.",
         "generic": "해당 기능을 사용하려면 이 호스트에 {{brand}}를 설정하세요."
+      },
+      "log": {
+        "title": "Git 로그",
+        "open": "Git 로그 열기",
+        "checkedOut": "{{name}}(으)로 체크아웃했습니다",
+        "checkoutFailed": "브랜치를 체크아웃하지 못했습니다",
+        "search": { "placeholder": "커밋 메시지 검색" },
+        "toolbar": {
+          "refresh": "새로고침",
+          "showBranches": "브랜치 패널 표시",
+          "hideBranches": "브랜치 패널 숨기기",
+          "search": "검색",
+          "closeSearch": "검색 닫기",
+          "clear": "지우기",
+          "back": "뒤로"
+        },
+        "filters": {
+          "branch": "브랜치: {{name}}",
+          "user": "사용자: {{name}}",
+          "allBranches": "전체",
+          "allUsers": "전체",
+          "branchTitle": "브랜치",
+          "userTitle": "사용자",
+          "userSearch": "사용자 검색",
+          "userEmpty": "사용자가 없습니다"
+        },
+        "branches": {
+          "head": "HEAD",
+          "local": "로컬",
+          "remote": "원격",
+          "tags": "태그",
+          "detached": "HEAD ({{sha}}에서 분리됨)",
+          "gone": "삭제됨",
+          "search": "브랜치 및 태그 검색",
+          "empty": "브랜치나 태그가 없습니다"
+        },
+        "columns": {
+          "subject": "제목",
+          "author": "작성자",
+          "date": "날짜",
+          "hash": "해시"
+        },
+        "menu": {
+          "checkout": "체크아웃",
+          "showOnly": "이 브랜치만 보기",
+          "copyName": "이름 복사",
+          "copyRevision": "리비전 번호 복사",
+          "copySubject": "제목 복사",
+          "openDiff": "변경 사항 열기",
+          "more": "더 보기"
+        },
+        "toasts": {
+          "nameCopied": "이름을 복사했습니다",
+          "revisionCopied": "리비전 번호를 복사했습니다",
+          "subjectCopied": "제목을 복사했습니다"
+        },
+        "details": {
+          "select": "커밋을 선택하면 변경 사항이 표시됩니다",
+          "changedFiles": "변경된 파일 ({{count}})",
+          "noFiles": "변경된 파일이 없습니다",
+          "missing": "더 이상 존재하지 않는 커밋입니다",
+          "committedBy": "{{name}} 님이 {{date}}에 커밋함",
+          "hash": "해시",
+          "copyHash": "리비전 번호 복사",
+          "parent": "부모",
+          "parents": "부모"
+        },
+        "states": {
+          "disconnected": "호스트 연결이 끊어졌습니다. 다시 연결되면 Git 로그를 불러옵니다.",
+          "unsupported": "Git 로그를 사용하려면 이 호스트의 데몬을 업데이트하세요.",
+          "empty": "아직 커밋이 없습니다",
+          "noMatches": "필터와 일치하는 커밋이 없습니다",
+          "retry": "다시 시도"
+        },
+        "time": {
+          "justNow": "방금 전",
+          "minutesAgo": "{{count}}분 전",
+          "hoursAgo": "{{count}}시간 전",
+          "daysAgo": "{{count}}일 전"
+        }
       }
     }
   },
@@ -1172,7 +1255,7 @@
       "discord": "Discord",
       "github": "GitHub 이슈 만들기",
       "whatsNew": "새로운 소식",
-      "appName": "Paseo"
+      "appName": "Passession"
     },
     "sections": { "sessions": "기록", "search": "검색", "schedules": "일정" },
     "worktreeSetup": {
@@ -1315,7 +1398,7 @@
       "restore": "창 복원",
       "close": "창 닫기"
     },
-    "quitting": { "title": "Paseo 종료 중...", "detail": "로컬 데몬을 중지하는 중입니다." },
+    "quitting": { "title": "Passession 종료 중...", "detail": "로컬 데몬을 중지하는 중입니다." },
     "daemon": {
       "lifecycle": {
         "owned": "Launched by this Desktop session",
@@ -1342,17 +1425,17 @@
       },
       "management": {
         "title": "내장 데몬 관리",
-        "hint": "Paseo가 내장 데몬을 시작하고 중지하도록 허용합니다",
+        "hint": "Passession이 내장 데몬을 시작하고 중지하도록 허용합니다",
         "pauseTitle": "내장 데몬 일시 중지",
         "pauseMessage": "내장 데몬이 즉시 중지됩니다. 내장 데몬에 연결된 실행 중인 에이전트와 터미널이 중지됩니다.",
         "pauseAndStop": "일시 중지 후 중지",
-        "registrationFailed": "내장 데몬이 시작되었지만 Paseo가 localhost 연결을 저장하지 못했습니다. 데몬 관리를 껐다가 다시 켜거나 localhost를 수동으로 추가하세요.",
-        "pausedStopFailed": "내장 데몬 관리가 일시 중지되었지만 Paseo가 데몬을 중지하지 못했습니다.",
+        "registrationFailed": "내장 데몬이 시작되었지만 Passession이 localhost 연결을 저장하지 못했습니다. 데몬 관리를 껐다가 다시 켜거나 localhost를 수동으로 추가하세요.",
+        "pausedStopFailed": "내장 데몬 관리가 일시 중지되었지만 Passession이 데몬을 중지하지 못했습니다.",
         "updateFailed": "내장 데몬 관리를 업데이트할 수 없습니다."
       },
       "keepRunning": {
         "title": "종료 후에도 데몬 계속 실행",
-        "hint": "Paseo를 종료해도 데몬이 계속 실행됩니다"
+        "hint": "Passession을 종료해도 데몬이 계속 실행됩니다"
       },
       "logs": {
         "title": "로그 파일",
@@ -1416,7 +1499,7 @@
     },
     "rosetta": {
       "title": "Apple Silicon 빌드 다운로드",
-      "runningIntel": "Apple Silicon에서 Rosetta로 Paseo의 Intel 빌드를 실행하고 있습니다.",
+      "runningIntel": "Apple Silicon에서 Rosetta로 Passession의 Intel 빌드를 실행하고 있습니다.",
       "highCpu": "이로 인해 CPU 사용량이 높아집니다. 이를 해결하려면 Apple Silicon 빌드를 다운로드하세요.",
       "download": "다운로드"
     },
@@ -1456,7 +1539,7 @@
         "microphone": "마이크 상태를 아직 확인하지 않았습니다."
       },
       "testNotification": {
-        "title": "Paseo 알림 테스트",
+        "title": "Passession 알림 테스트",
         "body": "이 메시지가 보이면 데스크톱 알림이 작동하는 것입니다.",
         "notDelivered": "알림이 전달되지 않았습니다. 시스템 설정 > 알림을 확인하세요.",
         "failed": "알림을 보내지 못했습니다."
@@ -1470,7 +1553,7 @@
     }
   },
   "rootError": {
-    "title": "Paseo에 문제가 발생했습니다.",
+    "title": "Passession에 문제가 발생했습니다.",
     "body": "앱을 다시 로드해 보세요. 이런 일이 계속 발생하면 신고할 때 아래 세부정보를 포함하세요.",
     "details": "세부"
   },
@@ -1557,7 +1640,7 @@
     }
   },
   "onboarding": {
-    "title": "Paseo에 오신 것을 환영합니다",
+    "title": "Passession에 오신 것을 환영합니다",
     "subtitle": "시작하려면 컴퓨터를 연결하세요",
     "actions": { "settings": "설정" }
   },
@@ -1723,9 +1806,9 @@
       "enablingRelay": "활성화 중...",
       "notNow": "지금은 아님",
       "directConnectionHint": "릴레이 없이 TCP, Tailscale 또는 다른 VPN을 통해 직접 연결하세요. QR 코드가 생성되지 않습니다.",
-      "updateRequired": "Paseo 데스크톱에서 릴레이를 활성화하려면 호스트를 업데이트하세요.",
+      "updateRequired": "Passession에서 릴레이를 활성화하려면 호스트를 업데이트하세요.",
       "unavailable": "페어링 정보를 사용할 수 없습니다.",
-      "hint": "휴대폰의 Paseo로 이 QR 코드를 스캔하거나 아래 링크를 복사하세요.",
+      "hint": "휴대폰의 Passession으로 이 QR 코드를 스캔하거나 아래 링크를 복사하세요.",
       "securityWarning": "이 페어링 링크는 비밀번호처럼 취급하세요. 링크를 가진 사람은 누구나 이 데몬에 접근할 수 있습니다.",
       "qrUnavailable": "QR 코드를 사용할 수 없습니다.",
       "qrAccessibility": "페어링 QR 코드",
@@ -1755,7 +1838,7 @@
   "serviceUrl": {
     "title": "서비스 URL 열기",
     "message": "{{url}}을(를) 열까요?",
-    "inPaseo": "Paseo에서",
+    "inPaseo": "Passession에서",
     "externalBrowser": "외부 브라우저",
     "dontAskAgain": "다시 묻지 않기"
   },
@@ -2060,7 +2143,7 @@
       "send": "보내기",
       "sending": "보내는 중...",
       "sentTitle": "테스트 알림을 보냈습니다",
-      "sentDescription": "Paseo가 알림을 운영 체제에 전달했습니다.",
+      "sentDescription": "Passession이 알림을 운영 체제에 전달했습니다.",
       "sendFailedTitle": "테스트 알림을 보낼 수 없음"
     },
     "hostSections": {
@@ -2156,7 +2239,7 @@
       "browserData": {
         "title": "브라우저 데이터",
         "siteData": "쿠키 및 사이트 데이터",
-        "description": "브라우저 탭은 Paseo 전체에서 로그인 및 사이트 데이터를 공유합니다.",
+        "description": "브라우저 탭은 Passession 전체에서 로그인 및 사이트 데이터를 공유합니다.",
         "clear": "브라우저 데이터 지우기",
         "clearing": "삭제 중...",
         "confirmTitle": "브라우저 데이터를 삭제하시겠습니까?",
@@ -2174,7 +2257,7 @@
         "options": { "interrupt": "중단", "steer": "지시", "queue": "대기열" }
       },
       "serviceUrls": {
-        "options": { "ask": "물어보기", "inApp": "Paseo에서", "external": "외부 브라우저" }
+        "options": { "ask": "물어보기", "inApp": "Passession에서", "external": "외부 브라우저" }
       },
       "terminalScrollback": {
         "label": "터미널 스크롤백",
@@ -2238,7 +2321,7 @@
         "label": "앱 업데이트",
         "readyToInstall": "설치 준비됨: {{version}}",
         "installTitle": "데스크톱 업데이트 설치",
-        "installMessage": "이 컴퓨터의 Paseo를 업데이트합니다",
+        "installMessage": "이 컴퓨터의 Passession을 업데이트합니다",
         "installConfirm": "업데이트 설치",
         "update": "업데이트",
         "updateTo": "{{version}}(으)로 업데이트",
@@ -2595,13 +2678,13 @@
           "unavailableTitle": "호스트를 사용할 수 없습니다",
           "unavailableMessage": "이 호스트는 연결되어 있지 않습니다. 재시작하기 전에 온라인 상태가 될 때까지 기다리세요.",
           "offlineTitle": "호스트 오프라인",
-          "offlineMessage": "이 호스트는 오프라인입니다. Paseo가 자동으로 다시 연결하므로 다시 온라인이 될 때까지 기다린 후 재시작하세요.",
+          "offlineMessage": "이 호스트는 오프라인입니다. Passession이 자동으로 다시 연결하므로 다시 온라인이 될 때까지 기다린 후 재시작하세요.",
           "requestFailedTitle": "오류",
-          "requestFailedMessage": "재시작 요청을 보내지 못했습니다. Paseo가 자동으로 다시 연결하므로 호스트가 온라인으로 표시되면 다시 시도하세요.",
+          "requestFailedMessage": "재시작 요청을 보내지 못했습니다. Passession이 자동으로 다시 연결하므로 호스트가 온라인으로 표시되면 다시 시도하세요.",
           "dialogFailedMessage": "재시작 확인 대화 상자를 열 수 없습니다."
         },
         "update": {
-          "desktopManagedHint": "이 데몬은 Paseo Desktop에서 관리됩니다. 호스트에서 Paseo 데스크톱을 업데이트합니다.",
+          "desktopManagedHint": "이 데몬은 Passession에서 관리됩니다. 호스트에서 Passession을 업데이트하세요.",
           "title": "데몬 업데이트",
           "hint": "데몬을 최신 버전으로 업데이트하고 다시 시작하세요.",
           "confirm": "업데이트",

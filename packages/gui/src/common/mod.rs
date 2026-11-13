@@ -226,7 +226,7 @@ impl Route {
                     path: Some(if path.is_empty() { id } else { path.to_string() }),
                 }
             }
-            "changes_tree" | "working_diff" | "commit_diff" | "pull_request" => {
+            "changes_tree" | "working_diff" | "commit_diff" | "pull_request" | "git_log" => {
                 Route::Git { host_id, workspace_id }
             }
             "execution_log" => Route::ExecutionLog { host_id, workspace_id, terminal_id: id },

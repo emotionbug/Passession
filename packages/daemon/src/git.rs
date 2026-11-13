@@ -388,6 +388,8 @@ fn checkout_error(error: &anyhow::Error) -> Value {
         "MERGE_CONFLICT"
     } else if error.downcast_ref::<command::NotGitRepo>().is_some() {
         "NOT_GIT_REPO"
+    } else if error.downcast_ref::<diff::InvalidRevision>().is_some() {
+        "invalid_revision"
     } else {
         "UNKNOWN"
     };

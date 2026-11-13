@@ -12,7 +12,7 @@ use makepad_widgets::*;
 use paseo_gui_core::{CoreError, RequestId};
 use serde_json::{Value, json};
 
-use crate::common::overlay::{SelectOption, SelectRequest};
+use crate::common::overlay::{self as overlay_api, MenuItem, SelectOption, SelectRequest};
 use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::widgets::RowMetrics;
@@ -402,7 +402,10 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
             page.reset();
         }
     }
-    match page.search_field.handle_event(cx, event, &mut Scope::with_data(ui)) {
+    // A shell modal (menu, dialog, sheet) above the page owns pointer and keyboard input; the
+    // page's timers and fetches keep running.
+    let covered = shell.data.overlays.is_modal() && is_input(event);
+    match if covered { None } else { page.search_field.handle_event(cx, event, &mut Scope::with_data(ui)) } {
         Some(FieldEvent::Changed(_)) => {
             cx.stop_timer(page.debounce);
             page.debounce = cx.start_timeout(SEARCH_DEBOUNCE);
@@ -417,12 +420,14 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
         }
         None => {}
     }
-    let hit = if matches!(event, Event::TouchUpdate(_) | Event::LongPress(_)) {
+    let hit = if !covered && matches!(event, Event::TouchUpdate(_) | Event::LongPress(_)) {
         event.hits(cx, shell.data.bg_area)
     } else {
         Hit::Nothing
     };
-    if let Hit::FingerDown(e) = &hit
+    if covered {
+        page.touch_scroll.reset();
+    } else if let Hit::FingerDown(e) = &hit
         && !page.viewport.contains(e.abs)
     {
         page.touch_scroll.reset();
@@ -432,7 +437,8 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
             shell.redraw(cx);
         }
     }
-    if let Event::Scroll(e) = event
+    if !covered
+        && let Event::Scroll(e) = event
         && page.viewport.contains(e.abs)
     {
         page.touch_scroll.reset();
@@ -445,6 +451,25 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
         shell.redraw(cx);
     }
     shell.data.history = Some(page);
+}
+
+/// Pointer, wheel and keyboard events (everything a covering modal takes over).
+fn is_input(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::MouseDown(_)
+            | Event::MouseMove(_)
+            | Event::MouseUp(_)
+            | Event::MouseLeave(_)
+            | Event::Scroll(_)
+            | Event::TouchUpdate(_)
+            | Event::LongPress(_)
+            | Event::KeyDown(_)
+            | Event::KeyUp(_)
+            | Event::TextInput(_)
+            | Event::TextCopy(_)
+            | Event::TextCut(_)
+    )
 }
 
 /// Responses routed to the page (requests registered under [`PAGE_SHEET`]).
@@ -484,11 +509,11 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) 
             // `SidebarMenuToggle`: beside the sidebar it shows or hides it; over the shell
             // (compact) revealing the agent list leaves this screen.
             if shell.data.compact {
-                shell.data.layout.show_sidebar(true);
+                shell.data.layout.show_sidebar(true, true);
                 commands::close_page(shell, cx);
             } else {
                 let visible = shell.data.layout.sidebar_visible;
-                shell.data.layout.show_sidebar(!visible);
+                shell.data.layout.show_sidebar(false, !visible);
             }
         }
         "clear" => with_page(shell, |page| {
@@ -731,10 +756,27 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
     let w = area.size.x - inset * 2.0;
     if host_count > 1 || search_supported {
         y += 16.0;
+        // The host trigger shares the row with search: its label shrinks first, and when even
+        // a short label beside a 160px search field does not fit it moves to its own row.
+        let host_filter = (host_count > 1).then(|| {
+            let host = hosts::host(&state, &page.selected_host).filter(|_| !page.selected_host.is_empty());
+            let label = host.as_ref().map(|h| h.display_label()).unwrap_or_else(|| "All hosts".to_string());
+            (host, label)
+        });
+        let host_spec = ui.spec(Font::Medium, 14.0, p.foreground);
+        let trigger_chrome = 12.0 + 14.0 + 6.0 + 6.0 + 14.0 + 12.0;
+        let natural_lw = host_filter.as_ref().map_or(0.0, |(_, label)| ui.measure(cx, host_spec, label).min(180.0));
+        let inline_room = w - 160.0 - 8.0 - trigger_chrome;
+        let stacked = search_supported && host_filter.is_some() && inline_room < 48.0;
+        let lw = if search_supported && !stacked { natural_lw.min(inline_room) } else { natural_lw.min(w - trigger_chrome) }.max(0.0);
         let mut fx = x;
         if search_supported {
-            let sw = w.min(420.0) - if host_count > 1 { 180.0 } else { 0.0 };
-            let r = rect(fx, y, sw.max(160.0), field_h + 2.0);
+            let sw = if host_filter.is_some() && !stacked {
+                (w.min(420.0) - 180.0).max(160.0).min(w - 8.0 - trigger_chrome - lw)
+            } else {
+                w.min(420.0)
+            };
+            let r = rect(fx, y, sw, field_h + 2.0);
             ui.painter.outline(cx, r, p.surface1, p.border, 1.0, 6.0);
             ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "search", 14.0, p.muted);
             let has_text = !page.search_field.text().is_empty();
@@ -745,14 +787,14 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
                 ui.icon(cx, rect(clear.pos.x + 8.0, clear.pos.y + 8.0, 14.0, 14.0), "x", 14.0, p.muted);
                 ui.hit_tip(clear, "hist:clear", &tr("sessions.actions.clearSearch"));
             }
-            fx = r.pos.x + r.size.x + 8.0;
+            if stacked {
+                y += field_h + 2.0 + 8.0;
+            } else {
+                fx = r.pos.x + r.size.x + 8.0;
+            }
         }
-        if host_count > 1 {
-            let host = hosts::host(&state, &page.selected_host).filter(|_| !page.selected_host.is_empty());
-            let label = host.map(|h| h.display_label()).unwrap_or_else(|| "All hosts".to_string());
-            let spec = ui.spec(Font::Medium, 14.0, p.foreground);
-            let lw = ui.measure(cx, spec, &label).min(180.0);
-            let r = rect(fx, y, 12.0 + 14.0 + 6.0 + lw + 6.0 + 14.0 + 12.0, field_h + 2.0);
+        if let Some((host, label)) = host_filter {
+            let r = rect(fx, y, trigger_chrome + lw, field_h + 2.0);
             let bg = if ui.is_pressed("hist:filter") { p.surface3 } else if ui.is_hover("hist:filter") { p.surface2 } else { p.surface1 };
             ui.painter.outline(cx, r, bg, p.border, 1.0, 6.0);
             match host {
@@ -762,7 +804,8 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
                 }
                 None => ui.icon(cx, rect(r.pos.x + 12.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "server", 14.0, p.muted),
             }
-            ui.text(cx, rect(r.pos.x + 32.0, r.pos.y, lw, r.size.y), spec, &label);
+            let fitted = ui.painter.fit(cx, host_spec, &label, lw);
+            ui.text(cx, rect(r.pos.x + 32.0, r.pos.y, lw, r.size.y), host_spec, &fitted);
             ui.icon(cx, rect(r.pos.x + 32.0 + lw + 6.0, r.pos.y + (r.size.y - 14.0) * 0.5, 14.0, 14.0), "chevron-down", 14.0, p.muted);
             ui.hit(r, "hist:filter");
         }
@@ -865,8 +908,9 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
 }
 
 /// Original `SessionRow`. Phones: workspace title and badges, then the provider + agent title,
-/// then `project · branch · time · host`. Wider layouts: one line with fixed project (132),
-/// host (120, right-aligned), branch (132) and time (72, right-aligned) columns.
+/// then `project · branch · time · host`. Wider layouts: one line with the project (132),
+/// host (120, right-aligned), branch (132) and time (72, right-aligned) columns that still
+/// leave the title its minimum width (see [`wide_columns`]).
 #[allow(clippy::too_many_arguments)]
 fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize, row: &HistoryAgent, host_label: &str, query: &str, compact: bool, metrics: RowMetrics) -> f64 {
     let p = ui.p;
@@ -929,9 +973,10 @@ fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize,
         let text = meta.join(sep);
         highlighted(ui, cx, rect(cx0, ty + line * 2.0 + 2.0, inner_w, line), muted, &text, query);
     } else {
-        let columns = 12.0 + 132.0 + 12.0 + 16.0 + 120.0 + 12.0 + 132.0 + 12.0 + 72.0;
+        let shown = wide_columns(inner_w);
+        let columns: f64 = WIDE_COLUMNS.iter().zip(shown).filter(|(_, on)| *on).map(|(c, _)| c.width).sum();
         let title_w = (inner_w - columns).max(0.0);
-        let ws_w = ui.measure(cx, base, workspace_title).min(320.0).min(title_w);
+        let ws_w = ui.measure(cx, base, workspace_title).min(320.0).min(title_w * 0.5);
         highlighted(ui, cx, rect(cx0, ty, ws_w, line), base, workspace_title, query);
         let mut tx = cx0 + ws_w + 8.0;
         ui.icon(cx, rect(tx, ty + (line - 12.0) * 0.5, 12.0, 12.0), "chevron-right", 12.0, p.muted);
@@ -941,18 +986,71 @@ fn session_row(ui: &mut Ui, cx: &mut Cx2d, x: f64, y: f64, w: f64, index: usize,
         if badges_w > 0.0 {
             badges(ui, cx, tx + agent_w + 8.0, ty);
         }
-        let mut colx = cx0 + title_w + 12.0;
-        highlighted(ui, cx, rect(colx, ty, 132.0, line), muted, project_name, query);
-        colx += 132.0 + 12.0 + 16.0;
-        let hw = ui.measure(cx, muted, host_label).min(120.0);
-        let fitted = ui.painter.fit(cx, muted, host_label, 120.0);
-        ui.text(cx, rect(colx + 120.0 - hw, ty, hw, line), muted, &fitted);
-        colx += 120.0 + 12.0;
-        highlighted(ui, cx, rect(colx, ty, 132.0, line), muted, branch, query);
-        colx += 132.0 + 12.0;
-        ui.text_right(cx, rect(colx, ty, 72.0, line), muted, &time);
+        let mut colx = cx0 + title_w;
+        for (column, on) in WIDE_COLUMNS.iter().zip(shown) {
+            if !on {
+                continue;
+            }
+            let cell = rect(colx + column.gap, ty, column.width - column.gap, line);
+            match column.kind {
+                WideColumn::Project => highlighted(ui, cx, cell, muted, project_name, query),
+                WideColumn::Host => {
+                    let hw = ui.measure(cx, muted, host_label).min(cell.size.x);
+                    let fitted = ui.painter.fit(cx, muted, host_label, cell.size.x);
+                    ui.text(cx, rect(cell.pos.x + cell.size.x - hw, ty, hw, line), muted, &fitted);
+                }
+                WideColumn::Branch => highlighted(ui, cx, cell, muted, branch, query),
+                WideColumn::Time => {
+                    ui.text_right(cx, cell, muted, &time);
+                }
+            }
+            colx += column.width;
+        }
     }
     h
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WideColumn {
+    Project,
+    Host,
+    Branch,
+    Time,
+}
+
+/// A metadata column after the title on wide rows: `gap` leading space included in `width`.
+struct ColumnSpec {
+    kind: WideColumn,
+    width: f64,
+    gap: f64,
+}
+
+/// Left to right: project (132), host (120, right-aligned after 16 more), branch (132) and
+/// time (72, right-aligned), each 12px after the previous one.
+const WIDE_COLUMNS: [ColumnSpec; 4] = [
+    ColumnSpec { kind: WideColumn::Project, width: 12.0 + 132.0, gap: 12.0 },
+    ColumnSpec { kind: WideColumn::Host, width: 12.0 + 16.0 + 120.0, gap: 12.0 + 16.0 },
+    ColumnSpec { kind: WideColumn::Branch, width: 12.0 + 132.0, gap: 12.0 },
+    ColumnSpec { kind: WideColumn::Time, width: 12.0 + 72.0, gap: 12.0 },
+];
+
+/// The title keeps at least this much of a wide row before metadata columns are dropped.
+const MIN_TITLE_WIDTH: f64 = 280.0;
+
+/// Which [`WIDE_COLUMNS`] fit beside a title of at least [`MIN_TITLE_WIDTH`] in `inner_w`:
+/// branch goes first, then host, project and finally time.
+fn wide_columns(inner_w: f64) -> [bool; 4] {
+    let mut shown = [true; 4];
+    for drop in [WideColumn::Branch, WideColumn::Host, WideColumn::Project, WideColumn::Time] {
+        let used: f64 = WIDE_COLUMNS.iter().zip(shown).filter(|(_, on)| *on).map(|(c, _)| c.width).sum();
+        if inner_w - used >= MIN_TITLE_WIDTH {
+            break;
+        }
+        if let Some(index) = WIDE_COLUMNS.iter().position(|c| c.kind == drop) {
+            shown[index] = false;
+        }
+    }
+    shown
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -979,9 +1077,10 @@ pub struct ImportSheet {
     generation: u64,
     debounce_at: Option<f64>,
     load_now: bool,
-    /// Provider filter rows drawn last frame (window coordinates).
+    /// Provider filter trigger drawn last frame (window coordinates).
     filter_rect: Rect,
-    filter_open: bool,
+    /// Overlay owner the provider filter menu answers to (unique per sheet).
+    owner: String,
     state: Arc<Value>,
 }
 
@@ -1007,7 +1106,7 @@ impl ImportSheet {
             debounce_at: None,
             load_now: false,
             filter_rect: Rect::default(),
-            filter_open: false,
+            owner: format!("{}import-{}", overlay_api::WIDGET_OWNER_PREFIX, overlay_api::next_id()),
             state: Arc::new(Value::Null),
         }
     }
@@ -1187,9 +1286,6 @@ impl Sheet for ImportSheet {
             ui.text_centered(cx, rect(x, y, w, line_h), spec, &text);
             y += line_h + 32.0;
         }
-        if self.filter_open && providers.len() > 1 {
-            self.draw_provider_menu(cx, ui, &providers, interactive);
-        }
         if self.debounce_at.is_some() {
             crate::shell::sheets::SPINNING.with(|s| s.set(true));
         }
@@ -1209,20 +1305,13 @@ impl Sheet for ImportSheet {
                 self.scope_cwd.clear();
                 self.load(ops);
             }
-            "provider" => self.filter_open = !self.filter_open,
-            "pick:dismiss" => self.filter_open = false,
+            "provider" => self.open_provider_menu(ops),
             "more" => {
                 self.limit += 50;
                 self.load(ops);
             }
             _ => {
-                if let Some(index) = id.strip_prefix("pick:").and_then(|i| i.parse::<usize>().ok()) {
-                    let mut providers = self.providers.clone();
-                    providers.sort();
-                    self.provider = if index == 0 { None } else { providers.get(index - 1).cloned() };
-                    self.filter_open = false;
-                    self.load(ops);
-                } else if let Some(row) = id.strip_prefix("row:").and_then(|i| i.parse::<usize>().ok()).and_then(|i| self.entries.get(i).cloned()) {
+                if let Some(row) = id.strip_prefix("row:").and_then(|i| i.parse::<usize>().ok()).and_then(|i| self.entries.get(i).cloned()) {
                     self.busy = true;
                     self.error = None;
                     self.importing = Some(Self::key(&row));
@@ -1252,6 +1341,12 @@ impl Sheet for ImportSheet {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) -> SheetFlow {
         if let Some(FieldEvent::Changed(_) | FieldEvent::Returned(_)) = self.search.handle_event(cx, event, scope) {
             self.debounce_at = Some(cx.seconds_since_app_start() + 0.3);
+        }
+        for (_, args) in overlay_api::take_answers(&self.owner) {
+            if let Some(value) = args.get("value").and_then(Value::as_str) {
+                self.provider = (!value.is_empty()).then(|| value.to_string());
+                self.load_now = true;
+            }
         }
         SheetFlow::Stay
     }
@@ -1339,47 +1434,25 @@ impl Sheet for ImportSheet {
 }
 
 impl ImportSheet {
-    /// Material 3 `PopupMenuButton` (position over the button): surfaceContainer (surface2),
-    /// 4px radius, elevation 3, 8px vertical padding, 36px items with 12px padding and the
-    /// labelLarge (medium 14) label, width stepped to 56px within 112–280. "All", then each
-    /// provider with its 14px icon. A tap outside closes it.
-    fn draw_provider_menu(&mut self, cx: &mut Cx2d, ui: &mut Ui, providers: &[String], interactive: bool) {
-        let p = ui.p;
-        let group = ui.painter.new_layer(cx);
-        ui.draw_icon.draw_vars.set_draw_call_group(group);
-        let spec = ui.spec(Font::Medium, 14.0, p.foreground);
-        let mut options = vec![(String::new(), tr("importSession.filters.all"))];
-        options.extend(providers.iter().map(|p| (p.clone(), p.clone())));
-        let natural = options
-            .iter()
-            .map(|(value, label)| 24.0 + if value.is_empty() { 0.0 } else { 14.0 + 8.0 } + ui.measure(cx, spec, label))
-            .fold(0.0, f64::max);
-        let width = ((natural / 56.0).ceil() * 56.0).clamp(112.0, 280.0);
-        let anchor = self.filter_rect;
-        let metrics = RowMetrics::measure(ui.painter, cx, spec, None, 0.0);
-        let row_h = metrics.height(36.0, 8.0, 14.0);
-        let list = rect(anchor.pos.x, anchor.pos.y, width, 8.0 + options.len() as f64 * row_h + 8.0);
-        if interactive {
-            ui.hit(rect(-1.0e5, -1.0e5, 2.0e5, 2.0e5), "pick:dismiss");
-        }
-        ui.fill(cx, rect(list.pos.x, list.pos.y + 1.0, list.size.x, list.size.y + 2.0), argb(0x26000000), 5.0);
-        ui.fill(cx, rect(list.pos.x - 1.0, list.pos.y + 2.0, list.size.x + 2.0, list.size.y + 3.0), argb(0x14000000), 6.0);
-        ui.fill(cx, list, p.surface2, 4.0);
-        for (i, (value, label)) in options.iter().enumerate() {
-            let row = rect(list.pos.x, list.pos.y + 8.0 + i as f64 * row_h, list.size.x, row_h);
-            let id = format!("pick:{i}");
-            if ui.is_hover(&id) || ui.is_pressed(&id) {
-                ui.fill(cx, row, with_alpha(p.foreground, if ui.is_pressed(&id) { 0.1 } else { 0.08 }), 0.0);
+    /// The provider filter as the shared anchored menu (compact: menu sheet), which fits the
+    /// window and scrolls: "All", then each provider with its icon. The owner is unique to this
+    /// sheet and only this menu uses it, so its answers arrive in `handle_event`.
+    fn open_provider_menu(&mut self, ops: &mut SheetOps) {
+        let mut providers = self.providers.clone();
+        providers.sort();
+        let mut entries = vec![MenuItem::new("", tr("importSession.filters.all")).icon("layers").checked(self.provider.is_none()).entry()];
+        entries.extend(providers.into_iter().map(|provider| {
+            let checked = self.provider.as_deref() == Some(provider.as_str());
+            let mut item = MenuItem::new(provider.clone(), provider.clone()).checked(checked);
+            if let Some(svg) = crate::common::provider_icon::svg_for(&provider, None) {
+                item = item.svg(svg);
             }
-            let slots = metrics.layout(row, 12.0, if value.is_empty() { 0.0 } else { 14.0 }, 0.0, 8.0);
-            if !value.is_empty() {
-                ProviderIcon::paint(ui.painter, ui.draw_icon, cx, rect(slots.leading.pos.x, row.pos.y + (row_h - 14.0) * 0.5, slots.leading.size.x, 14.0), value, None, p.muted);
-            }
-            ui.text(cx, slots.title, spec, label);
-            if interactive {
-                ui.hit(row, id);
-            }
-        }
+            item.entry()
+        }));
+        let (owner, anchor) = (self.owner.clone(), self.filter_rect);
+        ops.run(move |_, _, ui| {
+            overlay_api::with_owner(ui, &owner, |ui| overlay_api::open_menu(ui, anchor, Some("Filter by provider".to_string()), entries));
+        });
     }
 
     /// The catalog error plus one line per failed provider.
@@ -1389,5 +1462,19 @@ impl ImportSheet {
             notices.push(tr_args("importSession.status.failedProvider", &[("provider", j::text(error, "provider"))]));
         }
         notices.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_rows_drop_columns_before_starving_the_title() {
+        let all: f64 = WIDE_COLUMNS.iter().map(|c| c.width).sum();
+        assert_eq!(wide_columns(all + MIN_TITLE_WIDTH), [true; 4]);
+        assert_eq!(wide_columns(all + MIN_TITLE_WIDTH - 1.0), [true, true, false, true]);
+        assert_eq!(wide_columns(MIN_TITLE_WIDTH + 12.0 + 72.0), [false, false, false, true]);
+        assert_eq!(wide_columns(100.0), [false; 4]);
     }
 }

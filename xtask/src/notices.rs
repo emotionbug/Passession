@@ -632,7 +632,7 @@ fn render_section(document: &Value) -> Result<String> {
     })
 }
 
-const GUI_BOUNDARY: &str = "Paseo Sessions application Cargo dependency closure for the packaged target (normal and build dependencies; dev-only edges excluded). Includes upstream license/notice files and nested vendored-component notices; this is not a source-offer or a toolchain/system-library compliance certification.";
+const GUI_BOUNDARY: &str = "Passession application Cargo dependency closure for the packaged target (normal and build dependencies; dev-only edges excluded). Includes upstream license/notice files and nested vendored-component notices; this is not a source-offer or a toolchain/system-library compliance certification.";
 const SUPPLEMENTS: &str = "packaging/cargo-notice-supplements.json";
 const RESOURCE_NOTICES: &str = "packaging/resource-notices.json";
 const NATIVE_NOTICES: &str = "packaging/native-notices.json";

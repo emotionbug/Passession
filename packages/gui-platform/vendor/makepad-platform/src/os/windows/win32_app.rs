@@ -4,6 +4,8 @@ use {
         os::windows::ffi::OsStrExt,
         mem,
         collections::VecDeque,
+        sync::atomic::{AtomicU8, Ordering},
+        ffi::c_void,
         cell::{
             Cell,
             RefCell,
@@ -23,6 +25,19 @@ use {
                         WNDCLASSEXW,
                         PM_REMOVE,
                         LoadIconW,
+                        LoadImageW,
+                        GetSystemMetrics,
+                        SetWindowPos,
+                        HICON,
+                        IMAGE_ICON,
+                        LR_DEFAULTCOLOR,
+                        SM_CXSMICON,
+                        SM_CYSMICON,
+                        SWP_FRAMECHANGED,
+                        SWP_NOACTIVATE,
+                        SWP_NOMOVE,
+                        SWP_NOSIZE,
+                        SWP_NOZORDER,
                         RegisterClassExW,
                         IsGUIThread,
                         GetMessageW,
@@ -62,6 +77,7 @@ use {
                         MDT_EFFECTIVE_DPI
                     },
                 },
+                Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
                 Graphics::Gdi::{
                     CreateSolidBrush,
                     HMONITOR,
@@ -75,6 +91,7 @@ use {
                     COLORREF,
                     S_OK,
                     HWND,
+                    HINSTANCE,
                     BOOL,
                     FARPROC,
                     DRAGDROP_S_DROP,
@@ -118,6 +135,44 @@ use {
     },
 };
 pub const FALSE: BOOL = BOOL(0);
+
+/// Paseo: the caption's light/dark appearance (`Cx::set_window_dark_appearance`):
+/// 0 until the app picks a theme (the system's light caption), 1 light, 2 dark.
+static DARK_CAPTION: AtomicU8 = AtomicU8::new(0);
+
+/// Applies the chosen caption appearance to one window; failures (Windows before 10 20H1)
+/// keep the default caption.
+pub fn apply_dark_caption(hwnd: HWND) {
+    let mode = DARK_CAPTION.load(Ordering::Relaxed);
+    if mode == 0 {
+        return;
+    }
+    let dark = BOOL::from(mode == 2);
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const BOOL as *const c_void,
+            mem::size_of::<BOOL>() as u32,
+        );
+    }
+}
+
+/// Every window's caption follows the app theme; later windows take it at creation.
+pub fn set_dark_appearance(dark: bool) {
+    let mode = if dark { 2 } else { 1 };
+    if DARK_CAPTION.swap(mode, Ordering::Relaxed) == mode {
+        return;
+    }
+    let windows = WIN32_APP.with_borrow(|app| app.as_ref().map(|app| app.all_windows.clone()).unwrap_or_default());
+    for hwnd in windows {
+        apply_dark_caption(hwnd);
+        // Windows 10 repaints the caption only once its frame changes.
+        unsafe {
+            let _ = SetWindowPos(hwnd, HWND(0), 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
 pub const TRUE: BOOL = BOOL(1);
 
 
@@ -204,24 +259,29 @@ impl Win32App {
     pub fn new(event_callback: Box<dyn FnMut(Win32Event) -> EventFlow>) -> Win32App {
         
         let window_class_name = encode_wide("MakepadWindow\0");
+        let instance: HINSTANCE = unsafe {GetModuleHandleW(None).unwrap().into()};
+        // Paseo: the executable's icon resource 1 labels the caption, taskbar and Alt+Tab.
+        // Upstream used the stock Windows logo, which stays the fallback without one.
+        let app_icon = PCWSTR(1 as *const u16);
+        let icon = unsafe {LoadIconW(instance, app_icon).or_else(|_| LoadIconW(None, IDI_WINLOGO)).unwrap()};
+        let small_icon = unsafe {
+            LoadImageW(instance, app_icon, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR)
+                .map(|handle| HICON(handle.0))
+                .unwrap_or(icon)
+        };
         let class = WNDCLASSEXW {
             cbSize: mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW
                 | CS_VREDRAW
                 | CS_OWNDC,
             lpfnWndProc: Some(Win32Window::window_class_proc),
-            hInstance: unsafe {GetModuleHandleW(None).unwrap().into()},
-            hIcon: unsafe {LoadIconW(None, IDI_WINLOGO).unwrap()}, //h_icon,
+            hInstance: instance,
+            hIcon: icon,
+            hIconSm: small_icon,
             lpszClassName: PCWSTR(window_class_name.as_ptr()),
             hbrBackground: unsafe {CreateSolidBrush(COLORREF(0x3f3f3f3f))},
+            // hCursor stays null so the app's cursor state is not overridden in the client area.
             ..Default::default()
-            /*            
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hCursor: Default::default(), //unsafe {winuser::LoadCursorW(ptr::null_mut(), winuser::IDC_ARROW)}, // must be null in order for cursor state to work properly
-            hbrBackground: Default::default(),
-            lpszMenuName: PCWSTR::null(),
-            hIconSm: Default::default(),*/
         };
         
         unsafe {
@@ -512,40 +572,7 @@ impl Win32App {
     
     pub fn set_mouse_cursor(&mut self, cursor: MouseCursor) {
         if self.current_cursor.is_none() || self.current_cursor.unwrap() != cursor {
-            let win32_cursor = match cursor {
-                MouseCursor::Hidden => {
-                    PCWSTR::null()
-                },
-                MouseCursor::Default => IDC_ARROW,
-                MouseCursor::Crosshair => IDC_CROSS,
-                MouseCursor::Hand => IDC_HAND,
-                // Default to Hand for non-supported cursors, until we include our own custom cursor files.
-                MouseCursor::Grab | MouseCursor::Grabbing => IDC_HAND,
-                MouseCursor::Arrow => IDC_ARROW,
-                MouseCursor::Move => IDC_SIZEALL,
-                MouseCursor::Text => IDC_IBEAM,
-                MouseCursor::Wait => IDC_ARROW,
-                MouseCursor::Help => IDC_HELP,
-                MouseCursor::NotAllowed => IDC_NO,
-                
-                MouseCursor::EResize => IDC_SIZEWE,
-                MouseCursor::NResize => IDC_SIZENS,
-                MouseCursor::NeResize => IDC_SIZENESW,
-                MouseCursor::NwResize => IDC_SIZENWSE,
-                MouseCursor::SResize => IDC_SIZENS,
-                MouseCursor::SeResize => IDC_SIZENWSE,
-                MouseCursor::SwResize => IDC_SIZENESW,
-                MouseCursor::WResize => IDC_SIZEWE,
-                
-                
-                MouseCursor::NsResize => IDC_SIZENS,
-                MouseCursor::NeswResize => IDC_SIZENESW,
-                MouseCursor::EwResize => IDC_SIZEWE,
-                MouseCursor::NwseResize => IDC_SIZENWSE,
-                
-                MouseCursor::ColResize => IDC_SIZEWE,
-                MouseCursor::RowResize => IDC_SIZENS,
-            };
+            let win32_cursor = win32_cursor_id(cursor);
             self.current_cursor = Some(cursor);
             unsafe {
                 if win32_cursor == PCWSTR::null() {
@@ -558,6 +585,55 @@ impl Win32App {
             }
             //TODO
         }
+    }
+
+    /// Paseo: re-sets the app's cursor after the native frame showed its own (`WM_SETCURSOR`
+    /// over the client area). Only the cursor shape changes; the show count is untouched.
+    pub fn reapply_mouse_cursor(&mut self) {
+        let cursor = *self.current_cursor.get_or_insert(MouseCursor::Default);
+        let win32_cursor = win32_cursor_id(cursor);
+        unsafe {
+            if win32_cursor == PCWSTR::null() {
+                SetCursor(None);
+            }
+            else if let Ok(handle) = LoadCursorW(None, win32_cursor) {
+                SetCursor(handle);
+            }
+        }
+    }
+}
+
+fn win32_cursor_id(cursor: MouseCursor) -> PCWSTR {
+    match cursor {
+        MouseCursor::Hidden => PCWSTR::null(),
+        MouseCursor::Default => IDC_ARROW,
+        MouseCursor::Crosshair => IDC_CROSS,
+        MouseCursor::Hand => IDC_HAND,
+        // Default to Hand for non-supported cursors, until we include our own custom cursor files.
+        MouseCursor::Grab | MouseCursor::Grabbing => IDC_HAND,
+        MouseCursor::Arrow => IDC_ARROW,
+        MouseCursor::Move => IDC_SIZEALL,
+        MouseCursor::Text => IDC_IBEAM,
+        MouseCursor::Wait => IDC_ARROW,
+        MouseCursor::Help => IDC_HELP,
+        MouseCursor::NotAllowed => IDC_NO,
+
+        MouseCursor::EResize => IDC_SIZEWE,
+        MouseCursor::NResize => IDC_SIZENS,
+        MouseCursor::NeResize => IDC_SIZENESW,
+        MouseCursor::NwResize => IDC_SIZENWSE,
+        MouseCursor::SResize => IDC_SIZENS,
+        MouseCursor::SeResize => IDC_SIZENWSE,
+        MouseCursor::SwResize => IDC_SIZENESW,
+        MouseCursor::WResize => IDC_SIZEWE,
+
+        MouseCursor::NsResize => IDC_SIZENS,
+        MouseCursor::NeswResize => IDC_SIZENESW,
+        MouseCursor::EwResize => IDC_SIZEWE,
+        MouseCursor::NwseResize => IDC_SIZENWSE,
+
+        MouseCursor::ColResize => IDC_SIZEWE,
+        MouseCursor::RowResize => IDC_SIZENS,
     }
 }
 

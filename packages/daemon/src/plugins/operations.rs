@@ -143,6 +143,9 @@ impl PluginService {
     }
     fn require_available_id(&self, id: &str) -> Result<()> {
         manifest::validate_id(id)?;
+        if id == "omp-kiro" {
+            bail!("Kiro usage is built in; the external omp-kiro usage plugin is no longer installed in Paseo. The OMP model extension and managed login remain separate.");
+        }
         if is_builtin(id) {
             bail!("Plugin ID \"{id}\" is reserved for a built-in plugin");
         }

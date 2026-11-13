@@ -1,6 +1,6 @@
 # Android
 
-The Android application is the native Rust **Paseo Sessions** client (Makepad), package `sh.paseo.sessions`. It connects to a Rust daemon on another machine; it does not run a local daemon, and its terminal tabs control shells on that host. The same client also targets iOS, Linux, macOS and Windows. There is no Expo/Metro, EAS, Flutter engine, embedded browser or web client in the native application.
+The Android application is the native Rust **Passession** client (Makepad), package `sh.paseo.sessions`. It connects to a Rust daemon on another machine; it does not run a local daemon, and its terminal tabs control shells on that host. The same client also targets iOS, Linux, macOS and Windows. There is no Expo/Metro, EAS, Flutter engine, embedded browser or web client in the native application.
 
 ## Build and launch
 
@@ -36,7 +36,7 @@ The build compiles `paseo-gui` as a `cdylib` per ABI with the NDK clang for API 
 
 The development run selects the single attached `adb` device or the `--device` serial, builds only that device's primary ABI (an x86_64 emulator gets an x86_64 library; a 32-bit-only device is rejected), installs with `adb install -r`, starts the launcher activity and follows `adb logcat` for the app process until interrupted. `--run` rejects an explicit `--arch` or AAB output.
 
-Artifacts are copied into `artifacts/native/` as `Paseo-Sessions-<version>-android-<arch>[-debug-signed].apk` or `.aab`. Non-release profiles and release builds without a production key carry the `-debug-signed` suffix. `packages-android-<arch>[-aab].json` records the artifact filename, format, profile and source revision for release validation. The independent artifact copy keeps Gradle's incremental output intact.
+Artifacts are copied into `artifacts/native/` as `Passession-<version>-android-<arch>[-debug-signed].apk` or `.aab`. Non-release profiles and release builds without a production key carry the `-debug-signed` suffix. `packages-android-<arch>[-aab].json` records the artifact filename, format, profile and source revision for release validation. The independent artifact copy keeps Gradle's incremental output intact.
 
 The earlier ARM64 Rust APK was signature/alignment-checked and installed as an in-place update on Android 17; visual verification remained blocked by the device lock. That evidence does not cover the new profile/AAB paths, establish API 24 compatibility or prove store readiness; see [testing](testing.md).
 

@@ -177,7 +177,7 @@ fn start_activation_window(ready: HANDLE) {
             let Ok(window) = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 ACTIVATION_CLASS,
-                w!("Paseo Sessions"),
+                w!("Passession"),
                 WS_OVERLAPPED,
                 0,
                 0,
@@ -343,7 +343,7 @@ pub(crate) fn init_notifications(_shared: &Arc<Shared>) -> Result<(), PlatformEr
     set_registry_string(HKEY_CURRENT_USER, &backup, Some("Setting"), "s:banner,s:toast,s:audio,c:toast,c:ringing")?;
     set_registry_string(HKEY_CURRENT_USER, &backup, Some("wnsId"), "NonImmersivePackage")?;
     let app = format!("Software\\Classes\\AppUserModelId\\{AUMID}");
-    set_registry_string(HKEY_CURRENT_USER, &app, Some("DisplayName"), "Paseo Sessions")?;
+    set_registry_string(HKEY_CURRENT_USER, &app, Some("DisplayName"), "Passession")?;
     set_registry_string(HKEY_CURRENT_USER, &app, Some("CustomActivator"), ACTIVATOR_CLSID)?;
     let executable = std::env::current_exe().map_err(|e| PlatformError::io(&e))?;
     let server = format!("Software\\Classes\\CLSID\\{ACTIVATOR_CLSID}\\LocalServer32");

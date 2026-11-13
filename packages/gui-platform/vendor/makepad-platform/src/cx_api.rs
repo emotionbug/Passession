@@ -477,6 +477,19 @@ impl Cx {
         }
     }
 
+    /// Paseo: native window chrome follows the app's own light/dark theme rather than only
+    /// the system setting: the Windows caption, the macOS title bar, menus and panels, and
+    /// the X11 frame hint read by GTK-based window managers. Windows created later follow.
+    pub fn set_window_dark_appearance(&mut self, dark: bool) {
+        #[cfg(target_os = "windows")]
+        crate::os::windows::win32_app::set_dark_appearance(dark);
+        #[cfg(target_os = "macos")]
+        crate::os::apple::macos::macos_app::set_dark_appearance(dark);
+        #[cfg(all(target_os = "linux", not(linux_direct), not(target_env = "ohos")))]
+        crate::os::linux::x11::xlib_app::set_dark_appearance(dark);
+        let _ = dark;
+    }
+
 
     pub fn get_dpi_factor_of(&mut self, area: &Area) -> f64 {
         if let Some(draw_list_id) = area.draw_list_id() {

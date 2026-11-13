@@ -20,7 +20,8 @@
     "newSession": "New session",
     "untitled": "Untitled session",
     "search": "Search sessions",
-    "empty": "No sessions. Start a new session or import an existing one."
+    "empty": "No sessions. Start a new session or import an existing one.",
+    "pick": "Pick a session from the sidebar or start a new one."
   },
   "paneFind": {
     "connectionFailure": "Could not search this chat. Check the host connection and retry.",
@@ -605,6 +606,8 @@
     "sheet": { "openAsTab": "Open as tab" },
     "tabs": {
       "loading": "Loading...",
+      "overflow": "{{count}} more tabs",
+      "overflowTitle": "Other tabs",
       "modified": "Unsaved changes",
       "loadingAgentTitle": "Loading agent title",
       "fallback": {
@@ -634,8 +637,8 @@
         "closeRight": "Close to the right",
         "closeOthers": "Close other tabs",
         "moveToMain": "Move to main panel",
-        "reloadAgent": "Reload agent",
-        "reloadAgentTooltip": "Reload agent to update skills, MCPs or login status.",
+        "reloadAgent": "Restart agent",
+        "reloadAgentTooltip": "Restart the agent to pick up skills, MCPs or login changes.",
         "close": "Close",
         "renameTerminal": "Rename terminal",
         "renameAgent": "Rename agent"
@@ -674,9 +677,9 @@
         "filePathCopiedLabel": "File path",
         "resumeIdUnavailable": "Resume ID not available",
         "resumeCommandUnavailable": "Resume command not available",
-        "reloadingAgent": "Reloading agent...",
-        "reloadedAgent": "Reloaded agent",
-        "failedToReloadAgent": "Failed to reload agent",
+        "reloadingAgent": "Restarting agent...",
+        "reloadedAgent": "Restarted agent",
+        "failedToReloadAgent": "Failed to restart agent",
         "failedToCloseAgent": "Failed to close agent"
       },
       "confirmations": {
@@ -1031,6 +1034,86 @@
         "installCli": "Install the {{cli}} CLI to use {{brand}} features.",
         "signIn": "Run {{command}} to use {{brand}} features.",
         "generic": "Set up {{brand}} on this host to use its features."
+      },
+      "log": {
+        "title": "Git Log",
+        "open": "Open Git Log",
+        "checkedOut": "Checked out {{name}}",
+        "checkoutFailed": "Failed to check out the branch",
+        "search": { "placeholder": "Search commit messages" },
+        "toolbar": {
+          "refresh": "Refresh",
+          "showBranches": "Show branches",
+          "hideBranches": "Hide branches",
+          "search": "Search",
+          "closeSearch": "Close search",
+          "clear": "Clear",
+          "back": "Back"
+        },
+        "filters": {
+          "branch": "Branch: {{name}}",
+          "user": "User: {{name}}",
+          "allBranches": "All",
+          "allUsers": "All",
+          "branchTitle": "Branch",
+          "userTitle": "User",
+          "userSearch": "Search users",
+          "userEmpty": "No users"
+        },
+        "branches": {
+          "head": "HEAD",
+          "local": "Local",
+          "remote": "Remote",
+          "tags": "Tags",
+          "detached": "HEAD (detached at {{sha}})",
+          "gone": "gone",
+          "search": "Search branches and tags",
+          "empty": "No branches or tags"
+        },
+        "columns": {
+          "subject": "Subject",
+          "author": "Author",
+          "date": "Date",
+          "hash": "Hash"
+        },
+        "menu": {
+          "checkout": "Checkout",
+          "showOnly": "Show only this branch",
+          "copyName": "Copy name",
+          "copyRevision": "Copy revision number",
+          "copySubject": "Copy subject",
+          "openDiff": "Open diff",
+          "more": "More actions"
+        },
+        "toasts": {
+          "nameCopied": "Name copied",
+          "revisionCopied": "Revision number copied",
+          "subjectCopied": "Subject copied"
+        },
+        "details": {
+          "select": "Select a commit to see its changes",
+          "changedFiles": "Changed files ({{count}})",
+          "noFiles": "No changed files",
+          "missing": "This commit no longer exists",
+          "committedBy": "Committed by {{name}} on {{date}}",
+          "hash": "Hash",
+          "copyHash": "Copy revision number",
+          "parent": "Parent",
+          "parents": "Parents"
+        },
+        "states": {
+          "disconnected": "The host is disconnected. The Git Log loads once it reconnects.",
+          "unsupported": "Update this host's daemon to use the Git Log.",
+          "empty": "No commits yet",
+          "noMatches": "No commits match the filters",
+          "retry": "Retry"
+        },
+        "time": {
+          "justNow": "just now",
+          "minutesAgo": "{{count}}m ago",
+          "hoursAgo": "{{count}}h ago",
+          "daysAgo": "{{count}}d ago"
+        }
       }
     }
   },
@@ -1166,7 +1249,7 @@
       "discord": "Discord",
       "github": "Create GitHub issue",
       "whatsNew": "What's new",
-      "appName": "Paseo"
+      "appName": "Passession"
     },
     "sections": { "sessions": "History", "search": "Search", "schedules": "Schedules" },
     "worktreeSetup": {
@@ -1306,7 +1389,7 @@
       "restore": "Restore window",
       "close": "Close window"
     },
-    "quitting": { "title": "Quitting Paseo...", "detail": "Stopping the local daemon." },
+    "quitting": { "title": "Quitting Passession...", "detail": "Stopping the local daemon." },
     "daemon": {
       "title": "Daemon",
       "lifecycle": {
@@ -1333,17 +1416,17 @@
       },
       "management": {
         "title": "Manage built-in daemon",
-        "hint": "Let Paseo start and stop the built-in daemon",
+        "hint": "Let Passession start and stop the built-in daemon",
         "pauseTitle": "Pause built-in daemon",
         "pauseMessage": "This will stop the built-in daemon immediately. Running agents and terminals connected to the built-in daemon will be stopped.",
         "pauseAndStop": "Pause and stop",
-        "registrationFailed": "Built-in daemon started, but Paseo could not save the localhost connection. Toggle daemon management off and on again, or add localhost manually.",
-        "pausedStopFailed": "Built-in daemon management was paused, but Paseo could not stop the daemon.",
+        "registrationFailed": "Built-in daemon started, but Passession could not save the localhost connection. Toggle daemon management off and on again, or add localhost manually.",
+        "pausedStopFailed": "Built-in daemon management was paused, but Passession could not stop the daemon.",
         "updateFailed": "Unable to update built-in daemon management."
       },
       "keepRunning": {
         "title": "Keep daemon running after quit",
-        "hint": "Daemon keeps running when you quit Paseo"
+        "hint": "Daemon keeps running when you quit Passession"
       },
       "logs": {
         "title": "Log file",
@@ -1407,7 +1490,7 @@
     },
     "rosetta": {
       "title": "Download the Apple Silicon build",
-      "runningIntel": "You're running the Intel build of Paseo under Rosetta on Apple Silicon.",
+      "runningIntel": "You're running the Intel build of Passession under Rosetta on Apple Silicon.",
       "highCpu": "This causes high CPU usage. Download the Apple Silicon build to fix it.",
       "download": "Download"
     },
@@ -1447,7 +1530,7 @@
         "microphone": "Microphone status has not been checked yet."
       },
       "testNotification": {
-        "title": "Paseo notification test",
+        "title": "Passession notification test",
         "body": "If you can see this, desktop notifications work.",
         "notDelivered": "Notification was not delivered. Check System Settings > Notifications.",
         "failed": "Failed to send notification."
@@ -1461,7 +1544,7 @@
     }
   },
   "rootError": {
-    "title": "Paseo ran into a problem.",
+    "title": "Passession ran into a problem.",
     "body": "Try again to reload the app. If this keeps happening, include the details below when you report it.",
     "details": "Details"
   },
@@ -1548,7 +1631,7 @@
     }
   },
   "onboarding": {
-    "title": "Welcome to Paseo",
+    "title": "Welcome to Passession",
     "subtitle": "Connect your computer to get started",
     "actions": { "settings": "Settings" }
   },
@@ -1714,9 +1797,9 @@
       "enablingRelay": "Enabling...",
       "notNow": "Not now",
       "directConnectionHint": "Without relay, connect directly over TCP, Tailscale, or another VPN. No QR code is created.",
-      "updateRequired": "Update the host to enable relay from Paseo Desktop.",
+      "updateRequired": "Update the host to enable relay from Passession.",
       "unavailable": "Pairing offer unavailable.",
-      "hint": "Scan this QR code with Paseo on your phone, or copy the link below.",
+      "hint": "Scan this QR code with Passession on your phone, or copy the link below.",
       "securityWarning": "Treat this pairing link like a password. Anyone with it can access this daemon.",
       "qrUnavailable": "QR code unavailable.",
       "qrAccessibility": "Pairing QR code",
@@ -1746,7 +1829,7 @@
   "serviceUrl": {
     "title": "Open service URL",
     "message": "Open {{url}}?",
-    "inPaseo": "In Paseo",
+    "inPaseo": "In Passession",
     "externalBrowser": "External browser",
     "dontAskAgain": "Don't ask again"
   },
@@ -2042,7 +2125,7 @@
       "send": "Send",
       "sending": "Sending...",
       "sentTitle": "Test notification sent",
-      "sentDescription": "Paseo handed the notification to the operating system.",
+      "sentDescription": "Passession handed the notification to the operating system.",
       "sendFailedTitle": "Unable to send test notification"
     },
     "hostSections": {
@@ -2138,7 +2221,7 @@
       "browserData": {
         "title": "Browser data",
         "siteData": "Cookies and site data",
-        "description": "Browser tabs share sign-ins and site data across Paseo.",
+        "description": "Browser tabs share sign-ins and site data across Passession.",
         "clear": "Clear browser data",
         "clearing": "Clearing...",
         "confirmTitle": "Clear browser data?",
@@ -2156,7 +2239,7 @@
         "options": { "interrupt": "Interrupt", "steer": "Steer", "queue": "Queue" }
       },
       "serviceUrls": {
-        "options": { "ask": "Ask", "inApp": "In Paseo", "external": "External browser" }
+        "options": { "ask": "Ask", "inApp": "In Passession", "external": "External browser" }
       },
       "terminalScrollback": {
         "label": "Terminal scrollback",
@@ -2220,7 +2303,7 @@
         "label": "App updates",
         "readyToInstall": "Ready to install: {{version}}",
         "installTitle": "Install desktop update",
-        "installMessage": "This updates Paseo on this computer",
+        "installMessage": "This updates Passession on this computer",
         "installConfirm": "Install update",
         "update": "Update",
         "updateTo": "Update to {{version}}",
@@ -2577,13 +2660,13 @@
           "unavailableTitle": "Host unavailable",
           "unavailableMessage": "This host is not connected. Wait for it to come online before restarting.",
           "offlineTitle": "Host offline",
-          "offlineMessage": "This host is offline. Paseo reconnects automatically-wait until it's back online before restarting.",
+          "offlineMessage": "This host is offline. Passession reconnects automatically-wait until it's back online before restarting.",
           "requestFailedTitle": "Error",
-          "requestFailedMessage": "Failed to send the restart request. Paseo reconnects automatically-try again once the host shows as online.",
+          "requestFailedMessage": "Failed to send the restart request. Passession reconnects automatically-try again once the host shows as online.",
           "dialogFailedMessage": "Unable to open the restart confirmation dialog."
         },
         "update": {
-          "desktopManagedHint": "This daemon is managed by Paseo Desktop. Update Paseo Desktop on the host.",
+          "desktopManagedHint": "This daemon is managed by Passession. Update Passession on the host.",
           "title": "Update daemon",
           "hint": "Update the daemon to the latest version and restart it",
           "confirm": "Update",

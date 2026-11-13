@@ -38,6 +38,39 @@ pub fn init_xlib_app_global(event_callback: Box<dyn FnMut(&mut XlibApp, XlibEven
     }
 }
 
+/// Paseo: the app's light/dark theme for the window manager's frame
+/// (`Cx::set_window_dark_appearance`): 0 until the app picks one, 1 light, 2 dark.
+static DARK_APPEARANCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `_GTK_THEME_VARIANT` asks GTK-based window managers (mutter, xfwm) to draw this window's
+/// server-side frame in the app's light or dark variant.
+pub fn apply_theme_variant(display: *mut x11_sys::Display, window: c_ulong) {
+    let variant: &[u8] = match DARK_APPEARANCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => b"light",
+        2 => b"dark",
+        _ => return,
+    };
+    unsafe {
+        let property = x11_sys::XInternAtom(display, "_GTK_THEME_VARIANT\0".as_ptr() as *const _, 0);
+        let utf8 = x11_sys::XInternAtom(display, "UTF8_STRING\0".as_ptr() as *const _, 0);
+        x11_sys::XChangeProperty(display, window, property, utf8, 8, x11_sys::PropModeReplace as i32, variant.as_ptr(), variant.len() as i32);
+    }
+}
+
+pub fn set_dark_appearance(dark: bool) {
+    let mode = if dark {2} else {1};
+    if DARK_APPEARANCE.swap(mode, std::sync::atomic::Ordering::Relaxed) == mode {
+        return;
+    }
+    let app = unsafe {XLIB_APP.as_mut()};
+    let Some(app) = app else {return};
+    let windows: Vec<c_ulong> = app.window_map.keys().copied().collect();
+    for window in windows {
+        apply_theme_variant(app.display, window);
+    }
+    unsafe {x11_sys::XFlush(app.display);}
+}
+
 pub struct XlibApp {
     pub display: *mut x11_sys::Display,
     event_loop_running: bool,

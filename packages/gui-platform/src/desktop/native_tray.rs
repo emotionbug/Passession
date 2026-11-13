@@ -41,8 +41,8 @@ fn build_tray() -> Result<Tray, String> {
     let (width, height, rgba) = crate::image::decode_png_rgba(bytes).map_err(|e| format!("Unable to load tray icon: {e}"))?;
     let icon = tray_icon::Icon::from_rgba(rgba, width, height).map_err(|e| format!("Unable to load tray icon: {e}"))?;
     let menu = Menu::new();
-    let open = MenuItem::new("Open Paseo", true, None);
-    let quit = MenuItem::new("Quit Paseo", true, None);
+    let open = MenuItem::new("Open Passession", true, None);
+    let quit = MenuItem::new("Quit Passession", true, None);
     menu.append(&open).map_err(|e| e.to_string())?;
     menu.append(&PredefinedMenuItem::separator()).map_err(|e| e.to_string())?;
     menu.append(&quit).map_err(|e| e.to_string())?;
@@ -59,7 +59,7 @@ fn build_tray() -> Result<Tray, String> {
         | TrayIconEvent::DoubleClick { .. } => deliver(NativeSignal::TrayOpen),
         _ => {}
     }));
-    let builder = TrayIconBuilder::new().with_id(crate::paths::DESKTOP_APP_ID).with_tooltip("Paseo");
+    let builder = TrayIconBuilder::new().with_id(crate::paths::DESKTOP_APP_ID).with_tooltip("Passession");
     #[cfg(target_os = "macos")]
     let builder = builder.with_icon_templated(icon);
     #[cfg(not(target_os = "macos"))]

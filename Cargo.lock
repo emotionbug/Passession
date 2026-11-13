@@ -1001,6 +1001,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1941,6 +1951,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -3551,6 +3562,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "openssl-probe"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3603,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-client"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3627,7 +3644,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-daemon"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3702,7 +3719,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-gui"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3738,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-gui-core"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3759,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-gui-platform"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3798,7 +3815,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-highlight"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "arborium",
  "tree-sitter-astro-next",
@@ -3807,7 +3824,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-plugin"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3827,7 +3844,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-protocol"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -3848,7 +3865,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-relay"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "axum",
  "clap",
@@ -3865,7 +3882,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-relay-cloudflare"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "js-sys",
  "url",
@@ -3876,14 +3893,14 @@ dependencies = [
 
 [[package]]
 name = "paseo-terminal"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "libghostty-vt",
 ]
 
 [[package]]
 name = "paseo-workspace-inspector"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "paseo-plugin",
  "serde_json",
@@ -3894,7 +3911,7 @@ dependencies = [
 
 [[package]]
 name = "paseo-xtask"
-version = "0.13.17"
+version = "0.13.18"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4441,6 +4458,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4612,6 +4630,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-native-certs"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
+dependencies = [
+ "openssl-probe",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4669,6 +4699,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "schannel"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cb23c424d8ee841bb4d813677ca237e2a610067d594fec130f87d6093495ab5"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4685,6 +4724,29 @@ name = "sdfer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27fd75ebc7c721a70d202c7cdd2beb108bbe5dfaaea68e06aff4de2f4cc240ed"
+
+[[package]]
+name = "security-framework"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
+dependencies = [
+ "bitflags 2.13.2",
+ "core-foundation",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
 
 [[package]]
 name = "semver"

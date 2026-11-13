@@ -39,6 +39,10 @@ use std::collections::{HashMap, HashSet};
 
 /// Original `FLOATING_ACTION_BUTTON_CLEARANCE`: the 56px action plus its 16px inset.
 const FAB_CLEARANCE: f64 = 56.0 + 16.0;
+/// Narrowest diff document beside the 220px tree rail; below it the rail yields to the file picker.
+const MIN_RAIL_DOC_WIDTH: f64 = 320.0;
+/// Diff body height the expanded Commits footer always leaves.
+const MIN_DOC_HEIGHT: f64 = 120.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Presentation {
@@ -134,6 +138,10 @@ pub struct ChangesView {
     pub icons_pending: bool,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     horizontal_scroll: makepad_widgets::scroll_bars::TouchScroll,
+    /// The Jump floating button did not fit the diff body at the last draw (offered in Options instead).
+    jump_hidden: bool,
+    /// The enabled feedback action did not fit the diff body at the last draw (offered in Options instead).
+    feedback_hidden: Option<String>,
 }
 
 fn preferences(ui: &UiContext) -> Map<String, Value> {
@@ -194,6 +202,8 @@ impl ChangesView {
             icons_pending: false,
             touch_scroll: Default::default(),
             horizontal_scroll: Default::default(),
+            jump_hidden: false,
+            feedback_hidden: None,
         };
         view.bind_review(ui, store);
         view
@@ -988,6 +998,17 @@ impl ChangesView {
         if self.presentation(compact, &prefs) == Presentation::Tree {
             entries.push(MenuEntry::Item(MenuItem::new("open-diff", t("workspace.git.diff.openDiffTab")).icon("maximize")));
         } else {
+            // Floating actions that did not fit the diff body stay reachable here.
+            let jump = self.jump_hidden && !self.controller.files.is_empty();
+            if jump {
+                entries.push(MenuEntry::Item(MenuItem::new("jump", t("workspace.git.diff.jumpToFile.title")).icon("folder-tree")));
+            }
+            if let Some(label) = self.feedback_hidden.clone() {
+                entries.push(MenuEntry::Item(MenuItem::new("feedback", label).icon("send")));
+            }
+            if jump || self.feedback_hidden.is_some() {
+                entries.push(MenuEntry::Separator);
+            }
             if !self.controller.files.is_empty() {
                 let collapsed = self.all_files_collapsed();
                 entries.push(MenuEntry::Item(
@@ -1070,6 +1091,11 @@ impl ChangesView {
                     "whitespace" => Self::update_preferences(ui, &[("hideWhitespace", json!(!pref_flag(&prefs, "hideWhitespace")))]),
                     "wrap" => Self::update_preferences(ui, &[("wrapLines", json!(!pref_flag(&prefs, "wrapLines")))]),
                     "inline-diff" => Self::update_preferences(ui, &[("inlineDiff", json!(!pref_flag(&prefs, "inlineDiff")))]),
+                    "jump" => self.activate(cx, ui, parts, store, Hit::Jump, Rect::default(), false, compact),
+                    "feedback" => {
+                        let anchor = self.hits.rect_of(&Hit::Options).unwrap_or_default();
+                        self.activate(cx, ui, parts, store, Hit::Feedback, anchor, false, compact);
+                    }
                     _ => {}
                 }
             }
@@ -1523,7 +1549,13 @@ impl ChangesView {
         if host::supports(ui, self.host(), "checkoutRefresh") {
             right = self.refresh_button(cx, paint, store, compact, right, center_y);
         }
-        let title = self.target.title.clone().unwrap_or_else(|| t("panels.diff.commitSubtitle"));
+        let title = self
+            .target
+            .title
+            .clone()
+            .filter(|title| !title.is_empty())
+            .or_else(|| self.controller.subject.clone())
+            .unwrap_or_else(|| t("panels.diff.commitSubtitle"));
         let left = band.pos.x + 8.0 + 4.0;
         paint.text_centered(cx, Font::Regular, ui_px(14.0), colors.foreground, left, band.pos.y, band.size.y - 1.0, &title, (right - 8.0 - left).max(0.0));
     }
@@ -1623,8 +1655,9 @@ impl ChangesView {
         paint.end_clip(cx);
     }
 
-    /// Original `CommitsSection`; returns its height.
-    fn commits_height(&self, cx: &mut Cx2d, paint: &mut GitPaint, window_height: f64) -> f64 {
+    /// Original `CommitsSection`; returns its height within the `pane_height` left below the
+    /// toolbars, keeping at least `MIN_DOC_HEIGHT` for the diff body (rows scroll inside).
+    fn commits_height(&self, cx: &mut Cx2d, paint: &mut GitPaint, pane_height: f64) -> f64 {
         let header = 8.0 + paint.measure(cx, Font::Regular, ui_px(14.0), "Ag").y + 8.0;
         if self.commits_collapsed {
             return header + 1.0;
@@ -1637,9 +1670,9 @@ impl ChangesView {
         } else if commits.is_empty() {
             28.0 + (ui_px(12.0) - 12.0).max(0.0) * 1.4
         } else {
-            (commits.len() as f64 * row_h + 4.0).min(window_height * 0.3)
+            (commits.len() as f64 * row_h + 4.0).min(pane_height * 0.3)
         };
-        header + content + 1.0
+        (header + content + 1.0).min((pane_height - MIN_DOC_HEIGHT).max(header + 1.0))
     }
 
     fn workspace_commits(&self) -> Vec<&Value> {
@@ -1742,8 +1775,10 @@ impl ChangesView {
     }
 
     /// Original `GitFloatingActionButton`: a 56px surface3 circle (or a pill with a label).
+    /// Returns false, drawing nothing, when it does not fit inside `body` (a short pane would
+    /// otherwise put it over the toolbars above).
     #[allow(clippy::too_many_arguments)]
-    fn fab(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, body: Rect, bottom: f64, icon: &str, label: Option<&str>, enabled: bool, hit: Hit) {
+    fn fab(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, body: Rect, bottom: f64, icon: &str, label: Option<&str>, enabled: bool, hit: Hit) -> bool {
         let colors = palette();
         let size = ui_px(14.0);
         let width = match label {
@@ -1751,6 +1786,9 @@ impl ChangesView {
             None => 56.0,
         };
         let area = rect(body.pos.x + body.size.x - 16.0 - width, body.pos.y + body.size.y - bottom - 16.0 - 56.0, width, 56.0);
+        if area.pos.y < body.pos.y || area.pos.x < body.pos.x {
+            return false;
+        }
         let alpha = if enabled { 1.0 } else { 0.5 };
         let pressed = self.pressed.as_ref() == Some(&hit);
         paint.rounded(cx, area, with_alpha(colors.surface3, alpha), 28.0, None);
@@ -1766,8 +1804,9 @@ impl ChangesView {
             None => paint.icon(cx, icon, 20.0, with_alpha(colors.foreground, alpha), area.center()),
         }
         if enabled {
-            self.push_hit(area, hit);
+            self.hits.push_clipped(area, body, hit);
         }
+        true
     }
 
     /// Original `ReviewFeedbackAction`.
@@ -1796,17 +1835,24 @@ impl ChangesView {
             .or_else(|| reason.filter(|_| count > 0).map(|reason| t(&format!("review.feedback.{reason}"))));
         let failed = draft.phase.failed.is_some();
         if count > 0 {
-            if compact {
-                self.fab(cx, paint, body, bottom_offset, "send", Some(&label), enabled, Hit::Feedback);
+            let shown = if compact {
+                self.fab(cx, paint, body, bottom_offset, "send", Some(&label), enabled, Hit::Feedback)
             } else {
                 let width = measure_button(cx, paint, &label, true, ButtonSize::Sm, false);
                 let height = button_height(ButtonSize::Sm, false);
                 let area = rect(body.pos.x + (body.size.x - width) / 2.0, body.pos.y + body.size.y - bottom_offset - 16.0 - height, width, height);
-                let hovered = self.is_hovered(&Hit::Feedback);
-                button(cx, paint, area, &label, Some("send"), ButtonVariant::Primary, ButtonSize::Sm, false, enabled, hovered);
-                if enabled {
-                    self.push_hit(area, Hit::Feedback);
+                let fits = area.pos.y >= body.pos.y;
+                if fits {
+                    let hovered = self.is_hovered(&Hit::Feedback);
+                    button(cx, paint, area, &label, Some("send"), ButtonVariant::Primary, ButtonSize::Sm, false, enabled, hovered);
+                    if enabled {
+                        self.hits.push_clipped(area, body, Hit::Feedback);
+                    }
                 }
+                fits
+            };
+            if !shown && enabled {
+                self.feedback_hidden = Some(label.clone());
             }
         }
         if let Some(notice) = notice {
@@ -1817,8 +1863,10 @@ impl ChangesView {
             let bottom = bottom_offset + if compact { 88.0 } else { 32.0 + 16.0 + 8.0 };
             let x = if compact { body.pos.x + body.size.x - 16.0 - width } else { body.pos.x + (body.size.x - width) / 2.0 };
             let card = rect(x, body.pos.y + body.size.y - bottom - height, width, height);
-            paint.rounded(cx, card, colors.surface1, 6.0, None);
-            paint.text_wrapped(cx, Font::Regular, size, if failed { colors.danger } else { colors.foreground }, dvec2(card.pos.x + 8.0, card.pos.y + 8.0), &notice, width - 15.0);
+            if card.pos.y >= body.pos.y {
+                paint.rounded(cx, card, colors.surface1, 6.0, None);
+                paint.text_wrapped(cx, Font::Regular, size, if failed { colors.danger } else { colors.foreground }, dvec2(card.pos.x + 8.0, card.pos.y + 8.0), &notice, width - 15.0);
+            }
         }
     }
 
@@ -1839,6 +1887,8 @@ impl ChangesView {
         self.icons_pending = false;
         self.tree_area = Rect::default();
         self.commits_area = Rect::default();
+        self.jump_hidden = false;
+        self.feedback_hidden = None;
         paint.fill(cx, area, if presentation == Presentation::Tree { colors.sidebar } else { colors.surface0 });
         let status = self.controller.status.clone();
         let is_git = status.as_ref().is_some_and(|s| flag(s, "isGit"));
@@ -1893,8 +1943,8 @@ impl ChangesView {
             let height = paint.text_wrapped(cx, Font::Regular, size, colors.destructive, dvec2(area.pos.x + 12.0, y), &message, area.size.x - 24.0);
             y += height + 4.0;
         }
-        let window_height = cx.current_pass_size().y;
-        let footer = if is_git && presentation != Presentation::Diff { self.commits_height(cx, paint, window_height) } else { 0.0 };
+        let remaining = (area.pos.y + area.size.y - y).max(0.0);
+        let footer = if is_git && presentation != Presentation::Diff { self.commits_height(cx, paint, remaining) } else { 0.0 };
         let body = rect(area.pos.x, y, area.size.x, (area.pos.y + area.size.y - footer - y).max(0.0));
         self.draw_body(cx, ui, store, paint, body, presentation, split, wrap, compact, hide_whitespace);
         if footer > 0.0 {
@@ -1957,11 +2007,14 @@ impl ChangesView {
             }
             Presentation::Diff => self.draw_doc(cx, ui, store, paint, body, split, wrap, 0.0),
             Presentation::Combined => {
-                let jump = if compact { FAB_CLEARANCE } else { 0.0 };
+                // Original TreeRail: content left, a 220px tree right of a 1px border, while the
+                // document keeps a usable width; otherwise the file picker stands in for it.
+                let rail_fits = body.size.x - 221.0 >= MIN_RAIL_DOC_WIDTH;
+                let picker = compact || (self.tree_visible && !rail_fits);
+                let jump = if picker { FAB_CLEARANCE } else { 0.0 };
                 let has_feedback = self.draft_key.as_deref().and_then(|k| store.draft(k)).is_some_and(|d| !d.comments.is_empty());
                 let feedback = if has_feedback { if compact { FAB_CLEARANCE } else { 32.0 + 16.0 } } else { 0.0 };
-                let (doc_area, rail) = if !compact && self.tree_visible {
-                    // Original TreeRail: content left, a 220px tree right of a 1px border.
+                let (doc_area, rail) = if !compact && self.tree_visible && rail_fits {
                     (
                         rect(body.pos.x, body.pos.y, body.size.x - 221.0, body.size.y),
                         Some(rect(body.pos.x + body.size.x - 220.0, body.pos.y, 220.0, body.size.y)),
@@ -1970,8 +2023,8 @@ impl ChangesView {
                     (body, None)
                 };
                 self.draw_doc(cx, ui, store, paint, doc_area, split, wrap, jump + feedback);
-                if compact {
-                    self.fab(cx, paint, doc_area, 0.0, "folder-tree", None, true, Hit::Jump);
+                if picker {
+                    self.jump_hidden = !self.fab(cx, paint, doc_area, 0.0, "folder-tree", None, true, Hit::Jump);
                 }
                 self.draw_feedback(cx, ui, store, paint, doc_area, compact, jump);
                 if let Some(rail) = rail {

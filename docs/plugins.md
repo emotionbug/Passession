@@ -1,6 +1,6 @@
 # Backend extensions
 
-Paseo's daemon, built-in providers and usage integrations are Rust. Third-party backend plugins are **standalone native executables** using bounded JSONL IPC, not Rust dynamic libraries, JavaScript workers or interpreted shims. The Rust client does not execute plugin UI. This describes the source contract, not publication or deployment evidence. Kiro coding-agent provider enablement is separate from the optional `omp-kiro` account-usage source.
+Paseo's daemon, built-in providers and usage integrations are Rust. Third-party backend plugins are **standalone native executables** using bounded JSONL IPC, not Rust dynamic libraries, JavaScript workers or interpreted shims. The Rust client does not execute plugin UI. This describes the source contract, not publication or deployment evidence. Built-in account-usage sources, including Kiro, do not require external plugin execution.
 
 ## Runtime and source ownership
 

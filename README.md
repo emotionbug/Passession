@@ -1,8 +1,8 @@
 > Passession is a fork of [Paseo](https://github.com/getpaseo/paseo).
 
-# Paseo Sessions
+# Passession
 
-Paseo Sessions is a native environment for running and reviewing coding-agent work. The client is native Rust (Makepad) on **Linux, macOS, Windows, Android, and iOS**. The daemon and `paseo` CLI are Rust. Desktop clients can manage a local daemon; Android and iOS connect to a daemon on another machine.
+Passession is a native environment for running and reviewing coding-agent work. The client is native Rust (Makepad) on **Linux, macOS, Windows, Android, and iOS**. The daemon and `paseo` CLI are Rust. Desktop clients can manage a local daemon; Android and iOS connect to a daemon on another machine.
 
 This checkout is version **0.13.6**. See [release requirements](docs/release.md) for native artifacts, signing and distribution.
 
@@ -57,7 +57,7 @@ cargo xtask build-gui android --arch arm64
 cargo xtask build-gui ios
 ```
 
-Desktop builds require their target OS; iOS requires macOS/Xcode. Android/iOS builds contain no daemon. Artifacts and build descriptors are written under `artifacts/native/`. Android uses **Paseo Sessions**, package `sh.paseo.sessions`; unsigned/debug-signed output is not a store-ready release. See [Android](docs/android.md) and [release](docs/release.md) for signing and packaging.
+Desktop builds require their target OS; iOS requires macOS/Xcode. Android/iOS builds contain no daemon. Artifacts and build descriptors are written under `artifacts/native/`. Android uses **Passession**, package `sh.paseo.sessions`; unsigned/debug-signed output is not a store-ready release. See [Android](docs/android.md) and [release](docs/release.md) for signing and packaging.
 
 For a headless host, the native build produces `target/debug/paseo` (`paseo.exe` on Windows), or the corresponding directory under `CARGO_TARGET_DIR`. Keep its generated runtime assets alongside it:
 

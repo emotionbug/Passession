@@ -66,8 +66,9 @@ fn resolve() -> AppPaths {
 
 #[cfg(windows)]
 fn resolve() -> AppPaths {
-    // path_provider_windows: FOLDERID_RoamingAppData\<CompanyName>\<ProductName>
-    // from the original executable's version resource ("Paseo", "Paseo Sessions").
+    // path_provider_windows: FOLDERID_RoamingAppData\<CompanyName>\<ProductName> from the
+    // original executable's version resource ("Paseo", "Paseo Sessions"). Fixed here so the
+    // Passession rename keeps existing state.
     let roaming = crate::desktop::windows_util::roaming_app_data()
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
         .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"));

@@ -1429,10 +1429,21 @@ pub fn derive_status_bucket(
 
 /// Bucket of a daemon agent row.
 pub fn agent_status_bucket(agent: &Value) -> StatusBucket {
+    agent_bucket(agent, agent.get("status").and_then(Value::as_str))
+}
+
+/// [`agent_status_bucket`] counting an open turn as running before the row's status catches up.
+pub fn agent_live_status_bucket(agent: &Value) -> StatusBucket {
+    use crate::common::json as j;
+    let open = agent.get("activeTurn").is_some_and(|v| !v.is_null()) || j::text(j::object(agent, "turn"), "phase") == "open";
+    agent_bucket(agent, if open { Some("running") } else { agent.get("status").and_then(Value::as_str) })
+}
+
+fn agent_bucket(agent: &Value, status: Option<&str>) -> StatusBucket {
     let pending = agent.get("pendingPermissions").and_then(Value::as_array).map_or(0, Vec::len);
     let pending = pending.max(crate::common::json::int(agent, "pendingPermissionCount", 0).max(0) as usize);
     derive_status_bucket(
-        agent.get("status").and_then(Value::as_str),
+        status,
         pending,
         crate::common::json::boolean(agent, "requiresAttention", false),
         agent.get("attentionReason").and_then(Value::as_str),

@@ -220,13 +220,17 @@ pub struct AnswerField {
 }
 
 /// _CardButton: 8/12 padding, radius 6, 14px icon + base label 8 apart.
+/// At most `max_w` wide; a label that does not fit is ellipsized. Busy or
+/// disabled buttons register no hit.
 #[allow(clippy::too_many_arguments)]
-fn card_button(cx: &mut Cx2d, d: &mut Draw, x: f64, y: f64, w: Option<f64>, label: &str, icon: &str, fg: Vec4, bg: Option<Vec4>, border: Vec4, responding: bool, dimmed: bool, target: HitTarget) -> DVec2 {
+fn card_button(cx: &mut Cx2d, d: &mut Draw, x: f64, y: f64, w: Option<f64>, max_w: f64, label: &str, icon: &str, fg: Vec4, bg: Option<Vec4>, border: Vec4, responding: bool, dimmed: bool, target: HitTarget) -> DVec2 {
     let p = d.look.palette;
     let base = d.look.ui(14.0);
-    let text = d.kit.measure(cx, Font::Regular, base, 1.4, label, None);
-    let natural = 12.0 + 14.0 + 8.0 + text.x + 12.0;
-    let bw = w.unwrap_or(natural);
+    let measured = d.kit.measure(cx, Font::Regular, base, 1.4, label, None);
+    let bw = w.unwrap_or(button_width(measured.x)).min(max_w).max(1.0);
+    let room = (bw - button_width(0.0)).max(1.0);
+    let clamped = (measured.x > room + 0.5).then(|| d.kit.layout_clamped(cx, Font::Regular, base, 1.4, label, room, 1));
+    let text = clamped.as_ref().map_or(measured, |laid| laidout_size(laid));
     let bh = text.y.max(14.0) + 16.0;
     let r = rect_xywh(x, y, bw, bh);
     let hovered = d.state.hover_hit.as_deref() == Some(hit_key(&target).as_str());
@@ -238,11 +242,25 @@ fn card_button(cx: &mut Cx2d, d: &mut Draw, x: f64, y: f64, w: Option<f64>, labe
         d.animating = true;
     } else {
         let start = x + (bw - (14.0 + 8.0 + text.x)) * 0.5;
-        d.kit.icon(cx, icon, rect_xywh(start, y, 14.0, bh), 14.0, with_alpha(fg, fg.w * alpha));
-        d.kit.label(cx, Font::Regular, base, 1.4, with_alpha(fg, fg.w * alpha), dvec2(start + 22.0, y + (bh - text.y) * 0.5), label, None);
+        let color = with_alpha(fg, fg.w * alpha);
+        d.kit.icon(cx, icon, rect_xywh(start, y, 14.0, bh), 14.0, color);
+        let pos = dvec2(start + 22.0, y + (bh - text.y) * 0.5);
+        match &clamped {
+            Some(laid) => d.kit.draw_laidout(cx, Font::Regular, color, pos, laid),
+            None => {
+                d.kit.label(cx, Font::Regular, base, 1.4, color, pos, label, None);
+            }
+        }
     }
-    d.canvas.add_hit(r, target);
+    if !responding && !dimmed {
+        d.canvas.add_hit(r, target);
+    }
     dvec2(bw, bh)
+}
+
+/// A card button's width around a label `text_w` wide (padding and icon).
+fn button_width(text_w: f64) -> f64 {
+    12.0 + 14.0 + 8.0 + text_w + 12.0
 }
 
 pub fn hit_key(target: &HitTarget) -> String {
@@ -287,16 +305,16 @@ fn footer(cx: &mut Cx2d, d: &mut Draw, key: &str, r: &Value, x: f64, y: f64, w: 
         let target = HitTarget::PermissionAction { key: key.to_owned(), action: id.clone() };
         let responding = state.responding_action.as_deref() == Some(id.as_str());
         if d.look.compact {
-            let s = card_button(cx, d, x, cy, Some(w), &label, icon, fg, None, p.border_accent, responding, state.pending && !responding, target);
+            let s = card_button(cx, d, x, cy, Some(w), w, &label, icon, fg, None, p.border_accent, responding, state.pending && !responding, target);
             cy += s.y + 8.0;
         } else {
-            let text_w = d.kit.measure(cx, Font::Regular, base, 1.4, &label, None).x + 46.0;
+            let text_w = button_width(d.kit.measure(cx, Font::Regular, base, 1.4, &label, None).x);
             if cx_pos > x && cx_pos + text_w > x + w {
                 cx_pos = x;
                 cy += row_h + 8.0;
                 row_h = 0.0;
             }
-            let s = card_button(cx, d, cx_pos, cy, None, &label, icon, fg, None, p.border_accent, responding, state.pending && !responding, target);
+            let s = card_button(cx, d, cx_pos, cy, None, x + w - cx_pos, &label, icon, fg, None, p.border_accent, responding, state.pending && !responding, target);
             cx_pos += s.x + 8.0;
             row_h = row_h.max(s.y);
         }
@@ -473,14 +491,22 @@ fn question_form(cx: &mut Cx2d, d: &mut Draw, key: &str, qs: &[Question], x: f64
         let primary_label = t(if last { "message.question.submit" } else { "message.question.next" });
         let dismiss_target = HitTarget::QuestionDismiss { key: key.to_owned() };
         let primary_target = HitTarget::QuestionPrimary { key: key.to_owned() };
-        if d.look.compact {
-            let s = card_button(cx, d, x + 12.0, cy, Some(inner), &dismiss_label, "x", p.muted, None, p.border_accent, state.pending && state.responding_action.as_deref() == Some("dismiss"), false, dismiss_target);
+        let dismiss_responding = state.pending && state.responding_action.as_deref() == Some("dismiss");
+        let primary_responding = state.pending && state.responding_action.as_deref() == Some("submit");
+        // Side by side when both fit, else stacked full width.
+        let stacked = d.look.compact || {
+            let dismiss_w = button_width(d.kit.measure(cx, Font::Regular, base, 1.4, &dismiss_label, None).x);
+            let primary_w = button_width(d.kit.measure(cx, Font::Regular, base, 1.4, &primary_label, None).x);
+            dismiss_w + 8.0 + primary_w > inner
+        };
+        if stacked {
+            let s = card_button(cx, d, x + 12.0, cy, Some(inner), inner, &dismiss_label, "x", p.muted, None, p.border_accent, dismiss_responding, state.pending && !dismiss_responding, dismiss_target);
             cy += s.y + 8.0;
-            let s = card_button(cx, d, x + 12.0, cy, Some(inner), &primary_label, "check", p.on_tertiary, Some(p.accent), p.accent, state.pending && state.responding_action.as_deref() == Some("submit"), primary_disabled, primary_target);
+            let s = card_button(cx, d, x + 12.0, cy, Some(inner), inner, &primary_label, "check", p.on_tertiary, Some(p.accent), p.accent, primary_responding, primary_disabled, primary_target);
             cy += s.y;
         } else {
-            let s = card_button(cx, d, x + 12.0, cy, None, &dismiss_label, "x", p.muted, None, p.border_accent, state.pending && state.responding_action.as_deref() == Some("dismiss"), false, dismiss_target);
-            let s2 = card_button(cx, d, x + 12.0 + s.x + 8.0, cy, None, &primary_label, "check", p.on_tertiary, Some(p.accent), p.accent, state.pending && state.responding_action.as_deref() == Some("submit"), primary_disabled, primary_target);
+            let s = card_button(cx, d, x + 12.0, cy, None, inner, &dismiss_label, "x", p.muted, None, p.border_accent, dismiss_responding, state.pending && !dismiss_responding, dismiss_target);
+            let s2 = card_button(cx, d, x + 12.0 + s.x + 8.0, cy, None, inner - s.x - 8.0, &primary_label, "check", p.on_tertiary, Some(p.accent), p.accent, primary_responding, primary_disabled, primary_target);
             cy += s.y.max(s2.y);
         }
         cy + 12.0 - y

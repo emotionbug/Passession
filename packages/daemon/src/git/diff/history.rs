@@ -193,70 +193,11 @@ pub(super) fn parse_records(bytes: &[u8]) -> Result<Vec<Value>> {
                     .into_owned(),
             );
         }
-        let mut statuses = BTreeMap::new();
-        let mut stats = Vec::new();
-        while let Some(field) = fields.next() {
-            let field = field.strip_prefix(b"\n").unwrap_or(field);
-            if field.is_empty() {
-                continue;
-            }
-            if field.starts_with(b":") {
-                let status = field
-                    .rsplit(|b| *b == b' ')
-                    .next()
-                    .and_then(|s| s.first())
-                    .copied()
-                    .context("Missing raw change status")?;
-                let first = fields.next().context("Missing raw change path")?;
-                let path = if status == b'R' || status == b'C' {
-                    fields.next().context("Missing raw rename destination")?
-                } else {
-                    first
-                };
-                let status = match status {
-                    b'A' | b'C' => Some("added"),
-                    b'M' | b'T' => Some("modified"),
-                    b'D' => Some("deleted"),
-                    b'R' => Some("renamed"),
-                    _ => None,
-                };
-                if let Some(status) = status {
-                    statuses.insert(String::from_utf8_lossy(path).into_owned(), status);
-                }
-            } else {
-                let mut parts = field.splitn(3, |b| *b == b'\t');
-                let additions = parts.next().context("Missing history additions")?;
-                let deletions = parts.next().context("Missing history deletions")?;
-                let mut path = parts.next().context("Missing history numstat path")?;
-                if path.is_empty() {
-                    fields.next().context("Missing history rename source")?;
-                    path = fields
-                        .next()
-                        .context("Missing history rename destination")?;
-                }
-                let binary = additions == b"-" || deletions == b"-";
-                let additions = if binary {
-                    0
-                } else {
-                    std::str::from_utf8(additions)?.parse::<u64>()?
-                };
-                let deletions = if binary {
-                    0
-                } else {
-                    std::str::from_utf8(deletions)?.parse::<u64>()?
-                };
-                stats.push((
-                    String::from_utf8_lossy(path).into_owned(),
-                    additions,
-                    deletions,
-                ));
-            }
-        }
-        let files: Vec<Value> = stats
+        let files: Vec<Value> = parse_files(fields)?
             .into_iter()
-            .map(|(path, additions, deletions)| {
-                let mut file = json!({"path":path,"additions":additions,"deletions":deletions});
-                if let Some(status) = statuses.get(&path) {
+            .map(|entry| {
+                let mut file = json!({"path":entry.path,"additions":entry.additions,"deletions":entry.deletions});
+                if let Some(status) = entry.status {
                     file["status"] = json!(status);
                 }
                 file
@@ -265,4 +206,100 @@ pub(super) fn parse_records(bytes: &[u8]) -> Result<Vec<Value>> {
         result.push(json!({"sha":header[0].trim(),"shortSha":header[1].trim(),"authorName":header[2],"authorDate":header[3].trim(),"subject":header[4],"files":files}));
     }
     Ok(result)
+}
+
+/// One changed file from a commit's first-parent `--raw --numstat -z -M` output.
+pub(super) struct HistoryFile {
+    pub path: String,
+    /// Rename source; only set for `renamed` entries.
+    pub old_path: Option<String>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub status: Option<&'static str>,
+}
+
+/// Parses the NUL-separated `--raw` and `--numstat` fields that follow one
+/// commit header. Binary entries count zero additions and deletions.
+pub(super) fn parse_files<'a>(
+    mut fields: impl Iterator<Item = &'a [u8]>,
+) -> Result<Vec<HistoryFile>> {
+    let mut statuses = BTreeMap::new();
+    let mut stats = Vec::new();
+    while let Some(field) = fields.next() {
+        let field = field.strip_prefix(b"\n").unwrap_or(field);
+        if field.is_empty() {
+            continue;
+        }
+        if field.starts_with(b":") {
+            let status = field
+                .rsplit(|b| *b == b' ')
+                .next()
+                .and_then(|s| s.first())
+                .copied()
+                .context("Missing raw change status")?;
+            let first = fields.next().context("Missing raw change path")?;
+            let path = if status == b'R' || status == b'C' {
+                fields.next().context("Missing raw rename destination")?
+            } else {
+                first
+            };
+            let old_path = (status == b'R').then(|| String::from_utf8_lossy(first).into_owned());
+            let status = match status {
+                b'A' | b'C' => Some("added"),
+                b'M' | b'T' => Some("modified"),
+                b'D' => Some("deleted"),
+                b'R' => Some("renamed"),
+                _ => None,
+            };
+            if let Some(status) = status {
+                statuses.insert(
+                    String::from_utf8_lossy(path).into_owned(),
+                    (status, old_path),
+                );
+            }
+        } else {
+            let mut parts = field.splitn(3, |b| *b == b'\t');
+            let additions = parts.next().context("Missing history additions")?;
+            let deletions = parts.next().context("Missing history deletions")?;
+            let mut path = parts.next().context("Missing history numstat path")?;
+            if path.is_empty() {
+                fields.next().context("Missing history rename source")?;
+                path = fields
+                    .next()
+                    .context("Missing history rename destination")?;
+            }
+            let binary = additions == b"-" || deletions == b"-";
+            let additions = if binary {
+                0
+            } else {
+                std::str::from_utf8(additions)?.parse::<u64>()?
+            };
+            let deletions = if binary {
+                0
+            } else {
+                std::str::from_utf8(deletions)?.parse::<u64>()?
+            };
+            stats.push((
+                String::from_utf8_lossy(path).into_owned(),
+                additions,
+                deletions,
+            ));
+        }
+    }
+    Ok(stats
+        .into_iter()
+        .map(|(path, additions, deletions)| {
+            let (status, old_path) = match statuses.get(&path) {
+                Some((status, old_path)) => (Some(*status), old_path.clone()),
+                None => (None, None),
+            };
+            HistoryFile {
+                path,
+                old_path,
+                additions,
+                deletions,
+                status,
+            }
+        })
+        .collect())
 }

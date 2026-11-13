@@ -719,13 +719,18 @@ pub fn draw_badge(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, badge: &Badge, 
     let inline = badge.force_inline || !look.compact;
     let interactive = badge.can_open;
     let expanded = interactive && inline && d.state.is_expanded(&badge.key, badge.initially_expanded);
-    let hovered = d.state.hover_hit.as_deref().is_some_and(|h| h.contains(&badge.key));
+    // Hovering the open-file glyph still hovers its badge.
+    let file_key = badge.open_file.as_ref().map(|path| super::permission::hit_key(&HitTarget::OpenFile(path.clone())));
+    let over_file = file_key.is_some() && d.state.hover_hit == file_key;
+    let hovered = over_file || d.state.hover_hit.as_deref().is_some_and(|h| h.contains(&badge.key));
+    // Touch layouts cannot hover: the glyph stays visible there.
+    let show_file = badge.open_file.is_some() && (hovered || look.mobile);
     let active = hovered || expanded;
     let base = look.ui(14.0);
     let label_color = if badge.loading { with_alpha(p.foreground, 0.72) } else if active { p.foreground } else { p.muted };
     let secondary_color = if active { p.foreground } else { p.muted };
     let lx = x + 8.0 + 26.0;
-    let avail = (w - 8.0 - 26.0 - 8.0 - if badge.open_file.is_some() && hovered { 26.0 } else { 0.0 }).max(1.0);
+    let avail = (w - 8.0 - 26.0 - 8.0 - if show_file { 26.0 } else { 0.0 }).max(1.0);
     let label = d.kit.layout_clamped(cx, Font::Regular, base, 1.3, &badge.label, avail, 1);
     let label_size = laidout_size(&label);
     let secondary_x = lx + label_size.x.min(avail) + 8.0;
@@ -797,10 +802,9 @@ pub fn draw_badge(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, badge: &Badge, 
         d.animating = true;
     }
     cx.end_turtle();
-    if let (Some(path), true) = (&badge.open_file, hovered && !look.mobile) {
+    if let (Some(path), true) = (&badge.open_file, show_file) {
         let r = rect_xywh((end_x + 4.0).min(x + w - 30.0), y + (header_h - 22.0) * 0.5, 22.0, 22.0);
-        let over = d.state.hover_hit.as_deref() == Some(format!("{:?}", HitTarget::OpenFile(path.clone())).as_str());
-        d.kit.icon(cx, "file-symlink", r, 14.0, if over { p.foreground } else { p.muted });
+        d.kit.icon(cx, "file-symlink", r, 14.0, if over_file { p.foreground } else { p.muted });
         d.canvas.add_hit(r, HitTarget::OpenFile(path.clone()));
     }
     if interactive {
@@ -851,14 +855,15 @@ fn overview_group(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, calls
         let sy = if pinned { max_y } else { d.state.scroll_y.get(&key).copied().unwrap_or(max_y).clamp(0.0, max_y) };
         d.state.scroll_y.insert(key.clone(), sy);
         let view = rect_xywh(x, y, w, h);
+        // Registered before the calls so their own detail regions win.
+        if max_y > 0.0 {
+            d.canvas.add_hit(view, HitTarget::ScrollY(key));
+        }
         cx.begin_turtle(Walk { abs_pos: Some(view.pos), margin: Margin::default(), width: Size::Fixed(w), height: Size::Fixed(h.max(1.0)) }, Layout::default());
         d.canvas.push_clip(view);
         embedded_calls(cx, d, ctx, id, &calls, x, y + 4.0 - sy, w);
         d.canvas.pop_clip();
         cx.end_turtle();
-        if max_y > 0.0 {
-            d.canvas.add_hit(view, HitTarget::ScrollY(key));
-        }
         h
     })
 }

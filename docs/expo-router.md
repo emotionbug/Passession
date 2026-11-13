@@ -12,6 +12,8 @@ Workspaces remain durable daemon entities and Command Center targets, but they a
 
 Feature dispatch receives the owning panel's `UiContext.route`, `target`, `tab_key`, activity and window ID. Never resolve a split pane's action through the focused pane of another window. Moving or resizing a panel changes presentation, not its remote identity. Persist window layout through the core storage boundary described in [data model](data-model.md#client-side-stores).
 
+Creation completion replaces the originating New Session tab in its existing pane or Explorer slot. Do not open the result through the focused pane or a desktop activation route: receipt updates can arrive after focus moves elsewhere. Keep the form recoverable until its destination exists, including the terminal response after workspace creation.
+
 ## Compact behavior
 
 Back returns from file explorer to the session, then from session to sidebar. Leaving the mobile client does not stop a remote daemon or its sessions. Settings and modal workflows retain their own navigation state. Width changes must not change host/session identity or duplicate provider connections.

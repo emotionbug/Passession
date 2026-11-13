@@ -3,11 +3,11 @@
   <id>sh.paseo.Paseo</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>Apache-2.0</project_license>
-  <name>Paseo Sessions</name>
+  <name>Passession</name>
   <summary>Native client for local AI coding agents</summary>
   <description>
     <p>
-      Paseo Sessions connects to a Paseo daemon to run, follow and steer local
+      Passession connects to a Paseo daemon to run, follow and steer local
       AI coding agents, with their workspaces, terminals and timelines.
     </p>
   </description>

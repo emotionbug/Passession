@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Paseo Sessions (sh.paseo.sessions). Remote-only client; no daemon runs on the device.
+<!-- Passession (sh.paseo.sessions). Remote-only client; no daemon runs on the device.
      Namespace comes from packaging/android/app/build.gradle.kts. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
@@ -36,8 +36,9 @@
     <uses-permission android:name="com.vivo.notification.permission.BADGE_ICON"/>
 
     <application
-        android:label="Paseo Sessions"
+        android:label="Passession"
         android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="true"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"

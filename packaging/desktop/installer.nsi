@@ -4,17 +4,19 @@ Unicode true
 !include "StrFunc.nsh"
 !include "${INVENTORY_INCLUDE}"
 ${StrLoc}
-Name "Paseo Sessions"
+Name "Passession"
 OutFile "${OUTPUT}"
-InstallDir "$LOCALAPPDATA\Programs\Paseo Sessions"
+; New installs use the Passession folder. The registry key keeps its pre-rename name so an
+; upgrade finds and replaces an earlier "Paseo Sessions" installation in place.
+InstallDir "$LOCALAPPDATA\Programs\Passession"
 InstallDirRegKey HKCU "Software\Paseo Sessions" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 Icon "${ICON}"
 UninstallIcon "${ICON}"
 VIProductVersion "${NUMERIC_VERSION}"
-VIAddVersionKey /LANG=1033 "ProductName" "Paseo Sessions"
-VIAddVersionKey /LANG=1033 "FileDescription" "Paseo Sessions Installer"
+VIAddVersionKey /LANG=1033 "ProductName" "Passession"
+VIAddVersionKey /LANG=1033 "FileDescription" "Passession Installer"
 VIAddVersionKey /LANG=1033 "FileVersion" "${VERSION}"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "Paseo contributors"
 !insertmacro MUI_PAGE_WELCOME
@@ -47,7 +49,7 @@ Function PaseoCheckOwnedFile
     FileClose $1
     Return
   unrelated:
-    MessageBox MB_OK|MB_ICONSTOP "The selected folder contains a file not owned by Paseo Sessions:$\r$\n$0$\r$\nChoose another installation folder. No package files have been written."
+    MessageBox MB_OK|MB_ICONSTOP "The selected folder contains a file not owned by Passession:$\r$\n$0$\r$\nChoose another installation folder. No package files have been written."
     Abort
 FunctionEnd
 
@@ -98,7 +100,7 @@ Function PaseoRemovePreviousFiles
   previous_done:
 FunctionEnd
 
-Section "Paseo Sessions" SEC_MAIN
+Section "Passession" SEC_MAIN
   SetShellVarContext current
   !insertmacro PaseoCheckOwnedFiles
   Call PaseoRemovePreviousFiles
@@ -110,21 +112,26 @@ Section "Paseo Sessions" SEC_MAIN
   WriteRegStr HKCU "Software\Classes\paseo" "" "URL:Paseo agent link"
   WriteRegStr HKCU "Software\Classes\paseo" "URL Protocol" ""
   WriteRegStr HKCU "Software\Classes\paseo\DefaultIcon" "" '"$INSTDIR\paseo_sessions.exe",0'
-  WriteRegStr HKCU "Software\Classes\AppUserModelId\sh.paseo.sessions.desktop" "DisplayName" "Paseo Sessions"
+  WriteRegStr HKCU "Software\Classes\AppUserModelId\sh.paseo.sessions.desktop" "DisplayName" "Passession"
   WriteRegStr HKCU "Software\Classes\AppUserModelId\sh.paseo.sessions.desktop" "IconUri" "$INSTDIR\paseo_sessions.exe"
   WriteRegStr HKCU "Software\Classes\paseo\shell\open\command" "" '"$INSTDIR\paseo_sessions.exe" "%1"'
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "DisplayName" "Paseo Sessions"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "DisplayName" "Passession"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "InstallLocation" "$INSTDIR"
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\sh.paseo.sessions.desktop" "NoRepair" 1
-  CreateShortCut "$SMPROGRAMS\Paseo Sessions.lnk" "$INSTDIR\paseo_sessions.exe"
-  CreateShortCut "$DESKTOP\Paseo Sessions.lnk" "$INSTDIR\paseo_sessions.exe"
+  ; Shortcuts created under the pre-rename product name.
+  Delete "$SMPROGRAMS\Paseo Sessions.lnk"
+  Delete "$DESKTOP\Paseo Sessions.lnk"
+  CreateShortCut "$SMPROGRAMS\Passession.lnk" "$INSTDIR\paseo_sessions.exe"
+  CreateShortCut "$DESKTOP\Passession.lnk" "$INSTDIR\paseo_sessions.exe"
 SectionEnd
 
 Section "Uninstall"
   SetShellVarContext current
+  Delete "$SMPROGRAMS\Passession.lnk"
+  Delete "$DESKTOP\Passession.lnk"
   Delete "$SMPROGRAMS\Paseo Sessions.lnk"
   Delete "$DESKTOP\Paseo Sessions.lnk"
   ReadRegStr $0 HKCU "Software\Classes\paseo\shell\open\command" ""

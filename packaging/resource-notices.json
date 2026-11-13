@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "boundary": "Font files and vendored non-Cargo components packaged into the Paseo Sessions application. Each entry is bound to the exact packaged file digest and to license text pinned at an upstream revision.",
+  "boundary": "Font files and vendored non-Cargo components packaged into the Passession application. Each entry is bound to the exact packaged file digest and to license text pinned at an upstream revision.",
   "fonts": [
     {
       "crate": "makepad-widgets",

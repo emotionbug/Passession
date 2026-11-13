@@ -903,8 +903,10 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
     }
 
     /// Flutter `SettingsRow`: label/hint/error with a control beside it, or
-    /// under it when the control leaves less than 160px for the label.
-    pub fn row(&mut self, r: Row) {
+    /// under it when the control leaves less than 160px for the label. An `inline` row keeps
+    /// its control beside the label down to 120px of label; narrower, it stacks too, so a
+    /// wide field never squeezes the label into a column of single syllables.
+    pub fn row(&mut self, mut r: Row) {
         self.card_row_separator();
         let pad = r.padding;
         let x0 = self.x + pad;
@@ -912,7 +914,9 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
         let control_size = r.control.as_ref().map(|c| self.measure_ctl(c)).unwrap_or_default();
         let leading_size = r.leading.as_ref().map(|c| self.measure_ctl(c)).unwrap_or_default();
         let lead_w = if r.leading.is_some() { leading_size.x + 8.0 } else { 0.0 };
-        let inline_control = r.control.is_some() && (r.inline || control_size.x <= inner_w - 160.0 - 12.0);
+        let roomy = control_size.x <= inner_w - 160.0 - 12.0;
+        let inline_fits = control_size.x + 12.0 + lead_w + 120.0 <= inner_w;
+        let inline_control = r.control.is_some() && (roomy || (r.inline && inline_fits));
         let label_w = if inline_control { (inner_w - control_size.x - 12.0 - lead_w).max(60.0) } else { inner_w - lead_w };
         let accessory_size = r.accessory.as_ref().map(|c| self.measure_ctl(c)).unwrap_or_default();
         let label_color = if r.muted_label { self.pal.muted } else { self.pal.foreground };
@@ -936,12 +940,15 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
         let content_h = if inline_control { block_h.max(control_size.y) } else if r.control.is_some() { block_h + 12.0 + control_size.y } else { block_h };
         let total = content_h + pad * 2.0;
         let rect = Rect { pos: dvec2(self.x, self.y), size: dvec2(self.w, total) };
-        if let Some((k, _)) = &r.on_tap {
-            let (hovered, pressed) = self.state(k);
+        if let Some((k, on)) = r.on_tap.take() {
+            let (hovered, pressed) = self.state(&k);
             if hovered || pressed {
                 let fill = if pressed { self.pal.surface3 } else { self.pal.surface2 };
                 self.rect(rect, fill, None, 0.0);
             }
+            // Registered before the row's own controls: zones resolve last-registered first, so
+            // a switch, menu or remove button inside a tappable row keeps its own action.
+            self.zone(&k, rect, Some(on));
         }
         let top = self.y + pad;
         let text_top = if inline_control { top + (content_h - block_h) / 2.0 } else { top };
@@ -975,9 +982,6 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
                 dvec2(x0, top + block_h + 12.0)
             };
             self.draw_ctl(control, pos);
-        }
-        if let Some((k, on)) = r.on_tap {
-            self.zone(&k, rect, Some(on));
         }
         self.y += total;
     }

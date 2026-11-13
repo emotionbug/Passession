@@ -146,6 +146,17 @@ pub enum OverlayKind {
         placeholder: String,
         empty: String,
     },
+    /// `showPaseoSelect` with prepared options (per-option icons, trailing
+    /// text, separators): the Git Log ref and author filters.
+    Select {
+        title: String,
+        anchor: Rect,
+        min_width: f64,
+        options: Vec<shared::SelectOption>,
+        selected: Option<String>,
+        placeholder: String,
+        empty: String,
+    },
 }
 
 /// A `showAdaptiveSheet` content drawn by the git feature.
@@ -302,6 +313,13 @@ impl<P> OverlayHost<P> {
                         }
                     })
                     .collect();
+                let mut request = shared::SelectRequest::new(title, options).searchable(Some(placeholder)).empty_text(empty).min_width(min_width);
+                if let Some(selected) = selected {
+                    request = request.value(selected);
+                }
+                Box::new(move |ui| shared::open_select(ui, anchor, request))
+            }
+            OverlayKind::Select { title, anchor, min_width, options, selected, placeholder, empty } => {
                 let mut request = shared::SelectRequest::new(title, options).searchable(Some(placeholder)).empty_text(empty).min_width(min_width);
                 if let Some(selected) = selected {
                     request = request.value(selected);

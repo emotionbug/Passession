@@ -1,11 +1,11 @@
 use super::*;
 
-struct Repo {
+pub(super) struct Repo {
     directory: tempfile::TempDir,
-    env: BTreeMap<String, String>,
+    pub(super) env: BTreeMap<String, String>,
 }
 impl Repo {
-    async fn new() -> Result<Self> {
+    pub(super) async fn new() -> Result<Self> {
         let directory = tempfile::tempdir()?;
         let mut env = BTreeMap::new();
         env.insert("GIT_CONFIG_NOSYSTEM".into(), "1".into());
@@ -25,10 +25,10 @@ impl Repo {
         repo.git(&["init", "-b", "main"]).await?;
         Ok(repo)
     }
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         self.directory.path()
     }
-    async fn git(&self, values: &[&str]) -> Result<Vec<u8>> {
+    pub(super) async fn git(&self, values: &[&str]) -> Result<Vec<u8>> {
         git(
             self.path(),
             &args(values),
@@ -38,11 +38,11 @@ impl Repo {
         )
         .await
     }
-    async fn write(&self, path: &str, bytes: &[u8]) -> Result<()> {
+    pub(super) async fn write(&self, path: &str, bytes: &[u8]) -> Result<()> {
         tokio::fs::write(self.path().join(path), bytes).await?;
         Ok(())
     }
-    async fn commit(&self, message: &str) -> Result<String> {
+    pub(super) async fn commit(&self, message: &str) -> Result<String> {
         self.git(&["add", "-A"]).await?;
         self.git(&["-c", "commit.gpgsign=false", "commit", "-m", message])
             .await?;
