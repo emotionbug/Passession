@@ -137,6 +137,22 @@ fn helper_error(code: &str, message: impl Into<String>) -> PlatformError {
     PlatformError::new(code, message)
 }
 
+fn helper_command(runtime: &DaemonRuntime) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(&runtime.executable);
+    command
+        .current_dir(&runtime.working_directory)
+        .envs(&runtime.environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(false);
+    // A GUI parent does not stop Windows allocating a console for its CLI child.
+    // Keep the JSONL pipes; only suppress console allocation.
+    #[cfg(windows)]
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    command
+}
+
 impl DaemonService {
     pub fn new(
         runtime: DaemonRuntime,
@@ -182,14 +198,8 @@ impl DaemonService {
                 format!("Bundled native Paseo executable is missing. ({})", self.runtime.executable.display()),
             ));
         }
-        let mut child = tokio::process::Command::new(&self.runtime.executable)
+        let mut child = helper_command(&self.runtime)
             .arg("desktop-host")
-            .current_dir(&self.runtime.working_directory)
-            .envs(&self.runtime.environment)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false)
             .spawn()
             .map_err(|error| helper_error("HELPER_START_FAILED", format!("Could not start the desktop daemon helper: {error}")))?;
         let stdin = child.stdin.take();
@@ -450,5 +460,48 @@ mod tests {
         service.close(None).await.unwrap();
         let error = service.ensure_open().await.err().unwrap();
         assert_eq!(error.code, "DAEMON_SERVICE_CLOSED");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_console_fixture() {
+        if std::env::var_os("PASEO_HELPER_CONSOLE_PROBE").is_none() {
+            return;
+        }
+        use windows::Win32::System::Console::{GetConsoleCP, GetConsoleWindow};
+        unsafe {
+            assert!(GetConsoleWindow().0.is_null(), "helper allocated a console window");
+            assert_eq!(GetConsoleCP(), 0, "helper attached to a console");
+        }
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        assert_eq!(input, "initialize\n");
+        println!("helper-ready");
+        eprintln!("helper-diagnostic");
+        std::process::exit(0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn desktop_helper_starts_without_console_and_keeps_pipes() {
+        let executable = std::env::current_exe().unwrap();
+        let runtime = DaemonRuntime {
+            working_directory: executable.parent().unwrap().to_owned(),
+            cli_shim_path: executable.clone(),
+            executable,
+            environment: HashMap::new(),
+        };
+        let mut child = helper_command(&runtime)
+            .args(["--exact", "desktop::daemon_service::tests::helper_console_fixture", "--nocapture"])
+            .env("PASEO_HELPER_CONSOLE_PROBE", "1")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"initialize\n").await.unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+            .await.unwrap().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("helper-ready"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("helper-diagnostic"));
     }
 }

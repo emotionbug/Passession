@@ -82,16 +82,16 @@ pub(crate) fn probe_report() -> Value {
 }
 
 async fn probe_executable(path: &Path) -> Result<Value> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(20),
-        Command::new(path)
-            .arg("__managed-probe")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
+    let mut command = Command::new(path);
+    command
+        .arg("__managed-probe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000); // CREATE_NO_WINDOW: this probe has no interactive UI.
+    let output = tokio::time::timeout(Duration::from_secs(20), command.output())
     .await
     .map_err(|_| anyhow!("{} did not answer its startup probe", path.display()))?
     .with_context(|| format!("Cannot execute {}", path.display()))?;
@@ -1790,6 +1790,8 @@ pub(crate) async fn start_owner(
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
             #[cfg(target_os = "linux")]
             if scope.is_some() && !launch.environment.iter().any(|(key, _)| key == "XDG_RUNTIME_DIR") {
                 command.env("XDG_RUNTIME_DIR", format!("/run/user/{}", identity::uid()));
@@ -2355,9 +2357,17 @@ pub(crate) async fn run_launcher(home: &Path, standalone: bool) -> Result<i32> {
             failures.push(format!("{}: {failure}", executable.display()));
         }
         #[cfg(not(unix))]
-        match Command::new(&executable).args(&args).status().await {
-            Ok(status) => return Ok(status.code().unwrap_or(1)),
-            Err(failure) => failures.push(format!("{}: {failure}", executable.display())),
+        {
+            let mut command = Command::new(&executable);
+            command.args(&args);
+            #[cfg(windows)]
+            if standalone {
+                command.creation_flags(0x08000000); // Background restart; foreground CLI keeps its console.
+            }
+            match command.status().await {
+                Ok(status) => return Ok(status.code().unwrap_or(1)),
+                Err(failure) => failures.push(format!("{}: {failure}", executable.display())),
+            }
         }
     }
     bail!("No managed runtime could be launched: {}", failures.join("; "))
