@@ -49,6 +49,13 @@ released on completion or cancellation. Waiting for shared serialization storage
 must remain shutdown-, cancellation- and deadline-aware. Stdin close waits behind
 already queued JSON writers; partial writes still use the termination guard.
 
+Pi/OMP stdout line storage retains at most 1 MiB between reads. This limits retained
+capacity, not accepted frame size: legacy v1 still has no frame ceiling; v2 chunk
+limits are unchanged. Correlated successful RPC replies transfer their `data`
+without cloning it; unmatched frames retain their complete payload. Base64 chunk
+decoding remains strict (including canonical padding and trailing bits); removing
+an encode-back comparison must not widen accepted input.
+
 ### OMP host-tool loading
 
 OMP receives the same executable native and bridged MCP catalog, with history-derived

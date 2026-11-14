@@ -34,6 +34,14 @@ full provider replay replaces the checkpoint in one transaction. The checkpoint 
 provider history as the transcript authority. `{id}.json` checkpoints from earlier releases are not
 read.
 
+Saved-page selection uses a SQLite expression index for sequence metadata, avoiding
+source-row JSON extraction across the whole history on each indexed page. Selected
+rows are still decoded and validated. The checkpoint remains version 1: SQLite
+maintains the index even when an older writer changes `row_json`. Writable open
+creates and validates the index transactionally; failure leaves no partial migration.
+Read-only opens never migrate a checkpoint. An unmigrated database retains the
+original JSON-extraction read path until a writable open creates its index.
+
 The invariants are:
 
 > A continuously subscribed client applies every committed row in order. Opening or resuming an
@@ -44,6 +52,27 @@ Tool output is bounded before it enters either delivery path. Canonical shell to
 to 64 KiB, and the same bounded item is used for runtime timeline rows and live stream events.
 Provider history hydration applies the same rule so reopening an agent cannot restore an oversized
 tool payload.
+
+## OMP authoritative message repair
+
+An OMP terminal message can contradict text already published live. Repair is
+limited to that exact marked message in the current agent cell, with its turn
+checked when supplied; a provider-supplied identifier never authorizes changes to
+another agent. Reasoning and assistant items retain `metadata.ompStreamMessageId`
+so adjacent native messages cannot lose their ownership through projection.
+
+The private `timeline_reconcile` provider event must be consumed by the agent
+owner, never forwarded as an unknown public event. A safe repair replaces the
+marked message's complete authoritative content atomically, preserves unrelated
+rows, and publishes the existing `timeline_replacement` epoch invalidation after
+persistence. Clients recover through normal history fetches; no new public wire
+event or duplicate final append is needed.
+
+Missing or ambiguous ownership, including interleaving that cannot be placed
+uniquely, must retain the previous canonical data. Report an ordinary error with
+structured recovery guidance and bounded non-text diagnostics, without ending the
+event owner. Do not infer placement from matching text or treat a failed repair as
+successful reconciliation. Native history remains the transcript authority.
 
 ## Saved history and execution readiness
 

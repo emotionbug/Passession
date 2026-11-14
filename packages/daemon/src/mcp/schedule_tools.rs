@@ -37,7 +37,7 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         ),
         definition(
             "list_schedules",
-            "List all schedules managed by the daemon.",
+            "List compact schedule summaries. Use each row's detail reference to inspect the full prompt, target configuration, and run history.",
             json!({}),
             &[],
         ),
@@ -245,6 +245,32 @@ fn summary(mut value: Value) -> Value {
     }
     value
 }
+fn list_summary(mut value: Value) -> Value {
+    let runs = value["runs"].as_array();
+    let run_count = runs.map_or(0, Vec::len);
+    let completed_run_count = runs.map_or(0, |runs| {
+        runs.iter().filter(|run| run["status"] != "running").count()
+    });
+    let detail = json!({"tool":"inspect_schedule","arguments":{"id":value["id"]}});
+    if let Some(config) = value.pointer_mut("/target/config").and_then(Value::as_object_mut) {
+        config.retain(|key, _| {
+            matches!(key.as_str(), "provider" | "model" | "cwd" | "modeId" | "isolation")
+        });
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.retain(|key, _| {
+            matches!(
+                key.as_str(),
+                "id" | "name" | "status" | "cadence" | "nextRunAt" | "lastRunAt"
+                    | "pausedAt" | "expiresAt" | "maxRuns" | "target"
+            )
+        });
+        obj.insert("runCount".into(), json!(run_count));
+        obj.insert("completedRunCount".into(), json!(completed_run_count));
+        obj.insert("detail".into(), detail);
+    }
+    value
+}
 fn result(value: Value) -> Value {
     json!({"content":[],"structuredContent":value})
 }
@@ -282,7 +308,7 @@ pub(crate) async fn execute(
             .await?
             .into_iter()
             .filter(|r| r.pointer("/target/type").and_then(Value::as_str) == Some("new-agent"))
-            .map(summary)
+            .map(list_summary)
             .collect::<Vec<_>>();
         return Ok(result(json!({"schedules":schedules})));
     }
@@ -456,6 +482,50 @@ pub(crate) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn list_summaries_preserve_schedule_state_without_prompts_or_run_payloads() {
+        let full = json!({
+            "id":"abcd1234","name":"Nightly","status":"paused",
+            "cadence":{"type":"cron","expression":"0 0 * * *","timezone":"UTC"},
+            "nextRunAt":null,"lastRunAt":"2026-11-13T00:00:00Z",
+            "pausedAt":"2026-11-13T01:00:00Z","expiresAt":null,"maxRuns":4,
+            "prompt":"private prompt","createdAt":"yesterday","updatedAt":"today",
+            "target":{"type":"new-agent","config":{
+                "provider":"codex","model":"gpt-5.4","cwd":"/project","modeId":"default",
+                "isolation":"local","systemPrompt":"private system","mcpServers":{"private":{}},
+                "providerOptions":{"large":"payload"}
+            }},
+            "runs":[
+                {"status":"running","output":"large"},
+                {"status":"succeeded","output":"large"},
+                {"status":"failed","error":"retained by inspect"}
+            ]
+        });
+        let compact = list_summary(full.clone());
+        for key in [
+            "id", "name", "status", "cadence", "nextRunAt", "lastRunAt",
+            "pausedAt", "expiresAt", "maxRuns",
+        ] {
+            assert_eq!(compact[key], full[key], "{key}");
+        }
+        assert_eq!(compact["runCount"], 3);
+        assert_eq!(compact["completedRunCount"], 2);
+        assert_eq!(compact["detail"], json!({
+            "tool":"inspect_schedule","arguments":{"id":"abcd1234"}
+        }));
+        assert_eq!(compact["target"]["config"], json!({
+            "provider":"codex","model":"gpt-5.4","cwd":"/project",
+            "modeId":"default","isolation":"local"
+        }));
+        assert!(compact.get("prompt").is_none());
+        assert!(compact.get("runs").is_none());
+        // Creation still returns all configuration and the prompt, minus run history.
+        let created = summary(full.clone());
+        assert_eq!(created["prompt"], full["prompt"]);
+        assert_eq!(created["target"], full["target"]);
+        assert!(created.get("runs").is_none());
+        assert_eq!(list_summary(json!({"id":"empty","runs":[]}))["runCount"], 0);
+    }
     #[test]
     fn update_cadence_rejects_inconsistent_selectors() {
         assert!(cadence(&json!({"cron":"* * * * *","every":"1m"})).is_err());

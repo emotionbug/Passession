@@ -98,6 +98,8 @@ impl StreamCoalescer {
                     && ty == previous["item"]["type"].as_str()
                     && entry.get("provider") == previous.get("provider")
                     && entry.get("turnId") == previous.get("turnId")
+                    && entry["item"]["metadata"].get("ompStreamMessageId")
+                        == previous["item"]["metadata"].get("ompStreamMessageId")
                     && (ty == Some("reasoning")
                         || entry["item"].get("messageId") == previous["item"].get("messageId"))
                 {
@@ -262,5 +264,26 @@ impl SubagentStore {
         ids.into_iter()
             .map(|id| json!({"type":"remove","parentAgentId":parent_id,"subagentId":id}))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod message_identity_tests {
+    use super::*;
+
+    #[test]
+    fn coalescer_keeps_distinct_omp_reasoning_messages_repairable() {
+        let event = |id, text| json!({"type":"timeline","provider":"omp","turnId":"turn",
+            "item":{"type":"reasoning","text":text,"metadata":{"ompStreamMessageId":id}}});
+        let mut coalescer = StreamCoalescer::default();
+        coalescer.handle("agent", &event("first", "leading"), 0);
+        coalescer.handle("agent", &event("first", " A"), 1);
+        coalescer.handle("agent", &event("second", " B"), 2);
+        coalescer.handle("agent", &event("second", " C"), 3);
+        let rows = coalescer.flush_due(61);
+        assert_eq!(rows.iter().map(|row| row["item"]["text"].as_str().unwrap())
+            .collect::<Vec<_>>(), [" A", " B C"]);
+        assert_eq!(rows[0]["item"]["metadata"]["ompStreamMessageId"], "first");
+        assert_eq!(rows[1]["item"]["metadata"]["ompStreamMessageId"], "second");
     }
 }

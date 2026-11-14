@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.25 - 2026-11-14
 
 ### Changed
 
@@ -11,9 +11,14 @@
 - OMP and OpenCode generate lossless compact tool JSON without redundant count/ID summaries. OMP result conversion and RPC frames transfer owned payloads instead of deep-cloning them; explicit text/media and error state are preserved.
 - Native JSONL writes reject known cancellations and expired deadlines before serialization, preserving healthy processes on pre-I/O rejection and ambiguity protection after partial writes. Writers reuse bounded serialization storage without retaining oversized frames; queued writes remain cancellable and stdin close respects queued JSON writers.
 - Provider event spool admission and replay account for JSON container storage and reserved string/array capacity, preventing container-heavy frames from bypassing the estimated in-memory budget while preserving whole-frame FIFO delivery.
+- Schedule listings return compact operational summaries with exact-detail references; inspecting a schedule retains its full prompt and configuration. Terminal capture optionally selects explicit literal matches and bounded neighboring rows, with physical indices and honest continuation metadata.
+- Saved history pages read sequence metadata from a transactionally maintained SQLite expression index instead of repeatedly decoding every stored message. Read-only legacy checkpoints remain readable without migration.
+- Repeated activity/status detail chunks reuse bounded exact JSON encodings while revalidating authoritative source and revision. Oversized values and contention retain the streaming path.
+- Pi/OMP stdout buffers release capacities above 1 MiB between frames without imposing a legacy frame-size limit. Successful RPC responses transfer owned data; strict Base64 decoding no longer re-encodes the decoded payload.
 
 ### Fixed
 
+- OMP final messages that revise already streamed text, including removed temporary reasoning headings, safely replace only their exact marked message. Persistence precedes epoch invalidation; unrelated history and durable identities are retained. Ambiguous ownership or failed persistence preserves prior data and reports recovery guidance without ending the event owner.
 - OMP Eval rows display the supplied task title and retain request language, code and options alongside output and errors, both live and after native-history replay. Requests remain visible while execution is pending.
 - Resolved native client, platform and highlighter Clippy warnings without lint suppressions, including render argument grouping and test fixture initialization.
 

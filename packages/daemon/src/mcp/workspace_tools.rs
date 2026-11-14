@@ -114,8 +114,14 @@ pub(crate) fn definitions(_agent_scope: bool) -> Vec<Value> {
         definition(
             "capture_terminal",
             "Capture terminal",
-            "Capture plain-text terminal output lines from a terminal session.",
-            json!({"terminalId":string(),"start":{"type":"number"},"end":{"type":"number"},"scrollback":boolean(),"stripAnsi":{"type":"boolean","default":true}}),
+            "Capture terminal output. Omit query for unchanged, unfiltered lines. An explicit query selects case-insensitive literal matches (including newline-separated physical rows), with bounded context. This is a filtered snapshot, not a complete error audit; row indices can shift or reset after scrolling, resize, or terminal reset.",
+            json!({
+                "terminalId":string(),"start":{"type":"number"},"end":{"type":"number"},
+                "scrollback":boolean(),"stripAnsi":{"type":"boolean","default":true},
+                "query":{"type":"string","minLength":1,"description":"Case-insensitive literal text, not a regex. Unicode lowercasing is used; whitespace is significant. Matching is restricted to the captured start/end window."},
+                "contextLines":{"type":"integer","minimum":0,"maximum":20,"description":"Context rows on each side of selected matches, inside the captured window. Defaults to 2. Requires query."},
+                "matchLimit":{"type":"integer","minimum":1,"maximum":100,"description":"Maximum selected matching start rows. Defaults to 20. Multiple occurrences on one row count once; context may contain additional matches. Requires query."}
+            }),
             &["terminalId"],
         ),
         definition(
@@ -284,6 +290,7 @@ pub(crate) async fn execute(
         }
         "capture_terminal" => {
             let id = required(&input, "terminalId")?;
+            let filter = TerminalFilter::parse(&input)?;
             let terminal = existing_terminal(app, id).await?;
             let start = if flag(&input, "scrollback", false) {
                 Some(0.0)
@@ -294,7 +301,10 @@ pub(crate) async fn execute(
             let (lines, total_lines) = terminal
                 .capture(start, end, flag(&input, "stripAnsi", true))
                 .await?;
-            json!({"terminalId":id,"lines":lines,"totalLines":total_lines})
+            match filter {
+                Some(filter) => filter.capture(id, lines, total_lines, start),
+                None => json!({"terminalId":id,"lines":lines,"totalLines":total_lines}),
+            }
         }
         "send_terminal_keys" => {
             let terminal = existing_terminal(app, required(&input, "terminalId")?).await?;
@@ -311,6 +321,128 @@ pub(crate) async fn execute(
         _ => bail!("Unknown workspace tool: {name}"),
     };
     Ok(json!({"content":[],"structuredContent":result,"isError":false}))
+}
+
+struct TerminalFilter<'a> {
+    query: &'a str,
+    context_lines: usize,
+    match_limit: usize,
+}
+
+impl<'a> TerminalFilter<'a> {
+    fn parse(input: &'a Value) -> Result<Option<Self>> {
+        let Some(query) = input.get("query") else {
+            if input.get("contextLines").is_some() || input.get("matchLimit").is_some() {
+                return Err(super::input_error("contextLines and matchLimit require query"));
+            }
+            return Ok(None);
+        };
+        let query = query
+            .as_str()
+            .filter(|query| !query.is_empty())
+            .ok_or_else(|| super::input_error("query must be a nonempty string"))?;
+        let bounded = |key: &str, default: usize, min: usize, max: usize| -> Result<usize> {
+            let Some(value) = input.get(key) else {
+                return Ok(default);
+            };
+            let number = value.as_f64().filter(|number| {
+                number.fract() == 0.0 && *number >= min as f64 && *number <= max as f64
+            });
+            number.map(|number| number as usize).ok_or_else(|| {
+                super::input_error(format!("{key} must be an integer between {min} and {max}"))
+            })
+        };
+        Ok(Some(Self {
+            query,
+            context_lines: bounded("contextLines", 2, 0, 20)?,
+            match_limit: bounded("matchLimit", 20, 1, 100)?,
+        }))
+    }
+
+    fn capture(
+        &self,
+        terminal_id: &str,
+        lines: Vec<String>,
+        total_lines: usize,
+        start: Option<f64>,
+    ) -> Value {
+        // Screen::capture resolves negatives and clamps before truncating the
+        // fractional index. Derive the origin from that same snapshot's total,
+        // never from a second capture which could observe scrolling or resize.
+        let start = start.unwrap_or(0.0);
+        let start = if start < 0.0 {
+            total_lines as f64 + start
+        } else {
+            start
+        };
+        let origin = start.clamp(0.0, total_lines.saturating_sub(1) as f64) as usize;
+        let inspected_range = if lines.is_empty() {
+            Value::Null
+        } else {
+            json!({"start":origin,"end":origin + lines.len() - 1})
+        };
+        let query = self.query.to_lowercase();
+        let parts: Vec<_> = query.split('\n').collect();
+        let folded: Vec<_> = lines.iter().map(|line| line.to_lowercase()).collect();
+        let mut matches = Vec::new();
+        let mut matched = vec![false; lines.len()];
+        for (row, window) in folded.windows(parts.len()).enumerate() {
+            let is_match = if parts.len() == 1 {
+                window[0].contains(parts[0])
+            } else {
+                window[0].ends_with(parts[0])
+                    && window[parts.len() - 1].starts_with(parts[parts.len() - 1])
+                    && window[1..parts.len() - 1]
+                        .iter()
+                        .zip(&parts[1..parts.len() - 1])
+                        .all(|(line, part)| line.as_str() == *part)
+            };
+            if is_match {
+                matches.push(row);
+                matched[row..row + parts.len()].fill(true);
+            }
+        }
+        let total_matches = matches.len();
+        let returned_matches = total_matches.min(self.match_limit);
+        let truncated = total_matches > returned_matches;
+        let next_range = matches.get(self.match_limit).map(|row| {
+            json!({"start":origin + row,"end":origin + lines.len() - 1})
+        });
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for row in matches.into_iter().take(self.match_limit) {
+            let start = row.saturating_sub(self.context_lines);
+            let end = (row + parts.len() + self.context_lines).min(lines.len());
+            if let Some(previous) = ranges.last_mut()
+                && start <= previous.end
+            {
+                previous.end = previous.end.max(end);
+            } else {
+                ranges.push(start..end);
+            }
+        }
+        let mut ranges = ranges.into_iter().peekable();
+        let selected: Vec<_> = lines
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, text)| {
+                while ranges.peek().is_some_and(|range| row >= range.end) {
+                    ranges.next();
+                }
+                ranges.peek().filter(|range| range.contains(&row)).map(|_| {
+                    json!({"index":origin + row,"text":text,"matched":matched[row]})
+                })
+            })
+            .collect();
+        json!({
+            "terminalId":terminal_id,"lines":selected,"totalLines":total_lines,
+            "query":self.query,"contextLines":self.context_lines,"matchLimit":self.match_limit,
+            "inspectedRange":inspected_range,"totalMatches":total_matches,
+            "returnedMatches":returned_matches,"noMatches":total_matches == 0,
+            "truncated":truncated,"nextRange":next_range,
+            "indexScope":"snapshot",
+            "notice":"Filtered snapshot, not a complete error audit. Indices address physical rows in this snapshot only and may shift or reset after scrolling, resize, or terminal reset. nextRange is an inclusive range for another capture with the same query and scrollback omitted (scrollback=true overrides start); it is not a stable cursor."
+        })
+    }
 }
 
 async fn existing_terminal(
@@ -749,4 +881,162 @@ fn encode_key<'a>(original: &'a str, preamble: &str) -> std::borrow::Cow<'a, str
         _ => return Cow::Borrowed(original),
     };
     Cow::Owned(encoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filtered(input: Value, lines: &[&str], total: usize, start: Option<f64>) -> Value {
+        TerminalFilter::parse(&input)
+            .unwrap()
+            .unwrap()
+            .capture("terminal", lines.iter().map(|line| (*line).into()).collect(), total, start)
+    }
+
+    #[test]
+    fn capture_filter_preserves_unfiltered_requests_and_validates_inputs() {
+        assert!(TerminalFilter::parse(&json!({
+            "terminalId":"terminal","start":-2.5,"end":3.9,"stripAnsi":false
+        })).unwrap().is_none());
+        let defaults = json!({"query":" "});
+        let defaults = TerminalFilter::parse(&defaults).unwrap().unwrap();
+        assert_eq!(defaults.query, " ");
+        assert_eq!(defaults.context_lines, 2);
+        assert_eq!(defaults.match_limit, 20);
+        for input in [
+            json!({"query":""}), json!({"query":null}), json!({"query":12}),
+            json!({"contextLines":1}), json!({"matchLimit":1}),
+            json!({"query":"x","contextLines":-1}),
+            json!({"query":"x","contextLines":21}),
+            json!({"query":"x","contextLines":1.5}),
+            json!({"query":"x","contextLines":"2"}),
+            json!({"query":"x","contextLines":null}),
+            json!({"query":"x","matchLimit":0}),
+            json!({"query":"x","matchLimit":101}),
+            json!({"query":"x","matchLimit":1.5}),
+            json!({"query":"x","matchLimit":true}),
+        ] {
+            let error = TerminalFilter::parse(&input).err().unwrap();
+            assert!(error.downcast_ref::<crate::providers::api::NativeToolInputError>().is_some(), "{input}");
+        }
+        assert!(TerminalFilter::parse(&json!({
+            "query":"x","contextLines":20.0,"matchLimit":100
+        })).is_ok());
+        let definition = definitions(false).into_iter()
+            .find(|tool| tool["name"] == "capture_terminal").unwrap();
+        for mut input in [
+            json!({"terminalId":"t","query":""}),
+            json!({"terminalId":"t","query":"x","contextLines":21}),
+            json!({"terminalId":"t","query":"x","matchLimit":0}),
+            json!({"terminalId":"t","query":"x","matchLimit":2.5}),
+        ] {
+            assert!(super::super::validate_input(&definition["inputSchema"], &mut input).is_err());
+        }
+        let mut original = json!({"terminalId":"t","start":-2.5,"end":3.9});
+        super::super::validate_input(&definition["inputSchema"], &mut original).unwrap();
+        assert!(TerminalFilter::parse(&original).unwrap().is_none());
+    }
+
+    #[test]
+    fn capture_filter_uses_snapshot_negative_and_fractional_row_origins() {
+        for (start, lines, expected) in [
+            (Some(-2.0), vec!["two", "three"], vec![2, 3]),
+            (Some(-2.9), vec!["one", "two", "three"], vec![1, 2, 3]),
+            (Some(1.1), vec!["one"], vec![1]),
+            (Some(-999.0), vec!["zero"], vec![0]),
+            (Some(999.0), vec!["three"], vec![3]),
+            (Some(-0.5), vec![], vec![]),
+            (Some(1.9), vec![], vec![]),
+        ] {
+            // Captured windows follow screen_tests' inclusive bounds, including
+            // reversed fractional ranges which are empty before truncation.
+            let result = filtered(json!({"query":"e","contextLines":2}), &lines, 4, start);
+            let indices: Vec<_> = result["lines"].as_array().unwrap().iter()
+                .map(|line| line["index"].as_u64().unwrap()).collect();
+            assert_eq!(indices, expected, "{start:?}");
+            assert_eq!(result["totalLines"], 4);
+            if let (Some(first), Some(last)) = (expected.first(), expected.last()) {
+                assert_eq!(result["inspectedRange"], json!({"start":first,"end":last}));
+            } else {
+                assert!(result["inspectedRange"].is_null());
+            }
+        }
+    }
+
+    #[test]
+    fn capture_filter_merges_context_and_keeps_unicode_and_literal_text() {
+        let result = filtered(
+            json!({"query":"ÉRROR [x]","contextLines":1}),
+            &["before", "érror [x] 日本語", "between", "ÉRROR [x] again", "after"],
+            20,
+            Some(10.8),
+        );
+        assert_eq!(result["totalMatches"], 2);
+        assert_eq!(result["lines"], json!([
+            {"index":10,"text":"before","matched":false},
+            {"index":11,"text":"érror [x] 日本語","matched":true},
+            {"index":12,"text":"between","matched":false},
+            {"index":13,"text":"ÉRROR [x] again","matched":true},
+            {"index":14,"text":"after","matched":false}
+        ]));
+        assert_eq!(result["inspectedRange"], json!({"start":10,"end":14}));
+        assert_eq!(result["truncated"], false);
+        assert!(result["nextRange"].is_null());
+        let literal = filtered(json!({"query":".*","contextLines":0}), &["error", ".*"], 2, None);
+        assert_eq!(literal["totalMatches"], 1);
+        assert_eq!(literal["lines"][0]["index"], 1);
+    }
+
+    #[test]
+    fn capture_filter_matches_multiline_literals_and_overlapping_spans() {
+        let result = filtered(
+            json!({"query":"ÉRROR\n日本語\ntrace","contextLines":0}),
+            &["prefix érror", "日本語", "TRACE suffix", "not included"],
+            10,
+            Some(-4.0),
+        );
+        assert_eq!(result["totalMatches"], 1);
+        assert_eq!(result["lines"].as_array().unwrap().len(), 3);
+        assert!(result["lines"].as_array().unwrap().iter().all(|line| line["matched"] == true));
+        assert_eq!(result["lines"][0]["index"], 6);
+        let overlapping = filtered(
+            json!({"query":"x\nx","contextLines":0}),
+            &["x", "x", "x"],
+            3,
+            None,
+        );
+        assert_eq!(overlapping["totalMatches"], 2);
+        assert_eq!(overlapping["lines"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn capture_filter_reports_no_matches_and_bounded_continuation() {
+        let empty = filtered(json!({"query":"missing"}), &["error"], 10, Some(3.0));
+        assert_eq!(empty["lines"], json!([]));
+        assert_eq!(empty["totalMatches"], 0);
+        assert_eq!(empty["noMatches"], true);
+        assert_eq!(empty["truncated"], false);
+        assert_eq!(empty["inspectedRange"], json!({"start":3,"end":3}));
+        let result = filtered(
+            json!({"query":"ERROR","contextLines":1,"matchLimit":1}),
+            &["before", "error error", "context", "ERROR", "after"],
+            10,
+            Some(-5.0),
+        );
+        assert_eq!(result["totalMatches"], 2);
+        assert_eq!(result["returnedMatches"], 1);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["nextRange"], json!({"start":8,"end":9}));
+        assert_eq!(result["lines"].as_array().unwrap().len(), 3);
+        assert_eq!(result["indexScope"], "snapshot");
+        assert!(result["notice"].as_str().unwrap().contains("not a complete error audit"));
+        let bounded = filtered(
+            json!({"query":"x","contextLines":20,"matchLimit":1}),
+            &["x", "x"], 2, None,
+        );
+        assert_eq!(bounded["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(bounded["lines"][1]["matched"], true);
+        assert_eq!(bounded["truncated"], true);
+    }
 }

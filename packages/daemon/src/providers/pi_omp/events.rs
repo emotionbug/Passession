@@ -337,6 +337,19 @@ impl Mapper {
         v["item"] = item;
         v
     }
+    fn stream_events(&self, items: Vec<Value>) -> Vec<Value> {
+        items.into_iter().map(|mut item| {
+            if item["type"] == "omp_authoritative_message" {
+                let mut event = self.event("timeline_reconcile");
+                for key in ["messageId", "items", "diagnostic"] {
+                    event[key] = item[key].take();
+                }
+                event
+            } else {
+                self.timeline(item)
+            }
+        }).collect()
+    }
     fn subagents(&self, events: Vec<Value>) -> Vec<Value> {
         events
             .into_iter()
@@ -435,12 +448,12 @@ impl Mapper {
             "agent_start"=>{self.started=true;self.no_turn_output.clear();if let Some(id)=frame["sessionId"].as_str(){out.push(json!({"type":"thread_started","provider":self.provider,"sessionId":id}));}},
             "turn_start"=>{if self.suppress_next_start{self.suppress_next_start=false;}else if self.family=="omp"||!self.turn_started{out.push(self.event("turn_started"));}self.started=true;self.turn_started=true;self.no_turn_output.clear();},
             "thinking_level_changed"=>{if let Some(level)=frame["level"].as_str().filter(|s|matches!(*s,"off"|"minimal"|"low"|"medium"|"high"|"xhigh")){out.push(json!({"type":"thinking_option_changed","provider":self.provider,"thinkingOptionId":level}));}},
-            "message_start"=>{if frame["message"]["role"]=="assistant"{if self.family=="omp"{let items=self.omp_streams.start(frame);out.extend(items.into_iter().map(|item|self.timeline(item)));}else{self.assistant=first(&[&frame["message"]["responseId"]]).map(str::to_owned);self.stream_text.clear();self.stream_thinking.clear();}}},
+            "message_start"=>{if frame["message"]["role"]=="assistant"{if self.family=="omp"{let items=self.omp_streams.start(frame);out.extend(self.stream_events(items));}else{self.assistant=first(&[&frame["message"]["responseId"]]).map(str::to_owned);self.stream_text.clear();self.stream_thinking.clear();}}},
             "message_update"=>{
                 if frame.get("message").is_some_and(|m|!m.is_null()&&m["role"]!="assistant"){return out;}
                 if self.family == "omp" {
                     let items = self.omp_streams.update(frame);
-                    out.extend(items.into_iter().map(|item| self.timeline(item)));
+                    out.extend(self.stream_events(items));
                     return out;
                 }
                 if frame["message"]["role"]=="assistant" && frame["message"]["content"].is_array() {
@@ -455,7 +468,7 @@ impl Mapper {
             }
             "message_end"=>{
                 let message=&frame["message"];match string(&message["role"]){
-                    "assistant"=>{if self.family=="omp"{let items=self.omp_streams.finish(frame);out.extend(items.into_iter().map(|item|self.timeline(item)));}else{out.extend(self.cumulative(message));self.assistant=None;self.stream_text.clear();self.stream_thinking.clear();}self.terminal=Some(message.clone());if self.family=="omp"{for block in array(&message["content"]){if block["type"]=="toolCall"&&block["name"]=="ask"{self.permissions.start(&self.family,&self.provider,string(&block["id"]),"ask",&block["arguments"]);}}}},
+                    "assistant"=>{if self.family=="omp"{let items=self.omp_streams.finish(frame);out.extend(self.stream_events(items));}else{out.extend(self.cumulative(message));self.assistant=None;self.stream_text.clear();self.stream_thinking.clear();}self.terminal=Some(message.clone());if self.family=="omp"{for block in array(&message["content"]){if block["type"]=="toolCall"&&block["name"]=="ask"{self.permissions.start(&self.family,&self.provider,string(&block["id"]),"ask",&block["arguments"]);}}}},
                     "custom"=>{let changes=if self.family=="omp"{self.extensions.omp_custom(message)}else{self.extensions.custom(message)};out.extend(self.subagents(changes));let id=format!("{}-custom-{}",self.provider,Uuid::new_v4());if let Some(mut item)=custom_item(&self.family,message,&id){if self.family=="omp"&&item["type"]=="user_message"{if let Some((text,client))=self.clients.pop_front(){item["text"]=json!(text);put(&mut item,"clientMessageId",client.as_deref());}else{return out;}}out.push(self.timeline(item));}},
                     "toolResult" if self.family=="omp"=>{let changes=self.extensions.omp_custom(message);out.extend(self.subagents(changes));},
                     "user" if self.family=="omp"=>{let id=first(&[&message["id"],&message["entryId"]]);if id.is_some_and(|id|!self.users.insert(id.into())){return out;}let text=tools::content_text(&message["content"]);if !text.is_empty(){let mut item=json!({"type":"user_message","text":text});put(&mut item,"messageId",id);if let Some((_,client))=self.clients.pop_front(){put(&mut item,"clientMessageId",client.as_deref());}out.push(self.timeline(item));}},_=>{}

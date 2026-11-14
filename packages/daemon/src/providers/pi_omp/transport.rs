@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_REASSEMBLED: usize = 64 * 1024 * 1024;
 const MAX_FRAME: usize = 1024 * 1024;
+const MAX_RETAINED_LINE: usize = 1024 * 1024;
 /// After exit, stdout may stay open through a descendant. Frames already written
 /// still precede process_exit, but an inherited pipe cannot postpone it forever.
 const STDOUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -75,7 +76,7 @@ impl Decoder {
         let bytes = STANDARD
             .decode(data)
             .map_err(|_| anyhow!("invalid-base64"))?;
-        if bytes.len() > 256 * 1024 || STANDARD.encode(&bytes) != data {
+        if bytes.len() > 256 * 1024 {
             bail!("invalid-base64");
         }
         if self.assembly.is_none() {
@@ -116,6 +117,14 @@ impl Decoder {
             bail!("invalid-chunk-payload");
         }
         Ok(Some(frame))
+    }
+}
+
+fn clear_read_buffer(line: &mut Vec<u8>) {
+    line.clear();
+    // Retention only: legacy frames can grow this buffer without a size ceiling.
+    if line.capacity() > MAX_RETAINED_LINE {
+        *line = Vec::new();
     }
 }
 
@@ -206,7 +215,6 @@ impl Transport {
             let mut line = Vec::new();
             let mut decoder = Decoder::default();
             loop {
-                line.clear();
                 // Legacy v1 frames have no wire size ceiling. Only the negotiated
                 // v2 chunk envelope enforces the 64 MiB reassembled-frame maximum.
                 let read = async {
@@ -223,11 +231,14 @@ impl Transport {
                     }
                     Ok(true) => {}
                 }
-                if line.iter().all(u8::is_ascii_whitespace) {
-                    continue;
-                }
-                match decoder.decode(&line) {
-                    Ok(Some(frame)) => {
+                let decoded = if line.iter().all(u8::is_ascii_whitespace) {
+                    Ok(None)
+                } else {
+                    decoder.decode(&line)
+                };
+                clear_read_buffer(&mut line);
+                match decoded {
+                    Ok(Some(mut frame)) => {
                         if frame["type"] == "ready" {
                             reader.ready.send_replace(Some(frame.clone()));
                         }
@@ -240,7 +251,7 @@ impl Transport {
                         };
                         if let Some(reply) = pending {
                             let result = if frame["success"] == true {
-                                Ok(frame.get("data").cloned().unwrap_or(Value::Null))
+                                Ok(frame.get_mut("data").map(Value::take).unwrap_or(Value::Null))
                             } else {
                                 Err(CommandError(
                                     frame["error"]
@@ -437,6 +448,102 @@ impl Transport {
 mod tests {
     use super::*;
 
+    #[test]
+    fn read_buffer_retains_small_allocations_and_releases_oversized_capacity() {
+        let mut line = Vec::with_capacity(MAX_RETAINED_LINE);
+        line.extend_from_slice(b"small frame\n");
+        let pointer = line.as_ptr();
+        clear_read_buffer(&mut line);
+        assert!(line.is_empty());
+        assert_eq!(line.capacity(), MAX_RETAINED_LINE);
+        assert_eq!(line.as_ptr(), pointer);
+        line.resize(MAX_RETAINED_LINE + 1, b' ');
+        clear_read_buffer(&mut line);
+        assert!(line.is_empty());
+        assert_eq!(line.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_large_then_small_lines_preserve_payloads_and_release_capacity() {
+        let expected = json!({"type":"message_update","text":"a€".repeat(MAX_RETAINED_LINE)});
+        let mut input = serde_json::to_vec(&expected).unwrap();
+        input.extend_from_slice(b"\n{\"type\":\"small\",\"data\":[null,42,\"ok\"]}\n");
+        let mut input = BufReader::new(input.as_slice());
+        let mut decoder = Decoder::default();
+        let mut line = Vec::new();
+        input.read_until(b'\n', &mut line).await.unwrap();
+        assert!(line.len() > MAX_RETAINED_LINE);
+        let decoded = decoder.decode(&line).unwrap();
+        clear_read_buffer(&mut line);
+        assert_eq!(line.capacity(), 0);
+        assert_eq!(decoded, Some(expected));
+        input.read_until(b'\n', &mut line).await.unwrap();
+        assert_eq!(decoder.decode(&line).unwrap(),
+            Some(json!({"type":"small","data":[null,42,"ok"]})));
+        let capacity = line.capacity();
+        let pointer = line.as_ptr();
+        clear_read_buffer(&mut line);
+        assert!(capacity <= MAX_RETAINED_LINE);
+        assert_eq!(line.capacity(), capacity);
+        assert_eq!(line.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn noncanonical_and_oversized_base64_reset_pending_assembly() {
+        let expected = json!({"type":"message_update","text":"x".repeat(MAX_FRAME)});
+        let frames = chunks(&expected);
+        let decoded_oversize = STANDARD.encode(vec![b'x'; 256 * 1024 + 1]);
+        assert_eq!(decoded_oversize.len(), 349528);
+        let invalid = [
+            "Zg".to_owned(), "Zg=".to_owned(), "Zg===".to_owned(),
+            "Zh==".to_owned(), "Zm9=".to_owned(), "Z g==".to_owned(),
+            String::new(), decoded_oversize, "A".repeat(349532),
+        ];
+        let mut decoder = Decoder::default();
+        for data in invalid {
+            assert!(decoder.decode(&frames[0]).unwrap().is_none());
+            let mut frame: Value = serde_json::from_slice(&frames[1]).unwrap();
+            frame["data"] = json!(data);
+            let error = decoder.decode(&serde_json::to_vec(&frame).unwrap()).unwrap_err();
+            assert_eq!(error.to_string(), "invalid-base64");
+            assert!(decoder.assembly.is_none());
+            assert_eq!(decoder.decode(&frames[1]).unwrap_err().to_string(), "out-of-order-chunk");
+        }
+        for frame in &frames[..frames.len() - 1] {
+            assert!(decoder.decode(frame).unwrap().is_none());
+        }
+        assert_eq!(decoder.decode(frames.last().unwrap()).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn invalid_chunk_bounds_and_metadata_reset_pending_assembly() {
+        let expected = json!({"type":"message_update","text":"x".repeat(MAX_FRAME)});
+        let frames = chunks(&expected);
+        let invalid = [
+            ("count", json!(1), "invalid-chunk"),
+            ("count", json!(257), "invalid-chunk"),
+            ("byteLength", json!(MAX_FRAME - 1), "invalid-chunk"),
+            ("byteLength", json!(MAX_REASSEMBLED + 1), "invalid-chunk"),
+            ("index", json!(frames.len()), "invalid-chunk"),
+            ("chunkId", json!("different"), "out-of-order-chunk"),
+            ("count", json!(frames.len() + 1), "out-of-order-chunk"),
+            ("byteLength", json!(MAX_FRAME + 100), "out-of-order-chunk"),
+        ];
+        let mut decoder = Decoder::default();
+        for (field, value, message) in invalid {
+            assert!(decoder.decode(&frames[0]).unwrap().is_none());
+            let mut frame: Value = serde_json::from_slice(&frames[1]).unwrap();
+            frame[field] = value;
+            assert_eq!(decoder.decode(&serde_json::to_vec(&frame).unwrap())
+                .unwrap_err().to_string(), message);
+            assert!(decoder.assembly.is_none());
+        }
+        for frame in &frames[..frames.len() - 1] {
+            assert!(decoder.decode(frame).unwrap().is_none());
+        }
+        assert_eq!(decoder.decode(frames.last().unwrap()).unwrap(), Some(expected));
+    }
+
     fn chunks(value: &Value) -> Vec<Vec<u8>> {
         let bytes = serde_json::to_vec(value).unwrap();
         let count = bytes.len().div_ceil(256 * 1024);
@@ -506,6 +613,53 @@ mod request_tests {
             args: vec!["-c".into(), script.into()],
             cwd: None, env: Default::default(), clear_env: false,
         }, Duration::from_secs(2), CancellationToken::new()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn successful_native_replies_preserve_missing_null_and_all_data_types() {
+        let (transport, _events) = fixture("cat").await;
+        assert_eq!(transport.request(json!({"type":"response","success":true})).await.unwrap(),
+            Value::Null);
+        let values = [
+            Value::Null, json!(false), json!(42), json!(-1.5), json!("hello €"),
+            json!([null, true, {"text":"nested"}]),
+            json!({"text":"a€".repeat(MAX_RETAINED_LINE), "nested":{"values":[1,2,3]}}),
+            json!({"small":"after the large legacy reply"}),
+        ];
+        for expected in values {
+            let reply = transport.request(json!({
+                "type":"response","success":true,"data":expected,
+            })).await.unwrap();
+            assert_eq!(reply, expected);
+        }
+        assert!(transport.pending.lock().unwrap().is_empty());
+        transport.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unmatched_responses_and_matching_id_events_keep_complete_frames() {
+        let (transport, mut events) = fixture(
+            "IFS= read -r first; \
+             printf '%s\\n' \
+             '{\"type\":\"message_update\",\"id\":\"req_1\",\"success\":true,\"data\":{\"text\":\"event\"}}' \
+             '{\"type\":\"response\",\"id\":\"unknown\",\"success\":true,\"data\":[null,{\"text\":\"unsolicited\"}]}' \
+             '{\"type\":\"response\",\"id\":\"unknown\",\"success\":false,\"error\":\"unmatched rejection\",\"data\":{\"detail\":42}}' \
+             '{\"type\":\"response\",\"id\":\"req_1\",\"success\":true,\"data\":{\"reply\":true}}'; \
+             cat >/dev/null"
+        ).await;
+        assert_eq!(transport.request(json!({"type":"get_state"})).await.unwrap(),
+            json!({"reply":true}));
+        assert_eq!(next(&mut events).await.unwrap(), json!({
+            "type":"message_update","id":"req_1","success":true,"data":{"text":"event"},
+        }));
+        assert_eq!(next(&mut events).await.unwrap(), json!({
+            "type":"response","id":"unknown","success":true,"data":[null,{"text":"unsolicited"}],
+        }));
+        assert_eq!(next(&mut events).await.unwrap(), json!({
+            "type":"response","id":"unknown","success":false,
+            "error":"unmatched rejection","data":{"detail":42},
+        }));
+        transport.close().await.unwrap();
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ struct Block {
     emitted: usize,
     closed: bool,
     authoritative: bool,
-    mismatch_reported: bool,
+    conflict: Option<Value>,
 }
 
 impl Message {
@@ -43,7 +43,9 @@ impl Message {
         let later_emitted = self.later_emitted(index);
         let block = self.blocks.entry(index).or_default();
         if later_emitted || (!block.text.is_empty() && block.thinking != thinking) {
-            return block.mismatch(&self.id, index).into_iter().collect();
+            let reason = if later_emitted { "append_after_later_block" } else { "block_type_changed" };
+            block.mismatch(&self.id, index, reason, None);
+            return Vec::new();
         }
         block.thinking = thinking;
         block.text.push_str(text);
@@ -59,6 +61,11 @@ impl Message {
     }
 
     fn drain(&mut self) -> Vec<Value> {
+        // A contradictory speculative prefix cannot be repaired by appending.
+        // Freeze this message until its complete authoritative body can replace it.
+        if self.blocks.values().any(|block| block.conflict.is_some()) {
+            return Vec::new();
+        }
         let mut items = Vec::new();
         for block in self.blocks.values_mut() {
             // OMP streams summary separators that its final thinking body trims.
@@ -91,16 +98,23 @@ impl Message {
         thinking: bool,
         text: &str,
         authoritative: bool,
-    ) -> Option<Value> {
+    ) {
         let later_emitted = self.later_emitted(index);
         let block = self.blocks.entry(index).or_default();
         if authoritative {
-            if !text.starts_with(&block.text[..block.emitted])
-                || (block.emitted != 0 && block.thinking != thinking)
-                || (later_emitted && text.len() != block.emitted)
-            {
+            let reason = if !text.starts_with(&block.text[..block.emitted]) {
+                Some("published_prefix_changed")
+            } else if block.emitted != 0 && block.thinking != thinking {
+                Some("block_type_changed")
+            } else if later_emitted && text.len() != block.emitted {
+                Some("later_block_overtaken")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                block.mismatch(&self.id, index, reason, Some(text));
                 block.text.truncate(block.emitted);
-                return block.mismatch(&self.id, index);
+                return;
             }
             // Only published bytes constrain reconciliation. Buffered later blocks
             // can still be replaced by their authoritative content without loss.
@@ -118,18 +132,16 @@ impl Message {
                 block.authoritative = false;
             }
         }
-        None
     }
 
     fn snapshot(&mut self, message: &Value, authoritative: bool) -> Vec<Value> {
-        let mut items = Vec::new();
         for (index, block) in array(&message["content"]).iter().enumerate() {
             let (thinking, text) = match string(&block["type"]) {
                 "text" => (false, string(&block["text"])),
                 "thinking" => (true, string(&block["thinking"])),
                 _ => continue,
             };
-            items.extend(self.reconcile(index, thinking, text, authoritative));
+            self.reconcile(index, thinking, text, authoritative);
             self.blocks.get_mut(&index).unwrap().closed =
                 authoritative || index + 1 < array(&message["content"]).len();
         }
@@ -142,15 +154,14 @@ impl Message {
                     })
                 {
                     if block.emitted != 0 {
-                        items.extend(block.mismatch(&self.id, index));
+                        block.mismatch(&self.id, index, "published_block_missing", None);
                     }
                     block.text.truncate(block.emitted);
                     block.closed = true;
                 }
             }
         }
-        items.extend(self.drain());
-        items
+        self.drain()
     }
 }
 
@@ -158,6 +169,7 @@ fn text_item(id: &str, thinking: bool, text: &str) -> Value {
     let mut item = json!({
         "type": if thinking { "reasoning" } else { "assistant_message" },
         "text": text,
+        "metadata": {"ompStreamMessageId": id},
     });
     if !thinking {
         item["messageId"] = json!(id);
@@ -166,16 +178,20 @@ fn text_item(id: &str, thinking: bool, text: &str) -> Value {
 }
 
 impl Block {
-    fn mismatch(&mut self, message: &str, index: usize) -> Option<Value> {
-        if self.mismatch_reported {
-            return None;
+    fn mismatch(&mut self, message: &str, index: usize, reason: &'static str, authority: Option<&str>) {
+        if self.conflict.is_none() {
+            let emitted = &self.text[..self.emitted];
+            let first_difference = authority.map(|text| emitted.bytes().zip(text.bytes())
+                .position(|(a, b)| a != b).unwrap_or(emitted.len().min(text.len())));
+            let diagnostic = json!({
+                "block": index, "reason": reason, "emittedBytes": self.emitted,
+                "authoritativeBytes": authority.map(str::len), "firstDifference": first_difference,
+            });
+            tracing::warn!(message_id=message, block=index, reason,
+                emitted_bytes=self.emitted, authoritative_bytes=?authority.map(str::len),
+                first_difference, "OMP stream conflict awaits authoritative message reconciliation");
+            self.conflict = Some(diagnostic);
         }
-        self.mismatch_reported = true;
-        // The neutral stream is append-only. Never duplicate a conflicting final body.
-        Some(json!({
-            "type": "error",
-            "message": format!("OMP authoritative content differs from streamed message {message}, block {index}; reload native history to recover the final content."),
-        }))
     }
 }
 
@@ -235,26 +251,50 @@ impl Streams {
                 };
                 // Delta-mode end events may omit content. Only a supplied body,
                 // including an explicit empty string, is authoritative.
-                let mut items: Vec<_> = message
-                    .reconcile(
-                        index,
-                        thinking,
-                        text.unwrap_or_default(),
-                        complete && text.is_some(),
-                    )
-                    .into_iter()
-                    .collect();
+                message.reconcile(
+                    index, thinking, text.unwrap_or_default(), complete && text.is_some(),
+                );
                 if complete {
                     message.blocks.get_mut(&index).unwrap().closed = true;
                 }
-                items.extend(message.drain());
-                items
+                message.drain()
             }
         }
     }
 
     pub(super) fn finish(&mut self, frame: &Value) -> Vec<Value> {
-        let items = self.message(frame).snapshot(&frame["message"], true);
+        let message = self.message(frame);
+        let mut items = message.snapshot(&frame["message"], true);
+        if message.blocks.values().any(|block| block.conflict.is_some()) {
+            let content = frame["message"]["content"].as_array();
+            let valid = content.is_some_and(|blocks| blocks.iter().all(|block| match string(&block["type"]) {
+                "thinking" => block["thinking"].is_string(),
+                "text" => block["text"].is_string(),
+                _ => true,
+            }));
+            if valid {
+                let authoritative: Vec<Value> = content.unwrap().iter().filter_map(|block| {
+                    let (thinking, text) = match string(&block["type"]) {
+                        "thinking" => (true, string(&block["thinking"])),
+                        "text" => (false, string(&block["text"])),
+                        _ => return None,
+                    };
+                    (!text.is_empty()).then(|| text_item(&message.id, thinking, text))
+                }).collect();
+                let conflicts: Vec<_> = message.blocks.values()
+                    .filter_map(|block| block.conflict.as_ref()).take(8).collect();
+                items.push(json!({
+                    "type":"omp_authoritative_message", "messageId":message.id,
+                    "items":authoritative,
+                    "diagnostic":{"rpcMessageId":frame["messageId"],
+                        "responseId":frame["message"]["responseId"],"conflicts":conflicts},
+                }));
+            } else {
+                items.push(json!({"type":"error",
+                    "message":"OMP final content is unavailable or invalid; retained streamed content requires native-history recovery.",
+                    "metadata":{"ompStreamMessageId":message.id,"reason":"invalid_authoritative_message"}}));
+            }
+        }
         if let Some(id) = frame["messageId"].as_str() {
             self.messages.remove(id);
         } else {
@@ -445,7 +485,10 @@ mod tests {
         );
         let events = mapper.map(&message);
         let replay = Mapper::new("omp", "omp").replay_message(&message["message"], None);
-        assert_eq!(events, replay);
+        let contents = |rows: &[Value]| rows.iter()
+            .map(|row| (row["item"]["type"].clone(), row["item"]["text"].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(contents(&events), contents(&replay));
 
         mapper.map(&start("msg-3", json!([])));
         let mut streamed = mapper.map(&update("msg-3", 0, "text_delta", "먼저"));
@@ -658,13 +701,16 @@ mod tests {
                     {"type":"thinking","thinking":final_body}
                 ]))));
                 assert_eq!(events.len(), 1);
-                assert_eq!(events[0]["item"]["type"], "error");
+                assert_eq!(events[0]["type"], "timeline_reconcile");
+                let expected = if final_body.is_empty() { Vec::new() } else { vec![final_body] };
+                assert_eq!(events[0]["items"].as_array().unwrap().iter()
+                    .map(|item| item["text"].as_str().unwrap()).collect::<Vec<_>>(), expected);
             }
         }
     }
 
     #[test]
-    fn omp_delta_conflicting_authority_reports_error_without_duplicate_body() {
+    fn omp_delta_conflicting_authority_requests_scoped_repair_without_duplicate_body() {
         for content in [
             json!([{"type":"text","text":"다른 최종 답변"}]),
             json!([{"type":"text","text":"원"}]),
@@ -676,7 +722,7 @@ mod tests {
             mapper.map(&update("msg-2", 0, "text_delta", "원본"));
             let events = mapper.map(&end("msg-2", content));
             assert_eq!(events.len(), 1);
-            assert_eq!(events[0]["item"]["type"], "error");
+            assert_eq!(events[0]["type"], "timeline_reconcile");
             assert_eq!(rendered(&events, "assistant_message"), "");
             assert_eq!(
                 mapper
@@ -758,5 +804,56 @@ mod authority_tests {
                 .iter()
                 .all(|event| event["item"]["type"] == "assistant_message")
         );
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::super::Mapper;
+    use serde_json::json;
+
+    #[test]
+    fn omp_summary_heading_revision_reconciles_only_after_complete_message() {
+        let mut mapper = Mapper::new("omp", "omp");
+        mapper.begin_turn("turn");
+        let update = |kind, content| json!({"type":"message_update","messageId":"rpc-message",
+            "message":{"role":"assistant"},
+            "assistantMessageEvent":{"type":kind,"contentIndex":0,"delta":content,"content":content}});
+        let first = mapper.map(&update("thinking_delta", "**임시 제목**\n\n확정된 본문🙂"));
+        let marker = first[0]["item"]["metadata"]["ompStreamMessageId"].clone();
+        assert!(mapper.map(&update("thinking_end", "확정된 본문🙂")).is_empty());
+        let finished = mapper.map(&json!({"type":"message_end","messageId":"rpc-message",
+            "message":{"role":"assistant","responseId":"native-response","content":[
+                {"type":"thinking","thinking":"확정된 본문🙂","summary":true},
+                {"type":"text","text":"최종 답변"}
+            ]}}));
+        assert_eq!(finished.len(), 1);
+        let repair = &finished[0];
+        assert_eq!(repair["type"], "timeline_reconcile");
+        assert_eq!(repair["messageId"], marker);
+        assert_eq!(repair["turnId"], "turn");
+        assert_eq!(repair["items"][0]["text"], "확정된 본문🙂");
+        assert_eq!(repair["items"][1]["text"], "최종 답변");
+        assert!(repair["items"].as_array().unwrap().iter()
+            .all(|item| item["metadata"]["ompStreamMessageId"] == marker));
+        assert_eq!(repair["diagnostic"]["rpcMessageId"], "rpc-message");
+        assert_eq!(repair["diagnostic"]["responseId"], "native-response");
+        assert_eq!(repair["diagnostic"]["conflicts"][0]["reason"], "published_prefix_changed");
+        assert_eq!(repair["diagnostic"]["conflicts"][0]["firstDifference"], 0);
+        assert!(!repair["diagnostic"].to_string().contains("확정된 본문"));
+    }
+
+    #[test]
+    fn omp_invalid_final_body_cannot_authorize_removal_of_published_text() {
+        let mut mapper = Mapper::new("omp", "omp");
+        mapper.map(&json!({"type":"message_update","messageId":"message",
+            "message":{"role":"assistant"},"assistantMessageEvent":{
+                "type":"text_delta","contentIndex":0,"delta":"보존할 본문"}}));
+        let events = mapper.map(&json!({"type":"message_end","messageId":"message",
+            "message":{"role":"assistant","content":[{"type":"text","text":null}]}}));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "timeline");
+        assert_eq!(events[0]["item"]["type"], "error");
+        assert_eq!(events[0]["item"]["metadata"]["reason"], "invalid_authoritative_message");
     }
 }

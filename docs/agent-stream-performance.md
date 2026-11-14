@@ -41,13 +41,24 @@ acknowledgements and transport failures remain errors. Pi is unchanged.
 OMP reconstruction tracks RPC message IDs and content-block indices independently,
 preserving Unicode and text/thinking order. Block ends and the complete terminal
 message recover missing suffixes and replace unpublished fragments without
-duplicating emitted text. The neutral stream is append-only: a terminal body
-contradicting already published bytes produces an explicit error, not a fabricated
-merge; native history remains the authority for recovering that final body.
+duplicating emitted text. A terminal body contradicting published bytes, block
+types or order uses [message-scoped authoritative repair](timeline-sync.md#omp-authoritative-message-repair),
+not an appended second final message or a text-based merge.
 Trailing thinking whitespace stays unpublished until it becomes internal text or
 an explicit end/terminal body confirms it. An end event without a body closes the
 block but does not assert empty content; an explicit empty body is authoritative.
 This changes provider payload handling, not batching, settling or polling policy.
+
+Model-facing activity/status detail reads reuse pure JSON encodings in a cache
+bounded to 16 entries, 2 MiB total charged storage and 256 KiB per entry. The charge
+includes conservative source-value overhead and retained encoded capacity; these
+are cache-admission limits, not response-size limits or process-memory ceilings.
+Exact encoding identity includes object order and numeric distinctions such as
+signed zero. Every read still fetches and validates its authoritative source,
+epoch/row range or selected-value revision. Cached bytes never grant access or
+carry agent/server scopes, paths or continuation references across callers.
+Oversized values and cache contention retain the streaming serialization path;
+UTF-8 chunk boundaries and revision semantics are unchanged.
 
 Physical client frame admission has a one-second stall deadline as well as its byte budget;
 a saturated small-frame queue disconnects that source without failing the agent commit.

@@ -12,6 +12,8 @@ mod search;
 mod storage;
 #[path = "timeline_history.rs"]
 mod history;
+#[path = "timeline_reconcile.rs"]
+mod reconcile;
 
 pub(super) fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -136,6 +138,8 @@ fn merge_text(previous: &mut Value, next: &Value) -> bool {
         || ty != kind(&next["item"])
         || num(previous, "seqEnd") + 1 != num(next, "seqStart")
         || previous.get("turnId") != next.get("turnId")
+        || previous["item"]["metadata"].get("ompStreamMessageId")
+            != next["item"]["metadata"].get("ompStreamMessageId")
     {
         return false;
     }

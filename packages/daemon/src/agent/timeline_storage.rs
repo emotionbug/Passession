@@ -1,6 +1,6 @@
 use super::Timeline;
 use anyhow::{Result, bail, ensure};
-use rusqlite::{Connection, OpenFlags, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::fs;
 #[cfg(unix)]
@@ -11,10 +11,19 @@ const UPSERT_ROW: &str = "INSERT INTO timeline_rows(position, row_json) VALUES (
     ON CONFLICT(position) DO UPDATE SET row_json = excluded.row_json";
 const UPDATE_METADATA: &str = "UPDATE timeline_metadata SET epoch = ?1, next_seq = ?2, min_seq = ?3 WHERE id = 1";
 const READ_METADATA: &str = "SELECT version, agent_id, epoch, next_seq, min_seq FROM timeline_metadata WHERE id = 1";
+// An expression index, rather than a side table, stays exact even when an older
+// v1 writer updates row_json. SQLite maintains it in the row's own transaction.
+const CREATE_PAGE_INDEX: &str = "CREATE INDEX timeline_rows_page ON timeline_rows(\
+    position, json_extract(row_json, '$.seqStart'), \
+    json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges'))";
 /// Everything `Timeline::fetch` selection reads from a row, without its item.
 const ROW_PAGE_METADATA: &str = "SELECT position, json_extract(row_json, '$.seqStart'), \
     json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges') \
-    FROM timeline_rows ORDER BY position";
+    FROM timeline_rows INDEXED BY timeline_rows_page ORDER BY position";
+// Saved reads never migrate a database, including a read-only legacy checkpoint.
+const LEGACY_ROW_PAGE_METADATA: &str = "SELECT position, json_extract(row_json, '$.seqStart'), \
+    json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges') \
+    FROM timeline_rows NOT INDEXED ORDER BY position";
 
 #[derive(Debug)]
 pub(super) struct Store {
@@ -25,7 +34,7 @@ pub(super) struct Store {
 
 impl Store {
     fn open(path: &Path, agent_id: &str) -> Result<Self> {
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         let (version, stored_agent): (i64, String) = connection.query_row(
             "SELECT version, agent_id FROM timeline_metadata WHERE id = 1",
             [],
@@ -35,6 +44,7 @@ impl Store {
         ensure!(stored_agent == agent_id, "Timeline checkpoint agent mismatch");
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
+        ensure_page_index(&mut connection)?;
         Ok(Self { connection, path: path.to_owned(), agent_id: agent_id.to_owned() })
     }
 
@@ -51,6 +61,61 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn has_page_index(connection: &Connection) -> Result<bool> {
+    let sql: Option<String> = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE name = 'timeline_rows_page'",
+        [],
+        |row| row.get(0),
+    ).optional()?;
+    if let Some(sql) = sql {
+        ensure!(sql == CREATE_PAGE_INDEX, "Invalid timeline page index");
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn ensure_page_index(connection: &mut Connection) -> Result<()> {
+    if has_page_index(connection)? {
+        return Ok(());
+    }
+    // Recheck under the write lock: another connection may have migrated first.
+    // Invalid legacy metadata rolls back the index creation, not just its rows.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !has_page_index(&transaction)? {
+        transaction.execute_batch(CREATE_PAGE_INDEX)?;
+        let mut statement = transaction.prepare(ROW_PAGE_METADATA)?;
+        let mut rows = statement.query([])?;
+        let mut position = 0;
+        while let Some(row) = rows.next()? {
+            read_page_metadata(row, position)?;
+            position += 1;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn read_page_metadata(row: &rusqlite::Row<'_>, position: usize) -> Result<Value> {
+    ensure!(row.get::<_, i64>(0)? == position as i64, "Invalid timeline row position");
+    let (Some(start), Some(end), Some(ranges)) =
+        (row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?)
+    else {
+        bail!("Invalid timeline row metadata");
+    };
+    let ranges: Value = serde_json::from_str(&ranges)?;
+    ensure!(valid_page_metadata(start, end, &ranges), "Invalid timeline row metadata");
+    Ok(json!({"seqStart":start,"seqEnd":end,"sourceSeqRanges":ranges,"position":position}))
+}
+
+fn valid_page_metadata(start: i64, end: i64, ranges: &Value) -> bool {
+    start > 0 && end >= start && ranges.as_array().is_some_and(|ranges| {
+        !ranges.is_empty() && ranges.iter().all(|range| {
+            matches!((range["startSeq"].as_i64(), range["endSeq"].as_i64()),
+                (Some(a), Some(b)) if a >= start && b >= a && b <= end)
+        })
+    })
 }
 
 fn write_metadata(transaction: &Transaction<'_>, timeline: &Timeline) -> Result<()> {
@@ -95,6 +160,7 @@ fn create(path: &Path, agent_id: &str, timeline: &Timeline) -> Result<Store> {
         "INSERT INTO timeline_metadata VALUES (1, 1, ?1, ?2, ?3, ?4)",
         params![agent_id, timeline.epoch, timeline.next_seq, timeline.min_seq],
     )?;
+    transaction.execute_batch(CREATE_PAGE_INDEX)?;
     write_rows(&transaction, &timeline.rows)?;
     transaction.commit()?;
     drop(connection);
@@ -129,7 +195,11 @@ pub(super) fn encoded_bytes(row: &Value) -> u64 {
 }
 
 fn valid_row(row: &Value) -> bool {
-    row["seq"].as_i64().is_some_and(|seq| seq > 0) && row["item"].is_object() && row["timestamp"].is_string()
+    row["seq"].as_i64().is_some_and(|seq| seq > 0)
+        && row["item"].is_object()
+        && row["timestamp"].is_string()
+        && matches!((row["seqStart"].as_i64(), row["seqEnd"].as_i64()),
+            (Some(start), Some(end)) if valid_page_metadata(start, end, &row["sourceSeqRanges"]))
 }
 
 /// `load`, plus the stored JSON bytes of the hydrated rows.
@@ -183,7 +253,7 @@ pub(super) fn load_measured(path: &Path, agent_id: &str) -> Result<(Timeline, u6
 /// the whole history. Only reads; never alters the database.
 pub(super) fn fetch_page(path: &Path, agent_id: &str, options: &Value) -> Result<Value> {
     ensure!(path.try_exists()?, "Timeline database missing: {}", path.display());
-    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let transaction = connection.transaction()?;
     let (version, stored_agent, epoch, next_seq, min_seq): (i64, String, String, i64, i64) =
         transaction.query_row(READ_METADATA, [], |row| {
@@ -196,19 +266,11 @@ pub(super) fn fetch_page(path: &Path, agent_id: &str, options: &Value) -> Result
     timeline.next_seq = next_seq;
     timeline.min_seq = min_seq;
     {
-        let mut statement = transaction.prepare(ROW_PAGE_METADATA)?;
+        let query = if has_page_index(&transaction)? { ROW_PAGE_METADATA } else { LEGACY_ROW_PAGE_METADATA };
+        let mut statement = transaction.prepare(query)?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            let index = timeline.rows.len();
-            ensure!(row.get::<_, i64>(0)? == index as i64, "Invalid timeline row position");
-            let (Some(start), Some(end), Some(ranges)) =
-                (row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?)
-            else {
-                bail!("Invalid timeline row metadata");
-            };
-            let ranges: Value = serde_json::from_str(&ranges)?;
-            ensure!(ranges.is_array(), "Invalid timeline row metadata");
-            timeline.rows.push(json!({"seqStart":start,"seqEnd":end,"sourceSeqRanges":ranges,"position":index}));
+            timeline.rows.push(read_page_metadata(row, timeline.rows.len())?);
         }
     }
     let selected: Vec<usize> = timeline.fetch(options)["rows"].as_array().expect("page rows").iter()
@@ -220,6 +282,9 @@ pub(super) fn fetch_page(path: &Path, agent_id: &str, options: &Value) -> Result
             let encoded: String = statement.query_row([index as i64], |row| row.get(0))?;
             let row: Value = serde_json::from_str(&encoded)?;
             ensure!(valid_row(&row), "Invalid timeline row");
+            for field in ["seqStart", "seqEnd", "sourceSeqRanges"] {
+                ensure!(row[field] == timeline.rows[index][field], "Invalid timeline row metadata");
+            }
             timeline.rows[index] = row;
         }
     }

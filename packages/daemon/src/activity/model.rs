@@ -1,5 +1,9 @@
 //! Bounded MCP views over the existing authoritative timeline and agent snapshot.
-use std::io::{self, Write};
+use std::{
+    collections::VecDeque,
+    io::{self, Write},
+    sync::{LazyLock, Mutex},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -180,7 +184,242 @@ struct Serialized {
     revision: Option<String>,
 }
 
+const DETAIL_CACHE_ENTRIES: usize = 16;
+const DETAIL_CACHE_BYTES: usize = 2 * 1024 * 1024;
+const DETAIL_CACHE_ENTRY_BYTES: usize = 256 * 1024;
+
+struct CachedJson {
+    source: Value,
+    text: String,
+    revision: Option<String>,
+    charge: usize,
+}
+
+#[derive(Default)]
+struct DetailCache {
+    entries: VecDeque<CachedJson>,
+    bytes: usize,
+    #[cfg(test)]
+    hits: usize,
+}
+
+impl DetailCache {
+    fn insert(&mut self, entry: CachedJson) {
+        while self.entries.len() >= DETAIL_CACHE_ENTRIES
+            || self.bytes + entry.charge > DETAIL_CACHE_BYTES
+        {
+            let old = self.entries.pop_front().expect("cache budget has an entry");
+            self.bytes -= old.charge;
+        }
+        self.bytes += entry.charge;
+        self.entries.push_back(entry);
+    }
+}
+
+// Cache only pure encodings, never responses, scopes or caller revisions. Every
+// read still validates and selects from its freshly fetched authoritative value.
+// Preflight counts source bytes, conservative rebuilt node/map storage, and
+// actual JSON escaping without allocating. Reserve twice the encoded length
+// for serializer buffer growth; charge retained capacity explicitly afterward.
+// Sparse source capacities are not cloned. Oversized values keep streaming.
+fn cache_charge(value: &Value) -> Option<usize> {
+    if matches!(value, Value::Null | Value::Bool(_) | Value::Number(_))
+        || value.as_str().is_some_and(|text| text.len() <= PREVIEW_BYTES)
+    {
+        return None;
+    }
+    fn add(
+        source: &mut usize,
+        encoded: &mut usize,
+        source_bytes: usize,
+        encoded_bytes: usize,
+    ) -> Option<()> {
+        *source = source.checked_add(source_bytes)?;
+        *encoded = encoded.checked_add(encoded_bytes)?;
+        (source.checked_add(encoded.checked_mul(2)?)? <= DETAIL_CACHE_ENTRY_BYTES)
+            .then_some(())
+    }
+    fn string(text: &str, source: &mut usize, encoded: &mut usize) -> Option<()> {
+        // Reject oversized strings by length before scanning their bytes.
+        add(source, encoded, text.len(), text.len().checked_add(2)?)?;
+        let escapes = text
+            .bytes()
+            .map(|byte| match byte {
+                b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 1,
+                0..=0x1f => 5,
+                _ => 0,
+            })
+            .sum();
+        add(source, encoded, 0, escapes)
+    }
+    fn charge(
+        value: &Value,
+        depth: usize,
+        source: &mut usize,
+        encoded: &mut usize,
+    ) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        add(source, encoded, 256, 0)?;
+        match value {
+            Value::Null => add(source, encoded, 0, 4)?,
+            Value::Bool(_) => add(source, encoded, 0, 5)?,
+            Value::Number(_) => add(source, encoded, 0, 32)?,
+            Value::String(text) => string(text, source, encoded)?,
+            Value::Array(values) => {
+                add(source, encoded, 0, 2 + values.len().saturating_sub(1))?;
+                for value in values {
+                    charge(value, depth + 1, source, encoded)?;
+                }
+            }
+            Value::Object(values) => {
+                add(source, encoded, 0, 2 + values.len().saturating_sub(1))?;
+                for (key, value) in values {
+                    add(source, encoded, 256, 1)?;
+                    string(key, source, encoded)?;
+                    charge(value, depth + 1, source, encoded)?;
+                }
+            }
+        }
+        Some(())
+    }
+    let mut source = 0;
+    let mut encoded = 0;
+    charge(value, 0, &mut source, &mut encoded)?;
+    Some(source)
+}
+
+fn cache_source(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(cache_source).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), cache_source(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+// Value equality ignores object insertion order and considers -0.0 == 0.0.
+// Both distinctions affect the exact bytes (and therefore the revision).
+fn same_encoding(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(a, b)| same_encoding(a, b))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|((ak, av), (bk, bv))| ak == bk && same_encoding(av, bv))
+        }
+        (Value::Number(left), Value::Number(right)) if left.is_f64() && right.is_f64() => {
+            left.as_f64().map(f64::to_bits) == right.as_f64().map(f64::to_bits)
+        }
+        _ => left == right,
+    }
+}
+
+fn cached_window(
+    entry: &mut CachedJson,
+    offset: usize,
+    length: usize,
+    with_revision: bool,
+) -> Result<Serialized> {
+    let total = entry.text.len();
+    ensure!(offset <= total, "Detail offset exceeds the JSON length");
+    let end = offset.saturating_add(length).min(total);
+    let bytes = &entry.text.as_bytes()[offset..end];
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()])?
+        }
+        Err(_) => bail!("Detail offset must be a UTF-8 character boundary"),
+    };
+    if with_revision && entry.revision.is_none() {
+        entry.revision = Some(format!("{:x}", Sha256::digest(entry.text.as_bytes())));
+    }
+    Ok(Serialized {
+        text: text.to_owned(),
+        total,
+        revision: if with_revision {
+            entry.revision.clone()
+        } else {
+            None
+        },
+    })
+}
+
+fn serialize_cached(
+    cache: &Mutex<DetailCache>,
+    value: &Value,
+    offset: usize,
+    length: usize,
+    with_revision: bool,
+) -> Result<Serialized> {
+    // A busy cache must not serialize independent callers behind its lock.
+    // Compare against bounded retained sources first: matching type/length and
+    // depth bound this walk, even if the incoming source is huge. Hits need no
+    // second traversal to estimate storage or count JSON escapes.
+    if let Ok(mut cache) = cache.try_lock() {
+        if let Some(index) = cache
+            .entries
+            .iter()
+            .position(|entry| same_encoding(&entry.source, value))
+        {
+            #[cfg(test)]
+            {
+                cache.hits += 1;
+            }
+            let mut entry = cache.entries.remove(index).expect("matched cache entry");
+            let result = cached_window(&mut entry, offset, length, with_revision);
+            cache.entries.push_back(entry);
+            return result;
+        }
+    } else {
+        return serialize_streaming(value, offset, length, with_revision);
+    }
+    let Some(charge) = cache_charge(value) else {
+        return serialize_streaming(value, offset, length, with_revision);
+    };
+    let mut entry = CachedJson {
+        source: Value::Null,
+        text: serde_json::to_string(value)?,
+        revision: None,
+        charge,
+    };
+    let result = cached_window(&mut entry, offset, length, with_revision)?;
+    entry.charge += entry.text.capacity();
+    // Tiny previews do not displace multi-chunk details. Invalid offsets never
+    // admit an entry; canceled callers cannot leave partially encoded entries.
+    if entry.text.len() > PREVIEW_BYTES
+        && entry.charge <= DETAIL_CACHE_ENTRY_BYTES
+        && let Ok(mut cache) = cache.try_lock()
+        && !cache.entries.iter().any(|entry| same_encoding(&entry.source, value))
+    {
+        entry.source = cache_source(value);
+        cache.insert(entry);
+    }
+    Ok(result)
+}
+
 fn serialize(
+    value: &Value,
+    offset: usize,
+    length: usize,
+    with_revision: bool,
+) -> Result<Serialized> {
+    static CACHE: LazyLock<Mutex<DetailCache>> = LazyLock::new(Mutex::default);
+    serialize_cached(&CACHE, value, offset, length, with_revision)
+}
+
+fn serialize_streaming(
     value: &Value,
     offset: usize,
     length: usize,

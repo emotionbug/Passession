@@ -696,6 +696,63 @@ impl AgentManager {
         })
         .await?
     }
+    async fn reconcile_timeline_message(
+        &self,
+        id: &str,
+        cell: &Arc<AgentCell>,
+        event: Value,
+    ) {
+        let snapshot = cell.data.lock().await.snapshot.clone();
+        let timeline = cell.timeline.clone();
+        let events = self.events.clone();
+        let agent_id = id.to_owned();
+        let destination = if snapshot["internal"] == true {
+            Ok(None)
+        } else {
+            self.timeline_path(id).map(Some)
+        };
+        let provider = snapshot["provider"].clone();
+        let expected_provider = provider.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<()> {
+            if !expected_provider.is_string() || event["provider"] != expected_provider {
+                bail!("Reconciliation provider does not match the current agent");
+            }
+            let destination = destination?;
+            let mut timeline = timeline.lock().map_err(|_| anyhow!("Timeline lock poisoned"))?;
+            if let Some(epoch) = timeline.reconcile_message(
+                &event, destination.as_deref().map(|path| (path, agent_id.as_str())),
+            )? {
+                // Keep publication with the admitted synchronous commit. Dropping
+                // its async waiter must not leave observers on the obsolete epoch.
+                let _ = events.send(json!({
+                    "type":"timeline_replacement","agentId":agent_id,"epoch":epoch
+                }));
+            }
+            Ok(())
+        }).await;
+        let failure = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error,
+            Err(error) => anyhow!(error),
+        };
+        tracing::warn!(agent_id=id, error=%failure, "Retaining canonical timeline after rejected message correction");
+        // A failed checkpoint cannot persist an error row either. Send the ordinary
+        // timeline error without changing canonical history or failing its owner.
+        let error = json!({
+            "type":"timeline","provider":provider,
+            "item":{
+                "type":"error",
+                "message":"The final OMP message could not be safely applied. Previous history was retained. Retry loading native history to recover the final content.",
+                "metadata":{
+                    "code":"omp_timeline_reconcile_retained",
+                    "recovery":{"action":"reload_native_history","canonicalPreserved":true}
+                }
+            }
+        });
+        if let Err(error) = self.publish_stream(id, cell, error, None).await {
+            tracing::warn!(agent_id=id, error=%error, "Unable to publish message correction recovery notice");
+        }
+    }
     pub(super) async fn apply_event(
         &self,
         id: &str,
@@ -714,6 +771,10 @@ impl AgentManager {
             }
         }
         let _commit = cell.commit.lock().await;
+        if event["type"] == "timeline_reconcile" {
+            self.reconcile_timeline_message(id, cell, event).await;
+            return Ok(());
+        }
         if event["type"] == "provider_subagent" && event["event"]["type"] == "replay" {
             // Applied in the parent's event order; the outcome goes to the
             // provider and the reader. A failed replay never ends the parent's owner.
@@ -2003,3 +2064,7 @@ pub(super) mod tests {
         assert_eq!(transition_attention(Some("running"), &mut internal), None);
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_reconcile_tests.rs"]
+mod reconcile_tests;

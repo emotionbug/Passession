@@ -1,6 +1,8 @@
 mod catalog;
 mod event_queue;
 mod events;
+#[cfg(test)]
+pub(crate) use events::Mapper;
 mod history;
 mod host_tools;
 mod launch;

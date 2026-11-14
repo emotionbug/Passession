@@ -218,6 +218,28 @@ These are daemon-side PTY APIs. The native client opens interactive shells as **
 | `capture_terminal`   | Capture plain-text output from a terminal session.                           |
 | `send_terminal_keys` | Send text or special key tokens to a terminal session.                       |
 
+`capture_terminal` remains unfiltered when `query` is omitted, returning the
+existing `terminalId`, string `lines` and `totalLines`. Filtering is explicit:
+provide a nonempty literal `query` (not a regex). Matching uses Unicode lowercasing,
+preserves significant whitespace and can span newline-separated physical rows.
+Search and context stay inside the captured `start`/`end` window.
+
+With a query, `contextLines` accepts 0–20 (default 2) on each side and `matchLimit`
+accepts 1–100 (default 20). Both require `query`. Limits and `totalMatches` count
+matching start rows, not occurrences: repeated matches on one row count once.
+Overlapping context is merged; `lines` becomes `{index, text, matched}` rows in
+original order with original snapshot indices. Context can include extra matches
+beyond the selected start-row limit.
+
+`inspectedRange` gives inclusive snapshot bounds (`null` for an empty capture).
+`noMatches: true` means only that this query matched nothing in that window, not
+that the terminal contains no errors. `returnedMatches` counts selected start rows;
+`truncated: true` means more matching starts remain. Use the inclusive `nextRange`
+as `start`/`end` with the same query and omit `scrollback` (`true` overrides `start`).
+This is another capture, not stable pagination: scrolling, resizing or resetting
+the terminal can shift indices or change content. Omit `query` when you need the
+unfiltered window; filtered snapshots are not a complete error audit.
+
 ### Schedules and heartbeats
 
 Both use the same cron engine, but they have deliberately different interfaces.
@@ -237,6 +259,18 @@ Both use the same cron engine, but they have deliberately different interfaces.
 | `delete_heartbeat`  | Delete one of the current agent's heartbeats.                                |
 
 MCP heartbeats are ephemeral: create or delete them. To change one, delete it and create a replacement. Pause, resume, update, inspect, logs, and run-once apply to new-agent schedules only.
+
+`list_schedules` returns compact new-agent schedule rows: `id`, `name`, `status`,
+`cadence`, available run/pause/expiry timestamps (`nextRunAt`, `lastRunAt`,
+`pausedAt`, `expiresAt`), `maxRuns`, and `target`. Within `target.config`, only
+`provider`, `model`, `cwd`, `modeId` and `isolation` are retained. `runCount` counts
+recorded runs; `completedRunCount` counts recorded runs no longer marked `running`,
+not only successful runs.
+
+Each row includes `detail: {tool: "inspect_schedule", arguments: {id: ...}}`.
+Use it for the complete schedule, including prompt, full target configuration and
+run history. `inspect_schedule` is unchanged; compact listing does not discard
+stored schedule data.
 
 New-agent run workspaces are archived when each run ends by default. `create_schedule` and `update_schedule` do not expose **Archive on finish** (`archiveOnFinish`); [change the option in the app](/docs/schedules#keep-run-workspaces) to keep subsequent run workspaces active.
 

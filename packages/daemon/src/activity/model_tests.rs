@@ -404,3 +404,301 @@ fn json_chunks_preserve_unicode_and_reject_invalid_offsets_and_limits() {
         json!({"epoch":"e","window":{"maxSeq":2,"minSeq":1},"hasOlder":false,"rows":[{},{}]});
     assert!(activity(&page, &snapshot, &input).is_err());
 }
+
+#[test]
+fn detail_cache_reuses_exact_encoding_and_revision_across_unicode_chunks() {
+    let cache = Mutex::new(DetailCache::default());
+    let value = json!({"text":"🙂界\n\u{0000}\\\"".repeat(400)});
+    let expected = serde_json::to_string(&value).unwrap();
+    let first = serialize_cached(&cache, &value, 0, CHUNK_BYTES, false).unwrap();
+    let pointer = {
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries[0].revision.is_none());
+        cache.entries[0].text.as_ptr()
+    };
+    let revision = format!("{:x}", Sha256::digest(expected.as_bytes()));
+    let mut recovered = first.text;
+    while recovered.len() < expected.len() {
+        let offset = recovered.len();
+        let part = serialize_cached(&cache, &value, offset, CHUNK_BYTES, true).unwrap();
+        let streamed = serialize_streaming(&value, offset, CHUNK_BYTES, true).unwrap();
+        assert_eq!(part.text, streamed.text);
+        assert_eq!(part.total, expected.len());
+        assert_eq!(part.revision.as_ref(), Some(&revision));
+        assert!(!part.text.is_empty());
+        assert!(part.text.len() <= CHUNK_BYTES);
+        recovered.push_str(&part.text);
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].text.as_ptr(), pointer);
+    }
+    assert_eq!(recovered, expected);
+    let last = serialize_cached(&cache, &value, expected.len(), CHUNK_BYTES, false).unwrap();
+    assert!(last.text.is_empty());
+    assert!(last.revision.is_none());
+}
+
+#[test]
+fn detail_cache_distinguishes_order_keys_numbers_and_same_sized_mutations() {
+    let cache = Mutex::new(DetailCache::default());
+    let padding = "p".repeat(500);
+    let mut ordered = serde_json::Map::new();
+    ordered.insert("a".into(), json!(1));
+    ordered.insert("b".into(), json!(2));
+    let mut reversed = serde_json::Map::new();
+    reversed.insert("b".into(), json!(2));
+    reversed.insert("a".into(), json!(1));
+    let variants = [
+        json!({"padding":padding,"value":ordered}),
+        json!({"padding":padding,"value":reversed}),
+        json!({"padding":padding,"value":{"a":1,"c":2}}),
+        json!({"padding":padding,"value":[1,2]}),
+        json!({"padding":padding,"value":[2,1]}),
+        json!({"padding":padding,"value":1}),
+        json!({"padding":padding,"value":1.0}),
+        json!({"padding":padding,"value":0.0}),
+        json!({"padding":padding,"value":-0.0}),
+        json!({"padding":padding,"value":"ab"}),
+        json!({"padding":padding,"value":"cd"}),
+    ];
+    for (index, value) in variants.iter().enumerate() {
+        let expected = serde_json::to_string(value).unwrap();
+        let result = serialize_cached(&cache, value, 0, CHUNK_BYTES, true).unwrap();
+        assert_eq!(result.text, expected);
+        assert_eq!(
+            result.revision,
+            Some(format!("{:x}", Sha256::digest(expected.as_bytes())))
+        );
+        assert_eq!(cache.lock().unwrap().entries.len(), index + 1);
+        for previous in &variants[..index] {
+            assert!(!same_encoding(previous, value));
+        }
+    }
+}
+
+#[test]
+fn detail_cache_evicts_by_entry_and_byte_budgets_without_changing_reads() {
+    let cache = Mutex::new(DetailCache::default());
+    let values: Vec<_> = (0..=DETAIL_CACHE_ENTRIES)
+        .map(|index| json!({"index":index,"text":"x".repeat(600)}))
+        .collect();
+    for value in &values[..DETAIL_CACHE_ENTRIES] {
+        serialize_cached(&cache, value, 0, CHUNK_BYTES, false).unwrap();
+    }
+    serialize_cached(&cache, &values[0], 0, CHUNK_BYTES, false).unwrap();
+    serialize_cached(&cache, &values[DETAIL_CACHE_ENTRIES], 0, CHUNK_BYTES, false)
+        .unwrap();
+    {
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), DETAIL_CACHE_ENTRIES);
+        assert!(cache.entries.iter().any(|entry| entry.source == values[0]));
+        assert!(!cache.entries.iter().any(|entry| entry.source == values[1]));
+        assert!(cache.bytes <= DETAIL_CACHE_BYTES);
+    }
+    let result = serialize_cached(&cache, &values[1], 0, CHUNK_BYTES, true).unwrap();
+    assert_eq!(result.text, values[1].to_string());
+
+    let cache = Mutex::new(DetailCache::default());
+    for index in 0..DETAIL_CACHE_ENTRIES {
+        let value = json!({"index":index,"text":"x".repeat(64 * 1024)});
+        serialize_cached(&cache, &value, 0, CHUNK_BYTES, true).unwrap();
+        let cache = cache.lock().unwrap();
+        assert!(cache.bytes <= DETAIL_CACHE_BYTES);
+        assert_eq!(
+            cache.bytes,
+            cache.entries.iter().map(|entry| entry.charge).sum::<usize>()
+        );
+        assert!(cache.entries.iter().all(|entry| {
+            entry.charge == cache_charge(&entry.source).unwrap() + entry.text.capacity()
+                && entry.charge <= DETAIL_CACHE_ENTRY_BYTES
+        }));
+    }
+    let cache = cache.lock().unwrap();
+    assert!(!cache.entries.is_empty());
+    assert!(cache.entries.len() < DETAIL_CACHE_ENTRIES);
+    assert!(!cache.entries.iter().any(|entry| entry.source["index"] == 0));
+}
+
+#[test]
+fn detail_cache_oversized_and_busy_reads_keep_streaming_windows() {
+    let cache = Mutex::new(DetailCache::default());
+    for value in [
+        json!({"text":"界".repeat(200_000)}),
+        json!({"text":"\u{0000}".repeat(64 * 1024)}),
+        Value::Array(vec![Value::Null; DETAIL_CACHE_ENTRY_BYTES / 256 + 1]),
+    ] {
+        assert!(cache_charge(&value).is_none());
+        let encoded = serde_json::to_string(&value).unwrap();
+        for offset in [0, 4095, encoded.len()] {
+            let cached = serialize_cached(&cache, &value, offset, CHUNK_BYTES, true);
+            let streamed = serialize_streaming(&value, offset, CHUNK_BYTES, true);
+            match (cached, streamed) {
+                (Ok(cached), Ok(streamed)) => {
+                    assert_eq!(cached.text, streamed.text);
+                    assert_eq!(cached.total, streamed.total);
+                    assert_eq!(cached.revision, streamed.revision);
+                    assert!(cached.text.len() <= CHUNK_BYTES);
+                }
+                (Err(cached), Err(streamed)) => {
+                    assert_eq!(cached.to_string(), streamed.to_string());
+                }
+                _ => panic!("cache changed streaming behavior"),
+            }
+        }
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+    let value = json!({"text":"still readable".repeat(500)});
+    let locked = cache.lock().unwrap();
+    let result = serialize_cached(&cache, &value, 0, CHUNK_BYTES, true).unwrap();
+    let streamed = serialize_streaming(&value, 0, CHUNK_BYTES, true).unwrap();
+    assert_eq!(result.text, streamed.text);
+    assert_eq!(result.revision, streamed.revision);
+    assert!(locked.entries.is_empty());
+}
+
+#[test]
+fn detail_cache_rebuilds_bounded_sources_without_retaining_spare_capacity() {
+    let cache = Mutex::new(DetailCache::default());
+    let mut text = String::with_capacity(1_000_000);
+    text.push_str(&"x".repeat(600));
+    let mut values = Vec::with_capacity(100_000);
+    values.push(Value::String(text));
+    let mut object = serde_json::Map::with_capacity(100_000);
+    object.insert("values".into(), Value::Array(values));
+    let value = Value::Object(object);
+    serialize_cached(&cache, &value, 0, CHUNK_BYTES, true).unwrap();
+    let cache = cache.lock().unwrap();
+    assert_eq!(cache.entries.len(), 1);
+    assert!(cache.bytes < 20_000);
+    let values = cache.entries[0].source["values"].as_array().unwrap();
+    assert_eq!(values.capacity(), 1);
+    let Value::String(text) = &values[0] else {
+        panic!("expected retained string");
+    };
+    assert_eq!(text.capacity(), text.len());
+    assert!(same_encoding(&cache.entries[0].source, &value));
+}
+
+#[test]
+fn detail_cache_invalid_offsets_match_streaming_without_partial_entries() {
+    let cache = Mutex::new(DetailCache::default());
+    let value = json!("🙂界".repeat(200));
+    let total = value.to_string().len();
+    assert!(serialize_cached(&cache, &value, total + 1, CHUNK_BYTES, true).is_err());
+    assert!(serialize_cached(&cache, &value, 2, CHUNK_BYTES, true).is_err());
+    assert!(cache.lock().unwrap().entries.is_empty());
+    serialize_cached(&cache, &value, 0, CHUNK_BYTES, true).unwrap();
+    for offset in [0, 1, 2, 3, 4, 5, 6, total, total + 1, usize::MAX] {
+        for length in [0, 1, 2, CHUNK_BYTES] {
+            let cached = serialize_cached(&cache, &value, offset, length, true);
+            let streamed = serialize_streaming(&value, offset, length, true);
+            match (cached, streamed) {
+                (Ok(cached), Ok(streamed)) => {
+                    assert_eq!(cached.text, streamed.text);
+                    assert_eq!(cached.total, streamed.total);
+                    assert_eq!(cached.revision, streamed.revision);
+                }
+                (Err(cached), Err(streamed)) => {
+                    assert_eq!(cached.to_string(), streamed.to_string());
+                }
+                _ => panic!("cache changed offset validation"),
+            }
+        }
+    }
+}
+
+#[test]
+fn detail_cache_status_checks_current_selected_value_and_scope() {
+    let mut snapshot = json!({"status":"running","custom":"a".repeat(9000)});
+    let input = json!({"agentId":"agent","serverId":"host","detail":{"path":"/custom"}});
+    let first = status(&snapshot, &input).unwrap();
+    let next = first["nextRead"].clone();
+    snapshot["status"] = json!("idle");
+    assert!(status(&snapshot, &next).is_ok());
+    snapshot["custom"] = json!("b".repeat(9000));
+    assert!(status(&snapshot, &next).unwrap_err().to_string().contains("Status value changed"));
+    let current = status(&snapshot, &input).unwrap();
+    assert_ne!(current["chunk"], first["chunk"]);
+    assert_ne!(
+        current["nextRead"]["detail"]["revision"],
+        first["nextRead"]["detail"]["revision"]
+    );
+    let mut malformed = current["nextRead"].clone();
+    malformed["detail"]["unexpected"] = json!(true);
+    assert!(status(&snapshot, &malformed).is_err());
+    malformed = current["nextRead"].clone();
+    malformed["detail"]["path"] = json!("/missing");
+    assert!(status(&snapshot, &malformed).is_err());
+    malformed = input.clone();
+    malformed["agentId"] = json!("");
+    assert!(status(&snapshot, &malformed).is_err());
+    let routed = json!({"agentId":"other-agent","serverId":"other-host",
+        "detail":{"path":"/custom"}});
+    let other = status(&snapshot, &routed).unwrap();
+    assert_eq!(other["agentId"], "other-agent");
+    assert_eq!(other["nextRead"]["serverId"], "other-host");
+    assert_eq!(other["chunk"], current["chunk"]);
+    assert_eq!(recover_snapshot(&snapshot, input), snapshot["custom"]);
+}
+
+#[test]
+fn detail_cache_activity_reads_mutated_source_at_unchanged_sequence() {
+    let mut page = json!({"epoch":"epoch","window":{"minSeq":1,"maxSeq":1},
+        "rows":[{"seqStart":1,"seqEnd":1,"item":{"text":"a".repeat(9000)}}]});
+    let input = json!({"agentId":"agent","detail":{"epoch":"epoch","seqStart":1,"seqEnd":1}});
+    let first = activity(&page, &snapshot(), &input).unwrap();
+    let next = first["nextRead"].clone();
+    page["window"]["maxSeq"] = json!(2);
+    let unchanged = activity(&page, &snapshot(), &next).unwrap();
+    page["rows"][0]["item"]["text"] = json!("b".repeat(9000));
+    let changed = activity(&page, &snapshot(), &next).unwrap();
+    assert_ne!(changed["chunk"], unchanged["chunk"]);
+    let expected = serialize_streaming(&page["rows"][0]["item"], CHUNK_BYTES, CHUNK_BYTES, false)
+        .unwrap();
+    assert_eq!(changed["chunk"], expected.text);
+    page["rows"][0]["seqEnd"] = json!(2);
+    assert!(activity(&page, &snapshot(), &next).is_err());
+    page["rows"][0]["seqEnd"] = json!(1);
+    page["reset"] = json!(true);
+    assert!(activity(&page, &snapshot(), &next).is_err());
+    page["reset"] = json!(false);
+    page["epoch"] = json!("replacement");
+    assert!(activity(&page, &snapshot(), &next).is_err());
+    page["epoch"] = json!("epoch");
+    page["rows"] = json!([]);
+    assert!(activity(&page, &snapshot(), &next).is_err());
+}
+
+#[test]
+fn detail_cache_reuses_a_64k_tool_result_for_every_continuation() {
+    let cache = Mutex::new(DetailCache::default());
+    let value = json!({"type":"tool_call","name":"read_file","status":"completed",
+        "detail":{"type":"unknown","output":"x".repeat(64 * 1024)}});
+    let expected = serde_json::to_string(&value).unwrap();
+    let first = serialize_cached(&cache, &value, 0, CHUNK_BYTES, true).unwrap();
+    let (pointer, revision) = {
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.hits, 0);
+        (cache.entries[0].text.as_ptr(), cache.entries[0].revision.clone())
+    };
+    let mut recovered = first.text;
+    let mut continuations = 0;
+    while recovered.len() < expected.len() {
+        let part = serialize_cached(&cache, &value, recovered.len(), CHUNK_BYTES, true)
+            .unwrap();
+        assert_eq!(part.revision, revision);
+        assert_eq!(part.total, expected.len());
+        assert!(!part.text.is_empty());
+        assert!(part.text.len() <= CHUNK_BYTES);
+        recovered.push_str(&part.text);
+        continuations += 1;
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.hits, continuations);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].text.as_ptr(), pointer);
+    }
+    assert!(continuations >= 16);
+    assert_eq!(recovered, expected);
+}
