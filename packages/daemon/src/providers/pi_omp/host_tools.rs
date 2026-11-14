@@ -357,44 +357,29 @@ async fn forward_updates<F, FF>(
     }
 }
 fn map_result(result: Value) -> Result<Value> {
-    let mut content = result["content"]
-        .as_array()
-        .cloned()
-        .ok_or_else(|| anyhow!("Native tool result requires content"))?;
+    let Value::Object(mut result) = result else {
+        bail!("Native tool result requires content");
+    };
+    let Some(Value::Array(mut content)) = result.remove("content") else {
+        bail!("Native tool result requires content");
+    };
+    let details = result.remove("structuredContent");
     if content.is_empty()
-        && let Some(structured) = result.get("structuredContent")
+        && let Some(structured) = &details
     {
-        let mut summary = Vec::new();
-        if let Some(object) = structured.as_object() {
-            for (key, value) in object {
-                if let Some(values) = value.as_array() {
-                    summary.push(format!("{key}_count={}", values.len()));
-                    let ids = values
-                        .iter()
-                        .filter_map(|item| item["id"].as_str().filter(|s| !s.is_empty()))
-                        .collect::<Vec<_>>();
-                    if !ids.is_empty() && ids.len() == values.len() {
-                        summary.push(format!("{key}_ids={}", ids.join(",")));
-                    }
-                }
-            }
-        }
-        let text = serde_json::to_string_pretty(structured)?;
-        let text = if summary.is_empty() {
-            text
-        } else {
-            format!("{}\n\n{text}", summary.join("\n"))
-        };
-        content.push(json!({"type":"text","text":text}));
+        let mut block = json!({"type":"text"});
+        block["text"] = Value::String(serde_json::to_string(structured)?);
+        content.push(block);
     }
-    let mut mapped = json!({"content":content});
-    if let Some(details) = result.get("structuredContent") {
-        mapped["details"] = details.clone();
+    let mut mapped = serde_json::Map::new();
+    mapped.insert("content".into(), Value::Array(content));
+    if let Some(details) = details {
+        mapped.insert("details".into(), details);
     }
-    if let Some(error) = result.get("isError") {
-        mapped["isError"] = error.clone();
+    if let Some(error) = result.remove("isError") {
+        mapped.insert("isError".into(), error);
     }
-    Ok(mapped)
+    Ok(Value::Object(mapped))
 }
 fn bridge_name(server: &str, tool: &str) -> String {
     let hash = hex::encode(Sha256::digest(format!("{server}\0{tool}")));
@@ -424,6 +409,57 @@ fn bridge_name(server: &str, tool: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_result_text_recovers_structured_values_without_loss() {
+        for details in [
+            json!({"models":[{"id":"한글","text":"line one\n  line two","value":null}],
+                "empty":[],"nested":{"flag":true,"fraction":0.25}}),
+            json!([null, "spaces  remain", {"quoted":"\"value\""}]),
+            json!("literal\n  text"),
+            Value::Null,
+        ] {
+            let result = map_result(json!({"content":[],"structuredContent":details})).unwrap();
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert_eq!(serde_json::from_str::<Value>(text).unwrap(), details);
+            assert_eq!(result["details"], details);
+            assert!(result.get("isError").is_none());
+        }
+    }
+
+    #[test]
+    fn supplied_content_takes_precedence_without_losing_details_or_error_state() {
+        let content = json!([
+            {"type":"text","text":"A deliberately formatted result:\n  unchanged"},
+            {"type":"image","data":"AA==","mimeType":"image/png"}
+        ]);
+        for error in [None, Some(Value::Null), Some(json!(false)), Some(json!(true))] {
+            let mut input = json!({"content":content,"structuredContent":{"failure":{"code":32}}});
+            if let Some(error) = &error {
+                input["isError"] = error.clone();
+            }
+            let result = map_result(input).unwrap();
+            assert_eq!(result["content"], content);
+            assert_eq!(result["details"]["failure"]["code"], 32);
+            assert_eq!(result.get("isError"), error.as_ref());
+        }
+        let empty = map_result(json!({"content":[]})).unwrap();
+        assert_eq!(empty["content"], json!([]));
+        assert!(empty.get("details").is_none());
+    }
+
+    #[test]
+    fn malformed_content_is_not_converted_to_an_empty_success() {
+        for input in [
+            Value::Null,
+            json!([]),
+            json!({"structuredContent":{"valid":true}}),
+            json!({"content":null,"structuredContent":{"valid":true}}),
+            json!({"content":{},"isError":true}),
+        ] {
+            assert!(map_result(input).is_err());
+        }
+    }
     #[cfg(unix)]
     #[derive(Default)]
     struct RecordingExecutor {

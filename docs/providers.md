@@ -54,6 +54,11 @@ shuffle the emitted catalog. Connections remain concurrent; tool identities, dis
 routes and history-derived load modes are unchanged. This stabilizes catalog order,
 not membership, and does not guarantee additional provider prompt-cache savings.
 
+Model prompt formatting must not become UI or storage policy. Generated tool text
+uses compact JSON, while structured details stay complete for presentation and
+history. Preserve tool-authored text, media and error state rather than rewriting
+them to match the generated format.
+
 Bootstrap reads the daemon home's `agent-timelines/*.sqlite3` and retained legacy
 `*.json` checkpoints, plus OMP's resolved session directory, configured
 `PI_CODING_AGENT_DIR/sessions`, and `HOME/.omp/agent/sessions`. It runs off Tokio's
