@@ -842,7 +842,7 @@ impl Widget for SettingsPanel {
                                 let head = pages::sheet_head(&self.st, &view, sheet);
                                 let measured = self.sheet_heights.get(&id).copied().unwrap_or(200.0);
                                 let busy = pages::sheet_busy(sheet);
-                                let (frame, body) = overlay::sheet_frame(&mut kit, screen, viewport, id, sheet.max_w, &head, measured, busy);
+                                let (frame, body) = overlay::sheet_frame(&mut kit, screen, viewport, sheet, &head, measured, busy);
                                 let scroll = sheet.scroll;
                                 let h = scrolled(&mut kit, body, scroll, 24.0, |kit| pages::sheet_body(kit, &self.st, &view, sheet));
                                 // The frame is sized from last frame's content height: draw

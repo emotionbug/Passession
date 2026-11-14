@@ -339,8 +339,7 @@ pub(crate) fn activity(page: &Value, snapshot: &Value, input: &Value) -> Result<
         let end = row["seqEnd"]
             .as_i64()
             .context("Timeline row has no end sequence")?;
-        let mut entry = json!({"seqStart":seq,"seqEnd":end,
-            "detail":read_ref(&scope, json!({"epoch":page_epoch,"seqEnd":end,"seqStart":seq,"offset":0}))});
+        let mut entry = json!({"seqStart":seq,"seqEnd":end});
         for field in ["type", "status", "name"] {
             if let Some(value) = item.get(field) {
                 entry[field] = preview(value, &format!("/{field}"), false)?;
@@ -388,8 +387,7 @@ pub(crate) fn activity(page: &Value, snapshot: &Value, input: &Value) -> Result<
         "authority":"Retained projected timeline, not certification of complete provider history",
         "scanned":rows.len(),"shown":entries.len(),"hasOlder":has_older,
         "failureCoverage":"scanned rows only; older pages may contain failures",
-        "order":"oldest to newest within each backward page",
-        "detail":"Full item JSON is available through each entry's detail arguments, including omitted reasoning and truncated fields"});
+        "order":"oldest to newest within each backward page"});
     result["nextCursor"] = next_cursor;
     result["failuresRead"] = failure_read;
     Ok(result)
@@ -474,6 +472,26 @@ pub(crate) fn status(snapshot: &Value, input: &Value) -> Result<Value> {
     Ok(result)
 }
 
+pub(crate) fn agent_list(mut items: Vec<Value>) -> Value {
+    for item in &mut items {
+        if let Some(fields) = item.as_object_mut() {
+            fields.retain(|key, value| {
+                !value.is_null()
+                    && !matches!(
+                        key.as_str(),
+                        "shortId"
+                            | "model"
+                            | "thinkingOptionId"
+                            | "effectiveThinkingOptionId"
+                            | "createdAt"
+                            | "lastUserMessageAt"
+                    )
+            });
+        }
+    }
+    json!({"agents":items})
+}
+
 pub(crate) fn activity_properties() -> Value {
     json!({
         "agentId":{"type":"string"},
@@ -484,7 +502,7 @@ pub(crate) fn activity_properties() -> Value {
         },"description":"Use nextCursor unchanged. Unrelated tail growth is allowed; changed rows in the requested page, retention loss or epoch changes reject continuation. Restart and discard old pages rather than mixing snapshots."},
         "detail":{"type":"object","additionalProperties":false,"required":["epoch","seqEnd","seqStart"],"properties":{
             "epoch":{"type":"string"},"seqEnd":{"type":"integer","description":"Canonical item revision; unrelated tail growth does not invalidate it."},"seqStart":{"type":"integer"},"offset":{"type":"integer","minimum":0,"default":0}
-        },"description":"Use entry.detail arguments for exact item JSON, including omitted fields/reasoning. Returns at most 4096 UTF-8 bytes; follow nextRead and concatenate chunks before decoding JSON. Mutually exclusive with cursor."}
+        },"description":"For exact item JSON, combine coverage.epoch with the entry's seqStart and seqEnd, preserving the page's agentId/serverId. Includes omitted fields/reasoning. Returns at most 4096 UTF-8 bytes; follow nextRead and concatenate chunks before decoding JSON. Mutually exclusive with cursor."}
     })
 }
 

@@ -103,6 +103,11 @@ Paseo agents receive finish, error, and permission notifications by default; set
 
 #### Reading activity and details
 
+`list_agents` keeps identity, lifecycle, location, labels and attention metadata.
+Null fields, short IDs, detailed model/thinking settings and redundant timestamps
+are omitted. A non-null `archivedAt` still identifies archived agents. Use
+`get_agent_status` detail to recover the complete snapshot when those fields matter.
+
 `get_agent_activity` defaults to eight canonical rows; `limit` accepts 1–20.
 Pages run backward, with entries ordered oldest to newest within each page.
 Following `nextCursor` never expands a page to include an entire overlapping tool
@@ -116,8 +121,11 @@ Remote hosts must advertise `readOnlyAgentTimeline`; older hosts require an upda
 for this model-facing observation path.
 
 Reasoning text is omitted from the default page; long fields have explicit previews.
-Pass an entry's complete `detail` argument object back to `get_agent_activity` for
-the exact retained item JSON. Follow `nextRead`, concatenate its `chunk` strings,
+For the exact retained item JSON, call `get_agent_activity` with the page's
+`agentId`/`serverId` and
+`detail: {epoch: page.coverage.epoch, seqStart: entry.seqStart, seqEnd: entry.seqEnd}`.
+The page carries the shared identity and epoch once instead of repeating a full
+request on every row. Follow `nextRead` unchanged, concatenate its `chunk` strings,
 then decode JSON. Chunks contain at most 4096 UTF-8 bytes; offsets are bytes, not
 character positions. Unrelated tail growth does not invalidate older pages or item
 details. Changed requested rows, epoch changes and retention loss fail explicitly
@@ -136,6 +144,44 @@ Recovery references retain `agentId` and, for remote calls, `serverId`. These co
 defaults affect model-facing tools only; UI/SDK timeline and snapshot contracts
 retain their existing contents. “Exact” recovery means the stored canonical item or
 the transport's authorized snapshot, not fields discarded by earlier normalization.
+
+#### Batching read-only checks with OMP Eval
+
+Use Eval to combine independent reads and print the fields needed for the current
+question instead of returning every intermediate response to the model. This is
+explicit task-specific selection, not a server-side lossy summary or an automatic
+compaction policy. Keep errors, permission counts and exact-detail references;
+follow truncated previews when their omitted content is needed.
+
+For example, check the lifecycle and errors of up to three recent agents in one
+Eval call. OMP's Eval tool bridge returns structured tool data in `details`:
+
+```python
+import asyncio
+
+listed = (await tool.list_agents({"limit": 3}))["details"]
+requests = [
+    {"agentId": agent["id"], "serverId": listed["serverId"]}
+    for agent in listed["agents"]
+]
+responses = await asyncio.gather(
+    *(tool.get_agent_status(request) for request in requests)
+)
+fields = (
+    "agentId", "serverId", "status", "lastError", "errorText",
+    "requiresAttention", "attentionReason", "pendingPermissions", "detail",
+)
+print([
+    {key: value for key, value in response["details"].items() if key in fields}
+    for response in responses
+])
+```
+
+Give the Eval call a descriptive `title`. The timeline uses that request title;
+opening the row shows the request (language, code and options) alongside available
+output and errors. Running calls already expose their request. A missing or blank
+title leaves the row labelled **Eval**, without using code or output as its title.
+
 
 ### Workspaces
 

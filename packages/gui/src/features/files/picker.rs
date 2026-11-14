@@ -196,6 +196,13 @@ impl Default for PickerView {
 
 const LIST_PADDING: f64 = 4.0;
 
+/// Theme and responsive-layout inputs shared by one picker frame.
+struct PickerLook<'a> {
+    palette: &'a Palette,
+    typography: &'a Typography,
+    compact: bool,
+}
+
 impl PickerView {
     fn interaction(&self, hot: &Hot, enabled: bool, selected: bool) -> ui::Interaction {
         ui::Interaction {
@@ -239,7 +246,10 @@ impl PickerView {
         self.more_open = false;
     }
 
-    fn draw(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, state: &ExplorerState, p: &Palette, ty: &Typography, compact: bool, widget: Area) {
+    fn draw(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, state: &ExplorerState, look: &PickerLook, widget: Area) {
+        let p = look.palette;
+        let ty = look.typography;
+        let compact = look.compact;
         self.hits.clear();
         self.tips.clear();
         // Boxes (button fills, hover chips) must sit under icons and text drawn earlier in
@@ -391,9 +401,9 @@ impl PickerView {
             kit.icon(cx, rect(x, region.pos.y, separator, region.size.y), "chevron-right", 12.0, p.extra_muted);
             x += separator;
         }
-        for index in self.hidden_crumbs..count {
+        for (index, width) in widths.iter().enumerate().skip(self.hidden_crumbs) {
             let last = index + 1 == count;
-            let w = widths[index].min(end - x);
+            let w = width.min(end - x);
             if w <= 12.0 {
                 break;
             }
@@ -726,14 +736,13 @@ impl PickerView {
                 } else if self.pressed == Some(Hot::Field) {
                     self.field.handle_hit(cx, kit, hit);
                     *changed = true;
-                } else if let Some(dy) = self.touch_scroll.handle_hit(hit) {
-                    if self.list_rect.contains(fe.abs_start) {
+                } else if let Some(dy) = self.touch_scroll.handle_hit(hit)
+                    && self.list_rect.contains(fe.abs_start) {
                         let max = self.content_height(state.rows().len()) - self.list_rect.size.y;
                         self.touch_scroll.apply_delta(&mut self.scroll_y, dy, max);
                         self.pressed = None;
                         *changed = true;
                     }
-                }
             }
             Hit::FingerLongPress(fe) => {
                 self.touch_scroll.reset();
@@ -1016,12 +1025,13 @@ impl Widget for RemoteFolderPicker {
         self.drawn_at = rect.pos;
         let p = crate::theme::current_palette();
         let ty = crate::theme::current_typography();
+        let look = PickerLook { palette: &p, typography: &ty, compact };
         let view = &mut self.view;
         let kit = &mut self.kit;
         // The hosting sheet supplies the surface; the picker draws only its content.
         store::with(|s| {
             if let Some(state) = s.explorer_mut(&owner) {
-                view.draw(cx, kit, rect, state, &p, &ty, compact, area);
+                view.draw(cx, kit, rect, state, &look, area);
             }
         });
         cx.end_turtle();

@@ -332,11 +332,11 @@ fn append_range(ranges: &mut Vec<StyledRange>, range: Range<usize>, style: Optio
     if range.is_empty() {
         return;
     }
-    if let Some(last) = ranges.last_mut() {
-        if last.style == style && last.range.end == range.start {
-            last.range.end = range.end;
-            return;
-        }
+    if let Some(last) = ranges.last_mut()
+        && last.style == style && last.range.end == range.start
+    {
+        last.range.end = range.end;
+        return;
     }
     ranges.push(StyledRange { range, style });
 }

@@ -710,6 +710,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn eval_retains_request_and_results_across_live_updates_and_replay() {
+        let args = json!({"title":"오류 상태 집계","language":"py","code":"print('결과')",
+            "timeout":30,"reset":false});
+        let partial = json!({"content":[{"type":"text","text":"partial result"}]});
+        let result = json!({"content":[{"type":"text","text":"example error"}],
+            "details":{"title":"not the request title","exitCode":1}});
+        let tool = |events: Vec<Value>| {
+            events.into_iter().find_map(|event| {
+                (event["item"]["type"] == "tool_call").then(|| event["item"].clone())
+            }).expect("tool timeline item")
+        };
+        let mut live = Mapper::new("omp", "omp");
+        let started = tool(live.map(&json!({"type":"tool_execution_start",
+            "toolCallId":"eval-call","toolName":"eval","args":args})));
+        assert_eq!(started["status"], "running");
+        assert_eq!(started["detail"]["input"], args);
+        assert!(started["detail"]["output"].is_null());
+        let updated = tool(live.map(&json!({"type":"tool_execution_update",
+            "toolCallId":"eval-call","partialResult":partial})));
+        assert_eq!(updated["detail"]["input"], args);
+        assert_eq!(updated["detail"]["output"], partial);
+        let finished = tool(live.map(&json!({"type":"tool_execution_end",
+            "toolCallId":"eval-call","toolName":"eval","result":result,"isError":true})));
+        assert_eq!(finished["status"], "failed");
+        assert_eq!(finished["detail"]["input"], args);
+        assert_eq!(finished["detail"]["output"], result);
+        assert_eq!(finished["error"], "example error");
+
+        let mut replay = Mapper::new("omp", "omp");
+        replay.replay_message(&json!({"role":"assistant","content":[
+            {"type":"toolCall","id":"eval-call","name":"eval","arguments":args}
+        ]}), None);
+        let restored = tool(replay.replay_message(&json!({"role":"toolResult",
+            "toolCallId":"eval-call","toolName":"eval","content":result["content"],
+            "details":result["details"],"isError":true}), None));
+        assert_eq!(restored["detail"], finished["detail"]);
+        assert_eq!(restored["status"], "failed");
+        assert_eq!(restored["error"], finished["error"]);
+    }
+
+    #[test]
     fn process_exit_reports_session_end_during_and_between_turns() {
         for family in ["pi", "omp"] {
             let mut mapper = Mapper::new(family, family);

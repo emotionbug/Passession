@@ -1173,9 +1173,11 @@ mod tests {
         fn new(document_height: f64) -> Self {
             let mut cx = Cx::new(Box::new(|_, _| {}));
             let list = DrawList::new(&mut cx);
-            let mut preview = MarkdownPreview::default();
-            preview.area = rect(0.0, 96.0, 357.0, 600.0);
-            preview.height = document_height;
+            let preview = MarkdownPreview {
+                area: rect(0.0, 96.0, 357.0, 600.0),
+                height: document_height,
+                ..Default::default()
+            };
             let mut panel = Panel { cx, list, area: Area::Empty, preview };
             panel.repaint();
             panel

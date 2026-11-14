@@ -1167,8 +1167,10 @@ mod tests {
 
     #[test]
     fn stale_file_list_keeps_the_current_review() {
-        let mut store = GitStore::default();
-        store.review = Some(Review::PrText { plan: review_plan(), base: "main".into(), prompt: 7 });
+        let mut store = GitStore {
+            review: Some(Review::PrText { plan: review_plan(), base: "main".into(), prompt: 7 }),
+            ..Default::default()
+        };
         assert!(store.take_review_files(1).is_none());
         assert_eq!(store.review.as_ref().and_then(Review::prompt), Some(7));
         store.review = Some(Review::CommitFiles { plan: review_plan(), generation: 2 });

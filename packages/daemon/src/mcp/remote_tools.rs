@@ -401,7 +401,9 @@ async fn execute_remote(
                 options["cwd"] =
                     json!(super::workspace_tools::expand_path(app, cwd, None)?.to_string_lossy());
             }
-            Ok(json!({"agents":crate::agent::select_agent_list_items(agents, &options)?}))
+            Ok(crate::activity::model::agent_list(
+                crate::agent::select_agent_list_items(agents, &options)?,
+            ))
         }
         _ => Err(super::input_error(format!("Unknown remote tool: {name}"))),
     }

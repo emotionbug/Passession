@@ -1474,11 +1474,11 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     // reach it through its own sweep area. Resolve the hit once (moves mark the event handled)
     // and share it.
     let swept = event.hits_with_sweep_area(cx, area, area);
-    if let Hit::FingerScroll(e) = &swept {
-        if scroll_viewport(shell).contains(e.abs) {
-            scroll_top(shell, e.scroll.y);
-            shell.redraw(cx);
-        }
+    if let Hit::FingerScroll(e) = &swept
+        && scroll_viewport(shell).contains(e.abs)
+    {
+        scroll_top(shell, e.scroll.y);
+        shell.redraw(cx);
     }
     // Compact draggable sheets already combine resizing and scrolling below.
     let draggable = shell.data.overlays.stack.last().is_some_and(|top| {

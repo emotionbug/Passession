@@ -77,36 +77,6 @@ pub mod appearance {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::TextScale;
-
-        #[test]
-        fn system_text_scale_interpolates_native_curve_without_density() {
-            let identity = TextScale::default();
-            assert_eq!(identity.logical_size(13.25), 13.25);
-            let linear = TextScale::from_dp(TextScale::SP.map(|sp| sp * 1.5));
-            assert_eq!(linear.logical_size(13.25), 19.875);
-            let nonlinear = TextScale::from_dp([0.0, 16.0, 20.0, 24.0, 28.0, 34.0, 36.0, 40.0, 46.0, 116.0]);
-            assert_eq!(nonlinear.logical_size(16.0), 31.0);
-            assert_eq!(nonlinear.logical_size(24.0), 40.0);
-            assert_eq!(nonlinear.logical_size(200.0), 232.0);
-        }
-
-        #[test]
-        fn text_scale_from_factor() {
-            assert_eq!(TextScale::from_factor(1.0), TextScale::default());
-            assert_eq!(TextScale::from_factor(1.25).logical_size(14.0), 17.5);
-            assert_eq!(TextScale::from_factor(2.25).logical_size(100.0), 225.0);
-            assert_eq!(TextScale::from_factor(0.0), TextScale::default());
-            assert_eq!(TextScale::from_factor(f64::NAN), TextScale::default());
-            assert_eq!(TextScale::checked([0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]), None);
-            assert!(TextScale::checked(TextScale::SP).is_some());
-            assert_eq!(TextScale::from_curve(|sp| sp * 2.0).logical_size(14.0), 28.0);
-            assert_eq!(TextScale::from_curve(|_| 17.0), TextScale::default());
-        }
-    }
-
     struct Cached {
         at: Instant,
         dark: bool,
@@ -168,6 +138,36 @@ pub mod appearance {
     /// BCP 47-ish language tag of the OS UI language (`ko-KR`, `en_US.UTF-8`, …).
     pub fn system_language() -> String {
         read(|c| c.language.clone())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::TextScale;
+
+        #[test]
+        fn system_text_scale_interpolates_native_curve_without_density() {
+            let identity = TextScale::default();
+            assert_eq!(identity.logical_size(13.25), 13.25);
+            let linear = TextScale::from_dp(TextScale::SP.map(|sp| sp * 1.5));
+            assert_eq!(linear.logical_size(13.25), 19.875);
+            let nonlinear = TextScale::from_dp([0.0, 16.0, 20.0, 24.0, 28.0, 34.0, 36.0, 40.0, 46.0, 116.0]);
+            assert_eq!(nonlinear.logical_size(16.0), 31.0);
+            assert_eq!(nonlinear.logical_size(24.0), 40.0);
+            assert_eq!(nonlinear.logical_size(200.0), 232.0);
+        }
+
+        #[test]
+        fn text_scale_from_factor() {
+            assert_eq!(TextScale::from_factor(1.0), TextScale::default());
+            assert_eq!(TextScale::from_factor(1.25).logical_size(14.0), 17.5);
+            assert_eq!(TextScale::from_factor(2.25).logical_size(100.0), 225.0);
+            assert_eq!(TextScale::from_factor(0.0), TextScale::default());
+            assert_eq!(TextScale::from_factor(f64::NAN), TextScale::default());
+            assert_eq!(TextScale::checked([0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]), None);
+            assert!(TextScale::checked(TextScale::SP).is_some());
+            assert_eq!(TextScale::from_curve(|sp| sp * 2.0).logical_size(14.0), 28.0);
+            assert_eq!(TextScale::from_curve(|_| 17.0), TextScale::default());
+        }
     }
 }
 

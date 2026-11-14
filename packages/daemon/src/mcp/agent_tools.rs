@@ -69,7 +69,7 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         definition(
             "list_agents",
             "List agents",
-            "List recent agents as compact metadata.",
+            "List recent agents with identity, lifecycle, location and attention metadata. Null fields and detailed model/timing settings are omitted; retrieve the full snapshot through get_agent_status detail.",
             json!({
                 "includeBackground":{"type":"boolean","default":false}, "includeArchived":{"type":"boolean","default":false},
                 "cwd":{"type":"string"}, "sinceHours":{"type":"integer","minimum":1,"maximum":720,"default":48},
@@ -144,7 +144,7 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         definition(
             "get_agent_activity",
             "Get agent activity",
-            "Return a bounded recent canonical timeline page and compact agent status, without reasoning text. Follow nextCursor for older pages, or view=failures for bounded failure discovery. Use entry.detail with this tool for exact item JSON; agentStatus.detail belongs to get_agent_status. Unrelated tail growth is allowed; changed requested rows or epochs explicitly invalidate continuations.",
+            "Return a bounded recent canonical timeline page and compact agent status, without reasoning text. Follow nextCursor for older pages, or view=failures for bounded failure discovery. For exact item JSON, set detail to {epoch: coverage.epoch, seqStart: entry.seqStart, seqEnd: entry.seqEnd}, preserving page agentId/serverId. agentStatus.detail belongs to get_agent_status. Unrelated tail growth is allowed; changed requested rows or epochs explicitly invalidate continuations.",
             crate::activity::model::activity_properties(),
             &["agentId"],
         ),
@@ -318,7 +318,7 @@ pub(crate) async fn execute(
                     "limit",
                 ],
             );
-            json!({"agents":app.agents.list_agents(&actor, input).await?})
+            crate::activity::model::agent_list(app.agents.list_agents(&actor, input).await?)
         }
         "archive_agent" | "kill_agent" => {
             let id = string(&input, "agentId")?;

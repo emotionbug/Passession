@@ -176,21 +176,20 @@ impl CellGrid {
         self.draw_cell.draw_abs(cx, rect);
     }
 
-    /// Paints presented row `row` of `line` at `origin`: backgrounds, find `highlights`
+    /// Paints `line` at its absolute row `origin`: backgrounds, find `highlights`
     /// (char ranges, active flag), the selected cell span, glyphs and decorations. Returns the
     /// painted selection rect.
     pub fn draw_line(
         &mut self,
         cx: &mut Cx2d,
         origin: DVec2,
-        row: usize,
         line: &Line,
         paint: &GridPaint<'_>,
         highlights: &[(usize, usize, bool)],
         selection: Option<(usize, usize)>,
     ) -> Option<Rect> {
         let (width, height) = self.cell().unwrap_or((8.0, 14.0));
-        let y = origin.y + row as f64 * height;
+        let y = origin.y;
         let cells = |from: usize, count: usize| Rect { pos: dvec2(origin.x + from as f64 * width, y), size: dvec2(count as f64 * width, height) };
         // Backgrounds first.
         let mut col = 0usize;

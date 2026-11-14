@@ -1075,10 +1075,10 @@ fn kdeglobals_font() -> Option<String> {
     for line in text.lines().map(str::trim) {
         if line.starts_with('[') {
             in_general = line == "[General]";
-        } else if in_general {
-            if let Some(value) = line.strip_prefix("font=") {
-                return crate::fonts::qt_family(value);
-            }
+        } else if in_general
+            && let Some(value) = line.strip_prefix("font=")
+        {
+            return crate::fonts::qt_family(value);
         }
     }
     None
@@ -1293,10 +1293,10 @@ pub(crate) mod fonts {
         fn face(&mut self, family: Family<'_>, role: Role) -> Option<(FontFace, String)> {
             match family {
                 Family::SystemUi => {
-                    if let Some(os_family) = self.os_family() {
-                        if let Some(found) = self.matched(&os_family, role, true) {
-                            return Some(found);
-                        }
+                    if let Some(os_family) = self.os_family()
+                        && let Some(found) = self.matched(&os_family, role, true)
+                    {
+                        return Some(found);
                     }
                     self.matched("system-ui", role, false)
                 }
@@ -1405,10 +1405,10 @@ pub(crate) mod fonts {
             eprintln!("hangul: {} {:?}", hangul.source, hangul.variations);
             let parsed = makepad_widgets::makepad_draw::text::font_face::FontFace::from_data_and_index(hangul.data.clone(), hangul.index).unwrap();
             assert!(parsed.as_ttf_parser_face().glyph_index(HANGUL_PROBE).is_some());
-            if let Some(semibold) = &fonts.ui.semibold {
-                if let Some((_, wght)) = semibold.variations.iter().find(|(tag, _)| tag == b"wght") {
-                    assert!(*wght > 400.0, "semibold variable face uses a heavier wght, got {wght}");
-                }
+            if let Some(semibold) = &fonts.ui.semibold
+                && let Some((_, wght)) = semibold.variations.iter().find(|(tag, _)| tag == b"wght")
+            {
+                assert!(*wght > 400.0, "semibold variable face uses a heavier wght, got {wght}");
             }
         }
 

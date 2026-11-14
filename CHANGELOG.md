@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- Model-facing agent activity shares page identity and epoch instead of repeating detail requests on every row. Agent lists omit redundant metadata while preserving lifecycle, attention and archived state; exact item and snapshot recovery remain available.
+- Documented task-specific OMP Eval batching for read-only checks, retaining errors, permissions and full-detail recovery without introducing automatic compaction.
+
+### Fixed
+
+- OMP Eval rows display the supplied task title and retain request language, code and options alongside output and errors, both live and after native-history replay. Requests remain visible while execution is pending.
+- Resolved native client, platform and highlighter Clippy warnings without lint suppressions, including render argument grouping and test fixture initialization.
+
 ## 0.13.24 - 2026-11-14
 
 ### Fixed

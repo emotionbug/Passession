@@ -11,6 +11,16 @@ fn read(timeline: &Timeline, snapshot: &Value, input: &Value) -> Value {
     activity(&timeline.fetch(&options), snapshot, input).unwrap()
 }
 
+fn item_reference(page: &Value, entry: &Value) -> Value {
+    let mut input = json!({"agentId":page["agentId"],
+        "detail":{"epoch":page["coverage"]["epoch"],
+            "seqStart":entry["seqStart"],"seqEnd":entry["seqEnd"]}});
+    if let Some(server) = page.get("serverId") {
+        input["serverId"] = server.clone();
+    }
+    input
+}
+
 fn recover_item(timeline: &Timeline, mut input: Value) -> Value {
     let mut encoded = String::new();
     loop {
@@ -85,7 +95,7 @@ fn defaults_bound_large_activity_status_and_permissions_without_reasoning() {
     assert!(result["agentStatus"].get("capabilities").is_none());
     let reasoning = result["entries"].as_array().unwrap().last().unwrap();
     assert_eq!(
-        recover_item(&timeline, reasoning["detail"].clone())["text"],
+        recover_item(&timeline, item_reference(&result, reasoning))["text"],
         "private reasoning body"
     );
     // The raw UI/SDK projection retains the full source text.
@@ -115,7 +125,7 @@ fn failure_pages_discover_old_errors_and_recover_every_item_byte() {
         let page = read(&timeline, &snapshot(), &input);
         let entries = page["entries"].as_array().unwrap();
         empty_pages += usize::from(entries.is_empty());
-        found.extend(entries.iter().cloned());
+        found.extend(entries.iter().map(|entry| (entry.clone(), item_reference(&page, entry))));
         if page["nextCursor"].is_null() {
             break;
         }
@@ -123,10 +133,10 @@ fn failure_pages_discover_old_errors_and_recover_every_item_byte() {
     }
     assert!(empty_pages > 0);
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0]["seqStart"], 1);
-    assert_eq!(found[0]["status"], "failed");
-    assert_eq!(found[0]["errorText"]["truncated"], true);
-    assert_eq!(recover_item(&timeline, found[0]["detail"].clone()), failure);
+    assert_eq!(found[0].0["seqStart"], 1);
+    assert_eq!(found[0].0["status"], "failed");
+    assert_eq!(found[0].0["errorText"]["truncated"], true);
+    assert_eq!(recover_item(&timeline, found[0].1.clone()), failure);
 }
 
 #[test]
@@ -156,7 +166,7 @@ fn crossing_tool_lifecycle_never_expands_or_duplicates_backward_pages() {
         for row in page["entries"].as_array().unwrap() {
             assert!(seen.insert(row["seqStart"].as_i64().unwrap()));
             if row["seqStart"] == 1 {
-                failure = Some(row.clone());
+                failure = Some((row.clone(), item_reference(&page, row)));
             }
         }
         if page["nextCursor"].is_null() {
@@ -165,11 +175,11 @@ fn crossing_tool_lifecycle_never_expands_or_duplicates_backward_pages() {
         input["cursor"] = page["nextCursor"].clone();
     }
     assert_eq!(seen.len(), 31);
-    let failure = failure.unwrap();
+    let (failure, reference) = failure.unwrap();
     assert_eq!(failure["seqEnd"], 32);
     assert_eq!(failure["errorText"], "cross-boundary failure");
     assert_eq!(
-        recover_item(&timeline, failure["detail"].clone())["status"],
+        recover_item(&timeline, reference)["status"],
         "failed"
     );
 }
@@ -188,7 +198,8 @@ fn history_mutations_reject_cursor_and_detail_instead_of_drifting() {
         &json!({"agentId":"agent","limit":1}),
     );
     let cursor = json!({"agentId":"agent","cursor":first["nextCursor"],"limit":1});
-    let detail = read(&timeline, &snapshot(), &cursor)["entries"][0]["detail"].clone();
+    let older = read(&timeline, &snapshot(), &cursor);
+    let detail = item_reference(&older, &older["entries"][0]);
     timeline.append(
         json!({"type":"tool_call","callId":"span","status":"failed","error":"failed"}),
         &json!({}),
@@ -224,7 +235,7 @@ fn unrelated_tail_growth_preserves_older_pages_and_exact_item_continuations() {
         &snapshot(),
         &json!({"agentId":"agent","limit":2}),
     );
-    let detail = first["entries"][0]["detail"].clone();
+    let detail = item_reference(&first, &first["entries"][0]);
     let first_chunk = read(&timeline, &snapshot(), &detail);
     let mut encoded = first_chunk["chunk"].as_str().unwrap().to_owned();
     let mut reference = first_chunk["nextRead"].clone();
@@ -345,7 +356,7 @@ fn local_and_remote_pages_share_bounded_contract_and_routed_recovery() {
     let local = activity(&local_page, &snapshot(), &input).unwrap();
     let remote = activity(&remote_page, &snapshot(), &input).unwrap();
     assert_eq!(local, remote);
-    let reference = remote["entries"][0]["detail"].clone();
+    let reference = item_reference(&remote, &remote["entries"][0]);
     assert_eq!(reference["serverId"], "remote-host");
     let detail_page = read(&timeline, &snapshot(), &reference);
     assert_eq!(detail_page["nextRead"]["serverId"], "remote-host");

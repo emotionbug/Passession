@@ -34,6 +34,9 @@ pub struct SemanticSpan {
     pub link: bool,
 }
 
+/// Byte range, destination, source kind and display text of one paragraph link.
+pub type SemanticLink = (usize, usize, Arc<str>, FileLinkSourceType, Arc<str>);
+
 #[derive(Debug, Default)]
 pub struct SemanticParagraph {
     pub text: Arc<str>,
@@ -43,7 +46,7 @@ pub struct SemanticParagraph {
     pub spans: Arc<[SemanticSpan]>,
     pub codes: Arc<[(usize, usize)]>,
     pub strikes: Arc<[(usize, usize)]>,
-    pub links: Arc<[(usize, usize, Arc<str>, FileLinkSourceType, Arc<str>)]>,
+    pub links: Arc<[SemanticLink]>,
     pub link_max_ends: Arc<[usize]>,
 }
 
@@ -184,6 +187,13 @@ static PARSER_QUEUE: LazyLock<mpsc::SyncSender<ParseRequest>> = LazyLock::new(||
     send
 });
 
+/// Parsing settings shared by every revision until the worker's epoch changes.
+pub struct ParseOptions<'a> {
+    pub root: Option<&'a str>,
+    pub linkify: bool,
+    pub find: Option<&'a Regex>,
+}
+
 /// Per-row state. Rc entry identities are revision tokens, not content hashes;
 /// same-length replacements therefore schedule a new authoritative parse too.
 #[derive(Default)]
@@ -209,7 +219,8 @@ pub struct MarkdownWorker {
 impl MarkdownWorker {
     /// Call once in the row's preparation pass, never in its final paint pass.
     /// Returns whether the UI should schedule another preparation frame.
-    pub fn update(&mut self, owner: (&str, &str, &str), entry: Rc<Value>, live: bool, root: Option<&str>, linkify: bool, now: f64, find: Option<&Regex>) -> bool {
+    pub fn update(&mut self, owner: (&str, &str, &str), entry: Rc<Value>, live: bool, options: ParseOptions<'_>, now: f64) -> bool {
+        let ParseOptions { root, linkify, find } = options;
         let reset = self.owner.as_ref().map(|(row, host, agent)| (row.as_str(), host.as_str(), agent.as_str())) != Some(owner)
             || self.root.as_deref() != root || self.linkify != linkify
             || self.find.as_ref().map(Regex::as_str) != find.map(Regex::as_str);
@@ -244,13 +255,13 @@ impl MarkdownWorker {
         }
         self.latest = Some(Demand { entry, bytes: self.paced_bytes, live });
 
-        if let Some(parser) = &self.parser {
-            if let Ok(document) = parser.results.try_recv() {
-                let finished = self.active.take();
-                if document.epoch == self.epoch {
-                    self.completed = finished;
-                    self.candidate = Some(Rc::new(document.into()));
-                }
+        if let Some(parser) = &self.parser
+            && let Ok(document) = parser.results.try_recv()
+        {
+            let finished = self.active.take();
+            if document.epoch == self.epoch {
+                self.completed = finished;
+                self.candidate = Some(Rc::new(document.into()));
             }
         }
         if self.active.is_none() && self.capture.is_none() && self.candidate.is_none() {
@@ -406,7 +417,7 @@ fn flatten(inlines: &[Inline]) -> SemanticParagraph {
         spans: Vec<SemanticSpan>,
         codes: Vec<(usize, usize)>,
         strikes: Vec<(usize, usize)>,
-        links: Vec<(usize, usize, Arc<str>, FileLinkSourceType, Arc<str>)>,
+        links: Vec<SemanticLink>,
     }
     fn push(text: &mut String, rich: &mut FlatBuilder, value: &str, style: Style, code: bool, link: bool) {
         if value.is_empty() {
@@ -473,17 +484,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const OPTIONS: ParseOptions<'_> = ParseOptions { root: None, linkify: true, find: None };
+
     #[test]
     fn captures_bounded_chunks_and_does_not_restart_for_new_tokens() {
         let first = Rc::new(json!({"item": {"text": "a".repeat(CAPTURE_BYTES * 4)}}));
         let next = Rc::new(json!({"item": {"text": "b".repeat(CAPTURE_BYTES * 4)}}));
         let mut worker = MarkdownWorker::default();
-        assert!(worker.update(("row", "host", "agent"), first.clone(), true, None, true, 0.0, None));
+        assert!(worker.update(("row", "host", "agent"), first.clone(), true, OPTIONS, 0.0));
         let capture = worker.capture.as_ref().unwrap();
         assert_eq!(capture.offset, CAPTURE_BYTES);
         assert!(Rc::ptr_eq(&capture.demand.entry, &first));
         assert!(worker.is_pending(), "final paint must keep the dry-pass capture scheduled");
-        assert!(worker.update(("row", "host", "agent"), next.clone(), false, None, true, 0.01, None));
+        assert!(worker.update(("row", "host", "agent"), next.clone(), false, OPTIONS, 0.01));
         let capture = worker.capture.as_ref().unwrap();
         assert_eq!(capture.offset, CAPTURE_BYTES * 2);
         assert!(Rc::ptr_eq(&capture.demand.entry, &first));
@@ -558,7 +571,7 @@ mod tests {
         let mut worker = MarkdownWorker {
             owner: Some(("row".into(), "host".into(), "agent".into())), linkify: true, candidate: Some(snapshot.clone()), ..MarkdownWorker::default()
         };
-        assert!(worker.update(("row", "host", "agent"), entry, false, None, true, 0.0, None));
+        assert!(worker.update(("row", "host", "agent"), entry, false, OPTIONS, 0.0));
         assert!(worker.capture.is_none());
         assert!(worker.parser.is_none());
         assert!(!worker.publish(6));
@@ -572,13 +585,13 @@ mod tests {
     fn owner_context_and_query_changes_advance_epoch_without_ui_parsing() {
         let entry = Rc::new(json!({"item": {"text": "a".repeat(CAPTURE_BYTES * 8)}}));
         let mut worker = MarkdownWorker::default();
-        worker.update(("row", "host", "agent"), entry.clone(), false, None, true, 0.0, None);
+        worker.update(("row", "host", "agent"), entry.clone(), false, OPTIONS, 0.0);
         let first = worker.epoch();
-        worker.update(("row", "other-host", "agent"), entry.clone(), false, None, true, 0.0, None);
+        worker.update(("row", "other-host", "agent"), entry.clone(), false, OPTIONS, 0.0);
         assert_ne!(worker.epoch(), first);
         let second = worker.epoch();
         let pattern = model::find_pattern("a").unwrap();
-        worker.update(("row", "other-host", "agent"), entry, false, None, true, 0.0, Some(&pattern));
+        worker.update(("row", "other-host", "agent"), entry, false, ParseOptions { find: Some(&pattern), ..OPTIONS }, 0.0);
         assert_ne!(worker.epoch(), second);
         assert!(worker.candidate().is_none());
         assert!(worker.published().is_none());
@@ -632,17 +645,17 @@ mod tests {
     #[test]
     fn live_backlog_reaches_the_received_text_within_the_horizon_rule() {
         let mut worker = MarkdownWorker::default();
-        worker.update(OWNER, message("a"), true, None, true, 100.0, None);
+        worker.update(OWNER, message("a"), true, OPTIONS, 100.0);
         assert_eq!(worker.paced_bytes, 1, "first sight is whole");
         let grown = message(&"a".repeat(10_001));
         let mut now = 100.5;
-        worker.update(OWNER, grown.clone(), true, None, true, now, None);
+        worker.update(OWNER, grown.clone(), true, OPTIONS, now);
         assert_eq!(worker.paced_bytes, 1 + 10_000_usize.div_ceil(9), "growth starts on the frame that sees it");
         let mut frames = 1;
         while worker.paced_bytes < 10_001 {
             now += 1.0 / 60.0;
             frames += 1;
-            assert!(worker.update(OWNER, grown.clone(), true, None, true, now, None), "held-back text keeps frames scheduled");
+            assert!(worker.update(OWNER, grown.clone(), true, OPTIONS, now), "held-back text keeps frames scheduled");
             assert!(frames < 70, "10 kB must not trail the stream for more than about 1.1s");
         }
         assert_eq!(worker.latest.as_ref().unwrap().bytes, 10_001);
@@ -651,11 +664,11 @@ mod tests {
     #[test]
     fn completion_releases_the_backlog_at_once() {
         let mut worker = MarkdownWorker::default();
-        worker.update(OWNER, message("a"), true, None, true, 0.0, None);
+        worker.update(OWNER, message("a"), true, OPTIONS, 0.0);
         let grown = message(&"a".repeat(50_000));
-        worker.update(OWNER, grown.clone(), true, None, true, 1.0, None);
+        worker.update(OWNER, grown.clone(), true, OPTIONS, 1.0);
         assert!(worker.paced_bytes < 50_000);
-        worker.update(OWNER, grown, false, None, true, 1.01, None);
+        worker.update(OWNER, grown, false, OPTIONS, 1.01);
         let latest = worker.latest.as_ref().unwrap();
         assert_eq!((latest.bytes, latest.live), (50_000, false));
     }
@@ -663,13 +676,13 @@ mod tests {
     #[test]
     fn text_received_while_hidden_is_shown_whole_on_return() {
         let mut worker = MarkdownWorker::default();
-        worker.update(OWNER, message("a"), true, None, true, 0.0, None);
+        worker.update(OWNER, message("a"), true, OPTIONS, 0.0);
         // Hidden: no preparation pass ran while the text arrived.
         worker.release_backlog();
-        worker.update(OWNER, message(&"a".repeat(50_000)), true, None, true, 60.0, None);
+        worker.update(OWNER, message(&"a".repeat(50_000)), true, OPTIONS, 60.0);
         assert_eq!(worker.latest.as_ref().unwrap().bytes, 50_000);
         // Growth the reader watches is paced again.
-        worker.update(OWNER, message(&"a".repeat(60_000)), true, None, true, 60.02, None);
+        worker.update(OWNER, message(&"a".repeat(60_000)), true, OPTIONS, 60.02);
         let bytes = worker.latest.as_ref().unwrap().bytes;
         assert!(bytes > 50_000 && bytes < 60_000, "{bytes}");
     }
@@ -680,7 +693,7 @@ mod tests {
         let complete = message(source);
         let mut worker = MarkdownWorker::default();
         // A complete historical message is parsed on the worker pool, never inline.
-        assert!(worker.update(OWNER, complete.clone(), false, None, true, 0.0, None));
+        assert!(worker.update(OWNER, complete.clone(), false, OPTIONS, 0.0));
         assert!(worker.active.is_some() && worker.candidate.is_none());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while worker.candidate.is_none() {
@@ -688,13 +701,13 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the parser result never arrived");
             std::thread::sleep(std::time::Duration::from_millis(1));
             // The next frame's preparation pass collects the result; no other event is needed.
-            assert!(worker.update(OWNER, complete.clone(), false, None, true, 0.0, None));
+            assert!(worker.update(OWNER, complete.clone(), false, OPTIONS, 0.0));
         }
         let revision = worker.candidate().unwrap().revision;
         assert!(worker.is_pending(), "an unpublished candidate still needs its layout passes");
         assert!(worker.publish(revision));
         assert!(!worker.is_pending());
-        assert!(!worker.update(OWNER, complete, false, None, true, 0.0, None), "a published document stops scheduling frames");
+        assert!(!worker.update(OWNER, complete, false, OPTIONS, 0.0), "a published document stops scheduling frames");
         assert_eq!(&*worker.published().unwrap().source, source);
     }
 }

@@ -279,9 +279,7 @@ impl TextBuffer {
             anchor: floor_boundary(&self.text, anchor.min(self.text.len())),
             head: floor_boundary(&self.text, head.min(self.text.len())),
         };
-        if changed {
-            if let Some(group) = self.undo.last_mut() { group.after = self.selection; }
-        }
+        if changed && let Some(group) = self.undo.last_mut() { group.after = self.selection; }
         self.ime_composing = event.composing.is_some();
         if !self.ime_composing && (composition || !changed) { self.open_group = false; }
     }

@@ -188,7 +188,8 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
             // Preparation alone advances capture and publication. The final
             // paint pass uses the same complete source/layout snapshot.
             if !d.state.managed_preparation || d.state.preparing {
-                d.animating |= d.state.markdown_worker.update((id, &ctx.host_id, &ctx.agent_id), row.entry.clone(), live, ctx.cwd.as_deref(), true, d.now, find.as_ref().map(|mark| &mark.pattern));
+                let options = markdown::worker::ParseOptions { root: ctx.cwd.as_deref(), linkify: true, find: find.as_ref().map(|mark| &mark.pattern) };
+                d.animating |= d.state.markdown_worker.update((id, &ctx.host_id, &ctx.agent_id), row.entry.clone(), live, options, d.now);
             }
             let top = 12.0;
             let mut opts = md_opts(ctx, id, find.as_mut());

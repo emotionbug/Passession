@@ -238,6 +238,7 @@ fn detail(family: &str, name: &str, display_name: &str, args: &Value, result: &V
                 let answer_text = (!lines.is_empty()).then(|| lines.join("\n\n"));
                 return plain(label, answer_text.as_deref().or(output.as_deref()));
             }
+            "eval" => return json!({"type":"unknown","input":args,"output":result}),
             _ if opaque(name) => {
                 let label = [
                     first(&[

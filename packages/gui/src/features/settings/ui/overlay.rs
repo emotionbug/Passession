@@ -13,7 +13,7 @@ use crate::features::settings::i18n::t;
 use crate::features::settings::model::forms::{FormSheet, Kind};
 use crate::features::settings::model::match_score::rank;
 use crate::features::settings::rpc::{Handler, handler};
-use crate::features::settings::state::{Settings, Tip};
+use crate::features::settings::state::{Settings, Sheet, Tip};
 
 pub struct MenuItem {
     pub label: String,
@@ -525,8 +525,9 @@ fn header_actions_size(ui: &mut Ui, head: &SheetHead) -> DVec2 {
     })
 }
 
-/// Draws the frame of one sheet and positions `ui` for its body; returns the
-/// body clip rect. `content_h` is the body height measured last frame.
+/// Draws the frame of `sheet` using its identity and maximum width, and positions
+/// `ui` for its body; returns the frame and body clip rects. `content_h` is the body
+/// height measured last frame.
 ///
 /// Flutter `showAdaptiveSheet` + `SheetContents`: wide layouts get a
 /// `Dialog` (surface1, 12px radius, surface2 rule, 24px inset, at most 85%
@@ -539,7 +540,9 @@ fn header_actions_size(ui: &mut Ui, head: &SheetHead) -> DVec2 {
 /// The barrier covers `screen`; the sheet lies inside `view` (the window less
 /// safe areas and the keyboard). The body yields height before the header and
 /// footer; a view too short for even those keeps the footer's actions on screen.
-pub fn sheet_frame(ui: &mut Ui, screen: Rect, view: Rect, id: u64, max_w: f64, head: &SheetHead, content_h: f64, busy_close: bool) -> (Rect, Rect) {
+pub fn sheet_frame(ui: &mut Ui, screen: Rect, view: Rect, sheet: &Sheet, head: &SheetHead, content_h: f64, busy_close: bool) -> (Rect, Rect) {
+    let id = sheet.id;
+    let max_w = sheet.max_w;
     let pal = ui.pal;
     let compact = ui.compact;
     let barrier = if compact { 0x8a000000 } else { 0x8c000000 };

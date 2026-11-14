@@ -707,7 +707,7 @@ impl Widget for WaTerminalView {
                     let cells: usize = line.runs.iter().map(|run| run.cells).sum();
                     let span = self.selection.span(row, cells);
                     let highlights = self.find.row(row, line.columns.len());
-                    if let Some(rect) = self.grid.draw_line(cx, origin, row, line, &paint, &highlights, span) {
+                    if let Some(rect) = self.grid.draw_line(cx, dvec2(origin.x, origin.y + row as f64 * height), line, &paint, &highlights, span) {
                         self.selection.painted(rect, hit_rect);
                     }
                 }

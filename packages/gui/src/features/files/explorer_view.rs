@@ -327,14 +327,13 @@ impl ExplorerView {
                     let content_h = 8.0 + state.rows().len() as f64 * self.row_height + 16.0;
                     self.scroll_y = scroll + (fe.abs.y - start) * content_h / self.list_rect.size.y.max(1.0);
                     *changed = true;
-                } else if let Some(dy) = self.touch_scroll.handle_hit(hit) {
-                    if self.list_rect.contains(fe.abs_start) {
+                } else if let Some(dy) = self.touch_scroll.handle_hit(hit)
+                    && self.list_rect.contains(fe.abs_start) {
                         let max = 8.0 + state.rows().len() as f64 * self.row_height + 16.0 - self.list_rect.size.y;
                         self.touch_scroll.apply_delta(&mut self.scroll_y, dy, max);
                         self.pressed = None;
                         *changed = true;
                     }
-                }
             }
             Hit::FingerLongPress(fe) => {
                 self.touch_scroll.reset();

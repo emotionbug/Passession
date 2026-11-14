@@ -264,7 +264,7 @@ fn toggle(ui: &mut Ui, s: &Settings, host: &HostView, switch_of: ConfigSwitch, l
     let on = values.get(key).and_then(Value::as_bool).unwrap_or(fallback);
     let enabled = !d.map(|d| d.busy).unwrap_or(false) && host.can_manage();
     let id = host.server_id.clone();
-    let confirm = confirm.filter(|c| c.when == !on).map(|c| (c.title, c.message, c.action));
+    let confirm = confirm.filter(|c| c.when != on).map(|c| (c.title, c.message, c.action));
     let act = enabled.then(|| {
         handler(move |s, env| {
             let value = match group {

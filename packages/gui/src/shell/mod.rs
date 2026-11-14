@@ -621,12 +621,11 @@ impl Widget for PaseoShell {
 
         // Keyboard shortcuts (not while a modal overlay is open).
         let mut key_consumed = false;
-        if !modal {
-            if let Event::KeyDown(key) = event
-                && let Some(ui) = Self::ui(scope)
-            {
-                key_consumed = commands::handle_shortcut(self, cx, ui, key);
-            }
+        if !modal
+            && let Event::KeyDown(key) = event
+            && let Some(ui) = Self::ui(scope)
+        {
+            key_consumed = commands::handle_shortcut(self, cx, ui, key);
         }
         if !modal && !locked {
             chrome::observe_pane_focus(self, event);
@@ -644,7 +643,7 @@ impl Widget for PaseoShell {
         {
             handled.set(true);
         }
-        if !locked && !window_modal && !explorer_input && !(input && command_center) && !key_consumed {
+        if !(locked || window_modal || explorer_input || key_consumed || input && command_center) {
             if let Some(search) = self.data.search.clone() {
                 search.handle_event(cx, event, scope);
             }

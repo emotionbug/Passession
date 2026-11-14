@@ -557,11 +557,10 @@ impl SourceEditor {
         }
         self.ime_area = ime_area;
         self.owner_draw_pos = ime_area.rect(cx).pos;
-        if self.handles_revision != self.buffer.revision || !self.focused {
-            if let Some(handles) = self.handles.as_mut() {
+        if (self.handles_revision != self.buffer.revision || !self.focused)
+            && let Some(handles) = self.handles.as_mut() {
                 handles.cancel(cx);
             }
-        }
         self.handles_revision = self.buffer.revision;
         let p = look.palette;
         self.ensure_char_width(cx, kit, look.font_size);

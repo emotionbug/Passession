@@ -112,11 +112,10 @@ impl TextField {
         self.frame = frame;
         self.ime_area = ime_area;
         self.owner_draw_pos = ime_area.rect(cx).pos;
-        if self.handles_revision != self.buffer.revision || !self.focused {
-            if let Some(handles) = self.handles.as_mut() {
+        if (self.handles_revision != self.buffer.revision || !self.focused)
+            && let Some(handles) = self.handles.as_mut() {
                 handles.cancel(cx);
             }
-        }
         self.handles_revision = self.buffer.revision;
         // Focus shows on the surface2 fill (border_accent is ~1.1:1 against it).
         let border = if self.focused { p.muted } else { p.surface2 };

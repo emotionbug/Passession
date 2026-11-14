@@ -746,6 +746,8 @@ pub fn build_tool_call_presentation(item: &Value, cwd: Option<&str>, target_agen
                 (Some("Task"), read_string(get(metadata, "subAgentActivity")))
             } else if unknown && lower == "thinking" {
                 (Some("Thinking"), None)
+            } else if unknown && lower == "eval" {
+                (Some("Eval"), get(get(&raw_detail, "input"), "title").as_str().and_then(to_summary_text))
             } else if lower == "terminal" {
                 let label = if get(&raw_detail, "type") == "plain_text" { read_string(get(&raw_detail, "label")) } else { None };
                 (Some("Terminal"), label)
@@ -1114,6 +1116,51 @@ pub fn detail_blocks(detail: &Value, tool_name: Option<&str>, error_text: Option
 /// Full-bleed detail types sit 8 apart, the rest 16.
 pub fn detail_is_full_bleed(detail: &Value) -> bool {
     matches!(str_of(get(detail, "type")), "edit" | "shell" | "write")
+}
+
+#[cfg(test)]
+mod eval_tests {
+    use super::*;
+
+    #[test]
+    fn eval_request_title_and_sections_survive_running_completion_and_failure() {
+        let request = json!({"title":"  오류 상태\n집계  ","language":"py",
+            "code":"print('결과')","timeout":30});
+        let result = json!({"content":[{"type":"text","text":"결과"}],
+            "details":{"title":"not the request title"}});
+        for status in ["running", "completed", "failed"] {
+            let output = if status == "running" { Value::Null } else { result.clone() };
+            let error = if status == "failed" { json!("execution failed") } else { Value::Null };
+            let item = json!({"type":"tool_call","name":"eval","status":status,"error":error,
+                "detail":{"type":"unknown","input":request,"output":output}});
+            let presentation = build_tool_call_presentation(&item, None, None);
+            assert_eq!(presentation.display_name, "Eval");
+            assert_eq!(presentation.summary.as_deref(), Some("오류 상태 집계"));
+            assert!(presentation.can_open_details);
+            assert!(!presentation.is_loading_details);
+            let blocks = detail_blocks(&presentation.detail, Some("eval"),
+                presentation.error_text.as_deref(), &str::to_owned);
+            let payloads: Vec<Value> = blocks.iter().filter_map(|block| match block {
+                DetailBlock::JsonBox(text) => Some(serde_json::from_str(text).unwrap()),
+                _ => None,
+            }).collect();
+            assert_eq!(payloads, if status == "running" { vec![request.clone()] }
+                else { vec![request.clone(), result.clone()] });
+            let errors: Vec<&str> = blocks.iter().filter_map(|block| match block {
+                DetailBlock::Error(error) => Some(error.as_str()),
+                _ => None,
+            }).collect();
+            assert_eq!(errors, if status == "failed" { vec!["execution failed"] } else { vec![] });
+        }
+        for title in [Value::Null, json!(" \n\t")] {
+            let item = json!({"name":"eval","status":"completed",
+                "detail":{"type":"unknown","input":{"title":title,"code":"private code"},
+                    "output":result}});
+            let presentation = build_tool_call_presentation(&item, None, None);
+            assert_eq!(presentation.display_name, "Eval");
+            assert_eq!(presentation.summary, None);
+        }
+    }
 }
 
 #[cfg(test)]
