@@ -97,7 +97,7 @@ fn touch(path: &Path) -> Result<()> {
 /// Lock files live outside removable payloads so waiters never lock deleted inodes.
 pub struct Lease {
     target: Option<File>,
-    _source: File,
+    source_lease: File,
     generation: Option<PathBuf>,
     source: PathBuf,
 }
@@ -109,7 +109,11 @@ impl Lease {
         if let Some(path) = self.generation.take() {
             let _ = touch(&path);
         }
-        self.target.take();
+        if let Some(target) = self.target.take() {
+            // A concurrent fork can retain this file description until exec.
+            // Unlock explicitly instead of waiting for its last descriptor to close.
+            let _ = target.unlock();
+        }
     }
 }
 
@@ -117,6 +121,7 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.release_target();
         let _ = touch(&self.source);
+        let _ = self.source_lease.unlock();
     }
 }
 
@@ -153,7 +158,7 @@ pub fn acquire() -> Result<Lease> {
     };
     mark(&source)?;
     drop(coordinator);
-    Ok(Lease { target: Some(target_lease), _source: source_lease, generation, source })
+    Ok(Lease { target: Some(target_lease), source_lease, generation, source })
 }
 
 /// Optional accelerators are opt-in and never downloaded. Explicit wrapper and
@@ -328,9 +333,14 @@ mod tests {
         target.lock().unwrap();
         let source = lock(&source_path).unwrap();
         source.lock().unwrap();
+        // Duplicates model descriptors inherited by a concurrent fork before exec.
+        #[cfg(unix)]
+        let _inherited_target = target.try_clone().unwrap();
+        #[cfg(unix)]
+        let _inherited_source = source.try_clone().unwrap();
         let mut lease = Lease {
             target: Some(target),
-            _source: source,
+            source_lease: source,
             generation: None,
             source: directory.path().to_path_buf(),
         };

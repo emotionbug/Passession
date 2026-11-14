@@ -9,6 +9,7 @@
 - Composer height, wrapping and caret hit testing use the editor's actual scaled font layout. Replacing a system font refreshes retained editor metrics without resetting composition or selection.
 - Touch selection handles follow each scroll/alignment displacement once instead of drifting when enclosing layouts finish repeatedly.
 - Native text-widget subclasses upload their authored focus/hover values rather than reading Rust-only page bookkeeping as shader instance data.
+- Build-cache leases explicitly unlock before closing their files, so descriptors inherited by a concurrent child process cannot keep finished builds or exited bundles locked.
 
 ## 0.13.20 - 2026-11-14
 
