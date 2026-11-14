@@ -463,33 +463,9 @@ fn add_model_visible_structured_content(mut result: Value) -> Result<Value> {
     let Some(structured) = object.get("structuredContent") else {
         return Ok(result);
     };
-    let mut summaries = Vec::new();
-    if let Some(object) = structured.as_object() {
-        for (key, value) in object {
-            let Some(items) = value.as_array() else {
-                continue;
-            };
-            summaries.push(format!("{key}_count={}", items.len()));
-            let ids: Vec<_> = items
-                .iter()
-                .filter_map(|item| {
-                    item.get("id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                })
-                .collect();
-            if !ids.is_empty() && ids.len() == items.len() {
-                summaries.push(format!("{key}_ids={}", ids.join(",")));
-            }
-        }
-    }
-    let json = serde_json::to_string_pretty(structured)?;
-    let text = if summaries.is_empty() {
-        json
-    } else {
-        format!("{}\n\n{json}", summaries.join("\n"))
-    };
-    object.insert("content".into(), json!([{"type":"text","text":text}]));
+    let mut block = json!({"type":"text"});
+    block["text"] = Value::String(serde_json::to_string(structured)?);
+    object.insert("content".into(), Value::Array(vec![block]));
     Ok(result)
 }
 
@@ -536,4 +512,44 @@ async fn atomic_write(path: PathBuf, bytes: &'static [u8]) -> Result<()> {
     })
     .await
     .context("OpenCode asset writer failed")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_output_is_parseable_without_losing_metadata() {
+        let input = json!({
+            "content":[],
+            "structuredContent":{"agents":[{"id":"한글","text":"line\n  spaced"}],"empty":[]},
+            "isError":true,
+            "_meta":{"extension":{"value":null}}
+        });
+        let mut result = add_model_visible_structured_content(input.clone()).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), input["structuredContent"]);
+        result["content"] = json!([]);
+        assert_eq!(result, input);
+        let explicit_null = add_model_visible_structured_content(
+            json!({"content":[],"structuredContent":null})
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(explicit_null["content"][0]["text"].as_str().unwrap()).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn supplied_content_is_not_replaced_by_structured_output() {
+        let input = json!({
+            "content":[{"type":"text","text":"Already formatted:\n  result"},
+                {"type":"image","data":"AA==","mimeType":"image/png"}],
+            "structuredContent":{"privatePresentation":"unchanged"},
+            "isError":false
+        });
+        assert_eq!(add_model_visible_structured_content(input.clone()).unwrap(), input);
+        let empty = json!({"content":[]});
+        assert_eq!(add_model_visible_structured_content(empty.clone()).unwrap(), empty);
+    }
 }

@@ -279,6 +279,38 @@ mod unix {
     }
 
     #[tokio::test]
+    async fn pre_cancelled_or_expired_json_does_not_send_or_stop_the_process() {
+        let (process, stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
+        let guard = process.stdin.lock().await;
+        let value = serde_json::json!({"discarded": "한글".repeat(1024)});
+        for (cancelled, expired, kind) in [
+            (true, false, std::io::ErrorKind::Interrupted),
+            (false, true, std::io::ErrorKind::TimedOut),
+            (true, true, std::io::ErrorKind::Interrupted),
+        ] {
+            let cancel = CancellationToken::new();
+            if cancelled {
+                cancel.cancel();
+            }
+            let deadline = expired.then(tokio::time::Instant::now);
+            let error = process.write_json_with_deadline(&value, deadline, &cancel)
+                .await.unwrap_err();
+            let error = error.downcast_ref::<WriteError>().unwrap();
+            assert!(!error.attempted);
+            assert_eq!(error.written, 0);
+            assert_eq!(error.total, 0);
+            assert_eq!(error.source.kind(), kind);
+        }
+        drop(guard);
+        process.write_json(&serde_json::json!({"surviving": 1})).await.unwrap();
+        process.close_stdin().await.unwrap();
+        let mut output = String::new();
+        BufReader::new(stdout).read_to_string(&mut output).await.unwrap();
+        assert_eq!(output, "{\"surviving\":1}\n");
+        assert_eq!(process.wait().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn deadline_during_partial_json_write_preserves_ambiguity_and_closes_stream() {
         let (process, stdout) = ManagedProcess::spawn(shell(
             "dd bs=1 count=1 of=/dev/null 2>/dev/null; printf 'ready\\n'; exec sleep 30",

@@ -257,8 +257,8 @@ impl Router {
         let update_task = tokio::spawn(async move {
             forward_updates(receive, completion, update_cancel, |result| {
                 let runtime = &update_runtime;
-                let frame =
-                    json!({"type":"host_tool_update","id":update_id,"partialResult":result});
+                let mut frame = json!({"type":"host_tool_update","id":update_id});
+                frame["partialResult"] = result;
                 async move { runtime.send(&frame).await }
             })
             .await
@@ -284,7 +284,8 @@ impl Router {
         }
         if !cancel.is_cancelled() && !self.closed.load(Ordering::Acquire) {
             let result=result.and_then(map_result).unwrap_or_else(|error|json!({"content":[{"type":"text","text":error.to_string()}],"details":{},"isError":true}));
-            let mut frame = json!({"type":"host_tool_result","id":id,"result":result});
+            let mut frame = json!({"type":"host_tool_result","id":id});
+            frame["result"] = result;
             if let Some(is_error) = frame["result"].get("isError").cloned() {
                 frame["isError"] = is_error;
             }

@@ -40,6 +40,10 @@ CLI-default profiles are host-owned. Explicit command-line provider/model argume
 
 Provider helpers that outlive one session belong to the daemon's managed-process lifecycle. Record and verify process-start identity before signalling a PID. Graceful shutdown, forced termination, restart, and cancellation must not affect another process that reused the same PID.
 
+Rejecting a JSONL request before I/O must not stop a healthy provider process.
+Serialization optimizations must retain the write-attempt distinction and the
+incomplete-frame termination guard; a byte count alone does not prove admission.
+
 ### OMP host-tool loading
 
 OMP receives the same executable native and bridged MCP catalog, with history-derived

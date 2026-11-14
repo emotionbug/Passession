@@ -63,6 +63,7 @@ pub struct WriteError {
     /// Bytes accepted by AsyncWrite. On Windows this may include buffered
     /// bytes if the final OS-write flush fails; it never proves admission.
     pub written: usize,
+    /// Serialized frame length, or zero if rejected before serialization.
     pub total: usize,
     pub source: io::Error,
 }
@@ -75,6 +76,8 @@ impl fmt::Display for WriteError {
                 "subprocess stdin write failed after I/O was attempted ({}/{} bytes written); command admission is ambiguous: {}",
                 self.written, self.total, self.source
             )
+        } else if self.total == 0 {
+            write!(f, "subprocess stdin write rejected before I/O: {}", self.source)
         } else {
             write!(
                 f,
@@ -238,6 +241,17 @@ impl ManagedProcess {
         deadline: Option<Instant>,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        let stopped = self.control.stopping.is_cancelled()
+            || cancel.is_cancelled()
+            || deadline.is_some_and(|deadline| deadline <= Instant::now());
+        if stopped {
+            return Err(WriteError {
+                attempted: false,
+                written: 0,
+                total: 0,
+                source: write_stopped(&self.control.stopping, Some(cancel), deadline).await,
+            }.into());
+        }
         let mut frame = serde_json::to_vec(value).context("serializing subprocess JSON frame")?;
         frame.push(b'\n');
         self.write_bytes_controlled(&frame, deadline, Some(cancel)).await

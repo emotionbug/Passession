@@ -8,7 +8,8 @@
 - Documented task-specific OMP Eval batching for read-only checks, retaining errors, permissions and full-detail recovery without introducing automatic compaction.
 - Model discovery now returns bounded ID/label pages with search and exact-model detail lookup. Detailed pages share repeated thinking-option sets without losing original fields or defaults; revision-bound cursors reject changed catalogs.
 - OMP native and bridged MCP tool definitions use deterministic registration order while preserving concurrent connections, dispatch identities and history-derived essential loading.
-- OMP-generated tool text uses lossless compact JSON without redundant count/ID summaries. Result conversion transfers owned content and details instead of deep-cloning them; explicit text/media and error state are preserved.
+- OMP and OpenCode generate lossless compact tool JSON without redundant count/ID summaries. OMP result conversion and RPC frames transfer owned payloads instead of deep-cloning them; explicit text/media and error state are preserved.
+- Native JSONL writes reject known cancellations and expired deadlines before serialization, preserving healthy processes on pre-I/O rejection and ambiguity protection after partial writes.
 
 ### Fixed
 
