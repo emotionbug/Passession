@@ -1624,8 +1624,26 @@ printf ' 43210\n'"#).await?;
         write_worktree_metadata(temp.path(), &json!({"baseRefName":"main"})).await?;
         let port = ensure_worktree_runtime_port(temp.path()).await?;
         assert_eq!(read_worktree_runtime_port(temp.path()).await?, Some(port));
-        assert_eq!(ensure_worktree_runtime_port(temp.path()).await?, port);
-        let listener = bind_worktree_port(port as u16).await?;
+        // Keep the busy-port fixture outside the ephemeral pool used by
+        // concurrent network tests; allocation probes do not reserve sockets.
+        let mut listener = None;
+        for port in 16384..20000 {
+            match bind_worktree_port(port).await {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let listener = listener.context("No free test worktree port outside the ephemeral pool")?;
+        let port = f64::from(listener.local_addr()?.port());
+        write_worktree_runtime_metadata(temp.path(), port).await?;
         assert_eq!(
             ensure_worktree_runtime_port(temp.path())
                 .await

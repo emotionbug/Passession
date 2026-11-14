@@ -18,6 +18,8 @@ Rust tests are colocated with the daemon, GUI crates, SDKs, relay and `xtask` mo
 
 Do not run all heavy suites concurrently. Select a bounded relevant check during an explicitly authorized verification pass. Preserve errors and failing output; do not suppress a real service failure or silently relabel a mock as end-to-end.
 
+Port tests that close and rebind a socket must select their fixture outside the OS ephemeral pool, which concurrent tests and outbound connections also use. Keep the occupied-port listener open while persisting its port; a successful allocation probe does not reserve that port for a later bind.
+
 ## Required native smoke boundaries
 
 Use a disposable `PASEO_HOME`, checkout, endpoint, and model cache where applicable. Never stop, reset, install over, or reuse the user's installed daemon/application for a migration smoke.
