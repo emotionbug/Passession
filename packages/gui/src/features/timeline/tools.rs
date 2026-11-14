@@ -752,7 +752,9 @@ pub fn build_tool_call_presentation(item: &Value, cwd: Option<&str>, target_agen
             } else {
                 (None, None)
             };
-            let display = override_name.map(str::to_owned).unwrap_or_else(|| {
+            let display = override_name.map(|label| {
+                if label == "Thinking" { super::i18n::t("agentStream.thinking") } else { label.to_owned() }
+            }).unwrap_or_else(|| {
                 if canonical_name.is_empty() { humanize_tool_name(&name) } else { canonical_name }
             });
             let summary = if override_name.is_some() { override_summary } else { canonical_summary };

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.21 - 2026-11-14
+
+### Fixed
+
+- Korean glyphs no longer turn into solid rectangles with Android's variable CFF2 system fonts. Font outlines close implicitly at each contour boundary, including when the font parser omits the final close callback.
+- Korean reasoning activity reads “생각중”; reasoning settings use “추론” rather than the ambiguous “사고”.
+- Composer height, wrapping and caret hit testing use the editor's actual scaled font layout. Replacing a system font refreshes retained editor metrics without resetting composition or selection.
+- Touch selection handles follow each scroll/alignment displacement once instead of drifting when enclosing layouts finish repeatedly.
+- Native text-widget subclasses upload their authored focus/hover values rather than reading Rust-only page bookkeeping as shader instance data.
+
 ## 0.13.20 - 2026-11-14
 
 > System fonts, a clearer project-folder picker, draggable horizontal scrollbars, and improvements to Git Log, terminal search, notifications, settings and keyboard navigation.

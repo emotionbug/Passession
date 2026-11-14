@@ -333,6 +333,7 @@
     "hints": { "thinking": "Thinking mode", "model": "Change model", "mode": "Change mode" }
   },
   "agentStream": {
+    "thinking": "Thinking",
     "empty": "Start chatting with this agent...",
     "scrollToBottom": "Scroll to bottom",
     "historyLoadFailed": "Couldn't load agent history",

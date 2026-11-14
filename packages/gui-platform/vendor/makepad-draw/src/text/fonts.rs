@@ -113,6 +113,12 @@ impl Fonts {
         self.layouter.redefine_font_family(id, definition);
     }
 
+    /// Changes whenever font definitions or family membership change. Retained
+    /// layouts must include this revision in their cache identity.
+    pub fn revision(&self) -> u64 {
+        self.catalog.revision
+    }
+
     /// The current font list of a family, as last defined or redefined.
     pub fn font_family_definition(&self, id: FontFamilyId) -> Option<&FontFamilyDefinition> {
         self.catalog.families.get(&id)

@@ -1,0 +1,5 @@
+Fixed
+- Korean glyphs no longer turn into solid rectangles with Android's variable CFF2 system fonts. Font outlines close implicitly at each contour boundary, including when the font parser omits the final close callback.
+- Korean reasoning activity reads “생각중”; reasoning settings use “추론” rather than the ambiguous “사고”.
+
+Full notes: https://github.com/emotionbug/Passession/releases

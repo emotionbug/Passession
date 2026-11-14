@@ -63,7 +63,6 @@ live_design! {
             fn get_color(self) -> vec4 { return self.color; }
         }
         draw_image: <DrawComposerImage> {}
-        caret_text: { text_style: <PASEO_FONT_REGULAR> { line_spacing: 1.4 } }
         input: <ComposerInput> {}
         profile_editor: <SettingsSheetHost> {}
         search: <ComposerInput> { draw_text: { text_style: { line_spacing: 1.2 } } }
@@ -252,10 +251,6 @@ pub struct ComposerPanel {
     pub draw_icon: DrawIcon,
     #[live]
     pub draw_image: DrawComposerImage,
-    /// Lays the draft out exactly like the editor to find the caret row (TextInput keeps its
-    /// layout private).
-    #[live]
-    pub caret_text: DrawText,
     #[live]
     pub input: TextInput,
     #[live]

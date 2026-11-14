@@ -112,17 +112,29 @@ impl Builder {
         }
     }
 
-    pub fn finish(self, bounds: Rect<f32>, units_per_em: f32) -> GlyphOutline {
+    pub fn finish(mut self, bounds: Rect<f32>, units_per_em: f32) -> GlyphOutline {
+        self.close_contour();
         GlyphOutline {
             bounds,
             units_per_em,
             commands: self.commands,
         }
     }
+
+    fn close_contour(&mut self) {
+        // Font contours are implicitly closed at the next move or end of the
+        // outline. In particular, CFF2 has no endchar operator and the parser
+        // can omit the final close callback. An open edge otherwise leaves
+        // the coverage rasterizer's winding accumulator nonzero across rows.
+        if !matches!(self.commands.last(), None | Some(Command::Close)) {
+            self.commands.push(Command::Close);
+        }
+    }
 }
 
 impl ttf_parser::OutlineBuilder for Builder {
     fn move_to(&mut self, x: f32, y: f32) {
+        self.close_contour();
         self.commands.push(Command::MoveTo(Point::new(x, y)));
     }
 
@@ -144,6 +156,59 @@ impl ttf_parser::OutlineBuilder for Builder {
     }
 
     fn close(&mut self) {
-        self.commands.push(Command::Close);
+        self.close_contour();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::image::Image;
+    use super::ttf_parser::OutlineBuilder;
+
+    fn ring(close_before_move: bool, close_at_end: bool) -> GlyphOutline {
+        let mut builder = Builder::new();
+        builder.move_to(10.0, 10.0);
+        builder.line_to(90.0, 10.0);
+        builder.line_to(90.0, 90.0);
+        builder.line_to(10.0, 90.0);
+        if close_before_move {
+            builder.close();
+            builder.close();
+        }
+        // Opposite winding leaves a hole. Both contours end on a vertical
+        // closing edge, as in the affected Korean CFF2 glyphs.
+        builder.move_to(30.0, 30.0);
+        builder.line_to(30.0, 70.0);
+        builder.line_to(70.0, 70.0);
+        builder.line_to(70.0, 30.0);
+        if close_at_end {
+            builder.close();
+            builder.close();
+        }
+        builder.finish(Rect::new(Point::ZERO, Size::new(100.0, 100.0)), 100.0)
+    }
+
+    fn coverage(outline: &GlyphOutline) -> Image<R> {
+        let size = Size::new(100, 100);
+        let mut image = Image::new(size);
+        outline.rasterize(100.0, &mut image.subimage_mut(size.into()));
+        image
+    }
+
+    #[test]
+    fn implicit_contour_closure_preserves_holes_and_exterior() {
+        let expected = coverage(&ring(true, true));
+        for (close_before_move, close_at_end) in [(false, true), (true, false), (false, false)] {
+            let outline = ring(close_before_move, close_at_end);
+            let actual = coverage(&outline);
+            assert_eq!(actual.as_pixels(), expected.as_pixels());
+            assert_eq!(actual[Point::new(20, 50)].r(), 255, "stroke");
+            assert_eq!(actual[Point::new(50, 50)].r(), 0, "counter");
+            assert_eq!(actual[Point::new(5, 50)].r(), 0, "left exterior");
+            assert_eq!(actual[Point::new(95, 50)].r(), 0, "right exterior");
+            assert_eq!(actual[Point::new(50, 5)].r(), 0, "top exterior");
+            assert_eq!(actual[Point::new(50, 95)].r(), 0, "bottom exterior");
+        }
     }
 }

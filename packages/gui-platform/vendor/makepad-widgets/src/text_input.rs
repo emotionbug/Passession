@@ -793,6 +793,7 @@ live_design! {
 
 #[derive(PartialEq)]
 struct TextInputLayoutMetrics {
+    font_revision: u64,
     font_family: crate::makepad_draw::shader::draw_text::FontFamily,
     font_size: f32,
     line_spacing: f32,
@@ -1106,7 +1107,14 @@ impl TextInput {
             None
         };
         let wrap = cx.turtle().layout().flow == Flow::RightWrap;
+        self.update_text_layout(cx, max_width_in_lpxs, wrap);
+    }
+
+    fn update_text_layout(&mut self, cx: &mut Cx, max_width_in_lpxs: Option<f32>, wrap: bool) {
+        CxDraw::lazy_construct_fonts(cx);
+        let font_revision = cx.get_global::<Rc<std::cell::RefCell<crate::makepad_draw::text::fonts::Fonts>>>().borrow().revision();
         let metrics = TextInputLayoutMetrics {
+            font_revision,
             font_family: self.draw_text.text_style.font_family.clone(),
             font_size: self.draw_text.text_style.font_size,
             line_spacing: self.draw_text.text_style.line_spacing,
@@ -1126,11 +1134,24 @@ impl TextInput {
     // Editing invalidates layout before the next paint. Navigation must resolve
     // the new text with the last viewport instead of using stale rows or dropping keys.
     fn ensure_text_layout(&mut self, cx: &mut Cx) -> Result<(), ()> {
-        if self.laidout_text.is_none() {
-            let metrics = self.layout_metrics.as_ref().ok_or(())?;
-            self.rebuild_text_layout(cx, metrics.max_width, metrics.wrap);
-        }
+        let metrics = self.layout_metrics.as_ref().ok_or(())?;
+        self.update_text_layout(cx, metrics.max_width, metrics.wrap);
         Ok(())
+    }
+
+    /// Measures with the editor's font, alignment and wrapping. Width is in
+    /// viewport logical pixels; returned layout coordinates precede font_scale.
+    pub fn text_layout(&self, cx: &mut Cx, text: &str, width: Option<f32>) -> Rc<LaidoutText> {
+        self.layout_display_text(cx, text, width, self.layout.flow == Flow::RightWrap)
+    }
+
+    pub fn text_scale(&self) -> f32 {
+        self.draw_text.font_scale
+    }
+
+    fn layout_display_text(&self, cx: &mut Cx, text: &str, width: Option<f32>, wrap: bool) -> Rc<LaidoutText> {
+        // DrawText::layout operates before the draw-time font_scale transform.
+        self.draw_text.layout(cx, 0.0, 0.0, width.map(|width| width / self.draw_text.font_scale), wrap, self.label_align, text)
     }
 
     fn rebuild_text_layout(&mut self, cx: &mut Cx, max_width_in_lpxs: Option<f32>, wrap: bool) {
@@ -1147,15 +1168,7 @@ impl TextInput {
         } else {
             &self.text
         };
-        self.laidout_text = Some(self.draw_text.layout(
-            cx,
-            0.0,
-            0.0,
-            max_width_in_lpxs,
-            wrap,
-            self.label_align, 
-            text
-        ));
+        self.laidout_text = Some(self.layout_display_text(cx, text, max_width_in_lpxs, wrap));
     }
 
     fn draw_text(&mut self, cx: &mut Cx2d) -> Rect {
@@ -1163,12 +1176,8 @@ impl TextInput {
         let text_rect = if self.text.is_empty() {
             self.text_scroll = DVec2::default();
             self.text_scroll_max = DVec2::default();
-            self.draw_text.draw_walk(
-                cx,
-                inner_walk,
-                self.label_align,
-                &self.empty_text
-            )
+            let placeholder = self.text_layout(cx, &self.empty_text, self.layout_metrics.as_ref().and_then(|metrics| metrics.max_width));
+            self.draw_text.draw_walk_laidout(cx, inner_walk, &placeholder)
         } else {
             let laidout_text = self.laidout_text.as_ref().unwrap();
             let size = laidout_text.size_in_lpxs * self.draw_text.font_scale;
@@ -1208,36 +1217,22 @@ impl TextInput {
         let Ok(position) = self.cursor_to_position(cursor) else { return Rect::default(); };
         let row = &layout.rows[position.row_index];
         Rect {
-            pos: origin + dvec2(position.x_in_lpxs as f64, ((row.origin_in_lpxs.y - row.ascender_in_lpxs) * self.draw_text.font_scale) as f64),
-            size: dvec2(2.0, ((row.ascender_in_lpxs - row.descender_in_lpxs) * self.draw_text.font_scale) as f64),
+            pos: origin + dvec2((position.x_in_lpxs - self.draw_text.font_scale) as f64, ((row.origin_in_lpxs.y - row.ascender_in_lpxs) * self.draw_text.font_scale) as f64),
+            size: dvec2((2.0 * self.draw_text.font_scale) as f64, ((row.ascender_in_lpxs - row.descender_in_lpxs) * self.draw_text.font_scale) as f64),
         }
     }
 
     /// Draws the caret and returns its absolute rect.
     fn draw_cursor(&mut self, cx: &mut Cx2d, text_rect: Rect) -> Rect {
-        let CursorPosition {
-            row_index,
-            x_in_lpxs,
-        } = self
-            .cursor_to_position(self.selection.cursor)
-            .ok()
-            .expect("layout should not be `None` because we called `layout_text` in `draw_walk`");
-        let laidout_text = self
-            .laidout_text
-            .as_ref()
-            .expect("layout should not be `None` because we called `layout_text` in `draw_walk`");
-        let row = &laidout_text.rows[row_index];
-        let scale = self.draw_text.font_scale;
+        let caret = self.caret_rect(self.selection.cursor, text_rect.pos);
         // Whole device pixels, at least one wide.
         let dpi = cx.current_dpi_factor();
         let snap = |v: f64| (v * dpi).round() / dpi;
-        let left = snap(text_rect.pos.x + (x_in_lpxs - 1.0 * scale) as f64);
-        let top = snap(text_rect.pos.y + ((row.origin_in_lpxs.y - row.ascender_in_lpxs) * scale) as f64);
         let caret = rect(
-            left,
-            top,
-            snap((2.0 * scale) as f64).max(1.0 / dpi),
-            snap(((row.ascender_in_lpxs - row.descender_in_lpxs) * scale) as f64),
+            snap(caret.pos.x),
+            snap(caret.pos.y),
+            snap(caret.size.x).max(1.0 / dpi),
+            snap(caret.size.y),
         );
         self.draw_cursor.draw_abs(cx, caret);
         caret
@@ -2506,8 +2501,7 @@ mod keyboard_edit_tests {
         text::{font::FontId, fonts::Fonts, loader::{FontDefinition, FontFamilyDefinition}},
     };
 
-    #[test]
-    fn vertical_navigation_after_edit_uses_new_rows_before_paint() {
+    fn editor() -> (Cx, TextInput) {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let mut fonts = Fonts::new(&mut cx, Default::default());
         let font = FontId::from("keyboard-edit-test");
@@ -2521,10 +2515,17 @@ mod keyboard_edit_tests {
         input.draw_text.text_style.font_size = 12.0;
         input.draw_text.font_scale = 1.0;
         input.layout_metrics = Some(TextInputLayoutMetrics {
+            font_revision: cx.get_global::<Rc<RefCell<Fonts>>>().borrow().revision(),
             font_family: input.draw_text.text_style.font_family.clone(),
             font_size: 12.0, line_spacing: input.draw_text.text_style.line_spacing,
             font_scale: 1.0, max_width: None, wrap: false, align_x: 0.0, align_y: 0.0,
         });
+        (cx, input)
+    }
+
+    #[test]
+    fn vertical_navigation_after_edit_uses_new_rows_before_paint() {
+        let (mut cx, mut input) = editor();
         input.set_text(&mut cx, "ab\ncd");
         input.set_cursor(&mut cx, Cursor { index: 1, prefer_next_row: false }, false);
         input.create_or_extend_edit_group(EditKind::Other);
@@ -2541,5 +2542,63 @@ mod keyboard_edit_tests {
         assert!(input.redo(&mut cx));
         input.move_cursor_up(&mut cx, false).unwrap();
         assert_eq!((input.text.as_str(), input.selection.cursor.index), ("ax\nyb\ncd", 1));
+    }
+
+    #[test]
+    fn scaled_editor_measurement_wrap_and_caret_hit_testing_agree() {
+        let (mut cx, mut input) = editor();
+        input.layout.flow = Flow::RightWrap;
+        input.set_text(&mut cx, "ab cd ef gh ij kl");
+        let unscaled = input.text_layout(&mut cx, &input.text, Some(40.0));
+        input.draw_text.font_scale = 2.0;
+        input.update_text_layout(&mut cx, Some(80.0), true);
+        let measured = input.text_layout(&mut cx, &input.text, Some(80.0));
+        let painted = input.laidout_text.as_ref().unwrap().clone();
+        assert!(Rc::ptr_eq(&measured, &painted));
+        assert_eq!(painted.rows.len(), unscaled.rows.len());
+        assert!(painted.rows.len() > 1);
+        for (row, original) in painted.rows.iter().zip(&unscaled.rows) {
+            assert_eq!(row.text.as_str(), original.text.as_str());
+            assert!(row.width_in_lpxs * input.text_scale() <= 80.01);
+        }
+        for index in 0..=input.text.len() {
+            let cursor = Cursor { index, prefer_next_row: true };
+            let caret = input.caret_rect(cursor, DVec2::default());
+            let center = caret.pos + caret.size * 0.5;
+            assert_eq!(input.point_in_lpxs_to_cursor(Point::new(center.x as f32, center.y as f32)).unwrap().index, index);
+            assert_eq!(input.position_to_cursor(input.cursor_to_position(cursor).unwrap()).unwrap().index, index);
+        }
+        // The placeholder uses this same viewport-space width conversion.
+        let placeholder = input.text_layout(&mut cx, "ab cd ef gh ij kl", Some(80.0));
+        assert!(Rc::ptr_eq(&placeholder, &painted));
+    }
+
+    #[test]
+    fn font_family_replacement_refreshes_retained_editor_without_resetting_ime() {
+        let (mut cx, mut input) = editor();
+        input.set_text(&mut cx, "WWWW iiiii");
+        input.set_cursor(&mut cx, Cursor { index: 4, prefer_next_row: false }, false);
+        input.ime_composing = true;
+        input.ensure_text_layout(&mut cx).unwrap();
+        let old = input.laidout_text.as_ref().unwrap().clone();
+        let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
+        {
+            let mut fonts = fonts.borrow_mut();
+            let font = FontId::from("replacement-test");
+            fonts.define_font(font, FontDefinition {
+                data: std::sync::Arc::new(include_bytes!("../resources/NotoSans-Regular.ttf").to_vec()),
+                index: 0, variations: Vec::new(), ascender_fudge_in_ems: 0.0, descender_fudge_in_ems: 0.0,
+            });
+            fonts.redefine_font_family(0.into(), FontFamilyDefinition { font_ids: vec![font] });
+        }
+        let measured = input.text_layout(&mut cx, &input.text, None);
+        input.ensure_text_layout(&mut cx).unwrap();
+        let painted = input.laidout_text.as_ref().unwrap();
+        assert!(!Rc::ptr_eq(&old, painted));
+        assert!(Rc::ptr_eq(&measured, painted));
+        assert_ne!(old.size_in_lpxs.width, painted.size_in_lpxs.width);
+        assert!(input.ime_composing);
+        assert_eq!(input.selection.cursor.index, 4);
+        assert_eq!(input.text, "WWWW iiiii");
     }
 }

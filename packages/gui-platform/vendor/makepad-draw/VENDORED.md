@@ -29,6 +29,15 @@ The upstream `text::tests::test` rasterization demo is removed. It registered no
 `Sans` font, asserted no behavior, and saved PNGs to `/Users/ejpbruel/Desktop`.
 The portable layout and atlas regression tests retain their bundled fixtures.
 
+## Implicit font contour closure
+
+`text/glyph_outline.rs` closes each outline contour at the next move or end,
+and treats repeated explicit closes as idempotent. CFF2 outlines from Android's
+variable Noto Sans CJK can omit the final close callback; the missing edge left
+scanline winding nonzero and filled Korean glyphs with rectangles. The synthetic
+regression checks closed versus implicit contours, an interior counter and the
+exterior pixels without depending on a device font.
+
 ## Tabs and control characters
 
 Upstream shapes control characters as themselves. No font maps them, so every
@@ -93,6 +102,11 @@ let long text paint above later overlay backgrounds and icons.
 `src/cx_draw.rs` uploads all live pages without the old atlas-reset redraw loop;
 the text debug exporter explicitly selects page zero.
 
+`DrawText` keeps its Rust-only page-area list before `DrawVars`. Native Rust
+subclasses append shader instance fields after the base float tail; a trailing
+`Vec` previously displaced their uploaded focus/hover values from the reflected
+slots. The regression exercises Live reflection and the actual instance slice.
+
 ## Selection handle geometry
 
 `DrawText::draw_abs_laidout` paints retained text at a scrolled origin without
@@ -101,6 +115,9 @@ reshaping it, keeping selection hit testing and rendered text on the same layout
 their owner's final alignment while escaping nested text-content clips.
 Draw-list/window clipping still applies; a clipped caret hides its decoration.
 The widget layer shares this mechanism across editable and read-only owners.
+The overlay records its owner's position after applying each displacement, so
+successive enclosing-turtle finalizations cannot apply the same scroll or
+bottom-alignment shift repeatedly.
 
 ## Runtime font families
 
@@ -114,6 +131,7 @@ given and redefines any family whose list changed in a newer catalog, instead
 of only defining unseen families. `Fonts::font_family_definition` returns the
 current list and `Fonts::get_or_load_font` exposes a font's metrics.
 `FontFamily::font_family_id()` makes a DSL text style's family id public.
+`Fonts::revision` exposes the catalog revision for retained widget layout caches.
 
 `FontDefinition::variations` selects a variable-font instance with user-space
 axis values (`(*b"wght", 600.0)`); `FontFace::from_data_index_and_variations`

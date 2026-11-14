@@ -413,14 +413,13 @@ impl ComposerPanel {
     }
 
     /// One editor line (the editor's own font and 1.4 line spacing).
-    fn line(&mut self, cx: &mut Cx2d, look: &Look) -> f64 {
-        self.caret_text.text_style.font_size = crate::theme::Typography::pt(look.content());
-        let laid = self.caret_text.layout(cx, 0.0, 0.0, None, false, Align::default(), "Ag");
-        laid.size_in_lpxs.height as f64 * self.caret_text.font_scale as f64
+    fn line(&mut self, cx: &mut Cx) -> f64 {
+        let laid = self.input.text_layout(cx, "Ag", None);
+        laid.size_in_lpxs.height as f64 * self.input.text_scale() as f64
     }
 
     fn input_bounds(&mut self, cx: &mut Cx2d, look: &Look) -> (f64, f64, f64) {
-        let line = self.line(cx, look);
+        let line = self.line(cx);
         let vertical = if look.native { 6.0 } else { 4.0 };
         let min_lines = if look.compact { 1.0 } else { 2.0 };
         let mut min = line * min_lines + vertical * 2.0;
@@ -457,7 +456,7 @@ impl ComposerPanel {
         }
         let (min, max, vertical) = self.input_bounds(cx, look);
         let reserve = if look.compact { 36.0 } else { 0.0 };
-        let natural = self.editor_natural(cx, look, width - side * 2.0 - reserve, vertical, min);
+        let natural = self.editor_natural(cx, width - side * 2.0 - reserve, vertical, min);
         let visible = natural.clamp(min, max);
         h += visible;
         h += 12.0 + 28.0 + bottom;
@@ -497,7 +496,7 @@ impl ComposerPanel {
         let compact = look.compact;
         let reserve = if compact { 36.0 } else { 0.0 };
         let (min, max, vertical) = self.input_bounds(cx, look);
-        let natural = self.editor_natural(cx, look, r.size.x - side * 2.0 - reserve, vertical, min);
+        let natural = self.editor_natural(cx, r.size.x - side * 2.0 - reserve, vertical, min);
         let visible = natural.clamp(min, max);
         let text_rect = rect(r.pos.x + side, y, r.size.x - side * 2.0, visible);
         let fullscreen = matches!(self.st.overlay(), super::panel::Overlay::Fullscreen);
@@ -505,7 +504,7 @@ impl ComposerPanel {
             self.draw_input(cx, look, text_rect, reserve, vertical, min);
         }
         self.draw_focus_hint(cx, ui, look, text_rect);
-        let line = self.line(cx, look);
+        let line = self.line(cx);
         if compact && self.st.input_natural > line * 2.0 + vertical * 2.0 + 0.5 {
             // presentation.tsx Maximize2 on the send rail, after more than two lines.
             let glyph = look.glyph();
@@ -520,25 +519,23 @@ impl ComposerPanel {
         let _ = bottom;
     }
 
-    /// The editor inside a clipped, scrollable viewport (TextInput has no own scrolling).
-    pub(super) fn draw_input(&mut self, cx: &mut Cx2d, look: &Look, r: Rect, reserve: f64, vertical: f64, min: f64) {
+    /// The editor inside the composer's clipped, scrollable viewport.
+    pub(super) fn draw_input(&mut self, cx: &mut Cx2d, _look: &Look, r: Rect, reserve: f64, vertical: f64, min: f64) {
         let viewport = rect(r.pos.x, r.pos.y, (r.size.x - reserve).max(10.0), r.size.y);
         self.st.input_clip = viewport;
-        let natural = self.editor_natural(cx, look, viewport.size.x, vertical, min);
+        let natural = self.editor_natural(cx, viewport.size.x, vertical, min);
         let max_scroll = (natural - viewport.size.y).max(0.0);
         let text = self.input.text();
         if self.st.input_scroll == f64::MAX {
             self.st.input_scroll = max_scroll;
         } else if max_scroll > 0.0 && !self.st.input_manual_scroll {
-            // Keep the caret row visible: lay the text out exactly as the editor does (same
-            // font, line spacing, width and wrapping) and take the caret row's extent, the
-            // rect TextInput draws its cursor in.
-            self.caret_text.text_style.font_size = crate::theme::Typography::pt(look.content());
-            let laid = self.caret_text.layout(cx, 0.0, 0.0, Some(viewport.size.x as f32), true, Align::default(), &text);
+            // Measure through the editor: system-font replacement, scaling and
+            // wrapping must be identical to the rows it paints and hit-tests.
+            let laid = self.input.text_layout(cx, &text, Some(viewport.size.x as f32));
             let cursor = self.input.cursor();
             let position = laid.cursor_to_position(cursor);
             if let Some(row) = laid.rows.get(position.row_index) {
-                let scale = self.caret_text.font_scale as f64;
+                let scale = self.input.text_scale() as f64;
                 let caret_top = (row.origin_in_lpxs.y - row.ascender_in_lpxs) as f64 * scale + vertical;
                 let caret_bottom = caret_top + (row.ascender_in_lpxs - row.descender_in_lpxs) as f64 * scale;
                 if caret_bottom > self.st.input_scroll + viewport.size.y {
@@ -567,19 +564,18 @@ impl ComposerPanel {
 
     /// The editor's content height at `width` before it is drawn (same font, spacing and
     /// wrapping as the TextInput), so the card grows in the same frame as the text.
-    fn editor_natural(&mut self, cx: &mut Cx2d, look: &Look, width: f64, vertical: f64, min: f64) -> f64 {
+    fn editor_natural(&mut self, cx: &mut Cx, width: f64, vertical: f64, min: f64) -> f64 {
         let mut text = self.input.text();
         if text.is_empty() {
             // The hint wraps like text (input.tsx placeholder).
             text = self.input.empty_text().to_owned();
         }
-        let line = self.line(cx, look);
+        let line = self.line(cx);
         let height = if text.is_empty() {
             line
         } else {
-            self.caret_text.text_style.font_size = crate::theme::Typography::pt(look.content());
-            let laid = self.caret_text.layout(cx, 0.0, 0.0, Some(width.max(1.0) as f32), true, Align::default(), &text);
-            laid.size_in_lpxs.height as f64 * self.caret_text.font_scale as f64
+            let laid = self.input.text_layout(cx, &text, Some(width.max(10.0) as f32));
+            laid.size_in_lpxs.height as f64 * self.input.text_scale() as f64
         };
         let natural = (height + vertical * 2.0).max(min);
         self.st.input_natural = natural;
@@ -599,9 +595,8 @@ impl ComposerPanel {
         // The hint shares the placeholder's first line; a pane too narrow for both keeps the placeholder.
         let placeholder = self.input.empty_text().to_owned();
         if !placeholder.is_empty() {
-            self.caret_text.text_style.font_size = crate::theme::Typography::pt(look.content());
-            let laid = self.caret_text.layout(cx, 0.0, 0.0, None, false, Align::default(), &placeholder);
-            let placeholder_w = laid.size_in_lpxs.width as f64 * self.caret_text.font_scale as f64;
+            let laid = self.input.text_layout(cx, &placeholder, None);
+            let placeholder_w = laid.size_in_lpxs.width as f64 * self.input.text_scale() as f64;
             if placeholder_w + 16.0 + w > r.size.x {
                 return;
             }
@@ -1115,4 +1110,48 @@ struct Trigger<'a> {
     tint: Option<Vec4>,
     label: Option<&'a str>,
     caret: bool,
+}
+
+#[cfg(test)]
+mod input_measurement_tests {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+    use makepad_widgets::makepad_draw::text::{
+        font::FontId, fonts::Fonts, loader::{FontDefinition, FontFamilyDefinition},
+    };
+
+    #[test]
+    fn korean_composer_height_uses_editor_font_scale_and_wrap_width() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fonts = Fonts::new(&mut cx, Default::default());
+        let font = FontId::from("composer-korean-test");
+        fonts.define_font(font, FontDefinition {
+            data: Arc::new(include_bytes!("../../../../resources/fonts/NotoSansKR-Regular.otf").to_vec()),
+            index: 0, variations: Vec::new(), ascender_fudge_in_ems: 0.0, descender_fudge_in_ems: 0.0,
+        });
+        fonts.define_font_family(0.into(), FontFamilyDefinition { font_ids: vec![font] });
+        cx.set_global(Rc::new(RefCell::new(fonts)));
+        let mut panel = ComposerPanel::new(&mut cx);
+        let text = "그리고 현재 UI의 폰트가 시스템하고 결합되지 않고 자체적으로 렌더링하는데 이거 시스템하고 잘 결합할 방법도 찾아봐";
+        panel.input.set_text(&mut cx, text);
+        for scale in [1.0, 1.3, 2.0] {
+            panel.input.apply_over(&mut cx, live! {
+                flow: RightWrap
+                draw_text: { font_scale: (scale), text_style: { font_size: 15.0, line_spacing: 1.6 } }
+            });
+            for width in [268.0, 600.0] {
+                let laid = panel.input.text_layout(&mut cx, text, Some(width as f32));
+                assert!(laid.rows.len() > 1);
+                let measured = panel.editor_natural(&mut cx, width, 6.0, 30.0);
+                let expected = (laid.size_in_lpxs.height as f64 * panel.input.text_scale() as f64 + 12.0).max(30.0);
+                assert_eq!(measured, expected);
+                assert_eq!(panel.st.input_natural, expected);
+                // Line breaking may hang trailing spaces beyond the fit width.
+                for row in &laid.rows {
+                    let visible = panel.input.text_layout(&mut cx, row.text.as_str().trim_end(), None);
+                    assert!(visible.size_in_lpxs.width * panel.input.text_scale() <= width as f32 + 0.01);
+                }
+            }
+        }
+    }
 }

@@ -109,6 +109,11 @@ pub struct DrawText {
     #[live]
     pub temp_y_shift: f32,
     
+    // Rust-only state must precede DrawVars: native DrawText subclasses append
+    // their shader fields directly after this struct's contiguous float tail.
+    #[rust]
+    page_areas: Vec<Area>,
+
     #[deref]
     pub draw_vars: DrawVars,
     #[calc]
@@ -129,8 +134,6 @@ pub struct DrawText {
     pub t_min: Vec2,
     #[calc]
     pub t_max: Vec2,
-    #[rust]
-    page_areas: Vec<Area>,
 }
 
 impl LiveHook for DrawText {
@@ -767,3 +770,7 @@ impl LiveHook for FontFamily {
         Some(nodes.skip_node(index))
     }
 }
+
+#[cfg(test)]
+#[path = "draw_text_tests.rs"]
+mod instance_layout_tests;

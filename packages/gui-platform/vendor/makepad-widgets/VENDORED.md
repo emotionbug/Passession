@@ -95,10 +95,14 @@ Touch release no longer auto-copies on Android. Outside dismissal and focus
 teardown collapse selection and invalidate native action ownership. Painted
 selection/caret areas provide anchors that the platform resolves after layout.
 
-The retained text layout is keyed by font family/size/spacing/scale, available
-width, wrapping and alignment. Live system-font changes and width reflow do not
-reuse stale glyph metrics or replace the editor's text, selection or history;
-color-only animation keeps the cached layout.
+The retained text layout is keyed by the font catalog revision as well as font
+family/size/spacing/scale, available width, wrapping and alignment. Replacing a
+system face under the same family id invalidates retained metrics, including
+navigation before repaint, without replacing text, selection or IME composition.
+Color-only animation keeps the cached layout. Viewport widths are converted to
+unscaled layout coordinates once; `TextInput::text_layout` exposes that same
+measurement to composer height calculations. Painting, hit testing, caret and
+touch-handle geometry share the resulting scaled layout.
 
 Cursor navigation and pointer placement rebuild an invalidated layout using the
 last viewport before resolving rows. Input events may arrive between an edit

@@ -210,7 +210,7 @@ fn entry(cx: &mut Cx2d, d: &mut Draw, ctx: &RowContext, id: &str, row: &StreamRo
             let badge = Badge {
                 key: format!("thinking:{id}"),
                 glyph: ToolGlyph::Brain,
-                label: t("agentControls.thinking.title"),
+                label: t("agentStream.thinking"),
                 secondary: None,
                 loading: streaming,
                 error: false,
@@ -1042,7 +1042,7 @@ pub fn sheet_header(ctx: &RowContext, item: &RowItem, kind: &str) -> Option<Shee
     let row = rows.get(*index)?;
     let entry_item = get(&row.entry, "item");
     match kind {
-        "thinking" => Some(SheetHeader { glyph: ToolGlyph::Brain, title: t("agentControls.thinking.title"), max_lines: 1, semibold: true }),
+        "thinking" => Some(SheetHeader { glyph: ToolGlyph::Brain, title: t("agentStream.thinking"), max_lines: 1, semibold: true }),
         "group" => {
             let calls = row.group.as_deref()?;
             let (summary, _) = tools::build_overview_summary(calls);

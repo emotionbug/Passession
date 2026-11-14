@@ -171,7 +171,7 @@
       "modelGroupLabel": "모델",
       "modelSearchKeywords": "모델 전환 모델 변경 모델 설정 모델 선택",
       "thinkingGroupLabel": "추론",
-      "thinkingSearchKeywords": "추론 수준 사고 생각",
+      "thinkingSearchKeywords": "추론 수준 생각 생각중",
       "modeGroupLabel": "모드",
       "modeSearchKeywords": "접근 권한 승인 모드",
       "planModeGroupLabel": "계획 모드",
@@ -316,11 +316,11 @@
   "agentControls": {
     "provider": { "fallback": "프로바이더", "select": "에이전트 프로바이더 선택" },
     "thinking": {
-      "title": "사고",
+      "title": "추론",
       "unknown": "알 수 없음",
       "extraHigh": "매우 높음",
-      "select": "사고 옵션 선택",
-      "selectWithValue": "사고 옵션 선택 ({{value}})"
+      "select": "추론 옵션 선택",
+      "selectWithValue": "추론 옵션 선택 ({{value}})"
     },
     "model": { "unknown": "알 수 없는 모델" },
     "features": { "title": "기능", "open": "에이전트 기능 열기", "on": "켜짐", "off": "꺼짐" },
@@ -329,9 +329,10 @@
       "searchPlaceholder": "모드 검색...",
       "selectWithValue": "에이전트 모드 선택 ({{value}})"
     },
-    "hints": { "thinking": "사고 모드", "model": "모델 변경", "mode": "모드 변경" }
+    "hints": { "thinking": "추론 모드", "model": "모델 변경", "mode": "모드 변경" }
   },
   "agentStream": {
+    "thinking": "생각중",
     "empty": "이 에이전트와 대화를 시작하세요...",
     "scrollToBottom": "맨 아래로 스크롤",
     "historyLoadFailed": "에이전트 기록을 로드할 수 없습니다.",
@@ -405,7 +406,7 @@
       "sourceRef": "원본",
       "targetRef": "대상",
       "terminalId": "터미널",
-      "thinkingOptionId": "사고 수준",
+      "thinkingOptionId": "추론 수준",
       "timeoutMs": "제한 시간(ms)",
       "updateCount": "업데이트",
       "workspaceId": "워크스페이스",
@@ -2657,7 +2658,7 @@
       },
       "autoExpandReasoning": {
         "label": "추론 항상 펼치기",
-        "description": "에이전트의 사고 및 추론 블록을 기본적으로 모두 펼쳐 표시합니다."
+        "description": "에이전트의 추론 블록을 기본적으로 모두 펼쳐 표시합니다."
       },
       "toolCallDetail": {
         "label": "도구 호출 표시",
@@ -3041,8 +3042,8 @@
         "noModels": "이 프로바이더에는 선택할 수 있는 모델이 없습니다",
         "modeLabel": "모드",
         "noModes": "이 프로바이더에는 선택할 수 있는 모드가 없습니다",
-        "thinkingLabel": "사고",
-        "noThinkingOptions": "이 모델에는 사고 수준이 없습니다",
+        "thinkingLabel": "추론",
+        "noThinkingOptions": "이 모델에는 추론 수준이 없습니다",
         "featuresLabel": "기능",
         "featureCount": "기능 {{count}}개",
         "featureCountOne": "기능 {{count}}개",

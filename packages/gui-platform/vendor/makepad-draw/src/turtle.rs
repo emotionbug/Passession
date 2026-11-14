@@ -755,8 +755,15 @@ impl<'a,'b> Cx2d<'a,'b> {
                 }
                 AlignEntry::AnchoredOverlay{owner, origin, area, anchor_offset, skip} =>{
                     let (owner, origin, area, anchor_offset, skip) = (*owner, *origin, *area, *anchor_offset, *skip);
-                    let shift = owner.rect(self).pos - origin;
+                    let owner_origin = owner.rect(self).pos;
+                    let shift = owner_origin - origin;
                     self.move_align_list(shift.x, shift.y, i + 1, skip, false, dvec2(0.0,0.0));
+                    // Every enclosing turtle finalizes this overlay again.
+                    // Consume only the owner's displacement since the last
+                    // finalization, not the total from the original draw.
+                    if let AlignEntry::AnchoredOverlay { origin, .. } = &mut self.align_list[i] {
+                        *origin = owner_origin;
+                    }
                     let mut anchor = area.rect(self).pos + anchor_offset;
                     if let Some(id) = area.draw_list_id() {
                         let list = &self.cx.cx.draw_lists[id];
@@ -1465,5 +1472,52 @@ fn max_zero_keep_nan(v: f64) -> f64 {
     }
     else {
         f64::max(v, 0.0)
+    }
+}
+
+#[cfg(test)]
+mod anchored_overlay_tests {
+    use super::*;
+    use crate::{cx_draw::CxDraw, draw_list_2d::{DrawList2d, DrawListExt}};
+
+    #[test]
+    fn selection_handle_follows_each_owner_shift_once() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        crate::live_design(&mut cx);
+        crate::shader::draw_trapezoid::DrawTrapezoidVector::register_main_module(&mut cx);
+        cx.live_expand();
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(720.0, 1568.0));
+        let mut list = DrawList2d::new(&mut cx);
+        let event = DrawEvent::default();
+        let mut draw = CxDraw::new(&mut cx, &event);
+        draw.begin_pass(&pass, Some(1.0));
+        list.begin_always(&mut draw);
+        let mut cx = Cx2d::new(&mut draw);
+        cx.begin_sized_turtle(dvec2(720.0, 1568.0), Layout::default());
+        let mut owner = Area::Empty;
+        let owner_rect = Rect { pos: dvec2(100.0, 300.0), size: dvec2(300.0, 150.0) };
+        cx.add_aligned_rect_area(&mut owner, owner_rect);
+        cx.begin_sized_turtle(dvec2(720.0, 1568.0), Layout::default());
+        let mut handle = Area::Empty;
+        let handle_rect = Rect { pos: dvec2(200.0, 370.0), size: dvec2(18.0, 20.0) };
+        cx.add_aligned_rect_area(&mut handle, handle_rect);
+        cx.end_pass_sized_turtle_with_visible_anchor(owner, owner_rect.pos, handle, dvec2(9.0, -5.0));
+        let range = cx.get_turtle_align_range();
+        let mut expected = handle_rect;
+        // Composer scrolling, then its host's same-frame bottom alignment.
+        for shift in [dvec2(18.0, -40.0), dvec2(0.0, -24.0)] {
+            cx.shift_align_range(&range, shift);
+            expected.pos += shift;
+            for _ in 0..3 {
+                let end = cx.align_list.len();
+                cx.perform_nested_clipping_on_align_list_and_shift(0, end);
+                assert_eq!(handle.rect(&cx), expected);
+            }
+        }
+        cx.end_pass_sized_turtle();
+        assert_eq!(handle.rect(&cx), expected);
+        list.end(&mut cx);
+        cx.end_pass(&pass);
     }
 }
