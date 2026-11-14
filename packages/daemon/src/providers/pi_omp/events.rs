@@ -65,7 +65,9 @@ pub(super) fn omp_task_status(row: &Value, terminal: bool) -> &'static str {
 
 /// Native delivery metadata, never task-result markup quoted in arbitrary text.
 pub(super) fn omp_task_completions(message: &Value) -> impl Iterator<Item = (&str, &'static str)> {
-    let jobs = if message["role"] == "custom" && message["customType"] == "async-result" {
+    let jobs = if (message["role"] == "custom" && message["customType"] == "async-result")
+        || (message["role"] == "toolResult" && message["toolName"] == "wait")
+    {
         array(&message["details"]["jobs"])
     } else {
         &[]
@@ -80,7 +82,7 @@ pub(super) fn omp_task_completions(message: &Value) -> impl Iterator<Item = (&st
             return None;
         }
         Some((
-            first(&[&job["agentId"], &job["jobId"]])?,
+            first(&[&job["agentId"], &job["jobId"], &job["id"]])?,
             omp_task_status(job, true),
         ))
     })
@@ -455,6 +457,7 @@ impl Mapper {
                 let message=&frame["message"];match string(&message["role"]){
                     "assistant"=>{if self.family=="omp"{let items=self.omp_streams.finish(frame);out.extend(items.into_iter().map(|item|self.timeline(item)));}else{out.extend(self.cumulative(message));self.assistant=None;self.stream_text.clear();self.stream_thinking.clear();}self.terminal=Some(message.clone());if self.family=="omp"{for block in array(&message["content"]){if block["type"]=="toolCall"&&block["name"]=="ask"{self.permissions.start(&self.family,&self.provider,string(&block["id"]),"ask",&block["arguments"]);}}}},
                     "custom"=>{let changes=if self.family=="omp"{self.extensions.omp_custom(message)}else{self.extensions.custom(message)};out.extend(self.subagents(changes));let id=format!("{}-custom-{}",self.provider,Uuid::new_v4());if let Some(mut item)=custom_item(&self.family,message,&id){if self.family=="omp"&&item["type"]=="user_message"{if let Some((text,client))=self.clients.pop_front(){item["text"]=json!(text);put(&mut item,"clientMessageId",client.as_deref());}else{return out;}}out.push(self.timeline(item));}},
+                    "toolResult" if self.family=="omp"=>{let changes=self.extensions.omp_custom(message);out.extend(self.subagents(changes));},
                     "user" if self.family=="omp"=>{let id=first(&[&message["id"],&message["entryId"]]);if id.is_some_and(|id|!self.users.insert(id.into())){return out;}let text=tools::content_text(&message["content"]);if !text.is_empty(){let mut item=json!({"type":"user_message","text":text});put(&mut item,"messageId",id);if let Some((_,client))=self.clients.pop_front(){put(&mut item,"clientMessageId",client.as_deref());}out.push(self.timeline(item));}},_=>{}
                 }
             }
@@ -857,6 +860,67 @@ mod tests {
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0]["event"]["id"], "second");
         assert_eq!(closed[0]["event"]["status"], "canceled");
+    }
+
+    #[test]
+    fn omp_task_completion_identity_preserves_native_alias_precedence() {
+        for (role, tool_name, custom_type) in [
+            ("toolResult", "wait", ""),
+            ("custom", "", "async-result"),
+        ] {
+            let message = json!({"role":role,"toolName":tool_name,"customType":custom_type,
+                "details":{"jobs":[
+                    {"type":"task","agentId":"agent","jobId":"job","id":"fallback","status":"completed"},
+                    {"type":"task","agentId":"","jobId":"job","id":"fallback","status":"failed"},
+                    {"type":"task","agentId":" ","jobId":"","id":"fallback","status":"canceled"},
+                    {"type":"task","id":"","status":"completed"}
+                ]}});
+            assert_eq!(omp_task_completions(&message).collect::<Vec<_>>(), [
+                ("agent", "completed"), ("job", "failed"), ("fallback", "canceled")
+            ]);
+        }
+    }
+
+    #[test]
+    fn omp_task_wait_delivery_requires_native_terminal_jobs_and_preserves_respawns() {
+        let mut mapper = Mapper::new("omp", "omp");
+        let spawn = |owner: &str| json!({"type":"tool_execution_end","toolCallId":owner,"toolName":"task",
+            "result":{"details":{"progress":[
+                {"id":"done","status":"pending"},{"id":"bad","status":"pending"},
+                {"id":"stopped","status":"pending"},{"id":"active","status":"pending"}
+            ]}}});
+        let delivery = json!({"role":"toolResult","toolName":"wait","details":{"jobs":[
+            {"type":"task","id":"done","status":"completed"},
+            {"type":"task","id":"bad","status":"failed"},
+            {"type":"task","id":"stopped","status":"canceled"},
+            {"type":"task","id":"unknown","status":"completed"},
+            {"type":"bash","id":"active","status":"completed"},
+            {"type":"task","id":"active","status":"running"},
+            {"type":"task","id":"active","status":"pending"},
+            {"type":"task","id":"active","status":"queued"},
+            {"type":"task","id":"active","status":"unknown"}
+        ]},"content":[{"type":"text","text":"<task-result id=\"active\" status=\"completed\">"}]});
+        assert!(mapper.map(&json!({"type":"message_end","message":delivery})).is_empty());
+        mapper.map(&spawn("first"));
+        for (role, name) in [("user", "wait"), ("assistant", "wait"), ("toolResult", "bash")] {
+            let mut foreign = delivery.clone();
+            foreign["role"] = json!(role);
+            foreign["toolName"] = json!(name);
+            assert!(!mapper.map(&json!({"type":"message_end","message":foreign}))
+                .iter().any(|e| e["type"] == "provider_subagent"));
+        }
+        let events = mapper.map(&json!({"type":"message_end","message":delivery}));
+        let statuses: Vec<_> = events.iter().map(|e|
+            (e["event"]["id"].as_str().unwrap(), e["event"]["status"].as_str().unwrap())).collect();
+        assert_eq!(statuses, [("done", "completed"), ("bad", "failed"), ("stopped", "canceled")]);
+        assert!(mapper.map(&json!({"type":"message_end","message":delivery})).is_empty());
+        let restarted = mapper.map(&spawn("second"));
+        let children: Vec<_> = restarted.iter().filter(|e| e["type"] == "provider_subagent").collect();
+        assert_eq!(children.len(), 4);
+        assert!(children.iter().all(|e| e["event"]["status"] == "running"
+            && e["event"]["toolCallId"] == "second"));
+        let closed = mapper.close_work();
+        assert_eq!(closed.len(), 4);
     }
 
     #[test]

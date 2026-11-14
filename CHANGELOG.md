@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.13.24 - 2026-11-14
+
+### Fixed
+
+- OMP thinking streams retain trailing whitespace until authoritative content confirms it, avoiding false content-mismatch errors when OMP removes summary separators. End events without a body no longer assert empty content; genuine conflicts remain explicit errors.
+- OMP native children recognize structured `wait` completion records as well as asynchronous notices. Completed background tasks no longer remain running in live updates or restored history, including catalogs persisted by earlier versions.
+
 ## 0.13.23 - 2026-11-14
 
 ### Changed

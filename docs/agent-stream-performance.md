@@ -38,6 +38,9 @@ message recover missing suffixes and replace unpublished fragments without
 duplicating emitted text. The neutral stream is append-only: a terminal body
 contradicting already published bytes produces an explicit error, not a fabricated
 merge; native history remains the authority for recovering that final body.
+Trailing thinking whitespace stays unpublished until it becomes internal text or
+an explicit end/terminal body confirms it. An end event without a body closes the
+block but does not assert empty content; an explicit empty body is authoritative.
 This changes provider payload handling, not batching, settling or polling policy.
 
 Physical client frame admission has a one-second stall deadline as well as its byte budget;

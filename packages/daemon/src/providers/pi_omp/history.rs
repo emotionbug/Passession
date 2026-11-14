@@ -1426,6 +1426,21 @@ mod tests {
     }
 
     fn omp_background_session(id: &str, progress: Value, jobs: Value) -> String {
+        omp_background_session_with_delivery(id, progress,
+            json!({"type":"custom_message","id":"c1","parentId":"r1","customType":"async-result",
+                "timestamp":"2026-01-01T00:00:04.000Z","content":"<system-notice>Background delivery</system-notice>",
+                "details":{"jobs":jobs}}))
+    }
+
+    fn omp_wait_session(id: &str, progress: Value, jobs: Value) -> String {
+        omp_background_session_with_delivery(id, progress,
+            json!({"type":"message","id":"w1","parentId":"r1",
+                "timestamp":"2026-01-01T00:00:04.000Z","message":{
+                    "role":"toolResult","toolName":"wait","toolCallId":"wait-1",
+                    "content":text("completed"),"details":{"jobs":jobs}}}))
+    }
+
+    fn omp_background_session_with_delivery(id: &str, progress: Value, delivery: Value) -> String {
         lines(&[
             json!({"type":"session","id":id,"cwd":"/work","timestamp":"2026-01-01T00:00:00.000Z"}),
             json!({"type":"message","id":"a1","parentId":null,"message":{"role":"assistant",
@@ -1434,9 +1449,7 @@ mod tests {
             json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:03.000Z",
                 "message":{"role":"toolResult","toolCallId":"task-1","toolName":"task",
                     "content":text("queued"),"details":{"async":true,"results":[],"progress":progress}}}),
-            json!({"type":"custom_message","id":"c1","parentId":"r1","customType":"async-result",
-                "timestamp":"2026-01-01T00:00:04.000Z","content":"<system-notice>Background delivery</system-notice>",
-                "details":{"jobs":jobs}}),
+            delivery,
         ])
     }
 
@@ -1486,7 +1499,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn omp_task_wait_history_restores_terminal_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent.jsonl");
+        fs::write(&parent, omp_wait_session("parent", json!([
+            {"id":"done","status":"pending"},{"id":"bad","status":"pending"},
+            {"id":"stopped","status":"pending"},{"id":"active","status":"pending"}
+        ]), json!([
+            {"type":"task","id":"done","status":"completed"},
+            {"type":"task","id":"bad","status":"failed"},
+            {"type":"task","id":"stopped","status":"canceled"},
+            {"type":"task","id":"unknown","status":"completed"},
+            {"type":"bash","id":"active","status":"completed"},
+            {"type":"task","id":"active","status":"pending"},
+            {"type":"task","id":"active","status":"running"},
+            {"type":"task","id":"active","status":"unknown"}
+        ]))).await.unwrap();
+        let history = load_live("omp", "omp", &parent, None, &Value::Null).await.unwrap();
+        let children: Vec<_> = history.subagent_events.iter().map(|e|
+            (e["event"]["id"].as_str().unwrap(), e["event"]["status"].as_str().unwrap())).collect();
+        assert_eq!(children, [
+            ("done", "completed"), ("bad", "failed"), ("stopped", "canceled"), ("active", "running")
+        ]);
+    }
+
+    #[tokio::test]
     async fn omp_progress_child_without_source_replays_nested_outcomes() {
+        for wait in [false, true] {
+        let session = if wait { omp_wait_session } else { omp_background_session };
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().join("parent.jsonl");
         let child = parent.with_extension("").join("child.jsonl");
@@ -1496,12 +1536,12 @@ mod tests {
             {"id":"sibling","agent":"worker","status":"pending"}
         ]), json!([]))).await.unwrap();
         fs::create_dir_all(parent.with_extension("").join("sibling.jsonl")).await.unwrap();
-        fs::write(&child, omp_background_session("child", json!([
+        fs::write(&child, session("child", json!([
             {"id":"nested-ok","agent":"scout","status":"pending"},
             {"id":"nested-failed","agent":"worker","status":"pending"}
         ]), json!([
-            {"type":"task","agentId":"nested-ok","status":"completed"},
-            {"type":"task","agentId":"nested-failed","status":"failed"}
+            {"type":"task","id":"nested-ok","status":"completed"},
+            {"type":"task","id":"nested-failed","status":"failed"}
         ]))).await.unwrap();
         let events = child_history("omp", "omp", &request("child", &parent, Value::Null)).await.unwrap();
         assert_eq!(events[0]["event"]["title"], "scout");
@@ -1515,6 +1555,7 @@ mod tests {
         assert_eq!(nested[1]["event"]["id"], "nested-failed");
         assert_eq!(nested[1]["event"]["status"], "failed");
         assert_eq!(nested[1]["event"]["source"]["path"], json!(child.with_extension("").join("nested-failed.jsonl")));
+        }
     }
 
     #[test]
@@ -1533,6 +1574,11 @@ mod tests {
             json!({"role":"custom","customType":"async-result",
                 "content":"<task-result id=\"known\" status=\"failed\">",
                 "details":{"jobs":[{"type":"task","agentId":"unrelated","status":"completed"}]}}),
+            json!({"role":"toolResult","toolName":"bash",
+                "details":{"jobs":[{"type":"task","id":"known","status":"completed"}]}}),
+            json!({"role":"toolResult","toolName":"wait",
+                "content":text("<task-result id=\"known\" status=\"completed\">"),
+                "details":{"jobs":[{"type":"task","id":"unrelated","status":"completed"}]}}),
             result("unknown-call", "invented", "wrong"),
         ];
         let children = subagent_transcripts(&messages, Path::new("/tmp/parent.jsonl"));
@@ -1549,8 +1595,12 @@ mod tests {
             {"type":"toolCall","name":"task","id":id,"arguments":{"agent":"worker"}}]});
         let result = |id: &str| json!({"role":"toolResult","toolName":"task","toolCallId":id,
             "details":{"results":[],"progress":[{"id":"reused","status":"pending"}]}});
-        let delivery = json!({"role":"custom","customType":"async-result",
-            "details":{"jobs":[{"type":"task","agentId":"reused","status":"completed"}]}});
+        for delivery in [
+            json!({"role":"custom","customType":"async-result",
+                "details":{"jobs":[{"type":"task","agentId":"reused","status":"completed"}]}}),
+            json!({"role":"toolResult","toolName":"wait",
+                "details":{"jobs":[{"type":"task","id":"reused","status":"completed"}]}}),
+        ] {
         let messages = [
             delivery.clone(),
             call("first"),
@@ -1563,6 +1613,7 @@ mod tests {
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].status, "running");
         assert_eq!(children[0].tool_call, "second");
+        }
     }
 
     #[test]

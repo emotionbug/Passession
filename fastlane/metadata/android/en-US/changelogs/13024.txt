@@ -1,0 +1,4 @@
+Fixed
+- OMP thinking streams retain trailing whitespace until authoritative content confirms it, avoiding false content-mismatch errors when OMP removes summary separators. End events without a body no longer assert empty content; genuine conflicts remain explicit errors.
+
+Full notes: https://github.com/emotionbug/Passession/releases

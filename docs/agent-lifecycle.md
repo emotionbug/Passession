@@ -150,6 +150,12 @@ their descriptors and timelines under the managed parent rather than creating an
 Opening a child reads its transcript. It does not grant independent prompt, archive, or detach control.
 See [the subagents track](#the-subagents-track) for the shared presentation and ownership boundary.
 
+OMP task completions can arrive in structured `wait` tool results or asynchronous
+result notices. Both settle already-declared running children in live handling
+and native-history replay, repairing stale persisted status after a restart.
+Printed result text, nonterminal jobs, and background shell jobs are not child
+completion evidence.
+
 ## Background workspaces
 
 `workspace.background` controls discovery only. Background workspaces contain ordinary durable
