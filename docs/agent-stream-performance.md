@@ -26,6 +26,12 @@ transcript delivery. Ordinary frames go through a single FIFO delivery pump; con
 spills through the admission spool instead of blocking the stdout reader on a bounded channel.
 This isolates a demonstrated propagation mechanism, not proof of the first lock owner in a
 historical incident. Private spool I/O can still fail or stall independently of the consumer.
+Admission and replay share a 4096-frame/16 MiB accounting budget that includes
+inline JSON values, array/string reserved capacity and a conservative live map-entry
+allowance. This is an estimate, not an allocator or RSS ceiling: opaque retained map
+capacity, allocator overhead, spool buffers and outer stage-vector spare capacity
+are excluded. An incoming or deserialized single frame may exceed the budget;
+delivery preserves the complete frame rather than truncating or dropping it.
 
 OMP requests `set_event_filter` with `events: null` and `messageUpdates: "delta"`
 on initial open and runtime restart. Only an echoed `"delta"` enables that

@@ -22,6 +22,28 @@ fn stderr_tail_decodes_utf8_after_joining_ring_segments() {
     assert!(tail.text().ends_with("��글"));
 }
 
+#[tokio::test]
+async fn json_frame_lease_retains_only_bounded_empty_storage() {
+    use super::{JSON_FRAME_RETAIN_LIMIT, JsonFrame};
+
+    for capacity in [0, 1024, JSON_FRAME_RETAIN_LIMIT, JSON_FRAME_RETAIN_LIMIT + 1] {
+        let storage = tokio::sync::Mutex::new(vec![b'x'; capacity]);
+        let original_capacity = storage.lock().await.capacity();
+        let frame = JsonFrame { bytes: storage.lock().await };
+        drop(frame);
+        let storage = storage.try_lock().expect("lease must release storage");
+        assert!(storage.is_empty());
+        assert_eq!(
+            storage.capacity(),
+            if original_capacity > JSON_FRAME_RETAIN_LIMIT {
+                0
+            } else {
+                original_capacity
+            },
+        );
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     use std::{collections::BTreeMap, os::unix::process::ExitStatusExt, time::Duration};
@@ -29,7 +51,7 @@ mod unix {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio_util::sync::CancellationToken;
 
-    use super::super::{CommandSpec, ManagedProcess, WriteError, run};
+    use super::super::{CommandSpec, JSON_FRAME_RETAIN_LIMIT, ManagedProcess, WriteError, run};
 
     fn shell(script: &str) -> CommandSpec {
         CommandSpec {
@@ -103,12 +125,19 @@ mod unix {
         for index in 0..32 {
             let process = process.clone();
             writers.push(tokio::spawn(async move {
-                process
-                    .write_json(
-                        &serde_json::json!({"index": index, "text": "한글\nquoted \"text\""}),
-                    )
-                    .await
-                    .unwrap();
+                let value = serde_json::json!({
+                    "index": index,
+                    "text": "한글\nquoted \"text\"".repeat(128 * (index + 1)),
+                });
+                if index % 2 == 0 {
+                    process.write_json(&value).await.unwrap();
+                } else {
+                    process.write_json_with_deadline(
+                        &value,
+                        Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+                        &CancellationToken::new(),
+                    ).await.unwrap();
+                }
             }));
         }
         for writer in writers {
@@ -118,17 +147,220 @@ mod unix {
         assert_eq!(process.wait().await.unwrap(), 0);
         assert_eq!(process.wait().await.unwrap(), 0);
         let output = reader.await.unwrap();
+        assert!(output.ends_with(b"\n"));
+        assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 32);
         let frames = output
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(frames.len(), 32);
+        for frame in &frames {
+            let index = frame["index"].as_u64().unwrap() as usize;
+            assert_eq!(
+                frame,
+                &serde_json::json!({
+                    "index": index,
+                    "text": "한글\nquoted \"text\"".repeat(128 * (index + 1)),
+                }),
+            );
+        }
         let indices = frames
             .iter()
             .map(|frame| frame["index"].as_u64().unwrap())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(indices.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn close_stdin_waits_for_json_writers_queued_for_scratch() {
+        let (process, stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
+        let stdin = process.stdin.lock().await;
+        let one = serde_json::json!({"order":1});
+        let two = serde_json::json!({"order":2});
+        let mut first = Box::pin(process.write_json(&one));
+        let mut second = Box::pin(process.write_json(&two));
+        let mut close = Box::pin(process.close_stdin());
+        assert!(futures_util::poll!(first.as_mut()).is_pending());
+        assert!(futures_util::poll!(second.as_mut()).is_pending());
+        assert!(futures_util::poll!(close.as_mut()).is_pending());
+        drop(stdin);
+        let (first, second, close) = tokio::time::timeout(
+            Duration::from_secs(5),
+            async { tokio::join!(first, second, close) },
+        ).await.unwrap();
+        first.unwrap();
+        second.unwrap();
+        close.unwrap();
+        let mut output = String::new();
+        BufReader::new(stdout).read_to_string(&mut output).await.unwrap();
+        assert_eq!(output, "{\"order\":1}\n{\"order\":2}\n");
+        assert_eq!(process.wait().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn json_frame_reuse_preserves_exact_bytes_and_discards_oversized_storage() {
+        let (process, mut stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
+        let reader = tokio::spawn(async move {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).await.unwrap();
+            output
+        });
+        let values = [
+            serde_json::json!({"large": "한글\n\"".repeat(4096)}),
+            serde_json::json!({"small": [false, null, 1]}),
+            serde_json::json!({"oversized": "x".repeat(JSON_FRAME_RETAIN_LIMIT + 1)}),
+            serde_json::json!(""),
+            serde_json::json!({}),
+        ];
+        let mut expected = Vec::new();
+        let mut retained_capacity = 0;
+        for (index, value) in values.iter().enumerate() {
+            serde_json::to_writer(&mut expected, value).unwrap();
+            expected.push(b'\n');
+            if index % 2 == 0 {
+                process.write_json(value).await.unwrap();
+            } else {
+                process.write_json_with_deadline(
+                    value, None, &CancellationToken::new(),
+                ).await.unwrap();
+            }
+            let storage = process.json_frame.try_lock().expect("write must release storage");
+            assert!(storage.is_empty());
+            assert!(storage.capacity() <= JSON_FRAME_RETAIN_LIMIT);
+            match index {
+                0 => {
+                    assert!(storage.capacity() > 0);
+                    retained_capacity = storage.capacity();
+                }
+                1 => assert_eq!(storage.capacity(), retained_capacity),
+                2 => assert_eq!(storage.capacity(), 0),
+                _ => {}
+            }
+        }
+        process.close_stdin().await.unwrap();
+        assert_eq!(reader.await.unwrap(), expected);
+        assert_eq!(process.wait().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn stopped_json_scratch_waiters_leave_active_work_healthy() {
+        let (process, stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
+        let stdin = process.stdin.lock().await;
+        let active_value = serde_json::json!({"active": true});
+        let active = process.write_json(&active_value);
+        tokio::pin!(active);
+        tokio::select! {
+            biased;
+            result = &mut active => panic!("active write must wait for stdin: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert!(process.json_frame.try_lock().is_err());
+
+        let waiting_value = serde_json::json!({"discarded": "x".repeat(JSON_FRAME_RETAIN_LIMIT + 1)});
+        for cancelled in [true, false] {
+            let cancel = CancellationToken::new();
+            let deadline = (!cancelled).then(|| {
+                tokio::time::Instant::now() + Duration::from_secs(60)
+            });
+            let waiting = process.write_json_with_deadline(&waiting_value, deadline, &cancel);
+            tokio::pin!(waiting);
+            tokio::select! {
+                biased;
+                result = &mut waiting => panic!("write must wait for scratch: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if cancelled {
+                cancel.cancel();
+            } else {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(60)).await;
+            }
+            let error = waiting.await.unwrap_err();
+            if !cancelled {
+                tokio::time::resume();
+            }
+            let error = error.downcast_ref::<WriteError>().unwrap();
+            assert!(!error.attempted);
+            assert_eq!(error.written, 0);
+            assert_eq!(error.total, 0);
+            assert_eq!(
+                error.source.kind(),
+                if cancelled {
+                    std::io::ErrorKind::Interrupted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                },
+            );
+            assert!(process.json_frame.try_lock().is_err());
+            assert!(!process.control.stopping.is_cancelled());
+        }
+        drop(stdin);
+        active.await.unwrap();
+        process.write_json(&serde_json::json!({"next": true})).await.unwrap();
+        process.close_stdin().await.unwrap();
+        let mut output = String::new();
+        BufReader::new(stdout).read_to_string(&mut output).await.unwrap();
+        assert_eq!(output, "{\"active\":true}\n{\"next\":true}\n");
+        assert_eq!(process.wait().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_json_waiting_for_stdin_discards_scratch_without_stopping() {
+        let (process, stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
+        let stdin = process.stdin.lock().await;
+        let value = serde_json::json!({"discarded": "x".repeat(JSON_FRAME_RETAIN_LIMIT + 1)});
+        let mut write = Box::pin(process.write_json(&value));
+        tokio::select! {
+            biased;
+            result = &mut write => panic!("write must wait for stdin: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert!(process.json_frame.try_lock().is_err());
+        drop(write);
+        {
+            let storage = process.json_frame.try_lock().expect("drop must release storage");
+            assert!(storage.is_empty());
+            assert_eq!(storage.capacity(), 0);
+        }
+        assert!(!process.control.stopping.is_cancelled());
+        drop(stdin);
+        process.write_json(&serde_json::json!({"next": true})).await.unwrap();
+        process.close_stdin().await.unwrap();
+        let mut output = String::new();
+        BufReader::new(stdout).read_to_string(&mut output).await.unwrap();
+        assert_eq!(output, "{\"next\":true}\n");
+        assert_eq!(process.wait().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_json_scratch_waiters_before_encoding() {
+        let (process, _stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
+        let storage = process.json_frame.lock().await;
+        let cancel = CancellationToken::new();
+        let value = serde_json::json!({"discarded": true});
+        let waiting = process.write_json_with_deadline(&value, None, &cancel);
+        tokio::pin!(waiting);
+        tokio::select! {
+            biased;
+            result = &mut waiting => panic!("write must wait for scratch: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        // Tree termination must bypass scratch even while a writer waits for it.
+        process.terminate(Duration::ZERO).await.unwrap();
+        cancel.cancel();
+        for error in [
+            waiting.await.unwrap_err(),
+            process.write_json(&value).await.unwrap_err(),
+        ] {
+            let error = error.downcast_ref::<WriteError>().unwrap();
+            assert!(!error.attempted);
+            assert_eq!(error.written, 0);
+            assert_eq!(error.total, 0);
+            assert_eq!(error.source.kind(), std::io::ErrorKind::Interrupted);
+        }
+        assert!(storage.is_empty());
+        assert_eq!(storage.capacity(), 0);
     }
 
     #[tokio::test]
@@ -256,7 +488,7 @@ mod unix {
         let (process, stdout) = ManagedProcess::spawn(shell("cat")).await.unwrap();
         let guard = process.stdin.lock().await;
         let cancel = CancellationToken::new();
-        let value = serde_json::json!({"cancelled": true});
+        let value = serde_json::json!({"cancelled": "x".repeat(JSON_FRAME_RETAIN_LIMIT + 1)});
         let write = process.write_json_with_deadline(&value, None, &cancel);
         tokio::pin!(write);
         tokio::select! {
@@ -269,6 +501,12 @@ mod unix {
         let error = error.downcast_ref::<WriteError>().unwrap();
         assert!(!error.attempted);
         assert_eq!(error.source.kind(), std::io::ErrorKind::Interrupted);
+        assert!(error.total > JSON_FRAME_RETAIN_LIMIT);
+        {
+            let storage = process.json_frame.try_lock().expect("cancellation must release storage");
+            assert!(storage.is_empty());
+            assert_eq!(storage.capacity(), 0);
+        }
         drop(guard);
         process.write_bytes(b"new work\n").await.unwrap();
         process.close_stdin().await.unwrap();
@@ -339,8 +577,39 @@ mod unix {
         assert!(error.attempted);
         assert!(error.written > 0 && error.written < error.total, "{error}");
         assert_eq!(error.source.kind(), std::io::ErrorKind::TimedOut);
+        {
+            let storage = process.json_frame.try_lock().expect("failure must release storage");
+            assert!(storage.is_empty());
+            assert_eq!(storage.capacity(), 0);
+        }
         tokio::time::timeout(Duration::from_secs(3), process.wait()).await.unwrap().unwrap();
         let next = process.write_bytes(b"next\n").await.unwrap_err();
+        assert!(!next.downcast_ref::<WriteError>().unwrap().attempted);
+    }
+
+    #[tokio::test]
+    async fn dropped_partial_json_write_discards_scratch_and_stops_child() {
+        let (process, stdout) = ManagedProcess::spawn(shell(
+            "dd bs=1 count=1 of=/dev/null 2>/dev/null; printf 'ready\\n'; exec sleep 30",
+        )).await.unwrap();
+        let value = serde_json::json!({"payload": "x".repeat(8 * 1024 * 1024)});
+        let mut write = Box::pin(process.write_json(&value));
+        let mut lines = BufReader::new(stdout).lines();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                result = &mut write => panic!("write ended before the pipe filled: {result:?}"),
+                line = lines.next_line() => assert_eq!(line.unwrap().as_deref(), Some("ready")),
+            }
+        }).await.unwrap();
+        drop(write);
+        {
+            let storage = process.json_frame.try_lock().expect("drop must release storage");
+            assert!(storage.is_empty());
+            assert_eq!(storage.capacity(), 0);
+        }
+        assert!(process.control.stopping.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), process.wait()).await.unwrap().unwrap();
+        let next = process.write_json(&serde_json::json!({"next": true})).await.unwrap_err();
         assert!(!next.downcast_ref::<WriteError>().unwrap().attempted);
     }
 

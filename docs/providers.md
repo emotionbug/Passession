@@ -43,6 +43,11 @@ Provider helpers that outlive one session belong to the daemon's managed-process
 Rejecting a JSONL request before I/O must not stop a healthy provider process.
 Serialization optimizations must retain the write-attempt distinction and the
 incomplete-frame termination guard; a byte count alone does not prove admission.
+The per-process JSON serialization buffer retains at most 256 KiB of capacity between
+writes; this is a retention limit, not a request-size limit. Oversized buffers are
+released on completion or cancellation. Waiting for shared serialization storage
+must remain shutdown-, cancellation- and deadline-aware. Stdin close waits behind
+already queued JSON writers; partial writes still use the termination guard.
 
 ### OMP host-tool loading
 

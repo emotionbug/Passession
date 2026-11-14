@@ -31,6 +31,7 @@ mod tail;
 use tail::Tail;
 
 const STDERR_LIMIT: usize = 64 * 1024;
+const JSON_FRAME_RETAIN_LIMIT: usize = 256 * 1024;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const FORCE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const FAILURE_GRACE: Duration = Duration::from_millis(200);
@@ -147,6 +148,10 @@ enum Completion {
 pub struct ManagedProcess {
     id: u32,
     stdin: Mutex<Option<ChildStdin>>,
+    // Held through flushing: JSON callers queue before encoding rather than
+    // retaining one serialized frame each. Close queues behind these callers;
+    // raw writes take only stdin and may pass JSON callers waiting here.
+    json_frame: Mutex<Vec<u8>>,
     control: Control,
     completion: watch::Receiver<Option<Completion>>,
     stderr: Arc<StdMutex<Tail>>,
@@ -212,6 +217,7 @@ impl ManagedProcess {
         let process = Arc::new(Self {
             id,
             stdin: Mutex::new(Some(stdin)),
+            json_frame: Mutex::new(Vec::new()),
             control: control.clone(),
             completion,
             stderr: tail.clone(),
@@ -227,9 +233,7 @@ impl ManagedProcess {
     /// Serialize exactly one JSON value followed by LF. The write lock covers
     /// the whole frame, so concurrent provider requests cannot interleave.
     pub async fn write_json(&self, value: &serde_json::Value) -> Result<()> {
-        let mut frame = serde_json::to_vec(value).context("serializing subprocess JSON frame")?;
-        frame.push(b'\n');
-        self.write_bytes(&frame).await
+        self.write_json_controlled(value, None, None).await
     }
 
     /// Use one caller-owned deadline for lock admission, the complete frame and
@@ -241,20 +245,45 @@ impl ManagedProcess {
         deadline: Option<Instant>,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let stopped = self.control.stopping.is_cancelled()
-            || cancel.is_cancelled()
-            || deadline.is_some_and(|deadline| deadline <= Instant::now());
-        if stopped {
-            return Err(WriteError {
-                attempted: false,
-                written: 0,
-                total: 0,
-                source: write_stopped(&self.control.stopping, Some(cancel), deadline).await,
-            }.into());
-        }
-        let mut frame = serde_json::to_vec(value).context("serializing subprocess JSON frame")?;
-        frame.push(b'\n');
-        self.write_bytes_controlled(&frame, deadline, Some(cancel)).await
+        self.write_json_controlled(value, deadline, Some(cancel)).await
+    }
+
+    async fn write_json_controlled(
+        &self,
+        value: &serde_json::Value,
+        deadline: Option<Instant>,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<()> {
+        let mut frame = {
+            let stopped = write_stopped(&self.control.stopping, cancel, deadline);
+            tokio::pin!(stopped);
+            let bytes = tokio::select! {
+                biased;
+                source = &mut stopped => return Err(WriteError {
+                    attempted: false, written: 0, total: 0, source,
+                }.into()),
+                bytes = self.json_frame.lock() => bytes,
+            };
+            let frame = JsonFrame { bytes };
+            let rejected = self.control.stopping.is_cancelled()
+                || cancel.is_some_and(CancellationToken::is_cancelled)
+                || deadline.is_some_and(|deadline| deadline <= Instant::now());
+            if rejected {
+                return Err(WriteError {
+                    attempted: false,
+                    written: 0,
+                    total: 0,
+                    source: stopped.await,
+                }.into());
+            }
+            frame
+        };
+        frame.bytes.clear();
+        frame.bytes.reserve(128);
+        serde_json::to_writer(&mut *frame.bytes, value)
+            .context("serializing subprocess JSON frame")?;
+        frame.bytes.push(b'\n');
+        self.write_bytes_controlled(&frame.bytes, deadline, cancel).await
     }
 
     /// Writes all bytes asynchronously. If this future is dropped during I/O,
@@ -355,9 +384,10 @@ impl ManagedProcess {
         Ok(())
     }
 
-    /// Close after all preceding writes, delivering EOF. Every successful write
-    /// has already flushed the platform adapter before releasing the lock.
+    /// Close after already-queued JSON and stdin writes, delivering EOF.
+    /// Successful writes flush the platform adapter before releasing stdin.
     pub async fn close_stdin(&self) -> Result<()> {
+        let _frame = self.json_frame.lock().await;
         self.stdin.lock().await.take();
         Ok(())
     }
@@ -446,6 +476,20 @@ impl ManagedProcess {
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
         self.control.force();
+    }
+}
+
+struct JsonFrame<'a> {
+    bytes: MutexGuard<'a, Vec<u8>>,
+}
+
+impl Drop for JsonFrame<'_> {
+    fn drop(&mut self) {
+        if self.bytes.capacity() > JSON_FRAME_RETAIN_LIMIT {
+            *self.bytes = Vec::new();
+        } else {
+            self.bytes.clear();
+        }
     }
 }
 
