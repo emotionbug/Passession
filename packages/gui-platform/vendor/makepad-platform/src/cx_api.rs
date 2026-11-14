@@ -307,9 +307,9 @@ impl Cx {
     /// Publish the focused native editor. Selection offsets are UTF-8 bytes. Android
     /// mirrors it in the input method; Windows composes into it inline.
     pub fn update_text_input(&mut self, _area: Area, _editor: u64, _text: &str, _start: usize,
-        _end: usize, _password: bool, _numeric: bool) {
+        _end: usize, _password: bool, _numeric: bool, _single_line: bool) {
         #[cfg(target_os = "android")]
-        self.android_update_text_input(_area, _editor, _text, _start, _end, _password, _numeric, false);
+        self.android_update_text_input(_area, _editor, _text, _start, _end, _password, _numeric, false, _single_line);
         #[cfg(target_os = "windows")]
         self.windows_update_text_input(_area, _editor, _text, _start, _end);
     }
@@ -319,7 +319,7 @@ impl Cx {
     pub fn update_terminal_text_input(&mut self, _area: Area, _editor: u64, _text: &str, _start: usize,
         _end: usize) {
         #[cfg(target_os = "android")]
-        self.android_update_text_input(_area, _editor, _text, _start, _end, false, false, true);
+        self.android_update_text_input(_area, _editor, _text, _start, _end, false, false, true, false);
         #[cfg(target_os = "windows")]
         self.windows_update_text_input(_area, _editor, _text, _start, _end);
     }

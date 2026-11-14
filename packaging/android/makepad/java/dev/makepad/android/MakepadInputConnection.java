@@ -23,6 +23,7 @@ import java.util.function.BooleanSupplier;
 final class MakepadInputConnection extends BaseInputConnection {
     private final MakepadSurface view;
     private long session;
+    private final boolean singleLine;
     private final Editable editable;
     private long revision;
     private int batchDepth;
@@ -32,10 +33,12 @@ final class MakepadInputConnection extends BaseInputConnection {
     private int sentStart, sentEnd, sentComposeStart = -1, sentComposeEnd = -1;
     private ExtractedTextRequest extractedRequest;
 
-    MakepadInputConnection(MakepadSurface view, long session, String text, int start, int end) {
+    MakepadInputConnection(MakepadSurface view, long session, String text, int start, int end,
+                           boolean singleLine) {
         super(view, true);
         this.view = view;
         this.session = session;
+        this.singleLine = singleLine;
         editable = new SpannableStringBuilder(text);
         Selection.setSelection(editable, start, end);
         sentText = text;
@@ -47,7 +50,7 @@ final class MakepadInputConnection extends BaseInputConnection {
         publish();
         // A framework restart closes the old connection. Never hand it out again.
         MakepadInputConnection next = new MakepadInputConnection(view, session,
-            editable.toString(), Selection.getSelectionStart(editable), Selection.getSelectionEnd(editable));
+            editable.toString(), Selection.getSelectionStart(editable), Selection.getSelectionEnd(editable), singleLine);
         next.revision = revision;
         int start = getComposingSpanStart(editable), end = getComposingSpanEnd(editable);
         if (!closed && start >= 0 && end >= start) next.restoreComposition(start, end);
@@ -75,9 +78,9 @@ final class MakepadInputConnection extends BaseInputConnection {
                 : InputType.TYPE_NUMBER_FLAG_DECIMAL)
             : InputType.TYPE_CLASS_TEXT | (password ? InputType.TYPE_TEXT_VARIATION_PASSWORD
                 : terminal ? InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                : InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+                : singleLine ? 0 : InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
         info.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_EXTRACT_UI
-            | EditorInfo.IME_ACTION_NONE;
+            | (singleLine ? EditorInfo.IME_ACTION_DONE : EditorInfo.IME_ACTION_NONE);
         info.initialSelStart = Selection.getSelectionStart(editable);
         info.initialSelEnd = Selection.getSelectionEnd(editable);
         if (android.os.Build.VERSION.SDK_INT >= 30) info.setInitialSurroundingText(editable);
@@ -112,6 +115,14 @@ final class MakepadInputConnection extends BaseInputConnection {
     }
     @Override public boolean commitText(CharSequence text, int cursor) {
         return edit(() -> super.commitText(text, cursor));
+    }
+    @Override public boolean performEditorAction(int action) {
+        if (closed || !singleLine || action != EditorInfo.IME_ACTION_DONE) return false;
+        // Publish even inside an IME batch: native must see the completed Hangul
+        // syllable before Enter. Keep commitText as text, including multiline paste.
+        flushBeforeNativeAction();
+        MakepadNative.surfaceOnTextSubmit(session, revision);
+        return true;
     }
     @Override public boolean finishComposingText() {
         return edit(() -> super.finishComposingText());

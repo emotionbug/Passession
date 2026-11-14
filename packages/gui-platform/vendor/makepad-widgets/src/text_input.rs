@@ -1554,7 +1554,7 @@ impl Widget for TextInput {
         if cx.has_key_focus(self.draw_bg.area()) && !self.is_read_only {
             cx.update_text_input(self.draw_bg.area(), self.widget_uid().0, &self.text,
                 self.selection.anchor.index, self.selection.cursor.index,
-                self.is_password, self.is_numeric_only);
+                self.is_password, self.is_numeric_only, false);
             // Desktop input methods draw the composition at the caret, at its height.
             let bg = self.draw_bg.area().rect(cx);
             cx.show_text_ime_caret(
@@ -1629,7 +1629,7 @@ impl Widget for TextInput {
                 self.reset_blink_timer(cx);
                 if !self.is_read_only {
                     cx.update_text_input(area, self.widget_uid().0, &self.text,
-                        self.selection.anchor.index, self.selection.cursor.index, self.is_password, self.is_numeric_only);
+                        self.selection.anchor.index, self.selection.cursor.index, self.is_password, self.is_numeric_only, false);
                 }
                 if action.phase == TextHandlePhase::End { self.open_text_actions(cx); }
             }
@@ -2008,7 +2008,7 @@ impl Widget for TextInput {
         if cx.has_key_focus(self.draw_bg.area()) && !self.is_read_only {
             cx.update_text_input(self.draw_bg.area(), self.widget_uid().0, &self.text,
                 self.selection.anchor.index, self.selection.cursor.index,
-                self.is_password, self.is_numeric_only);
+                self.is_password, self.is_numeric_only, false);
         }
     }
 }

@@ -143,6 +143,9 @@ fn home_of(requested: &str, absolute: &str) -> Option<String> {
     if rest == "." {
         return Some(absolute.to_owned());
     }
+    if rest.split('/').any(|segment| segment == "..") {
+        return None;
+    }
     let style = Style::of(absolute);
     let mut home = absolute.to_owned();
     for _ in rest.split('/') {
@@ -154,6 +157,14 @@ fn home_of(requested: &str, absolute: &str) -> Option<String> {
     }
     let suffix = style.relative(absolute, &home);
     (suffix.replace('\\', "/") == rest).then_some(home)
+}
+
+/// Expand only the host-home alias; never consult the client's environment or resolve symlinks.
+fn expand_home(path: &str, home: Option<&str>) -> Option<String> {
+    let rest = if path == "~" { "" } else { path.strip_prefix("~/")? };
+    let home = home?;
+    let style = Style::of(home);
+    Some(style.normalize(&style.join(home, rest)))
 }
 
 /// One visible row of the flattened tree.
@@ -365,6 +376,8 @@ impl ExplorerState {
         self.path = self.initial_path.clone();
         self.rows.clear();
         self.selected = None;
+        self.home = None;
+        self.cmds.retain(|cmd| !matches!(cmd, ExplorerCmd::List { .. }));
         self.initialized = true;
         if self.preferences.is_some() {
             self.initialize(stored);
@@ -531,7 +544,7 @@ impl ExplorerState {
                 let sort = self.sort;
                 entries.sort_by(|a, b| compare(sort, a, b));
                 self.directories.insert(path.to_owned(), entries.clone());
-                if self.picker && let Some(absolute) = listing.absolute.filter(|absolute| !absolute.is_empty()) {
+                if self.picker && let Some(absolute) = listing.absolute.filter(|absolute| Style::of(absolute).is_absolute(absolute)) {
                     self.adopt_absolute(path, absolute);
                 }
                 self.flatten();
@@ -557,19 +570,25 @@ impl ExplorerState {
         {
             self.home = Some(home);
         }
-        if path != self.path || absolute == path {
-            return;
+        // Resolve history even if the user left before this response arrived. Otherwise Back
+        // can revisit `.` or `~` as a second entry for the same directory.
+        for entry in &mut self.history {
+            if entry == path {
+                *entry = absolute.clone();
+            } else if let Some(resolved) = expand_home(entry, self.home.as_deref()) {
+                *entry = resolved;
+            }
         }
-        if let Some(entries) = self.directories.remove(path) {
-            self.directories.insert(absolute.clone(), entries);
+        if let Some(index) = self.history_index {
+            self.history_index = Some(self.history.windows(2).take(index).filter(|pair| pair[0] != pair[1]).count());
         }
-        if let Some(index) = self.history_index
-            && let Some(entry) = self.history.get_mut(index)
-            && entry == path
-        {
-            *entry = absolute.clone();
+        self.history.dedup();
+        if path == self.path && absolute != path {
+            if let Some(entries) = self.directories.remove(path) {
+                self.directories.insert(absolute.clone(), entries);
+            }
+            self.path = absolute;
         }
-        self.path = absolute;
     }
 
     fn advance_restore(&mut self, path: &str, listed: Option<Vec<Entry>>) {
@@ -665,11 +684,17 @@ impl ExplorerState {
         if path.trim().is_empty() {
             return;
         }
+        let resolved = if self.picker { expand_home(path, self.home()) } else { None };
+        let path = resolved.as_deref().unwrap_or(path);
+        let same_directory = self.picker && self.current_directory() == path;
         self.path = path.to_owned();
         self.selected = None;
         if record_history {
             let same = self.history_index.and_then(|index| self.history.get(index)).is_some_and(|last| last == path);
-            if !same {
+            if same_directory && let Some(index) = self.history_index {
+                self.history[index] = path.to_owned();
+            }
+            if (!same && !same_directory) || self.history_index.is_none() {
                 let keep = self.history_index.map(|index| index + 1).unwrap_or(0);
                 self.history.truncate(keep);
                 self.history.push(path.to_owned());
@@ -715,9 +740,16 @@ impl ExplorerState {
     /// The remote directory currently shown (the picker's selection): absolute once the host
     /// reported it, otherwise the cwd-resolved text path (`~/work` on older hosts).
     pub fn current_directory(&self) -> String {
-        let style = Style::of(&self.path);
-        if style.is_absolute(&self.path) || self.path == "~" || self.path.starts_with("~/") {
-            style.normalize(&self.path)
+        let path = if self.path == "." { &self.cwd } else { &self.path };
+        if let Some(absolute) = expand_home(path, self.home()) {
+            return absolute;
+        }
+        let style = Style::of(path);
+        if path == "~" || path.starts_with("~/") {
+            // An older host has not supplied enough metadata to resolve this alias.
+            path.clone()
+        } else if style.is_absolute(path) {
+            style.normalize(path)
         } else {
             remote_absolute(&self.cwd, &self.path)
         }
@@ -748,7 +780,11 @@ impl ExplorerState {
         }
         let current = self.current_directory();
         let style = Style::of(if Style::of(text) == Style::Windows { text } else { &current });
-        let target = if style.is_absolute(text) || text == "~" || text.starts_with("~/") {
+        let target = if text == "~" || text.starts_with("~/") {
+            // Keep unresolved tilde paths intact for the host, including `~/..`. With a known
+            // home, navigate expands using that home's style (not the current directory's).
+            text.to_owned()
+        } else if style.is_absolute(text) {
             style.normalize(text)
         } else {
             style.normalize(&style.join(&current, text))
@@ -1056,7 +1092,142 @@ mod tests {
         state.go_to("work/../work/src");
         assert_eq!(state.path(), "/home/me/work/src");
         state.go_to("~/x");
-        assert_eq!(state.path(), "~/x");
+        assert_eq!(state.path(), "/home/me/x");
+    }
+
+    #[test]
+    fn picker_known_home_aliases_keep_absolute_location_and_history_while_loading() {
+        let mut state = ExplorerState::new("~", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        answer_absolute(&mut state, &|_| "/home/me".to_owned(), Vec::new());
+        state.go_to("~");
+        assert_eq!(state.path(), "/home/me");
+        assert_eq!(state.current_directory(), "/home/me");
+        assert_eq!(state.history, vec!["/home/me"]);
+        assert!(!state.can_go_back());
+        assert!(state.is_loading("/home/me"));
+        answer_absolute(&mut state, &str::to_owned, Vec::new());
+        state.go_to("~/work");
+        assert_eq!(state.path(), "/home/me/work");
+        answer_absolute(&mut state, &str::to_owned, Vec::new());
+        state.go_to("~");
+        assert_eq!(state.current_directory(), "/home/me");
+        assert_eq!(state.history, vec!["/home/me", "/home/me/work", "/home/me"]);
+        state.back();
+        assert_eq!(state.path(), "/home/me/work");
+        state.forward();
+        assert_eq!(state.path(), "/home/me");
+        state.parent();
+        assert_eq!(state.path(), "/home");
+        state.refresh();
+        assert!(state.refreshing());
+        answer_absolute(&mut state, &str::to_owned, Vec::new());
+        assert!(!state.refreshing());
+        assert_eq!(state.path(), "/home");
+    }
+
+    #[test]
+    fn picker_late_initial_response_resolves_history_without_changing_location() {
+        let mut state = ExplorerState::new("~", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        state.go_to("/home/me");
+        state.go_to("/srv");
+        // Initial `.` resolves after navigation, not while it is the visible location.
+        state.on_listed(".", 0, Ok(Listing { entries: Vec::new(), absolute: Some("/home/me".to_owned()) }));
+        assert_eq!(state.current_directory(), "/srv");
+        assert_eq!(state.history, vec!["/home/me", "/srv"]);
+        assert_eq!(state.history_index, Some(1));
+        state.back();
+        assert_eq!(state.path(), "/home/me");
+        assert!(!state.can_go_back());
+        state.forward();
+        assert_eq!(state.path(), "/srv");
+    }
+
+    #[test]
+    fn picker_initial_absolute_cwd_does_not_add_history_for_same_typed_path() {
+        let mut state = ExplorerState::new("/home/me", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        state.go_to("/home/me");
+        assert_eq!(state.history, vec!["/home/me"]);
+        assert!(!state.can_go_back());
+        answer_absolute(&mut state, &|_| "/home/me".to_owned(), Vec::new());
+        assert_eq!(state.history, vec!["/home/me"]);
+        assert_eq!(state.current_directory(), "/home/me");
+        assert_eq!(state.home(), None);
+        // An absolute cwd is not evidence that this directory is the remote home.
+        state.go_to("~");
+        assert_eq!(state.path(), "~");
+        answer_absolute(&mut state, &|_| "/home/me".to_owned(), Vec::new());
+        assert_eq!(state.history, vec!["/home/me"]);
+        assert!(!state.can_go_back());
+    }
+
+    #[test]
+    fn picker_reset_discards_home_and_old_responses() {
+        let mut state = ExplorerState::new("~", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        answer_absolute(&mut state, &|_| "/home/old".to_owned(), Vec::new());
+        state.go_to("~/pending");
+        state.reset_cwd("/srv/new", &json!({}));
+        assert_eq!(state.home(), None);
+        assert_eq!(state.current_directory(), "/srv/new");
+        assert_eq!(state.cmds.len(), 1);
+        state.on_listed("~/pending", 0, Ok(Listing { entries: Vec::new(), absolute: Some("/home/old/pending".to_owned()) }));
+        assert_eq!(state.home(), None);
+        state.go_to("~");
+        assert_eq!(state.current_directory(), "~");
+        answer_absolute(&mut state, &|path| if path == "." { "/srv/new" } else { "/users/new" }.to_owned(), Vec::new());
+        assert_eq!(state.home(), Some("/users/new"));
+        assert_eq!(state.current_directory(), "/users/new");
+    }
+
+    #[test]
+    fn picker_home_expansion_uses_remote_windows_and_unc_style() {
+        for home in ["C:\\Users\\me", "\\\\server\\share\\me"] {
+            let mut state = ExplorerState::new("~", ".", true, None, &json!({}));
+            state.start(&json!({}));
+            answer_absolute(&mut state, &|_| home.to_owned(), Vec::new());
+            state.go_to("~");
+            assert_eq!(state.history, vec![home]);
+            state.go_to("~/work");
+            assert_eq!(state.path(), format!("{home}\\work"));
+            assert_eq!(state.current_directory(), format!("{home}\\work"));
+            state.parent();
+            assert_eq!(state.path(), home);
+            state.go_to("~/..");
+            assert_eq!(state.path(), Style::Windows.dirname(home));
+        }
+    }
+
+    #[test]
+    fn picker_keeps_host_reported_symlink_spelling() {
+        let mut state = ExplorerState::new("~/linked", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        answer_absolute(&mut state, &|_| "/home/me/linked".to_owned(), Vec::new());
+        assert_eq!(state.current_directory(), "/home/me/linked");
+        assert_eq!(state.home(), Some("/home/me"));
+        state.go_to("~/linked");
+        assert_eq!(state.history, vec!["/home/me/linked"]);
+        assert_eq!(state.child_directory(&Entry::from_json(&entry("child", "child", "directory"))), "/home/me/linked/child");
+    }
+
+    #[test]
+    fn picker_unresolved_parent_alias_is_not_a_fake_absolute_directory_or_home() {
+        let mut state = ExplorerState::new("~/..", ".", true, None, &json!({}));
+        state.start(&json!({}));
+        assert_eq!(state.current_directory(), "~/..");
+        state.on_listed(".", 0, Ok(Listing { entries: Vec::new(), absolute: Some("relative".to_owned()) }));
+        assert_eq!(state.current_directory(), "~/..");
+        assert_eq!(state.home(), None);
+        state.go_to("~");
+        assert_eq!(state.path(), "~");
+        state.go_to("~/..");
+        assert_eq!(state.path(), "~/..");
+        answer_absolute(&mut state, &|path| if path == "~" { "/home/me" } else { "/home" }.to_owned(), Vec::new());
+        assert_eq!(state.current_directory(), "/home");
+        assert_eq!(state.home(), Some("/home/me"));
+        assert_eq!(home_of("~/..", "/home"), None);
     }
 
     #[test]

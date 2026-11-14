@@ -257,6 +257,22 @@ impl Cx {
                     self.os.text_input.processing = false;
                 }
             }
+            FromJavaMessage::TextSubmit { session, revision } => {
+                // The UI thread queues the final composition snapshot first. A delayed
+                // action must not submit another editor or a newer native selection.
+                if self.os.text_input.single_line
+                    && session == self.os.text_input.session
+                    && revision == self.os.text_input.revision
+                    && self.has_key_focus(self.os.text_input.area)
+                {
+                    let event = Event::KeyDown(KeyEvent {
+                        key_code: KeyCode::ReturnKey,
+                        time: self.os.timers.time_now(),
+                        ..Default::default()
+                    });
+                    self.call_event_handler(&event);
+                }
+            }
             FromJavaMessage::TextAction { token, action, text } => {
                 self.android_text_action(token, action, text);
             }
@@ -1049,6 +1065,66 @@ pub(crate) struct AndroidTextInput {
     numeric: bool,
     /// Terminal editors ask for no auto-capitalization, suggestions or autocorrect.
     terminal: bool,
+    single_line: bool,
+}
+
+#[cfg(test)]
+mod android_ime_submit_tests {
+    use super::*;
+    use crate::area::{Area, RectArea};
+    use crate::event::TextImeEvent;
+
+    #[test]
+    fn submit_requires_current_single_line_editor_and_flushed_revision() {
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let events = received.clone();
+        let mut cx = Cx::new(Box::new(move |_, event| {
+            match event {
+                Event::TextIme(edit) => events.borrow_mut().push(edit.text.clone()),
+                Event::KeyDown(key) if key.key_code == KeyCode::ReturnKey => {
+                    events.borrow_mut().push("submit".into());
+                }
+                _ => {}
+            }
+        }));
+        cx.os_type = OsType::Android(crate::cx::AndroidParams {
+            cache_path: String::new(),
+            density: 1.0,
+            is_emulator: true,
+            has_xr_mode: false,
+            android_version: String::new(),
+            build_number: String::new(),
+            kernel_version: String::new(),
+        });
+        let list = cx.draw_lists.alloc();
+        let area = Area::Rect(RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 1 });
+        cx.keyboard.set_key_focus(area);
+        cx.keyboard.cycle_key_focus_changed();
+        cx.os.text_input = AndroidTextInput {
+            area, session: 7, single_line: true, ..Default::default()
+        };
+        let submit = |session, revision| FromJavaMessage::TextSubmit { session, revision };
+        // Future/unflushed text cannot be submitted.
+        cx.handle_message(submit(7, 1));
+        assert!(received.borrow().is_empty());
+        cx.handle_message(FromJavaMessage::TextEdit(TextImeEvent {
+            session: 7, revision: 1, text: "/home/한".into(),
+            selection_start: 7, selection_end: 7, composing: None,
+        }));
+        cx.handle_message(submit(6, 1));
+        cx.handle_message(submit(7, 0));
+        cx.os.text_input.single_line = false;
+        cx.handle_message(submit(7, 1));
+        cx.os.text_input.single_line = true;
+        cx.keyboard.set_key_focus(Area::Empty);
+        cx.keyboard.cycle_key_focus_changed();
+        cx.handle_message(submit(7, 1));
+        assert_eq!(&*received.borrow(), &["/home/한"]);
+        cx.keyboard.set_key_focus(area);
+        cx.keyboard.cycle_key_focus_changed();
+        cx.handle_message(submit(7, 1));
+        assert_eq!(&*received.borrow(), &["/home/한", "submit"]);
+    }
 }
 
 impl Cx {
@@ -1151,7 +1227,8 @@ impl Cx {
     }
 
     pub(crate) fn android_update_text_input(&mut self, area: crate::area::Area,
-        editor: u64, text: &str, start: usize, end: usize, password: bool, numeric: bool, terminal: bool) {
+        editor: u64, text: &str, start: usize, end: usize, password: bool, numeric: bool,
+        terminal: bool, single_line: bool) {
         if !area.is_valid(self) || !self.has_key_focus(area) { return; }
         self.os.ime_blur_pending = false;
         let editor_changed = self.os.text_input.area != area || self.os.text_input.editor != editor;
@@ -1162,9 +1239,9 @@ impl Cx {
         let state = &mut self.os.text_input;
         if state.area == area && state.editor == editor && state.text == text && state.selection == (start, end)
             && state.password == password && state.numeric == numeric && state.terminal == terminal
-            && !state.processing { return; }
+            && state.single_line == single_line && !state.processing { return; }
         let restart = editor_changed || state.password != password || state.numeric != numeric
-            || state.terminal != terminal;
+            || state.terminal != terminal || state.single_line != single_line;
         if restart || !state.processing {
             state.session += 1;
             state.revision = 0;
@@ -1177,9 +1254,10 @@ impl Cx {
         state.password = password;
         state.numeric = numeric;
         state.terminal = terminal;
+        state.single_line = single_line;
         unsafe { android_jni::to_java_text_input(state.session, state.revision, Some(text),
             text[..start].encode_utf16().count(), text[..end].encode_utf16().count(),
-            password, numeric, terminal, restart); }
+            password, numeric, terminal, single_line, restart); }
     }
 
     pub(crate) fn android_clear_text_input(&mut self, area: crate::area::Area) {
@@ -1190,7 +1268,7 @@ impl Cx {
         state.session += 1;
         state.revision = 0;
         state.text.clear();
-        unsafe { android_jni::to_java_text_input(state.session, 0, None, 0, 0, false, false, false, true); }
+        unsafe { android_jni::to_java_text_input(state.session, 0, None, 0, 0, false, false, false, false, true); }
     }
 }
 

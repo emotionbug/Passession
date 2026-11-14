@@ -51,6 +51,7 @@ pub enum FromJavaMessage {
     },
     Touch { touches: Vec<TouchPoint>, cancelled: bool },
     TextEdit(crate::event::TextImeEvent),
+    TextSubmit { session: u64, revision: u64 },
     TextAction { token: u64, action: u32, text: Option<String> },
     Character {
         character: u32,
@@ -536,6 +537,19 @@ unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTextEdit(
     }));
 }
 
+#[no_mangle]
+extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTextSubmit(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jobject,
+    session: jni_sys::jlong,
+    revision: jni_sys::jlong,
+) {
+    send_from_java_message(FromJavaMessage::TextSubmit {
+        session: session as u64,
+        revision: revision as u64,
+    });
+}
+
 unsafe fn editor_text_from_java(env: *mut jni_sys::JNIEnv, text: jni_sys::jstring) -> Option<String> {
     if text.is_null() { return None; }
     // JNI modified UTF-8 cannot preserve emoji or embedded NUL.
@@ -560,7 +574,7 @@ unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTextAction(
 }
 
 pub unsafe fn to_java_text_input(session: u64, revision: u64, text: Option<&str>,
-    start: usize, end: usize, password: bool, numeric: bool, terminal: bool, restart: bool) {
+    start: usize, end: usize, password: bool, numeric: bool, terminal: bool, single_line: bool, restart: bool) {
     let env = attach_jni_env();
     let string = if let Some(text) = text {
         let utf16: Vec<u16> = text.encode_utf16().collect();
@@ -569,9 +583,9 @@ pub unsafe fn to_java_text_input(session: u64, revision: u64, text: Option<&str>
         std::ptr::null_mut()
     };
     ndk_utils::call_void_method!(env, get_activity(), "updateTextInput",
-        "(JJLjava/lang/String;IIZZZZ)V", session as i64, revision as i64,
+        "(JJLjava/lang/String;IIZZZZZ)V", session as i64, revision as i64,
         string, start as i32, end as i32, password as i32, numeric as i32, terminal as i32,
-        restart as i32);
+        single_line as i32, restart as i32);
     if !string.is_null() { (**env).DeleteLocalRef.unwrap()(env, string); }
 }
 

@@ -31,6 +31,7 @@ public class MakepadNative {
     // Paseo: positions are UTF-16 code units, not Rust UTF-8 byte offsets.
     public native static void surfaceOnTextEdit(long session, long revision, String text,
         int selectionStart, int selectionEnd, int composingStart, int composingEnd);
+    public native static void surfaceOnTextSubmit(long session, long revision);
     // Paseo: token is the native selection owner, not the IME session.
     public native static void surfaceOnTextAction(long token, int action, String text);
     public native static void surfaceOnResizeTextIME(int keyboard_height, boolean is_open);

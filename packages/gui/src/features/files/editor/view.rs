@@ -690,7 +690,7 @@ impl SourceEditor {
             // Keep KeyboardView avoidance local to the caret, not the entire pane.
             cx.add_aligned_rect_area(&mut self.ime_caret_area, caret);
             cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
-                self.buffer.selection.anchor, self.buffer.selection.head, false, false);
+                self.buffer.selection.anchor, self.buffer.selection.head, false, false, false);
             cx.show_text_ime_caret(self.ime_caret_area, Rect { pos: dvec2(0.0, 0.0), size: caret.size });
         }
         if self.focused && !self.handles.as_ref().is_some_and(TextSelectionHandles::is_dragging)
@@ -804,7 +804,7 @@ impl SourceEditor {
             self.blink.restart(cx);
             if !self.read_only {
                 cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
-                    self.buffer.selection.anchor, self.buffer.selection.head, false, false);
+                    self.buffer.selection.anchor, self.buffer.selection.head, false, false, false);
             }
             self.show_actions = action.phase == TextHandlePhase::End && cfg!(target_os = "android");
         }
@@ -1043,7 +1043,7 @@ impl SourceEditor {
         }
         if self.focused && !self.read_only {
             cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
-                self.buffer.selection.anchor, self.buffer.selection.head, false, false);
+                self.buffer.selection.anchor, self.buffer.selection.head, false, false, false);
         }
         result
     }

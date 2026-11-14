@@ -170,7 +170,7 @@ impl TextField {
             // caret position. Using the owner area would pan the whole file pane.
             cx.add_aligned_rect_area(&mut self.ime_caret_area, caret);
             cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
-                sel.anchor, sel.head, false, false);
+                sel.anchor, sel.head, false, false, true);
             cx.show_text_ime_caret(self.ime_caret_area, Rect { pos: dvec2(0.0, 0.0), size: caret.size });
         } else {
             self.blink.disarm(cx);
@@ -236,7 +236,7 @@ impl TextField {
             self.scroll_follows_anchor = action.endpoint == TextHandleEndpoint::Anchor;
             self.blink.restart(cx);
             cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
-                self.buffer.selection.anchor, self.buffer.selection.head, false, false);
+                self.buffer.selection.anchor, self.buffer.selection.head, false, false, true);
             self.show_actions = action.phase == TextHandlePhase::End && cfg!(target_os = "android");
         }
         true
@@ -407,7 +407,7 @@ impl TextField {
         }
         if self.focused {
             cx.update_text_input(self.ime_area, self.ime_id, self.buffer.text(),
-                self.buffer.selection.anchor, self.buffer.selection.head, false, false);
+                self.buffer.selection.anchor, self.buffer.selection.head, false, false, true);
         }
         event
     }
@@ -416,7 +416,7 @@ impl TextField {
 #[cfg(test)]
 pub(super) mod touch_tests {
     use super::*;
-    use makepad_widgets::makepad_draw::event::TouchUpdateEvent;
+    use makepad_widgets::makepad_draw::event::{TextImeEvent, TouchUpdateEvent};
 
     pub fn down() -> Hit {
         Hit::FingerDown(FingerDownEvent {
@@ -450,6 +450,39 @@ pub(super) mod touch_tests {
             window_id: WindowId(0, 0), time: 0.05, modifiers: KeyModifiers::default(),
             touches: Vec::new(), cancelled: true,
         })
+    }
+    #[test]
+    fn single_line_ime_composition_submits_exact_path_and_paste_stays_text() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut kit = Kit::new(&mut cx);
+        let mut field = TextField::new("/home/");
+        for (revision, text, composing) in [
+            (1, "/home/ㅎ", Some((6, 7))),
+            (2, "/home/한", Some((6, 7))),
+            (3, "/home/한", None),
+        ] {
+            let event = field.handle_hit(&mut cx, &mut kit, &Hit::TextIme(TextImeEvent {
+                session: 1, revision, text: text.into(),
+                selection_start: 7, selection_end: 7, composing,
+            }));
+            assert_ne!(event, FieldEvent::Submitted { shift: false });
+        }
+        // Android editor actions are translated to the same Return as hardware.
+        for key_code in [KeyCode::ReturnKey, KeyCode::NumpadEnter] {
+            assert_eq!(field.handle_hit(&mut cx, &mut kit, &Hit::KeyDown(KeyEvent {
+                key_code, ..Default::default()
+            })), FieldEvent::Submitted { shift: false });
+            assert_eq!(field.text(), "/home/한");
+        }
+        assert_eq!(field.handle_hit(&mut cx, &mut kit, &Hit::TextInput(TextInputEvent {
+            input: "\nnext\r\nline".into(), was_paste: true, replace_last: false,
+        })), FieldEvent::Changed);
+        assert_eq!(field.text(), "/home/한 next  line");
+        assert_eq!(field.handle_hit(&mut cx, &mut kit, &Hit::TextIme(TextImeEvent {
+            session: 1, revision: 4, text: "a\nb".into(),
+            selection_start: 3, selection_end: 3, composing: None,
+        })), FieldEvent::Changed);
+        assert_eq!(field.text(), "a b");
     }
 
     #[test]

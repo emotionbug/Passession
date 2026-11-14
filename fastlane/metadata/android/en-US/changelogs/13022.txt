@@ -1,0 +1,5 @@
+Fixed
+- Remote folder pickers consistently show resolved absolute paths, including when navigating with ~.
+- The Android keyboard's Done key now navigates to the entered folder and dismisses the keyboard instead of inserting a space.
+
+Full notes: https://github.com/emotionbug/Passession/releases

@@ -151,7 +151,10 @@ JNI strings use UTF-16, including supplementary characters; widget offsets remai
 UTF-8. Editor identities distinguish multiple fields sharing one drawn area.
 Session changes fence stale connections; revision acknowledgements cannot replace
 newer IME text. Focused custom editors must publish via `update_text_input` after
-edits and during drawing, and handle `Hit::TextIme` through their own undo model.
+edits and during drawing, declare whether they are single-line, and handle
+`Hit::TextIme` through their own undo model. Single-line editors request Android's
+Done action; it flushes composition before a session/revision-fenced native Enter.
+Committed text, including multiline paste, is never interpreted as an action.
 The focused-area reference follows Makepad redraw area remapping.
 `update_terminal_text_input` publishes the same editor as a terminal kind: the Java
 `EditorInfo` drops `CAP_SENTENCES` and sets `NO_SUGGESTIONS`, so shell input is not

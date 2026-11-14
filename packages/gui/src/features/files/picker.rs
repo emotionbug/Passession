@@ -50,20 +50,14 @@ pub struct Crumb {
     pub path: String,
 }
 
-/// The breadcrumb of a picker directory, outermost first: the root (`/`, `C:`), or `~` for the
-/// host home when the directory lies within it, then one segment per folder. Text paths an
-/// older host has not resolved (`~/work`) start at `~`.
-pub fn breadcrumb(directory: &str, home: Option<&str>) -> Vec<Crumb> {
+/// The breadcrumb of a picker directory, outermost first: the root (`/`, `C:`), then one
+/// segment per folder. Resolved paths never shorten to `~`; only unresolved host aliases do.
+pub fn breadcrumb(directory: &str) -> Vec<Crumb> {
     let style = Style::of(directory);
-    let same = |a: &str, b: &str| match style {
-        Style::Windows => a.eq_ignore_ascii_case(b),
-        Style::Posix => a == b,
-    };
-    let home = home.map(|home| style.normalize(home)).filter(|home| style.is_absolute(home));
-    let mut current = style.normalize(directory);
+    let mut current = if directory.starts_with("~/") { directory.to_owned() } else { style.normalize(directory) };
     let mut crumbs = Vec::new();
     loop {
-        if home.as_deref().is_some_and(|home| same(home, &current)) || current == "~" {
+        if current == "~" {
             crumbs.push(Crumb { label: "~".to_owned(), path: current });
             break;
         }
@@ -230,6 +224,21 @@ impl PickerView {
         self.tips.push((hot, frame));
     }
 
+    /// Adopt a resolved location without overwriting a path the user is currently typing.
+    fn sync_directory(&mut self, directory: &str) {
+        if self.shown == directory {
+            return;
+        }
+        if self.editing && self.field.text() == self.shown {
+            self.field.set_text(directory);
+            self.field.select_all();
+        }
+        self.shown = directory.to_owned();
+        self.scroll_y = 0.0;
+        self.highlight = None;
+        self.more_open = false;
+    }
+
     fn draw(&mut self, cx: &mut Cx2d, kit: &mut Kit, area: Rect, state: &ExplorerState, p: &Palette, ty: &Typography, compact: bool, widget: Area) {
         self.hits.clear();
         self.tips.clear();
@@ -237,12 +246,7 @@ impl PickerView {
         // the frame: open this painter's box batch first.
         kit.painter.new_layer(cx);
         let directory = state.current_directory();
-        if self.shown != directory {
-            self.shown = directory.clone();
-            self.scroll_y = 0.0;
-            self.highlight = None;
-            self.more_open = false;
-        }
+        self.sync_directory(&directory);
         let pad = if compact { 12.0 } else { 16.0 };
         let button = if compact { 40.0 } else { 28.0 };
         let base = ty.ui_size(14.0);
@@ -348,7 +352,7 @@ impl PickerView {
             self.draw_rows(cx, kit, list, state, p, base, pad, compact);
         }
 
-        self.draw_footer(cx, kit, rect(area.pos.x, footer_top, area.size.x, footer_h - occluded), state, &directory, p, ty, compact, pad, action_h);
+        self.draw_footer(cx, kit, rect(area.pos.x, footer_top, area.size.x, footer_h - occluded), &directory, p, ty, compact, pad, action_h);
 
         if self.more_open {
             self.draw_more_menu(cx, kit, area, p, crumb_font, compact);
@@ -357,7 +361,7 @@ impl PickerView {
 
     #[allow(clippy::too_many_arguments)]
     fn draw_breadcrumb(&mut self, cx: &mut Cx2d, kit: &mut Kit, region: Rect, state: &ExplorerState, p: &Palette, font: f64, compact: bool) {
-        self.crumbs = breadcrumb(&state.current_directory(), state.home());
+        self.crumbs = breadcrumb(&state.current_directory());
         let count = self.crumbs.len();
         let separator = 16.0;
         let more_w = if compact { 36.0 } else { 28.0 };
@@ -527,12 +531,12 @@ impl PickerView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_footer(&mut self, cx: &mut Cx2d, kit: &mut Kit, footer: Rect, state: &ExplorerState, directory: &str, p: &Palette, ty: &Typography, compact: bool, pad: f64, action_h: f64) {
+    fn draw_footer(&mut self, cx: &mut Cx2d, kit: &mut Kit, footer: Rect, directory: &str, p: &Palette, ty: &Typography, compact: bool, pad: f64, action_h: f64) {
         let base = ty.ui_size(14.0);
         let small = ty.ui_size(12.0);
         let name_h = (base * 1.4).ceil();
         let path_h = (small * 1.4).ceil();
-        let name = breadcrumb(directory, state.home()).last().map(|crumb| crumb.label.clone()).unwrap_or_else(|| directory.to_owned());
+        let name = breadcrumb(directory).last().map(|crumb| crumb.label.clone()).unwrap_or_else(|| directory.to_owned());
         let choose = t("workspace.folderPicker.choose");
         let cancel = t("workspace.folderPicker.cancel");
         let (text_x, text_w, text_y);
@@ -589,6 +593,8 @@ impl PickerView {
         self.editing = false;
         self.field.clear_selection(cx);
         self.field.focused = false;
+        self.focus_requested = false;
+        cx.hide_text_ime();
     }
 
     fn handle_selection_handles(&mut self, cx: &mut Cx, kit: &mut Kit, event: &Event) -> bool {
@@ -1058,37 +1064,77 @@ mod tests {
 
     #[test]
     fn breadcrumb_segments_from_root() {
-        let crumbs = breadcrumb("/srv/app/data", None);
+        let crumbs = breadcrumb("/srv/app/data");
         assert_eq!(labels(&crumbs), vec!["/", "srv", "app", "data"]);
         assert_eq!(crumbs[0].path, "/");
         assert_eq!(crumbs[2].path, "/srv/app");
-        assert_eq!(labels(&breadcrumb("/", None)), vec!["/"]);
+        assert_eq!(labels(&breadcrumb("/")), vec!["/"]);
     }
 
     #[test]
-    fn breadcrumb_starts_at_home_within_it() {
-        let crumbs = breadcrumb("/home/me/work/paseo", Some("/home/me"));
-        assert_eq!(labels(&crumbs), vec!["~", "work", "paseo"]);
-        assert_eq!(crumbs[0].path, "/home/me");
-        assert_eq!(crumbs[1].path, "/home/me/work");
-        // Outside home (and a sibling sharing its prefix) the root leads.
-        assert_eq!(labels(&breadcrumb("/home/meow", Some("/home/me"))), vec!["/", "home", "meow"]);
-        assert_eq!(labels(&breadcrumb("/home/me", Some("/home/me"))), vec!["~"]);
-        // An older host's unresolved text path.
-        let crumbs = breadcrumb("~/work", None);
+    fn unresolved_breadcrumb_retains_the_host_alias() {
+        let crumbs = breadcrumb("~/work");
         assert_eq!(labels(&crumbs), vec!["~", "work"]);
         assert_eq!(crumbs[1].path, "~/work");
+        let crumbs = breadcrumb("~/..");
+        assert_eq!(labels(&crumbs), vec!["~", ".."]);
+        assert_eq!(crumbs[1].path, "~/..");
+    }
+
+    #[test]
+    fn resolving_a_location_updates_an_untouched_path_field_but_keeps_user_edits() {
+        use serde_json::json;
+
+        let state = ExplorerState::new("~", ".", true, None, &json!({}));
+        let mut view = PickerView::default();
+        view.sync_directory(&state.current_directory());
+        view.begin_edit(&state);
+        view.sync_directory("/home/me");
+        assert_eq!(view.field.text(), "/home/me");
+        view.field.set_text("~/work");
+        view.sync_directory("/home/me/work");
+        assert_eq!(view.field.text(), "~/work");
+    }
+
+    #[test]
+    fn resolved_home_display_and_path_field_do_not_depend_on_open_route() {
+        use super::super::explorer::Listing;
+        use serde_json::json;
+
+        // Each open creates a fresh state, even when reopening a selected absolute directory.
+        for cwd in ["~", "~/work/..", "/home/me"] {
+            let mut state = ExplorerState::new(cwd, ".", true, None, &json!({}));
+            state.start(&json!({}));
+            state.on_listed(".", 0, Ok(Listing { entries: Vec::new(), absolute: Some("/home/me".to_owned()) }));
+            let selected = state.current_directory();
+            assert_eq!(selected, "/home/me");
+            let crumbs = breadcrumb(&selected);
+            assert_eq!(labels(&crumbs), vec!["/", "home", "me"]);
+            assert_eq!(crumbs.last().unwrap().path, selected);
+            assert_eq!(crumbs.last().unwrap().label, "me");
+            let mut view = PickerView::default();
+            view.begin_edit(&state);
+            assert_eq!(view.field.text(), selected);
+            state.refresh();
+            state.on_listed("/home/me", 0, Ok(Listing { entries: Vec::new(), absolute: Some(selected.clone()) }));
+            assert_eq!(breadcrumb(&state.current_directory()), crumbs);
+        }
     }
 
     #[test]
     fn breadcrumb_windows_paths() {
-        let crumbs = breadcrumb("C:\\Users\\me\\src", Some("C:\\Users\\me"));
-        assert_eq!(labels(&crumbs), vec!["~", "src"]);
-        let crumbs = breadcrumb("D:\\data\\logs", Some("C:\\Users\\me"));
+        let crumbs = breadcrumb("C:\\Users\\me\\src");
+        assert_eq!(labels(&crumbs), vec!["C:", "Users", "me", "src"]);
+        assert_eq!(crumbs[2].path, "C:\\Users\\me");
+        let crumbs = breadcrumb("D:\\data\\logs");
         assert_eq!(labels(&crumbs), vec!["D:", "data", "logs"]);
         assert_eq!(crumbs[0].path, "D:\\");
         assert_eq!(crumbs[1].path, "D:\\data");
-        assert_eq!(labels(&breadcrumb("C:\\", None)), vec!["C:"]);
+        assert_eq!(labels(&breadcrumb("C:\\")), vec!["C:"]);
+        let crumbs = breadcrumb("\\\\server\\share\\work");
+        assert_eq!(labels(&crumbs), vec!["\\\\server\\share", "work"]);
+        assert_eq!(crumbs[0].path, "\\\\server\\share\\");
+        assert_eq!(crumbs[1].path, "\\\\server\\share\\work");
     }
 
     #[test]

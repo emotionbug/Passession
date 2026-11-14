@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.22 - 2026-11-14
+
+### Fixed
+
+- Remote folder pickers consistently show host-resolved absolute paths in breadcrumbs, the location field and the selection footer. Known `~` aliases reuse that location without duplicate history; late responses update untouched fields without overwriting edits. Hosts that omit absolute-path metadata retain their unresolved paths rather than guessing the remote home.
+- Android single-line file/location fields use the keyboard's Done action to submit after committing composition, rather than inserting a space. Leaving path editing dismisses the keyboard; pasted text and multiline editors retain their text-input behavior.
+
 ## 0.13.21 - 2026-11-14
 
 ### Fixed

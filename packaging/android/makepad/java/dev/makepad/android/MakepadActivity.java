@@ -437,7 +437,7 @@ class MakepadSurface
     }
 
     void updateTextInput(long session, long revision, String text, int start, int end,
-                         boolean password, boolean numeric, boolean terminal, boolean restart) {
+                         boolean password, boolean numeric, boolean terminal, boolean singleLine, boolean restart) {
         if (session != inputSession) {
             inputSession = session;
             inputPassword = password;
@@ -449,7 +449,7 @@ class MakepadSurface
                 // Do not restart IMM with TYPE_NULL between native fields.
             } else if (restart || inputConnection == null) {
                 if (inputConnection != null) inputConnection.invalidate();
-                inputConnection = new MakepadInputConnection(this, session, text, start, end);
+                inputConnection = new MakepadInputConnection(this, session, text, start, end, singleLine);
                 ((InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE))
                     .restartInput(this);
             } else {
@@ -884,8 +884,8 @@ public class MakepadActivity
     
     // Paseo: JNI runs on Makepad's render thread; Editable and IMM stay on UI.
     public void updateTextInput(long session, long revision, String text, int start, int end,
-                                boolean password, boolean numeric, boolean terminal, boolean restart) {
-        runOnUiThread(() -> view.updateTextInput(session, revision, text, start, end, password, numeric, terminal, restart));
+                                boolean password, boolean numeric, boolean terminal, boolean singleLine, boolean restart) {
+        runOnUiThread(() -> view.updateTextInput(session, revision, text, start, end, password, numeric, terminal, singleLine, restart));
     }
 
     // Paseo: these calls originate on the render thread. The Surface fences

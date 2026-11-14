@@ -10,9 +10,9 @@
   "modified": true,
   "files": {
     "java/dev/makepad/android/ByteArrayMediaDataSource.java": "b807383f5a981d13b1da28445f2ae7c7b6f3bf02ace53f0cd65b25ddcd75e674",
-    "java/dev/makepad/android/MakepadActivity.java": "6e016a840939e3d3998ed6fbfebe9b5ba1a4d37c049469a98b79226633e51ac7",
-    "java/dev/makepad/android/MakepadNative.java": "0c97bad1b5772a6281f256e97e544b3ac577767dac07d50b2a7a6507cc1b5a57",
-    "java/dev/makepad/android/MakepadInputConnection.java": "0a660f68bec64d8f001e34a77bd8f9b8579818064bec7ef121902d9073f6056b",
+    "java/dev/makepad/android/MakepadActivity.java": "751da82eec952193fba71bce68604c7c1a8cd4135b392eeb5e12e06b7a142716",
+    "java/dev/makepad/android/MakepadNative.java": "0ff6266b12d4c013da53ebf63c8ddb196ec0a8fc9a59e5985463987d70e6c5d1",
+    "java/dev/makepad/android/MakepadInputConnection.java": "53fa3965ff96026be944aa6835c9f5604997843cb0fd0087a27fb09e0f6fa9da",
     "java/dev/makepad/android/MakepadNetwork.java": "dddc5bda3038064e9785f994fa5c98b8bced26ef4609a80a12069c3fc425a973",
     "java/dev/makepad/android/MakepadWebSocket.java": "14ca2e7c786e51ef7b14352d5c8caf3a4aba27dd3b55520ac494357e9a98d7fe",
     "java/dev/makepad/android/MakepadWebSocketReader.java": "55a0dbc91b88324408141eb20e2ee7208c2110edb6d970137e9f1c77cceddd66",
