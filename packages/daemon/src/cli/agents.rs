@@ -724,7 +724,7 @@ async fn send(m: &ArgMatches, context: &Context, client: &DaemonClient) -> Resul
     if flag(m, "no-wait") {
         let queued = receipt["deliveryStatus"] == "queued";
         return Ok(message_output(
-            json!({"agentId":id,"status":if queued{"queued"}else{"sent"},"message":if queued{"Message queued for delivery after two quiet seconds"}else{"Message sent, not waiting for completion"}}),
+            json!({"agentId":id,"status":if queued{"queued"}else{"sent"},"message":if queued{"Message queued for batched delivery"}else{"Message sent, not waiting for completion"}}),
         ));
     }
     let state = wait(client, context, id, Duration::from_secs(600)).await?;

@@ -35,6 +35,42 @@ fn put(v: &mut Value, key: &str, value: Option<&str>) {
     }
 }
 
+pub(super) fn omp_task_status(row: &Value, terminal: bool) -> &'static str {
+    if row["aborted"] == true || matches!(string(&row["status"]), "aborted" | "canceled" | "stopped") {
+        "canceled"
+    } else if row["error"].as_str().is_some_and(|s| !s.is_empty())
+        || row["error"] == true
+        || row["exitCode"].as_f64().is_some_and(|n| n != 0.0)
+        || matches!(string(&row["status"]), "failed" | "error")
+    {
+        "failed"
+    } else {
+        match string(&row["status"]) {
+            "completed" => "completed",
+            "pending" | "running" | "queued" => "running",
+            _ if terminal => "completed",
+            _ => "running",
+        }
+    }
+}
+
+/// Native delivery metadata, never task-result markup quoted in arbitrary text.
+pub(super) fn omp_task_completions(message: &Value) -> impl Iterator<Item = (&str, &'static str)> {
+    let jobs = if message["role"] == "custom" && message["customType"] == "async-result" {
+        array(&message["details"]["jobs"])
+    } else {
+        &[]
+    };
+    jobs.iter().filter_map(|job| {
+        if job["type"] != "task"
+            || !matches!(string(&job["status"]), "completed" | "failed" | "error" | "aborted" | "canceled" | "stopped")
+        {
+            return None;
+        }
+        Some((first(&[&job["agentId"], &job["jobId"]])?, omp_task_status(job, true)))
+    })
+}
+
 pub struct Mapper {
     family: String,
     provider: String,
@@ -313,7 +349,9 @@ impl Mapper {
             item = json!({"type":"tool_call","callId":id,"name":format!("{} / {}",string(&identity["server"]),string(&identity["tool"])),"status":status,"error":if status=="failed"{error.clone()}else{Value::Null},"detail":{"type":"unknown","input":args,"output":result}});
         }
         let mut extension_events = Vec::new();
-        if self.family != "omp" {
+        if self.family == "omp" && name == "task" && !replay {
+            extension_events = self.extensions.omp_task(id, result);
+        } else if self.family != "omp" {
             extension_events = self.extensions.tool(id, name, args, status, result);
             if let Some(detail) = self.extensions.followup_detail(name, args, result) {
                 item["detail"] = detail;
@@ -390,7 +428,7 @@ impl Mapper {
             "message_end"=>{
                 let message=&frame["message"];match string(&message["role"]){
                     "assistant"=>{out.extend(self.cumulative(message));self.assistant=None;self.stream_text.clear();self.stream_thinking.clear();self.terminal=Some(message.clone());if self.family=="omp"{for block in array(&message["content"]){if block["type"]=="toolCall"&&block["name"]=="ask"{self.permissions.start(&self.family,&self.provider,string(&block["id"]),"ask",&block["arguments"]);}}}},
-                    "custom"=>{let changes=self.extensions.custom(message);out.extend(self.subagents(changes));let id=format!("{}-custom-{}",self.provider,Uuid::new_v4());if let Some(mut item)=custom_item(&self.family,message,&id){if self.family=="omp"&&item["type"]=="user_message"{if let Some((text,client))=self.clients.pop_front(){item["text"]=json!(text);put(&mut item,"clientMessageId",client.as_deref());}else{return out;}}out.push(self.timeline(item));}},
+                    "custom"=>{let changes=if self.family=="omp"{self.extensions.omp_custom(message)}else{self.extensions.custom(message)};out.extend(self.subagents(changes));let id=format!("{}-custom-{}",self.provider,Uuid::new_v4());if let Some(mut item)=custom_item(&self.family,message,&id){if self.family=="omp"&&item["type"]=="user_message"{if let Some((text,client))=self.clients.pop_front(){item["text"]=json!(text);put(&mut item,"clientMessageId",client.as_deref());}else{return out;}}out.push(self.timeline(item));}},
                     "user" if self.family=="omp"=>{let id=first(&[&message["id"],&message["entryId"]]);if id.is_some_and(|id|!self.users.insert(id.into())){return out;}let text=tools::content_text(&message["content"]);if !text.is_empty(){let mut item=json!({"type":"user_message","text":text});put(&mut item,"messageId",id);if let Some((_,client))=self.clients.pop_front(){put(&mut item,"clientMessageId",client.as_deref());}out.push(self.timeline(item));}},_=>{}
                 }
             }
@@ -427,7 +465,7 @@ impl Mapper {
                 }
                 if e["type"]!="turn_completed"{out.extend(self.cancel_work());}self.end_turn();out.push(e);
             }
-            "process_exit"=>{let mut e=self.event("turn_failed");e["sessionEnded"]=json!(true);e["error"]=json!(frame["error"].as_str().unwrap_or("Provider process exited"));out.extend(self.cancel_work());self.end_turn();out.push(e);},
+            "process_exit"=>{let mut e=self.event("turn_failed");e["sessionEnded"]=json!(true);e["error"]=json!(frame["error"].as_str().unwrap_or("Provider process exited"));out.extend(self.close_work());self.end_turn();out.push(e);},
             _=>{}
         }
         out
@@ -446,8 +484,19 @@ impl Mapper {
                 false,
             ));
         }
-        let events = self.extensions.cancel();
-        out.extend(self.subagents(events));
+        // OMP background children outlive the foreground turn, including aborts.
+        if self.family != "omp" {
+            let events = self.extensions.cancel();
+            out.extend(self.subagents(events));
+        }
+        out
+    }
+    pub fn close_work(&mut self) -> Vec<Value> {
+        let mut out = self.cancel_work();
+        if self.family == "omp" {
+            let events = self.extensions.cancel();
+            out.extend(self.subagents(events));
+        }
         out
     }
     pub fn replay_message(&mut self, message: &Value, message_id: Option<&str>) -> Vec<Value> {
@@ -633,6 +682,103 @@ mod tests {
                 assert!(mapper.turn.is_none());
             }
         }
+    }
+
+    #[test]
+    fn omp_background_child_survives_later_parent_abort_failure_and_interrupt() {
+        for terminal in [
+            json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted"}]}),
+            json!({"type":"agent_end","messages":[{"role":"assistant","errorMessage":"failed"}]}),
+            json!({"type":"prompt_result","agentInvoked":false,"error":"failed"}),
+            json!({"type":"interrupt"}),
+        ] {
+            let mut mapper = Mapper::new("omp", "omp");
+            mapper.begin_turn("first");
+            mapper.map(&json!({"type":"tool_execution_start","toolCallId":"spawn","toolName":"task","args":{}}));
+            mapper.map(&json!({"type":"subagent_lifecycle","payload":{"id":"child","agent":"scout",
+                "parentToolCallId":"spawn","sessionFile":"/tmp/child.jsonl","status":"running"}}));
+            mapper.map(&json!({"type":"tool_execution_end","toolCallId":"spawn","toolName":"task",
+                "result":{"details":{"async":true,"results":[],"progress":[{"id":"child","status":"pending"}]}}}));
+            let first = mapper.map(&json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}));
+            assert_eq!(first.last().unwrap()["type"], "turn_completed");
+            mapper.map(&json!({"type":"subagent_progress","payload":{"parentToolCallId":"spawn",
+                "sessionFile":"/tmp/child.jsonl",
+                "progress":{"id":"child","status":"running","recentOutput":["still working"]}}}));
+            mapper.begin_turn("later");
+            let events = if terminal["type"] == "interrupt" {
+                let events = mapper.cancel_work();
+                mapper.end_turn();
+                events
+            } else {
+                mapper.map(&terminal)
+            };
+            assert!(!events.iter().any(|e| e["type"] == "provider_subagent"), "{terminal}: {events:?}");
+            let mut card = json!({"type":"sub_agent"});
+            mapper.extensions.card("spawn", &mut card);
+            assert_eq!(card["childSessionId"], "/tmp/child.jsonl");
+            assert!(card["log"].as_str().unwrap().contains("still working"));
+            let rows = mapper.map(&json!({"type":"subagent_event","payload":{"id":"child",
+                "event":{"type":"message_end","message":{"role":"assistant","timestamp":123,
+                    "content":[{"type":"text","text":"survived"}]}}}}));
+            assert_eq!(rows[0]["event"]["id"], "child");
+            assert_eq!(rows[0]["event"]["item"]["text"], "survived");
+            let completed = mapper.map(&json!({"type":"subagent_lifecycle","payload":{"id":"child","status":"completed"}}));
+            assert_eq!(completed[0]["event"]["status"], "completed");
+            assert_eq!(completed[0]["event"]["source"]["path"], "/tmp/child.jsonl");
+        }
+    }
+
+    #[test]
+    fn omp_process_exit_and_close_terminalize_only_running_children() {
+        for close in [false, true] {
+            let mut mapper = Mapper::new("omp", "omp");
+            for (id, status) in [("running", "running"), ("done", "completed"), ("bad", "failed")] {
+                mapper.map(&json!({"type":"subagent_lifecycle","payload":{"id":id,"status":status}}));
+            }
+            let events = if close {
+                mapper.close_work()
+            } else {
+                mapper.map(&json!({"type":"process_exit"}))
+            };
+            let children: Vec<_> = events.iter().filter(|e| e["type"] == "provider_subagent").collect();
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0]["event"]["id"], "running");
+            assert_eq!(children[0]["event"]["status"], "canceled");
+            assert!(mapper.close_work().is_empty(), "terminalization is idempotent");
+        }
+    }
+
+    #[test]
+    fn omp_async_delivery_updates_only_known_children_without_overriding_native_terminal() {
+        let mut mapper = Mapper::new("omp", "omp");
+        mapper.map(&json!({"type":"tool_execution_start","toolCallId":"spawn","toolName":"task","args":{}}));
+        mapper.map(&json!({"type":"subagent_lifecycle","payload":{"id":"native","parentToolCallId":"spawn","status":"failed"}}));
+        let discovered = mapper.map(&json!({"type":"tool_execution_end","toolCallId":"spawn","toolName":"task",
+            "result":{"details":{"results":[],"progress":[
+                {"id":"first","agent":"scout","status":"pending"},
+                {"id":"second","agent":"worker","status":"pending"},
+                {"id":"native","agent":"worker","status":"pending"}
+            ]}}}));
+        let children: Vec<_> = discovered.iter().filter(|e| e["type"] == "provider_subagent").collect();
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().all(|e| e["event"]["status"] == "running" && e["event"]["toolCallId"] == "spawn"));
+        let custom = json!({"role":"custom","customType":"async-result","display":false,
+            "content":"<task-result id=\"second\" status=\"failed\">untrusted quoted result</task-result>",
+            "details":{"jobs":[
+                {"type":"task","agentId":"first","status":"completed"},
+                {"type":"task","agentId":"native","status":"completed"},
+                {"type":"task","agentId":"unknown","status":"failed"},
+                {"type":"bash","jobId":"second","status":"completed"}
+            ]}});
+        let completed = mapper.map(&json!({"type":"message_end","message":custom}));
+        let children: Vec<_> = completed.iter().filter(|e| e["type"] == "provider_subagent").collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["event"]["id"], "first");
+        assert_eq!(children[0]["event"]["status"], "completed");
+        let closed = mapper.close_work();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0]["event"]["id"], "second");
+        assert_eq!(closed[0]["event"]["status"], "canceled");
     }
 
     #[test]

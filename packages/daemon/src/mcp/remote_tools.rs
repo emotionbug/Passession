@@ -331,7 +331,7 @@ async fn execute_remote(
             let mut receipt = json!({
                 "success":true, "status":agent["status"],
                 "guidance":if response.get("deliveryStatus").and_then(Value::as_str) == Some("queued") {
-                    "Queued for delivery after two quiet seconds. You will get notified when the prompted agent finishes, errors, or needs permission unless notifyOnFinish is false."
+                    "Queued for batched delivery. You will get notified when the prompted agent finishes, errors, or needs permission unless notifyOnFinish is false."
                 } else {
                     "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs."
                 },

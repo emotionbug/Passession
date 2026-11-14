@@ -1548,7 +1548,14 @@ impl AgentSession for Session {
             Ok(())
         };
         self.inner.assets.lock().unwrap().take();
-        result
+        result?;
+        if self.inner.spec.family == "omp" {
+            // Closing suppresses transport frames, so process_exit cannot settle
+            // children here. A turn interrupt deliberately does not do this.
+            let events = self.inner.state.lock().unwrap().mapper.close_work();
+            self.inner.accept_events(events).await?;
+        }
+        Ok(())
     }
     async fn list_commands(&self) -> Result<Vec<Value>> {
         if let Some(commands) = self.inner.state.lock().unwrap().commands.clone() {

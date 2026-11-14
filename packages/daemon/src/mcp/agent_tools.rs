@@ -50,7 +50,7 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         definition(
             "send_agent_prompt",
             "Send agent prompt",
-            "Send a task. Agent callers receive an immediate queued receipt; delivery follows after two quiet seconds per recipient. Completion reports include the target’s last response by default. Paseo supplies caller identity.",
+            "Send a task. Agent callers receive an immediate queued receipt; prompts are batched per recipient. Completion reports include the target’s last response by default. Paseo supplies caller identity.",
             json!({
                 "agentId":{"type":"string"}, "prompt":{"type":"string"},
                 "sessionMode":{"type":"string","description":"Optional mode to set before running the prompt."},
@@ -95,7 +95,7 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         definition(
             "kill_agent",
             "Kill agent",
-            "Terminate an agent session permanently.",
+            "Close an agent's runtime while retaining its record and history. The agent can be resumed; this does not delete or archive it.",
             id,
             &["agentId"],
         ),
@@ -287,7 +287,7 @@ pub(crate) async fn execute(
                 json!({
                     "success":true, "deliveryStatus":"queued",
                     "messageId":receipt["messageId"], "status":receipt["status"],
-                    "guidance":if notifying { format!("Queued for delivery after two quiet seconds. {PROMPT_NOTIFICATION}") } else { "Queued for delivery after two quiet seconds; provider dispatch has not occurred.".to_owned() }
+                    "guidance":if notifying { format!("Queued for batched delivery (2s quiet window, 10s batching cap). {PROMPT_NOTIFICATION}") } else { "Queued for batched delivery (2s quiet window, 10s batching cap); provider dispatch has not occurred.".to_owned() }
                 })
             } else {
                 let snapshot = app.agents.observe_agent_snapshot(&id).await?;

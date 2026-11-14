@@ -928,10 +928,14 @@ impl AgentManager {
         cancel: CancellationToken,
     ) -> Result<Value> {
         self.authorize(actor, id).await?;
-        if self
-            .agent_snapshot(id)
-            .await?
-            .is_some_and(|snapshot| !snapshot["archivedAt"].is_string())
+        // Start waits retain deliberate provider preparation; finish waits only
+        // observe existing work, including closed agents after recovery.
+        let start_only = options["phase"] == "start";
+        if start_only
+            && self
+                .agent_snapshot(id)
+                .await?
+                .is_some_and(|snapshot| !snapshot["archivedAt"].is_string())
         {
             self.ensure_loaded(id).await?;
         }
@@ -954,7 +958,6 @@ impl AgentManager {
                 .and_then(|v| v.first())
                 .cloned()
                 .unwrap_or(Value::Null);
-            let start_only = options["phase"] == "start";
             if (!start_only && (!is_busy(&snapshot) || !permission.is_null()))
                 || (start_only
                     && (snapshot["activeTurn"].is_object() || snapshot["status"] == "error"))
@@ -1678,6 +1681,260 @@ fn validate_send_identity(snapshot: &Value, input: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn finish_wire_request(
+        manager: &AgentManager,
+        id: &str,
+        options: Value,
+        cancel: CancellationToken,
+    ) -> Result<Option<Value>> {
+        let (source, mut output) = crate::transport::RequestContext::attach(
+            uuid::Uuid::new_v4().to_string(),
+            "finish-session".into(),
+            "finish-client".into(),
+            json!({"owned_subscriptions":true,"all_providers":true}),
+            json!({"id":"owner","kind":"owner"}),
+            Arc::new(std::sync::RwLock::new(
+                ["workspace.read".to_owned()].into_iter().collect(),
+            )),
+            true,
+            None,
+            cancel.clone(),
+        );
+        // Remote finish watches restore this subscription on every connection.
+        let subscription = json!({
+            "type":"agent.timeline.set_subscription.request",
+            "requestId":"subscribe","agentIds":[id]
+        });
+        assert!(manager.handle(&source.for_request(subscription.clone()), &subscription).await?);
+        let frame = output.recv().await.unwrap();
+        let crate::transport::OutboundFrame::Text(text) = &frame.frame else {
+            panic!("expected subscription response");
+        };
+        let response: Value = serde_json::from_str(text)?;
+        assert_eq!(response["message"]["type"], "agent.timeline.set_subscription.response");
+
+        let mut message = json!({
+            "type":"wait_for_finish_request","requestId":"finish","agentId":id
+        });
+        merge(&mut message, &options);
+        assert!(manager.handle(&source.for_request(message.clone()), &message).await?);
+        let mut response = None;
+        loop {
+            let frame = if cancel.is_cancelled() {
+                match output.try_recv() {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                }
+            } else {
+                output.recv().await.unwrap()
+            };
+            let crate::transport::OutboundFrame::Text(text) = &frame.frame else {
+                panic!("expected finish response");
+            };
+            let message: Value = serde_json::from_str(text)?;
+            if message["message"]["type"] == "wait_for_finish_response" {
+                assert!(!cancel.is_cancelled(), "canceled request sent a response");
+                response = Some(message["message"]["payload"].clone());
+                assert_eq!(response.as_ref().unwrap()["requestId"], "finish");
+                break;
+            }
+        }
+        source.detach();
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn finish_wait_reads_closed_persisted_results_after_recovery_and_reconnect() -> Result<()> {
+        for status in ["closed", "error"] {
+            for history in ["saved", "empty", "missing"] {
+                let root = tempfile::tempdir()?;
+                let home = root.path().join("home");
+                let id = "00000000-0000-4000-8000-000000000052";
+                let storage = AgentStorage::new(home.clone());
+                storage.upsert(json!({
+                    "id":id,"provider":"omp","cwd":root.path(),"config":{"model":"test/model"},
+                    "internal":false,"lastStatus":status,"archivedAt":null,
+                    "labels":{"paseo.parent-agent-id":"parent"},
+                    "createdAt":"2026-10-24T00:00:00.000Z",
+                    "updatedAt":"2026-10-31T00:00:00.000Z",
+                    "lastActivityAt":"2026-10-31T00:00:00.000Z",
+                    "requiresAttention":true,"attentionReason":"finished",
+                    "lastError":if status == "error" { json!("Provider process exited") } else { Value::Null },
+                    "persistence":{"provider":"omp","sessionId":"native","metadata":{"cwd":root.path()}}
+                })).await?;
+                let original = storage.get(id).await?.unwrap();
+                let app = AppState::new(home.clone(), root.path().into(), std::env::current_exe()?);
+                let manager = &app.agents;
+                manager.storage.get_or_init(|| async { AgentStorage::new(home.clone()) }).await;
+                manager.restore_persisted_state().await?;
+                // Like saved-history tests, no provider is configured: a resume
+                // would fail instead of silently serving the stored result.
+                assert!(app.providers.spec("omp").is_none());
+                let path = manager.timeline_path(id)?;
+                if history != "missing" {
+                    let mut timeline = Timeline::new();
+                    if history == "saved" {
+                        timeline.append(
+                            json!({"type":"assistant_message","text":"persisted final answer","messageId":"answer"}),
+                            &json!({}),
+                        );
+                    }
+                    timeline.persist(&path, id)?;
+                }
+                let before = manager.agent_snapshot(id).await?.unwrap();
+                let mut events = manager.subscribe_events();
+                // A recovered observer and a freshly reconnected observer both
+                // use the real routed subscription + wire handler.
+                for options in [json!({"timeoutMs":10_000}), json!({})] {
+                    let response = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        finish_wire_request(manager, id, options, CancellationToken::new()),
+                    ).await??.unwrap();
+                    assert_eq!(response["status"], if status == "error" { "error" } else { "idle" });
+                    assert_eq!(response["final"], wire::snapshot_payload(&before));
+                    assert_eq!(response["error"], original["lastError"]);
+                    assert_eq!(response["lastMessage"], if history == "saved" {
+                        json!("persisted final answer")
+                    } else {
+                        Value::Null
+                    });
+                    assert!(manager.session(id).await?.is_none());
+                    assert!(manager.agents.read().await.is_empty());
+                    assert!(manager.lifecycle.lock().await.is_empty(), "wait entered provider resume");
+                    assert_eq!(manager.agent_snapshot(id).await?.unwrap(), before);
+                    assert_eq!(AgentStorage::new(home.clone()).get(id).await?.unwrap(), original);
+                    assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+                }
+                assert_eq!(path.exists(), history != "missing");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_wait_preserves_saved_history_read_errors() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = AppState::new(root.path().join("home"), root.path().into(), std::env::current_exe()?);
+        let manager = &app.agents;
+        manager.storage.get_or_init(|| async { AgentStorage::new(app.home.clone()) }).await;
+        let id = "00000000-0000-4000-8000-000000000053";
+        manager.storage()?.upsert(json!({
+            "id":id,"provider":"omp","cwd":root.path(),"config":{},"lastStatus":"closed",
+            "createdAt":"2026-10-24T00:00:00.000Z","updatedAt":"2026-10-31T00:00:00.000Z"
+        })).await?;
+        let path = manager.timeline_path(id)?;
+        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
+        tokio::fs::write(&path, b"not a sqlite database").await?;
+        let response = finish_wire_request(manager, id, json!({}), CancellationToken::new())
+            .await?.unwrap();
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["final"]["status"], "closed");
+        assert!(response["lastMessage"].is_null());
+        assert!(manager.agents.read().await.is_empty());
+        assert!(manager.lifecycle.lock().await.is_empty());
+        assert_eq!(tokio::fs::read(path).await?, b"not a sqlite database");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_wait_preserves_start_permission_and_provider_failure_checkpoints() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = AppState::new(root.path().join("home"), root.path().into(), std::env::current_exe()?);
+        let manager = &app.agents;
+        let id = "00000000-0000-4000-8000-000000000054";
+        let cell = runtime::tests::staged_cell(&app, id).await;
+        manager.release_event_stage(&cell).await?;
+        manager.apply_event(id, &cell, json!({
+            "type":"turn_completed","provider":"mock","turnId":"live-turn"
+        }), false).await?;
+        let actor = json!({"kind":"owner"});
+        let started = manager.wait(&actor, id, json!({"phase":"start"}), CancellationToken::new());
+        tokio::pin!(started);
+        assert!(futures_util::poll!(started.as_mut()).is_pending());
+        manager.apply_event(id, &cell, json!({
+            "type":"turn_started","provider":"mock","turnId":"next-turn"
+        }), false).await?;
+        assert_eq!(started.await?["status"], "running");
+        let finished = finish_wire_request(manager, id, json!({}), CancellationToken::new());
+        tokio::pin!(finished);
+        assert!(futures_util::poll!(finished.as_mut()).is_pending());
+        let permission = json!({"id":"permission","kind":"tool","name":"shell"});
+        manager.apply_event(id, &cell, json!({
+            "type":"permission_requested","provider":"mock","turnId":"next-turn","request":permission
+        }), false).await?;
+        let checkpoint = finished.await?.unwrap();
+        assert_eq!(checkpoint["status"], "permission");
+        assert_eq!(checkpoint["final"]["pendingPermissions"], json!([permission]));
+        assert!(checkpoint["error"].is_null());
+        manager.apply_event(id, &cell, json!({
+            "type":"turn_failed","provider":"mock","turnId":"next-turn",
+            "sessionEnded":true,"error":"Provider process exited"
+        }), false).await?;
+        let failed = finish_wire_request(manager, id, json!({}), CancellationToken::new())
+            .await?.unwrap();
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["final"]["status"], "error");
+        assert_eq!(failed["error"], "Provider process exited");
+        assert!(manager.session(id).await?.is_none());
+        assert!(manager.lifecycle.lock().await.is_empty());
+        cell.cancel.cancel();
+        cell.task.lock().await.take().unwrap().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_wait_keeps_queued_dispatch_inside_wire_timeout_and_cancellation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = AppState::new(root.path().join("home"), root.path().into(), std::env::current_exe()?);
+        let manager = &app.agents;
+        manager.receipts.get_or_init(|| async { MessageReceipts::new(app.home.clone()) }).await;
+        let id = "00000000-0000-4000-8000-000000000055";
+        let caller = "00000000-0000-4000-8000-000000000056";
+        let cell = runtime::tests::staged_cell(&app, id).await;
+        let sender = runtime::tests::staged_cell(&app, caller).await;
+        manager.release_event_stage(&cell).await?;
+        manager.release_event_stage(&sender).await?;
+        manager.apply_event(id, &cell, json!({
+            "type":"turn_completed","provider":"mock","turnId":"live-turn"
+        }), false).await?;
+        let mutation = cell.mutation.lock().await;
+        let queued = manager.send(&json!({"kind":"agent","agentId":caller}), id, json!({
+            "prompt":"queued prompt","messageId":"wait-queued","notifyOnFinish":false,
+            "activeTurnBehavior":"steer"
+        })).await?;
+        assert_eq!(queued["deliveryStatus"], "queued");
+        tokio::time::pause();
+        let wait = finish_wire_request(
+            manager, id, json!({"timeoutMs":100}), CancellationToken::new(),
+        );
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let timed_out = wait.await?.unwrap();
+        assert_eq!(timed_out["status"], "timeout");
+        assert_eq!(timed_out["final"]["status"], "idle");
+        assert!(timed_out["lastMessage"].is_null());
+        let cancel = CancellationToken::new();
+        let canceled = finish_wire_request(manager, id, json!({}), cancel.clone());
+        tokio::pin!(canceled);
+        assert!(futures_util::poll!(canceled.as_mut()).is_pending());
+        cancel.cancel();
+        assert!(canceled.await?.is_none());
+        tokio::time::resume();
+        let phase = manager.receipts()?.get(id, "wait-queued").await?["phase"].clone();
+        assert!(matches!(phase.as_str(), Some("queued" | "preparing")), "{phase}");
+        assert_eq!(cell.data.lock().await.snapshot["status"], "idle");
+        drop(mutation);
+        manager.message_delivery.shutdown().await?;
+        let phase = manager.receipts()?.get(id, "wait-queued").await?["phase"].clone();
+        assert!(matches!(phase.as_str(), Some("submitted" | "accepted")), "{phase}");
+        cell.cancel.cancel();
+        sender.cancel.cancel();
+        cell.task.lock().await.take().unwrap().await?;
+        sender.task.lock().await.take().unwrap().await?;
+        Ok(())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn cancel_request_reports_provider_refusal_without_settling_the_turn() -> Result<()> {

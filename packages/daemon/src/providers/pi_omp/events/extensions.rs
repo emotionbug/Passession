@@ -277,6 +277,51 @@ impl Extensions {
         }
         out
     }
+    pub fn omp_task(&mut self, owner: &str, result: &Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        let details = &result["details"];
+        for (rows, terminal) in [(&details["results"], true), (&details["progress"], false)] {
+            for row in array(rows) {
+                let Some(id) = first(&[&row["id"]]) else { continue };
+                // A queued tool result may arrive after a newer native lifecycle event.
+                // It discovers missing children, but cannot regress those already observed.
+                if let Some(state) = self.states.get(id) {
+                    if state["toolCallId"].as_str().is_some_and(|id| id != owner) {
+                        self.states.remove(id);
+                    } else if !terminal || state["status"] != "running" {
+                        continue;
+                    }
+                }
+                let payload = json!({
+                    "id":id,
+                    "agent":first(&[&row["agent"]]).unwrap_or("OMP subagent"),
+                    "parentToolCallId":owner,
+                    "index":row["index"],
+                    "description":row["description"],
+                    "sessionFile":row["sessionFile"],
+                    "status":super::omp_task_status(row, terminal)
+                });
+                if let Some(event) = self.omp_event("subagent_lifecycle", &payload) {
+                    out.push(event);
+                }
+            }
+        }
+        out
+    }
+    pub fn omp_custom(&mut self, message: &Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        for (id, status) in super::omp_task_completions(message) {
+            let Some(state) = self.states.get_mut(id) else { continue };
+            // Native lifecycle is authoritative once terminal; a late delivery is
+            // only needed when that lifecycle event was missed.
+            if state["status"] != "running" {
+                continue;
+            }
+            state["status"] = json!(status);
+            out.push(json!({"type":"upsert","id":id,"status":status}));
+        }
+        out
+    }
     pub fn omp_event(&mut self, kind: &str, payload: &Value) -> Option<Value> {
         let progress = kind == "subagent_progress";
         let id = if progress {
@@ -306,11 +351,7 @@ impl Extensions {
             state["toolCallId"] = v.clone();
         }
         let status = string(&data["status"]);
-        state["status"] = json!(match status {
-            "completed" | "failed" => status,
-            "aborted" => "canceled",
-            _ => "running",
-        });
+        state["status"] = json!(super::omp_task_status(data, false));
         if let Some(model) = first(&[&data["resolvedModel"]]) {
             state["resolvedModel"] = json!(model);
         }
@@ -431,7 +472,9 @@ impl Extensions {
         }
     }
     pub fn finish_card(&mut self, id: &str) {
-        self.cards.remove(id);
+        if !self.states.values().any(|state| state["toolCallId"] == id && state["status"] == "running") {
+            self.cards.remove(id);
+        }
     }
     pub fn cancel(&mut self) -> Vec<Value> {
         let mut out = Vec::new();

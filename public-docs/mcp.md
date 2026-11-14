@@ -94,7 +94,7 @@ MCP does not expose an agent-detach tool. Detaching is a manual user action in t
 | `list_agents`        | List recent agents as compact metadata; `includeBackground: true` includes background work.                                                                    |
 | `cancel_agent`       | Abort an agent's current run but keep the agent alive.                                                                                                         |
 | `archive_agent`      | Soft-delete an agent and remove it from the active list.                                                                                                       |
-| `kill_agent`         | Terminate an agent session permanently.                                                                                                                        |
+| `kill_agent`         | Close an agent's runtime without deleting its record or history. The agent can be resumed.                                                                    |
 | `update_agent`       | Update an agent name, labels, or runtime settings such as mode/model/thinking/features.                                                                        |
 | `get_agent_activity` | Return recent agent timeline entries as a curated summary.                                                                                                     |
 | `set_agent_mode`     | Switch an agent's session mode.                                                                                                                                |

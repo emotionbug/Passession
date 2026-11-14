@@ -5,6 +5,10 @@
 ### Fixed
 
 - Windows folder browsing uses directory-entry metadata instead of opening every child to resolve its path. Exclusively locked files such as paging files no longer prevent listing the rest of a drive; symbolic links still report their target type and size.
+- OMP background children are restored from saved task progress and structured completion records. Interrupting or failing a parent turn no longer marks still-running children as canceled; provider shutdown still settles them.
+- Finish observers read saved results without restarting closed provider runtimes, including agents with no saved assistant message.
+- Agent-message batching retains its two-second quiet window but stops extending the batching deadline after ten seconds of continuous arrivals; an earlier in-flight dispatch still completes first.
+- Tool and lifecycle documentation distinguishes resumable runtime closure from deletion and native OMP children from daemon-managed agents.
 
 ## 0.13.22 - 2026-11-14
 

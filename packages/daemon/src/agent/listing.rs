@@ -209,17 +209,9 @@ impl AgentManager {
         let path = self.timeline_path(id)?;
         let agent_id = id.to_owned();
         let saved = tokio::task::spawn_blocking(move || Timeline::load(&path, &agent_id)).await??;
-        if saved.next_seq() > 1 {
-            return Ok(saved.last_assistant_message().map(str::to_owned));
-        }
-        let cell = self.timeline_cell(id).await?;
-        let message = cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?
-            .last_assistant_message()
-            .map(str::to_owned);
-        Ok(message)
+        // Finish/attention observers must not start a provider to discover that
+        // an agent has no saved assistant message.
+        Ok(saved.last_assistant_message().map(str::to_owned))
     }
     pub async fn activity(&self, id: &str, options: &Value) -> Result<Vec<Value>> {
         crate::activity::curate(&self.timeline_items(id).await?, options)

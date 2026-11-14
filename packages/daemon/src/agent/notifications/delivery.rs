@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 const QUEUE_CAPACITY: usize = 1024;
 const QUIET_PERIOD: Duration = Duration::from_secs(2);
+const MAX_BATCH_AGE: Duration = Duration::from_secs(10);
 type DispatchResult = std::result::Result<Value, String>;
 #[derive(Clone)]
 pub struct MessageReceipt {
@@ -41,6 +42,7 @@ struct Admitted {
 struct Recipient {
     pending: Vec<Admitted>,
     inflight: Vec<MessageReceipt>,
+    batch_started: Instant,
     deadline: Instant,
     changed: Arc<Notify>,
 }
@@ -118,22 +120,28 @@ impl AgentMessageDelivery {
             bail!("Agent message delivery is closed");
         }
         let fresh = !state.recipients.contains_key(&recipient_id);
+        let now = Instant::now();
         let recipient = state
             .recipients
             .entry(recipient_id.clone())
             .or_insert_with(|| Recipient {
                 pending: Vec::new(),
                 inflight: Vec::new(),
-                deadline: Instant::now() + QUIET_PERIOD,
+                batch_started: now,
+                deadline: now + QUIET_PERIOD,
                 changed: Arc::new(Notify::new()),
             });
+        if recipient.pending.is_empty() {
+            // A new pending batch gets its own cap while an older one dispatches.
+            recipient.batch_started = now;
+        }
         recipient.pending.push(Admitted {
             input,
             id,
             complete,
             _permit: permit,
         });
-        recipient.deadline = Instant::now() + QUIET_PERIOD;
+        recipient.deadline = (now + QUIET_PERIOD).min(recipient.batch_started + MAX_BATCH_AGE);
         recipient.changed.notify_one();
         if fresh {
             let inner = self.inner.clone();
@@ -372,6 +380,40 @@ async fn cross_dispatch_boundary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn continuous_messages_cannot_extend_the_batch_deadline() -> Result<()> {
+        let queue = AgentMessageDelivery::new(Weak::new());
+        let request = |id: &str| json!({
+            "recipientId":"agent", "messageId":id, "prompt":"hello",
+            "source":{"kind":"agent-message","agentId":"sender"}
+        });
+        let started = Instant::now();
+        let first = queue.enqueue(request("first")).await?;
+        let interval = QUIET_PERIOD / 2;
+        let mut elapsed = interval;
+        while elapsed < MAX_BATCH_AGE {
+            tokio::time::advance(interval).await;
+            queue.enqueue(request(&format!("message-{}", elapsed.as_secs()))).await?;
+            assert!(first.result.borrow().is_none(), "batch dispatched before its deadline");
+            elapsed += interval;
+        }
+        tokio::time::advance(interval).await;
+        // No daemon is attached: reaching the dispatch boundary returns its real
+        // shutdown error instead of leaving the receipt queued indefinitely.
+        assert!(first.dispatched(CancellationToken::new()).await.is_err());
+        assert_eq!(Instant::now() - started, MAX_BATCH_AGE);
+
+        let next_started = Instant::now();
+        let next = queue.enqueue(request("next-batch")).await?;
+        tokio::time::advance(interval).await;
+        queue.enqueue(request("next-follow-up")).await?;
+        assert!(next.result.borrow().is_none());
+        assert!(next.dispatched(CancellationToken::new()).await.is_err());
+        assert_eq!(Instant::now() - next_started, interval + QUIET_PERIOD);
+        queue.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn conflicting_modes_keep_order_and_defaults_coalesce() {
         let capacity = Arc::new(Semaphore::new(4));

@@ -85,8 +85,10 @@ Users can also detach an existing subagent from the subagents track. Detach is d
 
 Agent-originated messages and automatic notifications share a recipient-daemon delivery module.
 A queued receipt waits only for durable pending-receipt storage and enqueue, not provider dispatch
-or a second status read; its recipient status is advisory, captured before admission. This lets a
-child report and finish in the same two-second quiet window. Human prompts dispatch directly.
+or a second status read; its recipient status is advisory, captured before admission. A two-second
+quiet window lets a child report and finish together. The first pending message caps that batch's
+coalescing delay at ten seconds, so continuous arrivals cannot postpone it indefinitely. An earlier
+dispatch to the same recipient still completes first. Human prompts dispatch directly.
 Conflicting explicit interruption or session-mode choices retain separate ordered dispatches.
 Message sends reserve capacity without waiting before writing the pending receipt, so a full or
 closed queue rejects admission without leaving an ambiguous receipt. Automatic notifications keep
@@ -135,11 +137,13 @@ A watched child that closes before its finish event also notifies the caller so 
 A plan approval may require a provider mode change before the approval can be sent. Keep the
 permission pending if that prerequisite fails, so the user can retry or deny the same request.
 
-## Provider-managed child agents
+## Provider-owned child agents
 
-Some providers can create their own child sessions inside one provider runtime. OMP's task tool reports these with `child_session` events; `AgentManager` imports the live provider handle, stamps `paseo.parent-agent-id`, and surfaces the result as a normal subagent in the parent's subagents track.
-
-The provider still owns the underlying runtime. Paseo keeps an agent record so the child can be opened, tracked, archived, and cascaded with the parent, but prompts and history hydration route through the provider adapter for that native child handle.
+Provider-owned children are separate from managed agents created through `create_agent`.
+OMP reports them through `subagent_lifecycle`, `subagent_progress`, and `subagent_event`; Paseo stores
+their descriptors and timelines under the managed parent rather than creating another managed agent.
+Opening a child reads its transcript. It does not grant independent prompt, archive, or detach control.
+See [the subagents track](#the-subagents-track) for the shared presentation and ownership boundary.
 
 ## Background workspaces
 
@@ -282,7 +286,7 @@ The rows combine two kinds of children:
 parentAgentId === thisAgent.id  AND  !archivedAt
 ```
 
-- **Provider subagents** are child executions owned by Claude, Codex, or OpenCode. They are not inserted into `AgentManager` as managed agents. Providers emit a separate descriptor and timeline stream through `agent.provider_subagents.*`; the client keeps that state outside the normal agent store and merges only the presentation rows into the track. A descriptor's optional `parentSubagentId` identifies its direct provider-subagent parent; an absent value identifies a direct child of the managed agent.
+- **Provider subagents** are child executions owned by providers such as Claude, Codex, OpenCode, Pi, and OMP. They are not inserted into `AgentManager` as managed agents. Providers emit a separate descriptor and timeline stream through `agent.provider_subagents.*`; the client keeps that state outside the normal agent store and merges only the presentation rows into the track. A descriptor's optional `parentSubagentId` identifies its direct provider-subagent parent; an absent value identifies a direct child of the managed agent.
 
 Opening either kind selects its host and actual child identity in the native client. Managed agents retain their normal interactive capabilities; provider-owned child timelines are read-only observations, not independent managed agents with archive/detach/rewind authority. Closing a view changes presentation only.
 

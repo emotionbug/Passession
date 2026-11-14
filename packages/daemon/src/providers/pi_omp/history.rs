@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::LazyLock,
@@ -13,7 +14,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
 };
 
-use super::events::Mapper;
+use super::events::{Mapper, omp_task_completions, omp_task_status};
 use crate::providers::api::{HistoryCoverage, SubagentHistoryRequest, subagent_row};
 
 static TITLE_PREFIX: LazyLock<regex::Regex> =
@@ -1121,25 +1122,33 @@ fn truthy(value: &Value) -> bool {
 
 fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
     let mut calls = HashMap::new();
-    for message in messages.iter().filter(|m| m["role"] == "assistant") {
-        for block in message["content"].as_array().into_iter().flatten() {
-            if block["type"] == "toolCall" && block["name"] == "task" {
-                if let Some(id) = block["id"].as_str() {
-                    calls.insert(
-                        id,
-                        block["arguments"]["agent"]
-                            .as_str()
-                            .unwrap_or("OMP subagent"),
-                    );
+    let mut out: Vec<Transcript> = Vec::new();
+    let mut children: HashMap<Cow<'_, str>, usize> = HashMap::new();
+    for message in messages {
+        if message["role"] == "assistant" {
+            for block in message["content"].as_array().into_iter().flatten() {
+                if block["type"] == "toolCall" && block["name"] == "task" {
+                    if let Some(id) = block["id"].as_str() {
+                        calls.insert(
+                            id,
+                            block["arguments"]["agent"]
+                                .as_str()
+                                .unwrap_or("OMP subagent"),
+                        );
+                    }
                 }
             }
         }
-    }
-    let mut out = Vec::new();
-    for message in messages
-        .iter()
-        .filter(|m| m["role"] == "toolResult" && m["toolName"] == "task")
-    {
+        for (id, status) in omp_task_completions(message) {
+            if let Some(index) = children.get(id) {
+                if out[*index].status == "running" {
+                    out[*index].status = status;
+                }
+            }
+        }
+        if message["role"] != "toolResult" || message["toolName"] != "task" {
+            continue;
+        }
         let id = message["toolCallId"].as_str().unwrap_or("");
         let Some(title) = calls.get(id) else { continue };
         let details = message
@@ -1147,32 +1156,43 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
             .filter(|v| !v.is_null())
             .unwrap_or(&message["content"]["details"]);
         let mut found = false;
-        for result in details["results"].as_array().into_iter().flatten() {
-            let Some(child_id) = result["id"].as_str().filter(|s| !s.is_empty()) else {
-                continue;
-            };
-            found = true;
-            let status = if message["isError"] == true
-                || truthy(&result["error"])
-                || result["exitCode"].as_f64().is_some_and(|n| n != 0.0)
-            {
-                "failed"
-            } else if result["aborted"] == true {
-                "canceled"
-            } else {
-                "completed"
-            };
-            let basename = Path::new(child_id)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
-            out.push(Transcript {
-                id: child_id.to_owned(),
-                title: result["agent"].as_str().unwrap_or(title).to_owned(),
-                tool_call: id.to_owned(),
-                path: parent.with_extension("").join(format!("{basename}.jsonl")),
-                status,
-            });
+        // Results take precedence when both arrays describe the same child.
+        for (rows, terminal) in [(&details["results"], true), (&details["progress"], false)] {
+            for result in rows.as_array().into_iter().flatten() {
+                let Some(child_id) = result["id"].as_str().filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                found = true;
+                let existing = children.get(child_id).copied();
+                if existing.is_some_and(|index| out[index].tool_call == id) {
+                    continue;
+                }
+                let status = if terminal && (message["isError"] == true || truthy(&result["error"])) {
+                    "failed"
+                } else {
+                    omp_task_status(result, terminal)
+                };
+                let basename = Path::new(child_id)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let path = result["sessionFile"].as_str().filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| parent.with_extension("").join(format!("{basename}.jsonl")));
+                let transcript = Transcript {
+                    id: child_id.to_owned(),
+                    title: result["agent"].as_str().unwrap_or(title).to_owned(),
+                    tool_call: id.to_owned(),
+                    path,
+                    status,
+                };
+                if let Some(index) = existing {
+                    out[index] = transcript;
+                } else {
+                    children.insert(Cow::Borrowed(child_id), out.len());
+                    out.push(transcript);
+                }
+            }
         }
         if found {
             continue;
@@ -1189,12 +1209,13 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
             .unwrap_or_default();
         if let Some(capture) = LEGACY_TRANSCRIPT.captures(&text) {
             let path = PathBuf::from(&capture[1]);
+            let child_id = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+            if children.contains_key(child_id.as_str()) {
+                continue;
+            }
+            children.insert(Cow::Owned(child_id.clone()), out.len());
             out.push(Transcript {
-                id: path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
+                id: child_id,
                 title: (*title).to_owned(),
                 tool_call: id.to_owned(),
                 path,
@@ -1414,6 +1435,165 @@ mod tests {
                 "message":{"role":"toolResult","toolCallId":"task-1","toolName":"task",
                     "content":text("done"),"details":{"results":results}}}),
         ])
+    }
+
+    fn omp_background_session(id: &str, progress: Value, jobs: Value) -> String {
+        lines(&[
+            json!({"type":"session","id":id,"cwd":"/work","timestamp":"2026-01-01T00:00:00.000Z"}),
+            json!({"type":"message","id":"a1","parentId":null,"message":{"role":"assistant",
+                "content":[{"type":"text","text":"child body"},{"type":"toolCall","id":"task-1","name":"task",
+                    "arguments":{"tasks":[{"name":"worker","agent":"scout"}]}}]}}),
+            json!({"type":"message","id":"r1","parentId":"a1","timestamp":"2026-01-01T00:00:03.000Z",
+                "message":{"role":"toolResult","toolCallId":"task-1","toolName":"task",
+                    "content":text("queued"),"details":{"async":true,"results":[],"progress":progress}}}),
+            json!({"type":"custom_message","id":"c1","parentId":"r1","customType":"async-result",
+                "timestamp":"2026-01-01T00:00:04.000Z","content":"<system-notice>Background delivery</system-notice>",
+                "details":{"jobs":jobs}}),
+        ])
+    }
+
+    #[tokio::test]
+    async fn omp_progress_history_preserves_children_and_async_outcomes() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent.jsonl");
+        let explicit = directory.path().join("explicit.jsonl");
+        fs::write(&parent, omp_background_session("parent", json!([
+            {"id":"Exact.Child","agent":"scout","status":"pending","index":0},
+            {"id":"failed-child","agent":"reviewer","status":"running","index":1,"sessionFile":explicit},
+            {"id":"still-running","agent":"worker","status":"queued","index":2},
+            {"id":"aborted-child","agent":"worker","status":"pending","index":3}
+        ]), json!([
+            {"type":"task","jobId":"Exact.Child","agentId":"Exact.Child","status":"completed"},
+            {"type":"task","jobId":"failed-child","agentId":"failed-child","status":"failed"},
+            {"type":"task","jobId":"aborted-child","agentId":"aborted-child","status":"canceled"},
+            {"type":"bash","jobId":"still-running","status":"completed"},
+            {"type":"task","jobId":"unknown","status":"completed"}
+        ]))).await.unwrap();
+        // Directories at every locator prove descriptor recovery reads no child body.
+        for path in [
+            parent.with_extension("").join("Exact.Child.jsonl"),
+            explicit.clone(),
+            parent.with_extension("").join("still-running.jsonl"),
+            parent.with_extension("").join("aborted-child.jsonl"),
+        ] {
+            fs::create_dir_all(path).await.unwrap();
+        }
+        let history = load_live("omp", "custom-omp", &parent, None, &Value::Null).await.unwrap();
+        let children: Vec<_> = history.subagent_events.iter().map(|e| &e["event"]).collect();
+        assert_eq!(children.len(), 4);
+        for (child, (id, title, status)) in children.iter().zip([
+            ("Exact.Child", "scout", "completed"),
+            ("failed-child", "reviewer", "failed"),
+            ("still-running", "worker", "running"),
+            ("aborted-child", "worker", "canceled"),
+        ]) {
+            assert_eq!(child["id"], id);
+            assert_eq!(child["title"], title);
+            assert_eq!(child["status"], status);
+            assert_eq!(child["toolCallId"], "task-1");
+            assert_eq!(child["type"], "upsert");
+        }
+        assert_eq!(children[0]["source"]["path"], json!(parent.with_extension("").join("Exact.Child.jsonl")));
+        assert_eq!(children[1]["source"]["path"], json!(explicit));
+    }
+
+    #[tokio::test]
+    async fn omp_progress_child_without_source_replays_nested_outcomes() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent.jsonl");
+        let child = parent.with_extension("").join("child.jsonl");
+        fs::create_dir_all(child.parent().unwrap()).await.unwrap();
+        fs::write(&parent, omp_background_session("parent", json!([
+            {"id":"child","agent":"scout","status":"pending"},
+            {"id":"sibling","agent":"worker","status":"pending"}
+        ]), json!([]))).await.unwrap();
+        fs::create_dir_all(parent.with_extension("").join("sibling.jsonl")).await.unwrap();
+        fs::write(&child, omp_background_session("child", json!([
+            {"id":"nested-ok","agent":"scout","status":"pending"},
+            {"id":"nested-failed","agent":"worker","status":"pending"}
+        ]), json!([
+            {"type":"task","agentId":"nested-ok","status":"completed"},
+            {"type":"task","agentId":"nested-failed","status":"failed"}
+        ]))).await.unwrap();
+        let events = child_history("omp", "omp", &request("child", &parent, Value::Null)).await.unwrap();
+        assert_eq!(events[0]["event"]["title"], "scout");
+        let rows: Vec<_> = events.iter().filter(|e| e["event"]["type"] == "timeline").collect();
+        assert!(rows.iter().any(|e| e["event"]["item"]["text"] == "child body"));
+        assert!(rows.iter().all(|e| e["event"]["id"] == "child" && e["event"]["historyComplete"] == true));
+        let nested: Vec<_> = events.iter().filter(|e| e["event"]["parentSubagentId"] == "child").collect();
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested[0]["event"]["id"], "nested-ok");
+        assert_eq!(nested[0]["event"]["status"], "completed");
+        assert_eq!(nested[1]["event"]["id"], "nested-failed");
+        assert_eq!(nested[1]["event"]["status"], "failed");
+        assert_eq!(nested[1]["event"]["source"]["path"], json!(child.with_extension("").join("nested-failed.jsonl")));
+    }
+
+    #[test]
+    fn omp_task_history_rejects_text_claims_and_unrelated_identities() {
+        let call = |id: &str| json!({"role":"assistant","content":[
+            {"type":"toolCall","name":"task","id":id,"arguments":{"agent":"worker"}}]});
+        let result = |call: &str, child: &str, agent: &str| json!({"role":"toolResult","toolName":"task",
+            "toolCallId":call,"details":{"results":[],"progress":[{"id":child,"agent":agent,"status":"pending"}]}});
+        let messages = [
+            call("task-1"),
+            result("task-1", "known", "scout"),
+            json!({"role":"user","customType":"async-result",
+                "content":"<task-result id=\"known\" status=\"failed\">",
+                "details":{"jobs":[{"type":"task","agentId":"known","status":"failed"}],
+                    "progress":[{"id":"invented","status":"completed"}]}}),
+            json!({"role":"custom","customType":"async-result",
+                "content":"<task-result id=\"known\" status=\"failed\">",
+                "details":{"jobs":[{"type":"task","agentId":"unrelated","status":"completed"}]}}),
+            result("unknown-call", "invented", "wrong"),
+        ];
+        let children = subagent_transcripts(&messages, Path::new("/tmp/parent.jsonl"));
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, "known");
+        assert_eq!(children[0].title, "scout");
+        assert_eq!(children[0].tool_call, "task-1");
+        assert_eq!(children[0].status, "running");
+    }
+
+    #[test]
+    fn omp_task_history_does_not_apply_earlier_completion_to_later_spawn() {
+        let call = |id: &str| json!({"role":"assistant","content":[
+            {"type":"toolCall","name":"task","id":id,"arguments":{"agent":"worker"}}]});
+        let result = |id: &str| json!({"role":"toolResult","toolName":"task","toolCallId":id,
+            "details":{"results":[],"progress":[{"id":"reused","status":"pending"}]}});
+        let delivery = json!({"role":"custom","customType":"async-result",
+            "details":{"jobs":[{"type":"task","agentId":"reused","status":"completed"}]}});
+        let messages = [
+            delivery.clone(),
+            call("first"),
+            result("first"),
+            delivery,
+            call("second"),
+            result("second"),
+        ];
+        let children = subagent_transcripts(&messages, Path::new("/tmp/parent.jsonl"));
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, "running");
+        assert_eq!(children[0].tool_call, "second");
+    }
+
+    #[test]
+    fn omp_legacy_transcript_locator_and_terminal_results_remain_supported() {
+        let messages = [
+            json!({"role":"assistant","content":[
+                {"type":"toolCall","name":"task","id":"legacy","arguments":{"agent":"reviewer"}},
+                {"type":"toolCall","name":"task","id":"modern","arguments":{"agent":"worker"}}]}),
+            json!({"role":"toolResult","toolName":"task","toolCallId":"legacy",
+                "content":text("Session file: /tmp/legacy-child.jsonl")}),
+            json!({"role":"toolResult","toolName":"task","toolCallId":"modern","details":{"results":[
+                {"id":"done"},{"id":"bad","exitCode":1},{"id":"stopped","aborted":true}],
+                "progress":[{"id":"done","status":"pending"}]}}),
+        ];
+        let children = subagent_transcripts(&messages, Path::new("/tmp/parent.jsonl"));
+        assert_eq!(children.len(), 4);
+        assert_eq!(children[0].path, Path::new("/tmp/legacy-child.jsonl"));
+        assert_eq!(children[0].title, "reviewer");
+        assert_eq!(children.iter().map(|c| c.status).collect::<Vec<_>>(), ["completed", "completed", "failed", "canceled"]);
     }
 
     fn request(child: &str, parent: &Path, source: Value) -> SubagentHistoryRequest {
