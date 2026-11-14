@@ -2,11 +2,20 @@
 
 ## Unreleased
 
+## 0.13.23 - 2026-11-14
+
+### Changed
+
+- OMP negotiates delta-only message updates, reconstructing text/thinking blocks and reconciling terminal content without repeating streamed text. Older OMP continues using full snapshots.
+- Model-facing agent activity defaults to eight bounded rows and compact status. Older failures, complete retained items, errors and permission requests remain accessible through stable pagination and UTF-8 detail chunks; UI/SDK payloads are unchanged.
+- OMP host tools become essential when local structured history records any invocation, including failures. Other tools stay discoverable; new invocations persist for subsequent launches without changing the current catalog.
+
 ### Fixed
 
 - Windows folder browsing uses directory-entry metadata instead of opening every child to resolve its path. Exclusively locked files such as paging files no longer prevent listing the rest of a drive; symbolic links still report their target type and size.
 - OMP background children are restored from saved task progress and structured completion records. Interrupting or failing a parent turn no longer marks still-running children as canceled; provider shutdown still settles them.
 - Finish observers read saved results without restarting closed provider runtimes, including agents with no saved assistant message.
+- Model-facing activity reads use retained history without starting a provider. Remote reads negotiate this behavior explicitly; existing UI/SDK history preparation is unchanged.
 - Agent-message batching retains its two-second quiet window but stops extending the batching deadline after ten seconds of continuous arrivals; an earlier in-flight dispatch still completes first.
 - Tool and lifecycle documentation distinguishes resumable runtime closure from deletion and native OMP children from daemon-managed agents.
 - Removed Clippy warnings from the daemon, Rust client SDK and protocol crates without disabling lints or changing wire formats.

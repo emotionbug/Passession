@@ -136,6 +136,8 @@ pub(super) async fn handle(
                         &options,
                     )
                     .await
+            } else if message["observationOnly"] == true {
+                manager.observe_timeline(id, &options).await
             } else if supports(context, "saved_history_reads") {
                 manager.saved_timeline(id, &options).await
             } else {
@@ -272,8 +274,14 @@ pub(super) async fn handle(
             .await?;
         }
         "agent.provider_subagents.delete.request" => {
-            let ids = strings(&message["subagentIds"]).into_iter().map(str::to_owned).collect();
-            let payload = match manager.delete_subagents(text(message, "parentAgentId"), ids).await {
+            let ids = strings(&message["subagentIds"])
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let payload = match manager
+                .delete_subagents(text(message, "parentAgentId"), ids)
+                .await
+            {
                 Ok(mut result) => {
                     result["parentAgentId"] = message["parentAgentId"].clone();
                     result["error"] = Value::Null;

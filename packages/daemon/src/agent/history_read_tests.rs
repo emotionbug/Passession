@@ -61,6 +61,55 @@ async fn store_agent(app: &Arc<AppState>, id: &str, cwd: &Path, items: &[Value])
     timeline.epoch().to_owned()
 }
 
+#[tokio::test]
+async fn model_activity_observations_never_start_retained_or_missing_providers() {
+    let (root, app) = fixture().await;
+    let manager = &app.agents;
+    store_agent(&app, PARENT, root.path(), &messages(12)).await;
+    let lane = manager.lane(PARENT).await;
+    let _blocked = lane.lock().await;
+    let options = json!({"direction":"before","limit":2});
+    let local = tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.observe_timeline(PARENT, &options),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let expected = json!(["message 10", "message 11"]);
+    let actual: Vec<_> = local["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["item"]["text"].clone())
+        .collect();
+    assert_eq!(json!(actual), expected);
+    for capabilities in [legacy_reads(), saved_reads()] {
+        let routed = timeline_request_as(
+            manager,
+            capabilities,
+            true,
+            PARENT,
+            json!({"direction":"before","limit":2,"observationOnly":true}),
+        )
+        .await;
+        assert!(routed["error"].is_null(), "{routed}");
+        assert_eq!(json!(texts(&routed)), expected);
+    }
+    assert!(manager.preparations.status(PARENT).is_none());
+    assert!(!manager.agents.read().await.contains_key(PARENT));
+    let missing = "00000000-0000-4000-8000-0000000000a2";
+    manager
+        .storage()
+        .unwrap()
+        .upsert(record(missing, root.path(), true))
+        .await
+        .unwrap();
+    assert!(manager.observe_timeline(missing, &options).await.is_err());
+    assert!(manager.preparations.status(missing).is_none());
+    assert!(!manager.agents.read().await.contains_key(missing));
+}
+
 fn messages(count: usize) -> Vec<Value> {
     (0..count)
         .map(|i| json!({"type":"assistant_message","text":format!("message {i}"),"messageId":format!("m{i}")}))

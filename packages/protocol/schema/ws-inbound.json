@@ -5608,6 +5608,9 @@
                     "canonical"
                   ]
                 },
+                "observationOnly": {
+                  "type": "boolean"
+                },
                 "mergeWindow": {
                   "type": "boolean"
                 }

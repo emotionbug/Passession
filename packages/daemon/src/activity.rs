@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 mod presentation;
 pub use presentation::tool_display;
 
+pub(crate) mod model;
+
 pub(crate) fn utf16_prefix(text: &str, limit: usize) -> String {
     let mut units = 0;
     let mut end = 0;
@@ -54,9 +56,10 @@ fn curate_projected<'a>(
     for item in items {
         let kind = str_field(item, "type");
         if let Some(kinds) = options["includeKinds"].as_array()
-            && !kinds.iter().any(|k| k == kind) {
-                continue;
-            }
+            && !kinds.iter().any(|k| k == kind)
+        {
+            continue;
+        }
         match kind {
             "user_message" => push(
                 &mut entries,
@@ -176,65 +179,6 @@ pub fn curate(items: &[Value], options: &Value) -> Result<Vec<Value>> {
     };
     curate_projected(rows[start..].iter().map(|r| &r["item"]), options)
 }
-pub fn summarize(items: &[Value], limit: Option<f64>) -> Result<Value> {
-    let all = projected(items);
-    let total = all.len();
-    let count = limit.unwrap_or(0.0).floor().max(0.0) as usize;
-    let begin = if count == 0 {
-        0
-    } else {
-        total.saturating_sub(count)
-    };
-    let mut selected: Vec<&Value> = all[begin..].iter().collect();
-    // Tool lifecycles can cross display anchors. Include every overlapping source
-    // range until the selected canonical window is closed.
-    if !selected.is_empty() {
-        loop {
-            let min = selected
-                .iter()
-                .filter_map(|r| r["seqStart"].as_i64())
-                .min()
-                .unwrap();
-            let max = selected
-                .iter()
-                .filter_map(|r| r["seqEnd"].as_i64())
-                .max()
-                .unwrap();
-            let expanded: Vec<&Value> = all
-                .iter()
-                .filter(|r| {
-                    r["seqStart"].as_i64().unwrap_or(0) <= max
-                        && r["seqEnd"].as_i64().unwrap_or(0) >= min
-                })
-                .collect();
-            if expanded.len() == selected.len() {
-                break;
-            }
-            selected = expanded;
-        }
-    }
-    let shown = selected.len();
-    let noun = if total == 1 { "activity" } else { "activities" };
-    let header = if limit.is_some_and(|n| n != 0.0) && shown < total {
-        format!(
-            "Showing {shown} of {total} {noun} (limited to {})",
-            limit.unwrap()
-        )
-    } else {
-        format!("Showing all {total} {noun}")
-    };
-    let entries = curate_projected(selected.iter().map(|r| &r["item"]), &Value::Null)?;
-    let text = if entries.is_empty() {
-        "No activity to display.".into()
-    } else {
-        entries
-            .iter()
-            .map(|e| str_field(e, "text"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    Ok(json!({"updateCount":items.len(),"content":format!("{header}\n\n{text}")}))
-}
 pub fn build_fork_context(input: &Value) -> Result<Value> {
     let rows = project_rows(
         input["rows"]
@@ -251,9 +195,10 @@ pub fn build_fork_context(input: &Value) -> Result<Value> {
         .filter(|s| !s.is_empty());
     let selected: Vec<&Value> = if cursor.is_some() || message_id.is_some() {
         if let Some(boundary) = boundary
-            && boundary["cursor"]["epoch"] != boundary["timelineEpoch"] {
-                bail!("Selected timeline position is no longer available.");
-            }
+            && boundary["cursor"]["epoch"] != boundary["timelineEpoch"]
+        {
+            bail!("Selected timeline position is no longer available.");
+        }
         let index = if let Some(cursor) = cursor {
             rows.iter().position(|r| r["seqEnd"] == cursor["seq"])
         } else {

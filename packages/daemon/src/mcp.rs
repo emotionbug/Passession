@@ -179,7 +179,9 @@ impl McpService {
         policy: Option<&Value>,
         manifest: bool,
     ) -> Result<Vec<Value>> {
-        let mut tools = vec![json!({"name":"list_hosts","title":"List hosts","description":"Discover this host and registered destination hosts for fleet tools.","inputSchema":{"type":"object","properties":{},"additionalProperties":true}})];
+        let mut tools = vec![
+            json!({"name":"list_hosts","title":"List hosts","description":"Discover this host and registered destination hosts for fleet tools.","inputSchema":{"type":"object","properties":{},"additionalProperties":true}}),
+        ];
         tools.extend(workspace_tools::definitions(caller.is_some() || manifest));
         tools.extend(agent_tools::definitions(caller.is_some() || manifest));
         tools.extend(schedule_tools::definitions(caller.is_some() || manifest));
@@ -387,29 +389,32 @@ pub fn strip_internal_servers(mut servers: Value) -> Value {
 }
 fn normalize_input(schema: &Value, input: &mut Value) {
     if schema["x-trim"] == true
-        && let Some(s) = input.as_str() {
-            *input = json!(s.trim());
-        }
+        && let Some(s) = input.as_str()
+    {
+        *input = json!(s.trim());
+    }
     if let (Some(props), Some(obj)) = (schema["properties"].as_object(), input.as_object_mut()) {
         if schema["x-strip-unknown"] == true {
             obj.retain(|key, _| props.contains_key(key));
         }
         for (key, prop) in props {
             if !obj.contains_key(key)
-                && let Some(default) = prop.get("default") {
-                    obj.insert(key.clone(), default.clone());
-                }
+                && let Some(default) = prop.get("default")
+            {
+                obj.insert(key.clone(), default.clone());
+            }
             if let Some(v) = obj.get_mut(key) {
                 normalize_input(prop, v);
             }
         }
     }
     if let Some(values) = input.as_array_mut()
-        && let Some(items) = schema.get("items") {
-            for value in values {
-                normalize_input(items, value);
-            }
+        && let Some(items) = schema.get("items")
+    {
+        for value in values {
+            normalize_input(items, value);
         }
+    }
     for key in ["oneOf", "anyOf"] {
         if let Some(variants) = schema[key].as_array() {
             for variant in variants {
@@ -476,29 +481,7 @@ fn model_visible(mut result: Value) -> Value {
     {
         return result;
     }
-    let structured = &result["structuredContent"];
-    let mut lines = Vec::new();
-    if let Some(object) = structured.as_object() {
-        for (key, value) in object {
-            if let Some(array) = value.as_array() {
-                lines.push(format!("{key}_count={}", array.len()));
-                let ids: Option<Vec<&str>> = array
-                    .iter()
-                    .map(|v| v["id"].as_str().filter(|s| !s.is_empty()))
-                    .collect();
-                if let Some(ids) = ids.filter(|v| !v.is_empty()) {
-                    lines.push(format!("{key}_ids={}", ids.join(",")));
-                }
-            }
-        }
-    }
-    let formatted =
-        serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string());
-    let text = if lines.is_empty() {
-        formatted
-    } else {
-        format!("{}\n\n{formatted}", lines.join("\n"))
-    };
+    let text = result["structuredContent"].to_string();
     result["content"] = json!([{"type":"text","text":text}]);
     result
 }
@@ -543,20 +526,22 @@ mod tests {
         assert_eq!(error.issues.as_ref().unwrap()[0]["path"], json!(["n"]));
     }
     #[test]
-    fn structured_arrays_remain_model_visible() {
-        let v = model_visible(
-            json!({"content":[],"structuredContent":{"agents":[{"id":"a"},{"id":"b"}]}}),
-        );
-        assert!(
-            v["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("agents_count=2\nagents_ids=a,b\n\n")
-        );
+    fn model_content_preserves_structured_values_and_existing_errors() {
+        let structured = json!({"entries":[{"errorText":"failure\nwith details"}],
+            "nextCursor":{"epoch":"e","maxSeq":4,"beforeSeq":2}});
+        let result = model_visible(json!({"content":[],"structuredContent":structured}));
+        let decoded: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, structured);
+        assert_eq!(result["structuredContent"], structured);
+        let error = json!({"isError":true,"content":[{"type":"text","text":"permission denied"}],
+            "structuredContent":{"code":"denied"}});
+        assert_eq!(model_visible(error.clone()), error);
     }
     #[test]
     fn provider_policy_comes_from_provider_overrides() {
-        let daemon = json!({"providerOverrides":{"codex":{"paseoTools":{"disabledTools":["kill_agent"]}}}});
+        let daemon =
+            json!({"providerOverrides":{"codex":{"paseoTools":{"disabledTools":["kill_agent"]}}}});
         let policy = provider_tool_policy(&daemon, &json!({"provider":"codex"}));
         assert!(!tool_enabled(policy.as_ref(), "kill_agent"));
         assert!(tool_enabled(policy.as_ref(), "list_agents"));

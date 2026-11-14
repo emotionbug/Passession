@@ -114,7 +114,7 @@ fn routed_frames_have_exact_lengths_and_preserve_nested_payloads() {
 fn full_schema_catalog_retains_extensions_and_rejects_nested_errors() {
     assert!(message_types(Direction::Inbound).count() > 200);
     assert!(message_types(Direction::Outbound).count() > 200);
-    let raw = json!({"type":"fetch_agent_timeline_request","agentId":"a","requestId":"r","cursor":{"epoch":"e","seq":3},"projection":"canonical","limit":0,"futureField":{"nested":true}});
+    let raw = json!({"type":"fetch_agent_timeline_request","agentId":"a","requestId":"r","cursor":{"epoch":"e","seq":3},"projection":"canonical","limit":0,"observationOnly":true,"futureField":{"nested":true}});
     let message = SessionMessage::parse(raw.clone(), Direction::Inbound).unwrap();
     assert_eq!(message.request_id(), Some("r"));
     assert_eq!(message.clone().into_value(), raw);
@@ -124,6 +124,9 @@ fn full_schema_catalog_retains_extensions_and_rejects_nested_errors() {
         parse_envelope(&bytes, Direction::Inbound).unwrap(),
         envelope
     );
+    let mut invalid_observation = raw.clone();
+    invalid_observation["observationOnly"] = json!("true");
+    assert!(validate_session(&invalid_observation, Direction::Inbound).is_err());
     let mut invalid = raw;
     invalid["cursor"]["seq"] = json!(-1);
     assert!(validate_session(&invalid, Direction::Inbound).is_err());
@@ -157,13 +160,17 @@ fn terminal_and_listing_metadata_remain_optional_and_lossless() {
         assert_eq!(message.clone().into_value(), value);
         let envelope = message.into_envelope();
         let bytes = encode_envelope(&envelope, Direction::Outbound).unwrap();
-        assert_eq!(parse_envelope(&bytes, Direction::Outbound).unwrap(), envelope);
+        assert_eq!(
+            parse_envelope(&bytes, Direction::Outbound).unwrap(),
+            envelope
+        );
     }
     new_exit["payload"]["exitCode"] = json!("7");
     assert!(validate_session(&new_exit, Direction::Outbound).is_err());
     new_listing["payload"]["directory"]["absolutePath"] = json!(false);
     assert!(validate_session(&new_listing, Direction::Outbound).is_err());
-    let mut snapshot = json!({"rows":1,"cols":1,"grid":[[]],"scrollback":[],"cursor":{"row":0,"col":0}});
+    let mut snapshot =
+        json!({"rows":1,"cols":1,"grid":[[]],"scrollback":[],"cursor":{"row":0,"col":0}});
     assert!(validate_terminal_snapshot(&snapshot).is_ok());
     snapshot["alternateScreen"] = json!(true);
     assert!(validate_terminal_snapshot(&snapshot).is_ok());

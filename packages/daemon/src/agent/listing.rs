@@ -216,9 +216,6 @@ impl AgentManager {
     pub async fn activity(&self, id: &str, options: &Value) -> Result<Vec<Value>> {
         crate::activity::curate(&self.timeline_items(id).await?, options)
     }
-    pub async fn activity_summary(&self, id: &str, limit: Option<f64>) -> Result<Value> {
-        crate::activity::summarize(&self.timeline_items(id).await?, limit)
-    }
     pub async fn fork_context(&self, id: &str, options: &Value) -> Result<Value> {
         let cell = self.timeline_cell(id).await?;
         let snapshot = cell.data.lock().await.snapshot.clone();
@@ -249,13 +246,16 @@ impl AgentManager {
         let store = self.subagent_store.clone();
         let id = id.to_owned();
         let listed: Vec<Value> = tokio::task::spawn_blocking(move || {
-            let (subagents, unavailable) = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
+            let (subagents, unavailable) = store
+                .lock()
+                .map_err(|_| anyhow!("Subagent lock poisoned"))?
                 .list_persisted(&root, &id)?;
             match unavailable.into_iter().next() {
                 Some(error) => Err(anyhow::Error::from(error)),
                 None => Ok(subagents),
             }
-        }).await??;
+        })
+        .await??;
         Ok(listed
             .into_iter()
             .map(|descriptor| {
@@ -275,13 +275,25 @@ impl AgentManager {
         let store = self.subagent_store.clone();
         let owner = parent.to_owned();
         let result = tokio::task::spawn_blocking(move || {
-            store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.delete_persisted(&root, &owner, &ids)
-        }).await??;
+            store
+                .lock()
+                .map_err(|_| anyhow!("Subagent lock poisoned"))?
+                .delete_persisted(&root, &owner, &ids)
+        })
+        .await??;
         for id in &result.deleted {
-            self.emit_subagent_output(parent, false, json!({"type":"remove","parentAgentId":parent,"subagentId":id}))
-                .await?;
+            self.emit_subagent_output(
+                parent,
+                false,
+                json!({"type":"remove","parentAgentId":parent,"subagentId":id}),
+            )
+            .await?;
         }
-        let skipped: Vec<Value> = result.skipped.into_iter().map(|(id, reason)| json!({"id":id,"reason":reason})).collect();
+        let skipped: Vec<Value> = result
+            .skipped
+            .into_iter()
+            .map(|(id, reason)| json!({"id":id,"reason":reason}))
+            .collect();
         Ok(json!({"deleted":result.deleted,"skipped":skipped}))
     }
     /// Pages one child without listing (or hydrating) its siblings.
@@ -311,10 +323,19 @@ impl AgentManager {
         let store = self.subagent_store.clone();
         let root = self.app()?.home.join("agent-subagents");
         tokio::task::spawn_blocking(move || {
-            let (subagents, unavailable) = store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
+            let (subagents, unavailable) = store
+                .lock()
+                .map_err(|_| anyhow!("Subagent lock poisoned"))?
                 .list_persisted_parents(&root, public.iter().map(String::as_str));
-            Ok((subagents.into_iter().map(timeline::public_subagent).collect(), unavailable))
-        }).await?
+            Ok((
+                subagents
+                    .into_iter()
+                    .map(timeline::public_subagent)
+                    .collect(),
+                unavailable,
+            ))
+        })
+        .await?
     }
     pub async fn workspace_last_user_message_times(&self) -> Result<BTreeMap<String, String>> {
         let mut times = BTreeMap::new();
@@ -339,17 +360,18 @@ impl AgentManager {
     pub async fn commands(&self, id: Option<&str>, config: &Value) -> Result<Vec<Value>> {
         if let Some(id) = id
             && let Some(snapshot) = self.agent_snapshot(id).await?
-                && !snapshot["archivedAt"].is_string() {
-                    let cell = self.ensure_loaded(id).await?;
-                    let session = cell
-                        .data
-                        .lock()
-                        .await
-                        .session
-                        .clone()
-                        .ok_or_else(|| anyhow!("Agent has no session"))?;
-                    return session.list_commands().await;
-                }
+            && !snapshot["archivedAt"].is_string()
+        {
+            let cell = self.ensure_loaded(id).await?;
+            let session = cell
+                .data
+                .lock()
+                .await
+                .session
+                .clone()
+                .ok_or_else(|| anyhow!("Agent has no session"))?;
+            return session.list_commands().await;
+        }
         self.list_draft_commands(config).await
     }
     pub async fn list_draft_commands(&self, config: &Value) -> Result<Vec<Value>> {
@@ -369,9 +391,10 @@ impl AgentManager {
     }
     pub async fn features(&self, id: Option<&str>, config: &Value) -> Result<Vec<Value>> {
         if let Some(id) = id
-            && let Some(session) = self.session(id).await? {
-                return Ok(session.features().to_vec());
-            }
+            && let Some(session) = self.session(id).await?
+        {
+            return Ok(session.features().to_vec());
+        }
         self.list_draft_features(config).await
     }
     pub async fn list_draft_features(&self, config: &Value) -> Result<Vec<Value>> {
@@ -517,9 +540,9 @@ impl AgentManager {
                     Path::new(text(&session, "cwd").unwrap_or("")),
                 )
                 .await
-                {
-                    continue;
-                }
+            {
+                continue;
+            }
             if since.is_some_and(|since| timestamp(&session["lastActivityAt"]) < since) {
                 continue;
             }

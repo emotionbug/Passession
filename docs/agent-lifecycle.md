@@ -105,6 +105,11 @@ OMP host-tool completion closes progress intake and drains already accepted prog
 before sending the final result. Retained progress sender or permit lifetimes cannot delay that final
 reply after the executor has finished.
 
+Model-facing status/activity checks use bounded MCP projections without changing
+the UI/SDK snapshots or canonical history. Permission counts, errors and detail
+references remain available; reading a stored agent does not resume its provider.
+See the [MCP detail and pagination contract](../public-docs/mcp.md#reading-activity-and-details).
+
 Finish notification intent has a separate daemon-owned lifetime. The finish-subscriptions module
 persists caller, child, host, and ownership policy through an injectable store; its JSON adapter uses
 `$PASEO_HOME/finish-subscriptions.json`. Registration must commit before creation or queued-prompt

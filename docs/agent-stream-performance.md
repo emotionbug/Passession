@@ -27,6 +27,19 @@ spills through the admission spool instead of blocking the stdout reader on a bo
 This isolates a demonstrated propagation mechanism, not proof of the first lock owner in a
 historical incident. Private spool I/O can still fail or stall independently of the consumer.
 
+OMP requests `set_event_filter` with `events: null` and `messageUpdates: "delta"`
+on initial open and runtime restart. Only an echoed `"delta"` enables that
+capability; older OMP without the acknowledgement retains full snapshots. Invalid
+acknowledgements and transport failures remain errors. Pi is unchanged.
+
+OMP reconstruction tracks RPC message IDs and content-block indices independently,
+preserving Unicode and text/thinking order. Block ends and the complete terminal
+message recover missing suffixes and replace unpublished fragments without
+duplicating emitted text. The neutral stream is append-only: a terminal body
+contradicting already published bytes produces an explicit error, not a fabricated
+merge; native history remains the authority for recovering that final body.
+This changes provider payload handling, not batching, settling or polling policy.
+
 Physical client frame admission has a one-second stall deadline as well as its byte budget;
 a saturated small-frame queue disconnects that source without failing the agent commit.
 Read-only agent snapshots fall back to committed storage with

@@ -93,6 +93,7 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
         "workspaceLabels",
         "daemonStatusRpc",
         "gitLog",
+        "readOnlyAgentTimeline",
     ] {
         result.insert(name.to_owned(), Value::Bool(true));
     }

@@ -40,6 +40,34 @@ CLI-default profiles are host-owned. Explicit command-line provider/model argume
 
 Provider helpers that outlive one session belong to the daemon's managed-process lifecycle. Record and verify process-start identity before signalling a PID. Graceful shutdown, forced termination, restart, and cancellation must not affect another process that reused the same PID.
 
+### OMP host-tool loading
+
+OMP receives the same executable native and bridged MCP catalog, with history-derived
+`essential`/`discoverable` load modes. A structurally recorded invocation makes a tool
+essential even when it failed. Schema reads and tool names mentioned in prose or code
+are not execution evidence. Native namespace aliases and server-qualified MCP identities
+are matched exactly; ambiguous aliases do not promote a different server's tool.
+
+Bootstrap reads the daemon home's `agent-timelines/*.sqlite3` and retained legacy
+`*.json` checkpoints, plus OMP's resolved session directory, configured
+`PI_CODING_AGENT_DIR/sessions`, and `HOME/.omp/agent/sessions`. It runs off Tokio's
+async workers and checkpoints source progress in
+`$PASEO_HOME/omp-host-tool-history.sqlite3`. The cache stores tool identities/names
+and source cursors, not invocation arguments or conversation bodies. Existing history
+is read-only; new cache files are private on Unix.
+
+Successful and failed host calls extend a durable union before dispatch. Load modes
+stay fixed for the current provider runtime; a newly used tool becomes essential on
+the next launch/restart. Unused tools remain available through OMP discovery.
+This is prompt-loading policy, not a permission boundary.
+
+Unreadable or incomplete sources warn and conservatively keep the current catalog
+essential until a later scan succeeds. Some legacy `plain_text` rows discarded
+whether a renamed `xd://` access was a schema read or execution. Those rows cannot
+prove an invocation: they are skipped with a per-scan `skipped_legacy_rows` warning;
+structured OMP records can still establish the call. Missing historical provenance
+must not be described as proof that a tool was never used.
+
 ## Adding an integration
 
 1. Decide whether the integration is a native built-in or an optional native backend extension.

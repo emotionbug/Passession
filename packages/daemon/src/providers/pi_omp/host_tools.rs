@@ -1,3 +1,5 @@
+mod history;
+
 use super::transport::Transport;
 use crate::{
     mcp_client::McpConnection,
@@ -28,6 +30,8 @@ pub struct Router {
     runtime: Arc<Transport>,
     executor: Option<Arc<dyn NativeToolExecutor>>,
     tools: HashMap<String, BridgedTool>,
+    catalog: history::Catalog,
+    history: history::History,
     clients: Vec<Arc<McpConnection>>,
     pending: Mutex<HashMap<String, CancellationToken>>,
     closed: AtomicBool,
@@ -39,6 +43,7 @@ impl Router {
         context: &LaunchContext,
         cwd: &Path,
         env: &BTreeMap<String, String>,
+        session_options: &Value,
     ) -> Result<Arc<Self>> {
         let native = context
             .tool_catalog
@@ -123,10 +128,41 @@ impl Router {
             }
             clients.push(client);
         }
+        let mut catalog = history::Catalog::default();
+        for definition in &definitions {
+            let name = definition["name"].as_str().unwrap();
+            let identity = tools
+                .get(name)
+                .map(|tool| (tool.server.as_str(), tool.name.as_str()));
+            catalog.insert(name, identity);
+        }
+        let mut history_options = session_options.clone();
+        history_options["cwd"] = json!(cwd);
+        if history_options["homeDir"].is_null() {
+            history_options["homeDir"] = json!(env.get("HOME"));
+        }
+        let sessions = super::history::sessions_dir("omp", env, &history_options).await?;
+        let roots = history::session_roots(env, cwd, sessions);
+        let history = history::History::load(&context.home, roots).await;
+        {
+            let observed = catalog.observed(&history);
+            for definition in &mut definitions {
+                let identity = catalog
+                    .identity(definition["name"].as_str().unwrap())
+                    .unwrap();
+                definition["loadMode"] = json!(if observed.contains(identity) {
+                    "essential"
+                } else {
+                    "discoverable"
+                });
+            }
+        }
         let router = Arc::new(Self {
             runtime,
             executor: context.tool_executor.clone(),
             tools,
+            catalog,
+            history,
             clients,
             pending: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
@@ -140,10 +176,10 @@ impl Router {
                 .runtime
                 .request(json!({"type":"set_host_tools","tools":definitions}))
                 .await
-            {
-                router.close().await;
-                return Err(error);
-            }
+        {
+            router.close().await;
+            return Err(error);
+        }
         Ok(router)
     }
     pub fn identities(&self) -> Value {
@@ -183,9 +219,10 @@ impl Router {
             Some("host_tool_cancel") => {
                 if frame["id"].is_string()
                     && let Some(id) = frame["targetId"].as_str()
-                        && let Some(cancel) = self.pending.lock().unwrap().get(id) {
-                            cancel.cancel();
-                        }
+                    && let Some(cancel) = self.pending.lock().unwrap().get(id)
+                {
+                    cancel.cancel();
+                }
                 true
             }
             Some("host_tool_update") => true,
@@ -199,6 +236,11 @@ impl Router {
         args: Value,
         cancel: CancellationToken,
     ) {
+        if let Some(identity) = self.catalog.identity(&name)
+            && let Err(error) = self.history.record(identity).await
+        {
+            tracing::warn!(%name, %error, "OMP host tool invocation could not be retained for future catalogs");
+        }
         let (updates, receive) = mpsc::channel(32);
         let (finished, completion) = oneshot::channel();
         let update_runtime = self.runtime.clone();
@@ -207,7 +249,8 @@ impl Router {
         let update_task = tokio::spawn(async move {
             forward_updates(receive, completion, update_cancel, |result| {
                 let runtime = &update_runtime;
-                let frame = json!({"type":"host_tool_update","id":update_id,"partialResult":result});
+                let frame =
+                    json!({"type":"host_tool_update","id":update_id,"partialResult":result});
                 async move { runtime.send(&frame).await }
             })
             .await
@@ -311,30 +354,31 @@ fn map_result(result: Value) -> Result<Value> {
         .cloned()
         .ok_or_else(|| anyhow!("Native tool result requires content"))?;
     if content.is_empty()
-        && let Some(structured) = result.get("structuredContent") {
-            let mut summary = Vec::new();
-            if let Some(object) = structured.as_object() {
-                for (key, value) in object {
-                    if let Some(values) = value.as_array() {
-                        summary.push(format!("{key}_count={}", values.len()));
-                        let ids = values
-                            .iter()
-                            .filter_map(|item| item["id"].as_str().filter(|s| !s.is_empty()))
-                            .collect::<Vec<_>>();
-                        if !ids.is_empty() && ids.len() == values.len() {
-                            summary.push(format!("{key}_ids={}", ids.join(",")));
-                        }
+        && let Some(structured) = result.get("structuredContent")
+    {
+        let mut summary = Vec::new();
+        if let Some(object) = structured.as_object() {
+            for (key, value) in object {
+                if let Some(values) = value.as_array() {
+                    summary.push(format!("{key}_count={}", values.len()));
+                    let ids = values
+                        .iter()
+                        .filter_map(|item| item["id"].as_str().filter(|s| !s.is_empty()))
+                        .collect::<Vec<_>>();
+                    if !ids.is_empty() && ids.len() == values.len() {
+                        summary.push(format!("{key}_ids={}", ids.join(",")));
                     }
                 }
             }
-            let text = serde_json::to_string_pretty(structured)?;
-            let text = if summary.is_empty() {
-                text
-            } else {
-                format!("{}\n\n{text}", summary.join("\n"))
-            };
-            content.push(json!({"type":"text","text":text}));
         }
+        let text = serde_json::to_string_pretty(structured)?;
+        let text = if summary.is_empty() {
+            text
+        } else {
+            format!("{}\n\n{text}", summary.join("\n"))
+        };
+        content.push(json!({"type":"text","text":text}));
+    }
     let mut mapped = json!({"content":content});
     if let Some(details) = result.get("structuredContent") {
         mapped["details"] = details.clone();
@@ -390,7 +434,9 @@ mod tests {
         ) -> Result<Value> {
             let updates = updates.unwrap();
             for index in 0..3 {
-                updates.send(json!({"content":[{"type":"text","text":index.to_string()}]})).await?;
+                updates
+                    .send(json!({"content":[{"type":"text","text":index.to_string()}]}))
+                    .await?;
             }
             *self.sender.lock().unwrap() = Some(updates);
             Ok(json!({"content":[{"type":"text","text":"done"}]}))
@@ -400,6 +446,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn router_emits_final_result_after_progress_with_retained_sender() -> Result<()> {
+        let home = tempfile::tempdir()?;
         let cancel = CancellationToken::new();
         let _cleanup = cancel.clone().drop_guard();
         let (runtime, mut events) = Transport::spawn(
@@ -412,12 +459,17 @@ mod tests {
             },
             Duration::from_secs(1),
             cancel.clone(),
-        ).await?;
-        let executor = Arc::new(RetainedProgress { sender: Mutex::new(None) });
+        )
+        .await?;
+        let executor = Arc::new(RetainedProgress {
+            sender: Mutex::new(None),
+        });
         let router = Arc::new(Router {
             runtime: runtime.clone(),
             executor: Some(executor.clone()),
             tools: HashMap::new(),
+            catalog: history::Catalog::default(),
+            history: history::History::load(home.path(), Vec::new()).await,
             clients: Vec::new(),
             pending: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
@@ -428,23 +480,46 @@ mod tests {
             "toolName":"retained","arguments":{}
         })));
         for index in 0..3 {
-            let frame = tokio::time::timeout(Duration::from_secs(1), events.recv()).await?.unwrap();
+            let frame = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await?
+                .unwrap();
             assert_eq!(frame["type"], "host_tool_update");
-            assert_eq!(frame["partialResult"]["content"][0]["text"], index.to_string());
+            assert_eq!(
+                frame["partialResult"]["content"][0]["text"],
+                index.to_string()
+            );
         }
-        let frame = tokio::time::timeout(Duration::from_secs(1), events.recv()).await?.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await?
+            .unwrap();
         assert_eq!(frame["type"], "host_tool_result");
         assert_eq!(frame["result"]["content"][0]["text"], "done");
-        assert!(executor.sender.lock().unwrap().as_ref().unwrap().is_closed());
+        assert!(
+            executor
+                .sender
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_closed()
+        );
         let canceled = router.cancel.child_token();
         canceled.cancel();
         tokio::time::timeout(
             Duration::from_secs(1),
-            router.clone().call("canceled".into(), "retained".into(), json!({}), canceled),
-        ).await?;
+            router
+                .clone()
+                .call("canceled".into(), "retained".into(), json!({}), canceled),
+        )
+        .await?;
         runtime.send(&json!({"type":"after_cancellation"})).await?;
-        let frame = tokio::time::timeout(Duration::from_secs(1), events.recv()).await?.unwrap();
-        assert_eq!(frame["type"], "after_cancellation", "canceled calls must not emit a final result");
+        let frame = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await?
+            .unwrap();
+        assert_eq!(
+            frame["type"], "after_cancellation",
+            "canceled calls must not emit a final result"
+        );
         router.close().await;
         runtime.close().await?;
         Ok(())

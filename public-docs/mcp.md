@@ -90,16 +90,52 @@ MCP does not expose an agent-detach tool. Detaching is a manual user action in t
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `create_agent`       | Create an agent, optionally placing it in an existing workspace with `workspaceId`. Use `initialPrompt` to start work; returns without waiting for completion. |
 | `send_agent_prompt`  | Send a prompt using `agentId` and `prompt`; returns without waiting for completion.                                                                            |
-| `get_agent_status`   | Return the latest snapshot for an agent.                                                                                                                       |
+| `get_agent_status`   | Return compact lifecycle, error and permission status; use `detail` to recover full snapshot fields.                                                           |
 | `list_agents`        | List recent agents as compact metadata; `includeBackground: true` includes background work.                                                                    |
 | `cancel_agent`       | Abort an agent's current run but keep the agent alive.                                                                                                         |
 | `archive_agent`      | Soft-delete an agent and remove it from the active list.                                                                                                       |
 | `kill_agent`         | Close an agent's runtime without deleting its record or history. The agent can be resumed.                                                                    |
 | `update_agent`       | Update an agent name, labels, or runtime settings such as mode/model/thinking/features.                                                                        |
-| `get_agent_activity` | Return recent agent timeline entries as a curated summary.                                                                                                     |
+| `get_agent_activity` | Return a bounded recent timeline page with compact status and references for exact retained item details.                                                      |
 | `set_agent_mode`     | Switch an agent's session mode.                                                                                                                                |
 
 Paseo agents receive finish, error, and permission notifications by default; set `notifyOnFinish: false` to disable them. External MCP clients use `get_agent_status` and `get_agent_activity` to check results.
+
+#### Reading activity and details
+
+`get_agent_activity` defaults to eight canonical rows; `limit` accepts 1–20.
+Pages run backward, with entries ordered oldest to newest within each page.
+Following `nextCursor` never expands a page to include an entire overlapping tool
+lifecycle. `view: "failures"` filters each bounded page: an empty `entries` array
+does not mean there are no older failures. Continue until `nextCursor` is null.
+Coverage describes retained canonical history, not every byte a provider ever emitted.
+
+Activity reads do not load or resume a provider, including closed agents. If no
+retained timeline exists, the request fails explicitly instead of preparing one.
+Remote hosts must advertise `readOnlyAgentTimeline`; older hosts require an update
+for this model-facing observation path.
+
+Reasoning text is omitted from the default page; long fields have explicit previews.
+Pass an entry's complete `detail` argument object back to `get_agent_activity` for
+the exact retained item JSON. Follow `nextRead`, concatenate its `chunk` strings,
+then decode JSON. Chunks contain at most 4096 UTF-8 bytes; offsets are bytes, not
+character positions. Unrelated tail growth does not invalidate older pages or item
+details. Changed requested rows, epoch changes and retention loss fail explicitly
+rather than mixing incompatible history.
+
+`get_agent_status` shows selected status/error fields, a permission count and at most
+three permission previews. Its `detail` reads JSON pointers into the original
+snapshot, such as `/pendingPermissions/3` or `/lastError`; an empty path reads the
+whole snapshot. Start at offset zero, then use `nextRead` unchanged. A returned
+`revision` pins the selected value, so unrelated status changes do not invalidate
+a permission/error read. A changed selected value requires a new read; whole-snapshot
+reads therefore require a stable snapshot. Truncated previews include their path
+and revision. An activity page's `agentStatus.detail` belongs to `get_agent_status`.
+
+Recovery references retain `agentId` and, for remote calls, `serverId`. These compact
+defaults affect model-facing tools only; UI/SDK timeline and snapshot contracts
+retain their existing contents. “Exact” recovery means the stored canonical item or
+the transport's authorized snapshot, not fields discarded by earlier normalization.
 
 ### Workspaces
 

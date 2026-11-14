@@ -39,6 +39,14 @@ The app checks for the capability and either runs the feature or tells the user 
 
 Existing functionality keeps working across versions because of the protocol contract. Gating a new feature never substitutes for that.
 
+Model-facing history reads require `server_info.features.readOnlyAgentTimeline`.
+They send the optional boolean `observationOnly: true` on
+`fetch_agent_timeline_request`, reading retained memory/checkpoint pages without
+loading or preparing a provider. Missing retained history fails explicitly.
+Remote model tools gate this capability once; they do not fall back to a
+provider-starting read. Existing UI/SDK requests omit the flag and retain their
+history preparation behavior. Older clients still parse the unchanged response.
+
 ## Client capability ownership
 
 Each client boundary advertises only behavior it implements. The GUI core's connection pump uses

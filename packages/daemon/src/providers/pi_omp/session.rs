@@ -7,8 +7,8 @@ use super::{
     transport::{CommandError, RequestError, Transport},
 };
 use crate::providers::api::{
-    AgentSession, EventSink, HistoryCoverage, LaunchContext, PromptAck, PromptAckFuture, PromptDeliveryError,
-    ProviderSpec, RewindTarget,
+    AgentSession, EventSink, HistoryCoverage, LaunchContext, PromptAck, PromptAckFuture,
+    PromptDeliveryError, ProviderSpec, RewindTarget,
 };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -129,9 +129,10 @@ impl Inner {
                 Some("turn_completed" | "turn_failed" | "turn_canceled")
             ) {
                 let mut state = self.state.lock().unwrap();
-                if event["sessionEnded"] != true && event["turnId"]
-                    .as_str()
-                    .is_some_and(|id| state.active.as_deref() != Some(id))
+                if event["sessionEnded"] != true
+                    && event["turnId"]
+                        .as_str()
+                        .is_some_and(|id| state.active.as_deref() != Some(id))
                 {
                     continue;
                 }
@@ -177,19 +178,21 @@ impl Inner {
                 return;
             }
             if let Some(Ok(state)) = refreshed
-                && state["isStreaming"] != true && state["isCompacting"] != true {
-                    let events = {
-                        let mut state = self.state.lock().unwrap();
-                        if !owned(self.as_ref(), &state) {
-                            return;
-                        }
-                        state.settling = false;
-                        state.mapper.map(&frame)
-                    };
-                    let _ = self.accept_events(events).await;
-                    self.poll_usage(turn).await;
-                    return;
-                }
+                && state["isStreaming"] != true
+                && state["isCompacting"] != true
+            {
+                let events = {
+                    let mut state = self.state.lock().unwrap();
+                    if !owned(self.as_ref(), &state) {
+                        return;
+                    }
+                    state.settling = false;
+                    state.mapper.map(&frame)
+                };
+                let _ = self.accept_events(events).await;
+                self.poll_usage(turn).await;
+                return;
+            }
             tokio::select! {_ = self.context.cancel.cancelled()=>return,_=tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)))=>{}}
         }
     }
@@ -239,9 +242,10 @@ impl Inner {
         if stats.get("tokens").is_none()
             && stats.get("cost").is_none()
             && stats.get("contextUsage").is_none()
-            && let Ok(state) = runtime.request(json!({"type":"get_state"})).await {
-                stats = json!({"contextUsage":state["contextUsage"]});
-            }
+            && let Ok(state) = runtime.request(json!({"type":"get_state"})).await
+        {
+            stats = json!({"contextUsage":state["contextUsage"]});
+        }
         let events = {
             let mut state = self.state.lock().unwrap();
             if self.closed.load(Ordering::Acquire)
@@ -271,9 +275,10 @@ impl Inner {
         if self.spec.family == "omp" {
             let router = self.host_tools.lock().unwrap().clone();
             if let Some(router) = router
-                && router.handle(&frame) {
-                    return Ok(());
-                }
+                && router.handle(&frame)
+            {
+                return Ok(());
+            }
         }
         if self.spec.family == "omp"
             && frame["type"] == "response"
@@ -361,9 +366,10 @@ impl Inner {
             frame["sessionId"] = self.state.lock().unwrap().native["sessionId"].clone();
         }
         if frame["type"] == "available_commands_update"
-            && let Some(commands) = frame["commands"].as_array() {
-                self.state.lock().unwrap().commands = Some(catalog::commands(commands, true));
-            }
+            && let Some(commands) = frame["commands"].as_array()
+        {
+            self.state.lock().unwrap().commands = Some(catalog::commands(commands, true));
+        }
         if frame["type"] == "process_exit" {
             {
                 let mut state = self.state.lock().unwrap();
@@ -384,53 +390,58 @@ impl Inner {
                 });
             }
         }
-        if frame["type"] == "extension_ui_request" && frame["method"] == "notify"
-            && let Some(message) = frame["message"].as_str() {
-                if let Some(payload) = message.strip_prefix("PASEO_SUBMITTED_USER_ENTRY ") {
+        if frame["type"] == "extension_ui_request"
+            && frame["method"] == "notify"
+            && let Some(message) = frame["message"].as_str()
+        {
+            if let Some(payload) = message.strip_prefix("PASEO_SUBMITTED_USER_ENTRY ") {
+                let value: Value = serde_json::from_str(payload)?;
+                let events = {
+                    let mut state = self.state.lock().unwrap();
+                    state.turn_has_user = true;
+                    state.mapper.submitted_user_entry(&value["entry"])
+                };
+                self.accept_events(events).await?;
+                return Ok(());
+            }
+            for marker in ["PASEO_ENTRY_CAPTURE ", "PASEO_COMMAND_RESULT "] {
+                if let Some(payload) = message.strip_prefix(marker) {
                     let value: Value = serde_json::from_str(payload)?;
-                    let events = {
-                        let mut state = self.state.lock().unwrap();
-                        state.turn_has_user = true;
-                        state.mapper.submitted_user_entry(&value["entry"])
-                    };
-                    self.accept_events(events).await?;
+                    let mut state = self.state.lock().unwrap();
+                    if marker == "PASEO_ENTRY_CAPTURE " {
+                        state.tree_entries =
+                            value["treeEntries"].as_array().cloned().unwrap_or_default();
+                        state.context_entries = value["contextEntries"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+                        let leaf = value
+                            .get("leafId")
+                            .filter(|leaf| leaf.is_string() || leaf.is_null());
+                        state.native_leaf = (value["persisted"] == true)
+                            .then(|| value["sessionFile"].as_str().map(str::to_owned))
+                            .flatten()
+                            .zip(leaf.cloned());
+                    }
+                    if let Some(id) = value["requestId"].as_str()
+                        && let Some(reply) = state.extension_results.remove(id)
+                    {
+                        let result = if value["ok"] == false {
+                            Err(anyhow!(
+                                "{}",
+                                value["error"]
+                                    .as_str()
+                                    .unwrap_or("Pi extension command failed")
+                            ))
+                        } else {
+                            Ok(value.clone())
+                        };
+                        let _ = reply.send(result);
+                    }
                     return Ok(());
                 }
-                for marker in ["PASEO_ENTRY_CAPTURE ", "PASEO_COMMAND_RESULT "] {
-                    if let Some(payload) = message.strip_prefix(marker) {
-                        let value: Value = serde_json::from_str(payload)?;
-                        let mut state = self.state.lock().unwrap();
-                        if marker == "PASEO_ENTRY_CAPTURE " {
-                            state.tree_entries =
-                                value["treeEntries"].as_array().cloned().unwrap_or_default();
-                            state.context_entries = value["contextEntries"]
-                                .as_array()
-                                .cloned()
-                                .unwrap_or_default();
-                            let leaf = value.get("leafId").filter(|leaf| leaf.is_string() || leaf.is_null());
-                            state.native_leaf = (value["persisted"] == true)
-                                .then(|| value["sessionFile"].as_str().map(str::to_owned))
-                                .flatten()
-                                .zip(leaf.cloned());
-                        }
-                        if let Some(id) = value["requestId"].as_str()
-                            && let Some(reply) = state.extension_results.remove(id) {
-                                let result = if value["ok"] == false {
-                                    Err(anyhow!(
-                                        "{}",
-                                        value["error"]
-                                            .as_str()
-                                            .unwrap_or("Pi extension command failed")
-                                    ))
-                                } else {
-                                    Ok(value.clone())
-                                };
-                                let _ = reply.send(result);
-                            }
-                        return Ok(());
-                    }
-                }
             }
+        }
         if self.spec.family == "pi"
             && self.manual_compaction.load(Ordering::Acquire)
             && matches!(
@@ -506,46 +517,46 @@ impl Inner {
                     return;
                 }
                 if let Ok(mut handle) = tokio::fs::File::open(&file).await
-                    && let Ok(metadata) = handle.metadata().await {
-                        let count = metadata.len().min(MAX_BYTES).saturating_sub(offset) as usize;
-                        if count > 0 && handle.seek(std::io::SeekFrom::Start(offset)).await.is_ok()
-                        {
-                            let start = pending.len();
-                            pending.resize(start + count, 0);
-                            match handle.read(&mut pending[start..]).await {
-                                Ok(read) => {
-                                    offset += read as u64;
-                                    pending.truncate(start + read);
-                                }
-                                Err(_) => pending.truncate(start),
+                    && let Ok(metadata) = handle.metadata().await
+                {
+                    let count = metadata.len().min(MAX_BYTES).saturating_sub(offset) as usize;
+                    if count > 0 && handle.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                        let start = pending.len();
+                        pending.resize(start + count, 0);
+                        match handle.read(&mut pending[start..]).await {
+                            Ok(read) => {
+                                offset += read as u64;
+                                pending.truncate(start + read);
                             }
-                            if let Some(last) = pending.iter().rposition(|b| *b == b'\n') {
-                                for line in pending[..last].split(|b| *b == b'\n') {
-                                    let Ok(entry) = serde_json::from_slice::<Value>(line) else {
-                                        continue;
-                                    };
-                                    if !entry["message"]["role"].is_string() {
+                            Err(_) => pending.truncate(start),
+                        }
+                        if let Some(last) = pending.iter().rposition(|b| *b == b'\n') {
+                            for line in pending[..last].split(|b| *b == b'\n') {
+                                let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+                                    continue;
+                                };
+                                if !entry["message"]["role"].is_string() {
+                                    continue;
+                                }
+                                for event in mapper.replay_message(&entry["message"], None) {
+                                    if event["type"] != "timeline" {
                                         continue;
                                     }
-                                    for event in mapper.replay_message(&entry["message"], None) {
-                                        if event["type"] != "timeline" {
-                                            continue;
-                                        }
-                                        let mut child = json!({"type":"timeline","id":id,"item":history::limit_child_item(event["item"].clone())});
-                                        if let Some(timestamp) = entry.get("timestamp") {
-                                            child["timestamp"] = timestamp.clone();
-                                        }
-                                        if inner.emit(json!({"type":"provider_subagent","provider":inner.spec.id,"event":child})).await.is_err(){return;}
-                                        items += 1;
-                                        if items >= 200 {
-                                            return;
-                                        }
+                                    let mut child = json!({"type":"timeline","id":id,"item":history::limit_child_item(event["item"].clone())});
+                                    if let Some(timestamp) = entry.get("timestamp") {
+                                        child["timestamp"] = timestamp.clone();
+                                    }
+                                    if inner.emit(json!({"type":"provider_subagent","provider":inner.spec.id,"event":child})).await.is_err(){return;}
+                                    items += 1;
+                                    if items >= 200 {
+                                        return;
                                     }
                                 }
-                                pending.drain(..=last);
                             }
+                            pending.drain(..=last);
                         }
                     }
+                }
                 tokio::select! {_ = inner.context.cancel.cancelled()=>return,_ = tokio::time::sleep(Duration::from_millis(250))=>{}}
             }
         });
@@ -575,13 +586,12 @@ impl Inner {
             // The queue always ends with process_exit; an end without one (a
             // lost delivery task) still ends this generation instead of leaving
             // a live-looking session with no runtime output.
-            if !terminal
-                && let Some(inner) = weak.upgrade() {
-                    let frame = json!({"type":"process_exit","error":"Provider event stream ended without a process exit"});
-                    if let Err(error) = inner.frame(frame, generation).await {
-                        tracing::warn!(%error, "Provider stream end delivery failed");
-                    }
+            if !terminal && let Some(inner) = weak.upgrade() {
+                let frame = json!({"type":"process_exit","error":"Provider event stream ended without a process exit"});
+                if let Err(error) = inner.frame(frame, generation).await {
+                    tracing::warn!(%error, "Provider stream end delivery failed");
                 }
+            }
         });
     }
     async fn extension(&self, name: &str, mut payload: Value) -> Result<Value> {
@@ -672,12 +682,14 @@ impl Inner {
             next.negotiate(launch::ready_timeout(&self.spec, &config))
                 .await?;
             let state = initialized_state(&next, &config, true, true).await?;
+            configure_message_updates(&next).await?;
             let env = launch::external_env(&self.spec, &self.context);
             let router = Router::register(
                 next.clone(),
                 &self.context,
                 Path::new(config["cwd"].as_str().unwrap_or(".")),
                 &env,
+                &config,
             )
             .await?;
             Ok::<_, anyhow::Error>((state, router))
@@ -721,6 +733,7 @@ impl Inner {
             data.live = false;
             data.bridged_tools = identities.clone();
             data.mapper.set_bridged_tools(&identities);
+            data.mapper.reset_streams();
         }
         self.attach(receiver, generation);
         subscribe(&next).await;
@@ -739,6 +752,50 @@ impl Inner {
         Ok(())
     }
 }
+/// The acknowledgement, not a successful command alone, proves delta support.
+fn delta_updates_supported(result: Result<Value>) -> Result<bool> {
+    match result {
+        Ok(data) if data["messageUpdates"] == "delta" => Ok(true),
+        // COMPAT(ompMessageUpdates): added in v0.13.22, remove after 2027-05-14 once the OMP floor echoes messageUpdates.
+        Ok(data) if data.get("messageUpdates").is_none() || data["messageUpdates"] == "full" => {
+            Ok(false)
+        }
+        Ok(data) => bail!(
+            "OMP returned an invalid messageUpdates acknowledgement: {}",
+            data["messageUpdates"]
+        ),
+        Err(error) => {
+            if error.downcast_ref::<CommandError>().is_some_and(|command| {
+                let text = command.0.to_ascii_lowercase();
+                text.contains("set_event_filter")
+                    && (text.contains("unknown command")
+                        || text.contains("not supported")
+                        || text.contains("unrecognized"))
+            }) {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn configure_message_updates(runtime: &Transport) -> Result<()> {
+    let supported = delta_updates_supported(
+        runtime
+            .request(json!({"type":"set_event_filter","events":null,"messageUpdates":"delta"}))
+            .await,
+    )?;
+    if supported {
+        tracing::debug!("OMP RPC delta message updates enabled");
+    } else {
+        tracing::warn!(
+            "OMP does not support delta message updates; retaining full snapshots. Update OMP to enable delta delivery"
+        );
+    }
+    Ok(())
+}
+
 async fn subscribe(runtime: &Transport) {
     if runtime
         .request(json!({"type":"set_subagent_subscription","level":"events"}))
@@ -747,9 +804,9 @@ async fn subscribe(runtime: &Transport) {
         && let Err(error) = runtime
             .request(json!({"type":"set_subagent_subscription","level":"progress"}))
             .await
-        {
-            tracing::debug!(%error,"OMP subagent subscriptions unavailable");
-        }
+    {
+        tracing::debug!(%error,"OMP subagent subscriptions unavailable");
+    }
 }
 async fn initialized_state(
     runtime: &Transport,
@@ -763,25 +820,26 @@ async fn initialized_state(
             .as_str()
             .and_then(|model| model.split_once('/').or_else(|| model.split_once(':')))
             .filter(|(p, i)| !p.is_empty() && !i.is_empty())
-            && (state["model"]["provider"] != provider || state["model"]["id"] != id) {
-                let models = runtime
-                    .request(json!({"type":"get_available_models"}))
-                    .await?;
-                if models["models"].as_array().is_some_and(|models| {
-                    models
-                        .iter()
-                        .any(|model| model["provider"] == provider && model["id"] == id)
-                }) {
-                    runtime
-                        .request(json!({"type":"set_model","provider":provider,"modelId":id}))
-                        .await?;
-                    state = runtime.request(json!({"type":"get_state"})).await?;
-                } else {
-                    tracing::warn!(
-                        "Requested resume model unavailable; preserving provider's resolved model"
-                    );
-                }
-            }
+        && (state["model"]["provider"] != provider || state["model"]["id"] != id)
+    {
+        let models = runtime
+            .request(json!({"type":"get_available_models"}))
+            .await?;
+        if models["models"].as_array().is_some_and(|models| {
+            models
+                .iter()
+                .any(|model| model["provider"] == provider && model["id"] == id)
+        }) {
+            runtime
+                .request(json!({"type":"set_model","provider":provider,"modelId":id}))
+                .await?;
+            state = runtime.request(json!({"type":"get_state"})).await?;
+        } else {
+            tracing::warn!(
+                "Requested resume model unavailable; preserving provider's resolved model"
+            );
+        }
+    }
     if omp
         && config["featureValues"]["fast_mode"].is_boolean()
         && state["fastModeEnabled"].is_boolean()
@@ -799,7 +857,8 @@ impl Session {
     /// Whether this is `parent`'s session with a runtime that can still publish
     /// live child rows (an OMP `subagent_event` or a followed Pi child file).
     pub(super) fn publishes_for(&self, parent: &str) -> bool {
-        if self.inner.closed.load(Ordering::Acquire) || self.inner.runtime.lock().unwrap().is_none() {
+        if self.inner.closed.load(Ordering::Acquire) || self.inner.runtime.lock().unwrap().is_none()
+        {
             return false;
         }
         let state = self.inner.state.lock().unwrap();
@@ -817,9 +876,13 @@ impl Session {
     ) -> Result<crate::providers::api::SubagentHistory> {
         self.inner
             .holds
-            .publish_replay(request, &self.inner.spec.id, &self.inner.sink, read, |item, snapshot| {
-                snapshot.contains(item)
-            })
+            .publish_replay(
+                request,
+                &self.inner.spec.id,
+                &self.inner.sink,
+                read,
+                |item, snapshot| snapshot.contains(item),
+            )
             .await
     }
     pub async fn open(
@@ -959,9 +1022,10 @@ impl Session {
                     state.native = native;
                 }
                 if omp {
+                    configure_message_updates(&runtime).await?;
                     let cwd=config["cwd"].as_str().ok_or_else(||anyhow!("OMP requires cwd"))?;
                     let env=launch::external_env(&inner.spec,&inner.context);
-                    let router=Router::register(runtime.clone(),&inner.context,Path::new(cwd),&env).await?;
+                    let router=Router::register(runtime.clone(),&inner.context,Path::new(cwd),&env,&config).await?;
                     let identities=router.identities();
                     {let mut state=inner.state.lock().unwrap();state.bridged_tools=identities.clone();state.mapper.set_bridged_tools(&identities);}
                     *inner.host_tools.lock().unwrap()=Some(router);
@@ -1026,22 +1090,31 @@ impl Session {
     /// Whether a native rewind result can be replayed from a persisted file.
     fn rewindable(&self) -> bool {
         let state = self.inner.state.lock().unwrap();
-        self.capabilities["supportsRewindConversation"] == true && state.native["sessionFile"].is_string()
+        self.capabilities["supportsRewindConversation"] == true
+            && state.native["sessionFile"].is_string()
     }
     async fn prompt(&self, prompt: Value, options: Value, behavior: Option<&str>) -> Result<Value> {
         // Every refusal before the native request is spawned is proven undelivered.
         if self.history_events.is_some() {
-            return Err(PromptDeliveryError::not_delivered("OMP history session cannot start a turn"));
+            return Err(PromptDeliveryError::not_delivered(
+                "OMP history session cannot start a turn",
+            ));
         }
         let _gate = self.inner.operation.lock().await;
         if self.inner.closed.load(Ordering::Acquire) {
-            return Err(PromptDeliveryError::not_delivered("Provider session is closed"));
+            return Err(PromptDeliveryError::not_delivered(
+                "Provider session is closed",
+            ));
         }
         if self.inner.state.lock().unwrap().active.is_some() {
-            return Err(PromptDeliveryError::not_delivered("A provider turn is already active"));
+            return Err(PromptDeliveryError::not_delivered(
+                "A provider turn is already active",
+            ));
         }
         if self.inner.state.lock().unwrap().dead {
-            return Err(PromptDeliveryError::not_delivered("Provider session has ended"));
+            return Err(PromptDeliveryError::not_delivered(
+                "Provider session has ended",
+            ));
         }
         let model = self.inner.state.lock().unwrap().native["model"].clone();
         let mut command = super::prompt::convert(&prompt, &model)
@@ -1092,7 +1165,11 @@ impl Session {
                     && inner.generation.load(Ordering::Acquire) == generation
             };
             let outcome = match inner.runtime() {
-                Ok(runtime) => runtime.request_with_timeout(command, Some(request_timeout)).await,
+                Ok(runtime) => {
+                    runtime
+                        .request_with_timeout(command, Some(request_timeout))
+                        .await
+                }
                 Err(error) => Err(RequestError {
                     request_id: String::new(),
                     may_have_been_sent: false,
@@ -1140,15 +1217,15 @@ impl Session {
                         tokio::task::yield_now().await;
                         if let Ok(native) = inner.refresh().await
                             && native["isStreaming"] != true
-                                && native["isCompacting"] != true
-                                && native["queuedMessageCount"].as_u64().unwrap_or(0) == 0
-                                && owns(&inner.state.lock().unwrap())
-                            {
-                                inner.no_turn(
-                                    json!({"type":"prompt_result","agentInvoked":false}),
-                                    Duration::ZERO,
-                                );
-                            }
+                            && native["isCompacting"] != true
+                            && native["queuedMessageCount"].as_u64().unwrap_or(0) == 0
+                            && owns(&inner.state.lock().unwrap())
+                        {
+                            inner.no_turn(
+                                json!({"type":"prompt_result","agentInvoked":false}),
+                                Duration::ZERO,
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -1347,14 +1424,22 @@ impl AgentSession for Session {
             for event in events {
                 sink.emit(event.clone()).await?;
             }
-            return Ok(if *complete { HistoryCoverage::Complete } else { HistoryCoverage::Unverified });
+            return Ok(if *complete {
+                HistoryCoverage::Complete
+            } else {
+                HistoryCoverage::Unverified
+            });
         }
         let initial = self.initial_history.lock().unwrap().take();
         if let Some((events, complete)) = initial {
             for event in events {
                 sink.emit(event).await?;
             }
-            return Ok(if complete { HistoryCoverage::Complete } else { HistoryCoverage::Unverified });
+            return Ok(if complete {
+                HistoryCoverage::Complete
+            } else {
+                HistoryCoverage::Unverified
+            });
         }
         if self.inner.spec.family == "omp" {
             let mut coverage = HistoryCoverage::Unverified;
@@ -1376,7 +1461,9 @@ impl AgentSession for Session {
                     &metadata,
                 )
                 .await?;
-                if history.complete { coverage = HistoryCoverage::Complete; }
+                if history.complete {
+                    coverage = HistoryCoverage::Complete;
+                }
                 for event in history.events {
                     sink.emit(event).await?;
                 }
@@ -1497,16 +1584,17 @@ impl AgentSession for Session {
         }
         let runtime = self.inner.runtime()?;
         if self.inner.spec.family == "pi"
-            && let Err(error) = runtime.stop_work(json!({"type":"clear_queue"})).await {
-                let text = error.to_string().to_lowercase();
-                if !(text.contains("clear_queue")
-                    && (text.contains("unknown command")
-                        || text.contains("not supported")
-                        || text.contains("unrecognized")))
-                {
-                    return Err(error);
-                }
+            && let Err(error) = runtime.stop_work(json!({"type":"clear_queue"})).await
+        {
+            let text = error.to_string().to_lowercase();
+            if !(text.contains("clear_queue")
+                && (text.contains("unknown command")
+                    || text.contains("not supported")
+                    || text.contains("unrecognized")))
+            {
+                return Err(error);
             }
+        }
         runtime.stop_work(json!({"type":"abort"})).await?;
         let (turn, events) = {
             let mut state = self.inner.state.lock().unwrap();
@@ -1642,7 +1730,9 @@ impl AgentSession for Session {
         // returns. A native mutation whose result cannot be replayed completely
         // would strand the provider ahead of canonical history, so refuse first.
         if !self.rewindable() {
-            bail!("Conversation rewind requires a persisted native session file; the conversation was not changed");
+            bail!(
+                "Conversation rewind requires a persisted native session file; the conversation was not changed"
+            );
         }
         if self.inner.spec.family == "omp" {
             let result = self
@@ -1687,7 +1777,12 @@ impl AgentSession for Session {
         prompt: &Value,
     ) -> Option<futures_util::future::BoxFuture<'static, Result<()>>> {
         let text = prompt.as_str()?.trim().strip_prefix('/')?;
-        enum Command { Compact, AutoCompact, Handoff, Prompt(&'static str) }
+        enum Command {
+            Compact,
+            AutoCompact,
+            Handoff,
+            Prompt(&'static str),
+        }
         let (name, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
         let name = name.to_lowercase();
         let args = args.trim();
@@ -1695,8 +1790,9 @@ impl AgentSession for Session {
             "compact" => Command::Compact,
             "autocompact" => Command::AutoCompact,
             "handoff" if self.inner.spec.family == "omp" => Command::Handoff,
-            "steer" | "follow-up" if self.inner.spec.family == "omp" && !args.is_empty() =>
-                Command::Prompt(if name == "steer" { "steer" } else { "followUp" }),
+            "steer" | "follow-up" if self.inner.spec.family == "omp" && !args.is_empty() => {
+                Command::Prompt(if name == "steer" { "steer" } else { "followUp" })
+            }
             _ => return None,
         };
         let args = args.to_owned();
@@ -1734,7 +1830,9 @@ impl AgentSession for Session {
                     }
                     if let Err(error) = result {
                         self.inner
-                            .out_of_band_message(format!("[Error] Failed to compact context: {error}"))
+                            .out_of_band_message(format!(
+                                "[Error] Failed to compact context: {error}"
+                            ))
                             .await?;
                     } else if omp {
                         self.inner.poll_usage(None).await;
@@ -1794,7 +1892,9 @@ impl AgentSession for Session {
                     }
                     if let Err(error) = self.inner.runtime()?.request(command).await {
                         self.inner
-                            .out_of_band_message(format!("[Error] Failed to hand off turn: {error}"))
+                            .out_of_band_message(format!(
+                                "[Error] Failed to hand off turn: {error}"
+                            ))
                             .await?;
                     }
                 }
@@ -1813,5 +1913,67 @@ impl AgentSession for Session {
             }
             Ok(())
         }))
+    }
+}
+
+#[cfg(test)]
+mod message_update_tests {
+    use super::*;
+
+    #[test]
+    fn omp_delta_negotiation_requires_echo_and_preserves_full_snapshot_output() {
+        for (reply, expected) in [
+            (json!({"events":null,"messageUpdates":"delta"}), true),
+            (json!({"events":null,"messageUpdates":"full"}), false),
+            (json!({"events":null}), false),
+        ] {
+            let delta = delta_updates_supported(Ok(reply)).unwrap();
+            assert_eq!(delta, expected);
+            let mut mapper = Mapper::new("omp", "omp");
+            mapper.begin_turn("turn");
+            mapper.map(&json!({"type":"message_start","messageId":"msg-2","message":{"role":"assistant","content":[]}}));
+            let mut events = Vec::new();
+            for (fragment, snapshot) in [("원", "원본"), ("본", "원본"), ("🙂", "원본🙂")]
+            {
+                let mut frame = json!({"type":"message_update","messageId":"msg-2",
+                    "message":{"role":"assistant"},
+                    "assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":fragment}});
+                if !delta {
+                    frame["message"]["content"] = json!([{"type":"text","text":snapshot}]);
+                }
+                events.extend(mapper.map(&frame));
+            }
+            events.extend(mapper.map(&json!({"type":"message_end","messageId":"msg-2",
+                "message":{"role":"assistant","content":[{"type":"text","text":"원본🙂 끝"}]}})));
+            let text: String = events
+                .iter()
+                .filter_map(|event| event["item"]["text"].as_str())
+                .collect();
+            assert_eq!(text, "원본🙂 끝");
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event["item"]["type"] == "assistant_message")
+            );
+        }
+    }
+
+    #[test]
+    fn omp_delta_negotiation_distinguishes_old_commands_from_failures() {
+        assert!(
+            !delta_updates_supported(Err(CommandError(
+                "Unknown command: set_event_filter".into()
+            )
+            .into()))
+            .unwrap()
+        );
+        for result in [
+            Err(CommandError("Permission denied for set_event_filter".into()).into()),
+            Err(anyhow!("JSONL request timed out")),
+            Ok(json!({"messageUpdates":null})),
+            Ok(json!({"messageUpdates":"unexpected"})),
+        ] {
+            assert!(delta_updates_supported(result).is_err());
+        }
     }
 }

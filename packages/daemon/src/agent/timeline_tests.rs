@@ -272,7 +272,7 @@ fn search_counts_rendered_blocks_and_preserves_literal_user_text() {
 }
 
 #[test]
-fn activity_summary_uses_projected_counts_and_external_input_policy() {
+fn curated_activity_preserves_messages_and_controls_external_input() {
     let items = vec![
         json!({"type":"assistant_message","text":"a"}),
         json!({"type":"assistant_message","text":"b"}),
@@ -280,23 +280,14 @@ fn activity_summary_uses_projected_counts_and_external_input_policy() {
     ];
     let full = crate::activity::curate(&items, &json!({})).unwrap();
     assert_eq!(full[0]["text"], "ab");
-    assert!(
-        full[1]["text"]
-            .as_str()
-            .unwrap()
-            .starts_with("[Send message] {")
-    );
+    let text = full[1]["text"].as_str().unwrap();
+    let input: Value = serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap();
+    assert_eq!(input, items[2]["detail"]["input"]);
     let concise =
         crate::activity::curate(&items, &json!({"includeExternalToolInput":false})).unwrap();
-    assert_eq!(concise[1]["text"], "[Send message] Hello peer");
-    let summary = crate::activity::summarize(&items, Some(1.0)).unwrap();
-    assert_eq!(summary["updateCount"], 3);
-    assert!(
-        summary["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("Showing 1 of 2 activities (limited to 1)\n\n")
-    );
+    let concise_text = concise[1]["text"].as_str().unwrap();
+    assert!(concise_text.contains("Hello peer"));
+    assert!(!concise_text.contains("agentId"));
 }
 
 #[test]
@@ -398,27 +389,65 @@ fn incremental_commits_write_only_changed_projection_rows() {
     let mut timeline = interleaved();
     timeline.persist(&path, "agent").unwrap();
     let database = rusqlite::Connection::open(&path).unwrap();
-    database.execute_batch(
-        "CREATE TABLE row_writes(position INTEGER);
+    database
+        .execute_batch(
+            "CREATE TABLE row_writes(position INTEGER);
          CREATE TRIGGER record_row_insert AFTER INSERT ON timeline_rows
          BEGIN INSERT INTO row_writes VALUES (new.position); END;
          CREATE TRIGGER record_row_update AFTER UPDATE ON timeline_rows
-         BEGIN INSERT INTO row_writes VALUES (new.position); END;"
-    ).unwrap();
-    timeline.append_persisted(&path, "agent", tool("failed"), &options()).unwrap();
-    timeline.append_persisted(&path, "agent", json!({"type":"assistant_message","text":"a"}), &options()).unwrap();
-    timeline.append_persisted(&path, "agent", json!({"type":"assistant_message","text":"b"}), &options()).unwrap();
-    timeline.append_persisted(&path, "agent", json!({"type":"user_message","text":"hello","clientMessageId":"client"}), &options()).unwrap();
+         BEGIN INSERT INTO row_writes VALUES (new.position); END;",
+        )
+        .unwrap();
+    timeline
+        .append_persisted(&path, "agent", tool("failed"), &options())
+        .unwrap();
+    timeline
+        .append_persisted(
+            &path,
+            "agent",
+            json!({"type":"assistant_message","text":"a"}),
+            &options(),
+        )
+        .unwrap();
+    timeline
+        .append_persisted(
+            &path,
+            "agent",
+            json!({"type":"assistant_message","text":"b"}),
+            &options(),
+        )
+        .unwrap();
+    timeline
+        .append_persisted(
+            &path,
+            "agent",
+            json!({"type":"user_message","text":"hello","clientMessageId":"client"}),
+            &options(),
+        )
+        .unwrap();
     let next_seq = timeline.next_seq();
-    timeline.enrich_submitted_persisted(&path, "agent", "client", "provider").unwrap();
+    timeline
+        .enrich_submitted_persisted(&path, "agent", "client", "provider")
+        .unwrap();
     assert_eq!(timeline.next_seq(), next_seq);
-    let mut statement = database.prepare("SELECT position FROM row_writes ORDER BY rowid").unwrap();
-    let positions: Vec<i64> = statement.query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    let mut statement = database
+        .prepare("SELECT position FROM row_writes ORDER BY rowid")
+        .unwrap();
+    let positions: Vec<i64> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
     assert_eq!(positions, vec![0, 2, 2, 3, 3]);
     assert_eq!(timeline.items()[2]["text"], "ab");
     let expected = timeline.fetch(&json!({"limit":0}));
     drop(timeline);
-    assert_eq!(Timeline::load(&path, "agent").unwrap().fetch(&json!({"limit":0})), expected);
+    assert_eq!(
+        Timeline::load(&path, "agent")
+            .unwrap()
+            .fetch(&json!({"limit":0})),
+        expected
+    );
 }
 
 #[test]
@@ -426,36 +455,66 @@ fn failed_sqlite_commit_rolls_back_rows_metadata_and_memory() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("timeline.sqlite3");
     let mut timeline = interleaved();
-    timeline.append(json!({"type":"user_message","text":"hello","clientMessageId":"client"}), &options());
-    timeline.append(json!({"type":"assistant_message","text":"start"}), &options());
+    timeline.append(
+        json!({"type":"user_message","text":"hello","clientMessageId":"client"}),
+        &options(),
+    );
+    timeline.append(
+        json!({"type":"assistant_message","text":"start"}),
+        &options(),
+    );
     timeline.persist(&path, "agent").unwrap();
     let before = timeline.fetch(&json!({"limit":0}));
     let database = rusqlite::Connection::open(&path).unwrap();
     // The row statement has already succeeded when this trigger aborts metadata.
-    database.execute_batch(
-        "CREATE TRIGGER fail_metadata BEFORE UPDATE ON timeline_metadata
-         BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END;"
-    ).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER fail_metadata BEFORE UPDATE ON timeline_metadata
+         BEGIN SELECT RAISE(ABORT, 'injected commit failure'); END;",
+        )
+        .unwrap();
     for item in [
         json!({"type":"assistant_message","text":"uncommitted"}),
         tool("failed"),
         json!({"type":"user_message","text":"uncommitted","clientMessageId":"new-client"}),
     ] {
-        assert!(timeline.append_persisted(&path, "agent", item, &options()).is_err());
+        assert!(
+            timeline
+                .append_persisted(&path, "agent", item, &options())
+                .is_err()
+        );
         assert_eq!(timeline.fetch(&json!({"limit":0})), before);
-        assert_eq!(Timeline::load(&path, "agent").unwrap().fetch(&json!({"limit":0})), before);
+        assert_eq!(
+            Timeline::load(&path, "agent")
+                .unwrap()
+                .fetch(&json!({"limit":0})),
+            before
+        );
     }
     assert!(timeline.submitted_user_message("new-client").is_none());
-    assert!(timeline.enrich_submitted_persisted(&path, "agent", "client", "uncommitted").is_err());
+    assert!(
+        timeline
+            .enrich_submitted_persisted(&path, "agent", "client", "uncommitted")
+            .is_err()
+    );
     assert_eq!(timeline.fetch(&json!({"limit":0})), before);
-    database.execute_batch("DROP TRIGGER fail_metadata").unwrap();
-    timeline.append_persisted(&path, "agent", tool("completed"), &options()).unwrap();
-    timeline.enrich_submitted_persisted(&path, "agent", "client", "committed").unwrap();
+    database
+        .execute_batch("DROP TRIGGER fail_metadata")
+        .unwrap();
+    timeline
+        .append_persisted(&path, "agent", tool("completed"), &options())
+        .unwrap();
+    timeline
+        .enrich_submitted_persisted(&path, "agent", "client", "committed")
+        .unwrap();
     let expected = timeline.fetch(&json!({"limit":0}));
     drop(timeline);
     let recovered = Timeline::load(&path, "agent").unwrap();
     assert_eq!(recovered.fetch(&json!({"limit":0})), expected);
-    assert_eq!(recovered.submitted_user_message("client").unwrap()["providerMessageId"], "committed");
+    assert_eq!(
+        recovered.submitted_user_message("client").unwrap()["providerMessageId"],
+        "committed"
+    );
 }
 
 #[test]
@@ -467,29 +526,56 @@ fn full_history_replacement_is_atomic_with_an_existing_connection() {
     let before = current.fetch(&json!({"limit":0}));
     let old_epoch = current.epoch().to_owned();
     let mut replacement = Timeline::new();
-    replacement.append(json!({"type":"user_message","text":"full native history","clientMessageId":"native"}), &options());
-    replacement.append(json!({"type":"assistant_message","text":"restored response"}), &options());
+    replacement.append(
+        json!({"type":"user_message","text":"full native history","clientMessageId":"native"}),
+        &options(),
+    );
+    replacement.append(
+        json!({"type":"assistant_message","text":"restored response"}),
+        &options(),
+    );
     let database = rusqlite::Connection::open(&path).unwrap();
-    database.execute_batch(
-        "CREATE TRIGGER fail_replacement BEFORE UPDATE ON timeline_metadata
-         BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END;"
-    ).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER fail_replacement BEFORE UPDATE ON timeline_metadata
+         BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END;",
+        )
+        .unwrap();
     assert!(replacement.persist(&path, "agent").is_err());
     assert_eq!(current.fetch(&json!({"limit":0})), before);
-    assert_eq!(Timeline::load(&path, "agent").unwrap().fetch(&json!({"limit":0})), before);
-    database.execute_batch("DROP TRIGGER fail_replacement").unwrap();
+    assert_eq!(
+        Timeline::load(&path, "agent")
+            .unwrap()
+            .fetch(&json!({"limit":0})),
+        before
+    );
+    database
+        .execute_batch("DROP TRIGGER fail_replacement")
+        .unwrap();
     replacement.persist(&path, "agent").unwrap();
     current = replacement;
     assert_ne!(current.epoch(), old_epoch);
-    current.append_persisted(&path, "agent", json!({"type":"assistant_message","text":" continued"}), &options()).unwrap();
-    current.enrich_submitted_persisted(&path, "agent", "native", "provider").unwrap();
+    current
+        .append_persisted(
+            &path,
+            "agent",
+            json!({"type":"assistant_message","text":" continued"}),
+            &options(),
+        )
+        .unwrap();
+    current
+        .enrich_submitted_persisted(&path, "agent", "native", "provider")
+        .unwrap();
     let expected = current.fetch(&json!({"limit":0}));
     drop(current);
     let recovered = Timeline::load(&path, "agent").unwrap();
     assert_eq!(recovered.fetch(&json!({"limit":0})), expected);
     assert_eq!(recovered.rows().len(), 2);
     assert_eq!(recovered.items()[1]["text"], "restored response continued");
-    assert_eq!(recovered.fetch(&json!({"cursor":{"epoch":old_epoch,"seq":1}}))["reset"], true);
+    assert_eq!(
+        recovered.fetch(&json!({"cursor":{"epoch":old_epoch,"seq":1}}))["reset"],
+        true
+    );
 }
 
 #[cfg(unix)]
@@ -499,9 +585,23 @@ fn sqlite_checkpoint_and_live_sidecars_are_private() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("timeline.sqlite3");
     let mut timeline = Timeline::new();
-    timeline.append_persisted(&path, "agent", json!({"type":"user_message","text":"private"}), &options()).unwrap();
-    for name in ["timeline.sqlite3", "timeline.sqlite3-wal", "timeline.sqlite3-shm"] {
-        let mode = std::fs::metadata(directory.path().join(name)).unwrap().permissions().mode();
+    timeline
+        .append_persisted(
+            &path,
+            "agent",
+            json!({"type":"user_message","text":"private"}),
+            &options(),
+        )
+        .unwrap();
+    for name in [
+        "timeline.sqlite3",
+        "timeline.sqlite3-wal",
+        "timeline.sqlite3-shm",
+    ] {
+        let mode = std::fs::metadata(directory.path().join(name))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "{name}");
     }
 }
@@ -513,19 +613,46 @@ fn failed_empty_replacement_retries_before_incremental_append() {
     let mut original = interleaved();
     original.persist(&path, "agent").unwrap();
     let database = rusqlite::Connection::open(&path).unwrap();
-    database.execute_batch(
-        "CREATE TRIGGER fail_replacement BEFORE UPDATE ON timeline_metadata
-         BEGIN SELECT RAISE(ABORT, 'injected empty replacement failure'); END;"
-    ).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER fail_replacement BEFORE UPDATE ON timeline_metadata
+         BEGIN SELECT RAISE(ABORT, 'injected empty replacement failure'); END;",
+        )
+        .unwrap();
     let mut replacement = Timeline::new();
     assert!(replacement.persist(&path, "agent").is_err());
-    assert_eq!(Timeline::load(&path, "agent").unwrap().rows(), original.rows());
-    database.execute_batch("DROP TRIGGER fail_replacement").unwrap();
-    replacement.append_persisted(&path, "agent", json!({"type":"user_message","text":"new history"}), &options()).unwrap();
-    replacement.append(json!({"type":"assistant_message","text":"buffered"}), &options());
-    replacement.append_persisted(&path, "agent", json!({"type":"assistant_message","text":" committed"}), &options()).unwrap();
+    assert_eq!(
+        Timeline::load(&path, "agent").unwrap().rows(),
+        original.rows()
+    );
+    database
+        .execute_batch("DROP TRIGGER fail_replacement")
+        .unwrap();
+    replacement
+        .append_persisted(
+            &path,
+            "agent",
+            json!({"type":"user_message","text":"new history"}),
+            &options(),
+        )
+        .unwrap();
+    replacement.append(
+        json!({"type":"assistant_message","text":"buffered"}),
+        &options(),
+    );
+    replacement
+        .append_persisted(
+            &path,
+            "agent",
+            json!({"type":"assistant_message","text":" committed"}),
+            &options(),
+        )
+        .unwrap();
     let recovered = Timeline::load(&path, "agent").unwrap();
-    assert_eq!(recovered.fetch(&json!({"limit":0})), replacement.fetch(&json!({"limit":0})));
+    assert_eq!(
+        recovered.fetch(&json!({"limit":0})),
+        replacement.fetch(&json!({"limit":0}))
+    );
     assert_eq!(recovered.rows().len(), 2);
     assert_eq!(recovered.items()[1]["text"], "buffered committed");
 }
@@ -534,16 +661,30 @@ fn failed_empty_replacement_retries_before_incremental_append() {
 fn history_recovery_preserves_notices_without_guessing_user_message_identity() {
     use crate::providers::api::HistoryCoverage;
     let mut previous = Timeline::new();
-    previous.append(json!({"type":"notification","level":"info","message":"daemon notice"}), &options());
+    previous.append(
+        json!({"type":"notification","level":"info","message":"daemon notice"}),
+        &options(),
+    );
     previous.append(json!({"type":"user_message","text":"same text","messageId":"client-id","clientMessageId":"client-id"}), &options());
-    previous.enrich_submitted_user_message("client-id", "native-id").unwrap();
+    previous
+        .enrich_submitted_user_message("client-id", "native-id")
+        .unwrap();
     let before = previous.fetch(&json!({"limit":0}));
     let mut uncorrelated = Timeline::new();
-    uncorrelated.append(json!({"type":"user_message","text":"same text","messageId":"different-id"}), &options());
+    uncorrelated.append(
+        json!({"type":"user_message","text":"same text","messageId":"different-id"}),
+        &options(),
+    );
     assert!(!uncorrelated.reconcile_history(&previous, HistoryCoverage::Complete, false));
     let mut replacement = Timeline::new();
-    replacement.append(json!({"type":"user_message","text":"older","messageId":"older-id"}), &options());
-    replacement.append(json!({"type":"user_message","text":"same text","messageId":"native-id"}), &options());
+    replacement.append(
+        json!({"type":"user_message","text":"older","messageId":"older-id"}),
+        &options(),
+    );
+    replacement.append(
+        json!({"type":"user_message","text":"same text","messageId":"native-id"}),
+        &options(),
+    );
     assert!(!replacement.reconcile_history(&previous, HistoryCoverage::Unverified, false));
     assert_eq!(previous.fetch(&json!({"limit":0})), before);
     assert!(replacement.reconcile_history(&previous, HistoryCoverage::Complete, false));
@@ -552,8 +693,14 @@ fn history_recovery_preserves_notices_without_guessing_user_message_identity() {
     assert_eq!(rows[1]["item"], previous.rows()[0]["item"]);
     assert_eq!(rows[2]["item"]["messageId"], "client-id");
     assert_eq!(rows[2]["providerMessageId"], "native-id");
-    assert!(rows.windows(2).all(|pair| pair[0]["seqEnd"].as_i64() < pair[1]["seqStart"].as_i64()));
+    assert!(
+        rows.windows(2)
+            .all(|pair| pair[0]["seqEnd"].as_i64() < pair[1]["seqStart"].as_i64())
+    );
     let last_seq = rows.last().unwrap()["seqEnd"].as_i64().unwrap();
-    let appended = replacement.append(json!({"type":"assistant_message","text":"next"}), &options());
+    let appended = replacement.append(
+        json!({"type":"assistant_message","text":"next"}),
+        &options(),
+    );
     assert_eq!(appended["seq"].as_i64(), Some(last_seq + 1));
 }

@@ -5,10 +5,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    state::AppState,
-    transport::hosts::HostClient,
-};
+use crate::{state::AppState, transport::hosts::HostClient};
 use paseo_client::transport::HostError;
 
 pub(super) fn server_identity(app: &AppState) -> Result<String> {
@@ -277,23 +274,24 @@ async fn execute_remote(
         "send_agent_prompt" => {
             let agent_id = required(input, "agentId")?;
             if caller.is_none()
-                && let Some(mode) = input.get("sessionMode") {
-                    let response = request(
-                        client,
-                        json!({"type":"set_agent_mode_request", "agentId":agent_id,"modeId":mode}),
-                        "set_agent_mode_response",
-                    )
-                    .await?;
-                    if response.get("accepted") != Some(&Value::Bool(true)) {
-                        bail!(
-                            "{}",
-                            response
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("setAgentMode rejected")
-                        );
-                    }
+                && let Some(mode) = input.get("sessionMode")
+            {
+                let response = request(
+                    client,
+                    json!({"type":"set_agent_mode_request", "agentId":agent_id,"modeId":mode}),
+                    "set_agent_mode_response",
+                )
+                .await?;
+                if response.get("accepted") != Some(&Value::Bool(true)) {
+                    bail!(
+                        "{}",
+                        response
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("setAgentMode rejected")
+                    );
                 }
+            }
             let agent = fetch_agent(client, agent_id).await?;
             let mut message = json!({
                 "type":"send_agent_message_request", "agentId":agent_id,
@@ -344,28 +342,23 @@ async fn execute_remote(
         }
         "get_agent_status" => {
             let agent = fetch_agent(client, required(input, "agentId")?).await?;
-            Ok(json!({"status":agent["status"], "snapshot":agent}))
+            crate::activity::model::status(&agent, input)
         }
         "get_agent_activity" => {
+            require_feature(
+                client,
+                "readOnlyAgentTimeline",
+                "Update the destination host to read activity without starting its provider",
+            )?;
             let agent_id = required(input, "agentId")?;
-            let timeline = entries(request(client, json!({
-                "type":"fetch_agent_timeline_request", "agentId":agent_id,
-                "direction":"tail", "limit":input.get("limit").cloned().unwrap_or_else(|| json!(0)),
-            }), "fetch_agent_timeline_response").await?)?;
-            let items = timeline
-                .into_iter()
-                .map(|mut row| {
-                    row.as_object_mut()
-                        .and_then(|row| row.remove("item"))
-                        .ok_or_else(|| anyhow!("Remote timeline entry has no item"))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let mut options = crate::activity::model::timeline_options(input)?;
+            options["type"] = json!("fetch_agent_timeline_request");
+            options["agentId"] = json!(agent_id);
+            options["observationOnly"] = json!(true);
+            let page = request(client, options, "fetch_agent_timeline_response").await?;
+            payload_error(&page)?;
             let agent = fetch_agent(client, agent_id).await?;
-            let mut summary =
-                crate::activity::summarize(&items, input.get("limit").and_then(Value::as_f64))?;
-            summary["agentId"] = json!(agent_id);
-            copy_fields(&mut summary, &agent, &[("currentModeId", "currentModeId")]);
-            Ok(summary)
+            crate::activity::model::activity(&page, &agent, input)
         }
         "list_agents" => {
             let background = input.get("includeBackground") == Some(&Value::Bool(true));

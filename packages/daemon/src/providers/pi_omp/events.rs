@@ -10,6 +10,7 @@ macro_rules! cached_regex {
 mod extensions;
 mod notices;
 mod permissions;
+mod stream;
 mod tools;
 
 pub use notices::custom_item;
@@ -42,7 +43,9 @@ fn put(v: &mut Value, key: &str, value: Option<&str>) {
 }
 
 pub(super) fn omp_task_status(row: &Value, terminal: bool) -> &'static str {
-    if row["aborted"] == true || matches!(string(&row["status"]), "aborted" | "canceled" | "stopped") {
+    if row["aborted"] == true
+        || matches!(string(&row["status"]), "aborted" | "canceled" | "stopped")
+    {
         "canceled"
     } else if row["error"].as_str().is_some_and(|s| !s.is_empty())
         || row["error"] == true
@@ -69,11 +72,17 @@ pub(super) fn omp_task_completions(message: &Value) -> impl Iterator<Item = (&st
     };
     jobs.iter().filter_map(|job| {
         if job["type"] != "task"
-            || !matches!(string(&job["status"]), "completed" | "failed" | "error" | "aborted" | "canceled" | "stopped")
+            || !matches!(
+                string(&job["status"]),
+                "completed" | "failed" | "error" | "aborted" | "canceled" | "stopped"
+            )
         {
             return None;
         }
-        Some((first(&[&job["agentId"], &job["jobId"]])?, omp_task_status(job, true)))
+        Some((
+            first(&[&job["agentId"], &job["jobId"]])?,
+            omp_task_status(job, true),
+        ))
     })
 }
 
@@ -100,6 +109,7 @@ pub struct Mapper {
     no_turn_output: Vec<String>,
     stream_text: String,
     stream_thinking: String,
+    omp_streams: stream::Streams,
     suppress_next_start: bool,
     card_updates: HashMap<String, (std::time::Instant, bool)>,
     /// Child transcripts: messages are identified by their own timestamp, which a
@@ -132,6 +142,7 @@ impl Mapper {
             no_turn_output: Vec::new(),
             stream_text: String::new(),
             stream_thinking: String::new(),
+            omp_streams: stream::Streams::default(),
             card_updates: HashMap::new(),
             suppress_next_start: false,
             native_ids: false,
@@ -154,6 +165,9 @@ impl Mapper {
             .or_else(|| stamp.is_number().then(|| stamp.to_string()))?;
         Some(format!("{kind}-{stamp}"))
     }
+    pub(super) fn reset_streams(&mut self) {
+        self.omp_streams.clear();
+    }
     pub fn begin_turn(&mut self, turn_id: &str) {
         self.turn = Some(turn_id.into());
         self.started = false;
@@ -165,6 +179,7 @@ impl Mapper {
         self.no_turn_output.clear();
         self.stream_text.clear();
         self.stream_thinking.clear();
+        self.reset_streams();
     }
     pub fn announce_turn(&mut self) -> Value {
         self.suppress_next_start = true;
@@ -186,6 +201,7 @@ impl Mapper {
         self.no_turn_output.clear();
         self.stream_text.clear();
         self.stream_thinking.clear();
+        self.reset_streams();
         self.card_updates.clear();
     }
     pub fn pending_permissions(&self) -> Vec<Value> {
@@ -219,7 +235,11 @@ impl Mapper {
         for id in due {
             if let Some((name, args)) = self.tools.get(&id).cloned() {
                 out.extend(self.tool_events(
-                    ToolCall { id: &id, name: &name, args: &args },
+                    ToolCall {
+                        id: &id,
+                        name: &name,
+                        args: &args,
+                    },
                     "running",
                     &Value::Null,
                     &Value::Null,
@@ -383,19 +403,21 @@ impl Mapper {
         if !(replay && self.family == "omp")
             && (status == "completed" || (self.family == "omp" && status != "running"))
             && let Some(todo) = extensions::todo(&self.family, name, result)
-                && let Some(event) = self.todo_event(todo, replay) {
-                    out.push(event);
-                }
+            && let Some(event) = self.todo_event(todo, replay)
+        {
+            out.push(event);
+        }
         out
     }
     pub fn map(&mut self, frame: &Value) -> Vec<Value> {
         let mut out = Vec::new();
         let kind = string(&frame["type"]);
         if self.family == "omp"
-            && let Some(item) = notices::runtime(frame) {
-                out.push(json!({"type":"timeline","provider":self.provider,"item":item}));
-                return out;
-            }
+            && let Some(item) = notices::runtime(frame)
+        {
+            out.push(json!({"type":"timeline","provider":self.provider,"item":item}));
+            return out;
+        }
         match kind{
             "command_output" if self.turn.is_some()=>{
                 let ansi=cached_regex!(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))");
@@ -411,9 +433,14 @@ impl Mapper {
             "agent_start"=>{self.started=true;self.no_turn_output.clear();if let Some(id)=frame["sessionId"].as_str(){out.push(json!({"type":"thread_started","provider":self.provider,"sessionId":id}));}},
             "turn_start"=>{if self.suppress_next_start{self.suppress_next_start=false;}else if self.family=="omp"||!self.turn_started{out.push(self.event("turn_started"));}self.started=true;self.turn_started=true;self.no_turn_output.clear();},
             "thinking_level_changed"=>{if let Some(level)=frame["level"].as_str().filter(|s|matches!(*s,"off"|"minimal"|"low"|"medium"|"high"|"xhigh")){out.push(json!({"type":"thinking_option_changed","provider":self.provider,"thinkingOptionId":level}));}},
-            "message_start"=>{if frame["message"]["role"]=="assistant"{self.assistant=first(&[&frame["message"]["responseId"]]).map(str::to_owned);self.stream_text.clear();self.stream_thinking.clear();}},
+            "message_start"=>{if frame["message"]["role"]=="assistant"{if self.family=="omp"{let items=self.omp_streams.start(frame);out.extend(items.into_iter().map(|item|self.timeline(item)));}else{self.assistant=first(&[&frame["message"]["responseId"]]).map(str::to_owned);self.stream_text.clear();self.stream_thinking.clear();}}},
             "message_update"=>{
                 if frame.get("message").is_some_and(|m|!m.is_null()&&m["role"]!="assistant"){return out;}
+                if self.family == "omp" {
+                    let items = self.omp_streams.update(frame);
+                    out.extend(items.into_iter().map(|item| self.timeline(item)));
+                    return out;
+                }
                 if frame["message"]["role"]=="assistant" && frame["message"]["content"].is_array() {
                     // Snapshots may already include deltas still queued for delivery.
                     out.extend(self.cumulative(&frame["message"]));
@@ -426,7 +453,7 @@ impl Mapper {
             }
             "message_end"=>{
                 let message=&frame["message"];match string(&message["role"]){
-                    "assistant"=>{out.extend(self.cumulative(message));self.assistant=None;self.stream_text.clear();self.stream_thinking.clear();self.terminal=Some(message.clone());if self.family=="omp"{for block in array(&message["content"]){if block["type"]=="toolCall"&&block["name"]=="ask"{self.permissions.start(&self.family,&self.provider,string(&block["id"]),"ask",&block["arguments"]);}}}},
+                    "assistant"=>{if self.family=="omp"{let items=self.omp_streams.finish(frame);out.extend(items.into_iter().map(|item|self.timeline(item)));}else{out.extend(self.cumulative(message));self.assistant=None;self.stream_text.clear();self.stream_thinking.clear();}self.terminal=Some(message.clone());if self.family=="omp"{for block in array(&message["content"]){if block["type"]=="toolCall"&&block["name"]=="ask"{self.permissions.start(&self.family,&self.provider,string(&block["id"]),"ask",&block["arguments"]);}}}},
                     "custom"=>{let changes=if self.family=="omp"{self.extensions.omp_custom(message)}else{self.extensions.custom(message)};out.extend(self.subagents(changes));let id=format!("{}-custom-{}",self.provider,Uuid::new_v4());if let Some(mut item)=custom_item(&self.family,message,&id){if self.family=="omp"&&item["type"]=="user_message"{if let Some((text,client))=self.clients.pop_front(){item["text"]=json!(text);put(&mut item,"clientMessageId",client.as_deref());}else{return out;}}out.push(self.timeline(item));}},
                     "user" if self.family=="omp"=>{let id=first(&[&message["id"],&message["entryId"]]);if id.is_some_and(|id|!self.users.insert(id.into())){return out;}let text=tools::content_text(&message["content"]);if !text.is_empty(){let mut item=json!({"type":"user_message","text":text});put(&mut item,"messageId",id);if let Some((_,client))=self.clients.pop_front(){put(&mut item,"clientMessageId",client.as_deref());}out.push(self.timeline(item));}},_=>{}
                 }
@@ -485,7 +512,11 @@ impl Mapper {
         let mut out = Vec::new();
         for (id, (name, args)) in calls {
             out.extend(self.tool_events(
-                ToolCall { id: &id, name: &name, args: &args },
+                ToolCall {
+                    id: &id,
+                    name: &name,
+                    args: &args,
+                },
                 "canceled",
                 &Value::Null,
                 &Value::Null,
@@ -564,7 +595,11 @@ impl Mapper {
                     Value::Null
                 };
                 out.extend(self.tool_events(
-                    ToolCall { id, name: &name, args: &args },
+                    ToolCall {
+                        id,
+                        name: &name,
+                        args: &args,
+                    },
                     if failed { "failed" } else { "completed" },
                     &result,
                     &error,
@@ -613,13 +648,14 @@ impl Mapper {
             _ => {}
         }
         if self.family == "omp"
-            && let Some(timestamp) = timestamp(message.get("timestamp")) {
-                for event in &mut out {
-                    if event["type"] == "timeline" {
-                        event["timestamp"] = json!(timestamp);
-                    }
+            && let Some(timestamp) = timestamp(message.get("timestamp"))
+        {
+            for event in &mut out {
+                if event["type"] == "timeline" {
+                    event["timestamp"] = json!(timestamp);
                 }
             }
+        }
         out
     }
 }
@@ -683,7 +719,10 @@ mod tests {
                 assert_eq!(terminal["type"], "turn_failed");
                 assert_eq!(terminal["sessionEnded"], true);
                 assert_eq!(terminal["error"], "terminated");
-                assert_eq!(terminal["turnId"], if active { json!("turn") } else { Value::Null });
+                assert_eq!(
+                    terminal["turnId"],
+                    if active { json!("turn") } else { Value::Null }
+                );
                 assert!(mapper.turn.is_none());
             }
         }
@@ -700,15 +739,21 @@ mod tests {
             let mut mapper = Mapper::new("omp", "omp");
             mapper.begin_turn("first");
             mapper.map(&json!({"type":"tool_execution_start","toolCallId":"spawn","toolName":"task","args":{}}));
-            mapper.map(&json!({"type":"subagent_lifecycle","payload":{"id":"child","agent":"scout",
-                "parentToolCallId":"spawn","sessionFile":"/tmp/child.jsonl","status":"running"}}));
+            mapper.map(
+                &json!({"type":"subagent_lifecycle","payload":{"id":"child","agent":"scout",
+                "parentToolCallId":"spawn","sessionFile":"/tmp/child.jsonl","status":"running"}}),
+            );
             mapper.map(&json!({"type":"tool_execution_end","toolCallId":"spawn","toolName":"task",
                 "result":{"details":{"async":true,"results":[],"progress":[{"id":"child","status":"pending"}]}}}));
-            let first = mapper.map(&json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}));
+            let first = mapper.map(
+                &json!({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}),
+            );
             assert_eq!(first.last().unwrap()["type"], "turn_completed");
-            mapper.map(&json!({"type":"subagent_progress","payload":{"parentToolCallId":"spawn",
+            mapper.map(
+                &json!({"type":"subagent_progress","payload":{"parentToolCallId":"spawn",
                 "sessionFile":"/tmp/child.jsonl",
-                "progress":{"id":"child","status":"running","recentOutput":["still working"]}}}));
+                "progress":{"id":"child","status":"running","recentOutput":["still working"]}}}),
+            );
             mapper.begin_turn("later");
             let events = if terminal["type"] == "interrupt" {
                 let events = mapper.cancel_work();
@@ -717,7 +762,10 @@ mod tests {
             } else {
                 mapper.map(&terminal)
             };
-            assert!(!events.iter().any(|e| e["type"] == "provider_subagent"), "{terminal}: {events:?}");
+            assert!(
+                !events.iter().any(|e| e["type"] == "provider_subagent"),
+                "{terminal}: {events:?}"
+            );
             let mut card = json!({"type":"sub_agent"});
             mapper.extensions.card("spawn", &mut card);
             assert_eq!(card["childSessionId"], "/tmp/child.jsonl");
@@ -727,7 +775,9 @@ mod tests {
                     "content":[{"type":"text","text":"survived"}]}}}}));
             assert_eq!(rows[0]["event"]["id"], "child");
             assert_eq!(rows[0]["event"]["item"]["text"], "survived");
-            let completed = mapper.map(&json!({"type":"subagent_lifecycle","payload":{"id":"child","status":"completed"}}));
+            let completed = mapper.map(
+                &json!({"type":"subagent_lifecycle","payload":{"id":"child","status":"completed"}}),
+            );
             assert_eq!(completed[0]["event"]["status"], "completed");
             assert_eq!(completed[0]["event"]["source"]["path"], "/tmp/child.jsonl");
         }
@@ -737,19 +787,30 @@ mod tests {
     fn omp_process_exit_and_close_terminalize_only_running_children() {
         for close in [false, true] {
             let mut mapper = Mapper::new("omp", "omp");
-            for (id, status) in [("running", "running"), ("done", "completed"), ("bad", "failed")] {
-                mapper.map(&json!({"type":"subagent_lifecycle","payload":{"id":id,"status":status}}));
+            for (id, status) in [
+                ("running", "running"),
+                ("done", "completed"),
+                ("bad", "failed"),
+            ] {
+                mapper
+                    .map(&json!({"type":"subagent_lifecycle","payload":{"id":id,"status":status}}));
             }
             let events = if close {
                 mapper.close_work()
             } else {
                 mapper.map(&json!({"type":"process_exit"}))
             };
-            let children: Vec<_> = events.iter().filter(|e| e["type"] == "provider_subagent").collect();
+            let children: Vec<_> = events
+                .iter()
+                .filter(|e| e["type"] == "provider_subagent")
+                .collect();
             assert_eq!(children.len(), 1);
             assert_eq!(children[0]["event"]["id"], "running");
             assert_eq!(children[0]["event"]["status"], "canceled");
-            assert!(mapper.close_work().is_empty(), "terminalization is idempotent");
+            assert!(
+                mapper.close_work().is_empty(),
+                "terminalization is idempotent"
+            );
         }
     }
 
@@ -758,25 +819,37 @@ mod tests {
         let mut mapper = Mapper::new("omp", "omp");
         mapper.map(&json!({"type":"tool_execution_start","toolCallId":"spawn","toolName":"task","args":{}}));
         mapper.map(&json!({"type":"subagent_lifecycle","payload":{"id":"native","parentToolCallId":"spawn","status":"failed"}}));
-        let discovered = mapper.map(&json!({"type":"tool_execution_end","toolCallId":"spawn","toolName":"task",
+        let discovered = mapper.map(
+            &json!({"type":"tool_execution_end","toolCallId":"spawn","toolName":"task",
             "result":{"details":{"results":[],"progress":[
                 {"id":"first","agent":"scout","status":"pending"},
                 {"id":"second","agent":"worker","status":"pending"},
                 {"id":"native","agent":"worker","status":"pending"}
-            ]}}}));
-        let children: Vec<_> = discovered.iter().filter(|e| e["type"] == "provider_subagent").collect();
+            ]}}}),
+        );
+        let children: Vec<_> = discovered
+            .iter()
+            .filter(|e| e["type"] == "provider_subagent")
+            .collect();
         assert_eq!(children.len(), 2);
-        assert!(children.iter().all(|e| e["event"]["status"] == "running" && e["event"]["toolCallId"] == "spawn"));
+        assert!(
+            children
+                .iter()
+                .all(|e| e["event"]["status"] == "running" && e["event"]["toolCallId"] == "spawn")
+        );
         let custom = json!({"role":"custom","customType":"async-result","display":false,
-            "content":"<task-result id=\"second\" status=\"failed\">untrusted quoted result</task-result>",
-            "details":{"jobs":[
-                {"type":"task","agentId":"first","status":"completed"},
-                {"type":"task","agentId":"native","status":"completed"},
-                {"type":"task","agentId":"unknown","status":"failed"},
-                {"type":"bash","jobId":"second","status":"completed"}
-            ]}});
+        "content":"<task-result id=\"second\" status=\"failed\">untrusted quoted result</task-result>",
+        "details":{"jobs":[
+            {"type":"task","agentId":"first","status":"completed"},
+            {"type":"task","agentId":"native","status":"completed"},
+            {"type":"task","agentId":"unknown","status":"failed"},
+            {"type":"bash","jobId":"second","status":"completed"}
+        ]}});
         let completed = mapper.map(&json!({"type":"message_end","message":custom}));
-        let children: Vec<_> = completed.iter().filter(|e| e["type"] == "provider_subagent").collect();
+        let children: Vec<_> = completed
+            .iter()
+            .filter(|e| e["type"] == "provider_subagent")
+            .collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0]["event"]["id"], "first");
         assert_eq!(children[0]["event"]["status"], "completed");
@@ -807,8 +880,16 @@ mod tests {
             for thinking in [false, true] {
                 let mut mapper = Mapper::new(family, family);
                 mapper.begin_turn("turn");
-                let event_type = if thinking { "thinking_delta" } else { "text_delta" };
-                let item_type = if thinking { "reasoning" } else { "assistant_message" };
+                let event_type = if thinking {
+                    "thinking_delta"
+                } else {
+                    "text_delta"
+                };
+                let item_type = if thinking {
+                    "reasoning"
+                } else {
+                    "assistant_message"
+                };
                 let snapshot = |text: &str| {
                     let block = if thinking {
                         json!({"type":"thinking","thinking":text})
@@ -838,7 +919,10 @@ mod tests {
                     .filter(|event| event["item"]["type"] == item_type)
                     .filter_map(|event| event["item"]["text"].as_str())
                     .collect();
-                assert_eq!(rendered, "원본 대화 기록을 복구했어.", "{family} {item_type}");
+                assert_eq!(
+                    rendered, "원본 대화 기록을 복구했어.",
+                    "{family} {item_type}"
+                );
             }
         }
     }

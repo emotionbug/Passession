@@ -230,6 +230,24 @@ impl AgentManager {
             .attach(id, generation, task.abort_handle());
         Ok(done)
     }
+    /// Reads only retained history. Model observations must not start a provider,
+    /// even when no checkpoint exists or the agent's lifecycle lane is busy.
+    pub(crate) async fn observe_timeline(&self, id: &str, options: &Value) -> Result<Value> {
+        if let Some(cell) = self.agents.read().await.get(id).cloned() {
+            return Ok(cell
+                .timeline
+                .lock()
+                .map_err(|_| anyhow!("Timeline lock poisoned"))?
+                .fetch(options));
+        }
+        self.observe_agent_snapshot(id)
+            .await?
+            .ok_or_else(|| anyhow!("Unknown agent '{id}'"))?;
+        self.read_checkpoint(id, options.clone())
+            .await?
+            .ok_or_else(|| anyhow!("No retained timeline for agent '{id}'; reading activity does not start its provider"))
+    }
+
     /// A capable client's parent page. A ready runtime answers with its live
     /// projection; otherwise the saved projection answers immediately and
     /// preparation continues in the background. An agent with no checkpoint

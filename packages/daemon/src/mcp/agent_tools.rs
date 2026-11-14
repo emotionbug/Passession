@@ -62,8 +62,8 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         definition(
             "get_agent_status",
             "Get agent status",
-            "Return the latest snapshot for an agent, including lifecycle state, capabilities, and pending permissions.",
-            id.clone(),
+            "Return compact lifecycle, error and permission status. Full snapshot fields and every permission remain available via detail JSON-pointer reads in bounded chunks.",
+            crate::activity::model::status_properties(),
             &["agentId"],
         ),
         definition(
@@ -144,10 +144,8 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         definition(
             "get_agent_activity",
             "Get agent activity",
-            "Return recent agent timeline entries as a curated summary.",
-            json!({
-                "agentId":{"type":"string"}, "limit":{"type":"number","description":"Optional limit for number of activities to include (most recent first)."}
-            }),
+            "Return a bounded recent canonical timeline page and compact agent status, without reasoning text. Follow nextCursor for older pages, or view=failures for bounded failure discovery. Use entry.detail with this tool for exact item JSON; agentStatus.detail belongs to get_agent_status. Unrelated tail growth is allowed; changed requested rows or epochs explicitly invalidate continuations.",
+            crate::activity::model::activity_properties(),
             &["agentId"],
         ),
         definition(
@@ -306,7 +304,7 @@ pub(crate) async fn execute(
                 .observe_agent_snapshot(id)
                 .await?
                 .ok_or_else(|| anyhow!("Agent {id} not found"))?;
-            json!({"status":snapshot["status"],"snapshot":snapshot})
+            crate::activity::model::status(&snapshot, &input)?
         }
         "list_agents" => {
             retain_fields(
@@ -396,18 +394,14 @@ pub(crate) async fn execute(
         }
         "get_agent_activity" => {
             let id = string(&input, "agentId")?;
-            let mut summary = app
+            let options = crate::activity::model::timeline_options(&input)?;
+            let page = app.agents.observe_timeline(id, &options).await?;
+            let snapshot = app
                 .agents
-                .activity_summary(id, input.get("limit").and_then(Value::as_f64))
-                .await?;
-            let snapshot = app.agents.observe_agent_snapshot(id).await?;
-            summary["agentId"] = json!(id);
-            summary["currentModeId"] = snapshot
-                .as_ref()
-                .and_then(|value| value.get("currentModeId"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            summary
+                .observe_agent_snapshot(id)
+                .await?
+                .ok_or_else(|| anyhow!("Agent {id} not found"))?;
+            crate::activity::model::activity(&page, &snapshot, &input)?
         }
         "set_agent_mode" => {
             let id = string(&input, "agentId")?;
@@ -709,9 +703,10 @@ async fn resolve_create(
         ] {
             // Legacy top-level settings take precedence over their nested equivalents.
             if !object.contains_key(target)
-                && let Some(value) = settings.get(key) {
-                    object.insert(target.to_owned(), value.clone());
-                }
+                && let Some(value) = settings.get(key)
+            {
+                object.insert(target.to_owned(), value.clone());
+            }
         }
     }
     Ok(input)

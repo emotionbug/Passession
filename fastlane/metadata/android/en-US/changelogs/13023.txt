@@ -1,0 +1,4 @@
+Changed
+- OMP negotiates delta-only message updates, reconstructing text/thinking blocks and reconciling terminal content without repeating streamed text. Older OMP continues using full snapshots.
+
+Full notes: https://github.com/emotionbug/Passession/releases
