@@ -311,20 +311,17 @@ impl Inner {
                         "timeline" | "permission_requested" | "permission_resolved" | "turn_failed"
                     )
                 )
-            {
-                if let Some(turn) = &state.turn {
+                && let Some(turn) = &state.turn {
                     event["turnId"] = json!(turn);
                 }
-            }
             let deliver = (state.ready || event["type"] == "permission_requested") && !state.replay;
             state.history.push(event.clone());
             deliver
         };
-        if deliver {
-            if let Some(sink) = &self.sink {
+        if deliver
+            && let Some(sink) = &self.sink {
                 sink.emit(event).await?;
             }
-        }
         Ok(())
     }
     fn runtime(&self) -> Value {

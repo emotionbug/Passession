@@ -233,8 +233,8 @@ impl DirectorySyncService {
         seq: Option<u64>,
         include_background: bool,
     ) -> Result<Value> {
-        if include_sequence {
-            if let Some(seq) = seq {
+        if include_sequence
+            && let Some(seq) = seq {
                 let object = payload
                     .as_object_mut()
                     .context("Directory update payload must be an object")?;
@@ -244,7 +244,6 @@ impl DirectorySyncService {
                 );
                 object.insert("seq".into(), Value::from(seq));
             }
-        }
         Ok(payload)
     }
 }

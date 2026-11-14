@@ -58,6 +58,13 @@ enum Action {
 /// Builds the in-stream replay marker for an opened child's snapshot.
 pub(super) type Marker = Box<dyn FnOnce(Vec<Value>, HistoryCoverage) -> Value + Send>;
 
+struct SpawnedHost {
+    host: Arc<Connection>,
+    rx: mpsc::UnboundedReceiver<Value>,
+    env: BTreeMap<String, String>,
+    cwd: String,
+}
+
 impl Session {
     /// `register` makes the session findable for opened-child replays. It runs
     /// after every fallible step and before the actor starts, so the session is
@@ -97,11 +104,13 @@ impl Session {
             persistence,
             config,
             &context,
-            env,
+            SpawnedHost {
+                host: host.clone(),
+                rx,
+                env,
+                cwd,
+            },
             sink,
-            host.clone(),
-            rx,
-            cwd,
             register,
         )
         .await;
@@ -115,13 +124,11 @@ impl Session {
         persistence: Option<Value>,
         mut config: Value,
         context: &LaunchContext,
-        env: BTreeMap<String, String>,
+        spawned: SpawnedHost,
         sink: EventSink,
-        host: Arc<Connection>,
-        rx: mpsc::UnboundedReceiver<Value>,
-        cwd: String,
         register: impl FnOnce(&Arc<Self>) + Send,
     ) -> Result<Arc<Self>> {
+        let SpawnedHost { host, rx, env, cwd } = spawned;
         let mut mcp = serde_json::Map::new();
         let mut servers = config
             .get("mcpServers")
@@ -406,14 +413,13 @@ impl Session {
         if state.config["model"].is_null() {
             state.config["model"] = catalog["defaultModel"].clone();
         }
-        if state.config["thinkingOptionId"].is_null() {
-            if let Some(model) = catalog["models"]
+        if state.config["thinkingOptionId"].is_null()
+            && let Some(model) = catalog["models"]
                 .as_array()
                 .and_then(|a| a.iter().find(|m| m["id"] == state.config["model"]))
             {
                 state.config["thinkingOptionId"] = model["defaultThinkingOptionId"].clone();
             }
-        }
         state.catalog = catalog;
         Ok(())
     }
@@ -552,7 +558,7 @@ impl Session {
                     Some(Action::Activity)=>Ok(()),
                     Some(Action::Close(reply))=>{
                         let mut result=Ok(());
-                        while let Ok(event)=rx.try_recv(){if event["method"]!="$error" {if let Err(error)=self.notify(event,&mut projection,&mut questions).await{result=Err(error);break;}}}
+                        while let Ok(event)=rx.try_recv(){if event["method"]!="$error"&& let Err(error)=self.notify(event,&mut projection,&mut questions).await{result=Err(error);break;}}
                         if result.is_ok(){result=match projection.close_children().await {Ok(events)=>self.publish(events,true).await,Err(e)=>Err(e)};}
                         let _=reply.send(result);break;
                     },

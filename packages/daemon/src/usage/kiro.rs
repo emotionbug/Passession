@@ -35,7 +35,7 @@ fn scope_env(
 }
 
 pub(super) async fn discover(rt: &UsageRuntime, scope: &UsageScope) -> Result<Vec<UsageAccount>> {
-    let Some(env) = scope_env(&scope, || {
+    let Some(env) = scope_env(scope, || {
         let mut env = rt.env.clone();
         if !env.get("HOME").is_some_and(|home| std::path::Path::new(home).is_absolute()) {
             env.insert("HOME".into(), rt.home.to_string_lossy().into_owned());

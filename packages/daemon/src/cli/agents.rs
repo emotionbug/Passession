@@ -353,8 +353,8 @@ pub async fn execute(path: &[&str], m: &ArgMatches, context: &Context) -> Result
         _ => return Ok(None),
     };
     launch::check_noninteractive(command, m)?;
-    if command == "open" {
-        if let Some(server) = string(m, "server").map(str::trim).filter(|s| !s.is_empty()) {
+    if command == "open"
+        && let Some(server) = string(m, "server").map(str::trim).filter(|s| !s.is_empty()) {
             let id = required(m, "id")?;
             super::open_agent_desktop(server, id).await?;
             return Ok(Some(
@@ -367,7 +367,6 @@ pub async fn execute(path: &[&str], m: &ArgMatches, context: &Context) -> Result
                     ]),
             ));
         }
-    }
     let client = context.connect().await?;
     let result = execute_connected(command, m, context, &client).await;
     client.close().await;
@@ -519,8 +518,8 @@ async fn execute_connected(
                     .into(),
                 _ => "Agent is idle.".into(),
             };
-            if matches!(status, "idle" | "timeout") {
-                if let Ok(items) =
+            if matches!(status, "idle" | "timeout")
+                && let Ok(items) =
                     stream::history(client, context, id, Duration::from_secs(2)).await
                 {
                     let transcript = stream::transcript(&items, Some(5))?;
@@ -528,7 +527,6 @@ async fn execute_connected(
                         message.push_str(&format!("\nLast 5 activity items:\n{transcript}"));
                     }
                 }
-            }
             Ok(message_output(
                 json!({"agentId":id,"status":status,"message":message}),
             ))

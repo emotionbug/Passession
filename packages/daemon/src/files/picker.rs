@@ -257,11 +257,10 @@ async fn children(path: &Path, cancel: &CancellationToken) -> Result<Arc<Vec<Raw
     let stamp = Stamp::of(info);
     if !cfg!(windows) {
         let listings = shared().listings.lock().unwrap();
-        if let Some(cached) = listings.values.get(path) {
-            if cached.expires > Instant::now() && cached.stamp == stamp {
+        if let Some(cached) = listings.values.get(path)
+            && cached.expires > Instant::now() && cached.stamp == stamp {
                 return Ok(cached.entries.clone());
             }
-        }
     }
     let entries = match filesystem(Operation::ReadDir, path, cancel).await? {
         Some(value) => match value.as_ref() {
@@ -309,8 +308,7 @@ async fn git_ignored(root: &Path, cancel: &CancellationToken) -> Result<Arc<Hash
                 let mut paths = HashSet::new();
                 if let Ok(Ok(output)) =
                     tokio::time::timeout(Duration::from_secs(10), command.output()).await
-                {
-                    if output.status.success() {
+                    && output.status.success() {
                         for path in String::from_utf8_lossy(&output.stdout)
                             .split('\0')
                             .filter(|p| !p.is_empty())
@@ -318,7 +316,6 @@ async fn git_ignored(root: &Path, cancel: &CancellationToken) -> Result<Arc<Hash
                             paths.insert(normalize(&worker_root.join(path.trim_end_matches('/'))));
                         }
                     }
-                }
                 Arc::new(paths)
             });
             let paths = async move { task.await.unwrap_or_else(|_| Arc::new(HashSet::new())) }
@@ -909,30 +906,28 @@ async fn search(input: &Input) -> Result<Vec<Value>> {
     } else {
         None
     };
-    if input.limit == 1 {
-        if let Some(entry) = exact.as_ref() {
+    if input.limit == 1
+        && let Some(entry) = exact.as_ref() {
             return Ok(vec![input.format(entry)]);
         }
-    }
     let mut start = (input.root.clone(), input.root.clone());
     let mut browse =
         (input.plan.path_query && input.plan.normalized.is_empty()) || input.plan.browse_exact;
     if typed && !input.plan.parent.is_empty() && !browse {
         let visible = normalize(&input.root.join(&input.plan.parent));
-        if let Some(resolved) = canonical(&visible, &input.cancel).await? {
-            if inside(&input.root, &resolved)
+        if let Some(resolved) = canonical(&visible, &input.cancel).await?
+            && inside(&input.root, &resolved)
                 && kind(&resolved, &input.cancel).await? == Some(Kind::Directory)
             {
                 browse = input.excluded(&resolved);
                 start = (resolved, visible);
             }
-        }
     }
     let mut ranked = Vec::new();
     if browse {
         let visible = normalize(&input.root.join(&input.plan.parent));
-        if let Some(parent) = canonical(&visible, &input.cancel).await? {
-            if inside(&input.root, &parent) && !input.git_ignored(&parent) {
+        if let Some(parent) = canonical(&visible, &input.cancel).await?
+            && inside(&input.root, &parent) && !input.git_ignored(&parent) {
                 let allow_excluded = input.excluded(&parent);
                 for raw in children(&parent, &input.cancel).await?.iter() {
                     let Some(entry) =
@@ -949,7 +944,6 @@ async fn search(input: &Input) -> Result<Vec<Value>> {
                     }
                 }
             }
-        }
     } else {
         let mut visited = HashSet::from([start.0.clone()]);
         let mut walk = RoundRobin::new(start.0, start.1, 1);
@@ -1016,8 +1010,8 @@ pub async fn suggest(
     };
     let configured = absolute(&configured)?;
     let mut entries = Vec::new();
-    if let Some(root) = canonical(&configured, &cancel).await? {
-        if kind(&root, &cancel).await? == Some(Kind::Directory) {
+    if let Some(root) = canonical(&configured, &cancel).await?
+        && kind(&root, &cancel).await? == Some(Kind::Directory) {
             let ignored = if workspace {
                 git_ignored(&root, &cancel).await?
             } else {
@@ -1036,8 +1030,8 @@ pub async fn suggest(
                 .get("includeDirectories")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            if include_files || include_directories {
-                if let Some(plan) = parse_query(
+            if (include_files || include_directories)
+                && let Some(plan) = parse_query(
                     request.get("query").and_then(Value::as_str).unwrap_or(""),
                     &root,
                     &configured,
@@ -1073,9 +1067,7 @@ pub async fn suggest(
                     })
                     .await?;
                 }
-            }
         }
-    }
     let directories: Vec<_> = entries
         .iter()
         .filter(|v| v["kind"] == "directory")

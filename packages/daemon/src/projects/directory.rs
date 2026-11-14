@@ -180,14 +180,13 @@ fn base_descriptor(
     {
         descriptor["labels"] = workspace["labels"].clone();
     }
-    if enabled(workspace, "isPaseoOwnedWorktree") {
-        if let Some(root) = workspace["worktreeRoot"]
+    if enabled(workspace, "isPaseoOwnedWorktree")
+        && let Some(root) = workspace["worktreeRoot"]
             .as_str()
             .filter(|root| !root.is_empty())
         {
             descriptor["worktreeSlug"] = json!(basename(root));
         }
-    }
     if let Some(project) = project {
         descriptor["project"] = json!({
             "projectKey": project["projectId"], "projectName": project_name(project),
@@ -598,11 +597,10 @@ pub async fn fetch(
             .agents
             .directory_sync
             .synchronize_workspaces(entries, cursor, background)?;
-        if !background {
-            if let Some(entries) = result["entries"].as_array_mut() {
+        if !background
+            && let Some(entries) = result["entries"].as_array_mut() {
                 entries.retain(|entry| !enabled(entry, "background"));
             }
-        }
         return Ok(result);
     }
     let entries = build_entries_ref(app, &workspaces, &projects).await?;

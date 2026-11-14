@@ -61,14 +61,13 @@ impl ProjectService {
             return Ok(true);
         }
         let result = self.execute_wire(ctx, m).await;
-        if let Err(error) = &result {
-            if kind.starts_with("workspace.label.")
-                || matches!(kind, "project.list.request" | "fetch_workspaces_request")
+        if let Err(error) = &result
+            && (kind.starts_with("workspace.label.")
+                || matches!(kind, "project.list.request" | "fetch_workspaces_request"))
             {
                 send_rpc_error(ctx, m, error).await?;
                 return Ok(true);
             }
-        }
         let mut payload = match result {
             Ok(payload) => payload,
             Err(error) => failure(kind, m, &error),
@@ -360,10 +359,10 @@ impl ProjectService {
             tokio::select! {
                 result=&mut future=>break result,
                 event=events.recv(),if progress_open=>match event{
-                    Ok(snapshot) if snapshot["kind"]=="workspace"&&snapshot["idempotencyKey"]==key=>{if let Some(op)=operation.as_ref(){if op.emit(json!({"type":"workspace.create.update","payload":snapshot})).await.is_err(){progress_open=false;}}},
+                    Ok(snapshot) if snapshot["kind"]=="workspace"&&snapshot["idempotencyKey"]==key=>{if let Some(op)=operation.as_ref()&& op.emit(json!({"type":"workspace.create.update","payload":snapshot})).await.is_err(){progress_open=false;}},
                     Ok(_)=>{},
                     Err(broadcast::error::RecvError::Lagged(_))=>{
-                        if let Some(snapshot)=app.agents.creation_snapshot("workspace",&key).await? {if let Some(op)=operation.as_ref(){if op.emit(json!({"type":"workspace.create.update","payload":snapshot})).await.is_err(){progress_open=false;}}}
+                        if let Some(snapshot)=app.agents.creation_snapshot("workspace",&key).await?&& let Some(op)=operation.as_ref()&& op.emit(json!({"type":"workspace.create.update","payload":snapshot})).await.is_err(){progress_open=false;}
                     },
                     Err(broadcast::error::RecvError::Closed)=>{progress_open=false;},
                 }
@@ -732,11 +731,10 @@ impl ProjectService {
             }
         }
         let mut targets = Vec::new();
-        if !all {
-            if let Some(id) = m["workspaceId"].as_str() {
+        if !all
+            && let Some(id) = m["workspaceId"].as_str() {
                 targets.push(id.to_owned());
             }
-        }
         if targets.is_empty() {
             let mut matched = Vec::new();
             for w in records {
@@ -816,12 +814,11 @@ impl ProjectService {
                     break;
                 }
             }
-            if selected.is_empty() {
-                if let Err(error) = app.terminals.teardown_path(&path, repo.as_deref()).await {
+            if selected.is_empty()
+                && let Err(error) = app.terminals.teardown_path(&path, repo.as_deref()).await {
                     tracing::warn!(%error,"Orphan worktree teardown failed; retaining directory");
                     teardown_ok = false;
                 }
-            }
             let mut referenced = false;
             for workspace in self.list_workspaces().await? {
                 if workspace["archivedAt"].is_null()
@@ -839,8 +836,8 @@ impl ProjectService {
                     break;
                 }
             }
-            if teardown_ok && !referenced {
-                if let Some(repo) = repo {
+            if teardown_ok && !referenced
+                && let Some(repo) = repo {
                     if let Err(error) = worktrees::remove(
                         &app.home,
                         &app.config.snapshot(),
@@ -855,7 +852,6 @@ impl ProjectService {
                         app.git.invalidate(&repo).await?;
                     }
                 }
-            }
         } else {
             for id in targets {
                 let result = self.archive_workspace(ctx.principal(), &id).await?;

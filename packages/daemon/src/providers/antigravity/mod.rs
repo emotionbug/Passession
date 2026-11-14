@@ -199,11 +199,10 @@ impl AgentProvider for AntigravityProvider {
             std::mem::take(&mut *self.sessions.lock().unwrap_or_else(|e| e.into_inner()));
         let mut error = None;
         for session in sessions.into_iter().filter_map(|s| s.upgrade()) {
-            if let Err(next) = session.close().await {
-                if error.is_none() {
+            if let Err(next) = session.close().await
+                && error.is_none() {
                     error = Some(next);
                 }
-            }
         }
         match error {
             Some(error) => Err(error),

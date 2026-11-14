@@ -77,31 +77,27 @@ pub(super) async fn wait_ready(
         loop {
             let request =
                 runtime.request(Method::GET, "/api/plugin", &location, None, cancel.clone());
-            match tokio::time::timeout(Duration::from_secs(5), request).await {
-                Ok(result) => {
-                    let result = result?;
-                    let plugins = result
-                        .get("data")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| anyhow!("OpenCode plugin inventory is malformed"))?;
-                    if !require_bridge && !plugins.is_empty() {
-                        return Ok(());
-                    }
-                    if require_bridge {
-                        if let Some(bridge) = plugins.iter().find(|plugin| plugin["id"] == "paseo")
-                        {
-                            match bridge.pointer("/state/status").and_then(Value::as_str) {
-                                Some("active") => return Ok(()),
-                                Some("failed") => bail!(
-                                    "OpenCode Paseo tool bridge plugin failed: {}",
-                                    bridge["state"]["error"]
-                                ),
-                                _ => {}
-                            }
+            if let Ok(result) = tokio::time::timeout(Duration::from_secs(5), request).await {
+                let result = result?;
+                let plugins = result
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("OpenCode plugin inventory is malformed"))?;
+                if !require_bridge && !plugins.is_empty() {
+                    return Ok(());
+                }
+                if require_bridge
+                    && let Some(bridge) = plugins.iter().find(|plugin| plugin["id"] == "paseo")
+                    {
+                        match bridge.pointer("/state/status").and_then(Value::as_str) {
+                            Some("active") => return Ok(()),
+                            Some("failed") => bail!(
+                                "OpenCode Paseo tool bridge plugin failed: {}",
+                                bridge["state"]["error"]
+                            ),
+                            _ => {}
                         }
                     }
-                }
-                Err(_) => {}
             }
             tokio::select! {
                 _ = cancel.cancelled() => bail!("OpenCode location activation canceled"),

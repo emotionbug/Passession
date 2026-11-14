@@ -28,11 +28,10 @@ pub fn normalize_persisted(mut value: Value) -> Result<Value> {
         migrate_providers(providers)?;
     }
     visit(Node::Write(&mut value), Kind::Persisted).context("Invalid persisted config")?;
-    if let Some(daemon) = value.get_mut("daemon").and_then(Value::as_object_mut) {
-        if let Some(allowed_hosts) = daemon.remove("allowedHosts") {
+    if let Some(daemon) = value.get_mut("daemon").and_then(Value::as_object_mut)
+        && let Some(allowed_hosts) = daemon.remove("allowedHosts") {
             daemon.entry("hostnames").or_insert(allowed_hosts);
         }
-    }
     Ok(value)
 }
 
@@ -605,14 +604,13 @@ fn visit(mut node: Node<'_>, kind: Kind) -> Result<()> {
         }
         _ => {
             validate_leaf(node.value(), kind)?;
-            if matches!(kind, Trimmed | PortRange) {
-                if let Node::Write(Value::String(text)) = node {
+            if matches!(kind, Trimmed | PortRange)
+                && let Node::Write(Value::String(text)) = node {
                     let trimmed = js_trim(text);
                     if trimmed.len() != text.len() {
                         *text = trimmed.to_owned();
                     }
                 }
-            }
         }
     }
     Ok(())

@@ -152,8 +152,8 @@ pub fn features(family: &str, state: &Value, config: &Value) -> Vec<Value> {
         )),
         _ => None,
     };
-    if let Some((id, label, description, tooltip)) = definition {
-        if let Some(o) = option_id(&state["configOptions"], id).or_else(|| {
+    if let Some((id, label, description, tooltip)) = definition
+        && let Some(o) = option_id(&state["configOptions"], id).or_else(|| {
             if id == "agent" {
                 option(&state["configOptions"], "_agent")
             } else {
@@ -174,7 +174,6 @@ pub fn features(family: &str, state: &Value, config: &Value) -> Vec<Value> {
             }
             result.push(feature);
         }
-    }
     result
 }
 pub fn mcp(servers: &Value) -> Vec<Value> {
@@ -219,7 +218,7 @@ pub fn tool_text(snapshot: &Value) -> Option<String> {
         Some(parts.join("\n"))
     }
 }
-fn first<'a>(v: &'a Value, keys: &[&str]) -> Value {
+fn first(v: &Value, keys: &[&str]) -> Value {
     keys.iter()
         .find_map(|k| v.get(*k).filter(|v| !v.is_null()).cloned())
         .unwrap_or(Value::Null)
@@ -272,11 +271,10 @@ pub fn tool_detail(snapshot: &Value, terminal: Option<Value>) -> Value {
         }
         _ => json!({"type":"unknown","input":input,"output":output}),
     };
-    if detail["type"] != "unknown" {
-        if let Some(o) = detail.as_object_mut() {
+    if detail["type"] != "unknown"
+        && let Some(o) = detail.as_object_mut() {
             o.retain(|_, v| !v.is_null());
         }
-    }
     detail
 }
 fn stringify(v: &Value) -> Value {

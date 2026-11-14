@@ -238,19 +238,16 @@ async fn sidechain_index(path: &Path) -> Result<SidechainIndex> {
                 .strip_prefix("agent-")
                 .and_then(|name| name.strip_suffix(".meta.json"))
                 .filter(|id| !id.is_empty())
-            {
-                if let Some(value) = optional_json(&file).await.and_then(|value| {
+                && let Some(value) = optional_json(&file).await.and_then(|value| {
                     filtered_fields(
                         &value,
                         &["agentType", "description", "toolUseId"],
                         &["spawnDepth"],
                     )
-                }) {
-                    if value.as_object().is_some_and(|object| !object.is_empty()) {
+                })
+                    && value.as_object().is_some_and(|object| !object.is_empty()) {
                         index.meta.insert(agent_id.to_owned(), value);
                     }
-                }
-            }
         }
     }
     Ok(index)
@@ -779,11 +776,9 @@ pub async fn renamed_title(
     let result = visit_records(&path, |entry| {
         if !truthy(entry.get("isSidechain"))
             && entry.get("type").and_then(Value::as_str) == Some("custom-title")
-        {
-            if let Some(value) = trimmed(entry.get("customTitle")) {
+            && let Some(value) = trimmed(entry.get("customTitle")) {
                 title = Some(value.to_owned());
             }
-        }
     })
     .await;
     match result {
@@ -914,11 +909,10 @@ pub async fn fork_session(
         bail!("Invalid sessionId: {session_id}");
     }
     let up_to_message_id = up_to_message_id.filter(|id| !id.is_empty());
-    if let Some(id) = up_to_message_id {
-        if !valid_sdk_uuid(id) {
+    if let Some(id) = up_to_message_id
+        && !valid_sdk_uuid(id) {
             bail!("Invalid upToMessageId: {id}");
         }
-    }
     let directory = transcript_path
         .parent()
         .ok_or_else(|| anyhow!("Claude transcript has no project directory"))?;

@@ -129,11 +129,10 @@ fn replayed_denials_are_counted_not_reannounced() {
     let mut reported = HashMap::new();
     let mut notices = Vec::new();
     for frame in frames(capture!("denial-replay")) {
-        if let Frame::Result { result } = frame {
-            if let Some(title) = wire::denial_title(&result.denied_actions, &mut reported) {
+        if let Frame::Result { result } = frame
+            && let Some(title) = wire::denial_title(&result.denied_actions, &mut reported) {
                 notices.push(title);
             }
-        }
     }
     assert_eq!(notices, ["Shell command denied"]);
     let actions = || {

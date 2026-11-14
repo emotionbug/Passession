@@ -35,7 +35,7 @@ pub(super) fn same_records(
                     && before.content_hash == after.content_hash
                     && before.entry.get("fetchedAt") == after.entry.get("fetchedAt") =>
             {
-                ()
+                
             }
             _ => return false,
         }

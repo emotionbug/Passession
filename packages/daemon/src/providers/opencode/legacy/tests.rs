@@ -116,8 +116,7 @@ async fn nested_child_resolves_through_its_ancestry_and_strangers_are_refused() 
         .reply("/session/stray/message?directory=/work", json!([assistant("stray", "s1", "foreign", true)]));
     let error = replay_child(&native, "opencode", "root", "stray", "/work")
         .await
-        .err()
-        .expect("a session outside the parent family is refused");
+        .expect_err("a session outside the parent family is refused");
     assert!(error.to_string().contains("not a subagent of root"), "{error}");
     assert!(!native.reads().iter().any(|read| read.contains("/message")));
 }
@@ -129,8 +128,7 @@ async fn unreadable_child_body_is_an_error_not_an_empty_replay() {
         .reply("/session/beta/children?directory=/work", json!([]));
     let error = replay_child(&native, "opencode", "root", "beta", "/work")
         .await
-        .err()
-        .expect("a missing body fails");
+        .expect_err("a missing body fails");
     assert!(error.to_string().contains("404"), "{error}");
 
     let missing = FakeNative::default();
@@ -451,11 +449,13 @@ async fn live_parent_keeps_serving_while_an_opened_child_replay_awaits_its_outco
         runtime,
         manager.clone(),
         loopback::spec(),
-        json!({"id":"root","directory":"/work"}),
-        json!({"cwd":"/work"}),
-        loopback::context(home.path()),
-        json!({}),
-        sink,
+        super::super::SessionLaunch {
+            info: json!({"id":"root","directory":"/work"}),
+            config: json!({"cwd":"/work"}),
+            context: loopback::context(home.path()),
+            options: json!({}),
+            sink,
+        },
     )
     .await
     .unwrap();

@@ -62,6 +62,15 @@ fn present(obj: &Object, key: &str) -> bool {
     obj.get(key).is_some_and(|v| !v.is_null())
 }
 
+struct CreditPool<'a> {
+    id: String,
+    label: String,
+    source: &'a Value,
+    expiry: &'a Value,
+    summary: bool,
+    expired: bool,
+}
+
 #[derive(Default)]
 struct Quotas {
     windows: Vec<Value>,
@@ -71,14 +80,10 @@ struct Quotas {
 impl Quotas {
     fn pool(
         &mut self,
-        id: String,
-        label: String,
-        source: &Value,
-        expiry: &Value,
-        summary: bool,
-        expired: bool,
+        pool: CreditPool<'_>,
         now: DateTime<Utc>,
     ) -> Result<(f64, f64)> {
+        let CreditPool { id, label, source, expiry, summary, expired } = pool;
         let source = object(source)?;
         let used = precise(source, "currentUsage", "currentUsageWithPrecision")?;
         let limit = precise(source, "usageLimit", "usageLimitWithPrecision")?;
@@ -194,12 +199,14 @@ pub(super) fn normalize(payload: &Value, now: DateTime<Utc>) -> Result<Value> {
         }
         let resets_at = iso(reset_date);
         report.pool(
-            format!("{prefix}-base"),
-            format!("Monthly credits{suffix}"),
-            raw,
-            reset,
-            true,
-            false,
+            CreditPool {
+                id: format!("{prefix}-base"),
+                label: format!("Monthly credits{suffix}"),
+                source: raw,
+                expiry: reset,
+                summary: true,
+                expired: false,
+            },
             now,
         )?;
         if present(row, "freeTrialInfo") {
@@ -210,12 +217,14 @@ pub(super) fn normalize(payload: &Value, now: DateTime<Utc>) -> Result<Value> {
                 _ => return Err(Failure::InvalidResponse),
             };
             report.pool(
-                format!("{prefix}-trial"),
-                format!("Trial credits{suffix}"),
-                get(row, "freeTrialInfo"),
-                get(trial, "freeTrialExpiry"),
-                false,
-                expired,
+                CreditPool {
+                    id: format!("{prefix}-trial"),
+                    label: format!("Trial credits{suffix}"),
+                    source: get(row, "freeTrialInfo"),
+                    expiry: get(trial, "freeTrialExpiry"),
+                    summary: false,
+                    expired,
+                },
                 now,
             )?;
         }
@@ -229,12 +238,14 @@ pub(super) fn normalize(payload: &Value, now: DateTime<Utc>) -> Result<Value> {
                 };
                 // Codes, descriptions and user-chosen labels are intentionally not exposed.
                 report.pool(
-                    format!("{prefix}-bonus-{}", i + 1),
-                    format!("Bonus credits{suffix} {}", i + 1),
-                    bonus,
-                    get(source, "expiresAt"),
-                    false,
-                    expired,
+                    CreditPool {
+                        id: format!("{prefix}-bonus-{}", i + 1),
+                        label: format!("Bonus credits{suffix} {}", i + 1),
+                        source: bonus,
+                        expiry: get(source, "expiresAt"),
+                        summary: false,
+                        expired,
+                    },
                     now,
                 )?;
             }
@@ -253,12 +264,14 @@ pub(super) fn normalize(payload: &Value, now: DateTime<Utc>) -> Result<Value> {
         let (mut addon_used, mut addon_limit) = (0.0, 0.0);
         for (i, addon) in addons.iter().enumerate() {
             let (used, limit) = report.pool(
-                format!("{prefix}-addon-{}", i + 1),
-                format!("Add-on credits{suffix} {}", i + 1),
-                addon,
-                get(object(addon)?, "expiresAt"),
-                false,
-                false,
+                CreditPool {
+                    id: format!("{prefix}-addon-{}", i + 1),
+                    label: format!("Add-on credits{suffix} {}", i + 1),
+                    source: addon,
+                    expiry: get(object(addon)?, "expiresAt"),
+                    summary: false,
+                    expired: false,
+                },
                 now,
             )?;
             addon_used += used;

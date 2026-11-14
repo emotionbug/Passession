@@ -115,13 +115,12 @@ fn issue_path(input: &Value, pointer: &str) -> Vec<Value> {
     let mut current = input;
     for part in pointer.split('/').skip(1) {
         let part = part.replace("~1", "/").replace("~0", "~");
-        if current.is_array() {
-            if let Ok(index) = part.parse::<usize>() {
+        if current.is_array()
+            && let Ok(index) = part.parse::<usize>() {
                 path.push(json!(index));
                 current = current.get(index).unwrap_or(&Value::Null);
                 continue;
             }
-        }
         current = current.get(&part).unwrap_or(&Value::Null);
         path.push(Value::String(part));
     }
@@ -182,8 +181,8 @@ pub fn validate(provider: &str, family: &str, options: &Value) -> Result<Value> 
         object.entry("rpcTimeoutMs").or_insert(json!(60_000));
         object.entry("extensionTimeoutMs").or_insert(json!(30_000));
     }
-    if schema_family == "acp" {
-        if let Some(capabilities) = normalized
+    if schema_family == "acp"
+        && let Some(capabilities) = normalized
             .get_mut("clientCapabilities")
             .and_then(Value::as_object_mut)
         {
@@ -192,7 +191,6 @@ pub fn validate(provider: &str, family: &str, options: &Value) -> Result<Value> 
                 files.retain(|key, _| matches!(key.as_str(), "readTextFile" | "writeTextFile"));
             }
         }
-    }
     Ok(normalized)
 }
 

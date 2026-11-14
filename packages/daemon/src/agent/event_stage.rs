@@ -99,8 +99,8 @@ pub(crate) struct Replay {
 
 impl Replay {
     pub(crate) async fn next_batch(&mut self) -> Result<Vec<Value>> {
-        if self.reading.is_none() {
-            if let Some(mut reader) = self.disk.take() {
+        if self.reading.is_none()
+            && let Some(mut reader) = self.disk.take() {
                 self.reading = Some(tokio::task::spawn_blocking(move || {
                     let mut batch = Vec::new();
                     let mut bytes = 0usize;
@@ -115,7 +115,6 @@ impl Replay {
                     Ok((Some(reader), batch))
                 }));
             }
-        }
         if let Some(task) = self.reading.as_mut() {
             let result = task.await;
             self.reading = None;

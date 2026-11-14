@@ -162,11 +162,10 @@ pub(super) fn load_measured(path: &Path, agent_id: &str) -> Result<(Timeline, u6
             if let Some(id) = super::identity(&row["item"]) {
                 timeline.identities.insert(id, index);
             }
-            if row["item"]["type"] == "user_message" {
-                if let Some(id) = row["item"]["clientMessageId"].as_str().filter(|id| !id.is_empty()) {
+            if row["item"]["type"] == "user_message"
+                && let Some(id) = row["item"]["clientMessageId"].as_str().filter(|id| !id.is_empty()) {
                     timeline.submitted.entry(id.to_owned()).or_insert(index);
                 }
-            }
             timeline.rows.push(row);
         }
     }

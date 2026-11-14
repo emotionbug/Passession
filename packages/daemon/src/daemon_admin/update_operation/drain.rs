@@ -25,11 +25,10 @@ pub(crate) fn wire_admission(app: &AppState, message: &Value) -> Result<Option<W
 }
 
 pub(crate) async fn initialize(app: &Arc<AppState>) -> Result<()> {
-    if let Some(operation) = journal::current(&app.home).await? {
-        if matches!(operation.phase, Phase::Draining | Phase::Activating | Phase::Verifying | Phase::RollingBack) {
+    if let Some(operation) = journal::current(&app.home).await?
+        && matches!(operation.phase, Phase::Draining | Phase::Activating | Phase::Verifying | Phase::RollingBack) {
             pause(app, &operation)?;
         }
-    }
     Ok(())
 }
 

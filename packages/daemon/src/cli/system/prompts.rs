@@ -95,11 +95,10 @@ pub(super) async fn select(
         + 1;
     loop {
         let answer = text("Select a number", Some(&default.to_string()), cancel).await?;
-        if let Ok(index) = answer.parse::<usize>() {
-            if let Some((id, _)) = index.checked_sub(1).and_then(|index| options.get(index)) {
+        if let Ok(index) = answer.parse::<usize>()
+            && let Some((id, _)) = index.checked_sub(1).and_then(|index| options.get(index)) {
                 return Ok(id.clone());
             }
-        }
         if options.iter().any(|(id, _)| id == &answer) {
             return Ok(answer);
         }

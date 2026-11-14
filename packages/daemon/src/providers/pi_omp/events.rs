@@ -18,6 +18,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub use tools::tool_item;
 use uuid::Uuid;
 
+struct ToolCall<'a> {
+    id: &'a str,
+    name: &'a str,
+    args: &'a Value,
+}
+
 fn array(v: &Value) -> &[Value] {
     v.as_array().map(Vec::as_slice).unwrap_or(&[])
 }
@@ -213,9 +219,7 @@ impl Mapper {
         for id in due {
             if let Some((name, args)) = self.tools.get(&id).cloned() {
                 out.extend(self.tool_events(
-                    &id,
-                    &name,
-                    &args,
+                    ToolCall { id: &id, name: &name, args: &args },
                     "running",
                     &Value::Null,
                     &Value::Null,
@@ -336,14 +340,13 @@ impl Mapper {
     }
     fn tool_events(
         &mut self,
-        id: &str,
-        name: &str,
-        args: &Value,
+        call: ToolCall<'_>,
         status: &str,
         result: &Value,
         error: &Value,
         replay: bool,
     ) -> Vec<Value> {
+        let ToolCall { id, name, args } = call;
         let mut item = tool_item(&self.family, id, name, args, status, result, error);
         if let Some(identity) = self.bridged.get(name) {
             item = json!({"type":"tool_call","callId":id,"name":format!("{} / {}",string(&identity["server"]),string(&identity["tool"])),"status":status,"error":if status=="failed"{error.clone()}else{Value::Null},"detail":{"type":"unknown","input":args,"output":result}});
@@ -379,24 +382,20 @@ impl Mapper {
         out.extend(self.subagents(extension_events));
         if !(replay && self.family == "omp")
             && (status == "completed" || (self.family == "omp" && status != "running"))
-        {
-            if let Some(todo) = extensions::todo(&self.family, name, result) {
-                if let Some(event) = self.todo_event(todo, replay) {
+            && let Some(todo) = extensions::todo(&self.family, name, result)
+                && let Some(event) = self.todo_event(todo, replay) {
                     out.push(event);
                 }
-            }
-        }
         out
     }
     pub fn map(&mut self, frame: &Value) -> Vec<Value> {
         let mut out = Vec::new();
         let kind = string(&frame["type"]);
-        if self.family == "omp" {
-            if let Some(item) = notices::runtime(frame) {
+        if self.family == "omp"
+            && let Some(item) = notices::runtime(frame) {
                 out.push(json!({"type":"timeline","provider":self.provider,"item":item}));
                 return out;
             }
-        }
         match kind{
             "command_output" if self.turn.is_some()=>{
                 let ansi=cached_regex!(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))");
@@ -432,23 +431,34 @@ impl Mapper {
                     "user" if self.family=="omp"=>{let id=first(&[&message["id"],&message["entryId"]]);if id.is_some_and(|id|!self.users.insert(id.into())){return out;}let text=tools::content_text(&message["content"]);if !text.is_empty(){let mut item=json!({"type":"user_message","text":text});put(&mut item,"messageId",id);if let Some((_,client))=self.clients.pop_front(){put(&mut item,"clientMessageId",client.as_deref());}out.push(self.timeline(item));}},_=>{}
                 }
             }
-            "tool_execution_start"=>{let id=string(&frame["toolCallId"]);let name=string(&frame["toolName"]);let args=&frame["args"];self.tools.insert(id.into(),(name.into(),args.clone()));if let Some(req)=self.permissions.start(&self.family,&self.provider,id,name,args){let mut e=self.event("permission_requested");e["request"]=req;out.push(e);}out.extend(self.tool_events(id,name,args,"running",&Value::Null,&Value::Null,false));},
-            "tool_execution_update"=>{let id=string(&frame["toolCallId"]);if let Some((name,args))=self.tools.get(id).cloned(){out.extend(self.tool_events(id,&name,&args,"running",&frame["partialResult"],&Value::Null,false));}},
-            "tool_execution_end"=>{let id=string(&frame["toolCallId"]);let (name,args)=self.tools.remove(id).unwrap_or_else(||(string(&frame["toolName"]).into(),Value::Null));self.permissions.finish(id,&name);let result=&frame["result"];let failed=frame["isError"]==true||(self.family=="omp"&&name=="web_search"&&result["details"]["error"].is_string());let error=if !failed{Value::Null}else if self.family=="omp"{json!(tools::failure(result))}else{result.clone()};out.extend(self.tool_events(id,&name,&args,if failed{"failed"}else{"completed"},result,&error,false));if name=="task"{self.extensions.finish_card(id);self.card_updates.remove(id);}},
+            "tool_execution_start"=>{let id=string(&frame["toolCallId"]);let name=string(&frame["toolName"]);let args=&frame["args"];self.tools.insert(id.into(),(name.into(),args.clone()));if let Some(req)=self.permissions.start(&self.family,&self.provider,id,name,args){let mut e=self.event("permission_requested");e["request"]=req;out.push(e);}out.extend(self.tool_events(ToolCall { id, name, args },"running",&Value::Null,&Value::Null,false));},
+            "tool_execution_update"=>{let id=string(&frame["toolCallId"]);if let Some((name,args))=self.tools.get(id).cloned(){out.extend(self.tool_events(ToolCall { id, name: &name, args: &args },"running",&frame["partialResult"],&Value::Null,false));}},
+            "tool_execution_end"=>{let id=string(&frame["toolCallId"]);let (name,args)=self.tools.remove(id).unwrap_or_else(||(string(&frame["toolName"]).into(),Value::Null));self.permissions.finish(id,&name);let result=&frame["result"];let failed=frame["isError"]==true||(self.family=="omp"&&name=="web_search"&&result["details"]["error"].is_string());let error=if !failed{Value::Null}else if self.family=="omp"{json!(tools::failure(result))}else{result.clone()};out.extend(self.tool_events(ToolCall { id, name: &name, args: &args },if failed{"failed"}else{"completed"},result,&error,false));if name=="task"{self.extensions.finish_card(id);self.card_updates.remove(id);}},
             "extension_ui_request"=>{
                 if frame["method"]=="notify"{let message=string(&frame["message"]);if let Some(changes)=self.extensions.notification(message){out.extend(self.subagents(changes));}else if !["PASEO_ENTRY_CAPTURE ","PASEO_SUBMITTED_USER_ENTRY ","PASEO_COMMAND_RESULT "].iter().any(|prefix|message.strip_prefix(*prefix).and_then(|body|serde_json::from_str::<Value>(body).ok()).is_some_and(|v|v.is_object()))&&!message.is_empty(){out.push(self.timeline(json!({"type":"notification","level":match string(&frame["notifyType"]){"warning"=>"warning","error"=>"error",_=>"info"},"message":message})));}}
-                else if self.family=="omp"&&frame["method"]=="open_url"&&frame["url"].is_string(){let url=string(&frame["url"]);let mut lines=vec![format!("[Open URL]({url})"),format!("URL: {url}")];if let Some(url)=frame["launchUrl"].as_str(){lines.push(format!("Launch URL: {url}"));}if let Some(instructions)=frame["instructions"].as_str(){lines.push(String::new());lines.push(instructions.into());}out.push(self.timeline(json!({"type":"assistant_message","text":lines.join("\n")})));}
+                else if self.family == "omp" && frame["method"] == "open_url" && frame["url"].is_string() {
+                    let url = string(&frame["url"]);
+                    let mut lines = vec![format!("[Open URL]({url})"), format!("URL: {url}")];
+                    if let Some(url) = frame["launchUrl"].as_str() {
+                        lines.push(format!("Launch URL: {url}"));
+                    }
+                    if let Some(instructions) = frame["instructions"].as_str() {
+                        lines.push(String::new());
+                        lines.push(instructions.into());
+                    }
+                    out.push(self.timeline(json!({"type":"assistant_message","text":lines.join("\n")})));
+                }
                 else if let Some(request)=self.permissions.dialog(&self.family,&self.provider,frame){let mut e=self.event("permission_requested");e["request"]=request;out.push(e);}
             }
             "compaction_start"|"compaction_end"=>out.push(self.timeline(json!({"type":"compaction","status":if kind.ends_with("start"){"loading"}else{"completed"},"trigger":if frame["reason"]=="manual"{"manual"}else{"auto"}}))),
             "auto_retry_start" if self.family!="omp"=>out.push(self.timeline(json!({"type":"error","message":format!("Provider retry (attempt {}): {}",frame["attempt"],string(&frame["errorMessage"]))}))),
             "session_stats"=>{let stats=&frame["stats"];let number=|v:&Value|if v.is_number(){v.clone()}else{json!(0)};let mut usage=json!({"inputTokens":number(&stats["tokens"]["input"]),"cachedInputTokens":number(&stats["tokens"]["cacheRead"]),"outputTokens":number(&stats["tokens"]["output"]),"totalCostUsd":number(&stats["cost"])});for (from,to) in [("contextWindow","contextWindowMaxTokens"),("tokens","contextWindowUsedTokens")]{if stats["contextUsage"][from].is_number(){usage[to]=stats["contextUsage"][from].clone();}}let nonzero=usage.as_object().unwrap().iter().any(|(k,v)|k.starts_with("contextWindow")||v.as_f64().unwrap_or(0.)!=0.);if nonzero&&self.usage.as_ref()!=Some(&usage){self.usage=Some(usage.clone());let mut e=json!({"type":"usage_updated","provider":self.provider,"usage":usage});if let Some(id)=frame["turnId"].as_str(){e["turnId"]=json!(id);}out.push(e);}},
-            "todo_reminder" if self.family=="omp"=>{if let Some(item)=extensions::omp_todos(array(&frame["todos"])){if let Some(mut e)=self.todo_event(item,false){e.as_object_mut().unwrap().remove("turnId");out.push(e);}}},
+            "todo_reminder" if self.family=="omp"=>{if let Some(item)=extensions::omp_todos(array(&frame["todos"]))&& let Some(mut e)=self.todo_event(item,false){e.as_object_mut().unwrap().remove("turnId");out.push(e);}},
             "subagent_lifecycle"|"subagent_progress" if self.family=="omp"=>{
                 let payload=&frame["payload"];let parent=string(&payload["parentToolCallId"]);let mapped=self.extensions.omp_event(kind,payload);
                 if let Some((name,args))=self.tools.get(parent).cloned(){
                     let now=std::time::Instant::now();let emit=if let Some((last,dirty))=self.card_updates.get_mut(parent){if last.elapsed()>=std::time::Duration::from_millis(500){*last=now;*dirty=false;true}else{*dirty=true;false}}else{self.card_updates.insert(parent.into(),(now,false));true};
-                    if emit{out.extend(self.tool_events(parent,&name,&args,"running",&Value::Null,&Value::Null,false));}
+                    if emit{out.extend(self.tool_events(ToolCall { id: parent, name: &name, args: &args },"running",&Value::Null,&Value::Null,false));}
                 }
                 if let Some(e)=mapped{out.extend(self.subagents(vec![e]));}
             },
@@ -475,9 +485,7 @@ impl Mapper {
         let mut out = Vec::new();
         for (id, (name, args)) in calls {
             out.extend(self.tool_events(
-                &id,
-                &name,
-                &args,
+                ToolCall { id: &id, name: &name, args: &args },
                 "canceled",
                 &Value::Null,
                 &Value::Null,
@@ -529,7 +537,7 @@ impl Mapper {
                         )
                     });
                 for block in array(&message["content"]) {
-                    match string(&block["type"]){"text" if block["text"].as_str().is_some_and(|s|!s.is_empty())=>out.push(self.timeline(json!({"type":"assistant_message","text":block["text"],"messageId":id}))),"thinking" if block["thinking"].as_str().is_some_and(|s|!s.is_empty())=>{let mut reasoning=json!({"type":"reasoning","text":block["thinking"]});if self.native_ids{reasoning["messageId"]=json!(&id);}out.push(self.timeline(reasoning))},"toolCall"=>{let id=string(&block["id"]);let name=string(&block["name"]);self.tools.insert(id.into(),(name.into(),block["arguments"].clone()));out.extend(self.tool_events(id,name,&block["arguments"],"running",&Value::Null,&Value::Null,true));},_=>{}}
+                    match string(&block["type"]){"text" if block["text"].as_str().is_some_and(|s|!s.is_empty())=>out.push(self.timeline(json!({"type":"assistant_message","text":block["text"],"messageId":id}))),"thinking" if block["thinking"].as_str().is_some_and(|s|!s.is_empty())=>{let mut reasoning=json!({"type":"reasoning","text":block["thinking"]});if self.native_ids{reasoning["messageId"]=json!(&id);}out.push(self.timeline(reasoning))},"toolCall"=>{let id=string(&block["id"]);let name=string(&block["name"]);self.tools.insert(id.into(),(name.into(),block["arguments"].clone()));out.extend(self.tool_events(ToolCall { id, name, args: &block["arguments"] },"running",&Value::Null,&Value::Null,true));},_=>{}}
                 }
             }
             "toolResult" => {
@@ -556,9 +564,7 @@ impl Mapper {
                     Value::Null
                 };
                 out.extend(self.tool_events(
-                    id,
-                    &name,
-                    &args,
+                    ToolCall { id, name: &name, args: &args },
                     if failed { "failed" } else { "completed" },
                     &result,
                     &error,
@@ -606,15 +612,14 @@ impl Mapper {
             }
             _ => {}
         }
-        if self.family == "omp" {
-            if let Some(timestamp) = timestamp(message.get("timestamp")) {
+        if self.family == "omp"
+            && let Some(timestamp) = timestamp(message.get("timestamp")) {
                 for event in &mut out {
                     if event["type"] == "timeline" {
                         event["timestamp"] = json!(timestamp);
                     }
                 }
             }
-        }
         out
     }
 }

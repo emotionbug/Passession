@@ -235,8 +235,8 @@ impl ProjectService {
             )
             .await?;
             let project_changed = project["kind"] != kind || project["projectKey"] != key;
-            if project_changed {
-                if let Some(updated) = self
+            if project_changed
+                && let Some(updated) = self
                     .storage()
                     .await?
                     .update_project(project_id, |current| {
@@ -250,7 +250,6 @@ impl ProjectService {
                 {
                     self.publish_project(&updated).await?;
                 }
-            }
             for (workspace, state) in &workspace_states {
                 if workspace["projectId"] != project_id || *state != DirectoryObservation::Present {
                     continue;
@@ -324,14 +323,12 @@ impl ProjectService {
             if pr["state"]
                 .as_str()
                 .is_some_and(|s| s.eq_ignore_ascii_case("open"))
-            {
-                if let Some(url) = pr["url"].as_str() {
+                && let Some(url) = pr["url"].as_str() {
                     state.open.push_back((cwd, url.into()));
                     while state.open.len() > 1024 {
                         state.open.pop_front();
                     }
                 }
-            }
             return Ok(());
         }
         let Some(url) = pr["url"].as_str() else {

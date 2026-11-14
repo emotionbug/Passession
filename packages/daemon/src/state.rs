@@ -266,11 +266,10 @@ impl AppState {
         stop!(TERMINALS, "terminals", self.terminals.shutdown());
         stop!(FILES, "files", self.files.shutdown());
         stop!(GIT, "git", self.git.shutdown());
-        if let Err(error) = self.mcp.shutdown().await {
-            if failure.is_none() {
+        if let Err(error) = self.mcp.shutdown().await
+            && failure.is_none() {
                 failure = Some(error);
             }
-        }
         match failure {
             Some(error) => Err(error),
             None => Ok(()),

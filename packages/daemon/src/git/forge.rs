@@ -163,8 +163,8 @@ impl<T> Default for Cache<T> {
 impl<T> Cache<T> {
     fn cell(&mut self, key: String, ttl: impl Fn(&T) -> Option<Duration>) -> Arc<OnceCell<T>> {
         self.clock = self.clock.wrapping_add(1);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            if entry
+        if let Some(entry) = self.entries.get_mut(&key)
+            && entry
                 .cell
                 .get()
                 .is_none_or(|v| ttl(v).is_none_or(|ttl| entry.born.elapsed() < ttl))
@@ -172,9 +172,8 @@ impl<T> Cache<T> {
                 entry.used = self.clock;
                 return entry.cell.clone();
             }
-        }
-        if self.entries.len() >= self.capacity {
-            if let Some(oldest) = self
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, e)| e.used)
@@ -182,7 +181,6 @@ impl<T> Cache<T> {
             {
                 self.entries.remove(&oldest);
             }
-        }
         let cell = Arc::new(OnceCell::new());
         self.entries.insert(
             key,
@@ -364,9 +362,9 @@ impl ForgeEngine {
                     if glab.is_ok_and(|v| v.status == 0) {
                         matches.push("gitlab".to_owned());
                     }
-                    if let Ok(tea) = tea {
-                        if tea.status == 0 {
-                            if let Some(login) = serde_json::from_slice::<Value>(&tea.stdout)
+                    if let Ok(tea) = tea
+                        && tea.status == 0
+                            && let Some(login) = serde_json::from_slice::<Value>(&tea.stdout)
                                 .ok()
                                 .and_then(|v| tea_login(&v, &host).map(str::to_owned))
                             {
@@ -401,8 +399,6 @@ impl ForgeEngine {
                                 matches
                                     .push(if is_forgejo { "forgejo" } else { "gitea" }.to_owned());
                             }
-                        }
-                    }
                     Ok::<_, anyhow::Error>(if matches.len() == 1 {
                         matches.pop()
                     } else {
@@ -560,14 +556,13 @@ impl ForgeEngine {
         if let Some(remote) = remote {
             resolution.host = remote.host.clone();
             resolution.project_path = remote.path.clone();
-            if remote.ssh && cloud_forge(&resolution.host) != Some("github") {
-                if let Some(host) = self
+            if remote.ssh && cloud_forge(&resolution.host) != Some("github")
+                && let Some(host) = self
                     .ssh_hostname(cwd, env, cancel, &resolution.host)
                     .await?
                 {
                     resolution.host = host;
                 }
-            }
             if cloud_forge(&resolution.host) != Some("github") {
                 // `resolveGitHubEnterpriseHost`: a verified Enterprise host is cached for the
                 // daemon's lifetime; an unauthenticated one must never fall back to github.com.

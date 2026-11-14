@@ -274,15 +274,15 @@ impl AgentManager {
         let root = self.subagent_root(parent).await?;
         let store = self.subagent_store.clone();
         let owner = parent.to_owned();
-        let (deleted, skipped) = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?.delete_persisted(&root, &owner, &ids)
         }).await??;
-        for id in &deleted {
+        for id in &result.deleted {
             self.emit_subagent_output(parent, false, json!({"type":"remove","parentAgentId":parent,"subagentId":id}))
                 .await?;
         }
-        let skipped: Vec<Value> = skipped.into_iter().map(|(id, reason)| json!({"id":id,"reason":reason})).collect();
-        Ok(json!({"deleted":deleted,"skipped":skipped}))
+        let skipped: Vec<Value> = result.skipped.into_iter().map(|(id, reason)| json!({"id":id,"reason":reason})).collect();
+        Ok(json!({"deleted":result.deleted,"skipped":skipped}))
     }
     /// Pages one child without listing (or hydrating) its siblings.
     pub async fn subagent_timeline(
@@ -337,9 +337,9 @@ impl AgentManager {
         Ok(times)
     }
     pub async fn commands(&self, id: Option<&str>, config: &Value) -> Result<Vec<Value>> {
-        if let Some(id) = id {
-            if let Some(snapshot) = self.agent_snapshot(id).await? {
-                if !snapshot["archivedAt"].is_string() {
+        if let Some(id) = id
+            && let Some(snapshot) = self.agent_snapshot(id).await?
+                && !snapshot["archivedAt"].is_string() {
                     let cell = self.ensure_loaded(id).await?;
                     let session = cell
                         .data
@@ -350,8 +350,6 @@ impl AgentManager {
                         .ok_or_else(|| anyhow!("Agent has no session"))?;
                     return session.list_commands().await;
                 }
-            }
-        }
         self.list_draft_commands(config).await
     }
     pub async fn list_draft_commands(&self, config: &Value) -> Result<Vec<Value>> {
@@ -370,11 +368,10 @@ impl AgentManager {
         provider.list_commands(&config).await
     }
     pub async fn features(&self, id: Option<&str>, config: &Value) -> Result<Vec<Value>> {
-        if let Some(id) = id {
-            if let Some(session) = self.session(id).await? {
+        if let Some(id) = id
+            && let Some(session) = self.session(id).await? {
                 return Ok(session.features().to_vec());
             }
-        }
         self.list_draft_features(config).await
     }
     pub async fn list_draft_features(&self, config: &Value) -> Result<Vec<Value>> {
@@ -514,8 +511,8 @@ impl AgentManager {
         let mut entries = Vec::new();
         let mut filtered = 0;
         for session in sessions {
-            if let Some(cwd) = text(options, "cwd") {
-                if !same_cwd(
+            if let Some(cwd) = text(options, "cwd")
+                && !same_cwd(
                     Path::new(cwd),
                     Path::new(text(&session, "cwd").unwrap_or("")),
                 )
@@ -523,7 +520,6 @@ impl AgentManager {
                 {
                     continue;
                 }
-            }
             if since.is_some_and(|since| timestamp(&session["lastActivityAt"]) < since) {
                 continue;
             }

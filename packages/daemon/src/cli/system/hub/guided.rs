@@ -18,11 +18,10 @@ enum Connection {
     Connect,
 }
 fn connection(status: &Value, origin: &str) -> Connection {
-    if status["state"] == "connected" && status["hubOrigin"] == origin {
-        if let Some(id) = status["daemonId"].as_str() {
+    if status["state"] == "connected" && status["hubOrigin"] == origin
+        && let Some(id) = status["daemonId"].as_str() {
             return Connection::Connected(id.into());
         }
-    }
     if matches!(
         status["state"].as_str(),
         Some("connecting" | "reconnecting")
@@ -30,11 +29,10 @@ fn connection(status: &Value, origin: &str) -> Connection {
     {
         return Connection::Pending;
     }
-    if let Some(other) = status["hubOrigin"].as_str() {
-        if !matches!(status["state"].as_str(), Some("not_connected" | "revoked")) {
+    if let Some(other) = status["hubOrigin"].as_str()
+        && !matches!(status["state"].as_str(), Some("not_connected" | "revoked")) {
             return Connection::Conflict(other.into());
         }
-    }
     Connection::Connect
 }
 async fn wait_connected(origin: &str, ctx: &Context) -> Result<String> {
@@ -351,8 +349,8 @@ struct TriggerConnection {
 }
 fn connections(resources: &Value, repository: Option<&str>) -> Vec<TriggerConnection> {
     let mut results = Vec::new();
-    if let Some(repository) = repository {
-        if let Some(items) = resources["github"].as_array() {
+    if let Some(repository) = repository
+        && let Some(items) = resources["github"].as_array() {
             for item in items {
                 if item["repositories"]
                     .as_array()
@@ -367,7 +365,6 @@ fn connections(resources: &Value, repository: Option<&str>) -> Vec<TriggerConnec
                 }
             }
         }
-    }
     for (provider, key) in [("slack", "teamName"), ("discord", "guildName")] {
         if let Some(items) = resources[provider].as_array() {
             for item in items {

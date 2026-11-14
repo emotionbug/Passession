@@ -89,7 +89,7 @@ fn shared_key_never_shares_across_provider_ids() {
             ..Catalog::default()
         },
     );
-    assert!(catalogs["host"].get("codex").is_none());
+    assert!(!catalogs["host"].contains_key("codex"));
     assert!(catalogs["host"]["claude"].reusable(false));
 }
 
@@ -102,7 +102,7 @@ fn freshness_changes_snapshot_identity_but_not_content_identity() {
         json!({"provider":"codex","status":"ready","fetchedAt":"2026-01-02T00:00:00.000Z","models":[]}),
     );
     assert_eq!(first.content_hash, second.content_hash);
-    assert!(!same_records(&[first.clone()], &[second]));
+    assert!(!same_records(std::slice::from_ref(&first), &[second]));
     let unchanged = identify(first.entry.clone());
     assert!(same_records(&[first], &[unchanged]));
 }

@@ -45,15 +45,14 @@ fn identity(value: &Value) -> String {
     if value["kind"] == "directory" {
         return text(value, "path").into();
     }
-    if value["registry"].is_object() {
-        if let Ok(url) = url::Url::parse(text(&value["registry"], "url")) {
+    if value["registry"].is_object()
+        && let Ok(url) = url::Url::parse(text(&value["registry"], "url")) {
             return format!(
                 "{}/{}",
                 &url[url::Position::BeforeHost..url::Position::AfterPort],
                 text(&value["registry"], "id")
             );
         }
-    }
     let source = match value["kind"].as_str() {
         Some("cargo") => format!("cargo:{}", text(value, "crateName")),
         Some("release") => format!("release:{}", text(value, "origin")),
@@ -283,14 +282,13 @@ fn install_request(m: &ArgMatches) -> Result<Value> {
         return Err(anyhow!("--version, --sha256, and --format require a release: source; pin Cargo versions with cargo:<crate>@<version>"));
     }
     let mut request = json!({"type":"plugin.source.install.request","source":source});
-    if release {
-        if let Some(path) = path {
+    if release
+        && let Some(path) = path {
             if !portable(path) {
                 return Err(anyhow!("Plugin path must be a portable path relative to the archive"));
             }
             request["pluginPath"] = json!(path);
         }
-    }
     for key in ["id", "ref", "version", "sha256", "format"] {
         if let Some(value) = string(m, key).filter(|value| !value.is_empty()) {
             request[key] = json!(value);

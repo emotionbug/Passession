@@ -126,8 +126,8 @@ impl ForgeEngine {
                     }
                 }
             }
-            if s(&target, "headRef") == branch && s(&target, "headRepositoryOwner").is_empty() {
-                if let Some(remote) = self
+            if s(&target, "headRef") == branch && s(&target, "headRepositoryOwner").is_empty()
+                && let Some(remote) = self
                     .optional_git(
                         cwd,
                         env,
@@ -182,7 +182,6 @@ impl ForgeEngine {
                         }
                     }
                 }
-            }
         }
         if let Some(sha) = self
             .optional_git(cwd, env, &cancel, &["rev-parse", "HEAD"])

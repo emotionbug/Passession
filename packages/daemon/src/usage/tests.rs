@@ -158,7 +158,8 @@ async fn builtin_kiro_reports_expiry_without_an_external_plugin_or_auth_writes()
         .filter(|source| matches!(source, Source::Kiro)).collect();
     let scope = UsageScope { provider: None, model: None, env: BTreeMap::new() };
     let result = service.discover_and_fetch(
-        &runtime, &scope, &sources, None, true, &runtime.cancel, None,
+        super::DiscoveryContext { runtime: &runtime, scope: &scope, agent: None },
+        &sources, true, &runtime.cancel, None,
     ).await.unwrap();
     let expected_id = format!("kiro:{}", hash_account_key(auth.canonicalize().unwrap().to_str().unwrap()));
     assert_eq!(result.entries[0]["id"], expected_id);

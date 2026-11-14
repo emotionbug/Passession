@@ -204,8 +204,7 @@ impl Transfers {
             context.clone(),
             operation,
             upload,
-            receiver,
-            deadlines,
+            UploadInput { commands: receiver, deadlines },
         ));
         Ok(())
     }
@@ -251,11 +250,10 @@ impl Transfers {
         let mut first_error = None;
         while let Some(result) = tasks.join_next().await {
             let result = result.map_err(anyhow::Error::from).and_then(|r| r);
-            if let Err(error) = result {
-                if first_error.is_none() {
+            if let Err(error) = result
+                && first_error.is_none() {
                     first_error = Some(error);
                 }
-            }
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -339,6 +337,11 @@ impl Upload {
     }
 }
 
+struct UploadInput {
+    commands: mpsc::Receiver<Command>,
+    deadlines: watch::Receiver<Instant>,
+}
+
 async fn run_upload(
     registry: Arc<Mutex<Registry>>,
     key: UploadKey,
@@ -346,9 +349,9 @@ async fn run_upload(
     context: RequestContext,
     operation: OwnedOperation,
     mut upload: Upload,
-    mut commands: mpsc::Receiver<Command>,
-    mut deadlines: watch::Receiver<Instant>,
+    input: UploadInput,
 ) -> Result<()> {
+    let UploadInput { mut commands, mut deadlines } = input;
     let owner_cancel = operation.cancellation();
     let result: Result<()> = async {
         loop {
@@ -702,28 +705,28 @@ mod tests {
             "workspace.read".to_owned(),
             "workspace.write".to_owned(),
         ])));
-        let (a, mut outbound) = RequestContext::attach(
-            "a".into(),
-            "session".into(),
-            "client".into(),
-            json!({"owned_subscriptions":true}),
-            json!({}),
-            permissions.clone(),
-            false,
-            None,
-            CancellationToken::new(),
-        );
-        let (b, _other_outbound) = RequestContext::attach(
-            "b".into(),
-            "session".into(),
-            "client".into(),
-            json!({"owned_subscriptions":true}),
-            json!({}),
+        let (a, mut outbound) = RequestContext::attach(crate::transport::SourceConfig {
+            id: "a".into(),
+            session_id: "session".into(),
+            client_id: "client".into(),
+            capabilities: json!({"owned_subscriptions":true}),
+            principal: json!({}),
+            permissions: permissions.clone(),
+            routed: false,
+            app_version: None,
+            cancel: CancellationToken::new(),
+        });
+        let (b, _other_outbound) = RequestContext::attach(crate::transport::SourceConfig {
+            id: "b".into(),
+            session_id: "session".into(),
+            client_id: "client".into(),
+            capabilities: json!({"owned_subscriptions":true}),
+            principal: json!({}),
             permissions,
-            false,
-            None,
-            CancellationToken::new(),
-        );
+            routed: false,
+            app_version: None,
+            cancel: CancellationToken::new(),
+        });
         let message = request("notes.txt", 3);
         let requesting = a.for_request(message.clone());
         transfers.begin(&requesting, &message).await.unwrap();
@@ -769,17 +772,17 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let transfers = Transfers::new(home.path().to_owned(), Duration::from_secs(60));
         let source_cancel = CancellationToken::new();
-        let (context, _outbound) = RequestContext::attach(
-            "source".into(),
-            "session".into(),
-            "client".into(),
-            json!({}),
-            json!({}),
-            Arc::new(RwLock::new(HashSet::from(["workspace.write".to_owned()]))),
-            false,
-            None,
-            source_cancel.clone(),
-        );
+        let (context, _outbound) = RequestContext::attach(crate::transport::SourceConfig {
+            id: "source".into(),
+            session_id: "session".into(),
+            client_id: "client".into(),
+            capabilities: json!({}),
+            principal: json!({}),
+            permissions: Arc::new(RwLock::new(HashSet::from(["workspace.write".to_owned()]))),
+            routed: false,
+            app_version: None,
+            cancel: source_cancel.clone(),
+        });
         let message = request("old.txt", 3);
         let requesting = context.for_request(message.clone());
         transfers.begin(&requesting, &message).await.unwrap();

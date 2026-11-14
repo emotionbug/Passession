@@ -632,13 +632,12 @@ async fn service_owner(
             "systemd unit {unit} does not launch `paseo daemon run`"
         )));
     }
-    if let Some(configured) = home_argument(&main.cmd[1..]) {
-        if Path::new(configured).canonicalize().ok().as_deref() != Some(home) {
+    if let Some(configured) = home_argument(&main.cmd[1..])
+        && Path::new(configured).canonicalize().ok().as_deref() != Some(home) {
             return Err(unsupported(format!(
                 "systemd unit {unit} launches a different daemon home"
             )));
         }
-    }
     Ok(Some(ServiceOwner {
         unit,
         control_group,
@@ -2306,11 +2305,10 @@ pub(crate) async fn run_executor(home: &Path, operation_id: &str) -> Result<i32>
 /// active, then previous.
 fn launch_order(selection: &Selection, executor_alive: bool) -> Vec<&RuntimeIdentity> {
     let mut order = Vec::new();
-    if executor_alive {
-        if let Some(trial) = &selection.trial {
+    if executor_alive
+        && let Some(trial) = &selection.trial {
             order.push(&trial.runtime);
         }
-    }
     order.push(&selection.active);
     order.extend(selection.previous.iter());
     order

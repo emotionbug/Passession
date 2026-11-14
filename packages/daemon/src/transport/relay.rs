@@ -115,12 +115,11 @@ impl RelayService {
                     .unwrap_or(false),
                 Ordering::Release,
             );
-            if !enabled {
-                if let Some(active) = runtime.take() {
+            if !enabled
+                && let Some(active) = runtime.take() {
                     active.cancel.cancel();
                     active.task.await.context("Relay runtime failed")?;
                 }
-            }
         }
         Ok(())
     }
@@ -230,9 +229,8 @@ async fn run(
         tokio::select! {
             _ = cancel.cancelled() => break,
             result = data.join_next(), if !data.is_empty() => {
-                if let Some(Ok((id, generation))) = result {
-                    if sockets.get(&id).is_some_and(|(current, _)| *current == generation) { sockets.remove(&id); }
-                }
+                if let Some(Ok((id, generation))) = result
+                    && sockets.get(&id).is_some_and(|(current, _)| *current == generation) { sockets.remove(&id); }
             }
             message = rx.recv() => {
                 let ids = match message {

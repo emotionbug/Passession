@@ -376,68 +376,6 @@ impl LogCapture {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn native_validation_authenticates_manifest_and_registration_metadata() {
-        let manifest = json!({"id":"example"});
-        let report = json!({"valid":true,"plugin":{"id":"example"},"methods":["greet"],"providers":[{"id":"example.provider","label":"Example"}],"usageSources":[],"hooks":{"before":[],"events":[]}});
-        assert!(validate_report(&serde_json::to_vec(&report).unwrap(), &manifest).is_ok());
-        for invalid in [
-            json!({"valid":true}),
-            json!({"valid":false,"plugin":{"id":"example"},"methods":[],"providers":[]}),
-            json!({"valid":true,"plugin":{"id":"different"},"methods":[],"providers":[]}),
-            json!({"valid":true,"plugin":{"id":"example"},"methods":[1],"providers":[]}),
-            json!({"valid":true,"plugin":{"id":"example"},"methods":[],"providers":[{"id":"bad"}]}),
-            json!({"valid":true,"plugin":{"id":"example"},"methods":[],"providers":[],"hooks":{"before":"not an array","events":[]}}),
-        ] {
-            assert!(validate_report(&serde_json::to_vec(&invalid).unwrap(), &manifest).is_err());
-        }
-        assert!(validate_report(b"", &manifest).is_err());
-        assert!(validate_report(b"{}\n{}", &manifest).is_err());
-    }
-    #[test]
-    fn log_capture_preserves_utf8_across_chunks_and_flush_activity_order() {
-        let mut capture = LogCapture::default();
-        let mut lines = Vec::new();
-        let mut emit = |stream: &str, text: &str| lines.push((stream.to_owned(), text.to_owned()));
-        capture.write("stdout", &[0xe2, 0x82], &mut emit);
-        capture.write("stdout", &[0xac, b'\r', b'\n'], &mut emit);
-        capture.write("stderr", b"first", &mut emit);
-        capture.write("stdout", b"second", &mut emit);
-        capture.flush(&mut emit);
-        assert_eq!(
-            lines,
-            vec![
-                ("stdout".into(), "€".into()),
-                ("stderr".into(), "first".into()),
-                ("stdout".into(), "second".into())
-            ]
-        );
-    }
-    #[tokio::test]
-    async fn bounded_frames_reject_oversized_protocol_without_newline() {
-        let mut input = std::io::Cursor::new(vec![b'x'; FRAME_LIMIT + 1]);
-        assert!(
-            read_frame(&mut input)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds limit")
-        );
-        let mut input = std::io::Cursor::new(b"{\"type\":\"ready\"}\n{\"type\":\"result\"}\n");
-        assert_eq!(
-            read_frame(&mut input).await.unwrap(),
-            b"{\"type\":\"ready\"}\n"
-        );
-        assert_eq!(
-            read_frame(&mut input).await.unwrap(),
-            b"{\"type\":\"result\"}\n"
-        );
-    }
-}
-
 fn run_session_bridge(
     weak: Weak<PluginWorker>,
     transport: Arc<crate::transport::TransportService>,
@@ -550,9 +488,8 @@ fn validate_ready(message: &Value) -> Result<()> {
         .context("Invalid plugin provider metadata")?
     {
         for field in ["id", "label"] {
-            if !provider[field]
-                .as_str()
-                .is_some_and(|value| !value.is_empty())
+            if provider[field]
+                .as_str().is_none_or(|value| value.is_empty())
             {
                 bail!("Invalid plugin provider {field}");
             }
@@ -567,8 +504,8 @@ fn validate_ready(message: &Value) -> Result<()> {
                 bail!("Invalid plugin provider {field}");
             }
         }
-        if let Some(command) = provider.get("command") {
-            if !command.as_array().is_some_and(|args| {
+        if let Some(command) = provider.get("command")
+            && !command.as_array().is_some_and(|args| {
                 !args.is_empty()
                     && args
                         .iter()
@@ -576,7 +513,6 @@ fn validate_ready(message: &Value) -> Result<()> {
             }) {
                 bail!("Invalid plugin provider command");
             }
-        }
     }
     if let Some(sources) = message.get("usageSources") {
         for source in sources
@@ -584,9 +520,8 @@ fn validate_ready(message: &Value) -> Result<()> {
             .context("Invalid plugin usage metadata")?
         {
             for field in ["id", "label"] {
-                if !source[field]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty())
+                if source[field]
+                    .as_str().is_none_or(|value| value.is_empty())
                 {
                     bail!("Invalid plugin usage {field}");
                 }
@@ -600,4 +535,66 @@ fn validate_ready(message: &Value) -> Result<()> {
         validate_hooks(hooks)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_validation_authenticates_manifest_and_registration_metadata() {
+        let manifest = json!({"id":"example"});
+        let report = json!({"valid":true,"plugin":{"id":"example"},"methods":["greet"],"providers":[{"id":"example.provider","label":"Example"}],"usageSources":[],"hooks":{"before":[],"events":[]}});
+        assert!(validate_report(&serde_json::to_vec(&report).unwrap(), &manifest).is_ok());
+        for invalid in [
+            json!({"valid":true}),
+            json!({"valid":false,"plugin":{"id":"example"},"methods":[],"providers":[]}),
+            json!({"valid":true,"plugin":{"id":"different"},"methods":[],"providers":[]}),
+            json!({"valid":true,"plugin":{"id":"example"},"methods":[1],"providers":[]}),
+            json!({"valid":true,"plugin":{"id":"example"},"methods":[],"providers":[{"id":"bad"}]}),
+            json!({"valid":true,"plugin":{"id":"example"},"methods":[],"providers":[],"hooks":{"before":"not an array","events":[]}}),
+        ] {
+            assert!(validate_report(&serde_json::to_vec(&invalid).unwrap(), &manifest).is_err());
+        }
+        assert!(validate_report(b"", &manifest).is_err());
+        assert!(validate_report(b"{}\n{}", &manifest).is_err());
+    }
+    #[test]
+    fn log_capture_preserves_utf8_across_chunks_and_flush_activity_order() {
+        let mut capture = LogCapture::default();
+        let mut lines = Vec::new();
+        let mut emit = |stream: &str, text: &str| lines.push((stream.to_owned(), text.to_owned()));
+        capture.write("stdout", &[0xe2, 0x82], &mut emit);
+        capture.write("stdout", &[0xac, b'\r', b'\n'], &mut emit);
+        capture.write("stderr", b"first", &mut emit);
+        capture.write("stdout", b"second", &mut emit);
+        capture.flush(&mut emit);
+        assert_eq!(
+            lines,
+            vec![
+                ("stdout".into(), "€".into()),
+                ("stderr".into(), "first".into()),
+                ("stdout".into(), "second".into())
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn bounded_frames_reject_oversized_protocol_without_newline() {
+        let mut input = std::io::Cursor::new(vec![b'x'; FRAME_LIMIT + 1]);
+        assert!(
+            read_frame(&mut input)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds limit")
+        );
+        let mut input = std::io::Cursor::new(b"{\"type\":\"ready\"}\n{\"type\":\"result\"}\n");
+        assert_eq!(
+            read_frame(&mut input).await.unwrap(),
+            b"{\"type\":\"ready\"}\n"
+        );
+        assert_eq!(
+            read_frame(&mut input).await.unwrap(),
+            b"{\"type\":\"result\"}\n"
+        );
+    }
 }

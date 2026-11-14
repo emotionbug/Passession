@@ -111,8 +111,8 @@ impl HttpTransport {
 
     fn headers(&self) -> HeaderMap {
         let mut headers = self.headers.clone();
-        if !headers.contains_key("mcp-protocol-version") {
-            if let Some(version) = self
+        if !headers.contains_key("mcp-protocol-version")
+            && let Some(version) = self
                 .protocol
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -120,9 +120,8 @@ impl HttpTransport {
             {
                 headers.insert("mcp-protocol-version", version);
             }
-        }
-        if !self.legacy && !headers.contains_key("mcp-session-id") {
-            if let Some(session) = self
+        if !self.legacy && !headers.contains_key("mcp-session-id")
+            && let Some(session) = self
                 .session
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -130,7 +129,6 @@ impl HttpTransport {
             {
                 headers.insert("mcp-session-id", session);
             }
-        }
         headers
     }
 
@@ -169,8 +167,8 @@ impl HttpTransport {
                 response.status().as_u16()
             );
         }
-        if !self.legacy {
-            if let Some(session) = response.headers().get("mcp-session-id") {
+        if !self.legacy
+            && let Some(session) = response.headers().get("mcp-session-id") {
                 if session.as_bytes().is_empty()
                     || session.as_bytes().len() > 4096
                     || !session
@@ -184,7 +182,6 @@ impl HttpTransport {
                 session.set_sensitive(true);
                 *self.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
             }
-        }
         let request_id = message
             .get("method")
             .and_then(|_| message.get("id"))

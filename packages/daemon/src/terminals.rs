@@ -191,17 +191,27 @@ impl TerminalService {
         let cancel = app.cancel.clone();
         let mut events = terminal.subscribe_lifecycle();
         tokio::spawn(async move {
-            if let Some(app) = weak.upgrade() {
-                if let Err(error) = app.projects.publish_workspace(&waiter.workspace_id).await {
+            if let Some(app) = weak.upgrade()
+                && let Err(error) = app.projects.publish_workspace(&waiter.workspace_id).await {
                     tracing::warn!(%error,"Terminal workspace projection failed");
                 }
-            }
             loop {
                 tokio::select! {biased;
                     _=cancel.cancelled()=>{let _=waiter.terminate().await;break;},
                     event=events.recv()=>{match event{
-                        Ok(TerminalEvent::Activity(transition))=>{if let Some(app)=weak.upgrade(){let mut info=waiter.info();info["activity"]=transition["activity"].clone();if let Err(error)=app.agents.notifications.notify_terminal_activity(&transition["previous"],&info).await{tracing::warn!(%error,"Terminal attention delivery failed");}if let Err(error)=app.projects.publish_workspace(&waiter.workspace_id).await{tracing::warn!(%error,"Terminal workspace projection failed");}}},
-                        Ok(TerminalEvent::Changed)|Err(broadcast::error::RecvError::Lagged(_))=>{if let Some(app)=weak.upgrade(){if let Err(error)=app.projects.publish_workspace(&waiter.workspace_id).await{tracing::warn!(%error,"Terminal workspace projection failed");}}},
+                        Ok(TerminalEvent::Activity(transition)) => {
+                            if let Some(app) = weak.upgrade() {
+                                let mut info = waiter.info();
+                                info["activity"] = transition["activity"].clone();
+                                if let Err(error) = app.agents.notifications.notify_terminal_activity(&transition["previous"], &info).await {
+                                    tracing::warn!(%error,"Terminal attention delivery failed");
+                                }
+                                if let Err(error) = app.projects.publish_workspace(&waiter.workspace_id).await {
+                                    tracing::warn!(%error,"Terminal workspace projection failed");
+                                }
+                            }
+                        },
+                        Ok(TerminalEvent::Changed)|Err(broadcast::error::RecvError::Lagged(_))=>{if let Some(app)=weak.upgrade()&& let Err(error)=app.projects.publish_workspace(&waiter.workspace_id).await{tracing::warn!(%error,"Terminal workspace projection failed");}},
                         Ok(TerminalEvent::Exit(_)|TerminalEvent::Error(_))|Err(broadcast::error::RecvError::Closed)=>break,_=>{}
                     }},
                     _=waiter.wait()=>break,
@@ -365,11 +375,10 @@ impl TerminalService {
     }
     pub async fn clear_focused_attention(&self, id: &str) -> Result<()> {
         let terminal = { self.terminals.read().unwrap().get(id).cloned() };
-        if let Some(terminal) = terminal {
-            if !terminal.info()["activity"]["attentionReason"].is_null() {
+        if let Some(terminal) = terminal
+            && !terminal.info()["activity"]["attentionReason"].is_null() {
                 terminal.set_activity("clear_attention");
             }
-        }
         Ok(())
     }
     fn track_source(&self, context: &RequestContext) {
@@ -438,15 +447,14 @@ impl TerminalService {
         let kind = message["type"].as_str().unwrap_or("");
         match kind {
             "client_heartbeat" => {
-                if message["appVisible"].as_bool() == Some(true) {
-                    if let Some(id) = message["focusedTerminalId"]
+                if message["appVisible"].as_bool() == Some(true)
+                    && let Some(id) = message["focusedTerminalId"]
                         .as_str()
                         .map(str::trim)
                         .filter(|id| !id.is_empty())
                     {
                         self.clear_focused_attention(id).await?;
                     }
-                }
                 return Ok(false);
             }
             "list_terminals_request" => {
@@ -688,11 +696,10 @@ impl TerminalService {
         let mut error = self.scripts.shutdown().await.err();
         let terminals: Vec<_> = self.terminals.read().unwrap().values().cloned().collect();
         for terminal in terminals {
-            if let Err(e) = terminal.terminate().await {
-                if error.is_none() {
+            if let Err(e) = terminal.terminate().await
+                && error.is_none() {
                     error = Some(e);
                 }
-            }
         }
         self.terminals.write().unwrap().clear();
         for stream in self.streams.lock().unwrap().values() {

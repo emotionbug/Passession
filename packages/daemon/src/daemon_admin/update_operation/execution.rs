@@ -119,14 +119,13 @@ async fn rollback(operation: &mut Operation, installation: &Installation, lease:
             operation.rollback = Some(json!({"preservedOriginal":true,"owner":owner.public_summary()}));
             return journal::save(operation).await;
         }
-        if owner.executable_sha256 == previous.executable_sha256 {
-            if let Ok(evidence) = managed::verify_ready(&operation.launch_owner, &previous, READY_DEADLINE, &CancellationToken::new()).await {
+        if owner.executable_sha256 == previous.executable_sha256
+            && let Ok(evidence) = managed::verify_ready(&operation.launch_owner, &previous, READY_DEADLINE, &CancellationToken::new()).await {
                 installation.abandon_trial(lease, Some(&operation.operation_id)).await?;
                 operation.phase = Phase::RolledBack;
                 operation.rollback = Some(serde_json::to_value(evidence)?);
                 return journal::save(operation).await;
             }
-        }
     }
     managed::stop_owner(installation, &operation.launch_owner, STOP_DEADLINE).await?;
     installation.abandon_trial(lease, Some(&operation.operation_id)).await?;

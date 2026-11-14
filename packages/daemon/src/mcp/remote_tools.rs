@@ -276,8 +276,8 @@ async fn execute_remote(
         }
         "send_agent_prompt" => {
             let agent_id = required(input, "agentId")?;
-            if caller.is_none() {
-                if let Some(mode) = input.get("sessionMode") {
+            if caller.is_none()
+                && let Some(mode) = input.get("sessionMode") {
                     let response = request(
                         client,
                         json!({"type":"set_agent_mode_request", "agentId":agent_id,"modeId":mode}),
@@ -294,7 +294,6 @@ async fn execute_remote(
                         );
                     }
                 }
-            }
             let agent = fetch_agent(client, agent_id).await?;
             let mut message = json!({
                 "type":"send_agent_message_request", "agentId":agent_id,

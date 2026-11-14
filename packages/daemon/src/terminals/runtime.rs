@@ -171,7 +171,21 @@ impl Terminal {
             std::thread::spawn(move || {
                 let mut reader = reader; let mut buffer = [0u8;16384];
                 loop {
-                    let count = match reader.read(&mut buffer) { Ok(0)=>break, Ok(n)=>n, Err(e) if e.kind()==std::io::ErrorKind::Interrupted=>continue, Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{if reader_finished.load(Ordering::Acquire){break;}if reader_ready.wait(false).is_err(){break;}continue;},Err(_)=>break };
+                    let count = match reader.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if reader_finished.load(Ordering::Acquire) {
+                                break;
+                            }
+                            if reader_ready.wait(false).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
                     let Some(terminal)=reader_terminal.upgrade() else { break };
                     let mut display = terminal.display.lock().unwrap();
                     let effects = display.screen.process(&buffer[..count]);
@@ -356,11 +370,10 @@ impl Terminal {
             return Ok(());
         }
         let (tx, rx) = oneshot::channel();
-        if self.commands.send(Command::Stop(tx)).await.is_ok() {
-            if let Ok(result) = rx.await {
+        if self.commands.send(Command::Stop(tx)).await.is_ok()
+            && let Ok(result) = rx.await {
                 result?;
             }
-        }
         self.wait().await?;
         Ok(())
     }
@@ -542,7 +555,7 @@ impl Owner {
             let result = self.child.wait();
             self.unreaped = false;
             result?;
-            return Ok(Some(if exited { observed_status } else { 0 }));
+            Ok(Some(if exited { observed_status } else { 0 }))
         }
         #[cfg(windows)]
         {

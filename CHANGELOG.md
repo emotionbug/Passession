@@ -9,6 +9,8 @@
 - Finish observers read saved results without restarting closed provider runtimes, including agents with no saved assistant message.
 - Agent-message batching retains its two-second quiet window but stops extending the batching deadline after ten seconds of continuous arrivals; an earlier in-flight dispatch still completes first.
 - Tool and lifecycle documentation distinguishes resumable runtime closure from deletion and native OMP children from daemon-managed agents.
+- Removed Clippy warnings from the daemon, Rust client SDK and protocol crates without disabling lints or changing wire formats.
+- Subprocess partial-write timeout regression coverage no longer depends on serialization speed or scheduler timing.
 
 ## 0.13.22 - 2026-11-14
 

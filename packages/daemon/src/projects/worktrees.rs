@@ -352,11 +352,10 @@ pub async fn list(
     Ok(entries)
 }
 fn created_time(metadata: &std::fs::Metadata) -> SystemTime {
-    if let Ok(time) = metadata.created() {
-        if time > SystemTime::UNIX_EPOCH {
+    if let Ok(time) = metadata.created()
+        && time > SystemTime::UNIX_EPOCH {
             return time;
         }
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1152,15 +1151,14 @@ async fn create_with_identity(
                                 continue;
                             }
                             // Git lists its own spelling (`C:/…` on Windows): compare identities.
-                            if let Some(listed) = text(entry, "path") {
-                                if normalize_path(Path::new(listed))
+                            if let Some(listed) = text(entry, "path")
+                                && normalize_path(Path::new(listed))
                                     .await
                                     .is_ok_and(|p| p == path)
                                 {
                                     registered = true;
                                     break;
                                 }
-                            }
                         }
                         if registered {
                             remove_disk(home, config, cwd, &path, CancellationToken::new()).await?;
@@ -1207,8 +1205,7 @@ pub async fn create(
         .and_then(|v| v["number"].as_u64())
         .or_else(|| input["githubPrNumber"].as_u64());
     let reference = text(input, "refName");
-    let intent = if action != Some("branch-off") && number.is_some() {
-        let number = number.expect("checked number");
+    let intent = if let Some(number) = number.filter(|_| action != Some("branch-off")) {
         if number == 0 {
             bail!("Change request number must be positive");
         }
@@ -1217,8 +1214,8 @@ pub async fn create(
             .as_ref()
             .map(|r| r.forge.as_str())
             .unwrap_or("github");
-        if let Some(requested) = change.and_then(|v| text(v, "forge")) {
-            if requested != forge_name {
+        if let Some(requested) = change.and_then(|v| text(v, "forge"))
+            && requested != forge_name {
                 if resolved.is_none() {
                     bail!("Checkout from change request is not supported for {requested} yet");
                 }
@@ -1226,7 +1223,6 @@ pub async fn create(
                     "Checkout source is for {requested}, but this workspace resolved to {forge_name}"
                 );
             }
-        }
         let target_input = json!({"number":number,"forge":forge_name});
         let target = forge_engine
             .execute(
@@ -1258,7 +1254,7 @@ pub async fn create(
         let cross = target["isCrossRepository"].as_bool() == Some(true);
         let target_refs = target.get("checkoutRefs").and_then(Value::as_array);
         if cross
-            && !target_refs.is_some_and(|v| !v.is_empty())
+            && target_refs.is_none_or(|v| v.is_empty())
             && !forge::supports_cross_repo_checkout_without_refs(forge_name)
         {
             bail!("Checkout from change request is not supported for {forge_name} yet");
@@ -1431,11 +1427,10 @@ async fn remove_disk(
         if target.parent() != Some(expected.as_path()) {
             bail!("Refusing to delete a worktree belonging to another project");
         }
-        if let Ok(actual) = repo_root(&target, cancel.clone()).await {
-            if actual != root {
+        if let Ok(actual) = repo_root(&target, cancel.clone()).await
+            && actual != root {
                 bail!("Refusing to delete a worktree belonging to another repository");
             }
-        }
     }
     if cancel.is_cancelled() {
         bail!("Worktree operation cancelled");

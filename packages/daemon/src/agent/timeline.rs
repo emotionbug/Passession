@@ -81,12 +81,11 @@ fn merge_metadata(target: &mut Value, incoming: &Value, collapse: &str) {
         .expect("canonical ranges");
     if let Some(next) = incoming["sourceSeqRanges"].as_array() {
         for range in next {
-            if let Some(last) = ranges.last_mut() {
-                if num(range, "startSeq") <= num(last, "endSeq") + 1 {
+            if let Some(last) = ranges.last_mut()
+                && num(range, "startSeq") <= num(last, "endSeq") + 1 {
                     last["endSeq"] = json!(num(last, "endSeq").max(num(range, "endSeq")));
                     continue;
                 }
-            }
             ranges.push(range.clone());
         }
     }
@@ -169,11 +168,10 @@ pub fn project_rows(rows: &[Value]) -> Vec<Value> {
     for row in rows {
         let entry = canonical(row.clone());
         if let Some(id) = identity(&entry["item"]) {
-            if let Some(&index) = identities.get(&id) {
-                if merge_identity(&mut collapsed[index], &entry) {
+            if let Some(&index) = identities.get(&id)
+                && merge_identity(&mut collapsed[index], &entry) {
                     continue;
                 }
-            }
             identities.insert(id, collapsed.len());
         }
         collapsed.push(entry);
@@ -319,11 +317,10 @@ impl Timeline {
             self.min_seq = num(&entry, "seqStart");
         }
         if let Some(id) = identity(&entry["item"]) {
-            if let Some(&index) = self.identities.get(&id) {
-                if merge_identity(&mut self.rows[index], &entry) {
+            if let Some(&index) = self.identities.get(&id)
+                && merge_identity(&mut self.rows[index], &entry) {
                     return index;
                 }
-            }
             self.identities.insert(id, self.rows.len());
         }
         if self
@@ -333,14 +330,13 @@ impl Timeline {
         {
             return self.rows.len() - 1;
         }
-        if kind(&entry["item"]) == "user_message" {
-            if let Some(id) = entry["item"]["clientMessageId"]
+        if kind(&entry["item"]) == "user_message"
+            && let Some(id) = entry["item"]["clientMessageId"]
                 .as_str()
                 .filter(|s| !s.is_empty())
             {
                 self.submitted.entry(id.into()).or_insert(self.rows.len());
             }
-        }
         self.rows.push(entry);
         self.rows.len() - 1
     }

@@ -674,11 +674,10 @@ pub async fn run(
         _ = tokio::time::sleep_until(deadline) => Err(anyhow!("subprocess command timed out")),
         result = operation => result,
     };
-    if result.is_err() {
-        if let Err(cleanup) = process.terminate(FAILURE_GRACE).await {
+    if result.is_err()
+        && let Err(cleanup) = process.terminate(FAILURE_GRACE).await {
             return result.context(format!("subprocess cleanup failed: {cleanup:#}"));
         }
-    }
     result
 }
 

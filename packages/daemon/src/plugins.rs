@@ -152,8 +152,8 @@ impl PluginService {
                 self.stop_plugin(&id).await?;
             }
         }
-        if next["pluginsEnabled"] == true {
-            if let Some(sources) = sources {
+        if next["pluginsEnabled"] == true
+            && let Some(sources) = sources {
                 for (id, source) in sources {
                     if source["enabled"] == false || self.loaded.read().unwrap().contains_key(id) {
                         continue;
@@ -164,7 +164,6 @@ impl PluginService {
                     self.changed(id).await;
                 }
             }
-        }
         Ok(())
     }
     async fn start_plugin(&self, id: &str, source: &Value) -> Result<()> {
@@ -299,8 +298,8 @@ impl PluginService {
     }
     async fn stop_plugin(&self, id: &str) -> Result<()> {
         let loaded = self.loaded.write().unwrap().remove(id);
-        if let Some(loaded) = loaded {
-            if let Some(worker) = loaded.worker {
+        if let Some(loaded) = loaded
+            && let Some(worker) = loaded.worker {
                 let result = worker.shutdown().await;
                 let diagnostics = worker.logs();
                 if !diagnostics.is_empty() {
@@ -308,7 +307,6 @@ impl PluginService {
                 }
                 result?;
             }
-        }
         self.changed(id).await;
         Ok(())
     }
@@ -504,11 +502,10 @@ impl PluginService {
                         }
                     }
                 }
-                if let Some(managed) = self.managed.get() {
-                    if let Ok(installation) = managed.describe(id, path).await {
+                if let Some(managed) = self.managed.get()
+                    && let Ok(installation) = managed.describe(id, path).await {
                         item["installation"] = installation;
                     }
-                }
                 if item["installation"]["identity"]["kind"] == "git" {
                     item["source"] = json!("git");
                     item["remote"] = item["installation"]["identity"]["remote"].clone();

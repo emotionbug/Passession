@@ -47,8 +47,8 @@ pub fn validate_mode(mode: &str, env: &BTreeMap<String, String>) -> Result<()> {
             "Invalid mode '{mode}' for Claude provider. Valid modes: plan, default, acceptEdits, auto, bypassPermissions"
         );
     }
-    if mode == "auto" {
-        if let Some(transport) = catalog::auto_mode_transport(env) {
+    if mode == "auto"
+        && let Some(transport) = catalog::auto_mode_transport(env) {
             bail!(
                 "Claude Auto mode requires the Anthropic API and is not supported when Claude Code uses {transport}. Select another permission mode or unset the {} environment variable.",
                 if transport == "Bedrock" {
@@ -58,7 +58,6 @@ pub fn validate_mode(mode: &str, env: &BTreeMap<String, String>) -> Result<()> {
                 }
             );
         }
-    }
     Ok(())
 }
 fn strings(value: &Value) -> bool {
@@ -66,7 +65,9 @@ fn strings(value: &Value) -> bool {
         .as_array()
         .is_some_and(|values| values.iter().all(Value::is_string))
 }
-fn strict_fields(value: &Value, path: &str, fields: &[(&str, fn(&Value) -> bool)]) -> Result<()> {
+type FieldValidator<'a> = (&'a str, fn(&Value) -> bool);
+
+fn strict_fields(value: &Value, path: &str, fields: &[FieldValidator<'_>]) -> Result<()> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("{path} must be an object"))?;
@@ -158,7 +159,7 @@ fn settings_sandbox(value: &Value) -> bool {
     validate_sandbox(value, false).is_ok()
 }
 fn validate_sandbox(value: &Value, extended: bool) -> Result<()> {
-    let fields: &[(&str, fn(&Value) -> bool)] = &[
+    let fields: &[FieldValidator<'_>] = &[
         ("enabled", Value::is_boolean),
         ("failIfUnavailable", Value::is_boolean),
         ("autoAllowBashIfSandboxed", Value::is_boolean),

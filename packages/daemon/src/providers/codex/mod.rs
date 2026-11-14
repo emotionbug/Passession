@@ -334,7 +334,7 @@ impl AgentProvider for CodexProvider {
         let models:Vec<Value>=models.iter().map(|m|{
             let effort=config["model_reasoning_effort"].as_str().or(m["defaultReasoningEffort"].as_str());
             let mut thinking:Vec<Value>=m["supportedReasoningEfforts"].as_array().into_iter().flatten().filter_map(|e|{let id=e["reasoningEffort"].as_str()?;Some(json!({"id":id,"label":id,"description":e["description"],"isDefault":Some(id)==effort}))}).collect();
-            if let Some(e)=effort {if !thinking.iter().any(|t|t["id"]==e){thinking.push(json!({"id":e,"label":e,"isDefault":true}));}}
+            if let Some(e)=effort&& !thinking.iter().any(|t|t["id"]==e){thinking.push(json!({"id":e,"label":e,"isDefault":true}));}
             json!({"provider":self.spec.id,"id":m["id"],"label":m["displayName"].as_str().unwrap_or("").replace("gpt","GPT"),"description":m["description"],"isDefault":if configured{m["id"]==config["model"]}else{m["isDefault"]==true},"thinkingOptions":thinking,"defaultThinkingOptionId":effort,"metadata":{"model":m["model"],"defaultReasoningEffort":m["defaultReasoningEffort"],"supportedReasoningEfforts":m["supportedReasoningEfforts"]}})
         }).collect();
         Ok(
@@ -367,8 +367,18 @@ impl AgentProvider for CodexProvider {
         let c = self.client(CancellationToken::new()).await?;
         let result:Result<Vec<Value>>=async{let limit=options["limit"].as_u64().unwrap_or(20) as usize;let mut window=options["scanLimit"].as_u64().unwrap_or(limit as u64).min(500) as usize;if options["cwd"].is_string(){window=window.max(50);}
             let mut rows=Vec::new();let mut seen=HashSet::new();let mut cursor=Value::Null;
-            while rows.len()<window {let mut p=json!({"limit":window-rows.len(),"sortKey":"updated_at"});if options["cwd"].is_string(){p["cwd"]=options["cwd"].clone();}if !cursor.is_null(){p["cursor"]=cursor;}if let Some(custom)=custom_config(&self.spec){p["modelProviders"]=json!([custom["model_provider"]]);}
-                let reply=c.request("thread/list",p).await?;let before=rows.len();for row in reply["data"].as_array().into_iter().flatten(){if let Some(id)=row["id"].as_str(){if seen.insert(id.to_owned()){rows.push(row.clone());}}}cursor=reply["nextCursor"].clone();if cursor.is_null()||rows.len()==before{break}
+            while rows.len() < window {
+                let mut p = json!({"limit":window-rows.len(),"sortKey":"updated_at"});
+                if options["cwd"].is_string() {
+                    p["cwd"] = options["cwd"].clone();
+                }
+                if !cursor.is_null() {
+                    p["cursor"] = cursor;
+                }
+                if let Some(custom) = custom_config(&self.spec) {
+                    p["modelProviders"] = json!([custom["model_provider"]]);
+                }
+                let reply=c.request("thread/list",p).await?;let before=rows.len();for row in reply["data"].as_array().into_iter().flatten(){if let Some(id)=row["id"].as_str()&& seen.insert(id.to_owned()){rows.push(row.clone());}}cursor=reply["nextCursor"].clone();if cursor.is_null()||rows.len()==before{break}
             }
             let cwd=options["cwd"].as_str().map(|p|std::fs::canonicalize(p).unwrap_or_else(|_|PathBuf::from(p)));
             Ok(rows.into_iter().filter(|r|cwd.as_ref().is_none_or(|cwd|r["cwd"].as_str().is_some_and(|p|std::fs::canonicalize(p).unwrap_or_else(|_|PathBuf::from(p))==*cwd))).take(limit).map(|r|{let secs=r["updatedAt"].as_i64().or(r["createdAt"].as_i64()).unwrap_or(0);let timestamp=chrono::DateTime::from_timestamp(secs,0).map(|d|d.to_rfc3339());json!({"providerHandleId":r["id"],"cwd":r["cwd"],"title":r["name"].as_str().filter(|s|!s.trim().is_empty()).map(Value::from).unwrap_or_else(||r["preview"].clone()),"firstPromptPreview":r["preview"],"lastPromptPreview":r["preview"],"lastActivityAt":timestamp})}).collect())}.await;
@@ -461,11 +471,10 @@ impl AgentProvider for CodexProvider {
             .collect();
         let mut first = None;
         for s in sessions {
-            if let Err(e) = s.close().await {
-                if first.is_none() {
+            if let Err(e) = s.close().await
+                && first.is_none() {
                     first = Some(e);
                 }
-            }
         }
         if let Some(e) = first { Err(e) } else { Ok(()) }
     }

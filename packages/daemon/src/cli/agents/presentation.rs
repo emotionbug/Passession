@@ -65,13 +65,11 @@ pub(super) fn inspect(
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| data[key].to_string());
-        if key == "Cwd" {
-            if let Ok(home) = std::env::var("HOME") {
-                if let Some(rest) = value.strip_prefix(&home) {
+        if key == "Cwd"
+            && let Ok(home) = std::env::var("HOME")
+                && let Some(rest) = value.strip_prefix(&home) {
                     value = format!("~{rest}");
                 }
-            }
-        }
         rows.push(json!({"key":key,"value":value}));
     }
     if data["LastUsage"].is_object() {

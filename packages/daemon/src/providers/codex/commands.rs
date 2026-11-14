@@ -109,9 +109,9 @@ pub fn expand_template(template: &str, args: &str) -> String {
                 quote = None;
                 continue;
             }
-            if ch == '\\' {
-                if let Some(&next) = chars.peek() {
-                    if next == q || matches!(next, '\\' | 'n' | 't') {
+            if ch == '\\'
+                && let Some(&next) = chars.peek()
+                    && (next == q || matches!(next, '\\' | 'n' | 't')) {
                         chars.next();
                         current.push(match next {
                             'n' => '\n',
@@ -120,8 +120,6 @@ pub fn expand_template(template: &str, args: &str) -> String {
                         });
                         continue;
                     }
-                }
-            }
             current.push(ch);
         } else if matches!(ch, '\'' | '"') {
             quote = Some(ch);
@@ -200,18 +198,17 @@ pub async fn expand(home: &Path, prompt: &Value, skills: &[Value]) -> Result<Val
     let Some((name, args, explicit)) = invocation else {
         return Ok(prompt.clone());
     };
-    if let Some(prompt_name) = name.strip_prefix("prompts:") {
-        if explicit
+    if let Some(prompt_name) = name.strip_prefix("prompts:")
+        && (explicit
             || custom_prompts(home)
                 .await?
                 .iter()
-                .any(|p| p["name"] == name)
+                .any(|p| p["name"] == name))
         {
             let text =
                 fs::read_to_string(home.join("prompts").join(format!("{prompt_name}.md"))).await?;
             return Ok(Value::String(expand_template(front_matter(&text).1, args)));
         }
-    }
     if let Some(skill) = skills
         .iter()
         .find(|skill| skill["name"] == name && skill["enabled"] != false)

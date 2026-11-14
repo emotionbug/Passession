@@ -56,9 +56,9 @@ impl ProjectService {
         let env = app.config.environment();
         let cancel = app.cancel.child_token();
         let mut placeholder = None;
-        if workspace["kind"] == "worktree" {
-            if let Some(metadata) = runtime::read_worktree_metadata(root).await? {
-                if metadata["version"] == 2
+        if workspace["kind"] == "worktree"
+            && let Some(metadata) = runtime::read_worktree_metadata(root).await?
+                && metadata["version"] == 2
                     && metadata["firstAgentBranchAutoName"]["status"] == "pending"
                 {
                     let previous = text(
@@ -79,8 +79,6 @@ impl ProjectService {
                         placeholder = Some(previous);
                     }
                 }
-            }
-        }
         if !needs_title && placeholder.is_none() {
             return Ok(());
         }
@@ -199,11 +197,10 @@ impl ProjectService {
             .await?
             .update_workspace(id, |current| {
                 let mut next = current.clone();
-                if needs_generated_title(current, prompt_title.as_deref()) {
-                    if !title.is_empty() {
+                if needs_generated_title(current, prompt_title.as_deref())
+                    && !title.is_empty() {
                         next["title"] = json!(title);
                     }
-                }
                 if let Some(branch) = &renamed {
                     next["branch"] = json!(branch);
                 }

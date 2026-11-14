@@ -189,15 +189,14 @@ pub(super) async fn run(
         write_task.abort();
         let _ = write_task.await;
     }
-    if let Some(mut task) = application {
-        if tokio::time::timeout(Duration::from_secs(1), &mut task)
+    if let Some(mut task) = application
+        && tokio::time::timeout(Duration::from_secs(1), &mut task)
             .await
             .is_err()
         {
             task.abort();
             let _ = task.await;
         }
-    }
     result
 }
 

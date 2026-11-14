@@ -135,8 +135,8 @@ impl Router {
         // Controls are dispatched by the stdout reader, independently of the
         // ordered transcript consumer. A weak reference avoids a runtime cycle.
         router.runtime.set_host_tools(Arc::downgrade(&router));
-        if !native.is_empty() || servers.as_object().is_some_and(|s| !s.is_empty()) {
-            if let Err(error) = router
+        if (!native.is_empty() || servers.as_object().is_some_and(|s| !s.is_empty()))
+            && let Err(error) = router
                 .runtime
                 .request(json!({"type":"set_host_tools","tools":definitions}))
                 .await
@@ -144,7 +144,6 @@ impl Router {
                 router.close().await;
                 return Err(error);
             }
-        }
         Ok(router)
     }
     pub fn identities(&self) -> Value {
@@ -182,13 +181,11 @@ impl Router {
                 true
             }
             Some("host_tool_cancel") => {
-                if frame["id"].is_string() {
-                    if let Some(id) = frame["targetId"].as_str() {
-                        if let Some(cancel) = self.pending.lock().unwrap().get(id) {
+                if frame["id"].is_string()
+                    && let Some(id) = frame["targetId"].as_str()
+                        && let Some(cancel) = self.pending.lock().unwrap().get(id) {
                             cancel.cancel();
                         }
-                    }
-                }
                 true
             }
             Some("host_tool_update") => true,
@@ -313,8 +310,8 @@ fn map_result(result: Value) -> Result<Value> {
         .as_array()
         .cloned()
         .ok_or_else(|| anyhow!("Native tool result requires content"))?;
-    if content.is_empty() {
-        if let Some(structured) = result.get("structuredContent") {
+    if content.is_empty()
+        && let Some(structured) = result.get("structuredContent") {
             let mut summary = Vec::new();
             if let Some(object) = structured.as_object() {
                 for (key, value) in object {
@@ -338,7 +335,6 @@ fn map_result(result: Value) -> Result<Value> {
             };
             content.push(json!({"type":"text","text":text}));
         }
-    }
     let mut mapped = json!({"content":content});
     if let Some(details) = result.get("structuredContent") {
         mapped["details"] = details.clone();

@@ -79,7 +79,7 @@ pub(super) async fn subscribe(
         let runner_owner=owner.clone();let runner_terminal=terminal.clone();
         tokio::spawn(async move {
             let result=run_stream(&runner_terminal,&runner_owner,slot,receiver,mode,scrollback,wrapped).await;
-            if let Err(error)=result{if !runner_owner.cancellation().is_cancelled(){let _=runner_owner.emit(json!({"type":"terminal_stream_exit","payload":{"terminalId":runner_terminal.id,"error":error.to_string()}})).await;}}
+            if let Err(error)=result&& !runner_owner.cancellation().is_cancelled(){let _=runner_owner.emit(json!({"type":"terminal_stream_exit","payload":{"terminalId":runner_terminal.id,"error":error.to_string()}})).await;}
             cleanup(&registrations,&runner_owner,slot);
             let _=runner_owner.release().await;
         });

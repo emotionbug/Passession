@@ -88,19 +88,11 @@ struct Pending {
     paths: HashSet<PathBuf>,
     metadata: bool,
 }
+#[derive(Default)]
 struct CheckoutClock {
     due: Option<Instant>,
     last: Option<Instant>,
     pending: Pending,
-}
-impl Default for CheckoutClock {
-    fn default() -> Self {
-        Self {
-            due: None,
-            last: None,
-            pending: Pending::default(),
-        }
-    }
 }
 
 impl GitService {
@@ -166,11 +158,10 @@ impl GitService {
                 if demand.is_git {
                     released = Some(key.clone());
                 }
-                if demand.count == 0 {
-                    if let Some(demand) = demands.remove(&key) {
+                if demand.count == 0
+                    && let Some(demand) = demands.remove(&key) {
                         demand.lifetime.cancel();
                     }
-                }
                 if demands.is_empty() {
                     empty.push(common.clone());
                 } else {
@@ -756,12 +747,11 @@ impl Actor {
                             *poll_changes.entry(root.clone()).or_default() |= changed;
                         }
                     }
-                    if changed {
-                        if let Err(error) = app.git.publish_checkout_snapshot(&cwd, &snapshot).await
+                    if changed
+                        && let Err(error) = app.git.publish_checkout_snapshot(&cwd, &snapshot).await
                         {
                             tracing::debug!(%error,"Checkout update publication failed");
                         }
-                    }
                 }
                 Err(error) => tracing::debug!(%error,"Checkout observation refresh failed"),
             }
@@ -1121,7 +1111,7 @@ async fn forge_loop(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter_map(|(cwd, d)| (d.next <= Instant::now()).then(|| cwd.clone()))
+            .filter(|&(_cwd, d)| d.next <= Instant::now() ).map(|(cwd, _d)| cwd.clone())
             .collect();
         let Some(app) = app.upgrade() else { return };
         let Ok(env) = app.git.environment() else {
@@ -1162,15 +1152,14 @@ async fn forge_loop(
                     Instant::now() + forge_interval(demand.status.as_ref(), demand.failures);
                 apply
             };
-            if apply {
-                if let Err(error) = app
+            if apply
+                && let Err(error) = app
                     .git
                     .apply_forge_payload_at(&cwd, &payload, generations.get(&cwd).copied())
                     .await
                 {
                     tracing::debug!(%error,"Forge observation publication failed");
                 }
-            }
         }
     }
 }

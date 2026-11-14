@@ -25,6 +25,11 @@ impl Default for OutputOptions {
         }
     }
 }
+#[derive(Clone, Copy)]
+pub struct ColumnColor {
+    pub key: &'static str,
+    pub resolve: fn(&Value, &Value) -> Option<u8>,
+}
 pub struct Output {
     pub data: Value,
     pub table: Option<Value>,
@@ -35,7 +40,7 @@ pub struct Output {
     pub id_field: &'static str,
     pub exit_code: i32,
     pub silent: bool,
-    pub color: Option<(&'static str, fn(&Value, &Value) -> Option<u8>)>,
+    pub color: Option<ColumnColor>,
 }
 impl Output {
     pub fn new(data: Value) -> Self {
@@ -89,18 +94,17 @@ impl Output {
         key: &'static str,
         color: fn(&Value, &Value) -> Option<u8>,
     ) -> Self {
-        self.color = Some((key, color));
+        self.color = Some(ColumnColor { key, resolve: color });
         self
     }
     pub fn render(&self, options: &OutputOptions) -> Result<String> {
         if self.silent {
             return Ok(String::new());
         }
-        if options.quiet {
-            if let Some(text) = &self.quiet {
+        if options.quiet
+            && let Some(text) = &self.quiet {
                 return Ok(text.clone());
             }
-        }
         if options.quiet {
             return Ok(match &self.data {
                 Value::Array(rows) => rows
@@ -140,15 +144,12 @@ impl Output {
                             .map(|(_, key)| {
                                 let value = field(row, key);
                                 let text = cell(value);
-                                if color_enabled {
-                                    if let Some((column, color)) = self.color {
-                                        if column == *key {
-                                            if let Some(code) = color(value, row) {
+                                if color_enabled
+                                    && let Some(color) = self.color
+                                        && color.key == *key
+                                            && let Some(code) = (color.resolve)(value, row) {
                                                 return format!("\u{1b}[{code}m{text}\u{1b}[39m");
                                             }
-                                        }
-                                    }
-                                }
                                 text
                             })
                             .collect()

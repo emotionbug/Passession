@@ -215,11 +215,10 @@ impl AgentManager {
         }
         cell.cancel.cancel();
         let session = cell.data.lock().await.session.take();
-        if let Some(session) = session {
-            if let Err(error) = session.close().await {
+        if let Some(session) = session
+            && let Err(error) = session.close().await {
                 tracing::warn!(agent_id=id,%error,"Failed to close unregistered provider session");
             }
-        }
         self.agents.write().await.remove(id);
         if let Ok(app) = self.app() {
             app.mcp.revoke_agent(id).await;
@@ -560,11 +559,10 @@ impl AgentManager {
         result
     }
     pub(super) async fn ensure_loaded(&self, id: &str) -> Result<Arc<AgentCell>> {
-        if let Ok(cell) = self.cell(id).await {
-            if cell.data.lock().await.serves_runtime() {
+        if let Ok(cell) = self.cell(id).await
+            && cell.data.lock().await.serves_runtime() {
                 return Ok(cell);
             }
-        }
         self.resume(id, json!({}), false).await?;
         self.cell(id).await
     }
@@ -823,14 +821,13 @@ impl AgentManager {
                             snapshot["_live"] = json!(false);
                             cell.owner_ended.cancel();
                         }
-                        if let Some(turn) = &turn {
-                            if !data.finalized.contains(turn) {
+                        if let Some(turn) = &turn
+                            && !data.finalized.contains(turn) {
                                 data.finalized.push_back(turn.clone());
                                 while data.finalized.len() > 4096 {
                                     data.finalized.pop_front();
                                 }
                             }
-                        }
                         data.pending_replacement
                     };
                     // finalizeForegroundTurn: a replacing prompt holds the agent busy unless the
@@ -983,8 +980,8 @@ impl AgentManager {
                 dispatch = false;
                 for mut item in notifications::project_agent_messages(&event["item"]) {
                     let mut options = event.clone();
-                    if item["type"] == "user_message" {
-                        if let Some(message_id) = text(&item, "clientMessageId").map(str::to_owned)
+                    if item["type"] == "user_message"
+                        && let Some(message_id) = text(&item, "clientMessageId").map(str::to_owned)
                         {
                             let exists = cell
                                 .timeline
@@ -1030,7 +1027,6 @@ impl AgentManager {
                             }
                             item["messageId"] = json!(message_id);
                         }
-                    }
                     let row = self
                         .append_to_cell(id, cell, item.clone(), &options)
                         .await?;
@@ -1565,13 +1561,14 @@ pub(super) mod tests {
         assert_eq!(snapshot["lastUsage"]["outputTokens"], 4099);
         assert_eq!(snapshot["lifecycle"], "idle");
         assert_eq!(snapshot["activeTurnId"], Value::Null);
-        let timeline = cell.timeline.lock().unwrap();
-        let rows = timeline.rows();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["item"]["text"], "steered prompt");
-        assert_eq!(rows[1]["item"]["messageId"], "pending");
-        assert_eq!(rows[2]["item"]["messageId"], "live");
-        drop(timeline);
+        {
+            let timeline = cell.timeline.lock().unwrap();
+            let rows = timeline.rows();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0]["item"]["text"], "steered prompt");
+            assert_eq!(rows[1]["item"]["messageId"], "pending");
+            assert_eq!(rows[2]["item"]["messageId"], "live");
+        }
         cell.cancel.cancel();
         cell.task.lock().await.take().unwrap().await.unwrap();
     }
@@ -1708,19 +1705,19 @@ pub(super) mod tests {
     }
 
     async fn timeline_request(manager: &AgentManager, id: &str, options: Value) -> Value {
-        let (source, mut output) = RequestContext::attach(
-            "history-test-source".into(),
-            "history-test-session".into(),
-            "history-test-client".into(),
-            json!({"owned_subscriptions":true,"all_providers":true,"timeline_notifications":true}),
-            json!({"id":"owner","kind":"owner"}),
-            Arc::new(std::sync::RwLock::new(
+        let (source, mut output) = RequestContext::attach(crate::transport::SourceConfig {
+            id: "history-test-source".into(),
+            session_id: "history-test-session".into(),
+            client_id: "history-test-client".into(),
+            capabilities: json!({"owned_subscriptions":true,"all_providers":true,"timeline_notifications":true}),
+            principal: json!({"id":"owner","kind":"owner"}),
+            permissions: Arc::new(std::sync::RwLock::new(
                 ["workspace.read".to_owned()].into_iter().collect(),
             )),
-            false,
-            None,
-            CancellationToken::new(),
-        );
+            routed: false,
+            app_version: None,
+            cancel: CancellationToken::new(),
+        });
         let mut message = json!({
             "type":"fetch_agent_timeline_request","requestId":"history",
             "agentId":id,"projection":"projected"

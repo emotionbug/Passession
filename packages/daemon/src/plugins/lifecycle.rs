@@ -175,14 +175,13 @@ fn validate_before(name: &str, input: &Value) -> Result<()> {
             {
                 bail!("Invalid agent.create hook request");
             }
-            if let Some(env) = object.get("env") {
-                if !env
+            if let Some(env) = object.get("env")
+                && !env
                     .as_object()
                     .is_some_and(|env| env.values().all(Value::is_string))
                 {
                     bail!("Invalid agent.create environment");
                 }
-            }
         }
         "workspace.create" => {
             // `WorkspaceCreateRequestSchema.omit({type, requestId}).strict()`:

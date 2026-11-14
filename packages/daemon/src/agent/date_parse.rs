@@ -624,7 +624,7 @@ fn local_offset(utc: i64) -> Option<i64> {
         return None;
     }
     let tm = unsafe { tm.assume_init() };
-    Some(tm.tm_gmtoff as i64 * 1000)
+    Some(tm.tm_gmtoff * 1000)
 }
 #[cfg(not(unix))]
 fn local_to_utc(wall: i64) -> anyhow::Result<Option<i64>> {

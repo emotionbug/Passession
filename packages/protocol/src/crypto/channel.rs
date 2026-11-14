@@ -447,8 +447,8 @@ fn process(
             ))
         }
         State::Open(mut open) => {
-            if let Frame::Text(text) = &frame {
-                if text.trim_start().starts_with('{') {
+            if let Frame::Text(text) = &frame
+                && text.trim_start().starts_with('{') {
                     let outbound = handle_plaintext(&mut open, text)?;
                     return Ok((
                         State::Open(open),
@@ -458,7 +458,6 @@ fn process(
                         },
                     ));
                 }
-            }
             let received_kind = frame.kind();
             let wire = match frame {
                 Frame::Text(text) => decode_base64(&text, MAX_WIRE_BYTES)?,
@@ -613,14 +612,11 @@ fn envelope_type(text: &str) -> Option<String> {
 
 /// Option<T> would silently interpret JSON null as absent and allow a downgrade.
 /// Missing and present-but-invalid are deliberately distinct in every envelope.
+#[derive(Default)]
 enum Presence<T> {
+    #[default]
     Missing,
     Present(T),
-}
-impl<T> Default for Presence<T> {
-    fn default() -> Self {
-        Self::Missing
-    }
 }
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Presence<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

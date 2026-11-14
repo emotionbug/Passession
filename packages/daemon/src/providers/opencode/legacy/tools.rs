@@ -49,11 +49,10 @@ fn normalized(value: &Value) -> Option<String> {
 fn task_session(value: &Value) -> Option<String> {
     static ID: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)\btask_id:\s*(ses_[A-Za-z0-9]+)").unwrap());
-    if let Some(s) = output_text(value) {
-        if let Some(c) = ID.captures(&s) {
+    if let Some(s) = output_text(value)
+        && let Some(c) = ID.captures(&s) {
             return Some(c[1].to_owned());
         }
-    }
     ["task_id", "taskId", "sessionID", "sessionId"]
         .iter()
         .find_map(|k| normalized(&value[*k]))
@@ -166,9 +165,7 @@ fn strip_gutter(content: &str) -> Option<(String, u64)> {
             matches += 1;
             out.push(c[2].to_owned());
         } else {
-            if first.is_none() {
-                return None;
-            }
+            first?;
             out.push(line.to_owned());
         }
     }
@@ -209,8 +206,8 @@ fn xml_decode(value: &str) -> String {
         .into_owned()
 }
 fn read_output(output: &Value) -> (Option<String>, Option<String>) {
-    if let Some(raw) = output.as_str() {
-        if raw.trim().starts_with("<path>") {
+    if let Some(raw) = output.as_str()
+        && raw.trim().starts_with("<path>") {
             static PATH: LazyLock<Regex> =
                 LazyLock::new(|| Regex::new(r"(?is)<path>(.*?)</path>").unwrap());
             static CONTENT: LazyLock<Regex> =
@@ -231,7 +228,6 @@ fn read_output(output: &Value) -> (Option<String>, Option<String>) {
                 );
             }
         }
-    }
     let payload = output
         .get("data")
         .or_else(|| output.get("structuredContent"))

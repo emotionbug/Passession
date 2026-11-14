@@ -102,6 +102,18 @@ struct SubscriptionDelivery {
     bytes: usize,
 }
 
+pub(crate) struct SourceConfig {
+    pub id: String,
+    pub session_id: String,
+    pub client_id: String,
+    pub capabilities: Value,
+    pub principal: Value,
+    pub permissions: Arc<RwLock<HashSet<String>>>,
+    pub routed: bool,
+    pub app_version: Option<String>,
+    pub cancel: CancellationToken,
+}
+
 /// Immutable physical-source identity. Cloning never redirects delivery to a resumed socket.
 #[derive(Clone)]
 pub struct RequestContext {
@@ -111,16 +123,12 @@ pub struct RequestContext {
 
 impl RequestContext {
     pub(crate) fn attach(
-        id: String,
-        session_id: String,
-        client_id: String,
-        capabilities: Value,
-        principal: Value,
-        permissions: Arc<RwLock<HashSet<String>>>,
-        routed: bool,
-        app_version: Option<String>,
-        cancel: CancellationToken,
+        config: SourceConfig,
     ) -> (Self, mpsc::Receiver<QueuedFrame>) {
+        let SourceConfig {
+            id, session_id, client_id, capabilities, principal, permissions,
+            routed, app_version, cancel,
+        } = config;
         let modern = has_capability(&capabilities, "owned_subscriptions");
         let (sender, receiver) = mpsc::channel(256);
         let source = Arc::new(Source {
@@ -561,11 +569,10 @@ impl RequestContext {
                 let owner = slots
                     .get(&bytes[1])
                     .ok_or_else(|| anyhow!("Terminal slot is not owned by physical source"))?;
-                if let Owner::Subscription(s) = &self.owner {
-                    if owner != &s.id {
+                if let Owner::Subscription(s) = &self.owner
+                    && owner != &s.id {
                         bail!("Terminal slot belongs to another subscription");
                     }
-                }
             }
             0x10..=0x12 => {
                 if !self.allows(if inbound {
@@ -781,11 +788,10 @@ impl OwnedSubscription {
             bail!("Subscription source is closed");
         }
         let mut slots = self.context.source.slots.lock().unwrap();
-        if let Some(prior) = slots.get(&slot) {
-            if prior != &self.state.id {
+        if let Some(prior) = slots.get(&slot)
+            && prior != &self.state.id {
                 bail!("Terminal slot already owned");
             }
-        }
         slots.insert(slot, self.state.id.clone());
         Ok(())
     }

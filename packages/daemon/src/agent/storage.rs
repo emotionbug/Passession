@@ -264,11 +264,10 @@ impl AgentStorage {
             }
         }
         let mut records = records.write().await;
-        if let Some(previous) = removed_previous {
-            if let Some(paths) = records.paths.get_mut(id) {
+        if let Some(previous) = removed_previous
+            && let Some(paths) = records.paths.get_mut(id) {
                 paths.remove(&previous);
             }
-        }
         records.insert(id.to_owned(), record, path);
         Ok(())
     }
@@ -306,11 +305,10 @@ impl AgentStorage {
         for path in paths {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {
-                    if let Some(parent) = path.parent() {
-                        if let Err(error) = sync_directory(parent).await {
+                    if let Some(parent) = path.parent()
+                        && let Err(error) = sync_directory(parent).await {
                             errors.push(error.to_string());
                         }
-                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
                 Err(error) => errors.push(format!("{}: {error}", path.display())),
@@ -408,7 +406,7 @@ fn validate_record(record: &mut Value) -> Result<()> {
     for key in ["config", "runtimeInfo"] {
         if object
             .get(key)
-            .is_some_and(|v| !v.is_object() && !(key == "config" && v.is_null()))
+            .is_some_and(|v| !(v.is_object() || key == "config" && v.is_null()))
         {
             bail!("Invalid agent {key}");
         }
@@ -445,7 +443,7 @@ fn validate_record(record: &mut Value) -> Result<()> {
                 .and_then(Value::as_array)
                 .context("Invalid preapproved tools")?;
             for tool in tools {
-                if !tool.as_object().is_some_and(|o| o.len() == 3)
+                if tool.as_object().is_none_or(|o| o.len() != 3)
                     || tool["kind"] != "mcp"
                     || !tool["server"].is_string()
                     || !tool["tool"].is_string()
@@ -475,11 +473,10 @@ fn validate_record(record: &mut Value) -> Result<()> {
             bail!("Invalid runtime extra");
         }
     }
-    if let Some(owner) = object.get("owner") {
-        if execution_key(owner).is_none() {
+    if let Some(owner) = object.get("owner")
+        && execution_key(owner).is_none() {
             bail!("Invalid daemon agent owner");
         }
-    }
     if let Some(features) = object.get("features") {
         for feature in features
             .as_array()

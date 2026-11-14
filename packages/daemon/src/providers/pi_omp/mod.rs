@@ -94,8 +94,8 @@ impl JsonlProvider {
         )
         .await?;
         let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
-        if self.spec.family == "omp" {
-            if let Err(error) = runtime
+        if self.spec.family == "omp"
+            && let Err(error) = runtime
                 .negotiate(launch::ready_timeout(&self.spec, config))
                 .await
             {
@@ -103,7 +103,6 @@ impl JsonlProvider {
                 drain.abort();
                 return Err(error);
             }
-        }
         Ok((runtime, drain))
     }
     fn probe_config(&self, options: &Value) -> Value {

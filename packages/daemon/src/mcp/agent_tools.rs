@@ -708,11 +708,10 @@ async fn resolve_create(
             ("features", "features"),
         ] {
             // Legacy top-level settings take precedence over their nested equivalents.
-            if !object.contains_key(target) {
-                if let Some(value) = settings.get(key) {
+            if !object.contains_key(target)
+                && let Some(value) = settings.get(key) {
                     object.insert(target.to_owned(), value.clone());
                 }
-            }
         }
     }
     Ok(input)

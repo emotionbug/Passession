@@ -137,11 +137,10 @@ impl HubService {
             state.record = record;
         }
         // Pending credentials are already durable and enrollment is explicitly idempotent.
-        if let Err(error) = self.inner.enroll_pending().await {
-            if error.downcast_ref::<remote::EnrollmentRejected>().is_none() {
+        if let Err(error) = self.inner.enroll_pending().await
+            && error.downcast_ref::<remote::EnrollmentRejected>().is_none() {
                 return Err(error);
             }
-        }
         let inner = self.inner.clone();
         *self.inner.worker.lock().await = Some(tokio::spawn(async move {
             if let Err(error) = inner.run().await {
@@ -589,11 +588,10 @@ impl Inner {
                 tokio::select! { _ = self.stop.cancelled() => return Ok(()), _ = lifecycle.cancelled() => continue, _ = wake => continue, _ = tokio::time::sleep_until(deadline) => {} }
             }
             if record.state == "pending" {
-                if let Err(error) = self.enroll_pending().await {
-                    if error.downcast_ref::<remote::EnrollmentRejected>().is_none() {
+                if let Err(error) = self.enroll_pending().await
+                    && error.downcast_ref::<remote::EnrollmentRejected>().is_none() {
                         return Err(error);
                     }
-                }
                 continue;
             }
             let opened = tokio::select! {

@@ -283,11 +283,10 @@ impl Session {
             cancel,
         )
         .await;
-        if let Err(error) = result {
-            if error_code(&error) != "DAEMON_NOT_READY" {
+        if let Err(error) = result
+            && error_code(&error) != "DAEMON_NOT_READY" {
                 return Err(error);
             }
-        }
         self.status().await
     }
     async fn restart(&mut self, args: &Value) -> Result<Value> {
@@ -328,12 +327,11 @@ impl Session {
             return Ok(());
         }
         self.closing = true;
-        if self.runtime.is_some() && !keep {
-            if let Err(error) = self.stop(&json!({"reason":"quit"})).await {
+        if self.runtime.is_some() && !keep
+            && let Err(error) = self.stop(&json!({"reason":"quit"})).await {
                 self.closing = false;
                 return Err(error);
             }
-        }
         Ok(())
     }
     async fn dispatch(

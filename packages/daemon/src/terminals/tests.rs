@@ -183,28 +183,28 @@ async fn physical_source_slots_cannot_write_each_others_pty() {
         "workspace.read".to_owned(),
         "workspace.write".to_owned(),
     ])));
-    let (owner, mut frames) = RequestContext::attach(
-        "source-one".into(),
-        "session".into(),
-        "client-one".into(),
-        json!({"owned_subscriptions":true}),
-        json!({"kind":"owner"}),
-        permissions.clone(),
-        false,
-        None,
-        tokio_util::sync::CancellationToken::new(),
-    );
-    let (other, _) = RequestContext::attach(
-        "source-two".into(),
-        "session".into(),
-        "client-two".into(),
-        json!({"owned_subscriptions":true}),
-        json!({"kind":"owner"}),
+    let (owner, mut frames) = RequestContext::attach(crate::transport::SourceConfig {
+        id: "source-one".into(),
+        session_id: "session".into(),
+        client_id: "client-one".into(),
+        capabilities: json!({"owned_subscriptions":true}),
+        principal: json!({"kind":"owner"}),
+        permissions: permissions.clone(),
+        routed: false,
+        app_version: None,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    });
+    let (other, _) = RequestContext::attach(crate::transport::SourceConfig {
+        id: "source-two".into(),
+        session_id: "session".into(),
+        client_id: "client-two".into(),
+        capabilities: json!({"owned_subscriptions":true}),
+        principal: json!({"kind":"owner"}),
         permissions,
-        false,
-        None,
-        tokio_util::sync::CancellationToken::new(),
-    );
+        routed: false,
+        app_version: None,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    });
     let message = json!({"type":"subscribe_terminal_request","terminalId":terminal.id,"requestId":"owned-subscribe"});
     let request = owner.for_request(message.clone());
     streams::subscribe(&service, &request, &message)
@@ -340,17 +340,17 @@ async fn subscribe_to_finished_script(service: &TerminalService, terminal_id: &s
     use crate::transport::OutboundFrame;
     use std::collections::HashSet;
 
-    let (context, mut frames) = RequestContext::attach(
-        "finished-log-reader".into(),
-        "finished-log-session".into(),
-        "finished-log-client".into(),
-        json!({"owned_subscriptions":true,"terminal_reflowable_snapshot":true}),
-        json!({"kind":"owner"}),
-        Arc::new(RwLock::new(HashSet::from(["workspace.read".to_owned()]))),
-        false,
-        None,
-        tokio_util::sync::CancellationToken::new(),
-    );
+    let (context, mut frames) = RequestContext::attach(crate::transport::SourceConfig {
+        id: "finished-log-reader".into(),
+        session_id: "finished-log-session".into(),
+        client_id: "finished-log-client".into(),
+        capabilities: json!({"owned_subscriptions":true,"terminal_reflowable_snapshot":true}),
+        principal: json!({"kind":"owner"}),
+        permissions: Arc::new(RwLock::new(HashSet::from(["workspace.read".to_owned()]))),
+        routed: false,
+        app_version: None,
+        cancel: tokio_util::sync::CancellationToken::new(),
+    });
     let message = json!({
         "type":"subscribe_terminal_request", "terminalId":terminal_id,
         "requestId":"finished-log"

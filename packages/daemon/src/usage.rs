@@ -45,6 +45,12 @@ pub struct UsageContext {
     pub plugins: Option<Arc<crate::plugins::PluginService>>,
 }
 
+struct DiscoveryContext<'a> {
+    runtime: &'a UsageRuntime,
+    scope: &'a UsageScope,
+    agent: Option<(&'a str, &'a Value)>,
+}
+
 macro_rules! sources {
     ($( $variant:ident => ($module:ident, $id:literal, $label:literal, $icon:literal) ),+ $(,)?) => {
         #[derive(Clone, PartialEq, Eq, Hash)]
@@ -363,7 +369,8 @@ impl UsageService {
                         .unwrap_or_default(),
                 };
                 return self.discover_and_fetch(
-                    &rt, &scope, &sources, Some((agent_id, &signature)),
+                    DiscoveryContext { runtime: &rt, scope: &scope, agent: Some((agent_id, &signature)) },
+                    &sources,
                     force, &cancel, updates.as_ref(),
                 ).await;
             }
@@ -383,7 +390,8 @@ impl UsageService {
                 env: context.env.clone(),
             };
             return self.discover_and_fetch(
-                &rt, &scope, &sources, None, force, &cancel, updates.as_ref(),
+                DiscoveryContext { runtime: &rt, scope: &scope, agent: None },
+                &sources, force, &cancel, updates.as_ref(),
             ).await;
         };
         Ok(UsageReports {
@@ -424,10 +432,11 @@ impl UsageService {
     }
 
     async fn discover_and_fetch(
-        &self, rt: &UsageRuntime, scope: &UsageScope, sources: &[Source],
-        agent: Option<(&str, &Value)>, force: bool, cancel: &CancellationToken,
+        &self, context: DiscoveryContext<'_>, sources: &[Source],
+        force: bool, cancel: &CancellationToken,
         updates: Option<&mpsc::Sender<Value>>,
     ) -> Result<UsageReports> {
+        let DiscoveryContext { runtime: rt, scope, agent } = context;
         let mut pending = FuturesUnordered::new();
         for (index, source) in sources.iter().enumerate() {
             pending.push(async move {
@@ -491,12 +500,11 @@ impl UsageService {
         }
         {
             let mut state = self.inner.state.lock().unwrap();
-            if let Some((id, signature)) = agent {
-                if let Some((_, mapping)) = state.by_agent.iter_mut()
+            if let Some((id, signature)) = agent
+                && let Some((_, mapping)) = state.by_agent.iter_mut()
                     .find(|(key, mapping)| key == id && &mapping.signature == signature) {
                     mapping.complete = unavailable_sources.is_empty();
                 }
-            }
             prune_cache(&mut state);
         }
         completed.sort_by_key(|(index, _)| *index);
@@ -517,15 +525,14 @@ impl UsageService {
         let key = cache_identity(&id, &known);
         let (mut receiver, owner) = {
             let mut state = self.inner.state.lock().unwrap();
-            if !force {
-                if let Some(cached) = state
+            if !force
+                && let Some(cached) = state
                     .cache
                     .get(&key)
                     .filter(|cached| cached.at.elapsed() < Duration::from_secs(300))
                 {
                     return Ok(cached.entry.clone());
                 }
-            }
             if let Some(pending) = state.pending.get(&key) {
                 (pending.subscribe(), false)
             } else {

@@ -842,15 +842,14 @@ struct StagingCleanup(Option<PathBuf>);
 
 impl Drop for StagingCleanup {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if let Some(path) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
                     if let Err(error) = remove_tree(&path).await {
                         tracing::warn!(path=%path.display(), %error, "Failed to remove abandoned plugin staging directory");
                     }
                 });
             }
-        }
     }
 }
 

@@ -6,11 +6,10 @@ pub fn text(value: &Value) -> Option<String> {
         return Some(s.to_owned());
     }
     for key in ["output", "stdout", "text"] {
-        if let Some(s) = value[key].as_str() {
-            if !s.is_empty() {
+        if let Some(s) = value[key].as_str()
+            && !s.is_empty() {
                 return Some(s.to_owned());
             }
-        }
     }
     let parts: Vec<&str> = array(&value["content"])
         .iter()
@@ -73,11 +72,10 @@ pub fn tool_item(
                 .next()
                 .unwrap_or(name)
                 .to_owned();
-        } else if name == "write" && result["details"]["xdev"]["mode"] == "execute" {
-            if let Some(n) = first(&[&result["details"]["xdev"]["tool"]]) {
+        } else if name == "write" && result["details"]["xdev"]["mode"] == "execute"
+            && let Some(n) = first(&[&result["details"]["xdev"]["tool"]]) {
                 display_name = n.into();
             }
-        }
     }
     if family != "omp" && name == "mcp" {
         let details = &result["details"];
@@ -108,13 +106,12 @@ fn detail(family: &str, name: &str, display_name: &str, args: &Value, result: &V
     let output = text(result);
     let details = &result["details"];
     if omp {
-        if name == "write" && string(&args["path"]).starts_with("xd://") {
-            if opaque(display_name) || display_name == "ast_grep" {
+        if name == "write" && string(&args["path"]).starts_with("xd://")
+            && (opaque(display_name) || display_name == "ast_grep") {
                 let decoded =
                     serde_json::from_str::<Value>(string(&args["content"])).unwrap_or(Value::Null);
                 return detail(family, display_name, display_name, &decoded, result);
             }
-        }
         match name {
             "task" => {
                 let task = array(&args["tasks"])
@@ -160,14 +157,13 @@ fn detail(family: &str, name: &str, display_name: &str, args: &Value, result: &V
                     &details["childSessionId"],
                 ]) {
                     d["childSessionId"] = json!(id);
-                } else if let Some(s) = output.as_deref() {
-                    if let Some(c) =
+                } else if let Some(s) = output.as_deref()
+                    && let Some(c) =
                         cached_regex!(r"(?i)(?:session|transcript)(?: file)?:\s*(/\S+\.jsonl)")
                             .captures(s)
                     {
                         d["childSessionId"] = json!(&c[1]);
                     }
-                }
                 return d;
             }
             "yield" => return plain("Submitted subagent result", output.as_deref()),

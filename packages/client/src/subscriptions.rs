@@ -477,11 +477,10 @@ async fn wait_connection(
         if cancel.is_cancelled() || lifetime.is_cancelled() {
             bail!("Connection wait cancelled")
         }
-        if let Some(client) = current.borrow_and_update().clone() {
-            if !client.cancellation().is_cancelled() {
+        if let Some(client) = current.borrow_and_update().clone()
+            && !client.cancellation().is_cancelled() {
                 return Ok(client);
             }
-        }
         tokio::select! {biased;_=cancel.cancelled()=>bail!("Connection wait cancelled"),_=lifetime.cancelled()=>bail!("Client closed"),result=current.changed()=>result?}
     }
 }

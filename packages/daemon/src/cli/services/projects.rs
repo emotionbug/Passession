@@ -132,15 +132,14 @@ async fn rpc(
     } else {
         client.request(message, response, RPC).await?
     };
-    if let Some(error) = result.get("error").filter(|e| !e.is_null()) {
-        if let Some(message) = error["message"].as_str() {
+    if let Some(error) = result.get("error").filter(|e| !e.is_null())
+        && let Some(message) = error["message"].as_str() {
             return Err(ClientError::new(
                 error["code"].as_str().unwrap_or("DAEMON_RPC_ERROR"),
                 message,
             )
             .into());
         }
-    }
     Ok(result)
 }
 fn project_row(value: &Value) -> Value {

@@ -553,7 +553,7 @@ async fn stdio_owns_process_env_cwd_out_of_order_replies_and_cancellation() {
     assert!(call.await.unwrap().is_err());
     wait_file(home.path().join("cancelled")).await;
     client.close().await.unwrap();
-    if let super::Transport::Stdio(process) = client.transport.as_ref() {
+    if let super::Transport::Stdio(process) = &client.transport {
         tokio::time::timeout(Duration::from_secs(1), process.wait())
             .await
             .unwrap()

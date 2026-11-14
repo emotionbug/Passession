@@ -99,11 +99,10 @@ fn todo_data(v: &Value) -> Option<Value> {
     if v.is_array() {
         return Some(v.clone());
     }
-    if let Some(v) = v.get("todos") {
-        if v.is_array() {
+    if let Some(v) = v.get("todos")
+        && v.is_array() {
             return Some(v.clone());
         }
-    }
     v.as_str()
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .and_then(|v| todo_data(&v))
@@ -119,11 +118,9 @@ fn replay(item: Value, info: &Value, part: &Value) -> Value {
     .into_iter()
     .flatten()
     .find_map(Value::as_i64)
-    {
-        if let Some(time) = DateTime::<Utc>::from_timestamp_millis(ms) {
+        && let Some(time) = DateTime::<Utc>::from_timestamp_millis(ms) {
             e["timestamp"] = json!(time.to_rfc3339_opts(SecondsFormat::Millis, true));
         }
-    }
     e
 }
 pub fn history_message(message: &Value) -> Vec<Value> {
@@ -174,27 +171,25 @@ pub fn history_message(message: &Value) -> Vec<Value> {
             out.push(replay(item, info, part));
         }
     }
-    if !has_text {
-        if let Some(text) = structured(info) {
+    if !has_text
+        && let Some(text) = structured(info) {
             out.push(replay(
                 json!({"type":"assistant_message","text":text,"messageId":info["id"]}),
                 info,
                 &Value::Null,
             ));
         }
-    }
     out
 }
 pub fn filter_reverted(messages: &mut Vec<Value>, info: &Value) {
     let revert = &info["revert"];
-    if !s(&revert["messageID"]).is_empty() && revert["partID"].is_null() {
-        if let Some(index) = messages
+    if !s(&revert["messageID"]).is_empty() && revert["partID"].is_null()
+        && let Some(index) = messages
             .iter()
             .position(|m| m["info"]["id"] == revert["messageID"])
         {
             messages.truncate(index);
         }
-    }
 }
 
 #[derive(Default)]
@@ -367,14 +362,13 @@ impl Track {
                         }
                         self.usage["contextWindowMaxTokens"] = json!(window);
                     }
-                    if !info["time"]["completed"].is_null() && !self.structured.contains(id) {
-                        if let Some(text) = structured(info) {
+                    if !info["time"]["completed"].is_null() && !self.structured.contains(id)
+                        && let Some(text) = structured(info) {
                             self.structured.insert(id.into());
                             out.push(timeline(
                                 json!({"type":"assistant_message","text":text,"messageId":id}),
                             ));
                         }
-                    }
                 }
             }
             "message.part.updated" => {
@@ -406,7 +400,7 @@ impl Track {
                         let suffix=full[emitted.len()..].to_owned();self.parts.insert(id.into(),(mid.into(),full.into(),true));self.held.remove(id);
                         if !suffix.is_empty(){out.push(timeline(if kind=="reasoning"{json!({"type":"reasoning","text":suffix,"messageId":id})}else{json!({"type":"assistant_message","text":suffix,"messageId":mid})}));}
                     }
-                    "tool" if !s(&part["tool"]).trim().eq_ignore_ascii_case("todowrite") => {if let Some(mut item)=tool(part){if item["detail"]["type"]=="sub_agent"{let id=s(&item["callId"]).to_owned();if item["detail"]["childSessionId"].is_null(){if let Some(old)=self.tasks.get(&id){if !old["detail"]["childSessionId"].is_null(){item["detail"]["childSessionId"]=old["detail"]["childSessionId"].clone();}}}self.tasks.insert(id,item.clone());}out.push(timeline(item));}},
+                    "tool" if !s(&part["tool"]).trim().eq_ignore_ascii_case("todowrite") => {if let Some(mut item)=tool(part){if item["detail"]["type"]=="sub_agent"{let id=s(&item["callId"]).to_owned();if item["detail"]["childSessionId"].is_null()&& let Some(old)=self.tasks.get(&id)&& !old["detail"]["childSessionId"].is_null(){item["detail"]["childSessionId"]=old["detail"]["childSessionId"].clone();}self.tasks.insert(id,item.clone());}out.push(timeline(item));}},
                     "compaction" if self.compactions.insert(id.into()) => out.push(timeline(json!({"type":"compaction","status":"loading","trigger":if part["auto"]==true{"auto"}else{"manual"}}))),
                     "step-finish" => self.usage_step(part,&mut out), _=>{}
                 }
@@ -586,8 +580,8 @@ impl Projection {
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
-            if waiting.len() == 1 {
-                if let Some(t) = track.tasks.get_mut(&waiting[0]) {
+            if waiting.len() == 1
+                && let Some(t) = track.tasks.get_mut(&waiting[0]) {
                     t["detail"]["childSessionId"] = json!(id);
                     let item = t.clone();
                     let ev = if parent == self.id {
@@ -597,7 +591,6 @@ impl Projection {
                     };
                     out.push(ev);
                 }
-            }
         }
         out.extend(self.links());
         out

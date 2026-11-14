@@ -44,6 +44,13 @@ struct Channel {
     route: Arc<Route>,
     output: mpsc::Receiver<HostFrame>,
 }
+struct RouteOrigin<'a> {
+    actor: &'a str,
+    session: &'a str,
+    permissions: Vec<String>,
+    source: &'a str,
+}
+
 impl HostsService {
     pub async fn detach_source(&self, source: &str) {
         let routes: Vec<_> = self
@@ -171,10 +178,12 @@ impl HostsService {
                     .open_remote(
                         field(message, "serverId")?,
                         scope,
-                        &context.actor_source_id(),
-                        context.session_id(),
-                        context.permissions(),
-                        context.source_id(),
+                        RouteOrigin {
+                            actor: &context.actor_source_id(),
+                            session: context.session_id(),
+                            permissions: context.permissions(),
+                            source: context.source_id(),
+                        },
                         owner.cancellation(),
                         Some(owner.clone()),
                     )
@@ -210,13 +219,11 @@ impl HostsService {
         &self,
         server: &str,
         scope: &str,
-        actor: &str,
-        origin: &str,
-        permissions: Vec<String>,
-        source: &str,
+        origin: RouteOrigin<'_>,
         cancel: CancellationToken,
         owner: Option<OwnedSubscription>,
     ) -> Result<Channel> {
+        let RouteOrigin { actor, session: origin, permissions, source } = origin;
         let row = self
             .inner
             .rows
@@ -444,10 +451,12 @@ impl HostsService {
             .open_remote(
                 server_id,
                 &scope,
-                "mcp",
-                "mcp",
-                permissions,
-                "mcp",
+                RouteOrigin {
+                    actor: "mcp",
+                    session: "mcp",
+                    permissions,
+                    source: "mcp",
+                },
                 cancel,
                 None,
             )
@@ -469,7 +478,7 @@ impl HostsService {
         };
         let value: Value = serde_json::from_str(&text)?;
         let info = value["message"]["payload"].clone();
-        let pending: Arc<Mutex<HashMap<String, (String, oneshot::Sender<Result<Value>>)>>> =
+        let pending: Arc<Mutex<PendingRequests>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (events_tx, events) = mpsc::channel(256);
         let pending_task = pending.clone();
@@ -480,7 +489,17 @@ impl HostsService {
             loop{tokio::select!{
                 _=task_route.cancel.cancelled()=>break,
                 _=heartbeat.tick()=>{if task_route.send(HostFrame::Text("{\"type\":\"ping\"}".into())).await.is_err(){break;}},
-                frame=channel.output.recv()=>{let Some(HostFrame::Text(text))=frame else{break};let Ok(value)=serde_json::from_str::<Value>(&text)else{break};if value["type"]=="ping"{let _=task_route.send(HostFrame::Text("{\"type\":\"pong\"}".into())).await;continue;}if value["type"]!="session"{continue;}let message=&value["message"];
+                frame=channel.output.recv()=>{
+                    let Some(HostFrame::Text(text)) = frame else { break };
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else { break };
+                    if value["type"] == "ping" {
+                        let _ = task_route.send(HostFrame::Text("{\"type\":\"pong\"}".into())).await;
+                        continue;
+                    }
+                    if value["type"] != "session" {
+                        continue;
+                    }
+                    let message = &value["message"];
                     let delivered=if let Some(id)=message["payload"]["requestId"].as_str(){let mut pending=pending_task.lock().unwrap();let matches=pending.get(id).is_some_and(|(expected,_)|message["type"]==expected.as_str()||message["type"]=="rpc_error");if matches{let(_,tx)=pending.remove(id).unwrap();let result=if message["type"]=="rpc_error"{Err(remote_error(message).into())}else{Ok(message.clone())};let _=tx.send(result);true}else{false}}else{false};
                     if !delivered&&events_tx.try_send(message.clone()).is_err(){task_route.stop("resource_limit","Host event consumer cannot keep up");break;}
                 }
@@ -495,9 +514,11 @@ impl HostsService {
     }
 }
 
+type PendingRequests = HashMap<String, (String, oneshot::Sender<Result<Value>>)>;
+
 pub struct HostClient {
     route: Arc<Route>,
-    pending: Arc<Mutex<HashMap<String, (String, oneshot::Sender<Result<Value>>)>>>,
+    pending: Arc<Mutex<PendingRequests>>,
     events: AsyncMutex<mpsc::Receiver<Value>>,
     info: Value,
 }
@@ -664,21 +685,21 @@ async fn emit_frame(owner: &OwnedSubscription, frame: HostFrame, limit: usize) -
 mod tests {
     use super::*;
     fn context(source: &str) -> RequestContext {
-        RequestContext::attach(
-            source.into(),
-            "session".into(),
-            "client".into(),
-            json!({}),
-            json!({"id":"owner"}),
-            Arc::new(RwLock::new(
+        RequestContext::attach(crate::transport::SourceConfig {
+            id: source.into(),
+            session_id: "session".into(),
+            client_id: "client".into(),
+            capabilities: json!({}),
+            principal: json!({"id":"owner"}),
+            permissions: Arc::new(RwLock::new(
                 ["workspace.read".into(), "workspace.write".into()]
                     .into_iter()
                     .collect(),
             )),
-            false,
-            None,
-            CancellationToken::new(),
-        )
+            routed: false,
+            app_version: None,
+            cancel: CancellationToken::new(),
+        })
         .0
     }
     #[tokio::test]
@@ -763,17 +784,17 @@ mod tests {
             .iter()
             .map(|p| (*p).to_owned())
             .collect();
-        let (context, mut writer) = RequestContext::attach(
-            "physical".into(),
-            "session".into(),
-            "client".into(),
-            json!({"owned_subscriptions":true}),
-            json!({"id":"owner"}),
-            Arc::new(RwLock::new(permissions)),
-            false,
-            None,
-            CancellationToken::new(),
-        );
+        let (context, mut writer) = RequestContext::attach(crate::transport::SourceConfig {
+            id: "physical".into(),
+            session_id: "session".into(),
+            client_id: "client".into(),
+            capabilities: json!({"owned_subscriptions":true}),
+            principal: json!({"id":"owner"}),
+            permissions: Arc::new(RwLock::new(permissions)),
+            routed: false,
+            app_version: None,
+            cancel: CancellationToken::new(),
+        });
         let request = context.for_request(
             json!({"type":"hosts.link.open.request","requestId":"open","channelId":"scope"}),
         );

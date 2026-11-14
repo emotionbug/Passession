@@ -440,7 +440,7 @@ impl CatalogService {
                 .targets
                 .get(cwd)
                 .and_then(|target| target.bindings.get(provider));
-            if !current.is_some_and(|current| current.id == binding.id) {
+            if current.is_none_or(|current| current.id != binding.id) {
                 current.map(|current| current.done.clone())
             } else {
                 match key_result {
@@ -554,7 +554,7 @@ impl CatalogService {
         else {
             return;
         };
-        if !catalog.load.as_ref().is_some_and(|load| load.id == id) {
+        if catalog.load.as_ref().is_none_or(|load| load.id != id) {
             return;
         }
         if result.entry["status"] == "error" {

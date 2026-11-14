@@ -653,7 +653,20 @@ impl HostsService {
             if connection.security==Some(SecurityMode::Protected){self.persist_protected_floor(id,cancel).await?;}
             let mut hello=json!({"type":"hello","clientId":format!("host-link-{}-{id}",self.identity()?["serverId"].as_str().unwrap_or("")),"clientType":"cli","protocolVersion":1,"capabilities":client_capabilities()});
             if let Some(password)=&target.password{hello["auth"]=json!({"kind":"password","password":password});}connection.sender.json(hello).await?;
-            let info=tokio::time::timeout(Duration::from_secs(10),async{loop{let frame=connection.incoming.recv().await.ok_or_else(||anyhow!("Host closed before identity"))??;if let HostFrame::Text(text)=frame{let value:Value=serde_json::from_str(&text)?;if value["type"]=="hello.rejected"{return Err(HostError::new("authentication_failed","Host rejected the credentials. Replace the connection credentials.").into());}if value["type"]=="session"&&value["message"]["type"]=="status"&&value["message"]["payload"]["status"]=="server_info"{return Ok::<_,anyhow::Error>(value["message"]["payload"].clone());}}}}).await??;
+            let info = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame = connection.incoming.recv().await.ok_or_else(|| anyhow!("Host closed before identity"))??;
+                    if let HostFrame::Text(text) = frame {
+                        let value: Value = serde_json::from_str(&text)?;
+                        if value["type"] == "hello.rejected" {
+                            return Err(HostError::new("authentication_failed", "Host rejected the credentials. Replace the connection credentials.").into());
+                        }
+                        if value["type"] == "session" && value["message"]["type"] == "status" && value["message"]["payload"]["status"] == "server_info" {
+                            return Ok::<_, anyhow::Error>(value["message"]["payload"].clone());
+                        }
+                    }
+                }
+            }).await??;
             let link=Arc::new(Link{sender:connection.sender.clone(),cancel:connection.cancel.clone(),pending:Mutex::new(HashMap::new()),channels:Mutex::new(HashMap::new())});
             self.accept(id,&info,cancel,link.clone()).await?;
             *attempt=0;

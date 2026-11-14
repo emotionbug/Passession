@@ -197,8 +197,8 @@ fn omp_path(home: &Path, env: &BTreeMap<String, String>) -> PathBuf {
     } else {
         default.clone()
     };
-    if cfg!(any(target_os = "linux", target_os = "macos")) && agent == default {
-        if let Some(xdg) = nonempty(env, "XDG_DATA_HOME") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) && agent == default
+        && let Some(xdg) = nonempty(env, "XDG_DATA_HOME") {
             let base = join(Path::new(xdg), "omp");
             let root = if profile == "default" {
                 base
@@ -209,7 +209,6 @@ fn omp_path(home: &Path, env: &BTreeMap<String, String>) -> PathBuf {
                 return root.join("agent.db");
             }
         }
-    }
     agent.join("agent.db")
 }
 
@@ -257,11 +256,10 @@ fn omp_rows(path: &Path, provider: &str) -> Vec<(i64, OAuth)> {
             if id <= 0 {
                 continue;
             }
-            if let Ok(value) = serde_json::from_str::<Value>(&data) {
-                if let Ok(auth) = oauth(&value) {
+            if let Ok(value) = serde_json::from_str::<Value>(&data)
+                && let Ok(auth) = oauth(&value) {
                     result.push((id, auth));
                 }
-            }
         }
         Ok(result)
     };

@@ -66,7 +66,7 @@ impl ProviderRegistry {
             bail!("Daemon is shutting down");
         }
         let previous = self.entries();
-        let (entries, muse) = build::entries(&app, next, &previous)?;
+        let build::BuiltEntries { entries, muse } = build::entries(&app, next, &previous)?;
         {
             let mut state = self.state.write().unwrap();
             for entry in &entries {

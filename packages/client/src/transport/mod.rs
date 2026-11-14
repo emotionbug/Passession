@@ -34,6 +34,9 @@ impl HostFrame {
             Self::Flush(_) => 0,
         }
     }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 pub fn encode_frame(id: &str, payload: &[u8]) -> Result<Bytes> {
     ensure!(

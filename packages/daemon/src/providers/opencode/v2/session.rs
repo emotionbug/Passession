@@ -84,20 +84,15 @@ pub(super) struct Session {
     settled: mpsc::UnboundedReceiver<(String, bool)>,
 }
 impl Session {
-    pub fn new(
+    pub(super) fn new(
         runtime: Arc<Runtime>,
         manager: Arc<RuntimeManager>,
         id: String,
-        info: Value,
-        config: Value,
-        context: LaunchContext,
-        options: Value,
-        sink: EventSink,
-        snapshot: Arc<Mutex<Snapshot>>,
-        cancel: CancellationToken,
-        closed: CancellationToken,
-        close_error: Arc<Mutex<Option<String>>>,
+        launch: super::super::SessionLaunch,
+        shared: &super::V2Session,
     ) -> Self {
+        let super::super::SessionLaunch { info, config, context, options, sink } = launch;
+        let cancel = shared.cancel.clone();
         let (event_sender, events) = mpsc::channel(256);
         let (settle_sender, settled) = mpsc::unbounded_channel();
         Self {
@@ -109,11 +104,11 @@ impl Session {
             context,
             options,
             sink,
-            snapshot,
+            snapshot: shared.snapshot.clone(),
             stream_cancel: cancel.child_token(),
             cancel,
-            closed,
-            close_error,
+            closed: shared.closed.clone(),
+            close_error: shared.close_error.clone(),
             stream: None,
             events,
             event_sender,
@@ -374,7 +369,7 @@ impl Session {
             tokio::select! {
                 _=self.cancel.cancelled()=>break,
                 call=calls.recv()=>{let Some(call)=call else{break;};if self.handle(call).await{break;}},
-                event=self.events.recv()=>{if let Some(event)=event{if let Err(error)=self.observe(event).await{tracing::warn!(%error,"OpenCode event reconciliation failed");self.stream_cancel.cancel();self.reconcile_at=Some(Instant::now()+Duration::from_millis(100));}}},
+                event=self.events.recv()=>{if let Some(event)=event&& let Err(error)=self.observe(event).await{tracing::warn!(%error,"OpenCode event reconciliation failed");self.stream_cancel.cancel();self.reconcile_at=Some(Instant::now()+Duration::from_millis(100));}},
                 settled=self.settled.recv()=>{if let Some((child,applied))=settled{self.settle_replay(&child,applied).await;}},
                 _=tick.tick()=>{
                     if self.runtime.is_exited(){
@@ -685,11 +680,10 @@ impl Session {
                 tracing::warn!(%error,"OpenCode child live rebase failed");
             }
         }
-        if self.children.contains_key(child) {
-            if let Err(error) = self.collect_child(child).await {
+        if self.children.contains_key(child)
+            && let Err(error) = self.collect_child(child).await {
                 tracing::warn!(%error,"OpenCode held child collection failed");
             }
-        }
     }
     /// Emits only the transcript this child's live timeline has not emitted yet.
     async fn collect_body(&mut self, id: &str) -> Result<()> {
@@ -766,14 +760,13 @@ impl Session {
             }
             "session.text.delta" | "session.reasoning.delta" => {
                 let text = kind == "session.text.delta";
-                if !text || !structured {
-                    if let Some(event) = self
+                if (!text || !structured)
+                    && let Some(event) = self
                         .timeline
                         .delta(data, if text { "text" } else { "reasoning" })?
                     {
                         self.emit_timeline(event).await?;
                     }
-                }
                 return Ok(());
             }
             "session.step.ended" => {
@@ -921,14 +914,12 @@ impl Session {
             return Ok(());
         }
         self.reconcile().await?;
-        if kind == "session.execution.succeeded" {
-            if let Some(validator) = self.turn.as_ref().and_then(|t| t.output.as_ref()) {
-                if let Err(error) = assert_output(validator, &self.history) {
+        if kind == "session.execution.succeeded"
+            && let Some(validator) = self.turn.as_ref().and_then(|t| t.output.as_ref())
+                && let Err(error) = assert_output(validator, &self.history) {
                     self.fail(error.to_string()).await?;
                     return Ok(());
                 }
-            }
-        }
         let Some(turn) = self.turn.take() else {
             return Ok(());
         };
@@ -1018,12 +1009,11 @@ impl Session {
         if !matches!(
             &operation,
             Operation::Steer(..) | Operation::Interrupt | Operation::Rewind(..)
-        ) {
-            if let Err(error) = self.ensure_runtime().await {
+        )
+            && let Err(error) = self.ensure_runtime().await {
                 let _ = reply.send(Err(error));
                 return false;
             }
-        }
         match operation {
             Operation::Start(prompt, options) => {
                 if let Some(error) = &self.stop_error {
@@ -1166,11 +1156,10 @@ impl Session {
             }
             Operation::Permission(id, response) => {
                 self.respond(&id, response).await?;
-                if self.turn.as_ref().is_some_and(|t| t.denied) {
-                    if let Err(error) = self.reconcile_turn().await {
+                if self.turn.as_ref().is_some_and(|t| t.denied)
+                    && let Err(error) = self.reconcile_turn().await {
                         tracing::warn!(%error,"OpenCode denied request reconciliation failed");
                     }
-                }
                 Ok(Value::Null)
             }
             Operation::Commands => Ok(Value::Array(

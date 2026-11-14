@@ -232,16 +232,14 @@ impl Context<'_> {
                             let cross = !pr["head"]["repo"]["id"].is_null()
                                 && !pr["base"]["repo"]["id"].is_null()
                                 && pr["head"]["repo"]["id"] != pr["base"]["repo"]["id"];
-                            if b(&run, "need_approval")
+                            if (b(&run, "need_approval")
                                 || (matches!(
                                     s(&run, "status").to_lowercase().as_str(),
                                     "waiting" | "blocked"
-                                ) && cross)
-                            {
-                                if let Some(id) = number_value(&run["id"]) {
+                                ) && cross))
+                                && let Some(id) = number_value(&run["id"]) {
                                     required.insert(id);
                                 }
-                            }
                         }
                     }
                     Err(e) if auth_state(&e) == "error" => {}
@@ -255,12 +253,11 @@ impl Context<'_> {
             ))
         }
         .await;
-        if let Ok(checks) = loaded {
-            if !checks.is_empty() {
+        if let Ok(checks) = loaded
+            && !checks.is_empty() {
                 out["checksStatus"] = checks_status(&checks).into();
                 out["checks"] = checks.into();
             }
-        }
         Ok(out)
     }
     pub(super) async fn gitea(&self, op: &str, input: &Value) -> Result<Value> {

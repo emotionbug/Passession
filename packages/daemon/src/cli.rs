@@ -251,15 +251,14 @@ pub async fn run_args(mut args: Vec<String>) -> Result<i32> {
     }
     let command = build_command();
     let known: Vec<_> = command.get_subcommands().map(|c| c.get_name()).collect();
-    if let Some(first) = args.first() {
-        if !first.starts_with('-') && !known.contains(&first.as_str()) {
+    if let Some(first) = args.first()
+        && !first.starts_with('-') && !known.contains(&first.as_str()) {
             let path = paseo_client::resolve_home(Some(first))?;
             if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
                 open_desktop(&[path.to_string_lossy().into_owned()]).await?;
                 return Ok(0);
             }
         }
-    }
     if args
         .first()
         .is_some_and(|s| s == "--relay" || s == "--no-relay")
@@ -434,8 +433,8 @@ fn desktop_application() -> Result<PathBuf> {
         } else {
             &["paseo-sessions", "paseo_sessions"]
         };
-        if runtime.file_name().is_some_and(|name| name == "runtime") {
-            if let Some(parent) = runtime.parent() {
+        if runtime.file_name().is_some_and(|name| name == "runtime")
+            && let Some(parent) = runtime.parent() {
                 let bundled = parent.join(if cfg!(windows) {
                     "paseo_sessions.exe"
                 } else {
@@ -445,7 +444,6 @@ fn desktop_application() -> Result<PathBuf> {
                     return Ok(bundled);
                 }
             }
-        }
         if let Some(search) = std::env::var_os("PATH") {
             for directory in std::env::split_paths(&search) {
                 for name in names {

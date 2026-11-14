@@ -74,7 +74,7 @@ fn parse_extra_ca(bytes: &[u8]) -> Result<Vec<Certificate>, &'static str> {
         }
         let length = BEGIN.len() + end + END.len();
         certificates
-            .push(Certificate::from_pem(rest[..length].as_bytes()).map_err(|_| INVALID_CA)?);
+            .push(Certificate::from_pem(&rest.as_bytes()[..length]).map_err(|_| INVALID_CA)?);
         rest = rest[length..].trim();
     }
     if certificates.is_empty() {

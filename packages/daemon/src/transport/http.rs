@@ -297,13 +297,12 @@ impl Handler {
         {
             return error(StatusCode::FORBIDDEN, "Host not allowed");
         }
-        if let Some(origin) = header(&request, "origin") {
-            if !policy::allowed_origin(origin, config, &self.listen)
+        if let Some(origin) = header(&request, "origin")
+            && !policy::allowed_origin(origin, config, &self.listen)
                 && !header(&request, "host").is_some_and(|host| policy::same_origin(origin, host))
             {
                 return error(StatusCode::FORBIDDEN, "Origin not allowed");
             }
-        }
         let valid_connection = header(&request, "connection").is_some_and(|value| {
             value
                 .split(',')
@@ -409,11 +408,10 @@ impl Handler {
             };
         }
         let sse = method == "POST";
-        if sse {
-            if let Some(response) = mcp_media_error(request.headers()) {
+        if sse
+            && let Some(response) = mcp_media_error(request.headers()) {
                 return response;
             }
-        }
         let body = match body_json(request).await {
             Ok(value) => value,
             Err(response) => return response,
@@ -456,7 +454,7 @@ impl Handler {
                 tokio::select! {
                     _ = service_token.cancelled() => break,
                     update = updates_rx.recv(), if !updates_rx.is_closed() || !updates_rx.is_empty() => {
-                        if let Some(update) = update { if events_tx.send(McpEvent::Update(update)).await.is_err() { break; } }
+                        if let Some(update) = update && events_tx.send(McpEvent::Update(update)).await.is_err() { break; }
                     }
                     response = &mut request => {
                         while let Ok(update) = updates_rx.try_recv() { if events_tx.send(McpEvent::Update(update)).await.is_err() { return; } }

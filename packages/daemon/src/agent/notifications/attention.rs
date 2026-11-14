@@ -116,15 +116,14 @@ impl FinishSubscriptions {
             assistant.as_deref(),
             permission,
         );
-        if decision.push {
-            if let Err(error) = self.push.enqueue(notification.clone()).await {
+        if decision.push
+            && let Err(error) = self.push.enqueue(notification.clone()).await {
                 tracing::warn!(
                     ?error,
                     agent_id = id,
                     "Failed to schedule push notification"
                 );
             }
-        }
         let notify_source = decision
             .recipient
             .map(|index| notification_sources[index].source_id());
@@ -183,8 +182,8 @@ impl FinishSubscriptions {
         if let Some(workspace) = terminal["workspaceId"].as_str().filter(|s| !s.is_empty()) {
             data["workspaceId"] = json!(workspace);
         }
-        if decision.push {
-            if let Err(error) = self
+        if decision.push
+            && let Err(error) = self
                 .push
                 .enqueue(json!({"title":title,"body":body,"data":data}))
                 .await
@@ -195,7 +194,6 @@ impl FinishSubscriptions {
                     "Failed to schedule terminal push notification"
                 );
             }
-        }
         let mut payload = data;
         payload["reason"] = json!(reason);
         payload["title"] = json!(title);

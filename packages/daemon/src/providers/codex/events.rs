@@ -219,8 +219,8 @@ impl CodexSession {
             .as_ref()
             .filter(|id| s.thread.as_ref() != Some(*id))
             .cloned();
-        if let Some(id) = &child {
-            if !s.children.contains_key(id) {
+        if let Some(id) = &child
+            && !s.children.contains_key(id) {
                 if !matches!(
                     method.as_str(),
                     "paseo/transportClosed" | "serverRequest/resolved" | "thread/started"
@@ -238,7 +238,6 @@ impl CodexSession {
                     return Ok((events, replay));
                 }
             }
-        }
         match method.as_str() {
             "paseo/transportClosed" => {
                 let active = s.foreground.is_some() || s.native_turn.is_some();
@@ -256,15 +255,14 @@ impl CodexSession {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in discarded {
-                    if let Some(pending) = s.pending.remove(&id) {
-                        if pending.method == "plan" {
+                    if let Some(pending) = s.pending.remove(&id)
+                        && pending.method == "plan" {
                             let mut event = json!({"type":"timeline","item":permissions::plan_timeline(&pending,Some("canceled"))});
                             if let Some(turn) = pending.params["turnId"].as_str() {
                                 event["turnId"] = json!(turn);
                             }
                             events.push(event);
                         }
-                    }
                 }
                 s.foreground = None;
                 s.native_turn = None;
@@ -321,8 +319,8 @@ impl CodexSession {
                     for _ in s.compactions.drain() {
                         events.push(json!({"type":"timeline","item":{"type":"compaction","status":"completed"}}));
                     }
-                    if status == "completed" && s.config["featureValues"]["plan_mode"] == true {
-                        if let Some(text) = s.last_plan.take() {
+                    if status == "completed" && s.config["featureValues"]["plan_mode"] == true
+                        && let Some(text) = s.last_plan.take() {
                             let previous: Vec<_> = s
                                 .pending
                                 .values()
@@ -353,7 +351,6 @@ impl CodexSession {
                             );
                             s.pending.insert(id, pending);
                         }
-                    }
                     if status == "interrupted" {
                         for request in s.async_questions.pending(&self.spec.id) {
                             if let Some(id) = request["id"].as_str() {
@@ -438,11 +435,10 @@ impl CodexSession {
                 if !done && matches!(kind.as_str(), "agentMessage" | "reasoning") {
                     return Ok((events, replay));
                 }
-                if done && child.is_none() {
-                    if let Some(request) = s.async_questions.receive(&self.spec.id, &raw) {
+                if done && child.is_none()
+                    && let Some(request) = s.async_questions.receive(&self.spec.id, &raw) {
                         events.push(json!({"type":"permission_requested","request":request}));
                     }
-                }
                 if kind == "contextCompaction" || kind == "context_compaction" {
                     if done {
                         s.compactions.remove(&key);
@@ -577,15 +573,14 @@ impl CodexSession {
                         }
                     }
                     for id in projection::child_threads(&raw) {
-                        if kind == "subAgentActivity" {
-                            if let Some(existing) = s.child_tools.get(&id) {
+                        if kind == "subAgentActivity"
+                            && let Some(existing) = s.child_tools.get(&id) {
                                 let mut original = existing.clone();
                                 original["status"] = item["status"].clone();
                                 original["detail"]["subAgentType"] =
                                     item["detail"]["subAgentType"].clone();
                                 item = original;
                             }
-                        }
                         let mut upsert = json!({"type":"upsert","id":id,
                             "title":item["detail"]["subAgentType"].as_str().unwrap_or("Codex subagent"),
                             "description":item["detail"]["description"],
@@ -602,21 +597,19 @@ impl CodexSession {
                         }
                     }
                     if item["type"] == "assistant_message" && child.is_none() {
-                        if s.assistant_boundary && !s.text.contains_key(&key) {
-                            if let Some(text) = item["text"].as_str() {
+                        if s.assistant_boundary && !s.text.contains_key(&key)
+                            && let Some(text) = item["text"].as_str() {
                                 item["text"] = json!(format!("\n\n---\n\n{text}"));
                             }
-                        }
                         s.assistant_boundary = done;
                     }
-                    if item["name"] == "request_user_input_async" {
-                        if let Some(reconciled) = s
+                    if item["name"] == "request_user_input_async"
+                        && let Some(reconciled) = s
                             .async_questions
                             .timeline(item["callId"].as_str().unwrap_or(""))
                         {
                             item = reconciled;
                         }
-                    }
                     events.push(timeline(child.as_deref(), item));
                 }
             }

@@ -356,17 +356,17 @@ mod tests {
             }];
         }
         let source = |id: &str| {
-            RequestContext::attach(
-                id.into(),
-                "session".into(),
-                "same-client".into(),
-                json!({}),
-                json!({"kind":"owner"}),
-                Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
-                false,
-                None,
-                CancellationToken::new(),
-            )
+            RequestContext::attach(crate::transport::SourceConfig {
+                id: id.into(),
+                session_id: "session".into(),
+                client_id: "same-client".into(),
+                capabilities: json!({}),
+                principal: json!({"kind":"owner"}),
+                permissions: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+                routed: false,
+                app_version: None,
+                cancel: CancellationToken::new(),
+            })
         };
         let (first, _first_output) = source("physical-one");
         let (replacement, _replacement_output) = source("physical-two");

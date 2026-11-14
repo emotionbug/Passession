@@ -397,11 +397,9 @@ pub async fn sessions_dir(
     if family == "omp"
         && cfg!(any(target_os = "linux", target_os = "macos"))
         && (profile.is_some()
-            || !env
-                .get("PI_CODING_AGENT_DIR")
-                .is_some_and(|s| !s.trim().is_empty()))
-    {
-        if let Some(xdg) = env.get("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+            || env
+                .get("PI_CODING_AGENT_DIR").is_none_or(|s| s.trim().is_empty()))
+        && let Some(xdg) = env.get("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
             let mut root = Path::new(xdg).join("omp");
             if let Some(profile) = &profile {
                 root = root.join("profiles").join(profile);
@@ -410,7 +408,6 @@ pub async fn sessions_dir(
                 return Ok(root.join("sessions"));
             }
         }
-    }
     Ok(agent.join("sessions"))
 }
 
@@ -465,11 +462,10 @@ pub async fn discover(
     let root = sessions_dir(family, env, options).await?;
     let mut ranked = Vec::new();
     for file in files(&root).await {
-        if let Ok(meta) = fs::metadata(&file).await {
-            if let Ok(mtime) = meta.modified() {
+        if let Ok(meta) = fs::metadata(&file).await
+            && let Ok(mtime) = meta.modified() {
                 ranked.push((file, mtime));
             }
-        }
     }
     ranked.sort_by(|a, b| b.1.cmp(&a.1));
     let limit = options["limit"].as_u64().unwrap_or(20) as usize;
@@ -550,11 +546,10 @@ pub async fn resolve_session_file(
             .is_some_and(|s| s.to_string_lossy().ends_with(&suffix))
     });
     for file in files {
-        if let Ok((head, _, _)) = chunks(&file).await {
-            if header(family, &head).is_some_and(|h| h["id"] == handle) {
+        if let Ok((head, _, _)) = chunks(&file).await
+            && header(family, &head).is_some_and(|h| h["id"] == handle) {
                 return Ok(Some(file));
             }
-        }
     }
     Ok(None)
 }
@@ -588,9 +583,8 @@ async fn active_entries_with_coverage(path: &Path, active_entry_id: Option<&str>
         .filter_map(|(i, e)| e["id"].as_str().map(|id| (id, i)))
         .collect();
     complete &= by_id.len() == entries.len();
-    if let Some(id) = active_entry_id.filter(|id| !id.is_empty()) {
-        if !by_id.contains_key(id) { return Ok((Vec::new(), false)); }
-    }
+    if let Some(id) = active_entry_id.filter(|id| !id.is_empty())
+        && !by_id.contains_key(id) { return Ok((Vec::new(), false)); }
     let parents: HashSet<_> = entries
         .iter()
         .filter_map(|e| e["parentId"].as_str())
@@ -673,10 +667,10 @@ fn entry_message(family: &str, entry: &Value) -> Option<Value> {
         {
             return None;
         }
-        if role == "developer" {
-            if let Some(content) = message["content"].as_array().filter(|c| c.len() == 1) {
-                if content[0]["type"] == "text" {
-                    if let Some(text) = content[0]["text"].as_str() {
+        if role == "developer"
+            && let Some(content) = message["content"].as_array().filter(|c| c.len() == 1)
+                && content[0]["type"] == "text"
+                    && let Some(text) = content[0]["text"].as_str() {
                         let text = text.trim();
                         if text.ends_with("</system-reminder>")
                             && text.strip_prefix("<system-reminder").is_some_and(|s| {
@@ -687,9 +681,6 @@ fn entry_message(family: &str, entry: &Value) -> Option<Value> {
                             return None;
                         }
                     }
-                }
-            }
-        }
         return Some(fallback_message(role, message));
     }
     if entry["type"] == "custom_message" {
@@ -912,14 +903,13 @@ fn project(
             let event = transcript.upsert(provider, transcript.status, &title, timestamp);
             push_event(&mut history, event);
         }
-        if append_todo {
-            if let Some(todo) = todo_state(entries) {
+        if append_todo
+            && let Some(todo) = todo_state(entries) {
                 push_event(
                     &mut history,
                     json!({"type":"timeline","provider":provider,"item":todo}),
                 );
             }
-        }
     } else {
         for child in mapper.drain_child_sessions() {
             if let Some(event) = pi_child_source(provider, &child) {
@@ -1010,7 +1000,7 @@ async fn omp_child_history(
                 None
             }
         })
-        .last();
+        .next_back();
     let descriptor = describe("omp", path).await?.unwrap_or(Value::Null);
     let child = project("omp", provider, path, descriptor, &entries, complete, false, None, true);
     let coverage = if child.complete {
@@ -1127,8 +1117,8 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
     for message in messages {
         if message["role"] == "assistant" {
             for block in message["content"].as_array().into_iter().flatten() {
-                if block["type"] == "toolCall" && block["name"] == "task" {
-                    if let Some(id) = block["id"].as_str() {
+                if block["type"] == "toolCall" && block["name"] == "task"
+                    && let Some(id) = block["id"].as_str() {
                         calls.insert(
                             id,
                             block["arguments"]["agent"]
@@ -1136,15 +1126,13 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
                                 .unwrap_or("OMP subagent"),
                         );
                     }
-                }
             }
         }
         for (id, status) in omp_task_completions(message) {
-            if let Some(index) = children.get(id) {
-                if out[*index].status == "running" {
+            if let Some(index) = children.get(id)
+                && out[*index].status == "running" {
                     out[*index].status = status;
                 }
-            }
         }
         if message["role"] != "toolResult" || message["toolName"] != "task" {
             continue;

@@ -290,11 +290,10 @@ pub async fn operation_base(
             .and_then(Value::as_str)
             .or_else(|| m.get("baseRefName").and_then(Value::as_str))
     });
-    if let (Some(stored), Some(requested)) = (stored, requested) {
-        if stored != requested && branch_name(stored) != requested {
+    if let (Some(stored), Some(requested)) = (stored, requested)
+        && stored != requested && branch_name(stored) != requested {
             bail!("Base ref mismatch: stored {stored}, requested {requested}");
         }
-    }
     if let Some(base) = stored.or(requested) {
         safe_ref(base)?;
         return Ok(Some(base.to_string()));

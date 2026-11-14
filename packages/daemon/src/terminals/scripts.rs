@@ -119,8 +119,8 @@ impl Scripts {
             .and_then(|git| git["currentBranch"].as_str())
             .or_else(|| workspace["branch"].as_str())
             .map(str::to_owned);
-        if let Some(id) = workspace["projectId"].as_str() {
-            if let Some(project) = app.projects.project(id).await? {
+        if let Some(id) = workspace["projectId"].as_str()
+            && let Some(project) = app.projects.project(id).await? {
                 let root = project["rootPath"]
                     .as_str()
                     .ok_or_else(|| anyhow!("Project rootPath missing"))?;
@@ -131,7 +131,6 @@ impl Scripts {
                 );
                 return Ok((slug, branch));
             }
-        }
         let remote = git
             .filter(|git| git["isGit"].as_bool() == Some(true))
             .and_then(|git| git["remoteUrl"].as_str());
@@ -346,13 +345,12 @@ impl Scripts {
                 .into_iter()
                 .flatten()
                 {
-                    if let Some(existing) = self.route(hostname) {
-                        if existing["workspaceId"] != id || existing["scriptName"] != name {
+                    if let Some(existing) = self.route(hostname)
+                        && (existing["workspaceId"] != id || existing["scriptName"] != name) {
                             bail!(
                                 "Another workspace is already serving \"{name}\" at {hostname}. Stop that service or run this one on a different branch to free the address."
                             );
                         }
-                    }
                 }
             }
         }
@@ -757,11 +755,10 @@ impl Scripts {
 }
 pub(crate) async fn wait_ready(terminal: &Arc<Terminal>) {
     let mut events = terminal.subscribe();
-    if let Ok((lines, _)) = terminal.capture(None, None, true).await {
-        if lines.iter().any(|line| !line.trim().is_empty()) {
+    if let Ok((lines, _)) = terminal.capture(None, None, true).await
+        && lines.iter().any(|line| !line.trim().is_empty()) {
             return;
         }
-    }
     let _ = tokio::time::timeout(Duration::from_millis(1500), async {
         loop {
             match events.recv().await {

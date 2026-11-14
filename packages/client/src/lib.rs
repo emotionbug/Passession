@@ -269,11 +269,10 @@ impl<T: Clone> ClientEvents<T> {
 }
 impl DaemonClient {
     pub async fn connect(options: ConnectOptions, cancel: CancellationToken) -> Result<Self> {
-        if let DaemonTarget::Endpoint { host } = &options.target {
-            if is_registration(host) {
+        if let DaemonTarget::Endpoint { host } = &options.target
+            && is_registration(host) {
                 return Self::connect_registration(options, cancel).await;
             }
-        }
         Self::connect_direct(options, cancel).await
     }
     async fn connect_direct(options: ConnectOptions, cancel: CancellationToken) -> Result<Self> {
@@ -462,7 +461,25 @@ impl DaemonClient {
                 let work=async{loop{tokio::select!{
                     _=task_cancel.cancelled()=>break,
                     frame=outgoing.recv()=>{let Some(frame)=frame else{break};match frame {HostFrame::Text(data)=>sender.json(json!({"type":"session","message":{"type":"hosts.route.frame.request","routeId":routing_id,"data":data,"binary":false}})).await?,HostFrame::Binary(bytes)=>sender.frame(HostFrame::Binary(crate::transport::encode_frame(&routing_id,&bytes)?)).await?,HostFrame::Flush(reply)=>{let result=sender.flush().await;let failed=result.is_err();let _=reply.send(result);if failed{bail!("Host output flush failed");}},HostFrame::Close{..}=>break}},
-                    event=events.recv()=>{let event=event?;if event["payload"]["subscriptionId"]!=routing_id{continue;}if event["type"]=="hosts.route.closed"{bail!("{}",event["payload"]["message"].as_str().unwrap_or("Connected host closed"));}if event["type"]=="hosts.route.frame"{let data=event["payload"]["data"].as_str().ok_or_else(||anyhow!("Invalid routed host frame"))?;tokio::select!{_=task_cancel.cancelled()=>break,result=incoming_tx.send(Ok(HostFrame::Text(data.into())))=>{result.map_err(|_|anyhow!("Routed host client closed"))?;}}}},
+                    event = events.recv() => {
+                        let event = event?;
+                        if event["payload"]["subscriptionId"] != routing_id {
+                            continue;
+                        }
+                        if event["type"] == "hosts.route.closed" {
+                            bail!("{}", event["payload"]["message"].as_str().unwrap_or("Connected host closed"));
+                        }
+                        if event["type"] == "hosts.route.frame" {
+                            let data = event["payload"]["data"].as_str()
+                                .ok_or_else(|| anyhow!("Invalid routed host frame"))?;
+                            tokio::select! {
+                                _ = task_cancel.cancelled() => break,
+                                result = incoming_tx.send(Ok(HostFrame::Text(data.into()))) => {
+                                    result.map_err(|_| anyhow!("Routed host client closed"))?;
+                                }
+                            }
+                        }
+                    },
                     frame=binary.recv()=>{let frame=frame?;if frame.first()!=Some(&0x30){continue;}let(id,offset)=crate::transport::decode_frame(&frame)?;if id==routing_id{tokio::select!{_=task_cancel.cancelled()=>break,result=incoming_tx.send(Ok(HostFrame::Binary(frame.slice(offset..))))=>{result.map_err(|_|anyhow!("Routed host client closed"))?;}}}}
                 }}Ok::<(),anyhow::Error>(())};
                 let result=tokio::select!{biased;_=task_cancel.cancelled()=>Ok(()),result=work=>result};

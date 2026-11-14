@@ -153,11 +153,16 @@ fn default_command(
     }
 }
 
+pub(super) struct BuiltEntries {
+    pub entries: Vec<Arc<ProviderEntry>>,
+    pub muse: Vec<Arc<MuseProvider>>,
+}
+
 pub(super) fn entries(
     app: &AppState,
     config: &Value,
     previous: &[Arc<ProviderEntry>],
-) -> Result<(Vec<Arc<ProviderEntry>>, Vec<Arc<MuseProvider>>)> {
+) -> Result<BuiltEntries> {
     let overrides = &config["providerOverrides"];
     let settings = &config["agentProviderSettings"];
     let environment = app.config.environment();
@@ -249,9 +254,8 @@ pub(super) fn entries(
                     .ok_or_else(|| anyhow!("Custom provider '{id}' requires a label"))
             };
             let mut entry = if base_id == "acp" {
-                if !override_value["command"]
-                    .as_array()
-                    .is_some_and(|command| !command.is_empty())
+                if override_value["command"]
+                    .as_array().is_none_or(|command| command.is_empty())
                 {
                     bail!("ACP provider '{id}' requires a command");
                 }
@@ -412,5 +416,5 @@ pub(super) fn entries(
             identity,
         }));
     }
-    Ok((entries, muse))
+    Ok(BuiltEntries { entries, muse })
 }

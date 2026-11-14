@@ -194,7 +194,7 @@ pub(super) fn apply_patch(file: &mut Value, bytes: &[u8], path: &str) -> Result<
         let mut additions = 0u64;
         let mut deletions = 0u64;
         for line in section.split('\n') {
-            if line.starts_with("@@ ") {
+            if let Some(header) = line.strip_prefix("@@ ") {
                 if let Some(previous) = hunk.take() {
                     hunks.push(previous);
                 }
@@ -204,7 +204,7 @@ pub(super) fn apply_patch(file: &mut Value, bytes: &[u8], path: &str) -> Result<
                     range(fields.next().context("Missing old hunk range")?, '-')?;
                 let (new_start, new_count) =
                     range(fields.next().context("Missing new hunk range")?, '+')?;
-                let end = line[3..]
+                let end = header
                     .find(" @@")
                     .map(|n| n + 6)
                     .context("Missing hunk header end")?;
@@ -312,11 +312,10 @@ pub(super) fn patch_format(bytes: &[u8]) -> PatchFormat {
             "core.abbrev" => {
                 if value.trim().eq_ignore_ascii_case("no") {
                     full = true;
-                } else if let Ok(n) = value.trim().parse::<usize>() {
-                    if (4..=64).contains(&n) {
+                } else if let Ok(n) = value.trim().parse::<usize>()
+                    && (4..=64).contains(&n) {
                         result.abbreviation = n;
                     }
-                }
             }
             _ => {}
         }

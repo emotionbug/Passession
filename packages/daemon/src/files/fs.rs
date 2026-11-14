@@ -132,13 +132,13 @@ pub fn revision(_file: &File, metadata: &Metadata) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        return Ok(format!(
+        Ok(format!(
             "{}:{}:{}:{}",
             metadata.dev(),
             metadata.ino(),
             metadata.len(),
             i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec())
-        ));
+        ))
     }
     #[cfg(windows)]
     {
@@ -447,7 +447,7 @@ fn decode_base64(content: &str) -> Result<Vec<u8>> {
         .take_while(|c| *c != '=')
     {
         ensure!(
-            clean.len() < ((EDIT_LIMIT as usize + 2) / 3) * 4,
+            clean.len() < (EDIT_LIMIT as usize).div_ceil(3) * 4,
             "File is too large to edit"
         );
         clean.push(c);

@@ -155,11 +155,9 @@ impl Inner {
         };
         if matches!(event["type"].as_str(), Some("timeline" | "usage_updated"))
             && event.get("turnId").is_none()
-        {
-            if let Some(turn) = turn {
+            && let Some(turn) = turn {
                 event["turnId"] = json!(turn);
             }
-        }
         if replay {
             if event["type"] == "timeline" {
                 self.state.lock().unwrap().history.push(event);
@@ -330,11 +328,10 @@ impl Inner {
                     flush = s.pending_user.take();
                 }
                 if let Some(pending) = s.pending_user.as_mut() {
-                    if pending.get("messageId").is_none() {
-                        if let Some(id) = update["messageId"].as_str().filter(|id| !id.is_empty()) {
+                    if pending.get("messageId").is_none()
+                        && let Some(id) = update["messageId"].as_str().filter(|id| !id.is_empty()) {
                             pending["messageId"] = json!(id);
                         }
-                    }
                     let Value::String(combined) = &mut pending["text"] else {
                         unreachable!("ACP user message text invariant")
                     };
@@ -501,8 +498,8 @@ impl Inner {
         }
         self.validate_owner(&params)?;
         let auto = self.state.lock().unwrap().config["featureValues"]["auto_accept"] == true;
-        if auto && !chooser(&params["options"]) {
-            if let Some(option) =
+        if auto && !chooser(&params["options"])
+            && let Some(option) =
                 permission_option(&params["options"], &json!({"behavior":"allow"}))?
             {
                 return self
@@ -513,7 +510,6 @@ impl Inner {
                     )
                     .await;
             }
-        }
         let request_id = id();
         let snapshot = {
             let s = self.state.lock().unwrap();
@@ -681,8 +677,8 @@ impl Inner {
         {
             self.rpc.cancel.cancel();
         }
-        if !released && !self.rpc.cancel.is_cancelled() {
-            if let Some(session) = session {
+        if !released && !self.rpc.cancel.is_cancelled()
+            && let Some(session) = session {
                 if active {
                     let _ = tokio::time::timeout(
                         Duration::from_secs(2),
@@ -705,7 +701,6 @@ impl Inner {
                         .await;
                 }
             }
-        }
         let terminals: Vec<_> = self
             .state
             .lock()
@@ -1016,7 +1011,11 @@ impl AcpProvider {
                 let capabilities=inner.agent_capabilities.lock().unwrap();
                 if capabilities["loadSession"]==true{"session/load"}else if capabilities["sessionCapabilities"].get("resume").is_some_and(|v|!v.is_null()&&v!=false){"session/resume"}else{bail!("{} does not support ACP session resume",self.spec.id);}
             }else{"session/new"};
-            {let mut s=inner.state.lock().unwrap();s.opening=!resumed;s.replay=method=="session/load";}
+            {
+                let mut s = inner.state.lock().unwrap();
+                s.opening = !resumed;
+                s.replay = method == "session/load";
+            }
             let request=inner.rpc.call(method,params);
             let response=if probe&&!resumed{refresh_activity("session/new",request).await?}else{request.await?};
             if !resumed {
@@ -1033,24 +1032,22 @@ impl AcpProvider {
             let mut caps=self.capabilities.clone();caps["supportsMcpServers"]=json!(supports_mcp);
             let session=AcpSession{inner:inner.clone(),capabilities:caps,initial:Vec::new()};
             if !probe&&!history{
-                if let Some(mode)=config["modeId"].as_str(){if inner.state.lock().unwrap().mode.as_deref()!=Some(mode){session.set_mode(mode).await?;}}
+                if let Some(mode)=config["modeId"].as_str()&& inner.state.lock().unwrap().mode.as_deref()!=Some(mode){session.set_mode(mode).await?;}
                 let mut switched=false;
-                if let Some(model)=config["model"].as_str(){
-                    if inner.state.lock().unwrap().model.as_deref()!=Some(model){
+                if let Some(model)=config["model"].as_str()
+                    && inner.state.lock().unwrap().model.as_deref()!=Some(model){
                         match session.set_model(Some(model)).await{
                             Ok(())=>switched=true,
                             Err(error) if error.to_string()==format!("{} does not expose ACP model selection",self.spec.id)=>tracing::warn!(provider=%self.spec.id,"ACP model selection unavailable; retaining provider default"),
                             Err(error)=>return Err(error),
                         }
                     }
-                }
-                if let Some(thinking)=config["thinkingOptionId"].as_str(){if inner.state.lock().unwrap().thinking.as_deref()!=Some(thinking){session.set_thinking_option(Some(thinking)).await?;}}
+                if let Some(thinking)=config["thinkingOptionId"].as_str()&& inner.state.lock().unwrap().thinking.as_deref()!=Some(thinking){session.set_thinking_option(Some(thinking)).await?;}
                 if let Some(values)=config["featureValues"].as_object(){for(key,value)in values{
-                    if key=="auto_accept"||self.spec.family=="cursor"&&key=="fast"||self.spec.family=="copilot"&&key=="agent"{
-                        if let Err(error)=session.set_feature(key,value.clone()).await {
+                    if (key=="auto_accept"||self.spec.family=="cursor"&&key=="fast"||self.spec.family=="copilot"&&key=="agent")
+                        && let Err(error)=session.set_feature(key,value.clone()).await {
                             if error.to_string().contains("does not expose ACP feature")||switched&&error.downcast_ref::<RpcError>().is_some_and(|e|e.code==-32602){tracing::warn!(provider=%self.spec.id,feature=%key,error=%error,"ACP stale feature preference not applicable to selected model");}else{return Err(error);}
                         }
-                    }
                 }}
             }
             if history{
@@ -1694,7 +1691,13 @@ impl AgentProvider for AcpProvider {
             let mut sessions=Vec::new();let mut scanned=0;let mut cursor=None;let mut seen=HashSet::new();
             loop{
                 if scanned>=scan_limit||sessions.len()>=limit{break;}
-                let mut params=json!({});if let Some(cursor)=&cursor{params["cursor"]=json!(cursor);}if let Some(cwd)=options.get("cwd"){params["cwd"]=cwd.clone();}
+                let mut params = json!({});
+                if let Some(cursor) = &cursor {
+                    params["cursor"] = json!(cursor);
+                }
+                if let Some(cwd) = options.get("cwd") {
+                    params["cwd"] = cwd.clone();
+                }
                 let page=inner.rpc.call("session/list",params).await?;
                 for session in array(&page["sessions"]){
                     if scanned>=scan_limit||sessions.len()>=limit{break;}scanned+=1;

@@ -62,11 +62,10 @@ pub(crate) fn valid_allocation(v: &Value) -> bool {
     if o.keys().any(|k| k != "range" && k != "portScript") || o.is_empty() {
         return false;
     }
-    if let Some(p) = o.get("portScript") {
-        if p.as_str().is_none_or(|s| s.trim().is_empty()) {
+    if let Some(p) = o.get("portScript")
+        && p.as_str().is_none_or(|s| s.trim().is_empty()) {
             return false;
         }
-    }
     if let Some(r) = o.get("range") {
         let Some((a, b)) = r.as_str().and_then(|s| s.trim().split_once('-')) else {
             return false;

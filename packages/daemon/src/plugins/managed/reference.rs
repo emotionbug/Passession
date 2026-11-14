@@ -131,13 +131,12 @@ pub fn is_commit(value: &str) -> bool {
 }
 
 pub fn redact(remote: &str) -> String {
-    if let Ok(mut url) = url::Url::parse(remote) {
-        if matches!(url.scheme(), "http" | "https" | "ssh" | "git" | "file") {
+    if let Ok(mut url) = url::Url::parse(remote)
+        && matches!(url.scheme(), "http" | "https" | "ssh" | "git" | "file") {
             let _ = url.set_username("");
             let _ = url.set_password(None);
             return url.into();
         }
-    }
     remote.to_owned()
 }
 

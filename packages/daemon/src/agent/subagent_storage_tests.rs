@@ -334,9 +334,9 @@ fn deleting_finished_children_removes_them_and_skips_running_or_unknown() {
         message(&mut store, root, "parent", id, 1);
     }
     let ids = ["done", "broke", "busy", "ghost", "done"].map(str::to_owned);
-    let (deleted, skipped) = store.delete_persisted(root, "parent", &ids).unwrap();
-    assert_eq!(deleted, ["done", "broke"]);
-    assert_eq!(skipped, [("busy".to_owned(), "running".to_owned()), ("ghost".to_owned(), "unknown".to_owned())]);
+    let result = store.delete_persisted(root, "parent", &ids).unwrap();
+    assert_eq!(result.deleted, ["done", "broke"]);
+    assert_eq!(result.skipped, [("busy".to_owned(), "running".to_owned()), ("ghost".to_owned(), "unknown".to_owned())]);
     assert!(!timeline_path(root, "parent", "done").try_exists().unwrap());
     assert!(timeline_path(root, "parent", "busy").try_exists().unwrap());
     assert!(store.fetch_persisted(root, "parent", "done", &json!({})).is_err());
@@ -344,9 +344,9 @@ fn deleting_finished_children_removes_them_and_skips_running_or_unknown() {
     let mut restarted = SubagentStore::default();
     assert_eq!(listed(&mut restarted, root, "parent"), 1);
     // A parent without stored children has nothing to delete.
-    let (deleted, skipped) = restarted.delete_persisted(root, "nobody", &["x".to_owned()]).unwrap();
-    assert!(deleted.is_empty());
-    assert_eq!(skipped, [("x".to_owned(), "unknown".to_owned())]);
+    let result = restarted.delete_persisted(root, "nobody", &["x".to_owned()]).unwrap();
+    assert!(result.deleted.is_empty());
+    assert_eq!(result.skipped, [("x".to_owned(), "unknown".to_owned())]);
 }
 
 /// Provider history re-ingested after a daemon restart or agent resume, and

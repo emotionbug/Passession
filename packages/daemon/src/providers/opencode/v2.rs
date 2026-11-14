@@ -12,7 +12,7 @@ use super::{
     runtime::{Runtime, RuntimeManager},
 };
 use crate::providers::api::{
-    AgentSession, EventSink, HistoryCoverage, LaunchContext, ProviderSpec, RewindTarget,
+    AgentSession, EventSink, HistoryCoverage, ProviderSpec, RewindTarget,
     SubagentHistoryRequest, subagent_row,
 };
 use anyhow::{Result, anyhow, bail};
@@ -255,16 +255,13 @@ impl Drop for V2Session {
         self.cancel.cancel();
     }
 }
-pub async fn attach(
+pub(super) async fn attach(
     runtime: Arc<Runtime>,
     manager: Arc<RuntimeManager>,
     spec: ProviderSpec,
-    info: Value,
-    mut config: Value,
-    context: LaunchContext,
-    options: Value,
-    sink: EventSink,
+    launch: super::SessionLaunch,
 ) -> Result<Arc<dyn AgentSession>> {
+    let super::SessionLaunch { info, mut config, context, options, sink } = launch;
     let id = s(&info, "id").to_owned();
     if id.is_empty() {
         bail!("OpenCode session response omitted its id");
@@ -286,11 +283,11 @@ pub async fn attach(
         id: id.clone(),
         capabilities: json!({"supportsStreaming":true,"supportsSessionPersistence":true,"supportsSessionListing":true,"supportsDynamicModes":true,"supportsMcpServers":true,"supportsReasoningStream":true,"supportsToolInvocations":true,"supportsRewindBoth":true,"supportsRewindConversation":false,"supportsRewindFiles":false}),
         initial,
-        snapshot: snapshot.clone(),
+        snapshot,
         sender,
         cancel: cancel.clone(),
-        closed: closed.clone(),
-        close_error: close_error.clone(),
+        closed,
+        close_error,
     });
     // Registered before the actor starts publishing: a child opened while the
     // session initializes queues its replay behind initialization, in-stream.
@@ -303,15 +300,8 @@ pub async fn attach(
         runtime,
         manager,
         id,
-        info,
-        config,
-        context,
-        options,
-        sink,
-        snapshot,
-        cancel.clone(),
-        closed,
-        close_error,
+        super::SessionLaunch { info, config, context, options, sink },
+        &facade,
     );
     let (ready, initialized) = oneshot::channel();
     tokio::spawn(actor.run(receiver, ready));

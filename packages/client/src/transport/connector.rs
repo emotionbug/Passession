@@ -155,8 +155,24 @@ impl Connection {
                         message=socket.next()=>{
                             match message.ok_or_else(||anyhow!("Host security transport closed"))?? {
                                 Message::Ping(bytes)=>socket.send(Message::Pong(bytes)).await?,
-                                Message::Text(text)=>{let update=channel.receive(Frame::Text(text.to_string()))?;if let Some(frame)=update.outbound{socket.send(to_message(frame)).await?;}if update.opened.is_some(){break;}},
-                                Message::Binary(bytes)=>{let update=channel.receive(Frame::Binary(bytes.to_vec()))?;if let Some(frame)=update.outbound{socket.send(to_message(frame)).await?;}if update.opened.is_some(){break;}},
+                                Message::Text(text) => {
+                                    let update = channel.receive(Frame::Text(text.to_string()))?;
+                                    if let Some(frame) = update.outbound {
+                                        socket.send(to_message(frame)).await?;
+                                    }
+                                    if update.opened.is_some() {
+                                        break;
+                                    }
+                                },
+                                Message::Binary(bytes) => {
+                                    let update = channel.receive(Frame::Binary(bytes.to_vec()))?;
+                                    if let Some(frame) = update.outbound {
+                                        socket.send(to_message(frame)).await?;
+                                    }
+                                    if update.opened.is_some() {
+                                        break;
+                                    }
+                                },
                                 Message::Close(_)=>bail!("Host security transport closed"), _=>{}
                             }
                         }
@@ -345,15 +361,13 @@ async fn open(
         }
     };
     let mut request = url.into_client_request()?;
-    if target.security.is_none() {
-        if let Some(password) = &target.password {
-            if password.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+    if target.security.is_none()
+        && let Some(password) = &target.password
+            && password.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
                 request
                     .headers_mut()
                     .insert("authorization", format!("Bearer {password}").parse()?);
             }
-        }
-    }
     if let Some(stream) = stream {
         Ok(Box::new(
             tokio_tungstenite::client_async_with_config(request, stream, Some(config))

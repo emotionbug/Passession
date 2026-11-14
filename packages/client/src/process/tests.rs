@@ -280,16 +280,32 @@ mod unix {
 
     #[tokio::test]
     async fn deadline_during_partial_json_write_preserves_ambiguity_and_closes_stream() {
-        let (process, _stdout) = ManagedProcess::spawn(shell("sleep 30")).await.unwrap();
+        let (process, stdout) = ManagedProcess::spawn(shell(
+            "dd bs=1 count=1 of=/dev/null 2>/dev/null; printf 'ready\\n'; exec sleep 30",
+        )).await.unwrap();
         let value = serde_json::json!({"payload": "x".repeat(8 * 1024 * 1024)});
-        let error = process.write_json_with_deadline(
+        let cancel = CancellationToken::new();
+        let write = process.write_json_with_deadline(
             &value,
-            Some(tokio::time::Instant::now() + Duration::from_millis(300)),
-            &CancellationToken::new(),
-        ).await.unwrap_err();
+            Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+            &cancel,
+        );
+        tokio::pin!(write);
+        let mut lines = BufReader::new(stdout).lines();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                result = &mut write => panic!("write ended before the pipe filled: {result:?}"),
+                line = lines.next_line() => assert_eq!(line.unwrap().as_deref(), Some("ready")),
+            }
+        }).await.unwrap();
+        // Expire only after the child proves that part of the frame reached stdin.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let error = write.await.unwrap_err();
+        tokio::time::resume();
         let error = error.downcast_ref::<WriteError>().unwrap();
         assert!(error.attempted);
-        assert!(error.written > 0 && error.written < error.total);
+        assert!(error.written > 0 && error.written < error.total, "{error}");
         assert_eq!(error.source.kind(), std::io::ErrorKind::TimedOut);
         tokio::time::timeout(Duration::from_secs(3), process.wait()).await.unwrap().unwrap();
         let next = process.write_bytes(b"next\n").await.unwrap_err();
@@ -386,11 +402,10 @@ mod unix {
             ));
             let pid = tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
-                    if let Ok(value) = tokio::fs::read_to_string(&pid_file).await {
-                        if let Ok(pid) = value.parse::<u32>() {
+                    if let Ok(value) = tokio::fs::read_to_string(&pid_file).await
+                        && let Ok(pid) = value.parse::<u32>() {
                             break pid;
                         }
-                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })

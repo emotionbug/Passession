@@ -1,22 +1,22 @@
 use super::*;
 
 fn make_source(id: &str, modern: bool) -> (RequestContext, mpsc::Receiver<context::QueuedFrame>) {
-    RequestContext::attach(
-        id.into(),
-        "same-session".into(),
-        "same-client".into(),
-        json!({"owned_subscriptions":modern}),
-        json!({"id":"owner","kind":"owner"}),
-        Arc::new(RwLock::new(
+    RequestContext::attach(SourceConfig {
+        id: id.into(),
+        session_id: "same-session".into(),
+        client_id: "same-client".into(),
+        capabilities: json!({"owned_subscriptions":modern}),
+        principal: json!({"id":"owner","kind":"owner"}),
+        permissions: Arc::new(RwLock::new(
             permissions::OWNER_PERMISSIONS
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
         )),
-        false,
-        None,
-        CancellationToken::new(),
-    )
+        routed: false,
+        app_version: None,
+        cancel: CancellationToken::new(),
+    })
 }
 fn make_request(source: &RequestContext, kind: &str, id: &str) -> RequestContext {
     source.for_request(json!({"type":kind,"requestId":id}))

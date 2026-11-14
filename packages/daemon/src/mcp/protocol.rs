@@ -85,14 +85,13 @@ impl McpService {
         caller: Option<&str>,
         authorization: Option<&str>,
     ) -> Result<Authority> {
-        if let Some(token) = authorization.and_then(crate::transport::extract_http_bearer_token) {
-            if let Some(grant) = self.grants.read().await.get(token).cloned() {
+        if let Some(token) = authorization.and_then(crate::transport::extract_http_bearer_token)
+            && let Some(grant) = self.grants.read().await.get(token).cloned() {
                 if grant.cancel.is_cancelled() || caller != Some(grant.agent_id.as_str()) {
                     return Err(anyhow!("Unauthorized"));
                 }
                 return Ok(Authority::Agent(grant));
             }
-        }
         // A run's caller cannot be chosen by query string under owner credentials.
         // Owner tools use owner scope, and run capabilities bind exact agent IDs.
         if caller.is_none()
@@ -201,15 +200,13 @@ impl McpService {
             return Some(rpc_error(id, -32600, "Invalid Request", None));
         }
         let method = method.unwrap();
-        if request.get("id").is_none() {
-            return None;
-        }
+        request.get("id")?;
         let (caller, policy) = match authority {
             Authority::Agent(grant) => (Some(grant.agent_id.as_str()), grant.policy.as_ref()),
             Authority::Owner => (None, None),
         };
-        if let Authority::Agent(grant) = authority {
-            if grant.cancel.is_cancelled() {
+        if let Authority::Agent(grant) = authority
+            && grant.cancel.is_cancelled() {
                 return Some(rpc_error(
                     id,
                     -32000,
@@ -217,7 +214,6 @@ impl McpService {
                     None,
                 ));
             }
-        }
         let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
         if !params.is_object() {
             return Some(rpc_error(

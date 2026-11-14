@@ -92,19 +92,19 @@ async fn timeline_request_as(
     id: &str,
     options: Value,
 ) -> Value {
-    let (source, mut output) = RequestContext::attach(
-        "saved-history-source".into(),
-        "saved-history-session".into(),
-        "saved-history-client".into(),
+    let (source, mut output) = RequestContext::attach(crate::transport::SourceConfig {
+        id: "saved-history-source".into(),
+        session_id: "saved-history-session".into(),
+        client_id: "saved-history-client".into(),
         capabilities,
-        json!({"id":"owner","kind":"owner"}),
-        Arc::new(std::sync::RwLock::new(
+        principal: json!({"id":"owner","kind":"owner"}),
+        permissions: Arc::new(std::sync::RwLock::new(
             ["workspace.read".to_owned()].into_iter().collect(),
         )),
         routed,
-        None,
-        CancellationToken::new(),
-    );
+        app_version: None,
+        cancel: CancellationToken::new(),
+    });
     let mut message = json!({
         "type":"fetch_agent_timeline_request","requestId":"history","agentId":id,"projection":"projected"
     });

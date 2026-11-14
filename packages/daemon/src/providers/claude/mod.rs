@@ -667,13 +667,11 @@ fn remember_anchor(anchors: &mut Vec<(String, Option<String>)>, frame: &Value) {
         if !tool_result && !anchors.iter().any(|a| a.0 == id) {
             anchors.push((id.to_owned(), None));
         }
-    } else if frame["type"] == "assistant"
-        || (frame["type"] == "stream_event" && frame["event"]["type"] == "message_start")
-    {
-        if let Some(anchor) = anchors.last_mut() {
+    } else if (frame["type"] == "assistant"
+        || (frame["type"] == "stream_event" && frame["event"]["type"] == "message_start"))
+        && let Some(anchor) = anchors.last_mut() {
             anchor.1 = Some(id.to_owned());
         }
-    }
 }
 
 impl ClaudeSession {
@@ -697,14 +695,13 @@ impl ClaudeSession {
             if state.closed {
                 bail!("Claude session is closed");
             }
-            if let Some(runtime) = &state.runtime {
-                if !state.restart
+            if let Some(runtime) = &state.runtime
+                && (!state.restart
                     || state.active_generation.as_deref() == Some(runtime.generation.as_str())
-                    || state.projection.is_autonomous()
+                    || state.projection.is_autonomous())
                 {
                     return Ok(runtime.clone());
                 }
-            }
             (
                 state.runtime.take(),
                 state.config.clone(),
@@ -799,10 +796,9 @@ impl ClaudeSession {
     async fn runtime_failed(&self, runtime: &Transport, error: String) {
         let mut events = {
             let mut state = self.state.lock().unwrap();
-            if !state
+            if state
                 .runtime
-                .as_ref()
-                .is_some_and(|r| r.generation == runtime.generation)
+                .as_ref().is_none_or(|r| r.generation != runtime.generation)
             {
                 return;
             }
@@ -945,12 +941,11 @@ impl ClaudeSession {
                     }
                 }
                 if frame["type"] == "command_lifecycle" {
-                    if frame["state"] != "queued" {
-                        if let Some(id) = frame["command_uuid"].as_str() {
+                    if frame["state"] != "queued"
+                        && let Some(id) = frame["command_uuid"].as_str() {
                             state.unstarted.remove(id);
                             state.clearing_steers.remove(id);
                         }
-                    }
                     if frame["state"] == "started" {
                         state.main_running = true;
                     }
@@ -1050,7 +1045,7 @@ impl AgentSession for ClaudeSession {
     async fn start_turn(&self, prompt: Value, options: Value) -> Result<Value> {
         if prompt
             .as_str()
-            .is_some_and(|text| text.trim().split_whitespace().next() == Some("/rewind"))
+            .is_some_and(|text| text.split_whitespace().next() == Some("/rewind"))
         {
             return self.rewind_command(&prompt).await;
         }
@@ -1310,17 +1305,15 @@ impl AgentSession for ClaudeSession {
             runtime.close().await?;
         }
         let _ = self.emit(events).await;
-        if self.persist == Some(false) {
-            if let Some(id) = id {
-                if let Ok(path) = storage::transcript_path(&cwd, &id, &self.env).await {
+        if self.persist == Some(false)
+            && let Some(id) = id
+                && let Ok(path) = storage::transcript_path(&cwd, &id, &self.env).await {
                     match tokio::fs::remove_file(path).await {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
-            }
-        }
         Ok(())
     }
     async fn list_commands(&self) -> Result<Vec<Value>> {

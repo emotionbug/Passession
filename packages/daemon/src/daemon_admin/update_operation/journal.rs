@@ -65,11 +65,10 @@ pub(super) async fn current(home: &Path) -> Result<Option<Operation>> {
 
 pub(super) async fn read(home: &Path, operation_id: &str) -> Result<Option<Operation>> {
     validate_id(operation_id)?;
-    if let Some(operation) = current(home).await? {
-        if operation.operation_id == operation_id {
+    if let Some(operation) = current(home).await?
+        && operation.operation_id == operation_id {
             return Ok(Some(operation));
         }
-    }
     let archived = load(&history_path(home, operation_id), home).await?;
     if let Some(operation) = &archived {
         ensure!(operation.operation_id == operation_id, "Archived update identity mismatch");

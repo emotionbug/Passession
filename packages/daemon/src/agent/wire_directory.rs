@@ -581,39 +581,6 @@ fn ordered(entries: Vec<Value>, sort: &[Value]) -> Vec<(Value, Value)> {
     entries
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn cursor_tiebreaker_avoids_losing_equal_timestamps() {
-        let entries = vec![
-            json!({"agent":{"id":"b","updatedAt":"2026-01-01T00:00:00Z"}}),
-            json!({"agent":{"id":"a","updatedAt":"2026-01-01T00:00:00Z"}}),
-        ];
-        let first = paginate(entries.clone(), &json!({"page":{"limit":1}})).unwrap();
-        assert_eq!(first["entries"][0]["agent"]["id"], "a");
-        let second = paginate(
-            entries,
-            &json!({"page":{"cursor":first["pageInfo"]["nextCursor"],"limit":1}}),
-        )
-        .unwrap();
-        assert_eq!(second["entries"][0]["agent"]["id"], "b");
-        assert_eq!(second["pageInfo"]["hasMore"], false);
-    }
-    #[test]
-    fn cursor_rejects_changed_sort() {
-        let token = URL_SAFE_NO_PAD.encode(
-            br#"{"sort":[{"key":"title","direction":"asc"}],"values":{"title":"a"},"id":"a"}"#,
-        );
-        assert_eq!(
-            paginate(vec![], &json!({"page":{"cursor":token}}))
-                .unwrap_err()
-                .to_string(),
-            "fetch_agents cursor does not match current sort"
-        );
-    }
-}
-
 pub(crate) async fn legacy_attention_eligible(
     manager: &AgentManager,
     context: &RequestContext,
@@ -645,4 +612,37 @@ pub(crate) async fn legacy_attention_eligible(
         agent_directory_includes(&agent, workspace.as_ref(), background)
             && matches_agent_updates_filter(&agent, &project, request.get("filter"))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cursor_tiebreaker_avoids_losing_equal_timestamps() {
+        let entries = vec![
+            json!({"agent":{"id":"b","updatedAt":"2026-01-01T00:00:00Z"}}),
+            json!({"agent":{"id":"a","updatedAt":"2026-01-01T00:00:00Z"}}),
+        ];
+        let first = paginate(entries.clone(), &json!({"page":{"limit":1}})).unwrap();
+        assert_eq!(first["entries"][0]["agent"]["id"], "a");
+        let second = paginate(
+            entries,
+            &json!({"page":{"cursor":first["pageInfo"]["nextCursor"],"limit":1}}),
+        )
+        .unwrap();
+        assert_eq!(second["entries"][0]["agent"]["id"], "b");
+        assert_eq!(second["pageInfo"]["hasMore"], false);
+    }
+    #[test]
+    fn cursor_rejects_changed_sort() {
+        let token = URL_SAFE_NO_PAD.encode(
+            br#"{"sort":[{"key":"title","direction":"asc"}],"values":{"title":"a"},"id":"a"}"#,
+        );
+        assert_eq!(
+            paginate(vec![], &json!({"page":{"cursor":token}}))
+                .unwrap_err()
+                .to_string(),
+            "fetch_agents cursor does not match current sort"
+        );
+    }
 }

@@ -17,6 +17,14 @@ use tokio_util::sync::CancellationToken;
 
 const LIMIT: usize = 64 * 1024;
 const MARKER: &str = "\n...<output truncated in the middle>...\n";
+
+struct CommandEnvironment<'a> {
+    observation: Option<(&'a str, &'a Value)>,
+    directory: &'a Path,
+    env: BTreeMap<String, String>,
+    kind: &'a str,
+}
+
 #[derive(Default)]
 struct Output {
     head: Vec<u8>,
@@ -176,11 +184,10 @@ impl Setup {
                 .transport
                 .publish_event(json!({"type":"workspace_setup_progress","payload":payload}))
                 .await;
-            if status_changed {
-                if let Err(error) = app.projects.publish_workspace(id).await {
+            if status_changed
+                && let Err(error) = app.projects.publish_workspace(id).await {
                     tracing::warn!(%error,workspace_id=id,"Failed to publish workspace setup status");
                 }
-            }
         }
     }
     pub async fn start(&self, id: &str) -> Result<Value> {
@@ -363,29 +370,24 @@ impl Setup {
             None
         };
         self.execute_commands(
-            observation,
-            &directory,
-            env,
+            CommandEnvironment { observation, directory: &directory, env, kind },
             authored_commands,
             cancel,
             commands,
             truncated,
-            kind,
         )
         .await?;
         Ok(config)
     }
     async fn execute_commands(
         &self,
-        observation: Option<(&str, &Value)>,
-        directory: &Path,
-        env: BTreeMap<String, String>,
+        environment: CommandEnvironment<'_>,
         authored_commands: Vec<String>,
         cancel: &CancellationToken,
         commands: &mut Vec<Value>,
         truncated: &mut bool,
-        kind: &str,
     ) -> Result<()> {
+        let CommandEnvironment { observation, directory, env, kind } = environment;
         for (index, command) in authored_commands.into_iter().enumerate() {
             if cancel.is_cancelled() {
                 bail!("Worktree {kind} cancelled");
@@ -518,14 +520,11 @@ impl Setup {
         drop(app);
         sanitize_environment(&mut env);
         self.execute_commands(
-            None,
-            directory,
-            env,
+            CommandEnvironment { observation: None, directory, env, kind: "teardown" },
             commands,
             &cancel,
             &mut Vec::new(),
             &mut false,
-            "teardown",
         )
         .await
     }
@@ -678,9 +677,9 @@ mod tests {
         let mut truncated = false;
         let result = setup
             .execute_commands(
-                None,
-                directory.path(),
-                env,
+                CommandEnvironment {
+                    observation: None, directory: directory.path(), env, kind: "teardown",
+                },
                 vec![
                     "printf 'out\\n'; printf 'err\\n' >&2; exit 7".into(),
                     "touch should-not-exist".into(),
@@ -688,7 +687,6 @@ mod tests {
                 &CancellationToken::new(),
                 &mut commands,
                 &mut truncated,
-                "teardown",
             )
             .await;
         assert!(
@@ -716,14 +714,13 @@ mod tests {
         assert!(
             setup
                 .execute_commands(
-                    None,
-                    directory.path(),
-                    env,
+                    CommandEnvironment {
+                        observation: None, directory: directory.path(), env, kind: "teardown",
+                    },
                     vec!["kill -TERM $$".into()],
                     &CancellationToken::new(),
                     &mut commands,
                     &mut false,
-                    "teardown"
                 )
                 .await
                 .is_err()

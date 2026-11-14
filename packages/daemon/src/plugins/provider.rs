@@ -196,7 +196,7 @@ impl PluginProvider {
                 let mut request = json!({}); if let Some(launch) = launch { request["launch"] = launch; }
                 let status = self.worker.request(json!({"type":"provider.status","providerId":self.registration_id(),"request":request}),cancel.clone()).await?;
                 let available = status["available"].as_bool().context("Invalid provider availability status")?;
-                if !available && !status["diagnostic"].as_str().is_some_and(|text|!text.is_empty()) { bail!("Unavailable provider omitted diagnostic"); }
+                if !available && status["diagnostic"].as_str().is_none_or(|text| text.is_empty()) { bail!("Unavailable provider omitted diagnostic"); }
                 if status.get("diagnostic").is_some_and(|value|!value.is_string()) { bail!("Invalid provider status diagnostic"); }
                 let mut output = json!({"available":available}); mapping::copy(&status,"diagnostic",&mut output,"diagnostic");
                 return Ok(output);

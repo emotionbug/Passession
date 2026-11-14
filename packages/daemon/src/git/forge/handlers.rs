@@ -302,15 +302,14 @@ impl ForgeEngine {
             };
             payload["forge"] = resolution.forge.clone().into();
             // GitHub's throwing auth probe runs before the PR lookup (`loadForgeSnapshot`).
-            if resolution.forge == "github" {
-                if let Err(error) = self
+            if resolution.forge == "github"
+                && let Err(error) = self
                     .execute(cwd, "isAuthenticated", &json!({}), env, cancel.clone())
                     .await
                 {
                     probe_failed = true;
                     return Err(error);
                 }
-            }
             let Some(lookup) = self.lookup_target(cwd, env, cancel.clone()).await? else {
                 // `getUnavailablePullRequestStatus`: a Paseo-owned worktree without a lookup
                 // target is an authenticated "no PR"; any other checkout has no branch to ask.

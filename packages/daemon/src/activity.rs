@@ -53,11 +53,10 @@ fn curate_projected<'a>(
     let mut entries = vec![];
     for item in items {
         let kind = str_field(item, "type");
-        if let Some(kinds) = options["includeKinds"].as_array() {
-            if !kinds.iter().any(|k| k == kind) {
+        if let Some(kinds) = options["includeKinds"].as_array()
+            && !kinds.iter().any(|k| k == kind) {
                 continue;
             }
-        }
         match kind {
             "user_message" => push(
                 &mut entries,
@@ -251,11 +250,10 @@ pub fn build_fork_context(input: &Value) -> Result<Value> {
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let selected: Vec<&Value> = if cursor.is_some() || message_id.is_some() {
-        if let Some(boundary) = boundary {
-            if boundary["cursor"]["epoch"] != boundary["timelineEpoch"] {
+        if let Some(boundary) = boundary
+            && boundary["cursor"]["epoch"] != boundary["timelineEpoch"] {
                 bail!("Selected timeline position is no longer available.");
             }
-        }
         let index = if let Some(cursor) = cursor {
             rows.iter().position(|r| r["seqEnd"] == cursor["seq"])
         } else {

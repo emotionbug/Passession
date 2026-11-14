@@ -41,15 +41,14 @@ pub(super) fn result(value: &Value) -> Result<()> {
 fn request_meta(value: &Value) -> Result<()> {
     if let Some(meta) = value.get("_meta") {
         object(meta)?;
-        if let Some(token) = meta.get("progressToken") {
-            if !(token.is_string()
+        if let Some(token) = meta.get("progressToken")
+            && !(token.is_string()
                 || token
                     .as_i64()
                     .is_some_and(|id| id.unsigned_abs() <= 9_007_199_254_740_991))
             {
                 bail!("MCP progressToken must be a string or safe integer");
             }
-        }
         if let Some(task) = meta.get("io.modelcontextprotocol/related-task") {
             object(task)?;
             string(task, "taskId")?;
@@ -71,15 +70,14 @@ pub(super) fn rpc(value: &Value) -> Result<()> {
     if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         bail!("MCP JSON-RPC version must be 2.0");
     }
-    if let Some(id) = value.get("id") {
-        if !(id.is_string()
+    if let Some(id) = value.get("id")
+        && !(id.is_string()
             || id
                 .as_i64()
                 .is_some_and(|id| id.unsigned_abs() <= 9_007_199_254_740_991))
         {
             bail!("MCP JSON-RPC id must be a string or safe integer");
         }
-    }
     if value.get("method").is_some() {
         string(value, "method")?;
         optional(value, "params", Value::is_object)?;
@@ -157,11 +155,10 @@ fn metadata(value: &Value) -> Result<()> {
             string(icon, "src")?;
             optional(icon, "mimeType", Value::is_string)?;
             optional(icon, "sizes", string_array)?;
-            if let Some(theme) = icon.get("theme") {
-                if !matches!(theme.as_str(), Some("light" | "dark")) {
+            if let Some(theme) = icon.get("theme")
+                && !matches!(theme.as_str(), Some("light" | "dark")) {
                     bail!("MCP icon theme must be light or dark")
                 }
-            }
         }
     }
     Ok(())
@@ -260,20 +257,18 @@ fn content(value: &Value) -> Result<()> {
     optional(value, "_meta", Value::is_object)?;
     if let Some(annotations) = value.get("annotations") {
         object(annotations)?;
-        if let Some(audience) = annotations.get("audience") {
-            if !audience.as_array().is_some_and(|items| {
+        if let Some(audience) = annotations.get("audience")
+            && !audience.as_array().is_some_and(|items| {
                 items
                     .iter()
                     .all(|item| matches!(item.as_str(), Some("user" | "assistant")))
             }) {
                 bail!("MCP content audience must contain user or assistant roles");
             }
-        }
-        if let Some(priority) = annotations.get("priority") {
-            if !priority.as_f64().is_some_and(|n| (0.0..=1.0).contains(&n)) {
+        if let Some(priority) = annotations.get("priority")
+            && !priority.as_f64().is_some_and(|n| (0.0..=1.0).contains(&n)) {
                 bail!("MCP content priority must be between zero and one")
             }
-        }
         if let Some(modified) = annotations.get("lastModified") {
             let text = modified
                 .as_str()
@@ -334,7 +329,7 @@ fn base64(text: &str) -> Result<()> {
             _ => bail!("MCP content is not base64"),
         }
     }
-    if data % 4 == 1 || (padding > 0 && ((data + padding) % 4 != 0 || data == 0)) {
+    if data % 4 == 1 || (padding > 0 && (!(data + padding).is_multiple_of(4) || data == 0)) {
         bail!("MCP content is not base64");
     }
     Ok(())

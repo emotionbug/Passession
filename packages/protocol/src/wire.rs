@@ -156,10 +156,9 @@ impl SessionMessage {
 impl<'de> Deserialize<'de> for SessionMessage {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let fields = Map::<String, Value>::deserialize(d)?;
-        if !fields
+        if fields
             .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
+            .and_then(Value::as_str).is_none_or(|s| s.is_empty())
         {
             return Err(serde::de::Error::custom("message type is required"));
         }
@@ -282,11 +281,9 @@ fn validate_semantics(value: &Value) -> Result<(), ProtocolError> {
         let payload = &value["payload"];
         if let (Some(agent_id), Some(nested_id)) =
             (payload["agentId"].as_str(), payload["agent"]["id"].as_str())
-        {
-            if agent_id != nested_id {
+            && agent_id != nested_id {
                 return Err(ProtocolError::Invalid("hub agent correlation"));
             }
-        }
     }
     if value["type"] == "browser.automation.execute.request" {
         let command = value.get("command").unwrap_or(value);
@@ -301,15 +298,14 @@ fn validate_semantics(value: &Value) -> Result<(), ProtocolError> {
                     return Err(ProtocolError::Invalid("wait condition"));
                 }
             }
-            if matches!(command["command"].as_str(), Some("new_tab" | "navigate")) {
-                if let Some(raw) = args["url"].as_str() {
+            if matches!(command["command"].as_str(), Some("new_tab" | "navigate"))
+                && let Some(raw) = args["url"].as_str() {
                     let url =
                         url::Url::parse(raw).map_err(|_| ProtocolError::Invalid("browser URL"))?;
                     if !matches!(url.scheme(), "http" | "https") {
                         return Err(ProtocolError::Invalid("browser URL"));
                     }
                 }
-            }
         }
     }
     Ok(())

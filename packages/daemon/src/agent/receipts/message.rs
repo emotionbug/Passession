@@ -325,11 +325,10 @@ impl MessageReceipts {
             Some(bytes) => Some(parse(&bytes, &path)?),
             None => None,
         };
-        if let Some(record) = &record {
-            if record.agent_id != agent_id || record.message_id != message_id {
+        if let Some(record) = &record
+            && (record.agent_id != agent_id || record.message_id != message_id) {
                 bail!("Message receipt identity mismatch");
             }
-        }
         Ok(project(agent_id, message_id, record.as_ref()))
     }
     /// Receipt updates, published only after the durable write.
@@ -369,11 +368,10 @@ impl MessageReceipts {
         let fingerprint = digest(request)?;
         let _lock = self.inner.operations.lock(&key).await;
         let record = self.inner.load(&key, agent_id, message_id).await?;
-        if let Some(record) = &record {
-            if let Some(admission) = self.existing(&key, agent_id, message_id, record, &fingerprint)? {
+        if let Some(record) = &record
+            && let Some(admission) = self.existing(&key, agent_id, message_id, record, &fingerprint)? {
                 return Ok(admission);
             }
-        }
         let mut record =
             record.unwrap_or_else(|| Record::new(agent_id, message_id, Some(fingerprint)));
         record.error = None;
@@ -396,11 +394,10 @@ impl MessageReceipts {
         if record.fingerprint.as_deref() != Some(fingerprint) {
             return Err(SendReceiptError { message: KEY_CONFLICT.to_owned(), receipt }.into());
         }
-        if in_flight(&record.phase) {
-            if let Some(settled) = self.inner.settled(key) {
+        if in_flight(&record.phase)
+            && let Some(settled) = self.inner.settled(key) {
                 return Ok(Some(Admission::Wait(settled)));
             }
-        }
         // Only a proven non-delivery may be attempted again under this identity.
         Ok((record.phase != "not_delivered").then_some(Admission::Replay(receipt)))
     }
@@ -425,11 +422,10 @@ impl MessageReceipts {
         let _lock = self.inner.operations.lock(&key).await;
         let record = self.inner.load(&key, agent_id, message_id).await?;
         if let Some(record) = &record {
-            if let Some(queued) = self.inner.queued(&key) {
-                if !record.dismissed && record.fingerprint.as_deref() == Some(fingerprint.as_str()) {
+            if let Some(queued) = self.inner.queued(&key)
+                && !record.dismissed && record.fingerprint.as_deref() == Some(fingerprint.as_str()) {
                     return Ok(QueuedAdmission::Duplicate(queued));
                 }
-            }
             match self.existing(&key, agent_id, message_id, record, &fingerprint)? {
                 Some(Admission::Replay(receipt)) => return Ok(QueuedAdmission::Replay(receipt)),
                 Some(_) => {

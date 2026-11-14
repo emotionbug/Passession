@@ -13,11 +13,10 @@ fn native_lock_excludes_node_compatible_writer_before_any_worker_start() {
     assert_eq!(serialized["desktopManaged"], true);
     assert!(serialized["processStartIdentity"].is_string());
     assert!(
-        !std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(home.path().join("paseo.pid"))
-            .is_ok()
+            .open(home.path().join("paseo.pid")).is_err()
     );
     assert!(lock::PidLock::acquire(home.path(), false).is_err());
     lock.publish(Some("127.0.0.1:4242".into()), Some("server".into()))

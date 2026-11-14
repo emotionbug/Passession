@@ -174,11 +174,10 @@ pub fn serialize_connection_uri(
     if parts.use_tls {
         url.query_pairs_mut().append_pair("ssl", "true");
     }
-    if include_password {
-        if let Some(password) = &parts.password {
+    if include_password
+        && let Some(password) = &parts.password {
             url.query_pairs_mut().append_pair("password", password);
         }
-    }
     Ok(url.into())
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

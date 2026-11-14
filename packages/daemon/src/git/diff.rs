@@ -598,14 +598,14 @@ pub(crate) async fn shortstat(
     let env = readonly(env);
     let comparison = if let Some(base) = base.filter(|base| base != branch) {
         if base.starts_with("refs/heads/") || base.starts_with("refs/remotes/") {
-            if !command::exists(&cwd, &base, &env, cancel.clone()).await? {
+            if !command::exists(cwd, &base, &env, cancel.clone()).await? {
                 return Ok(None);
             }
             base
         } else {
             let name = command::branch_name(&base);
             if command::exists(
-                &cwd,
+                cwd,
                 &format!("refs/remotes/origin/{name}"),
                 &env,
                 cancel.clone(),
@@ -613,7 +613,7 @@ pub(crate) async fn shortstat(
             .await?
             {
                 format!("origin/{name}")
-            } else if command::exists(&cwd, &format!("refs/heads/{name}"), &env, cancel.clone())
+            } else if command::exists(cwd, &format!("refs/heads/{name}"), &env, cancel.clone())
                 .await?
             {
                 name.to_owned()
@@ -623,7 +623,7 @@ pub(crate) async fn shortstat(
         }
     } else {
         if !command::exists(
-            &cwd,
+            cwd,
             &format!("refs/remotes/origin/{branch}"),
             &env,
             cancel.clone(),
@@ -635,7 +635,7 @@ pub(crate) async fn shortstat(
         format!("origin/{branch}")
     };
     let merge = command::run(
-        &cwd,
+        cwd,
         &args(&["merge-base", "HEAD", &comparison]),
         &env,
         cancel.clone(),
@@ -652,7 +652,7 @@ pub(crate) async fn shortstat(
         return Ok(None);
     }
     let tracked = git(
-        &cwd,
+        cwd,
         &args(&[
             "diff",
             "--no-ext-diff",
@@ -679,7 +679,7 @@ pub(crate) async fn shortstat(
         previous = word;
     }
     let paths = git(
-        &cwd,
+        cwd,
         &args(&["ls-files", "-z", "--others", "--exclude-standard"]),
         &env,
         &cancel,

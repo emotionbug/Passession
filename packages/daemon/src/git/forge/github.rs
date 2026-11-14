@@ -186,11 +186,10 @@ impl Context<'_> {
     async fn github_current(&self, input: &Value) -> Result<Value> {
         let head = required(input, "headRef")?;
         let mut selected = None;
-        if let Some(view) = self.github_try_view(strings(&["pr", "view"])).await? {
-            if matches_head(&view, input, s(input, "headRepositoryOwner")) {
+        if let Some(view) = self.github_try_view(strings(&["pr", "view"])).await?
+            && matches_head(&view, input, s(input, "headRepositoryOwner")) {
                 selected = Some(view);
             }
-        }
         if selected.is_none() {
             let mut owner = s(input, "headRepositoryOwner").to_owned();
             let mut candidates = Vec::new();
@@ -213,8 +212,9 @@ impl Context<'_> {
                         .json_array(vec!["api".into(), format!("repos/{parent}/pulls?{query}")])
                         .await?;
                     let mut refs: Vec<_> = array(&refs).iter().collect();
+                    let head_sha = s(input, "headSha");
                     refs.sort_by_key(|v| {
-                        !(s(input, "headSha") != "" && s(&v["head"], "sha") == s(input, "headSha"))
+                        head_sha.is_empty() || s(&v["head"], "sha") != head_sha
                     });
                     for row in refs.into_iter().take(3) {
                         if let Some(view) = self
@@ -545,6 +545,7 @@ fn matches_head(v: &Value, input: &Value, owner: &str) -> bool {
 pub(super) fn choose(mut values: Vec<Value>, input: &Value, owner: &str) -> Option<Value> {
     values.retain(|v| matches_head(v, input, owner));
     // `getPullRequestStateRank`: open or draft first, then merged, then closed.
+    let head_sha = s(input, "headSha");
     values.sort_by_key(|v| {
         (
             match raw_state(v).as_str() {
@@ -553,7 +554,7 @@ pub(super) fn choose(mut values: Vec<Value>, input: &Value, owner: &str) -> Opti
                 "merged" => 1,
                 _ => 2,
             },
-            !(s(input, "headSha") != "" && s(v, "headRefOid") == s(input, "headSha")),
+            head_sha.is_empty() || s(v, "headRefOid") != head_sha,
         )
     });
     values.into_iter().next()

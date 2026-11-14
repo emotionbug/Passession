@@ -134,53 +134,6 @@ fn project_fields(source: &Value, keys: &[&str]) -> Value {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn strips_private_configuration_and_mcp_handles() {
-        let result = snapshot_payload(
-            &json!({"id":"a","config":{"model":"m","env":{"SECRET":"value"},"title":"Title"},"owner":{"token":"private"},"persistence":{"provider":"claude","sessionId":"s","metadata":{"mcpServers":{"password":"secret"},"cwd":"/tmp"}},"runtimeInfo":{"provider":"claude","sessionId":"s","thinkingOptionId":"  high  "},"lifecycle":"idle"}),
-        );
-        assert!(result.get("config").is_none());
-        assert!(result.get("owner").is_none());
-        assert_eq!(result["persistence"]["metadata"], json!({"cwd":"/tmp"}));
-        assert_eq!(result["effectiveThinkingOptionId"], "high");
-        assert_eq!(result["title"], "Title");
-    }
-    #[test]
-    fn explicit_runtime_null_overrides_configured_thinking() {
-        let result = snapshot_payload(
-            &json!({"config":{"thinkingOptionId":"high"},"runtimeInfo":{"thinkingOptionId":null},"lastStatus":"closed","labels":{"valid":"yes","invalid":3}}),
-        );
-        assert!(result["effectiveThinkingOptionId"].is_null());
-        assert_eq!(result["labels"], json!({"valid":"yes"}));
-        assert!(result.get("activeTurn").is_none());
-    }
-    #[test]
-    fn unavailable_stored_provider_does_not_advertise_resumption() {
-        let result = snapshot_payload(
-            &json!({"_live":false,"_providerAvailable":false,"lifecycle":"closed","status":"closed","persistence":{"provider":"removed-provider","sessionId":"session"},"features":[{"id":"private"}]}),
-        );
-        assert_eq!(result["providerUnavailable"], true);
-        assert!(result["persistence"].is_null());
-        assert!(result.get("features").is_none());
-        assert!(result.get("activeTurn").is_none());
-    }
-    #[test]
-    fn stream_projection_excludes_internal_lifecycle_events() {
-        assert!(
-            serialize_stream_event(
-                &json!({"type":"runtime_info","provider":"claude","private":"value"})
-            )
-            .is_none()
-        );
-        let event = serialize_stream_event(&json!({"type":"turn_completed","provider":"claude","turnId":"turn","timestamp":"internal","usage":{"inputTokens":1}})).unwrap();
-        assert!(event.get("timestamp").is_none());
-        assert_eq!(event["usage"]["inputTokens"], 1);
-    }
-}
-
 pub(crate) fn serialize_stream_event(event: &Value) -> Option<Value> {
     let fields: &[&str] = match event["type"].as_str()? {
         "thread_started" => &["type", "provider", "sessionId"],
@@ -265,4 +218,51 @@ pub(crate) fn project_legacy_event(
         _ => return None,
     }
     Some(projected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn strips_private_configuration_and_mcp_handles() {
+        let result = snapshot_payload(
+            &json!({"id":"a","config":{"model":"m","env":{"SECRET":"value"},"title":"Title"},"owner":{"token":"private"},"persistence":{"provider":"claude","sessionId":"s","metadata":{"mcpServers":{"password":"secret"},"cwd":"/tmp"}},"runtimeInfo":{"provider":"claude","sessionId":"s","thinkingOptionId":"  high  "},"lifecycle":"idle"}),
+        );
+        assert!(result.get("config").is_none());
+        assert!(result.get("owner").is_none());
+        assert_eq!(result["persistence"]["metadata"], json!({"cwd":"/tmp"}));
+        assert_eq!(result["effectiveThinkingOptionId"], "high");
+        assert_eq!(result["title"], "Title");
+    }
+    #[test]
+    fn explicit_runtime_null_overrides_configured_thinking() {
+        let result = snapshot_payload(
+            &json!({"config":{"thinkingOptionId":"high"},"runtimeInfo":{"thinkingOptionId":null},"lastStatus":"closed","labels":{"valid":"yes","invalid":3}}),
+        );
+        assert!(result["effectiveThinkingOptionId"].is_null());
+        assert_eq!(result["labels"], json!({"valid":"yes"}));
+        assert!(result.get("activeTurn").is_none());
+    }
+    #[test]
+    fn unavailable_stored_provider_does_not_advertise_resumption() {
+        let result = snapshot_payload(
+            &json!({"_live":false,"_providerAvailable":false,"lifecycle":"closed","status":"closed","persistence":{"provider":"removed-provider","sessionId":"session"},"features":[{"id":"private"}]}),
+        );
+        assert_eq!(result["providerUnavailable"], true);
+        assert!(result["persistence"].is_null());
+        assert!(result.get("features").is_none());
+        assert!(result.get("activeTurn").is_none());
+    }
+    #[test]
+    fn stream_projection_excludes_internal_lifecycle_events() {
+        assert!(
+            serialize_stream_event(
+                &json!({"type":"runtime_info","provider":"claude","private":"value"})
+            )
+            .is_none()
+        );
+        let event = serialize_stream_event(&json!({"type":"turn_completed","provider":"claude","turnId":"turn","timestamp":"internal","usage":{"inputTokens":1}})).unwrap();
+        assert!(event.get("timestamp").is_none());
+        assert_eq!(event["usage"]["inputTokens"], 1);
+    }
 }

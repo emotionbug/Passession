@@ -205,11 +205,9 @@ impl Bridge {
         if bindings
             .get(id)
             .is_some_and(|binding| binding.agent_id == agent_id)
-        {
-            if let Some(binding) = bindings.remove(id) {
+            && let Some(binding) = bindings.remove(id) {
                 binding.cancel.cancel();
             }
-        }
     }
 
     pub fn close(&self) {

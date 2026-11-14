@@ -110,8 +110,8 @@ impl Permissions {
         let method = string(&event["method"]);
         let id = string(&event["id"]);
         if family != "omp" {
-            if let Some(r) = self.rpiv.as_mut() {
-                if matches!(method, "select" | "input") {
+            if let Some(r) = self.rpiv.as_mut()
+                && matches!(method, "select" | "input") {
                     if r.answers.is_none() && !r.cancelled {
                         r.deferred = Some(event.clone());
                     } else {
@@ -119,9 +119,8 @@ impl Permissions {
                     }
                     return None;
                 }
-            }
-            if method == "input" {
-                if let Some((comment, freeform)) = self.pi_pending.as_mut() {
+            if method == "input"
+                && let Some((comment, freeform)) = self.pi_pending.as_mut() {
                     if optional(string(&event["placeholder"])) {
                         self.responses.push(frame(id, json!({"value":comment})));
                         self.pi_pending = None;
@@ -132,7 +131,6 @@ impl Permissions {
                         return None;
                     }
                 }
-            }
         } else if let Some(p) = self.pending.as_mut() {
             if p.editor && method == "editor" && p.custom.is_some() {
                 let value = p.custom.take().unwrap();
@@ -253,8 +251,8 @@ impl Permissions {
         let answer = answers
             .as_object()
             .and_then(|m| m.values().find_map(Value::as_str));
-        if id.starts_with("rpiv-question:") {
-            if let Some(r) = self.rpiv.as_mut() {
+        if id.starts_with("rpiv-question:")
+            && let Some(r) = self.rpiv.as_mut() {
                 r.answers = if allow && answers.is_object() {
                     Some(answers.clone())
                 } else {
@@ -266,7 +264,6 @@ impl Permissions {
                 }
                 return Ok(Value::Null);
             }
-        }
         if req["metadata"]["toolApproval"] == "omp_rpc_ui_tool_approval" {
             return Ok(frame(id, json!({"value":if allow{"Approve"}else{"Deny"}})));
         }
@@ -323,12 +320,12 @@ impl Permissions {
         }
         Ok(frame(
             id,
-            if !allow || answer.is_none() {
-                json!({"cancelled":true})
-            } else if req["metadata"]["extensionUiMethod"] == "confirm" {
-                json!({"confirmed":answer.unwrap().trim().eq_ignore_ascii_case("yes")})
-            } else {
-                json!({"value":answer.unwrap()})
+            match answer.filter(|_| allow) {
+                Some(answer) if req["metadata"]["extensionUiMethod"] == "confirm" => {
+                    json!({"confirmed":answer.trim().eq_ignore_ascii_case("yes")})
+                }
+                Some(answer) => json!({"value":answer}),
+                None => json!({"cancelled":true}),
             },
         ))
     }

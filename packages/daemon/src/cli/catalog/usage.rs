@@ -27,7 +27,36 @@ async fn reports(
     tokio::pin!(response);
     let mut reports = Vec::new();
     loop {
-        tokio::select! {biased;event=events.recv()=>{let event=event?;if event["payload"]["requestId"]!=id{continue;}if event["type"]=="usage.list_reports.update"{reports.push(event["payload"]["report"].clone());}else if event["type"]=="usage.list_reports.response"||event["type"]=="rpc_error"{response.await?;break;}},result=&mut response=>{result?;loop{match events.try_recv(){Ok(event)=>{if event["payload"]["requestId"]==id&&event["type"]=="usage.list_reports.update"{reports.push(event["payload"]["report"].clone());}},Err(tokio::sync::broadcast::error::TryRecvError::Empty)=>break,Err(e)=>return Err(e.into())}}break;}}
+        tokio::select! {
+            biased;
+            event = events.recv() => {
+                let event = event?;
+                if event["payload"]["requestId"] != id {
+                    continue;
+                }
+                if event["type"] == "usage.list_reports.update" {
+                    reports.push(event["payload"]["report"].clone());
+                } else if event["type"] == "usage.list_reports.response" || event["type"] == "rpc_error" {
+                    response.await?;
+                    break;
+                }
+            }
+            result = &mut response => {
+                result?;
+                loop {
+                    match events.try_recv() {
+                        Ok(event) => {
+                            if event["payload"]["requestId"] == id && event["type"] == "usage.list_reports.update" {
+                                reports.push(event["payload"]["report"].clone());
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                break;
+            }
+        }
     }
     Ok(reports)
 }

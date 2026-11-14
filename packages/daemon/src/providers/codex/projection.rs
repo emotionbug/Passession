@@ -253,11 +253,10 @@ fn edit_input(input: &Value) -> Value {
     } else {
         json!({})
     };
-    if string(&result, &["path", "file_path", "filePath"]).is_none() {
-        if let Some((_, p)) = text.lines().find_map(directive) {
+    if string(&result, &["path", "file_path", "filePath"]).is_none()
+        && let Some((_, p)) = text.lines().find_map(directive) {
             result["path"] = p.into();
         }
-    }
     for key in ["patch", "diff", "unified_diff", "unifiedDiff"] {
         result.as_object_mut().unwrap().remove(key);
     }
@@ -710,8 +709,8 @@ fn item_with_images(
             Some(v)
         }
         "agentMessage" => {
-            if raw["delivery"] == "async" && nonempty(raw, &["id"]).is_some() {
-                if let Some(q) = raw["questions"].as_array().filter(|a| {
+            if raw["delivery"] == "async" && nonempty(raw, &["id"]).is_some()
+                && let Some(q) = raw["questions"].as_array().filter(|a| {
                     !a.is_empty()
                         && a.iter().all(|q| {
                             q["title"].as_str().is_some_and(|s| !s.trim().is_empty())
@@ -746,7 +745,6 @@ fn item_with_images(
                         json!({"type":"tool_call","callId":raw["id"],"name":"request_user_input_async","status":"completed","error":null,"detail":{"type":"plain_text","icon":"brain","text":text}}),
                     );
                 }
-            }
             let mut v =
                 json!({"type":"assistant_message","text":raw["text"].as_str().unwrap_or("")});
             put(&mut v, "messageId", nonempty(raw, &["id"]));
@@ -1199,8 +1197,8 @@ pub fn history_with_images(
                     raw["kind"].as_str(),
                     Some("started" | "interacted" | "interrupted")
                 );
-            if activity {
-                if let Some(index) = raw["agentThreadId"]
+            if activity
+                && let Some(index) = raw["agentThreadId"]
                     .as_str()
                     .and_then(|id| children.get(id))
                     .copied()
@@ -1212,15 +1210,13 @@ pub fn history_with_images(
                     }
                     .into();
                     events[index]["item"]["error"] = Value::Null;
-                    if let Some(mapped) = item(raw, true, cwd) {
-                        if mapped["detail"]["subAgentType"].is_string() {
+                    if let Some(mapped) = item(raw, true, cwd)
+                        && mapped["detail"]["subAgentType"].is_string() {
                             events[index]["item"]["detail"]["subAgentType"] =
                                 mapped["detail"]["subAgentType"].clone();
                         }
-                    }
                     continue;
                 }
-            }
             for mut mapped in item_entries_with_images(raw, true, cwd, materialize) {
                 if activity && mapped["type"] == "tool_call" {
                     mapped["status"] = if raw["kind"] == "interrupted" {

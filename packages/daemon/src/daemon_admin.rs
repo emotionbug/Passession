@@ -61,7 +61,7 @@ impl DaemonAdminService {
             "restart_server_request"|"shutdown_server_request"=>{
                 let restart=kind=="restart_server_request";
                 let mut payload=json!({"status":if restart{"restart_requested"}else{"shutdown_requested"},"clientId":context.client_id(),"requestId":request});
-                if restart{if let Some(reason)=message["reason"].as_str().filter(|s|!s.trim().is_empty()){payload["reason"]=json!(reason)}}
+                if restart&& let Some(reason)=message["reason"].as_str().filter(|s|!s.trim().is_empty()){payload["reason"]=json!(reason)}
                 context.send_flushed(json!({"type":"status","payload":payload})).await?;
                 app.request_shutdown(restart);
             }

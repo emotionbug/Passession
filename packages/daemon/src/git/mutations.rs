@@ -417,11 +417,10 @@ pub async fn merge_to_base(
         )
         .await),
     };
-    if operation == root {
-        if let Some(original) = original.filter(|b| b != target) {
+    if operation == root
+        && let Some(original) = original.filter(|b| b != target) {
             let _ = execute(&operation, &["checkout", &original], env, cancel.clone()).await;
         }
-    }
     result?;
     Ok(operation)
 }
@@ -623,8 +622,8 @@ pub async fn push(
         upstream_merge
             .as_deref()
             .and_then(|s| s.strip_prefix("refs/heads/")),
-    ) {
-        if optional(
+    )
+        && optional(
             cwd,
             &["config", "--get", &format!("remote.{remote}.url")],
             env,
@@ -643,7 +642,6 @@ pub async fn push(
             )
             .await;
         }
-    }
     if optional(
         cwd,
         &["config", "--get", "remote.origin.url"],

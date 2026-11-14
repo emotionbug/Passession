@@ -63,11 +63,10 @@ pub async fn read(directory: &Path) -> Result<Value> {
         bail!("Native plugin server.args must be an array of strings without NUL bytes");
     }
     for field in ["name", "description"] {
-        if let Some(value) = object.get(field) {
-            if value.as_str().is_none_or(|s| s.trim().is_empty()) {
+        if let Some(value) = object.get(field)
+            && value.as_str().is_none_or(|s| s.trim().is_empty()) {
                 bail!("Plugin manifest {field} must be a nonempty string");
             }
-        }
     }
     if let Some(value) = object.get("icon") {
         let icon = value.as_str().context("Plugin icon must be a path")?;

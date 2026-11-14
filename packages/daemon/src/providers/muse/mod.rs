@@ -105,14 +105,12 @@ impl MuseProvider {
                 if let Some(usage) = response
                     .as_object_mut()
                     .and_then(|object| object.remove("usage"))
-                {
-                    if newest.as_ref().is_none_or(|old| {
+                    && newest.as_ref().is_none_or(|old| {
                         usage["observedAtMs"].as_f64().unwrap_or(0.)
                             > old["observedAtMs"].as_f64().unwrap_or(0.)
                     }) {
                         newest = Some(usage);
                     }
-                }
             }
             return Ok(newest
                 .map(|usage| json!({"usage":usage}))

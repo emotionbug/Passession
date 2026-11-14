@@ -199,18 +199,16 @@ impl GitService {
                 entry.snapshot.invalidate();
             }
             let generation = entry.snapshot.generation.load(Ordering::Acquire);
-            if let Some((g, value)) = entry.snapshot.value.lock().await.as_ref() {
-                if *g == generation {
+            if let Some((g, value)) = entry.snapshot.value.lock().await.as_ref()
+                && *g == generation {
                     return Ok(value.clone());
                 }
-            }
             let _flight = tokio::select! {_=cancel.cancelled()=>bail!("Git snapshot cancelled"),guard=entry.snapshot.build.lock()=>guard};
             let generation = entry.snapshot.generation.load(Ordering::Acquire);
-            if let Some((g, value)) = entry.snapshot.value.lock().await.as_ref() {
-                if *g == generation {
+            if let Some((g, value)) = entry.snapshot.value.lock().await.as_ref()
+                && *g == generation {
                     return Ok(value.clone());
                 }
-            }
             let env = self.environment()?;
             let (home, config) = {
                 let app = self
@@ -238,13 +236,11 @@ impl GitService {
                 *entry.snapshot.value.lock().await = Some((generation, value.clone()));
             }
             drop(_flight);
-            if published {
-                if let Some(app) = self.app.upgrade() {
-                    if let Err(error) = app.projects.observe_git_snapshot(&value).await {
+            if published
+                && let Some(app) = self.app.upgrade()
+                    && let Err(error) = app.projects.observe_git_snapshot(&value).await {
                         tracing::warn!(%error,"Checkout snapshot lifecycle notification failed");
                     }
-                }
-            }
             Ok(value)
         })
     }
@@ -285,22 +281,18 @@ impl GitService {
                 .clone()
         };
         let generation = entry.generation.load(Ordering::Acquire);
-        if entry.fresh() {
-            if let Some((g, value)) = entry.value.lock().await.as_ref() {
-                if *g == generation {
+        if entry.fresh()
+            && let Some((g, value)) = entry.value.lock().await.as_ref()
+                && *g == generation {
                     return Ok(value.clone());
                 }
-            }
-        }
         let _flight = tokio::select! {_=cancel.cancelled()=>bail!("Git diff cancelled"),guard=entry.build.lock()=>guard};
         let generation = entry.generation.load(Ordering::Acquire);
-        if entry.fresh() {
-            if let Some((g, value)) = entry.value.lock().await.as_ref() {
-                if *g == generation {
+        if entry.fresh()
+            && let Some((g, value)) = entry.value.lock().await.as_ref()
+                && *g == generation {
                     return Ok(value.clone());
                 }
-            }
-        }
         let env = self.environment()?;
         let value = diff::read(&key, compare, &env, cancel.clone()).await?;
         self.ensure_observation(&key, &env, cancel).await?;
@@ -373,11 +365,10 @@ pub(super) fn status_projection(snapshot: &Value) -> Value {
         fields.remove("diffStat");
         fields.remove("worktreeRoot");
     }
-    if status["isGit"] != true {
-        if let Some(fields) = status.as_object_mut() {
+    if status["isGit"] != true
+        && let Some(fields) = status.as_object_mut() {
             fields.remove("mainRepoRoot");
         }
-    }
     status
 }
 /// The source's `toCheckoutError`: only typed not-a-repository and merge-conflict

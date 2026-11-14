@@ -62,11 +62,10 @@ pub fn paseo_tool_leaf_name(name: &str) -> Option<String> {
         {
             return Some(segments[2..].join("__"));
         }
-    } else if let Some((prefix, leaf)) = name.split_once('.') {
-        if prefix == "paseo" || prefix.starts_with("paseo_") {
+    } else if let Some((prefix, leaf)) = name.split_once('.')
+        && (prefix == "paseo" || prefix.starts_with("paseo_")) {
             return Some(leaf.to_owned());
         }
-    }
     None
 }
 pub fn strip_cwd_prefix(file_path: &str, cwd: Option<&str>) -> String {

@@ -51,10 +51,10 @@ pub fn start_identity(pid: u32) -> Result<Option<String>> {
         if matches!(fields.first(), Some(&"Z") | Some(&"X")) {
             return Ok(None);
         }
-        return Ok(Some(format!(
+        Ok(Some(format!(
             "linux:{}",
             fields.get(19).context("Missing process birth identity")?
-        )));
+        )))
     }
     #[cfg(target_os = "macos")]
     {
@@ -225,7 +225,7 @@ pub fn signal(instance: &DaemonInstance, force: bool) -> Result<()> {
         if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
             return Err(std::io::Error::last_os_error().into());
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     {

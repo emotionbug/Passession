@@ -329,11 +329,10 @@ pub(crate) async fn execute(
             let mut config = json!({"provider":provider,"cwd":cwd});
             if let Some(m) = model {
                 config["model"] = json!(m);
-            } else if input.get("provider").is_none() {
-                if let Some(m) = parent_config.get("model").filter(|v| truthy(v)) {
+            } else if input.get("provider").is_none()
+                && let Some(m) = parent_config.get("model").filter(|v| truthy(v)) {
                     config["model"] = m.clone();
                 }
-            }
             if parent_provider == Some(provider) {
                 if let Some(mode) = parent
                     .as_ref()
@@ -432,11 +431,10 @@ pub(crate) async fn execute(
                     if input.get("model") == Some(&Value::Null) {
                         return Err(input_error("provider specifies a model but model is null"));
                     }
-                    if let Some(other) = text(&input, "model") {
-                        if other.trim() != m {
+                    if let Some(other) = text(&input, "model")
+                        && other.trim() != m {
                             return Err(input_error("Conflicting model values provided"));
                         }
-                    }
                     config["model"] = json!(m);
                 }
             }

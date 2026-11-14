@@ -80,13 +80,11 @@ struct SocketOwnership {
 impl Drop for SocketOwnership {
     fn drop(&mut self) {
         use std::os::unix::fs::MetadataExt;
-        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
-            if metadata.dev() == self.device && metadata.ino() == self.inode {
-                if let Err(error) = std::fs::remove_file(&self.path) {
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+            && metadata.dev() == self.device && metadata.ino() == self.inode
+                && let Err(error) = std::fs::remove_file(&self.path) {
                     tracing::warn!(%error, path = %self.path.display(), "Failed to remove owned HTTP socket");
                 }
-            }
-        }
     }
 }
 

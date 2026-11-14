@@ -151,11 +151,10 @@ struct Writer {
 }
 impl Writer {
     fn end(&mut self) -> Result<()> {
-        if let Some(chain) = self.chain.take() {
-            if chain.emitted {
+        if let Some(chain) = self.chain.take()
+            && chain.emitted {
                 output::stdout_chunk("\n")?;
             }
-        }
         Ok(())
     }
     fn push(&mut self, item: &Value, turn: &Value, filter: Option<&str>) -> Result<()> {

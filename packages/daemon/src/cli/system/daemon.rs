@@ -705,7 +705,12 @@ pub(crate) async fn observe_status(
     let mut local = match target {
         DaemonTarget::Instance { home } => {
             let config = crate::config::resolve_persisted_for_pairing(home).await?;
-            json!({"home":home,"pid":instance.as_ref().map(|i|i.pid),"startedAt":instance.as_ref().map(|i|&i.started_at),"listen":instance.as_ref().and_then(|i|i.listen.as_ref()),"serverId":instance.as_ref().and_then(|i|i.server_id.as_ref()),"hostname":instance.as_ref().map(|i|&i.hostname),"configuredListen":config["listen"],"localDaemon":if instance.is_none(){"stopped"}else if instance.as_ref().unwrap().listen.is_some(){"running"}else{"not_ready"},"desktopManaged":instance.as_ref().is_some_and(|i|i.desktop_managed),"logPath":control::daemon_log_path(home)})
+            let local_daemon = match &instance {
+                None => "stopped",
+                Some(instance) if instance.listen.is_some() => "running",
+                Some(_) => "not_ready",
+            };
+            json!({"home":home,"pid":instance.as_ref().map(|i|i.pid),"startedAt":instance.as_ref().map(|i|&i.started_at),"listen":instance.as_ref().and_then(|i|i.listen.as_ref()),"serverId":instance.as_ref().and_then(|i|i.server_id.as_ref()),"hostname":instance.as_ref().map(|i|&i.hostname),"configuredListen":config["listen"],"localDaemon":local_daemon,"desktopManaged":instance.as_ref().is_some_and(|i|i.desktop_managed),"logPath":control::daemon_log_path(home)})
         }
         _ => json!({"host":target.description()}),
     };
@@ -950,8 +955,8 @@ async fn configuration(action: &str, m: &ArgMatches, ctx: &Context) -> Result<Ou
     let running = control::read_daemon_instance(&home)
         .await?
         .is_some_and(|i| i.listen.is_some());
-    if running {
-        if let Ok(client) = ctx.connect().await {
+    if running
+        && let Ok(client) = ctx.connect().await {
             let result = reload(&client).await;
             client.close().await;
             let mut result = result.map_err(|e| {
@@ -963,7 +968,6 @@ async fn configuration(action: &str, m: &ArgMatches, ctx: &Context) -> Result<Ou
             result["action"] = json!("saved");
             return Ok(pretty(result)?.quiet_text("configuration"));
         }
-    }
     Ok(pretty(json!({"action":"saved","applied":false,"message":"Saved; not applied to a running daemon","nextCommand":format!("paseo daemon {} --home {}",if running{"reload"}else{"start"},serde_json::to_string(&home)?)}))?.quiet_text("configuration"))
 }
 fn secret(key: &str) -> bool {
@@ -999,8 +1003,8 @@ pub async fn pairing(
     enable: bool,
     cancel: &CancellationToken,
 ) -> Result<Value> {
-    if let DaemonTarget::Instance { home } = target {
-        if control::read_daemon_instance(home).await?.is_none() {
+    if let DaemonTarget::Instance { home } = target
+        && control::read_daemon_instance(home).await?.is_none() {
             if enable {
                 let mut config = crate::config::read_persisted(home, true).await?;
                 set_path(&mut config, "daemon.relay.enabled", Some(json!(true)))?;
@@ -1008,7 +1012,6 @@ pub async fn pairing(
             }
             return pairing_result(crate::transport::offline_pairing_offer(home).await?);
         }
-    }
     let mut options = ConnectOptions::new(target.clone());
     options.timeout = Duration::from_millis(1500);
     let client = crate::client::connect(options, cancel.child_token()).await?;
@@ -1164,6 +1167,24 @@ pub async fn onboard(m: &ArgMatches, ctx: &Context) -> Result<Output> {
     )
 }
 
+pub(crate) fn status_text(status: &Value) -> Result<String> {
+    Ok(status
+        .as_object()
+        .context("Invalid daemon status")?
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{key}: {}",
+                value
+                    .as_str()
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|| std::borrow::Cow::Owned(value.to_string()))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1296,22 +1317,4 @@ mod tests {
             assert!(update_text(&ended).contains("Error: readiness failed"));
         }
     }
-}
-
-pub(crate) fn status_text(status: &Value) -> Result<String> {
-    Ok(status
-        .as_object()
-        .context("Invalid daemon status")?
-        .iter()
-        .map(|(key, value)| {
-            format!(
-                "{key}: {}",
-                value
-                    .as_str()
-                    .map(std::borrow::Cow::Borrowed)
-                    .unwrap_or_else(|| std::borrow::Cow::Owned(value.to_string()))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
 }

@@ -176,11 +176,10 @@ impl Terminal {
                 if let Some(error) = &state.failure {
                     bail!("ACP terminal failed: {error}");
                 }
-                if state.readers == 0 {
-                    if let Some(exit) = &state.exit {
+                if state.readers == 0
+                    && let Some(exit) = &state.exit {
                         return Ok(exit.clone());
                     }
-                }
             }
             notified.await;
         }

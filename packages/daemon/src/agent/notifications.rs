@@ -418,8 +418,8 @@ fn notification_body(
         format!("Agent {} ({title}) {reason}.", record.child_agent_id),
         format!("Server: {server}"),
     ];
-    if reason == "needs permission" {
-        if let Some(permission) = permission {
+    if reason == "needs permission"
+        && let Some(permission) = permission {
             sections.push(
                 "Respond with `respond_to_permission` using the `agentId` and `requestId` below."
                     .into(),
@@ -430,7 +430,6 @@ fn notification_body(
                 serde_json::to_string_pretty(&request).expect("JSON value serialization")
             ));
         }
-    }
     if let Some(text) = outcome
         .last_message
         .as_deref()

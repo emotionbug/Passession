@@ -88,18 +88,14 @@ impl GitService {
         let env = self.environment()?;
         if let Ok(root) =
             command::text(cwd, &["rev-parse", "--show-toplevel"], &env, cancel.clone()).await
-        {
-            if let Ok(bytes) = tokio::fs::read(Path::new(&root).join("paseo.json")).await {
-                if let Ok(config) = serde_json::from_slice::<Value>(&bytes) {
-                    if let Some(instructions) = config["metadataGeneration"][key]["instructions"]
+            && let Ok(bytes) = tokio::fs::read(Path::new(&root).join("paseo.json")).await
+                && let Ok(config) = serde_json::from_slice::<Value>(&bytes)
+                    && let Some(instructions) = config["metadataGeneration"][key]["instructions"]
                         .as_str()
                         .filter(|s| !s.trim().is_empty())
                     {
                         style = instructions.trim().into();
                     }
-                }
-            }
-        }
         let (contract, hint, name, title, schema, fallback) = if pull_request {
             (
                 "Write a pull request title and body for the changes below.",
@@ -140,8 +136,10 @@ impl GitService {
             .generate_structured_with_selection(
                 cwd,
                 &prompt,
-                &schema,
-                name,
+                crate::agent::StructuredGenerationSchema {
+                    value: &schema,
+                    name,
+                },
                 title,
                 selection.as_ref(),
                 cancel,

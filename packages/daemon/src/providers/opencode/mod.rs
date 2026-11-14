@@ -29,6 +29,14 @@ pub struct OpenCodeProvider {
     capabilities: Value,
 }
 
+struct SessionLaunch {
+    info: Value,
+    config: Value,
+    context: LaunchContext,
+    options: Value,
+    sink: EventSink,
+}
+
 impl OpenCodeProvider {
     pub fn new(spec: ProviderSpec) -> Self {
         Self {
@@ -125,11 +133,7 @@ impl OpenCodeProvider {
                     runtime,
                     self.runtime.clone(),
                     self.spec.clone(),
-                    info,
-                    config,
-                    context,
-                    options,
-                    sink,
+                    SessionLaunch { info, config, context, options, sink },
                 )
                 .await
             }
@@ -138,11 +142,7 @@ impl OpenCodeProvider {
                     runtime,
                     self.runtime.clone(),
                     self.spec.clone(),
-                    info,
-                    config,
-                    context,
-                    options,
-                    sink,
+                    SessionLaunch { info, config, context, options, sink },
                 )
                 .await
             }
@@ -666,18 +666,16 @@ impl AgentProvider for OpenCodeProvider {
                 .as_array()
                 .ok_or_else(|| anyhow!("OpenCode session messages are malformed"))?
                 .as_slice();
-            if info["revert"]["partID"].is_null() {
-                if let Some(revert) = info["revert"]["messageID"].as_str() {
-                    if let Some(index) = messages
+            if info["revert"]["partID"].is_null()
+                && let Some(revert) = info["revert"]["messageID"].as_str()
+                    && let Some(index) = messages
                         .iter()
                         .position(|message| message["info"]["id"] == revert)
                     {
                         messages = &messages[..index];
                     }
-                }
-            }
-            if !config["modeId"].is_string() {
-                if let Some(agent) = messages.iter().find_map(|message| {
+            if !config["modeId"].is_string()
+                && let Some(agent) = messages.iter().find_map(|message| {
                     message["info"]["agent"]
                         .as_str()
                         .filter(|s| !s.trim().is_empty())
@@ -685,7 +683,6 @@ impl AgentProvider for OpenCodeProvider {
                     config["modeId"] = json!(agent);
                     stored_config["modeId"] = json!(agent);
                 }
-            }
             if !config["model"].is_string() {
                 for message in messages {
                     let info = &message["info"];

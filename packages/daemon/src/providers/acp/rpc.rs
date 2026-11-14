@@ -42,9 +42,11 @@ fn error_message(error: &Value) -> String {
     base.to_owned()
 }
 
+type PendingResponse = oneshot::Sender<(Result<Value>, u64)>;
+
 pub struct Rpc {
     pub process: Arc<ManagedProcess>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<(Result<Value>, u64)>>>,
+    pending: Mutex<HashMap<u64, PendingResponse>>,
     next: AtomicU64,
     pub cancel: CancellationToken,
     failure: Mutex<Option<String>>,
@@ -91,14 +93,13 @@ impl Rpc {
                     };
                     if frame.get("method").is_none() {
                         let response_id = frame["id"].as_u64().or_else(|| frame["id"].as_str().filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).and_then(|s| s.parse::<u64>().ok()).filter(|id| *id <= 9_007_199_254_740_991));
-                        if let Some(id) = response_id {
-                            if let Some(reply) = reader_rpc.pending.lock().unwrap().remove(&id) {
+                        if let Some(id) = response_id
+                            && let Some(reply) = reader_rpc.pending.lock().unwrap().remove(&id) {
                                 let result = if let Some(error) = frame.get("error") {
                                     Err(RpcError { code: error["code"].as_i64().unwrap_or(-32603), message: error_message(error), data: error["data"].clone() }.into())
                                 } else { Ok(frame.get("result").cloned().unwrap_or_else(|| json!({}))) };
                                 let _ = reply.send((result, sequence));
                             }
-                        }
                     } else {
                         // Never block control replies behind event delivery or a permission dialog.
                         sequence += 1;

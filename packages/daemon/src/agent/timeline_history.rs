@@ -14,11 +14,10 @@ fn keys(row: &Value) -> Vec<String> {
     }
     if item["type"] == "tool_call" {
         if let Some(id) = item["callId"].as_str() { keys.push(format!("tool:{id}")); }
-    } else if item["type"] == "plugin" {
-        if let (Some(plugin), Some(id)) = (item["pluginId"].as_str(), item["id"].as_str()) {
+    } else if item["type"] == "plugin"
+        && let (Some(plugin), Some(id)) = (item["pluginId"].as_str(), item["id"].as_str()) {
             keys.push(format!("plugin:{plugin}:{id}"));
         }
-    }
     // Exact unique content may retain presentation identity for non-user rows.
     // It never correlates a submitted user message or settles a delivery receipt.
     if item["type"] != "user_message" {

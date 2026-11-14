@@ -415,13 +415,12 @@ impl SessionCore {
                 )
             }
             "session.prompt_result" => {
-                if event["result"]["type"] == "turn" {
-                    if let Some(child) = state.children.get_mut(id) {
+                if event["result"]["type"] == "turn"
+                    && let Some(child) = state.children.get_mut(id) {
                         child
                             .active
                             .insert(event["result"]["turnId"].as_str().unwrap().to_owned());
                     }
-                }
                 None
             }
             "session.turn" => {

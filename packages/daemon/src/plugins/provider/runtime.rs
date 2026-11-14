@@ -252,15 +252,14 @@ impl Connection {
             }
             let session = input["sessionId"].as_str();
             let kind = input["type"].as_str().unwrap();
-            let capabilities = if kind == "session.open" || session.is_none() {
-                self.capabilities
-                    .get()
-                    .context("Provider connection is not ready")?
-            } else {
-                state
+            let capabilities = match session {
+                Some(session) if kind != "session.open" => state
                     .sessions
-                    .get(session.unwrap())
-                    .with_context(|| format!("Unknown provider session: {}", session.unwrap()))?
+                    .get(session)
+                    .with_context(|| format!("Unknown provider session: {session}"))?,
+                _ => self.capabilities
+                    .get()
+                    .context("Provider connection is not ready")?,
             };
             mapping::require_capabilities(capabilities, &input)?;
             state.acceptances.insert(
@@ -466,8 +465,8 @@ impl Connection {
                     {
                         bail!("Provider parent session did not negotiate session.subsession");
                     }
-                    if !state.routes.contains_key(id) {
-                        if let Some(parent_route) = state.routes.get(parent).cloned() {
+                    if !state.routes.contains_key(id)
+                        && let Some(parent_route) = state.routes.get(parent).cloned() {
                             state.routes.insert(
                                 id.clone(),
                                 Route {
@@ -476,7 +475,6 @@ impl Connection {
                                 },
                             );
                         }
-                    }
                 }
                 state.sessions.insert(id.clone(), capabilities);
             }
@@ -490,8 +488,8 @@ impl Connection {
                             || pending.kind != "session.open"
                             || kind == "session.ready"
                     });
-                    if ready {
-                        if let Some(pending) = state.requests.remove(id) {
+                    if ready
+                        && let Some(pending) = state.requests.remove(id) {
                             let result = if kind == "request.failed" {
                                 Err(ProviderOperationError::from_value(&event["error"]).into())
                             } else {
@@ -499,7 +497,6 @@ impl Connection {
                             };
                             let _ = pending.reply.send(result);
                         }
-                    }
                 }
                 if kind != "session.ready" {
                     return Ok(());
@@ -512,21 +509,19 @@ impl Connection {
         };
         // Update session state before settling prompts or terminal requests. A
         // caller waking from a reply observes the state established by that event.
-        if let Some(route) = route {
-            if let Some(root) = route.root.upgrade() {
+        if let Some(route) = route
+            && let Some(root) = route.root.upgrade() {
                 root.accept(event.clone(), route.child).await?;
             }
-        }
         if let Some(session) = session {
             let mut state = self.state.lock().unwrap();
-            if kind == "session.prompt_result" {
-                if let Some(tx) = state.prompts.remove(&(
+            if kind == "session.prompt_result"
+                && let Some(tx) = state.prompts.remove(&(
                     session.clone(),
                     event["clientMessageId"].as_str().unwrap().to_owned(),
                 )) {
                     let _ = tx.send(Ok(event["result"].clone()));
                 }
-            }
             if matches!(kind.as_str(), "session.runtime_failed" | "session.closed") {
                 let error = event["error"]["message"]
                     .as_str()
@@ -638,8 +633,8 @@ impl Connection {
             state.closing = true;
             send
         };
-        if send {
-            if let Err(error) = self
+        if send
+            && let Err(error) = self
                 .worker
                 .send(json!({"type":"provider.close","connectionId":self.id}))
                 .await
@@ -647,7 +642,6 @@ impl Connection {
                 self.fail(&error.to_string(), false).await;
                 return Err(error);
             }
-        }
         self.done.cancelled().await;
         let error = self.error();
         if error != "Provider connection closed" {

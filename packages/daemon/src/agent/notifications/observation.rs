@@ -20,14 +20,13 @@ impl Outcome {
     fn from_response(value: &Value) -> Result<Self> {
         let value = value.get("payload").unwrap_or(value);
         let final_snapshot = value.get("final").filter(|v| !v.is_null()).cloned();
-        if final_snapshot.is_none() {
-            if let Some(error) = value["error"]
+        if final_snapshot.is_none()
+            && let Some(error) = value["error"]
                 .as_str()
                 .filter(|e| !e.starts_with("Agent not found: "))
             {
                 bail!("{error}");
             }
-        }
         Ok(Self {
             status: value["status"]
                 .as_str()
@@ -91,8 +90,8 @@ impl BufferState {
     fn initial(&mut self, mut result: Outcome) {
         self.initial_pending = false;
         if result.status == "permission" {
-            if let Some(snapshot) = &mut result.final_snapshot {
-                if let Some(requests) = snapshot["pendingPermissions"].as_array_mut() {
+            if let Some(snapshot) = &mut result.final_snapshot
+                && let Some(requests) = snapshot["pendingPermissions"].as_array_mut() {
                     requests.retain(|r| {
                         !r["id"]
                             .as_str()
@@ -102,7 +101,6 @@ impl BufferState {
                         self.push(result);
                     }
                 }
-            }
         } else if self.terminal.is_none()
             && !result
                 .final_snapshot
@@ -235,11 +233,10 @@ impl Observation {
                 )
                 .await
             };
-            if let Err(error) = result {
-                if !task_cancel.is_cancelled() {
+            if let Err(error) = result
+                && !task_cancel.is_cancelled() {
                     task_buffer.fail(error).await;
                 }
-            }
         });
         Self {
             buffer,

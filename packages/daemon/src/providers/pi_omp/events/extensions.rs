@@ -24,11 +24,10 @@ impl Extensions {
         std::mem::take(&mut self.children)
     }
     fn child(&mut self, id: &str, file: Option<&str>) {
-        if let Some(file) = file.filter(|s| !s.trim().is_empty()) {
-            if self.seen_files.insert(file.into()) {
+        if let Some(file) = file.filter(|s| !s.trim().is_empty())
+            && self.seen_files.insert(file.into()) {
                 self.children.push(json!({"id":id,"file":file}));
             }
-        }
     }
     pub fn tool(
         &mut self,
@@ -79,11 +78,10 @@ impl Extensions {
                 if array(&d["results"]).is_empty()
                     && (d["asyncId"].is_string() || args["async"] == true)
                 {
-                    if status != "failed" {
-                        if let Some(dir) = first(&[&d["asyncDir"]]) {
+                    if status != "failed"
+                        && let Some(dir) = first(&[&d["asyncDir"]]) {
                             self.async_runs.insert(dir.into(), (id.into(), true));
                         }
-                    }
                     let mut v = base;
                     v["status"] = json!(if status == "failed" {
                         "failed"
@@ -109,8 +107,8 @@ impl Extensions {
                 out.push(v);
             }
         } else if matches!(name, "get_subagent_result" | "steer_subagent") && status != "running" {
-            if let Some((owner, tintin)) = self.agents.get(string(&args["agent_id"])).cloned() {
-                if let Some(state) = d["status"].as_str().filter(|_| d["agentId"].is_string()) {
+            if let Some((owner, tintin)) = self.agents.get(string(&args["agent_id"])).cloned()
+                && let Some(state) = d["status"].as_str().filter(|_| d["agentId"].is_string()) {
                     if !tintin {
                         self.child(&owner, d["transcriptPath"].as_str());
                     }
@@ -118,7 +116,6 @@ impl Extensions {
                         json!({"type":"upsert","id":owner,"status":agent_status(state,tintin)}),
                     );
                 }
-            }
         } else if name == "bg_wait" && status != "running" {
             for c in array(&d["completions"]) {
                 if let Some(owner) = self.runs.get(string(&c["runId"])).cloned() {
@@ -197,11 +194,10 @@ impl Extensions {
                         if let Some(id) = &owner {
                             out.push(json!({"type":"upsert","id":id,"status":status}));
                         }
-                    } else if let Some(file) = line.strip_prefix("Session file: ") {
-                        if let Some(id) = owner.take() {
+                    } else if let Some(file) = line.strip_prefix("Session file: ")
+                        && let Some(id) = owner.take() {
                             self.child(&id, Some(file));
                         }
-                    }
                 }
             }
         }

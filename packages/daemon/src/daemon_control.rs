@@ -454,16 +454,15 @@ pub async fn stop_daemon_instance(
         bail!("Operation cancelled")
     }
     let current = read_pid_lock(home).await?;
-    if let (Some(expected), Some(current)) = (&options.instance, &current) {
-        if !same_daemon_instance(expected, current)
-            || expected.process_start_identity != current.process_start_identity
+    if let (Some(expected), Some(current)) = (&options.instance, &current)
+        && (!same_daemon_instance(expected, current)
+            || expected.process_start_identity != current.process_start_identity)
         {
             return Err(error(
                 "DAEMON_REPLACED",
                 "Supervisor changed; refusing to stop replacement",
             ));
         }
-    }
     let Some(instance) = current else {
         return Ok(StopResult {
             action: "not_running".into(),

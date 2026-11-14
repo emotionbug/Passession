@@ -189,16 +189,13 @@ impl Drop for LegacySession {
     }
 }
 
-pub async fn attach(
+pub(super) async fn attach(
     runtime: Arc<Runtime>,
     manager: Arc<RuntimeManager>,
     spec: ProviderSpec,
-    info: Value,
-    config: Value,
-    context: LaunchContext,
-    options: Value,
-    sink: EventSink,
+    launch: super::SessionLaunch,
 ) -> Result<Arc<dyn AgentSession>> {
+    let super::SessionLaunch { info, config, context, options, sink } = launch;
     let id = info["id"]
         .as_str()
         .ok_or_else(|| anyhow!("OpenCode returned a session without an id"))?
@@ -475,11 +472,10 @@ impl Inner {
                                 if let Err(error) = this.reconcile_permissions().await {
                                     tracing::warn!(%error,"OpenCode permissions hydration failed");
                                 }
-                                if let Ok(status) = this.runner_status().await {
-                                    if matches!(status.as_str(), "busy" | "retry") {
+                                if let Ok(status) = this.runner_status().await
+                                    && matches!(status.as_str(), "busy" | "retry") {
                                         this.consume(&json!({"type":"session.status","properties":{"sessionID":this.id,"status":{"type":status}}})).await?;
                                     }
-                                }
                             } else if let Err(error) = this.repair_gap().await {
                                 tracing::warn!(%error,"OpenCode event gap recovery failed");
                                 repair_pending = true;
@@ -607,14 +603,12 @@ impl Inner {
                 None
             };
             let mut changed = None;
-            if sid == self.id && kind == "message.updated" {
-                if let Some(model) = model(&e["properties"]["info"]) {
-                    if st.config["model"] != model {
+            if sid == self.id && kind == "message.updated"
+                && let Some(model) = model(&e["properties"]["info"])
+                    && st.config["model"] != model {
                         st.config["model"] = json!(model);
                         changed = Some(runtime_info(&self.spec.id, &self.id, &st.config));
                     }
-                }
-            }
             let events = st.projection.translate(e);
             (st.turn.clone(), new_turn, events, changed)
         };
@@ -1166,11 +1160,10 @@ impl Inner {
             }
         } else {
             let mut body = json!({"reply":if deny{"reject"}else if response["selectedActionId"]=="allow_always"{"always"}else{"once"}});
-            if deny {
-                if let Some(message) = response.get("message") {
+            if deny
+                && let Some(message) = response.get("message") {
                     body["message"] = message.clone();
                 }
-            }
             (format!("/permission/{}/reply", segment(id)), Some(body))
         };
         self.request(Method::POST, &path, &directory, body).await?;
@@ -1773,8 +1766,8 @@ impl AgentSession for LegacySession {
         {
             tracing::warn!(%error,"Failed to abort OpenCode session during close");
         }
-        if !this.persist {
-            if let Err(error) = runtime
+        if !this.persist
+            && let Err(error) = runtime
                 .request(
                     Method::DELETE,
                     &format!("/session/{}", segment(&this.id)),
@@ -1786,7 +1779,6 @@ impl AgentSession for LegacySession {
             {
                 tracing::debug!(%error,"Failed to delete non-persistent OpenCode session");
             }
-        }
         runtime.unbind_session(&this.id, &this.context.agent_id);
         this.state().turn = None;
         Ok(())

@@ -8,11 +8,10 @@ pub async fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("Private file has no parent"))?;
     tokio::fs::create_dir_all(parent).await?;
-    if let Ok(metadata) = tokio::fs::symlink_metadata(path).await {
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if let Ok(metadata) = tokio::fs::symlink_metadata(path).await
+        && (!metadata.is_file() || metadata.file_type().is_symlink()) {
             bail!("Refusing non-regular private file");
         }
-    }
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         path.file_name()

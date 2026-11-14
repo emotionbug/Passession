@@ -257,11 +257,10 @@ impl Executions {
                                 let id = event["agentId"].as_str().context("Missing stream agent ID")?;
                                 let snapshot = app.agents.agent_snapshot(id).await?;
                                 drop(app);
-                                if let Some(snapshot) = snapshot.filter(|s| s["_live"] == true && this.owns(s)) {
-                                    if let Some(event) = crate::agent::serialize_stream_event(&event["event"]) {
+                                if let Some(snapshot) = snapshot.filter(|s| s["_live"] == true && this.owns(s))
+                                    && let Some(event) = crate::agent::serialize_stream_event(&event["event"]) {
                                         context.send(json!({"type":"hub.execution.agent.stream","payload":{"executionId":snapshot["owner"]["executionId"],"agentId":id,"event":event}})).await?;
                                     }
-                                }
                             }
                         }
                     }

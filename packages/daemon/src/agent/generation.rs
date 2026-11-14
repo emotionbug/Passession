@@ -8,6 +8,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::AgentManager;
 
+pub struct StructuredGenerationSchema<'a> {
+    pub value: &'a Value,
+    pub name: &'a str,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Agent response did not match the required JSON schema")]
 pub struct StructuredAgentResponseError {
@@ -81,15 +86,14 @@ fn models(entry: &Value) -> &[Value] {
 
 fn thinking(model: Option<&Value>, preferred: Option<&str>) -> Option<String> {
     let model = model?;
-    if let Some(preferred) = preferred {
-        if model["thinkingOptions"].as_array().is_some_and(|options| {
+    if let Some(preferred) = preferred
+        && model["thinkingOptions"].as_array().is_some_and(|options| {
             options
                 .iter()
                 .any(|option| option["id"].as_str() == Some(preferred))
         }) {
             return Some(preferred.to_owned());
         }
-    }
     text(model, "defaultThinkingOptionId").map(str::to_owned)
 }
 
@@ -200,15 +204,14 @@ fn resolve_candidates(
                     })
                     .map(|model| (*entry, model))
             });
-            if let Some((entry, model)) = matched {
-                if let (Some(provider), Some(id)) = (text(entry, "provider"), text(model, "id")) {
+            if let Some((entry, model)) = matched
+                && let (Some(provider), Some(id)) = (text(entry, "provider"), text(model, "id")) {
                     candidates.push(Candidate {
                         provider: provider.to_owned(),
                         model: Some(id.to_owned()),
                         thinking_option_id: thinking(Some(model), preferred),
                     });
                 }
-            }
         }
         if let Some(selection) =
             selection.and_then(|selection| configured_candidate(selection, &enabled))
@@ -332,8 +335,7 @@ impl AgentManager {
         self.generate_structured_with_selection(
             cwd,
             prompt,
-            schema,
-            schema_name,
+            StructuredGenerationSchema { value: schema, name: schema_name },
             title,
             None,
             cancel,
@@ -375,12 +377,12 @@ impl AgentManager {
         &self,
         cwd: &Path,
         prompt: &str,
-        schema: &Value,
-        schema_name: &str,
+        schema: StructuredGenerationSchema<'_>,
         title: &str,
         current_selection: Option<&Value>,
         cancel: CancellationToken,
     ) -> Result<Value> {
+        let StructuredGenerationSchema { value: schema, name: schema_name } = schema;
         if cancel.is_cancelled() {
             return Err(StructuredGenerationCancelled.into());
         }

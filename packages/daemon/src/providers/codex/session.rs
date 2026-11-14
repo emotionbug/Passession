@@ -115,26 +115,24 @@ fn normalize_config(config: &mut Value, models: &[Value], resolved: &Value) {
     if config["model"].as_str().is_none_or(|s| s.trim().is_empty()) {
         config["model"] = resolved["model"].clone();
     }
-    if config["model"].is_null() {
-        if let Some(model) = models
+    if config["model"].is_null()
+        && let Some(model) = models
             .iter()
             .find(|m| m["isDefault"] == true)
             .or(models.first())
         {
             config["model"] = model["id"].clone();
         }
-    }
     if config["thinkingOptionId"]
         .as_str()
         .is_none_or(|s| s.trim().is_empty())
     {
         config["thinkingOptionId"] = resolved["model_reasoning_effort"].clone();
     }
-    if config["thinkingOptionId"].is_null() {
-        if let Some(model) = models.iter().find(|m| m["id"] == config["model"]) {
+    if config["thinkingOptionId"].is_null()
+        && let Some(model) = models.iter().find(|m| m["id"] == config["model"]) {
             config["thinkingOptionId"] = model["defaultReasoningEffort"].clone();
         }
-    }
     reconcile_tier(config, models);
 }
 fn reconcile_tier(config: &mut Value, models: &[Value]) {
@@ -287,10 +285,9 @@ impl CodexSession {
         .await?;
         let prepared = async {
             let initialized = client.initialize().await?;
-            let rollback = !initialized["userAgent"]
+            let rollback = initialized["userAgent"]
                 .as_str()
-                .and_then(super::version)
-                .is_some_and(|v| v >= (0, 156, 0));
+                .and_then(super::version).is_none_or(|v| v < (0, 156, 0));
             let (metadata, skills) = if history_only {
                 (Arc::new(Metadata::default()), None)
             } else {
@@ -326,14 +323,13 @@ impl CodexSession {
         let mut history = history;
         let async_questions = permissions::AsyncQuestions::new(&config["asyncQuestions"]);
         for entry in &mut history {
-            if entry["item"]["name"] == "request_user_input_async" {
-                if let Some(item) = entry["item"]["callId"]
+            if entry["item"]["name"] == "request_user_input_async"
+                && let Some(item) = entry["item"]["callId"]
                     .as_str()
                     .and_then(|id| async_questions.timeline(id))
                 {
                     entry["item"] = item;
                 }
-            }
         }
         let recorded_cards = card_logs(&options);
         apply_card_logs(&mut history, &recorded_cards);
@@ -616,11 +612,10 @@ impl CodexSession {
     }
     pub(super) async fn emit(&self, mut event: Value) -> Result<()> {
         event["provider"] = json!(self.spec.id);
-        if event.get("turnId").is_none() {
-            if let Some(turn) = self.state.lock().unwrap().foreground.clone() {
+        if event.get("turnId").is_none()
+            && let Some(turn) = self.state.lock().unwrap().foreground.clone() {
                 event["turnId"] = json!(turn);
             }
-        }
         self.holds.emit(&self.sink, event).await
     }
     async fn ensure_thread(&self) -> Result<String> {
@@ -1263,10 +1258,9 @@ impl AgentSession for CodexSession {
                 _ => return Ok(json!({"status":"unavailable"})),
             }
         };
-        if let Some(text) = prompt.as_str() {
-            if text.trim_start().starts_with('/') {
+        if let Some(text) = prompt.as_str()
+            && text.trim_start().starts_with('/') {
                 let name = text
-                    .trim_start()
                     .split_whitespace()
                     .next()
                     .unwrap_or("")
@@ -1280,7 +1274,6 @@ impl AgentSession for CodexSession {
                     return Ok(json!({"status":"unavailable"}));
                 }
             }
-        }
         let input = super::input::turn_input(prompt).await?;
         {
             let s = self.state.lock().unwrap();

@@ -209,22 +209,20 @@ fn recursive(path: &Path, depth: usize) -> Option<PathBuf> {
         if IGNORED.contains(&entry.file_name()?.to_string_lossy().as_ref()) {
             continue;
         }
-        if entry.is_dir() {
-            if let Some(found) = recursive(&entry, depth - 1) {
+        if entry.is_dir()
+            && let Some(found) = recursive(&entry, depth - 1) {
                 return Some(found);
             }
-        }
     }
     None
 }
 fn priority(path: &Path) -> Option<PathBuf> {
     for directory in PRIORITY {
         let directory = path.join(directory);
-        if directory.is_dir() {
-            if let Some(found) = recursive(&directory, 2) {
+        if directory.is_dir()
+            && let Some(found) = recursive(&directory, 2) {
                 return Some(found);
             }
-        }
     }
     None
 }
@@ -234,11 +232,10 @@ fn find(path: &Path) -> Option<PathBuf> {
     }
     for directory in ["packages", "apps"] {
         for package in entries(&path.join(directory)) {
-            if package.is_dir() {
-                if let Some(found) = priority(&package).or_else(|| in_directory(&package)) {
+            if package.is_dir()
+                && let Some(found) = priority(&package).or_else(|| in_directory(&package)) {
                     return Some(found);
                 }
-            }
         }
     }
     in_directory(path)
@@ -252,7 +249,7 @@ pub async fn project_icon(cwd: &Path) -> Result<Option<Value>> {
             let mut bytes=Vec::new();file.take(32*1024+1).read_to_end(&mut bytes)?;if bytes.len()>32*1024{return Ok(None);}
             let mut mime=sniff(&bytes).unwrap_or_else(||extension_mime(&path));
             let data=if mime=="image/x-icon"{if let Some(frame)=extract_ico_png_frame(&bytes){mime="image/png";frame}else{&bytes}}else{&bytes};
-            if !image_dimensions(data,mime).is_some_and(|(w,h)|w==h){return Ok(None);}
+            if image_dimensions(data,mime).is_none_or(|(w,h)| w != h){return Ok(None);}
             Ok(Some(json!({"data":base64::engine::general_purpose::STANDARD.encode(data),"mimeType":mime})))
         })();
         // Discovery is an optional decoration: the source explicitly returns

@@ -51,10 +51,11 @@ pub struct Init {
     pub _model: Option<String>,
 }
 #[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StepState {
-    ACTIVE,
-    DONE,
-    ERROR,
+    Active,
+    Done,
+    Error,
 }
 #[derive(Deserialize)]
 pub struct Step {
@@ -89,7 +90,8 @@ pub struct Tool {
     #[serde(default)]
     pub output: String,
     #[serde(default)]
-    pub error: Option<ToolError>,
+    // Keep ordinary text/tool frames inline; only uncommon error payloads allocate.
+    pub error: Option<Box<ToolError>>,
 }
 #[derive(Deserialize, serde::Serialize)]
 pub struct ToolError {
@@ -115,9 +117,10 @@ pub struct Child {
     pub workspace_uris: Vec<String>,
 }
 #[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Status {
-    SUCCESS,
-    ERROR,
+    Success,
+    Error,
 }
 #[derive(Deserialize)]
 pub struct TurnResult {
@@ -202,7 +205,7 @@ impl Turn {
                     json!({"type":"assistant_message","messageId":id,"text":step.text_delta}),
                 ));
             }
-            if step.state == StepState::DONE
+            if step.state == StepState::Done
                 && let Some(usage) = step.usage
                 && self.usage_steps.insert(step.step_index)
             {
@@ -286,11 +289,11 @@ fn tool_item(step: &Step, id: &str) -> Value {
         json!({"type":"plain_text","label":step.tool_name,"text":""})
     };
     let status = match step.state {
-        StepState::ACTIVE => "running",
-        StepState::DONE => "completed",
-        StepState::ERROR => "failed",
+        StepState::Active => "running",
+        StepState::Done => "completed",
+        StepState::Error => "failed",
     };
-    let error = if step.state == StepState::ERROR {
+    let error = if step.state == StepState::Error {
         json!(
             step.tool_info
                 .as_ref()

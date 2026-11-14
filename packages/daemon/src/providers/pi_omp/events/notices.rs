@@ -22,14 +22,13 @@ pub fn custom_item(family: &str, message: &Value, call_id: &str) -> Option<Value
     }
     let kind = first(&[&message["customType"]]).unwrap_or("custom-message");
     if family == "omp" {
-        if kind == "skill-prompt" && message["attribution"] == "user" {
-            if let Some(name) = first(&[&message["details"]["name"]]) {
+        if kind == "skill-prompt" && message["attribution"] == "user"
+            && let Some(name) = first(&[&message["details"]["name"]]) {
                 let args = string(&message["details"]["args"]).trim();
                 return Some(
                     json!({"type":"user_message","text":format!("/skill:{name}{}",if args.is_empty(){String::new()}else{format!(" {args}")})}),
                 );
             }
-        }
         if kind == "advisor" {
             let notes: Vec<&Value> = array(&message["details"]["notes"])
                 .iter()
@@ -121,16 +120,21 @@ pub fn system_notice(text: &str) -> Option<Value> {
     };
     Some(json!({"type":"notification","level":level,"message":label}))
 }
+struct NoticeDetail {
+    label: String,
+    text: String,
+    icon: &'static str,
+}
+
 fn status(
     id: String,
     name: &str,
-    label: String,
-    text: String,
-    icon: &str,
+    detail: NoticeDetail,
     state: &str,
     error: Value,
     metadata: Value,
 ) -> Value {
+    let NoticeDetail { label, text, icon } = detail;
     let mut detail = json!({"type":"plain_text","label":label,"icon":icon});
     if !text.is_empty() {
         detail["text"] = json!(text);
@@ -199,11 +203,13 @@ pub fn runtime(event: &Value) -> Option<Value> {
                         .unwrap_or_else(|| hash(&[&text], true))
                 ),
                 "omp_goal_updated",
-                first(&[&goal["status"]])
-                    .map(|s| format!("OMP goal {s}"))
-                    .unwrap_or_else(|| "OMP goal updated".into()),
-                text,
-                "brain",
+                NoticeDetail {
+                    label: first(&[&goal["status"]])
+                        .map(|s| format!("OMP goal {s}"))
+                        .unwrap_or_else(|| "OMP goal updated".into()),
+                    text,
+                    icon: "brain",
+                },
                 "completed",
                 Value::Null,
                 meta,
@@ -230,9 +236,11 @@ pub fn runtime(event: &Value) -> Option<Value> {
             Some(status(
                 format!("omp-auto-retry:{}", event["attempt"]),
                 "omp_auto_retry",
-                format!("OMP retry {}/{}", event["attempt"], event["maxAttempts"]),
-                format!("Retrying in {delay}: {}", string(&event["errorMessage"])),
-                "sparkles",
+                NoticeDetail {
+                    label: format!("OMP retry {}/{}", event["attempt"], event["maxAttempts"]),
+                    text: format!("Retrying in {delay}: {}", string(&event["errorMessage"])),
+                    icon: "sparkles",
+                },
                 "running",
                 Value::Null,
                 m,
@@ -243,20 +251,22 @@ pub fn runtime(event: &Value) -> Option<Value> {
             Some(status(
                 format!("omp-auto-retry:{}", event["attempt"]),
                 "omp_auto_retry",
-                format!(
-                    "OMP retry {} {}",
-                    event["attempt"],
-                    if ok { "recovered" } else { "failed" }
-                ),
-                event["finalError"]
-                    .as_str()
-                    .unwrap_or(if ok {
-                        "Retry recovered."
-                    } else {
-                        "Retry failed."
-                    })
-                    .into(),
-                "sparkles",
+                NoticeDetail {
+                    label: format!(
+                        "OMP retry {} {}",
+                        event["attempt"],
+                        if ok { "recovered" } else { "failed" }
+                    ),
+                    text: event["finalError"]
+                        .as_str()
+                        .unwrap_or(if ok {
+                            "Retry recovered."
+                        } else {
+                            "Retry failed."
+                        })
+                        .into(),
+                    icon: "sparkles",
+                },
                 if ok { "completed" } else { "failed" },
                 if ok {
                     Value::Null
@@ -277,9 +287,11 @@ pub fn runtime(event: &Value) -> Option<Value> {
             Some(status(
                 format!("omp-retry-fallback:{}", hash(&[role, from, to], true)),
                 "omp_retry_fallback",
-                format!("OMP fallback applied for {role}"),
-                format!("{from} -> {to}"),
-                "sparkles",
+                NoticeDetail {
+                    label: format!("OMP fallback applied for {role}"),
+                    text: format!("{from} -> {to}"),
+                    icon: "sparkles",
+                },
                 "completed",
                 Value::Null,
                 json!({"synthetic":true,"source":"omp_retry_fallback_applied","role":role,"from":from,"to":to}),
@@ -294,9 +306,11 @@ pub fn runtime(event: &Value) -> Option<Value> {
                     hash(&[role, model], true)
                 ),
                 "omp_retry_fallback",
-                format!("OMP fallback succeeded for {role}"),
-                format!("Using {model}"),
-                "sparkles",
+                NoticeDetail {
+                    label: format!("OMP fallback succeeded for {role}"),
+                    text: format!("Using {model}"),
+                    icon: "sparkles",
+                },
                 "completed",
                 Value::Null,
                 json!({"synthetic":true,"source":"omp_retry_fallback_succeeded","role":role,"model":model}),

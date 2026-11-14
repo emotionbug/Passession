@@ -49,7 +49,7 @@ type Cleanup = Option<std::result::Result<(), Arc<str>>>;
 /// releases the owned process/HTTP session; explicit close waits for cleanup.
 pub struct McpConnection {
     state: Arc<State>,
-    transport: Arc<Transport>,
+    transport: Transport,
     cleanup: watch::Receiver<Cleanup>,
     tools: Mutex<HashMap<String, schema::ToolMetadata>>,
 }
@@ -61,9 +61,10 @@ struct State {
     next_id: AtomicU64,
 }
 
+#[derive(Clone)]
 enum Transport {
     Stdio(Arc<ManagedProcess>),
-    Http(HttpTransport),
+    Http(Arc<HttpTransport>),
 }
 
 impl McpConnection {
@@ -134,10 +135,10 @@ impl McpConnection {
                         );
                     }
                 });
-                Arc::new(Transport::Stdio(process))
+                Transport::Stdio(process)
             }
             Some(kind @ ("http" | "sse")) => {
-                Arc::new(Transport::Http(HttpTransport::new(config, kind == "sse")?))
+                Transport::Http(Arc::new(HttpTransport::new(config, kind == "sse")?))
             }
             _ => bail!("MCP transport type must be stdio, http, or sse"),
         };
@@ -169,12 +170,11 @@ impl McpConnection {
         });
         let deadline = Instant::now() + SERVER_TIMEOUT;
         let initialize = async {
-            if let Transport::Http(http) = transport.as_ref() {
-                if http.legacy {
+            if let Transport::Http(http) = &transport
+                && http.legacy {
                     start_listener(&tasks, &transport, &state);
                     http.wait_endpoint().await?;
                 }
-            }
             let result = connection
                 .request(
                     "initialize",
@@ -187,7 +187,7 @@ impl McpConnection {
                 )
                 .await?;
             let version = schema::initialize(&result, VERSIONS)?;
-            if let Transport::Http(http) = transport.as_ref() {
+            if let Transport::Http(http) = &transport {
                 http.set_protocol(version)?;
             }
             transport
@@ -196,7 +196,7 @@ impl McpConnection {
                     &state,
                 )
                 .await?;
-            if matches!(transport.as_ref(), Transport::Http(http) if !http.legacy) {
+            if matches!(&transport, Transport::Http(http) if !http.legacy) {
                 start_listener(&tasks, &transport, &state);
             }
             Ok::<(), anyhow::Error>(())
@@ -368,7 +368,7 @@ impl McpConnection {
                 reply = &mut receiver => {
                     // A reply may arrive on the independent GET stream before
                     // its POST finishes. Stdio still finishes its atomic frame.
-                    if !self.state.stop.is_cancelled() && matches!(self.transport.as_ref(), Transport::Stdio(_)) { send.await?; }
+                    if !self.state.stop.is_cancelled() && matches!(&self.transport, Transport::Stdio(_)) { send.await?; }
                     reply
                 }
                 result = &mut send => {
@@ -540,11 +540,11 @@ impl Transport {
     }
 }
 
-fn start_listener(tasks: &TaskTracker, transport: &Arc<Transport>, state: &Arc<State>) {
+fn start_listener(tasks: &TaskTracker, transport: &Transport, state: &Arc<State>) {
     let transport = transport.clone();
     let state = state.clone();
     tasks.spawn(async move {
-        if let Transport::Http(http) = transport.as_ref() {
+        if let Transport::Http(http) = &transport {
             http.listen(&state).await;
         }
     });
@@ -552,7 +552,7 @@ fn start_listener(tasks: &TaskTracker, transport: &Arc<Transport>, state: &Arc<S
 
 async fn serve_controls(
     state: Arc<State>,
-    transport: Arc<Transport>,
+    transport: Transport,
     mut receiver: mpsc::Receiver<Value>,
 ) {
     loop {

@@ -9,6 +9,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::{fmt, fs, path::{Path, PathBuf}};
 
+pub struct SubagentDeletionResult {
+    pub deleted: Vec<String>,
+    pub skipped: Vec<(String, String)>,
+}
+
 /// Child timelines kept hydrated after an operation. Each holds one WAL
 /// connection (database, `-wal` and `-shm` descriptors).
 const RESIDENT_CHILDREN: usize = 16;
@@ -145,11 +150,10 @@ fn open_catalog(path: &Path, parent: &str) -> Result<Connection> {
 fn remove_timeline_files(root: &Path, parent: &str, id: &str) {
     let path = timeline_path(root, parent, id);
     for file in [path.clone(), PathBuf::from(format!("{}-wal", path.display())), PathBuf::from(format!("{}-shm", path.display()))] {
-        if let Err(error) = fs::remove_file(file) {
-            if error.kind() != std::io::ErrorKind::NotFound {
+        if let Err(error) = fs::remove_file(file)
+            && error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(%error, "Failed to remove unreferenced subagent storage");
             }
-        }
     }
 }
 
@@ -370,7 +374,7 @@ impl SubagentStore {
     /// reason (`running`, `unknown`, `unavailable`) and left untouched.
     pub fn delete_persisted(
         &mut self, root: &Path, parent: &str, ids: &[String],
-    ) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    ) -> Result<SubagentDeletionResult> {
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
         let indexed = self.ensure_parent(root, parent, false)?;
@@ -408,7 +412,7 @@ impl SubagentStore {
             deleted.push(id.clone());
         }
         self.release_excess();
-        Ok((deleted, skipped))
+        Ok(SubagentDeletionResult { deleted, skipped })
     }
 
     /// Appending needs the hydrated child (identity merges, sequence window).

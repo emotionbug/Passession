@@ -82,11 +82,10 @@ impl AgentManager {
             .then(|| text(actor, "agentId"))
             .flatten();
         let caller_id = text(&input, "callerAgentId").or(actor_agent);
-        if let (Some(bound), Some(requested)) = (actor_agent, caller_id) {
-            if bound != requested {
+        if let (Some(bound), Some(requested)) = (actor_agent, caller_id)
+            && bound != requested {
                 bail!("Caller agent does not match authenticated agent");
             }
-        }
         let parent = if let Some(id) = caller_id {
             self.authorize(actor, id).await?;
             let parent = self
@@ -220,11 +219,10 @@ impl AgentManager {
             merge_value(&mut config,&resolved);
             let mut options = json!({"workspaceId":workspace_id,"labels":labels});
             for key in ["env","owner","persistSession"] { copy_as(&input,key,&mut options,key); }
-            if let Some(owner) = input.get("owner").filter(|owner| !owner.is_null()) {
-                if actor["kind"] != "system" && actor["kind"] != "owner" && actor != owner {
+            if let Some(owner) = input.get("owner").filter(|owner| !owner.is_null())
+                && actor["kind"] != "system" && actor["kind"] != "owner" && actor != owner {
                     bail!("Agent owner does not match authenticated owner");
                 }
-            }
             if config["internal"] == true { options["persistSession"] = json!(false); }
             if !is_mcp {
                 options["initialPrompt"] = json!(initial_prompt);
@@ -285,18 +283,14 @@ impl AgentManager {
             if let Some(worktree) = created_worktree.as_ref() { result["createdWorktree"] = worktree.clone(); }
             Ok::<_,anyhow::Error>(result)
         }.await;
-        if operation.is_err() && created_agent.is_none() && cancel.is_none() {
-            if let Some(worktree) = created_worktree
+        if operation.is_err() && created_agent.is_none() && cancel.is_none()
+            && let Some(worktree) = created_worktree
                 .as_ref()
                 .filter(|worktree| worktree["created"] == true)
-            {
-                if let Some(id) = text(&worktree["workspace"], "workspaceId") {
-                    if let Err(error) = app.projects.archive_workspace(actor, id).await {
+                && let Some(id) = text(&worktree["workspace"], "workspaceId")
+                    && let Err(error) = app.projects.archive_workspace(actor, id).await {
                         tracing::warn!(?error, "Failed to clean up newly created worktree");
                     }
-                }
-            }
-        }
         // Hub failures, unlike ordinary first-turn failures, revoke only resources
         // created by this invocation. Replayed executions never enter this branch.
         if operation.is_err() && cancel.is_some() {
@@ -527,11 +521,10 @@ impl AgentManager {
             if agent["owner"] != *owner {
                 bail!("Hub execution owner does not match created agent");
             }
-        } else if let Some(agent) = self.storage()?.get(id).await? {
-            if agent["owner"] != *owner {
+        } else if let Some(agent) = self.storage()?.get(id).await?
+            && agent["owner"] != *owner {
                 bail!("Hub execution owner does not match created agent");
             }
-        }
         self.cleanup_creation(owner, Some(id), created.get("createdWorktree"))
             .await
     }
@@ -597,21 +590,17 @@ impl AgentManager {
             if let Err(error) = self.control(actor, id, "delete", json!({})).await {
                 failure = Some(error);
             }
-            if let Err(error) = self.storage()?.remove(id).await {
-                if failure.is_none() {
+            if let Err(error) = self.storage()?.remove(id).await
+                && failure.is_none() {
                     failure = Some(error);
                 }
-            }
         }
-        if let Some(worktree) = worktree.filter(|worktree| worktree["created"] == true) {
-            if let Some(id) = text(&worktree["workspace"], "workspaceId") {
-                if let Err(error) = self.app()?.projects.archive_workspace(actor, id).await {
-                    if failure.is_none() {
+        if let Some(worktree) = worktree.filter(|worktree| worktree["created"] == true)
+            && let Some(id) = text(&worktree["workspace"], "workspaceId")
+                && let Err(error) = self.app()?.projects.archive_workspace(actor, id).await
+                    && failure.is_none() {
                         failure = Some(error);
                     }
-                }
-            }
-        }
         if let Some(error) = failure {
             Err(error)
         } else {
@@ -803,18 +792,15 @@ impl CreationHooks for AgentManager {
         }
     }
     async fn validate_completed(&self, snapshot: &Value) -> Result<()> {
-        if let Some(id) = text(snapshot, "agentId") {
-            if !self.exists("agent", id).await? {
+        if let Some(id) = text(snapshot, "agentId")
+            && !self.exists("agent", id).await? {
                 bail!("Previously created agent no longer exists");
             }
-        }
-        if snapshot["kind"] == "workspace" {
-            if let Some(id) = text(snapshot, "workspaceId") {
-                if !self.exists("workspace", id).await? {
+        if snapshot["kind"] == "workspace"
+            && let Some(id) = text(snapshot, "workspaceId")
+                && !self.exists("workspace", id).await? {
                     bail!("Previously created workspace no longer exists");
                 }
-            }
-        }
         Ok(())
     }
 }

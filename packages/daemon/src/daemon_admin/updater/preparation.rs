@@ -1043,33 +1043,37 @@ mod tests {
     async fn local_preparation_rejects_incomplete_unsafe_or_misrepresented_runtimes() {
         let temp = tempfile::tempdir().unwrap();
         let (executable, runtimes) = installation(temp.path());
-        let cases: [(&str, fn(&Path)); 8] = [
-            ("symlink", |root| {
+        struct InvalidRuntimeCase {
+            name: &'static str,
+            edit: fn(&Path),
+        }
+        let cases = [
+            InvalidRuntimeCase { name: "symlink", edit: |root| {
                 std::os::unix::fs::symlink("/etc/passwd", root.join("skills/link")).unwrap()
-            }),
-            ("missing notice", |root| {
+            }},
+            InvalidRuntimeCase { name: "missing notice", edit: |root| {
                 fs::remove_file(root.join("LICENSE")).unwrap()
-            }),
-            ("missing libraries", |root| {
+            }},
+            InvalidRuntimeCase { name: "missing libraries", edit: |root| {
                 fs::remove_dir_all(root.join("lib")).unwrap()
-            }),
-            ("desktop bundle", |root| {
+            }},
+            InvalidRuntimeCase { name: "desktop bundle", edit: |root| {
                 write(&root.join(DESKTOP_DESCRIPTOR), b"{}", 0o644)
-            }),
-            ("executable changed after packaging", |root| {
+            }},
+            InvalidRuntimeCase { name: "executable changed after packaging", edit: |root| {
                 write(&root.join("paseo"), &elf(b"swapped"), 0o755)
-            }),
-            ("claims official release", |root| {
+            }},
+            InvalidRuntimeCase { name: "claims official release", edit: |root| {
                 edit_identity(root, "release", json!(true))
-            }),
-            ("claims official archive", |root| {
+            }},
+            InvalidRuntimeCase { name: "claims official archive", edit: |root| {
                 edit_identity(root, "installationKind", json!(STANDALONE_ARCHIVE))
-            }),
-            ("legacy desktop marker", |root| {
+            }},
+            InvalidRuntimeCase { name: "legacy desktop marker", edit: |root| {
                 edit_identity(root, "installationKind", json!("desktop-bundled"))
-            }),
+            }},
         ];
-        for (index, (name, edit)) in cases.iter().enumerate() {
+        for (index, InvalidRuntimeCase { name, edit }) in cases.iter().enumerate() {
             let source = temp.path().join(format!("bad-{index}"));
             local_runtime(&source, "0.13.1", &elf(b"candidate"));
             edit(&source);

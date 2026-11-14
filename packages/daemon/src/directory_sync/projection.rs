@@ -126,11 +126,9 @@ pub fn matches_workspace_filter(workspace: &Value, filter: Option<&Value>) -> bo
         .and_then(Value::as_str)
         .map(js_trim)
         .filter(|id| !id.is_empty())
-    {
-        if workspace.get("projectId").and_then(Value::as_str) != Some(project_id) {
+        && workspace.get("projectId").and_then(Value::as_str) != Some(project_id) {
             return false;
         }
-    }
     if let Some(query) = filter
         .get("query")
         .and_then(Value::as_str)
@@ -173,13 +171,12 @@ pub fn matches_agent_updates_filter(
     let Some(filter) = filter else {
         return true;
     };
-    if let Some(labels) = filter.get("labels").and_then(Value::as_object) {
-        if !labels.iter().all(|(key, value)| {
+    if let Some(labels) = filter.get("labels").and_then(Value::as_object)
+        && !labels.iter().all(|(key, value)| {
             agent.get("labels").and_then(|labels| labels.get(key)) == Some(value)
         }) {
             return false;
         }
-    }
     if let Some(expected) = filter.get("thinkingOptionId") {
         let expected = resolve_effective_thinking_option_id(None, Some(expected));
         let effective = agent
@@ -196,17 +193,16 @@ pub fn matches_agent_updates_filter(
             return false;
         }
     }
-    if let Some(statuses) = filter.get("statuses").and_then(Value::as_array) {
-        if !statuses.is_empty()
+    if let Some(statuses) = filter.get("statuses").and_then(Value::as_array)
+        && !statuses.is_empty()
             && !agent
                 .get("status")
                 .is_some_and(|status| statuses.contains(status))
         {
             return false;
         }
-    }
-    if let Some(expected) = filter.get("requiresAttention").and_then(Value::as_bool) {
-        if agent
+    if let Some(expected) = filter.get("requiresAttention").and_then(Value::as_bool)
+        && agent
             .get("requiresAttention")
             .and_then(Value::as_bool)
             .unwrap_or(false)
@@ -214,7 +210,6 @@ pub fn matches_agent_updates_filter(
         {
             return false;
         }
-    }
     if let Some(keys) = filter.get("projectKeys").and_then(Value::as_array) {
         let mut meaningful = keys
             .iter()

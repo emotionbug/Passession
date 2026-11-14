@@ -219,8 +219,8 @@ impl RuntimePorts {
         let result = async {
             let mut explicit: Vec<f64> = plan.values().copied().collect();
             for service in services {
-                if !plan.contains_key(&service.script_name) {
-                    if let Some(port) = service.port {
+                if !plan.contains_key(&service.script_name)
+                    && let Some(port) = service.port {
                         if explicit.contains(&port) {
                             bail!(
                                 "Service '{}' has a duplicate port {}",
@@ -230,7 +230,6 @@ impl RuntimePorts {
                         }
                         explicit.push(port);
                     }
-                }
             }
             for service in services {
                 if plan.contains_key(&service.script_name) {

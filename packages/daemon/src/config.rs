@@ -297,11 +297,10 @@ impl ConfigService {
         // Hook installers mutate user-owned provider configuration and retain
         // the source's warning-only failure semantics, not fictitious rollback.
         // Run only once all rejecting live owners have accepted the candidate.
-        if next.get("enableTerminalAgentHooks") != previous.get("enableTerminalAgentHooks") {
-            if let Err(error) = app.terminals.apply_config(next, previous).await {
+        if next.get("enableTerminalAgentHooks") != previous.get("enableTerminalAgentHooks")
+            && let Err(error) = app.terminals.apply_config(next, previous).await {
                 tracing::warn!(%error, "Daemon configuration applied but terminal hook installation failed");
             }
-        }
         Ok(())
     }
 
@@ -404,11 +403,10 @@ impl ConfigService {
             startup_persisted: before.startup_persisted,
             known_persisted: persisted,
         });
-        if changed {
-            if let Err(error) = app.transport.publish_daemon_config_changed(desired).await {
+        if changed
+            && let Err(error) = app.transport.publish_daemon_config_changed(desired).await {
                 tracing::warn!(%error,"Daemon configuration reloaded but notification failed");
             }
-        }
         Ok(
             json!({"appliedPaths":applied,"restartRequiredPaths":restart,"overrideControlledPaths":override_paths}),
         )

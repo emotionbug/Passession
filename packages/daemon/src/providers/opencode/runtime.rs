@@ -219,8 +219,8 @@ impl RuntimeManager {
         };
         let mut pending = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if !fresh {
-                if let Some(runtime) = state
+            if !fresh
+                && let Some(runtime) = state
                     .current
                     .get(&key)
                     .and_then(Weak::upgrade)
@@ -228,7 +228,6 @@ impl RuntimeManager {
                 {
                     return Ok(runtime);
                 }
-            }
             if let Some(pending) = state.pending.get(&key) {
                 pending.clone()
             } else {
@@ -472,11 +471,10 @@ impl Runtime {
                         } else {
                             listening_url(&text)
                         };
-                        if let Some(url) = url {
-                            if let Some(sender) = sender.take() {
+                        if let Some(url) = url
+                            && let Some(sender) = sender.take() {
                                 let _ = sender.send(url);
                             }
-                        }
                     }
                 }
             }
@@ -817,8 +815,8 @@ impl DeltaUtf16 {
     fn parse(&mut self, bytes: &[u8]) -> Result<Value> {
         let error = match serde_json::from_slice::<Value>(bytes) {
             Ok(event) => {
-                if !self.pending.is_empty() {
-                    if let Some(key) = delta_part(&event) {
+                if !self.pending.is_empty()
+                    && let Some(key) = delta_part(&event) {
                         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
                         if !event_type.ends_with(".delta") {
                             self.pending.remove(&key);
@@ -831,7 +829,6 @@ impl DeltaUtf16 {
                             bail!("OpenCode text delta contains an unpaired UTF-16 surrogate");
                         }
                     }
-                }
                 return Ok(event);
             }
             Err(error) => error,

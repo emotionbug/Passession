@@ -30,7 +30,7 @@ mod runtime;
 pub mod storage;
 pub mod timeline;
 mod wire;
-pub use generation::{StructuredAgentFallbackError, StructuredAgentResponseError};
+pub use generation::{StructuredAgentFallbackError, StructuredAgentResponseError, StructuredGenerationSchema};
 pub(crate) use generation::{compile_schema, retry_prompt, validate_response};
 pub use listing::select_agent_list_items;
 use event_stage::EventStage;
@@ -564,10 +564,10 @@ impl AgentManager {
                 config["model"] = json!(model);
             }
         }
-        if resolve_default_model && config.get("model").is_none() {
-            if let Ok(catalog) = app.providers.catalog(&provider, Some(&cwd), true).await {
-                if let Some(models) = catalog["models"].as_array() {
-                    if let Some(model) = models
+        if resolve_default_model && config.get("model").is_none()
+            && let Ok(catalog) = app.providers.catalog(&provider, Some(&cwd), true).await
+                && let Some(models) = catalog["models"].as_array()
+                    && let Some(model) = models
                         .iter()
                         .find(|m| m["isDefault"] == true)
                         .or_else(|| models.first())
@@ -575,9 +575,6 @@ impl AgentManager {
                     {
                         config["model"] = model.clone();
                     }
-                }
-            }
-        }
         if let Some(grants) = config["toolPolicy"]["preapproved"].as_array() {
             for grant in grants {
                 let server = required(grant, "server")?;
@@ -711,7 +708,7 @@ impl AgentManager {
                                     }
                                 }
                             }
-                            if let Some(key)=text(&event,"key"){if let Some(sender)=current.barriers.lock().await.remove(key){let _=sender.send(());}}
+                            if let Some(key)=text(&event,"key")&& let Some(sender)=current.barriers.lock().await.remove(key){let _=sender.send(());}
                         }else{manager.apply_event(&id,&current,event,false).await?;}
                     }
                     Ok::<_,anyhow::Error>(())}.await;
@@ -810,14 +807,13 @@ impl AgentManager {
             runtime::transition_attention(None, snapshot);
             let _ = self.events.send(json!({"type":"agent_state","agent":snapshot}));
         }
-        if let Some(session) = session {
-            if let Err(close_error) = session.close().await {
+        if let Some(session) = session
+            && let Err(close_error) = session.close().await {
                 tracing::error!(agent_id=%id,error=%close_error,"Failed to close failed event owner session");
                 // The event consumer has ended, but failed process cleanup still
                 // belongs to this cell and must block replacement until retried.
                 cell.data.lock().await.session = Some(session);
             }
-        }
     }
     /// Non-activity writes preserve both durable activity stamps and the live
     /// snapshot, even when an older record uses different values for the two.
@@ -825,8 +821,8 @@ impl AgentManager {
         object(snapshot).remove("snapshotAvailability");
         if record_activity {
             snapshot["lastActivityAt"] = snapshot["updatedAt"].clone();
-        } else if snapshot["internal"] != true {
-            if let Some(previous) = self.storage()?.get(required(snapshot, "id")?).await? {
+        } else if snapshot["internal"] != true
+            && let Some(previous) = self.storage()?.get(required(snapshot, "id")?).await? {
                 for field in ["updatedAt", "lastActivityAt"] {
                     match previous.get(field) {
                         Some(value) => { snapshot[field] = value.clone(); }
@@ -834,7 +830,6 @@ impl AgentManager {
                     }
                 }
             }
-        }
         if snapshot["internal"] == true {
             return Ok(());
         }

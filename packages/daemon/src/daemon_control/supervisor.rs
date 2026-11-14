@@ -397,16 +397,14 @@ async fn drain<R: AsyncRead + Unpin>(
         while let Some(end) = pending.iter().position(|b| *b == b'\n') {
             let line = &pending[..=end];
             let mut lifecycle = false;
-            if let Some((sender, token)) = &events {
-                if let Ok(value) = serde_json::from_slice::<Value>(line) {
-                    if matches!(value["type"].as_str(), Some("paseo:ready" | "paseo:stopping"))
+            if let Some((sender, token)) = &events
+                && let Ok(value) = serde_json::from_slice::<Value>(line)
+                    && matches!(value["type"].as_str(), Some("paseo:ready" | "paseo:stopping"))
                         && value["token"].as_str() == Some(token.as_str())
                     {
                         lifecycle = true;
                         let _ = sender.send(value).await;
                     }
-                }
-            }
             if !lifecycle {
                 log.write(line).await;
                 if stderr {

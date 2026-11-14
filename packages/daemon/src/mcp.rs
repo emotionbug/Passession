@@ -386,33 +386,30 @@ pub fn strip_internal_servers(mut servers: Value) -> Value {
     servers
 }
 fn normalize_input(schema: &Value, input: &mut Value) {
-    if schema["x-trim"] == true {
-        if let Some(s) = input.as_str() {
+    if schema["x-trim"] == true
+        && let Some(s) = input.as_str() {
             *input = json!(s.trim());
         }
-    }
     if let (Some(props), Some(obj)) = (schema["properties"].as_object(), input.as_object_mut()) {
         if schema["x-strip-unknown"] == true {
             obj.retain(|key, _| props.contains_key(key));
         }
         for (key, prop) in props {
-            if !obj.contains_key(key) {
-                if let Some(default) = prop.get("default") {
+            if !obj.contains_key(key)
+                && let Some(default) = prop.get("default") {
                     obj.insert(key.clone(), default.clone());
                 }
-            }
             if let Some(v) = obj.get_mut(key) {
                 normalize_input(prop, v);
             }
         }
     }
-    if let Some(values) = input.as_array_mut() {
-        if let Some(items) = schema.get("items") {
+    if let Some(values) = input.as_array_mut()
+        && let Some(items) = schema.get("items") {
             for value in values {
                 normalize_input(items, value);
             }
         }
-    }
     for key in ["oneOf", "anyOf"] {
         if let Some(variants) = schema[key].as_array() {
             for variant in variants {

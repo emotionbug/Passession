@@ -294,11 +294,9 @@ impl ProjectService {
         }
         if workspace["kind"] == "worktree"
             && tokio::fs::try_exists(Path::new(root).join(".git")).await?
-        {
-            if let Some(port) = runtime::read_worktree_runtime_port(Path::new(root)).await? {
+            && let Some(port) = runtime::read_worktree_runtime_port(Path::new(root)).await? {
                 env.insert("PASEO_WORKTREE_PORT".into(), port.to_string());
             }
-        }
         Ok(env)
     }
     pub async fn register_project(&self, cwd: &Path) -> Result<Value> {
@@ -390,11 +388,10 @@ impl ProjectService {
             return self.refresh_workspace(workspace.clone()).await;
         }
         for workspace in candidates {
-            if let Some(project) = self.project(text(&workspace, "projectId")?).await? {
-                if project["archivedAt"].is_null() {
+            if let Some(project) = self.project(text(&workspace, "projectId")?).await?
+                && project["archivedAt"].is_null() {
                     return self.unarchive(workspace).await;
                 }
-            }
         }
         self.create_directory(&cwd, &json!({})).await
     }
@@ -412,8 +409,8 @@ impl ProjectService {
             return Ok(value);
         }
         let mut caller = input["callerWorkspaceId"].as_str().map(str::to_owned);
-        if caller.is_none() {
-            if let Some(id) = input["callerAgentId"].as_str() {
+        if caller.is_none()
+            && let Some(id) = input["callerAgentId"].as_str() {
                 let a = self
                     .app()?
                     .agents
@@ -422,7 +419,6 @@ impl ProjectService {
                     .ok_or_else(|| anyhow!("Caller agent {id} not found"))?;
                 caller = a["workspaceId"].as_str().map(str::to_owned);
             }
-        }
         match caller {
             None => Ok(false),
             Some(id) => Ok(self
@@ -479,11 +475,10 @@ impl ProjectService {
             tracing::warn!(%error,"Created workspace observation unavailable");
         }
         self.publish_workspace(&id).await?;
-        if input["deferName"] != true {
-            if let Some(context) = input.get("firstAgentContext") {
+        if input["deferName"] != true
+            && let Some(context) = input.get("firstAgentContext") {
                 self.schedule_name(&record, context);
             }
-        }
         Ok(record)
     }
     pub async fn create_workspace(&self, input: &Value) -> Result<Value> {
@@ -571,11 +566,10 @@ impl ProjectService {
         if let Some(context) = options.get("firstAgentContext") {
             request["firstAgentContext"] = context.clone();
         }
-        if request.get("refName").is_none() {
-            if let Some(base) = source.get("baseBranch") {
+        if request.get("refName").is_none()
+            && let Some(base) = source.get("baseBranch") {
                 request["refName"] = base.clone();
             }
-        }
         let created = worktrees::create(
             &app.home,
             &app.config.snapshot(),
@@ -615,8 +609,8 @@ impl ProjectService {
             record["createdWorktree"]=json!({"worktree":created["worktree"],"intent":created["intent"],"repoRoot":created["repoRoot"],"workspace":record.clone(),"created":true});
             Ok(record)
         }.await;
-        if result.is_err() && !persisted {
-            if let Err(error) = worktrees::rollback_created(
+        if result.is_err() && !persisted
+            && let Err(error) = worktrees::rollback_created(
                 &app.home,
                 &app.config.snapshot(),
                 &created,
@@ -626,7 +620,6 @@ impl ProjectService {
             {
                 tracing::warn!(%error,"Failed to roll back created worktree; retaining owned resources");
             }
-        }
         result
     }
     pub async fn refresh_workspace(&self, workspace: Value) -> Result<Value> {
@@ -711,12 +704,11 @@ impl ProjectService {
         } else {
             app.git.cached_snapshot(cwd).await
         };
-        if let Some(snapshot) = snapshot {
-            if snapshot["forge"]["pullRequest"]["isMerged"] == true {
+        if let Some(snapshot) = snapshot
+            && snapshot["forge"]["pullRequest"]["isMerged"] == true {
                 workspace["autoArchivedChangeRequestUrl"] =
                     snapshot["forge"]["pullRequest"]["url"].clone();
             }
-        }
         project["archivedAt"] = Value::Null;
         project["updatedAt"] = json!(now());
         self.storage()
@@ -781,7 +773,7 @@ impl ProjectService {
             self.publish_workspace(id).await?;
             let mut agents=Vec::new();
             if workspace["archivedAt"].is_null(){
-                for agent in app.agents.list_snapshots().await? {if agent["workspaceId"]==id{let agent_id=text(&agent,"id")?.to_owned();agents.push(agent_id.clone());if agent["archivedAt"].is_null(){if let Err(error)=app.agents.control(actor,&agent_id,"archive",json!({})).await{tracing::warn!(%error,workspace_id=id,"Workspace agent archive failed");}}}}
+                for agent in app.agents.list_snapshots().await? {if agent["workspaceId"]==id{let agent_id=text(&agent,"id")?.to_owned();agents.push(agent_id.clone());if agent["archivedAt"].is_null()&& let Err(error)=app.agents.control(actor,&agent_id,"archive",json!({})).await{tracing::warn!(%error,workspace_id=id,"Workspace agent archive failed");}}}
                 if let Err(error)=app.terminals.kill_workspace(id).await{tracing::warn!(%error,workspace_id=id,"Workspace terminal archive failed");}
                 self.storage().await?.archive_workspace(id,&now(),auto_url).await?;
                 if let Some(archived)=self.workspace(id).await?{self.emit_workspace_hook("workspace.archived",&archived).await;}
@@ -795,7 +787,7 @@ impl ProjectService {
                 if let Err(error)=teardown{tracing::warn!(%error,workspace_id=id,"Worktree teardown failed; preserving directory");}else{
                     let mut referenced=false;
                     for other in self.list_workspaces().await?{if other["archivedAt"].is_null(){let backing=other["worktreeRoot"].as_str().unwrap_or(text(&other,"cwd")?);if same_path(Path::new(backing),Path::new(root)).await{referenced=true;break}}}
-                    if !referenced {if let Some(repo)=workspace["mainRepoRoot"].as_str(){match worktrees::remove(&app.home,&app.config.snapshot(),Path::new(repo),Path::new(root),app.cancel.child_token()).await{Ok(())=>removed=true,Err(error)=>tracing::warn!(%error,"Worktree removal failed; workspace remains archived")}}}
+                    if !referenced&& let Some(repo)=workspace["mainRepoRoot"].as_str(){match worktrees::remove(&app.home,&app.config.snapshot(),Path::new(repo),Path::new(root),app.cancel.child_token()).await{Ok(())=>removed=true,Err(error)=>tracing::warn!(%error,"Worktree removal failed; workspace remains archived")}}
                 }
             }
             self.runtime_ports.release_plan(id);
@@ -855,22 +847,20 @@ impl ProjectService {
             Some(entry) => json!({"kind":"upsert","workspace":entry}),
             None => json!({"kind":"remove","id":id}),
         };
-        if entry.is_none() {
-            if let Some(w) = &workspace {
+        if entry.is_none()
+            && let Some(w) = &workspace {
                 let project_id = text(w, "projectId")?;
                 if !self.list_workspaces().await?.iter().any(|candidate| {
                     candidate["projectId"] == project_id && candidate["archivedAt"].is_null()
-                }) {
-                    if let Some(project) = self
+                })
+                    && let Some(project) = self
                         .project(project_id)
                         .await?
                         .filter(|p| p["archivedAt"].is_null())
                     {
                         payload["emptyProject"] = directory::project_descriptor(&project);
                     }
-                }
             }
-        }
         let background = workspace.as_ref().is_some_and(|w| w["background"] == true);
         let payload = app
             .agents

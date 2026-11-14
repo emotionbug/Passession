@@ -88,11 +88,10 @@ pub fn command(
     }
     // Resume follows the engine's stored model, then explicit overrides are applied
     // with set_model after initialization (the original resume omits --model).
-    if session.is_none() {
-        if let Some(model) = config["model"].as_str().filter(|v| !v.is_empty()) {
+    if session.is_none()
+        && let Some(model) = config["model"].as_str().filter(|v| !v.is_empty()) {
             argv.extend(["--model".into(), model.into()]);
         }
-    }
     if let Some(level) = config["thinkingOptionId"]
         .as_str()
         .filter(|s| valid_thinking(s, omp))
@@ -186,22 +185,22 @@ pub fn validate_options(family: &str, options: &Value) -> Result<()> {
     for (key, value) in options {
         match key.as_str() {
             "rpcTimeoutMs" => {
-                if !value.as_u64().is_some_and(|v| v > 0) {
+                if value.as_u64().is_none_or(|v| v == 0) {
                     bail!("rpcTimeoutMs must be a positive integer");
                 }
             }
             "extensionTimeoutMs" if family == "pi" => {
-                if !value.as_u64().is_some_and(|v| v > 0) {
+                if value.as_u64().is_none_or(|v| v == 0) {
                     bail!("extensionTimeoutMs must be a positive integer");
                 }
             }
             "sessionDir" => {
-                if !value.as_str().is_some_and(|v| !v.is_empty()) {
+                if value.as_str().is_none_or(|v| v.is_empty()) {
                     bail!("sessionDir must be nonempty");
                 }
             }
             "smolModel" | "slowModel" | "planModel" if family == "omp" => {
-                if !value.as_str().is_some_and(|v| !v.is_empty()) {
+                if value.as_str().is_none_or(|v| v.is_empty()) {
                     bail!("{key} must be nonempty");
                 }
             }
@@ -409,9 +408,39 @@ pub fn private_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::probe_key;
+    use super::{probe_key, validate_options};
     use paseo_client::process::CommandSpec;
+    use serde_json::{Value, json};
     use std::{collections::BTreeMap, path::Path};
+
+    #[test]
+    fn timeout_options_require_positive_u64_integers() {
+        for (family, key) in [
+            ("pi", "rpcTimeoutMs"),
+            ("omp", "rpcTimeoutMs"),
+            ("pi", "extensionTimeoutMs"),
+        ] {
+            for value in [json!(1), json!(u64::MAX)] {
+                assert!(validate_options(family, &json!({key: value})).is_ok());
+            }
+            for value in [
+                Value::Null,
+                json!(false),
+                json!("1"),
+                json!(0),
+                json!(-1),
+                json!(1.0),
+                json!(0.5),
+                serde_json::from_str::<Value>("18446744073709551616").unwrap(),
+            ] {
+                assert!(
+                    validate_options(family, &json!({key: value})).is_err(),
+                    "{family} accepted {key}={value}"
+                );
+            }
+        }
+        assert!(validate_options("omp", &json!({"extensionTimeoutMs": 1})).is_err());
+    }
 
     fn launch(cwd: &Path, agent: &str, agent_dir: &Path) -> CommandSpec {
         CommandSpec {

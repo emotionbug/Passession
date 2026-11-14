@@ -35,11 +35,10 @@ impl AgentManager {
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut source = json!({"kind":"agent-message","agentId":caller});
-        if actor["kind"] != "agent" {
-            if let Some(server) = input.get("sourceAgentServerId") {
+        if actor["kind"] != "agent"
+            && let Some(server) = input.get("sourceAgentServerId") {
                 source["serverId"] = server.clone();
             }
-        }
         if let Some(title) = caller_snapshot
             .as_ref()
             .and_then(|s| s.get("title"))
@@ -444,8 +443,8 @@ impl AgentManager {
         if let Some(mode) = text(input, "sessionMode") {
             self.change_mode(cell, session.as_ref(), mode).await?;
         }
-        let command = notifications::agent_message_command(&prompt).map(Value::String);
-        if let Some(run) = session.clone().prepare_out_of_band(command.as_ref().unwrap_or(&prompt)) {
+        let command = notifications::agent_message_command(prompt).map(Value::String);
+        if let Some(run) = session.clone().prepare_out_of_band(command.as_ref().unwrap_or(prompt)) {
             self.drain_events(cell).await?;
             self.record_submitted(id, cell, prompt, client_id.as_deref(), None, false).await?;
             let sink = cell.sink.clone();
@@ -1144,14 +1143,13 @@ impl AgentManager {
                 // Fence storage first so the close's final persist cannot recreate the record.
                 self.storage()?.begin_delete(id).await?;
             }
-            if let Ok(cell) = self.cell(id).await {
-                if let Err(error) = self.close_cell(id, &cell).await {
+            if let Ok(cell) = self.cell(id).await
+                && let Err(error) = self.close_cell(id, &cell).await {
                     if action != "delete" {
                         return Err(error);
                     }
                     tracing::warn!(agent_id = id, %error, "Failed to close agent {id} during delete");
                 }
-            }
             if action == "delete" {
                 self.storage()?.remove(id).await?;
                 let app = self.app()?;
@@ -1568,15 +1566,12 @@ impl AgentManager {
                 .events
                 .send(json!({"type":"agent_state","agent":snapshot}));
         }
-        if let Some(handle) = snapshot.get("persistence").filter(|v| v.is_object()) {
-            if let Ok(factory) = self.app()?.providers.get(required(&snapshot, "provider")?) {
-                if factory.supports_native_archive() {
-                    if let Err(error) = factory.archive_native_session(handle).await {
+        if let Some(handle) = snapshot.get("persistence").filter(|v| v.is_object())
+            && let Ok(factory) = self.app()?.providers.get(required(&snapshot, "provider")?)
+                && factory.supports_native_archive()
+                    && let Err(error) = factory.archive_native_session(handle).await {
                         tracing::warn!(agent_id=id,%error,"Failed to archive native session");
                     }
-                }
-            }
-        }
         self.app()?.automation.complete_for_agent(id).await?;
         if newly_archived && snapshot["internal"] != true {
             let _ = self
@@ -1688,19 +1683,19 @@ mod tests {
         options: Value,
         cancel: CancellationToken,
     ) -> Result<Option<Value>> {
-        let (source, mut output) = crate::transport::RequestContext::attach(
-            uuid::Uuid::new_v4().to_string(),
-            "finish-session".into(),
-            "finish-client".into(),
-            json!({"owned_subscriptions":true,"all_providers":true}),
-            json!({"id":"owner","kind":"owner"}),
-            Arc::new(std::sync::RwLock::new(
+        let (source, mut output) = crate::transport::RequestContext::attach(crate::transport::SourceConfig {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: "finish-session".into(),
+            client_id: "finish-client".into(),
+            capabilities: json!({"owned_subscriptions":true,"all_providers":true}),
+            principal: json!({"id":"owner","kind":"owner"}),
+            permissions: Arc::new(std::sync::RwLock::new(
                 ["workspace.read".to_owned()].into_iter().collect(),
             )),
-            true,
-            None,
-            cancel.clone(),
-        );
+            routed: true,
+            app_version: None,
+            cancel: cancel.clone(),
+        });
         // Remote finish watches restore this subscription on every connection.
         let subscription = json!({
             "type":"agent.timeline.set_subscription.request",
@@ -1953,19 +1948,19 @@ mod tests {
         )
         .await;
         manager.release_event_stage(&cell).await?;
-        let (source, mut output) = crate::transport::RequestContext::attach(
-            "cancel-source".into(),
-            "cancel-session".into(),
-            "cancel-client".into(),
-            json!({"owned_subscriptions":true}),
-            json!({"id":"owner","kind":"owner"}),
-            Arc::new(std::sync::RwLock::new(
+        let (source, mut output) = crate::transport::RequestContext::attach(crate::transport::SourceConfig {
+            id: "cancel-source".into(),
+            session_id: "cancel-session".into(),
+            client_id: "cancel-client".into(),
+            capabilities: json!({"owned_subscriptions":true}),
+            principal: json!({"id":"owner","kind":"owner"}),
+            permissions: Arc::new(std::sync::RwLock::new(
                 ["workspace.write".to_owned()].into_iter().collect(),
             )),
-            false,
-            None,
-            CancellationToken::new(),
-        );
+            routed: false,
+            app_version: None,
+            cancel: CancellationToken::new(),
+        });
         let message = json!({"type":"cancel_agent_request","requestId":"cancel","agentId":id});
         let request = source.for_request(message.clone());
         assert!(manager.handle(&request, &message).await?);

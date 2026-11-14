@@ -14,6 +14,7 @@ pub use context::{
     MAX_BUFFERED_BYTES, MAX_FRAME_BYTES, OutboundFrame, OwnedOperation, OwnedSubscription,
     RequestContext, has_capability, message_type, request_id,
 };
+pub(crate) use context::SourceConfig;
 pub use identity::{generate_local_pairing_offer, hash_daemon_password, offline_pairing_offer};
 
 use crate::state::AppState;
@@ -281,11 +282,10 @@ impl TransportService {
             .unwrap_or(false)
     }
     pub async fn authenticate_status(&self, authorization: Option<&str>) -> bool {
-        if let Some(token) = authorization.and_then(extract_http_bearer_token) {
-            if self.matches_local_credential(token) {
+        if let Some(token) = authorization.and_then(extract_http_bearer_token)
+            && self.matches_local_credential(token) {
                 return true;
             }
-        }
         self.authenticate_bearer(authorization).await
     }
     fn matches_local_credential(&self, candidate: &str) -> bool {
@@ -549,17 +549,17 @@ impl TransportService {
                     .routed
                     .fetch_or(routed, std::sync::atomic::Ordering::AcqRel);
             }
-            let (context, output) = RequestContext::attach(
-                uuid::Uuid::new_v4().to_string(),
-                session.id.clone(),
+            let (context, output) = RequestContext::attach(SourceConfig {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: session.id.clone(),
                 client_id,
-                hello.get("capabilities").cloned().unwrap_or(Value::Null),
-                admission.principal,
-                session.permissions.clone(),
+                capabilities: hello.get("capabilities").cloned().unwrap_or(Value::Null),
+                principal: admission.principal,
+                permissions: session.permissions.clone(),
                 routed,
-                hello["appVersion"].as_str().map(str::to_owned),
-                source_cancel,
-            );
+                app_version: hello["appVersion"].as_str().map(str::to_owned),
+                cancel: source_cancel,
+            });
             session.sources.insert(
                 context.source_id().to_owned(),
                 Arc::downgrade(&context.source),
@@ -580,7 +580,7 @@ impl TransportService {
                     let Some(mut queued) = queued else { break; };
                     let mut frame = std::mem::replace(&mut queued.frame, OutboundFrame::Pong(Bytes::new()));
                     let drain = !matches!(frame,OutboundFrame::Flush(_) | OutboundFrame::Close {..});
-                    if legacy_hub { if let OutboundFrame::Text(text) = &mut frame { if let Ok(mut envelope) = serde_json::from_str::<Value>(text) { if envelope["type"] == "session" { *text = envelope["message"].take().to_string(); } } } }
+                    if legacy_hub && let OutboundFrame::Text(text) = &mut frame && let Ok(mut envelope) = serde_json::from_str::<Value>(text) && envelope["type"] == "session" { *text = envelope["message"].take().to_string(); }
                     tokio::select! { _ = writer_cancel.cancelled() => break, result = output_sender.send(frame) => if result.is_err() { writer_cancel.cancel(); break; } }
                     if drain {
                         let (acknowledge, flushed) = tokio::sync::oneshot::channel();
@@ -1038,13 +1038,11 @@ impl TransportService {
             let path = app.home.join("local-credential");
             let owned = self.local_credential.write().unwrap().take();
             drop(app);
-            if let Some(owned) = owned {
-                if let Some(bytes) = storage::read_private(&path).await? {
-                    if String::from_utf8(bytes)?.trim() == owned {
+            if let Some(owned) = owned
+                && let Some(bytes) = storage::read_private(&path).await?
+                    && String::from_utf8(bytes)?.trim() == owned {
                         tokio::fs::remove_file(path).await?;
                     }
-                }
-            }
         }
         relay?;
         hosts?;
@@ -1279,14 +1277,13 @@ fn validate_hello(hello: &Value) -> std::result::Result<(), &'static str> {
             return Err("Invalid hello capability");
         }
     }
-    if let Some(values) = hello.get("sessionPermissions") {
-        if values.as_array().is_none_or(|a| {
+    if let Some(values) = hello.get("sessionPermissions")
+        && values.as_array().is_none_or(|a| {
             a.iter()
                 .any(|v| v.as_str().is_none_or(|p| !permissions::known_permission(p)))
         }) {
             return Err("Invalid session permissions");
         }
-    }
     if let Some(producer) = hello.get("producer") {
         for (key, max) in [("serverId", 256), ("sourceId", 1024)] {
             if producer[key]
@@ -1297,15 +1294,14 @@ fn validate_hello(hello: &Value) -> std::result::Result<(), &'static str> {
             }
         }
     }
-    if let Some(auth) = hello.get("auth") {
-        if match auth["kind"].as_str() {
+    if let Some(auth) = hello.get("auth")
+        && match auth["kind"].as_str() {
             Some("password") => !auth["password"].is_string(),
             Some("localCredential") => !auth["token"].is_string(),
             _ => true,
         } {
             return Err("Invalid hello credential");
         }
-    }
     Ok(())
 }
 /// Original `handleHello` after admission: a blank trimmed clientId, or a reserved

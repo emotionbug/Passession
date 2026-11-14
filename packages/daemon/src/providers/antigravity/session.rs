@@ -329,12 +329,11 @@ impl Runtime {
                 Next::Cancel | Next::Command(None) => break,
                 Next::Command(Some(Command::Close(reply))) => {
                     let result = self.stop(true).await.map(|_| Value::Null);
-                    if let Some(images) = self.images.take() {
-                        if let Err(error) = images.close() {
+                    if let Some(images) = self.images.take()
+                        && let Err(error) = images.close() {
                             let _ = reply.send(Err(error.into()));
                             break;
                         }
-                    }
                     let _ = reply.send(result);
                     break;
                 }
@@ -420,11 +419,9 @@ impl Runtime {
             .driver
             .as_ref()
             .is_some_and(|d| d.selection != selection)
-        {
-            if let Some(driver) = self.driver.take() {
+            && let Some(driver) = self.driver.take() {
                 driver.stop(false).await?;
             }
-        }
         if self.driver.is_some() {
             return Ok(());
         }
@@ -690,7 +687,7 @@ impl Runtime {
                     ))
                     .await?;
                 }
-                if result.status == Status::ERROR {
+                if result.status == Status::Error {
                     let canceled = result.error == "interrupted";
                     self.publish_all(
                         turn.finish(&self.spec.id, if canceled { "canceled" } else { "failed" }),
