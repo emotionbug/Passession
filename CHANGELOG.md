@@ -6,6 +6,8 @@
 
 - Model-facing agent activity shares page identity and epoch instead of repeating detail requests on every row. Agent lists omit redundant metadata while preserving lifecycle, attention and archived state; exact item and snapshot recovery remain available.
 - Documented task-specific OMP Eval batching for read-only checks, retaining errors, permissions and full-detail recovery without introducing automatic compaction.
+- Model discovery now returns bounded ID/label pages with search and exact-model detail lookup. Detailed pages share repeated thinking-option sets without losing original fields or defaults; revision-bound cursors reject changed catalogs.
+- OMP native and bridged MCP tool definitions use deterministic registration order while preserving concurrent connections, dispatch identities and history-derived essential loading.
 
 ### Fixed
 

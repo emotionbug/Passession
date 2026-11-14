@@ -109,7 +109,7 @@ If no profile fits, or no profiles are configured, use the provider discovery to
 
 **`list_providers`** — compact provider availability and modes.
 
-**`list_models`** — full model list for one provider. Use only when you need model IDs or thinking options; the list can be large.
+**`list_models`** — paged selectable model IDs and labels for one `provider`. Search IDs/labels with `query`; `limit` is 1–100 (default 20). Follow `nextCursor` with identical provider/query arguments; restart if the catalog changes. Use exact `modelId` for full details, or `details: true` for detailed pages. Do not combine `modelId` with query/cursor. Detailed rows share options: resolve `thinkingOptionsRef` against that response's `thinkingOptionSets`; use the unchanged `defaultThinkingOptionId`. Raw SDK/UI catalogs are unaffected.
 
 **`inspect_provider`** — compact provider capability and feature inspection. Required: `provider`; pass `cwd` when you are not in an agent-scoped session. Optional: `settings` with draft `model`, `modeId`, `thinkingOptionId`, and `features`.
 

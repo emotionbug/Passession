@@ -265,8 +265,26 @@ Omit absent optional settings. If no profile fits, use provider discovery to cho
 | Tool               | Function                                                          |
 | ------------------ | ----------------------------------------------------------------- |
 | `list_providers`   | List configured agent providers, availability, and modes.         |
-| `list_models`      | List models for an agent provider.                                |
+| `list_models`      | Search and page selectable model IDs/labels; retrieve exact or paged full details. |
 | `inspect_provider` | Inspect compact provider capabilities and draft feature settings. |
+
+`list_models` requires `provider`. Its default response contains up to 20 selectable
+models as `{id, label}` rows, the matched `total`, and `nextCursor` (`null` at the end).
+Use `query` for a case-insensitive substring search of IDs and labels, and `limit`
+from 1 to 100. Continue with the returned cursor and identical provider/query
+arguments. A changed matching catalog, order or query rejects the cursor; restart
+without it. Page size and detail level may change between pages.
+
+Use `modelId` for one exact, case-sensitive selectable model and its full details.
+An unavailable or nonselectable ID fails explicitly. Do not combine `modelId` with
+`query` or `cursor`. Alternatively, `details: true` returns detailed list pages.
+Detailed rows retain all original fields except `thinkingOptions`: a
+`thinkingOptionsRef` indexes the response-local `thinkingOptionSets` array instead.
+Reconstruct the original row by replacing that reference with
+`thinkingOptions: thinkingOptionSets[thinkingOptionsRef]`. Missing, `null`, and empty
+options remain distinct; `defaultThinkingOptionId` is unchanged. References belong
+only to their own response, not a subsequent page. Raw SDK and native UI model
+catalogs are unchanged.
 
 ### Permissions
 

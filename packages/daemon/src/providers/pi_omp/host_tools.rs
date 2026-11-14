@@ -157,6 +157,14 @@ impl Router {
                 });
             }
         }
+        // Registered names are unique, so no tie-breaker or allocated sort keys
+        // are needed. Sort only after history has assigned every load mode.
+        definitions.sort_unstable_by(|left, right| {
+            left["name"]
+                .as_str()
+                .unwrap()
+                .cmp(right["name"].as_str().unwrap())
+        });
         let router = Arc::new(Self {
             runtime,
             executor: context.tool_executor.clone(),
@@ -416,6 +424,264 @@ fn bridge_name(server: &str, tool: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl NativeToolExecutor for RecordingExecutor {
+        async fn execute_streaming(
+            &self,
+            name: &str,
+            input: Value,
+            _: CancellationToken,
+            _: Option<mpsc::Sender<Value>>,
+        ) -> Result<Value> {
+            self.calls.lock().unwrap().push((name.into(), input));
+            Ok(json!({"content":[{"type":"text","text":name}]}))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registration_order_preserves_catalog_routes_and_history_load_modes() -> Result<()> {
+        use axum::{
+            extract::{Path as AxumPath, State},
+            http::StatusCode,
+            response::IntoResponse,
+            routing::post,
+        };
+        use tokio::sync::Semaphore;
+
+        struct Server {
+            gates: [Semaphore; 2],
+            progress: mpsc::Sender<(String, usize)>,
+            reverse_tools: bool,
+            calls: Mutex<Vec<(String, Value)>>,
+        }
+
+        async fn handle(
+            State(server): State<Arc<Server>>,
+            AxumPath(name): AxumPath<String>,
+            axum::Json(message): axum::Json<Value>,
+        ) -> axum::response::Response {
+            let index = usize::from(name == "beta");
+            let method = message["method"].as_str().unwrap();
+            let result = match method {
+                "initialize" => {
+                    server.progress.send((method.into(), index)).await.unwrap();
+                    server.gates[index].acquire().await.unwrap().forget();
+                    json!({
+                        "protocolVersion":"2024-11-05",
+                        "capabilities":{"tools":{}},
+                        "serverInfo":{"name":name,"version":"1"}
+                    })
+                }
+                "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
+                "tools/list" => {
+                    let mut tools = vec![
+                        json!({"name":"same","description":"Shared name, distinct server",
+                            "inputSchema":{"type":"object","properties":{"value":{"type":"integer"}}}}),
+                        json!({"name":"unused","inputSchema":{"type":"object","properties":{}}}),
+                    ];
+                    if server.reverse_tools {
+                        tools.reverse();
+                    }
+                    server.progress.send((method.into(), index)).await.unwrap();
+                    json!({"tools":tools})
+                }
+                "tools/call" => {
+                    server
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .push((name.clone(), message["params"].clone()));
+                    json!({"content":[{"type":"text","text":format!("{name}/{}", message["params"]["name"].as_str().unwrap())}]})
+                }
+                _ => panic!("unexpected MCP request: {message}"),
+            };
+            axum::Json(json!({"jsonrpc":"2.0","id":message["id"],"result":result})).into_response()
+        }
+
+        let mut baseline = None;
+        for permutation in 0..8 {
+            let home = tempfile::tempdir()?;
+            let cancel = CancellationToken::new();
+            let _cleanup = cancel.clone().drop_guard();
+            let history = history::History::load(home.path(), Vec::new()).await;
+            history
+                .record(&json!(["native", "z_native"]).to_string())
+                .await?;
+            history
+                .record(&json!(["mcp", "alpha", "same"]).to_string())
+                .await?;
+
+            let (progress, mut progress_rx) = mpsc::channel(4);
+            let server = Arc::new(Server {
+                gates: [Semaphore::new(0), Semaphore::new(0)],
+                progress,
+                reverse_tools: permutation & 4 != 0,
+                calls: Mutex::new(Vec::new()),
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let app = axum::Router::new()
+                .route("/{server}", post(handle))
+                .with_state(server.clone());
+            let shutdown = cancel.clone();
+            let serving = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown.cancelled_owned())
+                    .await
+            });
+            // Reuse the Router's transport harness to capture the actual wire
+            // catalog and results; all registration and dispatch run normally.
+            let (runtime, mut events) = Transport::spawn(
+                paseo_client::process::CommandSpec {
+                    program: "cat".into(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    clear_env: false,
+                },
+                Duration::from_secs(5),
+                cancel.clone(),
+            )
+            .await?;
+            let executor = Arc::new(RecordingExecutor::default());
+            let mut native = vec![
+                json!({"name":"z_native","description":"Observed native","title":"Native label",
+                    "inputSchema":{"type":"object","properties":{"value":{"type":"integer"}}}}),
+                json!({"name":"a_native","description":"Unobserved native",
+                    "parameters":{"type":"object","properties":{}}}),
+            ];
+            if permutation & 1 != 0 {
+                native.reverse();
+            }
+            let env = BTreeMap::from([("HOME".into(), home.path().display().to_string())]);
+            let context = LaunchContext {
+                agent_id: "catalog-order".into(),
+                home: home.path().into(),
+                executable: "cat".into(),
+                env: env.clone(),
+                mcp_servers: json!({
+                    "alpha":{"type":"http","url":format!("http://{address}/alpha")},
+                    "beta":{"type":"http","url":format!("http://{address}/beta")}
+                }),
+                tool_catalog: json!(native),
+                tool_manifest: Value::Null,
+                tool_executor: Some(executor.clone()),
+                cancel: cancel.clone(),
+            };
+            let options = json!({"homeDir":home.path(),"sessionDir":home.path().join("sessions")});
+            let register = Router::register(runtime.clone(), &context, home.path(), &env, &options);
+            let capture = async {
+                // Both connections must initialize concurrently before either
+                // is released. Reverse which server reaches tools/list first.
+                let mut initialized = Vec::new();
+                for _ in 0..2 {
+                    let (method, index) = progress_rx.recv().await.unwrap();
+                    assert_eq!(method, "initialize");
+                    initialized.push(index);
+                }
+                initialized.sort_unstable();
+                assert_eq!(initialized, [0, 1]);
+                let first = usize::from(permutation & 2 != 0);
+                server.gates[first].add_permits(1);
+                assert_eq!(
+                    progress_rx.recv().await.unwrap(),
+                    ("tools/list".into(), first)
+                );
+                server.gates[1 - first].add_permits(1);
+                assert_eq!(
+                    progress_rx.recv().await.unwrap(),
+                    ("tools/list".into(), 1 - first)
+                );
+                let frame = events.recv().await.unwrap();
+                assert_eq!(frame["type"], "set_host_tools");
+                runtime
+                    .send(&json!({"type":"response","id":frame["id"],"success":true}))
+                    .await?;
+                Ok::<_, anyhow::Error>(frame["tools"].clone())
+            };
+            let (router, definitions) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(register, capture)
+            })
+            .await?;
+            let router = router?;
+            let definitions = definitions?;
+            let serialized = serde_json::to_vec(&definitions)?;
+            if let Some(expected) = &baseline {
+                assert_eq!(&serialized, expected, "permutation {permutation}");
+            } else {
+                baseline = Some(serialized);
+            }
+            let definitions = definitions.as_array().unwrap();
+            assert_eq!(definitions.len(), 6);
+            assert!(definitions.windows(2).all(|pair| {
+                pair[0]["name"].as_str().unwrap() < pair[1]["name"].as_str().unwrap()
+            }));
+            let observed_external = bridge_name("alpha", "same");
+            for (index, definition) in definitions.iter().enumerate() {
+                let name = definition["name"].as_str().unwrap();
+                let observed = name == "z_native" || name == observed_external;
+                assert_eq!(
+                    definition["loadMode"],
+                    if observed {
+                        "essential"
+                    } else {
+                        "discoverable"
+                    }
+                );
+                let args = json!({"value":index});
+                let expected = if let Some(tool) = router.tools.get(name) {
+                    assert_eq!(name, bridge_name(&tool.server, &tool.name));
+                    assert_eq!(
+                        definition["label"],
+                        format!("{} / {}", tool.server, tool.name)
+                    );
+                    format!("{}/{}", tool.server, tool.name)
+                } else {
+                    assert!(name == "z_native" || name == "a_native");
+                    name.to_owned()
+                };
+                assert!(router.handle(&json!({
+                    "type":"host_tool_call","id":format!("call-{index}"),
+                    "toolCallId":format!("tool-{index}"),"toolName":name,"arguments":args
+                })));
+                let frame = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await?
+                    .unwrap();
+                assert_eq!(frame["type"], "host_tool_result");
+                assert_eq!(frame["id"], format!("call-{index}"));
+                assert_eq!(frame["result"]["content"][0]["text"], expected);
+                if let Some(tool) = router.tools.get(name) {
+                    assert_eq!(
+                        server.calls.lock().unwrap().last(),
+                        Some(&(
+                            tool.server.clone(),
+                            json!({"name":tool.name,"arguments":args})
+                        ))
+                    );
+                } else {
+                    assert_eq!(
+                        executor.calls.lock().unwrap().last(),
+                        Some(&(name.into(), args))
+                    );
+                }
+            }
+            assert_eq!(executor.calls.lock().unwrap().len(), 2);
+            assert_eq!(server.calls.lock().unwrap().len(), 4);
+            router.close().await;
+            runtime.close().await?;
+            cancel.cancel();
+            serving.await??;
+        }
+        Ok(())
+    }
 
     #[cfg(unix)]
     struct RetainedProgress {

@@ -48,6 +48,12 @@ essential even when it failed. Schema reads and tool names mentioned in prose or
 are not execution evidence. Native namespace aliases and server-qualified MCP identities
 are matched exactly; ambiguous aliases do not promote a different server's tool.
 
+Before registration, definitions are sorted by their unique registered names, so
+native input order, MCP connection completion and server tool-list order cannot
+shuffle the emitted catalog. Connections remain concurrent; tool identities, dispatch
+routes and history-derived load modes are unchanged. This stabilizes catalog order,
+not membership, and does not guarantee additional provider prompt-cache savings.
+
 Bootstrap reads the daemon home's `agent-timelines/*.sqlite3` and retained legacy
 `*.json` checkpoints, plus OMP's resolved session directory, configured
 `PI_CODING_AGENT_DIR/sessions`, and `HOME/.omp/agent/sessions`. It runs off Tokio's

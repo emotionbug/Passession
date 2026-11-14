@@ -7,6 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::state::AppState;
 
+mod model_catalog;
+
 const PROMPT_NOTIFICATION: &str = "You will get notified when the prompted agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.";
 const DISPATCH_ACKNOWLEDGED: &str = "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.";
 
@@ -120,8 +122,8 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         definition(
             "list_models",
             "List models",
-            "List models for an agent provider.",
-            json!({"provider":{"type":"string"}}),
+            "Discover selectable models by ID/label with query and pagination. Use modelId for exact full details, or details:true for detailed pages. Detailed rows replace thinkingOptions with a zero-based thinkingOptionsRef into response-local thinkingOptionSets; absent options stay absent. Continue with nextCursor and the same provider/query; changed catalogs require restarting.",
+            model_catalog::properties(),
             &["provider"],
         ),
         definition(
@@ -134,7 +136,7 @@ pub(crate) fn definitions(agent_scope: bool) -> Vec<Value> {
         definition(
             "inspect_provider",
             "Inspect provider",
-            "Inspect compact provider capabilities for orchestration, including modes and draft feature settings. Use list_models for the full model list.",
+            "Inspect compact provider capabilities for orchestration, including modes and draft feature settings. Use list_models to discover models and inspect exact model details.",
             json!({
                 "provider":{"type":"string","x-trim":true,"minLength":1,"description":"Provider ID, optionally with a model ID (for example codex or codex/gpt-5.4)."},
                 "cwd":{"type":"string","description":"Working directory used to resolve provider feature availability."},"settings":inspect_settings
@@ -745,7 +747,8 @@ async fn execute_provider(
             json!({"providers":providers})
         }
         "list_models" => {
-            let provider = string(&input, "provider")?;
+            let request = model_catalog::Request::parse(&input)?;
+            let provider = request.provider;
             let entry = tokio::select! {
                 _ = cancel.cancelled() => bail!("Tool execution cancelled"),
                 entry = app.providers.catalog(provider, None, true) => entry?,
@@ -765,14 +768,7 @@ async fn execute_provider(
                 ),
                 _ => bail!("Provider '{provider}' is not available"),
             }
-            let models: Vec<&Value> = entry
-                .get("models")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|model| model.get("isSelectable") != Some(&Value::Bool(false)))
-                .collect();
-            json!({"provider":provider,"models":models})
+            request.project(&entry, &cancel)?
         }
         "inspect_provider" => {
             let (provider, model) = provider_model(string(&input, "provider")?, false)?;
