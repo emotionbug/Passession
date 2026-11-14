@@ -286,10 +286,17 @@ pub fn list(root: &str, path: &str, home: &Path, cancel: &CancellationToken) -> 
         let name = entry.file_name().to_string_lossy().into_owned();
         let requested = scope.requested.join(&name);
         let result = (|| -> Result<Value> {
-            let child = scoped(root, &requested.to_string_lossy(), home)?;
-            let metadata = fs::metadata(child.resolved)?;
+            // Windows directory enumeration already carries metadata for locked
+            // files (such as pagefile.sys). Canonicalizing every child opens a
+            // handle and can turn one sharing violation into a failed listing.
+            let metadata = entry.metadata()?;
+            let metadata = if metadata.file_type().is_symlink() {
+                fs::metadata(entry.path())?
+            } else {
+                metadata
+            };
             Ok(
-                json!({"name":name,"path":child.relative,"kind":if metadata.is_dir(){"directory"}else{"file"},"size":metadata.len(),"modifiedAt":modified(&metadata)?}),
+                json!({"name":name,"path":relative_name(&scope.root, &requested),"kind":if metadata.is_dir(){"directory"}else{"file"},"size":metadata.len(),"modifiedAt":modified(&metadata)?}),
             )
         })();
         match result {
@@ -983,9 +990,31 @@ mod tests {
         assert_eq!(listed["absolutePath"], home.to_string_lossy().as_ref());
         let nested = list("~", "work/./src/..", &home, &cancel).unwrap();
         assert_eq!(nested["absolutePath"], home.join("work").to_string_lossy().as_ref());
-        let absolute = home.join("work/src");
+        let absolute = home.join("work").join("src");
         let listed = list("~", &absolute.to_string_lossy(), &home, &cancel).unwrap();
         assert_eq!(listed["absolutePath"], absolute.to_string_lossy().as_ref());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn listing_includes_exclusively_locked_files_without_blocking_folders() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked.sys");
+        fs::write(&locked, b"locked").unwrap();
+        fs::create_dir(dir.path().join("Users")).unwrap();
+        let _lock = OpenOptions::new().read(true).share_mode(0).open(&locked).unwrap();
+        assert_eq!(fs::read(&locked).unwrap_err().raw_os_error(), Some(32));
+
+        let listed = list(dir.path().to_str().unwrap(), ".", dir.path(), &CancellationToken::new()).unwrap();
+        let entries = listed["entries"].as_array().unwrap();
+        let file = entries.iter().find(|entry| entry["name"] == "locked.sys").unwrap();
+        assert_eq!(file["path"], "locked.sys");
+        assert_eq!(file["kind"], "file");
+        assert_eq!(file["size"], 6);
+        let folder = entries.iter().find(|entry| entry["name"] == "Users").unwrap();
+        assert_eq!(folder["path"], "Users");
+        assert_eq!(folder["kind"], "directory");
     }
     #[test]
     fn external_paths_roundtrip_reads_lists_and_versioned_writes() {
@@ -1210,6 +1239,12 @@ mod tests {
             .map(|e| e["path"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"escape") && names.contains(&"link"));
+        let entries = listed["entries"].as_array().unwrap();
+        let directory_link = entries.iter().find(|entry| entry["path"] == "escape").unwrap();
+        assert_eq!(directory_link["kind"], "directory");
+        let file_link = entries.iter().find(|entry| entry["path"] == "link").unwrap();
+        assert_eq!(file_link["kind"], "file");
+        assert_eq!(file_link["size"], 6);
         for link in ["escape", "link", "self"] {
             mutate(
                 &json!({"type":"fs.entry.delete.request","cwd":cwd,"path":link}),

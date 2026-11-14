@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Windows folder browsing uses directory-entry metadata instead of opening every child to resolve its path. Exclusively locked files such as paging files no longer prevent listing the rest of a drive; symbolic links still report their target type and size.
+
 ## 0.13.22 - 2026-11-14
 
 ### Fixed
