@@ -3918,6 +3918,7 @@ name = "paseo-tailnet"
 version = "0.13.33"
 dependencies = [
  "anyhow",
+ "libc",
  "libloading",
  "serde",
  "serde_json",

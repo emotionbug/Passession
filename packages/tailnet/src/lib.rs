@@ -56,6 +56,28 @@ pub trait KeyStore: fmt::Debug + Send + Sync {
     fn delete(&self, namespace: &Path) -> Result<()>;
 }
 
+/// Takes the state lease without waiting; `WouldBlock` means another holder.
+/// Rust 1.93's `File::try_lock` is unsupported on Android, so Unix uses the
+/// same `flock` primitive directly. Closing the file releases it.
+#[cfg(unix)]
+fn try_lock_state(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the borrowed File keeps this descriptor open for the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_state(file: &File) -> std::io::Result<()> {
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => std::io::ErrorKind::WouldBlock.into(),
+        std::fs::TryLockError::Error(error) => error,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub state_dir: PathBuf,
@@ -352,9 +374,13 @@ impl Manager {
             .create(true)
             .truncate(false)
             .open(config.state_dir.join("runtime.lock"))?;
-        lease.try_lock().context(
-            "Tailscale state is in use by another process or a node still shutting down",
-        )?;
+        match try_lock_state(&lease) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => anyhow::bail!(
+                "Tailscale state is in use by another process or a node still shutting down"
+            ),
+            Err(error) => return Err(error).context("lock Tailscale state"),
+        }
         let key = Zeroizing::new(
             self.0
                 .keys
@@ -583,8 +609,28 @@ mod tests {
             .write(true)
             .open(directory.path().join("runtime.lock"))
             .unwrap();
-        lease.try_lock().unwrap();
+        try_lock_state(&lease).unwrap();
         manager.disconnect().unwrap();
+    }
+    #[test]
+    fn start_reports_a_lease_held_by_another_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.path().join("runtime.lock"))
+            .unwrap();
+        try_lock_state(&held).unwrap();
+        let error = Manager::new(Arc::new(LockedKeyStore))
+            .start(Config {
+                state_dir: directory.path().into(),
+                hostname: "passession-test".into(),
+                control_url: Some("http://127.0.0.1:1".into()),
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("in use by another process"));
     }
     #[test]
     fn control_url_policy() {
