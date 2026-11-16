@@ -1,0 +1,4 @@
+Fixed
+- Start embedded Tailscale on Android again. Since 0.13.32 the state lease used the standard library's file lock, which Android does not support, so every connection failed with "Tailscale state is in use by another process or a node still shutting down". Unix now takes the lease with flock directly, and a lock failure other than contention is reported as its own error.
+
+Full notes: https://github.com/emotionbug/Passession/releases
