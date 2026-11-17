@@ -171,7 +171,7 @@ async fn timeline_request_as(
 }
 
 /// The next published preparation observation for any agent.
-async fn next_preparation(events: &mut broadcast::Receiver<Value>) -> Value {
+async fn next_preparation(events: &mut broadcast::Receiver<Arc<Value>>) -> Value {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
             .await

@@ -13,10 +13,10 @@ async fn emit(cell: &AgentCell, events: Vec<Value>) {
         cell.sink.emit(event).await.unwrap();
     }
 }
-fn observed(receiver: &mut tokio::sync::broadcast::Receiver<Value>) -> Vec<Value> {
+fn observed(receiver: &mut tokio::sync::broadcast::Receiver<Arc<Value>>) -> Vec<Value> {
     let mut events = Vec::new();
     while let Ok(event) = receiver.try_recv() {
-        events.push(event);
+        events.push((*event).clone());
     }
     events
 }

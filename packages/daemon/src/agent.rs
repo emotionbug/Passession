@@ -203,7 +203,7 @@ pub struct AgentManager {
     child_replays: history_read::ReplayWaiters,
     /// Per-parent gates: child reads shared, parent start/replay exclusive.
     child_read_gates: Mutex<HashMap<String, Weak<RwLock<()>>>>,
-    events: broadcast::Sender<Value>,
+    events: broadcast::Sender<Arc<Value>>,
     closing: AtomicBool,
 }
 
@@ -305,7 +305,7 @@ impl AgentManager {
         }
         wire::handle(self, context, message).await
     }
-    pub fn subscribe_events(&self) -> broadcast::Receiver<Value> {
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Arc<Value>> {
         self.events.subscribe()
     }
     pub async fn register_finish_subscription(
@@ -847,7 +847,7 @@ impl AgentManager {
             runtime::transition_attention(None, snapshot);
             let _ = self
                 .events
-                .send(json!({"type":"agent_state","agent":snapshot}));
+                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
         }
         if let Some(session) = session
             && let Err(close_error) = session.close().await
@@ -983,7 +983,7 @@ impl AgentManager {
         if ready {
             let _ = self
                 .events
-                .send(json!({"type":"agent_state","agent":snapshot}));
+                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
         }
         Ok(())
     }

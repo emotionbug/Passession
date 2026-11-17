@@ -317,7 +317,7 @@ async fn list(manager: &AgentManager, context: &RequestContext, request: &Value)
 fn follow(
     manager: &AgentManager,
     owner: crate::transport::OwnedSubscription,
-    mut events: tokio::sync::broadcast::Receiver<Value>,
+    mut events: tokio::sync::broadcast::Receiver<std::sync::Arc<Value>>,
     request: Value,
     mut stamps: HashMap<String, String>,
 ) -> Result<()> {
@@ -350,13 +350,13 @@ fn follow(
                         let present: std::collections::HashSet<_> =
                             snapshots.iter().map(|agent| text(agent, "id")).collect();
                         for id in stamps.keys().filter(|id| !present.contains(id.as_str())) {
-                            pending.push_back(json!({"type":"agent_deleted","agentId":id}));
+                            pending.push_back(std::sync::Arc::new(
+                                json!({"type":"agent_deleted","agentId":id}),
+                            ));
                         }
-                        pending.extend(
-                            snapshots
-                                .into_iter()
-                                .map(|agent| json!({"type":"agent_state","agent":agent})),
-                        );
+                        pending.extend(snapshots.into_iter().map(|agent| {
+                            std::sync::Arc::new(json!({"type":"agent_state","agent":agent}))
+                        }));
                         continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

@@ -510,7 +510,7 @@ impl AgentManager {
     fn archive_after_creation_turn(
         &self,
         id: String,
-        mut events: broadcast::Receiver<Value>,
+        mut events: broadcast::Receiver<std::sync::Arc<Value>>,
     ) -> Result<()> {
         let app = self.app()?;
         let cancel = app.cancel.clone();

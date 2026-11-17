@@ -179,7 +179,7 @@ impl AgentManager {
             Ok(Some(agent)) if agent["internal"] != true => {
                 let _ = self
                     .events
-                    .send(json!({"type":"agent_preparation","agent":agent}));
+                    .send(Arc::new(json!({"type":"agent_preparation","agent":agent})));
             }
             Ok(_) => {}
             Err(error) => {

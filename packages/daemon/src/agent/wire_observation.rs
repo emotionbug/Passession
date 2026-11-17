@@ -54,7 +54,7 @@ pub(super) async fn handle(
                                 for id in &ids {
                                     // Recovery reports the current epoch; it never starts a provider.
                                     match app.agents.timeline_epoch(id).await {
-                                        Ok(Some(epoch)) => pending.push_back(json!({"type":"timeline_replacement","agentId":id,"epoch":epoch})),
+                                        Ok(Some(epoch)) => pending.push_back(std::sync::Arc::new(json!({"type":"timeline_replacement","agentId":id,"epoch":epoch}))),
                                         Ok(None) => {}
                                         Err(_) => {let _ = owner.release().await; return;}
                                     }

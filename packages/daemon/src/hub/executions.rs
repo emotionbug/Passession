@@ -227,7 +227,7 @@ impl Executions {
         let snapshots = app.agents.list_snapshots().await?;
         drop(app);
         for snapshot in snapshots {
-            self.emit_snapshot(context, snapshot).await?;
+            self.emit_snapshot(context, &snapshot).await?;
         }
         Ok(())
     }
@@ -242,7 +242,7 @@ impl Executions {
         tokio::spawn(async move {
             let cancelled = context.cancellation();
             let result: Result<()> = async {
-                for snapshot in snapshots { this.emit_snapshot(&context,snapshot).await?; }
+                for snapshot in snapshots { this.emit_snapshot(&context,&snapshot).await?; }
                 loop {
                     tokio::select! { biased;
                         _ = cancelled.cancelled() => break,
@@ -251,7 +251,7 @@ impl Executions {
                             let event = event.context("Hub execution event stream lost continuity")?;
                             if !context.allows("hub.execute") { continue; }
                             if event["type"] == "agent_state" {
-                                this.emit_snapshot(&context,event["agent"].clone()).await?;
+                                this.emit_snapshot(&context,&event["agent"]).await?;
                             } else if event["type"] == "agent_stream" {
                                 let app = this.app.upgrade().context("Daemon is shutting down")?;
                                 let id = event["agentId"].as_str().context("Missing stream agent ID")?;
@@ -274,13 +274,13 @@ impl Executions {
         });
         Ok(())
     }
-    async fn emit_snapshot(&self, context: &RequestContext, snapshot: Value) -> Result<()> {
+    async fn emit_snapshot(&self, context: &RequestContext, snapshot: &Value) -> Result<()> {
         if snapshot["_live"] == true
-            && self.owns(&snapshot)
+            && self.owns(snapshot)
             && context.allows("hub.execute")
             && !self.cancel.is_cancelled()
         {
-            context.send(json!({"type":"hub.execution.agent.update","payload":{"executionId":snapshot["owner"]["executionId"],"agentId":snapshot["id"],"agent":crate::agent::snapshot_payload(&snapshot)}})).await?;
+            context.send(json!({"type":"hub.execution.agent.update","payload":{"executionId":snapshot["owner"]["executionId"],"agentId":snapshot["id"],"agent":crate::agent::snapshot_payload(snapshot)}})).await?;
         }
         Ok(())
     }

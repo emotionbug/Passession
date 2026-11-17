@@ -315,7 +315,7 @@ impl AgentManager {
         }
         let _ = self
             .events
-            .send(json!({"type":"agent_state","agent":snapshot}));
+            .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
         Ok(snapshot)
     }
     pub(super) async fn resume(
@@ -667,7 +667,7 @@ impl AgentManager {
             if let Some(source) = initiating_source {
                 event["initiatingSourceId"] = json!(source);
             }
-            let _ = self.events.send(event);
+            let _ = self.events.send(Arc::new(event));
         } else if allow_removal {
             bail!(
                 "Provider rewind completed, but its history snapshot could not be safely reconciled; previous canonical history was preserved"
@@ -732,9 +732,9 @@ impl AgentManager {
             )? {
                 // Keep publication with the admitted synchronous commit. Dropping
                 // its async waiter must not leave observers on the obsolete epoch.
-                let _ = events.send(json!({
+                let _ = events.send(Arc::new(json!({
                     "type":"timeline_replacement","agentId":agent_id,"epoch":epoch
-                }));
+                })));
             }
             Ok(())
         })
@@ -1139,7 +1139,7 @@ impl AgentManager {
         if ready && !from_history {
             let _ = self
                 .events
-                .send(json!({"type":"agent_state","agent":snapshot}));
+                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
             for (stream, row) in streams {
                 self.publish_stream(id, cell, stream, Some(row)).await?;
             }
@@ -1219,7 +1219,7 @@ impl AgentManager {
         }
         let _ = self
             .events
-            .send(json!({"type":"provider_subagent","event":output}));
+            .send(Arc::new(json!({"type":"provider_subagent","event":output})));
         if !internal {
             let payload = match text(&output, "type") {
                 Some("upsert") => json!({"kind":"upsert","subagent":output["subagent"]}),
@@ -1258,6 +1258,7 @@ impl AgentManager {
                     .epoch()
             );
         }
+        let output = Arc::new(output);
         let _ = self.events.send(output.clone());
         let snapshot = cell.data.lock().await.snapshot.clone();
         if snapshot["internal"] == true {

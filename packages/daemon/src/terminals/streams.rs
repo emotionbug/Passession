@@ -149,8 +149,8 @@ async fn run_stream(
     }
     let mut pending = BytesMut::new();
     let mut produced = 0usize;
-    let mut timer = tokio::time::interval(Duration::from_millis(8));
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Coalescing deadline for buffered output; idle streams have none and do not wake.
+    let mut deadline: Option<tokio::time::Instant> = None;
     loop {
         let mut flush_due = false;
         tokio::select! {biased;
@@ -166,7 +166,7 @@ async fn run_stream(
                 },
                 Err(broadcast::error::RecvError::Closed)=>return Err(anyhow!("Terminal event owner closed")),
             },
-            _=timer.tick()=>{flush_due=true;}
+            _=tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)),if deadline.is_some()=>{flush_due=true;}
         }
         if !pending.is_empty() {
             if produced > 256 * 1024
@@ -183,6 +183,11 @@ async fn run_stream(
             } else if pending.len() >= 16 * 1024 || flush_due {
                 flush(owner, slot, &mut pending).await?;
             }
+        }
+        if pending.is_empty() {
+            deadline = None;
+        } else if deadline.is_none() {
+            deadline = Some(tokio::time::Instant::now() + Duration::from_millis(8));
         }
         if terminal.is_exited() && receiver.is_empty() {
             flush(owner, slot, &mut pending).await?;

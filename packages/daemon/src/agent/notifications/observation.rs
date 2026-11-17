@@ -357,7 +357,7 @@ async fn local_updates(
     manager: &crate::agent::AgentManager,
     id: &str,
     buffer: &Buffer,
-    events: &mut tokio::sync::broadcast::Receiver<Value>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<Value>>,
 ) -> Result<()> {
     loop {
         let event = events
@@ -517,7 +517,9 @@ mod tests {
         assert!(futures_util::poll!(&mut observing).is_pending());
         manager
             .events
-            .send(json!({"type":"agent_state","agent":{"id":id,"lifecycle":"running"}}))
+            .send(Arc::new(
+                json!({"type":"agent_state","agent":{"id":id,"lifecycle":"running"}}),
+            ))
             .unwrap();
         assert!(futures_util::poll!(&mut observing).is_pending());
         drop(data);

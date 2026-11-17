@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Share each daemon agent event among its subscribers instead of copying it for every one, and stop waking idle terminal streams every 8 ms. A subscribed terminal now wakes only when it has output to send.
 - Build the daemon's workspace directory once per second for all subscribed clients instead of once per client. Each rebuild reads agent snapshots and terminals once, and each client compares workspaces by id.
 - Stop re-serializing and re-saving every host's directory in the app when one host changes. Unchanged hosts are skipped by revision, and a connection probe that shows the same status and latency no longer republishes the app state.
 - Bound image and editor memory in the app. Conversation images are decoded at the size they are shown, on two shared worker threads instead of one thread per image, and their decoded pixels are capped at 100 MiB, evicting the least recently used first. The image viewer still opens images at full quality. The source editor keeps row layouts only near the visible rows.

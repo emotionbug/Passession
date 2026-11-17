@@ -788,7 +788,7 @@ impl AgentManager {
             cell.data.lock().await.snapshot = snapshot.clone();
             let _ = self
                 .events
-                .send(json!({"type":"agent_state","agent":snapshot}));
+                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
             (snapshot, attention.filter(|_| ready))
         };
         if let Some(reason) = attention {
@@ -1226,7 +1226,7 @@ impl AgentManager {
                 }
                 let _ = self
                     .events
-                    .send(json!({"type":"agent_deleted","agentId":id}));
+                    .send(Arc::new(json!({"type":"agent_deleted","agentId":id})));
                 app.automation.complete_for_agent(id).await?;
             }
             return Ok(json!({"closed":true,"deleted":action=="delete"}));
@@ -1349,7 +1349,7 @@ impl AgentManager {
             self.persist_snapshot(&mut snapshot, touch).await?;
             let _ = self
                 .events
-                .send(json!({"type":"agent_state","agent":snapshot}));
+                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
             return Ok(snapshot);
         }
         let cell = self.ensure_loaded(id).await?;
@@ -1573,7 +1573,7 @@ impl AgentManager {
         }
         let _ = self
             .events
-            .send(json!({"type":"agent_state","agent":snapshot}));
+            .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
         Ok(json!({"unarchived":true}))
     }
     async fn archive(&self, actor: &Value, id: &str) -> Result<Value> {
@@ -1616,7 +1616,7 @@ impl AgentManager {
             self.persist_snapshot(&mut snapshot, false).await?;
             let _ = self
                 .events
-                .send(json!({"type":"agent_state","agent":snapshot}));
+                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
         }
         if let Some(handle) = snapshot.get("persistence").filter(|v| v.is_object())
             && let Ok(factory) = self.app()?.providers.get(required(&snapshot, "provider")?)
