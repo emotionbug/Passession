@@ -28,7 +28,11 @@ pub(crate) struct Store {
     pub layouts: BTreeMap<String, Value>,
     dirty_layouts: BTreeSet<String>,
     written_state: Option<String>,
+    /// Contents last written or loaded, by file. Replicas drop out once their revision is
+    /// known.
     written_files: HashMap<PathBuf, String>,
+    /// Directory revision of the host each replica file was last written from.
+    replica_revisions: HashMap<PathBuf, u64>,
     pub prefs: prefs::Prefs,
     saving: bool,
     again: bool,
@@ -49,6 +53,7 @@ impl Store {
             dirty_layouts: BTreeSet::new(),
             written_state: None,
             written_files: HashMap::new(),
+            replica_revisions: HashMap::new(),
             prefs: prefs::Prefs::default(),
             saving: false,
             again: false,
@@ -221,20 +226,28 @@ pub(crate) async fn save_now(core: &Rc<Core>) -> Result<(), CoreError> {
 }
 
 async fn save_once(core: &Rc<Core>) -> Result<(), CoreError> {
+    if !core.store.borrow().writable {
+        return Ok(());
+    }
     let (rows, replicas) = {
         let hosts = core.hosts.borrow();
+        let store = core.store.borrow();
         let rows: Vec<Value> = hosts.iter().map(|host| host.record_json()).collect();
-        let replicas: Vec<(String, String)> = hosts
+        // Only a host whose directory revision moved since its replica was written is
+        // serialized again.
+        let replicas: Vec<(PathBuf, u64, String)> = hosts
             .iter()
-            .map(|host| (host.server_id(), host.replica_json().to_string()))
+            .filter_map(|host| {
+                let path = store.paths.replica(&host.server_id());
+                let revision = host.dir.borrow().revision();
+                (store.replica_revisions.get(&path) != Some(&revision))
+                    .then(|| (path, revision, host.replica_contents()))
+            })
             .collect();
         (rows, replicas)
     };
-    let (job, encoded, layout_keys) = {
+    let (job, encoded, layout_keys, replica_writes, layout_writes) = {
         let mut store = core.store.borrow_mut();
-        if !store.writable {
-            return Ok(());
-        }
         let snapshot = json!({
             "preferences": store.preferences,
             "hosts": rows,
@@ -243,12 +256,18 @@ async fn save_once(core: &Rc<Core>) -> Result<(), CoreError> {
         let encoded = snapshot.to_string();
         let state_changed = store.written_state.as_deref() != Some(encoded.as_str());
         let mut files = Vec::new();
-        for (server_id, contents) in replicas {
-            let path = store.paths.replica(&server_id);
-            if store.written_files.get(&path) != Some(&contents) {
+        let mut replica_writes = Vec::new();
+        for (path, revision, contents) in replicas {
+            // Content loaded from disk is only needed until its revision is known.
+            if store.written_files.get(&path) == Some(&contents) {
+                store.written_files.remove(&path);
+                store.replica_revisions.insert(path, revision);
+            } else {
+                replica_writes.push((path.clone(), revision));
                 files.push((path, contents));
             }
         }
+        let mut layout_writes = Vec::new();
         let layout_keys: Vec<String> = std::mem::take(&mut store.dirty_layouts)
             .into_iter()
             .collect();
@@ -257,6 +276,7 @@ async fn save_once(core: &Rc<Core>) -> Result<(), CoreError> {
                 let path = store.paths.layout(window);
                 let contents = layout.to_string();
                 if store.written_files.get(&path) != Some(&contents) {
+                    layout_writes.push((path.clone(), contents.clone()));
                     files.push((path, contents));
                 }
             }
@@ -275,10 +295,15 @@ async fn save_once(core: &Rc<Core>) -> Result<(), CoreError> {
             saved_hosts: store.saved_hosts.clone(),
             files,
         };
-        (job, state_changed.then_some(encoded), layout_keys)
+        (
+            job,
+            state_changed.then_some(encoded),
+            layout_keys,
+            replica_writes,
+            layout_writes,
+        )
     };
     let paths = core.store.borrow().paths.clone();
-    let files: Vec<(PathBuf, String)> = job.files.clone();
     let outcome = tokio::task::spawn_blocking(move || storage::save(&paths, job))
         .await
         .map_err(|error| CoreError::new("STORAGE_IO", error.to_string(), false))?;
@@ -292,13 +317,17 @@ async fn save_once(core: &Rc<Core>) -> Result<(), CoreError> {
             if let Some(encoded) = encoded {
                 store.written_state = Some(encoded);
             }
-            for (path, contents) in files {
+            for (path, revision) in replica_writes {
+                store.written_files.remove(&path);
+                store.replica_revisions.insert(path, revision);
+            }
+            for (path, contents) in layout_writes {
                 store.written_files.insert(path, contents);
             }
             Ok(())
         }
         Err(error) => {
-            // Retry the layouts with the next save.
+            // Retry the layouts with the next save; unwritten replicas keep their old revision.
             store.dirty_layouts.extend(layout_keys);
             Err(error)
         }

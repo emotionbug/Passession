@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Stop re-serializing and re-saving every host's directory in the app when one host changes. Unchanged hosts are skipped by revision, and a connection probe that shows the same status and latency no longer republishes the app state.
+
 ### Fixed
 
 - Resume or retry a host update after reopening the app instead of failing with "Selected host update failed: …". The saved update request is stored as JSON text, and reading it back used the whole text as the operation ID, which the daemon rejected as not a UUID. Saved requests are now read as requests, and a saved record whose ID the daemon can never accept is discarded.

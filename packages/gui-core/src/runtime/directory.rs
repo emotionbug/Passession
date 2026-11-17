@@ -10,6 +10,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -40,10 +41,14 @@ const PAGE: u64 = 200;
 
 #[derive(Default)]
 pub(crate) struct Directory {
-    pub projects: Vec<Value>,
-    pub workspaces: Vec<Value>,
-    pub agents: Vec<Value>,
-    pub cached_at: Option<String>,
+    projects: Vec<Value>,
+    workspaces: Vec<Value>,
+    agents: Vec<Value>,
+    cached_at: Option<String>,
+    /// Identity of the rows and `cached_at` above, renewed by every change of them; 0 is the
+    /// empty directory. Published as `directoryRevision` and used to persist only changed
+    /// replicas.
+    revision: u64,
     pub loading: bool,
     pub hydrating: BTreeSet<&'static str>,
     pub list_errors: BTreeMap<&'static str, CoreError>,
@@ -59,12 +64,53 @@ pub(crate) struct Directory {
     pub maintenance: Option<String>,
 }
 
+/// Process-wide, so two equal revisions are the same rows even across replaced hosts.
+fn next_revision() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Directory {
     pub fn apply_replica(&mut self, replica: Replica) {
         self.projects = replica.projects;
         self.workspaces = replica.workspaces;
         self.agents = replica.agents;
         self.cached_at = replica.cached_at;
+        self.changed();
+    }
+
+    pub fn projects(&self) -> &[Value] {
+        &self.projects
+    }
+
+    pub fn workspaces(&self) -> &[Value] {
+        &self.workspaces
+    }
+
+    pub fn agents(&self) -> &[Value] {
+        &self.agents
+    }
+
+    pub fn cached_at(&self) -> Option<&str> {
+        self.cached_at.as_deref()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn has_rows(&self) -> bool {
+        !self.projects.is_empty() || !self.workspaces.is_empty() || !self.agents.is_empty()
+    }
+
+    fn changed(&mut self) {
+        self.revision = next_revision();
+    }
+
+    /// Rows changed, or a baseline completed, now.
+    fn mark_cached(&mut self) {
+        self.cached_at = Some(ids::now_rfc3339());
+        self.changed();
     }
 }
 
@@ -273,6 +319,7 @@ async fn hydrate(core: &Rc<Core>, host: &Rc<Host>) -> Result<(), CoreError> {
             let rows = rows(&snapshot["projects"]);
             let mut dir = host.dir.borrow_mut();
             dir.projects = rows;
+            dir.changed();
             cursor(&mut dir, "project", &snapshot);
         }
         Ok(())
@@ -291,7 +338,9 @@ async fn hydrate(core: &Rc<Core>, host: &Rc<Host>) -> Result<(), CoreError> {
         )
         .await?;
         if let Some(rows) = rows {
-            host.dir.borrow_mut().workspaces = rows;
+            let mut dir = host.dir.borrow_mut();
+            dir.workspaces = rows;
+            dir.changed();
         }
         Ok(())
     });
@@ -309,7 +358,9 @@ async fn hydrate(core: &Rc<Core>, host: &Rc<Host>) -> Result<(), CoreError> {
         )
         .await?;
         if let Some(rows) = rows {
-            host.dir.borrow_mut().agents = rows.iter().map(agent_row).collect();
+            let mut dir = host.dir.borrow_mut();
+            dir.agents = rows.iter().map(agent_row).collect();
+            dir.changed();
         }
         Ok(())
     });
@@ -378,7 +429,7 @@ async fn hydrate_list(
     {
         let mut dir = host.dir.borrow_mut();
         match result {
-            Ok(()) => dir.cached_at = Some(ids::now_rfc3339()),
+            Ok(()) => dir.mark_cached(),
             // Retain the last complete list; other baselines publish independently.
             Err(error) => {
                 dir.list_errors.insert(kind, error);
@@ -698,11 +749,12 @@ fn directory_event(core: &Rc<Core>, host: &Rc<Host>, message: &Value) {
             _ => false,
         }
     };
-    // An update that leaves every row as it was saves nothing and rebuilds nothing.
+    // An update that leaves every row as it was saves nothing and rebuilds nothing; a change
+    // renews only this host's revision, so only its replica is serialized again.
     if !changed {
         return;
     }
-    host.dir.borrow_mut().cached_at = Some(ids::now_rfc3339());
+    host.dir.borrow_mut().mark_cached();
     store::schedule_save(core);
     core.touch();
 }

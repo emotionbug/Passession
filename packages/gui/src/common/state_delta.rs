@@ -4,6 +4,9 @@
 //! preference change; most of those publications only move a streaming session's activity
 //! timestamp. The app classifies each publication once per batch so retained layers
 //! (`common::layer`) repaint only when something they present changed.
+//!
+//! Each host record carries the core's `directoryRevision`: equal revisions mean equal
+//! `projects`, `workspaces`, `agents` and `cachedAt`, so those rows are not compared.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,6 +21,16 @@ const AGENT_ACTIVITY: [&str; 2] = ["updatedAt", "lastActivityAt"];
 const HOST_ACTIVITY: [&str; 3] = ["latencyMs", "probes", "cachedAt"];
 /// Saved window layouts: each shell owns its own layout and restores it only once.
 const LAYOUT_KEYS: [&str; 2] = ["layout", "windowLayouts"];
+/// Core metadata of a host record; see the module documentation.
+const DIRECTORY_REVISION: &str = "directoryRevision";
+/// Host fields an unchanged directory revision vouches for (and the revision itself).
+const DIRECTORY_FIELDS: [&str; 5] = [
+    "projects",
+    "workspaces",
+    "agents",
+    "cachedAt",
+    DIRECTORY_REVISION,
+];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateDelta {
@@ -93,13 +106,25 @@ impl StateDelta {
                 self.content = true;
                 return;
             }
-            match fields_differ(old_record, new_record, &HOST_ACTIVITY, &["agents"]) {
+            let same_directory = old_record
+                .get(DIRECTORY_REVISION)
+                .filter(|revision| revision.is_u64())
+                .is_some_and(|revision| new_record.get(DIRECTORY_REVISION) == Some(revision));
+            let skipped: &[&str] = if same_directory {
+                &DIRECTORY_FIELDS
+            } else {
+                &["agents", DIRECTORY_REVISION]
+            };
+            match fields_differ(old_record, new_record, &HOST_ACTIVITY, skipped) {
                 Difference::Content => {
                     self.content = true;
                     return;
                 }
                 Difference::Activity => self.host_activity = true,
                 Difference::None => {}
+            }
+            if same_directory {
+                continue;
             }
             let server_id = j::text(new_host, "serverId");
             if self.agents(
@@ -305,5 +330,24 @@ mod tests {
         let mut status = old.clone();
         status["hosts"][0]["status"] = json!("connecting");
         assert!(StateDelta::between(&old, &status).content);
+    }
+
+    #[test]
+    fn equal_directory_revisions_skip_rows_and_new_ones_compare_them() {
+        let mut old = state(json!([{"id": "a", "status": "running"}]), json!({}));
+        old["hosts"][0]["directoryRevision"] = json!(7);
+        let mut same = old.clone();
+        same["hosts"][0]["agents"][0]["status"] = json!("idle");
+        assert!(StateDelta::between(&old, &same).is_empty());
+
+        let mut renewed = same.clone();
+        renewed["hosts"][0]["directoryRevision"] = json!(8);
+        assert!(StateDelta::between(&old, &renewed).content);
+        let mut timestamp_only = old.clone();
+        timestamp_only["hosts"][0]["directoryRevision"] = json!(8);
+        timestamp_only["hosts"][0]["agents"][0]["updatedAt"] = json!("2");
+        let delta = StateDelta::between(&old, &timestamp_only);
+        assert!(!delta.content);
+        assert!(delta.touches_agent("h", "a"));
     }
 }

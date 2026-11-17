@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -155,25 +155,52 @@ impl Core {
         });
     }
 
+    /// The published state. Host records and store sections are moved or cloned into place:
+    /// `json!` would re-serialize every row of every host once more into a new `Value`.
     fn state(&self) -> Value {
         let hosts: Vec<Value> = self.hosts.borrow().iter().map(|h| h.state_json()).collect();
         let store = self.store.borrow();
-        json!({
-            "initialized": self.initialized.get(),
-            "clientId": *self.client_id.borrow(),
-            "storage": {
+        let mut state = Map::new();
+        state.insert("initialized".into(), self.initialized.get().into());
+        state.insert("clientId".into(), self.client_id.borrow().clone().into());
+        state.insert(
+            "storage".into(),
+            json!({
                 "error": store.error.as_ref().map(|e| e.message.clone()),
                 "errorCode": store.error.as_ref().map(|e| e.code.clone()),
                 "writable": store.writable,
-            },
-            "preferences": store.preferences,
-            "layout": store.layouts.get(crate::storage::MAIN_WINDOW).cloned().unwrap_or(Value::Null),
-            "windowLayouts": store.layouts,
-            "suppressedRoutes": store.suppressed,
-            "prefs": store.prefs.values,
-            "hosts": hosts,
-            "tailnet": self.tailnet.state(),
-        })
+            }),
+        );
+        state.insert(
+            "preferences".into(),
+            Value::Object(store.preferences.clone()),
+        );
+        state.insert(
+            "layout".into(),
+            store
+                .layouts
+                .get(crate::storage::MAIN_WINDOW)
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        state.insert(
+            "windowLayouts".into(),
+            Value::Object(
+                store
+                    .layouts
+                    .iter()
+                    .map(|(window, layout)| (window.clone(), layout.clone()))
+                    .collect(),
+            ),
+        );
+        state.insert(
+            "suppressedRoutes".into(),
+            Value::Array(store.suppressed.iter().cloned().map(Value::from).collect()),
+        );
+        state.insert("prefs".into(), Value::Object(store.prefs.values.clone()));
+        state.insert("hosts".into(), Value::Array(hosts));
+        state.insert("tailnet".into(), self.tailnet.state());
+        Value::Object(state)
     }
 }
 

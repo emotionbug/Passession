@@ -231,17 +231,33 @@ impl Host {
         })
     }
 
-    pub fn replica_json(&self) -> Value {
+    /// The replica file contents (the bytes the former `json!` object produced), written
+    /// straight from the rows instead of through an intermediate `Value`.
+    pub fn replica_contents(&self) -> String {
         let dir = self.dir.borrow();
-        json!({
-            "serverId": self.server_id(),
-            "cachedAt": dir.cached_at,
-            "projects": dir.projects,
-            "workspaces": dir.workspaces,
-            "agents": dir.agents,
-        })
+        let server_id = self.server_id.borrow();
+        let mut out = Vec::new();
+        let written: serde_json::Result<()> = (|| {
+            out.extend_from_slice(b"{\"serverId\":");
+            serde_json::to_writer(&mut out, server_id.as_str())?;
+            out.extend_from_slice(b",\"cachedAt\":");
+            serde_json::to_writer(&mut out, &dir.cached_at())?;
+            out.extend_from_slice(b",\"projects\":");
+            serde_json::to_writer(&mut out, dir.projects())?;
+            out.extend_from_slice(b",\"workspaces\":");
+            serde_json::to_writer(&mut out, dir.workspaces())?;
+            out.extend_from_slice(b",\"agents\":");
+            serde_json::to_writer(&mut out, dir.agents())?;
+            out.push(b'}');
+            Ok(())
+        })();
+        written.expect("JSON values serialize into memory");
+        String::from_utf8(out).expect("serde_json writes UTF-8")
     }
 
+    /// The host's published record. Built from clones rather than `json!`, which would
+    /// re-serialize every row into a new `Value`; `directoryRevision` lets the GUI skip
+    /// comparing rows that did not change.
     pub fn state_json(&self) -> Value {
         let link = self.link.borrow();
         let dir = self.dir.borrow();
@@ -252,8 +268,7 @@ impl Host {
             && error.is_none()
             && dir.hydrating.is_empty()
             && dir.list_errors.is_empty();
-        let cached = !live
-            && (!dir.projects.is_empty() || !dir.workspaces.is_empty() || !dir.agents.is_empty());
+        let cached = !live && dir.has_rows();
         let list_errors: Map<String, Value> = dir
             .list_errors
             .iter()
@@ -266,33 +281,51 @@ impl Host {
             .map(|selector| selector.probes_json())
             .unwrap_or_else(|| json!({}));
         let server_id = self.server_id();
-        json!({
-            "id": server_id,
-            "serverId": server_id,
-            "originServerId": self.origin,
-            "label": self.label(),
-            "config": *self.config.borrow(),
-            "connections": *self.connections.borrow(),
-            "activeConnectionId": self.config_id(),
-            "status": link.status.name(),
-            "error": error,
-            "loading": dir.loading,
-            "loadingLists": dir.hydrating.iter().collect::<Vec<_>>(),
-            "listErrors": list_errors,
-            "live": live,
-            "cached": cached,
-            "cachedAt": dir.cached_at,
-            "maintenanceOperationId": dir.maintenance,
-            "serverInfo": *self.server_info.borrow(),
-            "connectionGeneration": link.generation,
-            "httpGeneration": link.resource_generation,
-            "latencyMs": link.rtt.map(|rtt| rtt.as_millis() as u64),
-            "probes": probes,
-            "isLocal": self.is_local(),
-            "projects": dir.projects,
-            "workspaces": dir.workspaces,
-            "agents": dir.agents,
-        })
+        let mut record = Map::new();
+        let mut field = |key: &str, value: Value| {
+            record.insert(key.to_owned(), value);
+        };
+        field("id", server_id.clone().into());
+        field("serverId", server_id.into());
+        field("originServerId", self.origin.clone().into());
+        field("label", self.label().into());
+        field("config", self.config.borrow().clone());
+        field(
+            "connections",
+            Value::Array(self.connections.borrow().clone()),
+        );
+        field("activeConnectionId", self.config_id().into());
+        field("status", link.status.name().into());
+        field("error", error.into());
+        field("loading", dir.loading.into());
+        field(
+            "loadingLists",
+            Value::Array(
+                dir.hydrating
+                    .iter()
+                    .map(|kind| Value::from(*kind))
+                    .collect(),
+            ),
+        );
+        field("listErrors", Value::Object(list_errors));
+        field("live", live.into());
+        field("cached", cached.into());
+        field("cachedAt", dir.cached_at().into());
+        field("maintenanceOperationId", dir.maintenance.clone().into());
+        field("serverInfo", self.server_info.borrow().clone());
+        field("connectionGeneration", link.generation.into());
+        field("httpGeneration", link.resource_generation.into());
+        field(
+            "latencyMs",
+            link.rtt.map(|rtt| rtt.as_millis() as u64).into(),
+        );
+        field("probes", probes);
+        field("isLocal", self.is_local().into());
+        field("directoryRevision", dir.revision().into());
+        field("projects", Value::Array(dir.projects().to_vec()));
+        field("workspaces", Value::Array(dir.workspaces().to_vec()));
+        field("agents", Value::Array(dir.agents().to_vec()));
+        Value::Object(record)
     }
 }
 

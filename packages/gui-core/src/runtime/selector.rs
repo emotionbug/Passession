@@ -58,6 +58,13 @@ impl Probe {
             latency: Some(latency),
         }
     }
+
+    /// Equal as published: `probes_json` shows latency in whole milliseconds, so a heartbeat
+    /// remeasured to the same millisecond is no change.
+    fn presents_as(&self, other: &Self) -> bool {
+        self.status == other.status
+            && self.latency.map(|l| l.as_millis()) == other.latency.map(|l| l.as_millis())
+    }
 }
 
 /// Original `probeIntervalForConnection`.
@@ -275,18 +282,26 @@ impl Selector {
     }
 
     fn set_probe(&self, id: &str, probe: Probe) {
-        let changed = self.probes.borrow_mut().insert(id.to_owned(), probe) != Some(probe);
-        if changed {
+        let previous = self.probes.borrow_mut().insert(id.to_owned(), probe);
+        if !previous.is_some_and(|previous| previous.presents_as(&probe)) {
             self.touch();
         }
     }
 
+    /// Keeps the exact measurements for selection; publishes only what the state shows.
     fn publish(&self, probes: &BTreeMap<String, Probe>) {
-        if *self.probes.borrow() == *probes {
-            return;
-        }
+        let unchanged = {
+            let current = self.probes.borrow();
+            current.len() == probes.len()
+                && current
+                    .iter()
+                    .zip(probes)
+                    .all(|((id, probe), (next_id, next))| id == next_id && probe.presents_as(next))
+        };
         *self.probes.borrow_mut() = probes.clone();
-        self.touch();
+        if !unchanged {
+            self.touch();
+        }
     }
 
     fn touch(&self) {
