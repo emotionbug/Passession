@@ -72,7 +72,7 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
       epoch: ${{ steps.source.outputs.epoch }}
       matrix: ${{ steps.plan.outputs.matrix }}
-      windows_runners: ${{ steps.windows.outputs.runners }}
+      finalize: ${{ steps.plan.outputs.finalize }}
       expected: ${{ steps.plan.outputs.expected }}
       recovery: ${{ steps.plan.outputs.recovery }}
       release_tag: ${{ steps.plan.outputs.releaseTag }}
@@ -119,12 +119,6 @@ jobs:
           path: artifacts/component-plan.json
           if-no-files-found: error
           retention-days: 7
-      - id: windows
-        name: Select Windows runners for the COM smoke test
-        env:
-          MATRIX: ${{ steps.plan.outputs.matrix }}
-        shell: bash
-        run: echo "runners=$(jq -c '[.include[] | select(.platform == "windows" and (.components | index("app"))) | .runner] | unique' <<< "$MATRIX")" >> "$GITHUB_OUTPUT"
       - name: Validate recovery workflow and complete artifact inventory
         if: env.RECOVERY_RUN_ID != '' && steps.plan.outputs.recovery != '[]'
         env:
@@ -149,7 +143,7 @@ jobs:
       PASEO_NATIVE_RELEASE: "1"
       PASEO_UPDATE_REPOSITORY: emotionbug/Passession
       PASEO_BUILD_SOURCE_SHA: ${{ needs.source.outputs.sha }}
-      TARGET_ID: ${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}
+      TARGET_ID: ${{ matrix.id }}
     steps:
       - name: Keep checkout bytes identical to the planned fingerprints
         shell: bash
@@ -188,7 +182,7 @@ jobs:
             "$SOURCE_SHA" "$NOTICE_SUPPLEMENT_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: dtolnay/rust-toolchain@1.93.1
         with:
-          targets: ${{ matrix.platform == 'android' && 'aarch64-linux-android' || matrix.platform == 'ios' && 'aarch64-apple-ios' || '' }}
+          targets: ${{ matrix.finalizer && matrix.triple || matrix.platform == 'android' && matrix.triple || matrix.platform == 'ios' && matrix.triple || '' }}
       # libghostty-vt-sys builds the Ghostty VT library with Zig 0.15.2. This
       # job builds older tags too, so it cannot rely on the local
       # .github/actions/setup-zig existing in the checked-out source; keep the
@@ -213,7 +207,7 @@ jobs:
           restore-keys: |
             go-${{ runner.os }}-${{ runner.arch }}-native-release-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.format == 'aab' && '-aab' || '' }}-
       - name: Install Zig 0.15.2
-        if: contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
+        if: matrix.finalizer || contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
         shell: bash
         env:
           ZIG_VERSION: 0.15.2
@@ -258,7 +252,7 @@ jobs:
       # which a warm run copies instead of running Zig. build.rs pins
       # GHOSTTY_COMMIT, so its hash covers the commit.
       - uses: actions/cache@v6
-        if: contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
+        if: matrix.finalizer || contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
         with:
           path: |
             ${{ runner.temp }}/zig-global-cache
@@ -271,7 +265,7 @@ jobs:
       # shared with CI and Native Desktop Packages. build.rs reuses it only when
       # HEAD is the pinned GHOSTTY_COMMIT and the tree is clean, else reclones.
       - uses: actions/cache@v6
-        if: contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
+        if: matrix.finalizer || contains(matrix.components, 'app') || contains(matrix.components, 'daemon')
         with:
           path: ${{ runner.temp }}/ghostty-cache/ghostty-src
           key: ghostty-src-${{ runner.os }}-${{ hashFiles('packages/terminal/vendor/libghostty-vt-sys/build.rs') }}
@@ -282,6 +276,20 @@ jobs:
           shared-key: native-release-${{ matrix.platform }}-${{ matrix.arch }}
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      - name: Install cross compiler prerequisites
+        if: matrix.finalizer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18
+      - uses: actions/cache@v6
+        if: matrix.finalizer
+        with:
+          path: ~/.cache/paseo-cross/${{ matrix.id }}
+          key: cross-${{ matrix.id }}-${{ hashFiles('xtask/src/cross.rs', 'xtask/src/cross_tools.rs', 'xtask/src/cross_tools/**') }}
+      - name: Provision pinned cross toolchain
+        if: matrix.finalizer
+        shell: bash
+        run: cargo xtask cross-tools "$TARGET_ID" --root "$HOME/.cache/paseo-cross/$TARGET_ID" --github-env "$GITHUB_ENV"
       # Packaging downloads: the pinned AppImage tools (Linux desktop), the
       # pinned Gradle distribution and Gradle's dependency cache (Android).
       # The key covers only the inputs that select that content; xtask
@@ -324,7 +332,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Install NSIS
-        if: matrix.package && matrix.platform == 'windows'
+        if: matrix.package && matrix.platform == 'windows' && !matrix.finalizer
         shell: pwsh
         run: choco install nsis --version=3.11 --no-progress -y
       - uses: actions/setup-java@v6
@@ -369,13 +377,145 @@ jobs:
             printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/paseo-release.keystore"
             echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/paseo-release.keystore" >> "$GITHUB_ENV"
           fi
+      - name: Compile planned components for native finalization
+        if: matrix.finalizer
+        shell: bash
+        run: cargo xtask components build --plan artifacts/component-plan.json --target "$TARGET_ID" --stage compile --handoff "artifacts/handoff-$TARGET_ID"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER }}
+      - name: Cross-compile Windows COM and desktop-helper smoke tests
+        if: matrix.finalizer && matrix.platform == 'windows' && contains(matrix.components, 'app')
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          cargo xtask cross-run "$TARGET_ID" -- cargo test --locked --release --no-run -p paseo-gui-platform --lib --target "$RUST_TARGET" --message-format=json-render-diagnostics > "$RUNNER_TEMP/windows-smoke.json"
+          mapfile -t executables < <(jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "paseo_gui_platform" and .executable != null) | .executable' "$RUNNER_TEMP/windows-smoke.json")
+          [[ "${#executables[@]}" == 1 ]] || { echo "Expected one Windows smoke test executable" >&2; exit 1; }
+          mkdir -p "artifacts/smoke-$TARGET_ID"
+          cp "${executables[0]}" "artifacts/smoke-$TARGET_ID/windows-smoke.exe"
+      - uses: actions/upload-artifact@v7
+        if: matrix.finalizer
+        with:
+          name: native-handoff-${{ env.TARGET_ID }}
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            artifacts/handoff-${{ env.TARGET_ID }}
+            artifacts/smoke-${{ env.TARGET_ID }}
+      - name: Smoke native Windows COM and desktop-helper behavior
+        if: ${{ !matrix.finalizer && matrix.platform == 'windows' && contains(matrix.components, 'app') }}
+        shell: bash
+        run: |
+          cargo test --locked --release -p paseo-gui-platform --lib share_item_resolves_across_apartments
+          cargo test --locked --release -p paseo-gui-platform --lib desktop_helper_starts_without_console_and_keeps_pipes
       - name: Build only planned components and changed OS packages
+        if: ${{ !matrix.finalizer }}
         run: cargo xtask components build --plan artifacts/component-plan.json --target "${{ env.TARGET_ID }}"
         env:
           GH_TOKEN: ${{ github.token }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER }}
+          CSC_LINK: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE || '' }}
+          CSC_KEY_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ matrix.platform == 'macos' && secrets.APPLE_TEAM_ID || '' }}
+          WIN_CSC_LINK: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_LINK || '' }}
+          WIN_CSC_KEY_PASSWORD: ${{ matrix.platform == 'windows' && secrets.WIN_CSC_KEY_PASSWORD || '' }}
+      - name: Record exact source, run and artifact hashes
+        if: ${{ !matrix.finalizer }}
+        run: cargo xtask release record
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v7
+        if: ${{ !matrix.finalizer }}
+        with:
+          name: native-release-${{ env.TARGET_ID }}
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            artifacts/native/Paseo-Component-*
+            artifacts/native/Passession-*
+            artifacts/native/components-*.json
+            artifacts/native/packages-*.json
+            artifacts/native/provenance-*.json
+
+  finalize:
+    needs: [source, native]
+    if: github.event.inputs.mode != 'publish-only' && needs.native.result == 'success' && needs.source.outputs.finalize != '{"include":[]}'
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.source.outputs.finalize) }}
+    name: finalize (${{ matrix.id }})
+    runs-on: ${{ matrix.runner }}
+    env:
+      SOURCE_SHA: ${{ needs.source.outputs.sha }}
+      SOURCE_DATE_EPOCH: ${{ needs.source.outputs.epoch }}
+      RELEASE_VERSION: ${{ needs.source.outputs.version }}
+      PASEO_RELEASE_CHANNEL: ${{ needs.source.outputs.channel }}
+      PASEO_NATIVE_RELEASE: "1"
+      PASEO_UPDATE_REPOSITORY: emotionbug/Passession
+      PASEO_BUILD_SOURCE_SHA: ${{ needs.source.outputs.sha }}
+      TARGET_ID: ${{ matrix.id }}
+    steps:
+      - name: Keep checkout bytes identical to the planned fingerprints
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        env:
+          NODE_OPTIONS: --no-deprecation
+        with:
+          name: native-component-plan
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        env:
+          NODE_OPTIONS: --no-deprecation
+        with:
+          name: native-handoff-${{ env.TARGET_ID }}
+          path: artifacts
+      - name: Apply explicitly pinned packaging notice corrections
+        if: env.NOTICE_SUPPLEMENT_SHA != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$NOTICE_SUPPLEMENT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 origin "$NOTICE_SUPPLEMENT_SHA"
+          git show "$NOTICE_SUPPLEMENT_SHA:packaging/cargo-notice-supplements.json" > packaging/cargo-notice-supplements.json
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-finalize-xtask
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      - name: Install NSIS
+        if: matrix.package && matrix.platform == 'windows'
+        shell: pwsh
+        run: choco install nsis --version=3.11 --no-progress -y
+      - name: Run cross-built Windows COM and desktop-helper smoke tests
+        if: matrix.platform == 'windows' && contains(matrix.components, 'app')
+        shell: bash
+        # A filter that matches no test still exits 0; require exactly one pass.
+        run: |
+          set -euo pipefail
+          for test in share_item_resolves_across_apartments desktop_helper_starts_without_console_and_keeps_pipes; do
+            "artifacts/smoke-$TARGET_ID/windows-smoke.exe" "$test" | tee "$RUNNER_TEMP/smoke.log"
+            grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/smoke.log"
+          done
+      - name: Finalize planned components and changed OS packages
+        shell: bash
+        run: cargo xtask components build --plan artifacts/component-plan.json --target "$TARGET_ID" --stage finalize --handoff "artifacts/handoff-$TARGET_ID"
+        env:
+          GH_TOKEN: ${{ github.token }}
           PASEO_BUILD_NUMBER: ${{ vars.PASEO_BUILD_NUMBER }}
           CSC_LINK: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE || '' }}
           CSC_KEY_PASSWORD: ${{ matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
@@ -401,37 +541,9 @@ jobs:
             artifacts/native/packages-*.json
             artifacts/native/provenance-*.json
 
-  # The COM smoke test compiles its own release test graph (gui-platform alone
-  # resolves different features than the shipped gui + daemon build), so it
-  # runs beside the Windows builds instead of after them. It produces no
-  # artifacts, and publish still requires it to pass.
-  windows-com-smoke:
-    needs: source
-    if: github.event.inputs.mode != 'publish-only' && needs.source.outputs.windows_runners != '[]'
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: ${{ fromJSON(needs.source.outputs.windows_runners) }}
-    name: windows-com-smoke (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.source.outputs.sha }}
-      - uses: dtolnay/rust-toolchain@1.93.1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-windows-com-smoke
-          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-      - name: Smoke Windows file-share COM marshalling
-        run: cargo test --locked --release -p paseo-gui-platform --lib share_item_resolves_across_apartments
-      - name: Verify desktop helper has no console and retains control pipes
-        run: cargo test --locked --release -p paseo-gui-platform --lib desktop_helper_starts_without_console_and_keeps_pipes
-
   publish:
-    needs: [source, native, windows-com-smoke]
-    if: ${{ !cancelled() && github.repository == 'emotionbug/Passession' && needs.source.result == 'success' && needs.source.outputs.publish == 'true' && needs.source.outputs.no_changes != 'true' && (needs.native.result == 'success' || github.event.inputs.mode == 'publish-only' || (needs.native.result == 'skipped' && needs.source.outputs.matrix == '{"include":[]}')) && (needs.windows-com-smoke.result == 'success' || needs.windows-com-smoke.result == 'skipped') }}
+    needs: [source, native, finalize]
+    if: ${{ !cancelled() && github.repository == 'emotionbug/Passession' && needs.source.result == 'success' && needs.source.outputs.publish == 'true' && needs.source.outputs.no_changes != 'true' && (needs.native.result == 'success' || github.event.inputs.mode == 'publish-only' || (needs.native.result == 'skipped' && needs.source.outputs.matrix == '{"include":[]}')) && (needs.finalize.result == 'success' || github.event.inputs.mode == 'publish-only' || (needs.finalize.result == 'skipped' && needs.source.outputs.finalize == '{"include":[]}')) }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read

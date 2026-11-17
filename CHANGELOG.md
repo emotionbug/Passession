@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Compile Windows x64 and macOS arm64 release builds on Linux. The Native Release workflow cross-compiles the daemon, app, Tailscale library and update helper on Ubuntu with a pinned toolchain (`cargo xtask cross-tools`: the MSVC CRT and Windows SDK through xwin, Apple's macOS 15.5 SDK) and hands the unsigned, hash-listed files to a short job on Windows or macOS. That job only signs, adds the C runtime, builds the installer or app bundle, notarizes, and on Windows runs the COM and helper smoke tests, which are also compiled on Linux. In the last release the Windows job spent 20 minutes and the macOS job 15 minutes compiling.
+
 ### Removed
 
 - Stop migrating, importing or cleaning up data and settings written by earlier releases. This breaks compatibility with state that 0.13.36 and earlier left behind:
