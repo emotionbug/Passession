@@ -45,9 +45,13 @@ pub struct CreationPanel {
 impl Widget for CreationPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let composer = self.view.composer_panel(id!(composer));
-        if let Some(paths) = self
-            .file_drop
-            .handle_event(cx, event, composer.accepts_file_drop())
+        let visible = scope
+            .data
+            .get::<crate::common::UiContext>()
+            .is_some_and(|ui| ui.activity.visible);
+        if let Some(paths) =
+            self.file_drop
+                .handle_event(cx, event, composer.accepts_file_drop(visible))
         {
             composer.drop_files(cx, paths);
         }

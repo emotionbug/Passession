@@ -16,6 +16,12 @@ Use localized labels, accessible focus order and native controls. Compact forms 
 
 Remote directory selection uses `features/files/picker.rs` (`RemoteFolderPicker`) against the chosen host. Local attachment and save dialogs use `paseo-gui-platform`. Do not populate a remote destination with a client-side OS directory picker.
 
+An external file drag belongs to its visible destination pane, independently of
+native keyboard focus. Do not activate the window or editor to admit a drop.
+Hidden owners, modal-covered forms and pending sends/uploads still refuse it;
+recheck admission at drop and consume the files once. Visible inactive owners must
+repaint upload results without requesting focus.
+
 ## Verification
 
 Test slow and failed loads, out-of-order results, validation errors, duplicate submission, cancellation, retry, changing host/provider/model, and saving/read-back through the real daemon. Widget tests cover local transitions; actual native and wire behavior require their own execution evidence. See [testing](testing.md).

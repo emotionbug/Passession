@@ -689,7 +689,7 @@ impl WaProjectSettingsView {
             }
             Ok(json!({}))
         });
-        self.pending.track(id, "project.edit", Req::EditProject);
+        self.pending.track_operation(id, Req::EditProject);
     }
 
     fn handle_platform(&mut self, cx: &mut Cx, actions: &Actions) {

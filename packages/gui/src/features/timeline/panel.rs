@@ -3637,10 +3637,12 @@ impl Widget for ChatPanel {
         }
         // file-drop-zone.tsx: files dropped anywhere on the pane go to its composer. No
         // composer (archived, archiving, a subagent) or a busy one refuses the drag.
-        let drop_ready = composer_visible
-            && !modal_open
+        let drop_ready = !modal_open
             && self.non_ready().is_none()
-            && self.composer.as_composer_panel().accepts_file_drop();
+            && self
+                .composer
+                .as_composer_panel()
+                .accepts_file_drop(composer_visible);
         if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
             self.composer.as_composer_panel().drop_files(cx, paths);
         }

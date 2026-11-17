@@ -334,4 +334,26 @@ mod tests {
         assert_eq!(zone.route(&Event::DragEnd, true), None);
         assert!(!zone.dragging);
     }
+
+    #[test]
+    fn admission_is_rechecked_at_drop_and_only_one_zone_consumes_it() {
+        let mut zone = pane();
+        let mut other = pane();
+        let (event, ..) = drag(dvec2(700.0, 400.0), vec![file("/tmp/a.txt")]);
+        zone.route(&event, true);
+        assert!(zone.dragging);
+        let (event, handled) = drop_at(dvec2(700.0, 400.0), vec![file("/tmp/a.txt")]);
+        assert_eq!(zone.route(&event, false), None);
+        assert!(!*handled.lock().unwrap());
+        assert!(!zone.dragging);
+
+        let (event, handled) = drop_at(dvec2(700.0, 400.0), vec![file("/tmp/b.txt")]);
+        assert_eq!(
+            zone.route(&event, true),
+            Some(vec![PathBuf::from("/tmp/b.txt")])
+        );
+        assert!(*handled.lock().unwrap());
+        assert_eq!(other.route(&event, true), None);
+        assert_eq!(zone.route(&event, true), None);
+    }
 }

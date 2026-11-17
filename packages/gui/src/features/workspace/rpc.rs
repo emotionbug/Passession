@@ -256,9 +256,14 @@ pub fn settle_raw(result: &Result<Value, CoreError>) -> RpcResult {
     }
 }
 
+enum PendingResponse {
+    Rpc(String),
+    Operation,
+}
+
 /// In-flight requests of one widget, keyed by the core's request id.
 pub struct Pending<K> {
-    entries: HashMap<RequestId, (String, K)>,
+    entries: HashMap<RequestId, (PendingResponse, K)>,
 }
 
 impl<K> Default for Pending<K> {
@@ -280,8 +285,10 @@ impl<K> Pending<K> {
         key: K,
     ) -> RequestId {
         let id = send(core, host_id, request_type, fields);
-        self.entries
-            .insert(id.clone(), (request_type.to_owned(), key));
+        self.entries.insert(
+            id.clone(),
+            (PendingResponse::Rpc(request_type.to_owned()), key),
+        );
         id
     }
 
@@ -296,14 +303,22 @@ impl<K> Pending<K> {
         key: K,
     ) -> RequestId {
         let id = core.request(host_id, message(request_type, fields), response);
-        self.entries
-            .insert(id.clone(), (request_type.to_owned(), key));
+        self.entries.insert(
+            id.clone(),
+            (PendingResponse::Rpc(request_type.to_owned()), key),
+        );
         id
     }
 
-    /// Tracks a request id produced elsewhere (for example a [`CoreHandle::operation`]).
+    /// Tracks an RPC request id produced elsewhere.
     pub fn track(&mut self, id: RequestId, label: &str, key: K) {
-        self.entries.insert(id, (label.to_owned(), key));
+        self.entries
+            .insert(id, (PendingResponse::Rpc(label.to_owned()), key));
+    }
+
+    /// Operations own their result shape; a `payload` field is not a wire wrapper.
+    pub fn track_operation(&mut self, id: RequestId, key: K) {
+        self.entries.insert(id, (PendingResponse::Operation, key));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -328,7 +343,7 @@ impl<K> Pending<K> {
         self.entries.retain(|_, (_, key)| !predicate(key));
     }
 
-    /// Takes every answer in `events` that belongs to this widget, with domain checks.
+    /// Takes this widget's answers, checking RPC domains and preserving operation results.
     pub fn take(&mut self, events: &[CoreEvent]) -> Vec<(K, RpcResult)> {
         self.take_with(events, settle)
     }
@@ -351,9 +366,16 @@ impl<K> Pending<K> {
             if let CoreEvent::Response {
                 request_id, result, ..
             } = event
-                && let Some((request_type, key)) = self.entries.remove(request_id)
+                && let Some((response, key)) = self.entries.remove(request_id)
             {
-                answers.push((key, settle(result, &request_type)));
+                let result = match response {
+                    PendingResponse::Rpc(request_type) => settle(result, &request_type),
+                    PendingResponse::Operation => match result {
+                        Ok(value) => Ok(value.clone()),
+                        Err(error) => Err(RpcError::from_core(error)),
+                    },
+                };
+                answers.push((key, result));
             }
         }
         answers

@@ -2224,7 +2224,7 @@ impl WaNewTabView {
                         .operation(&self.target.host_id, move |_client| async move {
                             Ok(encode_images(files))
                         });
-                    self.pending.track(id, "images", Req::Images);
+                    self.pending.track_operation(id, Req::Images);
                 }
                 (PlatformReq::PickFiles, Ok(PlatformValue::Files(files))) if !files.is_empty() => {
                     let files = files
@@ -2299,7 +2299,7 @@ impl WaNewTabView {
         let id = ctx.core.operation(&self.target.host_id, move |client| {
             ops::upload_files(client, list)
         });
-        self.pending.track(id, "upload", Req::Upload);
+        self.pending.track_operation(id, Req::Upload);
     }
 
     /// Whether the composer card can take dropped files now (composer/index.tsx
@@ -2320,7 +2320,7 @@ impl WaNewTabView {
             .operation(&self.target.host_id, move |_client| async move {
                 Ok(stat_files(paths))
             });
-        self.pending.track(id, "dropped", Req::Dropped);
+        self.pending.track_operation(id, Req::Dropped);
     }
 
     /// `useFileDrop`: raster images join the tray (`onFiles`), every other file uploads
@@ -2349,7 +2349,7 @@ impl WaNewTabView {
                 .operation(&self.target.host_id, move |_client| async move {
                     Ok(encode_images(images))
                 });
-            self.pending.track(id, "images", Req::Images);
+            self.pending.track_operation(id, Req::Images);
         }
         if !uploads.is_empty() {
             self.upload_files(ctx, uploads);
@@ -3918,6 +3918,22 @@ mod completion_tests {
             }
         }
 
+        fn deliver_operation(&mut self, req: Req, value: Value) {
+            let request_id = new_id();
+            self.view.pending.track_operation(request_id.clone(), req);
+            let events = [paseo_gui_core::CoreEvent::Response {
+                host_id: self.view.target.host_id.clone(),
+                request_id,
+                result: Ok(value),
+            }];
+            // A retained event batch may be seen again; completion must consume its owner.
+            for _ in 0..2 {
+                for (req, result) in self.view.pending.take_raw(&events) {
+                    self.view.answer(&mut self.cx, &mut self.ctx, req, result);
+                }
+            }
+        }
+
         fn receipt(agent: bool) -> Value {
             let mut receipt = json!({
                 "idempotencyKey": "receipt", "phase": "completed", "revision": 3,
@@ -3979,6 +3995,81 @@ mod completion_tests {
             drop(self.core.take());
             std::fs::remove_dir_all(&self.dir).unwrap();
         }
+    }
+
+    #[test]
+    fn new_session_upload_operation_attaches_once_without_losing_failure_details() {
+        let mut h = Harness::new(false, false);
+        h.ctx.activity.app_active = false;
+        let attachment = json!({
+            "id": "upload-id", "fileName": "한글 문서.txt",
+            "path": "/uploads/한글 문서.txt", "size": 42, "mimeType": "text/plain"
+        });
+        h.view.upload_name = Some("한글 문서.txt".into());
+        h.deliver_operation(
+            Req::Upload,
+            json!({"ok": true, "payload": {"files": [attachment.clone()]}}),
+        );
+        assert_eq!(h.view.attachments, vec![attachment.clone()]);
+        assert!(h.view.upload_name.is_none());
+        assert!(
+            !h.ctx
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, UiEffect::Toast { .. }))
+        );
+
+        h.view.upload_name = Some("second.txt".into());
+        h.deliver_operation(
+            Req::Upload,
+            json!({"ok": false, "error": {"code": "UPLOAD_FAILED", "message": "Disk full"}}),
+        );
+        assert_eq!(h.view.attachments, vec![attachment]);
+        assert!(h.view.upload_name.is_none());
+        assert!(h.ctx.effects.iter().any(|effect| matches!(
+            effect, UiEffect::Toast { message, is_error: true } if message == "Disk full"
+        )));
+    }
+
+    #[test]
+    fn new_session_local_file_operations_preserve_images_and_stat_errors() {
+        let mut h = Harness::new(false, false);
+        let path = h.dir.join("한글 그림.png");
+        let bytes = b"\x89PNG\r\n\x1a\n";
+        std::fs::write(&path, bytes).unwrap();
+        h.deliver_operation(Req::Images, encode_images(vec![(path, "image/png".into())]));
+        assert_eq!(
+            h.view.images,
+            vec![json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                "mimeType": "image/png",
+            })]
+        );
+        assert!(
+            !h.ctx
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, UiEffect::Toast { .. }))
+        );
+
+        let text_path = h.dir.join("한글 문서.txt");
+        std::fs::write(&text_path, "attachment contents").unwrap();
+        h.view.connected = true;
+        h.view.drop_pending = true;
+        h.deliver_operation(Req::Dropped, stat_files(vec![text_path]));
+        assert!(!h.view.drop_pending);
+        assert_eq!(h.view.upload_name.as_deref(), Some("한글 문서.txt"));
+
+        let missing = h.dir.join("없는 문서.txt");
+        let failure = stat_files(vec![missing]);
+        let message = failure["error"]["message"].as_str().unwrap().to_owned();
+        h.view.drop_pending = true;
+        h.deliver_operation(Req::Dropped, failure);
+        assert!(!h.view.drop_pending);
+        assert!(h.view.attachments.is_empty());
+        assert!(h.ctx.effects.iter().any(|effect| matches!(
+            effect, UiEffect::Toast { message: actual, is_error: true } if actual == &message
+        )));
     }
 
     #[test]

@@ -43,7 +43,6 @@ use {
             Event,
             NetworkResponseChannel
         },
-        window::CxWindowPool,
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
         cx::{Cx, OsType},
     }
@@ -393,21 +392,25 @@ impl Cx {
             MacosEvent::TextInput(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::TextInput(e))
             }
-            MacosEvent::Drag(e) => {
-                self.call_event_handler(&Event::Drag(e));
+            MacosEvent::Drag(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::Drag(e));
                 self.drag_drop.cycle_drag();
             }
-            MacosEvent::Drop(e) => {
-                self.call_event_handler(&Event::Drop(e));
+            MacosEvent::Drop(window_id, e) => {
+                self.call_window_event_handler(window_id, &Event::Drop(e));
                 self.drag_drop.cycle_drag();
             }
             MacosEvent::DragEnd => {
-                // lets send mousebutton ups to fix missing it.
-                // TODO! make this more resilient
-                self.call_event_handler(&Event::MouseUp(MouseUpEvent {
+                self.call_event_handler(&Event::DragEnd);
+                self.drag_drop.cycle_drag();
+            }
+            MacosEvent::DragSourceEnd(window_id) => {
+                // AppKit owns the source gesture's release. Destination exit/drop
+                // only clears feedback and must not release an unrelated mouse capture.
+                self.call_window_event_handler(window_id, &Event::MouseUp(MouseUpEvent {
                     abs: dvec2(-100000.0, -100000.0),
                     button: MouseButton::PRIMARY,
-                    window_id: CxWindowPool::id_zero(),
+                    window_id,
                     modifiers: Default::default(),
                     time: 0.0
                 }));

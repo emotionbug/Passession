@@ -646,7 +646,7 @@ pub fn define_cocoa_view_class() -> *const Class {
     
     extern "C" fn dragging_session_ended_at_point_operation(this: &Object, _: Sel, _session: ObjcId, _point: NSPoint, _operation: NSDragOperation) {
         let window = get_cocoa_window(this);
-        window.do_callback(MacosEvent::DragEnd);
+        window.do_callback(MacosEvent::DragSourceEnd(window.window_id));
     }
     
     extern "C" fn dragging_entered(this: &Object, _: Sel, sender: ObjcId) -> NSDragOperation {
@@ -659,8 +659,10 @@ pub fn define_cocoa_view_class() -> *const Class {
         dragging(this, sender)
     }
     
-    extern "C" fn dragging_exited(this: &Object, _: Sel, sender: ObjcId) {
-        dragging(this, sender);
+    extern "C" fn dragging_exited(this: &Object, _: Sel, _sender: ObjcId) {
+        let window = get_cocoa_window(this);
+        window.do_callback(MacosEvent::DragEnd);
+        window.end_live_resize();
     }
     
     fn dragging(this: &Object, sender: ObjcId) -> NSDragOperation {
@@ -680,7 +682,7 @@ pub fn define_cocoa_view_class() -> *const Class {
             get_event_key_modifier(ns_event)
         };
         
-        window.do_callback(MacosEvent::Drag(DragEvent {
+        window.do_callback(MacosEvent::Drag(window.window_id, DragEvent {
             modifiers,
             handled: Arc::new(Mutex::new(false)),
             abs: pos,
@@ -699,6 +701,7 @@ pub fn define_cocoa_view_class() -> *const Class {
 
     extern "C" fn dragging_ended(this: &Object, _: Sel, _sender: ObjcId) {
         let window = get_cocoa_window(this);
+        window.do_callback(MacosEvent::DragEnd);
         window.end_live_resize();
     }
     
@@ -766,9 +769,7 @@ pub fn define_cocoa_view_class() -> *const Class {
         (Arc::new(items), pos)
     }
     
-    extern "C" fn perform_drag_operation(this: &Object, _: Sel, sender: ObjcId) {
-        //let window = get_cocoa_window(this);
-        //window.end_live_resize();
+    extern "C" fn perform_drag_operation(this: &Object, _: Sel, sender: ObjcId) -> BOOL {
         let modifiers = unsafe {
             let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
             let ns_event: ObjcId = msg_send![ns_app, currentEvent];
@@ -776,12 +777,16 @@ pub fn define_cocoa_view_class() -> *const Class {
         };    
         let window = get_cocoa_window(this);
         let (items, pos) = get_drag_items_from_pasteboard(this, sender);
-        window.do_callback(MacosEvent::Drop(DropEvent {
+        let handled = Arc::new(Mutex::new(false));
+        window.do_callback(MacosEvent::Drop(window.window_id, DropEvent {
             modifiers,
-            handled: Arc::new(Mutex::new(false)),
+            handled: handled.clone(),
             abs: pos,
             items
         }));
+        let accepted = *handled.lock().unwrap();
+        window.do_callback(MacosEvent::DragEnd);
+        if accepted { YES } else { NO }
     }
     
     /*
@@ -856,7 +861,7 @@ pub fn define_cocoa_view_class() -> *const Class {
             decl.add_method(sel!(draggingEntered:), dragging_entered as extern "C" fn(&Object, Sel, ObjcId) -> NSDragOperation);
             decl.add_method(sel!(draggingExited:), dragging_exited as extern "C" fn(&Object, Sel, ObjcId));
             decl.add_method(sel!(draggingUpdated:), dragging_updated as extern "C" fn(&Object, Sel, ObjcId) -> NSDragOperation);
-            decl.add_method(sel!(performDragOperation:), perform_drag_operation as extern "C" fn(&Object, Sel, ObjcId));
+            decl.add_method(sel!(performDragOperation:), perform_drag_operation as extern "C" fn(&Object, Sel, ObjcId) -> BOOL);
             decl.add_method(sel!(draggingEnded:), dragging_ended as extern "C" fn(&Object, Sel, ObjcId));
         }
     }

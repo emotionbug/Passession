@@ -50,8 +50,8 @@ impl Cx {
     }
 
     /// Paseo: a native drag has one target window and reports its position in that
-    /// window's coordinates. Backends that know the window (Windows, X11) dispatch drag
-    /// and drop events through `call_window_event_handler`; other windows must not
+    /// window's coordinates. Desktop backends dispatch drag and drop events through
+    /// `call_window_event_handler`; other windows must not
     /// hit-test them. A source-less drag event still reaches every window.
     pub fn drag_event_is_for_window(&self, event: &Event, window_id: WindowId) -> bool {
         !matches!(event, Event::Drag(_) | Event::Drop(_))
@@ -486,6 +486,46 @@ mod window_keyboard_tests {
         cx.call_window_event_handler(second_id, &Event::Signal);
         assert_eq!(modals.borrow()[0].2, 1);
         assert_eq!(modals.borrow()[1].2, 1);
+        assert_eq!(cx.keyboard_event_window, None);
+    }
+
+    #[test]
+    fn inactive_drop_target_is_exclusive_without_changing_keyboard_focus() {
+        use std::sync::{Arc, Mutex};
+        use crate::event::{DragEvent, DragItem, DragResponse, DropEvent};
+        let targets = Rc::new(RefCell::new(Vec::<(WindowId, usize)>::new()));
+        let observed = targets.clone();
+        let mut cx = Cx::new(Box::new(move |cx, event| {
+            for (window, drops) in observed.borrow_mut().iter_mut() {
+                if !cx.drag_event_is_for_window(event, *window) { continue; }
+                match event {
+                    Event::Drag(drag) => *drag.response.lock().unwrap() = DragResponse::Copy,
+                    Event::Drop(drop) => {
+                        *drops += 1;
+                        *drop.handled.lock().unwrap() = true;
+                    }
+                    _ => {}
+                }
+            }
+        }));
+        let focused = window(&mut cx);
+        let target = window(&mut cx);
+        targets.borrow_mut().extend([(focused.window_id(), 0), (target.window_id(), 0)]);
+        cx.set_window_keyboard_focus(focused.window_id(), true);
+        let response = Arc::new(Mutex::new(DragResponse::None));
+        let handled = Arc::new(Mutex::new(false));
+        let items = Arc::new(vec![DragItem::FilePath { path: "/tmp/a.txt".into(), internal_id: None }]);
+        cx.call_window_event_handler(target.window_id(), &Event::Drag(DragEvent {
+            modifiers: Default::default(), handled: Arc::new(Mutex::new(false)),
+            abs: Default::default(), items: items.clone(), response: response.clone(),
+        }));
+        assert_eq!(*response.lock().unwrap(), DragResponse::Copy);
+        cx.call_window_event_handler(target.window_id(), &Event::Drop(DropEvent {
+            modifiers: Default::default(), handled: handled.clone(), abs: Default::default(), items,
+        }));
+        assert!(*handled.lock().unwrap());
+        assert_eq!(*targets.borrow(), vec![(focused.window_id(), 0), (target.window_id(), 1)]);
+        assert_eq!(cx.keyboard_window, Some(focused.window_id()));
         assert_eq!(cx.keyboard_event_window, None);
     }
 

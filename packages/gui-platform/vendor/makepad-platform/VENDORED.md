@@ -56,6 +56,12 @@ scoped entry point. Lifecycle and non-input notifications remain broadcasts.
 The adjacent widgets patch applies this scope before navigation and overlays,
 not merely before the window's content view.
 
+Cocoa file drags and drops also carry their native destination window, like XDND
+and OLE. They do not depend on or transfer keyboard focus. `performDragOperation:`
+returns the actual handled BOOL. Destination exit/end/drop only clears drag
+feedback; the separate source-end notification releases capture in the source
+window, never through a synthetic release in window zero.
+
 Desktop clipboard producers (`xlib_app.rs`, `macos_app.rs`, `win32_window.rs`)
 ask the focused widget through the window-scoped `TextPasteShortcut` event
 before requesting keyboard-shortcut paste. Terminals veto plain Ctrl+V at that

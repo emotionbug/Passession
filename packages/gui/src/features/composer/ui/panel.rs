@@ -238,6 +238,14 @@ impl PanelState {
         !matches!(self.overlay(), Overlay::None)
     }
 
+    fn accepts_file_drop(&self, visible: bool) -> bool {
+        // Native drags target a visible pane without activating its keyboard.
+        // `hidden` also covers an unfocused app, so it is not drop admission.
+        visible
+            && !self.modal_open()
+            && self.ctl.as_ref().is_some_and(Controller::accepts_file_drop)
+    }
+
     pub(super) fn cancel_gestures(&mut self) {
         self.touch_scroll.reset();
         self.tap.cancel();
@@ -667,7 +675,7 @@ impl ComposerPanel {
             Some(false) => cx.stop_timer(self.st.forge_timer),
             None => {}
         }
-        if out.redraw && !self.st.hidden {
+        if out.redraw && ui.activity.visible {
             self.draw_bg.redraw(cx);
         }
         ui.effects.extend(service::with(|svc| svc.take_effects()));
@@ -1655,16 +1663,11 @@ impl ComposerPanelRef {
 
     /// Whether files dropped on the host's `FileDropZone` can be attached now
     /// (composer/index.tsx `useFileDrop`: a mounted composer that is not submitting or
-    /// uploading). A sheet over the composer owns the pointer instead.
-    pub fn accepts_file_drop(&self) -> bool {
+    /// uploading). The host supplies current visibility independently of keyboard focus.
+    pub fn accepts_file_drop(&self, visible: bool) -> bool {
         self.borrow().is_some_and(|inner| {
-            !inner.st.hidden
-                && !inner.st.modal_open()
-                && inner
-                    .st
-                    .ctl
-                    .as_ref()
-                    .is_some_and(Controller::accepts_file_drop)
+            inner.st.accepts_file_drop(visible)
+                && !inner.profile_editor.as_settings_panel().is_open()
         })
     }
 
@@ -1740,5 +1743,31 @@ impl ComposerPanelRef {
             ComposerAction::ReloadAgent { agent_id } => Some(agent_id.clone()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    #[test]
+    fn inactive_composer_accepts_only_visible_ready_drops() {
+        let mut ctl = Controller::new(0);
+        ctl.initialized = true;
+        let mut state = PanelState {
+            ctl: Some(ctl),
+            hidden: true,
+            ..Default::default()
+        };
+        assert!(state.accepts_file_drop(true));
+        assert!(!state.accepts_file_drop(false));
+        state.overlay = Some(Overlay::Context);
+        assert!(!state.accepts_file_drop(true));
+        state.overlay = None;
+        state.ctl.as_mut().unwrap().blob_tokens.insert(1, true);
+        assert!(!state.accepts_file_drop(true));
+        state.ctl.as_mut().unwrap().blob_tokens.clear();
+        assert!(state.accepts_file_drop(true));
+        assert!(state.hidden);
     }
 }
