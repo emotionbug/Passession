@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.35 - 2026-11-17
+
 ### Added
 
 - Reveal local file links in the system file manager with Ctrl+click on Windows/Linux or Command+click on macOS, including conversation links and Markdown previews. Plain clicks and remote files stay inside Passession.
