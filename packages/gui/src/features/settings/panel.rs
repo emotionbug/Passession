@@ -253,6 +253,8 @@ pub struct SettingsPanel {
     /// Requested only while a spinner was drawn last frame.
     #[rust]
     next_frame: NextFrame,
+    #[rust]
+    remeasure: bool,
     /// Hides the info tooltip (100 ms after hover exit, 1.5 s after a tap).
     #[rust]
     tip_timer: Timer,
@@ -320,12 +322,6 @@ impl SettingsPanel {
             Layer::Overlay,
             self.st.sheets.len() + usize::from(self.st.menu.is_some()),
         )
-    }
-
-    fn redraw_overlays(&mut self, cx: &mut Cx) {
-        for list in &mut self.layer_lists {
-            list.redraw(cx);
-        }
     }
 
     fn overlay_open(&self) -> bool {
@@ -613,7 +609,9 @@ impl Widget for SettingsPanel {
             dirty = true;
         }
         if self.next_frame.is_event(event).is_some() {
-            dirty = true;
+            self.draws.retained.animate(cx);
+            self.overlay_draws.retained.animate(cx);
+            dirty |= std::mem::take(&mut self.remeasure);
         }
         if self.tip_timer.is_event(event).is_some() && self.st.tip.take().is_some() {
             dirty = true;
@@ -858,8 +856,9 @@ impl Widget for SettingsPanel {
                 }
                 self.with_env(cx, ui, |s, env| pages::ensure(s, env, &view));
             }
+            // Recompose layout/hit metadata; paint operations and native fields
+            // retain their own lists and repaint only when their visual inputs change.
             self.area.redraw(cx);
-            self.redraw_overlays(cx);
         }
         let owner = self.widget_uid().0;
         let open = self.overlay_open();
@@ -899,6 +898,8 @@ impl Widget for SettingsPanel {
             ],
         );
         self.fields.begin_frame();
+        self.draws.retained.begin_frame();
+        self.overlay_draws.retained.begin_frame();
         self.zones.clear();
         self.regions.clear();
         let rect = cx.walk_turtle(walk);
@@ -1193,6 +1194,7 @@ impl Widget for SettingsPanel {
             }
             // A redraw requested mid-draw is dropped: re-lay the sheet next frame.
             animating |= remeasure;
+            self.remeasure = remeasure;
         }
         for sheet in self.st.sheets.iter_mut() {
             let visible = self
@@ -1206,6 +1208,8 @@ impl Widget for SettingsPanel {
         self.sheet_heights
             .retain(|id, _| self.st.sheets.iter().any(|s| s.id == *id));
         self.fields.end_frame(cx);
+        self.draws.retained.end_frame();
+        self.overlay_draws.retained.end_frame();
         // Spinners animate only while one is on screen; a resized sheet re-lays once.
         if animating {
             self.next_frame = cx.new_next_frame();
@@ -1629,7 +1633,6 @@ impl SettingsPanelRef {
             pages::profiles::open_editor(s, env, host_id, profile, seed)
         });
         inner.area.redraw(cx);
-        inner.redraw_overlays(cx);
     }
 
     /// Dismiss a hidden retained owner's layers; pending replies remain routable.
@@ -1652,7 +1655,7 @@ impl SettingsPanelRef {
             });
         }
         cx.clear_key_focus_if(inner.area);
-        inner.redraw_overlays(cx);
+        inner.area.redraw(cx);
     }
 
     /// Whether a sheet or menu of this panel is open.

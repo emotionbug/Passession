@@ -17,7 +17,7 @@ const DEFAULT_COLS: u16 = 80;
 const CACHE_LIMIT: usize = 4096;
 
 pub struct Screen {
-    emulator: Emulator,
+    emulator: Option<Emulator>,
     /// Presented scrollback rows (`Options::scrollback`).
     scrollback: usize,
     /// Presented lines by row index, valid until the next mutation.
@@ -26,6 +26,10 @@ pub struct Screen {
     revision: u64,
     line_count: usize,
     has_dimensions: bool,
+    /// Keep scroll geometry while a snapshot is in flight, so a paused viewport does not
+    /// clamp to an empty screen and lose its position before reattachment completes.
+    dormant_size: (u16, u16),
+    dormant_history: usize,
 }
 
 fn emulator(rows: u16, cols: u16, scrollback: usize) -> Result<Emulator, Error> {
@@ -40,19 +44,24 @@ fn emulator(rows: u16, cols: u16, scrollback: usize) -> Result<Emulator, Error> 
 impl Screen {
     pub fn new(scrollback: usize) -> Result<Self, Error> {
         Ok(Self {
-            emulator: emulator(DEFAULT_ROWS, DEFAULT_COLS, scrollback)?,
+            emulator: Some(emulator(DEFAULT_ROWS, DEFAULT_COLS, scrollback)?),
             scrollback,
             lines: HashMap::new(),
             title: String::new(),
             revision: 0,
             line_count: 0,
             has_dimensions: false,
+            dormant_size: (DEFAULT_ROWS, DEFAULT_COLS),
+            dormant_history: 0,
         })
     }
 
     /// Feeds process output through the VT parser.
     pub fn write(&mut self, bytes: &[u8]) {
-        self.emulator.write(bytes);
+        let Some(emulator) = self.emulator.as_mut() else {
+            return;
+        };
+        emulator.write(bytes);
         self.lines.clear();
     }
 
@@ -65,10 +74,10 @@ impl Screen {
         title: Option<&str>,
     ) -> Result<(), Error> {
         let (rows, cols) = size.unwrap_or((self.rows(), self.cols()));
-        self.emulator = emulator(rows, cols, self.scrollback)?;
+        self.emulator = Some(emulator(rows, cols, self.scrollback)?);
         self.lines.clear();
         self.has_dimensions = true;
-        self.emulator.write(text.as_bytes());
+        self.emulator.as_mut().unwrap().write(text.as_bytes());
         if let Some(title) = title.filter(|title| !title.is_empty()) {
             self.title = title.to_owned();
         }
@@ -78,10 +87,13 @@ impl Screen {
 
     /// Resizes the grid (the primary screen reflows); returns whether the size changed.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<bool, Error> {
-        if rows == self.rows() && cols == self.cols() {
+        let Some(emulator) = self.emulator.as_mut() else {
+            return Ok(false);
+        };
+        if rows == emulator.rows() && cols == emulator.cols() {
             return Ok(false);
         }
-        self.emulator.resize(rows, cols)?;
+        emulator.resize(rows, cols)?;
         self.lines.clear();
         Ok(true)
     }
@@ -89,7 +101,10 @@ impl Screen {
     /// Applies the effects of written output: the OSC title, the line count and a new
     /// revision for the views.
     pub fn publish(&mut self) {
-        if let Some(title) = self.emulator.take_title() {
+        let Some(emulator) = self.emulator.as_mut() else {
+            return;
+        };
+        if let Some(title) = emulator.take_title() {
             self.title = title;
         }
         self.line_count = self.count_lines();
@@ -97,16 +112,54 @@ impl Screen {
     }
 
     pub fn rows(&self) -> u16 {
-        self.emulator.rows()
+        self.emulator
+            .as_ref()
+            .map_or(self.dormant_size.0, Emulator::rows)
     }
 
     pub fn cols(&self) -> u16 {
-        self.emulator.cols()
+        self.emulator
+            .as_ref()
+            .map_or(self.dormant_size.1, Emulator::cols)
     }
 
     /// A snapshot or restore set the size; output alone never does.
     pub fn has_dimensions(&self) -> bool {
         self.has_dimensions
+    }
+
+    pub fn is_retained(&self) -> bool {
+        self.emulator.is_some()
+    }
+
+    /// Drop native and row-cache allocations, retaining only a compact plain replay.
+    /// The wrapper exposes no VT formatter; styled state returns from the daemon snapshot.
+    pub fn release(&mut self) -> Box<str> {
+        let mut replay = String::from("\x1b[?7h");
+        let mut previous_wraps = false;
+        let mut start = 0;
+        while start < self.line_count {
+            let lines = self.read_uncached(start, 512.min(self.line_count - start));
+            if lines.is_empty() {
+                break;
+            }
+            for (index, line) in lines.iter().enumerate() {
+                if start + index > 0 && !previous_wraps {
+                    replay.push_str("\r\n");
+                }
+                replay.push_str(&line.text);
+                previous_wraps = line.wraps_next;
+            }
+            start += lines.len();
+        }
+        replay.push_str("\x1b[?25l");
+        self.dormant_size = (self.rows(), self.cols());
+        self.dormant_history = self.history();
+        self.emulator = None;
+        self.lines = HashMap::new();
+        self.has_dimensions = false;
+        self.revision += 1;
+        replay.into_boxed_str()
     }
 
     pub fn title(&self) -> &str {
@@ -125,24 +178,40 @@ impl Screen {
 
     /// Presented scrollback rows above the screen.
     pub fn history(&self) -> usize {
-        self.emulator.history()
+        self.emulator
+            .as_ref()
+            .map_or(self.dormant_history, Emulator::history)
     }
 
     /// Presented scrollback plus screen rows.
     pub fn total_rows(&self) -> usize {
-        self.emulator.total_rows()
+        self.history() + usize::from(self.rows())
     }
 
     pub fn cursor(&mut self) -> Cursor {
-        self.emulator.cursor()
+        self.emulator.as_mut().map_or(
+            Cursor {
+                row: 0,
+                col: 0,
+                pending_wrap: false,
+                visible: false,
+                shape: Default::default(),
+                blinking: false,
+            },
+            Emulator::cursor,
+        )
     }
 
     pub fn modes(&self) -> Modes {
-        self.emulator.modes()
+        self.emulator
+            .as_ref()
+            .map_or_else(Modes::default, Emulator::modes)
     }
 
     pub fn encode_key(&mut self, key: Key, modifiers: Modifiers) -> Vec<u8> {
-        self.emulator.encode_key(key, modifiers)
+        self.emulator
+            .as_mut()
+            .map_or_else(Vec::new, |emulator| emulator.encode_key(key, modifiers))
     }
 
     pub fn encode_mouse_wheel(
@@ -153,18 +222,21 @@ impl Screen {
         modifiers: Modifiers,
         count: usize,
     ) -> Vec<u8> {
-        self.emulator
-            .encode_mouse_wheel(up, col, row, modifiers, count)
+        self.emulator.as_mut().map_or_else(Vec::new, |emulator| {
+            emulator.encode_mouse_wheel(up, col, row, modifiers, count)
+        })
     }
 
     pub fn encode_paste(&self, text: &str) -> Vec<u8> {
-        self.emulator.encode_paste(text)
+        self.emulator
+            .as_ref()
+            .map_or_else(Vec::new, |emulator| emulator.encode_paste(text))
     }
 
     fn count_lines(&mut self) -> usize {
         let history = self.history();
         let total = self.total_rows();
-        let cursor = usize::from(self.emulator.cursor().row);
+        let cursor = usize::from(self.cursor().row);
         let minimum = total.min(history + cursor + 1);
         let mut count = total;
         while count > minimum {
@@ -182,14 +254,15 @@ impl Screen {
 
     /// Presented rows `start..start+count` (scrollback first, then the screen), cached.
     pub fn read(&mut self, start: usize, count: usize) -> Vec<&Line> {
+        let Some(emulator) = self.emulator.as_ref() else {
+            return Vec::new();
+        };
         let end = start.saturating_add(count).min(self.total_rows());
         if self.lines.len() > CACHE_LIMIT {
             self.lines.clear();
         }
         for row in start..end {
-            self.lines
-                .entry(row)
-                .or_insert_with(|| self.emulator.line(row));
+            self.lines.entry(row).or_insert_with(|| emulator.line(row));
         }
         (start..end).map(|row| &self.lines[&row]).collect()
     }
@@ -197,13 +270,16 @@ impl Screen {
     /// Presented rows `start..start+count` read past the cache: bulk readers (find, copy
     /// all) visit every row once.
     pub fn read_uncached(&self, start: usize, count: usize) -> Vec<Line> {
+        let Some(emulator) = self.emulator.as_ref() else {
+            return Vec::new();
+        };
         let end = start.saturating_add(count).min(self.total_rows());
         (start..end)
             .map(|row| {
                 self.lines
                     .get(&row)
                     .cloned()
-                    .unwrap_or_else(|| self.emulator.line(row))
+                    .unwrap_or_else(|| emulator.line(row))
             })
             .collect()
     }
@@ -347,6 +423,10 @@ mod tests {
     fn queries_are_never_answered() {
         let mut screen = screen_with("\x1b[c\x1b[6n");
         assert_eq!(screen.read(0, 1)[0].text, "");
-        assert!(screen.emulator.take_replies().is_empty());
+        let emulator = screen
+            .emulator
+            .as_ref()
+            .expect("attached screen has an emulator");
+        assert!(emulator.take_replies().is_empty());
     }
 }

@@ -6,6 +6,7 @@
 use crate::features::workspace::kit::{WaModalWidgetExt, WaModalWidgetRefExt};
 use makepad_widgets::*;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 use super::matching::highlight_ranges;
 use super::results::{
@@ -118,6 +119,13 @@ pub struct CommandCenterPanel {
     /// Another layout pass after the chrome changed during drawing.
     #[rust]
     relayout: NextFrame,
+    #[rust]
+    row_layouts: HashMap<WidgetUid, (f64, f64)>,
+    #[rust]
+    row_query: String,
+    /// An event already projected this dispatch before invalidating retained rows.
+    #[rust]
+    presentation_prepared: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -152,8 +160,10 @@ impl MatchSpan {
 /// marked and never truncated.
 #[derive(Live, LiveHook, Widget)]
 pub struct WaMatchText {
-    #[redraw]
+    #[rust(DrawList2d::new(cx))]
+    list: DrawList2d,
     #[live]
+    #[redraw]
     painter: Painter,
     #[walk]
     walk: Walk,
@@ -183,6 +193,9 @@ impl Widget for WaMatchText {
             ..walk
         };
         let r = cx.walk_turtle(walk);
+        if self.list.begin(cx, Walk::abs_rect(r)).is_err() {
+            return DrawStep::done();
+        }
         // Opens the box batch before any text so marks paint under their glyphs.
         self.painter
             .capture_box(cx, r, Vec4::default(), Vec4::default(), 0.0, 0.0);
@@ -268,11 +281,21 @@ impl Widget for WaMatchText {
                 0.0,
             );
         }
+        self.list.end(cx);
         DrawStep::done()
     }
 }
 
 impl WaMatchTextRef {
+    fn set_line_height(&self, cx: &mut Cx, height: f64) {
+        if let Some(mut inner) = self.borrow_mut()
+            && inner.line_height != height
+        {
+            inner.line_height = height;
+            inner.redraw(cx);
+        }
+    }
+
     pub fn set(&self, cx: &mut Cx, spans: Vec<MatchSpan>, tail: &str) {
         if let Some(mut inner) = self.borrow_mut()
             && (inner.spans != spans || inner.tail != tail)
@@ -287,8 +310,10 @@ impl WaMatchTextRef {
 /// The material file icon (Files feature textures) for a file row.
 #[derive(Live, LiveHook, Widget)]
 pub struct WaFileIcon {
-    #[redraw]
+    #[rust(DrawList2d::new(cx))]
+    list: DrawList2d,
     #[live]
+    #[redraw]
     image: DrawFilesImage,
     #[walk]
     walk: Walk,
@@ -297,6 +322,8 @@ pub struct WaFileIcon {
     visible: bool,
     #[rust]
     name: String,
+    #[rust]
+    pending: bool,
 }
 
 impl Widget for WaFileIcon {
@@ -305,18 +332,31 @@ impl Widget for WaFileIcon {
             return DrawStep::done();
         }
         let r = cx.walk_turtle(walk);
+        if self.list.begin(cx, Walk::abs_rect(r)).is_err() {
+            return DrawStep::done();
+        }
         let name = self.name.clone();
-        crate::features::files::draw_file_icon(cx, &mut self.image, r, &name);
+        self.pending = !crate::features::files::draw_file_icon(cx, &mut self.image, r, &name);
+        self.list.end(cx);
         DrawStep::done()
     }
 }
 
 impl WaFileIconRef {
+    fn refresh_pending(&self, cx: &mut Cx) {
+        if let Some(inner) = self.borrow()
+            && inner.pending
+        {
+            inner.list.redraw(cx);
+        }
+    }
+
     pub fn set_name(&self, cx: &mut Cx, name: &str) {
         if let Some(mut inner) = self.borrow_mut()
             && inner.name != name
         {
             inner.name = name.to_owned();
+            inner.pending = true;
             inner.redraw(cx);
         }
     }
@@ -384,6 +424,47 @@ fn listed_agent(agent: &Value) -> bool {
         && agent.get("parentAgentId").is_none_or(Value::is_null)
 }
 
+fn same_row(a: &ListRow, b: &ListRow) -> bool {
+    match (a, b) {
+        (
+            ListRow::Section {
+                title: a,
+                divider: ad,
+            },
+            ListRow::Section {
+                title: b,
+                divider: bd,
+            },
+        ) => a == b && ad == bd,
+        (ListRow::Result(a), ListRow::Result(b)) => {
+            let icon = match (&a.icon, &b.icon) {
+                (Icon::None, Icon::None) => true,
+                (Icon::Glyph(a), Icon::Glyph(b)) => a == b,
+                (Icon::File(a), Icon::File(b)) => a == b,
+                (
+                    Icon::Provider {
+                        provider: a,
+                        bucket: ab,
+                    },
+                    Icon::Provider {
+                        provider: b,
+                        bucket: bb,
+                    },
+                ) => a == b && ab == bb,
+                _ => false,
+            };
+            a.id == b.id
+                && a.kind == b.kind
+                && a.title == b.title
+                && a.subtitle == b.subtitle
+                && a.shortcut == b.shortcut
+                && a.activity_at == b.activity_at
+                && icon
+        }
+        _ => false,
+    }
+}
+
 impl CommandCenterPanel {
     /// The content root as a handle (the deref `View` is not `Clone`).
     fn root(&self) -> WidgetRef {
@@ -392,6 +473,50 @@ impl CommandCenterPanel {
 
     fn target(ctx: &UiContext) -> Option<PanelTarget> {
         ctx.layout.selected_target().cloned()
+    }
+
+    fn refresh_relative_times(&self, cx: &mut Cx) {
+        let Some(projection) = &self.projection else {
+            return;
+        };
+        let list = self.view.portal_list(id!(list));
+        let now = chrono::Utc::now();
+        for (index, row) in projection.rows.iter().enumerate() {
+            let ListRow::Result(result) = row else {
+                continue;
+            };
+            if result.kind != Kind::Agent {
+                continue;
+            }
+            let Some((_, item)) = list.get_item(index) else {
+                continue;
+            };
+            let time = time_ago(result.activity_at, now);
+            let tail = if time.is_empty() || result.subtitle.is_empty() {
+                time
+            } else {
+                format!("\u{a0}· {time}")
+            };
+            item.wa_match_text(id!(subtitle)).set(
+                cx,
+                vec![MatchSpan::new(&result.subtitle, &self.query, true)],
+                &tail,
+            );
+        }
+    }
+
+    fn refresh_file_icons(&self, cx: &mut Cx) {
+        let Some(projection) = &self.projection else {
+            return;
+        };
+        let list = self.view.portal_list(id!(list));
+        for (index, row) in projection.rows.iter().enumerate() {
+            if matches!(row, ListRow::Result(result) if result.kind == Kind::File)
+                && let Some((_, item)) = list.get_item(index)
+            {
+                item.wa_file_icon(id!(file)).refresh_pending(cx);
+            }
+        }
     }
 
     /// Files are searched in the selected directory when the Files scope is on or anything has
@@ -463,6 +588,7 @@ impl CommandCenterPanel {
         for effect in self.pending_effects.drain(..) {
             ctx.effects.push(effect);
         }
+        let mut changed = false;
         for (req, result) in self.pending.take_raw(&ctx.events) {
             let Req::Files { generation } = req;
             if !self.open || generation != self.file_generation {
@@ -492,11 +618,30 @@ impl CommandCenterPanel {
                     self.file_error = Some(error.to_string());
                 }
             }
-            self.view.redraw(cx);
+            changed = true;
         }
-        if self.open && !ctx.events.is_empty() {
+        // The palette presents directory/session facts, host availability and
+        // shortcut preferences, not drafts, terminals, logs or arbitrary RPCs.
+        let delta = &ctx.state_delta;
+        let relevant = delta.sections.contains("preferences")
+            || delta.sections.contains("hostSet")
+            || !delta.hosts.is_empty()
+            || !delta.directories.is_empty()
+            || !delta.agent_activity.is_empty()
+            || ctx.events.iter().any(|event| {
+                matches!(
+                    event,
+                    paseo_gui_core::CoreEvent::Connected { .. }
+                        | paseo_gui_core::CoreEvent::Disconnected { .. }
+                )
+            });
+        if self.open && relevant {
             self.sync_file_search(cx, ctx);
-            self.view.redraw(cx);
+            changed = true;
+        }
+        if self.open && changed {
+            self.present(cx, ctx);
+            self.view.widget(id!(list)).redraw(cx);
         }
     }
 
@@ -1295,7 +1440,8 @@ impl CommandCenterPanel {
         }
     }
 
-    fn rebuild(&mut self, ctx: &UiContext) {
+    fn rebuild(&mut self, cx: &mut Cx, ctx: &UiContext) {
+        let previous_active = self.active_id.clone();
         let sections = if self.files_scope {
             vec![self.file_section(ctx)]
         } else {
@@ -1315,6 +1461,27 @@ impl CommandCenterPanel {
             if !self.active_id.as_ref().is_some_and(|id| ids.contains(id)) {
                 self.active_id = ids.first().cloned();
             }
+        }
+        let query_changed = self.row_query != self.query;
+        let list = self.view.portal_list(id!(list));
+        for (index, row) in projection.rows.iter().enumerate() {
+            let same = self
+                .projection
+                .as_ref()
+                .and_then(|old| old.rows.get(index))
+                .is_some_and(|old| same_row(old, row));
+            let selection_changed = previous_active != self.active_id
+                && row_id(row).is_some_and(|id| {
+                    previous_active.as_ref() == Some(&id) || self.active_id.as_ref() == Some(&id)
+                });
+            if (!same || query_changed || selection_changed)
+                && let Some((_, item)) = list.get_item(index)
+            {
+                item.redraw(cx);
+            }
+        }
+        if query_changed {
+            self.row_query.clone_from(&self.query);
         }
         self.projection = Some(projection);
     }
@@ -1395,14 +1562,15 @@ impl CommandCenterPanel {
         self.scroll_reset = true;
         if let Some(ctx) = ctx {
             self.sync_file_search(cx, ctx);
+            self.present(cx, ctx);
         }
-        self.view.redraw(cx);
+        self.view.widget(id!(list)).redraw(cx);
     }
 
     fn present(&mut self, cx: &mut Cx, ctx: &UiContext) {
         let view = self.root();
         self.compact = ctx.compact;
-        self.rebuild(ctx);
+        self.rebuild(cx, ctx);
         view.widget(id!(scope_chip))
             .set_visible(cx, self.files_scope);
         view.wa_button(id!(scope_chip))
@@ -1453,6 +1621,7 @@ impl CommandCenterPanel {
         view.widget(id!(footer_rule))
             .set_visible(cx, !footer.is_empty());
         set_optional(cx, &view.widget(id!(footer)), &footer);
+        self.presentation_prepared = true;
     }
 
     /// Sizes the list to its rows within the room the chrome leaves under the panel's cap,
@@ -1494,6 +1663,7 @@ impl CommandCenterPanel {
                 results::reveal_anchor(&heights, current, height, top, bottom)
             {
                 list.set_first_id_and_scroll(first, scroll);
+                list.redraw(cx);
             }
         }
         if !self.file_loading {
@@ -1533,7 +1703,11 @@ impl CommandCenterPanel {
                 ListRow::Section { title, divider } => {
                     let item = list.item(cx, index, live_id!(SectionRow));
                     let height = results::row_height(row, ctx_compact);
-                    item.apply_over(cx, live! { height: (height) });
+                    let layout = (height, -1.0);
+                    if self.row_layouts.get(&item.widget_uid()) != Some(&layout) {
+                        self.row_layouts.insert(item.widget_uid(), layout);
+                        item.apply_over(cx, live! { height: (height), optimize: DrawList });
+                    }
                     item.widget(id!(divider)).set_visible(cx, *divider);
                     set_optional(cx, &item.widget(id!(title)), title.as_deref().unwrap_or(""));
                     item.draw_all(cx, scope);
@@ -1555,10 +1729,14 @@ impl CommandCenterPanel {
                         },
                     );
                     let height = results::row_height(row, ctx_compact);
-                    item.apply_over(
-                        cx,
-                        live! { height: (height), padding: { top: (inset), bottom: (inset) } },
-                    );
+                    let layout = (height, inset);
+                    if self.row_layouts.get(&item.widget_uid()) != Some(&layout) {
+                        self.row_layouts.insert(item.widget_uid(), layout);
+                        item.apply_over(
+                            cx,
+                            live! { height: (height), padding: { top: (inset), bottom: (inset) }, optimize: DrawList },
+                        );
+                    }
                     let query = self.query.as_str();
                     let title = item.wa_match_text(id!(title));
                     match result.kind {
@@ -1595,10 +1773,7 @@ impl CommandCenterPanel {
                         Kind::Action => {
                             // A one-line action keeps the 20px line; with a subtitle 18 + 16.
                             let single = result.subtitle.is_empty();
-                            title.apply_over(
-                                cx,
-                                live! { line_height: (if single { 20.0 } else { 18.0 }) },
-                            );
+                            title.set_line_height(cx, if single { 20.0 } else { 18.0 });
                             title.set(cx, vec![MatchSpan::new(&result.title, query, false)], "");
                             let subtitle = item.wa_match_text(id!(subtitle));
                             subtitle.set_visible(cx, !single);
@@ -1618,28 +1793,33 @@ impl CommandCenterPanel {
                     let file = item.wa_file_icon(id!(file));
                     let provider = item.widget(id!(provider_box));
                     let mark = item.widget(id!(mark_box));
-                    glyph.set_visible(cx, false);
-                    file.set_visible(cx, false);
-                    provider.set_visible(cx, false);
-                    mark.set_visible(cx, false);
+                    glyph.set_visible(cx, matches!(&result.icon, Icon::Glyph(_)));
+                    file.set_visible(cx, matches!(&result.icon, Icon::File(_)));
+                    provider.set_visible(cx, matches!(&result.icon, Icon::Provider { .. }));
+                    mark.set_visible(
+                        cx,
+                        matches!(
+                            &result.icon,
+                            Icon::Provider {
+                                bucket: Some(_),
+                                ..
+                            }
+                        ),
+                    );
                     match &result.icon {
                         Icon::None => {}
                         Icon::Glyph(name) => {
-                            glyph.set_visible(cx, true);
                             glyph.set_icon(cx, name);
                         }
                         Icon::File(name) => {
-                            file.set_visible(cx, true);
                             file.set_name(cx, name);
                         }
                         Icon::Provider {
                             provider: name,
                             bucket,
                         } => {
-                            provider.set_visible(cx, true);
                             item.provider_icon(id!(provider))
                                 .set_provider(cx, name, None);
-                            mark.set_visible(cx, bucket.is_some());
                             item.status_mark(id!(mark)).set_status(cx, *bucket);
                         }
                     }
@@ -1961,13 +2141,16 @@ impl Widget for CommandCenterPanel {
                 self.file_timer = Timer::default();
                 self.run_file_search(ctx);
             }
-            if self.clock.is_event(event).is_some() || self.relayout.is_event(event).is_some() {
-                self.view.redraw(cx);
+            if self.clock.is_event(event).is_some() {
+                self.refresh_relative_times(cx);
+            }
+            if self.relayout.is_event(event).is_some() {
+                self.view.widget(id!(list)).redraw(cx);
             }
             let revision = crate::features::files::revision();
             if self.open && revision != self.files_revision {
                 self.files_revision = revision;
-                self.view.redraw(cx);
+                self.refresh_file_icons(cx);
             }
         }
         if !self.open {
@@ -2011,16 +2194,41 @@ impl Widget for CommandCenterPanel {
             self.scroll_reset = true;
             if let Some(ctx) = scope.data.get_mut::<UiContext>() {
                 self.sync_file_search(cx, ctx);
+                self.present(cx, ctx);
             }
-            self.view.redraw(cx);
+            self.view.widget(id!(list)).redraw(cx);
         }
-        if let Some(key) = input.key_down_unhandled(actions) {
-            match key.key_code {
-                KeyCode::ArrowDown => self.move_active(1),
-                KeyCode::ArrowUp => self.move_active(-1),
-                _ => {}
+        if let Some(key) = input.key_down_unhandled(actions)
+            && matches!(key.key_code, KeyCode::ArrowDown | KeyCode::ArrowUp)
+        {
+            let previous = self.active_id.clone();
+            self.move_active(if key.key_code == KeyCode::ArrowDown {
+                1
+            } else {
+                -1
+            });
+            if previous != self.active_id {
+                let list = self.view.portal_list(id!(list));
+                if let Some(projection) = &self.projection {
+                    for (index, row) in projection.rows.iter().enumerate() {
+                        let Some(id) = row_id(row) else { continue };
+                        if (previous.as_deref() == Some(id.as_str())
+                            || self.active_id.as_deref() == Some(id.as_str()))
+                            && let Some((_, item)) = list.get_item(index)
+                        {
+                            item.as_surface().set_role(
+                                cx,
+                                if self.active_id.as_deref() == Some(id.as_str()) {
+                                    SurfaceRole::Surface1
+                                } else {
+                                    SurfaceRole::Transparent
+                                },
+                            );
+                        }
+                    }
+                }
+                self.layout_list(cx, self.compact);
             }
-            self.view.redraw(cx);
         }
         if input.escaped(actions) {
             self.close_panel(cx);
@@ -2067,7 +2275,11 @@ impl Widget for CommandCenterPanel {
         }
         let compact = scope.data.get_mut::<UiContext>().map(|ctx| {
             let compact = ctx.compact;
-            self.present(cx, ctx);
+            let prepared = std::mem::take(&mut self.presentation_prepared);
+            if !prepared || self.compact != compact {
+                self.present(cx, ctx);
+                self.presentation_prepared = false;
+            }
             compact
         });
         let size = cx.current_pass_size();
@@ -2139,6 +2351,7 @@ impl CommandCenterPanelRef {
             return;
         };
         inner.open = true;
+        inner.presentation_prepared = false;
         inner.files_scope = files;
         inner.query.clear();
         inner.active_id = None;
@@ -2146,6 +2359,12 @@ impl CommandCenterPanelRef {
         inner.scroll_reset = true;
         inner.file_request = None;
         inner.focus_query = true;
+        for id in [id!(chrome_top), id!(chrome_bottom)] {
+            inner
+                .view
+                .widget(id)
+                .apply_over(cx, live! { optimize: DrawList });
+        }
         inner.view.wa_input(id!(query)).set_text(cx, "");
         inner.view.wa_modal(id!(modal)).open(cx);
         cx.stop_timer(inner.clock);
@@ -2161,5 +2380,33 @@ impl CommandCenterPanelRef {
 
     pub fn is_open(&self) -> bool {
         self.borrow().is_some_and(|inner| inner.open)
+    }
+}
+
+#[cfg(test)]
+mod redraw_tests {
+    use super::*;
+
+    #[test]
+    fn command_center_retains_rows_when_only_activation_changes() {
+        let row = ResultRow::new("action", Kind::Action, "Open", Run::Error("before".into()));
+        let mut changed = row.clone();
+        changed.run = Run::Error("after".into());
+        assert!(same_row(
+            &ListRow::Result(Box::new(row)),
+            &ListRow::Result(Box::new(changed))
+        ));
+    }
+
+    #[test]
+    fn command_center_repaints_changed_recency_and_labels() {
+        let row = ResultRow::new("session", Kind::Agent, "Session", Run::Error(String::new()));
+        let before = ListRow::Result(Box::new(row.clone()));
+        let mut changed = row.clone();
+        changed.activity_at = Some(60_000);
+        assert!(!same_row(&before, &ListRow::Result(Box::new(changed))));
+        let mut changed = row;
+        changed.title = "Renamed".into();
+        assert!(!same_row(&before, &ListRow::Result(Box::new(changed))));
     }
 }

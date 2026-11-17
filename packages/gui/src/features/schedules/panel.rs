@@ -56,6 +56,14 @@ pub struct SchedulesPanel {
     #[deref]
     view: View,
     #[rust]
+    presentation_dirty: bool,
+    #[rust]
+    retention_ready: bool,
+    #[rust]
+    retained_rows: usize,
+    #[rust]
+    retained_run_rows: usize,
+    #[rust]
     schedules: Vec<Value>,
     /// Labels of connected hosts whose `schedule/list` failed.
     #[rust]
@@ -222,10 +230,9 @@ impl SchedulesPanel {
         if signature != self.host_signature {
             self.host_signature = signature;
             self.load(ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         for (req, result) in self.pending.take(&ctx.events) {
-            self.view.redraw(cx);
             match req {
                 Req::List {
                     generation,
@@ -249,6 +256,7 @@ impl SchedulesPanel {
                     self.outstanding = self.outstanding.saturating_sub(1);
                     if self.outstanding == 0 {
                         self.complete_load();
+                        self.presentation_dirty = true;
                     }
                 }
                 Req::Action {
@@ -256,6 +264,7 @@ impl SchedulesPanel {
                     action,
                     previous,
                 } => {
+                    self.presentation_dirty = true;
                     match &result {
                         // A failed pause, resume or delete rolls back and says why.
                         Err(error) => {
@@ -285,6 +294,7 @@ impl SchedulesPanel {
                     self.load(ctx);
                 }
                 Req::Logs { key } => {
+                    self.presentation_dirty = true;
                     self.finish_row_action(&key, "runs");
                     match result {
                         Ok(body) => {
@@ -498,7 +508,7 @@ impl SchedulesPanel {
         }
         if let Some(filter) = view.psegmented(id!(status_filter)).changed(actions) {
             self.status_filter = filter;
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if view.wa_button(id!(host_filter)).clicked(actions) {
             let mut options = vec![SelectOption::new("", l("All hosts")).glyph("server")];
@@ -573,7 +583,7 @@ impl SchedulesPanel {
                     action => self.act(ctx, &schedule, action),
                 }
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if let Some(token) = view.wa_dialog(id!(dialog)).confirmed(actions) {
             if let Some(key) = token.strip_prefix("delete:")
@@ -581,7 +591,7 @@ impl SchedulesPanel {
             {
                 self.act(ctx, &schedule, "delete");
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         // Run history.
         let runs_modal = view.wa_modal(id!(runs_modal));
@@ -647,6 +657,29 @@ impl SchedulesPanel {
 
     fn present(&mut self, cx: &mut Cx, ctx: &UiContext) {
         let view = self.root();
+        // The DSL is owned by schedules/mod.rs; establish retained presentation boundaries once.
+        if !self.retention_ready {
+            self.retention_ready = true;
+            let paths: &[&[LiveId]] = &[
+                id!(header),
+                id!(filters),
+                id!(spinner_view),
+                id!(failed),
+                id!(body),
+                id!(banner),
+                id!(offline_banner),
+                id!(card),
+                id!(empty_state),
+                id!(ended_empty),
+                id!(offline_state),
+                id!(runs_modal.sheet.subtitle_row),
+                id!(runs_scroll),
+            ];
+            for &path in paths {
+                view.widget(path)
+                    .apply_over(cx, live! { optimize: DrawList });
+            }
+        }
         let width = view.area().rect(cx).size.x;
         if width > 0.0 {
             self.compact = host::is_compact(width);
@@ -806,6 +839,9 @@ impl SchedulesPanel {
         if ready {
             for (index, schedule) in rows.iter().enumerate() {
                 let item = repeat.item(cx, index);
+                if index >= self.retained_rows {
+                    item.apply_over(cx, live! { optimize: DrawList });
+                }
                 let host = host::host(&ctx.state, str_of(schedule, "_serverId"));
                 let state = model::schedule_state(schedule, host, now);
                 let (target, provider) = model::target_label(schedule, host);
@@ -840,6 +876,7 @@ impl SchedulesPanel {
                         .is_some_and(|busy| !busy.is_empty()),
                 );
             }
+            self.retained_rows = self.retained_rows.max(rows.len());
         }
         self.visible_rows = rows;
         // Run history.
@@ -861,6 +898,9 @@ impl SchedulesPanel {
             run_rows.set_count(cx, self.runs.len());
             for (index, run) in self.runs.iter().enumerate() {
                 let item = run_rows.item(cx, index);
+                if index >= self.retained_run_rows {
+                    item.apply_over(cx, live! { optimize: DrawList });
+                }
                 item.widget(id!(rule)).set_visible(cx, index > 0);
                 let (label, variant) = match str_of(run, "status") {
                     "succeeded" => (l("Succeeded"), BadgeVariant::Success),
@@ -893,6 +933,7 @@ impl SchedulesPanel {
                     .plabel(id!(text))
                     .set_color(cx, Some(crate::theme::current_palette().danger));
             }
+            self.retained_run_rows = self.retained_run_rows.max(self.runs.len());
         }
     }
 }
@@ -905,7 +946,7 @@ impl Widget for SchedulesPanel {
                 self.timer = cx.start_timeout(30.0);
                 if !self.loading {
                     self.load(ctx);
-                    self.view.redraw(cx);
+                    self.presentation_dirty = true;
                 }
             }
         }
@@ -914,6 +955,12 @@ impl Widget for SchedulesPanel {
             && let Some(ctx) = scope.data.get_mut::<UiContext>()
         {
             self.handle_actions(cx, actions, ctx);
+        }
+        if self.presentation_dirty
+            && let Some(ctx) = scope.data.get_mut::<UiContext>()
+        {
+            self.presentation_dirty = false;
+            self.present(cx, ctx);
         }
     }
 

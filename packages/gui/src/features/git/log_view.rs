@@ -4,11 +4,13 @@
 //! screen and a commit screen, one at a time. State and requests live in
 //! [`LogState`]; this file routes input and actions, `log_draw.rs` paints.
 
-use super::log::{Availability, Filters, Goto, LogState, RefFilter, RefKind, is_hash_query};
+use super::log::{
+    Availability, Detail, Filters, Goto, LogState, RefFilter, RefKind, is_hash_query,
+};
 use super::log_draw::{RefRow, local_time};
 use super::model::now_ms;
 use super::overlay::{MenuEntry, MenuItem, Overlay, OverlayHost, OverlayKind, OverlayResult};
-use super::paint::Hits;
+use super::paint::{GitPaint, Hits, Retained, rect_key};
 use super::store::GitStore;
 use super::text::{t, tr};
 use super::wire;
@@ -19,6 +21,7 @@ use makepad_widgets::*;
 use paseo_gui_core::{CoreEvent, RequestId};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 /// Typing in the search field filters after this pause.
 const SEARCH_DEBOUNCE: f64 = 0.3;
@@ -74,7 +77,7 @@ impl Scroller {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Region {
     List,
     Branches,
@@ -98,7 +101,7 @@ pub(super) enum Focus {
 }
 
 /// A draggable divider of the desktop layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Split {
     /// Branches panel | table.
     Branches,
@@ -174,7 +177,7 @@ struct Drag {
     start: f64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub(super) enum LogHit {
     BranchesToggle,
     Refresh,
@@ -236,6 +239,53 @@ enum Flow {
     Switch(String),
     StashSave(String),
     SwitchAfterStash(String),
+}
+/// Sibling paint boundaries. Layout still runs so scrollers and hit ordering stay current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum LogPart {
+    Background,
+    Toolbar,
+    Banner,
+    BranchesChrome,
+    RefRow(usize),
+    TableHeader,
+    Skeleton,
+    CommitRow(usize),
+    Footer,
+    FilesHeader,
+    FilesEmpty,
+    FileRow(usize),
+    Info,
+    PhoneToolbar,
+    Summary,
+    PhoneCommitToolbar,
+    PhoneInfo,
+    PhoneFilesHeader,
+    Splitter(Split),
+    Divider(u8),
+    Drawer,
+    Message(u64),
+}
+
+#[derive(Default)]
+struct LogLayer {
+    paint: Retained<LogHit>,
+    data: u64,
+    interaction: u64,
+    geometry: u64,
+    visited: bool,
+    spinning: bool,
+    icons_pending: bool,
+    before: (bool, bool),
+}
+
+impl LogLayer {
+    fn interaction(&self, hovered: Option<&LogHit>, pressed: Option<&LogHit>) -> u64 {
+        crate::common::layer::inputs((
+            hovered.filter(|hit| self.paint.owns_hit(hit)),
+            pressed.filter(|hit| self.paint.owns_hit(hit)),
+        ))
+    }
 }
 
 pub struct LogView {
@@ -301,6 +351,12 @@ pub struct LogView {
     pub spinning: bool,
     /// A material file icon was still decoding at the last draw.
     pub icons_pending: bool,
+    layers: HashMap<LogPart, LogLayer>,
+    pub(super) draw_detail_key: u64,
+    pub(super) phone_info_height: f64,
+    pub(super) availability: Availability,
+    pub(super) draw_ref_key: u64,
+    pub(super) presentation_now: i64,
 }
 
 pub(super) fn basename(path: &str) -> &str {
@@ -353,6 +409,7 @@ impl LogView {
         // Status pushes for this checkout tell the log when HEAD moved.
         store.acquire_checkout(cx, ui, &target.server_id, &target.cwd);
         let state = LogState::new(&target, store);
+        let availability = state.availability(ui);
         let sizes = SplitSizes::read(ui.preference(LAYOUT_PREF));
         Self {
             target,
@@ -401,6 +458,12 @@ impl LogView {
             input_style: String::new(),
             spinning: false,
             icons_pending: false,
+            layers: HashMap::new(),
+            draw_detail_key: 0,
+            phone_info_height: 0.0,
+            availability,
+            draw_ref_key: 0,
+            presentation_now: now_ms(),
         }
     }
 
@@ -411,6 +474,7 @@ impl LogView {
 
     pub fn close_overlay(&mut self, cx: &mut Cx) {
         self.overlay.close(cx);
+        self.invalidate(cx);
     }
 
     /// Sends a menu or select opened during this event to the shell.
@@ -432,6 +496,322 @@ impl LogView {
     pub(super) fn dragging(&self) -> Option<Split> {
         self.drag.map(|drag| drag.split)
     }
+    fn shown_sha(&self) -> Option<&str> {
+        match &self.screen {
+            Screen::Commit(sha) if self.phone => Some(sha.as_str()),
+            _ => self.state.selected.as_deref(),
+        }
+    }
+
+    pub(super) fn detail_key(&self) -> u64 {
+        let sha = self.shown_sha();
+        let detail = sha.and_then(|sha| self.state.details.get(sha));
+        let (kind, identity, error) = match detail {
+            None => (0_u8, 0, None),
+            Some(Detail::Loading) => (1, 0, None),
+            Some(Detail::Missing) => (2, 0, None),
+            Some(Detail::Failed(error)) => (3, 0, Some(error)),
+            // Ready details are immutable boxed responses; moving the cache never changes identity.
+            Some(Detail::Ready(commit)) => (4, &**commit as *const _ as usize, None),
+        };
+        crate::common::layer::inputs((sha, kind, identity, error))
+    }
+
+    fn part_key(&self, part: LogPart, detail: u64) -> u64 {
+        use crate::common::layer::inputs;
+        let filters = (
+            self.state
+                .filters
+                .revision
+                .as_ref()
+                .map(|r| (r.kind, &r.name)),
+            &self.state.filters.text,
+            &self.state.filters.author,
+            &self.state.filters.path,
+        );
+        match part {
+            LogPart::Background => inputs((
+                (
+                    self.phone,
+                    self.wide,
+                    self.branches_open,
+                    self.drawer_open,
+                    self.sizes.branches.map(f64::to_bits),
+                    self.sizes.side.map(f64::to_bits),
+                    self.sizes.stacked.map(f64::to_bits),
+                    self.availability as u8,
+                    self.shown_sha(),
+                    matches!(self.screen, Screen::Commit(_)),
+                    self.state.refs.is_some(),
+                ),
+                (
+                    self.state.commits.len(),
+                    self.state.loaded,
+                    self.state.page_error.is_some(),
+                    self.state.refs_error.is_some(),
+                    self.collapsed_version,
+                    &self.branch_query,
+                    self.search_open,
+                    self.list.offset.to_bits(),
+                    self.branches.offset.to_bits(),
+                    self.files.offset.to_bits(),
+                    self.info.offset.to_bits(),
+                    self.sheet.offset.to_bits(),
+                ),
+                detail,
+            )),
+            LogPart::Toolbar | LogPart::PhoneToolbar => inputs((
+                filters,
+                &self.search_text,
+                self.search_open,
+                self.focus_search,
+                self.branches_open,
+                self.drawer_open,
+                self.wide,
+                self.state.page_loading,
+                self.state.loaded,
+                matches!(self.overlay.purpose(), Some(Purpose::Branch)),
+                matches!(self.overlay.purpose(), Some(Purpose::Author)),
+            )),
+            LogPart::Banner => inputs((
+                self.state.loaded,
+                self.state.refresh_failed(),
+                &self.state.page_error,
+                &self.state.refs_error,
+                filters,
+            )),
+            LogPart::BranchesChrome => inputs(&self.branch_query),
+            LogPart::RefRow(index) => match (self.state.refs.as_ref(), self.ref_rows.get(index)) {
+                (Some(refs), Some(row)) => self.ref_row_key(refs, row),
+                _ => self.draw_ref_key,
+            },
+            LogPart::CommitRow(index) => {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                if let Some(commit) = self.state.commits.get(index) {
+                    (&commit.sha, &commit.subject, &commit.author_name).hash(&mut hash);
+                    for label in &commit.refs {
+                        (&label.name, label.kind, label.is_head).hash(&mut hash);
+                    }
+                    let age = commit.author_ms.map(|ms| {
+                        let minutes = (self.presentation_now - ms).max(0) / 60_000;
+                        if minutes < 60 {
+                            (0, minutes)
+                        } else if minutes < 1440 {
+                            (1, minutes / 60)
+                        } else if minutes < 10080 {
+                            (2, minutes / 1440)
+                        } else {
+                            (3, ms)
+                        }
+                    });
+                    (
+                        age,
+                        self.state.selected.as_deref() == Some(commit.sha.as_str()),
+                        self.state
+                            .refs
+                            .as_ref()
+                            .and_then(|refs| refs.head_sha.as_deref())
+                            == Some(commit.sha.as_str()),
+                    )
+                        .hash(&mut hash);
+                    if let Some(row) = self.state.rows.get(index) {
+                        (row.lane, row.color, row.lanes).hash(&mut hash);
+                        for edges in [&row.top, &row.bottom] {
+                            edges.len().hash(&mut hash);
+                            for edge in edges {
+                                (edge.from, edge.to, edge.color).hash(&mut hash);
+                            }
+                        }
+                    }
+                }
+                hash.finish()
+            }
+            LogPart::Footer => inputs((
+                self.state.page_loading,
+                &self.state.page_error,
+                self.state.page_error_at_end(),
+                self.state.has_more,
+            )),
+            LogPart::FilesHeader | LogPart::PhoneFilesHeader | LogPart::FilesEmpty => detail,
+            LogPart::FileRow(index) => {
+                let selected = self
+                    .listed_files
+                    .get(index)
+                    .is_some_and(|path| self.selected_file.as_ref() == Some(path));
+                inputs((detail, selected, selected && self.focus == Focus::Files))
+            }
+            LogPart::Info => inputs((detail, self.info.offset.to_bits())),
+            LogPart::PhoneInfo => inputs((detail, self.sheet.offset.to_bits())),
+            LogPart::PhoneCommitToolbar => inputs(self.shown_sha()),
+            LogPart::Summary => inputs((filters, self.search_open)),
+            LogPart::Splitter(split) => inputs(self.dragging() == Some(split)),
+            LogPart::Message(_) => inputs((
+                self.state.loaded,
+                self.state.commits.is_empty(),
+                filters,
+                &self.state.page_error,
+                &self.state.refs_error,
+                self.state.page_loading,
+                detail,
+                self.state.refs_version,
+                &self.branch_query,
+                self.collapsed_version,
+            )),
+            LogPart::TableHeader | LogPart::Drawer | LogPart::Divider(_) | LogPart::Skeleton => 0,
+        }
+    }
+
+    pub(super) fn ref_row_key(&self, refs: &super::log::Refs, row: &RefRow) -> u64 {
+        use crate::common::layer::inputs;
+        match row {
+            RefRow::Section { key, count, open } => inputs((0_u8, key, count, open)),
+            RefRow::Head => inputs((
+                1_u8,
+                &refs.head_sha,
+                &refs.head_branch,
+                refs.detached,
+                self.ref_selected(RefKind::Head, "HEAD"),
+            )),
+            RefRow::Local(index) => refs.local.get(*index).map_or(0, |branch| {
+                inputs((
+                    2_u8,
+                    &branch.name,
+                    branch.current,
+                    branch.gone,
+                    branch.ahead,
+                    branch.behind,
+                    self.ref_selected(RefKind::Local, &branch.name),
+                    self.switching.as_deref() == Some(branch.name.as_str()),
+                ))
+            }),
+            RefRow::Group {
+                remote,
+                count,
+                open,
+            } => inputs((3_u8, remote, count, open)),
+            RefRow::Remote(index) => refs.remote.get(*index).map_or(0, |branch| {
+                inputs((
+                    4_u8,
+                    &branch.name,
+                    &branch.branch,
+                    &branch.remote,
+                    self.ref_selected(RefKind::Remote, &branch.name),
+                    self.switching.as_deref() == Some(branch.branch.as_str())
+                        && !refs.local.iter().any(|local| local.name == branch.branch),
+                ))
+            }),
+            RefRow::Tag(index) => refs.tags.get(*index).map_or(0, |tag| {
+                inputs((5_u8, tag, self.ref_selected(RefKind::Tag, tag)))
+            }),
+        }
+    }
+
+    /// A panel dirty signal schedules only boundaries whose presentation changed.
+    pub fn invalidate(&mut self, cx: &mut Cx) {
+        self.presentation_now = now_ms();
+        let detail = self.detail_key();
+        for (part, layer) in &self.layers {
+            if layer.data != self.part_key(*part, detail)
+                || layer.interaction
+                    != layer.interaction(self.hovered.as_ref(), self.pressed.as_ref())
+            {
+                layer.paint.invalidate(cx);
+            }
+        }
+    }
+
+    /// Decode completion belongs to the visible file rows that used a pending icon.
+    pub fn invalidate_media(&mut self, cx: &mut Cx) {
+        for layer in self.layers.values().filter(|layer| layer.icons_pending) {
+            layer.paint.invalidate(cx);
+        }
+    }
+
+    /// Spinners are deferred to the panel's sibling list; only an elapsed date label can age here.
+    pub fn animate(&mut self, cx: &mut Cx) {
+        self.presentation_now = now_ms();
+        for (part, layer) in &self.layers {
+            if matches!(part, LogPart::CommitRow(_))
+                && layer.data != self.part_key(*part, self.draw_detail_key)
+            {
+                layer.paint.invalidate(cx);
+            }
+        }
+    }
+
+    pub(super) fn begin_part(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        part: LogPart,
+        area: Rect,
+        clip: Rect,
+        extra: u64,
+    ) -> bool {
+        let data = self.part_key(part, self.draw_detail_key);
+        let layer = self.layers.entry(part).or_default();
+        layer.visited = true;
+        let interaction = layer.interaction(self.hovered.as_ref(), self.pressed.as_ref());
+        if interaction != layer.interaction {
+            layer.paint.invalidate(cx);
+        }
+        layer.data = data;
+        layer.geometry =
+            crate::common::layer::inputs((rect_key(area), rect_key(clip), extra, self.phone));
+        if !layer.paint.begin(
+            cx,
+            area,
+            crate::common::layer::inputs((data, layer.geometry)),
+            &mut self.hits,
+            paint,
+        ) {
+            self.spinning |= layer.spinning;
+            self.icons_pending |= layer.icons_pending;
+            return false;
+        }
+        layer.before = (self.spinning, self.icons_pending);
+        self.spinning = false;
+        self.icons_pending = false;
+        true
+    }
+
+    pub(super) fn end_part(&mut self, cx: &mut Cx2d, paint: &GitPaint, part: LogPart) {
+        let layer = self.layers.get_mut(&part).expect("opened Git Log boundary");
+        layer.paint.end(cx, &self.hits, paint);
+        layer.interaction = layer.interaction(self.hovered.as_ref(), self.pressed.as_ref());
+        layer.spinning = self.spinning;
+        layer.icons_pending = self.icons_pending;
+        self.spinning |= layer.before.0;
+        self.icons_pending |= layer.before.1;
+    }
+
+    pub(super) fn begin_frame(&mut self) {
+        self.presentation_now = now_ms();
+        for layer in self.layers.values_mut() {
+            layer.visited = false;
+        }
+        self.draw_detail_key = self.detail_key();
+    }
+
+    pub(super) fn finish_frame(&mut self) {
+        // Layout and focus intents are consumed while composing. Other boundaries
+        // keep the data they actually painted (paging may start after the footer).
+        let detail = self.detail_key();
+        let mut layers = std::mem::take(&mut self.layers);
+        layers.retain(|_, layer| layer.visited);
+        for (part, layer) in &mut layers {
+            if matches!(
+                part,
+                LogPart::Background | LogPart::Toolbar | LogPart::PhoneToolbar
+            ) {
+                layer.data = self.part_key(*part, detail);
+                layer
+                    .paint
+                    .set_inputs(crate::common::layer::inputs((layer.data, layer.geometry)));
+            }
+        }
+        self.layers = layers;
+    }
 
     /// Applies a core batch, store change or timer; returns true when a redraw is due.
     pub fn process(
@@ -442,6 +822,9 @@ impl LogView {
         store: &mut GitStore,
         visible: bool,
     ) -> bool {
+        let availability = self.state.availability(ui);
+        let availability_changed = self.availability != availability;
+        self.availability = availability;
         if visible && !self.was_visible {
             self.want_focus = true;
         }
@@ -449,7 +832,7 @@ impl LogView {
         self.state.set_active(ui, visible);
         let anchor = self.list_anchor();
         let replaced = self.state.replaced;
-        let mut dirty = self.state.process(ui, store);
+        let mut dirty = self.state.process(ui, store) || availability_changed;
         if self.state.replaced != replaced
             && let Some((sha, delta)) = anchor
             && let Some(index) = self.state.index_of(&sha)
@@ -1779,6 +2162,7 @@ impl LogView {
             }
             Pointer::FingerUp(e) => {
                 let pressed = self.pressed.take();
+                redraw |= self.phone && pressed.is_some();
                 if !e.is_over || e.has_long_press_occurred || (e.device.is_touch() && !e.was_tap())
                 {
                     return redraw;

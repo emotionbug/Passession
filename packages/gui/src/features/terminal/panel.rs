@@ -15,7 +15,7 @@ use super::drop::{self, FILE_TOO_LARGE};
 use super::find::{FindCard, FindCommand};
 use super::keybar::{Control, Modifier, WaTerminalKeyBarWidgetExt};
 use super::session::{self, display_title, scrollback_preference};
-use super::stream::Stream;
+use super::stream::{HIDDEN_SCREEN_GRACE_SECONDS, Stream};
 use super::view::{WaTerminalViewRef, WaTerminalViewWidgetExt};
 use crate::common::file_drop::FileDropZone;
 use crate::common::{PanelTarget, UiContext, UiEffect};
@@ -44,6 +44,7 @@ live_design! {
             role: Surface0
             // Original `PaneContentToolbar`: 36px surface0 band with a bottom border.
             toolbar = <View> {
+                optimize: DrawList
                 width: Fill, height: 36., flow: Right, spacing: 12.
                 padding: { left: 12., right: 5. }
                 align: { y: 0.5 }
@@ -62,10 +63,14 @@ live_design! {
             <WaRule> {}
             body = <View> {
                 width: Fill, height: Fill, flow: Overlay
-                output = <WaTerminalView> {}
-                find_wrap = <WaPaneFind> {}
+                output_layer = <View> {
+                    width: Fill, height: Fill, optimize: DrawList
+                    output = <WaTerminalView> {}
+                }
+                find_wrap = <WaPaneFind> { optimize: DrawList }
                 // Original `centerState`: muted, centred, 16px side padding.
                 disconnected = <PointerShield> {
+                    optimize: DrawList
                     width: Fill, height: Fill, visible: false
                     content = <Surface> {
                         width: Fill, height: Fill
@@ -77,6 +82,7 @@ live_design! {
                 }
                 // Original attach overlay: a dimmed surface with a small muted spinner.
                 attach = <PointerShield> {
+                    optimize: DrawList
                     width: Fill, height: Fill, visible: false
                     show_bg: true, draw_bg: { color: #00000029 }
                     align: { x: 0.5, y: 0.5 }
@@ -85,6 +91,7 @@ live_design! {
             }
             // Original terminal error row: surface1 band with a top border, destructive small text.
             error_row = <Surface> {
+                optimize: DrawList
                 width: Fill, height: Fit, flow: Down, visible: false
                 role: Surface1
                 <WaRule> {}
@@ -99,6 +106,7 @@ live_design! {
             }
             // The process ended: neutral surface1 band with muted text, never the error row.
             exit_row = <Surface> {
+                optimize: DrawList
                 width: Fill, height: Fit, flow: Down, visible: false
                 role: Surface1
                 <WaRule> {}
@@ -112,6 +120,7 @@ live_design! {
                 }
             }
             keys = <View> {
+                optimize: DrawList
                 width: Fill, height: Fit, visible: false
                 keybar = <WaTerminalKeyBar> {}
             }
@@ -140,6 +149,8 @@ pub struct TerminalPanel {
     hidden: bool,
     #[rust]
     visibility_dirty: bool,
+    #[rust]
+    hidden_screen_timer: Timer,
     #[rust]
     focused: bool,
     #[rust]
@@ -212,6 +223,12 @@ impl TerminalPanel {
         stream.set_visible(&ctx.core, !self.hidden, self.connected);
         view.connected = self.connected;
         view.session = Some(stream);
+        cx.stop_timer(self.hidden_screen_timer);
+        self.hidden_screen_timer = if self.hidden {
+            cx.start_timeout(HIDDEN_SCREEN_GRACE_SECONDS)
+        } else {
+            Timer::default()
+        };
         self.focus_dirty = true;
         view.redraw(cx);
     }
@@ -221,6 +238,9 @@ impl TerminalPanel {
         let Some(target) = self.target.clone() else {
             return;
         };
+        let mut presentation_changed = !self.session_opened;
+        let was_connected = self.connected;
+        let had_new_terminal = self.new_terminal_cwd.is_some();
         if !self.session_opened {
             self.open_session(cx, ctx);
         }
@@ -230,12 +250,12 @@ impl TerminalPanel {
             .and_then(|h| h.workspace(&target.workspace_id))
             .map(|w| str_of(w, "workspaceDirectory").trim().to_owned())
             .filter(|dir| !dir.is_empty());
+        presentation_changed |=
+            was_connected != self.connected || had_new_terminal != self.new_terminal_cwd.is_some();
         self.handle_created(cx, ctx, &target);
         let core = ctx.core.clone();
         let output = self.output();
-        // The panel's own redraw walks its children, including `output`: it runs only after
-        // the view borrow below has ended.
-        let mut redraw_panel = false;
+        // Presentation is updated after releasing the output borrow.
         let mut output_changed = false;
         if let Some(mut view) = output.borrow_mut() {
             view.connected = self.connected;
@@ -249,7 +269,7 @@ impl TerminalPanel {
                     view.blur(cx);
                 }
                 self.focus_dirty = true;
-                redraw_panel = true;
+                presentation_changed = true;
             }
             if std::mem::take(&mut self.focus_dirty) {
                 let focused = self.focused && visible;
@@ -262,31 +282,33 @@ impl TerminalPanel {
                 view.sync_size(&core, true);
             }
             if let Some(session) = view.session.as_mut() {
+                let was_exited = session.exited;
                 let changed = session.pump(&core, &ctx.events);
                 let attached = session.take_attached();
                 let output_pending = std::mem::take(&mut session.output_pending);
                 if output_pending {
                     session.publish();
                 }
+                let exit_changed = was_exited != session.exited;
                 if attached {
                     // A new subscription or snapshot: the screen has the PTY's size until this
                     // pane's own size is applied and sent again.
                     view.reset_size();
                     view.sync_size(&core, true);
                 }
-                if output_pending || attached {
+                if output_pending || attached || exit_changed {
                     view.redraw(cx);
                 }
                 output_changed = output_pending || attached;
-                redraw_panel |= changed || attached;
+                presentation_changed |= changed || attached;
             }
         }
         if output_changed {
             // Matches follow new output while the find card is open.
             self.find.output_changed(cx);
         }
-        if redraw_panel {
-            self.view.redraw(cx);
+        if presentation_changed || output_changed {
+            self.present(cx);
         }
     }
 
@@ -306,12 +328,12 @@ impl TerminalPanel {
             fields,
             cwd,
         );
-        self.view.redraw(cx);
+        self.present(cx);
     }
 
     fn handle_created(&mut self, cx: &mut Cx, ctx: &mut UiContext, target: &TerminalTarget) {
         for (cwd, result) in self.create_pending.take(&ctx.events) {
-            self.view.redraw(cx);
+            self.present(cx);
             let terminal = match result {
                 Ok(body) => object_of(&body, "terminal").clone(),
                 Err(error) => {
@@ -372,7 +394,7 @@ impl TerminalPanel {
         if let Some(mut view) = output.borrow_mut() {
             view.focus(cx);
         }
-        self.view.redraw(cx);
+        self.present(cx);
     }
 
     /// Starts the next queued upload; one file is stored at a time.
@@ -449,14 +471,14 @@ impl TerminalPanel {
             }
         }
         self.upload_next(ctx);
-        self.view.redraw(cx);
+        self.present(cx);
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, ctx: &mut UiContext) {
         let output = self.output();
         let keybar = self.view.wa_terminal_key_bar(id!(keybar));
         if output.modifiers_consumed(actions) {
-            self.view.redraw(cx);
+            self.present(cx);
         }
         if let Some(control) = keybar.pressed(actions) {
             if let Some(mut view) = output.borrow_mut() {
@@ -487,7 +509,7 @@ impl TerminalPanel {
                     }
                 }
             }
-            self.view.redraw(cx);
+            self.present(cx);
         }
         for action in actions.iter() {
             let Some(PlatformAction::Completed { request, result }) =
@@ -523,7 +545,7 @@ impl TerminalPanel {
                     session.retry(&ctx.core, connected);
                 }
             }
-            self.view.redraw(cx);
+            self.present(cx);
         }
         if (self.view.wa_button(id!(close_tab)).clicked(actions)
             || self.view.wa_button(id!(exit_close)).clicked(actions))
@@ -565,7 +587,7 @@ impl TerminalPanel {
                 })],
             );
         }
-        self.view.redraw(cx);
+        self.present(cx);
     }
 
     fn apply_find(&mut self, cx: &mut Cx, commands: Vec<FindCommand>) {
@@ -586,42 +608,11 @@ impl TerminalPanel {
                 }
             }
         }
-        self.view.redraw(cx);
-    }
-}
-
-impl Widget for TerminalPanel {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if let Some(mode) = self.find.timer_fired(event) {
-            self.apply_find(cx, vec![FindCommand::Search(mode)]);
-        }
-        if let Some(ctx) = scope.data.get_mut::<UiContext>() {
-            self.handle_core(cx, ctx);
-            self.handle_upload(cx, ctx);
-            // terminal-pane.tsx: the output of a connected terminal takes dropped files.
-            let drop_ready = !self.hidden
-                && self.connected
-                && self
-                    .output()
-                    .borrow()
-                    .is_some_and(|view| view.session.is_some());
-            if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
-                self.drop_files(cx, ctx, paths);
-            }
-        }
-        self.view.handle_event(cx, event, scope);
-        if let Event::Actions(actions) = event
-            && let Some(ctx) = scope.data.get_mut::<UiContext>()
-        {
-            self.handle_actions(cx, actions, ctx);
-        }
+        self.present(cx);
     }
 
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.compact = scope
-            .data
-            .get_mut::<UiContext>()
-            .is_some_and(|ctx| ctx.compact);
+    /// Setters invalidate only the retained region whose displayed value changed.
+    fn present(&mut self, cx: &mut Cx) {
         let ty = crate::theme::current_typography();
         let toolbar_h = 36.0_f64.max(ty.ui_size(12.0) * 1.4 + 12.0);
         self.view
@@ -701,6 +692,9 @@ impl Widget for TerminalPanel {
         find.set_selected(cx, self.find.open);
         find.set_tooltip(cx, &t("paneFind.title"));
         let body_width = self.view.widget(id!(body)).area().rect(cx).size.x;
+        if self.view.widget(id!(find_wrap)).visible() != self.find.open {
+            self.view.area().redraw(cx);
+        }
         self.find.present(
             cx,
             &self.view.widget(id!(find_wrap)),
@@ -711,16 +705,25 @@ impl Widget for TerminalPanel {
         );
         let disconnected = self.view.widget(id!(body.disconnected));
         let show_disconnected = facts.has_session && !connected;
+        if disconnected.visible() != show_disconnected {
+            self.view.area().redraw(cx);
+        }
         disconnected.set_visible(cx, show_disconnected);
         if show_disconnected {
             disconnected
                 .widget(id!(text))
                 .set_text(cx, &t("workspace.terminal.hostDisconnected"));
         }
-        self.view
-            .widget(id!(attach))
-            .set_visible(cx, facts.attaching && !show_disconnected);
+        let attach = self.view.widget(id!(attach));
+        let show_attach = facts.attaching && !show_disconnected;
+        if attach.visible() != show_attach {
+            self.view.area().redraw(cx);
+        }
+        attach.set_visible(cx, show_attach);
         let error_row = self.view.widget(id!(error_row));
+        if error_row.visible() != facts.error.is_some() {
+            self.view.area().redraw(cx);
+        }
         error_row.set_visible(cx, facts.error.is_some());
         if let Some(message) = &facts.error {
             error_row
@@ -740,6 +743,9 @@ impl Widget for TerminalPanel {
         // A normal exit is not a failure: a neutral row offers a new shell or closing the tab.
         let exit_row = self.view.widget(id!(exit_row));
         let show_exit = facts.exited && facts.error.is_none();
+        if exit_row.visible() != show_exit {
+            self.view.area().redraw(cx);
+        }
         exit_row.set_visible(cx, show_exit);
         if show_exit {
             let message = match facts.exit_code {
@@ -769,7 +775,11 @@ impl Widget for TerminalPanel {
         let show_keys = facts.has_session
             && !facts.exited
             && (cfg!(any(target_os = "android", target_os = "ios")) || self.compact);
-        self.view.widget(id!(keys)).set_visible(cx, show_keys);
+        let keys = self.view.widget(id!(keys));
+        if keys.visible() != show_keys {
+            self.view.area().redraw(cx);
+        }
+        keys.set_visible(cx, show_keys);
         if show_keys {
             self.view.wa_terminal_key_bar(id!(keybar)).set_state(
                 cx,
@@ -778,6 +788,54 @@ impl Widget for TerminalPanel {
                 self.compact,
             );
         }
+    }
+}
+
+impl Widget for TerminalPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Some(mode) = self.find.timer_fired(event) {
+            self.apply_find(cx, vec![FindCommand::Search(mode)]);
+        }
+        if let Some(ctx) = scope.data.get_mut::<UiContext>() {
+            self.handle_core(cx, ctx);
+            self.handle_upload(cx, ctx);
+            // terminal-pane.tsx: the output of a connected terminal takes dropped files.
+            let drop_ready = !self.hidden
+                && self.connected
+                && self
+                    .output()
+                    .borrow()
+                    .is_some_and(|view| view.session.is_some());
+            if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
+                self.drop_files(cx, ctx, paths);
+            }
+        }
+        if self.hidden_screen_timer.is_event(event).is_some() {
+            self.hidden_screen_timer = Timer::default();
+            if let Some(mut view) = self.output().borrow_mut()
+                && view
+                    .session
+                    .as_mut()
+                    .is_some_and(Stream::evict_hidden_screen)
+            {
+                view.clear_selection(cx);
+                view.find.clear();
+            }
+        }
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event
+            && let Some(ctx) = scope.data.get_mut::<UiContext>()
+        {
+            self.handle_actions(cx, actions, ctx);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.compact = scope
+            .data
+            .get_mut::<UiContext>()
+            .is_some_and(|ctx| ctx.compact);
+        self.present(cx);
         let step = self.view.draw_walk(cx, scope, walk);
         self.find.take_focus(cx, &self.view.widget(id!(find_wrap)));
         // The drop backdrop covers the output (`styles.outputContainer`).
@@ -803,6 +861,8 @@ impl TerminalPanelRef {
             .is_some_and(|t| t.host_id == target.host_id && t.terminal_id == target.terminal_id);
         inner.target = Some(target);
         if !same_terminal {
+            cx.stop_timer(inner.hidden_screen_timer);
+            inner.hidden_screen_timer = Timer::default();
             inner.session_opened = false;
             inner.init_error = None;
             // Files dropped on the previous terminal are not pasted into this one.
@@ -813,9 +873,10 @@ impl TerminalPanelRef {
             if let Some(mut view) = inner.output().borrow_mut() {
                 view.clear_selection(cx);
                 view.session = None;
+                view.redraw(cx);
             }
         }
-        inner.view.redraw(cx);
+        inner.present(cx);
     }
 
     /// Hidden tabs release their stream; visible ones attach. Applied on the next dispatch,
@@ -828,8 +889,14 @@ impl TerminalPanelRef {
             return;
         }
         inner.hidden = !visible;
+        cx.stop_timer(inner.hidden_screen_timer);
+        inner.hidden_screen_timer = if visible {
+            Timer::default()
+        } else {
+            cx.start_timeout(HIDDEN_SCREEN_GRACE_SECONDS)
+        };
         inner.visibility_dirty = true;
-        inner.view.redraw(cx);
+        inner.output().redraw(cx);
     }
 
     /// The focused pane takes keyboard focus and claims the PTY size; others only update it.
@@ -842,6 +909,6 @@ impl TerminalPanelRef {
         }
         inner.focused = focused;
         inner.focus_dirty = true;
-        inner.view.redraw(cx);
+        inner.output().redraw(cx);
     }
 }

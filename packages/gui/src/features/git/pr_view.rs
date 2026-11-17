@@ -8,7 +8,7 @@ use super::host;
 use super::json::{array, flag, int, object, text};
 use super::model::{format_age, format_duration, now_ms};
 use super::overlay::{MenuEntry, MenuItem, Overlay, OverlayHost, OverlayKind, OverlayResult};
-use super::paint::{Font, GitPaint, Hits, rect, rgb, with_alpha};
+use super::paint::{Font, GitPaint, Hits, Retained, rect, rgb, with_alpha};
 use super::pr_pane::PrPane;
 use super::pull_request::{
     AVATAR_FILLS, Check, Entry, Thread, activity_counts, avatar_fill_index, build_timeline,
@@ -31,7 +31,7 @@ use crate::features::timeline::paint::{Draw, Look, MOBILE, RowState, now_seconds
 use crate::features::timeline::scrollbar::BarDrag;
 use makepad_widgets::*;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One Markdown body: its selectable runs and hit regions, and the painter's
 /// per-body state (parse cache, code-block scroll, copy feedback, hover).
@@ -39,6 +39,16 @@ use std::collections::HashMap;
 struct MdBody {
     canvas: Canvas,
     state: RowState,
+}
+
+#[derive(Default)]
+struct PrPart {
+    layer: Retained<PrHit>,
+    regions: Vec<(Rect, String)>,
+    bodies: Vec<(String, Rect)>,
+    height: f64,
+    spinning: bool,
+    children: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -101,9 +111,26 @@ pub struct PrView {
     /// The Markdown look of the frame being drawn.
     look: Option<Look>,
     heights: HashMap<String, f64>,
+    parts: HashMap<String, PrPart>,
+    dirty_parts: HashSet<String>,
+    animated_parts: HashSet<String>,
+    active_parts: Vec<String>,
+    child_parts: Vec<Vec<String>>,
+    region_owners: HashMap<String, String>,
+    visible_parts: HashSet<String>,
+    checkout_revision: Option<u64>,
+    presentation: Option<(bool, bool, bool)>,
+    pane_presentation: Option<(u64, u64)>,
+    activity_revision: u64,
+    checks_revision: u64,
+    toolbar_presentation: Option<(bool, bool)>,
+    timeline_entries: Vec<Entry>,
+    timeline_counts: (usize, usize, usize),
+    timeline_entries_key: Option<(i64, u64)>,
+    check_index: usize,
     pub spinning: bool,
-    /// An avatar was loading or a Markdown body (which may show images) was
-    /// drawn: the panel redraws when the shared image cache changes.
+    /// Image acquisitions register the retained body/avatar list directly.
+    /// Kept false: unrelated image-cache revisions never repaint the PR pane.
     pub images_pending: bool,
 }
 
@@ -142,6 +169,157 @@ fn check_icon(paint: &mut GitPaint, cx: &mut Cx2d, check: Check, size: f64, cent
 }
 
 impl PrView {
+    /// Replays paint and interaction geometry together. Nested bodies keep their
+    /// own owners, so image completion and selection do not repaint sibling rows.
+    fn retain(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        key: &str,
+        area: Rect,
+        inputs: u64,
+        draw: impl FnOnce(&mut Self, &mut Cx2d, &mut GitPaint) -> f64,
+    ) -> f64 {
+        let (key, mut part) = self
+            .parts
+            .remove_entry(key)
+            .unwrap_or_else(|| (key.to_owned(), PrPart::default()));
+        let inputs = crate::common::layer::inputs((
+            inputs,
+            area.pos.x.to_bits(),
+            area.pos.y.to_bits(),
+            area.size.x.to_bits(),
+            area.size.y.to_bits(),
+            self.viewport.pos.x.to_bits(),
+            self.viewport.pos.y.to_bits(),
+            self.viewport.size.x.to_bits(),
+            self.viewport.size.y.to_bits(),
+        ));
+        if let Some(children) = self.child_parts.last_mut() {
+            children.push(key.clone());
+        }
+        if part.layer.begin(cx, area, inputs, &mut self.hits, paint) {
+            let previous_height = part.height;
+            let region_start = self.regions.len();
+            let body_start = self.body_rects.len();
+            let spinning = self.spinning;
+            self.spinning = false;
+            self.animated_parts.remove(&key);
+            self.active_parts.push(key.clone());
+            part.children.clear();
+            self.child_parts.push(std::mem::take(&mut part.children));
+            part.height = draw(self, cx, paint);
+            self.active_parts.pop();
+            part.children = self.child_parts.pop().unwrap_or_default();
+            part.spinning = self.spinning;
+            self.spinning |= spinning;
+            part.regions.clear();
+            part.regions
+                .extend_from_slice(&self.regions[region_start..]);
+            part.bodies.clear();
+            part.bodies
+                .extend_from_slice(&self.body_rects[body_start..]);
+            part.layer.end(cx, &self.hits, paint);
+            if key.starts_with("entry:") && previous_height != part.height {
+                // Borders precede Markdown measurement. Repaint this row once
+                // with its settled height, including after an image changes it.
+                part.layer.invalidate(cx);
+            }
+        } else {
+            self.regions.extend_from_slice(&part.regions);
+            self.body_rects.extend_from_slice(&part.bodies);
+            self.spinning |= part.spinning;
+        }
+        if key.starts_with("entry:") {
+            for (_, id) in &part.regions {
+                self.region_owners.insert(id.clone(), key.clone());
+            }
+        }
+        let height = part.height;
+        self.parts.insert(key.clone(), part);
+        Self::visit_part(&self.parts, &mut self.visible_parts, &key);
+        height
+    }
+
+    fn visit_part(parts: &HashMap<String, PrPart>, visible: &mut HashSet<String>, key: &str) {
+        if !visible.insert(key.to_owned()) {
+            return;
+        }
+        if let Some(part) = parts.get(key) {
+            for child in &part.children {
+                Self::visit_part(parts, visible, child);
+            }
+        }
+    }
+
+    fn retain_cursor(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        key: &str,
+        c: &mut Cursor,
+        inputs: u64,
+        draw: impl FnOnce(&mut Self, &mut Cx2d, &mut GitPaint, &mut Cursor),
+    ) {
+        let top = c.y;
+        let area = rect(c.left, top, c.width, c.view.size.y);
+        let height = self.retain(cx, paint, key, area, inputs, |view, cx, paint| {
+            draw(view, cx, paint, c);
+            c.y - top
+        });
+        c.y = top + height;
+    }
+
+    fn dirty(&mut self, key: &str) {
+        self.dirty_parts.insert(key.to_owned());
+    }
+
+    fn dirty_hit(&mut self, hit: Option<&PrHit>) {
+        let Some(hit) = hit else { return };
+        let key = match hit {
+            PrHit::ViewPr | PrHit::Refresh => Some("toolbar".to_owned()),
+            PrHit::Header => Some("header".to_owned()),
+            PrHit::Retry => Some("state".to_owned()),
+            PrHit::ChecksToggle | PrHit::Group(_) => Some("checks".to_owned()),
+            PrHit::ActivityToggle => Some("activity".to_owned()),
+            PrHit::Entry { id, .. } | PrHit::Kebab { key: id, .. } => {
+                self.region_owners.get(id).cloned()
+            }
+            PrHit::Launch(_) => self
+                .parts
+                .iter()
+                .find(|(key, part)| {
+                    (key.starts_with("check:") || key.starts_with("entry:"))
+                        && part.layer.owns_hit(hit)
+                })
+                .map(|(key, _)| key.clone()),
+        };
+        if let Some(key) = key {
+            self.dirty(&key);
+        }
+    }
+
+    pub fn invalidate(&mut self, cx: &mut Cx) {
+        for key in self.dirty_parts.drain() {
+            if let Some(part) = self.parts.get(&key) {
+                part.layer.invalidate(cx);
+            }
+        }
+    }
+
+    pub fn animate(&mut self, cx: &mut Cx) {
+        for key in &self.animated_parts {
+            if self.visible_parts.contains(key)
+                && let Some(part) = self.parts.get(key)
+            {
+                part.layer.invalidate(cx);
+            }
+        }
+    }
+
+    pub fn invalidate_media(&mut self, _cx: &mut Cx) {
+        // images::image and Markdown's Draw::result_owner register exact lists.
+    }
     pub fn new(cx: &mut Cx, ui: &UiContext, store: &mut GitStore, target: PanelTarget) -> Self {
         store.acquire_checkout(cx, ui, &target.server_id, &target.cwd);
         let pane = PrPane::new(&target.server_id, &target.cwd, store);
@@ -171,6 +349,23 @@ impl PrView {
             body_bar_drag: None,
             look: None,
             heights: HashMap::new(),
+            parts: HashMap::new(),
+            dirty_parts: HashSet::new(),
+            animated_parts: HashSet::new(),
+            active_parts: Vec::new(),
+            region_owners: HashMap::new(),
+            visible_parts: HashSet::new(),
+            checkout_revision: None,
+            presentation: None,
+            pane_presentation: None,
+            activity_revision: 0,
+            checks_revision: 0,
+            toolbar_presentation: None,
+            timeline_entries: Vec::new(),
+            timeline_counts: (0, 0, 0),
+            timeline_entries_key: None,
+            child_parts: Vec::new(),
+            check_index: 0,
             spinning: false,
             images_pending: false,
         }
@@ -215,7 +410,52 @@ impl PrView {
         visible: bool,
     ) -> bool {
         self.pane.set_visible(cx, ui, store, visible);
-        self.pane.process(cx, event, ui, store)
+        let pane_changed = self.pane.process(cx, event, ui, store);
+        let state = store.checkout(&self.target.server_id, &self.target.cwd);
+        let revision = state.map(|state| state.pr_revision).unwrap_or(0);
+        let presentation = (
+            host::connected(ui, &self.target.server_id),
+            state.is_some_and(|state| state.pr_loading),
+            state.is_some_and(|state| state.pr_error.is_some()),
+        );
+        if self.checkout_revision != Some(revision) || self.presentation != Some(presentation) {
+            self.checkout_revision = Some(revision);
+            self.presentation = Some(presentation);
+            self.checks_revision = self.checks_revision.wrapping_add(1);
+            for key in ["state", "header", "checks"] {
+                self.dirty(key);
+            }
+        }
+        // PrPane owns the request identities. Only a pane mutation needs these
+        // content keys; pointer events and animation never traverse response data.
+        if pane_changed {
+            let next = (
+                crate::common::layer::inputs((&self.pane.timeline, self.pane.timeline_fetching)),
+                crate::common::layer::inputs((
+                    &self.pane.pipeline,
+                    &self.pane.pipeline_error,
+                    self.pane.pipeline_loading,
+                )),
+            );
+            if self.pane_presentation.is_none_or(|old| old.0 != next.0) {
+                self.activity_revision = self.activity_revision.wrapping_add(1);
+                self.dirty("activity");
+            }
+            if self.pane_presentation.is_none_or(|old| old.1 != next.1) {
+                self.checks_revision = self.checks_revision.wrapping_add(1);
+                self.dirty("checks");
+            }
+            self.pane_presentation = Some(next);
+        }
+        let toolbar = (
+            self.refreshing(store),
+            host::supports(ui, &self.target.server_id, "checkoutRefresh"),
+        );
+        if self.toolbar_presentation != Some(toolbar) {
+            self.toolbar_presentation = Some(toolbar);
+            self.dirty("toolbar");
+        }
+        !self.dirty_parts.is_empty()
     }
 
     /// The body under `abs` among those drawn this frame.
@@ -256,6 +496,9 @@ impl PrView {
                 }
             }
         }
+        if changed {
+            self.dirty(&format!("body:{key}"));
+        }
         changed
     }
 
@@ -280,14 +523,10 @@ impl PrView {
                     body.state.hovered = false;
                     body.state.hover_hit = None;
                     body.state.hover_link = None;
+                    self.dirty_parts.insert(format!("body:{previous}"));
                 }
                 self.body_hovered = key.clone();
-                let Some(key) = key else {
-                    if changed {
-                        area.redraw(cx);
-                    }
-                    return None;
-                };
+                let key = key?;
                 let body = self.bodies.get_mut(&key)?;
                 let (hover_hit, hover_link) = match body.canvas.hit_at(e.abs - body.canvas.origin) {
                     Some(HitTarget::Link { href, .. }) => (None, Some(href.clone())),
@@ -295,12 +534,16 @@ impl PrView {
                     None => (None, None),
                 };
                 let hand = hover_hit.is_some() || hover_link.is_some();
-                changed |= body.state.hover_hit != hover_hit
+                let body_changed = body.state.hover_hit != hover_hit
                     || body.state.hover_link != hover_link
                     || !body.state.hovered;
                 body.state.hovered = true;
                 body.state.hover_hit = hover_hit;
                 body.state.hover_link = hover_link;
+                if body_changed {
+                    self.dirty_parts.insert(format!("body:{key}"));
+                }
+                changed |= body_changed;
                 cx.set_cursor(if hand {
                     MouseCursor::Hand
                 } else {
@@ -328,7 +571,7 @@ impl PrView {
                     body.state.hovered = false;
                     body.state.hover_hit = None;
                     body.state.hover_link = None;
-                    area.redraw(cx);
+                    self.dirty_parts.insert(format!("body:{previous}"));
                 }
                 None
             }
@@ -339,14 +582,10 @@ impl PrView {
                 for (other, body) in self.bodies.iter_mut() {
                     if Some(other) != key.as_ref() && body.canvas.selection.take().is_some() {
                         changed = true;
+                        self.dirty_parts.insert(format!("body:{other}"));
                     }
                 }
-                let Some(key) = key else {
-                    if changed {
-                        area.redraw(cx);
-                    }
-                    return None;
-                };
+                let key = key?;
                 let body = self.bodies.get_mut(&key)?;
                 let rel = e.abs - body.canvas.origin;
                 if let Some(target) = body.canvas.hit_at(rel).cloned() {
@@ -360,9 +599,6 @@ impl PrView {
                 }
                 // Touch drags scroll; touch selection starts with a long press.
                 if e.device.is_touch() {
-                    if changed {
-                        area.redraw(cx);
-                    }
                     return None;
                 }
                 cx.set_key_focus(area);
@@ -375,6 +611,7 @@ impl PrView {
                         (offset, offset)
                     }
                 });
+                self.dirty_parts.insert(format!("body:{key}"));
                 self.body_selecting = Some(key);
                 Some(true)
             }
@@ -384,19 +621,24 @@ impl PrView {
                 let offset = body.canvas.offset_at(e.abs - body.canvas.origin)?;
                 self.body_pressed = None;
                 body.canvas.selection = Some(body.canvas.word_at(offset));
+                self.dirty_parts.insert(format!("body:{key}"));
                 self.body_selecting = Some(key);
                 Some(true)
             }
             Hit::FingerMove(e) => {
                 let key = self.body_selecting.clone()?;
                 let body = self.bodies.get_mut(&key)?;
-                if let (Some(offset), Some((anchor, _))) = (
+                let mut changed = false;
+                if let (Some(offset), Some((anchor, end))) = (
                     body.canvas.offset_at(e.abs - body.canvas.origin),
                     body.canvas.selection,
-                ) {
+                ) && offset != end
+                {
                     body.canvas.selection = Some((anchor, offset));
+                    self.dirty_parts.insert(format!("body:{key}"));
+                    changed = true;
                 }
-                Some(true)
+                Some(changed)
             }
             Hit::FingerUp(e) => {
                 if let Some((key, target)) = self.body_pressed.take() {
@@ -405,6 +647,7 @@ impl PrView {
                         && (!e.device.is_touch() || e.was_tap())
                         && body.canvas.hit_at(e.abs - body.canvas.origin) == Some(&target)
                     {
+                        self.dirty_parts.insert(format!("body:{key}"));
                         if crate::features::timeline::mermaid::tap(&mut body.state, &target) {
                             return Some(true);
                         }
@@ -444,17 +687,21 @@ impl PrView {
             Hit::KeyDown(ke)
                 if ke.key_code == KeyCode::KeyA && (ke.modifiers.control || ke.modifiers.logo) =>
             {
-                let body = self
+                let (key, body) = self
                     .bodies
-                    .values_mut()
-                    .find(|b| b.canvas.selection.is_some())?;
+                    .iter_mut()
+                    .find(|(_, body)| body.canvas.selection.is_some())?;
                 body.canvas.selection = Some((0, body.canvas.source_len()));
+                self.dirty_parts.insert(format!("body:{key}"));
                 Some(true)
             }
             Hit::KeyFocusLost(_) => {
                 let mut changed = false;
-                for body in self.bodies.values_mut() {
-                    changed |= body.canvas.selection.take().is_some();
+                for (key, body) in &mut self.bodies {
+                    if body.canvas.selection.take().is_some() {
+                        self.dirty_parts.insert(format!("body:{key}"));
+                        changed = true;
+                    }
                 }
                 Some(changed)
             }
@@ -494,6 +741,47 @@ impl PrView {
         store: &mut GitStore,
     ) -> bool {
         let hit = event.hits(cx, area);
+        let hovered = self.hovered.clone();
+        let region = self.hovered_region.clone();
+        let scroll = self.scroll;
+        let checks_scroll = self.checks_scroll;
+        let changed = self.pointer_event(cx, event, hit, area, ui, store);
+        if hovered != self.hovered || region != self.hovered_region {
+            self.dirty_hit(hovered.as_ref());
+            let next = self.hovered.clone();
+            self.dirty_hit(next.as_ref());
+            for region in [region.as_ref(), self.hovered_region.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(owner) = self.region_owners.get(region) {
+                    self.dirty_parts.insert(owner.clone());
+                }
+            }
+        }
+        if self.scroll != scroll {
+            self.dirty_parts.extend(
+                self.parts
+                    .keys()
+                    .filter(|key| key.as_str() != "background")
+                    .cloned(),
+            );
+        } else if self.checks_scroll != checks_scroll {
+            self.dirty("checks");
+        }
+        self.invalidate(cx);
+        changed
+    }
+
+    fn pointer_event(
+        &mut self,
+        cx: &mut Cx,
+        event: &Event,
+        hit: Hit,
+        area: Area,
+        ui: &mut UiContext,
+        store: &mut GitStore,
+    ) -> bool {
         if !area.is_valid(cx) {
             self.touch_scroll.reset();
             self.body_bar_drag = None;
@@ -505,8 +793,10 @@ impl PrView {
         {
             self.touch_scroll.reset();
             self.body_bar_drag = None;
-            for body in self.bodies.values_mut() {
-                body.state.dragging_bar = None;
+            for (key, body) in &mut self.bodies {
+                if body.state.dragging_bar.take().is_some() {
+                    self.dirty_parts.insert(format!("body:{key}"));
+                }
             }
         }
         if let Hit::FingerDown(e) = &hit
@@ -517,6 +807,7 @@ impl PrView {
             if let Some(target) = body.canvas.hit_at(relative)
                 && let Some(drag) = BarDrag::press(target, relative, &mut body.state)
             {
+                self.dirty_parts.insert(format!("body:{key}"));
                 self.body_bar_drag = Some((key, drag));
                 self.body_pressed = None;
                 self.body_selecting = None;
@@ -536,6 +827,7 @@ impl PrView {
                     if let Some(body) = self.bodies.get_mut(&key) {
                         drag.drag_to(e.abs - body.canvas.origin, &mut body.state);
                     }
+                    self.dirty(&format!("body:{key}"));
                     return true;
                 }
                 Hit::FingerUp(_) => {
@@ -543,6 +835,7 @@ impl PrView {
                     if let Some(body) = self.bodies.get_mut(&key) {
                         body.state.dragging_bar = None;
                     }
+                    self.dirty(&format!("body:{key}"));
                     return true;
                 }
                 _ => {}
@@ -619,6 +912,7 @@ impl PrView {
                 if pressed.as_ref() != Some(&hit) {
                     return false;
                 }
+                self.dirty_hit(Some(&hit));
                 self.activate(cx, ui, store, hit, anchor);
                 return true;
             }
@@ -748,17 +1042,21 @@ impl PrView {
     ) {
         let colors = palette();
         self.hits.clear();
+        self.visible_parts.clear();
         self.regions.clear();
+        self.region_owners.clear();
         self.spinning = false;
         self.images_pending = false;
-        self.checks_area = Rect::default();
         self.viewport = area;
-        paint.fill(cx, area, colors.sidebar);
+        self.retain(cx, paint, "background", area, 0, |_, cx, paint| {
+            paint.fill(cx, area, colors.sidebar);
+            0.0
+        });
         let state = store.checkout(&self.target.server_id, &self.target.cwd);
         let payload = state
-            .and_then(|s| s.pr_payload.clone())
-            .unwrap_or(Value::Null);
-        let status = pr_status(state).clone();
+            .and_then(|s| s.pr_payload.as_ref())
+            .unwrap_or(&Value::Null);
+        let status = pr_status(state);
         let compact = crate::common::is_compact_layout(cx);
         // `PaseoMarkdown` look: runtime palette and typography; block gaps follow
         // the window's compact layout (markdownBlockGap).
@@ -780,14 +1078,14 @@ impl PrView {
         let blocked = if !host::connected(ui, &self.target.server_id) {
             Some((Some("unplug"), t("workspace.git.log.states.disconnected")))
         } else if payload.get("error").is_some_and(|e| !e.is_null())
-            || payload_error(&payload).is_some()
+            || payload_error(payload).is_some()
             || state.is_some_and(|s| s.pr_error.is_some())
         {
             Some((None, t("workspace.git.diff.failedRefresh")))
         } else {
             None
         };
-        if let Some(number) = pull_request_number(&status) {
+        if let Some(number) = pull_request_number(status) {
             self.scroll = self
                 .scroll
                 .clamp(0.0, (self.content - area.size.y).max(0.0));
@@ -804,104 +1102,118 @@ impl PrView {
                 store,
                 paint,
                 &mut cursor,
-                &payload,
-                &status,
+                payload,
+                status,
                 number,
                 kit,
                 compact,
             );
             self.content = cursor.y + self.scroll - area.pos.y;
             paint.end_clip(cx);
-        } else if let Some((icon, message)) = blocked {
-            let size = ui_px(12.0);
-            let center = area.center();
-            if let Some(icon) = icon {
-                paint.icon(
-                    cx,
-                    icon,
-                    24.0,
-                    colors.muted,
-                    dvec2(center.x, center.y - 56.0),
-                );
-            }
-            let width = paint
-                .measure(cx, Font::Regular, size, &message)
-                .x
-                .min(area.size.x - 32.0);
-            paint.text_wrapped(
-                cx,
-                Font::Regular,
-                size,
-                colors.muted,
-                dvec2(center.x - width / 2.0, center.y - 24.0),
-                &message,
-                area.size.x - 32.0,
-            );
-            let label = t("common.actions.retry");
-            let width = super::chrome::measure_button(
-                cx,
-                paint,
-                &label,
-                true,
-                super::chrome::ButtonSize::Xs,
-                compact,
-            );
-            let button = rect(
-                center.x - width / 2.0,
-                center.y,
-                width,
-                super::chrome::button_height(super::chrome::ButtonSize::Xs, compact),
-            );
-            let hovered = self.hovered == Some(PrHit::Retry);
-            super::chrome::button(
-                cx,
-                paint,
-                button,
-                &label,
-                Some("rotate-cw"),
-                super::chrome::ButtonVariant::Ghost,
-                super::chrome::ButtonSize::Xs,
-                compact,
-                true,
-                hovered,
-            );
-            self.hits.push(button, PrHit::Retry);
-        } else if state.is_some_and(|s| s.pr_loading) {
-            self.skeleton(cx, paint, area);
         } else {
-            // Original `_PaneEmpty`.
-            let center = area.center();
-            let inner = area.size.x - 48.0;
-            let size = ui_px(14.0);
-            for (index, (key, color)) in [
-                ("panels.pullRequest.emptyTitle", colors.foreground),
-                ("panels.pullRequest.emptyDescription", colors.muted),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let copy = t(key);
-                let width = paint.measure(cx, Font::Regular, size, &copy).x.min(inner);
-                paint.text_wrapped(
-                    cx,
-                    Font::Regular,
-                    size,
-                    color,
-                    dvec2(
+            self.checks_area = Rect::default();
+            let loading = state.is_some_and(|s| s.pr_loading);
+            let inputs = crate::common::layer::inputs((&blocked, loading, compact));
+            self.retain(cx, paint, "state", area, inputs, |view, cx, paint| {
+                if let Some((icon, message)) = blocked {
+                    let size = ui_px(12.0);
+                    let center = area.center();
+                    if let Some(icon) = icon {
+                        paint.icon(
+                            cx,
+                            icon,
+                            24.0,
+                            colors.muted,
+                            dvec2(center.x, center.y - 56.0),
+                        );
+                    }
+                    let width = paint
+                        .measure(cx, Font::Regular, size, &message)
+                        .x
+                        .min(area.size.x - 32.0);
+                    paint.text_wrapped(
+                        cx,
+                        Font::Regular,
+                        size,
+                        colors.muted,
+                        dvec2(center.x - width / 2.0, center.y - 24.0),
+                        &message,
+                        area.size.x - 32.0,
+                    );
+                    let label = t("common.actions.retry");
+                    let width = super::chrome::measure_button(
+                        cx,
+                        paint,
+                        &label,
+                        true,
+                        super::chrome::ButtonSize::Xs,
+                        compact,
+                    );
+                    let button = rect(
                         center.x - width / 2.0,
-                        center.y - 20.0 + index as f64 * 28.0,
-                    ),
-                    &copy,
-                    inner,
-                );
-            }
+                        center.y,
+                        width,
+                        super::chrome::button_height(super::chrome::ButtonSize::Xs, compact),
+                    );
+                    let hovered = view.hovered == Some(PrHit::Retry);
+                    super::chrome::button(
+                        cx,
+                        paint,
+                        button,
+                        &label,
+                        Some("rotate-cw"),
+                        super::chrome::ButtonVariant::Ghost,
+                        super::chrome::ButtonSize::Xs,
+                        compact,
+                        true,
+                        hovered,
+                    );
+                    view.hits.push(button, PrHit::Retry);
+                } else if loading {
+                    view.skeleton(cx, paint, area);
+                } else {
+                    // Original `_PaneEmpty`.
+                    let center = area.center();
+                    let inner = area.size.x - 48.0;
+                    let size = ui_px(14.0);
+                    for (index, (key, color)) in [
+                        ("panels.pullRequest.emptyTitle", colors.foreground),
+                        ("panels.pullRequest.emptyDescription", colors.muted),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let copy = t(key);
+                        let width = paint.measure(cx, Font::Regular, size, &copy).x.min(inner);
+                        paint.text_wrapped(
+                            cx,
+                            Font::Regular,
+                            size,
+                            color,
+                            dvec2(
+                                center.x - width / 2.0,
+                                center.y - 20.0 + index as f64 * 28.0,
+                            ),
+                            &copy,
+                            inner,
+                        );
+                    }
+                }
+                0.0
+            });
         }
+        self.parts.retain(|key, _| self.visible_parts.contains(key));
+        self.animated_parts
+            .retain(|key| self.visible_parts.contains(key));
     }
 
     /// Original `useSkeletonPulse`: block opacity 0.4 ↔ 0.8, linear, 1s each
     /// way. Requests frames only while a skeleton is drawn.
     fn pulse_fill(&mut self, cx: &mut Cx2d) -> Vec4 {
         self.spinning = true;
+        if let Some(key) = self.active_parts.last() {
+            self.animated_parts.insert(key.clone());
+        }
         let phase = cx.seconds_since_app_start() % 2.0;
         let t = if phase < 1.0 { phase } else { 2.0 - phase };
         with_alpha(palette().surface2, (0.4 + 0.4 * t) as f32)
@@ -930,17 +1242,39 @@ impl PrView {
             None,
         );
         y += 28.0;
-        toolbar_band(cx, paint, rect(x, y, w, 36.0), true);
+        let toolbar_area = rect(x, y, w, 36.0);
+        self.retain(
+            cx,
+            paint,
+            "skeleton_toolbar",
+            toolbar_area,
+            0,
+            |_, cx, paint| {
+                toolbar_band(cx, paint, toolbar_area, true);
+                0.0
+            },
+        );
         paint.rounded(cx, rect(x + 12.0, y + 6.0, 96.0, 24.0), fill, 8.0, None);
         paint.rounded(cx, rect(x + 116.0, y + 6.0, 96.0, 24.0), fill, 8.0, None);
         y += 36.0 + 8.0;
-        paint.text(
+        let label_area = rect(x, y, w, 32.0);
+        self.retain(
             cx,
-            Font::Medium,
-            ui_px(12.0),
-            colors.muted,
-            dvec2(x + 12.0, y + 8.0),
-            &t("workspace.git.pr.sections.checks"),
+            paint,
+            "skeleton_label",
+            label_area,
+            0,
+            |_, cx, paint| {
+                paint.text(
+                    cx,
+                    Font::Medium,
+                    ui_px(12.0),
+                    colors.muted,
+                    dvec2(x + 12.0, label_area.pos.y + 8.0),
+                    &t("workspace.git.pr.sections.checks"),
+                );
+                0.0
+            },
         );
         y += 32.0;
         for _ in 0..3 {
@@ -1011,121 +1345,196 @@ impl PrView {
         }
         .to_owned();
         // Toolbar.
-        let toolbar_h = 36.0_f64.max(ui_px(12.0) * 1.4 + 12.0);
-        let band = rect(c.left, c.y, c.width, toolbar_h);
-        toolbar_band(cx, paint, band, true);
-        let center_y = band.pos.y + (toolbar_h - 1.0) / 2.0;
-        let label = t("workspace.git.pr.actions.viewPullRequest");
-        let label_size = ui_px(12.0);
-        let view_width =
-            4.0 + 12.0 + 4.0 + paint.measure(cx, Font::Regular, label_size, &label).x + 4.0;
-        let view_h = 24.0_f64.max(label_size * 1.4);
-        let view = rect(
-            band.pos.x + 12.0,
-            center_y - view_h / 2.0,
-            view_width,
-            view_h,
-        );
-        let hovered = self.hovered == Some(PrHit::ViewPr);
-        let fg = if hovered {
-            colors.foreground
-        } else {
-            colors.muted
-        };
-        paint.icon(
-            cx,
-            "external-link",
-            12.0,
-            fg,
-            dvec2(view.pos.x + 4.0 + 6.0, center_y),
-        );
-        paint.text_centered(
-            cx,
-            Font::Regular,
-            label_size,
-            fg,
-            view.pos.x + 20.0,
-            view.pos.y,
-            view_h,
-            &label,
-            view_width,
-        );
-        self.hits.push_clipped(view, c.view, PrHit::ViewPr);
-        if host::supports(ui, &self.target.server_id, "checkoutRefresh") {
-            let right = band.pos.x + band.size.x - 12.0;
-            if self.refreshing(store) {
-                paint.spinner(
-                    cx,
-                    dvec2(right - 10.0, center_y),
-                    14.0,
-                    colors.muted,
-                    cx.seconds_since_app_start(),
-                );
-                self.spinning = true;
-            } else {
-                let hovered = self.hovered == Some(PrHit::Refresh);
-                let button = toolbar_button(
-                    cx,
-                    paint,
-                    compact,
-                    right,
-                    center_y,
-                    Some("rotate-cw"),
-                    false,
-                    true,
-                    hovered,
-                );
-                self.hits.push_clipped(
-                    super::chrome::toolbar_hit(button, compact),
-                    c.view,
-                    PrHit::Refresh,
-                );
-            }
-        }
-        c.y += toolbar_h;
-        self.header(cx, paint, c, pr, &forge);
-        let facts = object(pr, "forgeSpecific").clone();
-        if self.pane.gitlab_pipeline_section(ui, &facts) {
-            self.pipeline_section(cx, paint, c, &facts);
-        } else {
-            self.checks_section(cx, paint, c, pr);
-        }
-        paint.fill(cx, rect(c.left, c.y, c.width, 1.0), colors.border);
-        c.y += 1.0;
-        // Activity.
-        let activities: Vec<Value> = timeline_items(self.pane.timeline.as_ref(), number)
-            .iter()
-            .filter_map(map_activity)
-            .collect();
-        let entries = build_timeline(&activities);
-        let (approvals, changes, comments) = activity_counts(&activities);
-        let open = self.pane.activity_open;
-        self.section_header(
+        let toolbar_inputs = crate::common::layer::inputs((
+            self.refreshing(store),
+            host::supports(ui, &self.target.server_id, "checkoutRefresh"),
+            compact,
+        ));
+        self.retain_cursor(
             cx,
             paint,
+            "toolbar",
             c,
-            &t("workspace.git.pr.sections.activity"),
-            open,
-            PrHit::ActivityToggle,
-            &[
-                (approvals, Some(Check::Success), colors.success),
-                (changes, Some(Check::Failure), colors.danger),
-                (comments, None, colors.muted),
-            ],
+            toolbar_inputs,
+            |pane, cx, paint, c| {
+                let toolbar_h = 36.0_f64.max(ui_px(12.0) * 1.4 + 12.0);
+                let band = rect(c.left, c.y, c.width, toolbar_h);
+                toolbar_band(cx, paint, band, true);
+                let center_y = band.pos.y + (toolbar_h - 1.0) / 2.0;
+                let label = t("workspace.git.pr.actions.viewPullRequest");
+                let label_size = ui_px(12.0);
+                let view_width =
+                    4.0 + 12.0 + 4.0 + paint.measure(cx, Font::Regular, label_size, &label).x + 4.0;
+                let view_h = 24.0_f64.max(label_size * 1.4);
+                let view = rect(
+                    band.pos.x + 12.0,
+                    center_y - view_h / 2.0,
+                    view_width,
+                    view_h,
+                );
+                let hovered = pane.hovered == Some(PrHit::ViewPr);
+                let fg = if hovered {
+                    colors.foreground
+                } else {
+                    colors.muted
+                };
+                paint.icon(
+                    cx,
+                    "external-link",
+                    12.0,
+                    fg,
+                    dvec2(view.pos.x + 4.0 + 6.0, center_y),
+                );
+                paint.text_centered(
+                    cx,
+                    Font::Regular,
+                    label_size,
+                    fg,
+                    view.pos.x + 20.0,
+                    view.pos.y,
+                    view_h,
+                    &label,
+                    view_width,
+                );
+                pane.hits.push_clipped(view, c.view, PrHit::ViewPr);
+                if host::supports(ui, &pane.target.server_id, "checkoutRefresh") {
+                    let right = band.pos.x + band.size.x - 12.0;
+                    if pane.refreshing(store) {
+                        paint.spinner(
+                            cx,
+                            dvec2(right - 10.0, center_y),
+                            14.0,
+                            colors.muted,
+                            cx.seconds_since_app_start(),
+                        );
+                        pane.spinning = true;
+                    } else {
+                        let hovered = pane.hovered == Some(PrHit::Refresh);
+                        let button = toolbar_button(
+                            cx,
+                            paint,
+                            compact,
+                            right,
+                            center_y,
+                            Some("rotate-cw"),
+                            false,
+                            true,
+                            hovered,
+                        );
+                        pane.hits.push_clipped(
+                            super::chrome::toolbar_hit(button, compact),
+                            c.view,
+                            PrHit::Refresh,
+                        );
+                    }
+                }
+                c.y += toolbar_h;
+            },
+        );
+        self.retain_cursor(
+            cx,
+            paint,
+            "header",
+            c,
+            self.checkout_revision.unwrap_or(0),
+            |view, cx, paint, c| {
+                view.header(cx, paint, c, pr, &forge);
+            },
+        );
+        let facts = object(pr, "forgeSpecific");
+        let pipeline = self.pane.gitlab_pipeline_section(ui, facts);
+        let checks_inputs =
+            crate::common::layer::inputs((self.checks_revision, self.pane.checks_open, pipeline));
+        self.retain_cursor(
+            cx,
+            paint,
+            "checks",
+            c,
+            checks_inputs,
+            |view, cx, paint, c| {
+                view.checks_area = Rect::default();
+                view.check_index = 0;
+                if pipeline {
+                    view.pipeline_section(cx, paint, c, facts);
+                } else {
+                    view.checks_section(cx, paint, c, pr);
+                }
+                paint.fill(cx, rect(c.left, c.y, c.width, 1.0), colors.border);
+                c.y += 1.0;
+            },
+        );
+        // Activity.
+        let entries_key = (number, self.activity_revision);
+        if self.timeline_entries_key != Some(entries_key) {
+            let activities: Vec<Value> = timeline_items(self.pane.timeline.as_ref(), number)
+                .iter()
+                .filter_map(map_activity)
+                .collect();
+            self.timeline_entries = build_timeline(&activities);
+            self.timeline_counts = activity_counts(&activities);
+            self.timeline_entries_key = Some(entries_key);
+        }
+        let entries = std::mem::take(&mut self.timeline_entries);
+        let (approvals, changes, comments) = self.timeline_counts;
+        let open = self.pane.activity_open;
+        let activity_inputs = crate::common::layer::inputs((number, self.activity_revision, open));
+        self.retain_cursor(
+            cx,
+            paint,
+            "activity",
+            c,
+            activity_inputs,
+            |view, cx, paint, c| {
+                view.section_header(
+                    cx,
+                    paint,
+                    c,
+                    &t("workspace.git.pr.sections.activity"),
+                    open,
+                    PrHit::ActivityToggle,
+                    &[
+                        (approvals, Some(Check::Success), colors.success),
+                        (changes, Some(Check::Failure), colors.danger),
+                        (comments, None, colors.muted),
+                    ],
+                );
+            },
         );
         if open {
             if self.pane.timeline_fetching && self.pane.timeline.is_none() {
-                c.y = self.activity_skeleton(cx, paint, c.left, c.width, c.y);
+                let area = rect(c.left, c.y, c.width, c.view.size.y);
+                let top = c.y;
+                c.y += self.retain(cx, paint, "activity_loading", area, 0, |view, cx, paint| {
+                    view.activity_skeleton(cx, paint, c.left, c.width, top) - top
+                });
             } else {
                 if entries.is_empty() {
-                    self.empty_text(cx, paint, c, &t("workspace.git.pr.empty.noActivity"));
+                    self.retain_cursor(
+                        cx,
+                        paint,
+                        "activity_empty",
+                        c,
+                        self.activity_revision,
+                        |view, cx, paint, c| {
+                            view.empty_text(cx, paint, c, &t("workspace.git.pr.empty.noActivity"));
+                        },
+                    );
                 }
                 for entry in &entries {
-                    self.entry(cx, paint, c, entry, Some(number), kit);
+                    let key = format!("entry:{}", entry.id());
+                    let inputs = crate::common::layer::inputs((
+                        number,
+                        self.activity_revision,
+                        self.look.map(|look| look.syntax.as_str()),
+                    ));
+                    self.retain_cursor(cx, paint, &key, c, inputs, |view, cx, paint, c| {
+                        view.entry(cx, paint, c, entry, Some(number), kit);
+                    });
                 }
             }
             c.y += 12.0;
         }
+        self.timeline_entries = entries;
     }
 
     /// Original `_Header`.
@@ -1347,6 +1756,51 @@ impl PrView {
     /// Original `_CheckRow`; returns its height.
     #[allow(clippy::too_many_arguments)]
     fn check_row(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        metrics: RowMetrics,
+        left_pad: f64,
+        icon: Check,
+        name: &str,
+        detail: &str,
+        trailing: Option<String>,
+        url: Option<String>,
+        clip: Rect,
+    ) {
+        let key = format!("check:{}", self.check_index);
+        self.check_index += 1;
+        let inputs = crate::common::layer::inputs((
+            self.checks_revision,
+            name,
+            detail,
+            &trailing,
+            &url,
+            icon.name(),
+            left_pad.to_bits(),
+        ));
+        self.retain(
+            cx,
+            paint,
+            &key,
+            rect(x, y, width, height),
+            inputs,
+            |view, cx, paint| {
+                view.check_row_paint(
+                    cx, paint, x, y, width, height, metrics, left_pad, icon, name, detail,
+                    trailing, url, clip,
+                );
+                height
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_row_paint(
         &mut self,
         cx: &mut Cx2d,
         paint: &mut GitPaint,
@@ -1828,6 +2282,24 @@ impl PrView {
         size: f64,
         center: DVec2,
     ) {
+        let key = format!("avatar:{}:{size}", text(activity, "id"));
+        let area = rect(center.x - size / 2.0, center.y - size / 2.0, size, size);
+        let inputs =
+            crate::common::layer::inputs((text(activity, "author"), text(activity, "avatarUrl")));
+        self.retain(cx, paint, &key, area, inputs, |view, cx, paint| {
+            view.avatar_paint(cx, paint, activity, size, center);
+            size
+        });
+    }
+
+    fn avatar_paint(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        activity: &Value,
+        size: f64,
+        center: DVec2,
+    ) {
         let author = text(activity, "author");
         let fill = rgb(AVATAR_FILLS[avatar_fill_index(author)]);
         let circle = rect(center.x - size / 2.0, center.y - size / 2.0, size, size);
@@ -1847,10 +2319,7 @@ impl PrView {
                     paint.texture(cx, circle, &texture, size / 2.0);
                     return;
                 }
-                ImageState::Loading => {
-                    self.images_pending = true;
-                    return;
-                }
+                ImageState::Loading => return,
                 ImageState::Failed | ImageState::Error(_) => {}
             }
         }
@@ -1890,15 +2359,67 @@ impl PrView {
         kebab: Option<(String, bool)>,
         clip: Rect,
     ) {
-        let colors = palette();
-        let center_y = top + height / 2.0;
         self.avatar(
             cx,
             paint,
             activity,
             avatar,
-            dvec2(x + avatar / 2.0, center_y),
+            dvec2(x + avatar / 2.0, top + height / 2.0),
         );
+        let key = format!("activity_header:{}:{avatar}", text(activity, "id"));
+        let revealed = kebab
+            .as_ref()
+            .is_some_and(|(key, _)| self.hovered_region.as_ref() == Some(key));
+        let hovered = kebab.as_ref().is_some_and(|(key, _)|
+            matches!(&self.hovered, Some(PrHit::Kebab { key: hovered, .. }) if hovered == key));
+        let inputs = crate::common::layer::inputs((
+            self.activity_revision,
+            trailing_extra,
+            revealed,
+            hovered,
+        ));
+        self.retain(
+            cx,
+            paint,
+            &key,
+            rect(x, top, width, height),
+            inputs,
+            |view, cx, paint| {
+                view.activity_header_paint(
+                    cx,
+                    paint,
+                    activity,
+                    avatar,
+                    x,
+                    top,
+                    width,
+                    height,
+                    trailing_extra,
+                    kebab,
+                    clip,
+                );
+                height
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn activity_header_paint(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        activity: &Value,
+        avatar: f64,
+        x: f64,
+        top: f64,
+        width: f64,
+        height: f64,
+        trailing_extra: Option<usize>,
+        kebab: Option<(String, bool)>,
+        clip: Rect,
+    ) {
+        let colors = palette();
+        let center_y = top + height / 2.0;
         let mut cursor = x + avatar + 8.0;
         let right_edge = x + width;
         // Trailing: kebab, count, age (right to left).
@@ -2027,6 +2548,34 @@ impl PrView {
     fn markdown_body(
         &mut self,
         cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        kit: &mut ChatKit,
+        key: &str,
+        body: &str,
+        pos: DVec2,
+        width: f64,
+        clip: Rect,
+    ) -> f64 {
+        let part = format!("body:{key}");
+        let height = self.heights.get(key).copied().unwrap_or(40.0);
+        let inputs = crate::common::layer::inputs((
+            self.activity_revision,
+            self.look.map(|look| look.syntax.as_str()),
+        ));
+        self.retain(
+            cx,
+            paint,
+            &part,
+            rect(pos.x, pos.y, width, height),
+            inputs,
+            |view, cx, _| view.markdown_body_paint(cx, kit, key, body, pos, width, clip),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn markdown_body_paint(
+        &mut self,
+        cx: &mut Cx2d,
         kit: &mut ChatKit,
         key: &str,
         body: &str,
@@ -2072,6 +2621,11 @@ impl PrView {
         );
         // Copy-glyph feedback and loading images animate through frames.
         self.spinning |= d.animating;
+        if d.animating
+            && let Some(key) = self.active_parts.last()
+        {
+            self.animated_parts.insert(key.clone());
+        }
         // Material's default selection colour: colorScheme.primary at 40%.
         let selection = with_alpha(look.palette.primary, 0.4);
         for r in entry.canvas.selection_rects() {
@@ -2079,7 +2633,6 @@ impl PrView {
         }
         self.body_rects
             .push((key.to_owned(), rect(pos.x, pos.y, width, height)));
-        self.images_pending = true;
         self.heights.insert(key.to_owned(), height);
         height
     }
@@ -2172,6 +2725,7 @@ impl PrView {
                 if !collapsed {
                     let height = self.markdown_body(
                         cx,
+                        paint,
                         kit,
                         &format!("{id}:body"),
                         text(activity, "body"),
@@ -2229,6 +2783,7 @@ impl PrView {
                     if !text(review, "body").trim().is_empty() {
                         let height = self.markdown_body(
                             cx,
+                            paint,
                             kit,
                             &format!("{id}:body"),
                             text(review, "body"),
@@ -2502,6 +3057,7 @@ impl PrView {
             y += 8.0;
             y += self.markdown_body(
                 cx,
+                paint,
                 kit,
                 &format!("{id}:body"),
                 text(comment, "body"),

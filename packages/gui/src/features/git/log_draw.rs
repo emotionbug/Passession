@@ -15,12 +15,13 @@ use super::log::{
     Availability, CommitDetail, Detail, RefFilter, RefKind, RefLabel, Refs, is_hash_query,
 };
 use super::log_view::{
-    Focus, LogHit, LogInputs, LogView, Screen, Split, ahead_behind, basename, dirname,
+    Focus, LogHit, LogInputs, LogPart, LogView, Screen, Split, ahead_behind, basename, dirname,
 };
 use super::model::now_ms;
 use super::paint::{Font, GitPaint, hex, rect, with_alpha};
 use super::text::{t, tr};
 use crate::common::UiContext;
+use crate::common::layer::inputs as paint_inputs;
 use crate::theme::Typography;
 use chrono::{Local, TimeZone};
 use makepad_widgets::*;
@@ -502,6 +503,12 @@ impl LogView {
         area: Rect,
         compact: bool,
     ) {
+        self.phone = compact || area.size.x < 600.0;
+        if !self.phone {
+            self.screen = Screen::Log;
+        }
+        self.availability = self.state.availability(ui);
+        self.begin_frame();
         self.hits.clear();
         self.spinning = false;
         self.icons_pending = false;
@@ -516,10 +523,9 @@ impl LogView {
         }
         self.style_inputs(cx, inputs);
         let colors = palette();
-        paint.fill(cx, area, colors.surface0);
-        self.phone = compact || area.size.x < 600.0;
-        if !self.phone {
-            self.screen = Screen::Log;
+        if self.begin_part(cx, paint, LogPart::Background, area, area, 0) {
+            paint.fill(cx, area, colors.surface0);
+            self.end_part(cx, paint, LogPart::Background);
         }
         let state = match self.state.availability(ui) {
             Availability::Disconnected => Some(("unplug", "workspace.git.log.states.disconnected")),
@@ -539,6 +545,7 @@ impl LogView {
                 Vec::new(),
                 false,
             );
+            self.finish_frame();
             return;
         }
         if self.phone {
@@ -549,11 +556,47 @@ impl LogView {
         } else {
             self.draw_desktop(cx, ui, paint, inputs, area);
         }
+        self.finish_frame();
+    }
+
+    fn draw_divider(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        id: u8,
+        area: Rect,
+        clip: Rect,
+    ) {
+        let part = LogPart::Divider(id);
+        if self.begin_part(cx, paint, part, area, clip, 0) {
+            paint.fill(cx, area, palette().border);
+            self.end_part(cx, paint, part);
+        }
     }
 
     /// A centred state: optional icon or spinner, wrapped copy, action buttons side by side.
     #[allow(clippy::too_many_arguments)]
     fn message(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        area: Rect,
+        icon: Option<&str>,
+        copy: &str,
+        error: bool,
+        actions: Vec<(String, LogHit)>,
+        spinner: bool,
+    ) {
+        let part = LogPart::Message(paint_inputs((area.pos.x.to_bits(), area.pos.y.to_bits())));
+        let key = paint_inputs((icon, copy, error, &actions, spinner, self.phone));
+        if self.begin_part(cx, paint, part, area, area, key) {
+            self.message_contents(cx, paint, area, icon, copy, error, actions, spinner);
+            self.end_part(cx, paint, part);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn message_contents(
         &mut self,
         cx: &mut Cx2d,
         paint: &mut GitPaint,
@@ -787,63 +830,66 @@ impl LogView {
             .max(28.0)
             .min(area.size.y);
         let band = rect(area.pos.x, area.pos.y, area.size.x, height);
-        paint.fill(cx, band, with_alpha(colors.danger, 0.10));
-        paint.fill(
-            cx,
-            rect(band.pos.x, band.pos.y + height - 1.0, band.size.x, 1.0),
-            colors.border,
-        );
-        let center_y = band.pos.y + height / 2.0;
-        paint.icon(
-            cx,
-            "circle-alert",
-            12.0,
-            colors.danger,
-            dvec2(band.pos.x + 14.0, center_y),
-        );
-        let mut right = band.pos.x + band.size.x - 6.0;
-        let mut actions = vec![(t("workspace.git.log.states.retry"), LogHit::PageRetry)];
-        if self.state.refresh_failed() && self.state.filters.revision.is_some() {
-            actions.push((
-                t("workspace.git.log.states.showAllBranches"),
-                LogHit::ShowAllBranches,
-            ));
-        }
-        for (label, hit) in actions {
-            let width = paint.measure(cx, Font::Medium, size, &label).x + 16.0;
-            if right - width < band.pos.x + 80.0 {
-                break;
+        if self.begin_part(cx, paint, LogPart::Banner, band, band, 0) {
+            paint.fill(cx, band, with_alpha(colors.danger, 0.10));
+            paint.fill(
+                cx,
+                rect(band.pos.x, band.pos.y + height - 1.0, band.size.x, 1.0),
+                colors.border,
+            );
+            let center_y = band.pos.y + height / 2.0;
+            paint.icon(
+                cx,
+                "circle-alert",
+                12.0,
+                colors.danger,
+                dvec2(band.pos.x + 14.0, center_y),
+            );
+            let mut right = band.pos.x + band.size.x - 6.0;
+            let mut actions = vec![(t("workspace.git.log.states.retry"), LogHit::PageRetry)];
+            if self.state.refresh_failed() && self.state.filters.revision.is_some() {
+                actions.push((
+                    t("workspace.git.log.states.showAllBranches"),
+                    LogHit::ShowAllBranches,
+                ));
             }
-            let frame = rect(right - width, center_y - 11.0, width, 22.0);
-            if self.is_hovered(&hit) {
-                paint.rounded(cx, frame, colors.interaction_highlight, 4.0, None);
+            for (label, hit) in actions {
+                let width = paint.measure(cx, Font::Medium, size, &label).x + 16.0;
+                if right - width < band.pos.x + 80.0 {
+                    break;
+                }
+                let frame = rect(right - width, center_y - 11.0, width, 22.0);
+                if self.is_hovered(&hit) {
+                    paint.rounded(cx, frame, colors.interaction_highlight, 4.0, None);
+                }
+                paint.text_centered(
+                    cx,
+                    Font::Medium,
+                    size,
+                    colors.accent_bright,
+                    frame.pos.x + 8.0,
+                    frame.pos.y,
+                    frame.size.y,
+                    &label,
+                    width - 15.0,
+                );
+                self.hits.push(frame, hit);
+                right = frame.pos.x - 4.0;
             }
+            let x = band.pos.x + 26.0;
             paint.text_centered(
                 cx,
-                Font::Medium,
+                Font::Regular,
                 size,
-                colors.accent_bright,
-                frame.pos.x + 8.0,
-                frame.pos.y,
-                frame.size.y,
-                &label,
-                width - 15.0,
+                colors.danger,
+                x,
+                band.pos.y,
+                height,
+                &message,
+                (right - 6.0 - x).max(0.0),
             );
-            self.hits.push(frame, hit);
-            right = frame.pos.x - 4.0;
+            self.end_part(cx, paint, LogPart::Banner);
         }
-        let x = band.pos.x + 26.0;
-        paint.text_centered(
-            cx,
-            Font::Regular,
-            size,
-            colors.danger,
-            x,
-            band.pos.y,
-            height,
-            &message,
-            (right - 6.0 - x).max(0.0),
-        );
         rect(
             area.pos.x,
             area.pos.y + height,
@@ -895,10 +941,12 @@ impl LogView {
             );
             let panel = rect(body.pos.x, body.pos.y, width, body.size.y);
             self.draw_branches(cx, paint, inputs.branch, panel);
-            paint.fill(
+            self.draw_divider(
                 cx,
+                paint,
+                0,
                 rect(body.pos.x + width, body.pos.y, 1.0, body.size.y),
-                colors.border,
+                body,
             );
             splitters.push((
                 rect(body.pos.x + width - 3.0, body.pos.y, 7.0, body.size.y),
@@ -932,10 +980,12 @@ impl LogView {
                 rest.size.y,
             );
             self.draw_table(cx, ui, paint, list);
-            paint.fill(
+            self.draw_divider(
                 cx,
+                paint,
+                1,
                 rect(list.pos.x + list.size.x, rest.pos.y, 1.0, rest.size.y),
-                colors.border,
+                rest,
             );
             self.draw_details(
                 cx,
@@ -965,10 +1015,12 @@ impl LogView {
                 rest.size.y - height - 1.0,
             );
             self.draw_table(cx, ui, paint, list);
-            paint.fill(
+            self.draw_divider(
                 cx,
+                paint,
+                2,
                 rect(rest.pos.x, list.pos.y + list.size.y, rest.size.x, 1.0),
-                colors.border,
+                rest,
             );
             self.draw_details(
                 cx,
@@ -991,6 +1043,10 @@ impl LogView {
         // Dividers sit over the edges of the regions they separate.
         for (frame, split, horizontal) in splitters {
             let hit = LogHit::Splitter(split);
+            let part = LogPart::Splitter(split);
+            if !self.begin_part(cx, paint, part, frame, frame, 0) {
+                continue;
+            }
             if self.is_hovered(&hit) || self.dragging() == Some(split) {
                 let line = if horizontal {
                     rect(frame.pos.x, frame.pos.y + 2.5, frame.size.x, 2.0)
@@ -1000,6 +1056,7 @@ impl LogView {
                 paint.fill(cx, line, colors.border_accent);
             }
             self.hits.push(frame, hit);
+            self.end_part(cx, paint, part);
         }
         if !wide && self.drawer_open {
             self.draw_drawer(cx, paint, inputs.branch, body);
@@ -1014,9 +1071,11 @@ impl LogView {
         input: &mut TextInput,
         body: Rect,
     ) {
-        let colors = palette();
-        paint.fill(cx, body, vec4(0.0, 0.0, 0.0, 0.22));
-        self.hits.push(body, LogHit::DrawerBackdrop);
+        if self.begin_part(cx, paint, LogPart::Drawer, body, body, 0) {
+            paint.fill(cx, body, vec4(0.0, 0.0, 0.0, 0.22));
+            self.hits.push(body, LogHit::DrawerBackdrop);
+            self.end_part(cx, paint, LogPart::Drawer);
+        }
         let width = self
             .sizes
             .get(Split::Branches)
@@ -1026,10 +1085,12 @@ impl LogView {
         let panel = rect(body.pos.x, body.pos.y, width, body.size.y);
         self.hits.push(panel, LogHit::Drawer);
         self.draw_branches(cx, paint, input, panel);
-        paint.fill(
+        self.draw_divider(
             cx,
+            paint,
+            3,
             rect(panel.pos.x + width, panel.pos.y, 1.0, panel.size.y),
-            colors.border,
+            body,
         );
     }
 
@@ -1042,6 +1103,9 @@ impl LogView {
         band: Rect,
         wide: bool,
     ) {
+        if !self.begin_part(cx, paint, LogPart::Toolbar, band, band, 0) {
+            return;
+        }
         toolbar_band(cx, paint, band, false);
         let center_y = band.pos.y + (band.size.y - 1.0) / 2.0;
         let mut x = band.pos.x + 8.0;
@@ -1191,6 +1255,7 @@ impl LogView {
                 self.hits.push(clear, LogHit::ClearPath);
             }
         }
+        self.end_part(cx, paint, LogPart::Toolbar);
     }
 
     /// Whether `filter` selects this branches-panel row.
@@ -1211,18 +1276,22 @@ impl LogView {
         area: Rect,
     ) {
         let colors = palette();
-        paint.fill(cx, area, colors.sidebar);
+        if self.begin_part(cx, paint, LogPart::BranchesChrome, area, area, 0) {
+            paint.fill(cx, area, colors.sidebar);
+            let field = rect(area.pos.x + 8.0, area.pos.y + 8.0, area.size.x - 16.0, 26.0);
+            let has_text = !self.branch_query.is_empty();
+            self.search_field(
+                cx,
+                paint,
+                input,
+                field,
+                has_text,
+                LogHit::BranchSearchClear,
+                false,
+            );
+            self.end_part(cx, paint, LogPart::BranchesChrome);
+        }
         let field = rect(area.pos.x + 8.0, area.pos.y + 8.0, area.size.x - 16.0, 26.0);
-        let has_text = !self.branch_query.is_empty();
-        self.search_field(
-            cx,
-            paint,
-            input,
-            field,
-            has_text,
-            LogHit::BranchSearchClear,
-            false,
-        );
         let list = rect(
             area.pos.x,
             field.pos.y + field.size.y + 6.0,
@@ -1298,6 +1367,11 @@ impl LogView {
                 break;
             }
             let band = rect(list.pos.x, top, list.size.x, row_h);
+            let part = LogPart::RefRow(index);
+            self.draw_ref_key = self.ref_row_key(refs, row);
+            if !self.begin_part(cx, paint, part, band, list, 0) {
+                continue;
+            }
             let center_y = top + row_h / 2.0;
             match row {
                 RefRow::Section { key, count, open } => {
@@ -1514,6 +1588,7 @@ impl LogView {
                     );
                 }
             }
+            self.end_part(cx, paint, part);
         }
         paint.end_clip(cx);
         self.ref_rows = rows;
@@ -1632,6 +1707,9 @@ impl LogView {
                     false,
                 );
             } else {
+                if !self.begin_part(cx, paint, LogPart::Skeleton, body, body, row_h.to_bits()) {
+                    return true;
+                }
                 // Skeleton rows while the first page loads.
                 let colors = palette();
                 let count = ((body.size.y / row_h).ceil() as usize).min(12);
@@ -1648,7 +1726,7 @@ impl LogView {
                         None,
                     );
                 }
-                self.spinning = true;
+                self.end_part(cx, paint, LogPart::Skeleton);
             }
             return true;
         }
@@ -1696,6 +1774,10 @@ impl LogView {
 
     /// The page row after the last commit: a spinner or the error with retry.
     fn draw_footer(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, band: Rect, clip: Rect) {
+        let part = LogPart::Footer;
+        if !self.begin_part(cx, paint, part, band, clip, 0) {
+            return;
+        }
         let colors = palette();
         let center_y = band.pos.y + band.size.y / 2.0;
         if let Some(error) = self
@@ -1749,6 +1831,7 @@ impl LogView {
             );
             self.spinning = true;
         }
+        self.end_part(cx, paint, part);
     }
 
     /// Asks for the next page while the end is within two screens.
@@ -1782,52 +1865,55 @@ impl LogView {
         let lane_cap =
             ((subject_w * GRAPH_SHARE / LANE_WIDTH).floor() as usize).clamp(2, MAX_LANES);
         let header = rect(area.pos.x, area.pos.y, area.size.x, header_h);
-        paint.fill(
-            cx,
-            rect(
-                header.pos.x,
-                header.pos.y + header_h - 1.0,
-                header.size.x,
-                1.0,
-            ),
-            colors.border,
-        );
-        let columns = [
-            (
-                area.pos.x + 12.0,
-                subject_w - 16.0,
-                "workspace.git.log.columns.subject",
-            ),
-            (
-                area.pos.x + subject_w,
-                author_w - 8.0,
-                "workspace.git.log.columns.author",
-            ),
-            (
-                area.pos.x + subject_w + author_w,
-                date_w - 8.0,
-                "workspace.git.log.columns.date",
-            ),
-            (
-                area.pos.x + subject_w + author_w + date_w,
-                hash_w - 8.0,
-                "workspace.git.log.columns.hash",
-            ),
-        ];
-        for (x, width, key) in columns {
-            if width > 0.0 {
-                paint.text_centered(
-                    cx,
-                    Font::Medium,
-                    small,
-                    colors.muted,
-                    x,
-                    header.pos.y,
-                    header_h - 1.0,
-                    &t(key),
-                    width,
-                );
+        if self.begin_part(cx, paint, LogPart::TableHeader, header, header, 0) {
+            paint.fill(
+                cx,
+                rect(
+                    header.pos.x,
+                    header.pos.y + header_h - 1.0,
+                    header.size.x,
+                    1.0,
+                ),
+                colors.border,
+            );
+            let columns = [
+                (
+                    area.pos.x + 12.0,
+                    subject_w - 16.0,
+                    "workspace.git.log.columns.subject",
+                ),
+                (
+                    area.pos.x + subject_w,
+                    author_w - 8.0,
+                    "workspace.git.log.columns.author",
+                ),
+                (
+                    area.pos.x + subject_w + author_w,
+                    date_w - 8.0,
+                    "workspace.git.log.columns.date",
+                ),
+                (
+                    area.pos.x + subject_w + author_w + date_w,
+                    hash_w - 8.0,
+                    "workspace.git.log.columns.hash",
+                ),
+            ];
+            for (x, width, key) in columns {
+                if width > 0.0 {
+                    paint.text_centered(
+                        cx,
+                        Font::Medium,
+                        small,
+                        colors.muted,
+                        x,
+                        header.pos.y,
+                        header_h - 1.0,
+                        &t(key),
+                        width,
+                    );
+                }
             }
+            self.end_part(cx, paint, LogPart::TableHeader);
         }
         let body = rect(
             area.pos.x,
@@ -1854,6 +1940,10 @@ impl LogView {
                 break;
             }
             let band = rect(body.pos.x, top, body.size.x, row_h);
+            let part = LogPart::CommitRow(index);
+            if !self.begin_part(cx, paint, part, band, body, 0) {
+                continue;
+            }
             self.hits.push_clipped(band, body, LogHit::Row(index));
             let commit = &self.state.commits[index];
             let date_cell = rect(band.pos.x + subject_w + author_w, top, date_w, row_h);
@@ -1969,6 +2059,7 @@ impl LogView {
                 hash,
                 hash_w - 8.0,
             );
+            self.end_part(cx, paint, part);
         }
         if footer > 0.0 {
             let top = body.pos.y + count as f64 * row_h - offset;
@@ -2009,6 +2100,7 @@ impl LogView {
         if !self.detail_waiting {
             self.state.ensure_detail(ui, &sha);
         }
+        self.draw_detail_key = self.detail_key();
         // Moved out while drawing (no per-frame copy of the file list).
         let Some(detail) = self.state.details.remove(&sha) else {
             self.message(cx, paint, area, None, "", false, Vec::new(), true);
@@ -2047,7 +2139,6 @@ impl LogView {
                 false,
             ),
             Detail::Ready(commit) => {
-                let colors = palette();
                 if side {
                     let files_h = (area.size.y * 0.55).round();
                     self.draw_files(
@@ -2056,10 +2147,12 @@ impl LogView {
                         commit,
                         rect(area.pos.x, area.pos.y, area.size.x, files_h),
                     );
-                    paint.fill(
+                    self.draw_divider(
                         cx,
+                        paint,
+                        4,
                         rect(area.pos.x, area.pos.y + files_h, area.size.x, 1.0),
-                        colors.border,
+                        area,
                     );
                     self.draw_info(
                         cx,
@@ -2080,10 +2173,12 @@ impl LogView {
                         commit,
                         rect(area.pos.x, area.pos.y, files_w, area.size.y),
                     );
-                    paint.fill(
+                    self.draw_divider(
                         cx,
+                        paint,
+                        5,
                         rect(area.pos.x + files_w, area.pos.y, 1.0, area.size.y),
-                        colors.border,
+                        area,
                     );
                     self.draw_info(
                         cx,
@@ -2125,21 +2220,25 @@ impl LogView {
         let colors = palette();
         let small = ui_px(12.0);
         let header_h = (paint.measure(cx, Font::Medium, small, "Ag").y + 12.0).max(28.0);
-        let title = tr(
-            "workspace.git.log.details.changedFiles",
-            &[("count", commit.files.len().to_string())],
-        );
-        paint.text_centered(
-            cx,
-            Font::Medium,
-            small,
-            colors.muted,
-            area.pos.x + 12.0,
-            area.pos.y,
-            header_h,
-            &title,
-            area.size.x - 24.0,
-        );
+        let header = rect(area.pos.x, area.pos.y, area.size.x, header_h);
+        if self.begin_part(cx, paint, LogPart::FilesHeader, header, header, 0) {
+            let title = tr(
+                "workspace.git.log.details.changedFiles",
+                &[("count", commit.files.len().to_string())],
+            );
+            paint.text_centered(
+                cx,
+                Font::Medium,
+                small,
+                colors.muted,
+                area.pos.x + 12.0,
+                area.pos.y,
+                header_h,
+                &title,
+                area.size.x - 24.0,
+            );
+            self.end_part(cx, paint, LogPart::FilesHeader);
+        }
         let list = rect(
             area.pos.x,
             area.pos.y + header_h,
@@ -2150,17 +2249,21 @@ impl LogView {
         self.file_row_height = row_h;
         self.list_files(commit);
         if commit.files.is_empty() {
-            paint.text_centered(
-                cx,
-                Font::Regular,
-                small,
-                colors.muted,
-                list.pos.x + 12.0,
-                list.pos.y,
-                row_h,
-                &t("workspace.git.log.details.noFiles"),
-                list.size.x - 24.0,
-            );
+            let band = rect(list.pos.x, list.pos.y, list.size.x, row_h);
+            if self.begin_part(cx, paint, LogPart::FilesEmpty, band, list, 0) {
+                paint.text_centered(
+                    cx,
+                    Font::Regular,
+                    small,
+                    colors.muted,
+                    list.pos.x + 12.0,
+                    list.pos.y,
+                    row_h,
+                    &t("workspace.git.log.details.noFiles"),
+                    list.size.x - 24.0,
+                );
+                self.end_part(cx, paint, LogPart::FilesEmpty);
+            }
             self.files.set(list, 0.0);
             return;
         }
@@ -2177,6 +2280,10 @@ impl LogView {
             let path = text(file, "path");
             let band = rect(list.pos.x, top, list.size.x, row_h);
             let hit = LogHit::File(path.to_owned());
+            let part = LogPart::FileRow(index);
+            if !self.begin_part(cx, paint, part, band, list, 0) {
+                continue;
+            }
             self.hits.push_clipped(band, list, hit.clone());
             let selected = self.selected_file.as_deref() == Some(path);
             if selected && self.focus == Focus::Files {
@@ -2185,6 +2292,7 @@ impl LogView {
                 paint.fill(cx, band, colors.sidebar_hover);
             }
             self.file_line(cx, paint, band, file, band.pos.x + 10.0);
+            self.end_part(cx, paint, part);
         }
         paint.end_clip(cx);
     }
@@ -2261,11 +2369,16 @@ impl LogView {
         commit: &CommitDetail,
         area: Rect,
     ) {
+        self.info.area = area;
+        if !self.begin_part(cx, paint, LogPart::Info, area, area, 0) {
+            return;
+        }
         let offset = self.info.offset;
         paint.begin_clip(cx, area);
         let end = self.commit_text(cx, paint, commit, area, area.pos.y + 12.0 - offset, false);
         paint.end_clip(cx);
         self.info.set(area, end + offset - area.pos.y + 12.0);
+        self.end_part(cx, paint, LogPart::Info);
     }
 
     /// The commit's message and metadata from `y` inside `area` (hits clipped
@@ -2526,43 +2639,46 @@ impl LogView {
         let colors = palette();
         let height = 36.0_f64.min(area.size.y);
         let band = rect(area.pos.x, area.pos.y, area.size.x, height);
-        paint.fill(cx, band, with_alpha(colors.accent, 0.08));
-        paint.fill(
-            cx,
-            rect(band.pos.x, band.pos.y + height - 1.0, band.size.x, 1.0),
-            colors.border,
-        );
-        let center_y = band.pos.y + height / 2.0;
-        paint.icon(
-            cx,
-            "list-filter",
-            14.0,
-            colors.accent_bright,
-            dvec2(band.pos.x + 18.0, center_y),
-        );
-        let clear = rect(
-            band.pos.x + band.size.x - 6.0 - 32.0,
-            center_y - 16.0,
-            32.0,
-            32.0,
-        );
-        if self.pressed.as_ref() == Some(&LogHit::ClearFilters) {
-            paint.rounded(cx, clear, colors.interaction_highlight, 6.0, None);
+        if self.begin_part(cx, paint, LogPart::Summary, band, band, 0) {
+            paint.fill(cx, band, with_alpha(colors.accent, 0.08));
+            paint.fill(
+                cx,
+                rect(band.pos.x, band.pos.y + height - 1.0, band.size.x, 1.0),
+                colors.border,
+            );
+            let center_y = band.pos.y + height / 2.0;
+            paint.icon(
+                cx,
+                "list-filter",
+                14.0,
+                colors.accent_bright,
+                dvec2(band.pos.x + 18.0, center_y),
+            );
+            let clear = rect(
+                band.pos.x + band.size.x - 6.0 - 32.0,
+                center_y - 16.0,
+                32.0,
+                32.0,
+            );
+            if self.pressed.as_ref() == Some(&LogHit::ClearFilters) {
+                paint.rounded(cx, clear, colors.interaction_highlight, 6.0, None);
+            }
+            paint.icon(cx, "x", 16.0, colors.muted, clear.center());
+            let x = band.pos.x + 32.0;
+            paint.text_centered(
+                cx,
+                Font::Regular,
+                ui_px(13.0),
+                colors.foreground,
+                x,
+                band.pos.y,
+                height - 1.0,
+                &parts.join(" · "),
+                (clear.pos.x - 4.0 - x).max(0.0),
+            );
+            self.hits.push(clear, LogHit::ClearFilters);
+            self.end_part(cx, paint, LogPart::Summary);
         }
-        paint.icon(cx, "x", 16.0, colors.muted, clear.center());
-        let x = band.pos.x + 32.0;
-        paint.text_centered(
-            cx,
-            Font::Regular,
-            ui_px(13.0),
-            colors.foreground,
-            x,
-            band.pos.y,
-            height - 1.0,
-            &parts.join(" · "),
-            (clear.pos.x - 4.0 - x).max(0.0),
-        );
-        self.hits.push(clear, LogHit::ClearFilters);
         rect(
             area.pos.x,
             area.pos.y + height,
@@ -2584,92 +2700,95 @@ impl LogView {
         let colors = palette();
         let bar_h = 48.0;
         let bar = rect(area.pos.x, area.pos.y, area.size.x, bar_h);
-        toolbar_band(cx, paint, bar, false);
-        let center_y = bar.pos.y + (bar_h - 1.0) / 2.0;
-        let mut right =
-            self.refresh_button(cx, paint, true, bar.pos.x + bar.size.x - 6.0, center_y);
-        let hovered = self.is_hovered(&LogHit::SearchToggle);
-        let icon = if self.search_open { "x" } else { "search" };
-        let toggle = toolbar_button(
-            cx,
-            paint,
-            true,
-            right,
-            center_y,
-            Some(icon),
-            self.search_open,
-            true,
-            hovered,
-        );
-        self.hits
-            .push(toolbar_hit(toggle, true), LogHit::SearchToggle);
-        right = toggle.pos.x - toolbar_gap(true, 4.0);
-        let open = matches!(
-            self.overlay.purpose(),
-            Some(super::log_view::Purpose::Author)
-        );
-        let user = toolbar_button(
-            cx,
-            paint,
-            true,
-            right,
-            center_y,
-            Some("user"),
-            open || self.state.filters.author.is_some(),
-            true,
-            false,
-        );
-        self.hits.push(toolbar_hit(user, true), LogHit::AuthorChip);
-        right = user.pos.x - toolbar_gap(true, 4.0);
-        let left = bar.pos.x + 8.0;
-        if self.search_open {
-            let focus = std::mem::take(&mut self.focus_search);
-            let field = rect(left, center_y - 16.0, (right - 4.0 - left).max(0.0), 32.0);
-            // The bar's × closes and clears; no second × inside the field.
-            self.search_field(
+        if self.begin_part(cx, paint, LogPart::PhoneToolbar, bar, bar, 0) {
+            toolbar_band(cx, paint, bar, false);
+            let center_y = bar.pos.y + (bar_h - 1.0) / 2.0;
+            let mut right =
+                self.refresh_button(cx, paint, true, bar.pos.x + bar.size.x - 6.0, center_y);
+            let hovered = self.is_hovered(&LogHit::SearchToggle);
+            let icon = if self.search_open { "x" } else { "search" };
+            let toggle = toolbar_button(
                 cx,
                 paint,
-                inputs.search,
-                field,
-                false,
-                LogHit::SearchClear,
-                focus,
+                true,
+                right,
+                center_y,
+                Some(icon),
+                self.search_open,
+                true,
+                hovered,
             );
-        } else {
-            let label = tr(
-                "workspace.git.log.filters.branch",
-                &[("name", self.branch_label())],
-            );
+            self.hits
+                .push(toolbar_hit(toggle, true), LogHit::SearchToggle);
+            right = toggle.pos.x - toolbar_gap(true, 4.0);
             let open = matches!(
                 self.overlay.purpose(),
-                Some(super::log_view::Purpose::Branch)
+                Some(super::log_view::Purpose::Author)
             );
-            let active = self.state.filters.revision.is_some();
-            let pressed_clear = self.pressed.as_ref() == Some(&LogHit::ClearBranch);
-            let (trigger, clear) = filter_chip(
+            let user = toolbar_button(
                 cx,
                 paint,
-                left,
+                true,
+                right,
                 center_y,
-                (right - 8.0 - left).max(0.0),
-                &label,
-                "git-branch",
-                active,
-                open,
-                pressed_clear,
+                Some("user"),
+                open || self.state.filters.author.is_some(),
+                true,
+                false,
             );
-            // A tall tap target around the compact chip; its × registers last.
-            let target = rect(trigger.pos.x, bar.pos.y + 4.0, trigger.size.x, bar_h - 9.0);
-            self.hits.push(target, LogHit::BranchChip);
-            if let Some(clear) = clear {
-                let target = rect(
-                    clear.pos.x - 6.0,
-                    bar.pos.y + 4.0,
-                    clear.size.x + 10.0,
-                    bar_h - 9.0,
+            self.hits.push(toolbar_hit(user, true), LogHit::AuthorChip);
+            right = user.pos.x - toolbar_gap(true, 4.0);
+            let left = bar.pos.x + 8.0;
+            if self.search_open {
+                let focus = std::mem::take(&mut self.focus_search);
+                let field = rect(left, center_y - 16.0, (right - 4.0 - left).max(0.0), 32.0);
+                // The bar's × closes and clears; no second × inside the field.
+                self.search_field(
+                    cx,
+                    paint,
+                    inputs.search,
+                    field,
+                    false,
+                    LogHit::SearchClear,
+                    focus,
                 );
-                self.hits.push(target, LogHit::ClearBranch);
+            } else {
+                let label = tr(
+                    "workspace.git.log.filters.branch",
+                    &[("name", self.branch_label())],
+                );
+                let open = matches!(
+                    self.overlay.purpose(),
+                    Some(super::log_view::Purpose::Branch)
+                );
+                let active = self.state.filters.revision.is_some();
+                let pressed_clear = self.pressed.as_ref() == Some(&LogHit::ClearBranch);
+                let (trigger, clear) = filter_chip(
+                    cx,
+                    paint,
+                    left,
+                    center_y,
+                    (right - 8.0 - left).max(0.0),
+                    &label,
+                    "git-branch",
+                    active,
+                    open,
+                    pressed_clear,
+                );
+                // A tall tap target around the compact chip; its × registers last.
+                let target = rect(trigger.pos.x, bar.pos.y + 4.0, trigger.size.x, bar_h - 9.0);
+                self.hits.push(target, LogHit::BranchChip);
+                if let Some(clear) = clear {
+                    let target = rect(
+                        clear.pos.x - 6.0,
+                        bar.pos.y + 4.0,
+                        clear.size.x + 10.0,
+                        bar_h - 9.0,
+                    );
+                    self.hits.push(target, LogHit::ClearBranch);
+                }
             }
+            self.end_part(cx, paint, LogPart::PhoneToolbar);
         }
         let below = rect(
             area.pos.x,
@@ -2708,6 +2827,10 @@ impl LogView {
                 break;
             }
             let band = rect(body.pos.x, top, body.size.x, row_h);
+            let part = LogPart::CommitRow(index);
+            if !self.begin_part(cx, paint, part, band, body, 0) {
+                continue;
+            }
             // The whole row is the tap target.
             self.hits.push_clipped(band, body, LogHit::Row(index));
             let commit = &self.state.commits[index];
@@ -2782,6 +2905,7 @@ impl LogView {
                 rect(x0, top + row_h - 1.0, band.size.x - (x0 - band.pos.x), 1.0),
                 with_alpha(colors.border, 0.6),
             );
+            self.end_part(cx, paint, part);
         }
         if footer > 0.0 {
             let top = body.pos.y + count as f64 * row_h - offset;
@@ -2805,34 +2929,37 @@ impl LogView {
         let colors = palette();
         let bar_h = 48.0;
         let bar = rect(area.pos.x, area.pos.y, area.size.x, bar_h);
-        toolbar_band(cx, paint, bar, false);
-        let center_y = bar.pos.y + (bar_h - 1.0) / 2.0;
-        let hovered = self.is_hovered(&LogHit::Back);
-        let back = toolbar_button(
-            cx,
-            paint,
-            true,
-            bar.pos.x + 6.0 + toolbar_button_size(true),
-            center_y,
-            Some("arrow-left"),
-            false,
-            true,
-            hovered,
-        );
-        self.hits.push(toolbar_hit(back, true), LogHit::Back);
-        let title = short(sha);
-        let x = back.pos.x + back.size.x + 8.0;
-        paint.text_centered(
-            cx,
-            Font::Mono,
-            ui_px(15.0),
-            colors.foreground,
-            x,
-            bar.pos.y,
-            bar_h - 1.0,
-            &title,
-            (bar.pos.x + bar.size.x - 12.0 - x).max(0.0),
-        );
+        if self.begin_part(cx, paint, LogPart::PhoneCommitToolbar, bar, bar, 0) {
+            toolbar_band(cx, paint, bar, false);
+            let center_y = bar.pos.y + (bar_h - 1.0) / 2.0;
+            let hovered = self.is_hovered(&LogHit::Back);
+            let back = toolbar_button(
+                cx,
+                paint,
+                true,
+                bar.pos.x + 6.0 + toolbar_button_size(true),
+                center_y,
+                Some("arrow-left"),
+                false,
+                true,
+                hovered,
+            );
+            self.hits.push(toolbar_hit(back, true), LogHit::Back);
+            let title = short(sha);
+            let x = back.pos.x + back.size.x + 8.0;
+            paint.text_centered(
+                cx,
+                Font::Mono,
+                ui_px(15.0),
+                colors.foreground,
+                x,
+                bar.pos.y,
+                bar_h - 1.0,
+                &title,
+                (bar.pos.x + bar.size.x - 12.0 - x).max(0.0),
+            );
+            self.end_part(cx, paint, LogPart::PhoneCommitToolbar);
+        }
         let body = rect(
             area.pos.x,
             area.pos.y + bar_h,
@@ -2840,6 +2967,7 @@ impl LogView {
             (area.size.y - bar_h).max(0.0),
         );
         self.state.ensure_detail(ui, sha);
+        self.draw_detail_key = self.detail_key();
         let Some(detail) = self.state.details.remove(sha) else {
             self.message(cx, paint, body, None, "", false, Vec::new(), true);
             return;
@@ -2879,42 +3007,55 @@ impl LogView {
             Detail::Ready(commit) => {
                 let offset = self.sheet.offset;
                 paint.begin_clip(cx, body);
-                let mut y =
-                    self.commit_text(cx, paint, commit, body, body.pos.y + 16.0 - offset, true);
+                let text_top = body.pos.y + 16.0 - offset;
+                let mut y = text_top + self.phone_info_height;
+                if self.begin_part(cx, paint, LogPart::PhoneInfo, body, body, 0) {
+                    y = self.commit_text(cx, paint, commit, body, text_top, true);
+                    self.phone_info_height = y - text_top;
+                    self.end_part(cx, paint, LogPart::PhoneInfo);
+                }
                 y += 8.0;
-                paint.fill(cx, rect(body.pos.x, y, body.size.x, 1.0), colors.border);
+                self.draw_divider(cx, paint, 6, rect(body.pos.x, y, body.size.x, 1.0), body);
                 y += 1.0;
                 let header_h = 40.0;
-                let header = tr(
-                    "workspace.git.log.details.changedFiles",
-                    &[("count", commit.files.len().to_string())],
-                );
-                paint.text_centered(
-                    cx,
-                    Font::Medium,
-                    ui_px(13.0),
-                    colors.muted,
-                    body.pos.x + 16.0,
-                    y,
-                    header_h,
-                    &header,
-                    body.size.x - 32.0,
-                );
-                y += header_h;
-                self.list_files(commit);
-                self.file_row_height = PHONE_FILE_ROW_HEIGHT;
-                if commit.files.is_empty() {
+                let header_band = rect(body.pos.x, y, body.size.x, header_h);
+                if self.begin_part(cx, paint, LogPart::PhoneFilesHeader, header_band, body, 0) {
+                    let header = tr(
+                        "workspace.git.log.details.changedFiles",
+                        &[("count", commit.files.len().to_string())],
+                    );
                     paint.text_centered(
                         cx,
-                        Font::Regular,
+                        Font::Medium,
                         ui_px(13.0),
                         colors.muted,
                         body.pos.x + 16.0,
                         y,
-                        PHONE_FILE_ROW_HEIGHT,
-                        &t("workspace.git.log.details.noFiles"),
+                        header_h,
+                        &header,
                         body.size.x - 32.0,
                     );
+                    self.end_part(cx, paint, LogPart::PhoneFilesHeader);
+                }
+                y += header_h;
+                self.list_files(commit);
+                self.file_row_height = PHONE_FILE_ROW_HEIGHT;
+                if commit.files.is_empty() {
+                    let band = rect(body.pos.x, y, body.size.x, PHONE_FILE_ROW_HEIGHT);
+                    if self.begin_part(cx, paint, LogPart::FilesEmpty, band, body, 0) {
+                        paint.text_centered(
+                            cx,
+                            Font::Regular,
+                            ui_px(13.0),
+                            colors.muted,
+                            body.pos.x + 16.0,
+                            y,
+                            PHONE_FILE_ROW_HEIGHT,
+                            &t("workspace.git.log.details.noFiles"),
+                            body.size.x - 32.0,
+                        );
+                        self.end_part(cx, paint, LogPart::FilesEmpty);
+                    }
                     y += PHONE_FILE_ROW_HEIGHT;
                 }
                 let start = y;
@@ -2929,11 +3070,16 @@ impl LogView {
                     let band = rect(body.pos.x, top, body.size.x, PHONE_FILE_ROW_HEIGHT);
                     let path = text(file, "path");
                     let hit = LogHit::File(path.to_owned());
+                    let part = LogPart::FileRow(index);
+                    if !self.begin_part(cx, paint, part, band, body, 0) {
+                        continue;
+                    }
                     self.hits.push_clipped(band, body, hit.clone());
                     if self.pressed.as_ref() == Some(&hit) {
                         paint.fill(cx, band, colors.selected);
                     }
                     self.file_line(cx, paint, band, file, band.pos.x + 16.0);
+                    self.end_part(cx, paint, part);
                 }
                 y = start + commit.files.len() as f64 * PHONE_FILE_ROW_HEIGHT + 16.0;
                 paint.end_clip(cx);

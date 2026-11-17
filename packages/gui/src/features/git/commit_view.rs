@@ -11,10 +11,11 @@ use super::chrome::{
 use super::host;
 use super::json::{array, flag, object, text};
 use super::model::utf16_cmp;
-use super::paint::{Font, GitPaint, Hits, rect, with_alpha};
+use super::paint::{Font, GitPaint, Hits, Retained, rect, with_alpha};
 use super::store::GitStore;
 use super::text::{t, tr};
 use super::wire;
+use crate::common::layer::inputs;
 use crate::common::overlay::tooltip_at;
 use crate::common::paint::TextSpec;
 use crate::common::{PanelTarget, UiContext};
@@ -22,7 +23,7 @@ use makepad_widgets::scroll_bars::TouchScroll;
 use makepad_widgets::*;
 use paseo_gui_core::{CoreError, CoreEvent, RequestId};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 pub const FEATURE: &str = "gitSelectedCommit";
@@ -45,7 +46,7 @@ enum Bucket {
     Unversioned,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Status {
     Modified,
     Added,
@@ -114,7 +115,7 @@ enum NodeId {
     File(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 enum NodeKind {
     Bucket(Bucket),
     /// `label` is the compacted chain, e.g. `packages/gui/src`.
@@ -171,7 +172,7 @@ impl DirBuild {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Check {
     Unchecked,
     Partial,
@@ -326,14 +327,19 @@ impl Tree {
     }
 
     /// Selected-file prefix counts over `order` for O(1) [`Check`]s while drawing.
-    fn selected_prefix(&self, files: &[Value], selected: &HashSet<String>) -> Vec<usize> {
-        let mut prefix = Vec::with_capacity(self.order.len() + 1);
+    fn selected_prefix(
+        &self,
+        files: &[Value],
+        selected: &HashSet<String>,
+        prefix: &mut Vec<usize>,
+    ) {
+        prefix.clear();
+        prefix.reserve(self.order.len() + 1);
         prefix.push(0);
         for &file in &self.order {
             let last = *prefix.last().expect("seeded");
             prefix.push(last + usize::from(selected.contains(text(&files[file], "path"))));
         }
-        prefix
     }
 
     /// A fully included node excludes every descendant; otherwise all are included.
@@ -351,7 +357,7 @@ impl Tree {
 // ---------------------------------------------------------------------------
 // Loading.
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 enum LoadFailure {
     NotRepository,
     TooLarge,
@@ -428,7 +434,7 @@ impl Selection {
 // ---------------------------------------------------------------------------
 // View.
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Action {
     /// Files toggle inclusion; roots and directories expand or collapse.
     Row(NodeId),
@@ -443,7 +449,7 @@ enum Action {
     Failure,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 enum Display {
     Disconnected,
     Unsupported,
@@ -461,6 +467,31 @@ struct StateCopy {
     body: String,
     detail: String,
     action: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Part {
+    Background,
+    State,
+    StateAction,
+    Toolbar,
+    Summary,
+    Tree,
+    Scrollbar,
+    Splitter,
+    Banner,
+    BannerAction,
+    Hint,
+    Editor,
+    Submit,
+}
+
+#[derive(Default)]
+struct RowPaint {
+    row: Retained<Action>,
+    icon: Retained<Action>,
+    pending: bool,
+    visible: bool,
 }
 
 pub struct CommitView {
@@ -486,6 +517,9 @@ pub struct CommitView {
     not_git: bool,
     reload_status: bool,
     tree: Tree,
+    selection_prefix: Vec<usize>,
+    visible_nodes: Vec<usize>,
+    visible_generation: Option<u64>,
     group_by_dir: bool,
     collapsed: HashSet<NodeId>,
     /// Keyboard cursor (desktop).
@@ -507,6 +541,15 @@ pub struct CommitView {
     offset: f64,
     max_scroll: f64,
     touch_scroll: TouchScroll,
+    sections: HashMap<Part, Retained<Action>>,
+    toolbar_actions: HashMap<Action, Retained<Action>>,
+    rows: HashMap<NodeId, RowPaint>,
+    rows_dirty: bool,
+    tree_generation: u64,
+    presentation: Display,
+    display_changed: bool,
+    message_generation: u64,
+    editor_focused: bool,
     pub icons_pending: bool,
     pub spinning: bool,
 }
@@ -535,6 +578,9 @@ impl CommitView {
             not_git: false,
             reload_status: false,
             tree: Tree::default(),
+            selection_prefix: vec![0],
+            visible_nodes: Vec::new(),
+            visible_generation: None,
             group_by_dir: true,
             collapsed: HashSet::new(),
             focus: None,
@@ -552,8 +598,211 @@ impl CommitView {
             offset: 0.0,
             max_scroll: 0.0,
             touch_scroll: TouchScroll::default(),
+            sections: HashMap::new(),
+            toolbar_actions: HashMap::new(),
+            rows: HashMap::new(),
+            rows_dirty: false,
+            tree_generation: 0,
+            presentation: Display::Loading,
+            display_changed: false,
+            message_generation: 0,
+            editor_focused: false,
             icons_pending: false,
             spinning: false,
+        }
+    }
+
+    fn part_key(&self, part: Part) -> u64 {
+        let files = self.presentation == Display::Files;
+        let available = !matches!(
+            self.presentation,
+            Display::Disconnected | Display::Unsupported
+        );
+        let committing = self.commit.is_some();
+        let ready = available && self.commit_ready();
+        match part {
+            Part::Background => 0,
+            Part::State => inputs((&self.presentation, &self.feedback, self.compact)),
+            Part::StateAction => inputs((
+                self.hovered == Some(Action::Refresh),
+                committing,
+                self.compact,
+            )),
+            Part::Toolbar => inputs(self.compact),
+            Part::Summary => inputs((
+                &self.branch,
+                self.selection.selected.len(),
+                files,
+                self.compact,
+            )),
+            Part::Tree => inputs((
+                self.tree_generation,
+                self.offset.to_bits(),
+                self.reveal_focus,
+                self.compact,
+            )),
+            Part::Scrollbar => inputs((self.offset.to_bits(), self.max_scroll.to_bits())),
+            Part::Splitter => inputs((
+                self.hovered == Some(Action::Splitter),
+                self.drag.is_some(),
+                self.form_height.map(f64::to_bits),
+                self.compact,
+            )),
+            Part::Banner => inputs((&self.commit_failure, self.uncertain, self.compact)),
+            Part::BannerAction => inputs((self.hovered == Some(Action::Refresh), self.compact)),
+            Part::Hint => {
+                let kind = if self.feedback.is_some() {
+                    0
+                } else if committing || ready || self.commit_failure.is_some() || self.uncertain {
+                    1
+                } else if self.selection.selected.is_empty() {
+                    2
+                } else if self.message.trim().is_empty() {
+                    3
+                } else {
+                    1
+                };
+                inputs((kind, &self.feedback, self.compact))
+            }
+            Part::Editor => inputs((
+                self.message_generation,
+                committing,
+                self.editor_focused,
+                self.compact,
+            )),
+            Part::Submit => inputs((
+                self.selection.selected.len(),
+                committing,
+                ready,
+                self.hovered == Some(Action::Commit),
+                self.pressed == Some(Action::Commit),
+                self.compact,
+            )),
+        }
+    }
+
+    fn toolbar_key(&self, action: &Action) -> u64 {
+        inputs((
+            self.hovered.as_ref() == Some(action),
+            self.commit.is_none()
+                && !matches!(
+                    self.presentation,
+                    Display::Disconnected | Display::Unsupported
+                ),
+            *action == Action::Refresh && self.reloading(),
+            *action == Action::GroupByDirectory && self.group_by_dir,
+            self.compact,
+        ))
+    }
+
+    fn row_key(&self, index: usize, selected: usize) -> u64 {
+        let node = &self.tree.nodes[index];
+        let file = match &node.kind {
+            NodeKind::File { index } => {
+                let file = &self.selection.files[*index];
+                Some((text(file, "path"), text(file, "oldPath"), file_status(file)))
+            }
+            _ => None,
+        };
+        let highlighted = self.hovered.as_ref().is_some_and(
+            |action| matches!(action, Action::Row(id) | Action::Check(id) if id == &node.id),
+        ) || self
+            .pressed
+            .as_ref()
+            .is_some_and(|action| matches!(action, Action::Row(id) if id == &node.id));
+        inputs((
+            (&node.kind, node.depth, node.files.len(), file),
+            (
+                Check::of(selected, node.files.len()),
+                self.collapsed.contains(&node.id),
+            ),
+            (
+                !self.compact && self.focus.as_ref() == Some(&node.id),
+                highlighted,
+            ),
+            (self.commit.is_none(), self.group_by_dir, self.compact),
+            (self.offset.to_bits(), self.list.size.y.to_bits()),
+        ))
+    }
+
+    fn part_visible(&self, part: Part) -> bool {
+        let files = self.presentation == Display::Files;
+        match part {
+            Part::Background => true,
+            Part::State => !files,
+            Part::StateAction => matches!(self.presentation, Display::Failed(_)),
+            Part::Toolbar | Part::Summary => files || self.presentation == Display::Empty,
+            Part::Banner | Part::BannerAction => {
+                files && (self.commit_failure.is_some() || self.uncertain)
+            }
+            _ => files,
+        }
+    }
+
+    fn begin_part(&mut self, cx: &mut Cx2d, paint: &mut GitPaint, part: Part, area: Rect) -> bool {
+        let key = self.part_key(part);
+        self.sections
+            .entry(part)
+            .or_default()
+            .begin(cx, area, key, &mut self.hits, paint)
+    }
+
+    fn end_part(&mut self, cx: &mut Cx2d, paint: &GitPaint, part: Part) {
+        let key = self.part_key(part);
+        let section = self.sections.get_mut(&part).unwrap();
+        section.end(cx, &self.hits, paint);
+        section.set_inputs(key);
+    }
+
+    /// Schedule only presentations whose inputs changed. The pane's composition
+    /// then replays every unaffected sibling, including editor and row hit geometry.
+    pub fn invalidate(&mut self, cx: &mut Cx) {
+        let transition = std::mem::take(&mut self.display_changed);
+        for (part, section) in &self.sections {
+            if transition && *part != Part::Background {
+                section.invalidate(cx);
+            } else if self.part_visible(*part) {
+                section.invalidate_if_changed(cx, self.part_key(*part));
+            }
+        }
+        for (action, section) in &self.toolbar_actions {
+            if transition {
+                section.invalidate(cx);
+            } else if self.part_visible(Part::Toolbar)
+                && (self.presentation == Display::Files || *action == Action::Refresh)
+            {
+                section.invalidate_if_changed(cx, self.toolbar_key(action));
+            }
+        }
+        if !std::mem::take(&mut self.rows_dirty) && !transition {
+            return;
+        }
+        let prefix = &self.selection_prefix;
+        for (index, node) in self.tree.nodes.iter().enumerate() {
+            if let Some(row) = self.rows.get(&node.id)
+                && (row.visible || transition)
+            {
+                if transition {
+                    row.row.invalidate(cx);
+                } else {
+                    row.row.invalidate_if_changed(
+                        cx,
+                        self.row_key(index, prefix[node.files.end] - prefix[node.files.start]),
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn invalidate_media(&mut self, cx: &mut Cx) {
+        for (id, row) in &self.rows {
+            if row.pending
+                && let NodeId::File(path) = id
+                && row.visible
+                && crate::features::files::file_icon(file_name(path)).is_some()
+            {
+                row.icon.invalidate(cx);
+            }
         }
     }
 
@@ -590,13 +839,18 @@ impl CommitView {
     }
 
     fn snapshot(&mut self, result: Result<Vec<Value>, LoadFailure>) {
+        self.rows_dirty = true;
         self.loaded = true;
         match result {
             Ok(files) => {
                 self.failed = None;
                 self.has_snapshot = true;
                 self.selection.replace(files);
-                self.tree = Tree::build(&self.selection.files, self.group_by_dir);
+                let tree = Tree::build(&self.selection.files, self.group_by_dir);
+                if tree != self.tree {
+                    self.tree = tree;
+                    self.tree_generation = self.tree_generation.wrapping_add(1);
+                }
             }
             Err(failure) => {
                 // Retrying shows loading, not the stale list beneath the failure.
@@ -604,6 +858,13 @@ impl CommitView {
                 self.has_snapshot = false;
             }
         }
+        self.tree.selected_prefix(
+            &self.selection.files,
+            &self.selection.selected,
+            &mut self.selection_prefix,
+        );
+        let ids: HashSet<_> = self.tree.nodes.iter().map(|node| &node.id).collect();
+        self.rows.retain(|id, _| ids.contains(id));
     }
 
     pub fn process(
@@ -637,11 +898,14 @@ impl CommitView {
                     request_id, result, ..
                 } if self.commit.as_ref() == Some(request_id) => {
                     self.commit = None;
+                    self.rows_dirty = true;
                     match wire::git_result(result) {
                         Ok(_) => {
                             self.message.clear();
+                            self.message_generation = self.message_generation.wrapping_add(1);
                             self.clear_input = true;
                             self.selection.selected.clear();
+                            self.selection_prefix.fill(0);
                             self.feedback = Some(t("workspace.git.commit.success"));
                             self.failed = None;
                         }
@@ -719,6 +983,10 @@ impl CommitView {
             self.observe(ui);
             changed = true;
         }
+        let display = self.display(ui);
+        changed |= display != self.presentation;
+        self.display_changed |= display != self.presentation;
+        self.presentation = display;
         changed
     }
 
@@ -744,8 +1012,11 @@ impl CommitView {
     }
 
     fn can_commit(&self, ui: &UiContext) -> bool {
-        self.available(ui)
-            && self.loaded
+        self.available(ui) && self.commit_ready()
+    }
+
+    fn commit_ready(&self) -> bool {
+        self.loaded
             && self.failed.is_none()
             && self.commit_failure.is_none()
             && !self.uncertain
@@ -755,8 +1026,14 @@ impl CommitView {
     }
 
     fn toggle_node(&mut self, index: usize) {
+        self.rows_dirty = true;
         self.tree
             .toggle(index, &self.selection.files, &mut self.selection.selected);
+        self.tree.selected_prefix(
+            &self.selection.files,
+            &self.selection.selected,
+            &mut self.selection_prefix,
+        );
         self.feedback = None;
     }
 
@@ -764,6 +1041,15 @@ impl CommitView {
         if self.commit.is_some() {
             return;
         }
+        self.rows_dirty |= matches!(
+            &action,
+            Action::Row(_)
+                | Action::Check(_)
+                | Action::ExpandAll
+                | Action::CollapseAll
+                | Action::GroupByDirectory
+                | Action::Commit
+        );
         match action {
             Action::Row(id) => {
                 let Some(index) = self.tree.find(&id) else {
@@ -771,8 +1057,11 @@ impl CommitView {
                 };
                 if self.tree.nodes[index].is_file() {
                     self.toggle_node(index);
-                } else if !self.collapsed.remove(&id) {
-                    self.collapsed.insert(id.clone());
+                } else {
+                    if !self.collapsed.remove(&id) {
+                        self.collapsed.insert(id.clone());
+                    }
+                    self.tree_generation = self.tree_generation.wrapping_add(1);
                 }
                 if !self.compact {
                     self.focus = Some(id);
@@ -786,7 +1075,10 @@ impl CommitView {
                     }
                 }
             }
-            Action::ExpandAll => self.collapsed.clear(),
+            Action::ExpandAll => {
+                self.collapsed.clear();
+                self.tree_generation = self.tree_generation.wrapping_add(1);
+            }
             Action::CollapseAll => {
                 self.collapsed = self
                     .tree
@@ -795,10 +1087,19 @@ impl CommitView {
                     .filter(|node| !node.is_file())
                     .map(|node| node.id.clone())
                     .collect();
+                self.tree_generation = self.tree_generation.wrapping_add(1);
             }
             Action::GroupByDirectory => {
                 self.group_by_dir = !self.group_by_dir;
                 self.tree = Tree::build(&self.selection.files, self.group_by_dir);
+                self.tree_generation = self.tree_generation.wrapping_add(1);
+                self.tree.selected_prefix(
+                    &self.selection.files,
+                    &self.selection.selected,
+                    &mut self.selection_prefix,
+                );
+                let ids: HashSet<_> = self.tree.nodes.iter().map(|node| &node.id).collect();
+                self.rows.retain(|id, _| ids.contains(id));
                 self.reveal_focus = true;
             }
             Action::Refresh => {
@@ -852,6 +1153,7 @@ impl CommitView {
                 let node = &self.tree.nodes[visible[at]];
                 if !node.is_file() && !self.collapsed.contains(&node.id) {
                     self.collapsed.insert(node.id.clone());
+                    self.tree_generation = self.tree_generation.wrapping_add(1);
                     at
                 } else {
                     self.tree
@@ -864,7 +1166,10 @@ impl CommitView {
                 let Some(at) = current else { return false };
                 let node = &self.tree.nodes[visible[at]];
                 // Files stay; a collapsed node expands; an expanded one steps in.
-                if node.is_file() || self.collapsed.remove(&node.id) {
+                if node.is_file() {
+                    at
+                } else if self.collapsed.remove(&node.id) {
+                    self.tree_generation = self.tree_generation.wrapping_add(1);
                     at
                 } else {
                     (at + 1).min(last)
@@ -881,6 +1186,7 @@ impl CommitView {
         };
         self.focus = Some(self.tree.nodes[visible[next]].id.clone());
         self.reveal_focus = true;
+        self.rows_dirty = true;
         true
     }
 
@@ -895,6 +1201,9 @@ impl CommitView {
         input.set_is_read_only(cx, self.commit.is_some());
         let uid = input.widget_uid();
         let actions = cx.capture_actions(|cx| input.handle_event(cx, event, &mut Scope::empty()));
+        let focused = cx.has_key_focus(input.area());
+        let focus_changed = self.editor_focused != focused;
+        self.editor_focused = focused;
         for action in &actions {
             if let Some(action) = action.as_widget_action()
                 && action.widget_uid == uid
@@ -902,11 +1211,12 @@ impl CommitView {
                     action.action.downcast_ref::<TextInputAction>()
             {
                 self.message.clone_from(value);
+                self.message_generation = self.message_generation.wrapping_add(1);
                 self.feedback = None;
                 return true;
             }
         }
-        false
+        focus_changed
     }
 
     fn tooltip(&self, action: &Action) -> Option<String> {
@@ -960,6 +1270,7 @@ impl CommitView {
             }
         }
         if let Some(delta) = self.touch_scroll.handle_event(cx, event, &hit) {
+            self.rows_dirty = true;
             self.pressed = None;
             if self.list.contains(self.touch_scroll.origin()) {
                 return self
@@ -970,6 +1281,7 @@ impl CommitView {
         }
         match hit {
             Hit::FingerScroll(e) if self.list.contains(e.abs) => {
+                self.rows_dirty = true;
                 return self.touch_scroll.apply_delta(
                     &mut self.offset,
                     e.scroll.y,
@@ -979,6 +1291,10 @@ impl CommitView {
             Hit::FingerDown(e) => {
                 tooltip_at(ui, None, Rect::default(), TOOLTIP_WAIT);
                 self.pressed = self.hits.find(e.abs).map(|(_, action)| action);
+                self.rows_dirty |= matches!(
+                    self.pressed.as_ref(),
+                    Some(Action::Row(_) | Action::Check(_))
+                );
                 if self.pressed == Some(Action::Splitter) {
                     self.pressed = None;
                     self.drag = Some((e.abs.y, self.shown_form_height));
@@ -1004,16 +1320,27 @@ impl CommitView {
                 if next != self.hovered {
                     let tip = next.as_ref().and_then(|action| self.tooltip(action));
                     tooltip_at(ui, tip.as_deref(), anchor, TOOLTIP_WAIT);
+                    self.rows_dirty |=
+                        matches!(
+                            self.hovered.as_ref(),
+                            Some(Action::Row(_) | Action::Check(_))
+                        ) || matches!(next.as_ref(), Some(Action::Row(_) | Action::Check(_)));
                     self.hovered = next;
                     return true;
                 }
             }
             Hit::FingerHoverOut(_) => {
                 tooltip_at(ui, None, Rect::default(), TOOLTIP_WAIT);
+                self.rows_dirty |= matches!(
+                    self.hovered.as_ref(),
+                    Some(Action::Row(_) | Action::Check(_))
+                );
                 return self.hovered.take().is_some();
             }
             Hit::FingerUp(e) => {
                 let pressed = self.pressed.take();
+                self.rows_dirty |=
+                    matches!(pressed.as_ref(), Some(Action::Row(_) | Action::Check(_)));
                 if e.is_over
                     && !e.has_long_press_occurred
                     && (!e.device.is_touch() || e.was_tap())
@@ -1021,6 +1348,9 @@ impl CommitView {
                     && pressed.as_ref() == Some(&action)
                 {
                     self.activate(ui, action);
+                    let display = self.display(ui);
+                    self.display_changed |= display != self.presentation;
+                    self.presentation = display;
                     return true;
                 }
                 return pressed.is_some();
@@ -1049,13 +1379,22 @@ impl CommitView {
         compact: bool,
     ) {
         self.hits.clear();
-        self.icons_pending = false;
         self.compact = compact;
-        self.spinning = self.commit.is_some();
+        self.spinning = false;
         let display = self.display(ui);
+        self.presentation = display.clone();
         self.form_visible = display == Display::Files;
+        if !self.form_visible {
+            self.icons_pending = false;
+            for row in self.rows.values_mut() {
+                row.visible = false;
+            }
+        }
         let colors = palette();
-        paint.fill(cx, area, colors.surface0);
+        if self.begin_part(cx, paint, Part::Background, area) {
+            paint.fill(cx, area, colors.surface0);
+            self.end_part(cx, paint, Part::Background);
+        }
         let state = match &display {
             Display::Files | Display::Empty => None,
             Display::Disconnected => Some(StateCopy {
@@ -1128,7 +1467,10 @@ impl CommitView {
             (area.size.y - toolbar_h - form_h).max(0.0),
         );
         if self.form_visible {
-            self.draw_tree(cx, paint, body, metrics, compact);
+            if self.begin_part(cx, paint, Part::Tree, body) {
+                self.draw_tree(cx, paint, body, metrics, compact);
+                self.end_part(cx, paint, Part::Tree);
+            }
         } else {
             self.list = Rect::default();
             let (title, body_copy) = if self.feedback.is_some() {
@@ -1255,77 +1597,89 @@ impl CommitView {
                 0.0
             };
         let mut y = area.pos.y + ((area.size.y - total) * 0.4).max(16.0);
-        match state.icon {
-            Some(icon) => paint.icon(
-                cx,
-                icon,
-                28.0,
-                if state.error {
-                    colors.danger
-                } else {
-                    colors.muted
-                },
-                dvec2(center_x, y + 14.0),
-            ),
-            None => {
-                paint.spinner(
+        let top = y;
+        self.spinning |= state.icon.is_none();
+        if self.begin_part(cx, paint, Part::State, area) {
+            match state.icon {
+                Some(icon) => paint.icon(
                     cx,
+                    icon,
+                    28.0,
+                    if state.error {
+                        colors.danger
+                    } else {
+                        colors.muted
+                    },
                     dvec2(center_x, y + 14.0),
-                    24.0,
-                    colors.muted,
-                    cx.seconds_since_app_start(),
-                );
-                self.spinning = true;
+                ),
+                None => {
+                    paint.spinner(
+                        cx,
+                        dvec2(center_x, y + 14.0),
+                        24.0,
+                        colors.muted,
+                        cx.seconds_since_app_start(),
+                    );
+                    self.spinning = true;
+                }
             }
-        }
-        y += 28.0 + 14.0;
-        paint.text_wrapped(
-            cx,
-            Font::Medium,
-            title_px,
-            colors.foreground,
-            dvec2(center_x - title_w / 2.0, y),
-            &state.title,
-            title_w + 1.0,
-        );
-        y += title_h;
-        if body_h > 0.0 {
-            y += 6.0;
+            y += 28.0 + 14.0;
             paint.text_wrapped(
                 cx,
-                Font::Regular,
-                body_px,
-                colors.muted,
-                dvec2(center_x - body_w / 2.0, y),
-                &state.body,
-                body_w + 1.0,
+                Font::Medium,
+                title_px,
+                colors.foreground,
+                dvec2(center_x - title_w / 2.0, y),
+                &state.title,
+                title_w + 1.0,
             );
-            y += body_h;
+            y += title_h;
+            if body_h > 0.0 {
+                y += 6.0;
+                paint.text_wrapped(
+                    cx,
+                    Font::Regular,
+                    body_px,
+                    colors.muted,
+                    dvec2(center_x - body_w / 2.0, y),
+                    &state.body,
+                    body_w + 1.0,
+                );
+                y += body_h;
+            }
+            if detail_h > 0.0 {
+                y += 6.0;
+                paint.text_wrapped(
+                    cx,
+                    Font::Regular,
+                    detail_px,
+                    if state.error {
+                        colors.danger
+                    } else {
+                        colors.extra_muted
+                    },
+                    dvec2(center_x - detail_w / 2.0, y),
+                    &state.detail,
+                    detail_w + 1.0,
+                );
+            }
+            self.end_part(cx, paint, Part::State);
         }
-        if detail_h > 0.0 {
-            y += 6.0;
-            paint.text_wrapped(
-                cx,
-                Font::Regular,
-                detail_px,
-                if state.error {
-                    colors.danger
-                } else {
-                    colors.extra_muted
-                },
-                dvec2(center_x - detail_w / 2.0, y),
-                &state.detail,
-                detail_w + 1.0,
-            );
-            y += detail_h;
-        }
+        y = top + total
+            - if state.action.is_some() {
+                16.0 + button_h
+            } else {
+                0.0
+            };
         if let Some(label) = &state.action {
             y += 16.0;
             let button_w = measure_button(cx, paint, label, true, ButtonSize::Sm, self.compact)
                 .min(inner)
                 .max(if self.compact { 120.0 } else { 0.0 });
             let frame = rect(center_x - button_w / 2.0, y, button_w, button_h);
-            if frame.pos.y + frame.size.y <= area.pos.y + area.size.y {
+            if frame.pos.y + frame.size.y <= area.pos.y + area.size.y
+                && self.begin_part(cx, paint, Part::StateAction, frame)
+            {
                 let enabled = self.commit.is_none();
                 button(
                     cx,
@@ -1342,6 +1696,7 @@ impl CommitView {
                 if enabled {
                     self.hits.push(frame, Action::Refresh);
                 }
+                self.end_part(cx, paint, Part::StateAction);
             }
         }
     }
@@ -1359,47 +1714,72 @@ impl CommitView {
         compact: bool,
     ) {
         let colors = palette();
-        toolbar_band(cx, paint, bar, false);
+        if self.begin_part(cx, paint, Part::Toolbar, bar) {
+            toolbar_band(cx, paint, bar, false);
+            self.end_part(cx, paint, Part::Toolbar);
+        }
         let center_y = bar.pos.y + bar.size.y / 2.0;
         let enabled = self.commit.is_none() && self.available(ui);
-        let mut actions = vec![(Action::Refresh, "refresh-cw", false)];
-        if self.form_visible {
-            actions.push((Action::CollapseAll, "chevrons-down-up", false));
-            actions.push((Action::ExpandAll, "chevrons-up-down", false));
-            actions.push((Action::GroupByDirectory, "folder-tree", self.group_by_dir));
-        }
+        let actions = [
+            (Action::Refresh, "refresh-cw", false),
+            (Action::CollapseAll, "chevrons-down-up", false),
+            (Action::ExpandAll, "chevrons-up-down", false),
+            (Action::GroupByDirectory, "folder-tree", self.group_by_dir),
+        ];
         // Touch hits are 44px squares whose centres sit 44px apart.
         let pitch = if compact { 44.0 } else { 26.0 };
         let mut right = bar.pos.x + bar.size.x - if compact { 6.0 } else { 8.0 };
-        for (action, icon, selected) in actions {
+        for (action, icon, selected) in
+            actions
+                .into_iter()
+                .take(if self.form_visible { 4 } else { 1 })
+        {
             let spinner = action == Action::Refresh && self.reloading();
             let center_x = right - pitch / 2.0;
             let button_right = center_x + toolbar_button_size(compact) / 2.0;
-            let frame = toolbar_button(
-                cx,
-                paint,
-                compact,
-                button_right,
-                center_y,
-                (!spinner).then_some(icon),
-                selected,
-                enabled,
-                self.hovered.as_ref() == Some(&action),
-            );
-            if spinner {
-                paint.spinner(
+            let size = toolbar_button_size(compact);
+            let bounds = rect(button_right - size, center_y - size / 2.0, size, size);
+            let key = self.toolbar_key(&action);
+            self.spinning |= spinner;
+            if self
+                .toolbar_actions
+                .entry(action.clone())
+                .or_default()
+                .begin(cx, bounds, key, &mut self.hits, paint)
+            {
+                let frame = toolbar_button(
                     cx,
-                    frame.center(),
-                    14.0,
-                    colors.muted,
-                    cx.seconds_since_app_start(),
+                    paint,
+                    compact,
+                    button_right,
+                    center_y,
+                    (!spinner).then_some(icon),
+                    selected,
+                    enabled,
+                    self.hovered.as_ref() == Some(&action),
                 );
-                self.spinning = true;
-            }
-            if enabled {
-                self.hits.push(toolbar_hit(frame, compact), action);
+                if spinner {
+                    paint.spinner(
+                        cx,
+                        frame.center(),
+                        14.0,
+                        colors.muted,
+                        cx.seconds_since_app_start(),
+                    );
+                    self.spinning = true;
+                }
+                if enabled {
+                    self.hits.push(toolbar_hit(frame, compact), action.clone());
+                }
+                self.toolbar_actions
+                    .get_mut(&action)
+                    .unwrap()
+                    .end(cx, &self.hits, paint);
             }
             right -= pitch;
+        }
+        if !self.begin_part(cx, paint, Part::Summary, bar) {
+            return;
         }
         let mut x = bar.pos.x + 12.0;
         let limit = right - 8.0;
@@ -1450,6 +1830,7 @@ impl CommitView {
                 limit - x,
             );
         }
+        self.end_part(cx, paint, Part::Summary);
     }
 
     fn draw_tree(
@@ -1462,12 +1843,20 @@ impl CommitView {
     ) {
         let colors = palette();
         self.list = list;
+        self.icons_pending = false;
+        for row in self.rows.values_mut() {
+            row.visible = false;
+        }
         let row_h = self.row_height;
         let top_pad = 4.0;
-        let visible = self.tree.visible(&self.collapsed);
+        if self.visible_generation != Some(self.tree_generation) {
+            self.visible_nodes = self.tree.visible(&self.collapsed);
+            self.visible_generation = Some(self.tree_generation);
+        }
+        let visible = &self.visible_nodes;
         // A collapsed ancestor takes over the cursor of a hidden node.
-        if let Some(id) = self.focus.clone() {
-            match self.tree.find(&id) {
+        if self.focus.is_some() {
+            match self.focus.as_ref().and_then(|id| self.tree.find(id)) {
                 None => self.focus = None,
                 Some(mut index) => {
                     while !visible.contains(&index) {
@@ -1476,7 +1865,9 @@ impl CommitView {
                             None => break,
                         }
                     }
-                    self.focus = Some(self.tree.nodes[index].id.clone());
+                    if self.focus.as_ref() != Some(&self.tree.nodes[index].id) {
+                        self.focus = Some(self.tree.nodes[index].id.clone());
+                    }
                 }
             }
         }
@@ -1497,9 +1888,7 @@ impl CommitView {
             }
         }
         self.offset = self.offset.clamp(0.0, self.max_scroll);
-        let prefix = self
-            .tree
-            .selected_prefix(&self.selection.files, &self.selection.selected);
+        let prefix = &self.selection_prefix;
         let interactive = self.commit.is_none();
         let indent = if compact { 16.0 } else { 14.0 };
         let font = ui_px(14.0);
@@ -1516,142 +1905,168 @@ impl CommitView {
                 break;
             }
             let node = &self.tree.nodes[index];
-            let row_action = Action::Row(node.id.clone());
-            let check_action = Action::Check(node.id.clone());
-            if !compact && focus_pos == Some(pos) {
-                paint.fill(cx, band, colors.selected);
-            }
-            if self.hovered.as_ref() == Some(&row_action)
-                || self.hovered.as_ref() == Some(&check_action)
-                || self.pressed.as_ref() == Some(&row_action)
-            {
-                paint.fill(cx, band, colors.interaction_highlight);
-            }
             let center_y = band.pos.y + band.size.y / 2.0;
             let x0 = band.pos.x + 6.0 + node.depth as f64 * indent;
-            if !node.is_file() {
-                let chevron = if self.collapsed.contains(&node.id) {
-                    "chevron-right"
-                } else {
-                    "chevron-down"
+            let key = self.row_key(index, prefix[node.files.end] - prefix[node.files.start]);
+            if !self.rows.contains_key(&node.id) {
+                self.rows.insert(node.id.clone(), RowPaint::default());
+            }
+            let retained = self.rows.get_mut(&node.id).unwrap();
+            retained.visible = true;
+            if retained.row.begin(cx, band, key, &mut self.hits, paint) {
+                let row_action = Action::Row(node.id.clone());
+                let check_action = Action::Check(node.id.clone());
+                if !compact && focus_pos == Some(pos) {
+                    paint.fill(cx, band, colors.selected);
+                }
+                if self.hovered.as_ref() == Some(&row_action)
+                    || self.hovered.as_ref() == Some(&check_action)
+                    || self.pressed.as_ref() == Some(&row_action)
+                {
+                    paint.fill(cx, band, colors.interaction_highlight);
+                }
+                if !node.is_file() {
+                    let chevron = if self.collapsed.contains(&node.id) {
+                        "chevron-right"
+                    } else {
+                        "chevron-down"
+                    };
+                    paint.icon(cx, chevron, 14.0, colors.muted, dvec2(x0 + 8.0, center_y));
+                }
+                let check_x = x0 + 16.0 + 4.0 + 8.0;
+                let range = &node.files;
+                let check = Check::of(prefix[range.end] - prefix[range.start], range.len());
+                let (glyph, glyph_color) = match check {
+                    Check::Checked => ("square-check", colors.foreground),
+                    Check::Partial => ("square-minus", colors.foreground),
+                    Check::Unchecked => ("square", colors.muted),
                 };
-                paint.icon(cx, chevron, 14.0, colors.muted, dvec2(x0 + 8.0, center_y));
-            }
-            let check_x = x0 + 16.0 + 4.0 + 8.0;
-            let range = &node.files;
-            let check = Check::of(prefix[range.end] - prefix[range.start], range.len());
-            let (glyph, glyph_color) = match check {
-                Check::Checked => ("square-check", colors.foreground),
-                Check::Partial => ("square-minus", colors.foreground),
-                Check::Unchecked => ("square", colors.muted),
-            };
-            paint.icon(cx, glyph, 16.0, glyph_color, dvec2(check_x, center_y));
-            let mut leading = 16.0 + 4.0 + 16.0;
-            let spec = TextSpec::new(Font::Regular, font, colors.foreground);
-            let muted = TextSpec::new(Font::Regular, font, colors.muted);
-            let (title, title_spec, detail, trailing) = match &node.kind {
-                NodeKind::Bucket(bucket) => (
-                    t(match bucket {
-                        Bucket::Changes => "workspace.git.commit.changes",
-                        Bucket::Unversioned => "workspace.git.commit.unversioned",
-                    }),
-                    TextSpec::new(Font::Medium, font, colors.foreground),
-                    file_count(range.len()),
-                    None,
-                ),
-                NodeKind::Dir { label } => {
-                    let open = !self.collapsed.contains(&node.id);
-                    paint.icon(
-                        cx,
-                        if open { "folder-open" } else { "folder" },
-                        15.0,
-                        colors.muted,
-                        dvec2(x0 + leading + 6.0 + 8.0, center_y),
-                    );
-                    leading += 6.0 + 16.0;
-                    (label.clone(), spec, file_count(range.len()), None)
-                }
-                NodeKind::File { index: file } => {
-                    let file = &self.selection.files[*file];
-                    let path = text(file, "path");
-                    let status = file_status(file);
-                    if !paint.file_icon(
-                        cx,
-                        rect(x0 + leading + 6.0, center_y - 8.0, 16.0, 16.0),
-                        file_name(path),
-                    ) {
-                        self.icons_pending = true;
+                paint.icon(cx, glyph, 16.0, glyph_color, dvec2(check_x, center_y));
+                let mut leading = 16.0 + 4.0 + 16.0;
+                let spec = TextSpec::new(Font::Regular, font, colors.foreground);
+                let muted = TextSpec::new(Font::Regular, font, colors.muted);
+                let (title, title_spec, detail, trailing) = match &node.kind {
+                    NodeKind::Bucket(bucket) => (
+                        t(match bucket {
+                            Bucket::Changes => "workspace.git.commit.changes",
+                            Bucket::Unversioned => "workspace.git.commit.unversioned",
+                        }),
+                        TextSpec::new(Font::Medium, font, colors.foreground),
+                        file_count(range.len()),
+                        None,
+                    ),
+                    NodeKind::Dir { label } => {
+                        let open = !self.collapsed.contains(&node.id);
+                        paint.icon(
+                            cx,
+                            if open { "folder-open" } else { "folder" },
+                            15.0,
+                            colors.muted,
+                            dvec2(x0 + leading + 6.0 + 8.0, center_y),
+                        );
+                        leading += 6.0 + 16.0;
+                        (label.clone(), spec, file_count(range.len()), None)
                     }
-                    leading += 6.0 + 16.0;
-                    let detail = rename_hint(file).unwrap_or_else(|| {
-                        if self.group_by_dir {
-                            String::new()
-                        } else {
-                            parent_dir(path).to_owned()
-                        }
-                    });
-                    (
-                        file_name(path).to_owned(),
-                        TextSpec::new(Font::Regular, font, status_color(status)),
-                        detail,
-                        Some(status),
-                    )
+                    NodeKind::File { index: file } => {
+                        let file = &self.selection.files[*file];
+                        let path = text(file, "path");
+                        let status = file_status(file);
+                        leading += 6.0 + 16.0;
+                        let detail = rename_hint(file).unwrap_or_else(|| {
+                            if self.group_by_dir {
+                                String::new()
+                            } else {
+                                parent_dir(path).to_owned()
+                            }
+                        });
+                        (
+                            file_name(path).to_owned(),
+                            TextSpec::new(Font::Regular, font, status_color(status)),
+                            detail,
+                            Some(status),
+                        )
+                    }
+                };
+                // The trailing column keeps clear of the scrollbar gutter whether or
+                // not it shows; names and hints ellipsize before the status letter.
+                let content = rect(
+                    x0,
+                    band.pos.y,
+                    (band.pos.x + band.size.x - SCROLLBAR_GUTTER - x0).max(0.0),
+                    band.size.y,
+                );
+                let trailing_w = if trailing.is_some() { 18.0 } else { 0.0 };
+                let slots = metrics.layout(content, 0.0, leading, trailing_w, 8.0);
+                let drawn = paint
+                    .painter
+                    .text_in(cx, slots.title, title_spec, &title, 0.0);
+                let detail_x = drawn.pos.x + drawn.size.x + 8.0;
+                let detail_w = slots.title.pos.x + slots.title.size.x - detail_x;
+                if !detail.is_empty() && detail_w > 24.0 {
+                    paint.painter.text_in(
+                        cx,
+                        rect(detail_x, slots.title.pos.y, detail_w, slots.title.size.y),
+                        muted,
+                        &detail,
+                        0.0,
+                    );
                 }
-            };
-            // The trailing column keeps clear of the scrollbar gutter whether or
-            // not it shows; names and hints ellipsize before the status letter.
-            let content = rect(
-                x0,
-                band.pos.y,
-                (band.pos.x + band.size.x - SCROLLBAR_GUTTER - x0).max(0.0),
-                band.size.y,
-            );
-            let trailing_w = if trailing.is_some() { 18.0 } else { 0.0 };
-            let slots = metrics.layout(content, 0.0, leading, trailing_w, 8.0);
-            let drawn = paint
-                .painter
-                .text_in(cx, slots.title, title_spec, &title, 0.0);
-            let detail_x = drawn.pos.x + drawn.size.x + 8.0;
-            let detail_w = slots.title.pos.x + slots.title.size.x - detail_x;
-            if !detail.is_empty() && detail_w > 24.0 {
-                paint.painter.text_in(
-                    cx,
-                    rect(detail_x, slots.title.pos.y, detail_w, slots.title.size.y),
-                    muted,
-                    &detail,
-                    0.0,
-                );
+                if let Some(status) = trailing {
+                    paint.painter.text_in(
+                        cx,
+                        slots.trailing,
+                        TextSpec::new(Font::Medium, ui_px(12.0), status_color(status)),
+                        status_letter(status),
+                        0.5,
+                    );
+                }
+                if interactive {
+                    self.hits.push_clipped(band, list, row_action);
+                    let half = if compact { 22.0 } else { 12.0 };
+                    self.hits.push_clipped(
+                        rect(check_x - half, band.pos.y, half * 2.0, band.size.y),
+                        list,
+                        check_action,
+                    );
+                }
+                retained.row.end(cx, &self.hits, paint);
             }
-            if let Some(status) = trailing {
-                paint.painter.text_in(
-                    cx,
-                    slots.trailing,
-                    TextSpec::new(Font::Medium, ui_px(12.0), status_color(status)),
-                    status_letter(status),
-                    0.5,
-                );
-            }
-            if interactive {
-                self.hits.push_clipped(band, list, row_action);
-                let half = if compact { 22.0 } else { 12.0 };
-                self.hits.push_clipped(
-                    rect(check_x - half, band.pos.y, half * 2.0, band.size.y),
-                    list,
-                    check_action,
-                );
+            if let NodeKind::File { index } = &node.kind {
+                let path = text(&self.selection.files[*index], "path");
+                let frame = rect(x0 + 16.0 + 4.0 + 16.0 + 6.0, center_y - 8.0, 16.0, 16.0);
+                let visible = frame.pos.x < list.pos.x + list.size.x
+                    && frame.pos.x + frame.size.x > list.pos.x
+                    && frame.pos.y < list.pos.y + list.size.y
+                    && frame.pos.y + frame.size.y > list.pos.y;
+                let key = inputs((
+                    file_name(path),
+                    self.offset.to_bits(),
+                    list.size.x.to_bits(),
+                    list.size.y.to_bits(),
+                ));
+                if visible && retained.icon.begin(cx, frame, key, &mut self.hits, paint) {
+                    retained.pending = !paint.file_icon(cx, frame, file_name(path));
+                    retained.icon.end(cx, &self.hits, paint);
+                }
+                retained.pending &= visible;
+                self.icons_pending |= retained.pending;
             }
         }
-        if self.max_scroll > 0.0 {
-            let content = self.max_scroll + list.size.y;
-            let thumb_h = (list.size.y * list.size.y / content).max(24.0);
-            let thumb_y = list.pos.y + (list.size.y - thumb_h) * (self.offset / self.max_scroll);
-            paint.rounded(
-                cx,
-                rect(list.pos.x + list.size.x - 5.0, thumb_y, 3.0, thumb_h),
-                with_alpha(colors.muted, 0.35),
-                1.5,
-                None,
-            );
+        if self.begin_part(cx, paint, Part::Scrollbar, list) {
+            if self.max_scroll > 0.0 {
+                let content = self.max_scroll + list.size.y;
+                let thumb_h = (list.size.y * list.size.y / content).max(24.0);
+                let thumb_y =
+                    list.pos.y + (list.size.y - thumb_h) * (self.offset / self.max_scroll);
+                paint.rounded(
+                    cx,
+                    rect(list.pos.x + list.size.x - 5.0, thumb_y, 3.0, thumb_h),
+                    with_alpha(colors.muted, 0.35),
+                    1.5,
+                    None,
+                );
+            }
+            self.end_part(cx, paint, Part::Scrollbar);
         }
         paint.end_clip(cx);
     }
@@ -1666,23 +2081,25 @@ impl CommitView {
         compact: bool,
     ) {
         let colors = palette();
-        // Divider; desktop drags it to resize the tree/message split.
-        let dragging = self.drag.is_some();
-        if !compact && (dragging || self.hovered == Some(Action::Splitter)) {
-            let line = rect(form.pos.x, form.pos.y - 1.0, form.size.x, 2.0);
-            paint.fill(cx, line, colors.border_accent);
-        } else {
-            paint.fill(
-                cx,
-                rect(form.pos.x, form.pos.y, form.size.x, 1.0),
-                colors.border,
-            );
-        }
-        if !compact {
-            self.hits.push(
-                rect(form.pos.x, form.pos.y - 3.0, form.size.x, 7.0),
-                Action::Splitter,
-            );
+        let splitter = rect(form.pos.x, form.pos.y - 3.0, form.size.x, 7.0);
+        if self.begin_part(cx, paint, Part::Splitter, splitter) {
+            if !compact && (self.drag.is_some() || self.hovered == Some(Action::Splitter)) {
+                paint.fill(
+                    cx,
+                    rect(form.pos.x, form.pos.y - 1.0, form.size.x, 2.0),
+                    colors.border_accent,
+                );
+            } else {
+                paint.fill(
+                    cx,
+                    rect(form.pos.x, form.pos.y, form.size.x, 1.0),
+                    colors.border,
+                );
+            }
+            if !compact {
+                self.hits.push(splitter, Action::Splitter);
+            }
+            self.end_part(cx, paint, Part::Splitter);
         }
         let pad = 12.0;
         let left = form.pos.x + pad;
@@ -1691,11 +2108,7 @@ impl CommitView {
         let banner_h = self.banner_height(compact);
         if banner_h > 0.0 {
             let banner = rect(left, y, width, banner_h - 8.0);
-            paint.rounded(cx, banner, with_alpha(colors.danger, 0.12), 6.0, None);
-            self.hits.push(banner, Action::Failure);
             let center_y = banner.pos.y + banner.size.y / 2.0;
-            let icon_at = dvec2(banner.pos.x + 16.0, center_y);
-            paint.icon(cx, "circle-alert", 14.0, colors.danger, icon_at);
             let label = t("workspace.git.commit.refresh");
             let button_h = button_height(ButtonSize::Xs, compact);
             let button_w = measure_button(cx, paint, &label, false, ButtonSize::Xs, compact);
@@ -1705,57 +2118,72 @@ impl CommitView {
                 button_w,
                 button_h,
             );
-            button(
-                cx,
-                paint,
-                frame,
-                &label,
-                None,
-                ButtonVariant::Secondary,
-                ButtonSize::Xs,
-                compact,
-                true,
-                self.hovered == Some(Action::Refresh),
-            );
-            let hit = if compact {
-                rect(frame.pos.x, banner.pos.y, frame.size.x, banner.size.y)
-            } else {
-                frame
-            };
-            self.hits.push(hit, Action::Refresh);
-            let copy = if self.uncertain {
-                t("workspace.git.commit.commitUncertain")
-            } else {
-                t("workspace.git.commit.commitFailed")
-            };
-            let text_x = banner.pos.x + 30.0;
-            let text_w = (frame.pos.x - 8.0 - text_x).max(0.0);
-            let drawn = paint.text_centered(
-                cx,
-                Font::Medium,
-                ui_px(13.0),
-                colors.danger,
-                text_x,
-                banner.pos.y,
-                banner.size.y,
-                &copy,
-                text_w,
-            );
-            if let Some(error) = self.commit_failure.as_deref()
-                && !self.uncertain
-                && text_w - drawn > 32.0
-            {
-                paint.text_centered(
+            if self.begin_part(cx, paint, Part::Banner, banner) {
+                paint.rounded(cx, banner, with_alpha(colors.danger, 0.12), 6.0, None);
+                self.hits.push(banner, Action::Failure);
+                paint.icon(
                     cx,
-                    Font::Regular,
+                    "circle-alert",
+                    14.0,
+                    colors.danger,
+                    dvec2(banner.pos.x + 16.0, center_y),
+                );
+                let copy = if self.uncertain {
+                    t("workspace.git.commit.commitUncertain")
+                } else {
+                    t("workspace.git.commit.commitFailed")
+                };
+                let text_x = banner.pos.x + 30.0;
+                let text_w = (frame.pos.x - 8.0 - text_x).max(0.0);
+                let drawn = paint.text_centered(
+                    cx,
+                    Font::Medium,
                     ui_px(13.0),
-                    colors.muted,
-                    text_x + drawn + 8.0,
+                    colors.danger,
+                    text_x,
                     banner.pos.y,
                     banner.size.y,
-                    error,
-                    text_w - drawn - 8.0,
+                    &copy,
+                    text_w,
                 );
+                if let Some(error) = self.commit_failure.as_deref()
+                    && !self.uncertain
+                    && text_w - drawn > 32.0
+                {
+                    paint.text_centered(
+                        cx,
+                        Font::Regular,
+                        ui_px(13.0),
+                        colors.muted,
+                        text_x + drawn + 8.0,
+                        banner.pos.y,
+                        banner.size.y,
+                        error,
+                        text_w - drawn - 8.0,
+                    );
+                }
+                self.end_part(cx, paint, Part::Banner);
+            }
+            if self.begin_part(cx, paint, Part::BannerAction, frame) {
+                button(
+                    cx,
+                    paint,
+                    frame,
+                    &label,
+                    None,
+                    ButtonVariant::Secondary,
+                    ButtonSize::Xs,
+                    compact,
+                    true,
+                    self.hovered == Some(Action::Refresh),
+                );
+                let hit = if compact {
+                    rect(frame.pos.x, banner.pos.y, frame.size.x, banner.size.y)
+                } else {
+                    frame
+                };
+                self.hits.push(hit, Action::Refresh);
+                self.end_part(cx, paint, Part::BannerAction);
             }
             y += banner_h;
         }
@@ -1777,74 +2205,78 @@ impl CommitView {
         } else {
             (String::new(), colors.muted)
         };
-        // The row fits both labels' measured heights (Hangul fallback fonts run
-        // taller than "Ag"), so the editor below never covers them.
+        // Fit the fallback-font heights before positioning the editor.
         let label_h = Self::line(cx, paint, label_px)
             .max(paint.measure(cx, Font::Medium, label_px, &label).y)
             .max(paint.measure(cx, Font::Regular, label_px, &hint).y);
-        let label_w = paint.text_centered(
-            cx,
-            Font::Medium,
-            label_px,
-            colors.muted,
-            left,
-            y,
-            label_h,
-            &label,
-            width * 0.5,
-        );
-        let hint_x = left + label_w + 12.0;
-        if !hint.is_empty() && left + width - hint_x > 24.0 {
-            // Right-aligned and ellipsized within the space beside the label.
-            paint.painter.text_in(
+        if self.begin_part(cx, paint, Part::Hint, rect(left, y, width, label_h)) {
+            let label_w = paint.text_centered(
                 cx,
-                rect(hint_x, y, left + width - hint_x, label_h),
-                TextSpec::new(Font::Regular, label_px, hint_color),
-                &hint,
-                1.0,
+                Font::Medium,
+                label_px,
+                colors.muted,
+                left,
+                y,
+                label_h,
+                &label,
+                width * 0.5,
             );
+            let hint_x = left + label_w + 12.0;
+            if !hint.is_empty() && left + width - hint_x > 24.0 {
+                paint.painter.text_in(
+                    cx,
+                    rect(hint_x, y, left + width - hint_x, label_h),
+                    TextSpec::new(Font::Regular, label_px, hint_color),
+                    &hint,
+                    1.0,
+                );
+            }
+            self.end_part(cx, paint, Part::Hint);
         }
         y += label_h + 6.0;
         let button_h = Self::commit_button_height(compact);
         let action_y = form.pos.y + form.size.y - 12.0 - button_h;
         let line = Self::line(cx, paint, ui_px(13.0));
         let input_frame = rect(left, y, width, (action_y - 10.0 - y).max(line + 12.0));
-        let focused = cx.has_key_focus(input.area());
-        paint.rounded(
-            cx,
-            input_frame,
-            colors.surface1,
-            6.0,
-            Some((
-                if focused {
-                    colors.border_accent
-                } else {
-                    colors.border
-                },
-                1.0,
-            )),
-        );
-        if !self.input_initialized || std::mem::take(&mut self.clear_input) {
-            input.set_text(cx, &self.message);
-            input.set_is_multiline(cx, true);
-            self.input_initialized = true;
+        self.editor_focused = cx.has_key_focus(input.area());
+        if self.begin_part(cx, paint, Part::Editor, input_frame) {
+            paint.rounded(
+                cx,
+                input_frame,
+                colors.surface1,
+                6.0,
+                Some((
+                    if self.editor_focused {
+                        colors.border_accent
+                    } else {
+                        colors.border
+                    },
+                    1.0,
+                )),
+            );
+            if !self.input_initialized || std::mem::take(&mut self.clear_input) {
+                input.set_text(cx, &self.message);
+                input.set_is_multiline(cx, true);
+                self.input_initialized = true;
+            }
+            let font_size = crate::theme::Typography::pt(ui_px(13.0));
+            let foreground = colors.foreground;
+            let muted = colors.muted;
+            input.apply_over(cx, live! { draw_text: { color: (foreground), color_empty: (muted), text_style: { font_size: (font_size) } } draw_cursor: { color: (foreground) } });
+            input.set_empty_text(cx, t("workspace.git.commit.messagePlaceholder"));
+            input.set_is_read_only(cx, self.commit.is_some());
+            let _ = input.draw_walk(
+                cx,
+                &mut Scope::empty(),
+                Walk::abs_rect(rect(
+                    input_frame.pos.x + 8.0,
+                    input_frame.pos.y + 6.0,
+                    (input_frame.size.x - 16.0).max(1.0),
+                    (input_frame.size.y - 12.0).max(1.0),
+                )),
+            );
+            self.end_part(cx, paint, Part::Editor);
         }
-        let font_size = crate::theme::Typography::pt(ui_px(13.0));
-        let foreground = colors.foreground;
-        let muted = colors.muted;
-        input.apply_over(cx, live! { draw_text: { color: (foreground), color_empty: (muted), text_style: { font_size: (font_size) } } draw_cursor: { color: (foreground) } });
-        input.set_empty_text(cx, t("workspace.git.commit.messagePlaceholder"));
-        input.set_is_read_only(cx, self.commit.is_some());
-        let _ = input.draw_walk(
-            cx,
-            &mut Scope::empty(),
-            Walk::abs_rect(rect(
-                input_frame.pos.x + 8.0,
-                input_frame.pos.y + 6.0,
-                (input_frame.size.x - 16.0).max(1.0),
-                (input_frame.size.y - 12.0).max(1.0),
-            )),
-        );
         let count = self.selection.selected.len();
         let label = if self.commit.is_some() {
             t("workspace.git.commit.committing")
@@ -1862,18 +2294,21 @@ impl CommitView {
             measure_primary(cx, paint, &label).max(120.0).min(width)
         };
         let commit_button = rect(left, action_y, button_w, button_h);
-        primary_button(
-            cx,
-            paint,
-            commit_button,
-            &label,
-            "git-commit-horizontal",
-            enabled,
-            self.hovered == Some(Action::Commit),
-            self.pressed == Some(Action::Commit),
-        );
-        if enabled {
-            self.hits.push(commit_button, Action::Commit);
+        if self.begin_part(cx, paint, Part::Submit, commit_button) {
+            primary_button(
+                cx,
+                paint,
+                commit_button,
+                &label,
+                "git-commit-horizontal",
+                enabled,
+                self.hovered == Some(Action::Commit),
+                self.pressed == Some(Action::Commit),
+            );
+            if enabled {
+                self.hits.push(commit_button, Action::Commit);
+            }
+            self.end_part(cx, paint, Part::Submit);
         }
     }
 }
@@ -2115,7 +2550,8 @@ mod tests {
             selected.iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["README.md"]
         );
-        let prefix = tree.selected_prefix(&files, &selected);
+        let mut prefix = Vec::new();
+        tree.selected_prefix(&files, &selected, &mut prefix);
         let root = &tree.nodes[0].files;
         assert_eq!(prefix[root.end] - prefix[root.start], 1);
     }

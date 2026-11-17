@@ -12,7 +12,7 @@ use super::chrome::{
 };
 use super::json::text;
 use super::model::{TreeRow, changed_tree_rows};
-use super::paint::{Font, GitPaint, Hits, rect, with_alpha};
+use super::paint::{Font, GitPaint, Hits, Retained, rect, with_alpha};
 use super::text::t;
 use crate::common::UiContext;
 use crate::common::overlay as shared;
@@ -264,6 +264,9 @@ pub struct OverlayHost<P> {
     window_modal: Option<shared::WindowModal>,
     /// The sheet changed visibly during event handling; the owner redraws its pane.
     changed: bool,
+    presentation: Retained<SheetHit>,
+    revision: u64,
+    icons_pending: bool,
 }
 
 impl<P> Default for OverlayHost<P> {
@@ -288,6 +291,9 @@ impl<P> Default for OverlayHost<P> {
             locked: Area::Empty,
             window_modal: None,
             changed: false,
+            presentation: Retained::default(),
+            revision: 0,
+            icons_pending: false,
         }
     }
 }
@@ -305,7 +311,15 @@ impl<P> OverlayHost<P> {
 
     /// Whether the sheet changed visibly since the last call (the owner redraws).
     pub fn take_changed(&mut self) -> bool {
-        std::mem::take(&mut self.changed)
+        let changed = std::mem::take(&mut self.changed);
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        changed
+    }
+
+    pub fn invalidate(&self, cx: &mut Cx) {
+        self.presentation.invalidate(cx);
     }
 
     /// What the open overlay was opened for.
@@ -445,6 +459,7 @@ impl<P> OverlayHost<P> {
         };
         self.sheet = Some(Sheet { purpose, kind });
         self.changed = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Sends a queued shared overlay to the shell under this host's owner.
@@ -673,14 +688,27 @@ impl<P> OverlayHost<P> {
         input: &mut TextInput,
         compact: bool,
     ) -> bool {
-        let Some(sheet) = &self.sheet else {
-            return false;
-        };
         self.hits.clear();
         list.begin_overlay_reuse(cx);
+        let Some(sheet) = &self.sheet else {
+            list.end(cx);
+            return false;
+        };
         let window = cx.current_pass_size();
         // Pass-sized: a parent turtle's alignment (shell header) never shifts the overlay.
         cx.begin_sized_turtle(window, Layout::default());
+        let key = crate::common::layer::inputs((self.revision, compact, crate::theme::epoch()));
+        if !self.presentation.begin(
+            cx,
+            rect(0.0, 0.0, window.x, window.y),
+            key,
+            &mut self.hits,
+            paint,
+        ) {
+            cx.end_pass_sized_turtle();
+            list.end(cx);
+            return self.icons_pending;
+        }
         let scrim = if compact {
             SHEET_BARRIER
         } else {
@@ -709,6 +737,8 @@ impl<P> OverlayHost<P> {
             }
             SheetKind::Tree { .. } => self.draw_tree(cx, paint, window, compact),
         };
+        self.icons_pending = icons_pending;
+        self.presentation.end(cx, &self.hits, paint);
         cx.end_pass_sized_turtle();
         list.end(cx);
         icons_pending

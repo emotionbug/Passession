@@ -15,6 +15,9 @@ use super::snapshot::render_terminal_snapshot;
 use crate::features::workspace::observe::{ObsEvent, Observation};
 use crate::features::workspace::rpc::{int_of, payload, str_of};
 
+/// One-shot grace period; hidden streams never need a polling timer.
+pub const HIDDEN_SCREEN_GRACE_SECONDS: f64 = 60.0;
+
 /// Failure copy of one stream owner (logs say "execution", terminals "terminal").
 pub struct StreamText {
     pub restore_failed: fn() -> String,
@@ -41,6 +44,8 @@ pub struct Stream {
     /// A slot was acknowledged or a snapshot replaced the screen since the last
     /// [`Stream::take_attached`].
     attached: bool,
+    /// Last visible plain rows, used only if the daemon removed the terminal while hidden.
+    replay: Option<Box<str>>,
     text: &'static StreamText,
 }
 
@@ -65,6 +70,7 @@ impl Stream {
             observation: None,
             output_pending: false,
             attached: false,
+            replay: None,
             text,
         })
     }
@@ -117,6 +123,20 @@ impl Stream {
         }
     }
 
+    /// Running streams always replace their emulator from the daemon snapshot on reattach,
+    /// so retaining their hidden screen cannot preserve any additional history.
+    /// Exited streams do not reattach, and the daemon may already have removed their PTY;
+    /// their screen remains the only copy of the output.
+    pub fn evict_hidden_screen(&mut self) -> bool {
+        if self.visible || self.exited || !self.screen.is_retained() {
+            return false;
+        }
+        self.output_pending = false;
+        self.attached = false;
+        self.replay = Some(self.screen.release());
+        true
+    }
+
     pub fn attach(&mut self, core: &CoreHandle, host_connected: bool) {
         if !self.visible
             || self.exited
@@ -155,8 +175,28 @@ impl Stream {
     }
 
     fn fail(&mut self, message: String) {
-        self.error = Some(message);
         self.attaching = false;
+        // Normal shells are removed on exit, including while this view is unobserved.
+        // Preserve their last output under the error row without retaining Ghostty while hidden.
+        if message == "Terminal not found"
+            && !self.screen.is_retained()
+            && let Some(replay) = self.replay.as_deref()
+        {
+            let size = (self.screen.rows(), self.screen.cols());
+            match self.screen.replace(replay, Some(size), None) {
+                Ok(()) => {
+                    self.replay = None;
+                    self.attached = true;
+                    self.slot = None;
+                    self.subscription_id = None;
+                }
+                Err(error) => {
+                    self.error = Some(format!("{message}: {error}"));
+                    return;
+                }
+            }
+        }
+        self.error = Some(message);
     }
 
     /// Connection changes for this host (`_connectionChanged`). Returns true when the view
@@ -344,7 +384,10 @@ impl Stream {
     pub(crate) fn replace(&mut self, text: &str, size: Option<(u16, u16)>, title: Option<&str>) {
         self.output_pending = false;
         match self.screen.replace(text, size, title) {
-            Ok(()) => self.attached = true,
+            Ok(()) => {
+                self.replay = None;
+                self.attached = true;
+            }
             Err(error) => self.fail(error.to_string()),
         }
     }
@@ -469,6 +512,54 @@ mod tests {
         stream.publish();
         assert_eq!(stream.read(0, 1)[0].text, "hi!");
         assert!(!stream.frame(&json!({"slot": 4, "opcode": "output", "text": "x"})));
+    }
+
+    #[test]
+    fn hidden_running_screen_is_rebuilt_but_exited_output_is_kept() {
+        let mut stream = stream();
+        stream.replace("old\r\noutput", Some((2, 20)), Some("shell"));
+        stream.read(0, 2);
+        assert!(!stream.evict_hidden_screen());
+        stream.visible = false;
+        stream.release();
+        assert!(stream.evict_hidden_screen());
+        assert!(!stream.screen.is_retained());
+        assert!(!stream.screen.has_dimensions());
+        assert_eq!(stream.line_count(), 2);
+        assert_eq!((stream.screen.rows(), stream.screen.cols()), (2, 20));
+        assert!(stream.rendered_text().is_empty());
+        assert!(stream.replay.is_some());
+        stream.set_visible_for_test();
+        stream.fail("unrelated observation error".into());
+        assert!(!stream.screen.is_retained());
+        stream.fail("Terminal not found".into());
+        assert_eq!(stream.rendered_text(), "old\noutput");
+        assert_eq!(stream.error.as_deref(), Some("Terminal not found"));
+        stream.visible = false;
+        assert!(stream.evict_hidden_screen());
+        let revision = stream.revision();
+        stream.set_visible_for_test();
+        stream.acknowledge(&json!({"terminalId": "t", "slot": 3}));
+        assert!(stream.frame(&json!({
+            "slot": 3, "opcode": "snapshot",
+            "snapshot": {
+                "rows": 2, "cols": 20,
+                "scrollback": [[{"char": "history"}]],
+                "grid": [[{"char": "restored"}], []],
+                "cursor": {"row": 0, "col": 8}, "title": "shell"
+            }
+        })));
+        assert!(stream.screen.is_retained());
+        assert!(stream.replay.is_none());
+        assert!(stream.revision() > revision);
+        assert_eq!(stream.rendered_text(), "history\nrestored");
+        assert!(stream.frame(&json!({"slot": 3, "opcode": "restore", "text": "\x1b[?2004h"})));
+        assert!(stream.screen.modes().bracketed_paste);
+        stream.replace("finished", Some((2, 20)), None);
+        stream.exited = true;
+        stream.visible = false;
+        assert!(!stream.evict_hidden_screen());
+        assert_eq!(stream.rendered_text(), "finished");
     }
 
     #[test]

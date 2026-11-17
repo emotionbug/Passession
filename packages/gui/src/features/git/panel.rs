@@ -28,6 +28,24 @@ impl View {
             View::Commit(view) => view.dispose(store),
         }
     }
+
+    fn animate(&mut self, cx: &mut Cx) {
+        match self {
+            View::Changes(view) => view.animate(cx),
+            View::Pr(view) => view.animate(cx),
+            View::Log(view) => view.animate(cx),
+            View::Commit(_) => {}
+        }
+    }
+
+    fn invalidate_media(&mut self, cx: &mut Cx) {
+        match self {
+            View::Changes(view) => view.invalidate_media(cx),
+            View::Pr(view) => view.invalidate_media(cx),
+            View::Log(view) => view.invalidate_media(cx),
+            View::Commit(view) => view.invalidate_media(cx),
+        }
+    }
 }
 
 #[derive(Live, LiveHook, Widget)]
@@ -132,8 +150,11 @@ impl Widget for GitPanel {
         };
         with_store(|store| store.begin_event(cx, event, ui));
         self.ensure_view(cx, ui);
-        if self.next_frame.is_event(event).is_some() {
-            self.redraw(cx);
+        if self.visible && self.next_frame.is_event(event).is_some() {
+            self.paint.animate(cx);
+            if let Some(view) = &mut self.view {
+                view.animate(cx);
+            }
         }
         // Decoded file icons and avatar images bump their caches' revisions
         // (on Signal, possibly after this widget saw it), so compare on every event.
@@ -141,7 +162,7 @@ impl Widget for GitPanel {
             crate::features::files::revision(),
             crate::features::timeline::images::version(),
         );
-        if revision != self.media_revision {
+        if self.visible && revision != self.media_revision {
             self.media_revision = revision;
             let pending = match &self.view {
                 Some(View::Changes(changes)) => changes.icons_pending,
@@ -150,8 +171,8 @@ impl Widget for GitPanel {
                 Some(View::Commit(commit)) => commit.icons_pending,
                 None => false,
             };
-            if pending {
-                self.redraw(cx);
+            if pending && let Some(view) = &mut self.view {
+                view.invalidate_media(cx);
             }
         }
         let compact = is_compact_layout(cx);
@@ -176,19 +197,26 @@ impl Widget for GitPanel {
             bg: overlay_bg,
             input,
         };
-        let redraw = with_store(|store| match view {
+        with_store(|store| match view {
             View::Changes(changes) => {
                 let mut redraw = process && changes.process(cx, ui, store, visible);
                 let (consumed, changed) =
                     changes.handle_overlay(cx, event, ui, &mut parts, store, compact);
                 redraw |= changed;
+                if changed && visible {
+                    parts.list.redraw(cx);
+                }
                 if !consumed && visible {
                     redraw |=
                         changes.handle_pointer(cx, event, area, ui, &mut parts, store, compact);
                 }
                 // Menus, confirmations and selects opened above go to the shell.
-                changes.flush_overlay(ui);
-                redraw
+                if changes.flush_overlay(ui) && visible {
+                    parts.list.redraw(cx);
+                }
+                if redraw && visible {
+                    changes.invalidate(cx, ui, compact);
+                }
             }
             View::Pr(pr) => {
                 let mut redraw = process && pr.process(cx, event, ui, store, visible);
@@ -196,7 +224,9 @@ impl Widget for GitPanel {
                 if visible {
                     redraw |= pr.handle_pointer(cx, event, area, ui, store);
                 }
-                redraw
+                if redraw && visible {
+                    pr.invalidate(cx);
+                }
             }
             View::Log(log) => {
                 let mut inputs = LogInputs {
@@ -211,7 +241,9 @@ impl Widget for GitPanel {
                 }
                 // Menus and selects opened above go to the shell.
                 log.flush_overlay(ui);
-                redraw
+                if redraw && visible {
+                    log.invalidate(cx);
+                }
             }
             View::Commit(commit) => {
                 let mut redraw = process && commit.process(cx, ui, store, visible);
@@ -219,13 +251,11 @@ impl Widget for GitPanel {
                     redraw |= commit.handle_input(cx, event, commit_input);
                     redraw |= commit.handle_pointer(cx, event, area, ui);
                 }
-                redraw
+                if redraw && visible {
+                    commit.invalidate(cx);
+                }
             }
         });
-        // Processing a timer/signal is not itself a visual change.
-        if redraw {
-            self.redraw(cx);
-        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -255,6 +285,7 @@ impl Widget for GitPanel {
             bg: overlay_bg,
             input,
         };
+        paint.begin_frame();
         paint.begin_clip(cx, rect);
         let spinning = with_store(|store| match view {
             View::Changes(changes) => {
@@ -279,8 +310,9 @@ impl Widget for GitPanel {
             }
         });
         paint.end_clip(cx);
+        paint.end_frame(cx);
         // Spinners animate only while something is pending and the tab is drawn.
-        if spinning {
+        if spinning && self.visible {
             self.next_frame = cx.new_next_frame();
         }
         DrawStep::done()
@@ -348,6 +380,18 @@ impl GitPanelRef {
                     Some(View::Log(log)) => log.close_overlay(cx),
                     Some(View::Commit(_)) => {}
                     None => {}
+                }
+            }
+            if visible {
+                let revision = (
+                    crate::features::files::revision(),
+                    crate::features::timeline::images::version(),
+                );
+                if revision != inner.media_revision {
+                    inner.media_revision = revision;
+                    if let Some(view) = &mut inner.view {
+                        view.invalidate_media(cx);
+                    }
                 }
             }
             inner.redraw(cx);

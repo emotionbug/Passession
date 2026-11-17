@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 
 use makepad_widgets::*;
 
-use super::draw::{Draws, Font, Icon};
+use super::draw::{Draws, Font, Icon, PaintInput};
 use super::field::{FieldHost, FieldSpec, Layer};
 use super::theme::{Palette, alpha};
 use crate::features::settings::rpc::{Handler, handler};
@@ -432,26 +432,48 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
 
     // ---------------------------------------------------------------- primitives
 
-    pub fn rect(&mut self, r: Rect, fill: Vec4, border: Option<Vec4>, radius: f64) -> Area {
-        let d = &mut self.d.rect;
-        match border {
-            Some(border) => d.paint_bordered(self.cx, r, fill, border, 1.0, radius),
-            None => d.paint(self.cx, r, fill, radius),
+    fn paint_input<'s>(&self, kind: u8, rect: Rect, color: Vec4) -> PaintInput<'s> {
+        PaintInput {
+            kind,
+            rect,
+            clip: self.clip,
+            epoch: crate::theme::epoch(),
+            args: [0.0; 4],
+            color,
+            border: None,
+            text: "".into(),
+            extra: "".into(),
         }
-        d.draw_vars.area
+    }
+
+    pub fn rect(&mut self, r: Rect, fill: Vec4, border: Option<Vec4>, radius: f64) -> Area {
+        let mut input = self.paint_input(0, r, fill);
+        input.border = border;
+        input.args[0] = radius;
+        let Draws {
+            rect: d, retained, ..
+        } = self.d;
+        retained
+            .paint(self.cx, self.depth, input, |cx| {
+                match border {
+                    Some(border) => d.paint_bordered(cx, r, fill, border, 1.0, radius),
+                    None => d.paint(cx, r, fill, radius),
+                }
+                (d.draw_vars.area, r.size)
+            })
+            .0
     }
 
     /// Top corners rounded, bottom square (compact bottom sheets): a rounded
     /// box plus a square box over its lower part. Only for opaque fills.
     pub fn rect_top(&mut self, r: Rect, fill: Vec4, radius: f64) {
-        let d = &mut self.d.rect;
-        d.paint(self.cx, r, fill, radius);
+        self.rect(r, fill, None, radius);
         if radius > 0.0 && r.size.y > radius {
             let lower = Rect {
                 pos: dvec2(r.pos.x, r.pos.y + radius),
                 size: dvec2(r.size.x, r.size.y - radius),
             };
-            d.paint(self.cx, lower, fill, 0.0);
+            self.rect(lower, fill, None, 0.0);
         }
     }
 
@@ -474,14 +496,28 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
             pos,
             size: dvec2(size, size),
         };
+        let mut input = self.paint_input(1, rect, color);
+        input.text = icon.name().into();
+        input.args[0] = size;
         if icon == Icon::Spinner {
-            // Flutter `SettingsSpinner`: indeterminate CircularProgressIndicator, 1.5px stroke.
             let (start, sweep) = spinner_arc(spinner_clock());
-            self.d.painter.ring(self.cx, rect, color, 1.5, sweep, start);
+            input.args[1] = start;
+            input.args[2] = sweep;
+            input.args[3] = 1.0;
             self.animating = true;
-            return;
         }
-        self.d.painter.icon(self.cx, rect, icon.name(), size, color);
+        let (start, sweep) = (input.args[1], input.args[2]);
+        let Draws {
+            painter, retained, ..
+        } = self.d;
+        retained.paint(self.cx, self.depth, input, |cx| {
+            if icon == Icon::Spinner {
+                painter.ring(cx, rect, color, 1.5, sweep, start);
+            } else {
+                painter.icon(cx, rect, icon.name(), size, color);
+            }
+            (Area::Empty, rect.size)
+        });
     }
 
     /// Provider glyph (built-in, host snapshot SVG, vendored catalog, else Bot).
@@ -497,15 +533,27 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
             pos,
             size: dvec2(size, size),
         };
-        crate::common::provider_icon::ProviderIcon::paint(
-            &mut self.d.painter,
-            &mut self.d.provider_icon,
-            self.cx,
-            rect,
-            provider,
-            snapshot_svg,
-            color,
-        );
+        let mut input = self.paint_input(2, rect, color);
+        input.text = provider.into();
+        input.extra = snapshot_svg.unwrap_or("").into();
+        let Draws {
+            painter,
+            provider_icon,
+            retained,
+            ..
+        } = self.d;
+        retained.paint(self.cx, self.depth, input, |cx| {
+            crate::common::provider_icon::ProviderIcon::paint(
+                painter,
+                provider_icon,
+                cx,
+                rect,
+                provider,
+                snapshot_svg,
+                color,
+            );
+            (Area::Empty, rect.size)
+        });
     }
 
     /// Measures `text` wrapped at `max_w` (unwrapped when `None`).
@@ -551,28 +599,48 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
             return self.measure(font, size, text, max_w);
         }
         let measured = self.measure(font, size, text, max_w);
-        let cx: &mut Cx = &mut *self.cx;
+        let mut input = self.paint_input(
+            3,
+            Rect {
+                pos,
+                size: measured,
+            },
+            color,
+        );
+        input.text = text.into();
+        input.args = [size, font as u8 as f64, max_w.unwrap_or(-1.0), 0.0];
+        let font_size = (self.typography.ui_size(size) * 0.75) as f32;
+        let Draws {
+            text: regular,
+            medium,
+            code,
+            retained,
+            ..
+        } = self.d;
         let d = match font {
-            Font::Regular => &mut self.d.text,
-            Font::Medium => &mut self.d.medium,
-            Font::Code => &mut self.d.code,
+            Font::Regular => regular,
+            Font::Medium => medium,
+            Font::Code => code,
         };
-        d.text_style.font_size = (self.typography.ui_size(size) * 0.75) as f32;
-        d.color = color;
-        let laid = d.layout(
-            cx,
-            0.0,
-            0.0,
-            max_w.map(|w| w.max(1.0) as f32),
-            max_w.is_some(),
-            Align::default(),
-            text,
-        );
-        d.draw_walk_laidout(
-            self.cx,
-            Walk::fixed(measured.x.max(1.0), measured.y.max(1.0)).with_abs_pos(pos),
-            &laid,
-        );
+        retained.paint(self.cx, self.depth, input, |cx| {
+            d.text_style.font_size = font_size;
+            d.color = color;
+            let laid = d.layout(
+                cx,
+                0.0,
+                0.0,
+                max_w.map(|w| w.max(1.0) as f32),
+                max_w.is_some(),
+                Align::default(),
+                text,
+            );
+            d.draw_walk_laidout(
+                cx,
+                Walk::fixed(measured.x.max(1.0), measured.y.max(1.0)).with_abs_pos(pos),
+                &laid,
+            );
+            (Area::Empty, measured)
+        });
         measured
     }
 
@@ -607,6 +675,7 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
                 pos,
                 size: dvec2(measured.x + 1.0, measured.y),
             },
+            self.clip,
         );
         measured
     }
@@ -1342,8 +1411,14 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
             Ctl::Field { spec, .. } => {
                 let pal = self.pal;
                 let layer = self.layer;
-                self.fields
-                    .draw(self.cx, &pal, (layer, self.depth), spec, Rect { pos, size });
+                self.fields.draw(
+                    self.cx,
+                    &pal,
+                    (layer, self.depth),
+                    spec,
+                    Rect { pos, size },
+                    self.clip,
+                );
             }
             Ctl::Gap(_) => {}
             Ctl::Row(items, gap) => {
@@ -1451,13 +1526,13 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
     pub fn card_end(&mut self) {
         if let Some(card) = self.card.take() {
             let h = (self.y - card.y).max(2.0);
-            card.area.set_rect(
-                self.cx,
-                &Rect {
-                    pos: dvec2(card.x, card.y),
-                    size: dvec2(card.w, h),
-                },
-            );
+            let rect = Rect {
+                pos: dvec2(card.x, card.y),
+                size: dvec2(card.w, h),
+            };
+            if card.area.rect(self.cx) != rect {
+                card.area.set_rect(self.cx, &rect);
+            }
         }
     }
 

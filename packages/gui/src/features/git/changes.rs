@@ -9,7 +9,7 @@ use super::model::{ChangeKind, absolute_path, change_kind, now_ms};
 use super::overlay::{
     MenuEntry, MenuItem, Overlay, OverlayHost, OverlayKind, OverlayResult, SheetRequest,
 };
-use super::paint::{Font, GitPaint, Hits, rect};
+use super::paint::{Font, GitPaint, Hits, Retained, rect};
 use super::store::GitStore;
 use super::text::t;
 use crate::common::overlay::tooltip_at;
@@ -34,7 +34,7 @@ enum Purpose {
     Jump,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 enum Hit {
     Refresh,
     ShowInLog,
@@ -60,6 +60,13 @@ pub struct ChangesView {
     pub icons_pending: bool,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     horizontal_scroll: makepad_widgets::scroll_bars::TouchScroll,
+    background: Retained<Hit>,
+    toolbar: Retained<Hit>,
+    banner: Retained<Hit>,
+    body: Retained<Hit>,
+    body_spinning: bool,
+    content_revision: u64,
+    layout_revision: u64,
 }
 
 fn preferences(ui: &UiContext) -> Map<String, Value> {
@@ -99,6 +106,13 @@ impl ChangesView {
             icons_pending: false,
             touch_scroll: Default::default(),
             horizontal_scroll: Default::default(),
+            background: Retained::default(),
+            toolbar: Retained::default(),
+            banner: Retained::default(),
+            body: Retained::default(),
+            body_spinning: false,
+            content_revision: 0,
+            layout_revision: 0,
         }
     }
 
@@ -155,6 +169,9 @@ impl ChangesView {
             dirty = true;
         }
         dirty |= self.controller.process(ui, store);
+        if dirty {
+            self.content_revision = self.content_revision.wrapping_add(1);
+        }
         dirty
     }
 
@@ -163,8 +180,77 @@ impl ChangesView {
     }
 
     /// Sends a menu / confirm / select opened during this event to the shell.
-    pub fn flush_overlay(&mut self, ui: &mut UiContext) {
+    pub fn flush_overlay(&mut self, ui: &mut UiContext) -> bool {
         self.overlay.flush(ui);
+        self.overlay.take_changed()
+    }
+
+    fn toolbar_key(&self, ui: &UiContext, compact: bool) -> u64 {
+        let prefs = host::preference(ui, "changesPreferences");
+        let hovered = self
+            .hovered
+            .as_ref()
+            .filter(|hit| !matches!(hit, Hit::Doc(_)));
+        crate::common::layer::inputs((
+            &self.target.title,
+            &self.controller.subject,
+            self.controller.files.len(),
+            self.all_files_collapsed(),
+            Self::can_split(compact) && prefs["layout"].as_str() == Some("split"),
+            prefs["wrapLines"].as_bool() == Some(true),
+            hovered,
+            host::supports(ui, self.host(), super::log::FEATURE),
+            compact,
+        ))
+    }
+
+    fn body_key(&self, ui: &UiContext, compact: bool) -> u64 {
+        let prefs = host::preference(ui, "changesPreferences");
+        let syntax = host::preference(ui, "syntaxTheme")
+            .as_str()
+            .unwrap_or("one");
+        crate::common::layer::inputs((
+            self.content_revision,
+            self.layout_revision,
+            self.doc.presentation_key(),
+            Self::can_split(compact) && prefs["layout"].as_str() == Some("split"),
+            prefs["wrapLines"].as_bool() == Some(true),
+            syntax,
+            (
+                &self.pending_focus,
+                self.controller.loading,
+                self.controller.patch_revision,
+                &self.controller.error,
+                self.controller.patches.len(),
+                self.controller.patch_errors.len(),
+            ),
+        ))
+    }
+
+    pub fn invalidate(&self, cx: &mut Cx, ui: &UiContext, compact: bool) {
+        self.toolbar
+            .invalidate_if_changed(cx, self.toolbar_key(ui, compact));
+        self.body
+            .invalidate_if_changed(cx, self.body_key(ui, compact));
+        self.banner.invalidate_if_changed(
+            cx,
+            crate::common::layer::inputs((
+                self.controller.status.is_some(),
+                &self.controller.error,
+            )),
+        );
+    }
+
+    pub fn invalidate_media(&self, cx: &mut Cx) {
+        if self.icons_pending {
+            self.overlay.invalidate(cx);
+        }
+    }
+
+    pub fn animate(&self, cx: &mut Cx) {
+        if self.doc.animating_selection() {
+            self.body.invalidate(cx);
+        }
     }
 }
 
@@ -217,6 +303,7 @@ impl ChangesView {
 
     /// Expands, selects and scrolls to `path`.
     pub fn focus(&mut self, ui: &UiContext, path: &str) {
+        self.layout_revision = self.layout_revision.wrapping_add(1);
         self.collapsed_files.remove(path);
         self.controller.select_file(ui, path);
         self.doc.reveal(path);
@@ -299,6 +386,12 @@ impl ChangesView {
         compact: bool,
     ) {
         let prefs = preferences(ui);
+        if matches!(
+            &hit,
+            Hit::Toggle("collapse") | Hit::Doc(DocHit::Header(_) | DocHit::Expand { .. })
+        ) {
+            self.layout_revision = self.layout_revision.wrapping_add(1);
+        }
         match hit {
             Hit::Refresh => self.controller.refresh(ui, store, false),
             Hit::ShowInLog => {
@@ -881,38 +974,67 @@ impl ChangesView {
         self.hits.clear();
         self.spinning = false;
         self.icons_pending = false;
-        paint.fill(cx, area, colors.surface0);
-        let toolbar_h = TOOLBAR_HEIGHT.max(ui_px(14.0) * 1.4 + 12.0);
-        self.diff_only_toolbar(
-            cx,
-            ui,
-            paint,
-            rect(area.pos.x, area.pos.y, area.size.x, toolbar_h),
-            compact,
-            &prefs,
-        );
-        let mut y = area.pos.y + toolbar_h;
-        if self.controller.status.is_some()
-            && let Some(error) = &self.controller.error
-        {
-            let size = ui_px(12.0);
-            y += paint.text_wrapped(
-                cx,
-                Font::Regular,
-                size,
-                colors.danger,
-                dvec2(area.pos.x + 12.0, y),
-                error,
-                area.size.x - 24.0,
-            ) + 4.0;
+        if self.background.begin(cx, area, 0, &mut self.hits, paint) {
+            paint.fill(cx, area, colors.surface0);
+            self.background.end(cx, &self.hits, paint);
         }
+        let toolbar_h = TOOLBAR_HEIGHT.max(ui_px(14.0) * 1.4 + 12.0);
+        let toolbar = rect(area.pos.x, area.pos.y, area.size.x, toolbar_h);
+        let toolbar_key = self.toolbar_key(ui, compact);
+        if self
+            .toolbar
+            .begin(cx, toolbar, toolbar_key, &mut self.hits, paint)
+        {
+            self.diff_only_toolbar(cx, ui, paint, toolbar, compact, &prefs);
+            self.toolbar.end(cx, &self.hits, paint);
+        }
+        let mut y = area.pos.y + toolbar_h;
+        let error = self
+            .controller
+            .error
+            .as_deref()
+            .filter(|_| self.controller.status.is_some());
+        let banner_h = error.map_or(0.0, |error| {
+            paint.measure_wrapped(cx, Font::Regular, ui_px(12.0), error, area.size.x - 24.0) + 4.0
+        });
+        let banner = rect(area.pos.x, y, area.size.x, banner_h);
+        let banner_key = crate::common::layer::inputs((
+            self.controller.status.is_some(),
+            &self.controller.error,
+        ));
+        if self
+            .banner
+            .begin(cx, banner, banner_key, &mut self.hits, paint)
+        {
+            if let Some(error) = error {
+                paint.text_wrapped(
+                    cx,
+                    Font::Regular,
+                    ui_px(12.0),
+                    colors.danger,
+                    dvec2(area.pos.x + 12.0, y),
+                    error,
+                    area.size.x - 24.0,
+                );
+            }
+            self.banner.end(cx, &self.hits, paint);
+        }
+        y += banner_h;
         let body = rect(
             area.pos.x,
             y,
             area.size.x,
             (area.pos.y + area.size.y - y).max(0.0),
         );
-        self.draw_body(cx, ui, paint, body, split, wrap);
+        let body_key = self.body_key(ui, compact);
+        if self.body.begin(cx, body, body_key, &mut self.hits, paint) {
+            self.draw_body(cx, ui, paint, body, split, wrap);
+            self.body_spinning = self.spinning;
+            self.body.end(cx, &self.hits, paint);
+            self.body.set_inputs(self.body_key(ui, compact));
+        } else {
+            self.spinning = self.body_spinning;
+        }
         if self
             .overlay
             .draw(cx, parts.list, parts.bg, paint, parts.input, compact)
@@ -1004,9 +1126,9 @@ impl ChangesView {
             syntax_theme: &syntax,
         };
         self.doc.draw(cx, paint, area, &input);
-        for (rect_area, clip, hit) in self.doc.hits.entries().to_vec() {
+        for (rect_area, clip, hit) in self.doc.hits.entries() {
             self.hits
-                .push_clipped(rect_area, clip.unwrap_or(area), Hit::Doc(hit));
+                .push_clipped(*rect_area, clip.unwrap_or(area), Hit::Doc(hit.clone()));
         }
         self.spinning |= self.doc.spinning;
         // Placeholders near the viewport request their patch once.

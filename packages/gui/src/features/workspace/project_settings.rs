@@ -35,15 +35,17 @@ live_design! {
     // Top-aligned with explicit insets: a centred row shifts already-drawn glyphs past their
     // clip rect, cutting the label's descenders.
     WaGroupHeader = <View> {
+        optimize: DrawList
         width: Fill, height: Fit, flow: Right, spacing: 8.
         padding: { bottom: 16. }
         title = <WaTextFit> { margin: { top: 1. } }
         info = <WaGlyphButton> { icon: "info" }
         <View> { width: Fill, height: 1. }
     }
-    WaInfo = <View> { width: Fill, height: Fit, visible: false, padding: { bottom: 12. }, text = <WaSmall> {} }
+    WaInfo = <View> { optimize: DrawList, width: Fill, height: Fit, visible: false, padding: { bottom: 12. }, text = <WaSmall> {} }
 
     WaProjectScriptRow = <View> {
+        optimize: DrawList
         width: Fill, height: Fit, flow: Down
         rule = <WaRule> {}
         body = <View> {
@@ -71,6 +73,7 @@ live_design! {
                     width: 720., height: Fit, flow: Down
                     padding: 16.
                     header = <View> {
+                        optimize: DrawList
                         width: Fill, height: Fit, flow: Right, spacing: 12., align: { y: 0.5 }
                         padding: { top: 8., bottom: 16. }
                         icon = <WaProjectIcon> { width: 28., height: 28. }
@@ -78,9 +81,10 @@ live_design! {
                         name = <WaMedium> { width: Fill, ellipsis: true }
                         edit_project = <WaGlyphButton> { icon: "pencil" }
                     }
-                    host_gone = <View> { width: Fill, height: Fit, padding: 16., visible: false, text = <WaMuted> {} }
-                    loading = <View> { width: Fill, height: Fit, padding: 24., align: { x: 0.5 }, visible: false, <WaSpinner> {} }
+                    host_gone = <View> { optimize: DrawList, width: Fill, height: Fit, padding: 16., visible: false, text = <WaMuted> {} }
+                    loading = <View> { optimize: DrawList, width: Fill, height: Fit, padding: 24., align: { x: 0.5 }, visible: false, <WaSpinner> {} }
                     read_failure = <WaAlert> {
+                        optimize: DrawList
                         visible: false, margin: { top: 8. }, large: true
                         padding: { left: 24., right: 24., top: 16., bottom: 16. }
                         body = { actions = { read_reload = <WaButtonOutlineSmall> {} } }
@@ -92,6 +96,7 @@ live_design! {
                             header = <WaGroupHeader> { add_script = <WaGlyphButton> { icon: "plus" } }
                             info = <WaInfo> {}
                             card = <WaCard> {
+                                optimize: DrawList
                                 scripts_empty = <View> { width: Fill, height: Fit, padding: 16., text = <WaMuted> {} }
                                 script_rows = <WaRepeat> { template: <WaProjectScriptRow> {} }
                             }
@@ -101,28 +106,33 @@ live_design! {
                             header = <WaGroupHeader> {}
                             info = <WaInfo> {}
                             branch_section = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: Down, spacing: 8., padding: { bottom: 24. }
                                 title = <WaMutedLine> {}
                                 meta_branch = <WaTextArea> {}
                             }
                             commit_section = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: Down, spacing: 8., padding: { bottom: 24. }
                                 title = <WaMutedLine> {}
                                 meta_commit = <WaTextArea> {}
                             }
                             pr_section = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: Down, spacing: 8.
                                 title = <WaMutedLine> {}
                                 meta_pr = <WaTextArea> {}
                             }
                         }
-                        stale = <WaAlert> { visible: false, margin: { top: 12. }, body = { actions = { stale_reload = <WaButtonOutlineSmall> {} } } }
+                        stale = <WaAlert> { optimize: DrawList, visible: false, margin: { top: 12. }, body = { actions = { stale_reload = <WaButtonOutlineSmall> {} } } }
                         write_failed = <WaAlert> {
+                            optimize: DrawList
                             visible: false, margin: { top: 12. }
                             body = { actions = { write_retry = <WaButtonOutlineSmall> {}, write_reload = <WaButtonOutlineSmall> {} } }
                         }
-                        save_error = <WaAlert> { visible: false, margin: { top: 12. } }
+                        save_error = <WaAlert> { optimize: DrawList, visible: false, margin: { top: 12. } }
                         save_row = <View> {
+                            optimize: DrawList
                             width: Fill, height: Fit, align: { x: 1.0 }, padding: { top: 16. }
                             save = <WaButtonPrimary> { size: Md }
                         }
@@ -138,15 +148,18 @@ live_design! {
                             width: Fill, height: Fit, flow: Down, spacing: 16.
                             padding: { left: 24., right: 24., top: 24., bottom: 20. }
                             name_field = <WaField> {
+                                optimize: DrawList
                                 script_name = <WaInput> { field_size: Sm, input = { empty_text: "dev" } }
                                 error = <View> { width: Fill, height: Fit, visible: false, text = <WaError> {} }
                             }
                             command_field = <WaField> {
+                                optimize: DrawList
                                 script_command = <WaInput> { field_size: Sm, multiline: true, input = { empty_text: "npm run dev" } }
                                 error = <View> { width: Fill, height: Fit, visible: false, text = <WaError> {} }
                             }
-                            port_field = <WaField> { script_port = <WaInput> { field_size: Sm, input = { empty_text: "3000 or $PORT" } } }
+                            port_field = <WaField> { optimize: DrawList, script_port = <WaInput> { field_size: Sm, input = { empty_text: "3000 or $PORT" } } }
                             service_row = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: Right, spacing: 12., align: { y: 0.5 }
                                 texts = <View> {
                                     width: Fill, height: Fit, flow: Down, spacing: 4.
@@ -156,6 +169,7 @@ live_design! {
                                 service = <WaToggle> {}
                             }
                             buttons = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: Right, spacing: 8., align: { x: 1.0 }, padding: { top: 8. }
                                 script_cancel = <WaButtonGhost> { size: Md }
                                 script_save = <WaButtonPrimary> { size: Md }
@@ -173,10 +187,12 @@ live_design! {
                             width: Fill, height: Fit, flow: Down, spacing: 16.
                             padding: { left: 24., right: 24., top: 24., bottom: 20. }
                             name_field = <WaField> {
+                                optimize: DrawList
                                 project_name = <WaInput> { field_size: Adaptive }
                                 error = <View> { width: Fill, height: Fit, visible: false, text = <WaError> {} }
                             }
                             icon_field = <WaField> {
+                                optimize: DrawList
                                 icon_row = <View> {
                                     width: Fill, height: Fit, flow: Right, spacing: 8., align: { y: 0.5 }
                                     preview_icon = <WaProjectIcon> { width: 40., height: 40. }
@@ -189,6 +205,7 @@ live_design! {
                                 error = <View> { width: Fill, height: Fit, visible: false, text = <WaError> {} }
                             }
                             buttons = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: Right, spacing: 8., align: { x: 1.0 }
                                 project_cancel = <WaButton> { size: Md, width: 112. }
                                 project_save = <WaButtonPrimary> { size: Md, width: 112. }
@@ -247,6 +264,9 @@ struct ScriptSheet {
 pub struct WaProjectSettingsView {
     #[deref]
     view: View,
+    // Field setters own invalidation, including dependent errors and submit state.
+    #[rust]
+    presentation_dirty: bool,
     #[rust]
     host_id: String,
     #[rust]
@@ -310,7 +330,8 @@ impl WaProjectSettingsView {
         self.started = false;
         self.config = None;
         self.dirty = false;
-        self.view.redraw(cx);
+        self.presentation_dirty = true;
+        self.root().area().redraw(cx);
     }
 
     fn read(&mut self, ctx: &UiContext) {
@@ -381,17 +402,17 @@ impl WaProjectSettingsView {
         if !self.started {
             self.last_status = status;
             self.read(ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         } else if status != self.last_status {
             self.last_status = status;
             // A config that never loaded is read again once the host is back.
             if status == Some(Connection::Connected) && self.config.is_none() && !self.loading {
                 self.read(ctx);
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         for (req, result) in self.pending.take_raw(&ctx.events) {
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
             match req {
                 Req::Read => {
                     self.loading = false;
@@ -508,7 +529,7 @@ impl WaProjectSettingsView {
             return;
         }
         self.read(ctx);
-        self.view.redraw(cx);
+        self.presentation_dirty = true;
     }
 
     fn open_script_sheet(&mut self, cx: &mut Cx, old_name: Option<String>) {
@@ -541,7 +562,7 @@ impl WaProjectSettingsView {
         if old_name.is_none() {
             view.wa_input(id!(script_name)).set_key_focus(cx);
         }
-        view.redraw(cx);
+        self.presentation_dirty = true;
     }
 
     fn save_script(&mut self, cx: &mut Cx) {
@@ -555,7 +576,7 @@ impl WaProjectSettingsView {
         if name_error.is_some() || command.trim().is_empty() {
             self.script_sheet.name_touched = true;
             self.script_sheet.command_touched = true;
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
             return;
         }
         let existing = old_name
@@ -567,7 +588,7 @@ impl WaProjectSettingsView {
         self.change(|config| model::replace_script(config, old_name.as_deref(), &key, entry));
         self.script_sheet.open = false;
         view.wa_modal(id!(script_sheet)).close(cx);
-        self.view.redraw(cx);
+        self.presentation_dirty = true;
     }
 
     fn open_project_sheet(&mut self, cx: &mut Cx, ctx: &UiContext) {
@@ -590,7 +611,7 @@ impl WaProjectSettingsView {
             ..Default::default()
         };
         view.wa_modal(id!(project_sheet)).open(cx);
-        view.redraw(cx);
+        self.presentation_dirty = true;
     }
 
     fn has_custom_icon(&self) -> bool {
@@ -729,7 +750,7 @@ impl WaProjectSettingsView {
                 Err(error) if error.code == "cancelled" => {}
                 Err(error) => self.project_sheet.icon_error = Some(error.message.clone()),
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
     }
 
@@ -745,7 +766,7 @@ impl WaProjectSettingsView {
                 let name = name.to_owned();
                 self.change(|config| model::remove_script(config, &name));
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         let select = view.wa_select(id!(select));
         if let Some((token, value)) = select.picked(actions)
@@ -784,7 +805,7 @@ impl WaProjectSettingsView {
             && !self.config.as_ref().is_some_and(model::invalid_scripts)
         {
             self.save(ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         for (index, button) in [
             id!(scripts_group.header.info),
@@ -795,7 +816,7 @@ impl WaProjectSettingsView {
         {
             if view.wa_button(*button).clicked(actions) {
                 self.info_open[index] = !self.info_open[index];
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
         }
         // Text areas: Enter inserts a newline (multi-line inputs), every change marks dirty.
@@ -810,7 +831,7 @@ impl WaProjectSettingsView {
                 continue;
             };
             self.change(|config| model::set_metadata_text(config, field, &text));
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if view.wa_button(id!(add_script)).clicked(actions) && !self.saving {
             self.open_script_sheet(cx, None);
@@ -856,13 +877,13 @@ impl WaProjectSettingsView {
             {
                 self.script_sheet.open = false;
                 view.wa_modal(id!(script_sheet)).close(cx);
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
             let command = view.wa_input(id!(script_command));
             if view.wa_input(id!(script_name)).changed(actions).is_some()
                 || command.changed(actions).is_some()
             {
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
             if let Some(active) = view.pswitch(id!(service)).changed(actions) {
                 self.script_sheet.service = active;
@@ -871,11 +892,11 @@ impl WaProjectSettingsView {
                 if let TextInputAction::KeyFocusLost = action.cast() {
                     if action.widget_uid == view.wa_input(id!(script_name)).widget_uid() {
                         self.script_sheet.name_touched = true;
-                        self.view.redraw(cx);
+                        self.presentation_dirty = true;
                     }
                     if action.widget_uid == command.widget_uid() {
                         self.script_sheet.command_touched = true;
-                        self.view.redraw(cx);
+                        self.presentation_dirty = true;
                     }
                 }
             }
@@ -901,12 +922,12 @@ impl WaProjectSettingsView {
                     self.project_sheet.open = false;
                     modal.close(cx);
                 }
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
             if view.wa_input(id!(project_name)).changed(actions).is_some() {
                 self.project_sheet.name_error = None;
                 self.project_sheet.icon_error = None;
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
             if let Some(url) = view.wa_input(id!(icon_url)).changed(actions) {
                 // Emptying the box withdraws the URL without discarding an earlier pick.
@@ -920,7 +941,7 @@ impl WaProjectSettingsView {
                 };
                 sheet.name_error = None;
                 sheet.icon_error = None;
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
             if view.wa_button(id!(choose_image)).clicked(actions) && !self.project_sheet.saving {
                 match platform() {
@@ -950,16 +971,16 @@ impl WaProjectSettingsView {
                 sheet.name_error = None;
                 sheet.icon_error = None;
                 view.wa_input(id!(icon_url)).set_text(cx, "");
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
             if view.wa_button(id!(project_save)).clicked(actions) && !self.project_sheet.saving {
                 self.submit_project(ctx);
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
         }
     }
 
-    fn present(&mut self, cx: &mut Cx2d, ctx: &UiContext, width: f64) {
+    fn present(&mut self, cx: &mut Cx, ctx: &UiContext, width: f64) {
         let view = self.root();
         let form_width = width.clamp(0.0, 720.0);
         if width > 0.0 && (form_width - self.form_width).abs() > 0.5 {
@@ -1398,6 +1419,12 @@ impl Widget for WaProjectSettingsView {
             && let Some(ctx) = scope.data.get_mut::<UiContext>()
         {
             self.handle_actions(cx, actions, ctx);
+        }
+        if self.presentation_dirty
+            && let Some(ctx) = scope.data.get_mut::<UiContext>()
+        {
+            self.presentation_dirty = false;
+            self.present(cx, ctx, self.form_width);
         }
     }
 

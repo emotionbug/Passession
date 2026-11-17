@@ -120,6 +120,8 @@ impl FieldSpec {
 
 struct Entry {
     widget: WidgetRef,
+    list: DrawList2d,
+    clip: Option<Rect>,
     layer: Layer,
     /// Overlay stacking depth it was drawn at (0 page, 1.. overlay layers).
     depth: usize,
@@ -139,6 +141,14 @@ struct Entry {
 impl Entry {
     fn release_editor(&self, cx: &mut Cx) {
         self.widget.as_text_input().release_focus(cx);
+    }
+
+    fn draw(&mut self, cx: &mut Cx2d, rect: Rect) {
+        let walk = Walk::fixed(rect.size.x, rect.size.y).with_abs_pos(rect.pos);
+        if self.list.begin(cx, walk).is_ok() {
+            self.widget.draw_walk_all(cx, &mut Scope::empty(), walk);
+            self.list.end(cx);
+        }
     }
 }
 
@@ -231,6 +241,7 @@ impl FieldHost {
         (layer, depth): (Layer, usize),
         spec: FieldSpec,
         rect: Rect,
+        clip: Option<Rect>,
     ) {
         let id = spec.id.clone();
         self.drawn.insert(id.clone());
@@ -247,6 +258,8 @@ impl FieldHost {
         let created = !self.entries.contains_key(&id);
         let entry = self.entries.entry(id.clone()).or_insert_with(|| Entry {
             widget: WidgetRef::new_from_ptr(cx, template),
+            list: DrawList2d::new(cx),
+            clip,
             layer,
             depth,
             enabled: true,
@@ -259,6 +272,10 @@ impl FieldHost {
             on_blur: None,
             focus_pending: spec.autofocus,
         });
+        if entry.layer != layer || entry.depth != depth || entry.clip != clip {
+            entry.list.redraw(cx);
+            entry.clip = clip;
+        }
         entry.layer = layer;
         entry.depth = depth;
         entry.on_submit = spec.on_submit;
@@ -299,11 +316,7 @@ impl FieldHost {
                     .widget
                     .apply_over(cx, &crate::theme::text_selection(selection));
             }
-            entry.widget.draw_walk_all(
-                cx,
-                &mut Scope::empty(),
-                Walk::fixed(rect.size.x, rect.size.y).with_abs_pos(rect.pos),
-            );
+            entry.draw(cx, rect);
             return;
         }
         if created {
@@ -376,11 +389,7 @@ impl FieldHost {
                 .widget
                 .apply_over(cx, &crate::theme::text_selection(selection));
         }
-        entry.widget.draw_walk_all(
-            cx,
-            &mut Scope::empty(),
-            Walk::fixed(rect.size.x, rect.size.y).with_abs_pos(rect.pos),
-        );
+        entry.draw(cx, rect);
         if entry.focus_pending {
             entry.focus_pending = false;
             entry.widget.set_key_focus(cx);

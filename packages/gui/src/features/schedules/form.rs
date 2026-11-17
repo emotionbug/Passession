@@ -38,6 +38,7 @@ live_design! {
     use crate::features::workspace::select::*;
 
     WaFormField = <WaField> {
+        optimize: DrawList
         hint = <View> { width: Fill, height: Fit, visible: false, text = <WaSmall> {} }
     }
 
@@ -52,7 +53,7 @@ live_design! {
                         body = <ScrollYView> {
                             width: Fill, height: 560., flow: Down, spacing: 16.
                             padding: { left: 24., right: 24., top: 24., bottom: 24. }
-                            permission = <View> { width: Fill, height: Fit, visible: false, text = <WaError> {} }
+                            permission = <View> { optimize: DrawList, width: Fill, height: Fit, visible: false, text = <WaError> {} }
                             target_field = <WaFormField> {
                                 // Original `ScheduleAgentTargetField`: surface2, 1px border, field geometry.
                                 target_box = <Surface> {
@@ -84,10 +85,11 @@ live_design! {
                                 cadence_note = <View> { width: Fill, height: Fit, text = <WaSmall> {} }
                             }
                             max_runs_field = <WaFormField> { max_runs = <WaInput> { field_size: Adaptive, input = { is_numeric_only: true } } }
-                            error = <View> { width: Fill, height: Fit, visible: false, text = <WaError> {} }
+                            error = <View> { optimize: DrawList, width: Fill, height: Fit, visible: false, text = <WaError> {} }
                         }
                         <WaSheetRule> {}
                         footer = <View> {
+                            optimize: DrawList
                             width: Fill, height: Fit, flow: Right, spacing: 12.
                             padding: { left: 24., right: 24., top: 12., bottom: 12. }
                             cancel = <WaButton> { width: Fill, size: Md }
@@ -129,6 +131,9 @@ enum Req {
 pub struct WaScheduleEditor {
     #[deref]
     view: View,
+    // Synchronize dependent hints/preview/footer without recursively redrawing the sheet.
+    #[rust]
+    presentation_dirty: bool,
     #[rust]
     open: bool,
     #[rust]
@@ -704,13 +709,13 @@ impl WaScheduleEditor {
             let zone = timezone::device_time_zone();
             if zone != self.timezone {
                 self.timezone = zone;
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
         }
         for (req, result) in self.pending.take(&ctx.events) {
-            self.view.redraw(cx);
             match req {
                 Req::Catalog(generation) if generation == self.catalog_generation => {
+                    self.presentation_dirty = true;
                     self.catalog_loading = false;
                     match result {
                         Ok(body) => {
@@ -723,6 +728,7 @@ impl WaScheduleEditor {
                 }
                 Req::Catalog(_) => {}
                 Req::Save => {
+                    self.presentation_dirty = true;
                     self.saving = false;
                     match result {
                         Ok(_) => {
@@ -756,7 +762,7 @@ impl WaScheduleEditor {
             } else {
                 self.load_catalog(ctx);
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
     }
 
@@ -848,12 +854,12 @@ impl WaScheduleEditor {
         let prompt = view.wa_input(id!(prompt));
         if let Some(text) = prompt.changed(actions) {
             self.prompt = text;
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if let Some(text) = view.wa_input(id!(cron)).changed(actions) {
             self.cron = text;
             self.cadence_changed = true;
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if let Some(text) = view.wa_input(id!(max_runs)).changed(actions) {
             self.max_runs = text;
@@ -863,7 +869,7 @@ impl WaScheduleEditor {
         }
         if view.wa_button(id!(save)).clicked(actions) {
             self.save(ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if view.wa_button(id!(host)).clicked(actions) && !self.editing {
             let options = host::hosts(&ctx.state)
@@ -975,7 +981,7 @@ impl WaScheduleEditor {
                 }
                 _ => {}
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
     }
 
@@ -1215,6 +1221,12 @@ impl Widget for WaScheduleEditor {
         {
             self.handle_actions(cx, actions, ctx);
         }
+        if self.presentation_dirty
+            && let Some(ctx) = scope.data.get_mut::<UiContext>()
+        {
+            self.presentation_dirty = false;
+            self.present(cx, ctx);
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -1299,7 +1311,7 @@ impl WaScheduleEditorRef {
         sync_input(cx, &view.wa_input(id!(cron)), &inner.cron);
         sync_input(cx, &view.wa_input(id!(max_runs)), &inner.max_runs);
         view.wa_modal(id!(modal)).open(cx);
-        view.redraw(cx);
+        inner.presentation_dirty = true;
     }
 
     pub fn saved(&self, actions: &Actions) -> bool {

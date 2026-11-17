@@ -70,6 +70,14 @@ pub struct GitPaint {
     pub segment: DrawSegment,
     #[live]
     pub manual_gear: DrawIcon,
+    #[rust]
+    spinners: Vec<Spinner>,
+    #[rust]
+    clips: Vec<Rect>,
+    #[rust]
+    spinner_list: Option<DrawList2d>,
+    #[rust]
+    retained_frame: bool,
 }
 
 pub fn transparent() -> Vec4 {
@@ -108,6 +116,15 @@ pub fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
         pos: dvec2(x, y),
         size: dvec2(w.max(0.0), h.max(0.0)),
     }
+}
+
+pub fn rect_key(area: Rect) -> (u64, u64, u64, u64) {
+    (
+        area.pos.x.to_bits(),
+        area.pos.y.to_bits(),
+        area.size.x.to_bits(),
+        area.size.y.to_bits(),
+    )
 }
 
 impl GitPaint {
@@ -285,14 +302,25 @@ impl GitPaint {
     /// A turning partial ring; callers request frames only while pending.
     pub fn spinner(&mut self, cx: &mut Cx2d, center: DVec2, size: f64, color: Vec4, phase: f64) {
         let area = rect(center.x - size / 2.0, center.y - size / 2.0, size, size);
-        self.painter.ring(
-            cx,
+        // Header controls already own small, independently redrawn areas. Only
+        // panel frames defer indicators out of their retained content regions.
+        if !self.retained_frame {
+            self.painter.ring(
+                cx,
+                area,
+                color,
+                (size / 9.0).max(1.5),
+                0.7,
+                (phase * 0.8).fract(),
+            );
+            return;
+        }
+        self.spinners.push(Spinner {
             area,
             color,
-            (size / 9.0).max(1.5),
-            0.7,
-            (phase * 0.8).fract(),
-        );
+            clip: self.clips.last().copied(),
+            phase_offset: phase - cx.seconds_since_app_start(),
+        });
     }
 
     /// Single-line size of `text`.
@@ -485,11 +513,163 @@ impl GitPaint {
 
     /// Clips what is drawn until [`end_clip`](Self::end_clip) to `area`.
     pub fn begin_clip(&mut self, cx: &mut Cx2d, area: Rect) {
+        let clip = self.clips.last().map_or(area, |outer| {
+            let left = area.pos.x.max(outer.pos.x);
+            let top = area.pos.y.max(outer.pos.y);
+            rect(
+                left,
+                top,
+                (area.pos.x + area.size.x).min(outer.pos.x + outer.size.x) - left,
+                (area.pos.y + area.size.y).min(outer.pos.y + outer.size.y) - top,
+            )
+        });
+        self.clips.push(clip);
         cx.begin_turtle(Walk::abs_rect(area), Layout::default());
     }
 
     pub fn end_clip(&mut self, cx: &mut Cx2d) {
+        self.clips.pop();
         cx.end_turtle();
+    }
+
+    /// Spinner animation is a sibling of the retained presentation, not a reason
+    /// to rebuild the toolbar, rows or document that contains the indicator.
+    pub fn animate(&self, cx: &mut Cx) {
+        if !self.spinners.is_empty()
+            && let Some(list) = &self.spinner_list
+        {
+            list.redraw(cx);
+        }
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.retained_frame = true;
+        self.spinners.clear();
+        self.clips.clear();
+    }
+
+    pub fn end_frame(&mut self, cx: &mut Cx2d) {
+        let list = self.spinner_list.get_or_insert_with(|| DrawList2d::new(cx));
+        list.begin_always(cx);
+        let phase = cx.seconds_since_app_start();
+        for spinner in &self.spinners {
+            if let Some(clip) = spinner.clip {
+                cx.begin_turtle(Walk::abs_rect(clip), Layout::default());
+            }
+            self.painter.ring(
+                cx,
+                spinner.area,
+                spinner.color,
+                (spinner.area.size.x / 9.0).max(1.5),
+                0.7,
+                ((phase + spinner.phase_offset) * 0.8).fract(),
+            );
+            if spinner.clip.is_some() {
+                cx.end_turtle();
+            }
+        }
+        list.end(cx);
+        self.retained_frame = false;
+    }
+}
+
+#[derive(Clone)]
+struct Spinner {
+    area: Rect,
+    color: Vec4,
+    clip: Option<Rect>,
+    phase_offset: f64,
+}
+
+/// One independently retained Git presentation, including its hit geometry and
+/// deferred animation. Inputs describe presentation, not the event that reached it.
+pub struct Retained<T> {
+    list: Option<DrawList2d>,
+    inputs: u64,
+    hit_mark: usize,
+    spinner_mark: usize,
+    hits: Vec<(Rect, Option<Rect>, T)>,
+    spinners: Vec<Spinner>,
+    clip: Option<Rect>,
+    epoch: u64,
+}
+
+impl<T> Default for Retained<T> {
+    fn default() -> Self {
+        Self {
+            list: None,
+            inputs: 0,
+            hit_mark: 0,
+            spinner_mark: 0,
+            hits: Vec::new(),
+            spinners: Vec::new(),
+            clip: None,
+            epoch: 0,
+        }
+    }
+}
+
+impl<T: Clone + PartialEq> Retained<T> {
+    pub fn invalidate(&self, cx: &mut Cx) {
+        if let Some(list) = &self.list {
+            list.redraw(cx);
+        }
+    }
+
+    pub fn invalidate_if_changed(&self, cx: &mut Cx, inputs: u64) {
+        if self.inputs != inputs {
+            self.invalidate(cx);
+        }
+    }
+
+    pub fn owns_hit(&self, hit: &T) -> bool {
+        self.hits.iter().any(|(_, _, target)| target == hit)
+    }
+
+    pub fn set_inputs(&mut self, inputs: u64) {
+        self.inputs = inputs;
+    }
+
+    pub fn begin(
+        &mut self,
+        cx: &mut Cx2d,
+        rect: Rect,
+        inputs: u64,
+        hits: &mut Hits<T>,
+        paint: &mut GitPaint,
+    ) -> bool {
+        let changed = std::mem::replace(&mut self.inputs, inputs) != inputs;
+        let clip_changed = std::mem::replace(&mut self.clip, paint.clips.last().copied())
+            != paint.clips.last().copied();
+        let epoch = crate::common::layer::inputs((
+            crate::theme::epoch(),
+            crate::common::i18n::locale_tag(),
+        ));
+        let epoch_changed = std::mem::replace(&mut self.epoch, epoch) != epoch;
+        let list = self.list.get_or_insert_with(|| DrawList2d::new(cx));
+        let dirty = cx.will_redraw(list, Walk::abs_rect(rect));
+        if list
+            .begin_maybe(cx, changed || clip_changed || epoch_changed || dirty)
+            .is_ok()
+        {
+            self.hit_mark = hits.items.len();
+            self.spinner_mark = paint.spinners.len();
+            return true;
+        }
+        hits.items.extend_from_slice(&self.hits);
+        paint.spinners.extend_from_slice(&self.spinners);
+        false
+    }
+
+    pub fn end(&mut self, cx: &mut Cx2d, hits: &Hits<T>, paint: &GitPaint) {
+        if let Some(list) = &mut self.list {
+            list.end(cx);
+        }
+        self.hits.clear();
+        self.hits.extend_from_slice(&hits.items[self.hit_mark..]);
+        self.spinners.clear();
+        self.spinners
+            .extend_from_slice(&paint.spinners[self.spinner_mark..]);
     }
 }
 

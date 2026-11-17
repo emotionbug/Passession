@@ -11,6 +11,7 @@ use super::view::{WaLogView, WaLogViewWidgetExt};
 use crate::common::widgets::PLabelWidgetRefExt;
 use crate::common::{PanelTarget, Route, UiContext, UiEffect};
 use crate::features::terminal::find::{FindCard, FindCommand, SearchMode};
+use crate::features::terminal::stream::HIDDEN_SCREEN_GRACE_SECONDS;
 use crate::features::workspace::host;
 use crate::features::workspace::i18n::{l, lf, t, ta};
 use crate::features::workspace::kit::{WaButtonWidgetExt, ellipsize, set_optional};
@@ -31,6 +32,7 @@ live_design! {
             role: Surface0
             // Original `PaneContentToolbar`: 36px surface0 band with a bottom border.
             toolbar = <View> {
+                optimize: DrawList
                 width: Fill, height: 36., flow: Right, spacing: 12.
                 padding: { left: 12., right: 5. }
                 align: { y: 0.5 }
@@ -51,8 +53,12 @@ live_design! {
             <WaRule> {}
             body = <View> {
                 width: Fill, height: Fill, flow: Overlay
-                output = <WaLogView> {}
+                output_layer = <View> {
+                    width: Fill, height: Fill, optimize: DrawList
+                    output = <WaLogView> {}
+                }
                 empty = <View> {
+                    optimize: DrawList
                     width: Fill, height: Fill, flow: Down, spacing: 8.
                     align: { x: 0.5, y: 0.5 }, padding: 24., visible: false
                     // Shown only while the host is offline, so that state never reads as
@@ -61,9 +67,10 @@ live_design! {
                     text = <WaMuted> { width: Fit }
                     hint = <WaSmall> { width: Fit, visible: false }
                 }
-                find_wrap = <WaPaneFind> {}
+                find_wrap = <WaPaneFind> { optimize: DrawList }
                 // Original attach overlay: a dimmed surface with a small muted spinner.
                 attach = <PointerShield> {
+                    optimize: DrawList
                     width: Fill, height: Fill, visible: false
                     show_bg: true, draw_bg: { color: #00000029 }
                     align: { x: 0.5, y: 0.5 }
@@ -72,6 +79,7 @@ live_design! {
             }
             // Original terminal error row: surface1 band with a top border, destructive small text.
             error_row = <Surface> {
+                optimize: DrawList
                 width: Fill, height: Fit, flow: Down, visible: false
                 role: Surface1
                 <WaRule> {}
@@ -123,6 +131,8 @@ pub struct ExecutionLogPanel {
     hidden: bool,
     #[rust]
     visibility_dirty: bool,
+    #[rust]
+    hidden_screen_timer: Timer,
     #[rust]
     session_opened: bool,
     #[rust]
@@ -182,6 +192,12 @@ impl ExecutionLogPanel {
         self.connected = host::host(&ctx.state, &target.host_id).is_some_and(|h| h.connected());
         session.set_visible(&ctx.core, !self.hidden, self.connected);
         view.session = Some(session);
+        cx.stop_timer(self.hidden_screen_timer);
+        self.hidden_screen_timer = if self.hidden {
+            cx.start_timeout(HIDDEN_SCREEN_GRACE_SECONDS)
+        } else {
+            Timer::default()
+        };
         view.redraw(cx);
     }
 
@@ -195,7 +211,7 @@ impl ExecutionLogPanel {
                 vec![FindCommand::Search(SearchMode::Reset { previous: false })],
             );
         }
-        self.view.redraw(cx);
+        self.present(cx);
     }
 
     fn apply_find(&mut self, cx: &mut Cx, commands: Vec<FindCommand>) {
@@ -212,7 +228,7 @@ impl ExecutionLogPanel {
                 FindCommand::Closed => view.clear_find(cx),
             }
         }
-        self.view.redraw(cx);
+        self.present(cx);
     }
 
     fn handle_core(&mut self, cx: &mut Cx, ctx: &mut UiContext) {
@@ -244,29 +260,38 @@ impl ExecutionLogPanel {
         let Some(target) = self.target.clone() else {
             return;
         };
+        let mut presentation_changed = !self.session_opened;
+        let was_connected = self.connected;
         if !self.session_opened {
             self.open_session(cx, ctx);
         }
         self.connected = host::host(&ctx.state, &target.host_id).is_some_and(|h| h.connected());
+        presentation_changed |= was_connected != self.connected;
         let core = ctx.core.clone();
         if self.visibility_dirty {
             self.visibility_dirty = false;
             let (visible, connected) = (!self.hidden, self.connected);
             self.with_session(|session, _| session.set_visible(&core, visible, connected));
-            self.view.redraw(cx);
+            presentation_changed = true;
         }
-        let outcome = self
-            .with_session(|session, _| (session.pump(&core, &ctx.events), session.output_pending));
-        if let Some((changed, pending)) = outcome {
+        let outcome = self.with_session(|session, _| {
+            let changed = session.pump(&core, &ctx.events);
+            (changed, session.output_pending, session.take_attached())
+        });
+        if let Some((changed, pending, attached)) = outcome {
             if pending && self.publish_timer.is_empty() {
                 // Coalesce output bursts (33ms) instead of repainting per chunk.
                 self.publish_timer = cx.start_timeout(0.033);
             }
-            if changed {
-                // A snapshot or restore replaced the output: matches follow it.
+            if attached {
+                // A replacement screen repaints output without waiting for the burst timer.
+                self.output().redraw(cx);
                 self.find.output_changed(cx);
-                self.view.redraw(cx);
             }
+            presentation_changed |= changed || attached;
+        }
+        if presentation_changed {
+            self.present(cx);
         }
     }
 
@@ -274,14 +299,14 @@ impl ExecutionLogPanel {
         let output = self.output();
         if output.user_scrolled(actions) {
             // The view paused or resumed following; the toolbar toggle shows it.
-            self.view.redraw(cx);
+            self.present(cx);
         }
         if self.view.wa_button(id!(follow)).clicked(actions) {
             if let Some(mut view) = output.borrow_mut() {
                 view.follow = !view.follow;
                 view.redraw(cx);
             }
-            self.view.redraw(cx);
+            self.present(cx);
         }
         let toggled = self.view.wa_button(id!(toggle_find)).clicked(actions);
         if toggled && self.find.open {
@@ -309,7 +334,7 @@ impl ExecutionLogPanel {
             let core = ctx.core.clone();
             let connected = self.connected;
             self.with_session(|session, _| session.retry(&core, connected));
-            self.view.redraw(cx);
+            self.present(cx);
         }
         if self.view.wa_button(id!(close_tab)).clicked(actions)
             && let Some(target) = &self.target
@@ -326,38 +351,9 @@ impl ExecutionLogPanel {
             }
         }
     }
-}
 
-impl Widget for ExecutionLogPanel {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if let Some(ctx) = scope.data.get_mut::<UiContext>() {
-            self.handle_core(cx, ctx);
-        }
-        if self.publish_timer.is_event(event).is_some() {
-            self.publish_timer = Timer::default();
-            self.with_session(|session, view| {
-                session.publish();
-                view.redraw(cx);
-            });
-            // Matches follow live output while the find card is open.
-            self.find.output_changed(cx);
-            self.view.redraw(cx);
-        }
-        if let Some(mode) = self.find.timer_fired(event) {
-            self.apply_find(cx, vec![FindCommand::Search(mode)]);
-        }
-        self.view.handle_event(cx, event, scope);
-        if let Event::Actions(actions) = event {
-            let ctx = scope.data.get_mut::<UiContext>();
-            self.handle_actions(cx, actions, ctx);
-        }
-    }
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.compact = scope
-            .data
-            .get_mut::<UiContext>()
-            .is_some_and(|ctx| ctx.compact);
+    /// Setters invalidate only the retained region whose displayed value changed.
+    fn present(&mut self, cx: &mut Cx) {
         let ty = crate::theme::current_typography();
         let toolbar_h = 36.0_f64.max(ty.ui_size(12.0) * 1.4 + 12.0);
         self.view
@@ -456,6 +452,9 @@ impl Widget for ExecutionLogPanel {
         copy.set_tooltip(cx, l("Copy all output"));
         let empty = self.view.widget(id!(body.empty));
         let show_empty = has_session && facts.rows == 0;
+        if empty.visible() != show_empty {
+            self.view.area().redraw(cx);
+        }
         empty.set_visible(cx, show_empty);
         if show_empty {
             let waiting = facts.outcome == Outcome::Waiting;
@@ -478,6 +477,9 @@ impl Widget for ExecutionLogPanel {
             }
         }
         let body_width = self.view.widget(id!(body)).area().rect(cx).size.x;
+        if self.view.widget(id!(find_wrap)).visible() != self.find.open {
+            self.view.area().redraw(cx);
+        }
         self.find.present(
             cx,
             &self.view.widget(id!(find_wrap)),
@@ -486,10 +488,15 @@ impl Widget for ExecutionLogPanel {
             facts.total,
             facts.active,
         );
-        self.view
-            .widget(id!(attach))
-            .set_visible(cx, facts.attaching);
+        let attach = self.view.widget(id!(attach));
+        if attach.visible() != facts.attaching {
+            self.view.area().redraw(cx);
+        }
+        attach.set_visible(cx, facts.attaching);
         let error_row = self.view.widget(id!(error_row));
+        if error_row.visible() != facts.error.is_some() {
+            self.view.area().redraw(cx);
+        }
         error_row.set_visible(cx, facts.error.is_some());
         if let Some(error) = &facts.error {
             error_row
@@ -502,6 +509,49 @@ impl Widget for ExecutionLogPanel {
             close.set_visible(cx, !has_session);
             close.set_text(cx, &t("common.actions.close"));
         }
+    }
+}
+
+impl Widget for ExecutionLogPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if let Some(ctx) = scope.data.get_mut::<UiContext>() {
+            self.handle_core(cx, ctx);
+        }
+        if self.hidden_screen_timer.is_event(event).is_some() {
+            self.hidden_screen_timer = Timer::default();
+            self.with_session(|session, view| {
+                if session.evict_hidden_screen() {
+                    view.clear_selection(cx);
+                    view.find.clear();
+                }
+            });
+        }
+        if self.publish_timer.is_event(event).is_some() {
+            self.publish_timer = Timer::default();
+            self.with_session(|session, view| {
+                session.publish();
+                view.redraw(cx);
+            });
+            // Matches follow live output while the find card is open.
+            self.find.output_changed(cx);
+            self.present(cx);
+        }
+        if let Some(mode) = self.find.timer_fired(event) {
+            self.apply_find(cx, vec![FindCommand::Search(mode)]);
+        }
+        self.view.handle_event(cx, event, scope);
+        if let Event::Actions(actions) = event {
+            let ctx = scope.data.get_mut::<UiContext>();
+            self.handle_actions(cx, actions, ctx);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.compact = scope
+            .data
+            .get_mut::<UiContext>()
+            .is_some_and(|ctx| ctx.compact);
+        self.present(cx);
         let step = self.view.draw_walk(cx, scope, walk);
         self.find.take_focus(cx, &self.view.widget(id!(find_wrap)));
         step
@@ -519,14 +569,17 @@ impl ExecutionLogPanelRef {
             return;
         }
         inner.target = Some(target);
+        cx.stop_timer(inner.hidden_screen_timer);
+        inner.hidden_screen_timer = Timer::default();
         inner.session_opened = false;
         inner.init_error = None;
         if let Some(mut view) = inner.output().borrow_mut() {
             view.clear_selection(cx);
             view.session = None;
             view.find.clear();
+            view.redraw(cx);
         }
-        inner.view.redraw(cx);
+        inner.present(cx);
     }
 
     /// Hidden tabs release their observation; visible ones attach (`setVisible`). Applied on
@@ -539,7 +592,13 @@ impl ExecutionLogPanelRef {
             return;
         }
         inner.hidden = !visible;
+        cx.stop_timer(inner.hidden_screen_timer);
+        inner.hidden_screen_timer = if visible {
+            Timer::default()
+        } else {
+            cx.start_timeout(HIDDEN_SCREEN_GRACE_SECONDS)
+        };
         inner.visibility_dirty = true;
-        inner.view.redraw(cx);
+        inner.output().redraw(cx);
     }
 }

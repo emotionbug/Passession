@@ -7,7 +7,7 @@
 use super::chrome::{change_icon, diff_stat, measure_diff_stat, palette, typography, ui};
 use super::json::{int, text};
 use super::model::{DiffLine, LineKind, change_kind, compare_diff_paths, number_diff};
-use super::paint::{Font, GitPaint, Hits, hex, rect, with_alpha};
+use super::paint::{Font, GitPaint, Hits, Retained, hex, rect, rect_key, with_alpha};
 use super::text::t;
 use crate::common::paint::intersect;
 use crate::features::timeline::canvas::{floor_char_boundary, range_rects};
@@ -29,13 +29,14 @@ use std::rc::Rc;
 pub type PieceKey = (usize, usize, u8);
 
 /// A text position: a piece and a byte offset into its text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TextPos {
     pub piece: PieceKey,
     pub offset: usize,
 }
 
 /// A piece drawn this frame with the layout it was drawn from.
+#[derive(Clone)]
 struct Piece {
     key: PieceKey,
     laid: Rc<LaidoutText>,
@@ -51,7 +52,7 @@ const HIGHLIGHT_WIDTH_LIMIT: usize = 2000;
 
 type Run = (String, Option<HighlightStyle>);
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Hash)]
 enum Row {
     Line(usize),
     Pair(Option<usize>, Option<usize>),
@@ -225,7 +226,7 @@ impl FileModel {
 }
 
 /// What a press on a document region does.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum DocHit {
     Header(String),
     Expand {
@@ -303,10 +304,14 @@ pub struct DiffDoc {
     bar_drag: Option<(Axis, f64, f64)>,
     /// The track under the pointer (its thumb widens).
     pub bar_hovered: Option<Axis>,
+    presentations: HashMap<PieceKey, DocPresentation>,
+    background: Retained<DocHit>,
+    scrollbar_layer: Retained<DocHit>,
+    expansion_revision: u64,
 }
 
 /// A scrollbar direction of the document.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Axis {
     Vertical,
     Horizontal,
@@ -378,7 +383,89 @@ impl Default for DiffDoc {
             bars: [ScrollBar::default(); 2],
             bar_drag: None,
             bar_hovered: None,
+            presentations: HashMap::new(),
+            background: Retained::default(),
+            scrollbar_layer: Retained::default(),
+            expansion_revision: 0,
         }
+    }
+}
+
+#[derive(Default)]
+struct DocPresentation {
+    layer: Retained<DocHit>,
+    pieces: Vec<Piece>,
+    piece_mark: usize,
+    visited: bool,
+}
+
+impl DocPresentation {
+    fn begin(
+        &mut self,
+        cx: &mut Cx2d,
+        paint: &mut GitPaint,
+        area: Rect,
+        inputs: u64,
+        hits: &mut Hits<DocHit>,
+        pieces: &mut Vec<Piece>,
+    ) -> bool {
+        self.visited = true;
+        if self.layer.begin(cx, area, inputs, hits, paint) {
+            self.piece_mark = pieces.len();
+            return true;
+        }
+        pieces.extend_from_slice(&self.pieces);
+        false
+    }
+
+    fn end(&mut self, cx: &mut Cx2d, paint: &GitPaint, hits: &Hits<DocHit>, pieces: &[Piece]) {
+        self.layer.end(cx, hits, paint);
+        self.pieces.clear();
+        self.pieces.extend_from_slice(&pieces[self.piece_mark..]);
+    }
+}
+
+impl DiffDoc {
+    pub fn presentation_key(&self) -> u64 {
+        crate::common::layer::inputs((
+            self.scroll_x.to_bits(),
+            self.scroll_y.to_bits(),
+            self.selection,
+            &self.hovered,
+            self.bar_hovered,
+            self.bar_drag.map(|(axis, _, _)| axis),
+            &self.reveal,
+            self.expansion_revision,
+            self.drag_pointer
+                .map(|point| (point.x.to_bits(), point.y.to_bits())),
+        ))
+    }
+
+    pub fn animating_selection(&self) -> bool {
+        self.drag_pointer.is_some_and(|point| {
+            point.y < self.viewport.pos.y || point.y > self.viewport.pos.y + self.viewport.size.y
+        })
+    }
+
+    fn row_selection(&self, file: usize, row: usize) -> Option<(TextPos, TextPos)> {
+        let (mut start, mut end) = self.ordered_selection()?;
+        if (file, row) < (start.piece.0, start.piece.1) || (file, row) > (end.piece.0, end.piece.1)
+        {
+            return None;
+        }
+        if (start.piece.0, start.piece.1) < (file, row) {
+            start = TextPos {
+                piece: (file, row, 0),
+                offset: 0,
+            };
+        }
+        if (end.piece.0, end.piece.1) > (file, row) {
+            end = TextPos {
+                piece: (file, row, u8::MAX),
+                offset: usize::MAX,
+            };
+        }
+        Some((start, end))
     }
 }
 
@@ -692,12 +779,12 @@ impl DiffDoc {
 
     /// Highlights the selected parts of this frame's pieces of one layer
     /// (Material's default selection colour: `colorScheme.primary` at 40%).
-    fn draw_selection(&self, cx: &mut Cx2d, paint: &mut GitPaint, header: bool) {
+    fn draw_selection(&self, cx: &mut Cx2d, paint: &mut GitPaint, header: bool, from: usize) {
         let Some(selection) = self.ordered_selection() else {
             return;
         };
         let color = with_alpha(palette().primary, 0.4);
-        for piece in self.pieces.iter().filter(|p| p.header == header) {
+        for piece in self.pieces[from..].iter().filter(|p| p.header == header) {
             let Some((a, b)) = Self::piece_span(selection, piece.key, piece.laid.text.len()) else {
                 continue;
             };
@@ -874,6 +961,7 @@ impl DiffDoc {
     }
 
     pub fn toggle_expand(&mut self, path: &str, start: usize) {
+        self.expansion_revision = self.expansion_revision.wrapping_add(1);
         if let Some(model) = self.models.get_mut(path) {
             model.expanded.insert(start);
             model.invalidate();
@@ -1007,7 +1095,13 @@ impl DiffDoc {
         self.hits.clear();
         self.wanted.clear();
         self.viewport = area;
-        paint.fill(cx, area, colors.surface0);
+        for presentation in self.presentations.values_mut() {
+            presentation.visited = false;
+        }
+        if self.background.begin(cx, area, 0, &mut self.hits, paint) {
+            paint.fill(cx, area, colors.surface0);
+            self.background.end(cx, &self.hits, paint);
+        }
         let mut files: Vec<&Value> = input.files.iter().collect();
         files.sort_by(|a, b| compare_diff_paths(text(a, "path"), text(b, "path")));
         let live: HashSet<&str> = files.iter().map(|f| text(f, "path")).collect();
@@ -1166,8 +1260,6 @@ impl DiffDoc {
                 colors.border,
             );
         }
-        // Selection beneath the body glyphs (the box batch precedes the text batch).
-        self.draw_selection(cx, paint, false);
         // Sticky headers paint over the rows.
         paint.new_layer(cx);
         for (file_index, (file, (path, top, height))) in files.iter().zip(blocks.iter()).enumerate()
@@ -1179,18 +1271,44 @@ impl DiffDoc {
             let pinned = natural
                 .max(area.pos.y)
                 .min(area.pos.y + top + height - self.scroll_y - HEADER_HEIGHT);
-            self.draw_header(
-                cx,
-                paint,
-                file_index,
-                file,
+            let header = rect(area.pos.x, pinned, area.size.x, HEADER_HEIGHT);
+            let key = crate::common::layer::inputs((
                 path,
-                rect(area.pos.x, pinned, area.size.x, HEADER_HEIGHT),
-                area,
-            );
+                int(file, "additions"),
+                int(file, "deletions"),
+                text(file, "status"),
+                self.hovered.as_ref() == Some(&DocHit::Header(path.clone())),
+                rect_key(area),
+                crate::theme::epoch(),
+                self.row_selection(file_index, 0),
+            ));
+            let id = (file_index, 0, 0);
+            let mut presentation = self.presentations.remove(&id).unwrap_or_default();
+            if presentation.begin(cx, paint, header, key, &mut self.hits, &mut self.pieces) {
+                self.draw_header(cx, paint, file_index, file, path, header, area);
+                self.draw_selection(cx, paint, true, presentation.piece_mark);
+                presentation.end(cx, paint, &self.hits, &self.pieces);
+            }
+            self.presentations.insert(id, presentation);
         }
-        self.draw_selection(cx, paint, true);
-        self.draw_scrollbars(cx, paint, area, input.wrap);
+        let bars_key = crate::common::layer::inputs((
+            self.scroll_x.to_bits(),
+            self.scroll_y.to_bits(),
+            self.content_width.to_bits(),
+            self.content_height.to_bits(),
+            self.bar_hovered,
+            self.bar_drag.map(|(axis, _, _)| axis),
+            input.wrap,
+        ));
+        if self
+            .scrollbar_layer
+            .begin(cx, area, bars_key, &mut self.hits, paint)
+        {
+            self.draw_scrollbars(cx, paint, area, input.wrap);
+            self.scrollbar_layer.end(cx, &self.hits, paint);
+        }
+        self.presentations
+            .retain(|_, presentation| presentation.visited);
         paint.end_clip(cx);
         if autoscroll {
             // The held pointer keeps extending the selection over newly scrolled text.
@@ -1418,6 +1536,16 @@ impl DiffDoc {
                 colors.surface0,
             );
             let band = rect(clip.pos.x + 12.0, origin.y + 8.0, clip.size.x - 24.0, lh);
+            let spinner_top = origin.y.max(clip.pos.y + HEADER_HEIGHT);
+            paint.begin_clip(
+                cx,
+                rect(
+                    clip.pos.x,
+                    spinner_top,
+                    clip.size.x,
+                    clip.pos.y + clip.size.y - spinner_top,
+                ),
+            );
             paint.spinner(
                 cx,
                 dvec2(band.pos.x + 6.0, band.pos.y + lh / 2.0),
@@ -1425,6 +1553,7 @@ impl DiffDoc {
                 colors.muted,
                 cx.seconds_since_app_start(),
             );
+            paint.end_clip(cx);
             paint.text_centered(
                 cx,
                 Font::Regular,
@@ -1502,6 +1631,53 @@ impl DiffDoc {
         for (row_index, row, top, bottom) in visible {
             let row_key = row_index + 1;
             if bottom < view_top {
+                continue;
+            }
+            let id = (file_index, row_key, 0);
+            let hovered = match self.hovered.as_ref() {
+                Some(DocHit::Expand {
+                    path: hovered_path,
+                    start,
+                }) => {
+                    hovered_path == path
+                        && matches!(row, Row::Hidden { start: row_start, .. } if row_start == *start)
+                }
+                Some(
+                    DocHit::Gutter {
+                        path: hovered_path,
+                        line,
+                    }
+                    | DocHit::LineMenu {
+                        path: hovered_path,
+                        line,
+                    },
+                ) => {
+                    hovered_path == path
+                        && match row {
+                            Row::Line(index) => index == *line,
+                            Row::Pair(left, right) => left == Some(*line) || right == Some(*line),
+                            Row::Hidden { .. } => false,
+                        }
+                }
+                _ => false,
+            };
+            let key = crate::common::layer::inputs((
+                path,
+                row,
+                input.patch_revision,
+                input.split,
+                input.wrap,
+                input.syntax_theme,
+                model.expanded.len(),
+                hovered.then_some(&self.hovered),
+                rect_key(clip),
+                crate::theme::epoch(),
+                self.row_selection(file_index, row_key),
+            ));
+            let mut presentation = self.presentations.remove(&id).unwrap_or_default();
+            let band = rect(origin.x, top, width, bottom - top);
+            if !presentation.begin(cx, paint, band, key, &mut self.hits, &mut self.pieces) {
+                self.presentations.insert(id, presentation);
                 continue;
             }
             match row {
@@ -1623,6 +1799,9 @@ impl DiffDoc {
                     );
                 }
             }
+            self.draw_selection(cx, paint, false, presentation.piece_mark);
+            presentation.end(cx, paint, &self.hits, &self.pieces);
+            self.presentations.insert(id, presentation);
         }
         self.models.insert(path.to_owned(), model);
     }
