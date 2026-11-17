@@ -132,6 +132,10 @@ impl DraftStore {
         self.outgoing_revision
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Agent draft keys owned by `server_id`'s delivery. Creation drafts (`'draft'` ids, or
     /// drafts marked `draft: true` by a creation composer with a generated tab id) have no
     /// daemon agent or message receipts.

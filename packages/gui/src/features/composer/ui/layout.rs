@@ -14,14 +14,24 @@ use crate::features::composer::i18n::{t, t_args};
 use crate::features::composer::json::*;
 use crate::features::composer::service;
 use crate::theme::fade;
+use makepad_widgets::makepad_draw::text::layouter::LaidoutText;
 use makepad_widgets::*;
 use serde_json::Value;
+use std::rc::Rc;
 
 pub const OVERHANG: f64 = 8.0;
 /// One tray row: a 48px pill below its disc overhang.
 const TRAY_ROW: f64 = 48.0 + OVERHANG;
 /// The model trigger's narrowest width beside the other agent controls.
 const MODEL_MIN_WIDTH: f64 = 40.0;
+
+pub(super) struct EditorMeasure {
+    source: Rc<LaidoutText>,
+    placeholder: Option<String>,
+    scale: f32,
+    layout: Rc<LaidoutText>,
+    height: f64,
+}
 
 /// One block of the column above the card.
 enum Block {
@@ -587,7 +597,7 @@ impl ComposerPanel {
         (12.0 + 18.0 + 8.0 + tw.max(sw) + 12.0).min(260.0)
     }
 
-    /// One editor line (the editor's own font and 1.4 line spacing).
+    /// One editor line (the editor's own font and spacing).
     fn line(&mut self, cx: &mut Cx) -> f64 {
         let laid = self.input.text_layout(cx, "Ag", None);
         laid.size_in_lpxs.height as f64 * self.input.text_scale() as f64
@@ -750,15 +760,16 @@ impl ComposerPanel {
         self.st.input_clip = viewport;
         let natural = self.editor_natural(cx, viewport.size.x, vertical, min);
         let max_scroll = (natural - viewport.size.y).max(0.0);
-        let text = self.input.text();
         if self.st.input_scroll == f64::MAX {
             self.st.input_scroll = max_scroll;
         } else if max_scroll > 0.0 && !self.st.input_manual_scroll {
-            // Measure through the editor: system-font replacement, scaling and
-            // wrapping must be identical to the rows it paints and hit-tests.
-            let laid = self
-                .input
-                .text_layout(cx, &text, Some(viewport.size.x as f32));
+            // Card sizing and caret reveal share the exact same measured rows.
+            let laid = &self
+                .st
+                .input_measure
+                .as_ref()
+                .expect("measured editor")
+                .layout;
             let cursor = self.input.cursor();
             let position = laid.cursor_to_position(cursor);
             if let Some(row) = laid.rows.get(position.row_index) {
@@ -800,24 +811,38 @@ impl ComposerPanel {
         cx.end_turtle();
     }
 
-    /// The editor's content height at `width` before it is drawn (same font, spacing and
-    /// wrapping as the TextInput), so the card grows in the same frame as the text.
+    /// Sizing, drawing and caret reveal share TextInput's retained layout, whose
+    /// cache tracks text edits, wrap width, font catalog and complete font metrics.
     fn editor_natural(&mut self, cx: &mut Cx, width: f64, vertical: f64, min: f64) -> f64 {
-        let mut text = self.input.text();
-        if text.is_empty() {
-            // The hint wraps like text (input.tsx placeholder).
-            text = self.input.empty_text().to_owned();
+        let width = width.max(10.0) as f32;
+        let source = self.input.retained_text_layout(cx, Some(width));
+        let empty = self.input.text_ref().is_empty();
+        let scale = self.input.text_scale();
+        let unchanged = self.st.input_measure.as_ref().is_some_and(|measure| {
+            Rc::ptr_eq(&measure.source, &source)
+                && measure.scale == scale
+                && (!empty || measure.placeholder.as_deref() == Some(self.input.empty_text()))
+        });
+        if !unchanged {
+            let placeholder = empty.then(|| self.input.empty_text().to_owned());
+            let layout = match placeholder.as_deref() {
+                Some(text) => self.input.text_layout(cx, text, Some(width)),
+                None => source.clone(),
+            };
+            let height = if placeholder.as_deref() == Some("") {
+                self.line(cx)
+            } else {
+                layout.size_in_lpxs.height as f64 * scale as f64
+            };
+            self.st.input_measure = Some(EditorMeasure {
+                source,
+                placeholder,
+                scale,
+                layout,
+                height,
+            });
         }
-        let line = self.line(cx);
-        let height = if text.is_empty() {
-            line
-        } else {
-            let laid = self
-                .input
-                .text_layout(cx, &text, Some(width.max(10.0) as f32));
-            laid.size_in_lpxs.height as f64 * self.input.text_scale() as f64
-        };
-        let natural = (height + vertical * 2.0).max(min);
+        let natural = (self.st.input_measure.as_ref().unwrap().height + vertical * 2.0).max(min);
         self.st.input_natural = natural;
         natural
     }
@@ -1741,6 +1766,18 @@ mod input_measurement_tests {
                     .max(30.0);
                 assert_eq!(measured, expected);
                 assert_eq!(panel.st.input_natural, expected);
+                let cached = panel.st.input_measure.as_ref().unwrap().layout.clone();
+                assert_eq!(panel.editor_natural(&mut cx, width, 6.0, 30.0), expected);
+                assert!(Rc::ptr_eq(
+                    &cached,
+                    &panel.st.input_measure.as_ref().unwrap().layout
+                ));
+                assert!(Rc::ptr_eq(
+                    &cached,
+                    &panel
+                        .input
+                        .retained_text_layout(&mut cx, Some(width as f32)),
+                ));
                 // Line breaking may hang trailing spaces beyond the fit width.
                 for row in &laid.rows {
                     let visible =

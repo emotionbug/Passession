@@ -34,6 +34,8 @@ pub(crate) struct Store {
     /// Directory revision of the host each replica file was last written from.
     replica_revisions: HashMap<PathBuf, u64>,
     pub prefs: prefs::Prefs,
+    pub prefs_revisions: Map<String, Value>,
+    pub layouts_revision: u64,
     saving: bool,
     again: bool,
     scheduled: bool,
@@ -55,10 +57,17 @@ impl Store {
             written_files: HashMap::new(),
             replica_revisions: HashMap::new(),
             prefs: prefs::Prefs::default(),
+            prefs_revisions: Map::new(),
+            layouts_revision: 0,
             saving: false,
             again: false,
             scheduled: false,
         }
+    }
+
+    pub fn bump_pref(&mut self, key: &str) {
+        self.prefs_revisions
+            .insert(key.to_owned(), super::directory::next_revision().into());
     }
 
     pub fn apply_loaded(&mut self, loaded: &mut storage::Loaded, prefs: prefs::Prefs) {
@@ -71,6 +80,13 @@ impl Store {
         self.layouts = std::mem::take(&mut loaded.layouts);
         self.written_files = std::mem::take(&mut loaded.written_files);
         self.prefs = prefs;
+        self.prefs_revisions = self
+            .prefs
+            .values
+            .keys()
+            .map(|key| (key.clone(), super::directory::next_revision().into()))
+            .collect();
+        self.layouts_revision = super::directory::next_revision();
     }
 }
 
@@ -102,6 +118,46 @@ pub(crate) async fn load(paths: Paths) -> (storage::Loaded, prefs::Prefs) {
 
 /// `CoreHandle::save_state`.
 pub(crate) async fn save_state(core: &Rc<Core>, key: String, value: Value, ack: Option<RequestId>) {
+    if let Some(name) = key.strip_prefix("prefs:").filter(|name| !name.is_empty()) {
+        let changed = {
+            let mut store = core.store.borrow_mut();
+            let value = prefs::stored_value(value);
+            let changed = store.prefs.values.get(name) != value.as_ref();
+            if changed {
+                match value {
+                    Some(value) => {
+                        store.prefs.values.insert(name.to_owned(), value);
+                    }
+                    None => {
+                        store.prefs.values.remove(name);
+                    }
+                }
+                store.bump_pref(name);
+            }
+            changed
+        };
+        if changed {
+            core.touch();
+        }
+        if !changed && ack.is_none() && core.store.borrow().prefs.writable {
+            return;
+        }
+        match queue_prefs(core, ack.is_some()) {
+            Ok(Some(completed)) => {
+                let core = core.clone();
+                tokio::task::spawn_local(async move {
+                    let result = prefs_completed(completed).await.map(|()| Value::Null);
+                    core.respond("", &ack.expect("flushed prefs acknowledgement"), result);
+                });
+            }
+            Ok(None) => {}
+            Err(error) => match ack {
+                Some(ack) => core.respond("", &ack, Err(error)),
+                None => core.error(None, error),
+            },
+        }
+        return;
+    }
     let result = apply(core, &key, value).await;
     match (result, ack) {
         (Ok(()), Some(ack)) => core.respond("", &ack, Ok(Value::Null)),
@@ -137,22 +193,14 @@ async fn apply(core: &Rc<Core>, key: &str, value: Value) -> Result<(), CoreError
         }
         {
             let mut store = core.store.borrow_mut();
-            store.layouts.insert(window.to_owned(), value);
-            store.dirty_layouts.insert(window.to_owned());
+            if store.layouts.get(window) != Some(&value) {
+                store.layouts.insert(window.to_owned(), value);
+                store.layouts_revision = super::directory::next_revision();
+                store.dirty_layouts.insert(window.to_owned());
+            }
         }
         core.touch();
         return save_now(core).await;
-    }
-    if let Some(name) = key.strip_prefix("prefs:").filter(|name| !name.is_empty()) {
-        {
-            let mut store = core.store.borrow_mut();
-            match prefs::stored_value(value) {
-                Some(value) => store.prefs.values.insert(name.to_owned(), value),
-                None => store.prefs.values.remove(name),
-            };
-        }
-        core.touch();
-        return write_prefs(core).await;
     }
     Err(CoreError::new(
         "INVALID_STATE_KEY",
@@ -161,27 +209,103 @@ async fn apply(core: &Rc<Core>, key: &str, value: Value) -> Result<(), CoreError
     ))
 }
 
-/// Persists `shared_preferences.json` (Flutter writes it on every `set*`).
-pub(crate) async fn write_prefs(core: &Rc<Core>) -> Result<(), CoreError> {
-    let (paths, values, foreign, writable) = {
-        let store = core.store.borrow();
-        (
-            store.paths.clone(),
-            store.prefs.values.clone(),
-            store.prefs.foreign.clone(),
-            store.prefs.writable,
-        )
+type PrefsCompletion = tokio::sync::oneshot::Receiver<Result<(), CoreError>>;
+
+/// Ordinary saves only mark the latest in-memory values dirty. Flushed saves seal a
+/// barrier: subsequent commands may overwrite a key, but cannot skip that durable value.
+fn queue_prefs(core: &Rc<Core>, flushed: bool) -> Result<Option<PrefsCompletion>, CoreError> {
+    let (completed, start) = {
+        let mut store = core.store.borrow_mut();
+        if !store.prefs.writable {
+            return Err(CoreError::new(
+                "STORAGE_READ_ONLY",
+                "Saved client preferences are unreadable; changes are kept only in memory.",
+                false,
+            ));
+        }
+        let completed = if flushed {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let write = prefs::Write {
+                values: store.prefs.values.clone(),
+                foreign: store.prefs.foreign.clone(),
+                report_error: std::mem::take(&mut store.prefs.writer.dirty),
+                completed: Some(sender),
+            };
+            store.prefs.writer.barriers.push_back(write);
+            Some(receiver)
+        } else {
+            store.prefs.writer.dirty = true;
+            None
+        };
+        let start = !store.prefs.writer.running;
+        store.prefs.writer.running = true;
+        (completed, start)
     };
-    if !writable {
-        return Err(CoreError::new(
-            "STORAGE_READ_ONLY",
-            "Saved client preferences are unreadable; changes are kept only in memory.",
-            false,
-        ));
+    if start {
+        let core = core.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                let next = {
+                    let mut store = core.store.borrow_mut();
+                    let write = store.prefs.writer.barriers.pop_front().or_else(|| {
+                        if !std::mem::take(&mut store.prefs.writer.dirty) {
+                            return None;
+                        }
+                        Some(prefs::Write {
+                            values: store.prefs.values.clone(),
+                            foreign: store.prefs.foreign.clone(),
+                            report_error: true,
+                            completed: None,
+                        })
+                    });
+                    match write {
+                        Some(write) => Some((store.paths.clone(), write)),
+                        None => {
+                            store.prefs.writer.running = false;
+                            None
+                        }
+                    }
+                };
+                let Some((paths, write)) = next else { break };
+                let prefs::Write {
+                    values,
+                    foreign,
+                    report_error,
+                    completed,
+                } = write;
+                // Exactly one replacement is in flight, including its fsync and rename.
+                let result =
+                    tokio::task::spawn_blocking(move || prefs::save(&paths, &values, &foreign))
+                        .await
+                        .map_err(|error| CoreError::new("STORAGE_IO", error.to_string(), false))
+                        .and_then(|result| result);
+                if report_error && let Err(error) = &result {
+                    core.error(None, error.clone());
+                }
+                if let Some(completed) = completed {
+                    let _ = completed.send(result);
+                }
+            }
+        });
     }
-    tokio::task::spawn_blocking(move || prefs::save(&paths, &values, &foreign))
-        .await
-        .map_err(|error| CoreError::new("STORAGE_IO", error.to_string(), false))?
+    Ok(completed)
+}
+
+async fn prefs_completed(completed: PrefsCompletion) -> Result<(), CoreError> {
+    completed.await.map_err(|error| {
+        CoreError::new(
+            "STORAGE_IO",
+            format!("Preferences writer stopped: {error}"),
+            false,
+        )
+    })?
+}
+
+/// A durable barrier for internal workflows and shutdown; shares the same ordered writer
+/// as `save_state`, never races a separate atomic replacement against it.
+pub(crate) async fn write_prefs(core: &Rc<Core>) -> Result<(), CoreError> {
+    let completed = queue_prefs(core, true)?.expect("flushed prefs completion");
+    prefs_completed(completed).await
 }
 
 /// Flutter `_scheduleSave`: one save 350 ms after the first change of a burst.
@@ -377,4 +501,48 @@ pub(crate) fn remember_saved_host(core: &Rc<Core>, config_id: &str, row: Value) 
         .borrow_mut()
         .saved_hosts
         .insert(config_id.to_owned(), row);
+}
+
+#[cfg(test)]
+mod prefs_writer_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn flushed_prefs_seal_exact_values_and_complete_after_write() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let core = Core::new(
+                    crate::CoreConfig {
+                        state_dir: dir.path().to_owned(),
+                        daemon_home: None,
+                        default_endpoint: None,
+                        tailnet_key_store: None,
+                    },
+                    Arc::new(crate::events::EventQueue::new(Arc::new(|| {}))),
+                );
+                core.store.borrow_mut().prefs.writable = true;
+                save_state(&core, "prefs:draft".into(), json!("first"), None).await;
+                let mut first = queue_prefs(&core, true).unwrap().unwrap();
+                assert!(matches!(
+                    first.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                assert!(!core.store.borrow().paths.prefs().exists());
+                save_state(&core, "prefs:draft".into(), json!("final"), None).await;
+                let final_write = queue_prefs(&core, true).unwrap().unwrap();
+                {
+                    let store = core.store.borrow();
+                    assert_eq!(store.prefs.writer.barriers[0].values["draft"], "first");
+                    assert_eq!(store.prefs.writer.barriers[1].values["draft"], "final");
+                }
+                prefs_completed(first).await.unwrap();
+                prefs_completed(final_write).await.unwrap();
+                let saved = prefs::load(&core.store.borrow().paths);
+                assert_eq!(saved.values["draft"], "final");
+                assert!(!core.store.borrow().prefs.writer.running);
+            })
+            .await;
+    }
 }

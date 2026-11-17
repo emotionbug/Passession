@@ -1,13 +1,15 @@
 //! The one adapter between core `State.hosts[]` (core-api.md) and the shell: Flutter
 //! `HostState` accessors, `hostDisplayLabel`, agent/workspace/project lookups.
 
+use paseo_gui_core::{CoreState, DirectorySnapshot};
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::common::json as j;
 
 /// A borrowed `state.hosts[i]` record.
 #[derive(Clone, Copy)]
-pub struct Host<'a>(pub &'a Value);
+pub struct Host<'a>(pub &'a Value, pub Option<&'a DirectorySnapshot>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -94,16 +96,23 @@ impl<'a> Host<'a> {
         j::text_or(self.config(), "color", "none")
     }
 
-    pub fn projects(&self) -> &'a [Value] {
-        j::array(self.0, "projects")
+    pub fn projects(&self) -> &'a [Arc<Value>] {
+        self.1
+            .map(|directory| directory.projects.as_slice())
+            .unwrap_or(&[])
     }
 
-    pub fn workspaces(&self) -> &'a [Value] {
-        j::array(self.0, "workspaces")
+    pub fn workspaces(&self) -> &'a [Arc<Value>] {
+        self.1
+            .map(|directory| directory.workspaces.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn agents(&self) -> impl Iterator<Item = &'a Value> {
-        j::array(self.0, "agents").iter().map(j::agent_of)
+        self.1
+            .into_iter()
+            .flat_map(|directory| directory.agents.iter())
+            .map(|row| j::agent_of(row))
     }
 
     pub fn agent(&self, id: &str) -> Option<&'a Value> {
@@ -111,7 +120,10 @@ impl<'a> Host<'a> {
     }
 
     pub fn workspace(&self, id: &str) -> Option<&'a Value> {
-        self.workspaces().iter().find(|w| j::text(w, "id") == id)
+        self.workspaces()
+            .iter()
+            .map(Arc::as_ref)
+            .find(|w| j::text(w, "id") == id)
     }
 
     /// `hostDisplayLabel`: a stored label that only repeats the endpoint or server id is
@@ -180,12 +192,15 @@ pub fn error_text(value: &Value) -> String {
     }
 }
 
-pub fn hosts(state: &Value) -> Vec<Host<'_>> {
-    j::array(state, "hosts").iter().map(Host).collect()
+pub fn hosts(state: &CoreState) -> Vec<Host<'_>> {
+    j::array(state, "hosts")
+        .iter()
+        .map(|record| Host(record, state.directory(record)))
+        .collect()
 }
 
-pub fn host<'a>(state: &'a Value, id: &str) -> Option<Host<'a>> {
-    crate::common::host_record(state, id).map(Host)
+pub fn host<'a>(state: &'a CoreState, id: &str) -> Option<Host<'a>> {
+    crate::common::host_record(state, id).map(|record| Host(record, state.directory(record)))
 }
 
 /// `_parentAgentId`: `parentAgentId` or the `paseo.parent-agent-id` label.

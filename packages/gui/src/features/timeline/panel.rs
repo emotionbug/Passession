@@ -300,6 +300,21 @@ struct Snap {
 }
 
 impl Snap {
+    /// Toasts and sync chrome do not change the transcript's retained list.
+    fn rows_changed(&self, next: &Self) -> bool {
+        !Rc::ptr_eq(&self.timeline, &next.timeline)
+            || self.agent != next.agent
+            || self.permissions != next.permissions
+            || self.turns != next.turns
+            || self.epoch != next.epoch
+            || self.running != next.running
+            || self.loading != next.loading
+            || self.start_cursor != next.start_cursor
+            || self.has_older != next.has_older
+            || self.older_failures != next.older_failures
+            || self.subagents != next.subagents
+    }
+
     fn of(s: &ChatSession, create_handoff: bool) -> Self {
         Self {
             version: s.version,
@@ -332,7 +347,7 @@ impl Snap {
 }
 
 /// Facts from the shell's state (`state.hosts[]`, preferences).
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 struct HostFacts {
     state_ptr: usize,
     connected: bool,
@@ -405,12 +420,90 @@ struct DeleteRun {
     total: usize,
 }
 
+/// One independently retained piece of chrome, including its current hit geometry.
+/// Parent composition and sibling paints must not invalidate these lists.
+struct ChromeLayer {
+    list: DrawList2d,
+    canvas: Canvas,
+    area: Area,
+    animating: bool,
+    visited: bool,
+}
+
+impl ChromeLayer {
+    fn new(cx: &mut Cx) -> Self {
+        Self {
+            list: DrawList2d::new(cx),
+            canvas: Canvas::default(),
+            area: Area::Empty,
+            animating: false,
+            visited: false,
+        }
+    }
+
+    fn paint<T>(
+        &mut self,
+        cx: &mut Cx2d,
+        kit: &mut ChatKit,
+        state: &mut RowState,
+        look: Look,
+        rect: Rect,
+        paint: impl FnOnce(&mut Cx2d, &mut Draw) -> T,
+    ) -> Option<T> {
+        self.visited = true;
+        if self.list.begin(cx, Walk::abs_rect(rect)).is_err() {
+            return None;
+        }
+        kit.begin_layer(cx);
+        cx.add_aligned_rect_area(&mut self.area, rect);
+        self.canvas.begin(rect.pos);
+        let mut d = Draw {
+            kit,
+            canvas: &mut self.canvas,
+            look,
+            state,
+            owner: None,
+            now: now_seconds(),
+            area: self.area,
+            animating: false,
+        };
+        let result = paint(cx, &mut d);
+        self.animating = d.animating;
+        self.list.end(cx);
+        Some(result)
+    }
+
+    fn finish_frame(&mut self, cx: &mut Cx2d) {
+        if !std::mem::take(&mut self.visited) {
+            self.list.release(cx);
+            self.canvas.hits.clear();
+            self.animating = false;
+        }
+    }
+}
+
+const NON_READY: usize = 0;
+const NON_READY_INDICATOR: usize = 1;
+const SUBTITLE: usize = 2;
+const EMPTY: usize = 3;
+const RAIL: usize = 4;
+const TRACKS: usize = 5;
+const JUMP: usize = 6;
+const FIND: usize = 7;
+const CALLOUTS: usize = 8;
+const HISTORY: usize = 9;
+const TOAST: usize = 10;
+const ARCHIVING: usize = 11;
+const CHROME_LAYERS: usize = 12;
+
 #[derive(Live, Widget)]
 pub struct ChatPanel {
-    /// Composer texture revision of a draw that showed a still-decoding user image
-    /// (thumbnail or lightbox); redraw once it changes.
+    /// Texture placeholders are owned by the region that actually drew them;
+    /// composer placeholders are handled by ComposerPanel itself.
     #[rust]
-    composer_texture_wait: Option<u64>,
+    timeline_texture_wait: Option<u64>,
+    #[rust]
+    modal_texture_wait: Option<u64>,
     #[redraw]
     #[rust]
     area: Area,
@@ -439,7 +532,19 @@ pub struct ChatPanel {
     sheet_template: Option<LivePtr>,
 
     #[rust(DrawList2d::new(cx))]
-    overlay_list: DrawList2d,
+    timeline_list: DrawList2d,
+    #[rust(DrawList2d::new(cx))]
+    composer_list: DrawList2d,
+    #[rust]
+    chrome_layers: Vec<ChromeLayer>,
+    #[rust]
+    painted_look: Option<Look>,
+    #[rust]
+    non_ready_indicator: Option<DVec2>,
+    #[rust]
+    modal_animating: bool,
+    #[rust(DrawList2d::new(cx))]
+    modal_content_list: DrawList2d,
     #[rust(DrawList2d::new(cx))]
     cover_list: DrawList2d,
     #[rust]
@@ -469,7 +574,7 @@ pub struct ChatPanel {
     #[rust]
     ensured: bool,
     #[rust]
-    snap: Option<Snap>,
+    snap: Option<Rc<Snap>>,
     #[rust]
     snapshot_stale: bool,
     #[rust]
@@ -671,6 +776,56 @@ fn error_text(value: &Value) -> Option<String> {
 }
 
 impl ChatPanel {
+    fn redraw_timeline(&self, cx: &mut Cx) {
+        self.timeline_list.redraw(cx);
+    }
+
+    fn redraw_chrome(&self, cx: &mut Cx) {
+        for layer in &self.chrome_layers {
+            layer.list.redraw(cx);
+        }
+        self.area.redraw(cx);
+    }
+
+    fn redraw_chrome_part(&self, cx: &mut Cx, part: usize) {
+        if let Some(layer) = self.chrome_layers.get(part) {
+            layer.list.redraw(cx);
+        } else {
+            self.area.redraw(cx);
+        }
+    }
+
+    fn redraw_modal(&self, cx: &mut Cx) {
+        self.modal_content_list.redraw(cx);
+        self.area.redraw(cx);
+    }
+
+    /// A changed session/target can change dock and stream geometry as well as rows.
+    fn redraw_session(&self, cx: &mut Cx) {
+        self.redraw_timeline(cx);
+        self.composer_list.redraw(cx);
+        self.redraw_chrome(cx);
+        self.redraw_modal(cx);
+    }
+
+    fn finish_chrome(&mut self, cx: &mut Cx2d) -> bool {
+        let mut animating = false;
+        self.overlay_canvas.begin(self.content_rect.pos);
+        for layer in &mut self.chrome_layers {
+            layer.finish_frame(cx);
+            animating |= layer.animating;
+            let offset = layer.canvas.origin - self.content_rect.pos;
+            self.overlay_canvas.hits.extend(
+                layer
+                    .canvas
+                    .hits
+                    .iter()
+                    .map(|(rect, hit)| (rect.translate(offset), hit.clone())),
+            );
+        }
+        animating
+    }
+
     // ── target and activity ─────────────────────────────────────────────
 
     pub fn set_target(&mut self, cx: &mut Cx, target: ChatTarget) {
@@ -679,13 +834,14 @@ impl ChatPanel {
         }
         let changed_session = self.target.as_ref().map(ChatTarget::key) != Some(target.key());
         if changed_session {
+            with_store(|store| store.release_view(cx, self.uid));
             self.reset_session_state(cx);
             // A new conversation opens at its latest edge.
             self.list.as_portal_list().set_tail_range(true);
         }
         self.target = Some(target);
         self.ensured = false;
-        self.area.redraw(cx);
+        self.redraw_session(cx);
     }
 
     fn reset_session_state(&mut self, cx: &mut Cx) {
@@ -723,6 +879,7 @@ impl ChatPanel {
     pub fn set_visible(&mut self, cx: &mut Cx, visible: bool) {
         if self.visible != visible {
             self.visible = visible;
+            with_store(|store| store.set_view_visible(cx, self.uid, visible));
             self.composer
                 .as_composer_panel()
                 .set_visible(cx, visible && self.composer_shown());
@@ -731,7 +888,7 @@ impl ChatPanel {
             } else {
                 self.dismiss_modal(cx);
             }
-            self.area.redraw(cx);
+            self.redraw_session(cx);
         }
     }
 
@@ -746,7 +903,7 @@ impl ChatPanel {
     pub fn set_focused(&mut self, cx: &mut Cx, focused: bool) {
         if self.focused != focused {
             self.focused = focused;
-            self.area.redraw(cx);
+            self.composer_list.redraw(cx);
         }
     }
 
@@ -788,13 +945,17 @@ impl ChatPanel {
         self.modal_horizontal_scroll.reset();
         if let Some(panel) = self.sheet_panel.take() {
             panel.as_chat_panel().set_visible(cx, false);
+            if let Some(child) = panel.as_chat_panel().borrow() {
+                with_store(|store| store.release_view(cx, child.uid));
+            }
         }
         self.modal = None;
         self.window_modal = None;
         self.modal_state = RowState::default();
         self.pressed.cancel();
         self.lightbox_drag = None;
-        self.area.redraw(cx);
+        self.redraw_modal(cx);
+        self.redraw_chrome_part(cx, TRACKS);
     }
 
     /// The tab menu picked a conversation action; runs with the next event.
@@ -810,7 +971,7 @@ impl ChatPanel {
         self.reveal_attention = true;
         self.pending_jump = None;
         self.reveal_top = None;
-        self.area.redraw(cx);
+        self.redraw_timeline(cx);
     }
 
     fn token(&mut self) -> u64 {
@@ -832,9 +993,10 @@ impl ChatPanel {
         result
     }
 
-    fn show_failure(&mut self, message: impl Into<String>) {
+    fn show_failure(&mut self, cx: &mut Cx, message: impl Into<String>) {
         self.error_seq += 1;
         self.error = Some((self.error_seq, message.into()));
+        self.redraw_chrome_part(cx, TOAST);
     }
 
     fn feature(&self, name: &str) -> bool {
@@ -848,7 +1010,7 @@ impl ChatPanel {
     // ── snapshots ───────────────────────────────────────────────────────
 
     /// Copies the session's presented facts when its version moved.
-    fn refresh_snapshot(&mut self) -> bool {
+    fn refresh_snapshot(&mut self, cx: &mut Cx) -> bool {
         if !self.visible {
             self.snapshot_stale = true;
             return false;
@@ -874,14 +1036,37 @@ impl ChatPanel {
         });
         match next {
             Some(snap) => {
-                self.snap = Some(snap);
+                let rows_changed = self.snap.as_ref().is_none_or(|old| old.rows_changed(&snap));
+                if rows_changed {
+                    self.redraw_session(cx);
+                } else {
+                    self.redraw_chrome_part(cx, TOAST);
+                    let chrome_changed = self.snap.as_ref().is_none_or(|old| {
+                        old.sync != snap.sync
+                            || old.error != snap.error
+                            || old.execution != snap.execution
+                            || old.preparation_error != snap.preparation_error
+                            || old.preparation_retrying != snap.preparation_retrying
+                            || old.child_refreshing != snap.child_refreshing
+                            || old.child_refresh_error != snap.child_refresh_error
+                            || old.create_handoff != snap.create_handoff
+                            || old.hydrated != snap.hydrated
+                            || old.initial_sync_failed != snap.initial_sync_failed
+                    });
+                    if chrome_changed {
+                        for part in [NON_READY, NON_READY_INDICATOR, CALLOUTS, HISTORY, EMPTY] {
+                            self.redraw_chrome_part(cx, part);
+                        }
+                    }
+                }
+                self.snap = Some(Rc::new(snap));
                 true
             }
             None => false,
         }
     }
 
-    fn refresh_host(&mut self, ui: &UiContext) {
+    fn refresh_host(&mut self, cx: &mut Cx, ui: &UiContext) {
         let ptr = Arc::as_ptr(&ui.state) as usize;
         let Some(target) = &self.target else { return };
         let server_info = ui.server_infos.get(&target.host_id).cloned();
@@ -913,7 +1098,12 @@ impl ChatPanel {
                 server_id.clone(),
                 str_or(get(host, "label"), &server_id).to_owned(),
             );
-            for raw in list(get(host, "agents")) {
+            for raw in ui
+                .directory(host)
+                .into_iter()
+                .flat_map(|directory| directory.agents.iter())
+                .map(Arc::as_ref)
+            {
                 let agent = if get(raw, "agent").is_object() {
                     get(raw, "agent")
                 } else {
@@ -936,6 +1126,10 @@ impl ChatPanel {
                     .filter(Value::is_object)
             })
             .unwrap_or_else(|| super::store::server_info(&target.host_id));
+        self.host.state_ptr = ptr;
+        if self.host != facts {
+            self.redraw_session(cx);
+        }
         self.host = facts;
     }
 
@@ -1387,7 +1581,8 @@ impl ChatPanel {
         let last = self.items.len().saturating_sub(1);
         list.set_first_id_and_scroll(last, 0.0);
         list.set_tail_range(true);
-        self.area.redraw(cx);
+        self.redraw_timeline(cx);
+        self.redraw_chrome_part(cx, JUMP);
     }
 
     /// Brings `row_id` to the top of the stream (`offset` below its top edge).
@@ -1400,7 +1595,8 @@ impl ChatPanel {
         self.list
             .as_portal_list()
             .set_first_id_and_scroll(index, offset);
-        self.area.redraw(cx);
+        self.redraw_timeline(cx);
+        self.redraw_chrome_part(cx, JUMP);
     }
 
     fn row_id_of_seq(&self, seq: i64) -> Option<String> {
@@ -1420,7 +1616,7 @@ impl ChatPanel {
         };
         self.older.request = Some(start);
         self.with_session(cx, ui, |s, io| s.older(io));
-        self.area.redraw(cx);
+        self.redraw_timeline(cx);
     }
 
     // ── outline ─────────────────────────────────────────────────────────
@@ -1458,6 +1654,7 @@ impl ChatPanel {
         self.prompts_latest = latest;
         if self.prompts_epoch != snap.epoch {
             self.rail.prompts.clear();
+            self.redraw_chrome_part(cx, RAIL);
         }
         self.prompts_epoch = snap.epoch.clone();
         self.prompts_request += 1;
@@ -1527,7 +1724,7 @@ impl ChatPanel {
             None => {
                 self.pending_jump = Some((seq, offset, find));
                 self.model_sig = None;
-                self.area.redraw(cx);
+                self.redraw_timeline(cx);
             }
         }
     }
@@ -1543,14 +1740,15 @@ impl ChatPanel {
             .as_ptext_field()
             .set_placeholder(cx, &t("paneFind.placeholder"));
         self.find_open = true;
-        self.area.redraw(cx);
+        self.redraw_chrome_part(cx, FIND);
     }
 
     fn close_find(&mut self, cx: &mut Cx) {
         self.find.close();
         self.find_open = false;
         self.find_field_rect = None;
-        self.area.redraw(cx);
+        self.redraw_chrome_part(cx, FIND);
+        self.redraw_timeline(cx);
     }
 
     /// Runs the find controller's requests.
@@ -1600,8 +1798,9 @@ impl ChatPanel {
         if !self.find.requests.is_empty() {
             self.pump_find(cx, ui);
         }
-        if self.visible {
-            self.area.redraw(cx);
+        if self.visible && self.find_open {
+            self.redraw_chrome_part(cx, FIND);
+            self.redraw_timeline(cx);
         }
     }
 
@@ -1614,7 +1813,7 @@ impl ChatPanel {
             "tools" => {
                 self.expanded_tools = !self.expanded_tools;
                 self.model_sig = None;
-                self.area.redraw(cx);
+                self.redraw_timeline(cx);
             }
             "sync" => {
                 self.with_session(cx, ui, |s, io| s.reload(io));
@@ -1716,7 +1915,7 @@ impl ChatPanel {
             "usage" => {
                 self.modal = Some(Modal::Usage);
                 self.modal_state = RowState::default();
-                self.area.redraw(cx);
+                self.redraw_modal(cx);
             }
             _ => {}
         }
@@ -1731,7 +1930,7 @@ impl ChatPanel {
             return false;
         };
         if !self.feature("agentForkContext") {
-            self.show_failure(t("message.actions.forkUnavailable"));
+            self.show_failure(cx, t("message.actions.forkUnavailable"));
             return false;
         }
         let mut fields = json!({});
@@ -1835,7 +2034,7 @@ impl ChatPanel {
                 state.invalidate();
             }
         }
-        self.area.redraw(cx);
+        self.redraw_timeline(cx);
     }
 
     /// The panel's toast (agent-panel.tsx `toast ?? syncToast`).
@@ -1912,7 +2111,7 @@ impl ChatPanel {
             self.dismissed_toasts.insert(id.to_owned());
         }
         self.toast_shown = None;
-        self.area.redraw(cx);
+        self.redraw_chrome_part(cx, TOAST);
     }
 
     // ── file links ──────────────────────────────────────────────────────
@@ -2160,7 +2359,7 @@ impl ChatPanel {
                 panel.as_chat_panel().set_visible(cx, true);
                 self.sheet_panel = Some(panel);
             }
-            self.area.redraw(cx);
+            self.redraw_modal(cx);
             return;
         }
         ui.push(UiEffect::OpenTab {
@@ -2169,24 +2368,7 @@ impl ChatPanel {
         });
     }
 
-    fn close_modal(&mut self, cx: &mut Cx, ui: &mut UiContext) {
-        if let (Some(Modal::Subagent { tab, .. }), Some(_)) = (&self.modal, &self.sheet_panel) {
-            // The sheet's chat leaves the replica unless a tab shows it.
-            if ui.layout.target(&tab.key()).is_none() {
-                let id = tab.id.clone().unwrap_or_default();
-                if tab.kind == "provider_subagent" {
-                    super::store::release_subagent(
-                        cx,
-                        ui,
-                        &tab.server_id,
-                        str_of(get(&tab.data, "parentAgentId")),
-                        &id,
-                    );
-                } else {
-                    super::store::release_session(cx, ui, &tab.server_id, &id);
-                }
-            }
-        }
+    fn close_modal(&mut self, cx: &mut Cx, _ui: &mut UiContext) {
         self.dismiss_modal(cx);
     }
 
@@ -2357,13 +2539,29 @@ impl ChatPanel {
             DeleteFinished::Idle
         };
         self.model_sig = None;
-        self.area.redraw(cx);
+        self.redraw_timeline(cx);
+        self.redraw_chrome_part(cx, TRACKS);
+        self.redraw_modal(cx);
     }
 
     // ── completions ─────────────────────────────────────────────────────
 
     fn on_completion(&mut self, cx: &mut Cx, ui: &mut UiContext, completion: Completion) {
         let Completion { kind, result } = completion;
+        match &kind {
+            ActionKind::Permission { .. } | ActionKind::Fork | ActionKind::Rewind { .. } => {
+                self.redraw_timeline(cx);
+            }
+            ActionKind::ArchiveSubagent { .. } => {
+                self.redraw_timeline(cx);
+                self.redraw_chrome_part(cx, TRACKS);
+                self.redraw_modal(cx);
+            }
+            ActionKind::ListPrompts { .. } => self.redraw_chrome_part(cx, RAIL),
+            ActionKind::Unarchive => self.redraw_chrome_part(cx, CALLOUTS),
+            ActionKind::Archive | ActionKind::Delete => self.redraw_chrome_part(cx, ARCHIVING),
+            _ => {}
+        }
         match kind {
             ActionKind::Permission { key } => {
                 let state = self.row_state(&format!("perm:{key}"));
@@ -2380,7 +2578,7 @@ impl ChatPanel {
                 Ok(_) => {
                     self.with_session(cx, ui, |s, io| s.reload(io));
                 }
-                Err(e) => self.show_failure(e.message),
+                Err(e) => self.show_failure(cx, e.message),
             },
             ActionKind::Refresh => match result {
                 Ok(_) => {
@@ -2389,7 +2587,7 @@ impl ChatPanel {
                     }
                     self.with_session(cx, ui, |s, io| s.reload(io));
                 }
-                Err(e) => self.show_failure(e.message),
+                Err(e) => self.show_failure(cx, e.message),
             },
             ActionKind::Unarchive => {
                 self.unarchiving = false;
@@ -2411,7 +2609,7 @@ impl ChatPanel {
                             });
                         }
                     }
-                    Err(e) => self.show_failure(e.message),
+                    Err(e) => self.show_failure(cx, e.message),
                 }
             }
             ActionKind::Fork => {
@@ -2439,8 +2637,8 @@ impl ChatPanel {
                             }),
                         });
                     }
-                    Ok(_) => self.show_failure(t("message.actions.forkFailed")),
-                    Err(e) => self.show_failure(e.message),
+                    Ok(_) => self.show_failure(cx, t("message.actions.forkFailed")),
+                    Err(e) => self.show_failure(cx, e.message),
                 }
             }
             ActionKind::Rewind { mode, text } => {
@@ -2465,7 +2663,7 @@ impl ChatPanel {
                         self.jump_to_latest(cx);
                     }
                     Ok(_) => {}
-                    Err(e) => self.show_failure(e.message),
+                    Err(e) => self.show_failure(cx, e.message),
                 }
             }
             ActionKind::ListPrompts { request } => {
@@ -2509,7 +2707,7 @@ impl ChatPanel {
                     );
                     self.asks.insert(id, Ask::Outline);
                 }
-                Err(e) => self.show_failure(e.message),
+                Err(e) => self.show_failure(cx, e.message),
             },
             ActionKind::Search { token } => {
                 let (epoch, rows) = self
@@ -2529,13 +2727,13 @@ impl ChatPanel {
             ActionKind::ArchiveSubagent { key } => {
                 if let Err(e) = result {
                     self.pending_removal.remove(&key);
-                    self.show_failure(e.message);
+                    self.show_failure(cx, e.message);
                 }
                 self.model_sig = None;
             }
             ActionKind::DetachSubagent { host_id, agent_id } => match result {
                 Ok(_) => ui.push(UiEffect::OpenSession { host_id, agent_id }),
-                Err(e) => self.show_failure(e.message),
+                Err(e) => self.show_failure(cx, e.message),
             },
             ActionKind::DeleteFinished { key } => {
                 match result {
@@ -2603,7 +2801,7 @@ impl ChatPanel {
                         self.open_inline_path(cx, ui, target.with_path(path), intent);
                     }
                     None => {
-                        self.show_failure(ta("common.errors.noFileFound", &[("token", &token)]))
+                        self.show_failure(cx, ta("common.errors.noFileFound", &[("token", &token)]))
                     }
                 }
             }
@@ -2630,9 +2828,6 @@ impl ChatPanel {
                     );
                 }
             }
-        }
-        if self.visible {
-            self.area.redraw(cx);
         }
     }
 
@@ -2690,7 +2885,7 @@ impl ChatPanel {
                         }
                     }
                 } else {
-                    self.show_failure(t("agentStream.historyLoadFailed"));
+                    self.show_failure(cx, t("agentStream.historyLoadFailed"));
                 }
             }
         }
@@ -2712,7 +2907,7 @@ impl ChatPanel {
                 };
                 let name = name.trim();
                 if name.is_empty() || name.chars().count() > 200 {
-                    self.show_failure(t("agentPanel.conversation.titleLength"));
+                    self.show_failure(cx, t("agentPanel.conversation.titleLength"));
                     return;
                 }
                 let name = name.to_owned();
@@ -2733,6 +2928,7 @@ impl ChatPanel {
                 if action == "archive" {
                     // The archiving overlay covers the panel until the tab closes.
                     self.archiving = true;
+                    self.redraw_chrome_part(cx, ARCHIVING);
                     self.with_session(cx, ui, |s, io| {
                         s.action(
                             io,
@@ -2761,6 +2957,9 @@ impl ChatPanel {
                 let key = format!("{}:{}", row.server_id, row.id);
                 self.pending_removal.insert(key.clone());
                 self.model_sig = None;
+                self.redraw_timeline(cx);
+                self.redraw_chrome_part(cx, TRACKS);
+                self.redraw_modal(cx);
                 let fields = json!({"agentId": row.id});
                 self.with_session(cx, ui, |s, io| {
                     s.request_on_host(
@@ -2785,7 +2984,7 @@ impl ChatPanel {
                 let child_connected = host_row(&ui.state, &row.server_id)
                     .is_some_and(|h| get(h, "status") == "connected");
                 if !child_connected {
-                    self.show_failure(t("workspaceSetup.errors.hostDisconnected"));
+                    self.show_failure(cx, t("workspaceSetup.errors.hostDisconnected"));
                     return;
                 }
                 let agent_id = row.id.clone();
@@ -2805,6 +3004,7 @@ impl ChatPanel {
                 });
             }
             Ask::Rewind { row, entry } => {
+                self.redraw_timeline(cx);
                 if let Some(state) = self.row_states.get(&row) {
                     let mut state = state.borrow_mut();
                     if state.menu_open.remove("rewind") {
@@ -2847,7 +3047,6 @@ impl ChatPanel {
                 }
             }
         }
-        self.area.redraw(cx);
     }
 
     // ── row and chrome taps ─────────────────────────────────────────────
@@ -3019,7 +3218,8 @@ impl ChatPanel {
                 _ => {}
             },
         }
-        self.area.redraw(cx);
+        self.redraw_timeline(cx);
+        self.redraw_modal(cx);
     }
 
     fn on_chrome_tap(&mut self, cx: &mut Cx, ui: &mut UiContext, id: &str) {
@@ -3121,12 +3321,16 @@ impl ChatPanel {
                 }
             }
         }
-        self.area.redraw(cx);
+        self.redraw_modal(cx);
+        if id == "unarchive" {
+            self.redraw_chrome_part(cx, CALLOUTS);
+        }
     }
 
     fn open_track(&mut self, cx: &mut Cx, ui: &mut UiContext, panel: TrackPanel) {
         self.modal = Some(Modal::Track(panel));
         self.modal_state = RowState::default();
+        self.redraw_chrome_part(cx, TRACKS);
         if panel == TrackPanel::Subagents {
             self.ensure_providers(cx, ui);
         }
@@ -3270,14 +3474,28 @@ impl Widget for ChatPanel {
         }
         let composer_visible = self.visible && self.composer_shown();
         if self.visible && self.next_frame.is_event(event).is_some() {
-            self.area.redraw(cx);
+            for layer in &self.chrome_layers {
+                if layer.animating {
+                    layer.list.redraw(cx);
+                }
+            }
+            if self.modal_animating {
+                self.redraw_modal(cx);
+            }
         }
         if self
-            .composer_texture_wait
+            .timeline_texture_wait
             .is_some_and(|rev| rev != crate::features::composer::texture_revision())
         {
-            self.composer_texture_wait = None;
-            self.area.redraw(cx);
+            self.timeline_texture_wait = None;
+            self.redraw_timeline(cx);
+        }
+        if self
+            .modal_texture_wait
+            .is_some_and(|rev| rev != crate::features::composer::texture_revision())
+        {
+            self.modal_texture_wait = None;
+            self.redraw_modal(cx);
         }
         let modal_open = self.modal.is_some();
         let modal_input = crate::common::is_user_input(event);
@@ -3516,7 +3734,11 @@ impl Widget for ChatPanel {
                             state.expanded.insert("sheet:detached".into(), true);
                         }
                         self.bar_drag = Some((drag, modal));
-                        self.area.redraw(cx);
+                        if modal {
+                            self.redraw_modal(cx);
+                        } else {
+                            self.redraw_chrome(cx);
+                        }
                     }
                 }
                 if self.bar_drag.is_some() {
@@ -3540,7 +3762,11 @@ impl Widget for ChatPanel {
                         (&self.overlay_canvas, &mut self.chrome_state)
                     };
                     if drag.drag_to(e.abs - canvas.origin, state) {
-                        self.area.redraw(cx);
+                        if *modal {
+                            self.redraw_modal(cx);
+                        } else {
+                            self.redraw_chrome(cx);
+                        }
                     }
                 }
                 if let (Some(last), Some(Modal::Lightbox { offset, scale, .. })) =
@@ -3549,7 +3775,7 @@ impl Widget for ChatPanel {
                 {
                     *offset += e.abs - last;
                     self.lightbox_drag = Some(e.abs);
-                    self.area.redraw(cx);
+                    self.redraw_modal(cx);
                 }
             }
             Hit::FingerLongPress(_) => self.pressed.cancel(),
@@ -3561,7 +3787,11 @@ impl Widget for ChatPanel {
                         &mut self.chrome_state
                     };
                     state.dragging_bar = None;
-                    self.area.redraw(cx);
+                    if modal {
+                        self.redraw_modal(cx);
+                    } else {
+                        self.redraw_chrome(cx);
+                    }
                 }
                 let dragged = self.lightbox_drag.take().is_some_and(|start| {
                     (e.abs - e.abs_start).length() > 4.0 && start != e.abs_start
@@ -3611,13 +3841,15 @@ impl Widget for ChatPanel {
                             },
                         });
                     }
-                    self.area.redraw(cx);
+                    if self.modal.is_some() {
+                        self.redraw_modal(cx);
+                    }
                 }
             }
             Hit::FingerScroll(e) => {
                 if let Some(Modal::Lightbox { .. }) = &self.modal {
                     self.zoom(if e.scroll.y < 0.0 { 1.1 } else { 1.0 / 1.1 });
-                    self.area.redraw(cx);
+                    self.redraw_modal(cx);
                 }
             }
             _ => {}
@@ -3674,15 +3906,16 @@ impl Widget for ChatPanel {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         cx.begin_turtle(walk, self.layout);
-        let texture_misses = crate::features::composer::texture_misses();
-        let texture_revision = crate::features::composer::texture_revision();
         let rect = cx.turtle().rect();
         self.content_rect = rect;
+        while self.chrome_layers.len() < CHROME_LAYERS {
+            self.chrome_layers.push(ChromeLayer::new(cx));
+        }
         self.cover_area = Area::Empty;
         if let Some(ui) = scope.data.get::<UiContext>() {
-            self.refresh_host(ui);
+            self.refresh_host(cx, ui);
         }
-        let changed = self.refresh_snapshot();
+        let changed = self.refresh_snapshot(cx);
         if self.visible
             && (changed || self.snapshot_stale)
             && let Some(ui) = scope.data.get_mut::<UiContext>()
@@ -3691,6 +3924,10 @@ impl Widget for ChatPanel {
             self.on_session_changed(cx, ui);
         }
         let look = self.look(rect.size.x);
+        if self.painted_look != Some(look) {
+            self.painted_look = Some(look);
+            self.redraw_session(cx);
+        }
         let p = look.palette;
         self.kit.begin_layer(cx);
         self.kit.rect(cx, rect, p.surface0, 0.0);
@@ -3698,22 +3935,31 @@ impl Widget for ChatPanel {
         let target = self.target.clone().unwrap_or_default();
         let non_ready = self.non_ready();
         if let Some(view) = non_ready {
-            self.overlay_list.begin_always(cx);
-            self.kit.begin_layer(cx);
-            self.overlay_canvas.begin(rect.pos);
-            let mut d = Draw {
-                kit: &mut self.kit,
-                canvas: &mut self.overlay_canvas,
+            if let Some(center) = self.chrome_layers[NON_READY].paint(
+                cx,
+                &mut self.kit,
+                &mut self.chrome_state,
                 look,
-                state: &mut self.chrome_state,
-                owner: None,
-                now: now_seconds(),
-                area: self.area,
-                animating: false,
-            };
-            chrome::non_ready(cx, &mut d, &view, rect);
-            animating |= d.animating;
-            self.overlay_list.end(cx);
+                rect,
+                |cx, d| chrome::non_ready(cx, d, &view, rect),
+            ) {
+                self.non_ready_indicator = center;
+            }
+            if let Some(center) = self.non_ready_indicator {
+                self.chrome_layers[NON_READY_INDICATOR].paint(
+                    cx,
+                    &mut self.kit,
+                    &mut self.chrome_state,
+                    look,
+                    rect,
+                    |cx, d| chrome::spinner(cx, d, center, 24.0, p.muted),
+                );
+            }
+            self.timeline_list.release(cx);
+            self.composer_list.release(cx);
+            self.find_list.release(cx);
+            self.modal_content_list.release(cx);
+            animating |= self.finish_chrome(cx);
             cx.end_turtle_with_area(&mut self.area);
             if animating {
                 self.next_frame = cx.new_next_frame();
@@ -3722,35 +3968,7 @@ impl Widget for ChatPanel {
         }
         let compact = look.compact;
         let track_height = tracks::pill_height(cx, &mut self.kit, look);
-        self.rebuild_items(look, track_height);
-        if let Some((seq, offset, find)) = self.pending_jump.take() {
-            // Once: a row still missing after the rebuild is not in the stream.
-            if let Some(id) = self.row_id_of_seq(seq) {
-                self.scroll_to_row(cx, &id, offset);
-                if find {
-                    self.find_scroll = Some((id, 0));
-                }
-            }
-        }
-        if self.reveal_attention && self.snap.is_some() {
-            self.reveal_attention = false;
-            self.find_scroll = None;
-            self.attention_row = self
-                .items
-                .iter()
-                .find(|i| matches!(i.kind, RowKind::Permission { .. }))
-                .map(|i| i.id.clone());
-            self.jump_to_latest(cx);
-        }
         let snap = self.snap.clone();
-        let core = scope
-            .data
-            .get::<UiContext>()
-            .map(|ui| ui.core.clone())
-            .or_else(|| self.core.clone());
-        if let Some(core) = &core {
-            self.ctx = Some(self.row_context(look, core));
-        }
         let subagent = target.is_subagent();
         let archived = snap.as_ref().is_some_and(|s| s.archived);
         let connected = self.host.connected;
@@ -3833,7 +4051,8 @@ impl Widget for ChatPanel {
         // ── the composer (drawn first so the stream gets its exact height) ─
         // It rests on the panel bottom at last frame's height; a height change
         // shifts what it just drew by the difference in the same frame.
-        if self.composer_shown() {
+        let composer_shown = self.composer_shown();
+        if composer_shown {
             self.sync_composer(cx);
             // The pane below its header is the composer dock's stationary viewport.
             self.composer
@@ -3846,23 +4065,37 @@ impl Widget for ChatPanel {
                 width: Size::Fixed(rect.size.x),
                 height: Size::Fit,
             };
-            cx.begin_turtle(walk, Layout::flow_down());
-            let _ = self.composer.draw_walk(
-                cx,
-                scope,
-                Walk {
-                    abs_pos: None,
-                    margin: Margin::default(),
-                    width: Size::Fill,
-                    height: Size::Fit,
-                },
+            let dirty = cx.will_redraw(
+                &mut self.composer_list,
+                Walk::abs_rect(rect_xywh(
+                    rect.pos.x,
+                    bottom - self.composer_h,
+                    rect.size.x,
+                    self.composer_h,
+                )),
             );
-            let range = cx.get_turtle_align_range();
-            let drawn = cx.end_turtle().size.y;
-            if drawn.is_finite() && (drawn - self.composer_h).abs() > 0.5 {
-                cx.shift_align_range(&range, dvec2(0.0, self.composer_h - drawn));
-                self.composer_h = drawn;
+            if self.composer_list.begin_maybe(cx, dirty).is_ok() {
+                cx.begin_turtle(walk, Layout::flow_down());
+                let _ = self.composer.draw_walk(
+                    cx,
+                    scope,
+                    Walk {
+                        abs_pos: None,
+                        margin: Margin::default(),
+                        width: Size::Fill,
+                        height: Size::Fit,
+                    },
+                );
+                let range = cx.get_turtle_align_range();
+                let drawn = cx.end_turtle().size.y;
+                if drawn.is_finite() && (drawn - self.composer_h).abs() > 0.5 {
+                    cx.shift_align_range(&range, dvec2(0.0, self.composer_h - drawn));
+                    self.composer_h = drawn;
+                }
+                self.composer_list.end(cx);
             }
+        } else {
+            self.composer_list.release(cx);
         }
         let composer_h = if self.composer_shown() {
             self.composer_h
@@ -3872,84 +4105,127 @@ impl Widget for ChatPanel {
         let stream_h = (rect.size.y - facts_h - callouts_h - archived_h - composer_h).max(0.0);
         let stream_rect = rect_xywh(rect.pos.x, rect.pos.y + facts_h, rect.size.x, stream_h);
         self.stream_rect = stream_rect;
+        let timeline_drawn = self
+            .timeline_list
+            .begin(cx, Walk::abs_rect(stream_rect))
+            .is_ok();
+        if timeline_drawn {
+            let texture_misses = crate::features::composer::texture_misses();
+            let texture_revision = crate::features::composer::texture_revision();
+            // Even an empty transcript retains a draw item, so composer/chrome
+            // paints can replay it without entering ModelSig or row layout.
+            self.kit.begin_layer(cx);
+            self.kit.rect(cx, stream_rect, p.surface0, 0.0);
+            self.rebuild_items(look, track_height);
+            if let Some((seq, offset, find)) = self.pending_jump.take() {
+                // Once: a row still missing after the rebuild is not in the stream.
+                if let Some(id) = self.row_id_of_seq(seq) {
+                    self.scroll_to_row(cx, &id, offset);
+                    if find {
+                        self.find_scroll = Some((id, 0));
+                    }
+                }
+            }
+            if self.reveal_attention && self.snap.is_some() {
+                self.reveal_attention = false;
+                self.find_scroll = None;
+                self.attention_row = self
+                    .items
+                    .iter()
+                    .find(|i| matches!(i.kind, RowKind::Permission { .. }))
+                    .map(|i| i.id.clone());
+                self.jump_to_latest(cx);
+            }
+            let core = scope
+                .data
+                .get::<UiContext>()
+                .map(|ui| ui.core.clone())
+                .or_else(|| self.core.clone());
+            if let Some(core) = &core {
+                self.ctx = Some(self.row_context(look, core));
+            }
+            let empty = self.stream_empty();
+            let loading = snap.as_ref().is_some_and(|s| s.loading);
+
+            // ── the stream ──────────────────────────────────────────────────
+            if !empty || loading {
+                let walk = Walk {
+                    abs_pos: Some(stream_rect.pos),
+                    margin: Margin::default(),
+                    width: Size::Fixed(stream_rect.size.x),
+                    height: Size::Fixed(stream_rect.size.y.max(1.0)),
+                };
+                let list_ref = self.list.clone();
+                let portal = list_ref.as_portal_list();
+                if self.sticky {
+                    // view.tsx scrollToBottom: a sticky stream rests on its newest
+                    // edge (the last item drawn first, then the list scans up and
+                    // aligns its bottom), however its rows grow.
+                    portal.set_first_id_and_scroll(self.items.len().saturating_sub(1), 0.0);
+                    portal.set_tail_range(true);
+                }
+                while list_ref.draw_walk(cx, scope, walk).is_step() {
+                    let Some(mut list) = portal.borrow_mut() else {
+                        break;
+                    };
+                    list.set_item_range(cx, 0, self.items.len());
+                    list.begin_measurement();
+                    while let Some(index) = list.next_visible_item(cx) {
+                        let Some(item) = self.items.get(index).cloned() else {
+                            continue;
+                        };
+                        let widget = list.item(cx, index, live_id!(Row));
+                        if let Some(ctx) = &self.ctx {
+                            let state = self.row_states.entry(item.id.clone()).or_default().clone();
+                            widget.as_chat_row().set_model(
+                                cx,
+                                RowModel {
+                                    panel: self.uid,
+                                    item,
+                                    ctx: ctx.clone(),
+                                    state,
+                                },
+                            );
+                        }
+                        let width = cx.turtle().rect().size.x;
+                        let height = widget.as_chat_row().measure(cx, width);
+                        cx.walk_turtle(Walk {
+                            abs_pos: None,
+                            margin: Margin::default(),
+                            width: Size::Fill,
+                            height: Size::Fixed(height),
+                        });
+                    }
+                    while let Some((index, walk, viewport)) = list.next_final_item(cx) {
+                        if let Some((_, widget)) = list.get_item(index) {
+                            widget.as_chat_row().paint_final(cx, scope, walk, viewport);
+                        }
+                    }
+                }
+                if self.reader_scrolled {
+                    // Only layout can determine whether the reader reached the
+                    // newest edge. Scroll actions arrive before that layout.
+                    let at_end = portal.is_at_end();
+                    self.sticky = at_end;
+                    // strategy-native.tsx isNearBottom: the jump button hides
+                    // within 32px of the newest edge, where it would only cover it.
+                    self.at_bottom = portal
+                        .end_overflow()
+                        .is_some_and(|overflow| overflow <= 32.0);
+                    portal.set_tail_range(at_end);
+                }
+            }
+            self.timeline_texture_wait = (crate::features::composer::texture_misses()
+                != texture_misses)
+                .then_some(texture_revision);
+            self.timeline_list.end(cx);
+        }
         let empty = self.stream_empty();
         let loading = snap.as_ref().is_some_and(|s| s.loading);
-
-        // ── the stream ──────────────────────────────────────────────────
-        if !empty || loading {
-            let walk = Walk {
-                abs_pos: Some(stream_rect.pos),
-                margin: Margin::default(),
-                width: Size::Fixed(stream_rect.size.x),
-                height: Size::Fixed(stream_rect.size.y.max(1.0)),
-            };
-            let list_ref = self.list.clone();
-            let portal = list_ref.as_portal_list();
-            if self.sticky {
-                // view.tsx scrollToBottom: a sticky stream rests on its newest
-                // edge (the last item drawn first, then the list scans up and
-                // aligns its bottom), however its rows grow.
-                portal.set_first_id_and_scroll(self.items.len().saturating_sub(1), 0.0);
-                portal.set_tail_range(true);
-            }
-            while list_ref.draw_walk(cx, scope, walk).is_step() {
-                let Some(mut list) = portal.borrow_mut() else {
-                    break;
-                };
-                list.set_item_range(cx, 0, self.items.len());
-                list.begin_measurement();
-                while let Some(index) = list.next_visible_item(cx) {
-                    let Some(item) = self.items.get(index).cloned() else {
-                        continue;
-                    };
-                    let widget = list.item(cx, index, live_id!(Row));
-                    if let Some(ctx) = &self.ctx {
-                        let state = self.row_states.entry(item.id.clone()).or_default().clone();
-                        widget.as_chat_row().set_model(
-                            cx,
-                            RowModel {
-                                panel: self.uid,
-                                item,
-                                ctx: ctx.clone(),
-                                state,
-                            },
-                        );
-                    }
-                    let width = cx.turtle().rect().size.x;
-                    let height = widget.as_chat_row().measure(cx, width);
-                    cx.walk_turtle(Walk {
-                        abs_pos: None,
-                        margin: Margin::default(),
-                        width: Size::Fill,
-                        height: Size::Fixed(height),
-                    });
-                }
-                while let Some((index, walk, viewport)) = list.next_final_item(cx) {
-                    if let Some((_, widget)) = list.get_item(index) {
-                        widget.as_chat_row().paint_final(cx, scope, walk, viewport);
-                    }
-                }
-            }
-            if self.reader_scrolled {
-                // Only layout can determine whether the reader reached the
-                // newest edge. Scroll actions arrive before that layout.
-                let at_end = portal.is_at_end();
-                self.sticky = at_end;
-                // strategy-native.tsx isNearBottom: the jump button hides
-                // within 32px of the newest edge, where it would only cover it.
-                self.at_bottom = portal
-                    .end_overflow()
-                    .is_some_and(|overflow| overflow <= 32.0);
-                portal.set_tail_range(at_end);
-            }
-        }
 
         let dock_top = stream_rect.pos.y + stream_rect.size.y;
 
         // ── chrome over the stream ──────────────────────────────────────
-        self.overlay_list.begin_always(cx);
-        self.kit.begin_layer(cx);
-        self.overlay_canvas.begin(rect.pos);
         let tracks_visible = self.tracks_visible();
         let rows = if tracks_visible {
             self.subagent_rows()
@@ -3992,48 +4268,56 @@ impl Widget for ChatPanel {
         let jump_visible = !self.at_bottom && !empty;
         let approval_pending =
             !subagent && snap.as_ref().is_some_and(|s| !s.permissions.is_empty());
-        let mut find_field_rect = None;
-        let mut track_anchors = Vec::new();
-        {
-            let mut d = Draw {
-                kit: &mut self.kit,
-                canvas: &mut self.overlay_canvas,
-                look,
-                state: &mut self.chrome_state,
-                owner: None,
-                now: now_seconds(),
-                area: self.area,
-                animating: false,
+        macro_rules! chrome_part {
+            ($part:expr, $bounds:expr, $paint:expr) => {
+                self.chrome_layers[$part].paint(
+                    cx,
+                    &mut self.kit,
+                    &mut self.chrome_state,
+                    look,
+                    $bounds,
+                    $paint,
+                )
             };
-            if let Some(f) = &facts {
-                chrome::pane_subtitle(cx, &mut d, f, rect.pos.x, rect.pos.y, rect.size.x);
-            }
-            if empty && !loading {
+        }
+        if let Some(f) = &facts {
+            chrome_part!(SUBTITLE, rect, |cx, d| {
+                chrome::pane_subtitle(cx, d, f, rect.pos.x, rect.pos.y, rect.size.x);
+            });
+        }
+        if empty && !loading {
+            chrome_part!(EMPTY, stream_rect, |cx, d| {
                 chrome::empty_state(
                     cx,
-                    &mut d,
+                    d,
                     stream_rect.pos.x,
                     stream_rect.pos.y + stream_rect.size.y,
                     stream_rect.size.x,
                 );
-            }
-            if outline_shown && self.rail.draw(cx, &mut d, stream_rect, prompts_active) {
-                d.animating = true;
-            }
-            if tracks_visible {
-                let model = TrackModel {
-                    tasks: &tasks,
-                    rows: &rows,
-                    delete: delete_status,
-                    can_delete_finished: !subagent,
-                    can_detach,
-                    host_id: &target.host_id,
-                    providers: &self.providers,
-                    host_label: &host_label_fn,
-                };
-                track_anchors = tracks::draw_bar(
+            });
+        }
+        if outline_shown {
+            chrome_part!(RAIL, stream_rect, |cx, d| {
+                if self.rail.draw(cx, d, stream_rect, prompts_active) {
+                    d.animating = true;
+                }
+            });
+        }
+        if tracks_visible {
+            let model = TrackModel {
+                tasks: &tasks,
+                rows: &rows,
+                delete: delete_status,
+                can_delete_finished: !subagent,
+                can_detach,
+                host_id: &target.host_id,
+                providers: &self.providers,
+                host_label: &host_label_fn,
+            };
+            if let Some(anchors) = chrome_part!(TRACKS, stream_rect, |cx, d| {
+                tracks::draw_bar(
                     cx,
-                    &mut d,
+                    d,
                     &mut self.painter,
                     &model,
                     open_track,
@@ -4041,97 +4325,119 @@ impl Widget for ChatPanel {
                     stream_rect.pos.y + stream_rect.size.y,
                     stream_rect.size.x,
                     track_height,
-                );
+                )
+            }) {
+                self.track_anchors = anchors;
             }
-            if jump_visible {
-                let clearance = if tracks_visible {
-                    tracks::control_clearance(compact, track_height)
-                } else {
-                    0.0
-                };
-                let bottom = stream_rect.pos.y + stream_rect.size.y - clearance.max(16.0);
+        } else {
+            self.track_anchors.clear();
+        }
+        if jump_visible {
+            let clearance = if tracks_visible {
+                tracks::control_clearance(compact, track_height)
+            } else {
+                0.0
+            };
+            let bottom = stream_rect.pos.y + stream_rect.size.y - clearance.max(16.0);
+            chrome_part!(JUMP, stream_rect, |cx, d| {
                 chrome::jump_button(
                     cx,
-                    &mut d,
+                    d,
                     stream_rect.center().x,
                     bottom,
                     stream_rect.size.x - 32.0,
                     approval_pending,
                 );
-            }
-            if find_open {
-                let (field, card_h) = find_card(
+            });
+        }
+        if find_open {
+            if let Some((field, card_h)) = chrome_part!(FIND, stream_rect, |cx, d| {
+                find_card(
                     cx,
-                    &mut d,
+                    d,
                     stream_rect,
                     &find_status,
                     find_can_navigate,
                     find_failure,
-                );
-                find_field_rect = Some(field);
+                )
+            }) {
+                self.find_field_rect = Some(field);
                 self.find_card_h = card_h;
             }
-            let mut cy = dock_top;
-            for callout in &callouts {
-                cy += chrome::callout(cx, &mut d, callout, rect.pos.x, cy, rect.size.x);
-            }
-            if show_archived_callout {
-                chrome::archived_callout(
-                    cx,
-                    &mut d,
-                    connected,
-                    self.unarchiving,
-                    self.unarchive_error.as_deref(),
-                    rect.pos.x,
-                    cy,
-                    rect.size.x,
-                );
-            }
-            let covered = history_overlay || self.archiving;
-            if covered {
-                // Keep the cover outside every underlying input's draw list.
-                // The toast remains in this layer, above history sync but below archiving.
-                self.cover_list.begin_always(cx);
-                d.kit.begin_layer(cx);
-                cx.add_aligned_rect_area(&mut self.cover_area, rect);
-                overlay::float(self.cover_area);
-                find_field_rect = None;
-            }
-            if history_overlay {
-                chrome::history_overlay(cx, &mut d, rect);
-            }
-            if let Some(toast) = &toast {
-                chrome::toast(cx, &mut d, toast, rect);
-            }
-            if self.archiving {
-                chrome::archiving_overlay(cx, &mut d, rect);
-            }
-            if covered {
-                self.cover_list.end(cx);
-            }
-            animating |= d.animating;
+        } else {
+            self.find_field_rect = None;
         }
-        self.overlay_list.end(cx);
-        self.track_anchors = track_anchors;
-        self.find_field_rect = find_field_rect;
+        let callout_rect = rect_xywh(rect.pos.x, dock_top, rect.size.x, callouts_h + archived_h);
+        if !callouts.is_empty() || show_archived_callout {
+            let unarchiving = self.unarchiving;
+            let unarchive_error = self.unarchive_error.as_deref();
+            chrome_part!(CALLOUTS, callout_rect, |cx, d| {
+                let mut cy = dock_top;
+                for callout in &callouts {
+                    cy += chrome::callout(cx, d, callout, rect.pos.x, cy, rect.size.x);
+                }
+                if show_archived_callout {
+                    chrome::archived_callout(
+                        cx,
+                        d,
+                        connected,
+                        unarchiving,
+                        unarchive_error,
+                        rect.pos.x,
+                        cy,
+                        rect.size.x,
+                    );
+                }
+            });
+        }
+        let covered = history_overlay || self.archiving;
+        if covered {
+            // Keep the input cover outside underlying inputs' lists. Its children
+            // preserve toast ordering above history sync and below archiving.
+            self.cover_list.begin_always(cx);
+            cx.add_aligned_rect_area(&mut self.cover_area, rect);
+            overlay::float(self.cover_area);
+            self.find_field_rect = None;
+        }
+        if history_overlay {
+            chrome_part!(HISTORY, rect, |cx, d| chrome::history_overlay(cx, d, rect));
+        }
+        if let Some(toast) = &toast {
+            chrome_part!(TOAST, rect, |cx, d| {
+                chrome::toast(cx, d, toast, rect);
+            });
+        }
+        if self.archiving {
+            chrome_part!(ARCHIVING, rect, |cx, d| chrome::archiving_overlay(
+                cx, d, rect
+            ));
+        }
+        if covered {
+            self.cover_list.end(cx);
+        }
+        animating |= self.finish_chrome(cx);
+        let find_field_rect = self.find_field_rect;
 
         // ── the find field ──────────────────────────────────────────────
         if let Some(field) = find_field_rect {
-            self.find_list.begin_always(cx);
-            let walk = Walk {
-                abs_pos: Some(field.pos),
-                margin: Margin::default(),
-                width: Size::Fixed(field.size.x),
-                height: Size::Fixed(field.size.y),
-            };
-            let _ = self.find_field.draw_walk(cx, scope, walk);
-            self.find_list.end(cx);
+            if self.find_list.begin(cx, Walk::abs_rect(field)).is_ok() {
+                let walk = Walk {
+                    abs_pos: Some(field.pos),
+                    margin: Margin::default(),
+                    width: Size::Fixed(field.size.x),
+                    height: Size::Fixed(field.size.y),
+                };
+                let _ = self.find_field.draw_walk(cx, scope, walk);
+                self.find_list.end(cx);
+            }
             if self.find_focus_seen != self.find.focus_requests {
                 self.find_focus_seen = self.find.focus_requests;
                 let field = self.find_field.as_ptext_field();
                 field.set_key_focus(cx);
                 field.select_all(cx);
             }
+        } else {
+            self.find_list.release(cx);
         }
 
         // ── the file drop backdrop, over the stream and the composer ────
@@ -4161,33 +4467,51 @@ impl Widget for ChatPanel {
                 0.0
             };
             self.modal_rect = bounds;
-            cx.begin_turtle(Walk::abs_rect(bounds), Layout::default());
-            self.modal_kit.begin_layer(cx);
-            self.modal_canvas.begin(bounds.pos);
-            animating |= self.draw_modal(
-                cx,
-                scope,
-                look,
-                bounds,
-                bottom_inset,
-                &rows,
-                &tasks,
-                &host_label_fn,
-            );
-            cx.end_turtle_with_area(&mut self.modal_area);
+            if self
+                .modal_content_list
+                .begin(cx, Walk::abs_rect(bounds))
+                .is_ok()
+            {
+                let texture_misses = crate::features::composer::texture_misses();
+                let texture_revision = crate::features::composer::texture_revision();
+                cx.begin_turtle(Walk::abs_rect(bounds), Layout::default());
+                self.modal_kit.begin_layer(cx);
+                self.modal_canvas.begin(bounds.pos);
+                self.modal_animating = self.draw_modal(
+                    cx,
+                    scope,
+                    look,
+                    bounds,
+                    bottom_inset,
+                    &rows,
+                    &tasks,
+                    &host_label_fn,
+                );
+                self.modal_texture_wait = (crate::features::composer::texture_misses()
+                    != texture_misses)
+                    .then_some(texture_revision);
+                cx.end_turtle_with_area(&mut self.modal_area);
+                self.modal_content_list.end(cx);
+            }
+            animating |= self.modal_animating;
             overlay::modal_float(self.widget_uid().0, self.modal_area);
             cx.end_pass_sized_turtle();
             self.modal_list.end(cx);
         } else {
             self.modal_canvas.begin(rect.pos);
+            self.modal_content_list.release(cx);
+            self.modal_animating = false;
         }
         cx.end_turtle_with_area(&mut self.area);
 
         // ── after layout ────────────────────────────────────────────────
-        self.after_draw(cx);
+        if timeline_drawn {
+            self.after_draw(cx);
+        }
         // A reply must be rebuilt and laid out before deciding whether the
         // reader is still at history start. Old indices can queue every page.
-        if let Some(ui) = scope.data.get_mut::<UiContext>()
+        if timeline_drawn
+            && let Some(ui) = scope.data.get_mut::<UiContext>()
             && self.wants_older()
         {
             self.load_older(cx, ui);
@@ -4217,9 +4541,6 @@ impl Widget for ChatPanel {
                 self.toast_timer = cx.start_timeout(duration);
             }
         }
-        self.composer_texture_wait = (crate::features::composer::texture_misses()
-            != texture_misses)
-            .then_some(texture_revision);
         if animating {
             self.next_frame = cx.new_next_frame();
         }
@@ -4431,7 +4752,7 @@ impl ChatPanel {
     fn chrome_hover(&mut self, cx: &mut Cx, abs: Option<DVec2>) {
         let now = now_seconds();
         if self.modal.is_none() && self.rail.hover(abs, now) {
-            self.area.redraw(cx);
+            self.redraw_chrome_part(cx, RAIL);
         }
         let key = abs
             .and_then(|abs| self.chrome_hit(abs))
@@ -4442,9 +4763,20 @@ impl ChatPanel {
             &mut self.chrome_state
         };
         if state.hover_hit != key {
-            state.hover_hit = key.clone();
+            let previous = std::mem::replace(&mut state.hover_hit, key.clone());
             state.hovered = abs.is_some();
-            self.area.redraw(cx);
+            if self.modal.is_some() {
+                self.redraw_modal(cx);
+            } else {
+                for layer in &self.chrome_layers {
+                    if layer.canvas.hits.iter().any(|(_, target)| {
+                        let hit = super::chat_row::hover_key(target);
+                        previous.as_ref() == Some(&hit) || key.as_ref() == Some(&hit)
+                    }) {
+                        layer.list.redraw(cx);
+                    }
+                }
+            }
         }
         if abs.is_some() {
             cx.set_cursor(if key.is_some() {
@@ -4458,7 +4790,7 @@ impl ChatPanel {
     fn modal_scroll(&mut self, cx: &mut Cx, abs: DVec2, delta: DVec2) -> bool {
         if let Some(Modal::Lightbox { .. }) = &self.modal {
             self.zoom(if delta.y < 0.0 { 1.1 } else { 1.0 / 1.1 });
-            self.area.redraw(cx);
+            self.redraw_modal(cx);
             return true;
         }
         let rel = abs - self.modal_canvas.origin;
@@ -4484,7 +4816,7 @@ impl ChatPanel {
                     .expanded
                     .insert("sheet:detached".into(), true);
             }
-            self.area.redraw(cx);
+            self.redraw_modal(cx);
             return true;
         }
         false
@@ -4503,14 +4835,16 @@ impl ChatPanel {
         let Some(target) = self.target.clone() else {
             return;
         };
+        let visible = self.visible && ui.activity.visible;
         if !self.ensured {
             self.ensured = true;
-            with_store(|store| store.ensure(cx, ui, &target.key()));
-            self.area.redraw(cx);
+            with_store(|store| store.ensure(cx, ui, &target.key(), self.uid, visible));
+            self.redraw_session(cx);
         }
+        with_store(|store| store.set_view_visible(cx, self.uid, visible));
         self.core = Some(ui.core.clone());
-        self.refresh_host(ui);
-        let changed = self.refresh_snapshot();
+        self.refresh_host(cx, ui);
+        let changed = self.refresh_snapshot(cx);
 
         // Commands addressed to this tab, and overlay answers by id.
         let mut overlay_answers = Vec::new();
@@ -4585,15 +4919,16 @@ impl ChatPanel {
                                 body,
                                 "get_providers_snapshot_request",
                             ) {
-                                self.show_failure(error.message);
+                                self.show_failure(cx, error.message);
                             } else {
                                 self.providers = bridge::provider_entries(body);
                             }
                         }
-                        Err(error) => self.show_failure(error.message.clone()),
+                        Err(error) => self.show_failure(cx, error.message.clone()),
                     }
                     if self.visible {
-                        self.area.redraw(cx);
+                        self.redraw_chrome(cx);
+                        self.redraw_modal(cx);
                     }
                 }
                 paseo_gui_core::CoreEvent::Connected { host_id, .. }
@@ -4643,7 +4978,8 @@ impl ChatPanel {
             if list.scrolled(actions) {
                 // Never consult is_at_end here: it is from the frame before
                 // this scroll. draw_walk reconciles the laid-out position.
-                self.area.redraw(cx);
+                self.redraw_timeline(cx);
+                self.redraw_chrome_part(cx, JUMP);
             }
             let composer = self.composer.as_composer_panel();
             if composer.prompt_submitted(actions).is_some() {
@@ -4753,7 +5089,6 @@ impl ChatPanel {
             self.with_session(cx, ui, |s, io| s.load_subagents(io));
         }
         self.refresh_prompts(cx, ui);
-        self.area.redraw(cx);
     }
 
     fn wants_older(&mut self) -> bool {
@@ -4780,7 +5115,7 @@ impl ChatPanel {
             let active = outline::active_prompt_seq(&self.rail.prompts, anchor);
             if active != self.active_prompt {
                 self.active_prompt = active;
-                self.area.redraw(cx);
+                self.redraw_chrome_part(cx, RAIL);
             }
         }
         // chatFindScrollToMatch: the highlighted match sits just under the find card.
@@ -4794,11 +5129,11 @@ impl ChatPanel {
                     let clearance = self.find_card_h + 8.0;
                     list.set_first_id_and_scroll(index, clearance - y);
                     self.find_scroll = None;
-                    self.area.redraw(cx);
+                    self.redraw_timeline(cx);
                 }
                 _ if attempts < 3 => {
                     self.find_scroll = Some((row, attempts + 1));
-                    self.area.redraw(cx);
+                    self.redraw_timeline(cx);
                 }
                 _ => self.find_scroll = None,
             }
@@ -5467,6 +5802,44 @@ impl ChatPanelRef {
 #[cfg(test)]
 mod reading_hold_tests {
     use super::*;
+
+    fn snapshot() -> Snap {
+        Snap::of(
+            &ChatSession::new(
+                SessionKey {
+                    host_id: "host".into(),
+                    agent_id: "agent".into(),
+                    subagent_id: None,
+                },
+                true,
+            ),
+            false,
+        )
+    }
+
+    #[test]
+    fn toast_and_sync_chrome_leave_timeline_retained() {
+        let before = snapshot();
+        let mut after = before.clone();
+        after.version += 1;
+        after.notice = Some("updated".into());
+        after.error = Some("retry failed".into());
+        after.sync = SyncStatus::Retrying;
+        assert!(!before.rows_changed(&after));
+    }
+
+    #[test]
+    fn transcript_and_permission_changes_invalidate_timeline() {
+        let before = snapshot();
+        let mut after = before.clone();
+        after.timeline = Rc::new(vec![Rc::new(json!({"seqStart": 1}))]);
+        assert!(before.rows_changed(&after));
+        after = before.clone();
+        after
+            .permissions
+            .push(("permission".into(), json!({"id": "permission"})));
+        assert!(before.rows_changed(&after));
+    }
 
     fn cursor(epoch: &str, seq: i64) -> Cursor {
         Cursor {

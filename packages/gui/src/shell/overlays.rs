@@ -228,6 +228,10 @@ pub struct Overlays {
 }
 
 impl Overlays {
+    pub(crate) fn presentation_key(&self) -> (usize, Option<u64>) {
+        (self.stack.len(), self.stack.last().map(Modal::id))
+    }
+
     /// Reconcile stack mutations before autofocus. Never restore a removed area or
     /// override a newer focus request made by the action that closed the owner.
     pub fn sync_focus(&mut self, cx: &mut Cx) {
@@ -2518,7 +2522,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             dismiss_top(shell, cx, scope);
         } else if explorer_open {
             shell.data.layout.show_compact_explorer(false);
-            shell.redraw(cx);
+            shell.invalidate_layout(cx);
         }
         return true;
     }
@@ -2565,7 +2569,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                     {
                         select.query = text.trim().to_lowercase();
                         select.scroll = 0.0;
-                        shell.redraw(cx);
+                        shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
                     }
                 }
             }
@@ -2728,7 +2732,7 @@ fn drag_sheet(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, hit: &Hit)
         dismiss_top(shell, cx, scope);
         return true;
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
     false
 }
 
@@ -2836,7 +2840,7 @@ fn modal_key(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, key: &KeyEv
                     top_y,
                     bottom_y,
                 );
-                shell.redraw(cx);
+                shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
                 return true;
             }
             match (key.key_code, active) {
@@ -2878,7 +2882,7 @@ fn modal_key(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, key: &KeyEv
                         bottom_y,
                     );
                 }
-                shell.redraw(cx);
+                shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
                 return true;
             }
             match (key.key_code, active) {
@@ -2890,7 +2894,7 @@ fn modal_key(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, key: &KeyEv
         Modal::Confirm { ok_focused, .. } => match key.key_code {
             KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::Tab => {
                 *ok_focused = !*ok_focused;
-                shell.redraw(cx);
+                shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
                 return true;
             }
             KeyCode::ReturnKey | KeyCode::Space => (if *ok_focused {
@@ -2970,7 +2974,7 @@ fn answer(
     if let Some(ui) = scope.data.get_mut::<UiContext>() {
         shell.overlay_answer(cx, ui, owner, id, args);
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 /// Closes every shell menu, dialog and sheet as if dismissed (owners get their cancel answer;
@@ -3007,7 +3011,7 @@ pub fn dismiss_all(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
             }
         }
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 fn dismiss_top(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope) {
@@ -3047,14 +3051,14 @@ fn dismiss_top(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope) {
             }
         }
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 fn click(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, id: &str) {
     let Some(top) = shell.data.overlays.stack.len().checked_sub(1) else {
         if id == "compact:backdrop" {
             shell.data.layout.show_compact_explorer(false);
-            shell.redraw(cx);
+            shell.invalidate_layout(cx);
         } else if let Some(ui) = scope.data.get_mut::<UiContext>() {
             crate::shell::commands::click(shell, cx, ui, id, KeyModifiers::default());
         }
@@ -3094,7 +3098,7 @@ fn click(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, id: &str) {
                     menu.scroll = 0.0;
                     menu.active = None;
                 }
-                shell.redraw(cx);
+                shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
                 return;
             }
             let entries = menu
@@ -3111,7 +3115,7 @@ fn click(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, id: &str) {
                     menu.scroll = 0.0;
                     menu.active = None;
                 }
-                shell.redraw(cx);
+                shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
                 return;
             }
             if let Some(index) = id
@@ -3178,7 +3182,7 @@ fn click(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, id: &str) {
             apply_flow(shell, cx, scope, top, flow);
         }
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 fn sheet_event(
@@ -3202,7 +3206,7 @@ fn sheet_event(
     if let Some(ui) = scope.data.get_mut::<UiContext>() {
         crate::shell::sheets::apply_ops(shell, cx, ui, ops, Some(sheet_id));
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
     Some(if matches!(flow, SheetFlow::Stay) {
         after
     } else {
@@ -3235,7 +3239,7 @@ pub fn apply_flow(
             shell.data.overlays.open_sheet(next);
         }
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 /// Margin helper for sheets.

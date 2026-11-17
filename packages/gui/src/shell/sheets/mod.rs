@@ -245,7 +245,7 @@ pub type ShellAction = Box<dyn FnOnce(&mut PaseoShell, &mut Cx, &mut UiContext)>
 /// Side-effect collector handed to sheet calls (no borrow of the shell is held).
 pub struct SheetOps {
     pub core: CoreHandle,
-    pub state: Arc<Value>,
+    pub state: Arc<paseo_gui_core::CoreState>,
     pub compact: bool,
     /// The sheet this call runs for (target of answers from sheets it pushes).
     pub origin: Option<u64>,
@@ -317,7 +317,7 @@ pub trait Sheet {
     }
 
     /// Reads shell state (layout, titles) and the core state right before each draw.
-    fn sync(&mut self, _shell: &PaseoShell, _state: &Value) {}
+    fn sync(&mut self, _shell: &PaseoShell, _state: &paseo_gui_core::CoreState) {}
 
     /// Centered card width on wide layouts (`maxWidth`, 520 default).
     fn max_width(&self) -> f64 {
@@ -450,7 +450,7 @@ pub fn apply_ops(
             ShellOp::Run(action) => action(shell, cx, ui),
         }
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 /// Routes a core response to the sheet that asked for it.

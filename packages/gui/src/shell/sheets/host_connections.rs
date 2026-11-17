@@ -89,7 +89,7 @@ pub struct ChooserSheet {
     search: Field,
     query: String,
     active: usize,
-    state: std::sync::Arc<Value>,
+    state: std::sync::Arc<paseo_gui_core::CoreState>,
     /// Enter in the search field: choose the active row with the next ops.
     submit: bool,
 }
@@ -104,7 +104,7 @@ impl ChooserSheet {
             search: Field::new("", &tr("pairing.hosts.search")).autofocus(),
             query: String::new(),
             active: 0,
-            state: std::sync::Arc::new(Value::Null),
+            state: std::sync::Arc::new(paseo_gui_core::CoreState::default()),
             submit: false,
         }
     }
@@ -118,7 +118,7 @@ impl ChooserSheet {
             search: Field::new("", &tr("pairing.hosts.search")),
             query: String::new(),
             active: 0,
-            state: std::sync::Arc::new(Value::Null),
+            state: std::sync::Arc::new(paseo_gui_core::CoreState::default()),
             submit: false,
         }
     }
@@ -168,7 +168,7 @@ impl Sheet for ChooserSheet {
         }
     }
 
-    fn sync(&mut self, _shell: &PaseoShell, state: &Value) {
+    fn sync(&mut self, _shell: &PaseoShell, state: &paseo_gui_core::CoreState) {
         self.state = std::sync::Arc::new(state.clone());
     }
 
@@ -417,7 +417,7 @@ pub struct ConnectionsSheet {
     host_id: String,
     busy: bool,
     error: Option<String>,
-    state: std::sync::Arc<Value>,
+    state: std::sync::Arc<paseo_gui_core::CoreState>,
     pending_remove: Option<Value>,
 }
 
@@ -427,7 +427,7 @@ impl ConnectionsSheet {
             host_id,
             busy: false,
             error: None,
-            state: std::sync::Arc::new(Value::Null),
+            state: std::sync::Arc::new(paseo_gui_core::CoreState::default()),
             pending_remove: None,
         }
     }
@@ -449,7 +449,7 @@ impl Sheet for ConnectionsSheet {
         tr("settings.host.connections.title")
     }
 
-    fn sync(&mut self, _shell: &PaseoShell, state: &Value) {
+    fn sync(&mut self, _shell: &PaseoShell, state: &paseo_gui_core::CoreState) {
         self.state = std::sync::Arc::new(state.clone());
     }
 

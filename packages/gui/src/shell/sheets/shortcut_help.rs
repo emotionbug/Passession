@@ -35,7 +35,7 @@ impl Sheet for ShortcutHelpSheet {
         tr("settings.shortcuts.dialogTitle")
     }
 
-    fn sync(&mut self, _shell: &PaseoShell, state: &Value) {
+    fn sync(&mut self, _shell: &PaseoShell, state: &paseo_gui_core::CoreState) {
         self.preferences = state.get("preferences").cloned().unwrap_or(Value::Null);
     }
 

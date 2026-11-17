@@ -103,7 +103,7 @@ struct Runtime {
     core_batch_timer: Timer,
     /// The core's last `State` publication: batch deltas compare publications, so a local
     /// optimistic write (`write_preference`) still reaches every window with its echo.
-    published: Arc<Value>,
+    published: Arc<paseo_gui_core::CoreState>,
 }
 
 #[derive(Live, LiveHook)]
@@ -181,7 +181,7 @@ impl App {
             menu_locale: "",
             tailnet_presence: None,
             core_batch_timer: Timer::default(),
-            published: Arc::new(Value::Null),
+            published: Arc::new(paseo_gui_core::CoreState::default()),
         });
         self.ui
             .widget(id!(main_window.shell))

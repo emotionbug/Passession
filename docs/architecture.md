@@ -62,20 +62,20 @@ File operations use the selected host. New Session and Add Project browse host-s
 
 Each window composes retained layers, like Android `RenderNode`s or iOS `CALayer`s. The window's own draw list holds only the background capture and the composition. The chrome (header, banner, tab strips, dividers and empty states), the sidebar, every pane root and the page each paint into their own `common::layer::Layer`. A layer that is not invalidated replays its retained draw calls, shell hit regions and overlay children instead of running its widgets again.
 
-Feature code keeps the ordinary Makepad contract: when a widget's own data changes, it redraws its own area (`self.redraw(cx)`, `area.redraw(cx)`). That repaints only the layer holding the area; nested draw lists repaint their ancestors, so a timeline row repaints its pane and requests a list measurement pass. Unchanged rows can reuse their work under the [Markdown row-retention contract](markdown-renderer.md#streaming-work). The shell repaints a layer by itself when:
+Feature code keeps the ordinary Makepad contract: when a widget's own data changes, it redraws its own area (`self.redraw(cx)`, `area.redraw(cx)`). That repaints only the draw list holding the area; nested draw lists repaint their ancestors. Widgets whose parts change at different rates keep them in separate retained draw lists: the chat panel retains its transcript, composer, chrome, rail, modal and toasts independently, so typing, hover or a toast does not re-run transcript rows. Unchanged rows can reuse their work under the [Markdown row-retention contract](markdown-renderer.md#streaming-work). The shell repaints a layer by itself when:
 
 - its rect changes;
 - its inputs change (focus, app activity, width class, safe-area insets, a different page root);
 - it is shown again after being hidden for a frame (hidden layers are detached and their overlays pruned);
-- the layout revision moves, which repaints the chrome, sidebar and page;
-- hover or press feedback changes, which repaints the layer that drew the affected hit id;
+- hover or press feedback changes, which repaints the layer that recorded the affected hit id (transient overlay hits included; an unknown hit repaints nothing);
+- a shell action names its region (chrome, sidebar, page, sessions, overlays or one pane root); there is no "repaint the whole shell" call, and layout changes recompose the chrome while retained layers compare their own geometry;
 - a core `State` publication changes what the layer presents (`common::state_delta`).
 
-For core `State` publications, the app classifies each one once per batch:
+The core publishes `CoreState`: small sections and host records as JSON, plus shared `prefs`, `layouts` and per-host `DirectorySnapshot`s whose rows are `Arc` values changed copy-on-write. A publication copies pointers for everything that did not change, and `revisions` names what did. The app classifies each publication once per batch from those revisions:
 
-- A publication that changes content repaints the chrome and every pane root. Content means a shared slice such as preferences, the host set, a host record, or an agent beyond its activity timestamps.
-- Activity alone (`updatedAt`/`lastActivityAt`, host latency and probes) repaints only that agent's own session immediately. Recency lists (sidebar, sessions page, pages) repaint once per second.
-- Saved window layouts are ignored; each shell owns its own layout.
+- Preferences, storage, session, the host set, host record content and directory content repaint the layers that present them.
+- `prefs` keys and Tailnet status repaint only the panels that present them (Settings, Git). Composer drafts and saved window layouts repaint nothing: their writers already own their presentation.
+- Activity alone (`updatedAt`/`lastActivityAt`, host latency and probes) repaints only recency presentations: sidebar rows and the History/sessions views, once per second, and only while they are shown. A chat never repaints for its own activity timestamps.
 
 A pane that presents another agent's recency must invalidate itself.
 

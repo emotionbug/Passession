@@ -10,14 +10,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use serde_json::{Value, json};
 
 use super::{Conn, Core, Host, hosts, requests, store};
-use crate::{CoreError, ids, protocol::response_error, storage::Replica};
+use crate::{CoreError, DirectorySnapshot, ids, protocol::response_error, storage::Replica};
 
 const EVENTS: [&str; 13] = [
     "project.update",
@@ -41,14 +44,15 @@ const PAGE: u64 = 200;
 
 #[derive(Default)]
 pub(crate) struct Directory {
-    projects: Vec<Value>,
-    workspaces: Vec<Value>,
-    agents: Vec<Value>,
+    projects: Vec<Arc<Value>>,
+    workspaces: Vec<Arc<Value>>,
+    agents: Vec<Arc<Value>>,
     cached_at: Option<String>,
     /// Identity of the rows and `cached_at` above, renewed by every change of them; 0 is the
     /// empty directory. Published as `directoryRevision` and used to persist only changed
     /// replicas.
     revision: u64,
+    snapshot: Option<Arc<DirectorySnapshot>>,
     pub loading: bool,
     pub hydrating: BTreeSet<&'static str>,
     pub list_errors: BTreeMap<&'static str, CoreError>,
@@ -65,29 +69,29 @@ pub(crate) struct Directory {
 }
 
 /// Process-wide, so two equal revisions are the same rows even across replaced hosts.
-fn next_revision() -> u64 {
+pub(super) fn next_revision() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Directory {
     pub fn apply_replica(&mut self, replica: Replica) {
-        self.projects = replica.projects;
-        self.workspaces = replica.workspaces;
-        self.agents = replica.agents;
+        self.projects = replica.projects.into_iter().map(Arc::new).collect();
+        self.workspaces = replica.workspaces.into_iter().map(Arc::new).collect();
+        self.agents = replica.agents.into_iter().map(Arc::new).collect();
         self.cached_at = replica.cached_at;
         self.changed();
     }
 
-    pub fn projects(&self) -> &[Value] {
+    pub fn projects(&self) -> &[Arc<Value>] {
         &self.projects
     }
 
-    pub fn workspaces(&self) -> &[Value] {
+    pub fn workspaces(&self) -> &[Arc<Value>] {
         &self.workspaces
     }
 
-    pub fn agents(&self) -> &[Value] {
+    pub fn agents(&self) -> &[Arc<Value>] {
         &self.agents
     }
 
@@ -97,6 +101,26 @@ impl Directory {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub fn snapshot(&mut self) -> Arc<DirectorySnapshot> {
+        if self
+            .snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.revision != self.revision)
+        {
+            self.snapshot = Some(Arc::new(DirectorySnapshot {
+                revision: self.revision,
+                cached_at: self.cached_at.clone(),
+                projects: self.projects.clone(),
+                workspaces: self.workspaces.clone(),
+                agents: self.agents.clone(),
+            }));
+        }
+        self.snapshot
+            .as_ref()
+            .expect("snapshot initialized")
+            .clone()
     }
 
     pub fn has_rows(&self) -> bool {
@@ -318,7 +342,7 @@ async fn hydrate(core: &Rc<Core>, host: &Rc<Host>) -> Result<(), CoreError> {
         if current() {
             let rows = rows(&snapshot["projects"]);
             let mut dir = host.dir.borrow_mut();
-            dir.projects = rows;
+            dir.projects = rows.into_iter().map(Arc::new).collect();
             dir.changed();
             cursor(&mut dir, "project", &snapshot);
         }
@@ -339,7 +363,7 @@ async fn hydrate(core: &Rc<Core>, host: &Rc<Host>) -> Result<(), CoreError> {
         .await?;
         if let Some(rows) = rows {
             let mut dir = host.dir.borrow_mut();
-            dir.workspaces = rows;
+            dir.workspaces = rows.into_iter().map(Arc::new).collect();
             dir.changed();
         }
         Ok(())
@@ -359,7 +383,7 @@ async fn hydrate(core: &Rc<Core>, host: &Rc<Host>) -> Result<(), CoreError> {
         .await?;
         if let Some(rows) = rows {
             let mut dir = host.dir.borrow_mut();
-            dir.agents = rows.iter().map(agent_row).collect();
+            dir.agents = rows.iter().map(|row| Arc::new(agent_row(row))).collect();
             dir.changed();
         }
         Ok(())
@@ -671,20 +695,29 @@ fn directory_event(core: &Rc<Core>, host: &Rc<Host>, message: &Value) {
                 }
             }
             "agent_status" => {
-                let info = &payload["info"];
-                let existing = dir.agents.iter().find(|a| a["id"] == info["id"]).cloned();
-                match existing {
-                    Some(mut merged) => {
-                        if let (Some(target), Some(source)) =
-                            (merged.as_object_mut(), info.as_object())
-                        {
-                            for (key, value) in source {
+                match (
+                    dir.agents
+                        .iter_mut()
+                        .find(|agent| agent["id"] == payload["info"]["id"]),
+                    payload["info"].as_object(),
+                ) {
+                    (Some(agent), Some(source))
+                        if agent.is_object()
+                            && source
+                                .iter()
+                                .any(|(key, value)| agent.get(key) != Some(value)) =>
+                    {
+                        let target = Arc::make_mut(agent)
+                            .as_object_mut()
+                            .expect("directory agent object");
+                        for (key, value) in source {
+                            if target.get(key) != Some(value) {
                                 target.insert(key.clone(), value.clone());
                             }
                         }
-                        upsert(&mut dir.agents, merged, "id")
+                        true
                     }
-                    None => false,
+                    _ => false,
                 }
             }
             "workspace_update" => {
@@ -740,7 +773,7 @@ fn directory_event(core: &Rc<Core>, host: &Rc<Host>, message: &Value) {
                     if workspace["id"] == payload["workspaceId"]
                         && workspace["scripts"] != payload["scripts"]
                     {
-                        workspace["scripts"] = payload["scripts"].clone();
+                        Arc::make_mut(workspace)["scripts"] = payload["scripts"].clone();
                         changed = true;
                     }
                 }
@@ -759,49 +792,57 @@ fn directory_event(core: &Rc<Core>, host: &Rc<Host>, message: &Value) {
     core.touch();
 }
 
-fn remove(rows: &mut Vec<Value>, test: impl Fn(&Value) -> bool) -> bool {
+fn remove(rows: &mut Vec<Arc<Value>>, test: impl Fn(&Value) -> bool) -> bool {
     let before = rows.len();
     rows.retain(|row| !test(row));
     rows.len() != before
 }
 
 /// Adds a live permission request to an agent row; false when it is already pending.
-fn add_permission(agent: &mut Value, request: &Value) -> bool {
-    if !request.is_object() {
+fn add_permission(agent: &mut Arc<Value>, request: &Value) -> bool {
+    if !request.is_object()
+        || (!request["id"].is_null()
+            && agent["pendingPermissions"]
+                .as_array()
+                .is_some_and(|pending| pending.iter().any(|entry| entry["id"] == request["id"])))
+    {
         return false;
     }
+    let agent = Arc::make_mut(agent);
     if !agent["pendingPermissions"].is_array() {
         agent["pendingPermissions"] = json!([]);
     }
-    let Some(pending) = agent["pendingPermissions"].as_array_mut() else {
-        return false;
-    };
-    if !request["id"].is_null() && pending.iter().any(|p| p["id"] == request["id"]) {
-        return false;
-    }
-    pending.push(request.clone());
+    agent["pendingPermissions"]
+        .as_array_mut()
+        .expect("initialized permissions")
+        .push(request.clone());
     true
 }
 
 /// Drops a resolved request from an agent row; false when it was not pending.
-fn remove_permission(agent: &mut Value, request_id: &Value) -> bool {
-    let Some(pending) = agent["pendingPermissions"].as_array_mut() else {
+fn remove_permission(agent: &mut Arc<Value>, request_id: &Value) -> bool {
+    if !agent["pendingPermissions"]
+        .as_array()
+        .is_some_and(|pending| pending.iter().any(|entry| entry["id"] == *request_id))
+    {
         return false;
-    };
-    let before = pending.len();
-    pending.retain(|p| p["id"] != *request_id);
-    pending.len() != before
+    }
+    Arc::make_mut(agent)["pendingPermissions"]
+        .as_array_mut()
+        .expect("existing permissions")
+        .retain(|entry| entry["id"] != *request_id);
+    true
 }
 
 /// Inserts or replaces `row`; false when an equal row is already there.
-fn upsert(rows: &mut Vec<Value>, row: Value, key: &str) -> bool {
+fn upsert(rows: &mut Vec<Arc<Value>>, row: Value, key: &str) -> bool {
     if !row.is_object() || row[key].is_null() {
         return false;
     }
     match rows.iter().position(|item| item[key] == row[key]) {
-        None => rows.push(row),
-        Some(index) if rows[index] == row => return false,
-        Some(index) => rows[index] = row,
+        None => rows.push(Arc::new(row)),
+        Some(index) if *rows[index] == row => return false,
+        Some(index) => rows[index] = Arc::new(row),
     }
     true
 }
@@ -909,13 +950,28 @@ mod tests {
 
     #[test]
     fn upserts_report_only_real_changes() {
-        let mut rows = vec![json!({"id":"a","v":1})];
+        let mut rows = vec![Arc::new(json!({"id":"a","v":1}))];
         assert!(!upsert(&mut rows, json!({"id":"a","v":1}), "id"));
         assert!(upsert(&mut rows, json!({"id":"a","v":2}), "id"));
         assert!(upsert(&mut rows, json!({"id":"b"}), "id"));
         assert!(!upsert(&mut rows, json!({"v":3}), "id"));
         assert!(remove(&mut rows, |r| r["id"] == "b"));
-        assert_eq!(rows, vec![json!({"id":"a","v":2})]);
+        assert_eq!(*rows[0], json!({"id":"a","v":2}));
+        let mut directory = Directory {
+            agents: rows,
+            ..Directory::default()
+        };
+        let mut other = Directory::default();
+        let before = directory.snapshot();
+        let other_before = other.snapshot();
+        assert!(Arc::ptr_eq(&before, &directory.snapshot()));
+        assert!(upsert(&mut directory.agents, json!({"id":"a","v":3}), "id"));
+        directory.changed();
+        let after = directory.snapshot();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(before.agents[0]["v"], 2);
+        assert_eq!(after.agents[0]["v"], 3);
+        assert!(Arc::ptr_eq(&other_before, &other.snapshot()));
     }
 
     #[test]
@@ -926,7 +982,7 @@ mod tests {
 
     #[test]
     fn live_permission_events_keep_the_pending_list_current() {
-        let mut agent = json!({"id":"a","status":"running"});
+        let mut agent = Arc::new(json!({"id":"a","status":"running"}));
         let request = json!({"id":"r1","kind":"question"});
         assert!(add_permission(&mut agent, &request));
         assert!(

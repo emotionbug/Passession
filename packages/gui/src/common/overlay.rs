@@ -696,7 +696,7 @@ pub fn open_menu_with(
     entries: Vec<MenuEntry>,
     options: MenuOptions,
 ) -> u64 {
-    ui.effects.push(crate::common::UiEffect::Redraw);
+    ui.effects.push(crate::common::UiEffect::RedrawOverlays);
     enqueue(ui, menu_kind(anchor, title, entries, options))
 }
 
@@ -724,7 +724,7 @@ pub fn confirm(
     confirm_label: &str,
     destructive: bool,
 ) -> u64 {
-    ui.effects.push(crate::common::UiEffect::Redraw);
+    ui.effects.push(crate::common::UiEffect::RedrawOverlays);
     enqueue(
         ui,
         OverlayKind::Confirm {
@@ -786,7 +786,7 @@ fn enqueue_prompt(
     confirm_label: &str,
     multiline: bool,
 ) -> u64 {
-    ui.effects.push(crate::common::UiEffect::Redraw);
+    ui.effects.push(crate::common::UiEffect::RedrawOverlays);
     enqueue(
         ui,
         OverlayKind::Prompt {
@@ -846,7 +846,7 @@ impl SelectRequest {
 /// Original `showPaseoSelect`; `anchor` is the trigger rect in window coordinates. Answers
 /// `{"value": <option value>}` or `{"cancelled": true}`.
 pub fn open_select(ui: &mut UiContext, anchor: Rect, request: SelectRequest) -> u64 {
-    ui.effects.push(crate::common::UiEffect::Redraw);
+    ui.effects.push(crate::common::UiEffect::RedrawOverlays);
     let SelectRequest {
         title,
         options,

@@ -11,11 +11,13 @@ use super::i18n::t;
 use super::json::*;
 use super::state_keys;
 use crate::common::{UiContext, UiEffect};
-use makepad_widgets::Cx;
-use paseo_gui_core::{CoreError, CoreEvent, CoreHandle};
+use makepad_widgets::{Cx, SignalToUI};
+use paseo_gui_core::{CoreError, CoreEvent, CoreHandle, CoreState};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 thread_local! {
     static SERVICE: RefCell<Option<ComposerService>> = const { RefCell::new(None) };
@@ -154,6 +156,87 @@ impl ProviderRequests {
     }
 }
 
+#[derive(Default)]
+struct SaveDeadline {
+    at: Option<Instant>,
+    stopped: bool,
+}
+
+/// One parked worker wakes the GUI at the current deadline; edits only move that
+/// deadline, never clone drafts or allocate a new timer/thread.
+struct DraftSaveTimer {
+    deadline: Arc<Mutex<SaveDeadline>>,
+    worker: std::thread::Thread,
+    first: Option<Instant>,
+    due: Option<Instant>,
+    revision: u64,
+}
+
+impl DraftSaveTimer {
+    fn new() -> Self {
+        let deadline = Arc::new(Mutex::new(SaveDeadline::default()));
+        let shared = deadline.clone();
+        let worker = std::thread::spawn(move || {
+            loop {
+                let sleep = {
+                    let mut state = shared.lock().unwrap();
+                    if state.stopped {
+                        return;
+                    }
+                    match state.at {
+                        Some(at) if at <= Instant::now() => {
+                            state.at = None;
+                            SignalToUI::set_ui_signal();
+                            None
+                        }
+                        Some(at) => Some(at.saturating_duration_since(Instant::now())),
+                        None => None,
+                    }
+                };
+                match sleep {
+                    Some(duration) => std::thread::park_timeout(duration),
+                    None => std::thread::park(),
+                }
+            }
+        });
+        Self {
+            deadline,
+            worker: worker.thread().clone(),
+            first: None,
+            due: None,
+            revision: 0,
+        }
+    }
+
+    fn schedule(&mut self, revision: u64, now: Instant) {
+        if revision == self.revision {
+            return;
+        }
+        self.revision = revision;
+        let first = *self.first.get_or_insert(now);
+        // Half a second of quiet avoids a write per keystroke. The two-second cap
+        // bounds unsaved input during sustained typing without periodic idle polling.
+        let due = (now + Duration::from_millis(500)).min(first + Duration::from_secs(2));
+        self.due = Some(due);
+        self.deadline.lock().unwrap().at = Some(due);
+        self.worker.unpark();
+    }
+
+    fn cancel(&mut self) {
+        self.first = None;
+        self.due = None;
+        self.deadline.lock().unwrap().at = None;
+        self.worker.unpark();
+    }
+}
+
+impl Drop for DraftSaveTimer {
+    fn drop(&mut self) {
+        self.deadline.lock().unwrap().stopped = true;
+        self.worker.unpark();
+    }
+}
+
 pub struct ComposerService {
     pub(super) core: Option<CoreHandle>,
     pub drafts: DraftStore,
@@ -179,9 +262,9 @@ pub struct ComposerService {
     texture_misses: u64,
     collected: bool,
     next_panel: u64,
-    /// Request id of the last full flush handed to the core, for `flush_drafts`.
     persist_error: Option<String>,
-    last_state: Option<std::sync::Arc<Value>>,
+    save_timer: DraftSaveTimer,
+    last_state: Option<Arc<CoreState>>,
 }
 
 impl ComposerService {
@@ -208,6 +291,7 @@ impl ComposerService {
             collected: false,
             next_panel: 0,
             persist_error: None,
+            save_timer: DraftSaveTimer::new(),
             last_state: None,
         }
     }
@@ -478,20 +562,32 @@ impl ComposerService {
         ui.effects.append(&mut self.effects);
     }
 
-    /// After any draft/delivery mutation: persist, wake delivery, redraw panels.
+    /// Ordinary input stays local until the debounce fires. Delivery mutations still
+    /// persist and wake delivery immediately; sends retain their explicit flush barrier.
     pub(super) fn after_mutation(&mut self) {
         let changed = self.drafts.drain_changed();
         let inbox = self.drafts.drain_inbox_changed();
         if !changed.is_empty() || !inbox.is_empty() {
             self.bump();
         }
-        if let Some(payload) = self.drafts.take_save()
-            && let Some(core) = &self.core
-        {
-            core.save_state(&state_keys::drafts_save_key(), payload);
+        let delivery = self.drafts.drain_delivery_changed();
+        if !delivery.is_empty() {
+            self.save_pending();
+        } else if self.core.is_some() && self.drafts.is_loaded() && !self.drafts.flushed() {
+            self.save_timer
+                .schedule(self.drafts.revision(), Instant::now());
         }
-        for host in self.drafts.drain_delivery_changed() {
+        for host in delivery {
             self.schedule(&host);
+        }
+    }
+
+    fn save_pending(&mut self) {
+        if let Some(core) = &self.core {
+            if let Some(payload) = self.drafts.take_save() {
+                core.save_state(&state_keys::drafts_save_key(), payload);
+            }
+            self.save_timer.cancel();
         }
     }
 
@@ -510,6 +606,7 @@ impl ComposerService {
             .drafts
             .take_save()
             .unwrap_or_else(|| self.full_payload());
+        self.save_timer.cancel();
         let request = core.save_state_flushed(&state_keys::drafts_save_key(), payload);
         self.pending.insert(request, Pending::Flush { then });
     }
@@ -812,6 +909,9 @@ impl ComposerService {
     }
 
     pub fn poll_background(&mut self, cx: &mut Cx) {
+        if self.save_timer.due.is_some_and(|due| due <= Instant::now()) {
+            self.save_pending();
+        }
         while let Some(result) = self.blobs.try_recv() {
             match result {
                 // Composer pills/overlays redraw through the revision; other consumers
@@ -841,15 +941,44 @@ impl ComposerService {
         if self.core.is_none() {
             self.core = Some(ui.core.clone());
         }
-        if let Some(payload) = self.drafts.take_save() {
-            ui.core.save_state(&state_keys::drafts_save_key(), payload);
-        }
+        self.save_pending();
         // In-flight sends are already durable (pending/queue state was flushed before the RPC),
         // so only a persistence failure keeps the window open (Flutter shell `drafts.flush()`).
         match self.persistence_error() {
             Some(error) => Err(format!("Draft persistence failed: {error}")),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod draft_save_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_edits_coalesce_until_quiet_or_two_second_cap() {
+        let mut drafts = DraftStore::default();
+        drafts.load(&json!({}));
+        let mut timer = DraftSaveTimer::new();
+        let start = Instant::now();
+        let key = draft_key("host", "workspace", "agent");
+        for edit in 0..100 {
+            drafts.update(&key, json!({"text": format!("edit {edit}")}));
+            timer.schedule(drafts.revision(), start + Duration::from_millis(edit * 20));
+            assert!(!drafts.flushed());
+        }
+        assert_eq!(timer.due, Some(start + Duration::from_secs(2)));
+        let payload = drafts.take_save().unwrap();
+        assert_eq!(payload["drafts"][&key]["text"], "edit 99");
+        assert!(drafts.take_save().is_none());
+        timer.cancel();
+        drafts.update(&key, json!({"text": "last edit"}));
+        timer.schedule(drafts.revision(), start + Duration::from_secs(3));
+        assert_eq!(timer.due, Some(start + Duration::from_millis(3500)));
+        assert_eq!(
+            drafts.take_save().unwrap()["drafts"][&key]["text"],
+            "last edit"
+        );
     }
 }
 

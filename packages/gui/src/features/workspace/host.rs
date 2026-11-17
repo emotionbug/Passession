@@ -6,13 +6,15 @@
 //! Host identity is the daemon `serverId` (Flutter `HostState.serverId`). Two hosts with
 //! equal directories or agent names stay distinct because every list is read per host.
 
+use paseo_gui_core::{CoreState, DirectorySnapshot};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use paseo_gui_core::CoreEvent;
 use serde_json::Value;
 
-use super::rpc::{array_of, empty_object, object_of, str_of};
+use super::rpc::{empty_object, object_of, str_of};
 
 /// Flutter `ConnectionStatus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +82,7 @@ pub fn learn(events: &[CoreEvent]) {
 #[derive(Clone, Copy)]
 pub struct Host<'a> {
     value: &'a Value,
+    directory: Option<&'a DirectorySnapshot>,
 }
 
 impl<'a> Host<'a> {
@@ -177,8 +180,10 @@ impl<'a> Host<'a> {
             || str_of(self.value, "kind") == "local"
     }
 
-    pub fn agents(&self) -> &'a [Value] {
-        array_of(self.value, "agents")
+    pub fn agents(&self) -> &'a [Arc<Value>] {
+        self.directory
+            .map(|directory| directory.agents.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Whether the agent directory has been hydrated at least once. A missing agent only
@@ -187,25 +192,30 @@ impl<'a> Host<'a> {
         !self.agents().is_empty()
     }
 
-    pub fn projects(&self) -> &'a [Value] {
-        array_of(self.value, "projects")
+    pub fn projects(&self) -> &'a [Arc<Value>] {
+        self.directory
+            .map(|directory| directory.projects.as_slice())
+            .unwrap_or(&[])
     }
 
-    pub fn workspaces(&self) -> &'a [Value] {
-        array_of(self.value, "workspaces")
+    pub fn workspaces(&self) -> &'a [Arc<Value>] {
+        self.directory
+            .map(|directory| directory.workspaces.as_slice())
+            .unwrap_or(&[])
     }
 
     /// An agent row, unwrapping the `{agent: {...}}` directory envelope.
     pub fn agent(&self, agent_id: &str) -> Option<&'a Value> {
         self.agents()
             .iter()
-            .map(agent_of)
+            .map(|row| agent_of(row))
             .find(|agent| str_of(agent, "id") == agent_id)
     }
 
     pub fn workspace(&self, workspace_id: &str) -> Option<&'a Value> {
         self.workspaces()
             .iter()
+            .map(Arc::as_ref)
             .find(|w| str_of(w, "id") == workspace_id)
     }
 
@@ -217,6 +227,7 @@ impl<'a> Host<'a> {
         }
         self.projects()
             .iter()
+            .map(Arc::as_ref)
             .find(|p| project_root(p).trim() == root)
     }
 }
@@ -259,19 +270,22 @@ pub fn last_segment(path: &str) -> String {
 }
 
 /// Every host of the directory state, in directory order.
-pub fn hosts(state: &Value) -> Vec<Host<'_>> {
+pub fn hosts(state: &CoreState) -> Vec<Host<'_>> {
     let list = match state.get("hosts") {
         Some(Value::Array(list)) => list.iter().collect::<Vec<_>>(),
         Some(Value::Object(map)) => map.values().collect(),
         _ => Vec::new(),
     };
     list.into_iter()
-        .map(|value| Host { value })
+        .map(|value| Host {
+            value,
+            directory: state.directory(value),
+        })
         .filter(|h| !h.id().is_empty())
         .collect()
 }
 
-pub fn host<'a>(state: &'a Value, host_id: &str) -> Option<Host<'a>> {
+pub fn host<'a>(state: &'a CoreState, host_id: &str) -> Option<Host<'a>> {
     hosts(state).into_iter().find(|h| h.id() == host_id)
 }
 

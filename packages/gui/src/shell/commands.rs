@@ -357,9 +357,9 @@ pub fn set_preference(shell: &mut PaseoShell, ui: &mut UiContext, key: &str, val
 fn write_preference(ui: &mut UiContext, key: &str, value: Value) -> Value {
     let mut state = (*ui.state).clone();
     if !state.get("preferences").is_some_and(Value::is_object) {
-        state["preferences"] = json!({});
+        state.value_mut()["preferences"] = json!({});
     }
-    let preferences = state["preferences"]
+    let preferences = state.value_mut()["preferences"]
         .as_object_mut()
         .expect("preferences is an object");
     if value.is_null() {
@@ -424,7 +424,7 @@ pub fn open_tab(
         panel.target = fresh;
         panels::retarget(cx, panel);
     }
-    shell.redraw(cx);
+    shell.invalidate_layout(cx);
 }
 
 /// `openAgent`: `fetch_agent_request`, then open (or select) its tab.
@@ -560,7 +560,7 @@ fn choose_any_host(
                 .open_sheet(Box::new(host_connections::ChooserSheet::new(
                     title, candidates, purpose,
                 )));
-            shell.redraw(cx);
+            shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
         }
     }
 }
@@ -602,7 +602,7 @@ pub fn host_chosen(
                 .data
                 .overlays
                 .open_sheet(Box::new(labels::LabelsSheet::new(host_id, None)));
-            shell.redraw(cx);
+            shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
         }
         HostPurpose::ProjectPath(path) => open_project_path(shell, ui, &host_id, &path),
         HostPurpose::SessionHistory => show_sessions(shell, cx, &host_id, true, "", ""),
@@ -685,11 +685,11 @@ fn toggle_compact_explorer(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext) 
     let layout = &shell.data.layout;
     if layout.compact_destination == CompactDestination::Explorer {
         shell.data.layout.show_compact_explorer(false);
-        shell.redraw(cx);
+        shell.invalidate_layout(cx);
         return;
     }
     open_default_explorer(shell, cx, ui);
-    shell.redraw(cx);
+    shell.invalidate_layout(cx);
 }
 
 /// `_splitWithLauncher`.
@@ -707,7 +707,7 @@ fn split_with_launcher(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, axis
         .with_id(new_id());
         open_tab(shell, cx, ui, target, TabPlacement::Main);
     }
-    shell.redraw(cx);
+    shell.invalidate_layout(cx);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -954,7 +954,7 @@ fn remove_tab(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, key: &str) {
             );
         }
     }
-    shell.redraw(cx);
+    shell.invalidate_layout(cx);
 }
 
 fn finish_closing(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, after: AfterClose) {
@@ -993,7 +993,7 @@ fn finish_closing(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, after
             }
         }
     }
-    shell.redraw(cx);
+    shell.invalidate_layout(cx);
 }
 
 fn close_os_window(shell: &mut PaseoShell, cx: &mut Cx) {
@@ -1062,7 +1062,7 @@ fn close_pane(shell: &mut PaseoShell, cx: &mut Cx, pane_id: &str) {
     let keys = pane.tabs.clone();
     if keys.is_empty() {
         shell.data.layout.close_pane(pane_id);
-        shell.redraw(cx);
+        shell.invalidate_layout(cx);
         return;
     }
     close_bulk(
@@ -1093,7 +1093,11 @@ pub fn close_workspace_tabs(
     close_tabs(shell, cx, ui, keys, true, AfterClose::Nothing);
 }
 
-fn workspace_value(state: &Value, host_id: &str, workspace_id: &str) -> Option<Value> {
+fn workspace_value(
+    state: &paseo_gui_core::CoreState,
+    host_id: &str,
+    workspace_id: &str,
+) -> Option<Value> {
     hosts::host(state, host_id).and_then(|h| h.workspace(workspace_id).cloned())
 }
 
@@ -1139,7 +1143,9 @@ pub fn show_page(shell: &mut PaseoShell, cx: &mut Cx, page: Page) {
     if shell.data.compact && shell.data.layout.compact_destination == CompactDestination::Explorer {
         shell.data.layout.show_compact_explorer(false);
     }
-    shell.redraw(cx);
+    shell.invalidate_layout(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Page);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Sessions);
 }
 
 pub(crate) fn show_sessions(
@@ -1166,7 +1172,7 @@ pub fn close_page(shell: &mut PaseoShell, cx: &mut Cx) {
     shell.data.page = None;
     shell.data.page_root = None;
     shell.data.history = None;
-    shell.redraw(cx);
+    shell.invalidate_layout(cx);
 }
 
 pub(crate) fn open_settings(
@@ -1194,7 +1200,7 @@ fn open_command_center(shell: &mut PaseoShell, cx: &mut Cx, files: bool) {
         panels::open_command_center(cx, &widget, files);
         shell.data.command_center_open = true;
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1232,6 +1238,7 @@ pub fn execute(
     action: &str,
     args: &Value,
 ) {
+    let layout_revision = shell.data.layout.revision;
     let target = selected(shell);
     let compact = shell.data.compact;
     let int = |key: &str, fallback: i64| j::int(args, key, fallback);
@@ -1454,7 +1461,9 @@ pub fn execute(
             );
         }
     }
-    shell.redraw(cx);
+    if shell.data.layout.revision != layout_revision {
+        shell.invalidate_layout(cx);
+    }
 }
 
 fn request_new_window() {
@@ -1595,7 +1604,7 @@ pub fn back(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) -> bool {
         return true;
     }
     if shell.data.layout.handle_back(compact) {
-        shell.redraw(cx);
+        shell.invalidate_layout(cx);
         return true;
     }
     false
@@ -1673,7 +1682,7 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
                 shell.data.dirty.remove(&owner)
             };
             if changed {
-                shell.redraw(cx);
+                shell.invalidate_region(cx, crate::shell::ShellRegion::Chrome);
             }
         }
         UiEffect::OpenTab { target, placement } => open_tab(shell, cx, ui, target, placement),
@@ -1701,12 +1710,14 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
             shell.data.dirty.remove(&tab_key);
             mark_child_tab_open(shell, ui, &target);
             shell.data.layout.replace_tab(&tab_key, target);
-            shell.redraw(cx);
+            shell.invalidate_layout(cx);
         }
         UiEffect::SetPreference { key, value } => {
             set_preference(shell, ui, &key, value);
             refresh_display_menu(shell, cx, ui);
-            shell.redraw(cx);
+            if matches!(key.as_str(), "navigation" | "sidebarNavItems") {
+                shell.invalidate_region(cx, crate::shell::ShellRegion::Sidebar);
+            }
         }
         UiEffect::SetFocusScope { owner, scope } => shell.data.focus_scope.update(owner, scope),
         UiEffect::RunCommand { action, args } => run_command(shell, cx, ui, &action, &args),
@@ -1726,6 +1737,7 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
                 .data
                 .overlays
                 .open_sheet(Box::new(host_dialog::PairingSheet::new(host_id)));
+            shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
         }
         UiEffect::CloseSettings => close_page(shell, cx),
         UiEffect::RemoveHost { host_id } => {
@@ -1739,11 +1751,16 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
                 .collect();
             close_tabs(shell, cx, ui, keys, true, AfterClose::RemoveHost(host_id));
         }
-        UiEffect::Redraw => shell.redraw(cx),
+        UiEffect::RedrawOverlays => {
+            shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays)
+        }
+        UiEffect::RedrawPane { tab_key } => {
+            shell.invalidate_region(cx, crate::shell::ShellRegion::Pane(&tab_key))
+        }
     }
 }
 
-fn file_link_host<'a>(state: &'a Value, host_id: &str) -> Option<&'a str> {
+fn file_link_host<'a>(state: &'a paseo_gui_core::CoreState, host_id: &str) -> Option<&'a str> {
     if cfg!(any(target_os = "android", target_os = "ios")) {
         return None;
     }
@@ -1752,7 +1769,7 @@ fn file_link_host<'a>(state: &'a Value, host_id: &str) -> Option<&'a str> {
 }
 
 fn verified_file_link_path(
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     target: &PanelTarget,
     expected_server: &str,
     status: &Value,
@@ -2067,6 +2084,7 @@ pub fn on_response(
             Some(message) => toast(shell, cx, message, true),
             None => {
                 history::mark_archived(shell, &host_id, &agent_id);
+                shell.invalidate_region(cx, crate::shell::ShellRegion::Sessions);
                 ui.core.refresh_host(&host_id);
             }
         },
@@ -2177,7 +2195,6 @@ pub fn on_response(
             }
         }
     }
-    shell.redraw(cx);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2190,6 +2207,7 @@ pub fn click(
     id: &str,
     _modifiers: KeyModifiers,
 ) {
+    let layout_revision = shell.data.layout.revision;
     let state = ui.state.clone();
     let compact = shell.data.compact;
     if let Some(rest) = id.strip_prefix("welcome:") {
@@ -2292,14 +2310,16 @@ pub fn click(
         "foot:settings" => open_settings(shell, cx, None, ""),
         _ => click_prefixed(shell, cx, ui, &state, id),
     }
-    shell.redraw(cx);
+    if shell.data.layout.revision != layout_revision {
+        shell.invalidate_layout(cx);
+    }
 }
 
 fn click_prefixed(
     shell: &mut PaseoShell,
     cx: &mut Cx,
     ui: &mut UiContext,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     id: &str,
 ) {
     if let Some(rest) = id.strip_prefix("tab:") {
@@ -2423,7 +2443,7 @@ pub fn secondary(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &s
     }
 }
 
-fn find_project(state: &Value, key: &str) -> Option<(String, Value)> {
+fn find_project(state: &paseo_gui_core::CoreState, key: &str) -> Option<(String, Value)> {
     hosts::hosts(state).into_iter().find_map(|host| {
         sidebar::projects(&host)
             .into_iter()
@@ -2432,7 +2452,7 @@ fn find_project(state: &Value, key: &str) -> Option<(String, Value)> {
     })
 }
 
-fn find_session(state: &Value, rest: &str) -> Option<(String, Value)> {
+fn find_session(state: &paseo_gui_core::CoreState, rest: &str) -> Option<(String, Value)> {
     let (sid, agent_id) = rest.rsplit_once(':')?;
     let host = hosts::host(state, sid)?;
     host.agent(agent_id)
@@ -2599,7 +2619,7 @@ fn tab_menu(
 fn tab_overflow_menu(
     shell: &mut PaseoShell,
     cx: &mut Cx,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     pane_id: &str,
     anchor: Rect,
 ) {
@@ -2923,7 +2943,12 @@ fn new_terminal(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, placement: 
 }
 
 /// Session actions and directory tools, with scripts first on compact layouts.
-fn header_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, anchor: Rect) {
+fn header_menu(
+    shell: &mut PaseoShell,
+    cx: &mut Cx,
+    state: &paseo_gui_core::CoreState,
+    anchor: Rect,
+) {
     let target = selected(shell);
     let workspace = target
         .as_ref()
@@ -3323,7 +3348,12 @@ fn help_menu_result(shell: &mut PaseoShell, cx: &mut Cx, value: &str) {
 
 /// Original sidebar `HostPicker`: hosts in sidebar order (status dot, active connection), then
 /// "Add host" and the host settings. Picking a host shows it in the sidebar.
-fn host_picker(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, anchor: Rect) {
+fn host_picker(
+    shell: &mut PaseoShell,
+    cx: &mut Cx,
+    state: &paseo_gui_core::CoreState,
+    anchor: Rect,
+) {
     let order = sidebar_host_order(state);
     if order.len() > 10 {
         // Searchable above ten hosts.
@@ -3392,10 +3422,17 @@ pub fn open_host(shell: &mut PaseoShell, cx: &mut Cx, value: &str) {
     shell.data.layout.show_sidebar(compact, true);
     shell.data.sidebar.expand_host = Some(value.to_string());
     shell.data.sidebar.reveal_host = Some(value.to_string());
-    shell.redraw(cx);
+    shell.invalidate_layout(cx);
+    shell.data.sidebar.tree_layer.invalidate(cx);
 }
 
-fn host_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, host_id: &str, anchor: Rect) {
+fn host_menu(
+    shell: &mut PaseoShell,
+    cx: &mut Cx,
+    state: &paseo_gui_core::CoreState,
+    host_id: &str,
+    anchor: Rect,
+) {
     let order = sidebar_host_order(state);
     let entries = [
         ("new", "sessionNavigation.newSession"),
@@ -3427,7 +3464,7 @@ fn host_menu(shell: &mut PaseoShell, cx: &mut Cx, state: &Value, host_id: &str, 
     );
 }
 
-fn sidebar_host_order(state: &Value) -> Vec<String> {
+fn sidebar_host_order(state: &paseo_gui_core::CoreState) -> Vec<String> {
     let prefs = sidebar::nav_prefs(state);
     let stored: Vec<String> = j::array(&prefs, "hostOrder")
         .iter()
@@ -3500,13 +3537,13 @@ fn host_action(
         ),
         _ => {}
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 fn project_menu(
     shell: &mut PaseoShell,
     cx: &mut Cx,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     host_id: &str,
     project: Value,
     anchor: Rect,
@@ -3554,7 +3591,11 @@ fn project_menu(
     );
 }
 
-fn project_history_key(state: &Value, host_id: &str, project: &Value) -> String {
+fn project_history_key(
+    state: &paseo_gui_core::CoreState,
+    host_id: &str,
+    project: &Value,
+) -> String {
     let key = j::text(project, "projectKey");
     if !key.is_empty() {
         return key.to_string();
@@ -3692,7 +3733,7 @@ fn project_action(
 pub(crate) fn session_menu(
     shell: &mut PaseoShell,
     cx: &mut Cx,
-    _state: &Value,
+    _state: &paseo_gui_core::CoreState,
     host_id: &str,
     agent: Value,
     anchor: Rect,
@@ -3775,7 +3816,7 @@ fn session_action(
 // ---------------------------------------------------------------------------------------------
 // Sidebar display preferences (`SidebarDisplayPreferencesMenu`)
 
-fn display_entries(shell: &PaseoShell, state: &Value) -> Vec<MenuEntry> {
+fn display_entries(shell: &PaseoShell, state: &paseo_gui_core::CoreState) -> Vec<MenuEntry> {
     let prefs = sidebar::nav_prefs(state);
     let all = hosts::hosts(state);
     let p = crate::theme::current_palette();
@@ -3944,7 +3985,7 @@ fn refresh_display_menu(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext) {
     if let Some(id) = shell.data.display_menu {
         let entries = display_entries(shell, &ui.state);
         shell.data.overlays.update_menu(id, entries);
-        shell.redraw(cx);
+        shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
     }
 }
 
@@ -4206,7 +4247,7 @@ pub fn shell_overlay_result(
         }
     }
     let _ = state;
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4349,10 +4390,10 @@ pub fn handle_platform_actions(
                     {
                         ui.core.discover_local_daemon();
                     }
-                    shell.redraw(cx);
+                    shell.invalidate_region(cx, crate::shell::ShellRegion::Chrome);
                 }
                 PlatformEvent::HostError { message } if main => toast(shell, cx, message, true),
-                PlatformEvent::Insets(_) => shell.redraw(cx),
+                PlatformEvent::Insets(_) => shell.invalidate_layout(cx),
                 // The OS background presence's controls are Settings' Pause, Resume and Stop.
                 PlatformEvent::TailnetControl(control) if main => {
                     let action = match control {
@@ -4547,7 +4588,12 @@ pub fn handle_window_events(
                 ui.core.set_app_visible(true);
             }
         }
-        Event::Background | Event::Pause | Event::AppLostFocus => shell.data.app_inactive = true,
+        Event::Background | Event::Pause | Event::AppLostFocus => {
+            shell.data.app_inactive = true;
+            if let Err(error) = crate::features::composer::flush_drafts(ui) {
+                toast(shell, cx, error, true);
+            }
+        }
         _ => {}
     }
     // A page shown beside the sidebar ends when a session or tab opens.
@@ -4651,11 +4697,11 @@ mod file_link_tests {
 
     #[test]
     fn native_file_link_accepts_manual_local_daemon_but_rejects_remote_identity() {
-        let state = json!({"hosts": [
+        let state = paseo_gui_core::CoreState::new(json!({"hosts": [
             {"serverId": "local", "isLocal": false, "config": {"id": "saved"}},
             {"serverId": "remote", "isLocal": false},
             {"serverId": "tunnel", "isLocal": true},
-        ]});
+        ]}));
         let cwd = if cfg!(target_os = "windows") {
             "C:/work"
         } else {
@@ -4676,9 +4722,9 @@ mod file_link_tests {
             );
         }
         // A saved connection is retargeted while its status request is in flight.
-        let changed = json!({"hosts": [
+        let changed = paseo_gui_core::CoreState::new(json!({"hosts": [
             {"serverId": "replacement", "isLocal": true, "config": {"id": "saved"}},
-        ]});
+        ]}));
         assert_eq!(
             verified_file_link_path(
                 &changed,
@@ -4701,7 +4747,9 @@ mod file_link_tests {
         } else {
             "/work"
         };
-        let state = json!({"hosts": [{"serverId": "local", "isLocal": true}]});
+        let state = paseo_gui_core::CoreState::new(
+            json!({"hosts": [{"serverId": "local", "isLocal": true}]}),
+        );
         let source = AssistantFileLinkSource {
             href: "src/%ED%95%9C%EA%B8%80%20%EB%AC%B8%EC%84%9C.rs#L12-L14".into(),
             text: None,

@@ -8,9 +8,9 @@ use std::{
     collections::HashSet,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 const SETTINGS: &str = "paseo.tailnet";
@@ -144,9 +144,16 @@ struct OperationResult {
 }
 
 /// A Running node's route; other states have none.
-fn routed(manager: &dyn Backend, status: Status) -> anyhow::Result<OperationResult> {
+fn routed(
+    manager: &dyn Backend,
+    status: Status,
+    proxy: Option<Proxy>,
+) -> anyhow::Result<OperationResult> {
     let proxy = if status.backend_state == "Running" {
-        Some(manager.proxy()?)
+        Some(match proxy.filter(Proxy::is_valid) {
+            Some(proxy) => proxy,
+            None => manager.proxy()?,
+        })
     } else {
         None
     };
@@ -165,6 +172,9 @@ pub(super) struct Tailnet {
     proxy: RefCell<Option<Proxy>>,
     error: RefCell<Option<String>>,
     busy: Cell<bool>,
+    visible_busy: Cell<bool>,
+    checked_at: Cell<Option<Instant>>,
+    poll_changed: Rc<Notify>,
     /// The user paused an enabled node. Runtime-only: an app restart is never paused.
     paused: Cell<bool>,
     /// Consecutive transient failures while a route is held.
@@ -182,6 +192,9 @@ impl Tailnet {
             proxy: RefCell::new(None),
             error: RefCell::new(None),
             busy: Cell::new(false),
+            visible_busy: Cell::new(false),
+            checked_at: Cell::new(None),
+            poll_changed: Rc::new(Notify::new()),
             paused: Cell::new(false),
             failures: Cell::new(0),
             generation: Cell::new(0),
@@ -226,7 +239,7 @@ impl Tailnet {
                 .unwrap_or_default()
         );
         state["error"] = json!(*self.error.borrow());
-        state["busy"] = json!(self.busy.get());
+        state["busy"] = json!(self.visible_busy.get());
         state
     }
 }
@@ -312,18 +325,47 @@ pub(super) fn initialize(core: &Rc<Core>) {
     }
     ensure(core);
     let weak = Rc::downgrade(core);
+    let changed = core.tailnet.poll_changed.clone();
     tokio::task::spawn_local(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        interval.tick().await;
         loop {
-            interval.tick().await;
             let Some(core) = weak.upgrade() else {
                 break;
             };
             if core.closing.get() {
                 break;
             }
-            poll(&core);
+            // Manager has no status-change subscription. Poll only a wanted node, five
+            // seconds after its last operation; an invalidated route wakes us sooner.
+            let should_poll =
+                core.tailnet.wanted() && core.tailnet.manager.is_some() && !core.tailnet.busy.get();
+            let due =
+                core.tailnet.checked_at.get().unwrap_or_else(Instant::now) + Duration::from_secs(5);
+            let proxy = core.tailnet.proxy.borrow().clone().filter(Proxy::is_valid);
+            let cancel = core.cancel.clone();
+            drop(core);
+            let poll_due = async {
+                if !should_poll {
+                    std::future::pending::<()>().await;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep_until(due.into()) => {}
+                    _ = async {
+                        match proxy {
+                            Some(proxy) => proxy.invalidated().await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
+                }
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = changed.notified() => continue,
+                _ = poll_due => {
+                    if let Some(core) = weak.upgrade() {
+                        poll(&core);
+                    }
+                }
+            }
         }
     });
 }
@@ -407,6 +449,7 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
         }
         return;
     }
+    let previous = core.tailnet.state();
     // Status, ensure and resume keep a healthy node's routes; every other action fences older
     // operations and closes the routes of the node it replaces or stops.
     let generation = if matches!(action.as_str(), "status" | "ensure" | "resume") {
@@ -427,10 +470,16 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
         _ => {}
     }
     core.tailnet.busy.set(true);
-    if action != "status" {
+    core.tailnet
+        .visible_busy
+        .set(id.is_some() && action != "status");
+    if core.tailnet.visible_busy.get() {
         *core.tailnet.error.borrow_mut() = None;
     }
-    core.touch();
+    if core.tailnet.state() != previous {
+        core.touch();
+    }
+    core.tailnet.poll_changed.notify_one();
     let core = core.clone();
     tokio::task::spawn_local(async move {
         let _guard = core.tailnet.operation.lock().await;
@@ -453,7 +502,14 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
         let result: Result<OperationResult, CoreError> = async {
             let mut persistence_error =
                 if matches!(action.as_str(), "configure" | "disconnect" | "logout") {
-                    core.store.borrow_mut().prefs.values.insert(SETTINGS.into(), settings.json());
+                    {
+                        let mut store = core.store.borrow_mut();
+                        let value = settings.json();
+                        if store.prefs.values.get(SETTINGS) != Some(&value) {
+                            store.prefs.values.insert(SETTINGS.into(), value);
+                            store.bump_pref(SETTINGS);
+                        }
+                    }
                     store::write_prefs(&core).await.err()
                 } else {
                     None
@@ -465,6 +521,7 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
                 unavailable("Embedded Tailscale requires an available platform secret store. Normal host connections are unaffected.")
             })?;
             let operation = action.clone();
+            let proxy = core.tailnet.proxy.borrow().clone().filter(Proxy::is_valid);
             // A storage failure must not prevent disconnect/revocation. Never start a newly
             // enabled node whose intent could not be persisted.
             if action == "configure" && enabled
@@ -480,12 +537,12 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
                         // failing node is replaced.
                         match manager.status() {
                             Ok(status) if status.backend_state != "Stopped" => {
-                                routed(&*manager, status)
+                                routed(&*manager, status, proxy)
                             }
                             _ => {
                                 manager.disconnect()?;
                                 let status = manager.start(config)?;
-                                Ok(OperationResult { restarted: true, ..routed(&*manager, status)? })
+                                Ok(OperationResult { restarted: true, ..routed(&*manager, status, None)? })
                             }
                         }
                     }
@@ -495,7 +552,7 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
                             return Ok(OperationResult::default());
                         }
                         let status = manager.start(config)?;
-                        Ok(OperationResult { restarted: true, ..routed(&*manager, status)? })
+                        Ok(OperationResult { restarted: true, ..routed(&*manager, status, None)? })
                     }
                     "disconnect" | "pause" => {
                         manager.disconnect()?;
@@ -511,9 +568,9 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
                         manager.start(config)?;
                         let auth_url = manager.login()?;
                         let status = manager.status()?;
-                        Ok(OperationResult { auth_url: Some(auth_url), ..routed(&*manager, status)? })
+                        Ok(OperationResult { auth_url: Some(auth_url), ..routed(&*manager, status, None)? })
                     }
-                    "status" => routed(&*manager, manager.status()?),
+                    "status" => routed(&*manager, manager.status()?, proxy),
                     _ => unreachable!(),
                 }
             })
@@ -537,7 +594,11 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
             }
             return;
         }
+        let previous = core.tailnet.state();
         core.tailnet.busy.set(false);
+        core.tailnet.visible_busy.set(false);
+        core.tailnet.checked_at.set(Some(Instant::now()));
+        core.tailnet.poll_changed.notify_one();
         // One stalled or rebinding check does not drop a held route; a terminal state, a
         // failure that persists or any other action applies at once.
         let held = core
@@ -561,7 +622,9 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
         let failures = core.tailnet.failures.get() + 1;
         if held && transient && failures < TOLERATED_FAILURES {
             core.tailnet.failures.set(failures);
-            core.touch();
+            if core.tailnet.state() != previous {
+                core.touch();
+            }
             if let Some(id) = id {
                 respond(&core, &id, &action, Ok(()), None);
             }
@@ -610,7 +673,9 @@ fn launch(core: &Rc<Core>, id: Option<RequestId>, action: String, settings: Opti
                 Err(error)
             }
         };
-        core.touch();
+        if core.tailnet.state() != previous {
+            core.touch();
+        }
         if let Some(id) = id {
             respond(&core, &id, &action, result, auth_url);
         }

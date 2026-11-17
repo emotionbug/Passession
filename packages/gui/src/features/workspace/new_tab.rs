@@ -94,6 +94,7 @@ live_design! {
                     // which takes the submit row's place, never shifts the form above it.
                     add_top = <View> { width: Fill, height: 48., visible: false }
                     pending = <View> {
+                        optimize: DrawList
                         width: Fill, height: Fit, flow: Down, visible: false, padding: { left: 16., right: 16., bottom: 16. }
                         card = <WaCard> {
                             row = <WaRow> {}
@@ -105,9 +106,10 @@ live_design! {
                             }
                         }
                     }
-                    notice = <View> { width: Fill, height: Fit, visible: false, padding: { left: 16., right: 16., bottom: 12. }, text = <WaMuted> {} }
-                    heading = <View> { width: Fill, height: Fit, padding: { left: 24., right: 16., bottom: 32. }, text = <WaText> { size: 20. } }
+                    notice = <View> { optimize: DrawList, width: Fill, height: Fit, visible: false, padding: { left: 16., right: 16., bottom: 12. }, text = <WaMuted> {} }
+                    heading = <View> { optimize: DrawList, width: Fill, height: Fit, padding: { left: 24., right: 16., bottom: 32. }, text = <WaText> { size: 20. } }
                     fields = <View> {
+                        optimize: DrawList
                         width: Fill, height: Fit, flow: Right, spacing: 8., align: { y: 0.5 }
                         padding: { left: 16., right: 16., bottom: 16. }
                         project_field = <WaTrigger> {}
@@ -123,6 +125,7 @@ live_design! {
                             padding: { bottom: 12. }
                             role: Surface1, border_role: BorderAccent, radius: 16.
                             tray = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: RightWrap, visible: false
                                 padding: { left: 8., right: 16., top: 8. }
                                 images = <WaRepeat> { width: Fit, flow: Right, template: <WaAttachmentPill> {} }
@@ -130,6 +133,7 @@ live_design! {
                                 uploading = <WaAttachmentPill> { visible: false }
                             }
                             prompt_box = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: Down, padding: { left: 16., right: 16., top: 16. }
                                 prompt = <WaBareInput> {
                                     faint_hint: true, content: true, multiline: true
@@ -141,10 +145,12 @@ live_design! {
                                 }
                             }
                             toolbar = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit, flow: Right, spacing: 0., align: { y: 1.0 }
                                 padding: { left: 10., right: 10. }
                                 // `Expanded(agent controls or SizedBox.shrink)`: submit stays at the end.
                                 agent_slot = <View> {
+                                optimize: DrawList
                                 width: Fill, height: Fit
                                 agent_controls = <View> {
                                     width: Fill, height: Fit, flow: RightWrap, spacing: 4., align: { y: 0.5 }
@@ -169,11 +175,13 @@ live_design! {
                     }
                     // A Terminal launch opens a blank shell: no composer, one action.
                     terminal_launch = <View> {
+                        optimize: DrawList
                         width: Fill, height: Fit, visible: false, padding: { left: 16., right: 16., bottom: 16. }
                         open_terminal = <WaButtonPrimary> { width: Fill, size: Lg, icon: "square-terminal" }
                     }
-                    error = <View> { width: Fill, height: Fit, visible: false, padding: { left: 16., right: 16., bottom: 16. }, text = <WaDangerText> {} }
+                    error = <View> { optimize: DrawList, width: Fill, height: Fit, visible: false, padding: { left: 16., right: 16., bottom: 16. }, text = <WaDangerText> {} }
                     bottom = <View> {
+                        optimize: DrawList
                         width: Fill, height: Fit, flow: RightWrap, spacing: 8., padding: { left: 16., right: 16. }
                         import_session = <WaButtonGhost> { icon: "import" }
                     }
@@ -181,29 +189,33 @@ live_design! {
                     add_form = <View> {
                         width: Fill, height: Fit, flow: Down, spacing: 16., visible: false
                         padding: { left: 16., right: 16., bottom: 16. }
-                        source_field = <WaField> { source = <WaFieldButton> {} }
+                        source_field = <WaField> { optimize: DrawList, source = <WaFieldButton> {} }
                         directory_field = <WaField> {
+                            optimize: DrawList
                             row = <View> {
                                 width: Fill, height: Fit, flow: Right, spacing: 8., align: { y: 0.5 }
                                 path = <WaInput> {}
                                 browse = <WaButtonOutline> { size: Md, icon: "folder-open" }
                             }
                         }
-                        repo_field = <WaField> { row = <WaSearchInput> {} }
-                        protocol_field = <WaField> { protocol = <PSegmented> {} }
-                        dirname_field = <WaField> { dirname_input = <WaInput> {} }
-                        unknown = <View> { width: Fill, height: Fit, visible: false, text = <WaMuted> {} }
+                        repo_field = <WaField> { optimize: DrawList, row = <WaSearchInput> {} }
+                        protocol_field = <WaField> { optimize: DrawList, protocol = <PSegmented> {} }
+                        dirname_field = <WaField> { optimize: DrawList, dirname_input = <WaInput> {} }
+                        unknown = <View> { optimize: DrawList, width: Fill, height: Fit, visible: false, text = <WaMuted> {} }
                         prepare_row = <View> {
+                            optimize: DrawList
                             width: Fill, height: Fit, flow: RightWrap, spacing: 8.
                             prepare = <WaButtonPrimary> { icon: "folder-plus" }
                             inspect_prepared = <WaButtonGhost> {}
                         }
-                        field_error = <View> { width: Fill, height: Fit, visible: false, text = <WaError> {} }
+                        field_error = <View> { optimize: DrawList, width: Fill, height: Fit, visible: false, text = <WaError> {} }
                         add_row = <View> {
+                            optimize: DrawList
                             width: Fill, height: Fit, align: { x: 1.0 }, padding: { top: 8. }
                             add_submit = <WaButtonPrimary> { size: Md, icon: "folder-plus" }
                         }
                         added = <WaSuccessAlert> {
+                            optimize: DrawList
                             visible: false
                             body = { actions = {
                                 new_session = <WaButtonPrimary> { size: Md, icon: "message-square-plus" }
@@ -561,6 +573,9 @@ struct CreateDraft {
 pub struct WaNewTabView {
     #[deref]
     view: View,
+    // Publish through change-checked setters before drawing; never invalidate retained siblings.
+    #[rust]
+    presentation_dirty: bool,
     #[rust]
     target: NewTabTarget,
     #[rust]
@@ -726,7 +741,8 @@ impl WaNewTabView {
         }
         self.target = target;
         self.initialized = false;
-        self.view.redraw(cx);
+        self.presentation_dirty = true;
+        self.root().area().redraw(cx);
     }
 
     /// `initState` + `didChangeDependencies`.
@@ -851,7 +867,7 @@ impl WaNewTabView {
         sync_input(cx, &view.wa_input(id!(path)), "");
         sync_input(cx, &view.wa_input(id!(repo_field.row.input_box)), "");
         sync_input(cx, &view.wa_input(id!(dirname_input)), "");
-        self.view.redraw(cx);
+        self.presentation_dirty = true;
     }
 
     fn host<'a>(&self, ctx: &'a UiContext) -> Option<host::Host<'a>> {
@@ -1059,7 +1075,7 @@ impl WaNewTabView {
         }
         if attached {
             self.sync_forge(cx, ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
     }
 
@@ -1520,7 +1536,7 @@ impl WaNewTabView {
         host::learn(&ctx.events);
         if !self.initialized {
             self.initialize(ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         let status = self.host(ctx).map(|h| h.status());
         if status != self.last_status {
@@ -1542,13 +1558,13 @@ impl WaNewTabView {
                 self.load_providers(ctx);
             }
             self.sync_forge(cx, ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         // Creation receipt observation.
         if let Some(observation) = self.observation.as_mut() {
             let items = observation.take(&ctx.events);
             for item in items {
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
                 match item {
                     ObsEvent::Snapshot { payload, restored } => {
                         if restored {
@@ -1587,7 +1603,7 @@ impl WaNewTabView {
         }
         let answers = self.pending.take_raw(&ctx.events);
         for (req, result) in answers {
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
             self.answer(cx, ctx, req, result);
         }
         // Loading snapshots complete through host events. Apply only this tab's
@@ -1613,7 +1629,7 @@ impl WaNewTabView {
             } else {
                 self.load_providers(ctx);
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
     }
 
@@ -2096,7 +2112,7 @@ impl WaNewTabView {
                 SelectRequest::new(title, options).selected(selected.as_deref()),
             );
         }
-        self.view.redraw(cx);
+        self.presentation_dirty = true;
     }
 
     /// Compact agent settings behind the model trigger (the composer's compact
@@ -2195,7 +2211,7 @@ impl WaNewTabView {
             })
     }
 
-    fn handle_platform(&mut self, cx: &mut Cx, ctx: &mut UiContext, actions: &Actions) {
+    fn handle_platform(&mut self, ctx: &mut UiContext, actions: &Actions) {
         for action in actions.iter() {
             let Some(PlatformAction::Completed { request, result }) =
                 action.downcast_ref::<PlatformAction>()
@@ -2265,7 +2281,7 @@ impl WaNewTabView {
                 }
                 _ => {}
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
     }
 
@@ -2368,7 +2384,7 @@ impl WaNewTabView {
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, ctx: &mut UiContext) {
-        self.handle_platform(cx, ctx, actions);
+        self.handle_platform(ctx, actions);
         let view = self.root();
         let pending_intent = self.intent.is_some();
         let locked = self.busy || pending_intent;
@@ -2389,7 +2405,7 @@ impl WaNewTabView {
                     cx.stop_timer(self.directory_timer);
                     self.directory_timer = cx.start_timeout(0.35);
                 }
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
         }
         if let Some((text, _)) = view.wa_input(id!(path)).returned(actions) {
@@ -2400,22 +2416,22 @@ impl WaNewTabView {
             self.prompt = text;
             self.prompt_reveal = true;
             self.sync_forge(cx, ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if prompt.returned(actions).is_some() {
             if self.can_create() {
                 self.start_create(ctx);
             }
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         let open_terminal = view.wa_button(id!(open_terminal)).clicked(actions);
         if (view.wa_button(id!(submit)).clicked(actions) || open_terminal) && self.can_create() {
             self.start_create(ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if view.wa_button(id!(add_submit)).clicked(actions) {
             self.start_add_project(ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if view.wa_button(id!(new_session)).clicked(actions) {
             self.open_added_project(ctx);
@@ -2523,7 +2539,7 @@ impl WaNewTabView {
             && index < self.images.len()
         {
             self.images.remove(index);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         let files = view.wa_repeat(id!(files));
         if let Some(index) = files
@@ -2536,7 +2552,7 @@ impl WaNewTabView {
             let removed = self.attachments.remove(index);
             self.forge_auto.mark_removed(&removed);
             self.sync_forge(cx, ctx);
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         // Bottom row and the Add project form.
         if view.wa_button(id!(import_session)).clicked(actions) {
@@ -2579,7 +2595,7 @@ impl WaNewTabView {
         }
         if let Some(protocol) = view.psegmented(id!(protocol)).changed(actions) {
             self.clone_protocol = protocol;
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         if view.wa_button(id!(prepare)).clicked(actions) && !self.preparation_unknown && !locked {
             self.prepare_directory(ctx);
@@ -2617,7 +2633,7 @@ impl WaNewTabView {
             self.intent = None;
             self.snapshot = None;
             self.error = None;
-            self.view.redraw(cx);
+            self.presentation_dirty = true;
         }
         self.handle_picks(cx, actions, ctx);
         self.handle_folder(cx, actions, ctx);
@@ -2694,7 +2710,7 @@ impl WaNewTabView {
                         self.source = "directory".into();
                         self.preparation_unknown = false;
                     }
-                    self.view.redraw(cx);
+                    self.presentation_dirty = true;
                 }
                 RemoteFolderPickerAction::Cancelled => modal.close(cx),
                 _ => {}
@@ -2883,7 +2899,7 @@ impl WaNewTabView {
             }
             _ => {}
         }
-        self.view.redraw(cx);
+        self.presentation_dirty = true;
     }
 
     fn visible_features(&self) -> Vec<Value> {
@@ -3033,7 +3049,7 @@ impl WaNewTabView {
                 h.projects()
                     .iter()
                     .filter(|p| !project_root(p).is_empty())
-                    .cloned()
+                    .map(|project| (**project).clone())
                     .collect()
             })
             .unwrap_or_default();
@@ -3354,7 +3370,7 @@ impl WaNewTabView {
         if !self.compact {
             if self.prompt_height.take().is_some() {
                 input.apply_over(cx, live! { height: Fit });
-                cx.redraw_area_in_draw(self.view.area());
+                cx.redraw_area_in_draw(view.widget(id!(prompt_box)).area());
             }
             self.prompt_layout = None;
             return;
@@ -3399,7 +3415,7 @@ impl WaNewTabView {
             } else {
                 input.apply_over(cx, live! { height: Fit });
             }
-            cx.redraw_area_in_draw(self.view.area());
+            cx.redraw_area_in_draw(view.widget(id!(prompt_box)).area());
         }
         if !prompt.key_focus(cx) {
             self.prompt_layout = None;
@@ -3439,7 +3455,7 @@ impl WaNewTabView {
         );
         if (next - scroll).abs() > 0.5 {
             view.view(id!(scroll)).set_scroll_pos(cx, dvec2(0.0, next));
-            cx.redraw_area_in_draw(self.view.area());
+            cx.redraw_area_in_draw(view.widget(id!(scroll)).area());
         }
     }
 
@@ -3765,7 +3781,7 @@ impl Widget for WaNewTabView {
             let drop_ready = self.accepts_file_drop();
             if let Some(paths) = self.file_drop.handle_event(cx, event, drop_ready) {
                 self.drop_files(ctx, paths);
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
             if self.directory_timer.is_event(event).is_some() {
                 self.directory_timer = Timer::default();
@@ -3773,13 +3789,13 @@ impl Widget for WaNewTabView {
                 self.load_repository_status(ctx);
                 self.load_providers(ctx);
                 self.sync_forge(cx, ctx);
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
             if self.forge_timer.is_event(event).is_some() {
                 self.forge_timer = Timer::default();
                 let effects = self.forge_auto.timer_fired();
                 self.apply_forge(cx, ctx, effects);
-                self.view.redraw(cx);
+                self.presentation_dirty = true;
             }
         }
         self.view.handle_event(cx, event, scope);
@@ -3787,6 +3803,12 @@ impl Widget for WaNewTabView {
             && let Some(ctx) = scope.data.get_mut::<UiContext>()
         {
             self.handle_actions(cx, actions, ctx);
+        }
+        if self.presentation_dirty
+            && let Some(ctx) = scope.data.get_mut::<UiContext>()
+        {
+            self.presentation_dirty = false;
+            self.present(cx, ctx, self.column_width);
         }
     }
 
@@ -3818,7 +3840,7 @@ impl Widget for WaNewTabView {
             self.scroll_align = Some(align_y);
             view.widget(id!(scroll))
                 .apply_over(cx, live! { align: { y: (align_y) } });
-            cx.redraw_area_in_draw(self.view.area());
+            cx.redraw_area_in_draw(view.widget(id!(scroll)).area());
         }
         if self.focus_prompt {
             self.focus_prompt = false;

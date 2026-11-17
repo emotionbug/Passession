@@ -160,6 +160,12 @@ pub struct HistoryPage {
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
     /// Fetch requested by an interaction; issued on the next tick (needs the core handle).
     fetch: Option<bool>,
+    header_layer: crate::common::layer::Layer,
+    section_layers: HashMap<&'static str, crate::common::layer::Layer>,
+    row_layers: HashMap<usize, crate::common::layer::Layer>,
+    visible_rows: HashSet<usize>,
+    header_bottom: f64,
+    clock_day: chrono::NaiveDate,
 }
 
 impl HistoryPage {
@@ -194,17 +200,42 @@ impl HistoryPage {
             viewport: Rect::default(),
             touch_scroll: Default::default(),
             fetch: None,
+            header_layer: Default::default(),
+            section_layers: HashMap::new(),
+            row_layers: HashMap::new(),
+            visible_rows: HashSet::new(),
+            header_bottom: 0.0,
+            clock_day: Local::now().date_naive(),
         }
     }
 
-    fn target_hosts<'a>(&self, state: &'a Value) -> Vec<Host<'a>> {
+    pub(crate) fn invalidate(&self, cx: &mut Cx) {
+        self.header_layer.invalidate(cx);
+        for layer in self.row_layers.values().chain(self.section_layers.values()) {
+            layer.invalidate(cx);
+        }
+    }
+
+    pub(crate) fn redraw_hit(&self, cx: &mut Cx, id: &str) -> bool {
+        if let Some(layer) = self.row_layers.values().find(|layer| layer.owns_hit(id)) {
+            layer.invalidate(cx);
+            true
+        } else if self.header_layer.owns_hit(id) {
+            self.header_layer.invalidate(cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn target_hosts<'a>(&self, state: &'a paseo_gui_core::CoreState) -> Vec<Host<'a>> {
         hosts::hosts(state)
             .into_iter()
             .filter(|h| self.selected_host.is_empty() || h.server_id() == self.selected_host)
             .collect()
     }
 
-    fn reachable_hosts<'a>(&self, state: &'a Value) -> Vec<Host<'a>> {
+    fn reachable_hosts<'a>(&self, state: &'a paseo_gui_core::CoreState) -> Vec<Host<'a>> {
         self.target_hosts(state)
             .into_iter()
             .filter(|h| h.status() == Status::Connected)
@@ -212,12 +243,12 @@ impl HistoryPage {
     }
 
     /// One gate: a fleet where any host predates history search has no search field.
-    fn search_supported(&self, state: &Value) -> bool {
+    fn search_supported(&self, state: &paseo_gui_core::CoreState) -> bool {
         let hosts = self.reachable_hosts(state);
         !hosts.is_empty() && hosts.iter().all(|h| h.supports("agentHistorySearch"))
     }
 
-    fn is_searching(&self, state: &Value) -> bool {
+    fn is_searching(&self, state: &paseo_gui_core::CoreState) -> bool {
         self.search_supported(state) && !self.search.is_empty()
     }
 
@@ -485,7 +516,18 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
         page.reset();
     }
     if page.clock.is_event(event).is_some() {
-        shell.redraw(cx);
+        let day = Local::now().date_naive();
+        if day != page.clock_day {
+            page.clock_day = day;
+            page.invalidate(cx);
+            shell.layers.sessions.invalidate(cx);
+        } else {
+            for key in &page.visible_rows {
+                if let Some(layer) = page.row_layers.get(key) {
+                    layer.invalidate(cx);
+                }
+            }
+        }
     }
     if page.debounce.is_event(event).is_some() {
         let next = page.search_field.text().trim().to_string();
@@ -506,7 +548,8 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
         Some(FieldEvent::Changed(_)) => {
             cx.stop_timer(page.debounce);
             page.debounce = cx.start_timeout(SEARCH_DEBOUNCE);
-            shell.redraw(cx);
+            page.invalidate(cx);
+            shell.layers.sessions.invalidate(cx);
         }
         Some(FieldEvent::Returned(text)) => {
             cx.stop_timer(page.debounce);
@@ -531,7 +574,7 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
     } else if let Some(dy) = page.touch_scroll.handle_event(cx, event, &hit) {
         let max = (page.content_h - page.viewport.size.y).max(0.0);
         if page.touch_scroll.apply_delta(&mut page.scroll, dy, max) {
-            shell.redraw(cx);
+            shell.layers.sessions.invalidate(cx);
         }
     }
     if !covered
@@ -541,11 +584,12 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
         page.touch_scroll.reset();
         let max = (page.content_h - page.viewport.size.y).max(0.0);
         page.scroll = (page.scroll + e.scroll.y).clamp(0.0, max);
-        shell.redraw(cx);
+        shell.layers.sessions.invalidate(cx);
     }
     if let Some(append) = page.fetch.take() {
         page.start_fetch(&mut shell.data.pending, ui, append);
-        shell.redraw(cx);
+        page.invalidate(cx);
+        shell.layers.sessions.invalidate(cx);
     }
     shell.data.history = Some(page);
 }
@@ -586,7 +630,7 @@ pub fn on_response(
     {
         page.host_page(generation, server_id, result);
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Sessions);
 }
 
 /// Opens the open History page on `query` (the sidebar's "Search all history"); a no-op
@@ -600,7 +644,7 @@ pub fn search(shell: &mut PaseoShell, cx: &mut Cx, query: &str) {
             page.reset();
         }
     });
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Sessions);
 }
 
 /// A session archived from the session menu: its History row shows the archived badge
@@ -749,7 +793,7 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) 
             }
         }
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Sessions);
 }
 
 /// Host filter answer (`ShellOverlay::HistoryHost`).
@@ -760,7 +804,7 @@ pub fn select_host(shell: &mut PaseoShell, cx: &mut Cx, server_id: &str) {
             page.reset();
         }
     });
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Sessions);
 }
 
 /// Right-click / long-press: the sidebar's session menu (Open, Rename, Archive with its
@@ -783,7 +827,7 @@ pub fn secondary(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &s
     let anchor = shell.data.hits.rect_of(&id.to_string()).unwrap_or_default();
     let state = ui.state.clone();
     commands::session_menu(shell, cx, &state, &row.server_id, row.agent, anchor, true);
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -879,7 +923,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
     let Some(mut page) = shell.data.history.take() else {
         return;
     };
-    let state: Arc<Value> = scope
+    let state: Arc<paseo_gui_core::CoreState> = scope
         .data
         .get::<UiContext>()
         .map(|ui| ui.state.clone())
@@ -889,196 +933,131 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
     let host_count = hosts::hosts(&state).len();
     let search_supported = page.search_supported(&state);
     let searching = page.is_searching(&state);
+    let mut y = page.header_bottom;
+    let header_paint =
+        page.header_layer
+            .begin(cx, area, 0, &mut shell.data.hits, &mut shell.data.tooltips);
     let mut ui = make_ui(shell);
     let p = ui.p;
-    ui.fill(cx, area, p.surface0, 0.0);
-    let mut y = area.pos.y;
     let line_h = text_line_height(20.0, 14.0);
     let small_h = text_line_height(16.0, 12.0);
     let field_h = crate::theme::control_height(ControlSize::Sm);
+    if header_paint {
+        ui.fill(cx, area, p.surface0, 0.0);
+        y = area.pos.y;
 
-    // `MenuHeader`: compact 12/8 insets and a 56px row, else a 36px bordered row.
-    let title = tr("sessions.title");
-    let (row_y, row_h) = if compact {
-        (y + 8.0, 32.0 + text_line_height(24.0, 16.0))
-    } else {
-        (y, 16.0 + line_h)
-    };
-    let extent = if compact { 32.0 } else { 26.0 };
-    let island = rect(
-        area.pos.x + 12.0,
-        row_y + (row_h - extent) * 0.5,
-        extent,
-        extent,
-    );
-    if ui.is_hover("hist:menu") || ui.is_pressed("hist:menu") {
-        let highlight = p.interaction_highlight;
-        ui.fill(cx, island, highlight, extent * 0.5);
-    }
-    if compact {
-        // MobileMenuIcon: 16/16/8 × 1.5 muted lines in a 16×12 box.
-        let (bx, by) = (island.pos.x + 8.0, island.pos.y + 10.0);
-        for (i, w) in [16.0, 16.0, 8.0].iter().enumerate() {
-            ui.fill(cx, rect(bx, by + i as f64 * 5.25, *w, 1.5), p.muted, 1.0);
-        }
-    } else {
-        ui.icon(
-            cx,
-            rect(island.pos.x + 5.0, island.pos.y + 5.0, 16.0, 16.0),
-            "panel-left",
-            16.0,
-            p.muted,
+        // `MenuHeader`: compact 12/8 insets and a 56px row, else a 36px bordered row.
+        let title = tr("sessions.title");
+        let (row_y, row_h) = if compact {
+            (y + 8.0, 32.0 + text_line_height(24.0, 16.0))
+        } else {
+            (y, 16.0 + line_h)
+        };
+        let extent = if compact { 32.0 } else { 26.0 };
+        let island = rect(
+            area.pos.x + 12.0,
+            row_y + (row_h - extent) * 0.5,
+            extent,
+            extent,
         );
-    }
-    // Phone: a 44x44 touch target centred on the 32px island.
-    let island_hit = if compact {
-        rect(
-            island.pos.x + island.size.x * 0.5 - 22.0,
-            island.pos.y + island.size.y * 0.5 - 22.0,
-            44.0,
-            44.0,
-        )
-    } else {
-        island
-    };
-    ui.hit_tip(
-        island_hit,
-        "hist:menu",
-        &tr(if compact {
-            "shell.menu.open"
-        } else {
-            "shell.menu.toggleSidebar"
-        }),
-    );
-    let spec = ui.spec(
-        if compact { Font::Medium } else { Font::Regular },
-        if compact { 16.0 } else { 14.0 },
-        p.foreground,
-    );
-    let tx = island.pos.x + extent + 8.0;
-    ui.text(
-        cx,
-        rect(tx, row_y, area.pos.x + area.size.x - 12.0 - tx, row_h),
-        spec,
-        &title,
-    );
-    y = row_y + row_h;
-    if !compact {
-        ui.painter
-            .hline(cx, area.pos.x, y - 1.0, area.size.x, p.border);
-    }
-
-    // Search + host filter row.
-    let x = area.pos.x + inset;
-    let w = area.size.x - inset * 2.0;
-    if host_count > 1 || search_supported {
-        y += 16.0;
-        // The host trigger shares the row with search: its label shrinks first, and when even
-        // a short label beside a 160px search field does not fit it moves to its own row.
-        let host_filter = (host_count > 1).then(|| {
-            let host =
-                hosts::host(&state, &page.selected_host).filter(|_| !page.selected_host.is_empty());
-            let label = host
-                .as_ref()
-                .map(|h| h.display_label())
-                .unwrap_or_else(|| tr("sessions.filter.allHosts"));
-            (host, label)
-        });
-        let host_spec = ui.spec(Font::Medium, 14.0, p.foreground);
-        let trigger_chrome = 12.0 + 14.0 + 6.0 + 6.0 + 14.0 + 12.0;
-        let natural_lw = host_filter.as_ref().map_or(0.0, |(_, label)| {
-            ui.measure(cx, host_spec, label).min(180.0)
-        });
-        let inline_room = w - 160.0 - 8.0 - trigger_chrome;
-        let stacked = search_supported && host_filter.is_some() && inline_room < 48.0;
-        let lw = if search_supported && !stacked {
-            natural_lw.min(inline_room)
-        } else {
-            natural_lw.min(w - trigger_chrome)
+        if ui.is_hover("hist:menu") || ui.is_pressed("hist:menu") {
+            let highlight = p.interaction_highlight;
+            ui.fill(cx, island, highlight, extent * 0.5);
         }
-        .max(0.0);
-        let mut fx = x;
-        if search_supported {
-            let sw = if host_filter.is_some() && !stacked {
-                (w.min(420.0) - 180.0)
-                    .max(160.0)
-                    .min(w - 8.0 - trigger_chrome - lw)
-            } else {
-                w.min(420.0)
-            };
-            let r = rect(fx, y, sw, field_h + 2.0);
-            ui.painter.outline(cx, r, p.surface1, p.border, 1.0, 6.0);
+        if compact {
+            // MobileMenuIcon: 16/16/8 × 1.5 muted lines in a 16×12 box.
+            let (bx, by) = (island.pos.x + 8.0, island.pos.y + 10.0);
+            for (i, w) in [16.0, 16.0, 8.0].iter().enumerate() {
+                ui.fill(cx, rect(bx, by + i as f64 * 5.25, *w, 1.5), p.muted, 1.0);
+            }
+        } else {
             ui.icon(
                 cx,
-                rect(
-                    r.pos.x + 12.0,
-                    r.pos.y + (r.size.y - 14.0) * 0.5,
-                    14.0,
-                    14.0,
-                ),
-                "search",
-                14.0,
+                rect(island.pos.x + 5.0, island.pos.y + 5.0, 16.0, 16.0),
+                "panel-left",
+                16.0,
                 p.muted,
             );
-            let has_text = !page.search_field.text().is_empty();
-            let field_w = r.size.x - 12.0 - 14.0 - 8.0 - if has_text { 30.0 } else { 12.0 };
-            // One surface: the outline above is the field; the plain input inside has no fill
-            // and its 12px vertical padding is placed so the text line centres on the glyph.
-            let input_spec = ui.spec(Font::Regular, 14.0, p.foreground);
-            let line_h = ui.painter.line_height(cx, input_spec);
-            page.search_field.draw(
-                cx,
-                scope,
-                rect(
-                    r.pos.x + 34.0,
-                    r.pos.y + r.size.y * 0.5 - line_h * 0.5 - 12.0,
-                    field_w,
-                    line_h + 24.0,
-                ),
-            );
-            if has_text {
-                let clear = rect(
-                    r.pos.x + r.size.x - 30.0,
-                    r.pos.y + (r.size.y - 30.0) * 0.5,
-                    30.0,
-                    30.0,
-                );
-                ui.icon(
-                    cx,
-                    rect(clear.pos.x + 8.0, clear.pos.y + 8.0, 14.0, 14.0),
-                    "x",
-                    14.0,
-                    p.muted,
-                );
-                ui.hit_tip(clear, "hist:clear", &tr("sessions.actions.clearSearch"));
-            }
-            if stacked {
-                y += field_h + 2.0 + 8.0;
-            } else {
-                fx = r.pos.x + r.size.x + 8.0;
-            }
         }
-        if let Some((host, label)) = host_filter {
-            let r = rect(fx, y, trigger_chrome + lw, field_h + 2.0);
-            let bg = if ui.is_pressed("hist:filter") {
-                p.surface3
-            } else if ui.is_hover("hist:filter") {
-                p.surface2
+        // Phone: a 44x44 touch target centred on the 32px island.
+        let island_hit = if compact {
+            rect(
+                island.pos.x + island.size.x * 0.5 - 22.0,
+                island.pos.y + island.size.y * 0.5 - 22.0,
+                44.0,
+                44.0,
+            )
+        } else {
+            island
+        };
+        ui.hit_tip(
+            island_hit,
+            "hist:menu",
+            &tr(if compact {
+                "shell.menu.open"
             } else {
-                p.surface1
-            };
-            ui.painter.outline(cx, r, bg, p.border, 1.0, 6.0);
-            match host {
-                Some(host) => {
-                    let color = sidebar::status_color(&p, &host);
-                    ui.dot(
-                        cx,
-                        dvec2(r.pos.x + 12.0 + 7.0, r.pos.y + r.size.y * 0.5),
-                        8.0,
-                        color,
-                    );
-                }
-                None => ui.icon(
+                "shell.menu.toggleSidebar"
+            }),
+        );
+        let spec = ui.spec(
+            if compact { Font::Medium } else { Font::Regular },
+            if compact { 16.0 } else { 14.0 },
+            p.foreground,
+        );
+        let tx = island.pos.x + extent + 8.0;
+        ui.text(
+            cx,
+            rect(tx, row_y, area.pos.x + area.size.x - 12.0 - tx, row_h),
+            spec,
+            &title,
+        );
+        y = row_y + row_h;
+        if !compact {
+            ui.painter
+                .hline(cx, area.pos.x, y - 1.0, area.size.x, p.border);
+        }
+
+        // Search + host filter row.
+        let x = area.pos.x + inset;
+        let w = area.size.x - inset * 2.0;
+        if host_count > 1 || search_supported {
+            y += 16.0;
+            // The host trigger shares the row with search: its label shrinks first, and when even
+            // a short label beside a 160px search field does not fit it moves to its own row.
+            let host_filter = (host_count > 1).then(|| {
+                let host = hosts::host(&state, &page.selected_host)
+                    .filter(|_| !page.selected_host.is_empty());
+                let label = host
+                    .as_ref()
+                    .map(|h| h.display_label())
+                    .unwrap_or_else(|| tr("sessions.filter.allHosts"));
+                (host, label)
+            });
+            let host_spec = ui.spec(Font::Medium, 14.0, p.foreground);
+            let trigger_chrome = 12.0 + 14.0 + 6.0 + 6.0 + 14.0 + 12.0;
+            let natural_lw = host_filter.as_ref().map_or(0.0, |(_, label)| {
+                ui.measure(cx, host_spec, label).min(180.0)
+            });
+            let inline_room = w - 160.0 - 8.0 - trigger_chrome;
+            let stacked = search_supported && host_filter.is_some() && inline_room < 48.0;
+            let lw = if search_supported && !stacked {
+                natural_lw.min(inline_room)
+            } else {
+                natural_lw.min(w - trigger_chrome)
+            }
+            .max(0.0);
+            let mut fx = x;
+            if search_supported {
+                let sw = if host_filter.is_some() && !stacked {
+                    (w.min(420.0) - 180.0)
+                        .max(160.0)
+                        .min(w - 8.0 - trigger_chrome - lw)
+                } else {
+                    w.min(420.0)
+                };
+                let r = rect(fx, y, sw, field_h + 2.0);
+                ui.painter.outline(cx, r, p.surface1, p.border, 1.0, 6.0);
+                ui.icon(
                     cx,
                     rect(
                         r.pos.x + 12.0,
@@ -1086,77 +1065,152 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
                         14.0,
                         14.0,
                     ),
-                    "server",
+                    "search",
                     14.0,
                     p.muted,
-                ),
+                );
+                let has_text = !page.search_field.text().is_empty();
+                let field_w = r.size.x - 12.0 - 14.0 - 8.0 - if has_text { 30.0 } else { 12.0 };
+                // One surface: the outline above is the field; the plain input inside has no fill
+                // and its 12px vertical padding is placed so the text line centres on the glyph.
+                let input_spec = ui.spec(Font::Regular, 14.0, p.foreground);
+                let line_h = ui.painter.line_height(cx, input_spec);
+                page.search_field.draw(
+                    cx,
+                    scope,
+                    rect(
+                        r.pos.x + 34.0,
+                        r.pos.y + r.size.y * 0.5 - line_h * 0.5 - 12.0,
+                        field_w,
+                        line_h + 24.0,
+                    ),
+                );
+                if has_text {
+                    let clear = rect(
+                        r.pos.x + r.size.x - 30.0,
+                        r.pos.y + (r.size.y - 30.0) * 0.5,
+                        30.0,
+                        30.0,
+                    );
+                    ui.icon(
+                        cx,
+                        rect(clear.pos.x + 8.0, clear.pos.y + 8.0, 14.0, 14.0),
+                        "x",
+                        14.0,
+                        p.muted,
+                    );
+                    ui.hit_tip(clear, "hist:clear", &tr("sessions.actions.clearSearch"));
+                }
+                if stacked {
+                    y += field_h + 2.0 + 8.0;
+                } else {
+                    fx = r.pos.x + r.size.x + 8.0;
+                }
             }
-            let fitted = ui.painter.fit(cx, host_spec, &label, lw);
-            ui.text(
-                cx,
-                rect(r.pos.x + 32.0, r.pos.y, lw, r.size.y),
-                host_spec,
-                &fitted,
-            );
-            ui.icon(
-                cx,
-                rect(
-                    r.pos.x + 32.0 + lw + 6.0,
-                    r.pos.y + (r.size.y - 14.0) * 0.5,
+            if let Some((host, label)) = host_filter {
+                let r = rect(fx, y, trigger_chrome + lw, field_h + 2.0);
+                let bg = if ui.is_pressed("hist:filter") {
+                    p.surface3
+                } else if ui.is_hover("hist:filter") {
+                    p.surface2
+                } else {
+                    p.surface1
+                };
+                ui.painter.outline(cx, r, bg, p.border, 1.0, 6.0);
+                match host {
+                    Some(host) => {
+                        let color = sidebar::status_color(&p, &host);
+                        ui.dot(
+                            cx,
+                            dvec2(r.pos.x + 12.0 + 7.0, r.pos.y + r.size.y * 0.5),
+                            8.0,
+                            color,
+                        );
+                    }
+                    None => ui.icon(
+                        cx,
+                        rect(
+                            r.pos.x + 12.0,
+                            r.pos.y + (r.size.y - 14.0) * 0.5,
+                            14.0,
+                            14.0,
+                        ),
+                        "server",
+                        14.0,
+                        p.muted,
+                    ),
+                }
+                let fitted = ui.painter.fit(cx, host_spec, &label, lw);
+                ui.text(
+                    cx,
+                    rect(r.pos.x + 32.0, r.pos.y, lw, r.size.y),
+                    host_spec,
+                    &fitted,
+                );
+                ui.icon(
+                    cx,
+                    rect(
+                        r.pos.x + 32.0 + lw + 6.0,
+                        r.pos.y + (r.size.y - 14.0) * 0.5,
+                        14.0,
+                        14.0,
+                    ),
+                    "chevron-down",
                     14.0,
-                    14.0,
-                ),
-                "chevron-down",
-                14.0,
-                p.muted,
-            );
-            ui.hit(r, "hist:filter");
+                    p.muted,
+                );
+                ui.hit(r, "hist:filter");
+            }
+            y += field_h + 2.0;
         }
-        y += field_h + 2.0;
+        // Failed hosts (danger) and offline hosts (muted, not a failure). With no reachable host
+        // at all the empty state below says so instead.
+        let reachable = !page.reachable_hosts(&state).is_empty();
+        let mut notices: Vec<(String, Vec4)> = page
+            .host_errors
+            .iter()
+            .map(|(_, label)| {
+                (
+                    tr_args("sessions.hostLoadFailed", &[("host", label)]),
+                    p.danger,
+                )
+            })
+            .collect();
+        if reachable {
+            notices.extend(
+                page.offline_hosts.iter().map(|(_, label)| {
+                    (tr_args("sessions.hostOffline", &[("host", label)]), p.muted)
+                }),
+            );
+        }
+        if !notices.is_empty() {
+            y += 12.0;
+            let h = 24.0
+                + notices.len() as f64 * small_h
+                + (notices.len().saturating_sub(1)) as f64 * 4.0;
+            ui.painter
+                .outline(cx, rect(x, y, w, h), Vec4::default(), p.border, 1.0, 8.0);
+            for (i, (line, color)) in notices.iter().enumerate() {
+                let spec = ui.spec(Font::Regular, 12.0, *color);
+                let fitted = ui.painter.fit(cx, spec, line, w - 24.0);
+                ui.text(
+                    cx,
+                    rect(
+                        x + 12.0,
+                        y + 12.0 + i as f64 * (small_h + 4.0),
+                        w - 24.0,
+                        small_h,
+                    ),
+                    spec,
+                    &fitted,
+                );
+            }
+            y += h;
+        }
+        page.header_bottom = y;
+        page.header_layer.end(cx, ui.hits, ui.tooltips);
     }
-    // Failed hosts (danger) and offline hosts (muted, not a failure). With no reachable host
-    // at all the empty state below says so instead.
     let reachable = !page.reachable_hosts(&state).is_empty();
-    let mut notices: Vec<(String, Vec4)> = page
-        .host_errors
-        .iter()
-        .map(|(_, label)| {
-            (
-                tr_args("sessions.hostLoadFailed", &[("host", label)]),
-                p.danger,
-            )
-        })
-        .collect();
-    if reachable {
-        notices.extend(
-            page.offline_hosts
-                .iter()
-                .map(|(_, label)| (tr_args("sessions.hostOffline", &[("host", label)]), p.muted)),
-        );
-    }
-    if !notices.is_empty() {
-        y += 12.0;
-        let h =
-            24.0 + notices.len() as f64 * small_h + (notices.len().saturating_sub(1)) as f64 * 4.0;
-        ui.painter
-            .outline(cx, rect(x, y, w, h), Vec4::default(), p.border, 1.0, 8.0);
-        for (i, (line, color)) in notices.iter().enumerate() {
-            let spec = ui.spec(Font::Regular, 12.0, *color);
-            let fitted = ui.painter.fit(cx, spec, line, w - 24.0);
-            ui.text(
-                cx,
-                rect(
-                    x + 12.0,
-                    y + 12.0 + i as f64 * (small_h + 4.0),
-                    w - 24.0,
-                    small_h,
-                ),
-                spec,
-                &fitted,
-            );
-        }
-        y += h;
-    }
 
     let body = rect(
         area.pos.x,
@@ -1200,6 +1254,7 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
                 cy += field_h;
             }
         };
+    page.visible_rows.clear();
     if page.initial_load {
         spinner(
             &mut ui,
@@ -1295,40 +1350,66 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
             0.0,
             0.0,
         );
-        let agents = page.agents.clone();
+        let agents = &page.agents;
         for (section, key) in SECTIONS {
-            let rows: Vec<(usize, &HistoryAgent)> = agents
+            let mut rows = agents
                 .iter()
                 .enumerate()
                 .filter(|(_, a)| date_section(a.last_activity) == section)
-                .collect();
-            if rows.is_empty() {
+                .peekable();
+            if rows.peek().is_none() {
                 continue;
             }
-            ui.text(
-                cx,
-                rect(lx + 12.0, ry + 8.0, lw - 24.0, line_h),
-                section_spec,
-                &tr(&format!("agentList.dateSections.{key}")),
-            );
+            let section_rect = rect(lx + 12.0, ry + 8.0, lw - 24.0, line_h);
+            let section_layer = page.section_layers.entry(key).or_default();
+            if section_layer.begin(cx, section_rect, 0, ui.hits, ui.tooltips) {
+                ui.text(
+                    cx,
+                    section_rect,
+                    section_spec,
+                    &tr(&format!("agentList.dateSections.{key}")),
+                );
+                section_layer.end(cx, ui.hits, ui.tooltips);
+            }
             ry += line_h + 20.0;
             for (index, agent) in rows {
-                let host_label = hosts::host(&state, &agent.server_id)
-                    .map(|h| h.display_label())
-                    .unwrap_or_else(|| agent.server_id.clone());
-                ry += session_row(
-                    &mut ui,
-                    cx,
-                    lx,
-                    ry,
-                    lw,
-                    index,
-                    agent,
-                    &host_label,
-                    &query,
-                    compact,
-                    row_metrics,
-                ) + 4.0;
+                let h = RowMetrics::new(
+                    row_metrics.title_height,
+                    if compact {
+                        row_metrics.title_height * 2.0 + 2.0
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                )
+                .height(0.0, 8.0, 14.0);
+                let row_rect = rect(lx, ry, lw, h);
+                let visible = row_rect.pos.y < body.pos.y + body.size.y
+                    && row_rect.pos.y + row_rect.size.y > body.pos.y;
+                if visible {
+                    page.visible_rows.insert(index);
+                    let row_layer = page.row_layers.entry(index).or_default();
+                    if row_layer.begin(cx, row_rect, 0, ui.hits, ui.tooltips) {
+                        let host_label = hosts::host(&state, &agent.server_id)
+                            .map(|h| h.display_label())
+                            .unwrap_or_else(|| agent.server_id.clone());
+                        session_row(
+                            &mut ui,
+                            cx,
+                            lx,
+                            ry,
+                            lw,
+                            index,
+                            agent,
+                            &host_label,
+                            &query,
+                            compact,
+                            row_metrics,
+                        );
+                        row_layer.end(cx, ui.hits, ui.tooltips);
+                    }
+                }
+                ry += h + 4.0;
             }
         }
         if page.search_truncated {
@@ -1361,6 +1442,16 @@ pub fn draw_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, area:
         cx.end_turtle();
         page.content_h = ry - start + 16.0;
     }
+    page.header_layer.finish_frame(cx);
+    for layer in page
+        .row_layers
+        .values_mut()
+        .chain(page.section_layers.values_mut())
+    {
+        layer.finish_frame(cx);
+    }
+    page.row_layers
+        .retain(|index, _| *index < page.agents.len());
     shell.data.history = Some(page);
 }
 
@@ -1694,7 +1785,7 @@ pub struct ImportSheet {
     filter_rect: Rect,
     /// Overlay owner the provider filter menu answers to (unique per sheet).
     owner: String,
-    state: Arc<Value>,
+    state: Arc<paseo_gui_core::CoreState>,
 }
 
 impl ImportSheet {
@@ -1724,7 +1815,7 @@ impl ImportSheet {
                 overlay_api::WIDGET_OWNER_PREFIX,
                 overlay_api::next_id()
             ),
-            state: Arc::new(Value::Null),
+            state: Arc::new(paseo_gui_core::CoreState::default()),
         }
     }
 
@@ -1779,7 +1870,7 @@ impl Sheet for ImportSheet {
         560.0
     }
 
-    fn sync(&mut self, _shell: &PaseoShell, state: &Value) {
+    fn sync(&mut self, _shell: &PaseoShell, state: &paseo_gui_core::CoreState) {
         self.state = Arc::new(state.clone());
     }
 

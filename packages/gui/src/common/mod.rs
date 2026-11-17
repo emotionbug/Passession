@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use makepad_widgets::*;
-use paseo_gui_core::{CoreError, CoreEvent, CoreHandle};
+use paseo_gui_core::{CoreError, CoreEvent, CoreHandle, CoreState, DirectorySnapshot};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 
@@ -64,7 +64,7 @@ pub(crate) fn is_user_input(event: &Event) -> bool {
 /// Per-dispatch UI context handed to feature widgets as Makepad `Scope` data.
 pub struct UiContext {
     pub core: CoreHandle,
-    pub state: Arc<Value>,
+    pub state: Arc<CoreState>,
     /// What the `State` publications of the current batch changed (empty without one).
     pub state_delta: state_delta::StateDelta,
     pub events: Vec<CoreEvent>,
@@ -85,7 +85,7 @@ impl UiContext {
     pub fn new(core: CoreHandle) -> Self {
         Self {
             core,
-            state: Arc::new(Value::Null),
+            state: Arc::new(CoreState::default()),
             state_delta: state_delta::StateDelta::default(),
             events: Vec::new(),
             route: Route::Welcome,
@@ -123,6 +123,10 @@ impl UiContext {
     /// `state.hosts[i]` by server id, config id or any saved connection id (Flutter `hostFor`).
     pub fn host(&self, host_id: &str) -> Option<&Value> {
         host_record(&self.state, host_id)
+    }
+
+    pub fn directory(&self, host: &Value) -> Option<&DirectorySnapshot> {
+        self.state.directory(host)
     }
 
     /// Host events of the current batch, in wire order.
@@ -479,7 +483,10 @@ pub enum UiEffect {
     RemoveHost {
         host_id: String,
     },
-    Redraw,
+    RedrawOverlays,
+    RedrawPane {
+        tab_key: String,
+    },
 }
 
 /// Flutter `PanelTarget` (`lib/core/target.dart`); `key()` is byte-identical so persisted

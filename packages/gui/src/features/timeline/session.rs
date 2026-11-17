@@ -27,6 +27,56 @@ pub fn next_retry_delay(previous: Option<f64>) -> f64 {
     }
 }
 
+const HIDDEN_SUBSCRIPTION_GRACE: f64 = 30.0;
+
+#[derive(Debug, PartialEq, Eq)]
+enum VisibilityChange {
+    None,
+    Grace,
+    Resume,
+}
+
+/// Visibility is aggregated across every view before reaching this policy.
+struct SubscriptionVisibility {
+    visible: bool,
+    suspended: bool,
+}
+
+impl SubscriptionVisibility {
+    fn new() -> Self {
+        Self {
+            visible: false,
+            suspended: true,
+        }
+    }
+
+    fn update(&mut self, visible: bool) -> VisibilityChange {
+        if self.visible == visible {
+            return VisibilityChange::None;
+        }
+        self.visible = visible;
+        if visible {
+            if std::mem::replace(&mut self.suspended, false) {
+                VisibilityChange::Resume
+            } else {
+                VisibilityChange::None
+            }
+        } else if !self.suspended {
+            VisibilityChange::Grace
+        } else {
+            VisibilityChange::None
+        }
+    }
+
+    fn expire(&mut self) -> bool {
+        if self.visible || self.suspended {
+            return false;
+        }
+        self.suspended = true;
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SessionKey {
     pub host_id: String,
@@ -285,7 +335,8 @@ pub struct ChatSession {
 
     pending: bool,
     manual_retry: bool,
-    app_visible: bool,
+    visibility: SubscriptionVisibility,
+    hidden_timer: Timer,
     disposed: bool,
 
     pub completions: Vec<Completion>,
@@ -345,7 +396,8 @@ impl ChatSession {
             catch_up_delay: None,
             pending: true,
             manual_retry: false,
-            app_visible: true,
+            visibility: SubscriptionVisibility::new(),
+            hidden_timer: Timer::empty(),
             disposed: false,
             completions: Vec::new(),
             reveals: Vec::new(),
@@ -576,10 +628,6 @@ impl ChatSession {
         id
     }
 
-    pub fn start(&mut self, io: &mut Io) {
-        self.reconcile_membership(io);
-    }
-
     // ── membership ──────────────────────────────────────────────────────
 
     /// viewed-timeline-sync.ts reconcileMembership through the core's owned
@@ -588,7 +636,7 @@ impl ChatSession {
     /// the connection-wide member set, legacy broadcast hosts no RPC. The
     /// core restores it after every reconnect (`subscription.restored`).
     pub fn reconcile_membership(&mut self, io: &mut Io) {
-        if self.disposed || !self.connected {
+        if self.disposed || !self.connected || self.visibility.suspended {
             return;
         }
         if self.observation.is_some() && !self.membership_needs_retry {
@@ -678,11 +726,16 @@ impl ChatSession {
     }
 
     fn membership_acknowledged(&mut self, io: &mut Io) {
+        if self.subscribed || self.visibility.suspended {
+            return;
+        }
         self.subscribed = true;
         io.cx.stop_timer(self.membership_retry);
         self.membership_retry = Timer::empty();
         self.membership_delay = None;
-        self.start_catch_up(io, false, false);
+        // A fetch that was already in flight at suspension must finish before
+        // the single resume catch-up, not stand in for that catch-up.
+        self.request_refresh(io);
         self.refresh_subagents(io);
     }
 
@@ -692,7 +745,11 @@ impl ChatSession {
         let delay = next_retry_delay(self.membership_delay);
         self.membership_delay = Some(delay);
         io.cx.stop_timer(self.membership_retry);
-        self.membership_retry = io.cx.start_timeout(delay);
+        self.membership_retry = if self.visibility.suspended {
+            Timer::empty()
+        } else {
+            io.cx.start_timeout(delay)
+        };
         self.set_error(failure);
     }
 
@@ -700,10 +757,18 @@ impl ChatSession {
     pub fn owns_timer(&self, event: &makepad_widgets::Event) -> bool {
         (!self.membership_retry.is_empty() && self.membership_retry.is_event(event).is_some())
             || (!self.catch_up_retry.is_empty() && self.catch_up_retry.is_event(event).is_some())
+            || (!self.hidden_timer.is_empty() && self.hidden_timer.is_event(event).is_some())
     }
 
     pub fn on_timer(&mut self, io: &mut Io, event: &makepad_widgets::Event) -> bool {
         let mut hit = false;
+        if self.hidden_timer.is_event(event).is_some() {
+            self.hidden_timer = Timer::empty();
+            hit = true;
+            if self.visibility.expire() {
+                self.suspend_membership(io);
+            }
+        }
         if self.membership_retry.is_event(event).is_some() {
             self.membership_retry = Timer::empty();
             hit = true;
@@ -768,19 +833,69 @@ impl ChatSession {
         self.notify();
     }
 
-    /// viewed-timeline-sync.ts setActive: returning to the foreground catches
-    /// the chat up again, showing it as pending until that settles.
-    pub fn set_app_visible(&mut self, io: &mut Io, visible: bool) {
-        if self.app_visible == visible {
+    /// A short tab switch keeps delivery continuous. Only a return after the
+    /// last view's grace expired establishes membership and catches up again.
+    pub fn set_visible(&mut self, io: &mut Io, visible: bool) {
+        if self.disposed {
             return;
         }
-        self.app_visible = visible;
-        if !visible || self.disposed {
-            return;
+        let change = self.visibility.update(visible);
+        if visible {
+            io.cx.stop_timer(self.hidden_timer);
+            self.hidden_timer = Timer::empty();
         }
-        self.pending = true;
-        self.error = None;
-        self.start_catch_up(io, false, true);
+        match change {
+            VisibilityChange::Grace => {
+                self.hidden_timer = io.cx.start_timeout(HIDDEN_SUBSCRIPTION_GRACE);
+            }
+            VisibilityChange::Resume => {
+                self.pending = true;
+                self.error = None;
+                self.membership_delay = None;
+                self.catch_up_delay = None;
+                self.reconcile_membership(io);
+                self.notify();
+            }
+            VisibilityChange::None => {}
+        }
+    }
+
+    /// A mobile suspension can interrupt delivery before a grace timer fires.
+    /// If membership survived, foreground still probes authoritative history.
+    pub fn resume_foreground(&mut self, io: &mut Io) {
+        if self.visibility.visible && self.subscribed && !self.visibility.suspended {
+            self.pending = true;
+            self.error = None;
+            self.request_refresh(io);
+            self.notify();
+        }
+    }
+
+    fn suspend_membership(&mut self, io: &mut Io) {
+        self.membership_generation += 1;
+        self.subscribed = false;
+        self.membership_needs_retry = false;
+        self.live_observed = false;
+        io.cx.stop_timer(self.membership_retry);
+        self.membership_retry = Timer::empty();
+        io.cx.stop_timer(self.catch_up_retry);
+        self.catch_up_retry = Timer::empty();
+        if let Some(id) = self.observation.take() {
+            io.requests.remove(&id);
+            io.core.cancel_request(&id);
+        }
+        // Keep active requests, canonical/optimistic rows and their generation.
+        // Unsent catch-ups no longer need to keep an invisible agent resident.
+        self.queue
+            .retain(|op| !matches!(op, LoadOp::CatchUp { .. }));
+        if !matches!(
+            self.active.as_ref().map(|a| &a.op),
+            Some(LoadOp::CatchUp { .. })
+        ) {
+            self.catch_up = None;
+        }
+        self.gap_pending = false;
+        self.refresh_pending = false;
         self.notify();
     }
 
@@ -870,7 +985,7 @@ impl ChatSession {
     // ── catch-up ────────────────────────────────────────────────────────
 
     fn can_catch_up(&self) -> bool {
-        !self.disposed && self.connected && self.subscribed
+        !self.disposed && self.connected && self.subscribed && !self.visibility.suspended
     }
 
     fn cancel_catch_up(&mut self, io: &mut Io) {
@@ -924,7 +1039,8 @@ impl ChatSession {
     }
 
     fn owns_catch_up(&self, generation: u64) -> bool {
-        self.can_catch_up() && self.catch_up_generation == generation
+        // Suspension never invalidates an already-issued history response.
+        !self.disposed && self.connected && self.catch_up_generation == generation
     }
 
     /// Bring the conversation current after a local action.
@@ -1162,7 +1278,11 @@ impl ChatSession {
                     self.catch_up_delay = Some(delay);
                     self.catch_up = Some(CatchUp::Error);
                     io.cx.stop_timer(self.catch_up_retry);
-                    self.catch_up_retry = io.cx.start_timeout(delay);
+                    self.catch_up_retry = if self.visibility.suspended {
+                        Timer::empty()
+                    } else {
+                        io.cx.start_timeout(delay)
+                    };
                     log_sync_failure(&self.key, &message);
                     self.set_error(message);
                 }
@@ -1181,6 +1301,10 @@ impl ChatSession {
     fn catch_up_complete(&mut self, io: &mut Io) {
         self.catch_up = Some(CatchUp::Complete);
         self.catch_up_delay = None;
+        if self.visibility.suspended {
+            self.gap_pending = false;
+            self.refresh_pending = false;
+        }
         if self.gap_pending {
             self.gap_pending = false;
             self.catch_up = None;
@@ -1194,12 +1318,6 @@ impl ChatSession {
             });
             return;
         }
-        self.pending = false;
-        // viewed-timeline-sync.ts onCatchUpEnded → create-flow-store clearByAgent.
-        self.ended_create_handoff = true;
-        self.error = None;
-        self.manual_retry = false;
-        self.notify();
         if self.refresh_pending {
             self.refresh_pending = false;
             self.catch_up_generation += 1;
@@ -1210,7 +1328,14 @@ impl ChatSession {
                 generation,
                 gap: false,
             });
+            return;
         }
+        self.pending = false;
+        // viewed-timeline-sync.ts onCatchUpEnded → create-flow-store clearByAgent.
+        self.ended_create_handoff = true;
+        self.error = None;
+        self.manual_retry = false;
+        self.notify();
         let _ = io;
     }
 
@@ -1833,6 +1958,7 @@ impl ChatSession {
         self.catch_up_generation += 1;
         io.cx.stop_timer(self.membership_retry);
         io.cx.stop_timer(self.catch_up_retry);
+        io.cx.stop_timer(self.hidden_timer);
         // Releasing the observation ends the selective-delivery demand.
         if let Some(id) = self.observation.take() {
             io.core.cancel_request(&id);
@@ -1879,6 +2005,38 @@ fn log_sync_failure(key: &SessionKey, message: &str) {
 mod timer_ownership_tests {
     use super::*;
     use makepad_widgets::{Event, TimerEvent};
+
+    #[test]
+    fn hidden_subscription_grace_waits_for_last_visible_view() {
+        let mut visibility = SubscriptionVisibility::new();
+        let mut views = [false, false];
+        let update = |state: &mut SubscriptionVisibility, views: &[bool]| {
+            state.update(views.iter().any(|visible| *visible))
+        };
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::None);
+        views[0] = true;
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::Resume);
+        views[1] = true;
+        views[0] = false;
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::None);
+        assert!(!visibility.expire());
+        views[1] = false;
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::Grace);
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::None);
+        views[0] = true;
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::None);
+        assert!(
+            !visibility.expire(),
+            "returning before grace cancels suspension"
+        );
+        views[0] = false;
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::Grace);
+        assert!(visibility.expire());
+        assert!(!visibility.expire(), "suspension happens only once");
+        views[1] = true;
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::Resume);
+        assert_eq!(update(&mut visibility, &views), VisibilityChange::None);
+    }
 
     #[test]
     fn only_live_session_retry_timers_are_owned() {

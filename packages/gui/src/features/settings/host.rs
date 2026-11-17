@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 use super::json::{arr, as_obj, get, str_of};
-use paseo_gui_core::CoreHandle;
+use paseo_gui_core::{CoreHandle, CoreState};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -36,7 +36,7 @@ pub struct HostView {
     pub error: Option<String>,
     pub config: Value,
     pub connections: Vec<Value>,
-    pub projects: Vec<Value>,
+    pub projects: Vec<std::sync::Arc<Value>>,
     pub loading_projects: bool,
     pub project_error: Option<String>,
     pub maintenance_operation: Option<String>,
@@ -88,7 +88,7 @@ fn error_text(value: &Value) -> Option<String> {
 }
 
 /// Saved hosts, local hosts first (Flutter `_sortedHosts`).
-pub fn hosts(state: &Value) -> Vec<HostView> {
+pub fn hosts(state: &CoreState) -> Vec<HostView> {
     let mut local = Vec::new();
     let mut remote = Vec::new();
     for entry in arr(state, "hosts") {
@@ -128,7 +128,10 @@ pub fn hosts(state: &Value) -> Vec<HostView> {
                 .map(Value::is_null)
                 .unwrap_or(true),
             connections,
-            projects: arr(entry, "projects").to_vec(),
+            projects: state
+                .directory(entry)
+                .map(|directory| directory.projects.clone())
+                .unwrap_or_default(),
             loading_projects: super::json::is_true(entry, "loading")
                 || loading_lists.iter().any(|v| v.as_str() == Some("project")),
             project_error: error_text(get(get(entry, "listErrors"), "project")),
@@ -164,8 +167,8 @@ pub fn update_operation_key(server_id: &str) -> String {
 /// The core keeps objects as their JSON text (Flutter key-value convention), so
 /// a string is a saved submit request when it parses to an object and an old
 /// ID-only record otherwise.
-fn stored_update_record(state: &Value, server_id: &str) -> Option<Value> {
-    let record = get(state, "prefs").get(update_operation_key(server_id))?;
+fn stored_update_record(state: &CoreState, server_id: &str) -> Option<Value> {
+    let record = state.prefs.get(&update_operation_key(server_id))?;
     if let Some(text) = record.as_str()
         && let Ok(object @ Value::Object(_)) = serde_json::from_str(text)
     {
@@ -176,7 +179,7 @@ fn stored_update_record(state: &Value, server_id: &str) -> Option<Value> {
 
 /// The saved operation ID, or `None` when it is missing or not a UUID the
 /// daemon can observe (such a record can only fail; drop it).
-pub fn stored_update_operation(state: &Value, server_id: &str) -> Option<String> {
+pub fn stored_update_operation(state: &CoreState, server_id: &str) -> Option<String> {
     let record = stored_update_record(state, server_id)?;
     record
         .as_str()
@@ -186,14 +189,15 @@ pub fn stored_update_operation(state: &Value, server_id: &str) -> Option<String>
 }
 
 /// Whether a saved record exists that [`stored_update_operation`] rejects.
-pub fn has_unusable_update_record(state: &Value, server_id: &str) -> bool {
-    get(state, "prefs")
-        .get(update_operation_key(server_id))
+pub fn has_unusable_update_record(state: &CoreState, server_id: &str) -> bool {
+    state
+        .prefs
+        .get(&update_operation_key(server_id))
         .is_some_and(|record| !record.is_null())
         && stored_update_operation(state, server_id).is_none()
 }
 
-pub fn stored_update_request(state: &Value, server_id: &str) -> Option<Value> {
+pub fn stored_update_request(state: &CoreState, server_id: &str) -> Option<Value> {
     stored_update_operation(state, server_id)?;
     let record = stored_update_record(state, server_id)?;
     if !record.is_object()
@@ -542,10 +546,11 @@ mod update_restore_tests {
             "forceRunning":false,"idleTimeoutMs":300_000,
             "selectedComponents":["daemon","update-helper"],
             "expectedRelease":{"version":"2.0.0","manifestSha512":"A".repeat(88)}});
-        let mut state = json!({"prefs":{}});
-        state["prefs"][update_operation_key("host-a")] = saved(&request);
-        state["prefs"][update_operation_key("host-b")] = json!(OP_B);
-        state["prefs"][update_operation_key("host-d")] = json!("op-d");
+        let mut state = CoreState::default();
+        let prefs = std::sync::Arc::make_mut(&mut state.prefs);
+        prefs.insert(update_operation_key("host-a"), saved(&request));
+        prefs.insert(update_operation_key("host-b"), json!(OP_B));
+        prefs.insert(update_operation_key("host-d"), json!("op-d"));
         assert_eq!(
             stored_update_operation(&state, "host-a").as_deref(),
             Some(OP_A)
@@ -577,8 +582,9 @@ mod update_restore_tests {
         ] {
             let mut partial = request.clone();
             partial.as_object_mut().unwrap().remove(field);
-            let mut state = json!({"prefs":{}});
-            state["prefs"][update_operation_key("host")] = saved(&partial);
+            let mut state = CoreState::default();
+            std::sync::Arc::make_mut(&mut state.prefs)
+                .insert(update_operation_key("host"), saved(&partial));
             assert_eq!(
                 stored_update_operation(&state, "host").as_deref(),
                 Some(OP_A)
@@ -588,8 +594,9 @@ mod update_restore_tests {
         for selected in [json!([]), json!(["daemon", "daemon"]), json!(["unknown"])] {
             let mut invalid = request.clone();
             invalid["selectedComponents"] = selected;
-            let mut state = json!({"prefs":{}});
-            state["prefs"][update_operation_key("host")] = saved(&invalid);
+            let mut state = CoreState::default();
+            std::sync::Arc::make_mut(&mut state.prefs)
+                .insert(update_operation_key("host"), saved(&invalid));
             assert!(stored_update_request(&state, "host").is_none());
         }
     }

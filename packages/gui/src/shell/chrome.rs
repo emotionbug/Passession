@@ -95,11 +95,11 @@ pub enum Drag {
 // ---------------------------------------------------------------------------------------------
 // Titles and icons (Flutter `_title`, `_headerTitle`, `_tabKindLabel`)
 
-fn agent_row<'a>(state: &'a Value, target: &PanelTarget) -> Option<&'a Value> {
+fn agent_row<'a>(state: &'a paseo_gui_core::CoreState, target: &PanelTarget) -> Option<&'a Value> {
     hosts::host(state, &target.server_id)?.agent(target.id.as_deref()?)
 }
 
-pub fn title(state: &Value, target: &PanelTarget) -> String {
+pub fn title(state: &paseo_gui_core::CoreState, target: &PanelTarget) -> String {
     if target.kind == "agent"
         && let Some(agent) = agent_row(state, target)
     {
@@ -151,7 +151,7 @@ pub fn title(state: &Value, target: &PanelTarget) -> String {
 }
 
 /// `_headerTitle`: an agent header shows the directory's title or "Untitled session".
-pub fn header_title(state: &Value, target: &PanelTarget) -> String {
+pub fn header_title(state: &paseo_gui_core::CoreState, target: &PanelTarget) -> String {
     if target.kind != "agent" {
         return title(state, target);
     }
@@ -329,6 +329,9 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
     let slots = shell.data.chrome.slots.clone();
     if !slots.iter().any(|slot| matches!(slot, Slot::Sidebar(_))) {
         shell.data.sidebar.viewport = Rect::default();
+        shell.data.sidebar.header_layer.finish_frame(cx);
+        shell.data.sidebar.tree_layer.finish_frame(cx);
+        shell.data.sidebar.footer_layer.finish_frame(cx);
     }
     for slot in slots {
         draw_slot(shell, cx, scope, slot);
@@ -420,11 +423,13 @@ fn draw_slot(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, slot: Slo
             let Some(state) = scope.data.get::<UiContext>().map(|ui| ui.state.clone()) else {
                 return;
             };
-            if shell
-                .layers
-                .sidebar
-                .begin(cx, r, 0, &mut shell.data.hits, &mut shell.data.tooltips)
-            {
+            if shell.layers.sidebar.begin(
+                cx,
+                r,
+                layer::inputs(shell.data.layout.selected().map(PanelTarget::key)),
+                &mut shell.data.hits,
+                &mut shell.data.tooltips,
+            ) {
                 open_batches(shell, cx, r);
                 shell.data.sidebar.viewport = Rect::default();
                 sidebar::draw(shell, cx, scope, &state, r);
@@ -432,6 +437,9 @@ fn draw_slot(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, slot: Slo
                     .layers
                     .sidebar
                     .end(cx, &shell.data.hits, &shell.data.tooltips);
+                shell.data.sidebar.header_layer.finish_frame(cx);
+                shell.data.sidebar.tree_layer.finish_frame(cx);
+                shell.data.sidebar.footer_layer.finish_frame(cx);
             }
         }
         Slot::Root { key, rect } => paint_root(shell, cx, scope, &key, rect, true),
@@ -581,7 +589,13 @@ fn island(
     r
 }
 
-fn draw_header(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Value, r: Rect) {
+fn draw_header(
+    shell: &mut PaseoShell,
+    cx: &mut Cx2d,
+    scope: &mut Scope,
+    state: &paseo_gui_core::CoreState,
+    r: Rect,
+) {
     let compact = shell.data.compact;
     let target = shell.data.layout.selected().cloned();
     let host = target
@@ -912,7 +926,7 @@ fn draw_header_git(
         .map_or(0.0, |(l, r)| (r - l).ceil());
     if used > 0.0 && (used - shell.data.chrome.header_git_w).abs() > 0.5 {
         shell.data.chrome.header_git_w = used;
-        shell.redraw(cx);
+        shell.invalidate_region(cx, crate::shell::ShellRegion::Chrome);
     }
 }
 
@@ -920,7 +934,7 @@ fn draw_wide(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
     scope: &mut Scope,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     content: Rect,
     page_shown: bool,
 ) {
@@ -1000,7 +1014,7 @@ fn draw_node(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
     scope: &mut Scope,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     node: &Node,
     r: Rect,
 ) {
@@ -1080,7 +1094,7 @@ fn draw_pane(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
     scope: &mut Scope,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     pane_id: &str,
     keys: &[String],
     selected: Option<&str>,
@@ -1323,7 +1337,7 @@ fn draw_explorer_empty(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect) {
 fn draw_tab_strip(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     pane_id: &str,
     keys: &[String],
     selected: Option<&str>,
@@ -1688,7 +1702,7 @@ fn draw_tab_strip(
 pub fn tab_icon(
     ui: &mut Ui,
     cx: &mut Cx2d,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     target: &PanelTarget,
     r: Rect,
     color: Vec4,
@@ -1778,7 +1792,7 @@ fn draw_compact(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
     scope: &mut Scope,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     content: Rect,
     page_shown: bool,
 ) {
@@ -1971,12 +1985,12 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             if fe.device.is_touch() && shell.data.sidebar.touch_move(fe.abs, fe.time) {
                 let previous = shell.data.pointer.pressed.take();
                 shell.data.chrome.edge_start = None;
-                shell.layers.sidebar.invalidate(cx);
+                shell.data.sidebar.tree_layer.invalidate(cx);
                 shell.redraw_hit_owners(cx, &[previous.as_deref()]);
                 return;
             }
             if update_drag(shell, cx, fe.abs, fe.time) {
-                shell.redraw(cx);
+                shell.invalidate_layout(cx);
             }
         }
         Hit::FingerLongPress(lp) => {
@@ -2009,15 +2023,15 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                     {
                         layout.show_sidebar(true, false);
                     }
-                    shell.redraw(cx);
+                    shell.invalidate_layout(cx);
                     return;
                 }
             }
             if dragged {
-                shell.redraw(cx);
+                shell.invalidate_layout(cx);
                 return;
             }
-            let clicked = if let Some(id) = pressed.as_deref()
+            if let Some(id) = pressed.as_deref()
                 && fe.is_over
                 && !fe.has_long_press_occurred
                 && (!fe.device.is_touch() || fe.was_tap())
@@ -2025,21 +2039,13 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 && let Some(ui) = scope.data.get_mut::<UiContext>()
             {
                 commands::click(shell, cx, ui, id, fe.modifiers);
-                true
-            } else {
-                false
-            };
+            }
             let hover = if fe.device.has_hovers() {
                 None
             } else {
                 shell.data.pointer.hover.take()
             };
-            if clicked {
-                // A command can change anything the shell presents.
-                shell.redraw(cx);
-            } else {
-                shell.redraw_hit_owners(cx, &[pressed.as_deref(), hover.as_deref()]);
-            }
+            shell.redraw_hit_owners(cx, &[pressed.as_deref(), hover.as_deref()]);
         }
         Hit::FingerScroll(e) => {
             if sidebar_visible && shell.data.chrome.sidebar_rect.contains(e.abs) {
@@ -2228,7 +2234,7 @@ fn finish_drag(shell: &mut PaseoShell, cx: &mut Cx, abs: DVec2) -> bool {
                     shell.data.layout.move_tab(&key, &pane, index);
                 }
             }
-            shell.redraw(cx);
+            shell.invalidate_layout(cx);
             true
         }
         Drag::Tab { .. } => false,
@@ -2280,7 +2286,7 @@ pub(crate) fn animate_explorer(shell: &mut PaseoShell, cx: &mut Cx, event: &Even
             chrome.explorer_anim_start = None;
             chrome.explorer_position = to;
         }
-        shell.redraw(cx);
+        shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
     }
 }
 

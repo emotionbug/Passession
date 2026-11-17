@@ -669,7 +669,7 @@ impl Sheet for LabelsSheet {
 }
 
 /// The core state as seen by sheets during draw (the dispatch scope carries `UiContext`).
-fn ui_state(scope: &mut Scope) -> std::sync::Arc<Value> {
+fn ui_state(scope: &mut Scope) -> std::sync::Arc<paseo_gui_core::CoreState> {
     scope
         .data
         .get::<crate::common::UiContext>()

@@ -5,7 +5,7 @@
 //! file and `flutter.` key prefix `shared_preferences_linux`/`_windows` use, so existing desktop
 //! data is read and written in place. On macOS/iOS (NSUserDefaults plist) and Android
 //! (`FlutterSharedPreferences.xml`) the file is seeded once from the native store.
-use std::{fs, path::Path};
+use std::{collections::VecDeque, fs, path::Path};
 
 use serde_json::{Map, Value};
 
@@ -22,6 +22,23 @@ pub(crate) struct Prefs {
     pub foreign: Map<String, Value>,
     pub error: Option<CoreError>,
     pub writable: bool,
+    pub writer: Writer,
+}
+
+/// Only the core task touches this queue. A flushed write seals a snapshot so a later
+/// overwrite of the same key cannot acknowledge a value that never reached disk.
+#[derive(Default)]
+pub(crate) struct Writer {
+    pub running: bool,
+    pub dirty: bool,
+    pub barriers: VecDeque<Write>,
+}
+
+pub(crate) struct Write {
+    pub values: Map<String, Value>,
+    pub foreign: Map<String, Value>,
+    pub report_error: bool,
+    pub completed: Option<tokio::sync::oneshot::Sender<Result<(), CoreError>>>,
 }
 
 fn split(file: Map<String, Value>) -> (Map<String, Value>, Map<String, Value>) {
@@ -51,6 +68,7 @@ pub(crate) fn load(paths: &Paths) -> Prefs {
                     foreign,
                     error: None,
                     writable: true,
+                    writer: Writer::default(),
                 }
             }
             _ => Prefs {
@@ -71,6 +89,7 @@ pub(crate) fn load(paths: &Paths) -> Prefs {
                 foreign,
                 error: None,
                 writable: true,
+                writer: Writer::default(),
             };
             if !prefs.values.is_empty()
                 && let Err(error) = save(paths, &prefs.values, &prefs.foreign)

@@ -6,12 +6,11 @@ use std::path::PathBuf;
 
 /// The SharedPreferences draft payload as the core publishes it (`state.prefs[key]`,
 /// a JSON string in the Flutter convention). Null until the core state is initialized.
-pub fn drafts_payload(state: &Value) -> Option<&Value> {
+pub fn drafts_payload(state: &paseo_gui_core::CoreState) -> Option<&Value> {
     if state.get("initialized") == Some(&Value::Bool(false)) {
         return None;
     }
-    let prefs = state.get("prefs")?;
-    Some(prefs.get(DRAFTS_STORAGE_KEY).unwrap_or(&Value::Null))
+    Some(state.prefs.get(DRAFTS_STORAGE_KEY).unwrap_or(&Value::Null))
 }
 
 /// `save_state` key that writes the draft payload.

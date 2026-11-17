@@ -40,6 +40,10 @@ pub struct SidebarState {
     pub reveal_host: Option<String>,
     /// A host to expand (`navigation.collapsed`) once a `UiContext` is at hand.
     pub expand_host: Option<String>,
+    pub(crate) header_layer: crate::common::layer::Layer,
+    pub(crate) tree_layer: crate::common::layer::Layer,
+    pub(crate) footer_layer: crate::common::layer::Layer,
+    header_bottom: f64,
     motion: makepad_widgets::scroll_bars::TouchScroll,
 }
 
@@ -68,7 +72,7 @@ impl SidebarState {
 }
 
 /// `preferences.navigation`.
-pub fn nav_prefs(state: &Value) -> Value {
+pub fn nav_prefs(state: &paseo_gui_core::CoreState) -> Value {
     j::object(j::object(state, "preferences"), "navigation").clone()
 }
 
@@ -93,7 +97,7 @@ pub fn project_key(host: &Host<'_>, project: &Value) -> String {
 
 /// `sidebarProjects`: registered projects plus projects only known through a workspace.
 pub fn projects(host: &Host<'_>) -> Vec<Value> {
-    let mut out: Vec<Value> = host.projects().to_vec();
+    let mut out: Vec<Value> = host.projects().iter().map(|row| (**row).clone()).collect();
     for workspace in host.workspaces() {
         let id = j::text(workspace, "projectId");
         if !out.iter().any(|p| j::text(p, "projectId") == id) {
@@ -145,7 +149,7 @@ pub fn workspace_matches_labels(workspace: &Value, filters: &[String]) -> bool {
     })
 }
 
-pub fn host_filters(state: &Value, prefs: &Value) -> Vec<String> {
+pub fn host_filters(state: &paseo_gui_core::CoreState, prefs: &Value) -> Vec<String> {
     let stored = strings(prefs, "hostFilters");
     hosts::hosts(state)
         .iter()
@@ -154,7 +158,7 @@ pub fn host_filters(state: &Value, prefs: &Value) -> Vec<String> {
         .collect()
 }
 
-pub fn project_filters(state: &Value, prefs: &Value) -> Vec<String> {
+pub fn project_filters(state: &paseo_gui_core::CoreState, prefs: &Value) -> Vec<String> {
     let stored = strings(prefs, "projectFilters");
     if stored.is_empty() {
         return Vec::new();
@@ -352,7 +356,7 @@ fn session_matches(host: &Host<'_>, agent: &Value, query: &str) -> bool {
 /// host/project/label filters and the (lowercased) search applied. `held` keeps each project's
 /// drawn order. Search ignores collapse; terminal rows are the caller's.
 pub fn session_tree<'a>(
-    state: &'a Value,
+    state: &'a paseo_gui_core::CoreState,
     query: &str,
     held: Option<&HashMap<String, Vec<String>>>,
 ) -> Vec<HostGroup<'a>> {
@@ -430,7 +434,7 @@ pub fn session_tree<'a>(
 /// Sessions in the order the sidebar shows them (session switching, Ctrl+1–9): rows inside a
 /// collapsed host or project are skipped unless `include_collapsed`.
 pub fn navigation_sessions(
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     query: &str,
     held: Option<&HashMap<String, Vec<String>>>,
     include_collapsed: bool,
@@ -473,7 +477,7 @@ pub fn pointer_on_tree(hover: Option<&str>) -> bool {
 }
 
 /// Whether a top-level session other than `focused` waits on the user (the header's ☰ dot).
-pub fn others_need_input(state: &Value, focused: Option<&PanelTarget>) -> bool {
+pub fn others_need_input(state: &paseo_gui_core::CoreState, focused: Option<&PanelTarget>) -> bool {
     hosts::hosts(state).iter().any(|host| {
         host.agents().any(|agent| {
             top_level(agent)
@@ -530,7 +534,7 @@ fn merge_terminals(previous: &[Value], listed: &[Value]) -> Vec<Value> {
 /// Workspaces whose terminals the sidebar lists, as (host, workspace, directory): every
 /// non-archived workspace of a project the host/project/label/background filters keep, on a
 /// connected host. Collapse and search only hide rows; their streams stay.
-fn terminal_directories(state: &Value) -> Vec<(String, String, String)> {
+fn terminal_directories(state: &paseo_gui_core::CoreState) -> Vec<(String, String, String)> {
     let prefs = nav_prefs(state);
     let hf = host_filters(state, &prefs);
     let pf = project_filters(state, &prefs);
@@ -691,7 +695,7 @@ pub fn terminal_rows(
 /// The row behind a `sideterm:<host>:<terminal>` hit.
 pub fn find_terminal(
     terminals: &TerminalDirectories,
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     rest: &str,
 ) -> Option<TerminalRow> {
     let (sid, terminal_id) = rest.rsplit_once(':')?;
@@ -810,7 +814,13 @@ pub fn nav_order(preferences: &Value) -> Vec<&'static str> {
 }
 
 /// Sidebar column: nav rows, section header + search, session tree, footer.
-pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Value, r: Rect) {
+fn draw_header(
+    shell: &mut PaseoShell,
+    cx: &mut Cx2d,
+    scope: &mut Scope,
+    state: &paseo_gui_core::CoreState,
+    r: Rect,
+) -> f64 {
     let p = theme::current_palette();
     let compact = shell.data.compact;
     shell.painter.fill(cx, r, p.sidebar, 0.0);
@@ -942,13 +952,76 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, state: &Va
             .fill(cx, rect(r.pos.x, y - 2.0, r.size.x, 2.0), p.accent, 0.0);
     }
 
+    y
+}
+
+pub fn draw(
+    shell: &mut PaseoShell,
+    cx: &mut Cx2d,
+    scope: &mut Scope,
+    state: &paseo_gui_core::CoreState,
+    r: Rect,
+) {
+    let compact = shell.data.compact;
+    if shell.data.sidebar.header_layer.begin(
+        cx,
+        r,
+        0,
+        &mut shell.data.hits,
+        &mut shell.data.tooltips,
+    ) {
+        shell.data.sidebar.header_bottom = draw_header(shell, cx, scope, state, r);
+        shell
+            .data
+            .sidebar
+            .header_layer
+            .end(cx, &shell.data.hits, &shell.data.tooltips);
+    }
+    let y = shell.data.sidebar.header_bottom;
     // Footer (8/6 padding, top border).
     let footer_h = if compact { 56.0 } else { 40.0 };
     let footer = rect(r.pos.x, r.pos.y + r.size.y - footer_h, r.size.x, footer_h);
     let list = rect(r.pos.x, y, r.size.x, (footer.pos.y - y).max(0.0));
     shell.data.sidebar.viewport = list;
-    draw_tree(shell, cx, state, list);
-    draw_footer(shell, cx, footer);
+    let inputs = crate::common::layer::inputs((
+        shell.data.layout.selected().map(PanelTarget::key),
+        &shell.data.sidebar.query,
+        shell.data.sidebar.modifier_held,
+    ));
+    if shell.data.sidebar.tree_layer.begin(
+        cx,
+        list,
+        inputs,
+        &mut shell.data.hits,
+        &mut shell.data.tooltips,
+    ) {
+        shell
+            .painter
+            .fill(cx, list, theme::current_palette().sidebar, 0.0);
+        draw_tree(shell, cx, state, list);
+        shell
+            .data
+            .sidebar
+            .tree_layer
+            .end(cx, &shell.data.hits, &shell.data.tooltips);
+    }
+    if shell.data.sidebar.footer_layer.begin(
+        cx,
+        footer,
+        0,
+        &mut shell.data.hits,
+        &mut shell.data.tooltips,
+    ) {
+        shell
+            .painter
+            .fill(cx, footer, theme::current_palette().sidebar, 0.0);
+        draw_footer(shell, cx, footer);
+        shell
+            .data
+            .sidebar
+            .footer_layer
+            .end(cx, &shell.data.hits, &shell.data.tooltips);
+    }
 }
 
 fn header_row(ui: &mut Ui, cx: &mut Cx2d, r: Rect, id: &str, icon: &str, label: &str) {
@@ -1011,7 +1084,7 @@ fn index_hint(ui: &mut Ui, cx: &mut Cx2d, slot: Rect, index: usize) {
     ui.text_centered(cx, r, spec, &(index + 1).to_string());
 }
 
-fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
+fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::CoreState, list: Rect) {
     let query = shell.data.sidebar.query.trim().to_lowercase();
     let host_count = hosts::hosts(state).len();
     // While the pointer rests on the tree, rows keep the order they were drawn in.
@@ -1542,7 +1615,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &Value, list: Rect) {
     let max = (shell.data.sidebar.content_height - list.size.y).max(0.0);
     if let Some(offset) = reveal_offset {
         shell.data.sidebar.scroll = offset.min(max);
-        shell.layers.sidebar.invalidate(cx);
+        shell.data.sidebar.tree_layer.invalidate(cx);
     } else if shell.data.sidebar.scroll > max {
         shell.data.sidebar.scroll = max;
     }
@@ -1627,7 +1700,7 @@ pub fn scroll(shell: &mut PaseoShell, cx: &mut Cx, delta: f64) {
     let s = &mut shell.data.sidebar;
     s.stop_motion();
     if s.scroll_by(delta) {
-        shell.layers.sidebar.invalidate(cx);
+        s.tree_layer.invalidate(cx);
     }
 }
 
@@ -1645,7 +1718,7 @@ pub fn animate(shell: &mut PaseoShell, cx: &mut Cx, event: &Event) {
     };
     let changed = s.scroll_by(delta);
     if changed {
-        shell.layers.sidebar.invalidate(cx);
+        s.tree_layer.invalidate(cx);
     }
 }
 
@@ -1661,7 +1734,7 @@ pub fn handle_actions(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, _ui: &
         shell.data.sidebar.stop_motion();
         shell.data.sidebar.query = text.trim().to_lowercase();
         shell.data.sidebar.scroll = 0.0;
-        shell.layers.sidebar.invalidate(cx);
+        shell.data.sidebar.tree_layer.invalidate(cx);
     }
 }
 
@@ -1750,6 +1823,38 @@ pub fn move_in_order(ui: &mut UiContext, field: &str, keys: &[String], key: &str
 mod tests {
     use super::*;
 
+    fn published(mut value: Value) -> paseo_gui_core::CoreState {
+        use paseo_gui_core::{CoreState, DirectorySnapshot};
+        use std::sync::Arc;
+        let mut directories = HashMap::new();
+        for (index, host) in value["hosts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            let key = index as u64 + 1;
+            let record = host.as_object_mut().unwrap();
+            let mut rows = |kind: &str| match record.remove(kind) {
+                Some(Value::Array(rows)) => rows.into_iter().map(Arc::new).collect(),
+                _ => Vec::new(),
+            };
+            let directory = DirectorySnapshot {
+                revision: key,
+                projects: rows("projects"),
+                workspaces: rows("workspaces"),
+                agents: rows("agents"),
+                cached_at: None,
+            };
+            record.insert("directoryKey".into(), key.into());
+            record.insert("directoryRevision".into(), key.into());
+            directories.insert(key, Arc::new(directory));
+        }
+        let mut state = CoreState::new(value);
+        state.directories = Arc::new(directories);
+        state
+    }
+
     #[test]
     fn compare_names_orders_digit_runs_by_value() {
         assert_eq!(compare_names("item2", "item10"), Ordering::Less);
@@ -1807,7 +1912,7 @@ mod tests {
                 .extend(extra.as_object().cloned().unwrap_or_default());
             w
         };
-        let state = json!({
+        let state = published(json!({
             "hosts": [
                 {"serverId": "on", "status": "connected", "workspaces": [
                     workspace("a", "p", json!({})),
@@ -1818,7 +1923,7 @@ mod tests {
                 {"serverId": "off", "status": "disconnected", "workspaces": [workspace("z", "p", json!({}))]},
             ],
             "preferences": {"navigation": {"projectFilters": ["project:on:p"]}},
-        });
+        }));
         assert_eq!(
             terminal_directories(&state),
             vec![("on".to_string(), "a".to_string(), "/w/a".to_string())]
@@ -1867,7 +1972,7 @@ mod tests {
         );
     }
 
-    fn tree_state(navigation: Value) -> Value {
+    fn tree_state(navigation: Value) -> paseo_gui_core::CoreState {
         let agent = |id: &str, ws: &str, updated: &str, extra: Value| {
             let mut a =
                 json!({"id": id, "workspaceId": ws, "updatedAt": updated, "status": "idle"});
@@ -1876,7 +1981,7 @@ mod tests {
                 .extend(extra.as_object().cloned().unwrap_or_default());
             a
         };
-        json!({
+        published(json!({
             "hosts": [
                 {"serverId": "b", "status": "connected",
                  "projects": [{"projectId": "p", "projectDisplayName": "Zeta"}, {"projectId": "q", "projectDisplayName": "Alpha"}],
@@ -1892,7 +1997,7 @@ mod tests {
                  "agents": [agent("first", "wr", "2026-01-01T00:00:00Z", json!({}))]},
             ],
             "preferences": {"navigation": navigation},
-        })
+        }))
     }
 
     fn ids(list: &[(String, Value)]) -> Vec<String> {

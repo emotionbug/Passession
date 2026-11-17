@@ -37,10 +37,14 @@ pub fn feature(ui: &UiContext, host_id: &str, key: &str) -> bool {
 }
 
 /// The cwd of a workspace: its `workspaceDirectory` on that host.
-pub fn workspace_directory(state: &Value, host_id: &str, workspace_id: &str) -> Option<String> {
-    host(state, host_id)?
-        .get("workspaces")?
-        .as_array()?
+pub fn workspace_directory(
+    state: &paseo_gui_core::CoreState,
+    host_id: &str,
+    workspace_id: &str,
+) -> Option<String> {
+    state
+        .directory(host(state, host_id)?)?
+        .workspaces
         .iter()
         .find(|w| w.get("id").and_then(Value::as_str) == Some(workspace_id))?
         .get("workspaceDirectory")

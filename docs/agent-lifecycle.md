@@ -40,6 +40,11 @@ record stays `idle`, timeline, attention and activity timestamps are unchanged, 
 finish notification, attention or `agent.closed` hook is produced. The next prompt, control action
 or history preparation resumes it through `ensureAgentLoaded()`.
 
+The native app keeps a chat's timeline subscription only while some window shows it: a chat hidden
+in a background tab, pane, dormant window or backgrounded mobile app unsubscribes after 30 seconds
+and catches up once when shown again. A minimized desktop window still counts as shown, because
+Makepad reports no minimized state.
+
 An agent stays resident while anything could still be running inside its provider: a turn,
 initialization, replacement, pending permission, queued or in-flight message delivery, an active
 finish watch on it, or a running provider subagent. The provider must also report itself settled and

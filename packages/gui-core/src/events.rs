@@ -92,7 +92,10 @@ mod tests {
     fn state_coalescing_does_not_cross_ordered_event_boundaries() {
         let queue = EventQueue::new(Arc::new(|| {}));
         let state = |revision| CoreEvent::State {
-            state: Arc::new(json!({"revision": revision})),
+            state: Arc::new(crate::CoreState {
+                value: json!({"revision": revision}),
+                ..crate::CoreState::default()
+            }),
         };
         queue.push(state(1));
         queue.push(state(2));

@@ -1,7 +1,7 @@
-//! Module-level replica of every opened conversation. Hidden or unmounted
-//! chats keep updating (docs/timeline-sync.md "Hidden chats update the
-//! replica"), so sessions live here rather than in mounted widgets. The shell
-//! calls [handle_event] once per Makepad event before widget dispatch.
+//! Module-level replicas survive hidden tabs without retaining daemon viewers.
+//! Each mounted view contributes visibility; the last hidden view starts the
+//! session's subscription grace period. The shell calls [handle_event] once per
+//! Makepad event before widget dispatch.
 
 use super::composer_bridge;
 use super::json::*;
@@ -22,12 +22,20 @@ struct HostRecord {
 /// `(host, parent agent, provider subagent)`.
 type SubagentKey = (String, String, String);
 
+struct SessionView {
+    key: SessionKey,
+    window_id: String,
+    visible: bool,
+}
+
 pub struct TimelineStore {
     pub sessions: HashMap<SessionKey, ChatSession>,
     hosts: HashMap<String, HostRecord>,
     requests: HashMap<RequestId, RequestRoute>,
     core: Option<CoreHandle>,
     app_visible: bool,
+    views: HashMap<u64, SessionView>,
+    windows: HashMap<String, bool>,
     /// provider-store.ts `hiddenFromTrack`: finished provider subagents that
     /// "Delete finished subagents" could only hide, because their daemon lacks
     /// `providerSubagentDelete`. App-wide for this app session; a later
@@ -73,6 +81,8 @@ impl TimelineStore {
             requests: HashMap::new(),
             core: None,
             app_visible: true,
+            views: HashMap::new(),
+            windows: HashMap::new(),
             hidden_subagents: HashSet::new(),
         }
     }
@@ -181,7 +191,14 @@ impl TimelineStore {
     }
 
     /// A panel shows this conversation: create its replica on first sight.
-    pub fn ensure(&mut self, cx: &mut Cx, ui: &mut UiContext, key: &SessionKey) {
+    pub fn ensure(
+        &mut self,
+        cx: &mut Cx,
+        ui: &mut UiContext,
+        key: &SessionKey,
+        view: u64,
+        visible: bool,
+    ) {
         if self.core.is_none() {
             self.core = Some(ui.core.clone());
         }
@@ -191,14 +208,81 @@ impl TimelineStore {
             record.server_info = server_info;
         }
         record.connected = connected;
-        if self.sessions.contains_key(key) {
+        self.sessions
+            .entry(key.clone())
+            .or_insert_with(|| ChatSession::new(key.clone(), connected));
+        self.views.insert(
+            view,
+            SessionView {
+                key: key.clone(),
+                window_id: ui.window_id.clone(),
+                visible,
+            },
+        );
+        let mut effects = std::mem::take(&mut ui.effects);
+        self.refresh_visibility(cx, &mut effects, key);
+        ui.effects = effects;
+    }
+
+    fn refresh_visibility(&mut self, cx: &mut Cx, effects: &mut Vec<UiEffect>, key: &SessionKey) {
+        let visible = self.app_visible
+            && self.views.values().any(|view| {
+                view.key == *key
+                    && view.visible
+                    && self.windows.get(&view.window_id).copied().unwrap_or(true)
+            });
+        self.with_session(cx, effects, key, |session, io| {
+            session.set_visible(io, visible)
+        });
+    }
+
+    pub fn set_view_visible(&mut self, cx: &mut Cx, view: u64, visible: bool) {
+        let Some(view) = self.views.get_mut(&view) else {
+            return;
+        };
+        if view.visible == visible {
             return;
         }
-        self.sessions
-            .insert(key.clone(), ChatSession::new(key.clone(), connected));
-        let mut effects = std::mem::take(&mut ui.effects);
-        self.with_session(cx, &mut effects, key, |session, io| session.start(io));
-        ui.effects = effects;
+        view.visible = visible;
+        let key = view.key.clone();
+        self.refresh_visibility(cx, &mut Vec::new(), &key);
+    }
+
+    pub fn release_view(&mut self, cx: &mut Cx, view: u64) {
+        let Some(view) = self.views.remove(&view) else {
+            return;
+        };
+        self.release_unviewed(cx, &view.key);
+    }
+
+    fn release_unviewed(&mut self, cx: &mut Cx, key: &SessionKey) {
+        if self.views.values().any(|view| view.key == *key) {
+            self.refresh_visibility(cx, &mut Vec::new(), key);
+        } else {
+            self.release(cx, key);
+        }
+    }
+
+    fn release_window_session(&mut self, cx: &mut Cx, window: &str, key: &SessionKey) {
+        self.views
+            .retain(|_, view| view.window_id != window || view.key != *key);
+        self.release_unviewed(cx, key);
+    }
+
+    fn set_window_visible(&mut self, cx: &mut Cx, window: &str, visible: bool) {
+        if self.windows.get(window).copied() == Some(visible) {
+            return;
+        }
+        self.windows.insert(window.to_owned(), visible);
+        let keys: HashSet<_> = self
+            .views
+            .values()
+            .filter(|view| view.window_id == window)
+            .map(|view| view.key.clone())
+            .collect();
+        for key in keys {
+            self.refresh_visibility(cx, &mut Vec::new(), &key);
+        }
     }
 
     /// The tab closed: the chat leaves the selective-delivery set and its
@@ -321,6 +405,11 @@ impl TimelineStore {
         if let Some(record) = self.hosts.remove(previous) {
             self.hosts.insert(next.to_owned(), record);
         }
+        for view in self.views.values_mut() {
+            if view.key.host_id == previous {
+                view.key.host_id = next.to_owned();
+            }
+        }
         if self.hidden_subagents.iter().any(|(h, _, _)| h == previous) {
             self.hidden_subagents = std::mem::take(&mut self.hidden_subagents)
                 .into_iter()
@@ -393,9 +482,12 @@ pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
                     store.app_visible = visible;
                     let keys: Vec<SessionKey> = store.sessions.keys().cloned().collect();
                     for key in keys {
-                        store.with_session(cx, &mut effects, &key, |s, io| {
-                            s.set_app_visible(io, visible)
-                        });
+                        store.refresh_visibility(cx, &mut effects, &key);
+                        if visible {
+                            store.with_session(cx, &mut effects, &key, |s, io| {
+                                s.resume_foreground(io)
+                            });
+                        }
                     }
                 }
             }
@@ -410,20 +502,26 @@ pub fn handle_event(cx: &mut Cx, event: &Event, ui: &mut UiContext) {
     });
 }
 
+/// Shell lifecycle, independent of keyboard focus: tray/dormant windows do not
+/// contribute viewers. Native minimized visibility is not exposed by Makepad.
+pub fn set_window_visible(cx: &mut Cx, window: &str, visible: bool) {
+    with_store(|store| store.set_window_visible(cx, window, visible));
+}
+
 /// Shell hook: a chat tab closed.
-pub fn release_session(cx: &mut Cx, _ui: &UiContext, host_id: &str, agent_id: &str) {
+pub fn release_session(cx: &mut Cx, ui: &UiContext, host_id: &str, agent_id: &str) {
     let key = SessionKey {
         host_id: host_id.to_owned(),
         agent_id: agent_id.to_owned(),
         subagent_id: None,
     };
-    with_store(|store| store.release(cx, &key));
+    with_store(|store| store.release_window_session(cx, &ui.window_id, &key));
 }
 
 /// Shell hook: a provider-subagent tab closed.
 pub fn release_subagent(
     cx: &mut Cx,
-    _ui: &UiContext,
+    ui: &UiContext,
     host_id: &str,
     parent_agent_id: &str,
     subagent_id: &str,
@@ -433,7 +531,7 @@ pub fn release_subagent(
         agent_id: parent_agent_id.to_owned(),
         subagent_id: Some(subagent_id.to_owned()),
     };
-    with_store(|store| store.release(cx, &key));
+    with_store(|store| store.release_window_session(cx, &ui.window_id, &key));
 }
 
 pub fn server_info(host_id: &str) -> Value {

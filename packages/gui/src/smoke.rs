@@ -35,7 +35,7 @@ pub(crate) fn close_guard_refuses() -> bool {
 
 /// What the driver reads from the app on each event.
 pub struct Ctx<'a> {
-    pub state: &'a Value,
+    pub state: &'a paseo_gui_core::CoreState,
     pub shell: &'a dyn Fn(&str) -> Option<PaseoShellRef>,
 }
 
@@ -327,7 +327,7 @@ impl Driver {
                     return self.waiting("restoring the window size");
                 }
                 if self.panel {
-                    main.request_close(cx);
+                    main.request_close();
                     self.go(Step::TrayHidden)
                 } else {
                     self.open_second()
@@ -363,7 +363,7 @@ impl Driver {
                 };
                 self.second = second;
                 CLOSE_GUARD.with(|g| g.set(true));
-                main.request_close(cx);
+                main.request_close();
                 self.settle = Some(Instant::now() + Duration::from_millis(500));
                 self.go(Step::GuardClose)
             }
@@ -399,7 +399,7 @@ impl Driver {
                 }
                 CLOSE_GUARD.with(|g| g.set(false));
                 self.record("primary-close-and-quit-cancellation", Value::Null);
-                main.request_close(cx);
+                main.request_close();
                 self.go(Step::PrimaryDormant)
             }
             Step::PrimaryDormant => {
@@ -424,7 +424,7 @@ impl Driver {
                     "New Window failed to reuse the retained primary",
                 )?;
                 let second = (ctx.shell)(&self.second).ok_or("The second window is missing")?;
-                second.request_close(cx);
+                second.request_close();
                 self.go(Step::SecondTornDown)
             }
             Step::SecondTornDown => {
@@ -457,7 +457,7 @@ impl Driver {
                     return self.waiting("replacement secondary visible");
                 };
                 self.second = second;
-                main.request_close(cx);
+                main.request_close();
                 self.go(Step::ReplacementDormant)
             }
             Step::ReplacementDormant => {
@@ -492,10 +492,10 @@ impl Driver {
                 if !self.panel {
                     // No tray to hide to: closing the last window quits and stops the daemon.
                     self.record("expect-no-panel-quit", Value::Null);
-                    second.request_close(cx);
+                    second.request_close();
                     return self.go(Step::Done);
                 }
-                second.request_close(cx);
+                second.request_close();
                 self.go(Step::LastHidden)
             }
             Step::LastHidden => {
@@ -564,7 +564,7 @@ impl Driver {
                 if self.logout {
                     let second =
                         (ctx.shell)(&self.second).ok_or("The retained window is missing")?;
-                    second.request_close(cx);
+                    second.request_close();
                     return self.go(Step::FinalHidden);
                 }
                 self.record("expect-real-tray-menu-quit", Value::Null);

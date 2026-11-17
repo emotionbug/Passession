@@ -1,176 +1,202 @@
-//! What changed between two published core states.
-//!
-//! The core republishes its whole state (at most every 16 ms) for any directory, host or
-//! preference change; most of those publications only move a streaming session's activity
-//! timestamp. The app classifies each publication once per batch so retained layers
-//! (`common::layer`) repaint only when something they present changed.
-//!
-//! Each host record carries the core's `directoryRevision`: equal revisions mean equal
-//! `projects`, `workspaces`, `agents` and `cachedAt`, so those rows are not compared.
-
-use std::collections::{HashMap, HashSet};
-
-use serde_json::{Map, Value};
-
+//! Section-keyed changes between immutable core publications.
 use super::json as j;
+use paseo_gui_core::{CoreState, DirectorySnapshot};
+use serde_json::{Map, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-/// Agent fields every stream event refreshes. A change limited to these moves recency
-/// (sorting, "updated 2m ago"), not presented content.
 const AGENT_ACTIVITY: [&str; 2] = ["updatedAt", "lastActivityAt"];
-/// Host connection telemetry refreshed by probes and heartbeats.
 const HOST_ACTIVITY: [&str; 3] = ["latencyMs", "probes", "cachedAt"];
-/// Saved window layouts: each shell owns its own layout and restores it only once.
-const LAYOUT_KEYS: [&str; 2] = ["layout", "windowLayouts"];
-/// Core metadata of a host record; see the module documentation.
-const DIRECTORY_REVISION: &str = "directoryRevision";
-/// Host fields an unchanged directory revision vouches for (and the revision itself).
-const DIRECTORY_FIELDS: [&str; 5] = [
-    "projects",
-    "workspaces",
-    "agents",
-    "cachedAt",
-    DIRECTORY_REVISION,
-];
+const DIRECTORY_FIELDS: [&str; 2] = ["directoryRevision", "directoryKey"];
+const DRAFTS: &str = "paseo.chat.drafts.v1";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateDelta {
-    /// Presented content changed: preferences and other shared slices, the host set, a host
-    /// record, or an agent beyond its activity timestamps.
+    pub sections: HashSet<String>,
+    pub prefs_keys: HashSet<String>,
+    pub hosts: HashSet<String>,
+    pub directories: HashSet<String>,
     pub content: bool,
-    /// Host connection telemetry changed (latency, probes, cache time) and nothing else.
     pub host_activity: bool,
-    /// Agents whose only change was an activity timestamp, as `(server id, agent id)`.
     pub agent_activity: HashSet<(String, String)>,
 }
 
 impl StateDelta {
-    pub fn between(old: &Value, new: &Value) -> Self {
+    pub fn between(old: &CoreState, new: &CoreState) -> Self {
         let mut delta = Self::default();
         if std::ptr::eq(old, new) {
             return delta;
         }
-        let (Some(old_map), Some(new_map)) = (old.as_object(), new.as_object()) else {
-            delta.content = old != new;
-            return delta;
-        };
-        let keys = old_map.keys().chain(new_map.keys());
-        for key in keys {
-            if key == "hosts" || LAYOUT_KEYS.contains(&key.as_str()) {
-                continue;
-            }
-            if old_map.get(key) != new_map.get(key) {
-                delta.content = true;
-                return delta;
+        let before = &old["revisions"];
+        let after = &new["revisions"];
+        for section in [
+            "preferences",
+            "layouts",
+            "suppressedRoutes",
+            "storage",
+            "tailnet",
+            "session",
+            "hostSet",
+        ] {
+            if before[section] != after[section] {
+                delta.sections.insert(section.to_owned());
+                if matches!(
+                    section,
+                    "preferences" | "suppressedRoutes" | "storage" | "session" | "hostSet"
+                ) {
+                    delta.content = true;
+                }
             }
         }
-        delta.hosts(j::array(old, "hosts"), j::array(new, "hosts"));
+        let old_prefs = before["prefs"].as_object();
+        let new_prefs = after["prefs"].as_object();
+        for key in old_prefs
+            .into_iter()
+            .flat_map(|map| map.keys())
+            .chain(new_prefs.into_iter().flat_map(|map| map.keys()))
+        {
+            if old_prefs.and_then(|map| map.get(key)) != new_prefs.and_then(|map| map.get(key)) {
+                delta.prefs_keys.insert(key.clone());
+            }
+        }
+        if !delta.prefs_keys.is_empty() {
+            delta.sections.insert("prefs".into());
+        }
+        let mut previous: HashMap<u64, &Value> = j::array(old, "hosts")
+            .iter()
+            .filter_map(|host| Some((host["directoryKey"].as_u64()?, host)))
+            .collect();
+        for host in j::array(new, "hosts") {
+            let server = j::text(host, "serverId");
+            let Some(previous_host) = host["directoryKey"]
+                .as_u64()
+                .and_then(|key| previous.remove(&key))
+            else {
+                delta.content = true;
+                delta.hosts.insert(server.to_owned());
+                delta.directories.insert(server.to_owned());
+                continue;
+            };
+            if let (Some(old), Some(new)) = (previous_host.as_object(), host.as_object()) {
+                match fields_differ(old, new, &HOST_ACTIVITY, &DIRECTORY_FIELDS) {
+                    Difference::Content => {
+                        delta.content = true;
+                        delta.hosts.insert(server.to_owned());
+                    }
+                    Difference::Activity => delta.host_activity = true,
+                    Difference::None => {}
+                }
+            }
+            match (old.directory(previous_host), new.directory(host)) {
+                (Some(before), Some(after)) if before.revision == after.revision => {}
+                (Some(before), Some(after)) => {
+                    if delta.directory(server, before, after) {
+                        delta.content = true;
+                        delta.directories.insert(server.to_owned());
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    delta.content = true;
+                    delta.directories.insert(server.to_owned());
+                }
+            }
+        }
+        for host in previous.values() {
+            delta.content = true;
+            delta.hosts.insert(j::text(host, "serverId").to_owned());
+            delta
+                .directories
+                .insert(j::text(host, "serverId").to_owned());
+        }
         delta
     }
 
-    /// Nothing any layer presents changed.
-    pub fn is_empty(&self) -> bool {
-        !self.content && !self.host_activity && self.agent_activity.is_empty()
+    pub fn preference_panels(&self) -> bool {
+        self.sections.contains("tailnet") || self.prefs_keys.iter().any(|key| key != DRAFTS)
     }
 
-    /// A later publication of the same batch.
+    /// No presenting shell layer changed (drafts and saved layouts have no presenter).
+    pub fn is_empty(&self) -> bool {
+        !self.content
+            && !self.host_activity
+            && self.agent_activity.is_empty()
+            && !self.preference_panels()
+    }
+
     pub fn merge(&mut self, other: Self) {
+        self.sections.extend(other.sections);
+        self.prefs_keys.extend(other.prefs_keys);
+        self.hosts.extend(other.hosts);
+        self.directories.extend(other.directories);
         self.content |= other.content;
         self.host_activity |= other.host_activity;
         self.agent_activity.extend(other.agent_activity);
     }
 
-    /// Content, or the activity of this one agent, changed.
-    pub fn touches_agent(&self, server_id: &str, agent_id: &str) -> bool {
+    pub fn touches_agent(&self, server: &str, agent: &str) -> bool {
         self.content
             || self
                 .agent_activity
                 .iter()
-                .any(|(server, agent)| server == server_id && agent == agent_id)
+                .any(|(host, id)| host == server && id == agent)
     }
 
-    fn hosts(&mut self, old: &[Value], new: &[Value]) {
-        if old.len() != new.len() {
-            self.content = true;
-            return;
-        }
-        for (old_host, new_host) in old.iter().zip(new) {
-            let (Some(old_record), Some(new_record)) = (old_host.as_object(), new_host.as_object())
-            else {
-                if old_host != new_host {
-                    self.content = true;
-                    return;
-                }
-                continue;
-            };
-            if j::text(old_host, "serverId") != j::text(new_host, "serverId") {
-                self.content = true;
-                return;
-            }
-            let same_directory = old_record
-                .get(DIRECTORY_REVISION)
-                .filter(|revision| revision.is_u64())
-                .is_some_and(|revision| new_record.get(DIRECTORY_REVISION) == Some(revision));
-            let skipped: &[&str] = if same_directory {
-                &DIRECTORY_FIELDS
-            } else {
-                &["agents", DIRECTORY_REVISION]
-            };
-            match fields_differ(old_record, new_record, &HOST_ACTIVITY, skipped) {
-                Difference::Content => {
-                    self.content = true;
-                    return;
-                }
-                Difference::Activity => self.host_activity = true,
-                Difference::None => {}
-            }
-            if same_directory {
-                continue;
-            }
-            let server_id = j::text(new_host, "serverId");
-            if self.agents(
-                server_id,
-                j::array(old_host, "agents"),
-                j::array(new_host, "agents"),
-            ) {
-                self.content = true;
-                return;
-            }
-        }
-    }
-
-    /// Records activity-only agent changes; true when any agent's content changed.
-    fn agents(&mut self, server_id: &str, old: &[Value], new: &[Value]) -> bool {
-        if old.len() != new.len() {
+    fn directory(
+        &mut self,
+        server: &str,
+        old: &DirectorySnapshot,
+        new: &DirectorySnapshot,
+    ) -> bool {
+        let rows_differ = |old: &[Arc<Value>], new: &[Arc<Value>]| {
+            old.len() != new.len() || old.iter().zip(new).any(|(old, new)| !Arc::ptr_eq(old, new))
+        };
+        if rows_differ(&old.projects, &new.projects)
+            || rows_differ(&old.workspaces, &new.workspaces)
+        {
             return true;
         }
-        // Directory order is stable between publications; fall back to an id map otherwise.
-        let mut by_id: Option<HashMap<&str, &Value>> = None;
-        for (index, row) in new.iter().enumerate() {
+        if old.cached_at != new.cached_at {
+            self.host_activity = true;
+        }
+        if old.agents.len() != new.agents.len() {
+            return true;
+        }
+        let mut by_id: Option<HashMap<&str, &Arc<Value>>> = None;
+        let mut content = false;
+        for (index, row) in new.agents.iter().enumerate() {
             let id = j::text(j::agent_of(row), "id");
-            let previous = match old.get(index) {
+            let previous = match old.agents.get(index) {
                 Some(candidate) if j::text(j::agent_of(candidate), "id") == id => candidate,
                 _ => {
                     let map = by_id.get_or_insert_with(|| {
-                        old.iter()
+                        old.agents
+                            .iter()
                             .map(|row| (j::text(j::agent_of(row), "id"), row))
                             .collect()
                     });
-                    match map.get(id) {
-                        Some(previous) => previous,
-                        None => return true,
-                    }
+                    let Some(previous) = map.get(id) else {
+                        content = true;
+                        continue;
+                    };
+                    *previous
                 }
             };
+            if Arc::ptr_eq(previous, row) {
+                continue;
+            }
             match agent_difference(previous, row) {
-                Difference::Content => return true,
+                Difference::Content => content = true,
                 Difference::Activity => {
                     self.agent_activity
-                        .insert((server_id.to_owned(), id.to_owned()));
+                        .insert((server.to_owned(), id.to_owned()));
                 }
                 Difference::None => {}
             }
         }
-        false
+        content
     }
 }
 
@@ -181,7 +207,6 @@ enum Difference {
     Content,
 }
 
-/// Rows are the agent object or `{agent: {...}, ...}`; the wrapper's other fields are content.
 fn agent_difference(old: &Value, new: &Value) -> Difference {
     match (old.get("agent"), new.get("agent")) {
         (Some(Value::Object(old_agent)), Some(Value::Object(new_agent)))
@@ -196,17 +221,13 @@ fn agent_difference(old: &Value, new: &Value) -> Difference {
             fields_differ(old_agent, new_agent, &AGENT_ACTIVITY, &[])
         }
         _ => match (old.as_object(), new.as_object()) {
-            (Some(old_agent), Some(new_agent)) => {
-                fields_differ(old_agent, new_agent, &AGENT_ACTIVITY, &[])
-            }
+            (Some(old), Some(new)) => fields_differ(old, new, &AGENT_ACTIVITY, &[]),
             _ if old == new => Difference::None,
             _ => Difference::Content,
         },
     }
 }
 
-/// Compares two records field by field: `activity` fields report [`Difference::Activity`],
-/// `skipped` fields are compared by the caller, anything else is content.
 fn fields_differ(
     old: &Map<String, Value>,
     new: &Map<String, Value>,
@@ -214,20 +235,8 @@ fn fields_differ(
     skipped: &[&str],
 ) -> Difference {
     let mut result = Difference::None;
-    for (key, value) in old {
-        if skipped.contains(&key.as_str()) {
-            continue;
-        }
-        if new.get(key) == Some(value) {
-            continue;
-        }
-        if !activity.contains(&key.as_str()) {
-            return Difference::Content;
-        }
-        result = Difference::Activity;
-    }
-    for key in new.keys() {
-        if old.contains_key(key) || skipped.contains(&key.as_str()) {
+    for key in old.keys().chain(new.keys()) {
+        if skipped.contains(&key.as_str()) || old.get(key) == new.get(key) {
             continue;
         }
         if !activity.contains(&key.as_str()) {
@@ -240,33 +249,91 @@ fn fields_differ(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use serde_json::json;
 
-    use super::*;
+    fn state(directories: HashMap<u64, Arc<DirectorySnapshot>>) -> CoreState {
+        let mut state = CoreState::new(
+            json!({"hosts":[{"serverId":"a","directoryKey":1},{"serverId":"b","directoryKey":2}],
+            "revisions":{"prefs":{},"layouts":1}}),
+        );
+        state.directories = Arc::new(directories);
+        state
+    }
 
-    fn state(agents: Value, preferences: Value) -> Value {
-        json!({
-            "preferences": preferences,
-            "layout": {"tree": 1},
-            "hosts": [{"serverId": "h", "status": "connected", "latencyMs": 4, "agents": agents}],
-        })
+    #[test]
+    fn drafts_and_layout_publications_have_no_shell_presenter() {
+        let old = state(HashMap::new());
+        let mut drafts = old.clone();
+        drafts.value_mut()["revisions"]["prefs"][DRAFTS] = json!(2);
+        drafts.prefs = Arc::new(Map::from_iter([(DRAFTS.into(), json!("draft"))]));
+        assert!(StateDelta::between(&old, &drafts).is_empty());
+        let mut layout = old.clone();
+        layout.value_mut()["revisions"]["layouts"] = json!(3);
+        layout.layouts = Arc::new(std::collections::BTreeMap::from([(
+            "main".into(),
+            json!({"tree":1}),
+        )]));
+        assert!(StateDelta::between(&old, &layout).is_empty());
+    }
+
+    #[test]
+    fn changed_directory_preserves_other_host_and_classifies_only_its_rows() {
+        let a = Arc::new(DirectorySnapshot {
+            revision: 1,
+            agents: vec![Arc::new(json!({"id":"x","title":"old"}))],
+            ..DirectorySnapshot::default()
+        });
+        let b = Arc::new(DirectorySnapshot {
+            revision: 2,
+            ..DirectorySnapshot::default()
+        });
+        let old = state(HashMap::from([(1, a), (2, b.clone())]));
+        let changed = Arc::new(DirectorySnapshot {
+            revision: 3,
+            agents: vec![Arc::new(json!({"id":"x","title":"new"}))],
+            ..DirectorySnapshot::default()
+        });
+        let new = state(HashMap::from([(1, changed), (2, b)]));
+        assert!(Arc::ptr_eq(&old.directories[&2], &new.directories[&2]));
+        let delta = StateDelta::between(&old, &new);
+        assert_eq!(delta.directories, HashSet::from(["a".to_owned()]));
+        assert!(delta.content);
+    }
+
+    fn agents_state(agents: Value, revision: u64) -> CoreState {
+        let directory = Arc::new(DirectorySnapshot {
+            revision,
+            agents: agents
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(Arc::new)
+                .collect(),
+            ..DirectorySnapshot::default()
+        });
+        let mut state = state(HashMap::from([(1, directory)]));
+        state.value_mut()["hosts"] =
+            json!([{"serverId":"h","directoryKey":1,"status":"connected","latencyMs":4}]);
+        state
     }
 
     #[test]
     fn streaming_timestamps_are_activity_of_that_agent_only() {
-        let old = state(
+        let old = agents_state(
             json!([
-                {"id": "a", "title": "A", "updatedAt": "1"},
-                {"agent": {"id": "b", "updatedAt": "1"}, "project": {"id": "p"}}
+                {"id":"a","title":"A","updatedAt":"1"},
+                {"agent":{"id":"b","updatedAt":"1"},"project":{"id":"p"}}
             ]),
-            json!({}),
+            1,
         );
-        let new = state(
+        let new = agents_state(
             json!([
-                {"id": "a", "title": "A", "updatedAt": "2", "lastActivityAt": "2"},
-                {"agent": {"id": "b", "updatedAt": "1"}, "project": {"id": "p"}}
+                {"id":"a","title":"A","updatedAt":"2","lastActivityAt":"2"},
+                {"agent":{"id":"b","updatedAt":"1"},"project":{"id":"p"}}
             ]),
-            json!({}),
+            2,
         );
         let delta = StateDelta::between(&old, &new);
         assert!(!delta.content);
@@ -276,36 +343,23 @@ mod tests {
 
     #[test]
     fn presented_agent_fields_and_membership_are_content() {
-        let base = state(
-            json!([{"agent": {"id": "a", "status": "running"}}]),
-            json!({}),
-        );
-        let renamed = state(json!([{"agent": {"id": "a", "status": "idle"}}]), json!({}));
-        let moved = state(
-            json!([{"agent": {"id": "a", "status": "running"}, "project": {"id": "q"}}]),
-            json!({}),
-        );
-        let added = state(
-            json!([{"agent": {"id": "a", "status": "running"}}, {"id": "b"}]),
-            json!({}),
-        );
-        for next in [renamed, moved, added] {
+        let base = agents_state(json!([{"agent":{"id":"a","status":"running"}}]), 1);
+        for agents in [
+            json!([{"agent":{"id":"a","status":"idle"}}]),
+            json!([{"agent":{"id":"a","status":"running"},"project":{"id":"q"}}]),
+            json!([{"agent":{"id":"a","status":"running"}},{"id":"b"}]),
+        ] {
+            let next = agents_state(agents, 2);
             let delta = StateDelta::between(&base, &next);
-            assert!(delta.content, "{next}");
+            assert!(delta.content);
             assert!(delta.touches_agent("h", "other"));
         }
     }
 
     #[test]
     fn reordered_agents_compare_by_id() {
-        let old = state(
-            json!([{"id": "a"}, {"id": "b", "updatedAt": "1"}]),
-            json!({}),
-        );
-        let new = state(
-            json!([{"id": "b", "updatedAt": "2"}, {"id": "a"}]),
-            json!({}),
-        );
+        let old = agents_state(json!([{"id":"a"},{"id":"b","updatedAt":"1"}]), 1);
+        let new = agents_state(json!([{"id":"b","updatedAt":"2"},{"id":"a"}]), 2);
         let delta = StateDelta::between(&old, &new);
         assert!(!delta.content);
         assert_eq!(
@@ -316,38 +370,17 @@ mod tests {
 
     #[test]
     fn layouts_are_ignored_and_telemetry_is_host_activity() {
-        let old = state(json!([]), json!({"theme": "dark"}));
+        let old = agents_state(json!([]), 1);
         let mut new = old.clone();
-        new["layout"] = json!({"tree": 2});
-        new["windowLayouts"] = json!({"w": {}});
-        new["hosts"][0]["latencyMs"] = json!(9);
+        new.value_mut()["revisions"]["layouts"] = json!(2);
+        new.value_mut()["hosts"][0]["latencyMs"] = json!(9);
         let delta = StateDelta::between(&old, &new);
         assert!(!delta.content);
         assert!(delta.host_activity);
-
-        new["preferences"] = json!({"theme": "light"});
+        new.value_mut()["revisions"]["preferences"] = json!(3);
         assert!(StateDelta::between(&old, &new).content);
         let mut status = old.clone();
-        status["hosts"][0]["status"] = json!("connecting");
+        status.value_mut()["hosts"][0]["status"] = json!("connecting");
         assert!(StateDelta::between(&old, &status).content);
-    }
-
-    #[test]
-    fn equal_directory_revisions_skip_rows_and_new_ones_compare_them() {
-        let mut old = state(json!([{"id": "a", "status": "running"}]), json!({}));
-        old["hosts"][0]["directoryRevision"] = json!(7);
-        let mut same = old.clone();
-        same["hosts"][0]["agents"][0]["status"] = json!("idle");
-        assert!(StateDelta::between(&old, &same).is_empty());
-
-        let mut renewed = same.clone();
-        renewed["hosts"][0]["directoryRevision"] = json!(8);
-        assert!(StateDelta::between(&old, &renewed).content);
-        let mut timestamp_only = old.clone();
-        timestamp_only["hosts"][0]["directoryRevision"] = json!(8);
-        timestamp_only["hosts"][0]["agents"][0]["updatedAt"] = json!("2");
-        let delta = StateDelta::between(&old, &timestamp_only);
-        assert!(!delta.content);
-        assert!(delta.touches_agent("h", "a"));
     }
 }

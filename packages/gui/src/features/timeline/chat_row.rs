@@ -446,7 +446,11 @@ impl ChatRow {
                 cx.copy_to_clipboard(text);
                 model.state.borrow_mut().copied.insert(key.clone(), now);
                 if let Some(ui) = scope.data.get_mut::<UiContext>() {
-                    ui.push(UiEffect::Redraw);
+                    ui.effects.extend(
+                        ui.tab_key
+                            .clone()
+                            .map(|tab_key| UiEffect::RedrawPane { tab_key }),
+                    );
                 }
                 true
             }

@@ -17,13 +17,15 @@ mod runtime;
 mod storage;
 
 use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
     path::PathBuf,
     pin::Pin,
     sync::{Arc, mpsc as std_mpsc},
     time::Duration,
 };
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 pub use error::CoreError;
@@ -34,6 +36,51 @@ use events::EventQueue;
 pub use paseo_client::transport::http::HostHttpResponse;
 
 pub type RequestId = String;
+
+/// Immutable publication: large sections retain their identity between revisions.
+#[derive(Clone, Debug, Default)]
+pub struct CoreState {
+    value: Value,
+    pub prefs: Arc<Map<String, Value>>,
+    pub layouts: Arc<BTreeMap<String, Value>>,
+    pub directories: Arc<HashMap<u64, Arc<DirectorySnapshot>>>,
+}
+
+impl Deref for CoreState {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.value
+    }
+}
+
+impl CoreState {
+    pub fn new(value: Value) -> Self {
+        Self {
+            value,
+            ..Self::default()
+        }
+    }
+
+    /// Edits only the small sections of a locally owned state (for optimistic preferences).
+    pub fn value_mut(&mut self) -> &mut Value {
+        &mut self.value
+    }
+
+    pub fn directory(&self, host: &Value) -> Option<&DirectorySnapshot> {
+        self.directories
+            .get(&host.get("directoryKey")?.as_u64()?)
+            .map(Arc::as_ref)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DirectorySnapshot {
+    pub revision: u64,
+    pub cached_at: Option<String>,
+    pub projects: Vec<Arc<Value>>,
+    pub workspaces: Vec<Arc<Value>>,
+    pub agents: Vec<Arc<Value>>,
+}
 
 /// Startup configuration supplied by the shell/platform layer.
 #[derive(Clone, Debug)]
@@ -53,7 +100,7 @@ pub struct CoreConfig {
 #[derive(Clone, Debug)]
 pub enum CoreEvent {
     State {
-        state: Arc<Value>,
+        state: Arc<CoreState>,
     },
     Connected {
         host_id: String,

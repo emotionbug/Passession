@@ -1258,6 +1258,17 @@ impl TextInput {
         self.layout_display_text(cx, text, width, self.layout.flow == Flow::RightWrap)
     }
 
+    /// The current editor layout shared by measurement, navigation and painting.
+    /// Refreshes the existing cache without changing text, selection or IME state.
+    pub fn retained_text_layout(&mut self, cx: &mut Cx, width: Option<f32>) -> Rc<LaidoutText> {
+        self.update_text_layout(cx, width, self.layout.flow == Flow::RightWrap);
+        self.laidout_text.as_ref().expect("updated text layout").clone()
+    }
+
+    pub fn text_ref(&self) -> &str {
+        &self.text
+    }
+
     pub fn text_scale(&self) -> f32 {
         self.draw_text.font_scale
     }

@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Command, CoreConfig, CoreError, CoreEvent, RequestId, events::EventQueue};
+use crate::{Command, CoreConfig, CoreError, CoreEvent, CoreState, RequestId, events::EventQueue};
 
 pub(crate) use hosts::Host;
 pub(crate) use requests::{Conn, Observation};
@@ -51,6 +51,7 @@ pub(crate) struct Core {
     tailnet: tailnet::Tailnet,
     state_scheduled: Cell<bool>,
     last_state: Cell<Option<Instant>>,
+    published: RefCell<CoreState>,
 }
 
 /// Minimum spacing of `State` publications; directory bursts collapse into one.
@@ -76,6 +77,7 @@ impl Core {
             next_key: Cell::new(0),
             state_scheduled: Cell::new(false),
             last_state: Cell::new(None),
+            published: RefCell::new(CoreState::default()),
         })
     }
 
@@ -155,19 +157,20 @@ impl Core {
         });
     }
 
-    /// The published state. Host records and store sections are moved or cloned into place:
-    /// `json!` would re-serialize every row of every host once more into a new `Value`.
-    fn state(&self) -> Value {
-        let hosts: Vec<Value> = self.hosts.borrow().iter().map(|h| h.state_json()).collect();
+    /// Only small records are rebuilt. Large sections retain their allocation until changed.
+    fn state(&self) -> CoreState {
+        let hosts = self.hosts.borrow();
+        let records: Vec<Value> = hosts.iter().map(|host| host.state_json()).collect();
         let store = self.store.borrow();
+        let mut previous = self.published.borrow_mut();
         let mut state = Map::new();
         state.insert("initialized".into(), self.initialized.get().into());
         state.insert("clientId".into(), self.client_id.borrow().clone().into());
         state.insert(
             "storage".into(),
             json!({
-                "error": store.error.as_ref().map(|e| e.message.clone()),
-                "errorCode": store.error.as_ref().map(|e| e.code.clone()),
+                "error": store.error.as_ref().map(|error| &error.message),
+                "errorCode": store.error.as_ref().map(|error| &error.code),
                 "writable": store.writable,
             }),
         );
@@ -176,31 +179,86 @@ impl Core {
             Value::Object(store.preferences.clone()),
         );
         state.insert(
-            "layout".into(),
-            store
-                .layouts
-                .get(crate::storage::MAIN_WINDOW)
-                .cloned()
-                .unwrap_or(Value::Null),
-        );
-        state.insert(
-            "windowLayouts".into(),
-            Value::Object(
-                store
-                    .layouts
-                    .iter()
-                    .map(|(window, layout)| (window.clone(), layout.clone()))
-                    .collect(),
-            ),
-        );
-        state.insert(
             "suppressedRoutes".into(),
             Value::Array(store.suppressed.iter().cloned().map(Value::from).collect()),
         );
-        state.insert("prefs".into(), Value::Object(store.prefs.values.clone()));
-        state.insert("hosts".into(), Value::Array(hosts));
+        state.insert("hosts".into(), Value::Array(records));
         state.insert("tailnet".into(), self.tailnet.state());
-        Value::Object(state)
+        let old_revisions = &previous.value["revisions"];
+        let mut revisions = Map::new();
+        for (section, fields) in [
+            ("preferences", &["preferences"][..]),
+            ("suppressedRoutes", &["suppressedRoutes"][..]),
+            ("storage", &["storage"][..]),
+            ("tailnet", &["tailnet"][..]),
+            ("session", &["initialized", "clientId"][..]),
+        ] {
+            let changed = fields
+                .iter()
+                .any(|key| previous.value.get(*key) != state.get(*key));
+            revisions.insert(
+                section.into(),
+                if changed {
+                    directory::next_revision().into()
+                } else {
+                    old_revisions[section].as_u64().unwrap_or(0).into()
+                },
+            );
+        }
+        let host_set_changed = !previous.value["hosts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|host| host["directoryKey"].as_u64())
+            .eq(hosts.iter().map(|host| host.key));
+        revisions.insert(
+            "hostSet".into(),
+            if host_set_changed {
+                directory::next_revision().into()
+            } else {
+                old_revisions["hostSet"].as_u64().unwrap_or(0).into()
+            },
+        );
+        let prefs_changed = old_revisions["prefs"].as_object() != Some(&store.prefs_revisions);
+        let layouts_changed = old_revisions["layouts"].as_u64() != Some(store.layouts_revision);
+        revisions.insert("prefs".into(), Value::Object(store.prefs_revisions.clone()));
+        revisions.insert("layouts".into(), store.layouts_revision.into());
+        let prefs = if prefs_changed {
+            Arc::new(store.prefs.values.clone())
+        } else {
+            previous.prefs.clone()
+        };
+        let layouts = if layouts_changed {
+            Arc::new(store.layouts.clone())
+        } else {
+            previous.layouts.clone()
+        };
+        let same_directories = previous.directories.len() == hosts.len()
+            && hosts.iter().all(|host| {
+                previous
+                    .directories
+                    .get(&host.key)
+                    .is_some_and(|snapshot| snapshot.revision == host.dir.borrow().revision())
+            });
+        let directories = if same_directories {
+            previous.directories.clone()
+        } else {
+            Arc::new(
+                hosts
+                    .iter()
+                    .map(|host| (host.key, host.dir.borrow_mut().snapshot()))
+                    .collect(),
+            )
+        };
+        state.insert("revisions".into(), Value::Object(revisions));
+        let published = CoreState {
+            value: Value::Object(state),
+            prefs,
+            layouts,
+            directories,
+        };
+        *previous = published.clone();
+        published
     }
 }
 
@@ -220,6 +278,11 @@ pub(crate) async fn run(
     }
     hosts::shutdown(&core).await;
     tailnet::shutdown(&core).await;
+    // Shutdown is FIFO with GUI saves. Do not drop the LocalSet while a preferences
+    // replacement (including its fsync/rename) or an earlier flush barrier is pending.
+    if let Err(error) = store::write_prefs(&core).await {
+        core.error(None, error);
+    }
 }
 
 async fn handle(core: &Rc<Core>, command: Command) {

@@ -417,15 +417,29 @@ impl ComposerAutocomplete {
         }
     }
 
-    /// The text or cursor changed. Returns `Some(query)` when a file lookup must be
-    /// (re)scheduled after the 180ms debounce; `None` cancels any pending debounce.
+    /// Refresh replacement text on every edit, but only rebuild suggestions or restart
+    /// file lookup when the active token changed. Edits after the caret are irrelevant.
     pub fn update(&mut self, text: &str, cursor: usize) -> Option<String> {
-        self.text = text.to_owned();
-        self.cursor = clamp_boundary(text, cursor);
-        self.slash = find_active_slash_command(&self.text, self.cursor);
-        self.mention = find_active_file_mention(&self.text, self.cursor);
+        let cursor = clamp_boundary(text, cursor);
+        let prefix_changed = self.text.get(..self.cursor) != text.get(..cursor);
+        self.text.clear();
+        self.text.push_str(text);
+        self.cursor = cursor;
+        if !prefix_changed {
+            return None;
+        }
+        let slash = find_active_slash_command(&self.text, self.cursor);
+        let mention = find_active_file_mention(&self.text, self.cursor);
+        if self.slash == slash && self.mention == mention {
+            return None;
+        }
+        let query_changed = self.mention.as_ref().map(|range| &range.query)
+            != mention.as_ref().map(|range| &range.query);
+        self.slash = slash;
+        self.mention = mention;
         let mut schedule = None;
-        if let Some(mention) = &self.mention
+        if query_changed
+            && let Some(mention) = &self.mention
             && self.loaded_file_query.as_deref() != Some(mention.query.as_str())
         {
             if self.loaded_file_query.is_none() {
@@ -433,7 +447,9 @@ impl ComposerAutocomplete {
             }
             schedule = Some(mention.query.clone());
         }
-        self.pending_file_query = schedule.clone();
+        if query_changed {
+            self.pending_file_query = schedule.clone();
+        }
         self.rebuild();
         schedule
     }

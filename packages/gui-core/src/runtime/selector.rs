@@ -22,7 +22,6 @@ use crate::{
     host_config,
 };
 
-const PROBE_TICK: Duration = Duration::from_secs(2);
 const PROBE_STEADY: Duration = Duration::from_secs(10);
 const PROBE_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROBE_INACTIVE_WHILE_ONLINE: Duration = Duration::from_secs(120);
@@ -86,6 +85,33 @@ fn probe_interval(age: Duration, is_active_online: bool, has_active_online: bool
     }
 }
 
+/// Backoff grows with first-seen age, including while a deadline is sleeping.
+fn probe_deadline(
+    now: Duration,
+    first: Duration,
+    last: Option<Duration>,
+    is_active_online: bool,
+    has_active_online: bool,
+) -> Duration {
+    let Some(last) = last else {
+        return now;
+    };
+    let mut due = now;
+    loop {
+        let next = now.max(
+            last + probe_interval(
+                due.saturating_sub(first),
+                is_active_online,
+                has_active_online,
+            ),
+        );
+        if next == due {
+            return due;
+        }
+        due = next;
+    }
+}
+
 /// Original `selectBestConnection`: the lowest available latency; ties keep the earlier one.
 fn select_best(candidates: &[String], probes: &BTreeMap<String, Probe>) -> Option<String> {
     let mut best: Option<(&String, Duration)> = None;
@@ -116,7 +142,7 @@ pub(crate) struct Selector {
     switch_hits: Cell<u32>,
     probe_version: Cell<u64>,
     cycle_running: Cell<bool>,
-    ticker: RefCell<Option<tokio::task::AbortHandle>>,
+    deadline: RefCell<Option<tokio::task::AbortHandle>>,
     stopped: Cell<bool>,
     sockets: RefCell<tokio_util::sync::CancellationToken>,
 }
@@ -135,7 +161,7 @@ impl Selector {
             switch_hits: Cell::new(0),
             probe_version: Cell::new(0),
             cycle_running: Cell::new(false),
-            ticker: RefCell::new(None),
+            deadline: RefCell::new(None),
             stopped: Cell::new(false),
             sockets: RefCell::new(core.cancel.child_token()),
         })
@@ -179,30 +205,71 @@ impl Selector {
     pub fn start(self: &Rc<Self>) {
         self.track_first_seen();
         self.run_cycle_now();
-        let selector = Rc::downgrade(self);
-        let ticker = tokio::task::spawn_local(async move {
-            let mut interval = tokio::time::interval(PROBE_TICK);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let Some(selector) = selector.upgrade() else {
-                    return;
-                };
-                if selector.stopped.get() {
-                    return;
+    }
+
+    /// Connection and foreground notifications can change which interval is due.
+    pub fn connection_changed(self: &Rc<Self>) {
+        self.arm_deadline();
+    }
+
+    fn arm_deadline(self: &Rc<Self>) {
+        if let Some(timer) = self.deadline.borrow_mut().take() {
+            timer.abort();
+        }
+        if self.stopped.get() || self.cycle_running.get() {
+            return;
+        }
+        let Some(host) = self.host.upgrade() else {
+            return;
+        };
+        let now = self.clock.elapsed();
+        let online = host.status() == hosts::Status::Connected;
+        let config = host.config.borrow();
+        let active_id = config["id"].as_str().unwrap_or_default();
+        let tailnet = host_config::uses_tailnet(&config);
+        let rejected = self.auth_rejected.borrow();
+        let first_seen = self.first_seen.borrow();
+        let last_probed = self.last_probed.borrow();
+        let due = host
+            .connections
+            .borrow()
+            .iter()
+            .filter(|connection| host_config::uses_tailnet(connection) == tailnet)
+            .filter_map(|connection| {
+                let id = connection["id"].as_str().unwrap_or_default();
+                if rejected.contains(id) {
+                    return None;
                 }
+                Some(probe_deadline(
+                    now,
+                    first_seen.get(id).copied().unwrap_or(now),
+                    last_probed.get(id).copied(),
+                    online && id == active_id,
+                    online,
+                ))
+            })
+            .min();
+        let Some(due) = due else {
+            return;
+        };
+        let selector = Rc::downgrade(self);
+        let deadline = tokio::time::Instant::from_std(self.clock + due);
+        let timer = tokio::task::spawn_local(async move {
+            tokio::time::sleep_until(deadline).await;
+            if let Some(selector) = selector.upgrade() {
+                selector.deadline.borrow_mut().take();
                 selector.run_cycle_now();
             }
         });
-        *self.ticker.borrow_mut() = Some(ticker.abort_handle());
+        *self.deadline.borrow_mut() = Some(timer.abort_handle());
     }
 
     pub fn stop(&self) {
         self.sockets.borrow().cancel();
         self.stopped.set(true);
         self.probe_version.set(self.probe_version.get() + 1);
-        if let Some(ticker) = self.ticker.borrow_mut().take() {
-            ticker.abort();
+        if let Some(timer) = self.deadline.borrow_mut().take() {
+            timer.abort();
         }
     }
 
@@ -227,7 +294,11 @@ impl Selector {
     /// Original `failConnection` for the active client: a credential rejection excludes that
     /// connection and probes the remaining ones right away.
     pub fn report_active_failure(self: &Rc<Self>, connection_id: &str, error: &CoreError) {
-        if !error.is_auth_failure() || self.stopped.get() {
+        if self.stopped.get() {
+            return;
+        }
+        if !error.is_auth_failure() {
+            self.connection_changed();
             return;
         }
         self.auth_rejected
@@ -247,11 +318,16 @@ impl Selector {
             .any(|c| !rejected.contains(c["id"].as_str().unwrap_or_default()))
         {
             self.run_cycle_now();
+        } else {
+            self.arm_deadline();
         }
     }
 
     fn run_cycle_now(self: &Rc<Self>) {
-        if self.cycle_running.replace(true) || self.stopped.get() {
+        if let Some(timer) = self.deadline.borrow_mut().take() {
+            timer.abort();
+        }
+        if self.stopped.get() || self.cycle_running.replace(true) {
             return;
         }
         let selector = self.clone();
@@ -261,6 +337,7 @@ impl Selector {
             selector.run_cycle(version).await;
             if selector.probe_version.get() == version {
                 selector.cycle_running.set(false);
+                selector.arm_deadline();
             }
         });
     }
@@ -574,6 +651,28 @@ mod tests {
             probe_interval(Duration::from_secs(90), false, false),
             PROBE_MAX_BACKOFF
         );
+    }
+
+    #[test]
+    fn probe_deadlines_sleep_until_due_and_rearm_for_connection_state() {
+        let seconds = Duration::from_secs;
+        let due = |now: u64, last: Option<u64>, active: bool, online: bool| {
+            probe_deadline(
+                seconds(now),
+                Duration::ZERO,
+                last.map(seconds),
+                active,
+                online,
+            )
+        };
+        assert_eq!(due(90, Some(90), true, true), seconds(100));
+        assert_eq!(due(90, Some(90), false, true), seconds(210));
+        assert_eq!(due(100, Some(90), false, false), seconds(120));
+        assert_eq!(due(150, Some(90), false, false), seconds(150));
+        assert_eq!(due(9, Some(9), false, false), seconds(14));
+        assert_eq!(due(28, Some(28), false, false), seconds(38));
+        assert_eq!(due(58, Some(58), false, false), seconds(88));
+        assert_eq!(due(90, None, false, true), seconds(90));
     }
 
     #[test]

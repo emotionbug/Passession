@@ -321,6 +321,10 @@ pub struct ForgeEffects {
 #[derive(Default)]
 pub struct ForgeAutoAttach {
     latest: Option<ForgeInput>,
+    /// Only URLs can contribute references. Ordinary prose edits do not invalidate
+    /// lookups, reparse repositories, or rebuild an unchanged auto-attach run.
+    url_region: Vec<String>,
+    removed_changed: bool,
     removed: HashSet<String>,
     lookups: Vec<Lookup>,
     run: Option<Run>,
@@ -352,6 +356,7 @@ impl ForgeAutoAttach {
     pub fn mark_removed(&mut self, attachment: &Value) {
         if let Some(key) = forge_attachment_key(attachment) {
             self.removed.insert(key);
+            self.removed_changed = true;
         }
     }
 
@@ -381,6 +386,30 @@ impl ForgeAutoAttach {
 
     pub fn update(&mut self, input: ForgeInput) -> ForgeEffects {
         let mut effects = ForgeEffects::default();
+        let text_changed = self
+            .latest
+            .as_ref()
+            .is_none_or(|last| last.text != input.text);
+        let urls = text_changed.then(|| web_urls(&input.text));
+        let region_changed = urls.as_ref().is_some_and(|urls| {
+            !urls
+                .iter()
+                .copied()
+                .eq(self.url_region.iter().map(String::as_str))
+        });
+        let same_context = self.latest.as_ref().is_some_and(|last| {
+            same_target(last, &input)
+                && last.connected == input.connected
+                && last.attachments == input.attachments
+        });
+        if same_context && !region_changed && !self.removed_changed {
+            self.latest = Some(input);
+            return effects;
+        }
+        if let Some(urls) = urls {
+            self.url_region = urls.into_iter().map(str::to_owned).collect();
+        }
+        self.removed_changed = false;
         self.latest = Some(input.clone());
         let target = format!(
             "{:?}|{}|{}|{}",

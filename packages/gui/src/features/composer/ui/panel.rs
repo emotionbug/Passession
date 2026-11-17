@@ -178,6 +178,7 @@ pub struct PanelState {
     pub input_scroll: f64,
     pub input_manual_scroll: bool,
     pub input_natural: f64,
+    pub(super) input_measure: Option<super::layout::EditorMeasure>,
     pub input_clip: Rect,
     /// The host's stationary viewport (dock `ComposerViewport`), set by the host each draw.
     pub viewport_height: Option<f64>,
@@ -1136,7 +1137,7 @@ impl ComposerPanel {
         if (was_fullscreen || restore_input) && !self.st.hidden {
             self.input.set_key_focus(cx);
         }
-        ui.push(UiEffect::Redraw);
+        ui.push(UiEffect::RedrawOverlays);
         self.draw_bg.redraw(cx);
     }
 
@@ -1603,6 +1604,7 @@ impl ComposerPanel {
         if placeholder != self.st.applied_placeholder {
             self.st.applied_placeholder = placeholder.clone();
             self.input.set_empty_text(cx, placeholder);
+            self.st.input_measure = None;
         }
         let read_only = self.ctl_ref().is_draft() && self.ctl_ref().sending();
         if self.input.is_read_only() != read_only {

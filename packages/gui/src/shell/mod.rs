@@ -333,6 +333,18 @@ pub struct Data {
     pub presented_layout: u64,
     /// Pending repaint of recency lists after activity-only state changes.
     pub recency_timer: Timer,
+    recency_sidebar: bool,
+    recency_sessions: bool,
+}
+
+/// The presentation that changed; layout composition checks each retained region's rect.
+pub(crate) enum ShellRegion<'a> {
+    Chrome,
+    Sidebar,
+    Page,
+    Sessions,
+    Overlays,
+    Pane(&'a str),
 }
 
 /// The retained layers one window composes (see `common::layer`); pane roots own theirs in
@@ -355,12 +367,9 @@ impl ShellLayers {
         self.bg
     }
 
-    /// Shell-owned presentation changed. Pane roots are not repainted: they redraw their own
-    /// areas, and a new rect, focus or shared-state change reaches them separately.
+    /// Widget-level redraw requests a composition pass, not every retained child.
     fn redraw(&self, cx: &mut Cx) {
-        for layer in [&self.chrome, &self.sidebar, &self.page, &self.sessions] {
-            layer.invalidate(cx);
-        }
+        self.chrome.invalidate(cx);
     }
 
     fn finish_frame(&mut self, cx: &mut Cx2d) {
@@ -421,22 +430,74 @@ impl PaseoShell {
             || overlay_api::window_modal_open(&self.data.window_id)
     }
 
-    /// Hover/press feedback changed for these shell hit ids: repaints only the layers that
-    /// drew them. An id no retained layer owns repaints every shell-owned layer.
+    pub(crate) fn invalidate_region(&self, cx: &mut Cx, region: ShellRegion<'_>) {
+        match region {
+            ShellRegion::Chrome => self.layers.chrome.invalidate(cx),
+            ShellRegion::Sidebar => {
+                self.layers.sidebar.invalidate(cx);
+                self.data.sidebar.header_layer.invalidate(cx);
+                self.data.sidebar.tree_layer.invalidate(cx);
+                self.data.sidebar.footer_layer.invalidate(cx);
+            }
+            ShellRegion::Page => self.layers.page.invalidate(cx),
+            ShellRegion::Sessions => {
+                self.layers.sessions.invalidate(cx);
+                if let Some(history) = &self.data.history {
+                    history.invalidate(cx);
+                }
+            }
+            ShellRegion::Overlays => self.overlay_list.redraw(cx),
+            ShellRegion::Pane(key) => {
+                if let Some(panel) = self.data.panels.get(key) {
+                    panel.layer.invalidate(cx);
+                }
+            }
+        }
+    }
+
+    /// Recompute slots; Layer::begin compares the old/new rect and presentation inputs.
+    /// Unmoved siblings replay, removed slots detach, new slots paint on first attachment.
+    pub(crate) fn invalidate_layout(&self, cx: &mut Cx) {
+        self.invalidate_region(cx, ShellRegion::Chrome);
+    }
+
+    /// Retained and transient hits both have explicit paint owners. A stale id paints nothing.
     pub(crate) fn redraw_hit_owners(&self, cx: &mut Cx, ids: &[Option<&str>]) {
-        let layers = &self.layers;
         for id in ids.iter().flatten() {
-            match [
-                &layers.chrome,
-                &layers.sidebar,
-                &layers.page,
-                &layers.sessions,
+            if self
+                .data
+                .overlays
+                .hits
+                .since(0)
+                .iter()
+                .any(|(_, hit)| hit.as_str() == *id)
+            {
+                self.invalidate_region(cx, ShellRegion::Overlays);
+            } else if self.data.sidebar.tree_layer.owns_hit(id) {
+                self.data.sidebar.tree_layer.invalidate(cx);
+            } else if self.data.sidebar.header_layer.owns_hit(id) {
+                self.data.sidebar.header_layer.invalidate(cx);
+            } else if self.data.sidebar.footer_layer.owns_hit(id) {
+                self.data.sidebar.footer_layer.invalidate(cx);
+            } else if self
+                .data
+                .history
+                .as_ref()
+                .is_some_and(|page| page.redraw_hit(cx, id))
+            {
+                // The history header or one retained visible row owns this hit.
+            } else if let Some(layer) = [
+                &self.layers.chrome,
+                &self.layers.sidebar,
+                &self.layers.page,
+                &self.layers.sessions,
             ]
             .into_iter()
             .find(|layer| layer.owns_hit(id))
             {
-                Some(layer) => layer.invalidate(cx),
-                None => layers.redraw(cx),
+                layer.invalidate(cx);
+            } else if let Some(panel) = self.data.panels.values().find(|p| p.layer.owns_hit(id)) {
+                panel.layer.invalidate(cx);
             }
         }
     }
@@ -452,12 +513,7 @@ impl PaseoShell {
         } else {
             self.data.window_id.as_str()
         };
-        let windows = j::object(&ui.state, "windowLayouts");
-        let saved = match windows.get(id) {
-            Some(layout @ Value::Object(_)) => layout.clone(),
-            _ if id == MAIN_WINDOW_ID => j::object(&ui.state, "layout").clone(),
-            _ => Value::Null,
-        };
+        let saved = ui.state.layouts.get(id).cloned().unwrap_or(Value::Null);
         if saved.is_object() {
             self.data.layout = Layout::restore(&saved);
         }
@@ -500,7 +556,7 @@ impl PaseoShell {
                         let next = j::text(payload, "hostId");
                         if !previous.is_empty() && !next.is_empty() {
                             self.data.layout.remap_server(previous, next);
-                            self.redraw(cx);
+                            self.invalidate_layout(cx);
                         }
                     }
                 }
@@ -533,46 +589,84 @@ impl PaseoShell {
         }
         ui.events = events;
         if published {
-            self.invalidate_for_state(cx, &ui.state_delta);
+            self.invalidate_for_state(cx, &ui.state_delta, &ui.state);
         }
     }
 
-    /// Repaints the layers presenting what this batch's `State` publications changed. Chrome
-    /// and pane roots present content; an agent's own session also presents its activity.
-    /// Recency lists and pages present everything, but activity alone (every streamed event
-    /// moves `updatedAt`) only changes minute-granular labels and order: it repaints them on
-    /// a [`RECENCY_INTERVAL`] cadence instead of per publication.
-    fn invalidate_for_state(&mut self, cx: &mut Cx, delta: &StateDelta) {
+    /// Invalidate presenters, never the transport envelope. Chat does not display directory
+    /// activity timestamps; the filtered sidebar and visible history own recency.
+    fn invalidate_for_state(
+        &mut self,
+        cx: &mut Cx,
+        delta: &StateDelta,
+        state: &paseo_gui_core::CoreState,
+    ) {
         if delta.is_empty() {
             return;
         }
         if delta.content {
             cx.stop_timer(self.data.recency_timer);
             self.data.recency_timer = Timer::empty();
-            self.layers.chrome.invalidate(cx);
-            self.redraw_recency(cx);
-        } else if self.data.recency_timer.is_empty() {
-            self.data.recency_timer = cx.start_timeout(RECENCY_INTERVAL);
+            self.data.recency_sidebar = false;
+            self.data.recency_sessions = false;
+            self.invalidate_region(cx, ShellRegion::Chrome);
+            self.invalidate_region(cx, ShellRegion::Sidebar);
+            self.invalidate_region(cx, ShellRegion::Page);
+            self.invalidate_region(cx, ShellRegion::Sessions);
+        } else if !delta.agent_activity.is_empty() && !self.pages_covered() {
+            if self.data.chrome.sidebar_rect.size.x > 0.0 {
+                let query = self.data.sidebar.query.trim().to_lowercase();
+                self.data.recency_sidebar |= sidebar::session_tree(state, &query, None)
+                    .iter()
+                    .filter(|group| !group.collapsed)
+                    .any(|group| {
+                        group
+                            .projects
+                            .iter()
+                            .filter(|project| !project.collapsed)
+                            .any(|project| {
+                                project.sessions.iter().any(|agent| {
+                                    delta.agent_activity.iter().any(|(server, id)| {
+                                        server == group.host.server_id()
+                                            && id == j::text(agent, "id")
+                                    })
+                                })
+                            })
+                    });
+            }
+            self.data.recency_sessions |= matches!(&self.data.page, Some(Page::Sessions { host_id, all_hosts, .. })
+                if *all_hosts || delta.agent_activity.iter().any(|(server, _)| server == host_id));
+            if (self.data.recency_sidebar || self.data.recency_sessions)
+                && self.data.recency_timer.is_empty()
+            {
+                self.data.recency_timer = cx.start_timeout(RECENCY_INTERVAL);
+            }
+        }
+        if delta.preference_panels() && matches!(self.data.page, Some(Page::Settings { .. })) {
+            self.invalidate_region(cx, ShellRegion::Page);
         }
         for panel in self.data.panels.values() {
-            let target = &panel.target;
-            let presents = match target.id.as_deref() {
-                Some(agent) if panels::root_kind(&target.kind) == Some(panels::RootKind::Chat) => {
-                    delta.touches_agent(&target.server_id, agent)
-                }
-                _ => delta.content,
-            };
-            if presents {
+            if panel.visible
+                && (delta.content
+                    || (delta.preference_panels() && panel.kind == panels::RootKind::Git))
+            {
                 panel.layer.invalidate(cx);
             }
         }
     }
 
-    /// Layers that list sessions or hosts with their recency.
-    fn redraw_recency(&self, cx: &mut Cx) {
-        self.layers.sidebar.invalidate(cx);
-        self.layers.page.invalidate(cx);
-        self.layers.sessions.invalidate(cx);
+    fn redraw_recency(&mut self, cx: &mut Cx) {
+        let sidebar = std::mem::take(&mut self.data.recency_sidebar);
+        let sessions = std::mem::take(&mut self.data.recency_sessions);
+        if self.pages_covered() {
+            return;
+        }
+        if sidebar && self.data.chrome.sidebar_rect.size.x > 0.0 {
+            self.data.sidebar.tree_layer.invalidate(cx);
+        }
+        if sessions && matches!(self.data.page, Some(Page::Sessions { .. })) {
+            self.invalidate_region(cx, ShellRegion::Sessions);
+        }
     }
 
     /// Applies effects pushed by feature roots, hooks and the shell itself, in order.
@@ -601,7 +695,7 @@ impl PaseoShell {
     fn open_overlay(&mut self, cx: &mut Cx, request: OverlayRequest) {
         let ptr = self.text_field;
         self.data.overlays.open(cx, request, ptr);
-        self.redraw(cx);
+        self.invalidate_region(cx, ShellRegion::Overlays);
     }
 
     /// Answers an overlay back to its owner (feature tab, page, or the shell itself).
@@ -779,6 +873,7 @@ impl Widget for PaseoShell {
         // A dismissing key still belongs to the modal that was open when it arrived.
         let shell_modal = self.data.overlays.is_modal();
         let command_center = self.data.command_center_open;
+        let overlay_key = self.data.overlays.presentation_key();
         // Every window's events reach every shell: only this window's geometry is recorded.
         if let Event::WindowGeomChange(e) = event
             && Some(e.window_id) == self.data.os_window
@@ -806,7 +901,7 @@ impl Widget for PaseoShell {
         if !ui.events.is_empty() {
             self.handle_core_batch(cx, ui);
             if sidebar::sync_terminals(&mut self.data.sidebar, ui) {
-                self.layers.sidebar.invalidate(cx);
+                self.data.sidebar.tree_layer.invalidate(cx);
             }
         }
         self.data.router.update(ui.preferences());
@@ -822,7 +917,7 @@ impl Widget for PaseoShell {
         commands::handle_window_events(self, cx, event, ui);
         overlays::handle_timers(&mut self.data.overlays, cx, event);
         if sidebar::track_modifier(&mut self.data.sidebar, event) {
-            self.layers.sidebar.invalidate(cx);
+            self.data.sidebar.tree_layer.invalidate(cx);
         }
 
         // The toast is painted last, above even standalone tool-call sheets.
@@ -940,6 +1035,11 @@ impl Widget for PaseoShell {
                 self.data.activity.update_view(ui, target.as_ref(), visible);
             }
         }
+        crate::features::timeline::store::set_window_visible(
+            cx,
+            &self.data.window_id,
+            window_state(&self.data.window_id) == Some(WindowState::Visible),
+        );
         // Commands above can change the destination. Arm motion in the same event,
         // and consume animation frames even when a modal temporarily owns input.
         self.data.overlays.sync_focus(cx);
@@ -948,7 +1048,10 @@ impl Widget for PaseoShell {
         // Any recorded layout change (tabs, focus, splits, destinations) is shell chrome.
         if self.data.layout.revision != self.data.presented_layout {
             self.data.presented_layout = self.data.layout.revision;
-            self.redraw(cx);
+            self.invalidate_layout(cx);
+        }
+        if self.data.overlays.presentation_key() != overlay_key {
+            self.invalidate_region(cx, ShellRegion::Overlays);
         }
     }
 
@@ -993,7 +1096,7 @@ impl PaseoShellRef {
         if let Some(mut shell) = self.borrow_mut() {
             shell.data.window_id = id.to_string();
             shell.data.restored = false;
-            shell.redraw(cx);
+            shell.invalidate_layout(cx);
         }
     }
 
@@ -1001,7 +1104,7 @@ impl PaseoShellRef {
     pub fn route(&self, cx: &mut Cx, route: Option<paseo_gui_platform::PlatformRoute>) {
         if let Some(mut shell) = self.borrow_mut() {
             shell.data.pending_route = route;
-            shell.redraw(cx);
+            shell.invalidate_layout(cx);
             SignalToUI::set_ui_signal();
         }
     }
@@ -1012,10 +1115,9 @@ impl PaseoShellRef {
     }
 
     /// Closes this window like its close button (guards, close-to-tray, dormant first window).
-    pub fn request_close(&self, cx: &mut Cx) {
+    pub fn request_close(&self) {
         if let Some(mut shell) = self.borrow_mut() {
             shell.data.close_requested = true;
-            shell.redraw(cx);
             SignalToUI::set_ui_signal();
         }
     }

@@ -112,7 +112,12 @@ thread_local! {
 
 /// Wheel and touch scrolling of the welcome body (shell window events). Only while the welcome
 /// screen is what the content area shows and no modal layer covers it.
-pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, state: &serde_json::Value) {
+pub fn handle_event(
+    shell: &mut PaseoShell,
+    cx: &mut Cx,
+    event: &Event,
+    state: &paseo_gui_core::CoreState,
+) {
     let shown = hosts::hosts(state).is_empty()
         && !matches!(shell.data.page, Some(Page::Settings { .. }))
         && !shell.pages_covered();
@@ -152,7 +157,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, state: &
     if moved {
         // A drag that scrolled is not a tap on the button it started on.
         shell.data.pointer.pressed = None;
-        shell.redraw(cx);
+        shell.invalidate_region(cx, crate::shell::ShellRegion::Chrome);
     }
 }
 
@@ -475,5 +480,5 @@ pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) 
         }
         _ => {}
     }
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }

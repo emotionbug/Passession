@@ -47,7 +47,7 @@ pub fn open_flow(
         Box::new(MethodSheet)
     };
     shell.data.overlays.open_sheet(sheet);
-    shell.redraw(cx);
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 /// Original `getConnectionAuthFailureReason`: the host refused the (missing) password.
@@ -170,7 +170,7 @@ fn key_fingerprint(key: &str) -> String {
 /// Original `HostConfirmation.confirmLink`: `None` when a saved host of that server already has
 /// this relay connection (endpoint, TLS and daemon key); otherwise the confirmation sheet.
 fn host_confirmation(
-    state: &Value,
+    state: &paseo_gui_core::CoreState,
     info: &HostConfigInfo,
     reply_to: Option<u64>,
 ) -> Option<HostConfirmSheet> {
@@ -669,7 +669,7 @@ pub struct ConnectionSheet {
     candidate: Option<(Value, String, bool)>,
     pending: Pending,
     focus_port: bool,
-    state: Arc<Value>,
+    state: Arc<paseo_gui_core::CoreState>,
 }
 
 impl ConnectionSheet {
@@ -764,7 +764,7 @@ impl ConnectionSheet {
             candidate: None,
             pending: Pending::None,
             focus_port: false,
-            state: Arc::new(Value::Null),
+            state: Arc::new(paseo_gui_core::CoreState::default()),
             original: config,
         }
     }
@@ -1468,7 +1468,7 @@ impl Sheet for ConnectionSheet {
         }
     }
 
-    fn sync(&mut self, _shell: &PaseoShell, state: &Value) {
+    fn sync(&mut self, _shell: &PaseoShell, state: &paseo_gui_core::CoreState) {
         self.state = Arc::new(state.clone());
     }
 
@@ -2097,7 +2097,7 @@ impl Sheet for PairingSheet {
         480.0
     }
 
-    fn sync(&mut self, _shell: &PaseoShell, state: &Value) {
+    fn sync(&mut self, _shell: &PaseoShell, state: &paseo_gui_core::CoreState) {
         let host = hosts::host(state, &self.host_id);
         let status = host.map_or(hosts::Status::Disconnected, |h| h.status());
         self.features = host.map(|h| h.features().clone()).unwrap_or(Value::Null);
@@ -2269,7 +2269,7 @@ pub struct ScanSheet {
     scanned: Option<String>,
     /// The scanned config being confirmed or probed.
     candidate: Option<(Value, String)>,
-    state: Arc<Value>,
+    state: Arc<paseo_gui_core::CoreState>,
     /// Height below the back header (the camera view's `Expanded`).
     body_height: f64,
 }
@@ -2288,7 +2288,7 @@ impl ScanSheet {
             error: None,
             scanned: None,
             candidate: None,
-            state: Arc::new(Value::Null),
+            state: Arc::new(paseo_gui_core::CoreState::default()),
             body_height: 0.0,
         }
     }
@@ -2435,7 +2435,7 @@ impl Sheet for ScanSheet {
         tr("pairing.scan.title")
     }
 
-    fn sync(&mut self, _shell: &PaseoShell, state: &Value) {
+    fn sync(&mut self, _shell: &PaseoShell, state: &paseo_gui_core::CoreState) {
         self.state = Arc::new(state.clone());
     }
 

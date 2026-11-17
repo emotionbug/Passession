@@ -243,11 +243,11 @@ impl Host {
             out.extend_from_slice(b",\"cachedAt\":");
             serde_json::to_writer(&mut out, &dir.cached_at())?;
             out.extend_from_slice(b",\"projects\":");
-            serde_json::to_writer(&mut out, dir.projects())?;
+            write_rows(&mut out, dir.projects())?;
             out.extend_from_slice(b",\"workspaces\":");
-            serde_json::to_writer(&mut out, dir.workspaces())?;
+            write_rows(&mut out, dir.workspaces())?;
             out.extend_from_slice(b",\"agents\":");
-            serde_json::to_writer(&mut out, dir.agents())?;
+            write_rows(&mut out, dir.agents())?;
             out.push(b'}');
             Ok(())
         })();
@@ -255,9 +255,7 @@ impl Host {
         String::from_utf8(out).expect("serde_json writes UTF-8")
     }
 
-    /// The host's published record. Built from clones rather than `json!`, which would
-    /// re-serialize every row into a new `Value`; `directoryRevision` lets the GUI skip
-    /// comparing rows that did not change.
+    /// Small host metadata; directory rows are published separately by stable key.
     pub fn state_json(&self) -> Value {
         let link = self.link.borrow();
         let dir = self.dir.borrow();
@@ -322,11 +320,21 @@ impl Host {
         field("probes", probes);
         field("isLocal", self.is_local().into());
         field("directoryRevision", dir.revision().into());
-        field("projects", Value::Array(dir.projects().to_vec()));
-        field("workspaces", Value::Array(dir.workspaces().to_vec()));
-        field("agents", Value::Array(dir.agents().to_vec()));
+        field("directoryKey", self.key.into());
         Value::Object(record)
     }
+}
+
+fn write_rows(out: &mut Vec<u8>, rows: &[std::sync::Arc<Value>]) -> serde_json::Result<()> {
+    out.push(b'[');
+    for (index, row) in rows.iter().enumerate() {
+        if index != 0 {
+            out.push(b',');
+        }
+        serde_json::to_writer(&mut *out, row.as_ref())?;
+    }
+    out.push(b']');
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -387,6 +395,9 @@ pub(crate) fn start_attempt(core: &Rc<Core>, host: &Rc<Host>) {
         link.status = Status::Connecting;
         link.generation
     };
+    if let Some(selector) = host.selector.borrow().as_ref() {
+        selector.connection_changed();
+    }
     core.touch();
     let core = core.clone();
     let host = host.clone();
@@ -524,11 +535,11 @@ async fn admit(core: &Rc<Core>, host: &Rc<Host>, opened: Opened, generation: u64
         let pref = protected_pref(&key);
         let known = core.store.borrow().prefs.values.get(&pref) == Some(&Value::Bool(true));
         if !known {
-            core.store
-                .borrow_mut()
-                .prefs
-                .values
-                .insert(pref, Value::Bool(true));
+            {
+                let mut store = core.store.borrow_mut();
+                store.prefs.values.insert(pref.clone(), Value::Bool(true));
+                store.bump_pref(&pref);
+            }
             if let Err(error) = store::write_prefs(core).await {
                 let client = opened.client.clone();
                 tokio::task::spawn_local(async move { client.close().await });
@@ -561,6 +572,9 @@ async fn admit(core: &Rc<Core>, host: &Rc<Host>, opened: Opened, generation: u64
         link.rtt = None;
         std::mem::take(&mut link.waiters)
     };
+    if let Some(selector) = host.selector.borrow().as_ref() {
+        selector.connection_changed();
+    }
     *host.server_info.borrow_mut() = info.clone();
     if host
         .error
@@ -747,6 +761,9 @@ pub(crate) fn close_link(core: &Rc<Core>, host: &Rc<Host>) {
             was_active,
         )
     };
+    if let Some(selector) = host.selector.borrow().as_ref() {
+        selector.connection_changed();
+    }
     let error = CoreError::new("DAEMON_CONNECTION_LOST", "Client closed", true);
     if let Some(conn) = conn {
         conn.fail_all(&error);
@@ -857,6 +874,9 @@ pub(crate) fn set_app_visible(core: &Rc<Core>, visible: bool) {
     let hosts: Vec<Rc<Host>> = core.hosts.borrow().clone();
     for host in hosts {
         ensure_connected(core, &host, true);
+        if let Some(selector) = host.selector.borrow().as_ref() {
+            selector.connection_changed();
+        }
     }
 }
 
@@ -1022,6 +1042,9 @@ pub(crate) fn activate_connection(core: &Rc<Core>, host: &Rc<Host>, connection: 
     detach(core, host);
     *host.config.borrow_mut() = connection;
     attach(core, host);
+    if let Some(selector) = host.selector.borrow().as_ref() {
+        selector.connection_changed();
+    }
     directory::refresh_host(core, host);
     store::schedule_save(core);
 }
@@ -1427,11 +1450,14 @@ pub(crate) async fn initialize(core: &Rc<Core>) {
         Some(id) => id,
         None => {
             let id = ids::new_id();
-            core.store
-                .borrow_mut()
-                .prefs
-                .values
-                .insert("paseo.clientId".into(), Value::String(id.clone()));
+            {
+                let mut store = core.store.borrow_mut();
+                store
+                    .prefs
+                    .values
+                    .insert("paseo.clientId".into(), Value::String(id.clone()));
+                store.bump_pref("paseo.clientId");
+            }
             if let Err(error) = store::write_prefs(core).await {
                 core.error(
                     None,

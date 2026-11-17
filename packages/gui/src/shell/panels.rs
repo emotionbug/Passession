@@ -290,6 +290,8 @@ pub fn release(cx: &mut Cx, ui: &UiContext, panel: &Panel) {
     if panel.kind != RootKind::Chat {
         return;
     }
+    // Also release any nested sheet views before the root is dropped.
+    panel.widget.as_chat_panel().set_visible(cx, false);
     let id = target.id.clone().unwrap_or_default();
     if target.kind == "provider_subagent" {
         timeline::release_subagent(

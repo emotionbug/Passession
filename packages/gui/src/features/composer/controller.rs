@@ -551,8 +551,8 @@ impl Controller {
         if text != self.editor_text {
             self.editor_text = text.to_owned();
             self.update_draft(json!({"text": text}));
+            self.sync_forge_auto_attach(&mut out);
         }
-        self.sync_forge_auto_attach(&mut out);
         out.redraw = true;
         out
     }
@@ -1043,11 +1043,12 @@ impl Controller {
         if self.is_subagent() || !self.initialized {
             return;
         }
-        let draft = self.draft();
+        let attachments =
+            service::with(|svc| maps(get(svc.drafts.draft(&self.key), "attachments")));
         let effects = self.forge_auto.update(ForgeInput {
             text: self.editor_text.clone(),
             remote_url: self.remote_url.clone(),
-            attachments: maps(get(&draft, "attachments")),
+            attachments,
             connected: self.connected(),
             server_id: self.target.host_id.clone(),
             cwd: self.target.cwd.clone(),

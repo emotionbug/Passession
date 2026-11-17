@@ -138,12 +138,13 @@ pub enum NonReady {
     },
 }
 
-pub fn non_ready(cx: &mut Cx2d, d: &mut Draw, view: &NonReady, rect: Rect) {
+/// Returns the independently painted loading indicator's center.
+pub fn non_ready(cx: &mut Cx2d, d: &mut Draw, view: &NonReady, rect: Rect) -> Option<DVec2> {
     let p = d.look.palette;
     d.kit.rect(cx, rect, p.surface0, 0.0);
     let size = base(d);
     match view {
-        NonReady::Loading => spinner(cx, d, rect.center(), 24.0, p.muted),
+        NonReady::Loading => return Some(rect.center()),
         NonReady::NotFound => {
             centered_lines(
                 cx,
@@ -224,7 +225,7 @@ pub fn non_ready(cx: &mut Cx2d, d: &mut Draw, view: &NonReady, rect: Rect) {
                     ),
                 ];
                 let top = centered_lines(cx, d, &lines, rect, 12.0, 36.0);
-                spinner(cx, d, dvec2(rect.center().x, top + 12.0), 24.0, p.muted);
+                return Some(dvec2(rect.center().x, top + 12.0));
             } else {
                 let mut lines = vec![
                     (
@@ -250,6 +251,7 @@ pub fn non_ready(cx: &mut Cx2d, d: &mut Draw, view: &NonReady, rect: Rect) {
             }
         }
     }
+    None
 }
 
 /// historySyncOverlay: surface0 over the dock with the large spinner.

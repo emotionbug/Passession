@@ -112,9 +112,11 @@ family/size/spacing/scale, available width, wrapping and alignment. Replacing a
 system face under the same family id invalidates retained metrics, including
 navigation before repaint, without replacing text, selection or IME composition.
 Color-only animation keeps the cached layout. Viewport widths are converted to
-unscaled layout coordinates once; `TextInput::text_layout` exposes that same
-measurement to composer height calculations. Painting, hit testing, caret and
-touch-handle geometry share the resulting scaled layout.
+unscaled layout coordinates once. `TextInput::retained_text_layout` exposes the
+current editor's cached rows to composer sizing and caret reveal; painting and
+navigation reuse those rows rather than shaping the same text again.
+`TextInput::text_ref` reads the editor text without cloning it; `text_layout`
+remains available for other text such as the placeholder.
 
 Cursor navigation and pointer placement rebuild an invalidated layout using the
 last viewport before resolving rows. Input events may arrive between an edit

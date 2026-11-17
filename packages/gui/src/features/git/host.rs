@@ -1,7 +1,7 @@
 //! The git feature's single reading point for shell and core state
 //! (ui-api.md §2/§8/§9, core-api.md "State").
 
-use super::json::{array, text};
+use super::json::text;
 use crate::common::{PanelTarget, UiContext};
 use serde_json::Value;
 
@@ -37,9 +37,10 @@ pub fn supports(ui: &UiContext, host_id: &str, feature: &str) -> bool {
     server_info(ui, host_id).is_some_and(|info| info["features"][feature] == Value::Bool(true))
 }
 
-pub fn workspaces<'a>(ui: &'a UiContext, host_id: &str) -> &'a [Value] {
+pub fn workspaces<'a>(ui: &'a UiContext, host_id: &str) -> &'a [std::sync::Arc<Value>] {
     host(ui, host_id)
-        .map(|h| array(h, "workspaces"))
+        .and_then(|host| ui.directory(host))
+        .map(|directory| directory.workspaces.as_slice())
         .unwrap_or(&[])
 }
 
@@ -57,6 +58,7 @@ pub fn workspace<'a>(
         return Some(found);
     }
     all.iter()
+        .map(std::sync::Arc::as_ref)
         .find(|w| text(w, "workspaceDirectory") == directory)
 }
 
@@ -70,7 +72,7 @@ pub fn preference<'a>(ui: &'a UiContext, key: &str) -> &'a Value {
 
 /// A SharedPreferences value saved through `save_state("prefs:<key>")`.
 pub fn prefs_value<'a>(ui: &'a UiContext, key: &str) -> Option<&'a Value> {
-    ui.state.get("prefs").and_then(|prefs| prefs.get(key))
+    ui.state.prefs.get(key)
 }
 
 pub fn tabs(ui: &UiContext) -> &[PanelTarget] {
@@ -82,7 +84,12 @@ pub fn agent_label(ui: &UiContext, host_id: &str, agent_id: &str) -> String {
     let Some(host) = host(ui, host_id) else {
         return String::new();
     };
-    for row in array(host, "agents") {
+    for row in ui
+        .directory(host)
+        .into_iter()
+        .flat_map(|directory| directory.agents.iter())
+        .map(std::sync::Arc::as_ref)
+    {
         let agent = match row.get("agent") {
             Some(agent @ Value::Object(_)) => agent,
             _ => row,
@@ -112,8 +119,10 @@ pub fn workspace_agents(
     if workspace_id.is_empty() {
         return Vec::new();
     }
-    array(host, "agents")
-        .iter()
+    ui.directory(host)
+        .into_iter()
+        .flat_map(|directory| directory.agents.iter())
+        .map(std::sync::Arc::as_ref)
         .map(|row| match row.get("agent") {
             Some(agent @ Value::Object(_)) => agent,
             _ => row,
