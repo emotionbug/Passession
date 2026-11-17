@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Draw the header's "open in" button (the GitHub mark) level with the controls next to it. Its icon was laid out as a second item of the centred header row, so the icon and the button's border sat 6 px lower than its hover fill and its neighbours.
 - Show the question in an OMP `ask` record. A form question recorded only each field's label and answer under the title "Question", and a cancelled or interrupted question only the cancellation. The record now carries the form's own title and text, the prose before each field and the field's title, with each answer; an unanswered question lists everything that was asked, and the cancellation stays the row's error instead of replacing the question.
 - Remove the eight compiler warnings that the vendored tiny-skia printed in every build since 0.13.32. Its hidden return-type lifetimes are written out and an unused re-export is gone; rendering is unchanged.
 

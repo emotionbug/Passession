@@ -788,7 +788,11 @@ impl Widget for OpenInButton {
         let colors = palette();
         let size = 28.0;
         let width = size * if targets.len() > 1 { 2.0 } else { 1.0 };
-        let frame = cx.walk_turtle_with_area(&mut self.area, Walk::fixed(width, size));
+        // One walk for the whole button. The header centres every walk by its own height,
+        // so the icon's 16 px walk next to the 28 px frame would land 6 px below it and
+        // drag everything painted after it along.
+        cx.begin_turtle(Walk::fixed(width, size), Layout::default());
+        let frame = cx.turtle().rect();
         let primary_rect = rect(frame.pos.x, frame.pos.y, size, size);
         if self.hovered == Some(Part::Primary) && !self.opening {
             self.paint.fill(cx, primary_rect, colors.surface2);
@@ -837,6 +841,7 @@ impl Widget for OpenInButton {
             6.0,
             Some((colors.border_accent, 1.0)),
         );
+        cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()
     }
 }
