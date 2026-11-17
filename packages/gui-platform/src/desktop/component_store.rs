@@ -1330,18 +1330,6 @@ mod selection_tests {
         assert_eq!(store.runnable(&loaded).unwrap(), active);
     }
     #[test]
-    fn legacy_previous_with_pruned_objects_never_blocks_active() {
-        let (_temp, store) = fixture();
-        let mut selection = store.selection().unwrap();
-        let active = selection.active.clone();
-        let mut pruned = active.clone();
-        pruned.get_mut(&ComponentId::Daemon).unwrap().root = "objects/missing".into();
-        selection.previous = Some(pruned);
-        atomic_sync(&store.directory.join("selection.json"), &selection).unwrap();
-        let loaded = store.selection().unwrap();
-        assert_eq!(store.runnable(&loaded).unwrap(), active);
-    }
-    #[test]
     fn corrupt_active_image_and_foreign_installation_are_rejected() {
         let (_temp, store) = fixture();
         let mut selection = store.selection().unwrap();

@@ -1,6 +1,4 @@
 //! Mobile platform preferences (push installation id, per-host Expo tokens).
-//! The first load imports the Flutter client's `mobile.*` shared_preferences
-//! values so existing push subscriptions can still be revoked.
 
 use serde_json::{Map, Value};
 use std::{path::PathBuf, sync::Mutex};
@@ -32,10 +30,7 @@ impl PlatformPrefs {
                 return map;
             }
         }
-        crate::legacy_prefs::load_legacy_preferences()
-            .into_iter()
-            .filter(|(key, _)| key.starts_with("mobile."))
-            .collect()
+        Map::new()
     }
 
     pub fn get_string(&self, key: &str) -> Option<String> {

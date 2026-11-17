@@ -519,10 +519,10 @@ Under `paseo-native/`:
 
 - `state.json` contains versioned preferences, saved hosts, route suppression and layout. Unknown keys are retained. A corrupt file or a newer unsupported version is never overwritten.
 - `state.lock` serializes updates. Writes merge changes three-way against the latest file so another window's or process's unrelated preference and host edits are not lost.
-- `layout-<window>.json` holds a window's saved tab and pane layout. Restoration drops removed browser and executable plugin tabs.
+- `layout-<window>.json` holds a window's saved tab and pane layout.
 - `replica-<base64url-server-id>.json` stores a host's project/workspace/agent snapshot and cache timestamp. It is scoped to the saved server identity and reconciled with the live daemon. Each published host record carries `directoryRevision`; equal values mean its projects, workspaces, agents and `cachedAt` are unchanged, and the replica file is rewritten only when that revision changes.
 
-Next to it, `shared_preferences.json` keeps keyed values (client id, relay protection floors `paseo.relayProtected.<key>`, update-operation records) in the Flutter Linux/Windows format, including the `flutter.` key prefix. Foreign keys survive writes. On macOS and iOS (NSUserDefaults binary plist) and Android (`FlutterSharedPreferences.xml`) the Flutter values are imported once into that file.
+Next to it, `shared_preferences.json` keeps keyed values (client id, relay protection floors `paseo.relayProtected.<key>`, update-operation records) in the Flutter Linux/Windows format, including the `flutter.` key prefix, on every platform. Foreign keys survive writes. Preferences left by the retired Flutter app in other stores (NSUserDefaults, `FlutterSharedPreferences.xml`) are not read.
 
 Composer drafts, queues and creation intents live in its `paseo.chat.drafts.v1` value, keyed by `[serverId, workspaceId, targetId]`, not in the general `preferences` object. The composer owns this data; retained image bytes live in immutable content-addressed blob files rather than repeated inline draft copies. A late acknowledgement may clear only the submitted editor generation, never newer input. Ordinary edits are saved after 500 ms without typing, and at least every 2 s while typing continues; delivery changes, send, creation, window close, app backgrounding or focus loss save at once.
 

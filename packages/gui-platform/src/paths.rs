@@ -1,5 +1,4 @@
-//! The Flutter client's storage locations (path_provider), kept so an upgrade
-//! finds existing state, desktop settings, geometry and updater identity.
+//! Application storage locations, with mobile paths supplied by the OS.
 
 use std::{
     path::{Path, PathBuf},
@@ -35,26 +34,19 @@ static PATHS: LazyLock<AppPaths> = LazyLock::new(|| {
     paths
 });
 
-/// The Flutter client's directories for this platform (mobile values come from the OS).
+/// Application directories for this platform (mobile values come from the OS).
 pub fn app_paths() -> &'static AppPaths {
     &PATHS
 }
 
 #[cfg(target_os = "linux")]
 fn resolve() -> AppPaths {
-    // path_provider_linux: $XDG_DATA_HOME/<GApplication id>, falling back to an
-    // existing directory named after the executable (the original plugin's layout).
+    // $XDG_DATA_HOME/<GApplication id>.
     let data_home = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| home_dir().join(".local").join("share"));
-    let primary = data_home.join(DESKTOP_APP_ID);
-    let legacy = data_home.join("paseo_sessions");
-    let support_dir = if !primary.is_dir() && legacy.is_dir() {
-        legacy
-    } else {
-        primary
-    };
+    let support_dir = data_home.join(DESKTOP_APP_ID);
     let temp_dir = std::env::temp_dir();
     AppPaths {
         support_dir,

@@ -139,9 +139,6 @@ pub const MAIN_PANE: &str = "main";
 pub const DEFAULT_SIDEBAR_WIDTH: f64 = 320.0;
 pub const DEFAULT_EXPLORER_WIDTH: f64 = 340.0;
 
-/// Removed surfaces that are dropped when a saved layout is restored.
-const REMOVED_KINDS: [&str; 4] = ["browser", "plugin", "changes_tree", "working_diff"];
-
 /// Tabs shown on top of the tab they were opened from (the original's compact-sheet and child
 /// targets): compact Back closes them, and closing one returns to its opener.
 pub fn is_detail_kind(kind: &str) -> bool {
@@ -897,9 +894,6 @@ impl Layout {
         let mut layout = Layout::default();
         for raw in j::array(saved, "tabs") {
             let target = PanelTarget::from_json(raw);
-            if REMOVED_KINDS.contains(&target.kind.as_str()) {
-                continue;
-            }
             let key = target.key();
             if !layout.tabs.iter().any(|t| t.key() == key) {
                 layout.tabs.push(target);
@@ -1311,24 +1305,20 @@ mod tests {
     }
 
     #[test]
-    fn restore_drops_working_changes_but_preserves_history_and_commit_views() {
+    fn restore_preserves_history_and_commit_views() {
         let session = agent("a");
-        let changes = PanelTarget::new("changes_tree", "srv", "ws", "/w");
-        let working = PanelTarget::new("working_diff", "srv", "ws", "/w");
         let history = PanelTarget::new("commit_diff", "srv", "ws", "/w").with_id("abc123");
         let log = PanelTarget::new("git_log", "srv", "ws", "/w");
         let commit = PanelTarget::new("git_commit", "srv", "ws", "/w");
         let saved = json!({
-            "tabs": [session.to_json(), changes.to_json(), working.to_json(), history.to_json(), log.to_json(), commit.to_json()],
-            "tree": {"kind": "pane", "id": "main", "tabs": [session.key(), working.key(), history.key()], "selected": working.key()},
-            "explorerTabs": [changes.key(), log.key(), commit.key()],
-            "selectedExplorer": changes.key(),
-            "tabOpeners": {(working.key()): session.key(), (history.key()): session.key()},
+            "tabs": [session.to_json(), history.to_json(), log.to_json(), commit.to_json()],
+            "tree": {"kind": "pane", "id": "main", "tabs": [session.key(), history.key()], "selected": session.key()},
+            "explorerTabs": [log.key(), commit.key()],
+            "selectedExplorer": log.key(),
+            "tabOpeners": {(history.key()): session.key()},
         });
         let layout = Layout::restore(&saved);
         assert_eq!(layout.tabs.len(), 4);
-        assert!(layout.target(&changes.key()).is_none());
-        assert!(layout.target(&working.key()).is_none());
         assert_eq!(layout.focused().tabs, vec![session.key(), history.key()]);
         assert_eq!(layout.selected().map(PanelTarget::key), Some(session.key()));
         assert_eq!(layout.explorer_tabs, vec![log.key(), commit.key()]);
@@ -1338,7 +1328,6 @@ mod tests {
             super::super::panels::root_kind("git_commit"),
             Some(super::super::panels::RootKind::Git)
         );
-        assert_eq!(super::super::panels::root_kind("working_diff"), None);
     }
 
     #[test]
@@ -1367,19 +1356,17 @@ mod tests {
     }
 
     #[test]
-    fn restore_drops_removed_kinds_keeps_terminals_and_places_unplaced_tabs_in_the_focused_pane() {
+    fn restore_keeps_terminals_and_places_unplaced_tabs_in_the_focused_pane() {
         let terminal = PanelTarget::new("terminal", "srv", "ws", "/w").with_id("t");
-        let browser = PanelTarget::new("browser", "srv", "ws", "/w").with_id("b");
         let saved = json!({
             "version": 2,
-            "tabs": [agent("a").to_json(), agent("b").to_json(), terminal.to_json(), browser.to_json()],
-            "tree": {"kind": "pane", "id": "main", "tabs": [agent("a").key(), browser.key(), terminal.key()], "selected": browser.key()},
+            "tabs": [agent("a").to_json(), agent("b").to_json(), terminal.to_json()],
+            "tree": {"kind": "pane", "id": "main", "tabs": [agent("a").key(), terminal.key()], "selected": agent("a").key()},
             "sidebarWidth": 9999,
         });
         let layout = Layout::restore(&saved);
         assert_eq!(layout.tabs.len(), 3);
         assert!(layout.target(&terminal.key()).is_some());
-        assert!(layout.target(&browser.key()).is_none());
         let pane = layout.focused();
         assert_eq!(
             pane.tabs,

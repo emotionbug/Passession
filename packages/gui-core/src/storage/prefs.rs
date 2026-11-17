@@ -1,11 +1,9 @@
 //! The Flutter `SharedPreferences` values the native client keeps (`paseo.clientId`,
 //! `paseo.chat.drafts.v1`, `paseo.review.*`, `paseo.relayProtected.*`, `mobile.*`).
 //!
-//! The store is `shared_preferences.json` in the application-support directory, the exact
-//! file and `flutter.` key prefix `shared_preferences_linux`/`_windows` use, so existing desktop
-//! data is read and written in place. On macOS/iOS (NSUserDefaults plist) and Android
-//! (`FlutterSharedPreferences.xml`) the file is seeded once from the native store.
-use std::{collections::VecDeque, fs, path::Path};
+//! The store is `shared_preferences.json` in the application-support directory, using the
+//! `flutter.` key prefix and preserving unrelated plugin values.
+use std::{collections::VecDeque, fs};
 
 use serde_json::{Map, Value};
 
@@ -81,26 +79,10 @@ pub(crate) fn load(paths: &Paths) -> Prefs {
                 ..Prefs::default()
             },
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let imported = native::import(&paths.app).unwrap_or_default();
-            let (values, foreign) = split(imported);
-            let prefs = Prefs {
-                values,
-                foreign,
-                error: None,
-                writable: true,
-                writer: Writer::default(),
-            };
-            if !prefs.values.is_empty()
-                && let Err(error) = save(paths, &prefs.values, &prefs.foreign)
-            {
-                return Prefs {
-                    error: Some(error),
-                    ..prefs
-                };
-            }
-            prefs
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Prefs {
+            writable: true,
+            ..Prefs::default()
+        },
         Err(error) => Prefs {
             error: Some(io_error("Cannot read", &path, error)),
             writable: false,
@@ -130,64 +112,6 @@ pub(crate) fn stored_value(value: Value) -> Option<Value> {
         Value::Null => None,
         Value::Object(_) | Value::Array(_) => Some(Value::String(value.to_string())),
         scalar => Some(scalar),
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
-fn prefixed(map: Map<String, Value>) -> Map<String, Value> {
-    map.into_iter()
-        .filter(|(key, _)| key.starts_with(PREFIX))
-        .collect()
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-mod native {
-    use super::*;
-
-    /// NSUserDefaults of the Flutter app: `Library/Preferences/<bundle id>.plist` next to the
-    /// `Library/Application Support[/<bundle id>]` application-support directory.
-    pub(super) fn import(app: &Path) -> Option<Map<String, Value>> {
-        // iOS returns the container's bare `Application Support`; macOS appends the bundle id.
-        let bare = app.file_name().is_some_and(|n| n == "Application Support");
-        let support = if bare { app } else { app.parent()? };
-        let library = support.parent()?;
-        let bundle = if bare {
-            "sh.paseo.sessions".to_owned()
-        } else {
-            app.file_name()?.to_str()?.to_owned()
-        };
-        let path = library.join("Preferences").join(format!("{bundle}.plist"));
-        let bytes = fs::read(path).ok()?;
-        match super::super::bplist::parse(&bytes)? {
-            Value::Object(map) => Some(super::prefixed(map)),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(target_os = "android")]
-mod native {
-    use super::*;
-
-    /// `shared_preferences_android` legacy store: `<data dir>/shared_prefs/FlutterSharedPreferences.xml`
-    /// beside the `files` application-support directory.
-    pub(super) fn import(app: &Path) -> Option<Map<String, Value>> {
-        let path = app
-            .parent()?
-            .join("shared_prefs")
-            .join("FlutterSharedPreferences.xml");
-        let text = fs::read_to_string(path).ok()?;
-        Some(super::prefixed(super::super::android_xml::parse(&text)))
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
-mod native {
-    use super::*;
-
-    /// Linux and Windows already use `shared_preferences.json`; nothing to import.
-    pub(super) fn import(_app: &Path) -> Option<Map<String, Value>> {
-        None
     }
 }
 

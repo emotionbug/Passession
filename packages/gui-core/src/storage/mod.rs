@@ -1,10 +1,6 @@
 //! Flutter-compatible client state under the application-support directory
 //! (`app_store.dart` `_initialize`, `savePreferences`, `_mergeState`, replicas and per-window
 //! layouts). Everything here is blocking and runs on Tokio's blocking pool.
-#[cfg(any(target_os = "android", test))]
-mod android_xml;
-#[cfg(any(target_os = "macos", target_os = "ios", test))]
-mod bplist;
 pub(crate) mod prefs;
 
 use std::{
@@ -141,10 +137,7 @@ fn read_state(path: &Path) -> Result<Map<String, Value>, CoreError> {
         return Err(structure_error());
     };
     let wrong = |key: &str, ok: fn(&Value) -> bool| map.get(key).is_some_and(|v| !ok(v));
-    if wrong("preferences", Value::is_object)
-        || wrong("hosts", Value::is_array)
-        || wrong("layout", Value::is_object)
-    {
+    if wrong("preferences", Value::is_object) || wrong("hosts", Value::is_array) {
         return Err(structure_error());
     }
     Ok(map)
@@ -168,14 +161,11 @@ fn array(value: Option<&Value>) -> Vec<Value> {
     value.and_then(Value::as_array).cloned().unwrap_or_default()
 }
 
-/// Flutter `_hostRecords`: rows keyed by their active config id (legacy flat rows by `id`).
+/// Host rows keyed by their active config id.
 pub(crate) fn host_records(rows: &[Value]) -> Map<String, Value> {
     let mut records = Map::new();
     for row in rows {
-        let id = row["config"]["id"]
-            .as_str()
-            .or_else(|| row["id"].as_str())
-            .unwrap_or_default();
+        let id = row["config"]["id"].as_str().unwrap_or_default();
         records.insert(id.to_owned(), row.clone());
     }
     records
@@ -280,11 +270,7 @@ pub(crate) fn load(paths: &Paths) -> Loaded {
         let rows = array(loaded.retained.get("hosts"));
         loaded.saved_hosts = host_records(&rows);
         for row in rows {
-            let config = if row["config"].is_object() {
-                row["config"].clone()
-            } else {
-                row.clone()
-            };
+            let config = row["config"].clone();
             if !valid_config(&config) {
                 return Err(structure_error());
             }
@@ -317,13 +303,6 @@ pub(crate) fn load(paths: &Paths) -> Loaded {
             });
         }
         load_layouts(paths, &mut loaded);
-        if !loaded.layouts.contains_key(MAIN_WINDOW)
-            && let Some(layout @ Value::Object(_)) = loaded.retained.get("layout")
-        {
-            loaded
-                .layouts
-                .insert(MAIN_WINDOW.to_owned(), layout.clone());
-        }
         loaded.suppressed_routes = array(loaded.retained.get("suppressedRoutes"))
             .into_iter()
             .filter_map(|v| v.as_str().map(str::to_owned))

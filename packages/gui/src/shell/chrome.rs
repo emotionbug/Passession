@@ -108,17 +108,7 @@ pub fn title(state: &paseo_gui_core::CoreState, target: &PanelTarget) -> String 
             return title.to_string();
         }
     }
-    // Tabs saved by older builds stored the English default; show the localized one instead.
-    let legacy_default = matches!(target.kind.as_str(), "draft" | "new_tab")
-        && matches!(
-            target.title.as_deref(),
-            Some("Add project" | "New session" | "New Session")
-        );
-    if let Some(title) = target
-        .title
-        .as_deref()
-        .filter(|t| !t.is_empty() && !legacy_default)
-    {
+    if let Some(title) = target.title.as_deref().filter(|t| !t.is_empty()) {
         return title.to_string();
     }
     match target.kind.as_str() {

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Removed
+
+- Stop migrating, importing or cleaning up data and settings written by earlier releases. This breaks compatibility with state that 0.13.36 and earlier left behind:
+  - The app no longer imports preferences left by the retired Flutter app (macOS/iOS NSUserDefaults, Android `FlutterSharedPreferences.xml`), reads flat saved-host rows or a layout embedded in `state.json`, drops retired tab kinds from saved layouts, renames old English default titles, restores update records that hold only an operation ID, or falls back to `~/.local/share/paseo_sessions` on Linux.
+
 ### Fixed
 
 - Show the same name for a host everywhere. The sidebar replaced a saved label that only repeated the endpoint or server ID with the daemon's hostname, but Settings (including the host's overview), the chat subtitle, workspace creation and other views showed the stored label or server ID, so one host appeared under two names. All of them now use one rule: a custom label wins, otherwise the daemon's hostname; rename fields still edit the stored label.

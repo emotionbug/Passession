@@ -10,7 +10,6 @@ pub mod deep_link;
 mod facade;
 mod fonts;
 pub mod image;
-pub mod legacy_prefs;
 pub mod notification_policy;
 pub mod paths;
 mod platform;

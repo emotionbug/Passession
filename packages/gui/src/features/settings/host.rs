@@ -187,26 +187,23 @@ pub fn update_operation_key(server_id: &str) -> String {
     format!("paseo.daemonUpdate.operation.{server_id}")
 }
 
-/// The core keeps objects as their JSON text (Flutter key-value convention), so
-/// a string is a saved submit request when it parses to an object and an old
-/// ID-only record otherwise.
+/// The core keeps request objects as JSON text; in-memory object records are
+/// accepted as well.
 fn stored_update_record(state: &CoreState, server_id: &str) -> Option<Value> {
     let record = state.prefs.get(&update_operation_key(server_id))?;
-    if let Some(text) = record.as_str()
-        && let Ok(object @ Value::Object(_)) = serde_json::from_str(text)
-    {
-        return Some(object);
-    }
-    Some(record.clone())
+    let record = match record.as_str() {
+        Some(text) => serde_json::from_str::<Value>(text).ok()?,
+        None => record.clone(),
+    };
+    record.is_object().then_some(record)
 }
 
 /// The saved operation ID, or `None` when it is missing or not a UUID the
 /// daemon can observe (such a record can only fail; drop it).
 pub fn stored_update_operation(state: &CoreState, server_id: &str) -> Option<String> {
     let record = stored_update_record(state, server_id)?;
-    record
+    record["operationId"]
         .as_str()
-        .or_else(|| record["operationId"].as_str())
         .filter(|id| uuid::Uuid::parse_str(id.trim()).is_ok_and(|id| !id.is_nil()))
         .map(String::from)
 }
@@ -564,7 +561,7 @@ mod update_restore_tests {
     }
 
     #[test]
-    fn restores_exact_host_request_and_legacy_ids_without_cross_wiring() {
+    fn restores_exact_host_requests_without_cross_wiring() {
         let request = json!({"operationId":OP_A,"source":"release","targetKind":"app",
             "forceRunning":false,"idleTimeoutMs":300_000,
             "selectedComponents":["daemon","update-helper"],
@@ -572,8 +569,12 @@ mod update_restore_tests {
         let mut state = CoreState::default();
         let prefs = std::sync::Arc::make_mut(&mut state.prefs);
         prefs.insert(update_operation_key("host-a"), saved(&request));
-        prefs.insert(update_operation_key("host-b"), json!(OP_B));
-        prefs.insert(update_operation_key("host-d"), json!("op-d"));
+        let mut other_request = request.clone();
+        other_request["operationId"] = json!(OP_B);
+        prefs.insert(update_operation_key("host-b"), other_request.clone());
+        let mut unusable = request.clone();
+        unusable["operationId"] = json!("op-d");
+        prefs.insert(update_operation_key("host-d"), saved(&unusable));
         assert_eq!(
             stored_update_operation(&state, "host-a").as_deref(),
             Some(OP_A)
@@ -583,7 +584,7 @@ mod update_restore_tests {
             stored_update_operation(&state, "host-b").as_deref(),
             Some(OP_B)
         );
-        assert_eq!(stored_update_request(&state, "host-b"), None);
+        assert_eq!(stored_update_request(&state, "host-b"), Some(other_request));
         assert_eq!(stored_update_operation(&state, "host-c"), None);
         assert!(!has_unusable_update_record(&state, "host-c"));
         // A non-UUID ID can never be observed by the daemon: drop it.

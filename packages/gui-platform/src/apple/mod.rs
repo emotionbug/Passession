@@ -111,22 +111,6 @@ pub(crate) fn to_json(object: Id) -> Value {
     Value::Null
 }
 
-/// `NSUserDefaults.standardUserDefaults` values whose key starts with `prefix`
-/// (Flutter shared_preferences stores `flutter.<key>` there on Apple platforms).
-pub(crate) fn user_defaults_with_prefix(prefix: &str) -> Vec<(String, Value)> {
-    unsafe {
-        let defaults: Id = msg_send![class!(NSUserDefaults), standardUserDefaults];
-        let dictionary: Id = msg_send![defaults, dictionaryRepresentation];
-        match to_json(dictionary) {
-            Value::Object(map) => map
-                .into_iter()
-                .filter(|(key, _)| key.starts_with(prefix))
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-}
-
 /// Adds `imp` for `selector` to an existing class (no-op if it already has one).
 pub(crate) unsafe fn add_method(class_name: &CStr, selector: &CStr, imp: Imp, types: &str) {
     let Some(class) = AnyClass::get(class_name) else {
