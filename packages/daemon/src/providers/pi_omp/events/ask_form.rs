@@ -41,6 +41,8 @@ enum Stage {
 
 /// One named field, as OMP will ask it.
 struct Plan {
+    /// The field's `name`, which OMP reports its answer under.
+    name: String,
     title: String,
     header: String,
     question: String,
@@ -98,6 +100,48 @@ pub(super) enum Step {
 pub(super) enum Submitted {
     Reply(Value),
     Cancelled,
+}
+
+/// What an `ask` form asked, for the tool's record, in document order: the form's title, and
+/// the text of every field's question (the prose before it and its title), each followed by
+/// its answer once OMP reports one (`{name, question, answer}` per field), then the prose
+/// after the last field. `None` when the form has no named control.
+pub(super) fn record(html: &str, answers: &[Value]) -> Option<(String, String)> {
+    let form = AskForm::new("", html)?;
+    let answer = |entry: &Value| {
+        entry["answer"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("No selection")
+            .to_owned()
+    };
+    let mut parts: Vec<String> = form
+        .plans
+        .iter()
+        .map(
+            |plan| match answers.iter().find(|a| a["name"] == plan.name.as_str()) {
+                Some(entry) => format!("{}\n{}", plan.question, answer(entry)),
+                None => plan.question.clone(),
+            },
+        )
+        .collect();
+    parts.extend(form.trailing.iter().cloned());
+    // An answer OMP reports under a name this parse did not find is still part of the record.
+    for entry in answers {
+        if form
+            .plans
+            .iter()
+            .any(|plan| entry["name"] == plan.name.as_str())
+        {
+            continue;
+        }
+        let question = [&entry["question"], &entry["name"]]
+            .into_iter()
+            .find_map(|v| v.as_str().filter(|text| !text.trim().is_empty()))
+            .unwrap_or("Question");
+        parts.push(format!("{question}\n{}", answer(entry)));
+    }
+    Some((form.title, parts.join("\n\n")))
 }
 
 impl AskForm {
@@ -189,6 +233,7 @@ impl AskForm {
                 },
             };
             plans.push(Plan {
+                name: field.name.clone(),
                 question: lines.join("\n\n"),
                 title,
                 header,

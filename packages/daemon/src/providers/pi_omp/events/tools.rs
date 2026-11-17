@@ -101,10 +101,25 @@ pub fn tool_item(
             }
         }
     }
-    let detail = detail(family, name, &display_name, args, result);
+    let detail = detail(
+        family,
+        name,
+        &display_name,
+        args,
+        result,
+        status == "failed",
+    );
     json!({"type":"tool_call","callId":call_id,"name":display_name,"status":status,"detail":detail,"error":if status == "failed" {error.clone()} else {Value::Null}})
 }
-fn detail(family: &str, name: &str, display_name: &str, args: &Value, result: &Value) -> Value {
+/// `failed`: the result's text is the row's error, which the client shows beside the detail.
+fn detail(
+    family: &str,
+    name: &str,
+    display_name: &str,
+    args: &Value,
+    result: &Value,
+    failed: bool,
+) -> Value {
     let omp = family == "omp";
     let output = text(result);
     let details = &result["details"];
@@ -115,7 +130,7 @@ fn detail(family: &str, name: &str, display_name: &str, args: &Value, result: &V
         {
             let decoded =
                 serde_json::from_str::<Value>(string(&args["content"])).unwrap_or(Value::Null);
-            return detail(family, display_name, display_name, &decoded, result);
+            return detail(family, display_name, display_name, &decoded, result, failed);
         }
         match name {
             "task" => {
@@ -207,6 +222,21 @@ fn detail(family: &str, name: &str, display_name: &str, args: &Value, result: &V
             }
             "think" => return plain("Thinking", first(&[&args["thoughts"]])),
             "ask" | "ask_user" => {
+                // The record shows what was asked even when nothing was answered. A failed
+                // call's text (cancelled, interrupted) is the row's error, not a reply.
+                let reply = output.as_deref().filter(|_| !failed);
+                // One HTML form: every field's question, each followed by its answer.
+                if let Some((title, mut text)) = args["html"]
+                    .as_str()
+                    .and_then(|html| super::ask_form::record(html, array(&details["answers"])))
+                {
+                    if array(&details["answers"]).is_empty()
+                        && let Some(reply) = reply
+                    {
+                        text = format!("{text}\n\n{reply}");
+                    }
+                    return plain(&title, Some(&text));
+                }
                 let answers = details["results"]
                     .as_array()
                     .map(Vec::as_slice)
@@ -233,7 +263,7 @@ fn detail(family: &str, name: &str, display_name: &str, args: &Value, result: &V
                         ))
                     })
                     .collect();
-                // An HTML form answers `{name, question, answer}` per field.
+                // A form this parse found no field in still answers `{name, question, answer}`.
                 if lines.is_empty() {
                     lines = array(&details["answers"])
                         .iter()
@@ -253,8 +283,19 @@ fn detail(family: &str, name: &str, display_name: &str, args: &Value, result: &V
                     &args["title"],
                 ])
                 .unwrap_or("Question");
-                let answer_text = (!lines.is_empty()).then(|| lines.join("\n\n"));
-                return plain(label, answer_text.as_deref().or(output.as_deref()));
+                if !lines.is_empty() {
+                    return plain(label, Some(&lines.join("\n\n")));
+                }
+                let mut asked: Vec<&str> = array(&args["questions"])
+                    .iter()
+                    .filter_map(|q| first(&[&q["question"]]))
+                    .chain(first(&[&args["question"]]))
+                    .collect();
+                if asked.is_empty() {
+                    return plain(label, output.as_deref());
+                }
+                asked.extend(reply);
+                return plain(label, Some(&asked.join("\n\n")));
             }
             "eval" => return json!({"type":"unknown","input":args,"output":result}),
             _ if opaque(name) => {

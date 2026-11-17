@@ -541,6 +541,69 @@ fn completed_form_lists_each_answer() {
     );
 }
 
+#[test]
+fn record_shows_what_was_asked_with_or_without_an_answer() {
+    const STORE: &str = r#"<form><p>Sessions are lost on restart.</p><fieldset><legend>Session store</legend><label><input type="radio" name="store" value="sqlite"> SQLite</label><label><input type="radio" name="store" value="redis"> Redis</label></fieldset><label>Notes <input type="text" name="notes"></label><p>Applies after a restart.</p></form>"#;
+    const CANCELLED: &str = "Ask tool was cancelled by the user";
+    let text = |args: Value, status: &str, result: Value| {
+        let error = if status == "failed" {
+            json!(CANCELLED)
+        } else {
+            Value::Null
+        };
+        let item = tool_item("omp", "ask-1", "ask", &args, status, &result, &error);
+        assert_eq!(item["error"], error);
+        (
+            item["detail"]["label"].as_str().unwrap().to_owned(),
+            item["detail"]["text"].as_str().unwrap().to_owned(),
+        )
+    };
+    let cancelled = json!({"content":[{"type":"text","text":CANCELLED}],"details":{}});
+    let asked = "Sessions are lost on restart.\n\nSession store";
+
+    let form = json!({"html":STORE});
+    let answered = json!({"content":[{"type":"text","text":"User answers:\n{}"}],
+        "details":{"answers":[
+            {"name":"store","question":"Session store","answer":"Redis"},
+            {"name":"notes","question":"Notes","answer":""}]}});
+    assert_eq!(
+        text(form.clone(), "completed", answered),
+        (
+            "Session store".into(),
+            format!("{asked}\nRedis\n\nNotes\nNo selection\n\nApplies after a restart.")
+        )
+    );
+    // The pending and the cancelled record show the question; the cancellation is the error.
+    for (status, result) in [("running", Value::Null), ("failed", cancelled.clone())] {
+        assert_eq!(
+            text(form.clone(), status, result),
+            (
+                "Session store".into(),
+                format!("{asked}\n\nNotes\n\nApplies after a restart.")
+            ),
+            "{status}"
+        );
+    }
+
+    let questions = json!({"questions":[
+        {"id":"a","question":"Which store?","options":[{"label":"SQLite"},{"label":"Redis"}]},
+        {"id":"b","question":"Which region?","options":[{"label":"Seoul"}]}]});
+    assert_eq!(
+        text(questions.clone(), "failed", cancelled),
+        (
+            "Which store?".into(),
+            "Which store?\n\nWhich region?".into()
+        )
+    );
+    let results = json!({"content":[{"type":"text","text":"User answers"}],"details":{"results":[
+        {"id":"a","question":"Which store?","selectedOptions":["Redis"]},
+        {"id":"b","question":"Which region?","selectedOptions":[],"customInput":"Tokyo"}]}});
+    assert_eq!(
+        text(questions, "completed", results).1,
+        "Which store?\nRedis\n\nWhich region?\nTokyo"
+    );
+}
+
 /// Card answers for the forms in `omp_rpc_dialogs.json`: the form card's response, then the
 /// answers to any step-by-step cards.
 fn recorded_cases() -> [(&'static str, Value, Vec<Value>); 3] {
