@@ -21,6 +21,7 @@
 - Stop periodic app work while idle. Connection probes sleep until the next one is due, and unchanged Tailscale status no longer republishes the app state.
 - Enable only the Tokio features the daemon and client use instead of `full`.
 - Bound the memory of long conversations and stream replies with less work. Rows far from the viewport drop their parsed Markdown, paragraph layout and code highlighting, keeping at most 128 rows plus the visible ones, and rebuild them when scrolled back without moving the page; heights, expansion and selection are kept. While a reply streams, finished blocks and their laid-out paragraphs are reused and only the growing tail is parsed again, falling back to a full parse when earlier text could change (link references, raw HTML, an open code fence or an edit that is not an append).
+- Build the sidebar's project and session list only when a host's directory, a filter, the search or the held order changes, instead of re-sorting every project's sessions on each draw. Activity updates find the visible sessions they touch from that index.
 
 ### Fixed
 

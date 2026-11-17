@@ -3,7 +3,8 @@
 //! collapse state, row actions and the footer buttons.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Local, Utc};
 use makepad_widgets::*;
@@ -34,6 +35,7 @@ pub struct SidebarState {
     /// Session order per project key as last drawn; kept while the pointer is over the tree
     /// so rows do not move under it.
     pub held: HashMap<String, Vec<String>>,
+    presentation: PresentationCache,
     /// The session-switch modifier (Ctrl, ⌘ on macOS) is held alone: rows show 1–9 hints.
     pub modifier_held: bool,
     /// A host the footer's host picker chose: the next frame scrolls its row to the top.
@@ -265,107 +267,183 @@ pub fn needs_input(agent: &Value) -> bool {
     agent_live_status_bucket(agent) == StatusBucket::NeedsInput
 }
 
-/// `_sessions`: a project's non-archived top-level agents in workspaces the filters keep;
-/// sessions waiting on the user first, then newest activity, newest created, id.
-pub fn sessions<'a>(host: &Host<'a>, project: &Value, prefs: &Value) -> Vec<&'a Value> {
-    let project_id = j::text(project, "projectId");
-    let labels = label_filters(prefs);
-    let show_background = j::boolean(prefs, "showBackground", false);
-    let mut out: Vec<&Value> = host
-        .agents()
-        .filter(|agent| {
-            if !top_level(agent) {
-                return false;
-            }
-            let Some(workspace) = host.workspace(j::text(agent, "workspaceId")) else {
-                return false;
-            };
-            if j::text(workspace, "projectId") != project_id {
-                return false;
-            }
-            if !show_background && j::boolean(workspace, "background", false) {
-                return false;
-            }
-            workspace_matches_labels(workspace, &labels)
-        })
-        .collect();
-    out.sort_by(|a, b| {
-        needs_input(b)
-            .cmp(&needs_input(a))
-            .then_with(|| time_ms(b, "updatedAt").cmp(&time_ms(a, "updatedAt")))
-            .then_with(|| time_ms(b, "createdAt").cmp(&time_ms(a, "createdAt")))
-            .then_with(|| j::text(a, "id").cmp(j::text(b, "id")))
-    });
-    out
-}
-
-/// Keeps `rows` in the previously drawn order `held`; sessions that were not drawn then lead in
-/// their own order.
-pub fn hold_order(rows: &mut [&Value], held: &[String]) {
-    rows.sort_by_key(|agent| {
-        held.iter()
-            .position(|id| id == j::text(agent, "id"))
-            .map_or(0, |at| at + 1)
-    });
-}
-
 /// One project of the session tree as the sidebar lists it.
-pub struct ProjectGroup<'a> {
+pub struct ProjectGroup {
     pub project: Value,
     pub key: String,
     pub collapsed: bool,
     /// The search matches the project's name or path.
     pub matches: bool,
     /// Sessions the search keeps, in display order.
-    pub sessions: Vec<&'a Value>,
+    pub sessions: Vec<SessionRow>,
     /// Sessions waiting on the user, search aside (the collapsed row's badge).
     pub waiting: usize,
 }
 
 /// One host of the session tree, in sidebar order with the host/project filters applied.
-pub struct HostGroup<'a> {
-    pub host: Host<'a>,
+pub struct HostGroup {
+    pub server_id: String,
     pub collapsed: bool,
     pub matches: bool,
     /// The host lists any project (else the tree offers "Add project").
     pub has_projects: bool,
-    pub projects: Vec<ProjectGroup<'a>>,
+    pub projects: Vec<ProjectGroup>,
 }
 
-impl HostGroup<'_> {
+impl HostGroup {
     pub fn waiting(&self) -> usize {
         self.projects.iter().map(|p| p.waiting).sum()
     }
 }
 
-/// Whether a session row matches the sidebar search: title, provider, workspace name or branch.
-fn session_matches(host: &Host<'_>, agent: &Value, query: &str) -> bool {
-    let workspace = host.workspace(j::text(agent, "workspaceId"));
-    let name = workspace.map_or("", |w| j::text(w, "name"));
-    let branch = workspace.map_or("", |w| j::text(j::object(w, "gitRuntime"), "currentBranch"));
-    format!(
-        "{} {} {name} {branch}",
-        j::text(agent, "title"),
-        j::text(agent, "provider")
-    )
-    .to_lowercase()
-    .contains(query)
+pub struct SessionRow {
+    row: Arc<Value>,
+    updated_at: i64,
+    created_at: i64,
+    waiting: bool,
+}
+
+impl SessionRow {
+    fn agent(&self) -> &Value {
+        j::agent_of(&self.row)
+    }
+}
+
+#[derive(Default)]
+struct SessionTree {
+    hosts: Vec<HostGroup>,
+    visible: HashMap<String, HashSet<String>>,
+}
+
+impl SessionTree {
+    fn touches_activity(&self, changed: &HashSet<(String, String)>) -> bool {
+        changed
+            .iter()
+            .any(|(server, id)| self.visible.get(server).is_some_and(|ids| ids.contains(id)))
+    }
+}
+
+struct HostKey {
+    server_id: String,
+    directory_key: Option<u64>,
+    revision: Option<u64>,
+    label: String,
+    endpoint: String,
+    hostname: String,
+}
+
+impl HostKey {
+    fn matches(&self, state: &paseo_gui_core::CoreState, host: &Value) -> bool {
+        self.server_id == j::text(host, "serverId")
+            && self.directory_key == host.get("directoryKey").and_then(Value::as_u64)
+            && self.revision == state.directory(host).map(|directory| directory.revision)
+            && self.label == j::text(j::object(host, "config"), "label")
+            && self.endpoint == j::text(j::object(host, "config"), "endpoint")
+            && self.hostname == j::text(j::object(host, "serverInfo"), "hostname")
+    }
+}
+
+struct PresentationKey {
+    hosts: Vec<HostKey>,
+    navigation: Value,
+    query: String,
+    held: Option<HashMap<String, Vec<String>>>,
+}
+
+impl PresentationKey {
+    fn matches(
+        &self,
+        state: &paseo_gui_core::CoreState,
+        query: &str,
+        held: Option<&HashMap<String, Vec<String>>>,
+    ) -> bool {
+        let hosts = j::array(state, "hosts");
+        self.query == query
+            && self.held.as_ref() == held
+            && &self.navigation == j::object(j::object(state, "preferences"), "navigation")
+            && self.hosts.len() == hosts.len()
+            && self
+                .hosts
+                .iter()
+                .zip(hosts)
+                .all(|(key, host)| key.matches(state, host))
+    }
+
+    fn new(
+        state: &paseo_gui_core::CoreState,
+        query: &str,
+        held: Option<&HashMap<String, Vec<String>>>,
+    ) -> Self {
+        let hosts = j::array(state, "hosts")
+            .iter()
+            .map(|host| HostKey {
+                server_id: j::text(host, "serverId").to_string(),
+                directory_key: host.get("directoryKey").and_then(Value::as_u64),
+                revision: state.directory(host).map(|directory| directory.revision),
+                label: j::text(j::object(host, "config"), "label").to_string(),
+                endpoint: j::text(j::object(host, "config"), "endpoint").to_string(),
+                hostname: j::text(j::object(host, "serverInfo"), "hostname").to_string(),
+            })
+            .collect();
+        Self {
+            hosts,
+            navigation: nav_prefs(state),
+            query: query.to_string(),
+            held: held.cloned(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PresentationCache {
+    key: Option<PresentationKey>,
+    tree: Arc<SessionTree>,
+}
+
+impl PresentationCache {
+    fn tree(
+        &mut self,
+        state: &paseo_gui_core::CoreState,
+        query: &str,
+        held: Option<&HashMap<String, Vec<String>>>,
+    ) -> Arc<SessionTree> {
+        if !self
+            .key
+            .as_ref()
+            .is_some_and(|key| key.matches(state, query, held))
+        {
+            self.tree = Arc::new(session_tree(state, query, held));
+            self.key = Some(PresentationKey::new(state, query, held));
+        }
+        Arc::clone(&self.tree)
+    }
+}
+
+/// Activity-only publications cannot change search/filter/collapse membership. Query the
+/// last drawn model, not the new directory revision, until the recency draw is due.
+pub fn touches_visible_activity(
+    sidebar: &SidebarState,
+    changed: &HashSet<(String, String)>,
+) -> bool {
+    sidebar.presentation.tree.touches_activity(changed)
 }
 
 /// The sidebar's session tree: hosts in `hostOrder`, `ordered_projects`, `sessions`, with the
 /// host/project/label filters and the (lowercased) search applied. `held` keeps each project's
 /// drawn order. Search ignores collapse; terminal rows are the caller's.
-pub fn session_tree<'a>(
-    state: &'a paseo_gui_core::CoreState,
+fn session_tree(
+    state: &paseo_gui_core::CoreState,
     query: &str,
     held: Option<&HashMap<String, Vec<String>>>,
-) -> Vec<HostGroup<'a>> {
+) -> SessionTree {
     let prefs = nav_prefs(state);
     let collapsed = strings(&prefs, "collapsed");
     let host_order = strings(&prefs, "hostOrder");
     let project_order = strings(&prefs, "projectOrder");
     let hf = host_filters(state, &prefs);
     let pf = project_filters(state, &prefs);
+    let labels = label_filters(&prefs);
+    let show_background = j::boolean(&prefs, "showBackground", false);
     let mut all = hosts::hosts(state);
     all.sort_by_key(|h| {
         host_order
@@ -373,7 +451,7 @@ pub fn session_tree<'a>(
             .position(|id| id == h.server_id())
             .unwrap_or(host_order.len())
     });
-    let mut out = Vec::new();
+    let mut out = SessionTree::default();
     for host in all {
         let sid = host.server_id();
         if !hf.is_empty() && !hf.iter().any(|h| h == sid) {
@@ -382,6 +460,36 @@ pub fn session_tree<'a>(
         let label = host.display_label();
         let host_matches = label.to_lowercase().contains(query);
         let ordered = ordered_projects(&host, &project_order);
+        // Index eligible workspaces once, then partition the host's agents in one pass.
+        let workspaces: HashMap<&str, &Value> = host
+            .workspaces()
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|workspace| {
+                (show_background || !j::boolean(workspace, "background", false))
+                    && workspace_matches_labels(workspace, &labels)
+            })
+            .map(|workspace| (j::text(workspace, "id"), workspace))
+            .collect();
+        let mut by_project: HashMap<&str, Vec<SessionRow>> = HashMap::new();
+        for row in host.1.into_iter().flat_map(|directory| &directory.agents) {
+            let agent = j::agent_of(row);
+            if !top_level(agent) {
+                continue;
+            }
+            let Some(workspace) = workspaces.get(j::text(agent, "workspaceId")) else {
+                continue;
+            };
+            by_project
+                .entry(j::text(workspace, "projectId"))
+                .or_default()
+                .push(SessionRow {
+                    row: Arc::clone(row),
+                    updated_at: time_ms(agent, "updatedAt"),
+                    created_at: time_ms(agent, "createdAt"),
+                    waiting: needs_input(agent),
+                });
+        }
         let mut projects = Vec::new();
         for project in &ordered {
             let key = project_key(&host, project);
@@ -395,19 +503,40 @@ pub fn session_tree<'a>(
             )
             .to_lowercase()
             .contains(query);
-            let all_rows = sessions(&host, project, &prefs);
-            let waiting = all_rows.iter().filter(|a| needs_input(a)).count();
-            let mut rows: Vec<&Value> = all_rows
-                .into_iter()
-                .filter(|agent| {
-                    query.is_empty()
-                        || host_matches
-                        || matches
-                        || session_matches(&host, agent, query)
-                })
-                .collect();
+            let mut rows = by_project
+                .remove(j::text(project, "projectId"))
+                .unwrap_or_default();
+            let waiting = rows.iter().filter(|row| row.waiting).count();
+            rows.retain(|row| {
+                if query.is_empty() || host_matches || matches {
+                    return true;
+                }
+                let agent = row.agent();
+                let workspace = workspaces[j::text(agent, "workspaceId")];
+                format!(
+                    "{} {} {} {}",
+                    j::text(agent, "title"),
+                    j::text(agent, "provider"),
+                    j::text(workspace, "name"),
+                    j::text(j::object(workspace, "gitRuntime"), "currentBranch"),
+                )
+                .to_lowercase()
+                .contains(query)
+            });
+            rows.sort_by(|a, b| {
+                b.waiting
+                    .cmp(&a.waiting)
+                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+                    .then_with(|| j::text(a.agent(), "id").cmp(j::text(b.agent(), "id")))
+            });
             if let Some(order) = held.and_then(|held| held.get(&key)) {
-                hold_order(&mut rows, order);
+                let ranks: HashMap<&str, usize> = order
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| (id.as_str(), index + 1))
+                    .collect();
+                rows.sort_by_key(|row| ranks.get(j::text(row.agent(), "id")).copied().unwrap_or(0));
             }
             let collapsed = query.is_empty() && collapsed.contains(&key);
             projects.push(ProjectGroup {
@@ -420,8 +549,19 @@ pub fn session_tree<'a>(
             });
         }
         let collapsed = query.is_empty() && collapsed.iter().any(|c| *c == format!("host:{sid}"));
-        out.push(HostGroup {
-            host,
+        if !collapsed {
+            let visible = out.visible.entry(sid.to_string()).or_default();
+            for project in projects.iter().filter(|project| !project.collapsed) {
+                visible.extend(
+                    project
+                        .sessions
+                        .iter()
+                        .map(|row| j::text(row.agent(), "id").to_string()),
+                );
+            }
+        }
+        out.hosts.push(HostGroup {
+            server_id: sid.to_string(),
             collapsed,
             matches: host_matches,
             has_projects: !ordered.is_empty(),
@@ -440,7 +580,7 @@ pub fn navigation_sessions(
     include_collapsed: bool,
 ) -> Vec<(String, Value)> {
     let mut out = Vec::new();
-    for group in session_tree(state, query, held) {
+    for group in session_tree(state, query, held).hosts {
         if group.collapsed && !include_collapsed {
             continue;
         }
@@ -452,7 +592,7 @@ pub fn navigation_sessions(
                 project
                     .sessions
                     .iter()
-                    .map(|agent| (group.host.server_id().to_string(), (*agent).clone())),
+                    .map(|row| (group.server_id.clone(), row.agent().clone())),
             );
         }
     }
@@ -1090,7 +1230,11 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
     // While the pointer rests on the tree, rows keep the order they were drawn in.
     let holding = pointer_on_tree(shell.data.pointer.hover.as_deref());
     let held = std::mem::take(&mut shell.data.sidebar.held);
-    let tree = session_tree(state, &query, holding.then_some(&held));
+    let tree = shell
+        .data
+        .sidebar
+        .presentation
+        .tree(state, &query, holding.then_some(&held));
     let mut drawn_order: HashMap<String, Vec<String>> = HashMap::new();
     let selected = shell.data.layout.selected().cloned();
     let scroll = shell.data.sidebar.scroll;
@@ -1137,8 +1281,9 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
     let mut any = false;
     // Position in the session-switch order (Ctrl+1–9), counted like `navigation_sessions`.
     let mut nav_index = 0usize;
-    for host_group in &tree {
-        let host = &host_group.host;
+    for host_group in &tree.hosts {
+        let host = hosts::host(state, &host_group.server_id).expect("cached sidebar host");
+        let host = &host;
         let sid = host.server_id();
         let label = host.display_label();
         let host_matches = host_group.matches;
@@ -1170,7 +1315,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
                 project
                     .sessions
                     .iter()
-                    .map(|a| j::text(a, "id").to_string())
+                    .map(|row| j::text(row.agent(), "id").to_string())
                     .collect(),
             );
             blocks.push((project, terms));
@@ -1381,7 +1526,8 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
             if project.collapsed {
                 continue;
             }
-            for agent in &project.sessions {
+            for session in &project.sessions {
+                let agent = session.agent();
                 let index = nav_index;
                 nav_index += 1;
                 let row = rect(x0 + 48.0, y, w - 56.0, session_h);
@@ -2007,6 +2153,54 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_model_reuses_unchanged_inputs_and_rebuilds_on_directory_revision() {
+        let mut state = tree_state(json!({"collapsed": ["host:a", "project:b:q"]}));
+        let mut cache = PresentationCache::default();
+        let initial = cache.tree(&state, "", None);
+        assert!(Arc::ptr_eq(&initial, &cache.tree(&state, "", None)));
+        assert!(initial.touches_activity(&HashSet::from([("b".into(), "old".into())])));
+        assert!(!initial.touches_activity(&HashSet::from([
+            ("a".into(), "first".into()),
+            ("b".into(), "alpha".into()),
+        ])));
+
+        let directory = Arc::make_mut(Arc::make_mut(&mut state.directories).get_mut(&1).unwrap());
+        directory.revision += 1;
+        Arc::make_mut(&mut directory.agents[0])["updatedAt"] = "2027-01-01T00:00:00Z".into();
+        let updated = cache.tree(&state, "", None);
+        assert!(!Arc::ptr_eq(&initial, &updated));
+        assert!(Arc::ptr_eq(&updated, &cache.tree(&state, "", None)));
+        let project = updated
+            .hosts
+            .iter()
+            .find(|host| host.server_id == "b")
+            .unwrap()
+            .projects
+            .iter()
+            .find(|project| project.key == "project:b:p")
+            .unwrap();
+        let order: Vec<&str> = project
+            .sessions
+            .iter()
+            .map(|row| j::text(row.agent(), "id"))
+            .collect();
+        assert_eq!(order, ["asks", "old", "new"]);
+
+        state.value_mut()["preferences"]["navigation"]["collapsed"] = json!([]);
+        let expanded = cache.tree(&state, "", None);
+        assert!(!Arc::ptr_eq(&updated, &expanded));
+        assert!(expanded.touches_activity(&HashSet::from([("a".into(), "first".into())])));
+        let searched = cache.tree(&state, "alp", None);
+        assert!(!Arc::ptr_eq(&expanded, &searched));
+        assert!(searched.touches_activity(&HashSet::from([("b".into(), "alpha".into())])));
+        assert!(!searched.touches_activity(&HashSet::from([("b".into(), "old".into())])));
+        let held = HashMap::from([("project:b:p".to_string(), vec!["old".to_string()])]);
+        let holding = cache.tree(&state, "", Some(&held));
+        assert!(!Arc::ptr_eq(&searched, &holding));
+        assert!(Arc::ptr_eq(&holding, &cache.tree(&state, "", Some(&held))));
+    }
+
+    #[test]
     fn navigation_follows_sidebar_order_filters_and_collapse() {
         let state = tree_state(json!({"hostOrder": ["a", "b"]}));
         // Host order, project name order, waiting sessions pinned, then newest first.
@@ -2056,7 +2250,7 @@ mod tests {
     fn collapsed_groups_count_waiting_sessions() {
         let state = tree_state(json!({"collapsed": ["host:b"]}));
         let tree = session_tree(&state, "", None);
-        let b = tree.iter().find(|g| g.host.server_id() == "b").unwrap();
+        let b = tree.hosts.iter().find(|g| g.server_id == "b").unwrap();
         assert!(b.collapsed);
         assert_eq!(b.waiting(), 1);
         assert!(others_need_input(&state, None));

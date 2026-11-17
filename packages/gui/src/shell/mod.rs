@@ -589,18 +589,13 @@ impl PaseoShell {
         }
         ui.events = events;
         if published {
-            self.invalidate_for_state(cx, &ui.state_delta, &ui.state);
+            self.invalidate_for_state(cx, &ui.state_delta);
         }
     }
 
     /// Invalidate presenters, never the transport envelope. Chat does not display directory
     /// activity timestamps; the filtered sidebar and visible history own recency.
-    fn invalidate_for_state(
-        &mut self,
-        cx: &mut Cx,
-        delta: &StateDelta,
-        state: &paseo_gui_core::CoreState,
-    ) {
+    fn invalidate_for_state(&mut self, cx: &mut Cx, delta: &StateDelta) {
         if delta.is_empty() {
             return;
         }
@@ -615,24 +610,8 @@ impl PaseoShell {
             self.invalidate_region(cx, ShellRegion::Sessions);
         } else if !delta.agent_activity.is_empty() && !self.pages_covered() {
             if self.data.chrome.sidebar_rect.size.x > 0.0 {
-                let query = self.data.sidebar.query.trim().to_lowercase();
-                self.data.recency_sidebar |= sidebar::session_tree(state, &query, None)
-                    .iter()
-                    .filter(|group| !group.collapsed)
-                    .any(|group| {
-                        group
-                            .projects
-                            .iter()
-                            .filter(|project| !project.collapsed)
-                            .any(|project| {
-                                project.sessions.iter().any(|agent| {
-                                    delta.agent_activity.iter().any(|(server, id)| {
-                                        server == group.host.server_id()
-                                            && id == j::text(agent, "id")
-                                    })
-                                })
-                            })
-                    });
+                self.data.recency_sidebar |=
+                    sidebar::touches_visible_activity(&self.data.sidebar, &delta.agent_activity);
             }
             self.data.recency_sessions |= matches!(&self.data.page, Some(Page::Sessions { host_id, all_hosts, .. })
                 if *all_hosts || delta.agent_activity.iter().any(|(server, _)| server == host_id));
