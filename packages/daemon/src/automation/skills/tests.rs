@@ -13,7 +13,6 @@ fn fixture() -> Result<(tempfile::TempDir, Targets)> {
         roots: [
             temporary.path().join("agents/skills"),
             temporary.path().join("claude/skills"),
-            temporary.path().join("codex/skills"),
         ],
     };
     fs::create_dir_all(targets.source.join("paseo/references"))?;

@@ -40,8 +40,6 @@ impl Drop for Lease {
 }
 
 fn current_path(home: &Path) -> PathBuf {
-    // Legacy supervisors parse native-update.json on every worker start. The
-    // versioned operation store must not make the known-good rollback unbootable.
     home.join("native-update-operation.json")
 }
 
@@ -58,7 +56,7 @@ async fn load(path: &Path, home: &Path) -> Result<Option<Operation>> {
         .context("Invalid native update journal; original file is retained")?;
     ensure!(
         value["schemaVersion"] == 2,
-        "Native update journal requires legacy recovery before a new operation can be admitted"
+        "Unsupported native update journal schema"
     );
     let operation: Operation = serde_json::from_value(value)
         .context("Incomplete native update journal; original file is retained")?;
@@ -142,16 +140,6 @@ pub(super) async fn admit(operation: &mut Operation) -> Result<()> {
         }
     }
     save(operation).await
-}
-
-pub(super) async fn ensure_no_legacy_update(home: &Path) -> Result<()> {
-    match tokio::fs::symlink_metadata(home.join("native-update.json")).await {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-        Ok(_) => bail!(
-            "LEGACY_UPDATE_PENDING: native-update.json belongs to legacy recovery; its original bytes are retained"
-        ),
-    }
 }
 
 pub(super) async fn retained(home: &Path) -> Result<(Vec<String>, Vec<PathBuf>)> {

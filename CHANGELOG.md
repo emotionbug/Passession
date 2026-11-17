@@ -9,6 +9,7 @@
   - The daemon ignores the retired settings `daemon.allowedHosts` (use `daemon.hostnames`), `daemon.browserTools`, `features.webUi`, `features.dictation`, `features.voiceMode` and top-level `providers` instead of converting or removing them, no longer converts old provider command objects, and no longer loads agent records stored directly under `agents/` or version-1 worktree metadata.
   - A timeline checkpoint without the current SQLite tables, indexes and triggers is no longer upgraded. The daemon replaces it with an empty one and refills it from the provider's history; closed agents read it as having no checkpoint.
   - The daemon no longer deletes retired JSON timeline checkpoints and old-style log files at startup, reads retired OMP host-tool checkpoints, history rows without invocation provenance or old textual transcript locators, or retires Paseo-managed skill copies in `~/.codex/skills`.
+  - Updates ignore a `native-update.json` left by the pre-managed updater instead of refusing to start, and accept local runtimes only with current provenance. The `agent.skills.import_legacy_selection` request is removed.
 
 ### Fixed
 

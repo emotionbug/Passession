@@ -193,8 +193,7 @@ pub fn inbound(operation: &str) -> Option<&'static [&'static str]> {
         | "workspace.script.list.request"
         | "workspace_setup_status_request"
         | "workspace.setup.subscribe.request" => Some(&["workspace.read"]),
-        "agent.skills.import_legacy_selection.request"
-        | "agent.skills.reconcile.request"
+        "agent.skills.reconcile.request"
         | "agent.skills.save_selection.request"
         | "agent.skills.uninstall.request"
         | "daemon.config.reload.request"
@@ -438,8 +437,7 @@ pub fn outbound(operation: &str) -> Option<&'static [&'static str]> {
         | "workspace.script.stop.response"
         | "workspace.setup.run.response"
         | "write_project_config_response" => Some(&["workspace.write"]),
-        "agent.skills.import_legacy_selection.response"
-        | "agent.skills.reconcile.response"
+        "agent.skills.reconcile.response"
         | "agent.skills.save_selection.response"
         | "agent.skills.uninstall.response"
         | "daemon.config.reload.response"

@@ -1,7 +1,7 @@
 //! Managed native installations. A fixed control entry selects immutable runtime
 //! trees through `installation.json`; updates run in an executor outside the
 //! daemon process tree and switch runtimes only through the real launch owner.
-//! The operation journal (native-update.json) belongs to
+//! The operation journal (native-update-operation.json) belongs to
 //! `daemon_admin::update_operation`; the selection here is not a second journal.
 use super::{
     DaemonInstance, StopOptions, error, identity, lock, read_daemon_instance, same_daemon_instance,
@@ -27,8 +27,6 @@ const SELECTION: &str = "installation.json";
 const LEASE: &str = "installation.lock";
 /// Home-side pointer to the installation root (metadata only; no runtime files).
 const POINTER: &str = "native-installation.json";
-/// Path the legacy (pre-managed) updater and supervisor own. New code never writes it.
-const LEGACY_UPDATE_RECORD: &str = "native-update.json";
 /// Increase only when the launcher contract changes; ordinary updates keep the entry.
 /// 2: the control entry also forwards user commands to the active runtime.
 const CONTROL_PROTOCOL: u32 = 2;
@@ -1243,7 +1241,7 @@ impl Installation {
             let _ = fs::remove_dir(staging.parent().context("Missing staging directory")?);
         }
         let (platform, arch) = host_platform()?;
-        let legacy = RuntimeIdentity {
+        let unmarked = RuntimeIdentity {
             root: destination.clone(),
             version: owner.version.clone(),
             source_sha: owner.source_sha.clone(),
@@ -1254,7 +1252,7 @@ impl Installation {
             tree_digest: digest.clone(),
         };
         // Accept marker provenance only when it is a strict standalone runtime
-        // describing exactly the running image; never a desktop/legacy marker.
+        // describing exactly the running image; a desktop-bundled daemon has none.
         let active = match crate::daemon_admin::updater::inspect_runtime(&destination).await {
             Ok(identity)
                 if identity.tree_digest == digest
@@ -1266,7 +1264,7 @@ impl Installation {
                     ..identity
                 }
             }
-            _ => legacy,
+            _ => unmarked,
         };
         let mut selection = Selection {
             schema_version: 1,
@@ -1918,49 +1916,6 @@ pub(crate) async fn restore_service(
     Ok(())
 }
 
-/// Legacy runtimes (pre-managed supervisors) read `home/native-update.json` as
-/// their own transaction on every worker readiness and abort on anything else.
-/// The v2 operation store must therefore live elsewhere; this rejects a start
-/// that would hand a legacy runtime a file it cannot parse. A genuine legacy
-/// record is left for that legacy supervisor's own recovery, never rewritten.
-pub(crate) fn assert_legacy_bootable(home: &Path) -> Result<()> {
-    let path = home.join(LEGACY_UPDATE_RECORD);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let legacy = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .is_some_and(|record| legacy_transaction_shape(&record));
-    if !legacy {
-        return Err(error(
-            "LEGACY_BOOT_BLOCKED",
-            format!(
-                "{} is not a legacy update transaction; a legacy runtime cannot start while it exists",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn legacy_transaction_shape(record: &Value) -> bool {
-    record.get("schemaVersion").is_none()
-        && [
-            "target",
-            "staged",
-            "backup",
-            "directory",
-            "originalDigest",
-            "newDigest",
-            "version",
-            "sourceSha",
-        ]
-        .iter()
-        .all(|key| record.get(key).is_some_and(Value::is_string))
-}
-
 /// Starts the daemon through its launch owner. A service owner is only ever
 /// started by its service manager, never as an unmanaged standalone daemon.
 pub(crate) async fn start_owner(
@@ -1968,9 +1923,6 @@ pub(crate) async fn start_owner(
     owner: &LaunchOwner,
     deadline: Duration,
 ) -> Result<()> {
-    // Every runtime may be legacy (the adopted known-good runtime is); never start
-    // one into a guaranteed readiness rejection.
-    assert_legacy_bootable(&owner.home)?;
     match &owner.service {
         Some(service) => {
             systemctl(
@@ -3156,38 +3108,6 @@ mod tests {
                 "ExecStart=\"/i/b in/paseo\" __launcher --home \"/h/100%%$$x\""
             ]
         );
-    }
-
-    #[test]
-    fn legacy_runtime_start_is_refused_while_a_v2_record_occupies_its_path() {
-        let home = tempfile::tempdir().unwrap();
-        assert!(assert_legacy_bootable(home.path()).is_ok());
-        let record = home.path().join(LEGACY_UPDATE_RECORD);
-        fs::write(
-            &record,
-            br#"{"schemaVersion":2,"operationId":"op","phase":"staged"}"#,
-        )
-        .unwrap();
-        let refused = assert_legacy_bootable(home.path()).unwrap_err();
-        assert_eq!(
-            refused
-                .downcast_ref::<super::super::DaemonInstanceError>()
-                .unwrap()
-                .code,
-            "LEGACY_BOOT_BLOCKED"
-        );
-        fs::write(&record, b"not json").unwrap();
-        assert!(assert_legacy_bootable(home.path()).is_err());
-        // A genuine legacy transaction is left for the legacy supervisor itself.
-        fs::write(
-            &record,
-            serde_json::to_vec(&json!({"target":"/r","staged":"/s","backup":"/b","directory":"/d",
-                "originalDigest":"o","newDigest":"n","version":"1.0.0","sourceSha":"x","committed":false}))
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(assert_legacy_bootable(home.path()).is_ok());
-        assert!(record.exists());
     }
 
     #[test]

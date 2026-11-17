@@ -334,7 +334,6 @@ async fn disconnected_status_reads_same_operation_and_blocks_standalone_until_te
     store(home.path(), "status.json", &failed).await;
     assert!(ensure_no_active(home.path()).await.is_err());
     assert!(!home.path().join("native-update-operation.json").exists());
-    assert!(!home.path().join("native-update.json").exists());
 }
 
 #[cfg(unix)]

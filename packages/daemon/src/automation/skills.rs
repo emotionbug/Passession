@@ -51,9 +51,6 @@ impl SkillsService {
                 selection: files::selection(&message["selection"]),
                 confirmed: files::names(&message["confirmedRemovals"]),
             },
-            "agent.skills.import_legacy_selection.request" => {
-                Operation::Import(files::selection(&message["selection"]))
-            }
             _ => return Ok(false),
         };
         let mut payload = self.execute(operation).await?;
@@ -69,17 +66,6 @@ impl SkillsService {
             let _guard = queue.lock().await;
             let configured = app.config.mutable_snapshot();
             let previous = files::selection(&configured["skills"]["selection"]);
-            if let Operation::Import(next) = operation {
-                if configured
-                    .get("skills")
-                    .and_then(|v| v.get("selection"))
-                    .is_some()
-                {
-                    return Ok(json!({"imported":false,"selection":previous}));
-                }
-                app.config.set_agent_skill_selection(next.clone()).await?;
-                return Ok(json!({"imported":true,"selection":next}));
-            }
             let targets = targets(&app);
             let recovery_targets = targets.clone();
             let committed = previous.clone();
@@ -128,7 +114,6 @@ enum Operation {
         selection: Value,
         confirmed: Vec<String>,
     },
-    Import(Value),
 }
 
 async fn blocking<T: Send + 'static>(
@@ -162,7 +147,6 @@ fn targets(app: &AppState) -> Targets {
         roots: [
             app.user_home.join(".agents/skills"),
             app.user_home.join(".claude/skills"),
-            app.user_home.join(".codex/skills"),
         ],
     }
 }

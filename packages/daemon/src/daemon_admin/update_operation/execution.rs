@@ -122,7 +122,6 @@ async fn activate(
         operation.phase = Phase::Draining;
         journal::save(operation).await?;
         drain(operation).await?;
-        journal::ensure_no_legacy_update(&operation.home).await?;
         // This durable intent precedes every action that can stop the old owner.
         operation.phase = Phase::Activating;
         journal::save(operation).await?;
@@ -136,7 +135,6 @@ async fn activate(
         .is_some_and(|trial| trial.operation_id == operation.operation_id);
     if !trial_selected {
         managed::stop_owner(installation, &operation.launch_owner, STOP_DEADLINE).await?;
-        journal::ensure_no_legacy_update(&operation.home).await?;
         managed::bind_service(installation, lease, &operation.launch_owner).await?;
         installation
             .select_trial(lease, &operation.operation_id, &candidate)
@@ -288,7 +286,6 @@ pub async fn execute(home: &Path, operation_id: &str) -> Result<i32> {
     operation.executor = Some(serde_json::to_value(managed::executor_identity()?)?);
     journal::save(&mut operation).await?;
     let result = async {
-        journal::ensure_no_legacy_update(&home).await?;
         match operation.phase {
             Phase::Admitted | Phase::Preparing => {
                 stage(&mut operation, &installation, &lease).await?

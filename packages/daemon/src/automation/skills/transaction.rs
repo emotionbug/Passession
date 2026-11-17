@@ -378,7 +378,7 @@ fn valid_selection(value: &Value) -> bool {
 }
 
 fn valid_entries(targets: &Targets, transaction: &Path, manifest: &Manifest) -> Result<bool> {
-    let names = files::managed(targets)?;
+    let names = files::available(targets)?;
     for entry in &manifest.entries {
         let Some(index) = targets
             .roots

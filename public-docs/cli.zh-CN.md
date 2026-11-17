@@ -358,7 +358,7 @@ paseo daemon update wait <operation-id> --home ~/paseo-test
 
 `--resume-agent` 与 `--continuation-file` 指定一个现有 Agent 以及更新提交后它收到的消息。文件在提交前读取，之后修改不会生效。`--idle-timeout <duration>`（默认 `5m`）限定等待其他运行中轮次的时间；超时后保留当前 daemon，操作以忙碌结果结束。`--force-running` 则会中断这些轮次。更新排空 daemon 期间会拒绝新消息和新建 Agent；停止 Agent、关闭项目和回应权限请求仍然可用。支持该功能的已连接应用会在此期间显示维护提示。
 
-`status` 读取主目录中的操作记录（`native-update-operation.json`），daemon 停止时也可用。旧版更新器留下的记录（`native-update.json`）既不会被转换也不会被修改，并会阻止新的更新。`wait` 只做观察；中断它不会取消更新。`phase` 为 `committed`、`rolled_back` 或 `failed` 才是更新结果，`wait` 仅在 `committed` 时以 0 退出。`continuation.state`（`pending`、`accepted`、`not_delivered`、`unknown`、`failed`）单独报告：未确认的会话恢复不会撤销已提交的更新；消息回执证明送达后，之后的 `status` 可能把 `unknown` 显示为 `accepted`，且不会再次发送。
+`status` 读取主目录中的操作记录（`native-update-operation.json`），daemon 停止时也可用。旧版更新器留下的记录（`native-update.json`）会被忽略。`wait` 只做观察；中断它不会取消更新。`phase` 为 `committed`、`rolled_back` 或 `failed` 才是更新结果，`wait` 仅在 `committed` 时以 0 退出。`continuation.state`（`pending`、`accepted`、`not_delivered`、`unknown`、`failed`）单独报告：未确认的会话恢复不会撤销已提交的更新；消息回执证明送达后，之后的 `status` 可能把 `unknown` 显示为 `accepted`，且不会再次发送。
 
 `--from` 和 `--continuation-file` 需要本地 `--home`。使用 `--host` 时，`update` 只能通过声明 `durableDaemonUpdates` 的 daemon 安装官方发布版，`status`/`wait` 远程查询；确认丢失时会用同一操作 ID 重试。
 

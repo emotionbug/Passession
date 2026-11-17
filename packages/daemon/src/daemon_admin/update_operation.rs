@@ -15,7 +15,6 @@ pub(crate) use execution::{execute, recover_bootstrap};
 pub(crate) use journal::Lease as AdmissionLease;
 
 pub(crate) async fn ensure_app_cutover_allowed(home: &Path) -> Result<()> {
-    journal::ensure_no_legacy_update(home).await?;
     if journal::current(home)
         .await?
         .is_some_and(|operation| !operation.terminal())

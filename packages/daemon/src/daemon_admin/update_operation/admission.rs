@@ -37,7 +37,6 @@ pub async fn submit(
         .context("Daemon home does not exist")?;
     let _admission = journal::Lease::acquire(&home, "admission")?;
     let _desktop_cutover = journal::Lease::acquire(&home, "desktop-cutover")?;
-    journal::ensure_no_legacy_update(&home).await?;
     super::super::desktop_update::ensure_no_active(&home).await?;
     let digest = match &mut request.source {
         UpdateSource::Local(source) => {

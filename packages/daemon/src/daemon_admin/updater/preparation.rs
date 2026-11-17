@@ -742,7 +742,10 @@ fn claimed_identity(root: &Path, expected: Option<&str>) -> Result<Claimed> {
     } else if !matches!(provenance["profile"].as_str(), Some("release" | "debug"))
         || !provenance["channel"].is_null()
         || !provenance["repository"].is_null()
-        || !matches!(provenance["sourceDirty"], Value::Bool(_) | Value::Null)
+        || !matches!(
+            provenance.get("sourceDirty"),
+            Some(Value::Bool(_) | Value::Null)
+        )
     {
         bail!("Local runtime provenance must describe a local build without release identity")
     }

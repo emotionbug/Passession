@@ -10,17 +10,11 @@ use std::{
 };
 
 pub(super) const MANAGED: &str = ".paseo-managed-files.json";
-const LEGACY: [&str; 4] = [
-    "paseo-chat",
-    "paseo-epic",
-    "paseo-orchestrate",
-    "paseo-orchestrator",
-];
 
 #[derive(Clone)]
 pub(super) struct Targets {
     pub source: PathBuf,
-    pub roots: [PathBuf; 3],
+    pub roots: [PathBuf; 2],
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -92,17 +86,6 @@ pub(super) fn available(targets: &Targets) -> Result<Vec<String>> {
     Ok(result)
 }
 
-pub(super) fn managed(targets: &Targets) -> Result<Vec<String>> {
-    Ok(managed_names(available(targets)?))
-}
-
-fn managed_names(mut result: Vec<String>) -> Vec<String> {
-    result.extend(LEGACY.into_iter().map(str::to_owned));
-    result.sort_by(|a, b| compare_names(a, b));
-    result.dedup();
-    result
-}
-
 pub(super) fn list_files(root: &Path, include_manifest: bool) -> Result<Vec<PathBuf>> {
     fn walk(
         root: &Path,
@@ -146,15 +129,6 @@ fn hash_dir(path: &Path) -> Result<Option<BTreeMap<PathBuf, String>>> {
     Ok(Some(result))
 }
 
-pub(super) fn legacy_copy(targets: &Targets, name: &str) -> bool {
-    let Ok(codex) = fs::canonicalize(targets.roots[2].join(name)) else {
-        return true;
-    };
-    !targets.roots[..2]
-        .iter()
-        .any(|root| fs::canonicalize(root.join(name)).ok().as_ref() == Some(&codex))
-}
-
 pub(super) fn manifest(root: &Path) -> Option<Map<String, Value>> {
     let value: Value = serde_json::from_slice(&fs::read(root.join(MANAGED)).ok()?).ok()?;
     if value["version"] != 1 {
@@ -165,7 +139,6 @@ pub(super) fn manifest(root: &Path) -> Option<Map<String, Value>> {
 
 pub(super) fn status(targets: &Targets, selection: &Value) -> Result<Status> {
     let available = available(targets)?;
-    let names = managed_names(available.clone());
     let chosen: BTreeSet<&str> = selection["skills"]
         .as_array()
         .into_iter()
@@ -175,14 +148,9 @@ pub(super) fn status(targets: &Targets, selection: &Value) -> Result<Status> {
     let all = selection["mode"] == "all";
     let mut ops = Vec::new();
     let mut installed = Vec::new();
-    for name in &names {
-        let desired = available.contains(name) && (all || chosen.contains(name.as_str()));
-        let bundle = if available.contains(name) {
-            hash_dir(&targets.source.join(name))?
-        } else {
-            None
-        };
-        let bundle = bundle.filter(|_| desired);
+    for name in &available {
+        let desired = all || chosen.contains(name.as_str());
+        let bundle = hash_dir(&targets.source.join(name))?.filter(|_| desired);
         let disks = targets
             .roots
             .iter()
@@ -191,10 +159,10 @@ pub(super) fn status(targets: &Targets, selection: &Value) -> Result<Status> {
         if disks.iter().any(Option::is_some) {
             installed.push(name.clone());
         }
-        let mut kind = if let Some(bundle) = bundle {
-            if disks[..2].iter().any(Option::is_none) {
+        let kind = if let Some(bundle) = bundle {
+            if disks.iter().any(Option::is_none) {
                 Some("add")
-            } else if disks[..2]
+            } else if disks
                 .iter()
                 .flatten()
                 .any(|disk| bundle.iter().any(|(rel, sha)| disk.get(rel) != Some(sha)))
@@ -203,18 +171,11 @@ pub(super) fn status(targets: &Targets, selection: &Value) -> Result<Status> {
             } else {
                 None
             }
-        } else if disks[..2].iter().any(Option::is_some) {
+        } else if disks.iter().any(Option::is_some) {
             Some("delete")
         } else {
             None
         };
-        if kind.is_none() && disks[2].is_some() && legacy_copy(targets, name) {
-            if !desired {
-                kind = Some("delete");
-            } else if manifest(&targets.roots[2].join(name)).is_some() {
-                kind = Some("update");
-            }
-        }
         if let Some(kind) = kind {
             ops.push(Op {
                 kind: kind.into(),
@@ -389,49 +350,14 @@ fn sync_directory(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn retire(target: &Path) -> Result<()> {
-    if !metadata(target)?.is_some_and(|m| m.is_dir()) {
-        return Ok(());
-    }
-    let Some(previous) = manifest(target) else {
-        return Ok(());
-    };
-    safe_paths(
-        target,
-        std::iter::once(PathBuf::from(MANAGED)).chain(previous.keys().map(PathBuf::from)),
-    )?;
-    let mut removed = Vec::new();
-    for (rel, old_hash) in previous {
-        let Some(previous_hash) = old_hash.as_str() else {
-            continue;
-        };
-        if hash(&target.join(&rel)).ok().as_deref() != Some(previous_hash) {
-            continue;
-        }
-        fs::remove_file(target.join(&rel))?;
-        removed.push(PathBuf::from(rel));
-    }
-    prune(target, &removed);
-    fs::remove_file(target.join(MANAGED))?;
-    match fs::remove_dir(target) {
-        Ok(()) => {}
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty) => {}
-        Err(e) => return Err(e.into()),
-    }
-    Ok(())
-}
-
 pub(super) fn apply(targets: &Targets, selection: &Value, ops: &[Op]) -> Result<Status> {
     for op in ops.iter().filter(|op| op.kind != "delete") {
         let source = targets.source.join(&op.name);
         if !source.is_dir() {
             continue;
         }
-        for root in &targets.roots[..2] {
+        for root in &targets.roots {
             sync_directory(&source, &root.join(&op.name))?;
-        }
-        if legacy_copy(targets, &op.name) {
-            retire(&targets.roots[2].join(&op.name))?;
         }
     }
     for op in ops.iter().filter(|op| op.kind == "delete") {
@@ -443,7 +369,7 @@ pub(super) fn apply(targets: &Targets, selection: &Value, ops: &[Op]) -> Result<
 }
 
 pub(super) fn uninstall(targets: &Targets, selection: &Value) -> Result<Status> {
-    for name in managed(targets)? {
+    for name in available(targets)? {
         for root in &targets.roots {
             remove(&root.join(&name))?;
         }

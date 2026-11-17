@@ -131,7 +131,6 @@ operations! {
     reconcile_agent_skills => ("agent.skills.reconcile.request", "agent.skills.reconcile.response"),
     uninstall_agent_skills => ("agent.skills.uninstall.request", "agent.skills.uninstall.response"),
     save_agent_skills_selection => ("agent.skills.save_selection.request", "agent.skills.save_selection.response"),
-    import_legacy_agent_skills_selection => ("agent.skills.import_legacy_selection.request", "agent.skills.import_legacy_selection.response"),
     install_directory_plugin => ("plugin.directory.install.request", "plugin.directory.install.response"),
     install_plugin_source => ("plugin.source.install.request", "plugin.source.install.response"),
     get_plugin_source_status => ("plugin.source.status.request", "plugin.source.status.response"),

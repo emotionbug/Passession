@@ -65,12 +65,12 @@ fn fixture(home: &Path) -> Operation {
 }
 
 #[test]
-fn release_pin_preserves_legacy_journals_and_changes_retry_fingerprint() -> Result<()> {
-    let legacy = json!({"operationId":uuid::Uuid::new_v4().to_string(),
+fn release_pin_preserves_unpinned_requests_and_changes_retry_fingerprint() -> Result<()> {
+    let unpinned_request = json!({"operationId":uuid::Uuid::new_v4().to_string(),
         "source":{"kind":"release"},"resume":null,"idleTimeoutMs":300000,"forceRunning":false});
-    let mut request: SubmitRequest = serde_json::from_value(legacy.clone())?;
+    let mut request: SubmitRequest = serde_json::from_value(unpinned_request.clone())?;
     assert!(request.expected_release.is_none());
-    assert_eq!(serde_json::to_value(&request)?, legacy);
+    assert_eq!(serde_json::to_value(&request)?, unpinned_request);
     let unpinned = crate::json::fingerprint(&json!({"request":request,"inputDigest":null}))?;
     request.expected_release = Some(super::super::updater::ReleaseIdentity {
         version: "2.0.0".into(),
@@ -121,7 +121,6 @@ async fn journal_preserves_current_admission_and_archived_results_offline() -> R
         status(home.path(), &second.operation_id).await?["phase"],
         "admitted"
     );
-    assert!(!home.path().join("native-update.json").exists());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -133,18 +132,6 @@ async fn journal_preserves_current_admission_and_archived_results_offline() -> R
             0o600
         );
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn legacy_recovery_is_never_overwritten_by_the_new_engine() -> Result<()> {
-    let home = tempfile::tempdir()?;
-    let path = home.path().join("native-update.json");
-    let original = b"legacy or damaged transaction bytes";
-    std::fs::write(&path, original)?;
-    assert!(journal::ensure_no_legacy_update(home.path()).await.is_err());
-    assert_eq!(std::fs::read(&path)?, original);
-    assert!(!home.path().join("native-update-operation.json").exists());
     Ok(())
 }
 
