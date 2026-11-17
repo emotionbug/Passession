@@ -181,7 +181,7 @@ impl SchedulesPanel {
             let req = Req::List {
                 generation: self.generation,
                 host_id: host.id().to_owned(),
-                label: host.label(),
+                label: host.display_label(),
             };
             self.pending.send_typed(
                 &ctx.core,
@@ -513,7 +513,7 @@ impl SchedulesPanel {
         if view.wa_button(id!(host_filter)).clicked(actions) {
             let mut options = vec![SelectOption::new("", l("All hosts")).glyph("server")];
             options.extend(host::hosts(&ctx.state).iter().map(|h| {
-                SelectOption::new(h.id(), h.label()).leading(Leading::Status(h.status()))
+                SelectOption::new(h.id(), h.display_label()).leading(Leading::Status(h.status()))
             }));
             view.wa_select(id!(select)).open(
                 cx,
@@ -740,7 +740,7 @@ impl SchedulesPanel {
                     } else {
                         "workspace.schedules.hostOffline"
                     };
-                    ta(key, &[("host", &h.label())])
+                    ta(key, &[("host", &h.display_label())])
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -806,7 +806,7 @@ impl SchedulesPanel {
             let label = hosts
                 .iter()
                 .find(|h| h.id() == selected_host)
-                .map(|h| h.label())
+                .map(|h| h.display_label())
                 .unwrap_or_else(|| l("All hosts").to_owned());
             host_filter.set_text(cx, &label);
             let status = hosts

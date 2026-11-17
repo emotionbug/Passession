@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Show the same name for a host everywhere. The sidebar replaced a saved label that only repeated the endpoint or server ID with the daemon's hostname, but Settings (including the host's overview), the chat subtitle, workspace creation and other views showed the stored label or server ID, so one host appeared under two names. All of them now use one rule: a custom label wins, otherwise the daemon's hostname; rename fields still edit the stored label.
+
 ## 0.13.36 - 2026-11-17
 
 ### Added

@@ -455,7 +455,7 @@ pub fn draw_connections_page(ui: &mut Ui, s: &Settings, _v: &View, host: &HostVi
         ui.row(row(t("settingsNative.noConnections")).one_line());
     }
     let (seed_label, seed_server, seed_color) = (
-        host.label.clone(),
+        str_of(&host.config, "label").to_owned(),
         host.server_id.clone(),
         host.config.get("color").cloned().unwrap_or(Value::Null),
     );

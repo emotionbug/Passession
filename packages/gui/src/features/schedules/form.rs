@@ -874,7 +874,10 @@ impl WaScheduleEditor {
         if view.wa_button(id!(host)).clicked(actions) && !self.editing {
             let options = host::hosts(&ctx.state)
                 .iter()
-                .map(|h| SelectOption::new(h.id(), h.label()).leading(Leading::Status(h.status())))
+                .map(|h| {
+                    SelectOption::new(h.id(), h.display_label())
+                        .leading(Leading::Status(h.status()))
+                })
                 .collect();
             self.open_select(
                 cx,
@@ -1054,7 +1057,10 @@ impl WaScheduleEditor {
         let host_field = field(id!(host_field), l("Host"), show_host, cx);
         show_hint(&host_field, &self.required_hint(ctx, "host"), true, cx);
         if show_host {
-            let label = self.host(ctx).map(|h| h.label()).or(self.server_id.clone());
+            let label = self
+                .host(ctx)
+                .map(|h| h.display_label())
+                .or(self.server_id.clone());
             let button = view.wa_button(id!(host));
             set_field(cx, &button, label.as_deref(), l("Select host"));
             button.set_enabled(cx, !self.editing);

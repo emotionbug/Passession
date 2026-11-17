@@ -3527,7 +3527,10 @@ fn host_action(
         "remove" => confirm(
             shell,
             cx,
-            &tr_args("shell.commands.removeHostTitle", &[("host", &host.label())]),
+            &tr_args(
+                "shell.commands.removeHostTitle",
+                &[("host", &host.display_label())],
+            ),
             &tr("shell.commands.removeHostMessage"),
             &tr("sidebar.project.confirmations.removeConfirm"),
             true,
@@ -3711,7 +3714,7 @@ fn project_action(
                 cx,
                 &tr_args(
                     "shell.commands.removeProjectTitle",
-                    &[("host", &host.label())],
+                    &[("host", &host.display_label())],
                 ),
                 &tr_args(
                     "shell.commands.removeProjectMessage",

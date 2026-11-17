@@ -103,11 +103,7 @@ pub fn hosts(state: &CoreState) -> Vec<HostView> {
         .find(|id| !id.is_empty())
         .unwrap_or("")
         .to_string();
-        let label = [str_of(entry, "label"), str_of(&config, "label")]
-            .into_iter()
-            .find(|l| !l.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| server_id.clone());
+        let label = crate::common::host_display_name(entry).to_owned();
         let server_info = entry
             .get("serverInfo")
             .or_else(|| entry.get("server_info"))
@@ -148,6 +144,33 @@ pub fn hosts(state: &CoreState) -> Vec<HostView> {
     }
     local.extend(remote);
     local
+}
+
+#[test]
+fn sidebar_and_settings_share_host_display_names() {
+    let endpoint = "ws://192.0.2.10:6767";
+    for (stored_label, expected) in [
+        ("", "emotionbug-ubuntu"),
+        ("server-a", "emotionbug-ubuntu"),
+        (endpoint, "emotionbug-ubuntu"),
+        ("192.0.2.10:6767", "emotionbug-ubuntu"),
+        ("192.0.2.10", "emotionbug-ubuntu"),
+        ("My workstation", "My workstation"),
+    ] {
+        let state = CoreState::new(json!({"hosts": [{
+            "serverId": "server-a",
+            "status": "connected",
+            "config": {"label": stored_label, "endpoint": endpoint},
+            "serverInfo": {"hostname": "emotionbug-ubuntu"}
+        }]}));
+        let sidebar = crate::shell::hosts::hosts(&state);
+        let settings = hosts(&state);
+        let workspace = crate::features::workspace::host::hosts(&state);
+        assert_eq!(sidebar[0].display_label(), expected);
+        assert_eq!(settings[0].label, expected);
+        assert_eq!(workspace[0].display_label(), expected);
+        assert_eq!(str_of(&settings[0].config, "label"), stored_label);
+    }
 }
 
 /// The whole preferences object (unknown keys included).

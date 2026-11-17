@@ -28,6 +28,44 @@ use serde_json::{Map, Value, json};
 pub use i18n::{locale_tag, month_day, tr, tr_args, tr_count};
 pub use paseo_gui_core::RequestId;
 
+/// The display name of a host record. Endpoint/server-id labels are automatic names,
+/// so the daemon hostname takes precedence; only a custom stored label overrides it.
+/// Editors must read `config.label` directly rather than storing this derived name.
+pub fn host_display_name(host: &Value) -> &str {
+    let config = json::object(host, "config");
+    let label = json::text(config, "label").trim();
+    let endpoint = json::text(config, "endpoint").trim();
+    let server_id = json::text(host, "serverId");
+    let without_scheme = match endpoint.find("://") {
+        Some(i)
+            if endpoint[..i]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+                && endpoint[..i]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic()) =>
+        {
+            &endpoint[i + 3..]
+        }
+        _ => endpoint,
+    };
+    let address = without_scheme.split('/').next().unwrap_or("");
+    let unnamed = label.is_empty()
+        || label == server_id
+        || label == endpoint
+        || label == address
+        || (address.contains(':') && label == &address[..address.rfind(':').unwrap_or(0)]);
+    if !unnamed {
+        return label;
+    }
+    let hostname = json::text(json::object(host, "serverInfo"), "hostname").trim();
+    if !hostname.is_empty() {
+        return hostname;
+    }
+    if label.is_empty() { server_id } else { label }
+}
+
 pub fn live_design(cx: &mut Cx) {
     paint::live_design(cx);
     file_drop::live_design(cx);

@@ -611,7 +611,7 @@ impl Sheet for ConnectionsSheet {
             };
             let seed = json!({
                 "id": uuid::Uuid::new_v4().to_string(),
-                "label": host.label(),
+                "label": j::text(host.config(), "label"),
                 "endpoint": "",
                 "expectedServerId": host.server_id(),
                 "color": host.config().get("color").cloned().unwrap_or(Value::Null),

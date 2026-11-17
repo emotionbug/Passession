@@ -1357,7 +1357,7 @@ impl CommandCenterPanel {
         let show_host = hosts.len() > 1;
         let mut agents = Vec::new();
         for host in &hosts {
-            let label = host.label();
+            let label = host.display_label();
             for entry in host.agents() {
                 let agent = agent_of(entry);
                 if !listed_agent(agent) {

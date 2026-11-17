@@ -1113,7 +1113,7 @@ impl ChatPanel {
         facts.connected = row.is_some_and(|r| get(r, "status") == "connected");
         facts.connecting = row.is_some_and(|r| get(r, "status") == "connecting");
         facts.label = row
-            .and_then(|r| non_empty_str(get(r, "label")))
+            .map(crate::common::host_display_name)
             .unwrap_or(&target.host_id)
             .to_owned();
         facts.host_error = row
@@ -1123,7 +1123,7 @@ impl ChatPanel {
             let server_id = str_of(get(host, "serverId")).to_owned();
             facts.labels.insert(
                 server_id.clone(),
-                str_or(get(host, "label"), &server_id).to_owned(),
+                crate::common::host_display_name(host).to_owned(),
             );
             for raw in ui
                 .directory(host)

@@ -2446,7 +2446,10 @@ impl WaNewTabView {
         if view.wa_trigger(id!(host_field)).clicked(actions) && !pending_intent {
             let mut options: Vec<SelectOption> = host::hosts(&ctx.state)
                 .iter()
-                .map(|h| SelectOption::new(h.id(), h.label()).leading(Leading::Status(h.status())))
+                .map(|h| {
+                    SelectOption::new(h.id(), h.display_label())
+                        .leading(Leading::Status(h.status()))
+                })
                 .collect();
             options.push(SelectOption::new("\u{0}add-host", l("Add host")).glyph("plus"));
             let request = SelectRequest::new(t("newWorkspace.fields.host"), options)
@@ -3087,7 +3090,7 @@ impl WaNewTabView {
         let host_status = host.map(|h| h.status()).unwrap_or(Connection::Disconnected);
         let host_trigger = view.wa_trigger(id!(host_field));
         let host_label = host
-            .map(|h| h.label())
+            .map(|h| h.display_label())
             .unwrap_or_else(|| l("Host").to_owned());
         host_trigger.set(
             cx,

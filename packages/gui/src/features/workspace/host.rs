@@ -101,20 +101,8 @@ impl<'a> Host<'a> {
         ""
     }
 
-    /// `hostDisplayLabel`: the configured label, else the server id.
-    pub fn label(&self) -> String {
-        for key in ["label", "name", "displayName"] {
-            let value = str_of(self.value, key).trim();
-            if !value.is_empty() {
-                return value.to_owned();
-            }
-        }
-        let info = self.server_info();
-        let hostname = str_of(info, "hostname").trim();
-        if !hostname.is_empty() {
-            return hostname.to_owned();
-        }
-        self.id().to_owned()
+    pub fn display_label(&self) -> String {
+        crate::common::host_display_name(self.value).to_owned()
     }
 
     pub fn status(&self) -> Connection {

@@ -126,54 +126,8 @@ impl<'a> Host<'a> {
             .find(|w| j::text(w, "id") == id)
     }
 
-    /// `hostDisplayLabel`: a stored label that only repeats the endpoint or server id is
-    /// unnamed, so the daemon hostname wins over it; the endpoint stays the last resort.
     pub fn display_label(&self) -> String {
-        let config = self.config();
-        let label = j::text(config, "label").trim();
-        let endpoint = j::text(config, "endpoint").trim();
-        let without_scheme = match endpoint.find("://") {
-            Some(i)
-                if endpoint[..i]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
-                    && endpoint[..i]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphabetic()) =>
-            {
-                &endpoint[i + 3..]
-            }
-            _ => endpoint,
-        };
-        let address = without_scheme.split('/').next().unwrap_or("");
-        let unnamed = label.is_empty()
-            || label == self.server_id()
-            || label == endpoint
-            || label == address
-            || (address.contains(':') && label == &address[..address.rfind(':').unwrap_or(0)]);
-        if !unnamed {
-            return label.to_string();
-        }
-        let hostname = j::text(self.server_info(), "hostname").trim();
-        if !hostname.is_empty() {
-            return hostname.to_string();
-        }
-        if label.is_empty() {
-            self.server_id().to_string()
-        } else {
-            label.to_string()
-        }
-    }
-
-    /// `HostState.label`: the configured label or the server id.
-    pub fn label(&self) -> String {
-        let label = j::text(self.config(), "label");
-        if label.is_empty() {
-            self.server_id().to_string()
-        } else {
-            label.to_string()
-        }
+        crate::common::host_display_name(self.0).to_owned()
     }
 }
 
