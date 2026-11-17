@@ -31,23 +31,21 @@ Per-agent projection checkpoints live in `agent-timelines/{id}.sqlite3`. A retai
 connection commits the changed projected row and sequence metadata together using WAL and
 `synchronous=FULL` before publishing the event. Failed commits restore the in-memory projection;
 full provider replay replaces the checkpoint in one transaction. The checkpoint never replaces
-provider history as the transcript authority. `{id}.json` checkpoints from earlier releases are not
-read.
+provider history as the transcript authority.
 
 Saved-page selection uses a SQLite expression index for sequence metadata, avoiding
 source-row JSON extraction across the whole history on each indexed page. Selected
-rows are still decoded and validated. The checkpoint remains version 1: SQLite
-maintains the index even when an older writer changes `row_json`. Writable open
-creates and validates the index transactionally; failure leaves no partial migration.
-Read-only opens never migrate a checkpoint. An unmigrated database retains the
-original JSON-extraction read path until a writable open creates its index.
+rows are still decoded and validated. A new checkpoint is created with its current tables,
+indexes and revision triggers. Old checkpoints are not upgraded: a writable open discards a
+checkpoint that lacks any of them (with its `-wal`/`-shm` files) and creates an empty current one,
+which provider replay refills; read-only readers treat such a file as absent. A checkpoint with an
+unsupported version or another agent's metadata is an error and is not deleted.
 
 A loaded agent keeps only a recent tail of its projection in memory: at most 256 rows and 4 MiB
 of stored row JSON, always including the newest row. Older pages, search, prompts, replay
 matching and corrections read the checkpoint on demand with the same selection results. Updates
 and enrichment of older rows commit in place through the `timeline_rows_identity` and
-`timeline_rows_submitted` expression indexes, which a writable open creates and validates in the
-same transaction as the page index. Readers of a closed agent use one read-only snapshot and never
+`timeline_rows_submitted` expression indexes. Readers of a closed agent use one read-only snapshot and never
 load its whole history. Agents without a checkpoint and provider child timelines stay fully
 resident.
 

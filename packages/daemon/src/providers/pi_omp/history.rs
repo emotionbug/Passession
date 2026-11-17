@@ -19,9 +19,6 @@ use crate::providers::api::{EventSink, HistoryCoverage, SubagentHistoryRequest, 
 
 static TITLE_PREFIX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}[-:]\d{2}[-:]\d{2}").unwrap());
-static LEGACY_TRANSCRIPT: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)(?:session|transcript)(?: file)?:\s*(/\S+\.jsonl)").unwrap()
-});
 static WINDOWS_PATH: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"^[a-zA-Z]:[\\/]|^[/\\]{2}\?[/\\]|^\\{2}[^/\\]+[/\\][^/\\]+").unwrap()
 });
@@ -1341,14 +1338,12 @@ impl TranscriptCollector {
             .get("details")
             .filter(|v| !v.is_null())
             .unwrap_or(&message["content"]["details"]);
-        let mut found = false;
         // Results take precedence when both arrays describe the same child.
         for (rows, terminal) in [(&details["results"], true), (&details["progress"], false)] {
             for result in rows.as_array().into_iter().flatten() {
                 let Some(child_id) = result["id"].as_str().filter(|s| !s.is_empty()) else {
                     continue;
                 };
-                found = true;
                 let existing = children.get(child_id).copied();
                 if existing.is_some_and(|index| out[index].tool_call == id) {
                     continue;
@@ -1382,42 +1377,6 @@ impl TranscriptCollector {
                     out.push(transcript);
                 }
             }
-        }
-        if found {
-            return;
-        }
-        let text = message["content"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|p| p["type"] == "text")
-                    .filter_map(|p| p["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        if let Some(capture) = LEGACY_TRANSCRIPT.captures(&text) {
-            let path = PathBuf::from(&capture[1]);
-            let child_id = path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            if children.contains_key(child_id.as_str()) {
-                return;
-            }
-            children.insert(child_id.clone(), out.len());
-            out.push(Transcript {
-                id: child_id,
-                title: (*title).to_owned(),
-                tool_call: id.to_owned(),
-                path,
-                status: if message["isError"] == true {
-                    "failed"
-                } else {
-                    "completed"
-                },
-            });
         }
     }
 }
@@ -1701,7 +1660,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("parent.jsonl");
         // Every child locator is unreadable as a file: neither replay may open it.
-        for child in ["child-a", "child-b", "reused", "legacy"] {
+        for child in ["child-a", "child-b", "reused"] {
             fs::create_dir_all(path.with_extension("").join(format!("{child}.jsonl")))
                 .await
                 .unwrap();
@@ -1837,9 +1796,8 @@ mod tests {
             bytes.extend_from_slice(suffix);
             cases.push((bytes, None));
         }
-        // Reused IDs, terminal-before-spawn ordering, results/progress precedence,
-        // and the legacy text locator all use the same incremental collector.
-        let legacy = path.with_extension("").join("legacy.jsonl");
+        // Reused IDs, terminal-before-spawn ordering and results/progress
+        // precedence all use the same incremental collector.
         cases.push((lines(&[
             header,
             message("first", "", json!({"role":"assistant","content":[
@@ -1849,13 +1807,10 @@ mod tests {
             json!({"type":"custom_message","id":"delivery","parentId":"spawn","customType":"async-result",
                 "details":{"jobs":[{"type":"task","agentId":"reused","status":"completed"}]}}),
             message("second", "delivery", json!({"role":"assistant","content":[
-                {"type":"toolCall","id":"second","name":"task","arguments":{"agent":"reviewer"}},
-                {"type":"toolCall","id":"legacy","name":"task","arguments":{"agent":"reviewer"}}]})),
+                {"type":"toolCall","id":"second","name":"task","arguments":{"agent":"reviewer"}}]})),
             message("respawn", "second", json!({"role":"toolResult","toolName":"task","toolCallId":"second",
                 "details":{"results":[{"id":"reused","status":"failed"}],
                     "progress":[{"id":"reused","status":"pending"}]}})),
-            message("legacy", "respawn", json!({"role":"toolResult","toolName":"task","toolCallId":"legacy",
-                "content":text(&format!("Session file: {}", legacy.display()))})),
         ]).into_bytes(), None));
         let metadata = json!({"bridgedTools":[]});
         for (index, (bytes, branch)) in cases.into_iter().enumerate() {
@@ -2149,24 +2104,21 @@ mod tests {
     }
 
     #[test]
-    fn omp_legacy_transcript_locator_and_terminal_results_remain_supported() {
+    fn omp_terminal_results_remain_supported() {
         let messages = [
             json!({"role":"assistant","content":[
-                {"type":"toolCall","name":"task","id":"legacy","arguments":{"agent":"reviewer"}},
                 {"type":"toolCall","name":"task","id":"modern","arguments":{"agent":"worker"}}]}),
-            json!({"role":"toolResult","toolName":"task","toolCallId":"legacy",
-                "content":text("Session file: /tmp/legacy-child.jsonl")}),
             json!({"role":"toolResult","toolName":"task","toolCallId":"modern","details":{"results":[
                 {"id":"done"},{"id":"bad","exitCode":1},{"id":"stopped","aborted":true}],
                 "progress":[{"id":"done","status":"pending"}]}}),
         ];
         let children = subagent_transcripts(&messages, Path::new("/tmp/parent.jsonl"));
-        assert_eq!(children.len(), 4);
-        assert_eq!(children[0].path, Path::new("/tmp/legacy-child.jsonl"));
-        assert_eq!(children[0].title, "reviewer");
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].path, Path::new("/tmp/parent/done.jsonl"));
+        assert_eq!(children[0].title, "worker");
         assert_eq!(
             children.iter().map(|c| c.status).collect::<Vec<_>>(),
-            ["completed", "completed", "failed", "canceled"]
+            ["completed", "failed", "canceled"]
         );
     }
 

@@ -653,6 +653,10 @@ impl Timeline {
     pub fn load(path: &Path, agent_id: &str) -> Result<Self> {
         storage::load(path, agent_id)
     }
+    /// Whether a reusable current-format checkpoint exists, without changing it.
+    pub(super) fn checkpoint_exists(path: &Path, agent_id: &str) -> Result<bool> {
+        storage::checkpoint_exists(path, agent_id)
+    }
     /// An existing checkpoint as one read-only snapshot with no resident rows.
     /// Saved readers page, scan and search it without hydrating history.
     pub fn open_saved(path: &Path, agent_id: &str) -> Result<Self> {

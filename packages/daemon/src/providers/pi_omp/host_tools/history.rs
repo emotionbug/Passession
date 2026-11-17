@@ -389,7 +389,6 @@ impl Index {
             for (file, stamp) in changed {
                 let result = match file.extension().and_then(|extension| extension.to_str()) {
                     Some("sqlite3") => scan_timeline(&transaction, &file),
-                    Some("json") => scan_legacy_timeline(&transaction, &file),
                     _ => scan_session(&transaction, &file),
                 };
                 let succeeded = result.is_ok();
@@ -449,7 +448,7 @@ impl Index {
             let included = if recursive {
                 extension == Some("jsonl")
             } else {
-                matches!(extension, Some("sqlite3" | "json"))
+                extension == Some("sqlite3")
             };
             if !included {
                 continue;
@@ -572,57 +571,16 @@ fn scan_timeline(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
     if since == next {
         return Ok(());
     }
-    let mut statement = snapshot.prepare("SELECT row_json FROM timeline_rows WHERE COALESCE(json_extract(row_json,'$.seqEnd'),json_extract(row_json,'$.seq'),0) >= ?1 ORDER BY position")?;
+    let mut statement = snapshot.prepare("SELECT row_json FROM timeline_rows WHERE json_extract(row_json,'$.seqEnd') >= ?1 ORDER BY position")?;
     let mut rows = statement.query([since])?;
     let mut names = HashSet::new();
-    let mut skipped_legacy_rows = 0;
     while let Some(row) = rows.next()? {
         let encoded: String = row.get(0)?;
         let row: Value = serde_json::from_str(&encoded)?;
-        if timeline_names(&row["item"], &mut names) {
-            skipped_legacy_rows += 1;
-        }
-    }
-    if skipped_legacy_rows > 0 {
-        tracing::warn!(path = %path.display(), skipped_legacy_rows,
-            "OMP legacy timeline rows lack invocation provenance; skipped rows are not evidence of unused tools");
+        timeline_names(&row["item"], &mut names);
     }
     save_names(transaction, names)?;
     save_cursor(transaction, path, &serde_json::to_string(&(epoch, next))?)
-}
-
-fn scan_legacy_timeline(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
-    let file = File::open(path)?;
-    let metadata = file.metadata()?;
-    let modified = metadata
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let stamp = serde_json::to_string(&(metadata.len(), modified))?;
-    if cursor(transaction, path)?.as_deref() == Some(stamp.as_str()) {
-        return Ok(());
-    }
-    let snapshot: Value = serde_json::from_reader(BufReader::new(file))?;
-    anyhow::ensure!(
-        snapshot["version"] == 1,
-        "Unsupported legacy timeline version"
-    );
-    let rows = snapshot["rows"]
-        .as_array()
-        .context("Legacy timeline has no rows")?;
-    let mut names = HashSet::new();
-    let mut skipped_legacy_rows = 0;
-    for row in rows {
-        if timeline_names(&row["item"], &mut names) {
-            skipped_legacy_rows += 1;
-        }
-    }
-    if skipped_legacy_rows > 0 {
-        tracing::warn!(path = %path.display(), skipped_legacy_rows,
-            "OMP legacy timeline rows lack invocation provenance; skipped rows are not evidence of unused tools");
-    }
-    save_names(transaction, names)?;
-    save_cursor(transaction, path, &stamp)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -714,18 +672,12 @@ fn scan_session(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Returns whether this row lacks the provenance needed to classify invocation.
-fn timeline_names(item: &Value, names: &mut HashSet<String>) -> bool {
+fn timeline_names(item: &Value, names: &mut HashSet<String>) {
     if item["type"] != "tool_call" || !item["callId"].is_string() {
-        return false;
-    }
-    // Older OMP timelines renamed schema reads to the queried tool and discarded
-    // the original operation. Only the native JSONL can disambiguate those rows.
-    if item["detail"]["type"] == "plain_text" {
-        return true;
+        return;
     }
     let Some(name) = item["name"].as_str() else {
-        return false;
+        return;
     };
     let input = &item["detail"]["input"];
     if item["detail"]["type"] == "read"
@@ -734,7 +686,7 @@ fn timeline_names(item: &Value, names: &mut HashSet<String>) -> bool {
             .is_some_and(|path| path.starts_with("xd://"))
     {
         names.insert("read".into());
-        return false;
+        return;
     }
     if item["detail"]["type"] == "write" {
         invocation(
@@ -745,7 +697,6 @@ fn timeline_names(item: &Value, names: &mut HashSet<String>) -> bool {
     } else {
         invocation(name, input, names);
     }
-    false
 }
 
 fn session_names(entry: &Value, names: &mut HashSet<String>) {

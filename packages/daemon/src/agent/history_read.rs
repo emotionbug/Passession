@@ -287,13 +287,13 @@ impl AgentManager {
         page["historySource"] = json!(if live { "live" } else { "saved" });
         Ok(Some(page))
     }
-    /// One page of the agent's checkpoint, or `None` when it has none. A
-    /// present but unreadable checkpoint is an error, never an empty history.
+    /// One page of a reusable checkpoint, or `None` when absent or obsolete.
+    /// A current-format but unreadable checkpoint remains an error.
     async fn read_checkpoint(&self, id: &str, options: Value) -> Result<Option<Value>> {
         let path = self.timeline_path(id)?;
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            if !path.try_exists()? {
+            if !Timeline::checkpoint_exists(&path, &id)? {
                 return Ok(None);
             }
             Timeline::fetch_saved(&path, &id, &options).map(Some)
@@ -331,10 +331,15 @@ impl AgentManager {
                     .await?
                     .ok_or_else(|| anyhow!("Unknown agent '{id}'"))?;
                 let path = self.timeline_path(id)?;
-                if tokio::fs::try_exists(&path).await? {
-                    let id = id.to_owned();
+                let saved_id = id.to_owned();
+                let (saved, path, saved_id) = tokio::task::spawn_blocking(move || -> Result<_> {
+                    let saved = Timeline::checkpoint_exists(&path, &saved_id)?;
+                    Ok((saved, path, saved_id))
+                })
+                .await??;
+                if saved {
                     return tokio::task::spawn_blocking(move || {
-                        read(&Timeline::open_saved(&path, &id)?)
+                        read(&Timeline::open_saved(&path, &saved_id)?)
                     })
                     .await?;
                 }

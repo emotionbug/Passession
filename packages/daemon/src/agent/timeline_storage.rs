@@ -1,8 +1,6 @@
 use super::{RESIDENT_BYTES, RESIDENT_ROWS, Timeline};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
-};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::fs;
@@ -17,8 +15,7 @@ const UPDATE_METADATA: &str =
     "UPDATE timeline_metadata SET epoch = ?1, next_seq = ?2, min_seq = ?3 WHERE id = 1";
 const READ_METADATA: &str =
     "SELECT version, agent_id, epoch, next_seq, min_seq FROM timeline_metadata WHERE id = 1";
-// Row triggers also invalidate certificates written by a newer daemon when an
-// older v1 daemon changes the checkpoint. No metadata schema/version cutover.
+// Row mutations invalidate native revision certificates in the same transaction.
 const REVISION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS timeline_native_revision (
     id INTEGER PRIMARY KEY CHECK(id = 1), revision_json TEXT NOT NULL
 );
@@ -28,25 +25,13 @@ CREATE TRIGGER IF NOT EXISTS timeline_revision_update AFTER UPDATE ON timeline_r
 BEGIN DELETE FROM timeline_native_revision; END;
 CREATE TRIGGER IF NOT EXISTS timeline_revision_delete AFTER DELETE ON timeline_rows
 BEGIN DELETE FROM timeline_native_revision; END;";
-const PAGE_INDEX: &str = "timeline_rows_page";
-// An expression index, rather than a side table, stays exact even when an older
-// v1 writer updates row_json. SQLite maintains it in the row's own transaction.
 const CREATE_PAGE_INDEX: &str = "CREATE INDEX timeline_rows_page ON timeline_rows(\
     position, json_extract(row_json, '$.seqStart'), \
     json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges'))";
-/// Everything `Timeline::fetch` selection reads from a row, without its item.
-const ROW_PAGE_METADATA: &str = "SELECT position, json_extract(row_json, '$.seqStart'), \
-    json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges') \
-    FROM timeline_rows INDEXED BY timeline_rows_page ORDER BY position";
 /// Page metadata of the stored rows before a resident tail.
 const STORED_PAGE_METADATA: &str = "SELECT position, json_extract(row_json, '$.seqStart'), \
     json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges') \
     FROM timeline_rows INDEXED BY timeline_rows_page WHERE position < ?1 ORDER BY position";
-// Saved reads never migrate a database, including a read-only legacy checkpoint.
-const LEGACY_STORED_PAGE_METADATA: &str = "SELECT position, \
-    json_extract(row_json, '$.seqStart'), json_extract(row_json, '$.seqEnd'), \
-    json_extract(row_json, '$.sourceSeqRanges') \
-    FROM timeline_rows NOT INDEXED WHERE position < ?1 ORDER BY position";
 const STORED_SEQ_END: &str = "SELECT MAX(json_extract(row_json, '$.seqEnd')) \
     FROM timeline_rows INDEXED BY timeline_rows_page WHERE position < ?1";
 const ROW_AT: &str = "SELECT position, row_json FROM timeline_rows WHERE position = ?1";
@@ -69,8 +54,7 @@ const IDENTITY_KEY: &str = "CASE json_extract(row_json, '$.item.type') \
 const SUBMITTED_KEY: &str = "CASE WHEN json_extract(row_json, '$.item.type') = 'user_message' \
     AND json_type(row_json, '$.item.clientMessageId') = 'text' \
     THEN json_extract(row_json, '$.item.clientMessageId') END";
-/// Identity lookups for rows outside the resident tail. Like the page index,
-/// SQLite maintains them for every writer, including older v1 daemons.
+/// Identity lookups for rows outside the resident tail, maintained by SQLite.
 static LOOKUP_INDEXES: LazyLock<[(&str, String); 2]> = LazyLock::new(|| {
     [
         (
@@ -102,22 +86,68 @@ static FIND_SUBMITTED: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// Checkpoint projections are disposable; only the complete current schema is reusable.
+fn current_schema(connection: &Connection, agent_id: &str) -> Result<bool> {
+    let (current, metadata): (bool, bool) = connection.query_row(
+        "SELECT count(*) = 9, COALESCE(max(type = 'table' AND name = 'timeline_metadata'), 0)
+         FROM sqlite_schema WHERE
+         (type = 'table' AND name IN ('timeline_metadata', 'timeline_rows', 'timeline_native_revision'))
+         OR (type = 'index' AND name IN ('timeline_rows_page', 'timeline_rows_identity', 'timeline_rows_submitted'))
+         OR (type = 'trigger' AND name IN ('timeline_revision_insert', 'timeline_revision_update', 'timeline_revision_delete'))",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if metadata && !current {
+        let (version, stored_agent): (i64, String) = connection.query_row(
+            "SELECT version, agent_id FROM timeline_metadata WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        ensure!(version == 1, "Unsupported timeline database version");
+        ensure!(
+            stored_agent == agent_id,
+            "Timeline checkpoint agent mismatch"
+        );
+    }
+    Ok(current)
+}
+
+/// Read-only callers treat an obsolete projection like an absent checkpoint.
+pub(super) fn checkpoint_exists(path: &Path, agent_id: &str) -> Result<bool> {
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    current_schema(&connection, agent_id)
+}
+
 #[derive(Debug)]
 pub(super) struct Store {
     connection: Connection,
     path: PathBuf,
     agent_id: String,
-    /// A saved reader's snapshot; it never writes or migrates.
+    /// A saved reader's snapshot; it never writes.
     writable: bool,
-    /// The page index exists. Unmigrated read-only checkpoints lack it.
-    indexed: bool,
     /// Owns disposable replay storage; it never becomes a durable checkpoint.
     temporary: Option<tempfile::TempDir>,
 }
 
 impl Store {
     fn open(path: &Path, agent_id: &str) -> Result<Self> {
-        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        if !current_schema(&connection, agent_id)? {
+            drop(connection);
+            for suffix in ["-wal", "-shm", ""] {
+                let mut file = path.as_os_str().to_os_string();
+                file.push(suffix);
+                match fs::remove_file(Path::new(&file)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            return create(path, agent_id, &Timeline::new()).map(|(store, _)| store);
+        }
         let (version, stored_agent): (i64, String) = connection.query_row(
             "SELECT version, agent_id FROM timeline_metadata WHERE id = 1",
             [],
@@ -130,16 +160,11 @@ impl Store {
         );
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        ensure_indexes(&mut connection)?;
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(REVISION_SCHEMA)?;
-        transaction.commit()?;
         Ok(Self {
             connection,
             path: path.to_owned(),
             agent_id: agent_id.to_owned(),
             writable: true,
-            indexed: true,
             temporary: None,
         })
     }
@@ -203,60 +228,6 @@ fn decode(encoded: &str) -> Result<Value> {
     let row: Value = serde_json::from_str(encoded)?;
     ensure!(valid_row(&row), "Invalid timeline row");
     Ok(row)
-}
-
-fn has_index(connection: &Connection, name: &str, sql: &str) -> Result<bool> {
-    let stored: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE name = ?1",
-            [name],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(stored) = stored {
-        ensure!(stored == sql, "Invalid timeline index {name}");
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn has_page_index(connection: &Connection) -> Result<bool> {
-    has_index(connection, PAGE_INDEX, CREATE_PAGE_INDEX)
-}
-
-fn has_lookup_indexes(connection: &Connection) -> Result<bool> {
-    for (name, sql) in LOOKUP_INDEXES.iter() {
-        if !has_index(connection, name, sql)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn ensure_indexes(connection: &mut Connection) -> Result<()> {
-    if has_page_index(connection)? && has_lookup_indexes(connection)? {
-        return Ok(());
-    }
-    // Recheck under the write lock: another connection may have migrated first.
-    // Invalid legacy metadata rolls back the index creation, not just its rows.
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if !has_page_index(&transaction)? {
-        transaction.execute_batch(CREATE_PAGE_INDEX)?;
-        let mut statement = transaction.prepare(ROW_PAGE_METADATA)?;
-        let mut rows = statement.query([])?;
-        let mut position = 0;
-        while let Some(row) = rows.next()? {
-            read_page_metadata(row, position)?;
-            position += 1;
-        }
-    }
-    for (name, sql) in LOOKUP_INDEXES.iter() {
-        if !has_index(&transaction, name, sql)? {
-            transaction.execute_batch(sql)?;
-        }
-    }
-    transaction.commit()?;
-    Ok(())
 }
 
 fn read_page_metadata(row: &rusqlite::Row<'_>, position: usize) -> Result<Value> {
@@ -518,8 +489,7 @@ fn hydrate(path: &Path, agent_id: &str, bounded: bool) -> Result<(Timeline, u64)
     Ok((timeline, bytes))
 }
 
-/// An existing checkpoint as one read-only snapshot: header only, no rows
-/// resident. Never migrates the database.
+/// An existing checkpoint as one read-only snapshot: header only, no rows resident.
 pub(super) fn open_saved(path: &Path, agent_id: &str) -> Result<Timeline> {
     ensure!(
         path.try_exists()?,
@@ -529,6 +499,10 @@ pub(super) fn open_saved(path: &Path, agent_id: &str) -> Result<Timeline> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     // Every later read through this handle sees the same committed state.
     connection.execute_batch("BEGIN")?;
+    ensure!(
+        current_schema(&connection, agent_id)?,
+        "Timeline checkpoint schema is obsolete"
+    );
     let (version, stored_agent, epoch, next_seq, min_seq): (i64, String, String, i64, i64) =
         connection.query_row(READ_METADATA, [], |row| {
             Ok((
@@ -545,7 +519,6 @@ pub(super) fn open_saved(path: &Path, agent_id: &str) -> Result<Timeline> {
         "Timeline checkpoint agent mismatch"
     );
     let count = row_count(&connection)?;
-    let indexed = has_page_index(&connection)?;
     let mut timeline = Timeline::new();
     timeline.epoch = epoch;
     timeline.next_seq = next_seq;
@@ -557,7 +530,6 @@ pub(super) fn open_saved(path: &Path, agent_id: &str) -> Result<Timeline> {
         path: path.to_owned(),
         agent_id: agent_id.to_owned(),
         writable: false,
-        indexed,
         temporary: None,
     });
     Ok(timeline)
@@ -668,12 +640,7 @@ impl Timeline {
         stubs.min_seq = self.min_seq;
         stubs.rows.reserve(self.len());
         {
-            let query = if store.indexed {
-                STORED_PAGE_METADATA
-            } else {
-                LEGACY_STORED_PAGE_METADATA
-            };
-            let mut statement = store.connection.prepare_cached(query)?;
+            let mut statement = store.connection.prepare_cached(STORED_PAGE_METADATA)?;
             let mut rows = statement.query([self.base as i64])?;
             while let Some(row) = rows.next()? {
                 stubs.rows.push(read_page_metadata(row, stubs.rows.len())?);
@@ -865,7 +832,7 @@ pub(super) fn persist(timeline: &mut Timeline, path: &Path, agent_id: &str) -> R
 }
 
 /// Certificate metadata updates never rewrite history. Row mutations clear the
-/// certificate in their own transaction, including writes by an older daemon.
+/// certificate in their own transaction.
 pub(super) fn certify(timeline: &mut Timeline, revision: Option<Value>) -> Result<()> {
     let Some(store) = timeline.storage.as_mut() else {
         return Ok(());

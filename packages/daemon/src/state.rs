@@ -325,8 +325,6 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
             .context("Daemon identity is missing")?;
         crate::daemon_control::publish_worker_ready(&listen, server_id)?;
         tracing::info!(%listen,%server_id,version=crate::VERSION,"Paseo native daemon ready");
-        let home = app.home.clone();
-        tokio::task::spawn_blocking(move || crate::maintenance::cleanup(&home));
         app.cancel.cancelled().await;
         Ok(())
     }

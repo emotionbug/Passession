@@ -150,7 +150,7 @@ impl AgentManager {
         let path = self.timeline_path(id)?;
         let id_owned = id.to_owned();
         let saved = tokio::task::spawn_blocking(move || {
-            if !path.try_exists()? {
+            if !Timeline::checkpoint_exists(&path, &id_owned)? {
                 return Ok(None);
             }
             let saved = Timeline::open_saved(&path, &id_owned)?;
@@ -205,7 +205,7 @@ impl AgentManager {
         // Finish/attention observers must not start a provider to discover that
         // an agent has no saved assistant message.
         tokio::task::spawn_blocking(move || {
-            if !path.try_exists()? {
+            if !Timeline::checkpoint_exists(&path, &agent_id)? {
                 return Ok(None);
             }
             Timeline::open_saved(&path, &agent_id)?.last_assistant_message()

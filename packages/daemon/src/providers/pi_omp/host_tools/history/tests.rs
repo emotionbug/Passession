@@ -49,7 +49,7 @@ async fn bootstrap_counts_failed_calls_and_excludes_schema_reads_and_mentions() 
         &[
             json!({"type":"tool_call","callId":"failed","name":"functions.used","status":"failed","detail":{"type":"unknown","input":{}}}),
             json!({"type":"assistant_message","text":"functions.mentioned xd://mentioned"}),
-            json!({"type":"tool_call","callId":"schema","name":"schema_only","detail":{"type":"plain_text","label":"schema_only"}}),
+            json!({"type":"tool_call","callId":"schema","name":"read","detail":{"type":"read","filePath":"xd://schema_only"}}),
         ],
     )?;
     session(
@@ -395,27 +395,6 @@ async fn new_history_cache_is_private() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn legacy_ambiguity_is_counted_separately_from_actual_invocations() {
-    let mut names = HashSet::new();
-    assert!(timeline_names(
-        &json!({
-            "type":"tool_call","callId":"schema","name":"target",
-            "detail":{"type":"plain_text","label":"target"}
-        }),
-        &mut names
-    ));
-    assert!(names.is_empty());
-    assert!(!timeline_names(
-        &json!({
-            "type":"tool_call","callId":"executed","name":"target",
-            "detail":{"type":"unknown","input":{}}
-        }),
-        &mut names
-    ));
-    assert!(names.contains("target"));
-}
-
 #[tokio::test]
 async fn resolved_provider_session_directory_participates_in_bootstrap() -> Result<()> {
     let home = tempfile::tempdir()?;
@@ -440,38 +419,5 @@ async fn resolved_provider_session_directory_participates_in_bootstrap() -> Resu
     let history = History::load(home.path(), roots).await;
     assert!(history.complete);
     assert!(history.names.contains("configured_call"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn legacy_json_preserves_failed_invocations_after_source_replacement() -> Result<()> {
-    let home = tempfile::tempdir()?;
-    let directory = home.path().join("agent-timelines");
-    fs::create_dir(&directory)?;
-    let path = directory.join("archived.json");
-    let original = json!({"version":1,"rows":[
-        {"item":{"type":"tool_call","callId":"failed","name":"paseo.list_hosts","status":"failed","detail":{"type":"unknown","input":{}}}},
-        {"item":{"type":"tool_call","callId":"external","name":"server.inspect","detail":{"type":"unknown","input":{}}}},
-        {"item":{"type":"tool_call","callId":"schema","name":"create_agent","detail":{"type":"plain_text","label":"schema only"}}}
-    ]}).to_string();
-    fs::write(&path, &original)?;
-    let mut catalog = Catalog::default();
-    catalog.insert("list_hosts", None);
-    catalog.insert("create_agent", None);
-    catalog.insert("bridge", Some(("server", "inspect")));
-    let first = History::load(home.path(), vec![]).await;
-    assert!(first.complete);
-    assert!(catalog.essential("list_hosts", &first));
-    assert!(catalog.essential("bridge", &first));
-    assert!(!catalog.essential("create_agent", &first));
-    assert_eq!(fs::read_to_string(&path)?, original);
-    fs::write(&path, json!({"version":1,"rows":[
-        {"item":{"type":"tool_call","callId":"new","name":"create_agent","detail":{"type":"unknown","input":{}}}}
-    ]}).to_string())?;
-    let next = History::load(home.path(), vec![]).await;
-    assert!(next.complete);
-    for name in ["list_hosts", "create_agent", "bridge"] {
-        assert!(catalog.essential(name, &next));
-    }
     Ok(())
 }

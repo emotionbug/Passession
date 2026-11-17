@@ -30,7 +30,6 @@ pub mod files;
 pub mod git;
 pub mod json;
 pub mod logging;
-mod maintenance;
 pub mod mcp;
 pub mod mcp_client;
 pub mod plugins;
