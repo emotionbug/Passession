@@ -1,0 +1,7 @@
+Changed
+- Lower CPU and memory use: typing no longer repaints the whole app, idle agents unload after an hour, long conversations and agent history stay bounded in memory, and Git projects are watched only while shown.
+
+Fixed
+- Markdown tables whose cells contain <br> no longer collapse into one column.
+
+Full notes: https://github.com/emotionbug/Passession/releases

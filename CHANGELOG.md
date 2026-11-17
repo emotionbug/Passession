@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.36 - 2026-11-17
+
 ### Added
 
 - Unload agents that have been idle for an hour while no app shows them, freeing their provider processes. They still appear as idle and resume automatically on the next message or when opened. Agents with running work, background jobs, pending permissions or queued messages stay loaded, and only providers that can confirm they are settled are unloaded: OMP, and Claude Code once every background task it started has finished. Change or turn off the timeout under a host's Agents settings.
