@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Remove the eight compiler warnings that the vendored tiny-skia printed in every build since 0.13.32. Its hidden return-type lifetimes are written out and an unused re-export is gone; rendering is unchanged.
+
 ## 0.13.34 - 2026-11-16
 
 ### Fixed

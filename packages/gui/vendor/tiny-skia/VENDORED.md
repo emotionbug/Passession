@@ -31,6 +31,20 @@ are source-compatible. png 0.18's encoder defaults (`Compression::Balanced`,
 adaptive filtering) can produce different PNG bytes than 0.17 for the same
 pixels; the decoded pixels are identical.
 
-Rasterization code is untouched. When updating, replace from the published
-crate and reapply the two `decode_png` hunks, or move to a tiny-skia release on
-png 0.18 once `resvg` accepts one.
+## Compiler warnings
+
+A patched path dependency is linted like workspace code, so warnings that Cargo
+hides for a registry crate appear in every build. Rust 1.93 reported eight; the
+source is edited rather than silencing the lints:
+
+- `mismatched_lifetime_syntaxes`: the hidden lifetime is written out in the
+  return types of `edge_iter` (`src/edge_builder.rs`), `Pixmap::as_ref`,
+  `Pixmap::as_mut`, `PixmapMut::as_ref`, `PixmapMut::as_subpixmap` and
+  `PixmapMut::subpixmap` (`src/pixmap.rs`), and `Pattern::new`
+  (`src/shaders/pattern.rs`). The signatures mean the same as before.
+- `unused_imports`: the private `wide` module no longer re-exports
+  `tiny_skia_path::f32x2`; its only user imports it directly.
+
+Rasterization code is otherwise untouched. When updating, replace from the
+published crate, reapply the two `decode_png` hunks and re-check the warnings,
+or move to a tiny-skia release on png 0.18 once `resvg` accepts one.
