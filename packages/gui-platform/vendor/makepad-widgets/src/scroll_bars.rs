@@ -608,6 +608,21 @@ mod touch_scroll_tests {
     }
 
     #[test]
+    fn content_shorter_than_its_viewport_neither_moves_nor_flings() {
+        let mut s = TouchScroll::default();
+        let mut offset = 0.0;
+        s.begin(dvec2(20.0, 100.0), 0.0, true);
+        for (y, time) in [(60.0, 0.016), (20.0, 0.032), (140.0, 0.048)] {
+            let delta = s.move_to(dvec2(20.0, y), time).unwrap();
+            // The content is 120px shorter than the viewport.
+            assert!(!s.apply_delta(&mut offset, delta, -120.0));
+            assert_eq!(offset, 0.0);
+        }
+        s.release(0.048);
+        assert!(!s.is_flinging());
+    }
+
+    #[test]
     fn cancelled_touch_cannot_fling_regardless_of_adapter_event_order() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let event = Event::TouchUpdate(makepad_draw::event::TouchUpdateEvent {

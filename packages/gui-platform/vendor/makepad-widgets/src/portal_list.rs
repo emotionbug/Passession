@@ -89,6 +89,8 @@ pub struct PortalList {
     /// See [`PortalList::end_overflow()`].
     #[rust] end_overflow: Option<f64>,
     #[rust(true)] not_filling_viewport: bool,
+    /// The measured rows end within the viewport, so there is nothing to scroll.
+    #[rust] fits_viewport: bool,
     #[live(false)] reuse_items: bool,
     
     #[rust] templates: ComponentMap<LiveId, LivePtr>,
@@ -129,20 +131,49 @@ impl AlignItem {
     }
 }
 
-/// Resolve bottom/underfill alignment before any viewport visibility query.
+/// Resolve bottom alignment before any viewport visibility query.
 fn final_alignment(
-    first_pos: f64,
     last_pos: Option<f64>,
     viewport_size: f64,
-    align_underfill_to_top: bool,
     measured_tail: bool,
 ) -> (f64, bool) {
     let Some(last_pos) = last_pos else { return (0.0, false) };
-    if align_underfill_to_top {
-        return (-first_pos, false);
-    }
     let shift = viewport_size - last_pos;
     (if measured_tail { shift } else { shift.max(0.0) }, shift >= 0.0 || measured_tail)
+}
+
+/// The shift that rests rows fitting the viewport at the top or on the bottom
+/// edge, wherever input or an anchor left their offset.
+fn fitting_shift(first_pos: f64, last_pos: Option<f64>, viewport_size: f64, align_top: bool) -> f64 {
+    match last_pos {
+        Some(last_pos) if !align_top => viewport_size - last_pos,
+        _ => -first_pos,
+    }
+}
+
+/// Whether every row of the range is laid out (`rows`: index and size, sorted)
+/// and the rows end within the viewport, give or take half a pixel. Rows below
+/// a pull-down may cover less than the viewport while later rows are not laid out.
+fn rows_fit<T>(
+    rows: &[T],
+    range_start: usize,
+    range_end: usize,
+    viewport_size: f64,
+    measure: impl Fn(&T) -> (usize, f64),
+) -> bool {
+    let mut next = range_start;
+    let mut total = 0.0;
+    for (index, size) in rows.iter().map(measure) {
+        if index >= range_end {
+            break;
+        }
+        if index != next {
+            return false;
+        }
+        total += size;
+        next += 1;
+    }
+    next == range_end && total <= viewport_size + 0.5
 }
 
 /// How far the range's last row extends below the viewport at its final
@@ -246,6 +277,7 @@ impl PortalList {
 
         self.at_end = false;
         self.not_filling_viewport = false;
+        self.fits_viewport = false;
         self.end_overflow = None;
 
         let vi = self.vec_index;
@@ -293,10 +325,18 @@ impl PortalList {
                         total += item.size.index(vi);
                     }
                     self.not_filling_viewport = total < viewport.size.index(vi);
+                    self.fits_viewport = rows_fit(
+                        list,
+                        self.range_start,
+                        self.range_end,
+                        viewport.size.index(vi),
+                        |item| (item.index, item.size.index(vi)),
+                    );
                 }
                 
-                // in this case we manage the 'pull down' situation when we are at the top
-                if list.first().unwrap().index == self.range_start && first_pos > 0.0 {
+                // in this case we manage the 'pull down' situation when we are at the top;
+                // rows that fit have no pull-down and rest at their edge below
+                if !self.fits_viewport && list.first().unwrap().index == self.range_start && first_pos > 0.0 {
                     let min = if matches!(self.scroll_state, ScrollState::Stopped)
                         && !self.touch_scroll.is_dragging() && !self.touch_scroll.is_flinging() {
                         0.0
@@ -321,13 +361,12 @@ impl PortalList {
                     // using its exact height; readers retain their anchor.
                     let measured_tail = self.measuring && self.tail_range
                         && list.iter().any(|item| item.index.checked_add(1) == Some(self.range_end));
-                    let (shift, at_end) = final_alignment(
-                        first_pos,
-                        last_item_pos,
-                        viewport.size.index(vi),
-                        self.align_top_when_empty && self.not_filling_viewport,
-                        measured_tail,
-                    );
+                    let (shift, at_end) = if self.fits_viewport {
+                        let viewport_size = viewport.size.index(vi);
+                        (fitting_shift(first_pos, last_item_pos, viewport_size, self.align_top_when_empty), true)
+                    } else {
+                        final_alignment(last_item_pos, viewport.size.index(vi), measured_tail)
+                    };
                     self.at_end = at_end;
                     // first we scan upwards and move items in place
                     let mut first_id_changed = false;
@@ -401,7 +440,12 @@ impl PortalList {
                 self.tail_range = true;
             }
         }
-        let total_views = (self.range_end - self.range_start) as f64 / self.view_window as f64;
+        // Rows that fit have nothing to scroll, so no bar.
+        let total_views = if self.fits_viewport {
+            1.0
+        } else {
+            (self.range_end - self.range_start) as f64 / self.view_window as f64
+        };
         match self.vec_index {
             Vec2Index::Y => {
                 self.scroll_bar.draw_scroll_bar(cx, ScrollAxis::Vertical, rect, dvec2(100.0, rect.size.y * total_views));
@@ -1028,7 +1072,7 @@ impl Widget for PortalList {
             ScrollState::Pulldown {next_frame, time} => {
                 if let Some(frame) = next_frame.is_event(event) {
                     // we have to bounce back
-                    if self.first_id == self.range_start && self.first_scroll > 0.0 {
+                    if !self.fits_viewport && self.first_id == self.range_start && self.first_scroll > 0.0 {
                         let dt = time.map_or(0.0, |previous| (frame.time - previous).max(0.0));
                         *time = Some(frame.time);
                         self.first_scroll *= 0.85_f64.powf(dt * 60.0);
@@ -1060,7 +1104,8 @@ impl Widget for PortalList {
         }
         if !self.scroll_bar.is_area_captured(cx) || is_scroll{ 
             match event.hits_with_capture_overload(cx, self.area, self.capture_overload) {
-                Hit::FingerScroll(e) => {
+                // Rows that fit leave the wheel to an enclosing scroller.
+                Hit::FingerScroll(e) if !self.fits_viewport => {
                     self.tail_range = false;
                     self.detect_tail_in_draw = true;
                     self.was_scrolling = false;
@@ -1148,22 +1193,28 @@ impl Widget for PortalList {
                     // Mouse drags belong to child text selection, including its cursor.
                     let point = match vi { Vec2Index::X => dvec2(e.abs.y, e.abs.x), Vec2Index::Y => e.abs };
                     if let Some(delta) = self.touch_scroll.move_to(point, e.time) {
-                        cx.set_cursor(MouseCursor::Default);
-                        if let Event::TouchUpdate(update) = event {
-                            for touch in &update.touches {
-                                if matches!(touch.state, TouchState::Move) {
-                                    touch.handled.set(self.area);
+                        if self.fits_viewport {
+                            // Rows that fit have nothing to pan: leave the touch unclaimed for
+                            // an enclosing scroller, with no pull-down or fling.
+                            self.touch_scroll.reset();
+                        } else {
+                            cx.set_cursor(MouseCursor::Default);
+                            if let Event::TouchUpdate(update) = event {
+                                for touch in &update.touches {
+                                    if matches!(touch.state, TouchState::Move) {
+                                        touch.handled.set(self.area);
+                                    }
                                 }
                             }
+                            self.delta_top_scroll(cx, -delta, false, false);
+                            cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
+                            self.area.redraw(cx);
                         }
-                        self.delta_top_scroll(cx, -delta, false, false);
-                        cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
-                        self.area.redraw(cx);
                     }
                 }
                 Hit::FingerUp(fe) if fe.is_primary_hit() => {
                     self.touch_scroll.release(fe.time);
-                    if self.first_id == self.range_start && self.first_scroll > 0.0 {
+                    if !self.fits_viewport && self.first_id == self.range_start && self.first_scroll > 0.0 {
                         self.touch_scroll.reset();
                         self.scroll_state = ScrollState::Pulldown { next_frame: cx.new_next_frame(), time: None };
                     } else if !self.touch_scroll.is_flinging() {
@@ -1179,9 +1230,13 @@ impl Widget for PortalList {
             }
         }
         if let Some(delta) = self.touch_scroll.frame(cx, event) {
-            self.delta_top_scroll(cx, -delta, false, true);
-            cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
-            self.area.redraw(cx);
+            if self.fits_viewport {
+                self.touch_scroll.reset();
+            } else {
+                self.delta_top_scroll(cx, -delta, false, true);
+                cx.widget_action(uid, &scope.path, PortalListAction::Scroll);
+                self.area.redraw(cx);
+            }
         }
     }
     
@@ -1461,7 +1516,7 @@ impl PortalListSet {
 
 #[cfg(test)]
 mod scroll_anchor_tests {
-    use super::{end_overflow, final_alignment, measured_scroll_anchor};
+    use super::{end_overflow, final_alignment, fitting_shift, measured_scroll_anchor, rows_fit};
 
     #[test]
     fn content_anchor_excludes_header_and_keeps_pending_drag_offset() {
@@ -1481,18 +1536,46 @@ mod scroll_anchor_tests {
 
     #[test]
     fn final_tail_alignment_uses_current_giant_row_height() {
-        assert_eq!(final_alignment(0.0, Some(40_000.0), 600.0, false, true), (-39_400.0, true));
+        assert_eq!(final_alignment(Some(40_000.0), 600.0, true), (-39_400.0, true));
         // Completed asynchronous snapshots may grow or shrink this frame.
-        assert_eq!(final_alignment(0.0, Some(50_000.0), 600.0, false, true), (-49_400.0, true));
-        assert_eq!(final_alignment(0.0, Some(900.0), 600.0, false, true), (-300.0, true));
+        assert_eq!(final_alignment(Some(50_000.0), 600.0, true), (-49_400.0, true));
+        assert_eq!(final_alignment(Some(900.0), 600.0, true), (-300.0, true));
     }
 
     #[test]
-    fn final_alignment_preserves_reader_and_short_underfill() {
-        assert_eq!(final_alignment(-120.0, Some(40_000.0), 600.0, false, false), (0.0, false));
-        assert_eq!(final_alignment(-120.0, Some(180.0), 600.0, true, true), (120.0, false));
-        assert_eq!(final_alignment(-120.0, Some(580.0), 600.0, false, false), (20.0, true));
-        assert_eq!(final_alignment(0.0, None, 600.0, false, true), (0.0, false));
+    fn final_alignment_preserves_reader_position() {
+        assert_eq!(final_alignment(Some(40_000.0), 600.0, false), (0.0, false));
+        assert_eq!(final_alignment(Some(580.0), 600.0, false), (20.0, true));
+        assert_eq!(final_alignment(None, 600.0, true), (0.0, false));
+    }
+
+    #[test]
+    fn fitting_rows_return_to_the_top_after_being_scrolled() {
+        // 180px of rows in a 600px viewport, left 50px above or 80px below the top.
+        assert_eq!(fitting_shift(-50.0, Some(130.0), 600.0, true), 50.0);
+        assert_eq!(fitting_shift(80.0, Some(260.0), 600.0, true), -80.0);
+    }
+
+    #[test]
+    fn fitting_rows_return_to_the_bottom_after_being_scrolled() {
+        // 180px of rows in a 600px viewport, left at the top or 80px down.
+        assert_eq!(fitting_shift(0.0, Some(180.0), 600.0, false), 420.0);
+        assert_eq!(fitting_shift(80.0, Some(260.0), 600.0, false), 340.0);
+    }
+
+    #[test]
+    fn rows_fit_when_all_are_laid_out_within_the_viewport() {
+        // (index, size); row 3 is padding past the range.
+        let rows = [(0, 200.0), (1, 200.0), (2, 200.0), (3, 50.0)];
+        assert!(rows_fit(&rows, 0, 3, 600.0, |r| *r));
+        assert!(!rows_fit(&rows, 0, 3, 599.0, |r| *r));
+    }
+
+    #[test]
+    fn rows_under_a_pull_down_do_not_fit_while_later_rows_are_not_laid_out() {
+        // Pulled 80px down, only rows 0 and 1 of 10 are laid out.
+        let rows = [(0, 200.0), (1, 200.0)];
+        assert!(!rows_fit(&rows, 0, 10, 600.0, |r| *r));
     }
 
     #[test]
