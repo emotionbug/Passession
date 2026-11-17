@@ -428,9 +428,33 @@ Upstream, an idle window kept the GUI thread at ~90–97% CPU. There were two ca
   redraw, platform op or dirty pass is pending.
 - `SelectTimers::select` in `os/linux/select_timer.rs` also selected fd 0. Under
   `xvfb-run`, desktop launchers and systemd, stdin is at EOF or `/dev/null` and always
-  readable, so `select` returned at once. Only the X connection fd is selected now.
+  readable, so `select` returned at once. Stdin is no longer selected.
 
-Timers, signals and input wake the loop as before. Idle CPU measured on Xvfb: 1–2%.
+The remaining signal/action poll timer fired every 8 ms even with no work
+(125 main-thread wakeups/s; measured 0.73% CPU in a debug idle window). It is
+removed. `thread.rs` posts Linux/X11 UI/action signals to a process-lifetime,
+nonblocking, close-on-exec eventfd (`os/linux/x11/ui_wake.rs`), selected alongside
+the X connection. A read coalesces pending posts before dispatch checks the signal
+flags and drains the action channel; posts racing with dispatch remain pending.
+Media notifications retain their existing signal path. Disk live edits, explicit
+DSL reloads and received Linux WebSocket messages also wake the UI, so live reload
+does not depend on a periodic UI poll.
+
+Application timers still supply the select deadline, and animation/next-frame
+work keeps polling until its paints finish. Timer callbacks now paint their work
+before sleeping again. `ui_wake` tests cover coalescing/rearming, cross-thread
+signals/actions waking select without X input, and timer delivery without signals.
+There is no native Wayland backend in this vendored crate; compositor sessions
+use this X11 path through XWayland. The separate `linux_direct` backend's 8 ms
+poll timer is unchanged, as are Android, OpenHarmony and stdin-hosted loops.
+
+To measure the change, leave a smoke-harness window idle without animation or
+application timers and compare `voluntary_ctxt_switches` in
+`/proc/<pid>/task/<pid>/status` before and after 30 seconds. The removed timer
+contributed about 3,750 switches in that interval; unrelated app/media work can
+still wake threads. Post a `SignalToUI` signal and `Cx::post_action` from a worker
+while idle and check prompt UI delivery, then exercise an animation and timer.
+No post-change runtime measurement is recorded here.
 
 ## Linux timer cancellation (GuiShell)
 

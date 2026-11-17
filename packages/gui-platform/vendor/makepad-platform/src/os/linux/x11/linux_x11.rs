@@ -68,7 +68,6 @@ impl Cx {
         
         cx.borrow_mut().call_event_handler(&Event::Startup);
         cx.borrow_mut().redraw_all();
-        get_xlib_app_global().start_timer(0,0.008,true);
         get_xlib_app_global().event_loop();
     }
     
@@ -217,23 +216,21 @@ impl Cx {
                 self.call_window_event_handler(window_id, &Event::TextCut(e))
             }
             XlibEvent::Timer(e) => {
-                //println!("TIMER! {:?}", std::time::Instant::now());
-                if e.timer_id == 0{
-                    if SignalToUI::check_and_clear_ui_signal(){
-                        self.handle_media_signals();
-                        self.call_event_handler(&Event::Signal);
-                    }
-                    self.handle_action_receiver();
+                self.call_event_handler(&Event::Timer(e));
+            }
+            XlibEvent::Wake => {
+                if SignalToUI::check_and_clear_ui_signal() {
+                    self.handle_media_signals();
+                    self.call_event_handler(&Event::Signal);
                 }
-                else{
-                    self.call_event_handler(&Event::Timer(e))
+                if SignalToUI::check_and_clear_action_signal() {
+                    self.handle_action_receiver();
                 }
 
                 if self.handle_live_edit() {
                     self.call_event_handler(&Event::LiveEdit);
                     self.redraw_all();
                 }
-                return EventFlow::Wait;
             }
         }
         

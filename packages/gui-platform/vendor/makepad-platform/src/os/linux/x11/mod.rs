@@ -6,4 +6,5 @@ pub mod xdnd;
 pub mod xlib_event;
 pub mod linux_x11; 
 pub mod linux_x11_stdin; 
+pub(crate) mod ui_wake;
 

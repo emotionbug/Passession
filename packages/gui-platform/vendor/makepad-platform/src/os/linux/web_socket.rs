@@ -53,11 +53,15 @@ impl OsWebSocket{
         // lets write the http request
         if stream.is_err(){
             rx_sender.send(WebSocketMessage::Error("Error connecting websocket tcpstream".into())).unwrap();
+            #[cfg(all(target_os = "linux", not(any(linux_direct, target_env = "ohos"))))]
+            crate::thread::SignalToUI::set_ui_signal();
             return OsWebSocket{sender:None, stream:None}
         }
         let mut stream = stream.unwrap();
         if write_bytes_to_tcp_stream_no_error(&mut stream, http_request.as_bytes()){
             rx_sender.send(WebSocketMessage::Error("Error writing request to websocket".into())).unwrap();
+            #[cfg(all(target_os = "linux", not(any(linux_direct, target_env = "ohos"))))]
+            crate::thread::SignalToUI::set_ui_signal();
             return OsWebSocket{sender:None, stream:None}
         }
                         
@@ -131,10 +135,14 @@ impl OsWebSocket{
                                 }
                             }
                         });                            
+                        #[cfg(all(target_os = "linux", not(any(linux_direct, target_env = "ohos"))))]
+                        crate::thread::SignalToUI::set_ui_signal();
                     }
                     Err(e) => {
                         eprintln!("Failed to receive data: {}", e);
                         let _ = rx_sender.send(WebSocketMessage::Closed);
+                        #[cfg(all(target_os = "linux", not(any(linux_direct, target_env = "ohos"))))]
+                        crate::thread::SignalToUI::set_ui_signal();
                         done = true;
                     }
                 }

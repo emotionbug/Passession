@@ -13,7 +13,6 @@ pub struct SelectTimer {
 }
 
 pub struct SelectTimers {
-    //pub signal_fds: [c_int; 2],
     pub timers: VecDeque<SelectTimer>,
     pub time_start: Instant,
     pub select_time: f64,
@@ -28,16 +27,18 @@ impl SelectTimers {
         }
     }
     
-    pub fn select(&mut self, fd: c_int) {
+    pub fn select(&mut self, read_fds: &[c_int]) {
         let mut fds = mem::MaybeUninit::uninit();
         unsafe {
             libc_sys::FD_ZERO(fds.as_mut_ptr());
             // Paseo: upstream also selected fd 0. A GUI launched with stdin at EOF or
             // /dev/null (desktop launchers, systemd, xvfb-run) finds it readable forever, so
-            // `select` never blocks and the GUI thread spins. Only the X connection wakes us.
-            libc_sys::FD_SET(fd, fds.as_mut_ptr());
+            // `select` never blocks and the GUI thread spins. Only explicit sources wake us.
+            for &fd in read_fds {
+                assert!(fd >= 0 && (fd as usize) < libc_sys::FD_SETSIZE);
+                libc_sys::FD_SET(fd, fds.as_mut_ptr());
+            }
         }
-        //libc_sys::FD_SET(self.signal_fds[0], fds.as_mut_ptr());
         // If there are any timers, we set the timeout for select to the `delta_timeout`
         // of the first timer that should be fired. Otherwise, we set the timeout to
         // None, so that select will block indefinitely.
@@ -50,7 +51,7 @@ impl SelectTimers {
                 tv_usec: (timer.delta_timeout.fract() * 1000_000.0) as libc_sys::time_t,
             });
         let _nfds = unsafe {libc_sys::select(
-            fd+1,
+            read_fds.iter().copied().max().map_or(0, |fd| fd + 1),
             fds.as_mut_ptr(),
             ptr::null_mut(),
             ptr::null_mut(),

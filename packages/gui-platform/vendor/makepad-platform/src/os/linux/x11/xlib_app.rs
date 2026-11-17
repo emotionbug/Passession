@@ -79,7 +79,6 @@ pub struct XlibApp {
     pub xim: x11_sys::XIM,
     pub clipboard: String,
     pub display_fd: c_int,
-    //pub signal_fds: [c_int; 2],
     pub window_map: HashMap<c_ulong, *mut XlibWindow>,
 
     pub timers: SelectTimers,
@@ -112,8 +111,6 @@ impl XlibApp {
             let display = x11_sys::XOpenDisplay(ptr::null());
             let display_fd = x11_sys::XConnectionNumber(display);
             let xim = x11_sys::XOpenIM(display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
-            //let mut signal_fds = [0, 0];
-            //libc_sys::pipe(signal_fds.as_mut_ptr());
             x11_sys::XrmInitialize();
             XlibApp {
                 event_loop_running: true,
@@ -122,7 +119,6 @@ impl XlibApp {
                 xim,
                 display,
                 display_fd,
-                //signal_fds,
                 clipboard: String::new(),
                 last_scroll_time: 0.0,
                 last_click_time: 0.0,
@@ -680,42 +676,30 @@ impl XlibApp {
     
     pub fn event_loop(&mut self) {
         unsafe {
-            
+            let wake = super::ui_wake::ui_wake();
             self.do_callback(XlibEvent::Paint);
-            
             let mut timer_ids = Vec::new();
             while self.event_loop_running {
+                let time = self.time_now();
+                self.timers.update_timers(&mut timer_ids);
+                for timer_id in &timer_ids {
+                    self.do_callback(XlibEvent::Timer(TimerEvent {
+                        timer_id: *timer_id,
+                        time: Some(time),
+                    }));
+                }
+                // Drain before checking the signal flags in the callback. A post racing
+                // with that callback leaves either its flag or another readable wake.
+                if wake.drain() {
+                    self.do_callback(XlibEvent::Wake);
+                }
                 match self.event_flow {
-                    EventFlow::Exit => {
-                        break;
-                    }
+                    EventFlow::Exit => break,
                     EventFlow::Wait => {
-                        let time = self.time_now();
-                        self.timers.update_timers(&mut timer_ids);
-                        for timer_id in &timer_ids{
-                            self.do_callback(
-                                XlibEvent::Timer(TimerEvent {
-                                    timer_id:*timer_id,
-                                    time: Some(time)
-                                })
-                            );
-                        }
-                        self.timers.select(self.display_fd);
+                        self.timers.select(&[self.display_fd, wake.fd()]);
                         self.event_flow = EventFlow::Poll;
                     }
-                    EventFlow::Poll => { 
-                        let time = self.time_now();
-                        self.timers.update_timers(&mut timer_ids);
-                        for timer_id in &timer_ids{
-                            self.do_callback(
-                                XlibEvent::Timer(TimerEvent {
-                                    timer_id:*timer_id,
-                                    time: Some(time)
-                                })
-                            );
-                        }
-                        self.event_loop_poll();
-                    }
+                    EventFlow::Poll => self.event_loop_poll(),
                 }
             }
         }

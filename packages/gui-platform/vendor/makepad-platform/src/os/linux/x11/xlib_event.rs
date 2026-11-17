@@ -27,6 +27,7 @@ pub enum XlibEvent {
     WindowGeomChange(WindowGeomChangeEvent),
     WindowClosed(WindowClosedEvent),
     Paint,
+    Wake,
     
     MouseDown(MouseDownEvent),
     MouseUp(MouseUpEvent),
