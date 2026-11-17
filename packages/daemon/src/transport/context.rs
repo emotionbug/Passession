@@ -59,6 +59,7 @@ pub(crate) struct Source {
     slots: Mutex<HashMap<u8, String>>,
     transfers: Mutex<HashSet<String>>,
     events: Mutex<HashMap<String, (HashSet<String>, bool)>>,
+    selective_subagent_timelines: AtomicBool,
 }
 
 pub(crate) struct QueuedFrame {
@@ -158,6 +159,7 @@ impl RequestContext {
             slots: Mutex::new(HashMap::new()),
             transfers: Mutex::new(HashSet::new()),
             events: Mutex::new(HashMap::new()),
+            selective_subagent_timelines: AtomicBool::new(false),
         });
         (
             Self {
@@ -413,6 +415,18 @@ impl RequestContext {
             bail!("Subscription IDs are assigned by the host");
         }
         let slot = legacy_slot.unwrap_or(family);
+        let selective_subagents =
+            family == "timelines" && request.message.get("subagents").is_some();
+        if selective_subagents {
+            let subagents = request.message["subagents"]
+                .as_array()
+                .ok_or_else(|| anyhow!("subagents must be an array"))?;
+            if subagents.iter().any(|child| {
+                child["parentAgentId"].as_str().is_none() || child["subagentId"].as_str().is_none()
+            }) {
+                bail!("subagents must identify a parentAgentId and subagentId");
+            }
+        }
         let mut subscriptions = self.source.subscriptions.lock().unwrap();
         if !self.is_modern() {
             subscriptions.retain(|_, prior| {
@@ -453,6 +467,13 @@ impl RequestContext {
             }),
         });
         subscriptions.insert(id, state.clone());
+        if selective_subagents {
+            // Opt-in survives release: closing the last child must not restore
+            // the older connection-wide broadcast behaviour.
+            self.source
+                .selective_subagent_timelines
+                .store(true, Ordering::Release);
+        }
         Ok(OwnedSubscription {
             context: Self {
                 source: self.source.clone(),
@@ -711,6 +732,49 @@ impl RequestContext {
                         .get(id)
                         .is_some_and(|s| !s.cancel.is_cancelled())
             })
+    }
+    pub(crate) async fn emit_subagent_timeline(&self, message: &Value) -> Result<()> {
+        if self
+            .source
+            .selective_subagent_timelines
+            .load(Ordering::Acquire)
+        {
+            let owners = self
+                .source
+                .subscriptions
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|state| {
+                    state.family == "timelines"
+                        && !state.cancel.is_cancelled()
+                        && state.request["subagents"]
+                            .as_array()
+                            .is_some_and(|children| {
+                                children.iter().any(|child| {
+                                    child["parentAgentId"] == message["payload"]["parentAgentId"]
+                                        && child["subagentId"] == message["payload"]["subagentId"]
+                                })
+                            })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for state in owners {
+                let subscription = OwnedSubscription {
+                    context: Self {
+                        source: self.source.clone(),
+                        owner: Owner::Subscription(state.clone()),
+                    },
+                    state,
+                };
+                subscription.emit(message.clone()).await?;
+            }
+            Ok(())
+        } else {
+            // Older apps have no child membership field and retain their
+            // existing session-event feed.
+            self.emit_event(message.clone()).await
+        }
     }
     pub(crate) async fn emit_event(&self, message: Value) -> Result<()> {
         let Some(category) = event_category(&message) else {

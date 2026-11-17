@@ -269,8 +269,16 @@ pub(crate) fn legacy_matches(request_type: &str, fields: &Value, message: &Value
             kind == "terminal_stream_exit" && payload["terminalId"] == fields["terminalId"]
         }
         "agent.timeline.set_subscription.request" => {
-            (kind == "agent_stream" || kind == "agent.timeline.replacement")
-                && contains(&fields["agentIds"], &payload["agentId"])
+            ((kind == "agent_stream" || kind == "agent.timeline.replacement")
+                && contains(&fields["agentIds"], &payload["agentId"]))
+                || (kind == "agent.provider_subagents.update"
+                    && payload["kind"] == "timeline"
+                    && fields["subagents"].as_array().is_some_and(|children| {
+                        children.iter().any(|child| {
+                            child["parentAgentId"] == payload["parentAgentId"]
+                                && child["subagentId"] == payload["subagentId"]
+                        })
+                    }))
         }
         "session.events.set_subscription.request" => {
             let name = if kind == "status" {
@@ -311,6 +319,32 @@ mod tests {
 
     fn entry(id: &str, cwd: &str, status: &str) -> Value {
         json!({"agent":{"id":id,"cwd":cwd,"status":status,"updatedAt":"t"},"project":{"projectKey":"p","projectName":"P","checkout":{"cwd":cwd,"isGit":false}}})
+    }
+
+    #[test]
+    fn legacy_child_observations_match_the_exact_parent_and_child() {
+        let fields = json!({"agentIds":["parent"],
+            "subagents":[{"parentAgentId":"parent","subagentId":"child"}]});
+        let row = json!({"type":"agent.provider_subagents.update","payload":{
+            "kind":"timeline","parentAgentId":"parent","subagentId":"child"}});
+        let request = "agent.timeline.set_subscription.request";
+        assert!(legacy_matches(request, &fields, &row));
+        for (parent, child) in [("parent", "sibling"), ("other", "child")] {
+            let mut other = row.clone();
+            other["payload"]["parentAgentId"] = json!(parent);
+            other["payload"]["subagentId"] = json!(child);
+            assert!(!legacy_matches(request, &fields, &other));
+        }
+        assert!(!legacy_matches(
+            request,
+            &json!({"agentIds":["parent"],"subagents":[]}),
+            &row
+        ));
+        assert!(legacy_matches(
+            request,
+            &fields,
+            &json!({"type":"agent_stream","payload":{"agentId":"parent"}})
+        ));
     }
 
     #[test]

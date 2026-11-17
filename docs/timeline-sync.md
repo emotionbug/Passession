@@ -261,6 +261,13 @@ Child transcripts use the same projected-page reconciliation as the main convers
 retains rendered items and sequence cursors, never a second cache of source events. Pagination
 uses the projected display anchor; live updates advance the source cursor without moving tools.
 
+`agent.timeline.set_subscription.request` may carry `subagents: [{parentAgentId, subagentId}]`.
+A connection that sends this field receives a child's live timeline rows only while it subscribes
+to that child; an empty list subscribes to none. Descriptor and status updates keep their session
+event feed. Closing a child stops its live rows without deleting history, and reopening catches up
+through the normal timeline fetch. Older clients that omit `subagents` keep receiving every child's
+rows.
+
 Persistence uses `agent-subagents/{parentId}/index.sqlite3` for descriptors and one
 `{sha256(childId)}.sqlite3` timeline per child. Row/cursor changes use the same WAL/FULL
 commit-before-publication contract as parent timelines. Blocking storage work runs outside

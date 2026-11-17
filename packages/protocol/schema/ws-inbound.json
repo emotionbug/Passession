@@ -5786,6 +5786,24 @@
                     "type": "string"
                   }
                 },
+                "subagents": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "parentAgentId": {
+                        "type": "string"
+                      },
+                      "subagentId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "parentAgentId",
+                      "subagentId"
+                    ]
+                  }
+                },
                 "requestId": {
                   "type": "string"
                 }

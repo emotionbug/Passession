@@ -812,3 +812,127 @@ async fn update_maintenance_reaches_subscribed_ui_but_never_legacy_or_unsubscrib
     }
     assert!(!permissions::allows_outbound(&notice, |p| p == "tunnel.manage"));
 }
+
+#[tokio::test]
+async fn subagent_rows_follow_child_membership_but_parent_status_keeps_its_feed() {
+    let transport = TransportService::new(Weak::new());
+    let make_session = |id: &str| {
+        RequestContext::attach(SourceConfig {
+            id: id.into(),
+            session_id: id.into(),
+            client_id: id.into(),
+            capabilities: json!({"owned_subscriptions":true,"provider_subagents":true}),
+            principal: json!({"id":"owner","kind":"owner"}),
+            permissions: Arc::new(RwLock::new(
+                permissions::OWNER_PERMISSIONS
+                    .iter()
+                    .map(|p| (*p).to_owned())
+                    .collect(),
+            )),
+            routed: false,
+            app_version: None,
+            cancel: CancellationToken::new(),
+        })
+    };
+    let (viewer, mut viewer_output) = make_session("child-viewer");
+    let (parent, mut parent_output) = make_session("parent-only");
+    let (older, mut older_output) = make_session("older-app");
+    for source in [&viewer, &parent, &older] {
+        transport.sessions.lock().unwrap().sessions.insert(
+            source.session_id().into(),
+            Session {
+                id: source.session_id().into(),
+                permissions: source.source.permissions.clone(),
+                sources: [(source.source_id().into(), Arc::downgrade(&source.source))]
+                    .into_iter()
+                    .collect(),
+                retained_until: None,
+                ephemeral: false,
+                permission_ceiling: None,
+            },
+        );
+        let request = source.for_request(json!({
+            "type":"session.events.set_subscription.request","requestId":"feed",
+            "events":["agent.provider_subagents.update"]
+        }));
+        assert!(
+            transport
+                .handle(&request, request.request().unwrap())
+                .await
+                .unwrap()
+        );
+    }
+    for output in [&mut viewer_output, &mut parent_output, &mut older_output] {
+        assert_eq!(
+            json_frame(&output.recv().await.unwrap())["message"]["type"],
+            "session.events.set_subscription.response"
+        );
+    }
+    let subscribe = |source: &RequestContext, children: Option<Value>| {
+        let mut request = json!({
+            "type":"agent.timeline.set_subscription.request","requestId":"timeline",
+            "agentIds":["parent"]
+        });
+        if let Some(children) = children {
+            request["subagents"] = children;
+        }
+        source
+            .for_request(request)
+            .begin_subscription("timelines", None, None)
+            .unwrap()
+    };
+    let child = subscribe(
+        &viewer,
+        Some(json!([{"parentAgentId":"parent","subagentId":"child"}])),
+    );
+    let parent_membership = subscribe(&parent, Some(json!([])));
+    let old_membership = subscribe(&older, None);
+    child.activate().await.unwrap();
+    parent_membership.activate().await.unwrap();
+    old_membership.activate().await.unwrap();
+    let row = json!({"type":"agent.provider_subagents.update","payload":{
+        "kind":"timeline","parentAgentId":"parent","subagentId":"child",
+        "provider":"omp","item":{"type":"assistant_message","text":"stored row"},
+        "timestamp":"2026-11-18T00:00:00Z","seq":1,"epoch":"child-epoch"
+    }});
+    transport.publish_event(row.clone()).await.unwrap();
+    let delivered = json_frame(&viewer_output.recv().await.unwrap());
+    assert_eq!(delivered["message"]["payload"]["kind"], "timeline");
+    assert_eq!(
+        delivered["message"]["payload"]["subscriptionId"],
+        child.response_id()
+    );
+    assert!(parent_output.try_recv().is_err());
+    // An app omitting `subagents` retains its original session-event delivery.
+    assert_eq!(
+        json_frame(&older_output.recv().await.unwrap())["message"]["payload"]["kind"],
+        "timeline"
+    );
+    let status = json!({"type":"agent.provider_subagents.update","payload":{
+        "kind":"upsert","subagent":{"id":"child","parentAgentId":"parent","status":"completed"}
+    }});
+    transport.publish_event(status).await.unwrap();
+    for output in [&mut viewer_output, &mut parent_output, &mut older_output] {
+        let delivered = json_frame(&output.recv().await.unwrap());
+        assert_eq!(
+            delivered["message"]["payload"]["subagent"]["status"],
+            "completed"
+        );
+    }
+    // Sibling children and identical child IDs under another parent do not match.
+    for (parent_id, child_id) in [("parent", "sibling"), ("other-parent", "child")] {
+        let mut other_row = row.clone();
+        other_row["payload"]["parentAgentId"] = json!(parent_id);
+        other_row["payload"]["subagentId"] = json!(child_id);
+        transport.publish_event(other_row).await.unwrap();
+        assert!(viewer_output.try_recv().is_err());
+        assert!(parent_output.try_recv().is_err());
+        older_output.recv().await.unwrap();
+    }
+    // Closing the final child does not silently restore broadcast delivery.
+    child.release().await.unwrap();
+    transport.publish_event(row).await.unwrap();
+    assert!(viewer_output.try_recv().is_err());
+    assert!(parent_output.try_recv().is_err());
+    older_output.recv().await.unwrap();
+}

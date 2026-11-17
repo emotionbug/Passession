@@ -965,6 +965,25 @@ fn legacy_members(core: &Core, host_key: u64, request_type: &str, key: &str) -> 
     )
 }
 
+fn legacy_subagents(core: &Core, host_key: u64) -> Vec<Value> {
+    let observations = core.observations.borrow();
+    let mut children: Vec<Value> = observations
+        .values()
+        .filter(|o| {
+            o.host_key == host_key && o.request_type == "agent.timeline.set_subscription.request"
+        })
+        .filter_map(|o| o.fields["subagents"].as_array())
+        .flatten()
+        .cloned()
+        .collect();
+    children.sort_by(|a, b| {
+        (a["parentAgentId"].as_str(), a["subagentId"].as_str())
+            .cmp(&(b["parentAgentId"].as_str(), b["subagentId"].as_str()))
+    });
+    children.dedup();
+    children
+}
+
 /// Flutter `_startObservation`; `restored` after a reconnect.
 pub(crate) async fn start_observation(core: &Rc<Core>, id: &str, restored: bool) {
     let (host_key, request_type, response_type, mut fields) = {
@@ -1021,6 +1040,9 @@ pub(crate) async fn start_observation(core: &Rc<Core>, id: &str, restored: bool)
             "agent.timeline.set_subscription.request" => {
                 fields["agentIds"] =
                     legacy_members(core, host_key, &request_type, "agentIds").into();
+                if fields.get("subagents").is_some() {
+                    fields["subagents"] = legacy_subagents(core, host_key).into();
+                }
             }
             "session.events.set_subscription.request" => {
                 fields["events"] =
@@ -1369,16 +1391,21 @@ async fn release_subscription(
             conn.send(json!({"type":"unsubscribe_checkout_diff_request","subscriptionId":subscription}))
                 .await
         }
-        "agent.timeline.set_subscription.request" if conn.supports("selectiveAgentTimeline") => conn
-            .request(
-                json!({"type":request_type,"agentIds":legacy_members(core, host.key, request_type, "agentIds")}),
+        "agent.timeline.set_subscription.request" if conn.supports("selectiveAgentTimeline") => {
+            let mut request = json!({"type":request_type,"agentIds":legacy_members(core, host.key, request_type, "agentIds")});
+            if fields.get("subagents").is_some() {
+                request["subagents"] = legacy_subagents(core, host.key).into();
+            }
+            conn.request(
+                request,
                 "agent.timeline.set_subscription.response",
                 Some(REQUEST_TIMEOUT),
                 None,
                 None,
             )
             .await
-            .map(|_| ()),
+            .map(|_| ())
+        },
         "session.events.set_subscription.request" if conn.supports("explicitEventSubscriptions") => conn
             .request(
                 json!({"type":request_type,"events":legacy_event_filter(legacy_members(core, host.key, request_type, "events"))}),

@@ -896,11 +896,15 @@ impl TransportService {
     }
     pub async fn publish_event(&self, message: Value) -> Result<()> {
         let sources = self.live_sources();
+        let subagent_timeline = message["type"] == "agent.provider_subagents.update"
+            && message["payload"]["kind"] == "timeline";
         for source in sources {
             if !source.is_live() {
                 continue;
             }
-            let result = if context::event_category(&message).is_some() {
+            let result = if subagent_timeline {
+                source.emit_subagent_timeline(&message).await
+            } else if context::event_category(&message).is_some() {
                 source.emit_event(message.clone()).await
             } else if !source.is_modern() {
                 if let Some(projected) = crate::agent::project_legacy_event(&source, &message) {

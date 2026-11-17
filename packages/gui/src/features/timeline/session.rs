@@ -653,6 +653,9 @@ impl ChatSession {
             json!({
                 "type": "agent.timeline.set_subscription.request",
                 "agentIds": [self.key.agent_id],
+                "subagents": self.key.subagent_id.as_ref().map(|subagent| {
+                    vec![json!({"parentAgentId": self.key.agent_id, "subagentId": subagent})]
+                }).unwrap_or_default(),
             }),
             "agent.timeline.set_subscription.response",
         );
