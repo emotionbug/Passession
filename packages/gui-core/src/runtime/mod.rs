@@ -41,6 +41,7 @@ pub(crate) struct Core {
     /// Shared outbound buffer budget of every connection (SDK default 256 MiB).
     pub buffers: Arc<Semaphore>,
     pub cancel: CancellationToken,
+    pub app_visible: tokio::sync::watch::Sender<bool>,
     /// Relay daemon keys seen protected in this process (Flutter `_protectedIdentities`).
     pub protected_keys: RefCell<HashSet<String>>,
     /// Routes being opened (`origin/server`), Flutter `_routing`.
@@ -70,6 +71,7 @@ impl Core {
             client_id: RefCell::new(String::new()),
             buffers: Arc::new(Semaphore::new(256 * 1024 * 1024)),
             cancel: CancellationToken::new(),
+            app_visible: tokio::sync::watch::channel(true).0,
             protected_keys: RefCell::new(HashSet::new()),
             routing: RefCell::new(HashSet::new()),
             initialized: Cell::new(false),

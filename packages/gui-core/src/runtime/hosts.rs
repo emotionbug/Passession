@@ -84,8 +84,48 @@ pub(crate) fn reconnect_delay(attempt: u32) -> Duration {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
+// The daemon arms a 45 s idle lease after the first envelope ping. Background clients
+// must keep that lease alive; stopping probes would disconnect an otherwise healthy app.
+const BACKGROUND_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVENESS_FAILURES: u32 = 2;
+
+struct LivenessCadence {
+    visible: bool,
+    sent_at: Instant,
+    settled_at: Instant,
+}
+
+impl LivenessCadence {
+    fn new(visible: bool, now: Instant) -> Self {
+        Self {
+            visible,
+            sent_at: now,
+            settled_at: now,
+        }
+    }
+
+    fn set_visible(&mut self, visible: bool, now: Instant) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if visible {
+            // Resume verifies separately, without waiting for the periodic deadline.
+            self.sent_at = now;
+            self.settled_at = now;
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        if self.visible {
+            self.settled_at + LIVENESS_INTERVAL
+        } else {
+            // Anchor keepalives to send time so a slow pong cannot overrun the lease.
+            self.sent_at + BACKGROUND_LIVENESS_INTERVAL
+        }
+    }
+}
 
 impl Host {
     pub fn new(
@@ -625,10 +665,24 @@ async fn read(
     lost(&core, &host, conn.generation, error);
 }
 
-/// Flutter liveness heartbeat: one envelope ping 10 s after the previous probe settles.
+/// Foreground probes settle before the next 10 s wait; background probes only keep the
+/// daemon's source lease alive. Visibility changes abandon suspended probe deadlines.
 async fn heartbeat(core: Rc<Core>, host: Rc<Host>, conn: Rc<Conn>) {
+    let mut visibility = core.app_visible.subscribe();
+    let mut cadence = LivenessCadence::new(*visibility.borrow_and_update(), Instant::now());
+    let cancel = host.link.borrow().socket_cancel.clone();
     loop {
-        tokio::time::sleep(LIVENESS_INTERVAL).await;
+        tokio::select! { biased;
+            _ = cancel.cancelled() => return,
+            changed = visibility.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                cadence.set_visible(*visibility.borrow_and_update(), Instant::now());
+                continue;
+            }
+            _ = tokio::time::sleep_until(cadence.deadline().into()) => {}
+        }
         if conn.closed.get() || host.conn_generation() != Some(conn.generation) {
             return;
         }
@@ -637,7 +691,19 @@ async fn heartbeat(core: Rc<Core>, host: Rc<Host>, conn: Rc<Conn>) {
             return;
         }
         let started = Instant::now();
-        match tokio::time::timeout(LIVENESS_TIMEOUT, answered).await {
+        cadence.sent_at = started;
+        let result = tokio::select! { biased;
+            _ = cancel.cancelled() => return,
+            changed = visibility.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                cadence.set_visible(*visibility.borrow_and_update(), Instant::now());
+                continue;
+            }
+            result = tokio::time::timeout(LIVENESS_TIMEOUT, answered) => result,
+        };
+        match result {
             Ok(Ok(())) => {
                 host.link.borrow_mut().rtt = Some(started.elapsed());
             }
@@ -667,6 +733,7 @@ async fn heartbeat(core: Rc<Core>, host: Rc<Host>, conn: Rc<Conn>) {
                 }
             }
         }
+        cadence.settled_at = Instant::now();
     }
 }
 
@@ -867,6 +934,13 @@ fn verify_connection(core: &Rc<Core>, host: &Rc<Host>) {
 }
 
 pub(crate) fn set_app_visible(core: &Rc<Core>, visible: bool) {
+    core.app_visible.send_if_modified(|current| {
+        if *current == visible {
+            return false;
+        }
+        *current = visible;
+        true
+    });
     if !visible {
         return;
     }
@@ -1518,6 +1592,31 @@ pub(crate) async fn shutdown(core: &Rc<Core>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn liveness_cadence_preserves_background_lease_and_resets_on_resume() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut cadence = LivenessCadence::new(true, start);
+        assert_eq!(cadence.deadline(), at(10));
+        cadence.sent_at = at(10);
+        cadence.settled_at = at(12);
+        assert_eq!(cadence.deadline(), at(22));
+
+        cadence.set_visible(false, at(15));
+        assert_eq!(cadence.deadline(), at(40));
+        cadence.set_visible(false, at(25));
+        assert_eq!(cadence.deadline(), at(40));
+        cadence.sent_at = at(40);
+        cadence.settled_at = at(50);
+        assert_eq!(cadence.deadline(), at(70));
+
+        cadence.set_visible(true, at(51));
+        assert_eq!(cadence.deadline(), at(61));
+        cadence.set_visible(true, at(55));
+        assert_eq!(cadence.deadline(), at(61));
+        assert_eq!(LivenessCadence::new(false, start).deadline(), at(30));
+    }
 
     #[test]
     fn reconnect_backoff_is_exponential_and_capped() {

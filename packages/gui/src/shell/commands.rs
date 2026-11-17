@@ -4590,6 +4590,12 @@ pub fn handle_window_events(
         }
         Event::Background | Event::Pause | Event::AppLostFocus => {
             shell.data.app_inactive = true;
+            // Desktop tray windows keep their live attention-notification connection.
+            if cfg!(any(target_os = "android", target_os = "ios"))
+                && matches!(event, Event::Background | Event::Pause)
+            {
+                ui.core.set_app_visible(false);
+            }
             if let Err(error) = crate::features::composer::flush_drafts(ui) {
                 toast(shell, cx, error, true);
             }
