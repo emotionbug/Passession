@@ -350,15 +350,51 @@ async fn build_entries_ref(
     app: &AppState,
     workspaces: &[Value],
     projects: &[Value],
+    scope: Option<&str>,
 ) -> Result<Vec<Value>> {
-    // One snapshot listing feeds every agent-derived projection of this rebuild.
-    let agents = app.agents.list_snapshots().await?;
+    // Full observations share one listing; publications use the durable workspace index.
+    let mut agents = match scope {
+        Some(workspace) => app.agents.list_workspace_snapshots(workspace).await?,
+        None => app.agents.list_snapshots().await?,
+    };
     let message_times = AgentManager::workspace_last_user_message_times_from_snapshots(&agents);
     let (provider_activity, unavailable_subagents) = app
         .agents
         .list_provider_subagent_activity_from_snapshots(&agents)
         .await?;
-    let terminals = app.terminals.live_by_workspace();
+    let terminals = if let Some(workspace) = scope {
+        HashMap::from([(
+            workspace.to_owned(),
+            app.terminals.live_for_workspace(workspace),
+        )])
+    } else {
+        app.terminals.live_by_workspace()
+    };
+    if scope.is_some() {
+        // A parent in another workspace makes this agent a root. Resolve only
+        // boundary identities, without listing their subagent catalogs/activity.
+        // An absent/inactive parent must still mask its orphan as in a full rebuild.
+        let known = agents
+            .iter()
+            .map(|agent| text(agent, "id"))
+            .collect::<HashSet<_>>();
+        let parents = agents
+            .iter()
+            .filter_map(|agent| {
+                agent
+                    .pointer("/labels/paseo.parent-agent-id")
+                    .and_then(Value::as_str)
+            })
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && !known.contains(id))
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        for parent in parents {
+            if let Some(snapshot) = app.agents.directory_parent_snapshot(&parent).await? {
+                agents.push(snapshot);
+            }
+        }
+    }
     let project_map: HashMap<&str, &Value> = projects
         .iter()
         .map(|project| (text(project, "projectId"), project))
@@ -570,7 +606,7 @@ impl Observation {
         let started = Instant::now();
         let records = app.projects.list_workspaces().await?;
         let projects = app.projects.list_projects().await?;
-        let entries = build_entries_ref(app, &records, &projects).await?;
+        let entries = build_entries_ref(app, &records, &projects, None).await?;
         Ok(Self::new(started, entries, records, projects))
     }
 
@@ -706,6 +742,7 @@ pub async fn descriptor(app: &AppState, workspace: &Value, project: &Value) -> R
         app,
         std::slice::from_ref(workspace),
         std::slice::from_ref(project),
+        Some(text(workspace, "workspaceId")),
     )
     .await?
     .into_iter()
@@ -755,7 +792,7 @@ pub async fn fetch(
     projects: Vec<Value>,
 ) -> Result<Value> {
     validate_fetch(request)?;
-    let entries = build_entries_ref(app, &workspaces, &projects).await?;
+    let entries = build_entries_ref(app, &workspaces, &projects, None).await?;
     fetch_entries(app, request, entries, &projects)
 }
 

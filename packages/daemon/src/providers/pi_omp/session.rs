@@ -67,6 +67,8 @@ struct Inner {
     sink: EventSink,
     /// Live rows of a child whose in-stream replay is being decided.
     holds: crate::providers::api::ChildRowHold,
+    child_status: watch::Sender<HashMap<(u64, String), bool>>,
+    child_files: crate::files::observer::Observers,
     closed: AtomicBool,
     generation: AtomicU64,
     operation: tokio::sync::Mutex<()>,
@@ -118,7 +120,43 @@ impl Inner {
         Ok(state)
     }
     async fn emit(&self, event: Value) -> Result<()> {
-        self.holds.emit(&self.sink, event).await
+        let session_ended = event["sessionEnded"] == true;
+        let descriptor = (event["type"] == "provider_subagent")
+            .then(|| &event["event"])
+            .filter(|event| matches!(event["type"].as_str(), Some("upsert" | "remove")))
+            .and_then(|event| {
+                let terminal = match event["status"].as_str() {
+                    Some("running") => false,
+                    Some("completed" | "failed" | "canceled") => true,
+                    _ if event["type"] == "remove" => true,
+                    _ => return None,
+                };
+                Some((
+                    (
+                        self.generation.load(Ordering::Acquire),
+                        event["id"].as_str()?.to_owned(),
+                    ),
+                    terminal,
+                ))
+            });
+        self.holds.emit(&self.sink, event).await?;
+        if let Some((key, terminal)) = descriptor {
+            self.child_status.send_if_modified(|statuses| {
+                if statuses.get(&key) == Some(&terminal) {
+                    return false;
+                }
+                statuses.insert(key, terminal);
+                true
+            });
+        }
+        if session_ended {
+            self.child_status.send_modify(|statuses| {
+                for terminal in statuses.values_mut() {
+                    *terminal = true;
+                }
+            });
+        }
+        Ok(())
     }
     async fn out_of_band_message(&self, text: String) -> Result<()> {
         self.emit(json!({"type":"timeline","provider":self.spec.id,"item":{"type":"assistant_message","text":text}})).await
@@ -497,10 +535,33 @@ impl Inner {
             return;
         }
         let (id, file) = (id.to_owned(), file.to_owned());
+        let status_key = (generation, id.clone());
+        let mut status = self.child_status.subscribe();
+        let cwd = self.state.lock().unwrap().config["cwd"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
         let weak = Arc::downgrade(self);
         // Identified as the opened child's file replay identifies the same records.
         let mut mapper = Mapper::new("pi", &self.spec.id).native_ids();
         tokio::spawn(async move {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            // Subscribe before the first read so a final append racing that read
+            // cannot be lost. The shared observer also handles atomic replacement.
+            let mut observation = match inner
+                .child_files
+                .subscribe(cwd, file.clone(), inner.context.home.clone())
+                .await
+            {
+                Ok(observation) => Some(observation),
+                Err(error) => {
+                    tracing::warn!(%error, %file, "Child transcript observation failed");
+                    None
+                }
+            };
+            drop(inner);
             let mut offset = 0u64;
             let mut pending = Vec::<u8>::new();
             let mut items = 0usize;
@@ -510,26 +571,31 @@ impl Inner {
                     return;
                 };
                 if inner.closed.load(Ordering::Acquire)
-                    || inner.state.lock().unwrap().dead
                     || inner.generation.load(Ordering::Acquire) != generation
                     || offset >= MAX_BYTES
                     || items >= 200
                 {
                     return;
                 }
+                // Mark the descriptor seen before reading: terminal notification
+                // during this read stays armed and forces another read to EOF.
+                let terminal = status
+                    .borrow_and_update()
+                    .get(&status_key)
+                    .copied()
+                    .unwrap_or(false);
                 if let Ok(mut handle) = tokio::fs::File::open(&file).await
-                    && let Ok(metadata) = handle.metadata().await
+                    && handle.seek(std::io::SeekFrom::Start(offset)).await.is_ok()
                 {
-                    let count = metadata.len().min(MAX_BYTES).saturating_sub(offset) as usize;
-                    if count > 0 && handle.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
-                        let start = pending.len();
-                        pending.resize(start + count, 0);
-                        match handle.read(&mut pending[start..]).await {
-                            Ok(read) => {
-                                offset += read as u64;
-                                pending.truncate(start + read);
-                            }
-                            Err(_) => pending.truncate(start),
+                    let start = pending.len();
+                    let result = (&mut handle)
+                        .take(MAX_BYTES - offset)
+                        .read_to_end(&mut pending)
+                        .await;
+                    offset += (pending.len() - start) as u64;
+                    if result.is_ok() {
+                        if terminal && !pending.is_empty() && !pending.ends_with(b"\n") {
+                            pending.push(b'\n');
                         }
                         if let Some(last) = pending.iter().rposition(|b| *b == b'\n') {
                             for line in pending[..last].split(|b| *b == b'\n') {
@@ -556,9 +622,24 @@ impl Inner {
                             }
                             pending.drain(..=last);
                         }
+                        if terminal {
+                            return;
+                        }
                     }
                 }
-                tokio::select! {_ = inner.context.cancel.cancelled()=>return,_ = tokio::time::sleep(Duration::from_millis(250))=>{}}
+                let cancel = inner.context.cancel.clone();
+                drop(inner);
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    changed = status.changed() => { if changed.is_err() { return; } },
+                    changed = async {
+                        match observation.as_mut() {
+                            Some(observation) => observation.receiver.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => { if changed.is_err() { observation = None; } },
+                    _ = tokio::time::sleep(Duration::from_secs(5)), if observation.is_none() && !terminal => {},
+                }
             }
         });
     }
@@ -721,6 +802,7 @@ impl Inner {
         let old_tools = self.host_tools.lock().unwrap().replace(router);
         let previous = self.runtime.lock().unwrap().replace(next.clone());
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.child_status.send_modify(|statuses| statuses.clear());
         {
             let mut data = self.state.lock().unwrap();
             data.config = config;
@@ -1017,6 +1099,8 @@ impl Session {
             host_tools: Mutex::new(None),
             sink,
             holds: Default::default(),
+            child_status: watch::channel(HashMap::new()).0,
+            child_files: crate::files::observer::Observers::new(),
             closed: AtomicBool::new(false),
             generation: AtomicU64::new(1),
             operation: tokio::sync::Mutex::new(()),

@@ -12,7 +12,7 @@ use cron::Cadence;
 use rand::RngCore;
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 use store::{Run, Schedule, Store, Target, date, timestamp};
@@ -48,6 +48,7 @@ pub struct AutomationService {
 struct Reservation {
     running: Arc<StdMutex<HashSet<String>>>,
     id: String,
+    changed: Arc<tokio::sync::Notify>,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
@@ -55,6 +56,7 @@ impl Drop for Reservation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
+        self.changed.notify_one();
     }
 }
 
@@ -195,38 +197,117 @@ impl AutomationService {
         let app = self.app.clone();
         let stop = self.stop.clone();
         *timer = Some(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await;
-            let mut ticks = tokio::task::JoinSet::new();
+            let mut external = tokio::time::interval(std::time::Duration::from_secs(30));
+            external.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            external.tick().await;
+            // Tokio deadlines are monotonic; this cheap probe only re-arms them
+            // when wall time jumps. It never lists schedules or touches disk.
+            let mut clock_probe = tokio::time::interval(std::time::Duration::from_secs(1));
+            clock_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticks: tokio::task::JoinSet<(String, Result<()>)> = tokio::task::JoinSet::new();
+            let mut pending: HashSet<String> = HashSet::new();
+            let mut retry: HashMap<String, tokio::time::Instant> = HashMap::new();
             loop {
-                tokio::select! {
-                    biased;
-                    _=stop.cancelled()=>break,
-                    result=ticks.join_next(), if !ticks.is_empty()=>{
-                        if let Some(Err(error))=result {tracing::error!(%error,"Schedule tick task failed");}
-                        continue;
-                    },
-                    _=interval.tick()=>{}
-                }
-                let Some(state) = app.upgrade() else {
-                    break;
-                };
+                let Some(state) = app.upgrade() else { break };
                 let service = state.automation.clone();
                 let cancel = state.cancel.clone();
                 drop(state);
                 if cancel.is_cancelled() {
                     break;
                 }
-                let tick_stop = stop.clone();
-                ticks.spawn(async move {
+                let Ok(store) = service.store() else { break };
+                let now = service.now();
+                let monotonic = tokio::time::Instant::now();
+                retry.retain(|_, until| *until > monotonic);
+                let mut excluded = service
+                    .running
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                excluded.extend(pending.iter().cloned());
+                excluded.extend(retry.keys().cloned());
+                let next = store.next_deadline(&excluded).await;
+                let mut delay = next.map_or(std::time::Duration::from_secs(86400), |at| {
+                    (at - now).to_std().unwrap_or_default()
+                });
+                if let Some(until) = retry.values().min() {
+                    delay = delay.min(until.saturating_duration_since(monotonic));
+                }
+                let wake = tokio::time::sleep(delay);
+                tokio::pin!(wake);
+                loop {
                     tokio::select! {
                         biased;
-                        _=tick_stop.cancelled()=>{},
-                        _=cancel.cancelled()=>{},
-                        result=service.tick()=>if let Err(e)=result {tracing::error!(error=%e,"Failed to process schedule tick");}
+                        _ = stop.cancelled() => break,
+                        _ = cancel.cancelled() => break,
+                        result = ticks.join_next(), if !ticks.is_empty() => {
+                            match result {
+                                Some(Ok((id, result))) => {
+                                    pending.remove(&id);
+                                    if let Err(error) = result {
+                                        tracing::error!(%error, schedule_id=%id, "Failed to process schedule");
+                                        retry.insert(id, tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    tracing::error!(%error, "Schedule task failed");
+                                    // A panic must not leave a scheduler-local reservation forever.
+                                    pending.clear();
+                                }
+                                None => {}
+                            }
+                            break;
+                        }
+                        _ = store.changed.notified() => {
+                            let _writer = store.writer.lock().await;
+                            if let Err(error) = store.refresh_external(false).await {
+                                tracing::error!(%error, "Failed to refresh external schedule edits");
+                            }
+                            break;
+                        }
+                        _ = external.tick() => {
+                            let _writer = store.writer.lock().await;
+                            if let Err(error) = store.refresh_external(true).await {
+                                tracing::error!(%error, "Failed to refresh external schedule edits");
+                            }
+                            break;
+                        }
+                        _ = clock_probe.tick() => {
+                            let elapsed = tokio::time::Instant::now().duration_since(monotonic);
+                            let wall_elapsed = service.now() - now;
+                            if (wall_elapsed - chrono::Duration::from_std(elapsed).unwrap_or_default())
+                                .num_milliseconds().unsigned_abs() > 500
+                            {
+                                break;
+                            }
+                        }
+                        _ = &mut wake => {
+                            let now = service.now();
+                            match store.due_ids(now).await {
+                                Ok(ids) => for id in ids {
+                                    if excluded.contains(&id) || !pending.insert(id.clone()) { continue; }
+                                    let service = service.clone();
+                                    let stop = stop.clone();
+                                    let cancel = cancel.clone();
+                                    ticks.spawn(async move {
+                                        let result = tokio::select! {
+                                            biased;
+                                            _ = stop.cancelled() => Ok(()),
+                                            _ = cancel.cancelled() => Ok(()),
+                                            result = service.tick_schedule(&id, now) => result,
+                                        };
+                                        (id, result)
+                                    });
+                                },
+                                Err(error) => tracing::error!(%error, "Failed to read due schedules"),
+                            }
+                            break;
+                        }
                     }
-                });
+                }
+                if stop.is_cancelled() || cancel.is_cancelled() {
+                    break;
+                }
             }
             ticks.abort_all();
             while ticks.join_next().await.is_some() {}
@@ -468,31 +549,39 @@ impl AutomationService {
     }
     pub async fn tick(&self) -> Result<()> {
         let now = self.now();
+        for id in self.store()?.due_ids(now).await? {
+            self.tick_schedule(&id, now).await?;
+        }
+        Ok(())
+    }
+    async fn tick_schedule(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
+        if self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+        {
+            return Ok(());
+        }
         let store = self.store()?;
-        for s in store.list().await? {
-            if s.status != "active"
-                || s.next_run_at.is_none()
-                || self
-                    .running
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(&s.id)
+        let Some(schedule) = store.get(id).await? else {
+            return Ok(());
+        };
+        if schedule.status != "active" || schedule.next_run_at.is_none() {
+            return Ok(());
+        }
+        if schedule.should_complete(now) {
+            let _writer = store.writer.lock().await;
+            if let Some(mut current) = store.get(id).await?
+                && current.status == "active"
+                && current.next_run_at.is_some()
+                && current.should_complete(now)
             {
-                continue;
+                current.complete(now);
+                store.write(&current).await?;
             }
-            if s.should_complete(now) {
-                let _writer = store.writer.lock().await;
-                if let Some(mut current) = store.get(&s.id).await?
-                    && current.status == "active"
-                    && current.next_run_at.is_some()
-                    && current.should_complete(now)
-                {
-                    current.complete(now);
-                    store.write(&current).await?;
-                }
-            } else if date(s.next_run_at.as_deref().unwrap())? <= now {
-                self.run(&s.id, false, now).await?;
-            }
+        } else if date(schedule.next_run_at.as_deref().unwrap())? <= now {
+            self.run(id, false, now).await?;
         }
         Ok(())
     }
@@ -513,6 +602,7 @@ impl AutomationService {
             Reservation {
                 running: self.running.clone(),
                 id: id.to_owned(),
+                changed: self.store()?.changed.clone(),
             }
         };
         let Some((schedule, run_id)) = self.claim(id, manual, now).await? else {

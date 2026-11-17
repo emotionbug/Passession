@@ -19,9 +19,16 @@ use std::{
 };
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{Instant, MissedTickBehavior},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
+
+async fn wait_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
 
 struct Turn {
     id: String,
@@ -328,11 +335,15 @@ impl Session {
                         self.observe(event.ok_or_else(||anyhow!("OpenCode event stream ended before connecting"))?).await?;
                         if self.connected{return Ok(());}
                     }
-                    _=tokio::time::sleep(Duration::from_millis(25))=>{
-                        if self.stream.as_ref().is_none_or(|task|task.is_finished()){
-                            if let Some(task)=self.stream.take(){task.await??;}
-                            bail!("OpenCode event stream ended before connecting");
+                    result=async {
+                        match self.stream.as_mut() {
+                            Some(task) => task.await,
+                            None => std::future::pending().await,
                         }
+                    }=>{
+                        self.stream = None;
+                        result??;
+                        bail!("OpenCode event stream ended before connecting");
                     }
                 }
             }
@@ -367,26 +378,82 @@ impl Session {
             return;
         }
         let _ = ready.send(Ok(()));
-        let mut tick = tokio::time::interval(Duration::from_millis(25));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut recovery = Instant::now() + Duration::from_secs(5);
-        let mut retry_stream = Instant::now();
+        let mut recovery = None;
+        let mut retry_stream = None;
+        let mut runtime_dead = false;
+        let mut watched_runtime = Arc::downgrade(&self.runtime);
         loop {
+            if !watched_runtime.ptr_eq(&Arc::downgrade(&self.runtime)) {
+                watched_runtime = Arc::downgrade(&self.runtime);
+                runtime_dead = false;
+                retry_stream = None;
+            }
+            if self.turn.is_some() {
+                recovery.get_or_insert_with(|| Instant::now() + Duration::from_secs(5));
+            } else {
+                recovery = None;
+            }
+            if !self.runtime.is_exited() {
+                runtime_dead = false;
+                if self.stream.is_none() && retry_stream.is_none() {
+                    retry_stream = Some(Instant::now());
+                }
+            }
+            let runtime = self.runtime.clone();
             tokio::select! {
                 _=self.cancel.cancelled()=>break,
+                _=runtime.wait_exited(),if !runtime_dead=>{
+                    runtime_dead=true;
+                    retry_stream=None;
+                    self.stream_cancel.cancel();
+                    if self.turn.is_some(){let _=self.fail("OpenCode helper server exited".to_owned()).await;}
+                },
                 call=calls.recv()=>{let Some(call)=call else{break;};if self.handle(call).await{break;}},
                 event=self.events.recv()=>{if let Some(event)=event&& let Err(error)=self.observe(event).await{tracing::warn!(%error,"OpenCode event reconciliation failed");self.stream_cancel.cancel();self.reconcile_at=Some(Instant::now()+Duration::from_millis(100));}},
                 settled=self.settled.recv()=>{if let Some((child,applied))=settled{self.settle_replay(&child,applied).await;}},
-                _=tick.tick()=>{
-                    if self.runtime.is_exited(){
-                        if self.turn.is_some(){let _=self.fail("OpenCode helper server exited".to_owned()).await;}
-                    }else if self.stream.as_ref().is_none_or(|task|task.is_finished())&&Instant::now()>=retry_stream {
-                        if let Err(error)=self.start_stream().await{tracing::warn!(%error,"OpenCode event stream reconnect failed");}retry_stream=Instant::now()+Duration::from_millis(100);
+                result=async {
+                    match self.stream.as_mut() {
+                        Some(task) => task.await,
+                        None => std::future::pending().await,
                     }
-                    if self.reconcile_at.is_some_and(|at|Instant::now()>=at){self.reconcile_at=None;if let Err(error)=self.reconcile().await{tracing::warn!(%error,"OpenCode reconciliation failed");}}
-                    if self.turn.is_some()&&Instant::now()>=recovery{if let Err(error)=self.reconcile_turn().await{tracing::warn!(%error,"OpenCode turn recovery failed");}recovery=Instant::now()+Duration::from_secs(5);}
-                    if self.turn.is_none(){self.finish_stops().await;}
-                    if self.stop_waiters.is_empty()&&self.rewind_waiters.is_empty()&&!self.deferred.is_empty(){let deferred=std::mem::take(&mut self.deferred);for call in deferred{if self.handle(call).await{self.cancel.cancel();break;}}}
+                }=>{
+                    self.stream=None;
+                    if let Err(error)=result{tracing::warn!(%error,"OpenCode event stream task failed");}
+                    if !self.runtime.is_exited(){retry_stream=Some(Instant::now());}
+                },
+                _=wait_deadline(retry_stream),if !runtime_dead=>{
+                    retry_stream=match self.start_stream().await {
+                        Ok(())=>None,
+                        Err(error)=>{
+                            tracing::warn!(%error,"OpenCode event stream reconnect failed");
+                            Some(Instant::now()+Duration::from_millis(100))
+                        }
+                    };
+                },
+                _=wait_deadline(self.reconcile_at)=>{
+                    self.reconcile_at=None;
+                    if let Err(error)=self.reconcile().await{tracing::warn!(%error,"OpenCode reconciliation failed");}
+                },
+                _=wait_deadline(recovery)=>{
+                    if let Err(error)=self.reconcile_turn().await{tracing::warn!(%error,"OpenCode turn recovery failed");}
+                    recovery=Some(Instant::now()+Duration::from_secs(5));
+                },
+            }
+            // Complete the stop/rewind barrier before admitting deferred prompts,
+            // immediately after whichever source settled the active turn.
+            if self.turn.is_none() {
+                self.finish_stops().await;
+            }
+            if self.stop_waiters.is_empty()
+                && self.rewind_waiters.is_empty()
+                && !self.deferred.is_empty()
+            {
+                let deferred = std::mem::take(&mut self.deferred);
+                for call in deferred {
+                    if self.handle(call).await {
+                        self.cancel.cancel();
+                        break;
+                    }
                 }
             }
         }

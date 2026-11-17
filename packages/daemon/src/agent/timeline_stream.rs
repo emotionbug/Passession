@@ -151,9 +151,10 @@ pub fn public_subagent(mut descriptor: Value) -> Value {
 /// memory-only parents keep every timeline, as they have no other copy.
 #[derive(Default)]
 pub struct SubagentStore {
-    descriptors: Vec<Value>,
+    descriptors: HashMap<String, Vec<Value>>,
     timelines: HashMap<(String, String), Timeline>,
     catalogs: HashMap<String, persistence::Catalog>,
+    open_catalogs: std::collections::HashSet<String>,
     /// Parents whose catalog could not be indexed, with the recorded reason.
     unavailable: HashMap<String, String>,
     residency: persistence::Residency,
@@ -164,14 +165,10 @@ impl SubagentStore {
             .as_str()
             .context("Provider subagent event missing id")?;
         let key = (parent_id.to_owned(), id.to_owned());
-        let index = self
-            .descriptors
-            .iter()
-            .position(|d| d["parentAgentId"] == parent_id && d["id"] == id);
         match event["type"].as_str() {
             Some("remove") => {
-                if let Some(index) = index {
-                    self.descriptors.remove(index);
+                if let Some(descriptors) = self.descriptors.get_mut(parent_id) {
+                    descriptors.retain(|descriptor| descriptor["id"] != id);
                 }
                 self.timelines.remove(&key);
                 Ok(json!({"type":"remove","parentAgentId":parent_id,"subagentId":id}))
@@ -220,27 +217,28 @@ impl SubagentStore {
         descriptor
     }
     fn store_descriptor(&mut self, descriptor: Value) {
-        match self.descriptors.iter().position(|d| {
-            d["parentAgentId"] == descriptor["parentAgentId"] && d["id"] == descriptor["id"]
-        }) {
-            Some(index) => self.descriptors[index] = descriptor,
-            None => self.descriptors.push(descriptor),
+        let parent = descriptor["parentAgentId"]
+            .as_str()
+            .expect("subagent parent identity");
+        let descriptors = self.descriptors.entry(parent.to_owned()).or_default();
+        match descriptors
+            .iter()
+            .position(|previous| previous["id"] == descriptor["id"])
+        {
+            Some(index) => descriptors[index] = descriptor,
+            None => descriptors.push(descriptor),
         }
     }
     pub fn list(&self, parent_id: &str) -> Vec<Value> {
-        let mut result: Vec<Value> = self
-            .descriptors
-            .iter()
-            .filter(|d| d["parentAgentId"] == parent_id)
-            .cloned()
-            .collect();
+        let mut result = self.descriptors.get(parent_id).cloned().unwrap_or_default();
         result.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
         result
     }
     pub fn get(&self, parent_id: &str, id: &str) -> Option<&Value> {
         self.descriptors
+            .get(parent_id)?
             .iter()
-            .find(|d| d["parentAgentId"] == parent_id && d["id"] == id)
+            .find(|descriptor| descriptor["id"] == id)
     }
     pub fn fetch_timeline(&self, parent_id: &str, id: &str, options: &Value) -> Result<Value> {
         Ok(self
@@ -250,13 +248,14 @@ impl SubagentStore {
             .fetch(options))
     }
     pub fn delete_parent(&mut self, parent_id: &str) -> Vec<Value> {
-        let ids: Vec<String> = self
+        let ids = self
             .descriptors
-            .iter()
-            .filter(|d| d["parentAgentId"] == parent_id)
-            .filter_map(|d| d["id"].as_str().map(str::to_owned))
-            .collect();
-        self.descriptors.retain(|d| d["parentAgentId"] != parent_id);
+            .remove(parent_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|descriptor| descriptor["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        self.open_catalogs.remove(parent_id);
         self.timelines.retain(|(parent, _), _| parent != parent_id);
         self.catalogs.remove(parent_id);
         self.unavailable.remove(parent_id);

@@ -79,9 +79,24 @@ struct Records {
     paths: HashMap<String, HashSet<PathBuf>>,
     deleting: HashSet<String>,
     execution_owners: HashMap<(String, String), String>,
+    workspaces: HashMap<String, HashSet<String>>,
 }
 impl Records {
     fn insert(&mut self, id: String, value: Value, path: PathBuf) {
+        if self
+            .values
+            .get(&id)
+            .and_then(|record| record["workspaceId"].as_str())
+            != value["workspaceId"].as_str()
+        {
+            self.remove_workspace_member(&id);
+            if let Some(workspace) = value["workspaceId"].as_str() {
+                self.workspaces
+                    .entry(workspace.to_owned())
+                    .or_default()
+                    .insert(id.clone());
+            }
+        }
         self.execution_owners.retain(|_, owner| owner != &id);
         if let Some(key) = execution_key(&value["owner"]) {
             self.execution_owners.insert(key, id.clone());
@@ -95,6 +110,19 @@ impl Records {
             .or_default()
             .insert(path.clone());
         self.current_paths.insert(id, path);
+    }
+    fn remove_workspace_member(&mut self, id: &str) {
+        if let Some(workspace) = self
+            .values
+            .get(id)
+            .and_then(|record| record["workspaceId"].as_str())
+            && let Some(members) = self.workspaces.get_mut(workspace)
+        {
+            members.remove(id);
+            if members.is_empty() {
+                self.workspaces.remove(workspace);
+            }
+        }
     }
 }
 
@@ -189,6 +217,17 @@ impl AgentStorage {
         Ok(records
             .order
             .iter()
+            .filter_map(|id| records.values.get(id).cloned())
+            .collect())
+    }
+    /// Membership is maintained at the same commit boundary as every stored record.
+    pub async fn list_workspace(&self, workspace: &str) -> Result<Vec<Value>> {
+        let records = self.records().await?.read().await;
+        Ok(records
+            .workspaces
+            .get(workspace)
+            .into_iter()
+            .flatten()
             .filter_map(|id| records.values.get(id).cloned())
             .collect())
     }
@@ -323,6 +362,7 @@ impl AgentStorage {
             );
         }
         let mut records = records.write().await;
+        records.remove_workspace_member(id);
         records.values.remove(id);
         records.order.retain(|value| value != id);
         records.current_paths.remove(id);
@@ -656,6 +696,42 @@ mod tests {
                 .await?
                 .is_empty()
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn workspace_index_tracks_committed_membership_and_restart() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let storage = AgentStorage::new(home.path().to_owned());
+        let mut record = json!({"id":"agent","provider":"custom","cwd":"/project",
+            "createdAt":"old","updatedAt":"now","workspaceId":"one"});
+        storage.upsert(record.clone()).await?;
+        record = storage.get("agent").await?.unwrap();
+        assert_eq!(storage.list_workspace("one").await?.len(), 1);
+        for (archived, internal, background) in [
+            (Value::Null, false, false),
+            (json!("archived"), false, false),
+            (Value::Null, true, true),
+        ] {
+            record["archivedAt"] = archived;
+            record["internal"] = json!(internal);
+            record["background"] = json!(background);
+            storage.upsert(record.clone()).await?;
+            assert_eq!(storage.list_workspace("one").await?, vec![record.clone()]);
+        }
+        record["workspaceId"] = json!("two");
+        storage.upsert(record.clone()).await?;
+        assert!(storage.list_workspace("one").await?.is_empty());
+        assert_eq!(storage.list_workspace("two").await?, vec![record.clone()]);
+        let restarted = AgentStorage::new(home.path().to_owned());
+        assert!(restarted.list_workspace("one").await?.is_empty());
+        assert_eq!(restarted.list_workspace("two").await?, vec![record.clone()]);
+        record.as_object_mut().unwrap().remove("workspaceId");
+        storage.upsert(record.clone()).await?;
+        assert!(storage.list_workspace("two").await?.is_empty());
+        record["workspaceId"] = json!("three");
+        storage.upsert(record).await?;
+        storage.remove("agent").await?;
+        assert!(storage.list_workspace("three").await?.is_empty());
         Ok(())
     }
 }

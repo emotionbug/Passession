@@ -191,3 +191,60 @@ async fn manual_run_outlives_its_request_and_commits_its_outcome() {
     );
     assert_eq!(service.inspect(&id).await.unwrap()["status"], "completed");
 }
+
+#[tokio::test]
+async fn schedule_index_rearms_on_api_mutations_and_external_edits() {
+    let (dir, service) = service().await;
+    let created = service.create(&input()).await.unwrap();
+    let id = created["id"].as_str().unwrap();
+    let store = service.store().unwrap();
+    let now = service.now();
+    let running = HashSet::new();
+    assert_eq!(store.next_deadline(&running).await, Some(now));
+    service.pause(id).await.unwrap();
+    assert_eq!(store.next_deadline(&running).await, None);
+    service.resume(id).await.unwrap();
+    assert_eq!(
+        store.next_deadline(&running).await,
+        Some(now + chrono::Duration::minutes(1))
+    );
+    service
+        .update(&json!({"id":id,"expiresAt":timestamp(now + chrono::Duration::seconds(10))}))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.next_deadline(&running).await,
+        Some(now + chrono::Duration::seconds(10))
+    );
+    assert!(store.due_ids(now).await.unwrap().is_empty());
+    let mut external = store.require(id).await.unwrap();
+    external.prompt = "externally changed prompt".into();
+    external.expires_at = None;
+    external.next_run_at = Some(timestamp(now + chrono::Duration::seconds(20)));
+    let path = dir.path().join("schedules").join(format!("{id}.json"));
+    tokio::fs::write(&path, serde_json::to_vec(&external).unwrap())
+        .await
+        .unwrap();
+    // Reconciliation is explicitly driven here, without depending on OS event timing.
+    {
+        let _writer = store.writer.lock().await;
+        store.refresh().await.unwrap();
+    }
+    assert_eq!(
+        service.inspect(id).await.unwrap()["prompt"],
+        external.prompt
+    );
+    assert_eq!(
+        store.next_deadline(&running).await,
+        Some(now + chrono::Duration::seconds(20))
+    );
+    service.delete(id).await.unwrap();
+    assert_eq!(store.next_deadline(&running).await, None);
+    assert!(
+        store
+            .due_ids(now + chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

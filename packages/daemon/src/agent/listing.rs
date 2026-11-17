@@ -305,6 +305,63 @@ impl AgentManager {
         let root = self.subagent_root(parent).await?;
         self.read_subagent(&root, parent, id, options).await
     }
+    /// The public workspace projection uses durable membership, then overlays only
+    /// those live cells. Internal-only cells have no directory contribution.
+    pub async fn list_workspace_snapshots(&self, workspace: &str) -> Result<Vec<Value>> {
+        let records = self.storage()?.list_workspace(workspace).await?;
+        let cells = {
+            let cells = self.agents.read().await;
+            records
+                .into_iter()
+                .map(|record| {
+                    let cell = text(&record, "id").and_then(|id| cells.get(id)).cloned();
+                    (record, cell)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut snapshots = Vec::with_capacity(cells.len());
+        for (record, cell) in cells {
+            let mut snapshot = self.stored_snapshot(record);
+            if let Some(cell) = cell {
+                match cell.data.try_lock() {
+                    Ok(data) if data.ready && data.snapshot["workspaceId"] == workspace => {
+                        snapshot = data.snapshot.clone();
+                        self.overlay_preparation(&mut snapshot, data.serves_runtime());
+                    }
+                    _ => snapshot["snapshotAvailability"] = json!("last_persisted"),
+                }
+            }
+            if snapshot["_live"] == false {
+                self.overlay_preparation(&mut snapshot, false);
+            }
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
+    }
+    /// Match the global listing's nonblocking parent observation, including a
+    /// temporarily locked internal parent with no durable fallback (absent).
+    pub async fn directory_parent_snapshot(&self, id: &str) -> Result<Option<Value>> {
+        let cell = { self.agents.read().await.get(id).cloned() };
+        let mut unavailable = false;
+        if let Some(cell) = cell {
+            if let Ok(data) = cell.data.try_lock()
+                && data.ready
+            {
+                let mut snapshot = data.snapshot.clone();
+                self.overlay_preparation(&mut snapshot, data.serves_runtime());
+                return Ok(Some(snapshot));
+            }
+            unavailable = true;
+        }
+        Ok(self.storage()?.get(id).await?.map(|record| {
+            let mut snapshot = self.stored_snapshot(record);
+            if unavailable {
+                snapshot["snapshotAvailability"] = json!("last_persisted");
+            }
+            self.overlay_preparation(&mut snapshot, false);
+            snapshot
+        }))
+    }
     /// Descriptors of every public parent's subagents, plus each parent catalog
     /// or child descriptor that could not be read. A non-empty second list
     /// means the first is incomplete; callers must surface that, not treat the

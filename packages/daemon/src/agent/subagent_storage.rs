@@ -364,14 +364,10 @@ impl SubagentStore {
             }
         }
         self.release_excess();
-        let subagents = self
-            .descriptors
-            .iter()
-            .filter(|descriptor| {
-                descriptor["parentAgentId"]
-                    .as_str()
-                    .is_some_and(|parent| listed.contains(parent))
-            })
+        let subagents = listed
+            .into_iter()
+            .filter_map(|parent| self.descriptors.get(parent))
+            .flatten()
             .cloned()
             .collect();
         (subagents, failures)
@@ -430,6 +426,7 @@ impl SubagentStore {
         if let Some(catalog) = self.catalogs.get_mut(parent) {
             catalog.connection = None;
         }
+        self.open_catalogs.remove(parent);
     }
 
     /// Called on a blocking worker. Parent event commits serialize these changes;
@@ -540,8 +537,9 @@ impl SubagentStore {
                 .expect("indexed subagent catalog");
             catalog.children.remove(id);
             catalog.tombstones.insert(id.clone());
-            self.descriptors
-                .retain(|d| !(d["parentAgentId"] == parent && d["id"] == id.as_str()));
+            if let Some(descriptors) = self.descriptors.get_mut(parent) {
+                descriptors.retain(|descriptor| descriptor["id"] != id.as_str());
+            }
             let key = (parent.to_owned(), id.clone());
             self.residency.evict(&key);
             self.timelines.remove(&key);
@@ -738,7 +736,8 @@ impl SubagentStore {
             ids.collect::<rusqlite::Result<HashSet<String>>>()?
         };
         self.delete_parent(parent);
-        self.descriptors.extend(descriptors);
+        self.descriptors.insert(parent.to_owned(), descriptors);
+        self.open_catalogs.insert(parent.to_owned());
         let used = self.residency.tick();
         self.catalogs.insert(
             parent.to_owned(),
@@ -749,6 +748,8 @@ impl SubagentStore {
                 used,
             },
         );
+        // Keep bulk workspace indexing bounded to the small open-catalog set.
+        self.release_excess();
         Ok(true)
     }
 
@@ -838,6 +839,7 @@ impl SubagentStore {
             let connection = open_catalog(&root.join(parent).join("index.sqlite3"), parent)
                 .map_err(|error| unavailable(parent, None, format!("{error:#}")))?;
             catalog.connection = Some(connection);
+            self.open_catalogs.insert(parent.to_owned());
         }
         Ok(catalog.connection.as_mut().expect("open subagent catalog"))
     }
@@ -866,15 +868,15 @@ impl SubagentStore {
             self.residency.evict(&key);
             self.timelines.remove(&key);
         }
-        let mut open: Vec<_> = self
-            .catalogs
-            .values_mut()
-            .filter(|catalog| catalog.connection.is_some())
-            .collect();
-        if open.len() > self.residency.max_catalogs {
-            open.sort_by_key(|catalog| catalog.used);
-            let excess = open.len() - self.residency.max_catalogs;
-            for catalog in open.into_iter().take(excess) {
+        while self.open_catalogs.len() > self.residency.max_catalogs {
+            let oldest = self
+                .open_catalogs
+                .iter()
+                .min_by_key(|parent| self.catalogs.get(*parent).map(|catalog| catalog.used))
+                .cloned();
+            let Some(parent) = oldest else { break };
+            self.open_catalogs.remove(&parent);
+            if let Some(catalog) = self.catalogs.get_mut(&parent) {
                 catalog.connection = None;
             }
         }

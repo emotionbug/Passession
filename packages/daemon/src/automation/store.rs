@@ -1,13 +1,22 @@
 use super::cron::Cadence;
 use anyhow::{Result, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
+use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::SystemTime,
 };
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex, Notify},
+};
 
 pub fn timestamp(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -199,73 +208,271 @@ fn safe_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct Index {
+    records: HashMap<String, Schedule>,
+    due: BTreeSet<(DateTime<Utc>, String)>,
+    files: HashMap<PathBuf, (Option<SystemTime>, u64)>,
+}
+impl Index {
+    fn deadline(schedule: &Schedule) -> Option<DateTime<Utc>> {
+        if schedule.status != "active" {
+            return None;
+        }
+        let next = date(schedule.next_run_at.as_deref()?).unwrap_or(DateTime::<Utc>::MIN_UTC);
+        if schedule
+            .max_runs
+            .is_some_and(|n| schedule.completed_runs() >= n)
+        {
+            return Some(DateTime::<Utc>::MIN_UTC);
+        }
+        Some(
+            schedule
+                .expires_at
+                .as_deref()
+                .and_then(|at| date(at).ok())
+                .map_or(next, |at| at.min(next)),
+        )
+    }
+    fn remove(&mut self, id: &str) {
+        if let Some(previous) = self.records.remove(id)
+            && let Some(at) = Self::deadline(&previous)
+        {
+            self.due.remove(&(at, id.to_owned()));
+        }
+    }
+    fn insert(&mut self, schedule: Schedule) {
+        self.remove(&schedule.id);
+        if let Some(at) = Self::deadline(&schedule) {
+            self.due.insert((at, schedule.id.clone()));
+        }
+        self.records.insert(schedule.id.clone(), schedule);
+    }
+}
+
 pub struct Store {
     dir: PathBuf,
     // A single writer also serializes named identity upserts against ordinary mutations.
     pub writer: Mutex<()>,
+    index: Mutex<Index>,
     reported_invalid: Mutex<HashSet<PathBuf>>,
+    pub changed: Arc<Notify>,
+    external_changed: Arc<AtomicBool>,
+    external_paths: Arc<StdMutex<HashSet<PathBuf>>>,
+    watch_failed: Arc<AtomicBool>,
+    watcher: StdMutex<Option<notify::RecommendedWatcher>>,
 }
 impl Store {
     pub async fn open(dir: PathBuf) -> Result<Self> {
         tokio::fs::create_dir_all(&dir).await?;
-        Ok(Self {
+        let changed = Arc::new(Notify::new());
+        let external_changed = Arc::new(AtomicBool::new(false));
+        let events = external_changed.clone();
+        let watch_failed = Arc::new(AtomicBool::new(false));
+        let failed = watch_failed.clone();
+        let external_paths = Arc::new(StdMutex::new(HashSet::new()));
+        let paths = external_paths.clone();
+        let watched = dir.clone();
+        let wake = changed.clone();
+        let watcher = (|| -> notify::Result<_> {
+            let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if matches!(&event, Ok(event) if matches!(event.kind, notify::EventKind::Access(_))) {
+                    return;
+                }
+                match event {
+                    Ok(event) => {
+                        if event.paths.contains(&watched)
+                            && matches!(event.kind, notify::EventKind::Remove(_)
+                                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_)))
+                        {
+                            failed.store(true, Ordering::Release);
+                        }
+                        if event.paths.is_empty() || event.paths.contains(&watched) {
+                            events.store(true, Ordering::Release);
+                        } else {
+                            let mut paths = paths.lock().unwrap_or_else(|error| error.into_inner());
+                            paths.extend(event.paths.into_iter().filter(|path| path.extension().is_some_and(|extension| extension == "json")));
+                            if paths.is_empty() { return; }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Schedule directory watch failed");
+                        failed.store(true, Ordering::Release);
+                        events.store(true, Ordering::Release);
+                    }
+                }
+                wake.notify_one();
+            })?;
+            watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+            Ok(watcher)
+        })().map_err(|error| {
+            tracing::warn!(%error, "Schedule directory watch unavailable; checking metadata every 30 seconds");
+            error
+        }).ok();
+        let store = Self {
             dir,
             writer: Mutex::new(()),
+            index: Mutex::new(Index::default()),
             reported_invalid: Mutex::new(HashSet::new()),
-        })
+            changed,
+            external_changed,
+            external_paths,
+            watch_failed,
+            watcher: StdMutex::new(watcher),
+        };
+        store.refresh().await?;
+        Ok(store)
     }
     fn path(&self, id: &str) -> Result<PathBuf> {
         safe_id(id)?;
         Ok(self.dir.join(format!("{id}.json")))
     }
-    pub async fn list(&self) -> Result<Vec<Schedule>> {
-        let mut entries = tokio::fs::read_dir(&self.dir).await?;
-        let mut records = Vec::new();
-        let mut invalid = HashSet::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if !entry.file_type().await?.is_file()
-                || entry.path().extension().is_none_or(|s| s != "json")
-            {
-                continue;
-            }
-            let path = entry.path();
-            let bytes = match tokio::fs::read(&path).await {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let parsed = serde_json::from_slice::<Schedule>(&bytes)
-                .map_err(anyhow::Error::from)
-                .and_then(|s| {
-                    s.validate()?;
-                    ensure!(self.path(&s.id)? == path, "Schedule file identity mismatch");
-                    Ok(s)
-                });
-            match parsed {
-                Ok(s) => records.push(s),
-                Err(e) => {
-                    if !self.reported_invalid.lock().await.contains(&path) {
-                        tracing::error!(file=%path.display(),error=%e,"Skipping invalid schedule file");
+    pub async fn refresh_external(&self, poll: bool) -> Result<()> {
+        let watching = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+            && !self.watch_failed.load(Ordering::Acquire);
+        let paths = std::mem::take(
+            &mut *self
+                .external_paths
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        let mut refresh =
+            self.external_changed.swap(false, Ordering::AcqRel) || (!watching && poll);
+        if !refresh {
+            let index = self.index.lock().await;
+            for path in paths {
+                let stamp = match tokio::fs::metadata(&path).await {
+                    Ok(metadata) => Some((metadata.modified().ok(), metadata.len())),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        self.external_changed.store(true, Ordering::Release);
+                        return Err(error.into());
                     }
-                    invalid.insert(path);
+                };
+                if stamp.as_ref() != index.files.get(&path) {
+                    refresh = true;
+                    break;
                 }
             }
         }
-        *self.reported_invalid.lock().await = invalid;
+        if !refresh {
+            // Own atomic writes already updated these exact fingerprints.
+            return Ok(());
+        }
+        if let Err(error) = self.refresh().await {
+            self.external_changed.store(true, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+    /// Slow external-edit reconciliation: unchanged files are only stat'ed, never read,
+    /// parsed, validated or sorted. The caller holds writer after initialization.
+    pub async fn refresh(&self) -> Result<()> {
+        let mut entries = tokio::fs::read_dir(&self.dir).await?;
+        let mut index = self.index.lock().await;
+        let mut seen = HashSet::new();
+        let mut invalid = self.reported_invalid.lock().await;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().is_none_or(|s| s != "json") {
+                continue;
+            }
+            let metadata = match entry.metadata().await {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            seen.insert(path.clone());
+            let stamp = (metadata.modified().ok(), metadata.len());
+            if index.files.get(&path) == Some(&stamp) {
+                continue;
+            }
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let parsed = serde_json::from_slice::<Schedule>(&bytes)
+                .map_err(anyhow::Error::from)
+                .and_then(|schedule| {
+                    schedule.validate()?;
+                    ensure!(
+                        self.path(&schedule.id)? == path,
+                        "Schedule file identity mismatch"
+                    );
+                    Ok(schedule)
+                });
+            if let Some(id) = path.file_stem().and_then(|id| id.to_str()) {
+                index.remove(id);
+            }
+            match parsed {
+                Ok(schedule) => {
+                    index.insert(schedule);
+                    invalid.remove(&path);
+                }
+                Err(error) => {
+                    if invalid.insert(path.clone()) {
+                        tracing::error!(file=%path.display(),%error,"Skipping invalid schedule file");
+                    }
+                }
+            }
+            index.files.insert(path, stamp);
+        }
+        let removed = index
+            .files
+            .keys()
+            .filter(|path| !seen.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in removed {
+            if let Some(id) = path.file_stem().and_then(|id| id.to_str()) {
+                index.remove(id);
+            }
+            index.files.remove(&path);
+            invalid.remove(&path);
+        }
+        Ok(())
+    }
+    pub async fn next_deadline(&self, running: &HashSet<String>) -> Option<DateTime<Utc>> {
+        self.index
+            .lock()
+            .await
+            .due
+            .iter()
+            .find(|(_, id)| !running.contains(id))
+            .map(|(at, _)| *at)
+    }
+    pub async fn due_ids(&self, now: DateTime<Utc>) -> Result<Vec<String>> {
+        Ok(self
+            .index
+            .lock()
+            .await
+            .due
+            .iter()
+            .take_while(|(at, _)| *at <= now)
+            .map(|(_, id)| id.clone())
+            .collect())
+    }
+    pub async fn list(&self) -> Result<Vec<Schedule>> {
+        let mut records = self
+            .index
+            .lock()
+            .await
+            .records
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         Ok(records)
     }
     pub async fn get(&self, id: &str) -> Result<Option<Schedule>> {
-        match tokio::fs::read(self.path(id)?).await {
-            Ok(bytes) => {
-                let s: Schedule = serde_json::from_slice(&bytes)?;
-                s.validate()?;
-                ensure!(s.id == id, "Schedule file identity mismatch");
-                Ok(Some(s))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        safe_id(id)?;
+        Ok(self.index.lock().await.records.get(id).cloned())
     }
     pub async fn require(&self, id: &str) -> Result<Schedule> {
         self.get(id)
@@ -289,7 +496,15 @@ impl Store {
             file.sync_all().await?;
             drop(file);
             tokio::fs::rename(&temp, &path).await?;
-            sync_directory(&self.dir).await
+            sync_directory(&self.dir).await?;
+            let metadata = tokio::fs::metadata(&path).await?;
+            let mut index = self.index.lock().await;
+            index
+                .files
+                .insert(path, (metadata.modified().ok(), metadata.len()));
+            index.insert(s.clone());
+            self.changed.notify_one();
+            Ok(())
         }
         .await;
         if result.is_err() {
@@ -298,11 +513,17 @@ impl Store {
         result
     }
     pub async fn delete(&self, id: &str) -> Result<()> {
-        match tokio::fs::remove_file(self.path(id)?).await {
-            Ok(()) => sync_directory(&self.dir).await,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        let path = self.path(id)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => sync_directory(&self.dir).await?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
         }
+        let mut index = self.index.lock().await;
+        index.remove(id);
+        index.files.remove(&path);
+        self.changed.notify_one();
+        Ok(())
     }
 }
 async fn sync_directory(path: &Path) -> Result<()> {

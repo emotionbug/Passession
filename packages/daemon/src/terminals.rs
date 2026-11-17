@@ -17,16 +17,64 @@ use rand::RngCore;
 pub use runtime::{CreateTerminal, Terminal, TerminalEvent};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, Weak},
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 
+/// All mutation goes through this table so workspace lookup cannot drift.
+#[derive(Default)]
+struct TerminalTable {
+    values: HashMap<String, Arc<Terminal>>,
+    workspaces: HashMap<String, HashSet<String>>,
+}
+impl std::ops::Deref for TerminalTable {
+    type Target = HashMap<String, Arc<Terminal>>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+impl TerminalTable {
+    fn insert(&mut self, id: String, terminal: Arc<Terminal>) {
+        self.remove(&id);
+        self.workspaces
+            .entry(terminal.workspace_id.clone())
+            .or_default()
+            .insert(id.clone());
+        self.values.insert(id, terminal);
+    }
+    fn remove(&mut self, id: &str) {
+        if let Some(terminal) = self.values.remove(id)
+            && let Some(ids) = self.workspaces.get_mut(&terminal.workspace_id)
+        {
+            ids.remove(id);
+            if ids.is_empty() {
+                self.workspaces.remove(&terminal.workspace_id);
+            }
+        }
+    }
+    fn retain(&mut self, mut keep: impl FnMut(&String, &Arc<Terminal>) -> bool) {
+        let removed = self
+            .values
+            .iter()
+            .filter(|(id, terminal)| !keep(id, terminal))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in removed {
+            self.remove(&id);
+        }
+    }
+    fn clear(&mut self) {
+        self.values.clear();
+        self.workspaces.clear();
+    }
+}
+
 pub struct TerminalService {
     app: Weak<AppState>,
-    terminals: RwLock<HashMap<String, Arc<Terminal>>>,
+    terminals: RwLock<TerminalTable>,
     workspace_env: RwLock<HashMap<String, BTreeMap<String, String>>>,
     changed: broadcast::Sender<()>,
     streams: Arc<Mutex<HashMap<(String, u8), streams::Registration>>>,
@@ -39,7 +87,7 @@ impl TerminalService {
         let (changed, _) = broadcast::channel(64);
         Self {
             app: app.clone(),
-            terminals: RwLock::new(HashMap::new()),
+            terminals: RwLock::new(TerminalTable::default()),
             workspace_env: RwLock::new(HashMap::new()),
             changed,
             streams: Arc::new(Mutex::new(HashMap::new())),
@@ -302,6 +350,25 @@ impl TerminalService {
                 .push(terminal.info());
         }
         grouped
+    }
+    /// A single-workspace publication never clones unrelated terminal descriptors.
+    pub fn live_for_workspace(&self, workspace: &str) -> Vec<Value> {
+        let terminals = {
+            let table = self.terminals.read().unwrap();
+            table
+                .workspaces
+                .get(workspace)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| table.values.get(id))
+                .filter(|terminal| !terminal.is_exited())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        terminals
+            .into_iter()
+            .map(|terminal| terminal.info())
+            .collect()
     }
     /// `killTerminalAndWait`: an unknown id is a no-op, and the session is removed
     /// even when waiting for termination fails.

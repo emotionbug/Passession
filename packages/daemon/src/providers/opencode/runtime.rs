@@ -533,6 +533,10 @@ impl Runtime {
         self.exited.is_cancelled()
     }
 
+    pub(super) async fn wait_exited(&self) {
+        self.exited.cancelled().await;
+    }
+
     pub fn bind_session(&self, id: &str, context: &LaunchContext) -> Result<()> {
         self.bridge.bind_session(id, context)
     }
