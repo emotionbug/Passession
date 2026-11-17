@@ -520,7 +520,8 @@ pub struct D3d11Window {
     pub win32_window: Box<Win32Window>,
     pub render_target_view: Option<ID3D11RenderTargetView >,
     pub swap_texture: Option<ID3D11Texture2D >,
-    pub alloc_size: DVec2,
+    /// Paseo: the swap chain's buffer size in pixels; `None` forces the next resize.
+    pub alloc_size: Option<(u32, u32)>,
     pub first_draw: bool,
     pub swap_chain: IDXGISwapChain1,
 }
@@ -534,12 +535,13 @@ impl D3d11Window {
         win32_window.init(inner_size);
         
         let wg = win32_window.get_window_geom();
+        let (width, height) = swap_chain_pixels(&wg);
         
         let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
             BufferCount: 2,
-            Width: (wg.inner_size.x * wg.dpi_factor) as u32,
-            Height: (wg.inner_size.y * wg.dpi_factor) as u32,
+            Width: width,
+            Height: height,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Flags: 0,
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
@@ -573,7 +575,7 @@ impl D3d11Window {
                 first_draw: true,
                 is_in_resize: false,
                 window_id: window_id,
-                alloc_size: wg.inner_size,
+                alloc_size: Some((width, height)),
                 window_geom: wg,
                 win32_window: win32_window,
                 swap_texture: Some(swap_texture),
@@ -590,24 +592,24 @@ impl D3d11Window {
     // switch back to swapchain
     pub fn stop_resize(&mut self) {
         self.is_in_resize = false;
-        self.alloc_size = DVec2::default();
+        self.alloc_size = None;
     }
     
     
     pub fn resize_buffers(&mut self, d3d11_cx: &D3d11Cx) {
-        if self.alloc_size == self.window_geom.inner_size {
+        let (width, height) = swap_chain_pixels(&self.window_geom);
+        if self.alloc_size == Some((width, height)) {
             return
         }
-        self.alloc_size = self.window_geom.inner_size;
+        self.alloc_size = Some((width, height));
         self.swap_texture = None;
         self.render_target_view = None;
         
         unsafe {
-            let wg = &self.window_geom;
             self.swap_chain.ResizeBuffers(
                 2,
-                (wg.inner_size.x * wg.dpi_factor) as u32,
-                (wg.inner_size.y * wg.dpi_factor) as u32,
+                width,
+                height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
                 DXGI_SWAP_CHAIN_FLAG(0)
             ).unwrap();
@@ -625,6 +627,34 @@ impl D3d11Window {
         unsafe {self.swap_chain.Present(if vsync {1}else {0}, DXGI_PRESENT(0)).unwrap()};
     }
     
+}
+
+/// Paseo: the client area in pixels for the swap chain. Upstream compared logical sizes,
+/// so a scale change that kept the logical size (100% to 200%) left the buffers at the old
+/// pixel size, and truncating `size * dpi` could fall one pixel short of the client area.
+fn swap_chain_pixels(geom: &WindowGeom) -> (u32, u32) {
+    let pixels = geom.inner_size * geom.dpi_factor;
+    (pixels.x.round() as u32, pixels.y.round() as u32)
+}
+
+#[cfg(test)]
+mod swap_chain_tests {
+    use super::*;
+
+    #[test]
+    fn same_logical_size_at_double_scale_needs_twice_the_pixels() {
+        let at_100 = WindowGeom { inner_size: dvec2(800.0, 600.0), dpi_factor: 1.0, ..Default::default() };
+        let at_200 = WindowGeom { inner_size: dvec2(800.0, 600.0), dpi_factor: 2.0, ..Default::default() };
+        assert_eq!(swap_chain_pixels(&at_100), (800, 600));
+        assert_eq!(swap_chain_pixels(&at_200), (1600, 1200));
+    }
+
+    #[test]
+    fn fractional_scale_rounds_back_to_the_client_pixels() {
+        // A 1559 x 1027 pixel client area at 175% is 890.857... x 586.857... logical.
+        let geom = WindowGeom { inner_size: dvec2(1559.0 / 1.75, 1027.0 / 1.75), dpi_factor: 1.75, ..Default::default() };
+        assert_eq!(swap_chain_pixels(&geom), (1559, 1027));
+    }
 }
 
 #[derive(Clone)]

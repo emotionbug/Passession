@@ -204,7 +204,7 @@ P1: IntoParam<IDropSource>,
 
 pub struct Win32App {
     event_callback: Option<Box<dyn FnMut(Win32Event) -> EventFlow >>,
-    pending_focus_events: VecDeque<Win32Event>,
+    pending_events: VecDeque<Win32Event>,
     pub window_class_name: Vec<u16>,
     pub all_windows: Vec<HWND>,
     pub time: Win32Time,
@@ -298,7 +298,7 @@ impl Win32App {
             was_signal_poll: false,
             time: Win32Time::new(),
             event_callback: Some(event_callback),
-            pending_focus_events: VecDeque::new(),
+            pending_events: VecDeque::new(),
             event_flow: EventFlow::Poll,
             all_windows: Vec::new(),
             timers: Vec::new(),
@@ -363,19 +363,19 @@ impl Win32App {
                 if let EventFlow::Exit = event_flow {
                     unsafe {ExitProcess(0);}
                 }
-                // Keep the callback taken while draining: nested focus changes append
-                // behind earlier notifications, including those from platform ops.
-                if let Some(pending) = with_win32_app(|app| app.pending_focus_events.pop_front()) {
+                // Keep the callback taken while draining: nested notifications append
+                // behind earlier ones, including those from platform ops.
+                if let Some(pending) = with_win32_app(|app| app.pending_events.pop_front()) {
                     event = pending;
                 } else {
                     break;
                 }
             }
             with_win32_app(|app| app.event_callback = Some(callback));
-        } else if matches!(&event, Win32Event::AppGotFocus(_) | Win32Event::AppLostFocus(_)) {
-            // Only focus notifications may be deferred. Clipboard and window-query
-            // callbacks require an immediate response and keep their existing contract.
-            with_win32_app(|app| app.pending_focus_events.push_back(event));
+        } else {
+            // Paseo: the callback is running and this message was sent from inside it
+            // (a platform op's MoveWindow/ShowWindow, a DPI change, a modal loop).
+            with_win32_app(|app| defer_event(&mut app.pending_events, event));
         }
     }
     
@@ -801,4 +801,72 @@ impl DpiFunctions {
         }
     }
     
+}
+
+/// Paseo: keeps a notification sent while the callback runs, for delivery right after it.
+/// Upstream dropped every such message, and a dropped `WindowGeomChange` left the app
+/// drawing at the window's previous size (the rest of the client area showed the swap
+/// chain's background) until the next resize. A newer geometry change of a window replaces
+/// the queued one's `new_geom`, so the app sees the latest size once. Clipboard and
+/// window-query callbacks need an answer now and stay dropped.
+fn defer_event(pending: &mut VecDeque<Win32Event>, event: Win32Event) {
+    match event {
+        Win32Event::AppGotFocus(_) | Win32Event::AppLostFocus(_) => pending.push_back(event),
+        Win32Event::WindowGeomChange(change) => {
+            let queued = pending.iter_mut().find_map(|queued| match queued {
+                Win32Event::WindowGeomChange(queued) if queued.window_id == change.window_id => Some(queued),
+                _ => None,
+            });
+            match queued {
+                Some(queued) => queued.new_geom = change.new_geom,
+                None => pending.push_back(Win32Event::WindowGeomChange(change)),
+            }
+        }
+        _ => (),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::makepad_math::dvec2;
+
+    fn resized(window: usize, from: f64, to: f64) -> Win32Event {
+        let geom = |width| WindowGeom { inner_size: dvec2(width, 820.0), ..Default::default() };
+        Win32Event::WindowGeomChange(WindowGeomChangeEvent {
+            window_id: WindowId(window, 0),
+            old_geom: geom(from),
+            new_geom: geom(to),
+        })
+    }
+
+    fn widths(pending: &VecDeque<Win32Event>) -> Vec<(usize, f64, f64)> {
+        pending.iter().filter_map(|event| match event {
+            Win32Event::WindowGeomChange(e) => Some((e.window_id.0, e.old_geom.inner_size.x, e.new_geom.inner_size.x)),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn resize_during_callback_is_kept() {
+        let mut pending = VecDeque::new();
+        defer_event(&mut pending, resized(0, 1280.0, 1700.0));
+        assert_eq!(widths(&pending), vec![(0, 1280.0, 1700.0)]);
+    }
+
+    #[test]
+    fn second_resize_of_same_window_updates_the_queued_one() {
+        let mut pending = VecDeque::new();
+        defer_event(&mut pending, resized(0, 1280.0, 1700.0));
+        defer_event(&mut pending, resized(0, 1700.0, 1500.0));
+        assert_eq!(widths(&pending), vec![(0, 1280.0, 1500.0)]);
+    }
+
+    #[test]
+    fn resizes_of_different_windows_are_both_kept() {
+        let mut pending = VecDeque::new();
+        defer_event(&mut pending, resized(0, 1280.0, 1700.0));
+        defer_event(&mut pending, resized(1, 800.0, 900.0));
+        assert_eq!(widths(&pending), vec![(0, 1280.0, 1700.0), (1, 800.0, 900.0)]);
+    }
 }

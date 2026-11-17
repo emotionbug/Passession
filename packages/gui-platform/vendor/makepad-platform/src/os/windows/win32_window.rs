@@ -864,14 +864,12 @@ impl Win32Window {
     pub fn restore(&self) {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_RESTORE);
-            PostMessageW(Some(self.hwnd), WM_SIZE, WPARAM(0), LPARAM(0)).unwrap();
         }
     }
     
     pub fn maximize(&self) {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_MAXIMIZE);
-            PostMessageW(Some(self.hwnd), WM_SIZE, WPARAM(0), LPARAM(0)).unwrap();
         }
     }
     
