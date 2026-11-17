@@ -283,6 +283,26 @@ impl TerminalService {
             .map(|terminal| terminal.info())
             .collect()
     }
+    /// Live terminal descriptors grouped by owning workspace id, so one directory
+    /// rebuild reads the terminal table once instead of once per workspace.
+    pub fn live_by_workspace(&self) -> HashMap<String, Vec<Value>> {
+        let terminals: Vec<_> = self
+            .terminals
+            .read()
+            .unwrap()
+            .values()
+            .filter(|terminal| !terminal.is_exited())
+            .cloned()
+            .collect();
+        let mut grouped: HashMap<String, Vec<Value>> = HashMap::new();
+        for terminal in terminals {
+            grouped
+                .entry(terminal.workspace_id.clone())
+                .or_default()
+                .push(terminal.info());
+        }
+        grouped
+    }
     /// `killTerminalAndWait`: an unknown id is a no-op, and the session is removed
     /// even when waiting for termination fails.
     pub async fn kill(&self, id: &str) -> Result<()> {

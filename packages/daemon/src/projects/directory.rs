@@ -1,17 +1,18 @@
 use std::{
     borrow::Cow,
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex, Weak},
 };
 
 use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
+use tokio::{sync::watch, time::Instant};
 
-use crate::state::AppState;
+use crate::{agent::AgentManager, state::AppState};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -23,6 +24,9 @@ pub struct DirectoryRequestError {
 #[derive(Default)]
 pub struct DirectoryState {
     state: Mutex<ProjectionState>,
+    /// The shared workspace observer's channel; the observer task owns the only
+    /// strong reference, so subscribers see it close when the observer stops.
+    observer: Mutex<Weak<ObservationSender>>,
 }
 
 #[derive(Default)]
@@ -342,24 +346,19 @@ fn resolve_entered_at(
         .map(str::to_owned)
 }
 
-pub async fn build_entries(
-    app: &AppState,
-    workspaces: Vec<Value>,
-    projects: Vec<Value>,
-) -> Result<Vec<Value>> {
-    build_entries_ref(app, &workspaces, &projects).await
-}
-
 async fn build_entries_ref(
     app: &AppState,
     workspaces: &[Value],
     projects: &[Value],
 ) -> Result<Vec<Value>> {
-    let (agents, message_times, (provider_activity, unavailable_subagents)) = tokio::try_join!(
-        app.agents.list_snapshots(),
-        app.agents.workspace_last_user_message_times(),
-        app.agents.list_provider_subagent_activity()
-    )?;
+    // One snapshot listing feeds every agent-derived projection of this rebuild.
+    let agents = app.agents.list_snapshots().await?;
+    let message_times = AgentManager::workspace_last_user_message_times_from_snapshots(&agents);
+    let (provider_activity, unavailable_subagents) = app
+        .agents
+        .list_provider_subagent_activity_from_snapshots(&agents)
+        .await?;
+    let terminals = app.terminals.live_by_workspace();
     let project_map: HashMap<&str, &Value> = projects
         .iter()
         .map(|project| (text(project, "projectId"), project))
@@ -421,9 +420,9 @@ async fn build_entries_ref(
             activity: Vec::new(),
             subagents_unavailable: Vec::new(),
         };
-        for terminal in app.terminals.list(Some(id), None).await {
+        for terminal in terminals.get(id).into_iter().flatten() {
             // Ownership is the workspace id, never its shared checkout directory.
-            if text(&terminal, "workspaceId") != id {
+            if text(terminal, "workspaceId") != id {
                 continue;
             }
             let activity = &terminal["activity"];
@@ -527,6 +526,181 @@ async fn build_entries_ref(
     Ok(entries)
 }
 
+type ObservationSender = watch::Sender<Option<Arc<Observation>>>;
+
+/// One rebuild of the workspace directory, shared by every `fetch_workspaces`
+/// subscription. Each subscriber applies its own filter to the same result.
+pub(super) struct Observation {
+    /// When the rebuild began reading durable state.
+    started: Instant,
+    entries: Vec<Value>,
+    records: Vec<Value>,
+    projects: Vec<Value>,
+    entry_index: HashMap<String, usize>,
+    project_ids: HashSet<String>,
+}
+
+impl Observation {
+    fn new(
+        started: Instant,
+        entries: Vec<Value>,
+        records: Vec<Value>,
+        projects: Vec<Value>,
+    ) -> Self {
+        let entry_index = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| Some((entry["id"].as_str()?.to_owned(), index)))
+            .collect();
+        let project_ids = projects
+            .iter()
+            .filter_map(|project| project["projectId"].as_str().map(str::to_owned))
+            .collect();
+        Self {
+            started,
+            entries,
+            records,
+            projects,
+            entry_index,
+            project_ids,
+        }
+    }
+
+    pub(super) async fn build(app: &AppState) -> Result<Self> {
+        let started = Instant::now();
+        let records = app.projects.list_workspaces().await?;
+        let projects = app.projects.list_projects().await?;
+        let entries = build_entries_ref(app, &records, &projects).await?;
+        Ok(Self::new(started, entries, records, projects))
+    }
+
+    pub(super) fn started(&self) -> Instant {
+        self.started
+    }
+
+    pub(super) fn entries(&self) -> &[Value] {
+        &self.entries
+    }
+
+    pub(super) fn records(&self) -> &[Value] {
+        &self.records
+    }
+
+    pub(super) fn projects(&self) -> &[Value] {
+        &self.projects
+    }
+
+    pub(super) fn entry(&self, id: &str) -> Option<&Value> {
+        self.entry_index.get(id).map(|index| &self.entries[*index])
+    }
+}
+
+/// Joins the daemon-wide workspace observer, starting it for the first
+/// subscriber. The observer stops once every returned receiver is dropped.
+pub(super) fn observe_workspaces(app: &Arc<AppState>) -> watch::Receiver<Option<Arc<Observation>>> {
+    let mut observer = app
+        .projects
+        .directory_state
+        .observer
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // Receivers are only added under this lock, so a sender with no receivers
+    // belongs to an observer that is stopping and must not be rejoined.
+    if let Some(sender) = observer.upgrade()
+        && sender.receiver_count() > 0
+    {
+        return sender.subscribe();
+    }
+    let (sender, receiver) = watch::channel(None);
+    let sender = Arc::new(sender);
+    *observer = Arc::downgrade(&sender);
+    tokio::spawn(run_observer(Arc::downgrade(app), sender));
+    receiver
+}
+
+async fn run_observer(weak: Weak<AppState>, sender: Arc<ObservationSender>) {
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = sender.closed() => break,
+            _ = timer.tick() => {}
+        }
+        let Some(app) = weak.upgrade() else { break };
+        match Observation::build(&app).await {
+            Ok(observation) => {
+                sender.send_replace(Some(Arc::new(observation)));
+            }
+            Err(error) => tracing::warn!(%error, "Workspace subscription observation failed"),
+        }
+    }
+}
+
+/// One subscriber's ordered `(id, value, payload)` workspace deltas between two
+/// observations. `visible` holds the ids this subscriber has shown.
+pub(super) fn workspace_deltas(
+    previous: &Observation,
+    next: &Observation,
+    include_background: bool,
+    filter: Option<&Value>,
+    visible: &mut BTreeSet<String>,
+) -> Vec<(String, Option<Value>, Value)> {
+    let mut updates = Vec::new();
+    for entry in &next.entries {
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        if previous.entry(id) == Some(entry) {
+            continue;
+        }
+        let matches =
+            crate::directory_sync::workspace_directory_includes(entry, include_background)
+                && crate::directory_sync::matches_workspace_filter(entry, filter);
+        if matches {
+            visible.insert(id.into());
+            updates.push((
+                id.to_owned(),
+                Some(entry.clone()),
+                json!({"kind":"upsert","workspace":entry}),
+            ));
+        } else if visible.remove(id) {
+            updates.push((
+                id.to_owned(),
+                Some(entry.clone()),
+                json!({"kind":"remove","id":id}),
+            ));
+        }
+    }
+    for old in &previous.entries {
+        let Some(id) = old["id"].as_str() else {
+            continue;
+        };
+        if !next.entry_index.contains_key(id) && visible.remove(id) {
+            updates.push((id.to_owned(), None, json!({"kind":"remove","id":id})));
+        }
+    }
+    for project in &previous.projects {
+        let Some(id) = project["projectId"].as_str() else {
+            continue;
+        };
+        if !next.project_ids.contains(id)
+            && !updates.iter().any(|(wid, _, _)| {
+                previous
+                    .entry(wid)
+                    .is_some_and(|workspace| workspace["projectId"] == id)
+            })
+        {
+            updates.push((
+                id.to_owned(),
+                None,
+                json!({"kind":"remove","id":id,"removedProjectId":id}),
+            ));
+        }
+    }
+    updates
+}
+
 pub async fn descriptor(app: &AppState, workspace: &Value, project: &Value) -> Result<Value> {
     build_entries_ref(
         app,
@@ -580,18 +754,35 @@ pub async fn fetch(
     workspaces: Vec<Value>,
     projects: Vec<Value>,
 ) -> Result<Value> {
-    if let Some(cursor) = request.get("sync").filter(|cursor| !cursor.is_null()) {
-        if request
+    validate_fetch(request)?;
+    let entries = build_entries_ref(app, &workspaces, &projects).await?;
+    fetch_entries(app, request, entries, &projects)
+}
+
+/// Request validation that precedes any directory rebuild.
+pub(super) fn validate_fetch(request: &Value) -> Result<()> {
+    if request.get("sync").is_some_and(|cursor| !cursor.is_null())
+        && request
             .get("filter")
             .is_some_and(|filter| !filter.is_null())
-        {
-            return Err(DirectoryRequestError {
-                code: "invalid_request",
-                message: "Sequenced workspace directory reads do not support filters.",
-            }
-            .into());
+    {
+        return Err(DirectoryRequestError {
+            code: "invalid_request",
+            message: "Sequenced workspace directory reads do not support filters.",
         }
-        let entries = build_entries(app, workspaces, projects).await?;
+        .into());
+    }
+    Ok(())
+}
+
+/// Shapes already-built directory entries into a `fetch_workspaces_response` payload.
+pub(super) fn fetch_entries(
+    app: &AppState,
+    request: &Value,
+    entries: Vec<Value>,
+    projects: &[Value],
+) -> Result<Value> {
+    if let Some(cursor) = request.get("sync").filter(|cursor| !cursor.is_null()) {
         let background = enabled(request, "includeBackground");
         let mut result = app
             .agents
@@ -602,8 +793,7 @@ pub async fn fetch(
         }
         return Ok(result);
     }
-    let entries = build_entries_ref(app, &workspaces, &projects).await?;
-    paginate(request, entries, &projects)
+    paginate(request, entries, projects)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1034,5 +1224,39 @@ mod tests {
         assert!(entry.get("gitRuntime").is_none());
         assert!(entry.get("githubRuntime").is_none());
         assert_eq!(entry["diffStat"], Value::Null);
+    }
+
+    #[test]
+    fn shared_observation_deltas_follow_each_subscriber_scope() {
+        let projects = vec![json!({"projectId":"p"}), json!({"projectId":"q"})];
+        let observe = |entries: Vec<Value>| {
+            Observation::new(Instant::now(), entries, Vec::new(), projects.clone())
+        };
+        let alpha = json!({"id":"a","projectId":"p","name":"Alpha"});
+        let beta = json!({"id":"b","projectId":"q","name":"Beta"});
+        let renamed = json!({"id":"b","projectId":"q","name":"Beta 2"});
+        let before = observe(vec![alpha, beta]);
+        let after = observe(vec![renamed.clone()]);
+        let p_filter = json!({"projectId":"p"});
+        let q_filter = json!({"projectId":"q"});
+        let mut p_visible = BTreeSet::from(["a".to_owned()]);
+        let mut q_visible = BTreeSet::from(["b".to_owned()]);
+        let payloads = |updates: Vec<(String, Option<Value>, Value)>| {
+            updates
+                .into_iter()
+                .map(|(_, _, payload)| payload)
+                .collect::<Vec<_>>()
+        };
+        let p_updates = workspace_deltas(&before, &after, false, Some(&p_filter), &mut p_visible);
+        let q_updates = workspace_deltas(&before, &after, false, Some(&q_filter), &mut q_visible);
+        assert_eq!(payloads(p_updates), vec![json!({"kind":"remove","id":"a"})]);
+        assert_eq!(
+            payloads(q_updates),
+            vec![json!({"kind":"upsert","workspace":renamed})]
+        );
+        assert!(p_visible.is_empty());
+        assert_eq!(q_visible, BTreeSet::from(["b".to_owned()]));
+        let unchanged = workspace_deltas(&after, &after, false, Some(&q_filter), &mut q_visible);
+        assert!(unchanged.is_empty());
     }
 }

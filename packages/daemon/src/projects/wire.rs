@@ -400,20 +400,24 @@ impl ProjectService {
         )?;
         let bootstrap = async {
             let app = self.app()?;
-            let records = self.list_workspaces().await?;
-            let projects = self.list_projects().await?;
-            let baseline =
-                directory::build_entries(&app, records.clone(), projects.clone()).await?;
-            let mut initial = directory::fetch(&app, m, records, projects.clone()).await?;
+            directory::validate_fetch(m)?;
+            // The response and the first delta baseline share one rebuild.
+            let baseline = directory::Observation::build(&app).await?;
+            let mut initial = directory::fetch_entries(
+                &app,
+                m,
+                baseline.entries().to_vec(),
+                baseline.projects(),
+            )?;
             initial["requestId"] = m["requestId"].clone();
             initial["subscriptionId"] = json!(owner.response_id());
             ctx.send(json!({"type":"fetch_workspaces_response","payload":initial}))
                 .await?;
             owner.activate().await?;
-            Ok::<_, anyhow::Error>((initial, baseline, projects))
+            Ok::<_, anyhow::Error>((initial, baseline, directory::observe_workspaces(&app)))
         }
         .await;
-        let (initial, mut previous, mut previous_projects) = match bootstrap {
+        let (initial, baseline, mut observations) = match bootstrap {
             Ok(value) => value,
             Err(error) => {
                 owner.release().await?;
@@ -432,89 +436,36 @@ impl ProjectService {
                 .flatten()
                 .filter_map(|v| v["id"].as_str().map(str::to_owned))
                 .collect();
+            let mut previous = Arc::new(baseline);
             let cancel = owner.cancellation();
-            let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::select! {_=cancel.cancelled()=>break,_=timer.tick()=>{}}
-                let Some(app) = weak.upgrade() else { break };
-                let result = async {
-                    let records = app.projects.list_workspaces().await?;
-                    let projects = app.projects.list_projects().await?;
-                    let entries =
-                        directory::build_entries(&app, records.clone(), projects.clone()).await?;
-                    Ok::<_, anyhow::Error>((entries, records, projects))
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    changed = observations.changed() => if changed.is_err() { break },
                 }
-                .await;
-                let (entries, records, projects) = match result {
-                    Ok(v) => v,
-                    Err(error) => {
-                        tracing::warn!(%error,"Workspace subscription observation failed");
-                        continue;
-                    }
+                let Some(observation) = observations.borrow_and_update().clone() else {
+                    continue;
                 };
-                let mut updates = Vec::new();
-                for entry in &entries {
-                    if previous.iter().any(|old| old == entry) {
-                        continue;
-                    }
-                    let Some(id) = entry["id"].as_str() else {
-                        continue;
-                    };
-                    let matches = crate::directory_sync::workspace_directory_includes(
-                        entry,
-                        include_background,
-                    ) && crate::directory_sync::matches_workspace_filter(
-                        entry,
-                        request.get("filter"),
-                    );
-                    if matches {
-                        visible.insert(id.into());
-                        updates.push((
-                            id.to_owned(),
-                            Some(entry.clone()),
-                            json!({"kind":"upsert","workspace":entry}),
-                        ));
-                    } else if visible.remove(id) {
-                        updates.push((
-                            id.to_owned(),
-                            Some(entry.clone()),
-                            json!({"kind":"remove","id":id}),
-                        ));
-                    }
+                // A rebuild that began before this subscription's baseline is older than it.
+                if observation.started() < previous.started() {
+                    continue;
                 }
-                for old in &previous {
-                    let Some(id) = old["id"].as_str() else {
-                        continue;
-                    };
-                    if !entries.iter().any(|new| new["id"] == id) && visible.remove(id) {
-                        updates.push((id.to_owned(), None, json!({"kind":"remove","id":id})));
-                    }
-                }
-                for project in &previous_projects {
-                    let Some(id) = project["projectId"].as_str() else {
-                        continue;
-                    };
-                    if !projects.iter().any(|p| p["projectId"] == id)
-                        && !updates.iter().any(|(wid, _, _)| {
-                            previous
-                                .iter()
-                                .any(|w| w["id"] == wid.as_str() && w["projectId"] == id)
-                        })
-                    {
-                        updates.push((
-                            id.to_owned(),
-                            None,
-                            json!({"kind":"remove","id":id,"removedProjectId":id}),
-                        ));
-                    }
-                }
+                let Some(app) = weak.upgrade() else { break };
+                let updates = directory::workspace_deltas(
+                    &previous,
+                    &observation,
+                    include_background,
+                    request.get("filter"),
+                    &mut visible,
+                );
+                let records = observation.records();
+                let projects = observation.projects();
                 for (id, value, mut payload) in updates {
                     if payload["kind"] == "remove" {
                         let project_id = records
                             .iter()
                             .find(|w| w["workspaceId"] == id)
-                            .or_else(|| previous.iter().find(|w| w["id"] == id))
+                            .or_else(|| previous.entry(&id))
                             .and_then(|w| w["projectId"].as_str());
                         if let Some(project_id) = project_id {
                             if let Some(project) = projects
@@ -559,8 +510,7 @@ impl ProjectService {
                         return;
                     }
                 }
-                previous = entries;
-                previous_projects = projects;
+                previous = observation;
             }
             let _ = owner.release().await;
         });

@@ -313,9 +313,15 @@ impl AgentManager {
     pub async fn list_provider_subagent_activity(
         &self,
     ) -> Result<(Vec<Value>, Vec<timeline::SubagentStorageUnavailable>)> {
-        let public: HashSet<String> = self
-            .list_snapshots()
-            .await?
+        self.list_provider_subagent_activity_from_snapshots(&self.list_snapshots().await?)
+            .await
+    }
+    /// `list_provider_subagent_activity` over snapshots the caller already listed.
+    pub async fn list_provider_subagent_activity_from_snapshots(
+        &self,
+        snapshots: &[Value],
+    ) -> Result<(Vec<Value>, Vec<timeline::SubagentStorageUnavailable>)> {
+        let public: HashSet<String> = snapshots
             .iter()
             .filter(|snapshot| snapshot["internal"] != true)
             .filter_map(|s| text(s, "id").map(str::to_owned))
@@ -338,14 +344,22 @@ impl AgentManager {
         .await?
     }
     pub async fn workspace_last_user_message_times(&self) -> Result<BTreeMap<String, String>> {
+        Ok(Self::workspace_last_user_message_times_from_snapshots(
+            &self.list_snapshots().await?,
+        ))
+    }
+    /// `workspace_last_user_message_times` over snapshots the caller already listed.
+    pub fn workspace_last_user_message_times_from_snapshots(
+        snapshots: &[Value],
+    ) -> BTreeMap<String, String> {
         let mut times = BTreeMap::new();
-        for record in self.list_snapshots().await? {
+        for record in snapshots {
             if record["internal"] == true {
                 continue;
             }
             if let (Some(workspace), Some(time)) = (
-                text(&record, "workspaceId"),
-                text(&record, "lastUserMessageAt"),
+                text(record, "workspaceId"),
+                text(record, "lastUserMessageAt"),
             ) {
                 let latest = times
                     .entry(workspace.to_owned())
@@ -355,7 +369,7 @@ impl AgentManager {
                 }
             }
         }
-        Ok(times)
+        times
     }
     pub async fn commands(&self, id: Option<&str>, config: &Value) -> Result<Vec<Value>> {
         if let Some(id) = id
