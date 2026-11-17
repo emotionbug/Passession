@@ -3,6 +3,21 @@ use std::fs::File;
 use std::path::Path;
 use std::io::prelude::*;
 
+fn target_tool(name: &str, target: &str, default: &str) -> std::ffi::OsString {
+    let keys = [
+        format!("{name}_{target}"),
+        format!("{name}_{}", target.replace('-', "_")),
+        format!("TARGET_{name}"),
+        name.to_owned(),
+    ];
+    for key in &keys {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    keys.iter()
+        .find_map(env::var_os)
+        .unwrap_or_else(|| default.into())
+}
+
 fn main() {
     // write a path to makepad platform into our output dir
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -38,13 +53,15 @@ fn main() {
         "macos"=>{
             use std::process::Command;
             let out_dir = env::var("OUT_DIR").unwrap();
-            if !Command::new("clang").args(&["src/os/apple/metal_xpc.m", "-c", "-o"])
+            let clang = target_tool("CC", &target, "clang");
+            let ar = target_tool("AR", &target, "ar");
+            if !Command::new(clang).args(&["src/os/apple/metal_xpc.m", "-c", "-o"])
                 .arg(&format!("{}/metal_xpc.o", out_dir))
                 .status().unwrap().success() {
                 panic!("CLANG FAILED");
             };
             
-            if !Command::new("ar").args(&["crus", "libmetal_xpc.a", "metal_xpc.o"])
+            if !Command::new(ar).args(&["crus", "libmetal_xpc.a", "metal_xpc.o"])
                 .current_dir(&Path::new(&out_dir))
                 .status().unwrap().success() {
                 panic!("AR FAILED"); 

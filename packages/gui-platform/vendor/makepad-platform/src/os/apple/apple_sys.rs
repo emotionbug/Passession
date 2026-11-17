@@ -67,7 +67,7 @@ impl Drop for RcObjcId {
     }
 }
 
-#[link(name = "system")]
+#[link(name = "System")]
 extern "C" {
     pub static _NSConcreteStackBlock: [*const c_void; 32];
     pub static _NSConcreteBogusBlock: [*const c_void; 32];
@@ -1194,7 +1194,7 @@ pub type AudioObjectID = u32;
 pub type AudioDeviceID = u32;
 
 
-#[link(name = "CoreMidi", kind = "framework")]
+#[link(name = "CoreMIDI", kind = "framework")]
 extern "C" {
     pub static kMIDIPropertyManufacturer: CFStringRef;
     pub static kMIDIPropertyDisplayName: CFStringRef;

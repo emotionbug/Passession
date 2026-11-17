@@ -12,6 +12,18 @@ The root `Cargo.toml` applies it with
 `[patch.crates-io] makepad-platform = { path = "packages/gui-platform/vendor/makepad-platform" }`
 and excludes this directory from the workspace members.
 
+## macOS native tools
+
+`build.rs` selects the Objective-C compiler and archiver through target-qualified
+`CC`/`AR` variables (literal triple, then underscore triple), then `TARGET_CC`/
+`TARGET_AR`, then `CC`/`AR`. Unset overrides preserve native `clang`/`ar`.
+Cross builds supply executable wrappers with their target and SDK flags; changing
+an override reruns the build script.
+
+`src/os/apple/apple_sys.rs` uses the SDK's canonical `System` library and
+`CoreMIDI` framework spelling. Native macOS's usual case-insensitive filesystem
+hid the upstream `system`/`CoreMidi` names; a case-sensitive cross SDK does not.
+
 ## Why
 
 Passession supports Android 7.0 (API 24) and later, the floor of the client
