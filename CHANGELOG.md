@@ -10,6 +10,7 @@
   - A timeline checkpoint without the current SQLite tables, indexes and triggers is no longer upgraded. The daemon replaces it with an empty one and refills it from the provider's history; closed agents read it as having no checkpoint.
   - The daemon no longer deletes retired JSON timeline checkpoints and old-style log files at startup, reads retired OMP host-tool checkpoints, history rows without invocation provenance or old textual transcript locators, or retires Paseo-managed skill copies in `~/.codex/skills`.
   - Updates ignore a `native-update.json` left by the pre-managed updater instead of refusing to start, and accept local runtimes only with current provenance. The `agent.skills.import_legacy_selection` request is removed.
+  - Release tooling no longer reads releases published without a component inventory or with version-1 desktop feeds.
 
 ### Fixed
 

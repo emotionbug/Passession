@@ -28,138 +28,6 @@ pub(super) fn digest512(path: &Path) -> Result<String> {
     }
     Ok(STANDARD.encode(hash.finalize()))
 }
-pub(super) fn names(id: &Identity, runtime: &str) -> Result<Vec<String>> {
-    let t = target(&id.target)?;
-    ensure!(t.desktop, "Mobile targets have no desktop update feed");
-    let (stem, extensions) = match runtime {
-        DAEMON => (
-            "Paseo-Daemon",
-            if t.platform == "windows" {
-                vec!["zip"]
-            } else {
-                vec!["tar.gz"]
-            },
-        ),
-        CLIENT => (
-            "Passession",
-            match t.platform {
-                "linux" => vec!["AppImage", "deb"],
-                "macos" => vec!["zip"],
-                _ => vec!["exe"],
-            },
-        ),
-        _ => bail!("Unknown manifest runtime"),
-    };
-    Ok(extensions
-        .iter()
-        .map(|ext| format!("{stem}-{}-{}.{ext}", id.version, id.target))
-        .collect())
-}
-#[cfg(test)]
-pub(super) fn feed(id: &Identity, runtime: &str) -> String {
-    format!(
-        "{}-{}-{}.json",
-        if runtime == DAEMON { "daemon" } else { CLIENT },
-        id.channel,
-        id.target
-    )
-}
-pub(super) fn validate_manifest(
-    manifest: &Value,
-    id: &Identity,
-    runtime: &str,
-) -> Result<Vec<Value>> {
-    let t = target(&id.target)?;
-    ensure!(
-        t.desktop && [DAEMON, CLIENT].contains(&runtime),
-        "Unsupported feed target/runtime"
-    );
-    let app_id = if runtime == DAEMON {
-        "sh.paseo.daemon"
-    } else {
-        CLIENT_APP_ID
-    };
-    for (key, value) in [
-        ("runtime", runtime),
-        ("appId", app_id),
-        ("version", id.version.as_str()),
-        ("channel", id.channel.as_str()),
-        ("platform", t.platform),
-        ("arch", t.arch),
-        ("sourceSha", id.sha.as_str()),
-    ] {
-        ensure!(
-            manifest[key] == value,
-            "Manifest identity mismatch {key}: {}",
-            id.target
-        );
-    }
-    ensure!(
-        manifest["schemaVersion"] == 1,
-        "Unsupported manifest schema"
-    );
-    if runtime == CLIENT {
-        chrono::DateTime::parse_from_rfc3339(
-            manifest["releaseDate"]
-                .as_str()
-                .context("Missing release date")?,
-        )?;
-        ensure!(
-            manifest["rolloutHours"]
-                .as_f64()
-                .is_some_and(|n| n.is_finite() && n >= 0.0),
-            "Invalid rollout hours"
-        );
-    }
-    let entries = if let Some(entries) = manifest.get("artifacts") {
-        ensure!(
-            manifest.get("artifact").is_none(),
-            "Ambiguous artifact inventory"
-        );
-        entries.as_array().context("Invalid artifact list")?.clone()
-    } else {
-        vec![
-            manifest
-                .get("artifact")
-                .context("Missing artifact")?
-                .clone(),
-        ]
-    };
-    let required = names(id, runtime)?;
-    ensure!(
-        entries.len() == required.len(),
-        "Incomplete artifact inventory"
-    );
-    for name in &required {
-        ensure!(
-            entries.iter().filter(|e| e["name"] == *name).count() == 1,
-            "Missing or duplicate {name}"
-        );
-    }
-    for entry in &entries {
-        let name = entry["name"].as_str().context("Missing artifact name")?;
-        basename(name)?;
-        let format = if name.ends_with(".tar.gz") {
-            "tar.gz".to_owned()
-        } else {
-            name.rsplit('.')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-        };
-        ensure!(
-            entry["format"] == format && entry["size"].as_u64().is_some_and(|n| n > 0),
-            "Invalid artifact size/format: {name}"
-        );
-        let sha = entry["sha512"].as_str().context("Missing SHA-512")?;
-        let decoded = STANDARD.decode(sha).context("Invalid SHA-512 encoding")?;
-        ensure!(
-            decoded.len() == 64 && STANDARD.encode(&decoded) == sha,
-            "Invalid SHA-512 length/encoding"
-        );
-    }
-    Ok(entries)
-}
 /// Reject renamed APKs as bundles and ABI labels that disagree with the payload.
 /// Store/signature acceptance still requires the platform signing tools.
 pub(crate) fn validate_android(path: &Path, arch: &str, format: &str) -> Result<()> {
@@ -555,53 +423,31 @@ pub(crate) fn manifests_at(dir: &Path, date: &str) -> Result<()> {
 }
 pub(super) fn restamp(mut manifest: Value, amount: f64) -> Result<Value> {
     ensure!(amount.is_finite() && amount >= 0.0, "Invalid rollout hours");
-    if manifest["schemaVersion"] == 2 {
-        let target = format!(
-            "{}-{}",
-            manifest["platform"].as_str().context("Missing platform")?,
-            manifest["arch"].as_str().context("Missing arch")?
-        );
-        super::target(&target)?;
-        let component: paseo_protocol::components::ComponentRef =
-            serde_json::from_value(manifest["component"].clone())?;
-        paseo_protocol::components::validate_component(&component, &target, REPOSITORY)?;
-        ensure!(
-            component.id == paseo_protocol::components::ComponentId::App
-                && manifest["runtime"] == CLIENT
-                && manifest["version"] == component.identity.version
-                && manifest["sourceSha"] == component.identity.source_sha,
-            "Invalid component rollout identity"
-        );
-        chrono::DateTime::parse_from_rfc3339(
-            manifest["releaseDate"]
-                .as_str()
-                .context("Missing release date")?,
-        )?;
-        manifest["rolloutHours"] = json!(amount);
-        return Ok(manifest);
-    }
-    let date = manifest["releaseDate"]
-        .as_str()
-        .context("Missing release date")?;
-    chrono::DateTime::parse_from_rfc3339(date)?;
-    let v = version(manifest["version"].as_str().context("Missing version")?)?;
-    let id = Identity {
-        sha: manifest["sourceSha"]
+    ensure!(
+        manifest["schemaVersion"] == 2,
+        "Unsupported rollout manifest schema"
+    );
+    let target = format!(
+        "{}-{}",
+        manifest["platform"].as_str().context("Missing platform")?,
+        manifest["arch"].as_str().context("Missing arch")?
+    );
+    super::target(&target)?;
+    let component: paseo_protocol::components::ComponentRef =
+        serde_json::from_value(manifest["component"].clone())?;
+    paseo_protocol::components::validate_component(&component, &target, REPOSITORY)?;
+    ensure!(
+        component.id == paseo_protocol::components::ComponentId::App
+            && manifest["runtime"] == CLIENT
+            && manifest["version"] == component.identity.version
+            && manifest["sourceSha"] == component.identity.source_sha,
+        "Invalid component rollout identity"
+    );
+    chrono::DateTime::parse_from_rfc3339(
+        manifest["releaseDate"]
             .as_str()
-            .context("Missing source SHA")?
-            .into(),
-        version: v.to_string(),
-        source_tag: String::new(),
-        channel: channel(&v).into(),
-        run_id: String::new(),
-        target: format!(
-            "{}-{}",
-            manifest["platform"].as_str().unwrap_or_default(),
-            manifest["arch"].as_str().unwrap_or_default()
-        ),
-    };
-    ensure!(valid_sha(&id.sha), "Invalid source SHA");
-    validate_manifest(&manifest, &id, CLIENT)?;
+            .context("Missing release date")?,
+    )?;
     manifest["rolloutHours"] = json!(amount);
     Ok(manifest)
 }
@@ -716,35 +562,21 @@ mod tests {
             target: "windows-x64".into(),
         }
     }
-    /// Installed clients accept only this exact feed identity.
-    fn manifest() -> Value {
-        json!({"schemaVersion":1,"runtime":"app","appId":"sh.paseo.sessions.desktop","platform":"windows","arch":"x64","version":"0.13.1","channel":"stable","sourceSha":"a".repeat(40),"releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36,"artifact":{"name":"Passession-0.13.1-windows-x64.exe","size":42,"format":"exe","sha512":STANDARD.encode([0_u8;64])}})
-    }
-    #[test]
-    fn manifest_identity_and_hashes_are_strict() {
-        let good = manifest();
-        assert!(validate_manifest(&good, &identity(), CLIENT).is_ok());
-        assert_eq!(feed(&identity(), CLIENT), "app-stable-windows-x64.json");
-        for (field, value) in [
-            ("sourceSha", json!("b".repeat(40))),
-            ("version", json!("0.13.2")),
-            ("runtime", json!("rust")),
-            ("arch", json!("arm64")),
-        ] {
-            let mut bad = good.clone();
-            bad[field] = value;
-            assert!(validate_manifest(&bad, &identity(), CLIENT).is_err());
-        }
-        let mut bad = good.clone();
-        bad["artifact"]["sha512"] = json!("invalid");
-        assert!(validate_manifest(&bad, &identity(), CLIENT).is_err());
-        let mut bad = good;
-        bad["artifacts"] = json!([]);
-        assert!(validate_manifest(&bad, &identity(), CLIENT).is_err());
-    }
     #[test]
     fn stamping_preserves_identity_date_and_hashes() {
-        let before = manifest();
+        let before = json!({
+            "schemaVersion":2,"runtime":"app","appId":CLIENT_APP_ID,
+            "platform":"windows","arch":"x64","version":"0.13.36","sourceSha":"a".repeat(40),
+            "releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36,
+            "component":{
+                "id":"app","target":"windows-x64",
+                "identity":{"version":"0.13.36","sourceSha":"a".repeat(40),"inputHash":"b".repeat(64),"abiVersion":1},
+                "artifact":{"url":format!("https://github.com/{REPOSITORY}/releases/download/v0.13.36/app.zip"),
+                    "originTag":"v0.13.36","sha256":"c".repeat(64),"size":42,"format":"zip"},
+                "executable":"app.exe","executableSha256":"d".repeat(64),
+                "requires":{"daemon":1,"tailnet":1,"update-helper":2}
+            }
+        });
         let mut after = restamp(before.clone(), 0.0).unwrap();
         assert_eq!(after["rolloutHours"], 0.0);
         after["rolloutHours"] = before["rolloutHours"].clone();

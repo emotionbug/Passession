@@ -26,7 +26,10 @@ fn ensure_local_identity(identity: &Value) -> Result<()> {
         identity["release"] == false
             && identity["channel"].is_null()
             && identity["repository"].is_null()
-            && matches!(identity["sourceDirty"], Value::Bool(_) | Value::Null),
+            && matches!(
+                identity.get("sourceDirty"),
+                Some(Value::Bool(_) | Value::Null)
+            ),
         "standalone-local packages only local builds (release=false, no channel/repository); package official releases with --kind standalone-archive"
     );
     Ok(())
@@ -488,9 +491,9 @@ mod tests {
     fn standalone_local_accepts_only_local_build_provenance() {
         let local = json!({"release":false,"channel":null,"repository":null,"sourceDirty":true});
         assert!(ensure_local_identity(&local).is_ok());
-        let mut legacy = local.clone();
-        legacy.as_object_mut().unwrap().remove("sourceDirty");
-        assert!(ensure_local_identity(&legacy).is_ok());
+        let mut unknown = local.clone();
+        unknown["sourceDirty"] = Value::Null;
+        assert!(ensure_local_identity(&unknown).is_ok());
         for (key, value) in [
             ("release", json!(true)),
             ("channel", json!("stable")),

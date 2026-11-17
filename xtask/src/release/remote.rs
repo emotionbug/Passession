@@ -1,6 +1,4 @@
 use super::integrity;
-#[cfg(test)]
-use super::integrity::{feed, validate_manifest};
 use super::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -405,18 +403,9 @@ pub(crate) fn prior_inventory(
     let Some(selected) = selected else {
         return Ok((None, BTreeMap::new()));
     };
-    let name = format!("components-{}.json", channel(&current));
-    // Legacy assets are not component identities. The first inventory-less release
-    // builds all components; malformed new-format inventories fail instead of fallback.
-    if !selected["assets"]
-        .as_array()
-        .context("Missing release assets")?
-        .iter()
-        .any(|asset| asset["name"] == name)
-    {
-        return Ok((None, BTreeMap::new()));
-    }
-    let tag = selected["tag_name"].as_str().context("Missing prior tag")?;
+    let tag = selected["tag_name"]
+        .as_str()
+        .context("Missing prior release tag")?;
     let prior_version = tag_version(tag)?;
     ensure!(
         prior_version <= current && channel(&prior_version) == channel(&current),
@@ -481,32 +470,6 @@ pub(crate) fn recovery_plan() -> Result<crate::components::plan::Plan> {
         "Recovery plan source mismatch"
     );
     Ok(plan)
-}
-#[cfg(test)]
-fn complete_feeds_with(
-    release: &Value,
-    ids: &[Identity],
-    mut read_feed: impl FnMut(&Value) -> Result<Value>,
-    mut check_binary: impl FnMut(&Value, &Value) -> Result<()>,
-) -> Result<()> {
-    for id in ids {
-        if !target(&id.target)?.desktop {
-            continue;
-        }
-        for runtime in [CLIENT, DAEMON] {
-            let name = feed(id, runtime);
-            let manifest = read_feed(asset(release, &name)?)?;
-            for entry in validate_manifest(&manifest, id, runtime)? {
-                let remote = asset(release, entry["name"].as_str().unwrap())?;
-                ensure!(
-                    remote["size"] == entry["size"],
-                    "Wrong remote artifact size"
-                );
-                check_binary(remote, &entry)?;
-            }
-        }
-    }
-    Ok(())
 }
 #[cfg(test)]
 fn upload_ordered(
@@ -822,36 +785,6 @@ pub(super) fn recovery(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
-fn published_desktop_targets(release: &Value, channel: &str) -> Result<Vec<Target>> {
-    let assets = release["assets"]
-        .as_array()
-        .context("Missing release assets")?;
-    let mut targets = Vec::new();
-    for target in TARGETS.iter().copied().filter(|target| target.desktop) {
-        let id = target.id();
-        let names = [
-            format!("provenance-{id}.json"),
-            format!("{CLIENT}-{channel}-{id}.json"),
-            format!("daemon-{channel}-{id}.json"),
-        ];
-        if !assets
-            .iter()
-            .any(|asset| names.iter().any(|name| asset["name"] == *name))
-        {
-            continue;
-        }
-        for name in names {
-            asset(release, &name)?;
-        }
-        targets.push(target);
-    }
-    ensure!(
-        !targets.is_empty(),
-        "Release has no declared desktop targets"
-    );
-    Ok(targets)
-}
-
 pub(super) fn rollout() -> Result<()> {
     repository()?;
     let tag = required("SOURCE_TAG")?;
@@ -859,77 +792,51 @@ pub(super) fn rollout() -> Result<()> {
     ensure!(tag == format!("v{v}"), "Canonical release tag required");
     let amount = hours(&required("NEW_HOURS")?)?;
     let release = lookup(&tag)?.context("Release not found")?;
-    let component_format = release["assets"]
-        .as_array()
-        .context("Missing release assets")?
-        .iter()
-        .any(|a| a["name"] == format!("components-{}.json", channel(&v)));
     let mut authenticated = BTreeMap::new();
-    if component_format {
-        authenticate_inventory(&tag, &mut authenticated, &mut BTreeSet::new())?;
-    }
-    let targets = if let Some(inventory) = authenticated.get(&tag) {
-        inventory
-            .targets
-            .keys()
-            .filter_map(|id| target(id).ok().filter(|t| t.desktop))
-            .collect()
-    } else {
-        published_desktop_targets(&release, channel(&v))?
-    };
+    authenticate_inventory(&tag, &mut authenticated, &mut BTreeSet::new())?;
+    let inventory = authenticated
+        .get(&tag)
+        .context("Missing authenticated rollout inventory")?;
+    let targets: Vec<_> = inventory
+        .targets
+        .keys()
+        .filter_map(|id| target(id).ok().filter(|t| t.desktop))
+        .collect();
     let dir = tempfile::tempdir()?;
     let mut updates = Vec::new();
-    let mut sha = None;
     for t in targets {
         let name = format!("{CLIENT}-{}-{}.json", channel(&v), t.id());
         let manifest: Value = serde_json::from_slice(&asset_bytes(asset(&release, &name)?)?)?;
         ensure!(
-            manifest[if component_format {
-                "collectionVersion"
-            } else {
-                "version"
-            }] == v.to_string()
+            manifest["collectionVersion"] == v.to_string()
                 && manifest["channel"] == channel(&v)
                 && manifest["platform"] == t.platform
                 && manifest["arch"] == t.arch,
             "Rollout manifest identity mismatch"
         );
-        if component_format {
-            let inventory = authenticated
-                .get(&tag)
-                .context("Missing authenticated rollout inventory")?;
-            let expected = inventory
-                .targets
-                .get(&t.id())
-                .and_then(|t| {
-                    t.components
-                        .get(&paseo_protocol::components::ComponentId::App)
-                })
-                .context("Missing app cohort")?;
-            ensure!(
-                manifest["schemaVersion"] == 2
-                    && manifest["collectionSourceSha"] == inventory.source_sha
-                    && manifest["component"] == serde_json::to_value(expected)?,
-                "Rollout feed does not reference authenticated component inventory"
-            );
-            let bytes =
-                trusted_asset_bytes(&release, &format!("components-{}.json", inventory.channel))?;
-            use base64::Engine;
-            use sha2::Digest;
-            ensure!(
-                manifest["inventory"]["sha512"]
-                    == base64::engine::general_purpose::STANDARD
-                        .encode(sha2::Sha512::digest(bytes)),
-                "Rollout inventory pin mismatch"
-            );
-        } else if let Some(sha) = &sha {
-            ensure!(
-                manifest["sourceSha"] == *sha,
-                "Mixed legacy source SHAs in release"
-            );
-        } else {
-            sha = Some(manifest["sourceSha"].clone());
-        }
+        let expected = inventory
+            .targets
+            .get(&t.id())
+            .and_then(|t| {
+                t.components
+                    .get(&paseo_protocol::components::ComponentId::App)
+            })
+            .context("Missing app cohort")?;
+        ensure!(
+            manifest["schemaVersion"] == 2
+                && manifest["collectionSourceSha"] == inventory.source_sha
+                && manifest["component"] == serde_json::to_value(expected)?,
+            "Rollout feed does not reference authenticated component inventory"
+        );
+        let bytes =
+            trusted_asset_bytes(&release, &format!("components-{}.json", inventory.channel))?;
+        use base64::Engine;
+        use sha2::Digest;
+        ensure!(
+            manifest["inventory"]["sha512"]
+                == base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes)),
+            "Rollout inventory pin mismatch"
+        );
         let updated = integrity::restamp(manifest, amount)?;
         let path = dir.path().join(name);
         common::write_json(&path, &updated)?;
@@ -944,7 +851,6 @@ pub(super) fn rollout() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine, engine::general_purpose::STANDARD};
     #[test]
     fn origin_assets_require_exact_url_hash_size_and_publisher() {
         let reference = paseo_protocol::components::ArtifactRef {
@@ -983,171 +889,6 @@ mod tests {
             );
         }
     }
-    fn fixture() -> (
-        Value,
-        Vec<Identity>,
-        std::collections::BTreeMap<String, Value>,
-    ) {
-        let template = Identity {
-            sha: "a".repeat(40),
-            source_tag: "v0.13.1".into(),
-            version: "0.13.1".into(),
-            channel: "stable".into(),
-            run_id: "10".into(),
-            target: "linux-x64".into(),
-        };
-        let mut assets = Vec::new();
-        let mut manifests = std::collections::BTreeMap::new();
-        let mut ids = Vec::new();
-        for t in TARGETS.iter().filter(|t| t.desktop) {
-            let mut id = template.clone();
-            id.target = t.id();
-            ids.push(id.clone());
-            for runtime in [CLIENT, DAEMON] {
-                let mut entries = Vec::new();
-                for name in integrity::names(&id, runtime).unwrap() {
-                    let format = if name.ends_with(".tar.gz") {
-                        "tar.gz".into()
-                    } else {
-                        name.rsplit('.').next().unwrap().to_lowercase()
-                    };
-                    assets.push(json!({"name":name,"size":10}));
-                    entries.push(json!({"name":name,"size":10,"format":format,"sha512":STANDARD.encode([0;64])}));
-                }
-                let mut manifest = json!({"schemaVersion":1,"runtime":runtime,"appId":if runtime==DAEMON{"sh.paseo.daemon"}else{CLIENT_APP_ID},"version":id.version,"channel":id.channel,"sourceSha":id.sha,"platform":t.platform,"arch":t.arch,"releaseDate":"2026-10-01T00:00:00Z","rolloutHours":36});
-                if entries.len() == 1 {
-                    manifest["artifact"] = entries.remove(0);
-                } else {
-                    manifest["artifacts"] = json!(entries);
-                }
-                let name = feed(&id, runtime);
-                assets.push(json!({"name":name,"size":100}));
-                manifests.insert(name, manifest);
-            }
-        }
-        (json!({"assets":assets}), ids, manifests)
-    }
-    #[test]
-    fn full_publication_requires_twelve_distinct_valid_feeds() {
-        let (release, id, mut manifests) = fixture();
-        let mut seen = 0;
-        complete_feeds_with(
-            &release,
-            &id,
-            |a| {
-                seen += 1;
-                Ok(manifests[a["name"].as_str().unwrap()].clone())
-            },
-            |_, _| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(seen, 12);
-        manifests
-            .get_mut("daemon-stable-windows-arm64.json")
-            .unwrap()["sourceSha"] = json!("b".repeat(40));
-        assert!(
-            complete_feeds_with(
-                &release,
-                &id,
-                |a| Ok(manifests[a["name"].as_str().unwrap()].clone()),
-                |_, _| Ok(())
-            )
-            .is_err()
-        );
-        let mut missing = release.clone();
-        missing["assets"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|a| a["name"] != "app-stable-macos-x64.json");
-        assert!(
-            complete_feeds_with(
-                &missing,
-                &id,
-                |a| Ok(manifests[a["name"].as_str().unwrap()].clone()),
-                |_, _| Ok(())
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn partial_publication_requires_all_and_only_declared_desktop_feeds() {
-        let (mut release, mut ids, manifests) = fixture();
-        ids.retain(|id| ["linux-x64", "windows-x64"].contains(&id.target.as_str()));
-        release["assets"].as_array_mut().unwrap().retain(|asset| {
-            let name = asset["name"].as_str().unwrap();
-            name.contains("linux-x64") || name.contains("windows-x64")
-        });
-        complete_feeds_with(
-            &release,
-            &ids,
-            |a| Ok(manifests[a["name"].as_str().unwrap()].clone()),
-            |_, _| Ok(()),
-        )
-        .unwrap();
-        release["assets"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|asset| asset["name"] != "daemon-stable-windows-x64.json");
-        assert!(
-            complete_feeds_with(
-                &release,
-                &ids,
-                |a| Ok(manifests[a["name"].as_str().unwrap()].clone()),
-                |_, _| Ok(()),
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn remote_binary_integrity_failure_blocks_publication_gate() {
-        let (release, id, manifests) = fixture();
-        assert!(
-            complete_feeds_with(
-                &release,
-                &id,
-                |a| Ok(manifests[a["name"].as_str().unwrap()].clone()),
-                |_, _| bail!("same-sized corrupt binary")
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn partial_rollout_requires_provenance_and_both_feeds_for_each_target() {
-        let names = [
-            "provenance-linux-x64.json",
-            "app-stable-linux-x64.json",
-            "daemon-stable-linux-x64.json",
-            "provenance-windows-x64.json",
-            "app-stable-windows-x64.json",
-            "daemon-stable-windows-x64.json",
-            "provenance-android-universal.json",
-        ];
-        let release = json!({"assets":names.map(|name| json!({"name":name}))});
-        let targets = published_desktop_targets(&release, "stable").unwrap();
-        assert_eq!(
-            targets.into_iter().map(Target::id).collect::<Vec<_>>(),
-            ["linux-x64", "windows-x64"]
-        );
-        for missing in [
-            "provenance-windows-x64.json",
-            "daemon-stable-linux-x64.json",
-        ] {
-            let mut incomplete = release.clone();
-            incomplete["assets"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|asset| asset["name"] != missing);
-            assert!(published_desktop_targets(&incomplete, "stable").is_err());
-        }
-        assert!(
-            published_desktop_targets(
-                &json!({"assets":[{"name":"provenance-android-universal.json"}]}),
-                "stable"
-            )
-            .is_err()
-        );
-    }
-
     #[test]
     fn failed_upload_never_reaches_feeds() {
         let binaries = BTreeSet::from(["app.zip".into(), "daemon.zip".into()]);
