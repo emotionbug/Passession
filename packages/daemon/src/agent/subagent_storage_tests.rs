@@ -185,7 +185,9 @@ fn unavailable_catalog_or_child_is_scoped_and_retains_stored_bytes() {
             .replay_history(
                 Some(root),
                 "broken-children",
-                vec![json!({"provider":"codex","event":replay})],
+                vec![json!({"provider":"codex","event":replay})]
+                    .into_iter()
+                    .map(Ok),
                 false,
             )
             .unwrap();
@@ -414,7 +416,7 @@ fn stored_pages_match_hydrated_pages_and_oversized_history_is_not_retained() {
         .collect();
     assert_eq!(
         bounded
-            .replay_history(Some(root), "parent", replay, false)
+            .replay_history(Some(root), "parent", replay.into_iter().map(Ok), false)
             .unwrap()
             .len(),
         1
@@ -458,7 +460,12 @@ fn replay_reconciles_against_stored_child_that_is_not_hydrated() {
     let mut fresh = SubagentStore::default();
     assert!(
         fresh
-            .replay_history(Some(root), "parent", replay(1, false), false)
+            .replay_history(
+                Some(root),
+                "parent",
+                replay(1, false).into_iter().map(Ok),
+                false
+            )
             .unwrap()
             .is_empty()
     );
@@ -477,7 +484,7 @@ fn replay_reconciles_against_stored_child_that_is_not_hydrated() {
         stale[0]["event"]["item"]["text"] = json!(text);
         assert!(
             fresh
-                .replay_history(Some(root), "parent", stale, false)
+                .replay_history(Some(root), "parent", stale.into_iter().map(Ok), false)
                 .unwrap()
                 .is_empty()
         );
@@ -496,7 +503,12 @@ fn replay_reconciles_against_stored_child_that_is_not_hydrated() {
     let mut fresh = SubagentStore::default();
     assert_eq!(
         fresh
-            .replay_history(Some(root), "parent", replay(4, true), false)
+            .replay_history(
+                Some(root),
+                "parent",
+                replay(4, true).into_iter().map(Ok),
+                false
+            )
             .unwrap()
             .len(),
         1
@@ -585,7 +597,7 @@ fn deleted_children_are_not_resurrected_by_replay_or_late_events() {
     ];
     assert!(
         restarted
-            .replay_history(Some(root), "parent", replay, false)
+            .replay_history(Some(root), "parent", replay.into_iter().map(Ok), false)
             .unwrap()
             .is_empty()
     );
@@ -594,7 +606,9 @@ fn deleted_children_are_not_resurrected_by_replay_or_late_events() {
             .replay_history(
                 Some(root),
                 "parent",
-                vec![json!({"provider":"omp","event":timeline})],
+                vec![json!({"provider":"omp","event":timeline})]
+                    .into_iter()
+                    .map(Ok),
                 true
             )
             .unwrap()

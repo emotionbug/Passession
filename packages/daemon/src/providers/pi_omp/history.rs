@@ -11,11 +11,11 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
 };
 
 use super::events::{Mapper, omp_task_completions, omp_task_status};
-use crate::providers::api::{HistoryCoverage, SubagentHistoryRequest, subagent_row};
+use crate::providers::api::{EventSink, HistoryCoverage, SubagentHistoryRequest, subagent_row};
 
 static TITLE_PREFIX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}[-:]\d{2}[-:]\d{2}").unwrap());
@@ -565,6 +565,59 @@ pub fn import_persistence(provider: &str, handle: &str, cwd: &str, stored_config
     json!({"provider":provider,"sessionId":handle,"nativeHandle":handle,"metadata":metadata})
 }
 
+fn title_preamble(entry: &Value) -> bool {
+    entry["type"] == "title"
+        && entry["title"].is_string()
+        && entry.get("id").is_none()
+        && entry.get("parentId").is_none()
+        && entry.get("message").is_none()
+}
+
+/// Both readers select the same last-wins ID graph, including damaged branches.
+fn active_chain<'a>(
+    len: usize,
+    entry: impl Fn(usize) -> (&'a str, Option<&'a str>),
+    active_entry_id: Option<&str>,
+    mut complete: bool,
+) -> (Vec<usize>, bool) {
+    let by_id: HashMap<_, _> = (0..len).map(|i| (entry(i).0, i)).collect();
+    complete &= by_id.len() == len;
+    if let Some(id) = active_entry_id.filter(|id| !id.is_empty())
+        && !by_id.contains_key(id)
+    {
+        return (Vec::new(), false);
+    }
+    let parents: HashSet<_> = (0..len)
+        .filter_map(|i| entry(i).1)
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut current = active_entry_id
+        .filter(|id| !id.is_empty())
+        .and_then(|id| by_id.get(id).copied())
+        .or_else(|| (0..len).rfind(|&i| !parents.contains(entry(i).0)))
+        .or_else(|| len.checked_sub(1));
+    let mut seen = HashSet::new();
+    let mut chain = Vec::new();
+    while let Some(index) = current {
+        let (id, parent) = entry(index);
+        if id.is_empty() || !seen.insert(id) {
+            complete = false;
+            break;
+        }
+        chain.push(index);
+        current = match parent.filter(|id| !id.is_empty()) {
+            Some(parent) => {
+                let next = by_id.get(parent).copied();
+                complete &= next.is_some();
+                next
+            }
+            None => None,
+        };
+    }
+    chain.reverse();
+    (chain, complete)
+}
+
 async fn active_entries_with_coverage(
     path: &Path,
     active_entry_id: Option<&str>,
@@ -576,63 +629,27 @@ async fn active_entries_with_coverage(
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         match record(line) {
             // OMP's title preamble is file metadata, not a session-tree entry.
-            Some(entry)
-                if entry["type"] == "title"
-                    && entry["title"].is_string()
-                    && entry.get("id").is_none()
-                    && entry.get("parentId").is_none()
-                    && entry.get("message").is_none() => {}
+            Some(entry) if title_preamble(&entry) => {}
             Some(entry) if entry["id"].is_string() => entries.push(entry),
             Some(_) => complete = false,
             None => complete = false,
         }
     }
-    let by_id: HashMap<_, _> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| e["id"].as_str().map(|id| (id, i)))
-        .collect();
-    complete &= by_id.len() == entries.len();
-    if let Some(id) = active_entry_id.filter(|id| !id.is_empty())
-        && !by_id.contains_key(id)
-    {
-        return Ok((Vec::new(), false));
-    }
-    let parents: HashSet<_> = entries
-        .iter()
-        .filter_map(|e| e["parentId"].as_str())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut current = active_entry_id
-        .filter(|s| !s.is_empty())
-        .and_then(|id| by_id.get(id).copied())
-        .or_else(|| {
-            entries
-                .iter()
-                .rposition(|e| !parents.contains(e["id"].as_str().unwrap_or("")))
-        })
-        .or_else(|| entries.len().checked_sub(1));
-    let mut seen = HashSet::new();
-    let mut chain = Vec::new();
-    while let Some(index) = current {
-        let entry = &entries[index];
-        let id = entry["id"].as_str().unwrap_or("");
-        if id.is_empty() || !seen.insert(id) {
-            complete = false;
-            break;
-        }
-        chain.push(entry.clone());
-        current = match entry["parentId"].as_str().filter(|id| !id.is_empty()) {
-            Some(parent) => {
-                let next = by_id.get(parent).copied();
-                complete &= next.is_some();
-                next
-            }
-            None => None,
-        };
-    }
-    chain.reverse();
-    Ok((chain, complete))
+    let (chain, complete) = active_chain(
+        entries.len(),
+        |i| {
+            (
+                entries[i]["id"].as_str().unwrap_or(""),
+                entries[i]["parentId"].as_str(),
+            )
+        },
+        active_entry_id,
+        complete,
+    );
+    Ok((
+        chain.into_iter().map(|i| entries[i].clone()).collect(),
+        complete,
+    ))
 }
 
 fn fallback_message(role: &str, value: &Value) -> Value {
@@ -729,6 +746,123 @@ fn entry_message(family: &str, entry: &Value) -> Option<Value> {
         return None;
     }
     Some(fallback_message(kind, entry))
+}
+
+struct EntryLocation {
+    id: String,
+    parent: Option<String>,
+    offset: u64,
+    length: usize,
+}
+
+/// Only tree links survive the first pass. The second pass holds one native
+/// entry and its mapped envelopes at a time; child bodies remain unopened.
+pub(super) async fn stream_omp(
+    provider: &str,
+    path: &Path,
+    active_entry_id: Option<&str>,
+    metadata: &Value,
+    sink: EventSink,
+) -> Result<(HistoryCoverage, bool)> {
+    let descriptor = describe("omp", path).await?.unwrap_or(Value::Null);
+    let file = match fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((HistoryCoverage::Unverified, true));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut reader = BufReader::new(file);
+    let mut locations = Vec::new();
+    let mut bytes = Vec::new();
+    let mut offset = 0;
+    let mut complete = descriptor.is_object();
+    loop {
+        bytes.clear();
+        let length = reader.read_until(b'\n', &mut bytes).await?;
+        if length == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        complete &= matches!(line, Cow::Borrowed(_));
+        if !line.trim().is_empty() {
+            match record(&line) {
+                Some(entry) if title_preamble(&entry) => {}
+                Some(entry) if entry["id"].is_string() => locations.push(EntryLocation {
+                    id: entry["id"].as_str().unwrap().to_owned(),
+                    parent: entry["parentId"].as_str().map(str::to_owned),
+                    offset,
+                    length,
+                }),
+                _ => complete = false,
+            }
+        }
+        offset += length as u64;
+    }
+    let (chain, complete) = active_chain(
+        locations.len(),
+        |i| (locations[i].id.as_str(), locations[i].parent.as_deref()),
+        active_entry_id,
+        complete,
+    );
+    let mut mapper = Mapper::new("omp", provider);
+    if let Some(tools) = metadata.get("bridgedTools") {
+        mapper.set_bridged_tools(tools);
+    }
+    let mut children = TranscriptCollector::default();
+    // A later result with no valid timestamp does not erase an earlier one.
+    // Keep only call IDs and timestamps, never result bodies.
+    let mut finished = HashMap::new();
+    let mut todo = None;
+    let mut childless = true;
+    for index in chain {
+        let location = &locations[index];
+        reader
+            .seek(std::io::SeekFrom::Start(location.offset))
+            .await?;
+        bytes.resize(location.length, 0);
+        reader.read_exact(&mut bytes).await?;
+        let entry = record(&String::from_utf8_lossy(&bytes))
+            .ok_or_else(|| anyhow!("OMP history entry changed during replay"))?;
+        if entry["message"]["role"] == "toolResult" {
+            if let (Some(id), Some(timestamp)) = (
+                entry["message"]["toolCallId"].as_str(),
+                replay_timestamp(&entry["timestamp"]),
+            ) {
+                finished.insert(id.to_owned(), timestamp);
+            }
+            if entry["message"]["toolName"] == "todo" {
+                todo = todo_message(&entry["message"]);
+            }
+        }
+        let (events, message) = replay_entry(&mut mapper, "omp", provider, &entry);
+        if let Some(message) = message {
+            children.observe(&message, path);
+        }
+        for event in events {
+            childless &= event["type"] != "provider_subagent";
+            sink.emit(event).await?;
+        }
+    }
+    for transcript in children.out {
+        let timestamp = finished.get(&transcript.tool_call).cloned();
+        let title = subagent_title(&transcript.title, None);
+        childless = false;
+        sink.emit(transcript.upsert(provider, transcript.status, &title, timestamp))
+            .await?;
+    }
+    if let Some(todo) = todo {
+        sink.emit(json!({"type":"timeline","provider":provider,"item":todo}))
+            .await?;
+    }
+    Ok((
+        if complete {
+            HistoryCoverage::Complete
+        } else {
+            HistoryCoverage::Unverified
+        },
+        childless,
+    ))
 }
 
 pub async fn load_with_metadata(
@@ -842,6 +976,47 @@ fn empty_history(descriptor: Value) -> History {
     }
 }
 
+fn replay_entry(
+    mapper: &mut Mapper,
+    family: &str,
+    provider: &str,
+    entry: &Value,
+) -> (Vec<Value>, Option<Value>) {
+    let timestamp = if family == "omp" {
+        replay_timestamp(&entry["timestamp"])
+    } else {
+        None
+    };
+    if family == "omp" && entry["type"] == "compaction" {
+        let mut item = json!({"type":"compaction","status":"completed"});
+        if entry["tokensBefore"].is_number() {
+            item["preTokens"] = entry["tokensBefore"].clone();
+        }
+        let mut event = json!({"type":"timeline","provider":provider,"item":item});
+        if let Some(timestamp) = timestamp {
+            event["timestamp"] = json!(timestamp);
+        }
+        return (vec![event], None);
+    }
+    let Some(message) = entry_message(family, entry) else {
+        return (Vec::new(), None);
+    };
+    let user_id = (message["role"] == "user")
+        .then(|| entry["id"].as_str())
+        .flatten();
+    let mut events = mapper.replay_message(&message, user_id);
+    for event in &mut events {
+        if event["type"] == "timeline" {
+            if let Some(timestamp) = &timestamp {
+                event["timestamp"] = json!(timestamp);
+            } else if let Some(object) = event.as_object_mut() {
+                object.remove("timestamp");
+            }
+        }
+    }
+    (events, Some(message))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project(
     family: &str,
@@ -871,40 +1046,13 @@ fn project(
         mapper.set_bridged_tools(tools);
     }
     for entry in entries {
-        let timestamp = if family == "omp" {
-            replay_timestamp(&entry["timestamp"])
-        } else {
-            None
-        };
-        if family == "omp" && entry["type"] == "compaction" {
-            let mut item = json!({"type":"compaction","status":"completed"});
-            if entry["tokensBefore"].is_number() {
-                item["preTokens"] = entry["tokensBefore"].clone();
-            }
-            let mut event = json!({"type":"timeline","provider":provider,"item":item});
-            if let Some(timestamp) = timestamp {
-                event["timestamp"] = json!(timestamp);
-            }
-            push_event(&mut history, event);
-            continue;
-        }
-        let Some(message) = entry_message(family, entry) else {
-            continue;
-        };
-        let user_id = (message["role"] == "user")
-            .then(|| entry["id"].as_str())
-            .flatten();
-        for mut event in mapper.replay_message(&message, user_id) {
-            if event["type"] == "timeline" {
-                if let Some(timestamp) = &timestamp {
-                    event["timestamp"] = json!(timestamp);
-                } else if let Some(object) = event.as_object_mut() {
-                    object.remove("timestamp");
-                }
-            }
+        let (events, message) = replay_entry(&mut mapper, family, provider, entry);
+        for event in events {
             push_event(&mut history, event);
         }
-        history.messages.push(message);
+        if let Some(message) = message {
+            history.messages.push(message);
+        }
     }
     if family == "omp" {
         let finished: HashMap<&str, String> = entries
@@ -1140,10 +1288,27 @@ fn truthy(value: &Value) -> bool {
 }
 
 fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
-    let mut calls = HashMap::new();
-    let mut out: Vec<Transcript> = Vec::new();
-    let mut children: HashMap<Cow<'_, str>, usize> = HashMap::new();
+    let mut collector = TranscriptCollector::default();
     for message in messages {
+        collector.observe(message, parent);
+    }
+    collector.out
+}
+
+#[derive(Default)]
+struct TranscriptCollector {
+    calls: HashMap<String, String>,
+    out: Vec<Transcript>,
+    children: HashMap<String, usize>,
+}
+
+impl TranscriptCollector {
+    fn observe(&mut self, message: &Value, parent: &Path) {
+        let Self {
+            calls,
+            out,
+            children,
+        } = self;
         if message["role"] == "assistant" {
             for block in message["content"].as_array().into_iter().flatten() {
                 if block["type"] == "toolCall"
@@ -1151,10 +1316,11 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
                     && let Some(id) = block["id"].as_str()
                 {
                     calls.insert(
-                        id,
+                        id.to_owned(),
                         block["arguments"]["agent"]
                             .as_str()
-                            .unwrap_or("OMP subagent"),
+                            .unwrap_or("OMP subagent")
+                            .to_owned(),
                     );
                 }
             }
@@ -1167,10 +1333,10 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
             }
         }
         if message["role"] != "toolResult" || message["toolName"] != "task" {
-            continue;
+            return;
         }
         let id = message["toolCallId"].as_str().unwrap_or("");
-        let Some(title) = calls.get(id) else { continue };
+        let Some(title) = calls.get(id) else { return };
         let details = message
             .get("details")
             .filter(|v| !v.is_null())
@@ -1212,13 +1378,13 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
                 if let Some(index) = existing {
                     out[index] = transcript;
                 } else {
-                    children.insert(Cow::Borrowed(child_id), out.len());
+                    children.insert(child_id.to_owned(), out.len());
                     out.push(transcript);
                 }
             }
         }
         if found {
-            continue;
+            return;
         }
         let text = message["content"]
             .as_array()
@@ -1238,9 +1404,9 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
                 .to_string_lossy()
                 .into_owned();
             if children.contains_key(child_id.as_str()) {
-                continue;
+                return;
             }
-            children.insert(Cow::Owned(child_id.clone()), out.len());
+            children.insert(child_id.clone(), out.len());
             out.push(Transcript {
                 id: child_id,
                 title: (*title).to_owned(),
@@ -1254,7 +1420,6 @@ fn subagent_transcripts(messages: &[Value], parent: &Path) -> Vec<Transcript> {
             });
         }
     }
-    out
 }
 
 fn subagent_title(title: &str, model: Option<&str>) -> String {
@@ -1281,6 +1446,10 @@ pub fn todo_state(entries: &[Value]) -> Option<Value> {
         .rev()
         .find(|e| e["message"]["role"] == "toolResult" && e["message"]["toolName"] == "todo")?
         .get("message")?;
+    todo_message(message)
+}
+
+fn todo_message(message: &Value) -> Option<Value> {
     let phases = message["details"]["phases"].as_array()?;
     let mut tasks = Vec::new();
     for phase in phases {
@@ -1525,6 +1694,212 @@ mod tests {
                     "content":text("queued"),"details":{"async":true,"results":[],"progress":progress}}}),
             delivery,
         ])
+    }
+
+    #[tokio::test]
+    async fn omp_stream_matches_materialized_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("parent.jsonl");
+        // Every child locator is unreadable as a file: neither replay may open it.
+        for child in ["child-a", "child-b", "reused", "legacy"] {
+            fs::create_dir_all(path.with_extension("").join(format!("{child}.jsonl")))
+                .await
+                .unwrap();
+        }
+        let header = json!({"type":"session","id":"parent","cwd":"/work",
+            "timestamp":"2026-01-01T00:00:00.000Z"});
+        let message = |id: &str, parent: &str, message: Value| {
+            json!({"type":"message","id":id,"parentId":parent,
+                "timestamp":"2026-01-01T00:00:01.000Z","message":message})
+        };
+        let valid_todo = json!({"role":"toolResult","toolName":"todo","toolCallId":"todo",
+            "details":{"phases":[{"name":"work","tasks":[
+                {"content":"first","status":"completed"},
+                {"content":"next","status":"in_progress"},
+                {"content":"blocked","status":"blocked","blocker":"dependency"},
+                {"content":"gone","status":"abandoned"}]}]}});
+        let todo_prefix = lines(&[header.clone(), message("todo", "", valid_todo.clone())]);
+        let rich = lines(&[
+            header.clone(),
+            message("u", "", json!({"role":"user","content":text("prompt")})),
+            message(
+                "a",
+                "u",
+                json!({"role":"assistant","responseId":"response",
+                "content":[{"type":"thinking","thinking":"reason"},
+                    {"type":"text","text":"answer"},
+                    {"type":"toolCall","id":"shell","name":"bash","arguments":{"command":"pwd"}}]}),
+            ),
+            message(
+                "r",
+                "a",
+                json!({"role":"toolResult","toolName":"bash","toolCallId":"shell",
+                "content":text("/work")}),
+            ),
+            json!({"type":"compaction","id":"compact","parentId":"r","tokensBefore":123,
+                "timestamp":1767225602000i64}),
+            message(
+                "developer",
+                "compact",
+                json!({"role":"developer",
+                "content":text("<system-reminder>hidden</system-reminder>")}),
+            ),
+            message(
+                "unknown",
+                "developer",
+                json!({"role":"unknown","content":"visible fallback"}),
+            ),
+            json!({"type":"custom_message","id":"custom","parentId":"unknown","content":"custom text"}),
+        ]);
+        let children = omp_session(
+            "parent",
+            &[("child-a", "reviewer"), ("child-b", "scout")],
+            "parent text",
+        );
+        let progress = json!([{"id":"child-a","agent":"scout","status":"pending"},
+            {"id":"child-b","agent":"worker","status":"running"}]);
+        let jobs = json!([{"type":"task","id":"child-a","agentId":"child-a","status":"completed"},
+            {"type":"task","id":"child-b","agentId":"child-b","status":"failed"}]);
+        let mut cases: Vec<(Vec<u8>, Option<&str>)> = vec![
+            (Vec::new(), None),
+            (b"{}\n".to_vec(), None),
+            (rewound_session().into_bytes(), None),
+            (rewound_session().into_bytes(), Some("a2")),
+            (rewound_session().into_bytes(), Some("missing")),
+            (rich.clone().into_bytes(), None),
+            (rich.trim_end().as_bytes().to_vec(), Some("")),
+            (rich.replace('\n', "\r\n").into_bytes(), None),
+            (("{\"type\":\"title\",\"title\":\"preamble\"}\n \t\n".to_owned() + &rich).into_bytes(), None),
+            (children.clone().into_bytes(), None),
+            ((children.clone() + &lines(&[
+                message("todo", "r1", valid_todo),
+            ])).into_bytes(), None),
+            ((children.clone() + &lines(&[
+                json!({"type":"message","id":"r2","parentId":"r1","timestamp":1767225609000i64,
+                    "message":{"role":"toolResult","toolName":"other","toolCallId":"task-1","content":[]}}),
+                json!({"type":"message","id":"r3","parentId":"r2","timestamp":"not a date",
+                    "message":{"role":"toolResult","toolName":"task","toolCallId":"task-1","content":[]}}),
+            ])).into_bytes(), None),
+            (omp_background_session("parent", progress.clone(), jobs.clone()).into_bytes(), None),
+            (omp_wait_session("parent", progress, jobs).into_bytes(), None),
+            (todo_prefix.clone().into_bytes(), None),
+            ((todo_prefix.clone() + &lines(&[
+                message("invalid", "todo", json!({"role":"toolResult","toolName":"todo",
+                    "details":{"phases":[{"name":"bad","tasks":[{"content":"bad","status":"unknown"}]}]}})),
+            ])).into_bytes(), None),
+            ((todo_prefix + &lines(&[
+                message("empty", "todo", json!({"role":"toolResult","toolName":"todo",
+                    "details":{"phases":[]}})),
+            ])).into_bytes(), None),
+        ];
+        for entries in [
+            vec![
+                header.clone(),
+                message(
+                    "x",
+                    "absent",
+                    json!({"role":"user","content":"missing ancestor"}),
+                ),
+            ],
+            vec![
+                header.clone(),
+                message("x", "y", json!({"role":"user","content":"cycle x"})),
+                message(
+                    "y",
+                    "x",
+                    json!({"role":"assistant","content":text("cycle y")}),
+                ),
+            ],
+            vec![
+                header.clone(),
+                message("x", "", json!({"role":"user","content":"old duplicate"})),
+                message("x", "", json!({"role":"user","content":"last duplicate"})),
+            ],
+            vec![
+                header.clone(),
+                message("", "", json!({"role":"user","content":"empty id"})),
+            ],
+            vec![message(
+                "x",
+                "",
+                json!({"role":"user","content":"missing descriptor"}),
+            )],
+        ] {
+            cases.push((lines(&entries).into_bytes(), None));
+        }
+        for suffix in [
+            b"{\"type\":\"message\"".as_slice(),
+            b"\xff\n".as_slice(),
+            b"{\"id\":\"invalid-utf8\",\"parentId\":\"custom\",\"message\":{\"role\":\"user\",\"content\":\"\xff\"}}\n".as_slice(),
+            b"{\"type\":\"message\",\"message\":{}}\n".as_slice(),
+        ] {
+            let mut bytes = rich.as_bytes().to_vec();
+            bytes.extend_from_slice(suffix);
+            cases.push((bytes, None));
+        }
+        // Reused IDs, terminal-before-spawn ordering, results/progress precedence,
+        // and the legacy text locator all use the same incremental collector.
+        let legacy = path.with_extension("").join("legacy.jsonl");
+        cases.push((lines(&[
+            header,
+            message("first", "", json!({"role":"assistant","content":[
+                {"type":"toolCall","id":"first","name":"task","arguments":{"agent":"worker"}}]})),
+            message("spawn", "first", json!({"role":"toolResult","toolName":"task","toolCallId":"first",
+                "details":{"progress":[{"id":"reused","status":"pending"}]}})),
+            json!({"type":"custom_message","id":"delivery","parentId":"spawn","customType":"async-result",
+                "details":{"jobs":[{"type":"task","agentId":"reused","status":"completed"}]}}),
+            message("second", "delivery", json!({"role":"assistant","content":[
+                {"type":"toolCall","id":"second","name":"task","arguments":{"agent":"reviewer"}},
+                {"type":"toolCall","id":"legacy","name":"task","arguments":{"agent":"reviewer"}}]})),
+            message("respawn", "second", json!({"role":"toolResult","toolName":"task","toolCallId":"second",
+                "details":{"results":[{"id":"reused","status":"failed"}],
+                    "progress":[{"id":"reused","status":"pending"}]}})),
+            message("legacy", "respawn", json!({"role":"toolResult","toolName":"task","toolCallId":"legacy",
+                "content":text(&format!("Session file: {}", legacy.display()))})),
+        ]).into_bytes(), None));
+        let metadata = json!({"bridgedTools":[]});
+        for (index, (bytes, branch)) in cases.into_iter().enumerate() {
+            fs::write(&path, bytes).await.unwrap();
+            let expected = load_with_metadata("omp", "custom-omp", &path, branch, &metadata)
+                .await
+                .unwrap();
+            // Capacity one exercises backpressure without retaining replay in the producer.
+            let (sink, mut receiver) =
+                EventSink::channel(1, tokio_util::sync::CancellationToken::new());
+            let collect = async move {
+                let mut events = Vec::new();
+                while let Some(event) = receiver.recv().await {
+                    events.push(event);
+                }
+                events
+            };
+            let (result, events) = tokio::join!(
+                stream_omp("custom-omp", &path, branch, &metadata, sink),
+                collect,
+            );
+            let (coverage, childless) = result.unwrap();
+            assert_eq!(events, expected.events, "case {index}, branch {branch:?}");
+            assert_eq!(
+                coverage == HistoryCoverage::Complete,
+                expected.complete,
+                "case {index}"
+            );
+            assert_eq!(
+                childless,
+                expected.subagent_events.is_empty(),
+                "case {index}"
+            );
+        }
+        let missing = directory.path().join("missing.jsonl");
+        let (sink, mut receiver) =
+            EventSink::channel(1, tokio_util::sync::CancellationToken::new());
+        assert_eq!(
+            stream_omp("omp", &missing, None, &Value::Null, sink)
+                .await
+                .unwrap(),
+            (HistoryCoverage::Unverified, true),
+        );
+        assert!(receiver.recv().await.is_none());
     }
 
     #[tokio::test]

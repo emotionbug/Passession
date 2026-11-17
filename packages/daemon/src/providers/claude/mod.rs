@@ -135,7 +135,27 @@ impl ClaudeProvider {
             crate::providers::api::HistoryCoverage::Unverified
         };
         let mut anchors = Vec::new();
-        if let Some(id) = &native_id {
+        let mut history_skipped = false;
+        let before = if let Some(id) = &native_id {
+            if let Ok(path) = storage::transcript_path(&cwd, id, &env).await {
+                storage::native_revision(&path).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if options["purpose"] != "history"
+            && before
+                .as_ref()
+                .is_some_and(|native| options["historyCheckpoint"]["native"] == *native)
+            && let Ok(saved) =
+                serde_json::from_value(options["historyCheckpoint"]["anchors"].clone())
+        {
+            anchors = saved;
+            history_skipped = true;
+        }
+        if let Some(id) = native_id.as_ref().filter(|_| !history_skipped) {
             let loaded = async {
                 let path = storage::transcript_path(&cwd, id, &env).await?;
                 storage::read_history(&path).await
@@ -149,6 +169,20 @@ impl ClaudeProvider {
                     history_events = projection::project_history(&self.spec.id, &history);
                     if history.complete {
                         history_coverage = crate::providers::api::HistoryCoverage::Complete;
+                        let after = if let Ok(path) = storage::transcript_path(&cwd, id, &env).await
+                        {
+                            storage::native_revision(&path).await
+                        } else {
+                            None
+                        };
+                        if history.subagents.is_empty()
+                            && history.workflows.is_empty()
+                            && before.is_some()
+                            && before == after
+                        {
+                            history_events.push(json!({"type":"history_checkpoint",
+                                "revision":{"native":before,"anchors":anchors}}));
+                        }
                     }
                 }
                 Err(error) => {
@@ -166,6 +200,7 @@ impl ClaudeProvider {
             holds: Default::default(),
             capabilities: capabilities(),
             history_events: Mutex::new((history_events, history_coverage)),
+            history_skipped: Mutex::new(history_skipped),
             env,
             persist: options["persistSession"].as_bool(),
             usage_key: uuid::Uuid::new_v4().to_string(),
@@ -689,6 +724,7 @@ struct ClaudeSession {
     holds: crate::providers::api::ChildRowHold,
     capabilities: Value,
     history_events: Mutex<(Vec<Value>, crate::providers::api::HistoryCoverage)>,
+    history_skipped: Mutex<bool>,
     env: BTreeMap<String, String>,
     persist: Option<bool>,
     usage_key: String,
@@ -1229,6 +1265,45 @@ impl AgentSession for ClaudeSession {
         &self,
         sink: EventSink,
     ) -> Result<crate::providers::api::HistoryCoverage> {
+        let skipped = std::mem::take(&mut *self.history_skipped.lock().unwrap());
+        if skipped {
+            let (cwd, id) = {
+                let state = self.state.lock().unwrap();
+                (
+                    state.config["cwd"].as_str().unwrap_or("").to_owned(),
+                    state.native_id.clone(),
+                )
+            };
+            if let Some(id) = id {
+                let path = storage::transcript_path(&cwd, &id, &self.env).await?;
+                let before = storage::native_revision(&path).await;
+                let history = storage::read_history(&path).await?;
+                let after = storage::native_revision(&path).await;
+                let mut anchors = Vec::new();
+                for entry in &history.parent_entries {
+                    remember_anchor(&mut anchors, entry);
+                }
+                let mut events = projection::project_history(&self.spec.id, &history);
+                if history.complete
+                    && history.subagents.is_empty()
+                    && history.workflows.is_empty()
+                    && before.is_some()
+                    && before == after
+                {
+                    events.push(json!({"type":"history_checkpoint",
+                        "revision":{"native":before,"anchors":anchors}}));
+                }
+                self.state.lock().unwrap().anchors = anchors;
+                *self.history_events.lock().unwrap() = (
+                    events,
+                    if history.complete {
+                        HistoryCoverage::Complete
+                    } else {
+                        HistoryCoverage::Unverified
+                    },
+                );
+            }
+        }
         let (events, coverage) = std::mem::replace(
             &mut *self.history_events.lock().unwrap(),
             (
@@ -1240,6 +1315,22 @@ impl AgentSession for ClaudeSession {
             sink.emit(event).await?;
         }
         Ok(coverage)
+    }
+    async fn history_revision(&self) -> Option<Value> {
+        let (cwd, id, anchors) = {
+            let state = self.state.lock().unwrap();
+            if state.tasks.readiness() != UnloadReadiness::Ready {
+                return None;
+            }
+            (
+                state.config["cwd"].as_str()?.to_owned(),
+                state.native_id.clone()?,
+                state.anchors.clone(),
+            )
+        };
+        let path = storage::transcript_path(&cwd, &id, &self.env).await.ok()?;
+        let native = storage::native_revision(&path).await?;
+        Some(json!({"native":native,"anchors":anchors}))
     }
     async fn runtime_info(&self) -> Result<Value> {
         let state = self.state.lock().unwrap();

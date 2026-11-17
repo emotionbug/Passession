@@ -6,6 +6,32 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Local native transcript identity without reading its body. Unix change time
+/// catches same-length rewrites even when an editor restores modification time.
+/// Other platforms stay on replay until an equally strong file identity exists.
+pub(crate) async fn native_file_revision(path: &std::path::Path) -> Option<Value> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let path = tokio::fs::canonicalize(path).await.ok()?;
+        let metadata = tokio::fs::metadata(&path).await.ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "path":path, "device":metadata.dev(), "inode":metadata.ino(),
+            "length":metadata.len(),
+            "modified":[metadata.mtime(), metadata.mtime_nsec()],
+            "changed":[metadata.ctime(), metadata.ctime_nsec()]
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Resolved executable prefix. Adapters append only their native protocol flags.
 /// Secrets intentionally do not implement Debug or Serialize.
 #[derive(Clone)]
@@ -377,6 +403,12 @@ pub trait AgentSession: Send + Sync {
     async fn start_turn(&self, prompt: Value, options: Value) -> Result<Value>;
     async fn steer_active_turn(&self, prompt: Value, options: Value) -> Result<Value>;
     async fn stream_history(&self, sink: EventSink) -> Result<HistoryCoverage>;
+    /// Cheap current native revision plus provider-owned resume indexes.
+    /// None means replay is required. A complete replay may emit a private
+    /// `history_checkpoint` event certifying the revision of that exact snapshot.
+    async fn history_revision(&self) -> Option<Value> {
+        None
+    }
     async fn runtime_info(&self) -> Result<Value>;
     /// Ready only when the provider positively knows it owns no running or queued
     /// work (foreground turn, compaction, queued messages, background jobs/tasks/

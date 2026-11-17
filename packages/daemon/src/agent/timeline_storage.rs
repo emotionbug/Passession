@@ -17,6 +17,17 @@ const UPDATE_METADATA: &str =
     "UPDATE timeline_metadata SET epoch = ?1, next_seq = ?2, min_seq = ?3 WHERE id = 1";
 const READ_METADATA: &str =
     "SELECT version, agent_id, epoch, next_seq, min_seq FROM timeline_metadata WHERE id = 1";
+// Row triggers also invalidate certificates written by a newer daemon when an
+// older v1 daemon changes the checkpoint. No metadata schema/version cutover.
+const REVISION_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS timeline_native_revision (
+    id INTEGER PRIMARY KEY CHECK(id = 1), revision_json TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS timeline_revision_insert AFTER INSERT ON timeline_rows
+BEGIN DELETE FROM timeline_native_revision; END;
+CREATE TRIGGER IF NOT EXISTS timeline_revision_update AFTER UPDATE ON timeline_rows
+BEGIN DELETE FROM timeline_native_revision; END;
+CREATE TRIGGER IF NOT EXISTS timeline_revision_delete AFTER DELETE ON timeline_rows
+BEGIN DELETE FROM timeline_native_revision; END;";
 const PAGE_INDEX: &str = "timeline_rows_page";
 // An expression index, rather than a side table, stays exact even when an older
 // v1 writer updates row_json. SQLite maintains it in the row's own transaction.
@@ -100,6 +111,8 @@ pub(super) struct Store {
     writable: bool,
     /// The page index exists. Unmigrated read-only checkpoints lack it.
     indexed: bool,
+    /// Owns disposable replay storage; it never becomes a durable checkpoint.
+    temporary: Option<tempfile::TempDir>,
 }
 
 impl Store {
@@ -118,12 +131,16 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         ensure_indexes(&mut connection)?;
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(REVISION_SCHEMA)?;
+        transaction.commit()?;
         Ok(Self {
             connection,
             path: path.to_owned(),
             agent_id: agent_id.to_owned(),
             writable: true,
             indexed: true,
+            temporary: None,
         })
     }
 
@@ -278,6 +295,18 @@ fn write_metadata(transaction: &Transaction<'_>, timeline: &Timeline) -> Result<
     transaction
         .prepare_cached(UPDATE_METADATA)?
         .execute(params![timeline.epoch, timeline.next_seq, timeline.min_seq])?;
+    write_revision(transaction, timeline.native_revision.as_ref())?;
+    Ok(())
+}
+
+fn write_revision(transaction: &Transaction<'_>, revision: Option<&Value>) -> Result<()> {
+    transaction.execute("DELETE FROM timeline_native_revision", [])?;
+    if let Some(revision) = revision {
+        transaction.execute(
+            "INSERT INTO timeline_native_revision VALUES (1, ?1)",
+            [serde_json::to_string(revision)?],
+        )?;
+    }
     Ok(())
 }
 
@@ -290,6 +319,24 @@ fn write_rows(transaction: &Transaction<'_>, rows: &[Value]) -> Result<Vec<u64>>
         statement.execute(params![index as i64, encoded])?;
         sizes.push(encoded.len() as u64);
     }
+    Ok(sizes)
+}
+
+/// Copies disk-backed projections one row at a time; sizes describe only the
+/// resident tail, just as they do after a normal bounded load.
+fn write_projection(transaction: &Transaction<'_>, timeline: &Timeline) -> Result<Vec<u64>> {
+    let mut statement = transaction.prepare_cached(UPSERT_ROW)?;
+    let mut sizes = Vec::with_capacity(timeline.rows.len());
+    let mut position = 0usize;
+    timeline.scan(&[], |row| {
+        let encoded = serde_json::to_string(row.as_ref())?;
+        statement.execute(params![position as i64, encoded])?;
+        if position >= timeline.base {
+            sizes.push(encoded.len() as u64);
+        }
+        position += 1;
+        Ok(true)
+    })?;
     Ok(sizes)
 }
 
@@ -346,7 +393,9 @@ fn create(path: &Path, agent_id: &str, timeline: &Timeline) -> Result<(Store, Ve
     for (_, sql) in LOOKUP_INDEXES.iter() {
         transaction.execute_batch(sql)?;
     }
-    let sizes = write_rows(&transaction, &timeline.rows)?;
+    let sizes = write_projection(&transaction, timeline)?;
+    transaction.execute_batch(REVISION_SCHEMA)?;
+    write_revision(&transaction, timeline.native_revision.as_ref())?;
     transaction.commit()?;
     drop(connection);
     file.as_file().sync_all()?;
@@ -411,6 +460,14 @@ fn hydrate(path: &Path, agent_id: &str, bounded: bool) -> Result<(Timeline, u64)
     timeline.epoch = epoch;
     timeline.next_seq = next_seq;
     timeline.min_seq = min_seq;
+    let encoded: Option<String> = transaction
+        .query_row(
+            "SELECT revision_json FROM timeline_native_revision WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    timeline.native_revision = encoded.and_then(|encoded| serde_json::from_str(&encoded).ok());
     let count = row_count(&transaction)?;
     let mut bytes = 0;
     {
@@ -501,6 +558,7 @@ pub(super) fn open_saved(path: &Path, agent_id: &str) -> Result<Timeline> {
         agent_id: agent_id.to_owned(),
         writable: false,
         indexed,
+        temporary: None,
     });
     Ok(timeline)
 }
@@ -511,6 +569,79 @@ pub(super) fn fetch_page(path: &Path, agent_id: &str, options: &Value) -> Result
 }
 
 impl Timeline {
+    /// A private projection database with the normal bounded resident tail.
+    /// Source-event writes are disposable: no WAL or fsync until final commit.
+    pub(in crate::agent) fn history_stage() -> Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("history.sqlite3");
+        let mut timeline = Self::new();
+        let (mut store, sizes) = create(&path, "history-stage", &timeline)?;
+        store.connection.execute_batch(
+            "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
+             PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;",
+        )?;
+        store.temporary = Some(directory);
+        timeline.storage = Some(store);
+        timeline.sizes = sizes;
+        timeline.bounded = true;
+        Ok(timeline)
+    }
+
+    pub(in crate::agent) fn append_history_item(
+        &mut self,
+        item: Value,
+        options: &Value,
+    ) -> Result<()> {
+        let row = self.source_row(item, options);
+        project_row(self, row)?;
+        Ok(())
+    }
+
+    /// Reprojects canonical rows during reconciliation without inventing source
+    /// sequence numbers. Only the affected row and bounded tail are resident.
+    pub(super) fn append_history_row(&mut self, row: Value) -> Result<()> {
+        let next = self.next_seq;
+        project_row(self, row)?;
+        self.next_seq = next;
+        Ok(())
+    }
+
+    pub(super) fn history_row(&self, position: usize) -> Result<Value> {
+        if position >= self.base {
+            return self
+                .rows
+                .get(position - self.base)
+                .cloned()
+                .context("Missing history row");
+        }
+        self.store()?
+            .find(ROW_AT, [position as i64])?
+            .map(|(_, row)| row)
+            .context("Missing history row")
+    }
+
+    /// Copies the disposable projection into the real checkpoint atomically.
+    /// Do not retarget the in-memory timeline until its transaction commits.
+    pub(in crate::agent) fn commit_history(&mut self, path: &Path, agent_id: &str) -> Result<()> {
+        if !path.try_exists()? {
+            let (destination, sizes) = create(path, agent_id, self)?;
+            self.storage = Some(destination);
+            self.sizes = sizes;
+            self.storage_dirty = false;
+            return Ok(());
+        }
+        let mut destination = Store::open(path, agent_id)?;
+        let transaction = destination.connection.transaction()?;
+        transaction.execute("DELETE FROM timeline_rows", [])?;
+        let sizes = write_projection(&transaction, self)?;
+        write_metadata(&transaction, self)?;
+        transaction.commit()?;
+        self.storage = Some(destination);
+        self.sizes = sizes;
+        self.storage_dirty = false;
+        Ok(())
+    }
+
     fn store(&self) -> Result<&Store> {
         self.storage.as_ref().context("Timeline storage missing")
     }
@@ -733,6 +864,19 @@ pub(super) fn persist(timeline: &mut Timeline, path: &Path, agent_id: &str) -> R
     Ok(())
 }
 
+/// Certificate metadata updates never rewrite history. Row mutations clear the
+/// certificate in their own transaction, including writes by an older daemon.
+pub(super) fn certify(timeline: &mut Timeline, revision: Option<Value>) -> Result<()> {
+    let Some(store) = timeline.storage.as_mut() else {
+        return Ok(());
+    };
+    let transaction = store.connection.transaction()?;
+    write_revision(&transaction, revision.as_ref())?;
+    transaction.commit()?;
+    timeline.native_revision = revision;
+    Ok(())
+}
+
 fn ensure_storage(timeline: &mut Timeline, path: &Path, agent_id: &str) -> Result<()> {
     if let Some(store) = &timeline.storage {
         store.check_target(path, agent_id)?;
@@ -750,6 +894,14 @@ fn commit_row(timeline: &mut Timeline, position: usize, encoded: &str) -> Result
         .storage
         .as_mut()
         .context("Timeline storage missing")?;
+    if store.temporary.is_some() {
+        store
+            .connection
+            .prepare_cached(UPSERT_ROW)?
+            .execute(params![position as i64, encoded])?;
+        timeline.native_revision = None;
+        return Ok(());
+    }
     let transaction = store.connection.transaction()?;
     transaction
         .prepare_cached(UPSERT_ROW)?
@@ -758,6 +910,7 @@ fn commit_row(timeline: &mut Timeline, position: usize, encoded: &str) -> Result
         .prepare_cached(UPDATE_METADATA)?
         .execute(params![timeline.epoch, timeline.next_seq, timeline.min_seq])?;
     transaction.commit()?;
+    timeline.native_revision = None;
     Ok(())
 }
 
@@ -770,6 +923,10 @@ pub(super) fn append(
 ) -> Result<Value> {
     ensure_storage(timeline, path, agent_id)?;
     let row = timeline.source_row(item, options);
+    project_row(timeline, row)
+}
+
+fn project_row(timeline: &mut Timeline, row: Value) -> Result<Value> {
     let id = super::identity(&row["item"]);
     // A lifecycle update of a tool or plugin row older than the resident tail
     // merges into its stored row in place; the tail is unchanged.

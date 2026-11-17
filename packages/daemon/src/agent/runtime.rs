@@ -432,9 +432,12 @@ impl AgentManager {
                 .await?;
             let launch = self.launch_config(config)?;
             let session = if let Some(handle) = handle.as_ref() {
-                let options = cell
+                let mut options = cell
                     .read_timeline(move |timeline| resume_options(history, timeline))
                     .await?;
+                if force_history {
+                    object(&mut options).remove("historyCheckpoint");
+                }
                 factory
                     .resume_session(handle.clone(), launch, context, options, cell.sink.clone())
                     .await?
@@ -594,16 +597,78 @@ impl AgentManager {
                 .clone()
                 .ok_or_else(|| anyhow!("Agent has no session"))?
         };
-        let (sink, mut receiver) = EventSink::channel(256, cell.cancel.child_token());
-        let collect = async {
-            let mut events = Vec::new();
-            while let Some(event) = receiver.recv().await {
-                events.push(event);
+        let store = self.subagent_store.clone();
+        let parent = id.to_owned();
+        let internal = cell.data.lock().await.snapshot["internal"] == true;
+        let root = (!internal)
+            .then(|| self.app().map(|app| app.home.join("agent-subagents")))
+            .transpose()?;
+        let childless = tokio::task::spawn_blocking(move || {
+            let Ok(mut store) = store.lock() else {
+                return false;
+            };
+            if let Some(root) = root {
+                store
+                    .list_persisted(&root, &parent)
+                    .is_ok_and(|(children, unreadable)| {
+                        children.is_empty() && unreadable.is_empty()
+                    })
+            } else {
+                store.list(&parent).is_empty()
             }
-            events
-        };
-        let (result, events) = tokio::join!(session.stream_history(sink), collect);
+        })
+        .await?;
+        if !force && !allow_removal && childless {
+            let revision = session.history_revision().await;
+            let matches = cell
+                .read_timeline(move |timeline| {
+                    Ok(timeline.matches_native_revision(revision.as_ref()))
+                })
+                .await?;
+            if matches {
+                self.drain_events(cell).await?;
+                self.release_event_stage(cell).await?;
+                cell.data.lock().await.history_primed = true;
+                return Ok(());
+            }
+        }
+        {
+            // A failed/partial replay must not leave an earlier certificate
+            // eligible to bypass the next recovery attempt.
+            let _commit = cell.commit.lock().await;
+            Self::certify_history(cell, None).await?;
+        }
+        let (sink, mut receiver) = EventSink::channel(256, cell.cancel.child_token());
+        let project = tokio::task::spawn_blocking(move || {
+            use std::io::{BufWriter, Seek, Write};
+            let mut replacement = Timeline::history_stage()?;
+            let mut children = BufWriter::new(tempfile::tempfile()?);
+            let mut has_children = false;
+            let mut revision = None;
+            while let Some(event) = receiver.blocking_recv() {
+                if event["type"] == "timeline" {
+                    for item in notifications::project_agent_messages(&event["item"]) {
+                        replacement.append_history_item(item, &event)?;
+                    }
+                } else if event["type"] == "provider_subagent" {
+                    serde_json::to_writer(&mut children, &event)?;
+                    children.write_all(b"\n")?;
+                    has_children = true;
+                } else if event["type"] == "history_checkpoint" {
+                    revision = event
+                        .get("revision")
+                        .filter(|value| value.is_object())
+                        .cloned();
+                }
+            }
+            children.flush()?;
+            let mut children = children.into_inner().map_err(|error| error.into_error())?;
+            children.rewind()?;
+            Ok::<_, anyhow::Error>((replacement, children, has_children, revision))
+        });
+        let (result, staged) = tokio::join!(session.stream_history(sink), project);
         let coverage = result?;
+        let (mut replacement, children, has_children, revision) = staged??;
         self.drain_events(cell).await?;
         let _commit = cell.commit.lock().await;
         let timeline = cell.timeline.clone();
@@ -618,35 +683,33 @@ impl AgentManager {
             let mut current = timeline
                 .lock()
                 .map_err(|_| anyhow!("Timeline lock poisoned"))?;
-            let mut replacement = Timeline::new();
-            let mut subagent_events = Vec::new();
-            for event in events {
-                if event["type"] == "timeline" {
-                    for item in notifications::project_agent_messages(&event["item"]) {
-                        replacement.append(item, &event);
-                    }
-                } else if event["type"] == "provider_subagent" {
-                    subagent_events.push(event);
-                }
-            }
+            // Projection and child envelopes were staged with bounded residency
+            // while the provider streamed. Reconciliation still follows the
+            // live-event drain and holds the same commit gate as publication.
             let epoch = if replacement.reconcile_history(&current, coverage, allow_removal)? {
-                replacement.persist(&path, &id_owned)?;
-                replacement.bound_residency();
+                if coverage == crate::providers::api::HistoryCoverage::Complete && childless && !has_children {
+                    replacement.set_replay_revision(revision);
+                }
+                replacement.commit_history(&path, &id_owned)?;
                 let epoch = replacement.epoch().to_owned();
                 *current = replacement;
                 Some(epoch)
             } else {
+                current.certify_native_revision(None)?;
                 tracing::warn!(agent_id=%id_owned, "Retaining canonical timeline: replay lacks complete identity coverage");
                 None
             };
             drop(current);
-            let outputs = if subagent_events.is_empty() { Vec::new() } else {
+            let outputs = if !has_children { Vec::new() } else {
+                let events = serde_json::Deserializer::from_reader(std::io::BufReader::new(children))
+                    .into_iter::<Value>().map(|event| event.map_err(anyhow::Error::from));
                 store.lock().map_err(|_| anyhow!("Subagent lock poisoned"))?
-                    .replay_history(root.as_deref(), &id_owned, subagent_events, false)?
+                    .replay_history(root.as_deref(), &id_owned, events, false)?
             };
             Ok::<_, anyhow::Error>((epoch, outputs))
         })
         .await??;
+        crate::allocator::release_unused();
         for output in subagent_outputs {
             self.publish_subagent_output(id, cell, &snapshot, output)
                 .await?;
@@ -795,6 +858,7 @@ impl AgentManager {
             return Ok(());
         }
         if event["type"] == "provider_subagent" {
+            Self::certify_history(cell, None).await?;
             self.apply_subagent_event(id, cell, &event, !from_history)
                 .await?;
             return Ok(());
@@ -1287,6 +1351,16 @@ impl AgentManager {
         }
         Ok(())
     }
+    async fn certify_history(cell: &Arc<AgentCell>, revision: Option<Value>) -> Result<()> {
+        let timeline = cell.timeline.clone();
+        tokio::task::spawn_blocking(move || {
+            timeline
+                .lock()
+                .map_err(|_| anyhow!("Timeline lock poisoned"))?
+                .certify_native_revision(revision)
+        })
+        .await?
+    }
     pub(super) async fn close_cell(&self, id: &str, cell: &Arc<AgentCell>) -> Result<()> {
         let _mutation = cell.mutation.lock().await;
         if cell.data.lock().await.event_error.is_some() {
@@ -1410,6 +1484,7 @@ impl AgentManager {
         }
         drop(agents);
         self.app()?.mcp.revoke_agent(id).await;
+        crate::allocator::release_unused();
         Ok(())
     }
     pub async fn shutdown(&self) -> Result<()> {
@@ -1447,6 +1522,9 @@ impl AgentManager {
 /// reading child bodies.
 pub(super) fn resume_options(history: bool, timeline: &Timeline) -> Result<Value> {
     let mut options = json!({"purpose":if history { "history" } else { "interactive" }});
+    if !history && let Some(revision) = timeline.native_revision() {
+        options["historyCheckpoint"] = revision.clone();
+    }
     let (logs, entries) = timeline.subagent_card_logs()?;
     if !logs.is_empty() {
         options["subagentCardLogs"] = Value::Object(logs);
@@ -2244,7 +2322,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         let restored = manager
-            .register_session(id, &cell, session, Some(persistence), true)
+            .register_session(id, &cell, session, Some(persistence.clone()), true)
             .await
             .unwrap();
         assert_eq!(restored["updatedAt"], original["updatedAt"]);
@@ -2259,11 +2337,72 @@ pub(super) mod tests {
         assert_eq!(refreshed["lastActivityAt"], original["lastActivityAt"]);
         assert_eq!(refreshed["historySync"]["status"], "complete");
         manager.close_cell(id, &cell).await.unwrap();
-        let closed = AgentStorage::new(home).get(id).await.unwrap().unwrap();
+        let closed = AgentStorage::new(home.clone())
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(closed["updatedAt"], original["updatedAt"]);
         assert_eq!(closed["lastActivityAt"], original["lastActivityAt"]);
         assert_eq!(closed["archivedAt"], original["archivedAt"]);
-        assert_eq!(tokio::fs::read_to_string(transcript).await.unwrap(), lines);
+        assert_eq!(tokio::fs::read_to_string(&transcript).await.unwrap(), lines);
+        #[cfg(unix)]
+        for changed in [false, true] {
+            if changed {
+                let question = json!({"type":"message","id":"question-2","parentId":"answer",
+                    "timestamp":"2026-01-02T00:00:01.000Z","message":{"role":"user","content":"new question"}});
+                let answer = json!({"type":"message","id":"answer-2","parentId":"question-2",
+                    "timestamp":"2026-01-02T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"new answer"}]}});
+                tokio::fs::write(&transcript, format!("{lines}\n{question}\n{answer}\n"))
+                    .await
+                    .unwrap();
+            }
+            let checkpoint = Timeline::load(&manager.timeline_path(id).unwrap(), id).unwrap();
+            assert!(checkpoint.native_revision().is_some());
+            let epoch = checkpoint.epoch().to_owned();
+            drop(checkpoint);
+            let (cell, receiver) = manager
+                .make_cell(id, original.clone(), false)
+                .await
+                .unwrap();
+            *cell.task.lock().await = Some(manager.start_events(id, &cell, receiver));
+            let session = provider
+                .resume_session(
+                    persistence.clone(),
+                    json!({"cwd":root.path()}),
+                    LaunchContext {
+                        agent_id: id.into(),
+                        home: home.clone(),
+                        executable: app.executable.clone(),
+                        env: BTreeMap::new(),
+                        mcp_servers: json!({}),
+                        tool_catalog: json!([]),
+                        tool_manifest: json!([]),
+                        tool_executor: None,
+                        cancel: cell.cancel.child_token(),
+                    },
+                    json!({"purpose":"history"}),
+                    cell.sink.clone(),
+                )
+                .await
+                .unwrap();
+            manager
+                .register_session(id, &cell, session, Some(persistence.clone()), true)
+                .await
+                .unwrap();
+            manager.hydrate_history(id, &cell, false).await.unwrap();
+            {
+                let timeline = cell.timeline.lock().unwrap();
+                assert_eq!(
+                    timeline.epoch() == epoch,
+                    !changed,
+                    "only a changed native marker replays"
+                );
+                assert_eq!(timeline.rows().len(), if changed { 4 } else { 2 });
+            }
+            assert!(cell.data.lock().await.history_primed);
+            manager.close_cell(id, &cell).await.unwrap();
+        }
     }
 
     #[test]

@@ -221,13 +221,14 @@ impl SubagentStore {
         &mut self,
         root: Option<&Path>,
         parent: &str,
-        events: Vec<Value>,
+        events: impl IntoIterator<Item = Result<Value>>,
         authoritative: bool,
     ) -> Result<Vec<Value>> {
         use crate::providers::api::HistoryCoverage;
         let mut timelines = BTreeMap::<String, (String, Timeline, bool)>::new();
         let mut outputs = Vec::new();
         for envelope in events {
+            let envelope = envelope?;
             let provider = envelope["provider"]
                 .as_str()
                 .context("Subagent provider missing")?;

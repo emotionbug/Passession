@@ -96,10 +96,11 @@ impl Drop for CompactionGuard<'_> {
 pub struct Session {
     inner: Arc<Inner>,
     capabilities: Value,
-    history_events: Option<(Vec<Value>, bool)>,
+    history_only: bool,
     initial_history: Mutex<Option<(Vec<Value>, bool)>>,
     original_persistence: Option<Value>,
     persistence_enabled: bool,
+    replay_revision: Mutex<Option<Value>>,
 }
 impl Inner {
     fn runtime(&self) -> Result<Arc<Transport>> {
@@ -1013,8 +1014,26 @@ impl Session {
             .and_then(|p| p["nativeHandle"].as_str().or(p["sessionId"].as_str()))
             .map(str::to_owned);
         let history_only = omp && options["purpose"] == "history";
+        let before = if omp {
+            if let Some(path) = path.as_deref() {
+                crate::providers::api::native_file_revision(Path::new(path))
+                    .await
+                    .map(|native| json!({"native":native}))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let checkpoint_matches = !history_only
+            && before
+                .as_ref()
+                .is_some_and(|revision| options["historyCheckpoint"] == *revision);
         let mut loaded = None;
-        if let Some(path) = path.as_deref() {
+        if let Some(path) = path
+            .as_deref()
+            .filter(|_| !checkpoint_matches && !history_only)
+        {
             loaded = Some(
                 history::load_with_metadata(
                     &spec.family,
@@ -1029,9 +1048,31 @@ impl Session {
                 .await?,
             );
         }
-        if history_only && loaded.is_none() {
-            bail!("OMP history session file is unavailable");
-        }
+        let history_descriptor = if history_only {
+            let path = path
+                .as_deref()
+                .ok_or_else(|| anyhow!("OMP history session file is unavailable"))?;
+            history::describe("omp", Path::new(path))
+                .await?
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        let replay_revision = if loaded
+            .as_ref()
+            .is_some_and(|history| history.complete && history.subagent_events.is_empty())
+        {
+            let after = if let Some(path) = path.as_deref() {
+                crate::providers::api::native_file_revision(Path::new(path))
+                    .await
+                    .map(|native| json!({"native":native}))
+            } else {
+                None
+            };
+            before.filter(|before| Some(before) == after.as_ref())
+        } else {
+            None
+        };
         let assets = if !omp && !history_only {
             Some(launch::pi_assets(&spec, &config, &context, probes).await?)
         } else {
@@ -1050,7 +1091,7 @@ impl Session {
             )?)
         };
         let native = if history_only {
-            json!({"sessionId":persistence.as_ref().unwrap()["sessionId"],"sessionFile":path,"model":loaded.as_ref().unwrap().descriptor["model"],"thinkingLevel":config["thinkingOptionId"]})
+            json!({"sessionId":persistence.as_ref().unwrap()["sessionId"],"sessionFile":path,"model":history_descriptor["model"],"thinkingLevel":config["thinkingOptionId"]})
         } else {
             json!({})
         };
@@ -1197,15 +1238,12 @@ impl Session {
                 supports_mcp,
                 !history_only && config["internal"] != true && config["persistSession"] != false,
             ),
-            history_events: if history_only {
-                loaded.take().map(|h| (h.events, h.complete))
-            } else {
-                None
-            },
+            history_only,
             // This snapshot precedes runtime startup. Reading the file again after
             // startup would replay messages also waiting in the manager's live stage.
             initial_history: Mutex::new(loaded.map(|h| (h.events, h.complete))),
             original_persistence: if history_only { persistence } else { None },
+            replay_revision: Mutex::new(replay_revision),
         }))
     }
     /// Whether a native rewind result can be replayed from a persisted file.
@@ -1216,7 +1254,7 @@ impl Session {
     }
     async fn prompt(&self, prompt: Value, options: Value, behavior: Option<&str>) -> Result<Value> {
         // Every refusal before the native request is spawned is proven undelivered.
-        if self.history_events.is_some() {
+        if self.history_only {
             return Err(PromptDeliveryError::not_delivered(
                 "OMP history session cannot start a turn",
             ));
@@ -1420,7 +1458,7 @@ impl AgentSession for Session {
             .pending_permissions()
     }
     fn usage_session(&self) -> Option<Value> {
-        if self.history_events.is_some() || self.inner.closed.load(Ordering::Acquire) {
+        if self.history_only || self.inner.closed.load(Ordering::Acquire) {
             return None;
         }
         let state = self.inner.state.lock().unwrap();
@@ -1431,7 +1469,7 @@ impl AgentSession for Session {
         Some(usage)
     }
     async fn unload_readiness(&self) -> UnloadReadiness {
-        if self.inner.closed.load(Ordering::Acquire) || self.history_events.is_some() {
+        if self.inner.closed.load(Ordering::Acquire) || self.history_only {
             return UnloadReadiness::Unknown;
         }
         let Ok(_operation) = self.inner.operation.try_lock() else {
@@ -1586,16 +1624,54 @@ impl AgentSession for Session {
         }
         Ok(json!({"status":"accepted"}))
     }
-    async fn stream_history(&self, sink: EventSink) -> Result<HistoryCoverage> {
-        if let Some((events, complete)) = &self.history_events {
-            for event in events {
-                sink.emit(event.clone()).await?;
+    async fn history_revision(&self) -> Option<Value> {
+        if self.inner.spec.family != "omp" {
+            return None;
+        }
+        let path = {
+            let state = self.inner.state.lock().unwrap();
+            if !state.followed_children.is_empty() {
+                return None;
             }
-            return Ok(if *complete {
-                HistoryCoverage::Complete
-            } else {
-                HistoryCoverage::Unverified
-            });
+            state.native["sessionFile"].as_str()?.to_owned()
+        };
+        let native = crate::providers::api::native_file_revision(Path::new(&path)).await?;
+        Some(json!({"native":native}))
+    }
+    async fn stream_history(&self, sink: EventSink) -> Result<HistoryCoverage> {
+        let revision = self.replay_revision.lock().unwrap().take();
+        if let Some(revision) = revision {
+            sink.emit(json!({"type":"history_checkpoint","revision":revision}))
+                .await?;
+        }
+        if self.history_only {
+            let persistence = self
+                .original_persistence
+                .as_ref()
+                .expect("History session persistence");
+            let path = Path::new(
+                persistence["nativeHandle"]
+                    .as_str()
+                    .expect("History session path"),
+            );
+            let before = self.history_revision().await;
+            let (coverage, childless) = history::stream_omp(
+                self.provider(),
+                path,
+                None,
+                &persistence["metadata"],
+                sink.clone(),
+            )
+            .await?;
+            if coverage == HistoryCoverage::Complete
+                && childless
+                && before.is_some()
+                && before == self.history_revision().await
+            {
+                sink.emit(json!({"type":"history_checkpoint","revision":before}))
+                    .await?;
+            }
+            return Ok(coverage);
         }
         let initial = self.initial_history.lock().unwrap().take();
         if let Some((events, complete)) = initial {
@@ -1609,6 +1685,7 @@ impl AgentSession for Session {
             });
         }
         if self.inner.spec.family == "omp" {
+            let before = self.history_revision().await;
             let mut coverage = HistoryCoverage::Unverified;
             let (path, branch, metadata, phases) = {
                 let state = self.inner.state.lock().unwrap();
@@ -1630,6 +1707,11 @@ impl AgentSession for Session {
                 .await?;
                 if history.complete {
                     coverage = HistoryCoverage::Complete;
+                    let after = self.history_revision().await;
+                    if history.subagent_events.is_empty() && before.is_some() && before == after {
+                        sink.emit(json!({"type":"history_checkpoint","revision":before}))
+                            .await?;
+                    }
                 }
                 for event in history.events {
                     sink.emit(event).await?;
@@ -1679,7 +1761,7 @@ impl AgentSession for Session {
         Ok(HistoryCoverage::Unverified)
     }
     async fn runtime_info(&self) -> Result<Value> {
-        if self.history_events.is_none() {
+        if !self.history_only {
             self.inner.refresh().await?;
         }
         let state = self.inner.state.lock().unwrap();
@@ -1694,7 +1776,7 @@ impl AgentSession for Session {
         Ok(self.inner.state.lock().unwrap().mode.clone())
     }
     async fn set_mode(&self, mode: &str) -> Result<Option<Value>> {
-        if self.history_events.is_some() {
+        if self.history_only {
             bail!("OMP history session cannot change mode");
         }
         if self.inner.spec.family != "omp" {
@@ -1722,7 +1804,7 @@ impl AgentSession for Session {
         Ok(None)
     }
     async fn respond_to_permission(&self, id: &str, response: Value) -> Result<Option<Value>> {
-        if self.history_events.is_some() {
+        if self.history_only {
             bail!("OMP history session cannot answer permissions");
         }
         let (frame, extra) = {
@@ -1746,7 +1828,7 @@ impl AgentSession for Session {
         Ok(None)
     }
     async fn interrupt(&self) -> Result<()> {
-        if self.history_events.is_some() {
+        if self.history_only {
             return Ok(());
         }
         let runtime = self.inner.runtime()?;
@@ -1886,7 +1968,7 @@ impl AgentSession for Session {
             if state.active.is_some() {
                 bail!("Cannot rewind conversation while a turn is active");
             }
-            if state.dead || self.history_events.is_some() {
+            if state.dead || self.history_only {
                 bail!("Cannot rewind conversation without a live provider session");
             }
         }

@@ -1427,7 +1427,9 @@ fn child_replay_reads_only_the_opened_child() {
         .replay_history(
             Some(root.path()),
             PARENT,
-            child_replay(events, "a", HistoryCoverage::Complete),
+            child_replay(events, "a", HistoryCoverage::Complete)
+                .into_iter()
+                .map(Ok),
             true,
         )
         .unwrap();

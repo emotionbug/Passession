@@ -232,6 +232,8 @@ pub struct Timeline {
     min_seq: i64,
     storage: Option<storage::Store>,
     storage_dirty: bool,
+    /// Certified native revision for these exact committed rows; never public.
+    native_revision: Option<Value>,
     /// Agent projections keep only a bounded tail resident once durable.
     bounded: bool,
 }
@@ -254,6 +256,7 @@ impl Timeline {
             min_seq: 0,
             storage: None,
             storage_dirty: false,
+            native_revision: None,
             bounded: false,
         }
     }
@@ -315,6 +318,7 @@ impl Timeline {
         let index = *self.submitted.get(id)? - self.base;
         let row = &mut self.rows[index];
         self.storage_dirty = true;
+        self.native_revision = None;
         row["providerMessageId"] = json!(provider_id);
         Some(row.clone())
     }
@@ -329,6 +333,7 @@ impl Timeline {
     }
     pub fn append(&mut self, item: Value, options: &Value) -> Value {
         self.storage_dirty = true;
+        self.native_revision = None;
         let row = self.source_row(item, options);
         self.next_seq += 1;
         self.append_row(row.clone());
@@ -416,12 +421,6 @@ impl Timeline {
         }
         self.sizes.drain(..evict);
         self.base += evict;
-    }
-    /// Keeps only the bounded recent tail resident from now on, as an agent's
-    /// live projection does.
-    pub(in crate::agent) fn bound_residency(&mut self) {
-        self.bounded = true;
-        self.trim();
     }
     /// One page selected from resident rows: the whole history of a timeline
     /// that never released rows. Agent readers use `page`.

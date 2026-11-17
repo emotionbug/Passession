@@ -720,7 +720,8 @@ impl AgentManager {
                 .iter()
                 .find(|descriptor| descriptor["id"] == child.as_str())
                 .is_some_and(|descriptor| finished_status(&descriptor["status"]));
-            let outputs = store.replay_history(Some(&root), &owner, events, finished)?;
+            let outputs =
+                store.replay_history(Some(&root), &owner, events.into_iter().map(Ok), finished)?;
             Ok::<_, anyhow::Error>((outputs, finished))
         })
         .await??;

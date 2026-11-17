@@ -1,8 +1,44 @@
 use super::Timeline;
 use crate::providers::api::HistoryCoverage;
 use anyhow::Result;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+
+struct ContentDigest(Sha256);
+
+impl std::io::Write for ContentDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn content_digest(item: &Value) -> String {
+    use serde::{
+        Serialize,
+        ser::{SerializeMap, Serializer},
+    };
+    let mut digest = ContentDigest(Sha256::new());
+    let mut serializer = serde_json::Serializer::new(&mut digest);
+    if let Some(object) = item.as_object() {
+        let mut map = serializer.serialize_map(None).expect("JSON item");
+        for (key, value) in object {
+            if !matches!(key.as_str(), "messageId" | "clientMessageId") {
+                map.serialize_entry(key, value).expect("JSON item field");
+            }
+        }
+        map.end().expect("JSON item");
+    } else {
+        item.serialize(&mut serializer).expect("JSON item");
+    }
+    hex::encode(digest.0.finalize())
+}
 
 fn keys(row: &Value) -> Vec<String> {
     let item = &row["item"];
@@ -31,27 +67,57 @@ fn keys(row: &Value) -> Vec<String> {
     // Exact unique content may retain presentation identity for non-user rows.
     // It never correlates a submitted user message or settles a delivery receipt.
     if item["type"] != "user_message" {
-        let mut content = item.clone();
-        if let Some(object) = content.as_object_mut() {
-            object.remove("messageId");
-            object.remove("clientMessageId");
-        }
-        keys.push(format!(
-            "content:{}",
-            serde_json::to_string(&content).expect("JSON item")
-        ));
+        keys.push(format!("content:{}", content_digest(item)));
     }
     keys
 }
 
-/// Durable identity fields a matched previous row restores onto its replacement.
-struct Restore {
-    index: usize,
-    row: Vec<(&'static str, Value)>,
-    item: Vec<(&'static str, Value)>,
+fn append_reconciled(timeline: &mut Timeline, row: Value, staged: bool) -> Result<()> {
+    if staged {
+        timeline.append_history_row(row)
+    } else {
+        timeline.append_row(row);
+        Ok(())
+    }
+}
+
+fn same_content(left: &Value, right: &Value) -> bool {
+    let ignored = |key: &str| matches!(key, "messageId" | "clientMessageId");
+    match (left.as_object(), right.as_object()) {
+        (Some(left), Some(right)) => {
+            left.iter().filter(|(key, _)| !ignored(key)).count()
+                == right.iter().filter(|(key, _)| !ignored(key)).count()
+                && left
+                    .iter()
+                    .filter(|(key, _)| !ignored(key))
+                    .all(|(key, value)| right.get(key) == Some(value))
+        }
+        _ => left == right,
+    }
 }
 
 impl Timeline {
+    pub(in crate::agent) fn native_revision(&self) -> Option<&Value> {
+        self.native_revision.as_ref()
+    }
+
+    pub(in crate::agent) fn matches_native_revision(&self, revision: Option<&Value>) -> bool {
+        self.native_revision
+            .as_ref()
+            .zip(revision)
+            .is_some_and(|(saved, current)| saved == current)
+    }
+
+    pub(in crate::agent) fn certify_native_revision(
+        &mut self,
+        revision: Option<Value>,
+    ) -> Result<()> {
+        super::storage::certify(self, revision)
+    }
+
+    pub(in crate::agent) fn set_replay_revision(&mut self, revision: Option<Value>) {
+        self.native_revision = revision;
+    }
     /// Non-destructive refresh requires unique, ordered matches for conversation
     /// rows. Complete provider history may omit daemon notifications: retain those
     /// beside the next matched row rather than dropping them or refusing recovery.
@@ -68,9 +134,21 @@ impl Timeline {
         if previous.len() == 0 {
             return Ok(true);
         }
+        // Only identity/digest indices live in RAM. Restored attachments and
+        // daemon notices can themselves be large, so stage those on disk too.
+        let file = tempfile::NamedTempFile::new()?;
+        let edits = Connection::open(file.path())?;
+        edits.execute_batch(
+            "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
+             PRAGMA cache_size=-2048; PRAGMA temp_store=FILE;
+             CREATE TABLE restores(position INTEGER PRIMARY KEY, row_json TEXT NOT NULL);
+             CREATE TABLE notices(ordinal INTEGER PRIMARY KEY, position INTEGER, row_json TEXT NOT NULL);
+             CREATE INDEX notice_position ON notices(position, ordinal);",
+        )?;
         let mut candidates: HashMap<String, Option<usize>> = HashMap::new();
-        for (index, row) in self.rows.iter().enumerate() {
-            for key in keys(row) {
+        let mut index = 0;
+        self.scan(&[], |row| {
+            for key in keys(&row) {
                 candidates
                     .entry(key)
                     .and_modify(|candidate| {
@@ -80,32 +158,36 @@ impl Timeline {
                     })
                     .or_insert(Some(index));
             }
-        }
+            index += 1;
+            Ok(true)
+        })?;
         let mut used = HashSet::new();
-        let mut matches = Vec::new();
         let mut previous_index = None;
-        let mut pending_notices = Vec::new();
-        let mut retained_notices = Vec::new();
         let mut accepted = true;
-        let rows = &self.rows;
         previous.scan(&[], |row| {
-            let resolved: HashSet<_> = keys(&row)
-                .iter()
-                .filter_map(|key| candidates.get(key).copied().flatten())
-                .collect();
+            let mut resolved = HashSet::new();
+            for key in keys(&row) {
+                if let Some(index) = candidates.get(&key).copied().flatten() {
+                    // Digests bound key residency, but never authorize a match
+                    // without exact content equality.
+                    if !key.starts_with("content:")
+                        || same_content(&row["item"], &self.history_row(index)?["item"])
+                    {
+                        resolved.insert(index);
+                    }
+                }
+            }
             let matched = (resolved.len() == 1).then(|| *resolved.iter().next().unwrap());
             if !allow_removal
-                && matched
-                    .is_some_and(|index| previous_index.is_some_and(|previous| index <= previous))
+                && matched.is_some_and(|index| previous_index.is_some_and(|old| index <= old))
             {
                 accepted = false;
                 return Ok(false);
             }
-            // A non-authoritative snapshot may lag live text even when IDs match.
             if !allow_removal
                 && let Some(index) = matched
                 && let Some(text) = row["item"]["text"].as_str().filter(|text| !text.is_empty())
-                && !rows[index]["item"]["text"]
+                && !self.history_row(index)?["item"]["text"]
                     .as_str()
                     .is_some_and(|next| next.starts_with(text))
             {
@@ -117,32 +199,34 @@ impl Timeline {
             }
             match matched.filter(|index| used.insert(*index)) {
                 Some(index) => {
-                    retained_notices.extend(pending_notices.drain(..).map(|old| (index, old)));
-                    let restored = |source: &Value, fields: &[&'static str]| {
-                        fields
-                            .iter()
-                            .filter_map(|&key| {
-                                source
-                                    .get(key)
-                                    .filter(|value| !value.is_null())
-                                    .map(|value| (key, value.clone()))
-                            })
-                            .collect::<Vec<_>>()
-                    };
-                    matches.push(Restore {
-                        index,
-                        row: restored(&row, &["turnId", "providerMessageId"]),
-                        item: restored(
-                            &row["item"],
-                            &["messageId", "clientMessageId", "images", "attachments"],
-                        ),
-                    });
+                    edits.execute(
+                        "UPDATE notices SET position = ?1 WHERE position IS NULL",
+                        [index as i64],
+                    )?;
+                    let mut restore = json!({"item":{}});
+                    for key in ["turnId", "providerMessageId"] {
+                        if let Some(value) = row.get(key).filter(|value| !value.is_null()) {
+                            restore[key] = value.clone();
+                        }
+                    }
+                    for key in ["messageId", "clientMessageId", "images", "attachments"] {
+                        if let Some(value) = row["item"].get(key).filter(|value| !value.is_null()) {
+                            restore["item"][key] = value.clone();
+                        }
+                    }
+                    edits.execute(
+                        "INSERT INTO restores VALUES (?1, ?2)",
+                        params![index as i64, serde_json::to_string(&restore)?],
+                    )?;
                 }
                 None if allow_removal => {}
                 None if coverage == HistoryCoverage::Complete
                     && row["item"]["type"] == "notification" =>
                 {
-                    pending_notices.push(row.into_owned());
+                    edits.execute(
+                        "INSERT INTO notices(position, row_json) VALUES (NULL, ?1)",
+                        [serde_json::to_string(row.as_ref())?],
+                    )?;
                 }
                 None => {
                     accepted = false;
@@ -154,36 +238,53 @@ impl Timeline {
         if !accepted {
             return Ok(false);
         }
-        retained_notices.extend(
-            pending_notices
-                .into_iter()
-                .map(|old| (self.rows.len(), old)),
-        );
-        for restore in matches {
-            let row = &mut self.rows[restore.index];
-            for (key, value) in restore.row {
-                row[key] = value;
-            }
-            for (key, value) in restore.item {
-                row["item"][key] = value;
-            }
-        }
-        // Identity restoration can change the submitted-message index. Rebuild
-        // projection indexes before any later live event is admitted.
-        let rows = std::mem::take(&mut self.rows);
-        self.identities.clear();
-        self.submitted.clear();
-        self.min_seq = 0;
-        let mut notices = retained_notices.into_iter().peekable();
+        drop(candidates);
+        drop(used);
+        edits.execute(
+            "UPDATE notices SET position = ?1 WHERE position IS NULL",
+            [self.len() as i64],
+        )?;
+        let staged = self.storage.is_some();
+        let mut rebuilt = if staged {
+            Self::history_stage()?
+        } else {
+            Self::new()
+        };
+        rebuilt.epoch = self.epoch.clone();
+        rebuilt.next_seq = self.next_seq;
+        rebuilt.storage_dirty = !staged;
         let mut shift = 0i64;
-        for (index, mut row) in rows.into_iter().enumerate() {
-            while notices.peek().is_some_and(|(before, _)| *before == index) {
-                let (_, mut notice) = notices.next().unwrap();
+        let mut index = 0;
+        let mut notices =
+            edits.prepare("SELECT row_json FROM notices WHERE position = ?1 ORDER BY ordinal")?;
+        self.scan(&[], |source| {
+            let mut row = source.into_owned();
+            let restore: Option<String> = edits
+                .query_row(
+                    "SELECT row_json FROM restores WHERE position = ?1",
+                    [index as i64],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(restore) = restore {
+                let restore: Value = serde_json::from_str(&restore)?;
+                for key in ["turnId", "providerMessageId"] {
+                    if let Some(value) = restore.get(key) {
+                        row[key] = value.clone();
+                    }
+                }
+                for (key, value) in restore["item"].as_object().unwrap() {
+                    row["item"][key] = value.clone();
+                }
+            }
+            let mut retained = notices.query([index as i64])?;
+            while let Some(notice) = retained.next()? {
+                let mut notice: Value = serde_json::from_str(notice.get_ref(0)?.as_str()?)?;
                 notice["seq"] = json!(super::num(&row, "seqStart") + shift);
                 for key in ["seqStart", "seqEnd", "sourceSeqRanges", "collapsed"] {
                     notice.as_object_mut().unwrap().remove(key);
                 }
-                self.append_row(notice);
+                append_reconciled(&mut rebuilt, notice, staged)?;
                 shift += 1;
             }
             if shift != 0 {
@@ -196,17 +297,140 @@ impl Timeline {
                     }
                 }
             }
-            self.append_row(row);
-        }
-        for (_, mut notice) in notices {
+            append_reconciled(&mut rebuilt, row, staged)?;
+            index += 1;
+            Ok(true)
+        })?;
+        let mut retained = notices.query([self.len() as i64])?;
+        while let Some(notice) = retained.next()? {
+            let mut notice: Value = serde_json::from_str(notice.get_ref(0)?.as_str()?)?;
             notice["seq"] = json!(self.next_seq + shift);
             for key in ["seqStart", "seqEnd", "sourceSeqRanges", "collapsed"] {
                 notice.as_object_mut().unwrap().remove(key);
             }
-            self.append_row(notice);
+            append_reconciled(&mut rebuilt, notice, staged)?;
             shift += 1;
         }
-        self.next_seq += shift;
+        rebuilt.next_seq += shift;
+        *self = rebuilt;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_revision_requires_exact_match_and_is_invalidated_by_every_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("timeline.sqlite3");
+        let marker = json!({"native":{"path":"session.jsonl","length":42}});
+        let mut timeline = Timeline::new();
+        timeline.append(
+            json!({"type":"user_message","text":"hello","messageId":"one"}),
+            &json!({}),
+        );
+        timeline.set_replay_revision(Some(marker.clone()));
+        timeline.persist(&path, "agent").unwrap();
+        drop(timeline);
+        let timeline = Timeline::load(&path, "agent").unwrap();
+        assert!(timeline.matches_native_revision(Some(&marker)));
+        assert!(!timeline.matches_native_revision(None));
+        assert!(!timeline.matches_native_revision(Some(&json!({"native":{"length":43}}))));
+        drop(timeline);
+        // An older writer knows only timeline_rows, not certificate metadata.
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute(
+                "UPDATE timeline_rows SET row_json = row_json WHERE position = 0",
+                [],
+            )
+            .unwrap();
+        drop(writer);
+        let mut timeline = Timeline::load(&path, "agent").unwrap();
+        assert!(!timeline.matches_native_revision(Some(&marker)));
+        timeline
+            .certify_native_revision(Some(marker.clone()))
+            .unwrap();
+        timeline
+            .append_persisted(
+                &path,
+                "agent",
+                json!({"type":"assistant_message","text":"reply","messageId":"two"}),
+                &json!({}),
+            )
+            .unwrap();
+        assert!(!timeline.matches_native_revision(Some(&marker)));
+        drop(timeline);
+        assert!(
+            Timeline::load(&path, "agent")
+                .unwrap()
+                .native_revision()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn streamed_history_stage_bounds_residency_and_rolls_back_failed_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("timeline.sqlite3");
+        let mut current = Timeline::new();
+        current.append(
+            json!({"type":"user_message","text":"hello","messageId":"one"}),
+            &json!({}),
+        );
+        current.append(
+            json!({"type":"notification","text":"daemon notice"}),
+            &json!({}),
+        );
+        let marker = json!({"native":{"length":42}});
+        current.set_replay_revision(Some(marker.clone()));
+        current.persist(&path, "agent").unwrap();
+        let before = current.all_rows().unwrap();
+        let epoch = current.epoch().to_owned();
+
+        let mut staged = Timeline::history_stage().unwrap();
+        staged
+            .append_history_item(
+                json!({"type":"user_message","text":"hello","messageId":"one"}),
+                &json!({}),
+            )
+            .unwrap();
+        for index in 1..600 {
+            staged.append_history_item(
+                json!({"type":"user_message","text":"x".repeat(16384),"messageId":format!("message-{index}")}),
+                &json!({}),
+            ).unwrap();
+        }
+        assert!(staged.base > 0);
+        assert!(staged.rows.len() <= super::super::RESIDENT_ROWS);
+        assert!(staged.sizes.iter().sum::<u64>() <= super::super::RESIDENT_BYTES);
+        assert!(
+            staged
+                .reconcile_history(&current, HistoryCoverage::Complete, false)
+                .unwrap()
+        );
+        staged.set_replay_revision(Some(json!({"native":{"length":999}})));
+
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch(
+            "CREATE TRIGGER reject_history BEFORE INSERT ON timeline_rows
+             WHEN NEW.position = 200 BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END;",
+        ).unwrap();
+        assert!(staged.commit_history(&path, "agent").is_err());
+        let saved = Timeline::load(&path, "agent").unwrap();
+        assert_eq!(saved.all_rows().unwrap(), before);
+        assert_eq!(saved.epoch(), epoch);
+        assert!(saved.matches_native_revision(Some(&marker)));
+        drop(saved);
+        writer.execute_batch("DROP TRIGGER reject_history").unwrap();
+
+        staged.commit_history(&path, "agent").unwrap();
+        let saved = Timeline::load(&path, "agent").unwrap();
+        assert_eq!(saved.len(), 601);
+        assert_eq!(saved.next_seq(), 602);
+        assert_eq!(saved.last_item().unwrap().unwrap()["text"], "daemon notice");
+        assert!(saved.matches_native_revision(Some(&json!({"native":{"length":999}}))));
     }
 }

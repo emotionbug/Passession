@@ -677,7 +677,8 @@ impl AgentManager {
             cancel,
             owner_ended: CancellationToken::new(),
             sink,
-            // Replay history before live events, even when the saved checkpoint is partial.
+            // Stage live events until native revision verification or full replay
+            // primes history; a saved checkpoint alone never certifies currency.
             stage: Mutex::new((!history).then(EventStage::default)),
             barriers: Mutex::new(HashMap::new()),
             task: Mutex::new(None),

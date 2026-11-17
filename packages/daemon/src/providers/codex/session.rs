@@ -33,6 +33,8 @@ pub(super) struct State {
     pub usage: Option<Value>,
     pub history: Vec<Value>,
     pub history_coverage: crate::providers::api::HistoryCoverage,
+    pub rollout_path: Option<PathBuf>,
+    pub history_skipped: bool,
     pub async_questions: permissions::AsyncQuestions,
     pub features: Arc<[Value]>,
     pub text: HashMap<String, String>,
@@ -307,21 +309,83 @@ impl CodexSession {
                 (discovery.metadata.clone(), discovery.skills.clone())
             };
             let sandbox = Value::Null;
-            let history = if let Some(id) = &native {
+            let revision = if let Some(id) = &native {
+                // updatedAt has second resolution and cannot detect rewinds or
+                // same-second edits. The protocol's rollout path permits a
+                // strong file revision without requesting/materializing turns.
+                client
+                    .request("thread/read", json!({"threadId":id,"includeTurns":false}))
+                    .await
+                    .ok()
+                    .and_then(|reply| {
+                        reply["thread"]["path"]
+                            .as_str()
+                            .filter(|path| Path::new(path).is_absolute())
+                            .map(PathBuf::from)
+                    })
+            } else {
+                None
+            };
+            let before = if let (Some(id), Some(path)) = (&native, &revision) {
+                native_file_revision(path)
+                    .await
+                    .map(|file| json!({"threadId":id,"file":file}))
+            } else {
+                None
+            };
+            let skipped = !history_only
+                && before
+                    .as_ref()
+                    .is_some_and(|before| options["historyCheckpoint"]["native"] == *before)
+                && serde_json::from_value::<Vec<(String, Option<String>)>>(
+                    options["historyCheckpoint"]["userTurns"].clone(),
+                )
+                .is_ok();
+            let mut history = if let Some(id) = native.as_ref().filter(|_| !skipped) {
                 load_history(client.as_ref(), id, config["cwd"].as_str(), &spec.id).await?
             } else {
                 Vec::new()
             };
-            Ok((rollback, metadata, skills, sandbox, history))
+            if !skipped
+                && !history
+                    .iter()
+                    .any(|event| event["type"] == "provider_subagent")
+            {
+                let after = if let (Some(id), Some(path)) = (&native, &revision) {
+                    native_file_revision(path)
+                        .await
+                        .map(|file| json!({"threadId":id,"file":file}))
+                } else {
+                    None
+                };
+                if before.is_some() && before == after {
+                    let turns: Vec<_> = history
+                        .iter()
+                        .filter(|e| e["item"]["type"] == "user_message")
+                        .filter_map(|e| {
+                            Some((
+                                e["item"]["messageId"].as_str()?.to_owned(),
+                                e["turnId"].as_str().map(str::to_owned),
+                            ))
+                        })
+                        .collect();
+                    history.push(json!({"type":"history_checkpoint",
+                        "revision":{"native":before,"userTurns":turns}}));
+                }
+            }
+            Ok((
+                rollback, metadata, skills, sandbox, history, revision, skipped,
+            ))
         }
         .await;
-        let (rollback, metadata, skills, sandbox, history) = match prepared {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = client.close().await;
-                return Err(e);
-            }
-        };
+        let (rollback, metadata, skills, sandbox, history, rollout_path, history_skipped) =
+            match prepared {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = client.close().await;
+                    return Err(e);
+                }
+            };
         let mut history = history;
         let async_questions = permissions::AsyncQuestions::new(&config["asyncQuestions"]);
         for entry in &mut history {
@@ -337,16 +401,20 @@ impl CodexSession {
         apply_card_logs(&mut history, &recorded_cards);
         let initial_features: Arc<[Value]> =
             features(&config, &metadata.models, &metadata.collaboration).into();
-        let user_turns = history
-            .iter()
-            .filter(|e| e["type"] == "timeline" && e["item"]["type"] == "user_message")
-            .filter_map(|e| {
-                Some((
-                    e["item"]["messageId"].as_str()?.to_owned(),
-                    e["turnId"].as_str().map(str::to_owned),
-                ))
-            })
-            .collect();
+        let user_turns = if history_skipped {
+            serde_json::from_value(options["historyCheckpoint"]["userTurns"].clone())?
+        } else {
+            history
+                .iter()
+                .filter(|e| e["type"] == "timeline" && e["item"]["type"] == "user_message")
+                .filter_map(|e| {
+                    Some((
+                        e["item"]["messageId"].as_str()?.to_owned(),
+                        e["turnId"].as_str().map(str::to_owned),
+                    ))
+                })
+                .collect()
+        };
         let mut children = HashMap::new();
         let mut child_items: HashMap<String, Vec<(String, Value)>> = HashMap::new();
         for (index, event) in history.iter().enumerate() {
@@ -413,6 +481,8 @@ impl CodexSession {
                 usage: None,
                 history,
                 history_coverage: crate::providers::api::HistoryCoverage::Complete,
+                rollout_path,
+                history_skipped,
                 text: HashMap::new(),
                 outputs: HashMap::new(),
                 completed: HashSet::new(),
@@ -662,6 +732,10 @@ impl CodexSession {
         {
             let mut s = self.state.lock().unwrap();
             s.thread = Some(id.clone());
+            s.rollout_path = response["thread"]["path"]
+                .as_str()
+                .filter(|path| Path::new(path).is_absolute())
+                .map(PathBuf::from);
             s.sandbox = response["sandbox"].clone();
             let mode = s.config["modeId"].as_str();
             let approval = s.config["providerOptions"]["approval_policy"]
@@ -843,7 +917,7 @@ async fn resume(client: &Transport, id: &str, config: &Value, inner: &Value) -> 
     {
         return Ok(json!({}));
     }
-    let mut p = json!({"threadId":id,"config":inner});
+    let mut p = json!({"threadId":id,"config":inner,"excludeTurns":true});
     instructions(&mut p, config);
     match client.request("thread/resume", p.clone()).await {
         Ok(value) => Ok(value),
@@ -1345,6 +1419,49 @@ impl AgentSession for CodexSession {
         &self,
         sink: EventSink,
     ) -> Result<crate::providers::api::HistoryCoverage> {
+        let skipped = {
+            let mut state = self.state.lock().unwrap();
+            std::mem::take(&mut state.history_skipped)
+        };
+        if skipped {
+            let (id, cwd) = {
+                let state = self.state.lock().unwrap();
+                (
+                    state.thread.clone(),
+                    state.config["cwd"].as_str().map(str::to_owned),
+                )
+            };
+            if let Some(id) = id {
+                let before = self.history_revision().await;
+                let mut history =
+                    load_history(self.client.as_ref(), &id, cwd.as_deref(), &self.spec.id).await?;
+                let turns: Vec<_> = history
+                    .iter()
+                    .filter(|e| e["item"]["type"] == "user_message")
+                    .filter_map(|e| {
+                        Some((
+                            e["item"]["messageId"].as_str()?.to_owned(),
+                            e["turnId"].as_str().map(str::to_owned),
+                        ))
+                    })
+                    .collect();
+                self.state.lock().unwrap().user_turns = turns;
+                let after = self.history_revision().await;
+                if !history
+                    .iter()
+                    .any(|event| event["type"] == "provider_subagent")
+                    && before
+                        .as_ref()
+                        .zip(after.as_ref())
+                        .is_some_and(|(before, after)| before["native"] == after["native"])
+                {
+                    history.push(json!({"type":"history_checkpoint","revision":after}));
+                }
+                let mut state = self.state.lock().unwrap();
+                state.history = history;
+                state.history_coverage = HistoryCoverage::Complete;
+            }
+        }
         let (history, coverage) = {
             let mut state = self.state.lock().unwrap();
             let history = std::mem::take(&mut state.history);
@@ -1358,6 +1475,21 @@ impl AgentSession for CodexSession {
             sink.emit(e).await?;
         }
         Ok(coverage)
+    }
+    async fn history_revision(&self) -> Option<Value> {
+        let (id, path, turns) = {
+            let state = self.state.lock().unwrap();
+            if !state.children.is_empty() {
+                return None;
+            }
+            (
+                state.thread.clone()?,
+                state.rollout_path.clone()?,
+                state.user_turns.clone(),
+            )
+        };
+        let file = native_file_revision(&path).await?;
+        Some(json!({"native":{"threadId":id,"file":file},"userTurns":turns}))
     }
     async fn runtime_info(&self) -> Result<Value> {
         let interactive = self.state.lock().unwrap().interactive;

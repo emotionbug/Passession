@@ -51,6 +51,24 @@ same transaction as the page index. Readers of a closed agent use one read-only 
 load its whole history. Agents without a checkpoint and provider child timelines stay fully
 resident.
 
+A complete replay of a childless agent commits, in the same transaction as its rows, a certificate
+of the provider's native revision: for OMP the session file and for Claude Code the transcript
+(canonical path, device/inode, length, nanosecond mtime and ctime), for Codex the thread id and
+rollout file identity. An interactive resume that observes the same revision before replay marks
+history primed, keeps the timeline epoch and skips provider history streaming; Codex then reads
+thread metadata only. Every live row write, a rewind, subagent history or a differing marker
+clears or rejects the certificate (SQLite triggers clear it for older writers too), and the resume
+falls back to full replay and reconciliation. Platforms without file identity always replay. The
+marker is metadata, not a content hash.
+
+Hydration never materializes a provider's whole history. History-only OMP sessions index the native
+session file first (entry id, parent, offset and kind), then parse and emit the active branch one
+entry at a time. The daemon replays those events into a disk-backed staging projection and child
+envelope spool in the checkpoint database, and the reconciled replacement swaps in with the same
+single transaction as before; a failed replacement rolls the staging back. After hydration and
+runtime teardown, glibc Linux builds return freed heap to the system with a coalesced
+`malloc_trim(0)` off the async workers.
+
 The invariants are:
 
 > A continuously subscribed client applies every committed row in order. Opening or resuming an

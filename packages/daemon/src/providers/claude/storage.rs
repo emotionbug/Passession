@@ -128,6 +128,22 @@ pub async fn transcript_path(
     Ok(expected)
 }
 
+/// Child and workflow files can change independently of the parent transcript.
+/// Until their revisions are certified together, keep those sessions on replay.
+pub async fn native_revision(path: &Path) -> Option<Value> {
+    for directory in ["subagents", "workflows"] {
+        match fs::read_dir(path.with_extension("").join(directory)).await {
+            Ok(mut entries) => match entries.next_entry().await {
+                Ok(None) => {}
+                _ => return None,
+            },
+            Err(error) if missing(&error) => {}
+            Err(_) => return None,
+        }
+    }
+    crate::providers::api::native_file_revision(path).await
+}
+
 fn missing(error: &io::Error) -> bool {
     matches!(
         error.kind(),

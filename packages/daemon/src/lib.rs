@@ -15,6 +15,7 @@ pub fn component_identity() -> paseo_protocol::components::ComponentIdentity {
 
 pub mod activity;
 pub mod agent;
+mod allocator;
 pub mod automation;
 pub mod cli;
 pub mod client;
