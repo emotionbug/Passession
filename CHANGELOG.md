@@ -15,6 +15,7 @@
 - Bound image and editor memory in the app. Conversation images are decoded at the size they are shown, on two shared worker threads instead of one thread per image, and their decoded pixels are capped at 100 MiB, evicting the least recently used first. The image viewer still opens images at full quality. The source editor keeps row layouts only near the visible rows.
 - Drop dependencies Passession never used. The app no longer bundles the Symphonia decoders, since it plays only PCM sound cues. The daemon no longer builds the HTTP/2, WebSocket and multipart server stacks. The embedded Tailscale library is built without Tailscale's node-management web page, and the desktop and Android libraries no longer carry the symbol table and debug information; browser sign-in is unchanged.
 - Stop periodic daemon work while idle. Idle OpenCode sessions no longer wake every 25 ms, finished OMP subagents are no longer re-read every 250 ms, schedules wake at their next due time instead of rereading every schedule file each second, and publishing one workspace reads only that workspace's agents, terminals and subagents.
+- Enable only the Tokio features the daemon and client use instead of `full`.
 
 ### Fixed
 
