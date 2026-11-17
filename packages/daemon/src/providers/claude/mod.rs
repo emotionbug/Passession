@@ -2,6 +2,7 @@ mod catalog;
 mod options;
 mod projection;
 mod prompt;
+mod readiness;
 mod storage;
 mod transport;
 
@@ -189,6 +190,7 @@ impl ClaudeProvider {
                 permissions: HashMap::new(),
                 anchors,
                 projection: Projection::new(provider),
+                tasks: readiness::TaskLedger::default(),
                 runtime_model: None,
             }),
         });
@@ -675,6 +677,7 @@ struct State {
     permissions: HashMap<String, Permission>,
     anchors: Vec<(String, Option<String>)>,
     projection: Projection,
+    tasks: readiness::TaskLedger,
     runtime_model: Option<String>,
 }
 struct ClaudeSession {
@@ -770,6 +773,7 @@ impl ClaudeSession {
             } else {
                 state.runtime = Some(runtime.clone());
                 state.restart = false;
+                state.tasks = readiness::TaskLedger::default();
                 true
             }
         };
@@ -794,6 +798,7 @@ impl ClaudeSession {
                             session.runtime_failed(&active, error.to_string()).await;
                             return;
                         }
+                        active.finish_event();
                     }
                     Err(error) => {
                         session.runtime_failed(&active, error.to_string()).await;
@@ -949,6 +954,7 @@ impl ClaudeSession {
         }
         let events = {
             let mut state = self.state.lock().unwrap();
+            state.tasks.observe(&frame);
             if frame["parent_tool_use_id"].as_str().is_some() {
                 state.projection.project(&frame)
             } else {
@@ -976,8 +982,8 @@ impl ClaudeSession {
                         Some("commands_changed") => {
                             state.initialized["commands"] = frame["commands"].clone()
                         }
-                        Some("session_state_changed") if frame["state"] == "idle" => {
-                            state.main_running = false
+                        Some("session_state_changed") => {
+                            state.main_running = frame["state"] != "idle"
                         }
                         _ => {}
                     }
@@ -1090,6 +1096,17 @@ impl AgentSession for ClaudeSession {
         let Some(runtime) = state.runtime.as_ref().filter(|_| !state.closed) else {
             return UnloadReadiness::Unknown;
         };
+        let tasks = state.tasks.readiness();
+        if self.persist == Some(false)
+            || state
+                .native_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            || !runtime.is_healthy()
+            || tasks == UnloadReadiness::Unknown
+        {
+            return UnloadReadiness::Unknown;
+        }
         if state.active_turn.is_some()
             || state.main_running
             || state.interrupt_pending
@@ -1101,15 +1118,12 @@ impl AgentSession for ClaudeSession {
             || state.projection.is_compacting()
             || state.projection.has_unterminated_tasks()
             || runtime.has_pending_requests()
+            || runtime.has_incoming_events()
+            || tasks == UnloadReadiness::Busy
         {
             return UnloadReadiness::Busy;
         }
-        // task_started deliberately omits local_bash, skip_transcript and other
-        // filtered tasks from the projection's declaration table. Neither a main
-        // result nor an empty visible task table proves those tasks have ended.
-        // Until all native task lifetimes are tracked, even a persisted idle
-        // session cannot positively authorize unloading.
-        UnloadReadiness::Unknown
+        UnloadReadiness::Ready
     }
 
     async fn start_turn(&self, prompt: Value, options: Value) -> Result<Value> {

@@ -45,9 +45,12 @@ initialization, replacement, pending permission, queued or in-flight message del
 finish watch on it, or a running provider subagent. The provider must also report itself settled and
 resumable (`AgentSession::unload_readiness`). OMP reports this through `get_state`
 (`isStreaming`, `isCompacting`, `queuedMessageCount`, `hasPendingAsyncWork`, `isSettled`) and a
-native session file. Providers that cannot prove the absence of background work stay resident:
-Claude Code drops ambient and shell task announcements before Paseo can track them, and Codex, ACP,
-OpenCode, Copilot and plugin providers expose no background-work inventory.
+native session file. Claude Code keeps a live ledger of every native task it announces
+(`task_started`/`task_updated`/`task_notification`, including shell, ambient and background tasks
+the timeline hides); it is ready only with an idle main session, every task terminal, no
+unmatched or unknown task status, and a resumable session id. Providers that cannot prove the
+absence of background work stay resident: Codex, ACP, OpenCode, Copilot and plugin providers
+expose no background-work inventory.
 The manager re-checks every condition inside the agent's lifecycle lane before closing.
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked

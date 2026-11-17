@@ -3,7 +3,10 @@ use paseo_client::process::{CommandSpec, ManagedProcess};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -19,6 +22,9 @@ pub(super) struct Transport {
     pub generation: String,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>,
     stop: CancellationToken,
+    healthy: AtomicBool,
+    incoming: AtomicUsize,
+    controls: AtomicUsize,
 }
 
 impl Transport {
@@ -32,6 +38,9 @@ impl Transport {
             generation: uuid::Uuid::new_v4().to_string(),
             pending: Mutex::new(HashMap::new()),
             stop: owner.child_token(),
+            healthy: AtomicBool::new(true),
+            incoming: AtomicUsize::new(0),
+            controls: AtomicUsize::new(0),
         });
         let cleanup_stop = this.stop.clone();
         let cleanup_process = this.process.clone();
@@ -41,6 +50,14 @@ impl Transport {
         });
         let (tx, rx) = mpsc::channel(256);
         let weak = Arc::downgrade(&this);
+        let process = this.process.clone();
+        let exited = weak.clone();
+        tokio::spawn(async move {
+            let _ = process.wait_status().await;
+            if let Some(transport) = exited.upgrade() {
+                transport.healthy.store(false, Ordering::Release);
+            }
+        });
         let stop = this.stop.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -63,6 +80,9 @@ impl Transport {
                     Ok(value) => value,
                     Err(error) => break format!("Invalid Claude stream-json frame: {error}"),
                 };
+                if message["type"].as_str().is_none() {
+                    break "Claude stream-json frame has no type".to_owned();
+                }
                 let Some(transport) = weak.upgrade() else {
                     return;
                 };
@@ -86,6 +106,7 @@ impl Transport {
                     }
                     continue;
                 }
+                transport.incoming.fetch_add(1, Ordering::AcqRel);
                 drop(transport);
                 let sent = tokio::select! {
                     _ = stop.cancelled() => false,
@@ -96,6 +117,7 @@ impl Transport {
                 }
             };
             if let Some(transport) = weak.upgrade() {
+                transport.healthy.store(false, Ordering::Release);
                 let pending = std::mem::take(&mut *transport.pending.lock().unwrap());
                 for (_, sender) in pending {
                     let _ = sender.send(Err(anyhow!(failure.clone())));
@@ -105,9 +127,20 @@ impl Transport {
         });
         Ok((this, rx))
     }
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire) && !self.stop.is_cancelled()
+    }
+
+    pub fn has_incoming_events(&self) -> bool {
+        self.incoming.load(Ordering::Acquire) != 0
+    }
+
+    pub fn finish_event(&self) {
+        self.incoming.fetch_sub(1, Ordering::AcqRel);
+    }
 
     pub fn has_pending_requests(&self) -> bool {
-        !self.pending.lock().unwrap().is_empty()
+        self.controls.load(Ordering::Acquire) != 0
     }
 
     pub async fn request(&self, request: Value, timeout: Duration) -> Result<Value> {
@@ -120,29 +153,47 @@ impl Transport {
         struct Pending<'a> {
             transport: &'a Transport,
             id: String,
+            completed: bool,
         }
         impl Drop for Pending<'_> {
             fn drop(&mut self) {
+                if !self.completed {
+                    self.transport.healthy.store(false, Ordering::Release);
+                }
+                self.transport.controls.fetch_sub(1, Ordering::AcqRel);
                 self.transport.pending.lock().unwrap().remove(&self.id);
             }
         }
-        let _pending = Pending {
+        self.controls.fetch_add(1, Ordering::AcqRel);
+        let mut pending = Pending {
             transport: self,
             id: id.clone(),
+            completed: false,
         };
         let operation = async {
             self.process
                 .write_json(&json!({"type":"control_request","request_id":id,"request":request}))
-                .await?;
-            rx.await
-                .map_err(|_| anyhow!("Claude control reply channel closed"))?
+                .await
+                .inspect_err(|_| self.healthy.store(false, Ordering::Release))?;
+            rx.await.map_err(|_| {
+                self.healthy.store(false, Ordering::Release);
+                anyhow!("Claude control reply channel closed")
+            })?
         };
-        tokio::select! {
-            _ = self.stop.cancelled() => Err(anyhow!("Claude transport closed during control request")),
+        let result = tokio::select! {
+            _ = self.stop.cancelled() => {
+                self.healthy.store(false, Ordering::Release);
+                Err(anyhow!("Claude transport closed during control request"))
+            },
             result = tokio::time::timeout(timeout, operation) => {
-                result.map_err(|_| anyhow!("Claude control request timed out; mutation outcome is unknown"))?
+                result.map_err(|_| {
+                    self.healthy.store(false, Ordering::Release);
+                    anyhow!("Claude control request timed out; mutation outcome is unknown")
+                })?
             }
-        }
+        };
+        pending.completed = true;
+        result
     }
 
     pub async fn reply(&self, id: &str, response: Result<Value>) -> Result<()> {
