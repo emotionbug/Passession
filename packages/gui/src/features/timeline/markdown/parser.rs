@@ -160,6 +160,7 @@ impl<'a> Markdown<'a> {
         Parser::new_with_broken_link_callback(&self.classified, self.options, Some(resolve))
             .into_offset_iter()
             .map(|(event, range)| match event {
+                Event::InlineHtml(html) if super::html::is_inline_break(&html) => Event::HardBreak,
                 Event::Text(text)
                     if matches!(&self.classified, Cow::Owned(_))
                         && text.as_ref() == &self.classified[range.clone()] =>

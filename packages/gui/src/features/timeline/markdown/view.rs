@@ -1532,7 +1532,7 @@ fn table(
     let p = d.look.palette;
     let fs = opts.font_size;
     let height = (fs * 1.4).round() / fs;
-    let columns = head.len().max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    let columns = head.len();
     if columns == 0 {
         return 0.0;
     }
@@ -1543,7 +1543,7 @@ fn table(
         for (bold, cells) in
             std::iter::once((true, head)).chain(rows.iter().map(|row| (false, row.as_slice())))
         {
-            for (c, cell) in cells.iter().enumerate() {
+            for (c, cell) in cells.iter().take(columns).enumerate() {
                 if contains_images(d, cell) {
                     widths[c] = 324.0;
                     continue;
@@ -1599,7 +1599,7 @@ fn table(
     measured(cx, d, opts, |cx, d, opts| {
         for (bold, cells) in &all_rows {
             let mut h: f64 = 0.0;
-            for (c, cell) in cells.iter().enumerate() {
+            for (c, cell) in cells.iter().take(columns).enumerate() {
                 if contains_images(d, cell) {
                     h = h.max(paragraph(
                         cx,

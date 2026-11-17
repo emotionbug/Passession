@@ -171,6 +171,20 @@ fn convert(
     String::new()
 }
 
+/// Inline HTML must not introduce source lines: a newline can end a heading,
+/// leave a quote/list, or split one GFM table row into several rows.
+pub(super) fn is_inline_break(raw: &str) -> bool {
+    let Some(tag) = raw.strip_prefix('<') else {
+        return false;
+    };
+    tag.get(..2)
+        .is_some_and(|name| name.eq_ignore_ascii_case("br"))
+        && tag
+            .as_bytes()
+            .get(2)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+}
+
 /// Use CommonMark's source ranges rather than a second fence/backtick grammar.
 /// This also covers indented code, list-contained fences, escaped backticks,
 /// reference definitions and balanced parentheses in link destinations.
@@ -185,6 +199,9 @@ fn protected_ranges(source: &str) -> Vec<(usize, usize)> {
     for (event, range) in parser.into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(_)) | Event::Code(_) => {
+                ranges.push((range.start, range.end));
+            }
+            Event::InlineHtml(html) if is_inline_break(&html) => {
                 ranges.push((range.start, range.end));
             }
             Event::Start(Tag::Link { .. } | Tag::Image { .. }) => {

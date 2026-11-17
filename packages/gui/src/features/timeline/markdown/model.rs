@@ -637,6 +637,87 @@ mod tests {
     }
 
     #[test]
+    fn table_inline_html_breaks_keep_six_columns_and_two_body_rows() {
+        let source = r#"| 순위 | 후보 | 근거 | 효과 | 위험 | 규모 |
+|---|---|---|---|---|---|
+| 1 | **Git 감시를 보고 있는 프로젝트로 한정**<br>· Git 화면·Git 버튼이 열린 프로젝트만 전체 감시. Git이 추적하는 폴더만 감시<br>· 나머지 프로젝트는 `.git/HEAD`만 감시해 브랜치 이름 유지<br>· 열지 않은 프로젝트는 3분마다 원격 가져오기(`git fetch`) 중단. 열 때 1회 실행 | 감시 59,881개 / 한도 65,536개<br>모든 프로젝트에 3분마다 `git fetch`<br>로그의 99.6%가 감시 경고 | 파일 감시 한도 위험 해소<br>대기 중 CPU·네트워크 감소<br>로그 정상화 | 원격 새 커밋은 Git 화면을 열 때 반영 | 중 |
+| 2 | **쓰지 않는 파일 정리** | 90 MB + 31 MB | 디스크 | 낮음 | 소 |"#;
+        for linkify_files in [false, true] {
+            let blocks = parse(source, None, linkify_files);
+            let [Block::Table { aligns, head, rows }] = blocks.as_slice() else {
+                panic!("expected one table, got {blocks:?}");
+            };
+            assert_eq!(aligns.len(), 6);
+            assert_eq!(head.len(), 6);
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.len() == 6));
+            assert_eq!(inline_text(&head[0]), "순위");
+            assert_eq!(inline_text(&head[5]), "규모");
+            let candidate = &rows[0][1];
+            assert_eq!(
+                styled_text(candidate, true, false),
+                "Git 감시를 보고 있는 프로젝트로 한정"
+            );
+            assert_eq!(
+                candidate
+                    .iter()
+                    .filter(|inline| matches!(inline, Inline::Break))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                inline_text(candidate),
+                "Git 감시를 보고 있는 프로젝트로 한정\n· Git 화면·Git 버튼이 열린 프로젝트만 전체 감시. Git이 추적하는 폴더만 감시\n· 나머지 프로젝트는 .git/HEAD만 감시해 브랜치 이름 유지\n· 열지 않은 프로젝트는 3분마다 원격 가져오기(git fetch) 중단. 열 때 1회 실행"
+            );
+            assert_eq!(inline_text(&rows[1][5]), "소");
+        }
+    }
+
+    #[test]
+    fn inline_html_breaks_preserve_blocks_and_header_defines_table_width() {
+        for source in [
+            "before<br>after",
+            "# before<BR />after",
+            "- before<br class=\"line\">after",
+            "> before<br/>after",
+        ] {
+            let blocks = parse(source, None, false);
+            let inlines = match blocks.as_slice() {
+                [Block::Paragraph(inlines)] | [Block::Heading { inlines, .. }] => inlines,
+                [Block::List { items, .. }] if items.len() == 1 => {
+                    let [Block::Paragraph(inlines)] = items[0].blocks.as_slice() else {
+                        panic!("list item split: {blocks:?}");
+                    };
+                    inlines
+                }
+                [Block::Quote(blocks)] => {
+                    let [Block::Paragraph(inlines)] = blocks.as_slice() else {
+                        panic!("quote split: {blocks:?}");
+                    };
+                    inlines
+                }
+                _ => panic!("block split for {source}: {blocks:?}"),
+            };
+            assert_eq!(inline_text(inlines), "before\nafter", "{source}");
+            assert!(inlines.iter().any(|inline| matches!(inline, Inline::Break)));
+        }
+        let blocks = parse(
+            "| a | b | c |\n|---|---|---|\n| short<br>line |\n| 1 | 2 | 3 | ignored |",
+            None,
+            false,
+        );
+        let [Block::Table { head, rows, .. }] = blocks.as_slice() else {
+            panic!("expected table, got {blocks:?}");
+        };
+        assert_eq!(head.len(), 3);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.len() == head.len()));
+        assert_eq!(inline_text(&rows[0][0]), "short\nline");
+        assert!(rows[0][1].is_empty() && rows[0][2].is_empty());
+        assert_eq!(inline_text(&rows[1][2]), "3");
+    }
+
+    #[test]
     fn multilingual_emphasis_keeps_display_and_find_text_exact() {
         let source = "첨부한 위치대로 **호스트 메뉴 맨 아래에 ‘버전’**을 추가하겠습니다.";
         let inlines = paragraph(source);

@@ -25,6 +25,7 @@
 
 - Resume or retry a host update after reopening the app instead of failing with "Selected host update failed: …". The saved update request is stored as JSON text, and reading it back used the whole text as the operation ID, which the daemon rejected as not a UUID. Saved requests are now read as requests, and a saved record whose ID the daemon can never accept is discarded.
 - Fix typing lag in the message composer. Each keystroke copied every saved draft, wrote the preferences file with `fsync` inside the app's command loop, republished the whole app state and repainted every layer of every window. Drafts are now saved after 500 ms without typing, and at least every 2 s while typing continues, on a background writer that never holds up other work; sending, creating a session, closing a window, backgrounding the app and quitting still save the latest text first. A keystroke repaints only the composer, and its text is laid out once instead of four times.
+- Keep Markdown tables intact when a cell contains `<br>`. The break was turned into a new source line before parsing, which split the row into several rows, pushed the remaining text into the first column and hid the other columns off-screen on narrow windows. The break now stays a line break inside its cell, paragraph, heading, list item or quote, and the header row sets the number of columns.
 
 ## 0.13.35 - 2026-11-17
 
