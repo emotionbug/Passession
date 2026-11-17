@@ -1,5 +1,5 @@
 use super::{Peer, plain};
-use axum::body::Body;
+use axum_core::body::Body;
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;

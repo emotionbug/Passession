@@ -8,7 +8,7 @@ use crate::{
     state::AppState,
     transport::{Admission, TransportService},
 };
-use axum::body::Body;
+use axum_core::body::Body;
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;

@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["ws", "multipart"] }
+axum-core = "0.5"
 base64 = "0.22"
 bcrypt = "0.17"
 bytes = "1"
@@ -32,15 +32,8 @@ hostname = "0.4"
 http = "1"
 jsonschema = { version = "0.60.2", default-features = false }
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = [
-  "client-legacy",
-  "server",
-  "http1",
-  "http2",
-  "tokio",
-  "service",
-] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 icu_collator = "2.4"
 icu_casemap = "2.4"
 icu_locale_core = "2.4"
@@ -85,8 +78,6 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
-tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "tracing-log"] }
 unicode-normalization = "0.1"
@@ -98,6 +89,7 @@ which = "8"
 zeroize = "1"
 
 [dev-dependencies]
+axum = "0.8"
 tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(not(unix))'.dependencies]

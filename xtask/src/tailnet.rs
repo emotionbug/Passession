@@ -11,6 +11,12 @@ use std::{
 };
 use walkdir::WalkDir;
 
+/// Build tags shared by the library build, the `go list` package set that
+/// selects notices, and the build fingerprint. `ts_omit_webclient` drops the
+/// node-management web UI on port 5252 (already stubbed on Android); browser
+/// sign-in uses the control server's auth URL and is unaffected.
+const GO_TAGS: &str = "-tags=ts_omit_webclient";
+
 pub struct NativeBuild {
     pub library: PathBuf,
     pub notices: String,
@@ -282,7 +288,7 @@ fn build(target: Target) -> Result<NativeBuild> {
         "go": toolchain, "goSha256": sha256_file(&go)?, "compiler": target.compiler,
         "compilerSha256": sha256_file(&target.compiler)?, "compilerVersion": compiler_version,
         "compilerArgs": target.compiler_args, "cflags": target.cflags,
-        "ldflags": target.ldflags, "sdk": target.sdk,
+        "ldflags": target.ldflags, "sdk": target.sdk, "goTags": GO_TAGS,
         "stamps": stamps,
         "pipeline": hex::encode(Sha256::digest(concat!(include_str!("tailnet.rs"), include_str!("notices.rs")).as_bytes())),
     });
@@ -304,13 +310,23 @@ fn build(target: Target) -> Result<NativeBuild> {
     }
     // Go verifies downloaded module bytes against the committed go.sum; readonly
     // resolution cannot silently update dependency versions or checksums.
-    let buildmode = if target.platform == "ios" {
-        "-buildmode=c-archive"
+    // A shared library ships as built, so it drops the symbol table and DWARF.
+    // The iOS archive keeps them: Xcode links and strips the app, and its
+    // debug information belongs in the dSYM.
+    let (buildmode, strip) = if target.platform == "ios" {
+        ("-buildmode=c-archive", "")
     } else {
-        "-buildmode=c-shared"
+        ("-buildmode=c-shared", "-s -w ")
     };
-    let packages =
-        capture(command().args(["list", "-mod=readonly", "-deps", "-json", buildmode, "."]))?;
+    let packages = capture(command().args([
+        "list",
+        "-mod=readonly",
+        GO_TAGS,
+        "-deps",
+        "-json",
+        buildmode,
+        ".",
+    ]))?;
     let mut modules = BTreeMap::new();
     for package in serde_json::Deserializer::from_str(&packages).into_iter::<Value>() {
         let package = package?;
@@ -344,8 +360,9 @@ fn build(target: Target) -> Result<NativeBuild> {
             "-trimpath",
             "-buildvcs=false",
             "-p=2",
+            GO_TAGS,
             &format!(
-                "-ldflags=-buildid= {}",
+                "-ldflags={strip}-buildid= {}",
                 crate::components::go_stamps(&stamps)
             ),
         ])

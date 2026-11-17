@@ -77,7 +77,7 @@ jobs:
           GOMAXPROCS: "2"
           CGO_ENABLED: "1"
         run: |
-          go build -mod=readonly -p=2 -buildmode=c-shared -o "$RUNNER_TEMP/libpaseo_tailscale.so" .
+          go build -mod=readonly -p=2 -tags=ts_omit_webclient -buildmode=c-shared -o "$RUNNER_TEMP/libpaseo_tailscale.so" .
           nm -D --defined-only "$RUNNER_TEMP/libpaseo_tailscale.so" | grep -w PaseoAbiVersion
       - name: Test isolated desktop update handoff and recovery
         if: steps.plan.outputs.helper == 'true'
