@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Unload agents that have been idle for an hour while no app shows them, freeing their provider processes. They still appear as idle and resume automatically on the next message or when opened. Agents with running work, background jobs, pending permissions or queued messages stay loaded, and only providers that can confirm they are settled are unloaded; today that is OMP. Change or turn off the timeout under a host's Agents settings.
+
 ### Changed
 
 - Share each daemon agent event among its subscribers instead of copying it for every one, and stop waking idle terminal streams every 8 ms. A subscribed terminal now wakes only when it has output to send.

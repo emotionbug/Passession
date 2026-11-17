@@ -367,6 +367,65 @@ fn toggle(
 
 // ------------------------------------------------------------ agents page
 
+fn idle_runtime_timeout_options(current: u64) -> Vec<(String, String)> {
+    let mut values = vec![0, 1_800_000, 3_600_000, 7_200_000, 14_400_000, 28_800_000];
+    if !values.contains(&current) {
+        values.push(current);
+        values.sort_unstable();
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let label = if value == 0 {
+                t("settings.host.agents.idleRuntime.off")
+            } else {
+                let (unit, count) = if value.is_multiple_of(3_600_000) {
+                    ("hours", value / 3_600_000)
+                } else if value.is_multiple_of(60_000) {
+                    ("minutes", value / 60_000)
+                } else if value.is_multiple_of(1_000) {
+                    ("seconds", value / 1_000)
+                } else {
+                    ("milliseconds", value)
+                };
+                ta(
+                    &format!("settings.host.agents.idleRuntime.{unit}"),
+                    &[("count", &count.to_string())],
+                )
+            };
+            (value.to_string(), label)
+        })
+        .collect()
+}
+
+fn draw_idle_runtime_timeout(ui: &mut Ui, s: &Settings, host: &HostView) {
+    let d = data(s, &host.server_id).expect("drawn after load");
+    let current = get(&d.config, "idleRuntimeTimeoutMs")
+        .as_u64()
+        .unwrap_or(3_600_000);
+    let id = host.server_id.clone();
+    let pick: super::app::Pick = Rc::new(move |s, env, picked| {
+        if let Ok(timeout) = picked.parse::<u64>() {
+            run_patch(s, env, &id, json!({"idleRuntimeTimeoutMs": timeout}));
+        }
+    });
+    let label = t("settings.host.agents.idleRuntime.title");
+    let ctl = super::app::select_ctl(
+        &format!("daemon.{}.idleRuntimeTimeoutMs", host.server_id),
+        label.clone(),
+        &current.to_string(),
+        idle_runtime_timeout_options(current),
+        220.0,
+        !d.busy && host.can_manage(),
+        pick,
+    );
+    ui.row(
+        row(label)
+            .hint(t("settings.host.agents.idleRuntime.hint"))
+            .control(ctl),
+    );
+}
+
 pub fn draw_agents(ui: &mut Ui, s: &Settings, v: &super::View, host: &HostView) {
     let disconnected = !host.connected();
     if !disconnected && draw_state(ui, s, host) {
@@ -391,6 +450,7 @@ pub fn draw_agents(ui: &mut Ui, s: &Settings, v: &super::View, host: &HostView) 
             t("settings.host.orchestration.enableTools.title"),
             Some(t("settings.host.orchestration.enableTools.hint")),
         );
+        draw_idle_runtime_timeout(ui, s, host);
         ui.card_end();
         ui.gap(12.0);
         ui.card_begin();
@@ -2371,5 +2431,40 @@ pub fn skills_body(ui: &mut Ui, id: u64, p: &SkillsSheet) {
     if let Some(error) = &p.error {
         ui.gap(16.0);
         ui.para(error, 12.0, pal.danger);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{idle_runtime_timeout_options, ta};
+
+    #[test]
+    fn idle_runtime_timeout_options_preserve_custom_values() {
+        let presets = idle_runtime_timeout_options(3_600_000);
+        assert_eq!(
+            presets
+                .iter()
+                .map(|(value, _)| value.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "1800000", "3600000", "7200000", "14400000", "28800000"],
+        );
+        for (value, unit, count) in [
+            (5_400_000, "minutes", "90"),
+            (1_000, "seconds", "1"),
+            (2_147_483_647, "milliseconds", "2147483647"),
+        ] {
+            let options = idle_runtime_timeout_options(value);
+            assert_eq!(options.len(), 7);
+            assert_eq!(
+                options.iter().find(|(id, _)| id == &value.to_string()),
+                Some(&(
+                    value.to_string(),
+                    ta(
+                        &format!("settings.host.agents.idleRuntime.{unit}"),
+                        &[("count", count)],
+                    ),
+                )),
+            );
+        }
     }
 }

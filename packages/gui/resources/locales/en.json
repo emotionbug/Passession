@@ -3179,7 +3179,22 @@
           "saving": "Saving..."
         }
       },
-      "agents": { "unavailable": "Connect to this host to manage agents" },
+      "agents": {
+        "unavailable": "Connect to this host to manage agents",
+        "idleRuntime": {
+          "title": "Unload idle agents after",
+          "hint": "Idle agents not open in any app are closed to free memory and resume automatically when used. Agents with running background work stay loaded.",
+          "off": "Off",
+          "hours_one": "{{count}} hour",
+          "hours_other": "{{count}} hours",
+          "minutes_one": "{{count}} minute",
+          "minutes_other": "{{count}} minutes",
+          "seconds_one": "{{count}} second",
+          "seconds_other": "{{count}} seconds",
+          "milliseconds_one": "{{count}} millisecond",
+          "milliseconds_other": "{{count}} milliseconds"
+        }
+      },
       "workspaces": { "unavailable": "Connect to this host to manage workspaces" },
       "terminalProfiles": {
         "unavailable": "Connect to this host to manage terminal profiles",

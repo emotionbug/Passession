@@ -3191,7 +3191,18 @@
           "saving": "저장하는 중..."
         }
       },
-      "agents": { "unavailable": "에이전트를 관리하려면 이 호스트에 연결하세요" },
+      "agents": {
+        "unavailable": "에이전트를 관리하려면 이 호스트에 연결하세요",
+        "idleRuntime": {
+          "title": "유휴 에이전트 메모리 해제 대기 시간",
+          "hint": "어느 앱에서도 열려 있지 않은 유휴 에이전트는 메모리 확보를 위해 닫히며, 사용할 때 자동으로 재개됩니다. 백그라운드 작업이 실행 중인 에이전트는 메모리에 유지됩니다.",
+          "off": "사용 안 함",
+          "hours_other": "{{count}}시간",
+          "minutes_other": "{{count}}분",
+          "seconds_other": "{{count}}초",
+          "milliseconds_other": "{{count}}밀리초"
+        }
+      },
       "workspaces": { "unavailable": "워크스페이스를 관리하려면 이 호스트에 연결하세요" },
       "terminalProfiles": {
         "unavailable": "터미널 프로필을 관리하려면 이 호스트에 연결하세요",
