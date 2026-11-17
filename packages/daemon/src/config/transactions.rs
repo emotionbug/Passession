@@ -32,6 +32,7 @@ pub const RELOADABLE: &[(&str, &str)] = &[
     ("app.baseUrl", "app.baseUrl"),
     ("agents.providers", "providers"),
     ("agents.catalogRefreshTimeoutMs", "catalogRefreshTimeoutMs"),
+    ("agents.idleRuntimeTimeoutMs", "idleRuntimeTimeoutMs"),
     ("agents.metadataGeneration", "metadataGeneration"),
     ("agents.skills.selection", "skills.selection"),
     ("pluginsEnabled", "pluginsEnabled"),
@@ -92,6 +93,7 @@ pub fn supported_patch(mut patch: Value, skills: bool) -> Result<Value> {
         "providers",
         "removeProviders",
         "metadataGeneration.providers",
+        "idleRuntimeTimeoutMs",
         "autoArchiveAfterMerge",
         "enableTerminalAgentHooks",
         "appendSystemPrompt",
@@ -179,6 +181,9 @@ pub fn persist_patch(current: &Value, patch: &Value, remove: &[String]) -> Resul
         if let Some(value) = patch.get(path) {
             set(&mut result, path, Some(value));
         }
+    }
+    if let Some(value) = patch.get("idleRuntimeTimeoutMs") {
+        set(&mut result, "agents.idleRuntimeTimeoutMs", Some(value));
     }
     if patch.get("providers").is_some()
         || patch.get("metadataGeneration").is_some()

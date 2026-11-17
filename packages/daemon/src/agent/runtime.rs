@@ -311,6 +311,7 @@ impl AgentManager {
         {
             let mut data = cell.data.lock().await;
             data.ready = true;
+            cell.activity.touch();
             data.snapshot = snapshot.clone();
         }
         let _ = self
@@ -559,6 +560,7 @@ impl AgentManager {
         result
     }
     pub(super) async fn ensure_loaded(&self, id: &str) -> Result<Arc<AgentCell>> {
+        let _resident = self.keep_runtime(id).await;
         if let Ok(cell) = self.cell(id).await
             && cell.data.lock().await.serves_runtime()
         {
@@ -766,6 +768,11 @@ impl AgentManager {
         mut event: Value,
         from_history: bool,
     ) -> Result<()> {
+        let _resident = cell.activity.gate.clone().read_owned().await;
+        if cell.unloaded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        cell.activity.touch();
         if event["type"] == "timeline" {
             event["item"] = timeline::limit_item_content(event["item"].take());
         }
@@ -1348,18 +1355,6 @@ impl AgentManager {
             {
                 self.apply_subagent_event(id,cell,&json!({"provider":child["provider"],"event":{"type":"upsert","id":child["id"],"status":"canceled"}}),true).await?;
             }
-            if !internal {
-                let store = self.subagent_store.clone();
-                let parent = id.to_owned();
-                tokio::task::spawn_blocking(move || {
-                    store
-                        .lock()
-                        .map_err(|_| anyhow!("Subagent lock poisoned"))?
-                        .release_parent(&parent);
-                    Ok::<_, anyhow::Error>(())
-                })
-                .await??;
-            }
         }
         let mut snapshot = cell.data.lock().await.snapshot.clone();
         let interrupted = is_busy(&snapshot) || snapshot["activeForegroundTurnId"].is_string();
@@ -1383,19 +1378,42 @@ impl AgentManager {
                 .emit("agent.closed", json!({"agent":hook_agent(&snapshot)}))
                 .await;
         }
-        cell.cancel.cancel();
-        if let Some(task) = cell.task.lock().await.take() {
-            let _ = task.await;
-        }
-        self.agents.write().await.remove(id);
-        self.app()?.mcp.revoke_agent(id).await;
+        self.teardown_cell(id, cell).await?;
         if let Some(error) = event_error {
             Err(error)
         } else {
             Ok(())
         }
     }
+    /// Shared ownership release; callers decide whether closure is a visible
+    /// lifecycle transition or a silent residency change.
+    pub(super) async fn teardown_cell(&self, id: &str, cell: &Arc<AgentCell>) -> Result<()> {
+        cell.cancel.cancel();
+        if let Some(task) = cell.task.lock().await.take() {
+            let _ = task.await;
+        }
+        let store = self.subagent_store.clone();
+        let parent = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .release_parent(&parent);
+        })
+        .await?;
+        let mut agents = self.agents.write().await;
+        if agents
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, cell))
+        {
+            agents.remove(id);
+        }
+        drop(agents);
+        self.app()?.mcp.revoke_agent(id).await;
+        Ok(())
+    }
     pub async fn shutdown(&self) -> Result<()> {
+        self.stop_idle_unload().await?;
         self.notifications.shutdown().await?;
         self.message_delivery.shutdown().await?;
         self.closing.store(true, Ordering::Release);

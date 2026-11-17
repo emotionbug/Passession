@@ -23,6 +23,7 @@ mod date_parse;
 pub(crate) mod event_stage;
 mod generation;
 mod history_read;
+mod idle_unload;
 mod listing;
 pub mod notifications;
 pub mod receipts;
@@ -180,6 +181,8 @@ struct AgentCell {
     stage: Mutex<Option<EventStage>>,
     barriers: Mutex<HashMap<String, oneshot::Sender<()>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    activity: Arc<idle_unload::RuntimeActivity>,
+    unloaded: AtomicBool,
 }
 
 pub struct AgentManager {
@@ -205,6 +208,7 @@ pub struct AgentManager {
     child_read_gates: Mutex<HashMap<String, Weak<RwLock<()>>>>,
     events: broadcast::Sender<Arc<Value>>,
     closing: AtomicBool,
+    idle_unload: idle_unload::IdleUnload,
 }
 
 impl AgentManager {
@@ -229,6 +233,7 @@ impl AgentManager {
             child_read_gates: Mutex::new(HashMap::new()),
             events,
             closing: AtomicBool::new(false),
+            idle_unload: idle_unload::IdleUnload::default(),
         }
     }
     pub(super) fn app(&self) -> Result<Arc<AppState>> {
@@ -273,7 +278,14 @@ impl AgentManager {
             .await;
         self.restore_persisted_state().await?;
         crate::daemon_admin::update_operation::initialize_admission(&self.app()?).await?;
-        self.notifications.initialize().await
+        self.notifications.initialize().await?;
+        self.configure_idle_runtime_timeout(
+            self.app()?.config.snapshot()["idleRuntimeTimeoutMs"]
+                .as_u64()
+                .unwrap_or(3_600_000),
+        );
+        self.start_idle_unload().await;
+        Ok(())
     }
     // Catalogs are read per parent on demand; unrelated corruption cannot abort startup.
     async fn restore_persisted_state(&self) -> Result<()> {
@@ -316,7 +328,9 @@ impl AgentManager {
         self.notifications.register(input, pending).await
     }
     pub async fn has_in_flight_run(&self, id: &str) -> Result<bool> {
-        let cell = self.cell(id).await?;
+        let Some(cell) = self.agents.read().await.get(id).cloned() else {
+            return Ok(false);
+        };
         let has_session = {
             let data = cell.data.lock().await;
             if data.session.is_none() || data.owner_ended {
@@ -667,6 +681,8 @@ impl AgentManager {
             stage: Mutex::new((!history).then(EventStage::default)),
             barriers: Mutex::new(HashMap::new()),
             task: Mutex::new(None),
+            activity: self.runtime_activity(id),
+            unloaded: AtomicBool::new(false),
         });
         self.agents
             .write()
@@ -705,6 +721,12 @@ impl AgentManager {
                 let closing = event.is_none();
                 let mut direct = None;
                 if let Some(event) = event {
+                    if !matches!(
+                        text(&event, "type"),
+                        Some("__flush" | "__barrier" | "__release_stage")
+                    ) {
+                        current.activity.touch();
+                    }
                     if event["type"] != "__flush" {
                         if matches!(text(&event, "type"), Some("__barrier" | "__release_stage")) {
                             flushed.extend(coalescer.flush_for(&id, now_ms));

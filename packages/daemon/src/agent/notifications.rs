@@ -162,6 +162,16 @@ impl FinishSubscriptions {
         }
         Ok(())
     }
+    pub(super) async fn watches_local_child(&self, id: &str) -> bool {
+        let state = self.inner.state.lock().await;
+        state.watches.iter().any(|((_, child, server), watches)| {
+            child == id
+                && server
+                    .as_deref()
+                    .is_none_or(|server| server == state.server_id)
+                && watches.iter().any(|watch| !watch.cancel.is_cancelled())
+        })
+    }
     pub async fn register(&self, mut input: Value, pending: bool) -> Result<FinishRegistration> {
         self.initialize().await?;
         input
@@ -170,6 +180,10 @@ impl FinishSubscriptions {
             .insert("id".into(), json!(uuid::Uuid::new_v4().to_string()));
         let mut record: FinishSubscription = serde_json::from_value(input)?;
         record.validate()?;
+        let _resident = match self.inner.app.upgrade() {
+            Some(app) => Some(app.agents.keep_runtime(&record.child_agent_id).await),
+            None => None,
+        };
         let mut state = self.inner.state.lock().await;
         if state.closed {
             bail!("Finish subscriptions are closed");

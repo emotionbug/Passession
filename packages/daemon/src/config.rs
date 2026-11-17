@@ -302,6 +302,11 @@ impl ConfigService {
         {
             tracing::warn!(%error, "Daemon configuration applied but terminal hook installation failed");
         }
+        if next.get("idleRuntimeTimeoutMs") != previous.get("idleRuntimeTimeoutMs") {
+            app.agents.configure_idle_runtime_timeout(
+                next["idleRuntimeTimeoutMs"].as_u64().unwrap_or(3_600_000),
+            );
+        }
         Ok(())
     }
 

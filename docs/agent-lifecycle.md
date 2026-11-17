@@ -30,8 +30,25 @@ Reload releases the old runtime before resuming its durable session: an idle pro
 still own an exclusive writer. A close failure retains that runtime for cleanup and blocks the
 replacement. Once closure succeeds, a failed resume leaves the durable agent closed and retryable.
 
-Idle agents remain resident indefinitely. Runtime closure happens only through an explicit lifecycle
-action such as archive, replacement, reload, or daemon shutdown.
+Runtime closure happens through an explicit lifecycle action such as archive, replacement, reload
+or daemon shutdown, or through idle unloading.
+
+Idle unloading releases the provider runtime of an agent that has been idle for
+`agents.idleRuntimeTimeoutMs` (default one hour, `0` disables it) while no connected client
+subscribes to its timeline. It leaves the agent exactly as a daemon restart would: the stored
+record stays `idle`, timeline, attention and activity timestamps are unchanged, and no closed or
+finish notification, attention or `agent.closed` hook is produced. The next prompt, control action
+or history preparation resumes it through `ensureAgentLoaded()`.
+
+An agent stays resident while anything could still be running inside its provider: a turn,
+initialization, replacement, pending permission, queued or in-flight message delivery, an active
+finish watch on it, or a running provider subagent. The provider must also report itself settled and
+resumable (`AgentSession::unload_readiness`). OMP reports this through `get_state`
+(`isStreaming`, `isCompacting`, `queuedMessageCount`, `hasPendingAsyncWork`, `isSettled`) and a
+native session file. Providers that cannot prove the absence of background work stay resident:
+Claude Code drops ambient and shell task announcements before Paseo can track them, and Codex, ACP,
+OpenCode, Copilot and plugin providers expose no background-work inventory.
+The manager re-checks every condition inside the agent's lifecycle lane before closing.
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and

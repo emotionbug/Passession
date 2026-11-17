@@ -502,6 +502,12 @@
           "exclusiveMinimum": 0,
           "maximum": 2147483647
         },
+        "idleRuntimeTimeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 3600000
+        },
         "metadataGeneration": {
           "type": "object",
           "properties": {

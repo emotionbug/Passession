@@ -7,6 +7,7 @@ use crate::providers::api::PromptDeliveryError;
 impl AgentManager {
     pub async fn send(&self, actor: &Value, id: &str, mut input: Value) -> Result<Value> {
         self.authorize(actor, id).await?;
+        let _resident = self.keep_runtime(id).await;
         if actor["kind"] != "agent" && text(&input, "sourceAgentId").is_none() {
             return self.send_immediate(actor, id, input).await;
         }
@@ -221,6 +222,7 @@ impl AgentManager {
         gate: Option<&DispatchGate>,
     ) -> Result<Value> {
         self.authorize(actor, id).await?;
+        let _resident = self.keep_runtime(id).await;
         let prompt = build_prompt(&input)?;
         let source = if actor["kind"] == "agent" {
             let caller = required(actor, "agentId")?;
@@ -964,6 +966,7 @@ impl AgentManager {
         cancel: CancellationToken,
     ) -> Result<Value> {
         self.authorize(actor, id).await?;
+        let preparation = self.keep_runtime(id).await;
         // Start waits retain deliberate provider preparation; finish waits only
         // observe existing work, including closed agents after recovery.
         let start_only = options["phase"] == "start";
@@ -975,6 +978,7 @@ impl AgentManager {
         {
             self.ensure_loaded(id).await?;
         }
+        drop(preparation);
         self.message_delivery
             .wait_for_dispatch(id, cancel.clone())
             .await?;
@@ -1007,6 +1011,7 @@ impl AgentManager {
         }
     }
     pub async fn schedule_run(&self, id: &str, prompt: Value) -> Result<Value> {
+        let _resident = self.keep_runtime(id).await;
         let actor = json!({"kind":"system","source":"schedule"});
         let cell = self.prepare_send(id, &json!({"prompt":prompt})).await?;
         self.dispatch_prompt(
@@ -1126,6 +1131,7 @@ impl AgentManager {
         action: &str,
         input: Value,
     ) -> Result<Value> {
+        let _resident = self.keep_runtime(id).await;
         if action == "commands" {
             return Ok(json!(
                 self.commands(

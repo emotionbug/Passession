@@ -98,6 +98,7 @@ enum Kind {
     Number,
     Positive,
     Timeout,
+    IdleTimeout,
     Version,
     Url,
     Bcrypt,
@@ -250,6 +251,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
             &[
                 ("providers", ProviderMap, false),
                 ("catalogRefreshTimeoutMs", Timeout, false),
+                ("idleRuntimeTimeoutMs", IdleTimeout, false),
                 ("metadataGeneration", Metadata, false),
                 ("skills", Skills, false),
             ],
@@ -400,6 +402,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
                 ("providers", Record(&PatchProvider), false),
                 ("removeProviders", Array(&Nonempty), false),
                 ("metadataGeneration", PatchMetadata, false),
+                ("idleRuntimeTimeoutMs", IdleTimeout, false),
                 ("autoArchiveAfterMerge", Boolean, false),
                 ("enableTerminalAgentHooks", Boolean, false),
                 ("appendSystemPrompt", Text, false),
@@ -642,7 +645,7 @@ fn validate_leaf(value: &Value, kind: Kind) -> Result<()> {
         }
         Boolean if !value.is_boolean() => bail!("Expected boolean"),
         Boolean => {}
-        Number | Positive | Timeout => {
+        Number | Positive | Timeout | IdleTimeout => {
             let number = value
                 .as_f64()
                 .filter(|n| n.is_finite())
@@ -655,7 +658,10 @@ fn validate_leaf(value: &Value, kind: Kind) -> Result<()> {
             if matches!(kind, Positive | Timeout) && number <= 0.0 {
                 bail!("Number must be greater than 0");
             }
-            if matches!(kind, Timeout) && number > 2_147_483_647.0 {
+            if matches!(kind, IdleTimeout) && number < 0.0 {
+                bail!("Number must be greater than or equal to 0");
+            }
+            if matches!(kind, Timeout | IdleTimeout) && number > 2_147_483_647.0 {
                 bail!("Number must be less than or equal to 2147483647");
             }
         }

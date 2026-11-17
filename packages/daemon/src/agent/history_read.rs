@@ -209,6 +209,7 @@ impl AgentManager {
             let Some(manager) = app.upgrade().map(|app| app.agents.clone()) else {
                 return;
             };
+            let _resident = manager.keep_runtime(&key).await;
             manager.publish_preparation(&key).await;
             let result = manager
                 .ensure_loaded(&key)
@@ -518,6 +519,7 @@ impl AgentManager {
         parent: &str,
         id: &str,
     ) -> Result<BodyRead> {
+        let _resident = self.keep_runtime(parent).await;
         let _reading = self.child_read_gate(parent).await.read_owned().await;
         let record = self
             .agent_snapshot(parent)

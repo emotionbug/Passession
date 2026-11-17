@@ -22,6 +22,10 @@ pub(super) async fn handle(
                 .map(str::to_owned)
                 .collect();
             let owner = context.begin_subscription("timelines", None, None)?;
+            let mut viewers = Vec::with_capacity(ids.len());
+            for id in &ids {
+                viewers.push(manager.watch_runtime(id).await);
+            }
             let mut events = manager.subscribe_events();
             reply(
                 context,
@@ -35,6 +39,7 @@ pub(super) async fn handle(
             owner.activate().await?;
             let app = std::sync::Arc::downgrade(&manager.app()?);
             tokio::spawn(async move {
+                let _viewers = viewers;
                 let cancel = owner.cancellation();
                 let mut pending = std::collections::VecDeque::new();
                 loop {

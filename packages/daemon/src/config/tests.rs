@@ -279,6 +279,7 @@ fn editable_configuration_paths_stop_at_dynamic_boundaries() {
         "daemon.listen",
         "agents.providers",
         "agents.skills.selection",
+        "agents.idleRuntimeTimeoutMs",
         "daemon.agentProfiles",
         "worktrees.servicePorts.range",
     ] {

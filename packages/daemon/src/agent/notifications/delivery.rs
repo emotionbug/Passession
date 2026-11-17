@@ -72,6 +72,15 @@ impl AgentMessageDelivery {
             }),
         }
     }
+    /// Recipient entries live through both coalescing and dispatch completion.
+    pub(in crate::agent) async fn has_pending_delivery(&self, recipient_id: &str) -> bool {
+        self.inner
+            .state
+            .lock()
+            .await
+            .recipients
+            .contains_key(recipient_id)
+    }
     pub(crate) fn try_reserve(&self) -> Result<OwnedSemaphorePermit> {
         self.inner
             .capacity
@@ -104,6 +113,10 @@ impl AgentMessageDelivery {
             .filter(|s| !s.is_empty())
             .context("Missing agent message recipient")?
             .to_owned();
+        let _resident = match self.inner.app.upgrade() {
+            Some(app) => Some(app.agents.keep_runtime(&recipient_id).await),
+            None => None,
+        };
         let id = input["messageId"]
             .as_str()
             .map(str::to_owned)
