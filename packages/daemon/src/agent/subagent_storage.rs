@@ -279,7 +279,7 @@ impl SubagentStore {
                 HistoryCoverage::Unverified
             };
             let removal = authoritative && coverage == HistoryCoverage::Complete;
-            if stored && !replacement.reconcile_history(&self.timelines[&key], coverage, removal) {
+            if stored && !replacement.reconcile_history(&self.timelines[&key], coverage, removal)? {
                 tracing::warn!(
                     parent_id = parent,
                     subagent_id = id,

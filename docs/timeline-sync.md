@@ -42,6 +42,15 @@ creates and validates the index transactionally; failure leaves no partial migra
 Read-only opens never migrate a checkpoint. An unmigrated database retains the
 original JSON-extraction read path until a writable open creates its index.
 
+A loaded agent keeps only a recent tail of its projection in memory: at most 256 rows and 4 MiB
+of stored row JSON, always including the newest row. Older pages, search, prompts, replay
+matching and corrections read the checkpoint on demand with the same selection results. Updates
+and enrichment of older rows commit in place through the `timeline_rows_identity` and
+`timeline_rows_submitted` expression indexes, which a writable open creates and validates in the
+same transaction as the page index. Readers of a closed agent use one read-only snapshot and never
+load its whole history. Agents without a checkpoint and provider child timelines stay fully
+resident.
+
 The invariants are:
 
 > A continuously subscribed client applies every committed row in order. Opening or resuming an

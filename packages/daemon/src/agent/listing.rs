@@ -139,38 +139,38 @@ impl AgentManager {
     }
     pub async fn timeline(&self, id: &str, options: &Value) -> Result<Value> {
         let cell = self.timeline_cell(id).await?;
-        let timeline = cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?;
-        Ok(timeline.fetch(options))
+        let options = options.clone();
+        cell.read_timeline(move |timeline| timeline.page(&options))
+            .await
     }
     pub async fn timeline_items(&self, id: &str) -> Result<Vec<Value>> {
         if let Ok(cell) = self.cell(id).await {
-            return Ok(cell
-                .timeline
-                .lock()
-                .map_err(|_| anyhow!("Timeline lock poisoned"))?
-                .items());
+            return cell.read_timeline(Timeline::all_items).await;
         }
         let path = self.timeline_path(id)?;
         let id_owned = id.to_owned();
-        let saved = tokio::task::spawn_blocking(move || Timeline::load(&path, &id_owned)).await??;
-        if saved.next_seq() > 1 {
-            return Ok(saved.items());
+        let saved = tokio::task::spawn_blocking(move || {
+            if !path.try_exists()? {
+                return Ok(None);
+            }
+            let saved = Timeline::open_saved(&path, &id_owned)?;
+            if saved.next_seq() > 1 {
+                saved.all_items().map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .await??;
+        if let Some(items) = saved {
+            return Ok(items);
         }
         let cell = self.timeline_cell(id).await?;
-        let items = cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?
-            .items();
-        Ok(items)
+        cell.read_timeline(Timeline::all_items).await
     }
     pub async fn timeline_search(&self, id: &str, options: &Value) -> Result<Value> {
         let options = options.clone();
         self.read_projection(id, move |timeline| timeline.search(&options))
-            .await?
+            .await
     }
     pub async fn timeline_prompts(&self, id: &str) -> Result<Value> {
         self.read_projection(id, Timeline::prompts).await
@@ -198,20 +198,19 @@ impl AgentManager {
     }
     pub async fn last_assistant_message(&self, id: &str) -> Result<Option<String>> {
         if let Ok(cell) = self.cell(id).await {
-            let message = cell
-                .timeline
-                .lock()
-                .map_err(|_| anyhow!("Timeline lock poisoned"))?
-                .last_assistant_message()
-                .map(str::to_owned);
-            return Ok(message);
+            return cell.read_timeline(Timeline::last_assistant_message).await;
         }
         let path = self.timeline_path(id)?;
         let agent_id = id.to_owned();
-        let saved = tokio::task::spawn_blocking(move || Timeline::load(&path, &agent_id)).await??;
         // Finish/attention observers must not start a provider to discover that
         // an agent has no saved assistant message.
-        Ok(saved.last_assistant_message().map(str::to_owned))
+        tokio::task::spawn_blocking(move || {
+            if !path.try_exists()? {
+                return Ok(None);
+            }
+            Timeline::open_saved(&path, &agent_id)?.last_assistant_message()
+        })
+        .await?
     }
     pub async fn activity(&self, id: &str, options: &Value) -> Result<Vec<Value>> {
         crate::activity::curate(&self.timeline_items(id).await?, options)
@@ -219,13 +218,13 @@ impl AgentManager {
     pub async fn fork_context(&self, id: &str, options: &Value) -> Result<Value> {
         let cell = self.timeline_cell(id).await?;
         let snapshot = cell.data.lock().await.snapshot.clone();
-        let timeline = cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?;
-        crate::activity::build_fork_context(
-            &json!({"rows":timeline.rows(),"agentTitle":snapshot["title"],"cwd":snapshot["cwd"],"boundaryMessageId":options["boundaryMessageId"],"cursorBoundary":options.get("boundaryCursor").filter(|v|!v.is_null()).map(|cursor|json!({"cursor":cursor,"timelineEpoch":timeline.epoch()}))}),
-        )
+        let options = options.clone();
+        cell.read_timeline(move |timeline| {
+            let mut input = json!({"agentTitle":snapshot["title"],"cwd":snapshot["cwd"],"boundaryMessageId":options["boundaryMessageId"],"cursorBoundary":options.get("boundaryCursor").filter(|v|!v.is_null()).map(|cursor|json!({"cursor":cursor,"timelineEpoch":timeline.epoch()}))});
+            input["rows"] = Value::Array(timeline.all_rows()?);
+            crate::activity::build_fork_context(&input)
+        })
+        .await
     }
     /// Validates a public parent and returns the persisted subagent storage
     /// root. Child descriptors and bodies are read without starting the parent.

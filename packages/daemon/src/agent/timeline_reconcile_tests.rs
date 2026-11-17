@@ -90,7 +90,7 @@ fn omp_message_reconcile_reorders_changes_and_drops_blocks_preserving_neighbors(
     assert_eq!(rows[3]["item"], tool);
     assert_eq!(rows[3]["timestamp"], "tool-time");
     assert_eq!(
-        timeline.submitted_user_message("client").unwrap()["providerMessageId"],
+        timeline.submitted_user_message("client").unwrap().unwrap()["providerMessageId"],
         "native-user"
     );
 

@@ -46,9 +46,10 @@ fn searchable_blocks(text: &str) -> Vec<String> {
     blocks
 }
 impl Timeline {
+    /// Streams every user and assistant row; stored rows are decoded one at a time.
     pub fn search(&self, options: &Value) -> Result<Value> {
         let query = options["query"].as_str().unwrap_or("").trim();
-        let mut locations = Vec::new();
+        let mut locations: Vec<Value> = Vec::new();
         if query.is_empty() {
             return Ok(json!({"epoch":self.epoch,"locations":locations,"nextCursor":null}));
         }
@@ -62,15 +63,16 @@ impl Timeline {
         .case_insensitive(true)
         .build()?;
         let cursor = options["cursor"].as_i64().unwrap_or(0);
-        for row in &self.rows {
+        let mut next = Value::Null;
+        self.scan(&["user_message", "assistant_message"], |row| {
             let seq = row["seqEnd"].as_i64().unwrap_or(0);
             if seq <= cursor {
-                continue;
+                return Ok(true);
             }
             let role = match row["item"]["type"].as_str() {
                 Some("user_message") => "user",
                 Some("assistant_message") => "assistant",
-                _ => continue,
+                _ => return Ok(true),
             };
             let raw = row["item"]["text"].as_str().unwrap_or("").replace('\r', "");
             let blocks = if role == "assistant" {
@@ -83,36 +85,35 @@ impl Timeline {
                 .map(|block| pattern.find_iter(block).count())
                 .sum::<usize>();
             if count == 0 {
-                continue;
+                return Ok(true);
             }
             if locations.len() == 200 {
-                let next = locations.last().and_then(|v: &Value| v.get("seq")).cloned();
-                return Ok(json!({"epoch":self.epoch,"locations":locations,"nextCursor":next}));
+                next = locations.last().map_or(Value::Null, |v| v["seq"].clone());
+                return Ok(false);
             }
             locations.push(json!({"seq":seq,"role":role,"count":count}));
-        }
-        Ok(json!({"epoch":self.epoch,"locations":locations,"nextCursor":null}))
+            Ok(true)
+        })?;
+        Ok(json!({"epoch":self.epoch,"locations":locations,"nextCursor":next}))
     }
-    pub fn prompts(&self) -> Value {
-        let prompts: Vec<Value> = self
-            .rows
-            .iter()
-            .filter(|row| row["item"]["type"] == "user_message")
-            .map(|row| {
-                let preview = row["item"]["text"]
-                    .as_str()
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let preview = if preview.encode_utf16().count() > 120 {
-                    crate::activity::utf16_prefix(&preview, 119) + "…"
-                } else {
-                    preview
-                };
-                json!({"seq":row["seq"],"timestamp":row["timestamp"],"preview":preview})
-            })
-            .collect();
-        json!({"epoch":self.epoch,"prompts":prompts})
+    /// Streams user rows; stored rows are decoded one at a time.
+    pub fn prompts(&self) -> Result<Value> {
+        let mut prompts = Vec::new();
+        self.scan(&["user_message"], |row| {
+            let preview = row["item"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let preview = if preview.encode_utf16().count() > 120 {
+                crate::activity::utf16_prefix(&preview, 119) + "…"
+            } else {
+                preview
+            };
+            prompts.push(json!({"seq":row["seq"],"timestamp":row["timestamp"],"preview":preview}));
+            Ok(true)
+        })?;
+        Ok(json!({"epoch":self.epoch,"prompts":prompts}))
     }
 }

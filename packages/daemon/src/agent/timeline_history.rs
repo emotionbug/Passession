@@ -1,5 +1,6 @@
 use super::Timeline;
 use crate::providers::api::HistoryCoverage;
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
@@ -43,21 +44,29 @@ fn keys(row: &Value) -> Vec<String> {
     keys
 }
 
+/// Durable identity fields a matched previous row restores onto its replacement.
+struct Restore {
+    index: usize,
+    row: Vec<(&'static str, Value)>,
+    item: Vec<(&'static str, Value)>,
+}
+
 impl Timeline {
     /// Non-destructive refresh requires unique, ordered matches for conversation
     /// rows. Complete provider history may omit daemon notifications: retain those
     /// beside the next matched row rather than dropping them or refusing recovery.
+    /// `previous` is streamed once; stored rows are decoded one at a time.
     pub(in crate::agent) fn reconcile_history(
         &mut self,
         previous: &Self,
         coverage: HistoryCoverage,
         allow_removal: bool,
-    ) -> bool {
+    ) -> Result<bool> {
         if allow_removal && coverage != HistoryCoverage::Complete {
-            return false;
+            return Ok(false);
         }
-        if previous.rows.is_empty() {
-            return true;
+        if previous.len() == 0 {
+            return Ok(true);
         }
         let mut candidates: HashMap<String, Option<usize>> = HashMap::new();
         for (index, row) in self.rows.iter().enumerate() {
@@ -77,8 +86,10 @@ impl Timeline {
         let mut previous_index = None;
         let mut pending_notices = Vec::new();
         let mut retained_notices = Vec::new();
-        for (old_index, row) in previous.rows.iter().enumerate() {
-            let resolved: HashSet<_> = keys(row)
+        let mut accepted = true;
+        let rows = &self.rows;
+        previous.scan(&[], |row| {
+            let resolved: HashSet<_> = keys(&row)
                 .iter()
                 .filter_map(|key| candidates.get(key).copied().flatten())
                 .collect();
@@ -87,17 +98,19 @@ impl Timeline {
                 && matched
                     .is_some_and(|index| previous_index.is_some_and(|previous| index <= previous))
             {
-                return false;
+                accepted = false;
+                return Ok(false);
             }
             // A non-authoritative snapshot may lag live text even when IDs match.
             if !allow_removal
                 && let Some(index) = matched
                 && let Some(text) = row["item"]["text"].as_str().filter(|text| !text.is_empty())
-                && !self.rows[index]["item"]["text"]
+                && !rows[index]["item"]["text"]
                     .as_str()
                     .is_some_and(|next| next.starts_with(text))
             {
-                return false;
+                accepted = false;
+                return Ok(false);
             }
             if let Some(index) = matched {
                 previous_index = Some(index);
@@ -105,34 +118,54 @@ impl Timeline {
             match matched.filter(|index| used.insert(*index)) {
                 Some(index) => {
                     retained_notices.extend(pending_notices.drain(..).map(|old| (index, old)));
-                    matches.push((old_index, index));
+                    let restored = |source: &Value, fields: &[&'static str]| {
+                        fields
+                            .iter()
+                            .filter_map(|&key| {
+                                source
+                                    .get(key)
+                                    .filter(|value| !value.is_null())
+                                    .map(|value| (key, value.clone()))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    matches.push(Restore {
+                        index,
+                        row: restored(&row, &["turnId", "providerMessageId"]),
+                        item: restored(
+                            &row["item"],
+                            &["messageId", "clientMessageId", "images", "attachments"],
+                        ),
+                    });
                 }
                 None if allow_removal => {}
                 None if coverage == HistoryCoverage::Complete
                     && row["item"]["type"] == "notification" =>
                 {
-                    pending_notices.push(old_index);
+                    pending_notices.push(row.into_owned());
                 }
-                None => return false,
+                None => {
+                    accepted = false;
+                    return Ok(false);
+                }
             }
+            Ok(true)
+        })?;
+        if !accepted {
+            return Ok(false);
         }
         retained_notices.extend(
             pending_notices
                 .into_iter()
                 .map(|old| (self.rows.len(), old)),
         );
-        for (old_index, index) in matches {
-            let old = &previous.rows[old_index];
-            let row = &mut self.rows[index];
-            for key in ["turnId", "providerMessageId"] {
-                if let Some(value) = old.get(key).filter(|value| !value.is_null()) {
-                    row[key] = value.clone();
-                }
+        for restore in matches {
+            let row = &mut self.rows[restore.index];
+            for (key, value) in restore.row {
+                row[key] = value;
             }
-            for key in ["messageId", "clientMessageId", "images", "attachments"] {
-                if let Some(value) = old["item"].get(key).filter(|value| !value.is_null()) {
-                    row["item"][key] = value.clone();
-                }
+            for (key, value) in restore.item {
+                row["item"][key] = value;
             }
         }
         // Identity restoration can change the submitted-message index. Rebuild
@@ -145,8 +178,7 @@ impl Timeline {
         let mut shift = 0i64;
         for (index, mut row) in rows.into_iter().enumerate() {
             while notices.peek().is_some_and(|(before, _)| *before == index) {
-                let (_, old) = notices.next().unwrap();
-                let mut notice = previous.rows[old].clone();
+                let (_, mut notice) = notices.next().unwrap();
                 notice["seq"] = json!(super::num(&row, "seqStart") + shift);
                 for key in ["seqStart", "seqEnd", "sourceSeqRanges", "collapsed"] {
                     notice.as_object_mut().unwrap().remove(key);
@@ -166,8 +198,7 @@ impl Timeline {
             }
             self.append_row(row);
         }
-        for (_, old) in notices {
-            let mut notice = previous.rows[old].clone();
+        for (_, mut notice) in notices {
             notice["seq"] = json!(self.next_seq + shift);
             for key in ["seqStart", "seqEnd", "sourceSeqRanges", "collapsed"] {
                 notice.as_object_mut().unwrap().remove(key);
@@ -176,6 +207,6 @@ impl Timeline {
             shift += 1;
         }
         self.next_seq += shift;
-        true
+        Ok(true)
     }
 }

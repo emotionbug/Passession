@@ -233,12 +233,12 @@ impl AgentManager {
     /// Reads only retained history. Model observations must not start a provider,
     /// even when no checkpoint exists or the agent's lifecycle lane is busy.
     pub(crate) async fn observe_timeline(&self, id: &str, options: &Value) -> Result<Value> {
-        if let Some(cell) = self.agents.read().await.get(id).cloned() {
-            return Ok(cell
-                .timeline
-                .lock()
-                .map_err(|_| anyhow!("Timeline lock poisoned"))?
-                .fetch(options));
+        let cell = { self.agents.read().await.get(id).cloned() };
+        if let Some(cell) = cell {
+            let options = options.clone();
+            return cell
+                .read_timeline(move |timeline| timeline.page(&options))
+                .await;
         }
         self.observe_agent_snapshot(id)
             .await?
@@ -279,11 +279,10 @@ impl AgentManager {
             return Ok(None);
         };
         let live = cell.data.lock().await.serves_runtime();
+        let options = options.clone();
         let mut page = cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?
-            .fetch(options);
+            .read_timeline(move |timeline| timeline.page(&options))
+            .await?;
         page["historySource"] = json!(if live { "live" } else { "saved" });
         Ok(Some(page))
     }
@@ -315,12 +314,13 @@ impl AgentManager {
         };
         Ok(page.and_then(|page| page["epoch"].as_str().map(str::to_owned)))
     }
-    /// Runs `read` on the runtime projection, else on the saved checkpoint,
-    /// without starting a provider. Only an agent with neither is loaded.
+    /// Runs `read` on the runtime projection, else on a read-only snapshot of
+    /// the saved checkpoint, without starting a provider. Neither hydrates the
+    /// stored history. Only an agent with neither is loaded.
     pub(super) async fn read_projection<T: Send + 'static>(
         &self,
         id: &str,
-        read: impl FnOnce(&Timeline) -> T + Send + 'static,
+        read: impl FnOnce(&Timeline) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let cell = { self.agents.read().await.get(id).cloned() };
         let cell = match cell {
@@ -333,18 +333,14 @@ impl AgentManager {
                 if tokio::fs::try_exists(&path).await? {
                     let id = id.to_owned();
                     return tokio::task::spawn_blocking(move || {
-                        Timeline::load(&path, &id).map(|timeline| read(&timeline))
+                        read(&Timeline::open_saved(&path, &id)?)
                     })
                     .await?;
                 }
                 self.ensure_loaded(id).await?
             }
         };
-        let timeline = cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?;
-        Ok(read(&timeline))
+        cell.read_timeline(read).await
     }
 
     /// Reads `id`'s stored page under `parent`, fetching that child's native
@@ -740,6 +736,24 @@ impl AgentManager {
             self.emit_subagent_output(parent, false, output).await?;
         }
         Ok(ChildReplay { replaced, finished })
+    }
+}
+
+impl AgentCell {
+    /// Runs `read` on this agent's projection off the async executor: rows
+    /// outside the resident tail are read from its SQLite checkpoint.
+    pub(super) async fn read_timeline<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Timeline) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let timeline = self.timeline.clone();
+        tokio::task::spawn_blocking(move || {
+            let timeline = timeline
+                .lock()
+                .map_err(|_| anyhow!("Timeline lock poisoned"))?;
+            read(&timeline)
+        })
+        .await?
     }
 }
 

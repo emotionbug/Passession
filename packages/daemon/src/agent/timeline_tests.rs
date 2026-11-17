@@ -126,7 +126,7 @@ fn checkpoint_recovery_retains_cursor_ranges_and_user_enrichment() {
         timeline.fetch(&json!({"limit":0}))
     );
     assert_eq!(
-        recovered.submitted_user_message("client").unwrap()["item"]["opaque"],
+        recovered.submitted_user_message("client").unwrap().unwrap()["item"]["opaque"],
         Value::Null
     );
     let mut recovered = recovered;
@@ -348,11 +348,11 @@ fn provider_message_identity_is_durable_without_new_sequence() {
     assert_eq!(recovered.epoch(), epoch);
     assert_eq!(recovered.next_seq(), next);
     assert_eq!(
-        recovered.submitted_user_message("client").unwrap()["providerMessageId"],
+        recovered.submitted_user_message("client").unwrap().unwrap()["providerMessageId"],
         "native-message"
     );
     assert_eq!(
-        recovered.submitted_user_message("client").unwrap()["item"]["messageId"],
+        recovered.submitted_user_message("client").unwrap().unwrap()["item"]["messageId"],
         "client"
     );
     let invalid = directory.path().join("absent").join("checkpoint");
@@ -363,7 +363,7 @@ fn provider_message_identity_is_durable_without_new_sequence() {
             .is_err()
     );
     assert_eq!(
-        timeline.submitted_user_message("client").unwrap()["providerMessageId"],
+        timeline.submitted_user_message("client").unwrap().unwrap()["providerMessageId"],
         "native-message"
     );
 }
@@ -496,7 +496,12 @@ fn failed_sqlite_commit_rolls_back_rows_metadata_and_memory() {
             before
         );
     }
-    assert!(timeline.submitted_user_message("new-client").is_none());
+    assert!(
+        timeline
+            .submitted_user_message("new-client")
+            .unwrap()
+            .is_none()
+    );
     assert!(
         timeline
             .enrich_submitted_persisted(&path, "agent", "client", "uncommitted")
@@ -522,7 +527,7 @@ fn failed_sqlite_commit_rolls_back_rows_metadata_and_memory() {
     let recovered = Timeline::load(&path, "agent").unwrap();
     assert_eq!(recovered.fetch(&json!({"limit":0})), expected);
     assert_eq!(
-        recovered.submitted_user_message("client").unwrap()["providerMessageId"],
+        recovered.submitted_user_message("client").unwrap().unwrap()["providerMessageId"],
         "committed"
     );
 }
@@ -963,7 +968,11 @@ fn history_recovery_preserves_notices_without_guessing_user_message_identity() {
         json!({"type":"user_message","text":"same text","messageId":"different-id"}),
         &options(),
     );
-    assert!(!uncorrelated.reconcile_history(&previous, HistoryCoverage::Complete, false));
+    assert!(
+        !uncorrelated
+            .reconcile_history(&previous, HistoryCoverage::Complete, false)
+            .unwrap()
+    );
     let mut replacement = Timeline::new();
     replacement.append(
         json!({"type":"user_message","text":"older","messageId":"older-id"}),
@@ -973,9 +982,17 @@ fn history_recovery_preserves_notices_without_guessing_user_message_identity() {
         json!({"type":"user_message","text":"same text","messageId":"native-id"}),
         &options(),
     );
-    assert!(!replacement.reconcile_history(&previous, HistoryCoverage::Unverified, false));
+    assert!(
+        !replacement
+            .reconcile_history(&previous, HistoryCoverage::Unverified, false)
+            .unwrap()
+    );
     assert_eq!(previous.fetch(&json!({"limit":0})), before);
-    assert!(replacement.reconcile_history(&previous, HistoryCoverage::Complete, false));
+    assert!(
+        replacement
+            .reconcile_history(&previous, HistoryCoverage::Complete, false)
+            .unwrap()
+    );
     let rows = replacement.rows();
     assert_eq!(rows[0]["item"]["messageId"], "older-id");
     assert_eq!(rows[1]["item"], previous.rows()[0]["item"]);
@@ -991,4 +1008,63 @@ fn history_recovery_preserves_notices_without_guessing_user_message_identity() {
         &options(),
     );
     assert_eq!(appended["seq"].as_i64(), Some(last_seq + 1));
+}
+
+#[test]
+fn bounded_agent_timeline_reads_older_rows_from_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("timeline.sqlite3");
+    let mut full = Timeline::seed(&json!({"epoch":"epoch"})).unwrap();
+    full.append(
+        json!({"type":"user_message","text":"first target","clientMessageId":"old"}),
+        &options(),
+    );
+    full.append(
+        json!({"type":"tool_call","callId":"early","name":"read","status":"running"}),
+        &options(),
+    );
+    for index in 0..RESIDENT_ROWS + 40 {
+        full.append(
+            json!({"type":"user_message","text":format!("row {index}")}),
+            &options(),
+        );
+    }
+    full.persist(&path, "agent").unwrap();
+    let mut bounded = Timeline::load(&path, "agent").unwrap();
+    assert_eq!(bounded.rows.len(), RESIDENT_ROWS);
+    // Completing a tool row outside the resident tail updates it in place.
+    let completed = json!({"type":"tool_call","callId":"early","name":"read","status":"completed"});
+    full.append(completed.clone(), &options());
+    bounded
+        .append_persisted(&path, "agent", completed, &options())
+        .unwrap();
+    assert_eq!(bounded.rows.len(), RESIDENT_ROWS);
+    let last = full.next_seq() - 1;
+    for page in [
+        json!({"limit":40}),
+        json!({"limit":0}),
+        json!({"direction":"before","cursor":{"epoch":"epoch","seq":last},"limit":10}),
+        json!({"direction":"before","cursor":{"epoch":"epoch","seq":12},"limit":5}),
+        json!({"direction":"after","cursor":{"epoch":"epoch","seq":0},"limit":3}),
+        json!({"direction":"after","cursor":{"epoch":"epoch","seq":last - 5},"limit":3}),
+        json!({"direction":"after","cursor":{"epoch":"stale","seq":4},"limit":2}),
+    ] {
+        assert_eq!(bounded.page(&page).unwrap(), full.fetch(&page), "{page}");
+    }
+    let search = json!({"query":"target"});
+    assert_eq!(
+        bounded.search(&search).unwrap(),
+        full.search(&search).unwrap()
+    );
+    assert_eq!(bounded.prompts().unwrap(), full.prompts().unwrap());
+    assert_eq!(bounded.all_items().unwrap(), full.items());
+    assert_eq!(
+        bounded.submitted_user_message("old").unwrap().unwrap()["item"]["text"],
+        "first target"
+    );
+    assert_eq!(bounded.last_item().unwrap().unwrap()["status"], "completed");
+    assert_eq!(
+        Timeline::fetch_saved(&path, "agent", &json!({"limit":0})).unwrap(),
+        full.fetch(&json!({"limit":0}))
+    );
 }

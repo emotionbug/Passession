@@ -431,13 +431,9 @@ impl AgentManager {
                 .await?;
             let launch = self.launch_config(config)?;
             let session = if let Some(handle) = handle.as_ref() {
-                let options = {
-                    let timeline = cell
-                        .timeline
-                        .lock()
-                        .map_err(|_| anyhow!("Timeline lock poisoned"))?;
-                    resume_options(history, &timeline)
-                };
+                let options = cell
+                    .read_timeline(move |timeline| resume_options(history, timeline))
+                    .await?;
                 factory
                     .resume_session(handle.clone(), launch, context, options, cell.sink.clone())
                     .await?
@@ -631,8 +627,9 @@ impl AgentManager {
                     subagent_events.push(event);
                 }
             }
-            let epoch = if replacement.reconcile_history(&current, coverage, allow_removal) {
+            let epoch = if replacement.reconcile_history(&current, coverage, allow_removal)? {
                 replacement.persist(&path, &id_owned)?;
+                replacement.bound_residency();
                 let epoch = replacement.epoch().to_owned();
                 *current = replacement;
                 Some(epoch)
@@ -944,10 +941,8 @@ impl AgentManager {
                         // skipped when it repeats the latest item.
                         let item = json!({"type":"assistant_message","text":format!("{SYSTEM_ERROR_PREFIX} {}", turn_failed_message(&event))});
                         let repeated = cell
-                            .timeline
-                            .lock()
-                            .map_err(|_| anyhow!("Timeline lock poisoned"))?
-                            .last_item()
+                            .read_timeline(|timeline| timeline.last_item())
+                            .await?
                             .is_some_and(|last| {
                                 last["type"] == "assistant_message" && last["text"] == item["text"]
                             });
@@ -1063,41 +1058,37 @@ impl AgentManager {
                     if item["type"] == "user_message"
                         && let Some(message_id) = text(&item, "clientMessageId").map(str::to_owned)
                     {
-                        let exists = cell
-                            .timeline
-                            .lock()
-                            .map_err(|_| anyhow!("Timeline lock poisoned"))?
-                            .submitted_user_message(&message_id)
-                            .is_some();
-                        if exists {
-                            if let Some(provider_id) = text(&item, "messageId").map(str::to_owned) {
-                                let timeline = cell.timeline.clone();
-                                let path = self.timeline_path(id)?;
-                                let agent_id = id.to_owned();
-                                let internal = snapshot["internal"] == true;
-                                tokio::task::spawn_blocking(move || {
-                                    let mut timeline = timeline
-                                        .lock()
-                                        .map_err(|_| anyhow!("Timeline lock poisoned"))?;
-                                    if internal {
-                                        timeline.enrich_submitted_user_message(
-                                            &message_id,
-                                            &provider_id,
-                                        );
-                                        Ok::<_, anyhow::Error>(())
-                                    } else {
-                                        timeline
-                                            .enrich_submitted_persisted(
-                                                &path,
-                                                &agent_id,
-                                                &message_id,
-                                                &provider_id,
-                                            )
-                                            .map(|_| ())
-                                    }
-                                })
-                                .await??;
+                        // A provider echo of a recorded submission only adds its native identity.
+                        let timeline = cell.timeline.clone();
+                        let path = self.timeline_path(id);
+                        let agent_id = id.to_owned();
+                        let internal = snapshot["internal"] == true;
+                        let submitted = message_id.clone();
+                        let provider_id = text(&item, "messageId").map(str::to_owned);
+                        let exists = tokio::task::spawn_blocking(move || {
+                            let mut timeline = timeline
+                                .lock()
+                                .map_err(|_| anyhow!("Timeline lock poisoned"))?;
+                            if timeline.submitted_user_message(&submitted)?.is_none() {
+                                return Ok::<_, anyhow::Error>(false);
                             }
+                            if let Some(provider_id) = provider_id {
+                                if internal {
+                                    timeline
+                                        .enrich_submitted_user_message(&submitted, &provider_id);
+                                } else {
+                                    timeline.enrich_submitted_persisted(
+                                        &path?,
+                                        &agent_id,
+                                        &submitted,
+                                        &provider_id,
+                                    )?;
+                                }
+                            }
+                            Ok(true)
+                        })
+                        .await??;
+                        if exists {
                             continue;
                         }
                         if let Some(provider_id) = item.get("messageId") {
@@ -1436,16 +1427,16 @@ impl AgentManager {
 /// recorded identities of that log's entries, so a provider keeps the log
 /// across replay and continues live child output exactly once without
 /// reading child bodies.
-pub(super) fn resume_options(history: bool, timeline: &Timeline) -> Value {
+pub(super) fn resume_options(history: bool, timeline: &Timeline) -> Result<Value> {
     let mut options = json!({"purpose":if history { "history" } else { "interactive" }});
-    let (logs, entries) = timeline.subagent_card_logs();
+    let (logs, entries) = timeline.subagent_card_logs()?;
     if !logs.is_empty() {
         options["subagentCardLogs"] = Value::Object(logs);
     }
     if !entries.is_empty() {
         options["subagentCardEntries"] = Value::Object(entries);
     }
-    options
+    Ok(options)
 }
 pub(super) fn hook_agent(snapshot: &Value) -> Value {
     json!({"id":snapshot["id"],"workspaceId":snapshot["workspaceId"],"parentAgentId":snapshot["labels"]["paseo.parent-agent-id"],"provider":snapshot["provider"],"cwd":snapshot["cwd"],"title":snapshot["title"]})

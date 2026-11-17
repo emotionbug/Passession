@@ -1,6 +1,7 @@
 use super::{Timeline, identity, kind};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::path::Path;
 
 const MARKER: &str = "ompStreamMessageId";
@@ -8,6 +9,7 @@ const MARKER: &str = "ompStreamMessageId";
 impl Timeline {
     /// Message-local authority is deliberately narrower than a history replay.
     /// Build without touching the owner, commit the complete checkpoint, then swap.
+    /// The rebuild rewrites every row, so stored rows are read for it.
     pub(in crate::agent) fn reconcile_message(
         &mut self,
         event: &Value,
@@ -16,6 +18,7 @@ impl Timeline {
         let Some(mut replacement) = self.message_replacement(event)? else {
             return Ok(None);
         };
+        replacement.bounded = self.bounded;
         if let Some((path, agent_id)) = destination {
             replacement.persist(path, agent_id)?;
         }
@@ -50,8 +53,13 @@ impl Timeline {
                 }
             }
         }
-        let mut matches = self
-            .rows
+        let history: Cow<'_, [Value]> = if self.base == 0 {
+            Cow::Borrowed(&self.rows)
+        } else {
+            Cow::Owned(self.all_rows()?)
+        };
+        let rows: &[Value] = &history;
+        let mut matches = rows
             .iter()
             .enumerate()
             .filter(|(_, row)| row["item"]["metadata"][MARKER].as_str() == Some(message));
@@ -70,7 +78,7 @@ impl Timeline {
             }
             end += 1;
         }
-        let old = &self.rows[start..end];
+        let old = &rows[start..end];
         for row in old {
             if !matches!(kind(&row["item"]), "reasoning" | "assistant_message")
                 || row.get("turnId") != first.get("turnId")
@@ -89,18 +97,14 @@ impl Timeline {
             .map(|row| super::num(row, "seqEnd"))
             .max()
             .unwrap();
-        if self.rows[..start]
-            .iter()
-            .chain(&self.rows[end..])
-            .any(|row| {
-                row["sourceSeqRanges"].as_array().is_some_and(|ranges| {
-                    ranges.iter().any(|range| {
-                        super::num(range, "startSeq") <= last_seq
-                            && super::num(range, "endSeq") >= first_seq
-                    })
+        if rows[..start].iter().chain(&rows[end..]).any(|row| {
+            row["sourceSeqRanges"].as_array().is_some_and(|ranges| {
+                ranges.iter().any(|range| {
+                    super::num(range, "startSeq") <= last_seq
+                        && super::num(range, "endSeq") >= first_seq
                 })
             })
-        {
+        }) {
             bail!("Message source events are interleaved with unrelated history");
         }
 
@@ -160,12 +164,12 @@ impl Timeline {
         let mut replacement = Self::new();
         replacement
             .rows
-            .reserve(self.rows.len() - old.len() + authoritative.rows.len());
-        for row in self.rows[..start]
+            .reserve(rows.len() - old.len() + authoritative.rows.len());
+        for row in rows[..start]
             .iter()
             .cloned()
             .chain(authoritative.rows)
-            .chain(self.rows[end..].iter().cloned())
+            .chain(rows[end..].iter().cloned())
         {
             replacement.push_rebased(row);
         }

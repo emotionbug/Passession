@@ -1,13 +1,15 @@
-use super::Timeline;
-use anyhow::{Result, bail, ensure};
+use super::{RESIDENT_BYTES, RESIDENT_ROWS, Timeline};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::fs;
 #[cfg(unix)]
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 const UPSERT_ROW: &str = "INSERT INTO timeline_rows(position, row_json) VALUES (?1, ?2) \
     ON CONFLICT(position) DO UPDATE SET row_json = excluded.row_json";
@@ -15,6 +17,7 @@ const UPDATE_METADATA: &str =
     "UPDATE timeline_metadata SET epoch = ?1, next_seq = ?2, min_seq = ?3 WHERE id = 1";
 const READ_METADATA: &str =
     "SELECT version, agent_id, epoch, next_seq, min_seq FROM timeline_metadata WHERE id = 1";
+const PAGE_INDEX: &str = "timeline_rows_page";
 // An expression index, rather than a side table, stays exact even when an older
 // v1 writer updates row_json. SQLite maintains it in the row's own transaction.
 const CREATE_PAGE_INDEX: &str = "CREATE INDEX timeline_rows_page ON timeline_rows(\
@@ -24,16 +27,79 @@ const CREATE_PAGE_INDEX: &str = "CREATE INDEX timeline_rows_page ON timeline_row
 const ROW_PAGE_METADATA: &str = "SELECT position, json_extract(row_json, '$.seqStart'), \
     json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges') \
     FROM timeline_rows INDEXED BY timeline_rows_page ORDER BY position";
-// Saved reads never migrate a database, including a read-only legacy checkpoint.
-const LEGACY_ROW_PAGE_METADATA: &str = "SELECT position, json_extract(row_json, '$.seqStart'), \
+/// Page metadata of the stored rows before a resident tail.
+const STORED_PAGE_METADATA: &str = "SELECT position, json_extract(row_json, '$.seqStart'), \
     json_extract(row_json, '$.seqEnd'), json_extract(row_json, '$.sourceSeqRanges') \
-    FROM timeline_rows NOT INDEXED ORDER BY position";
+    FROM timeline_rows INDEXED BY timeline_rows_page WHERE position < ?1 ORDER BY position";
+// Saved reads never migrate a database, including a read-only legacy checkpoint.
+const LEGACY_STORED_PAGE_METADATA: &str = "SELECT position, \
+    json_extract(row_json, '$.seqStart'), json_extract(row_json, '$.seqEnd'), \
+    json_extract(row_json, '$.sourceSeqRanges') \
+    FROM timeline_rows NOT INDEXED WHERE position < ?1 ORDER BY position";
+const STORED_SEQ_END: &str = "SELECT MAX(json_extract(row_json, '$.seqEnd')) \
+    FROM timeline_rows INDEXED BY timeline_rows_page WHERE position < ?1";
+const ROW_AT: &str = "SELECT position, row_json FROM timeline_rows WHERE position = ?1";
+const SCAN_ROWS: &str = "SELECT row_json FROM timeline_rows WHERE position < ?1 ORDER BY position";
+const SCAN_KINDS: &str = "SELECT row_json FROM timeline_rows WHERE position < ?1 \
+    AND json_extract(row_json, '$.item.type') IN (?2, ?3) ORDER BY position";
+const LAST_OF_KIND: &str = "SELECT position, row_json FROM timeline_rows WHERE position < ?1 \
+    AND json_extract(row_json, '$.item.type') = ?2 ORDER BY position DESC LIMIT 1";
+const ENDING_AT: &str = "SELECT position, row_json FROM timeline_rows WHERE position < ?1 \
+    AND json_extract(row_json, '$.seqEnd') = ?2 ORDER BY position LIMIT 1";
+/// `super::identity` in SQL: a tool call's string `callId`, or `pluginId/id`.
+const IDENTITY_KEY: &str = "CASE json_extract(row_json, '$.item.type') \
+    WHEN 'tool_call' THEN CASE json_type(row_json, '$.item.callId') \
+    WHEN 'text' THEN json_extract(row_json, '$.item.callId') END \
+    WHEN 'plugin' THEN CASE WHEN json_type(row_json, '$.item.pluginId') = 'text' \
+    AND json_type(row_json, '$.item.id') = 'text' \
+    THEN json_extract(row_json, '$.item.pluginId') || '/' || json_extract(row_json, '$.item.id') \
+    END END";
+/// A submitted user message's string `clientMessageId`.
+const SUBMITTED_KEY: &str = "CASE WHEN json_extract(row_json, '$.item.type') = 'user_message' \
+    AND json_type(row_json, '$.item.clientMessageId') = 'text' \
+    THEN json_extract(row_json, '$.item.clientMessageId') END";
+/// Identity lookups for rows outside the resident tail. Like the page index,
+/// SQLite maintains them for every writer, including older v1 daemons.
+static LOOKUP_INDEXES: LazyLock<[(&str, String); 2]> = LazyLock::new(|| {
+    [
+        (
+            "timeline_rows_identity",
+            format!(
+                "CREATE INDEX timeline_rows_identity ON timeline_rows({IDENTITY_KEY}, position)"
+            ),
+        ),
+        (
+            "timeline_rows_submitted",
+            format!(
+                "CREATE INDEX timeline_rows_submitted ON timeline_rows({SUBMITTED_KEY}, position)"
+            ),
+        ),
+    ]
+});
+/// The latest stored row with an identity: `identities` keeps the latest.
+static FIND_IDENTITY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT position, row_json FROM timeline_rows WHERE {IDENTITY_KEY} = ?1 \
+        AND position < ?2 ORDER BY position DESC LIMIT 1"
+    )
+});
+/// The first stored submission of a client message: `submitted` keeps the first.
+static FIND_SUBMITTED: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT position, row_json FROM timeline_rows WHERE {SUBMITTED_KEY} = ?1 \
+        AND position < ?2 ORDER BY position LIMIT 1"
+    )
+});
 
 #[derive(Debug)]
 pub(super) struct Store {
     connection: Connection,
     path: PathBuf,
     agent_id: String,
+    /// A saved reader's snapshot; it never writes or migrates.
+    writable: bool,
+    /// The page index exists. Unmigrated read-only checkpoints lack it.
+    indexed: bool,
 }
 
 impl Store {
@@ -51,11 +117,13 @@ impl Store {
         );
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
-        ensure_page_index(&mut connection)?;
+        ensure_indexes(&mut connection)?;
         Ok(Self {
             connection,
             path: path.to_owned(),
             agent_id: agent_id.to_owned(),
+            writable: true,
+            indexed: true,
         })
     }
 
@@ -64,36 +132,92 @@ impl Store {
             self.path == path && self.agent_id == agent_id,
             "Timeline storage target mismatch"
         );
+        ensure!(self.writable, "Saved timeline snapshots are read-only");
         Ok(())
     }
 
-    fn replace(&mut self, timeline: &Timeline) -> Result<()> {
+    fn replace(&mut self, timeline: &Timeline) -> Result<Vec<u64>> {
         let transaction = self.connection.transaction()?;
         transaction.execute("DELETE FROM timeline_rows", [])?;
-        write_rows(&transaction, &timeline.rows)?;
+        let sizes = write_rows(&transaction, &timeline.rows)?;
         write_metadata(&transaction, timeline)?;
         transaction.commit()?;
-        Ok(())
+        Ok(sizes)
+    }
+
+    /// One stored row selected by `sql` with `params`, and its position.
+    fn find(&self, sql: &str, params: impl rusqlite::Params) -> Result<Option<(usize, Value)>> {
+        let mut statement = self.connection.prepare_cached(sql)?;
+        let mut rows = statement.query(params)?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let position = usize::try_from(row.get::<_, i64>(0)?)?;
+        Ok(Some((position, decode(row.get_ref(1)?.as_str()?)?)))
+    }
+
+    /// Stored rows before `end` in position order, filtered to at most two
+    /// item `kinds` (none: every row), until `visit` returns false.
+    fn scan(
+        &self,
+        end: usize,
+        kinds: &[&str],
+        visit: &mut dyn FnMut(Cow<'_, Value>) -> Result<bool>,
+    ) -> Result<bool> {
+        debug_assert!(kinds.len() <= 2);
+        let mut statement;
+        let mut rows = if kinds.is_empty() {
+            statement = self.connection.prepare_cached(SCAN_ROWS)?;
+            statement.query([end as i64])?
+        } else {
+            statement = self.connection.prepare_cached(SCAN_KINDS)?;
+            statement.query(params![end as i64, kinds[0], kinds[kinds.len() - 1]])?
+        };
+        while let Some(row) = rows.next()? {
+            if !visit(Cow::Owned(decode(row.get_ref(0)?.as_str()?)?))? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
-fn has_page_index(connection: &Connection) -> Result<bool> {
-    let sql: Option<String> = connection
+fn decode(encoded: &str) -> Result<Value> {
+    let row: Value = serde_json::from_str(encoded)?;
+    ensure!(valid_row(&row), "Invalid timeline row");
+    Ok(row)
+}
+
+fn has_index(connection: &Connection, name: &str, sql: &str) -> Result<bool> {
+    let stored: Option<String> = connection
         .query_row(
-            "SELECT sql FROM sqlite_schema WHERE name = 'timeline_rows_page'",
-            [],
+            "SELECT sql FROM sqlite_schema WHERE name = ?1",
+            [name],
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(sql) = sql {
-        ensure!(sql == CREATE_PAGE_INDEX, "Invalid timeline page index");
+    if let Some(stored) = stored {
+        ensure!(stored == sql, "Invalid timeline index {name}");
         return Ok(true);
     }
     Ok(false)
 }
 
-fn ensure_page_index(connection: &mut Connection) -> Result<()> {
-    if has_page_index(connection)? {
+fn has_page_index(connection: &Connection) -> Result<bool> {
+    has_index(connection, PAGE_INDEX, CREATE_PAGE_INDEX)
+}
+
+fn has_lookup_indexes(connection: &Connection) -> Result<bool> {
+    for (name, sql) in LOOKUP_INDEXES.iter() {
+        if !has_index(connection, name, sql)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn ensure_indexes(connection: &mut Connection) -> Result<()> {
+    if has_page_index(connection)? && has_lookup_indexes(connection)? {
         return Ok(());
     }
     // Recheck under the write lock: another connection may have migrated first.
@@ -107,6 +231,11 @@ fn ensure_page_index(connection: &mut Connection) -> Result<()> {
         while let Some(row) = rows.next()? {
             read_page_metadata(row, position)?;
             position += 1;
+        }
+    }
+    for (name, sql) in LOOKUP_INDEXES.iter() {
+        if !has_index(&transaction, name, sql)? {
+            transaction.execute_batch(sql)?;
         }
     }
     transaction.commit()?;
@@ -152,17 +281,35 @@ fn write_metadata(transaction: &Transaction<'_>, timeline: &Timeline) -> Result<
     Ok(())
 }
 
-fn write_rows(transaction: &Transaction<'_>, rows: &[Value]) -> Result<()> {
+/// Writes every row and returns each one's stored JSON length.
+fn write_rows(transaction: &Transaction<'_>, rows: &[Value]) -> Result<Vec<u64>> {
     let mut statement = transaction.prepare_cached(UPSERT_ROW)?;
+    let mut sizes = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
-        statement.execute(params![index as i64, serde_json::to_string(row)?])?;
+        let encoded = serde_json::to_string(row)?;
+        statement.execute(params![index as i64, encoded])?;
+        sizes.push(encoded.len() as u64);
     }
-    Ok(())
+    Ok(sizes)
+}
+
+/// Rows are contiguous from position 0: the stored count.
+fn row_count(connection: &Connection) -> Result<usize> {
+    let (count, last): (i64, Option<i64>) = connection.query_row(
+        "SELECT COUNT(*), MAX(position) FROM timeline_rows",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        last.unwrap_or(-1) == count - 1,
+        "Invalid timeline row position"
+    );
+    Ok(usize::try_from(count)?)
 }
 
 // Build the complete initial database off to the side, so a failed creation
 // never leaves a partial database behind.
-fn create(path: &Path, agent_id: &str, timeline: &Timeline) -> Result<Store> {
+fn create(path: &Path, agent_id: &str, timeline: &Timeline) -> Result<(Store, Vec<u64>)> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -196,20 +343,24 @@ fn create(path: &Path, agent_id: &str, timeline: &Timeline) -> Result<Store> {
         ],
     )?;
     transaction.execute_batch(CREATE_PAGE_INDEX)?;
-    write_rows(&transaction, &timeline.rows)?;
+    for (_, sql) in LOOKUP_INDEXES.iter() {
+        transaction.execute_batch(sql)?;
+    }
+    let sizes = write_rows(&transaction, &timeline.rows)?;
     transaction.commit()?;
     drop(connection);
     file.as_file().sync_all()?;
     file.persist_noclobber(path).map_err(|error| error.error)?;
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
-    Store::open(path, agent_id)
+    Ok((Store::open(path, agent_id)?, sizes))
 }
 
 /// `path` names the SQLite database. An absent database is an empty timeline;
-/// it is created on the first commit.
+/// it is created on the first commit. Only the bounded recent tail is read;
+/// older rows are read on demand.
 pub(super) fn load(path: &Path, agent_id: &str) -> Result<Timeline> {
-    load_measured(path, agent_id).map(|(timeline, _)| timeline)
+    hydrate(path, agent_id, true).map(|(timeline, _)| timeline)
 }
 
 /// Serialized JSON length of a row: the stored size, without allocating it.
@@ -237,10 +388,18 @@ fn valid_row(row: &Value) -> bool {
             (Some(start), Some(end)) if valid_page_metadata(start, end, &row["sourceSeqRanges"]))
 }
 
-/// `load`, plus the stored JSON bytes of the hydrated rows.
+/// Every row of the checkpoint, plus the stored JSON bytes of the hydrated
+/// rows. Provider child timelines bound their residency as whole timelines.
 pub(super) fn load_measured(path: &Path, agent_id: &str) -> Result<(Timeline, u64)> {
+    hydrate(path, agent_id, false)
+}
+
+/// Reads rows newest first: all of them, or the bounded resident tail.
+fn hydrate(path: &Path, agent_id: &str, bounded: bool) -> Result<(Timeline, u64)> {
+    let mut timeline = Timeline::new();
+    timeline.bounded = bounded;
     if !path.try_exists()? {
-        return Ok((Timeline::new(), 0));
+        return Ok((timeline, 0));
     }
     let mut store = Store::open(path, agent_id)?;
     let transaction = store.connection.transaction()?;
@@ -249,60 +408,72 @@ pub(super) fn load_measured(path: &Path, agent_id: &str) -> Result<(Timeline, u6
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    let mut timeline = Timeline::new();
     timeline.epoch = epoch;
     timeline.next_seq = next_seq;
     timeline.min_seq = min_seq;
+    let count = row_count(&transaction)?;
     let mut bytes = 0;
     {
         let mut statement = transaction
-            .prepare("SELECT position, row_json FROM timeline_rows ORDER BY position")?;
+            .prepare("SELECT position, row_json FROM timeline_rows ORDER BY position DESC")?;
         let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let index = timeline.rows.len();
+        while !bounded || timeline.rows.len() < RESIDENT_ROWS {
+            let Some(row) = rows.next()? else {
+                break;
+            };
             ensure!(
-                row.get::<_, i64>(0)? == index as i64,
+                row.get::<_, i64>(0)? == count as i64 - 1 - timeline.rows.len() as i64,
                 "Invalid timeline row position"
             );
-            let encoded: String = row.get(1)?;
-            bytes += encoded.len() as u64;
-            let row: Value = serde_json::from_str(&encoded)?;
-            ensure!(valid_row(&row), "Invalid timeline row");
-            if let Some(id) = super::identity(&row["item"]) {
-                timeline.identities.insert(id, index);
+            let encoded = row.get_ref(1)?.as_str()?;
+            let size = encoded.len() as u64;
+            if bounded && !timeline.rows.is_empty() && bytes + size > RESIDENT_BYTES {
+                break;
             }
-            if row["item"]["type"] == "user_message"
-                && let Some(id) = row["item"]["clientMessageId"]
-                    .as_str()
-                    .filter(|id| !id.is_empty())
-            {
-                timeline.submitted.entry(id.to_owned()).or_insert(index);
-            }
-            timeline.rows.push(row);
+            timeline.rows.push(decode(encoded)?);
+            timeline.sizes.push(size);
+            bytes += size;
         }
     }
+    timeline.base = count - timeline.rows.len();
+    if timeline.base > 0 {
+        let end: Option<i64> =
+            transaction.query_row(STORED_SEQ_END, [timeline.base as i64], |row| row.get(0))?;
+        timeline.evicted_seq_end = end.context("Invalid timeline row metadata")?;
+    }
     transaction.commit()?;
+    timeline.rows.reverse();
+    timeline.sizes.reverse();
+    for (offset, row) in timeline.rows.iter().enumerate() {
+        let position = timeline.base + offset;
+        if let Some(id) = super::identity(&row["item"]) {
+            timeline.identities.insert(id, position);
+        }
+        if row["item"]["type"] == "user_message"
+            && let Some(id) = row["item"]["clientMessageId"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+        {
+            timeline.submitted.entry(id.to_owned()).or_insert(position);
+        }
+    }
     timeline.storage = Some(store);
     Ok((timeline, bytes))
 }
 
-/// One page of a stored timeline without hydrating it. `Timeline::fetch` first
-/// selects over metadata-only rows (`seqStart`, `seqEnd`, `sourceSeqRanges`:
-/// all that page selection reads), then runs again with only the selected rows'
-/// stored JSON in place, so epochs, cursors, gaps, limits and source ranges
-/// behave exactly as for a hydrated timeline. Transient memory is one small
-/// metadata stub per row plus the selected rows; `limit: 0` explicitly selects
-/// the whole history. Only reads; never alters the database.
-pub(super) fn fetch_page(path: &Path, agent_id: &str, options: &Value) -> Result<Value> {
+/// An existing checkpoint as one read-only snapshot: header only, no rows
+/// resident. Never migrates the database.
+pub(super) fn open_saved(path: &Path, agent_id: &str) -> Result<Timeline> {
     ensure!(
         path.try_exists()?,
         "Timeline database missing: {}",
         path.display()
     );
-    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let transaction = connection.transaction()?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // Every later read through this handle sees the same committed state.
+    connection.execute_batch("BEGIN")?;
     let (version, stored_agent, epoch, next_seq, min_seq): (i64, String, String, i64, i64) =
-        transaction.query_row(READ_METADATA, [], |row| {
+        connection.query_row(READ_METADATA, [], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -316,60 +487,238 @@ pub(super) fn fetch_page(path: &Path, agent_id: &str, options: &Value) -> Result
         stored_agent == agent_id,
         "Timeline checkpoint agent mismatch"
     );
+    let count = row_count(&connection)?;
+    let indexed = has_page_index(&connection)?;
     let mut timeline = Timeline::new();
     timeline.epoch = epoch;
     timeline.next_seq = next_seq;
     timeline.min_seq = min_seq;
-    {
-        let query = if has_page_index(&transaction)? {
-            ROW_PAGE_METADATA
-        } else {
-            LEGACY_ROW_PAGE_METADATA
-        };
-        let mut statement = transaction.prepare(query)?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            timeline
-                .rows
-                .push(read_page_metadata(row, timeline.rows.len())?);
-        }
+    timeline.base = count;
+    timeline.evicted_seq_end = i64::MAX;
+    timeline.storage = Some(Store {
+        connection,
+        path: path.to_owned(),
+        agent_id: agent_id.to_owned(),
+        writable: false,
+        indexed,
+    });
+    Ok(timeline)
+}
+
+/// One page of a stored timeline without hydrating it.
+pub(super) fn fetch_page(path: &Path, agent_id: &str, options: &Value) -> Result<Value> {
+    open_saved(path, agent_id)?.page(options)
+}
+
+impl Timeline {
+    fn store(&self) -> Result<&Store> {
+        self.storage.as_ref().context("Timeline storage missing")
     }
-    let selected: Vec<usize> = timeline.fetch(options)["rows"]
-        .as_array()
-        .expect("page rows")
-        .iter()
-        .map(|stub| stub["position"].as_u64().expect("stub position") as usize)
-        .collect();
-    {
-        let mut statement =
-            transaction.prepare("SELECT row_json FROM timeline_rows WHERE position = ?1")?;
-        for index in selected {
-            let encoded: String = statement.query_row([index as i64], |row| row.get(0))?;
-            let row: Value = serde_json::from_str(&encoded)?;
-            ensure!(valid_row(&row), "Invalid timeline row");
+
+    /// One page with exactly the selection of a fully resident timeline.
+    /// Pages the resident tail answers alone never touch SQLite. Otherwise
+    /// `fetch` selection runs over metadata-only stubs of the stored rows
+    /// (`seqStart`, `seqEnd`, `sourceSeqRanges`: all that selection reads)
+    /// followed by the resident rows, then again with the selected rows in
+    /// place, so epochs, cursors, gaps, limits and source ranges are
+    /// unchanged. Transient memory is one small stub per stored row plus the
+    /// selected rows; `limit: 0` explicitly selects the whole history.
+    pub fn page(&self, options: &Value) -> Result<Value> {
+        if self.base == 0 {
+            return Ok(self.fetch_resident(options));
+        }
+        if let Some(page) = self.resident_page(options) {
+            return Ok(page);
+        }
+        let store = self.store()?;
+        let mut stubs = Timeline::new();
+        stubs.epoch = self.epoch.clone();
+        stubs.next_seq = self.next_seq;
+        stubs.min_seq = self.min_seq;
+        stubs.rows.reserve(self.len());
+        {
+            let query = if store.indexed {
+                STORED_PAGE_METADATA
+            } else {
+                LEGACY_STORED_PAGE_METADATA
+            };
+            let mut statement = store.connection.prepare_cached(query)?;
+            let mut rows = statement.query([self.base as i64])?;
+            while let Some(row) = rows.next()? {
+                stubs.rows.push(read_page_metadata(row, stubs.rows.len())?);
+            }
+        }
+        ensure!(
+            stubs.rows.len() == self.base,
+            "Invalid timeline row position"
+        );
+        for (offset, row) in self.rows.iter().enumerate() {
+            stubs
+                .rows
+                .push(json!({"seqStart":row["seqStart"],"seqEnd":row["seqEnd"],
+                "sourceSeqRanges":row["sourceSeqRanges"],"position":self.base + offset}));
+        }
+        let selected: Vec<usize> = stubs.fetch_resident(options)["rows"]
+            .as_array()
+            .expect("page rows")
+            .iter()
+            .map(|stub| stub["position"].as_u64().expect("stub position") as usize)
+            .collect();
+        for position in selected {
+            if position >= self.base {
+                stubs.rows[position] = self.rows[position - self.base].clone();
+                continue;
+            }
+            let (_, row) = store
+                .find(ROW_AT, [position as i64])?
+                .context("Missing timeline row")?;
             for field in ["seqStart", "seqEnd", "sourceSeqRanges"] {
                 ensure!(
-                    row[field] == timeline.rows[index][field],
+                    row[field] == stubs.rows[position][field],
                     "Invalid timeline row metadata"
                 );
             }
-            timeline.rows[index] = row;
+            stubs.rows[position] = row;
         }
+        Ok(stubs.fetch_resident(options))
     }
-    transaction.commit()?;
-    Ok(timeline.fetch(options))
+
+    /// Visits rows in position order, stored rows before the resident tail,
+    /// until `visit` returns false. `kinds` (at most two item types) filters
+    /// the rows; empty visits every row. Stored rows are decoded one at a time.
+    pub(in crate::agent) fn scan(
+        &self,
+        kinds: &[&str],
+        mut visit: impl FnMut(Cow<'_, Value>) -> Result<bool>,
+    ) -> Result<()> {
+        if self.base > 0 && !self.store()?.scan(self.base, kinds, &mut visit)? {
+            return Ok(());
+        }
+        for row in &self.rows {
+            if (kinds.is_empty() || kinds.iter().any(|kind| *kind == super::kind(&row["item"])))
+                && !visit(Cow::Borrowed(row))?
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every row of the history.
+    pub fn all_rows(&self) -> Result<Vec<Value>> {
+        let mut rows = Vec::with_capacity(self.len());
+        self.scan(&[], |row| {
+            rows.push(row.into_owned());
+            Ok(true)
+        })?;
+        Ok(rows)
+    }
+
+    /// Every item of the history.
+    pub fn all_items(&self) -> Result<Vec<Value>> {
+        let mut items = Vec::with_capacity(self.len());
+        self.scan(&[], |row| {
+            items.push(match row {
+                Cow::Owned(mut row) => row["item"].take(),
+                Cow::Borrowed(row) => row["item"].clone(),
+            });
+            Ok(true)
+        })?;
+        Ok(items)
+    }
+
+    /// The first row of item `kinds` matching `predicate`.
+    pub fn find_row(
+        &self,
+        kinds: &[&str],
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Result<Option<Value>> {
+        let mut found = None;
+        self.scan(kinds, |row| {
+            if predicate(&row) {
+                found = Some(row.into_owned());
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Ok(found)
+    }
+
+    /// The item of the row holding the latest sequence number.
+    pub fn last_item(&self) -> Result<Option<Value>> {
+        let seq = self.next_seq - 1;
+        if self.base > 0
+            && self.evicted_seq_end >= seq
+            && let Some((_, row)) = self
+                .store()?
+                .find(ENDING_AT, params![self.base as i64, seq])?
+        {
+            return Ok(Some(row["item"].clone()));
+        }
+        Ok(self
+            .rows
+            .iter()
+            .find(|row| super::num(row, "seqEnd") == seq)
+            .map(|row| row["item"].clone()))
+    }
+
+    /// The text of the latest assistant message row, if it has text.
+    pub fn last_assistant_message(&self) -> Result<Option<String>> {
+        let resident = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row["item"]["type"] == "assistant_message");
+        let row = match resident {
+            Some(row) => Cow::Borrowed(row),
+            None if self.base > 0 => match self
+                .store()?
+                .find(LAST_OF_KIND, params![self.base as i64, "assistant_message"])?
+            {
+                Some((_, row)) => Cow::Owned(row),
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        Ok(row["item"]["text"].as_str().map(str::to_owned))
+    }
+
+    /// The first user row submitted with client message `id`.
+    pub fn submitted_user_message(&self, id: &str) -> Result<Option<Value>> {
+        if let Some((_, row)) = self.stored_submission(id)? {
+            return Ok(Some(row));
+        }
+        Ok(self
+            .submitted
+            .get(id)
+            .map(|&position| self.rows[position - self.base].clone()))
+    }
+
+    /// The first stored, non-resident submission of client message `id`.
+    fn stored_submission(&self, id: &str) -> Result<Option<(usize, Value)>> {
+        if self.base == 0 || id.is_empty() {
+            return Ok(None);
+        }
+        self.store()?
+            .find(&FIND_SUBMITTED, params![id, self.base as i64])
+    }
 }
 
 /// Full-history hydration/replacement is one transaction. Keep the connection
 /// with its owner so subsequent token commits touch only one projected row.
 pub(super) fn persist(timeline: &mut Timeline, path: &Path, agent_id: &str) -> Result<()> {
+    // Replacing rows from a partial resident tail would drop stored history.
+    ensure!(timeline.base == 0, "Timeline rows are not all resident");
     if let Some(store) = &timeline.storage {
         store.check_target(path, agent_id)?;
     }
     if timeline.storage.is_none() {
         if !path.try_exists()? {
-            timeline.storage = Some(create(path, agent_id, timeline)?);
+            let (store, sizes) = create(path, agent_id, timeline)?;
+            timeline.storage = Some(store);
+            timeline.sizes = sizes;
             timeline.storage_dirty = false;
+            timeline.trim();
             return Ok(());
         }
         timeline.storage = Some(Store::open(path, agent_id)?);
@@ -378,8 +727,9 @@ pub(super) fn persist(timeline: &mut Timeline, path: &Path, agent_id: &str) -> R
     timeline.storage_dirty = true;
     let result = store.replace(timeline);
     timeline.storage = Some(store);
-    result?;
+    timeline.sizes = result?;
     timeline.storage_dirty = false;
+    timeline.trim();
     Ok(())
 }
 
@@ -393,14 +743,17 @@ fn ensure_storage(timeline: &mut Timeline, path: &Path, agent_id: &str) -> Resul
     Ok(())
 }
 
-fn persist_row(timeline: &mut Timeline, index: usize) -> Result<()> {
-    // Serialization is bounded by the affected projected row, not history size.
-    let encoded = serde_json::to_string(&timeline.rows[index])?;
-    let store = timeline.storage.as_mut().unwrap();
+/// Commits one projected row with the sequence metadata. Serialization is
+/// bounded by the affected projected row, not history size.
+fn commit_row(timeline: &mut Timeline, position: usize, encoded: &str) -> Result<()> {
+    let store = timeline
+        .storage
+        .as_mut()
+        .context("Timeline storage missing")?;
     let transaction = store.connection.transaction()?;
     transaction
         .prepare_cached(UPSERT_ROW)?
-        .execute(params![index as i64, encoded])?;
+        .execute(params![position as i64, encoded])?;
     transaction
         .prepare_cached(UPDATE_METADATA)?
         .execute(params![timeline.epoch, timeline.next_seq, timeline.min_seq])?;
@@ -416,53 +769,97 @@ pub(super) fn append(
     options: &Value,
 ) -> Result<Value> {
     ensure_storage(timeline, path, agent_id)?;
+    let row = timeline.source_row(item, options);
+    let id = super::identity(&row["item"]);
+    // A lifecycle update of a tool or plugin row older than the resident tail
+    // merges into its stored row in place; the tail is unchanged.
+    let stored = match &id {
+        Some(id) if timeline.base > 0 && !timeline.identities.contains_key(id) => timeline
+            .store()?
+            .find(&FIND_IDENTITY, params![id, timeline.base as i64])?,
+        _ => None,
+    };
+    if let Some((position, mut stored)) = stored
+        && super::merge_identity(&mut stored, &super::canonical(row.clone()))
+    {
+        timeline.next_seq += 1;
+        let committed = serde_json::to_string(&stored)
+            .map_err(anyhow::Error::from)
+            .and_then(|encoded| commit_row(timeline, position, &encoded));
+        if let Err(error) = committed {
+            timeline.next_seq -= 1;
+            return Err(error);
+        }
+        timeline.evicted_seq_end = timeline.evicted_seq_end.max(super::num(&stored, "seqEnd"));
+        return Ok(row);
+    }
     let old_next = timeline.next_seq;
     let old_min = timeline.min_seq;
     let old_len = timeline.rows.len();
-    let id = super::identity(&item);
+    let item_kind = super::kind(&row["item"]).to_owned();
     let old_identity = id
         .as_ref()
         .and_then(|id| timeline.identities.get(id).copied());
-    let candidate = old_identity.or_else(|| {
-        if matches!(super::kind(&item), "assistant_message" | "reasoning") {
-            old_len
-                .checked_sub(1)
-                .filter(|&index| super::kind(&timeline.rows[index]["item"]) == super::kind(&item))
-        } else {
-            None
-        }
-    });
+    let candidate = old_identity
+        .map(|position| position - timeline.base)
+        .or_else(|| {
+            if matches!(item_kind.as_str(), "assistant_message" | "reasoning") {
+                old_len
+                    .checked_sub(1)
+                    .filter(|&index| super::kind(&timeline.rows[index]["item"]) == item_kind)
+            } else {
+                None
+            }
+        });
     let old_row = candidate.map(|index| (index, timeline.rows[index].clone()));
-    let submitted_id = (item["type"] == "user_message")
-        .then(|| item["clientMessageId"].as_str().map(str::to_owned))
+    let submitted_id = (row["item"]["type"] == "user_message")
+        .then(|| row["item"]["clientMessageId"].as_str().map(str::to_owned))
         .flatten();
     let old_submitted = submitted_id
         .as_ref()
         .and_then(|id| timeline.submitted.get(id).copied());
-    let (row, index) = timeline.append_indexed(item, options);
-    if let Err(error) = persist_row(timeline, index) {
-        timeline.rows.truncate(old_len);
-        if let Some((index, row)) = old_row {
-            timeline.rows[index] = row;
-        }
-        timeline.next_seq = old_next;
-        timeline.min_seq = old_min;
-        if let Some(id) = id {
-            if let Some(index) = old_identity {
-                timeline.identities.insert(id, index);
-            } else {
-                timeline.identities.remove(&id);
+    timeline.next_seq += 1;
+    let position = timeline.append_row(row.clone());
+    let index = position - timeline.base;
+    let committed = serde_json::to_string(&timeline.rows[index])
+        .map_err(anyhow::Error::from)
+        .and_then(|encoded| {
+            commit_row(timeline, position, &encoded).map(|()| encoded.len() as u64)
+        });
+    let size = match committed {
+        Ok(size) => size,
+        Err(error) => {
+            timeline.rows.truncate(old_len);
+            if let Some((index, row)) = old_row {
+                timeline.rows[index] = row;
             }
-        }
-        if let Some(id) = submitted_id {
-            if let Some(index) = old_submitted {
-                timeline.submitted.insert(id, index);
-            } else {
-                timeline.submitted.remove(&id);
+            timeline.next_seq = old_next;
+            timeline.min_seq = old_min;
+            if let Some(id) = id {
+                if let Some(position) = old_identity {
+                    timeline.identities.insert(id, position);
+                } else {
+                    timeline.identities.remove(&id);
+                }
             }
+            if let Some(id) = submitted_id {
+                if let Some(position) = old_submitted {
+                    timeline.submitted.insert(id, position);
+                } else {
+                    timeline.submitted.remove(&id);
+                }
+            }
+            return Err(error);
         }
-        return Err(error);
+    };
+    if timeline.sizes.len() == old_len {
+        if index == old_len {
+            timeline.sizes.push(size);
+        } else {
+            timeline.sizes[index] = size;
+        }
     }
+    timeline.trim();
     Ok(row)
 }
 
@@ -473,22 +870,43 @@ pub(super) fn enrich(
     message_id: &str,
     provider_id: &str,
 ) -> Result<Option<Value>> {
-    let Some(&index) = timeline.submitted.get(message_id) else {
+    if timeline.base > 0 {
+        timeline.store()?.check_target(path, agent_id)?;
+    }
+    if let Some((position, mut row)) = timeline.stored_submission(message_id)? {
+        row["providerMessageId"] = Value::String(provider_id.to_owned());
+        commit_row(timeline, position, &serde_json::to_string(&row)?)?;
+        return Ok(Some(row));
+    }
+    let Some(&position) = timeline.submitted.get(message_id) else {
         return Ok(None);
     };
     ensure_storage(timeline, path, agent_id)?;
+    let index = position - timeline.base;
     let previous = timeline.rows[index].get("providerMessageId").cloned();
     timeline.rows[index]["providerMessageId"] = Value::String(provider_id.to_owned());
-    if let Err(error) = persist_row(timeline, index) {
-        if let Some(previous) = previous {
-            timeline.rows[index]["providerMessageId"] = previous;
-        } else {
-            timeline.rows[index]
-                .as_object_mut()
-                .unwrap()
-                .remove("providerMessageId");
+    let committed = serde_json::to_string(&timeline.rows[index])
+        .map_err(anyhow::Error::from)
+        .and_then(|encoded| {
+            commit_row(timeline, position, &encoded).map(|()| encoded.len() as u64)
+        });
+    match committed {
+        Ok(size) => {
+            if timeline.sizes.len() == timeline.rows.len() {
+                timeline.sizes[index] = size;
+            }
         }
-        return Err(error);
+        Err(error) => {
+            if let Some(previous) = previous {
+                timeline.rows[index]["providerMessageId"] = previous;
+            } else {
+                timeline.rows[index]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("providerMessageId");
+            }
+            return Err(error);
+        }
     }
     Ok(Some(timeline.rows[index].clone()))
 }

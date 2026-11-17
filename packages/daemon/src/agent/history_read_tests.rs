@@ -1298,7 +1298,7 @@ fn resume_carries_only_the_stored_card_logs() {
     timeline.persist(&path, PARENT).unwrap();
     // The cell loads the stored projection before the provider resumes.
     let stored = Timeline::load(&path, PARENT).unwrap();
-    let options = crate::agent::runtime::resume_options(false, &stored);
+    let options = crate::agent::runtime::resume_options(false, &stored).unwrap();
     assert_eq!(
         options,
         json!({
@@ -1307,7 +1307,7 @@ fn resume_carries_only_the_stored_card_logs() {
             "subagentCardEntries":{"other":entries}
         })
     );
-    let history = crate::agent::runtime::resume_options(true, &Timeline::new());
+    let history = crate::agent::runtime::resume_options(true, &Timeline::new()).unwrap();
     assert_eq!(history, json!({"purpose":"history"}));
 }
 

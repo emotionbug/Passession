@@ -195,16 +195,45 @@ pub fn project_rows(rows: &[Value]) -> Vec<Value> {
     output
 }
 
+/// Rows a loaded agent keeps in memory. A client opens a chat with a 40-item
+/// tail page and model observations default to 200-row pages, so 256 rows
+/// answer the live tail, catch-up pages and in-place updates of the current
+/// turn without SQLite. The byte budget caps a tail of rows near the 64 KiB
+/// tool-output limit. Older rows stay in SQLite and are read on demand; the
+/// newest row always stays resident because streamed text extends it.
+const RESIDENT_ROWS: usize = 256;
+const RESIDENT_BYTES: u64 = 4 << 20;
+
+struct PageRequest<'a> {
+    direction: &'a str,
+    stale: bool,
+    gap: bool,
+    mode: &'a str,
+    cursor: Option<i64>,
+    limit: usize,
+}
+
 #[derive(Debug)]
 pub struct Timeline {
     epoch: String,
+    /// Resident projected rows, at positions `base..base + rows.len()`.
     rows: Vec<Value>,
+    /// Stored JSON length of each resident row while storage is in sync.
+    sizes: Vec<u64>,
+    /// Leading rows that live only in `storage`.
+    base: usize,
+    /// Largest `seqEnd` of a non-resident row; `i64::MAX` when unknown.
+    evicted_seq_end: i64,
+    /// Latest resident position of each tool or plugin identity.
     identities: HashMap<String, usize>,
+    /// First resident position of each submitted client message.
     submitted: HashMap<String, usize>,
     next_seq: i64,
     min_seq: i64,
     storage: Option<storage::Store>,
     storage_dirty: bool,
+    /// Agent projections keep only a bounded tail resident once durable.
+    bounded: bool,
 }
 impl Default for Timeline {
     fn default() -> Self {
@@ -216,12 +245,16 @@ impl Timeline {
         Self {
             epoch: uuid::Uuid::new_v4().to_string(),
             rows: Vec::new(),
+            sizes: Vec::new(),
+            base: 0,
+            evicted_seq_end: 0,
             identities: HashMap::new(),
             submitted: HashMap::new(),
             next_seq: 1,
             min_seq: 0,
             storage: None,
             storage_dirty: false,
+            bounded: false,
         }
     }
     pub fn seed(options: &Value) -> Result<Self> {
@@ -264,30 +297,23 @@ impl Timeline {
     pub fn next_seq(&self) -> i64 {
         self.next_seq
     }
+    fn len(&self) -> usize {
+        self.base + self.rows.len()
+    }
+    /// Resident items: the whole history of a timeline that never released
+    /// rows. Agent readers use `all_items`.
     pub fn items(&self) -> Vec<Value> {
+        debug_assert_eq!(self.base, 0, "timeline rows are not all resident");
         self.rows.iter().map(|r| r["item"].clone()).collect()
     }
+    /// Resident rows; see `items`. Agent readers use `all_rows`.
     pub fn rows(&self) -> Vec<Value> {
+        debug_assert_eq!(self.base, 0, "timeline rows are not all resident");
         self.rows.clone()
     }
-    pub fn last_item(&self) -> Option<&Value> {
-        self.rows
-            .iter()
-            .find(|r| num(r, "seqEnd") == self.next_seq - 1)
-            .map(|r| &r["item"])
-    }
-    pub fn last_assistant_message(&self) -> Option<&str> {
-        self.rows
-            .iter()
-            .rev()
-            .find(|r| r["item"]["type"] == "assistant_message")
-            .and_then(|r| r["item"]["text"].as_str())
-    }
-    pub fn submitted_user_message(&self, id: &str) -> Option<&Value> {
-        self.submitted.get(id).map(|&i| &self.rows[i])
-    }
     pub fn enrich_submitted_user_message(&mut self, id: &str, provider_id: &str) -> Option<Value> {
-        let row = &mut self.rows[*self.submitted.get(id)?];
+        let index = *self.submitted.get(id)? - self.base;
+        let row = &mut self.rows[index];
         self.storage_dirty = true;
         row["providerMessageId"] = json!(provider_id);
         Some(row.clone())
@@ -303,9 +329,13 @@ impl Timeline {
     }
     pub fn append(&mut self, item: Value, options: &Value) -> Value {
         self.storage_dirty = true;
-        self.append_indexed(item, options).0
+        let row = self.source_row(item, options);
+        self.next_seq += 1;
+        self.append_row(row.clone());
+        row
     }
-    fn append_indexed(&mut self, item: Value, options: &Value) -> (Value, usize) {
+    /// The source row for the next sequence number; it is not yet applied.
+    fn source_row(&self, item: Value, options: &Value) -> Value {
         let item = limit_item_content(item);
         let mut row = json!({"seq":self.next_seq,"timestamp":options["timestamp"].as_str().map(str::to_owned).unwrap_or_else(now),"item":item});
         for field in ["turnId", "providerMessageId"] {
@@ -313,41 +343,93 @@ impl Timeline {
                 row[field] = json!(value);
             }
         }
-        self.next_seq += 1;
-        let index = self.append_row(row.clone());
-        (row, index)
+        row
     }
+    /// Projects `row` into the resident tail and returns the affected
+    /// position. A stored identity outside the tail is merged by `storage`.
     fn append_row(&mut self, row: Value) -> usize {
         let entry = canonical(row);
         if self.min_seq == 0 {
             self.min_seq = num(&entry, "seqStart");
         }
         if let Some(id) = identity(&entry["item"]) {
-            if let Some(&index) = self.identities.get(&id)
-                && merge_identity(&mut self.rows[index], &entry)
+            if let Some(&position) = self.identities.get(&id)
+                && merge_identity(&mut self.rows[position - self.base], &entry)
             {
-                return index;
+                return position;
             }
-            self.identities.insert(id, self.rows.len());
+            self.identities.insert(id, self.len());
         }
         if self
             .rows
             .last_mut()
             .is_some_and(|previous| merge_text(previous, &entry))
         {
-            return self.rows.len() - 1;
+            return self.len() - 1;
         }
         if kind(&entry["item"]) == "user_message"
             && let Some(id) = entry["item"]["clientMessageId"]
                 .as_str()
                 .filter(|s| !s.is_empty())
         {
-            self.submitted.entry(id.into()).or_insert(self.rows.len());
+            let position = self.len();
+            self.submitted.entry(id.into()).or_insert(position);
         }
         self.rows.push(entry);
-        self.rows.len() - 1
+        self.len() - 1
     }
+    /// Releases the oldest durable rows beyond the resident budget. Rows that
+    /// are not yet committed, or whose stored size is unknown, stay resident.
+    fn trim(&mut self) {
+        if !self.bounded
+            || self.storage.is_none()
+            || self.storage_dirty
+            || self.sizes.len() != self.rows.len()
+        {
+            return;
+        }
+        let mut bytes: u64 = self.sizes.iter().sum();
+        let mut evict = 0;
+        while self.rows.len() - evict > 1
+            && (self.rows.len() - evict > RESIDENT_ROWS || bytes > RESIDENT_BYTES)
+        {
+            bytes -= self.sizes[evict];
+            evict += 1;
+        }
+        if evict == 0 {
+            return;
+        }
+        for (offset, row) in self.rows.drain(..evict).enumerate() {
+            let position = self.base + offset;
+            self.evicted_seq_end = self.evicted_seq_end.max(num(&row, "seqEnd"));
+            if let Some(id) = identity(&row["item"])
+                && self.identities.get(&id) == Some(&position)
+            {
+                self.identities.remove(&id);
+            }
+            if kind(&row["item"]) == "user_message"
+                && let Some(id) = row["item"]["clientMessageId"].as_str()
+                && self.submitted.get(id) == Some(&position)
+            {
+                self.submitted.remove(id);
+            }
+        }
+        self.sizes.drain(..evict);
+        self.base += evict;
+    }
+    /// Keeps only the bounded recent tail resident from now on, as an agent's
+    /// live projection does.
+    pub(in crate::agent) fn bound_residency(&mut self) {
+        self.bounded = true;
+        self.trim();
+    }
+    /// One page selected from resident rows: the whole history of a timeline
+    /// that never released rows. Agent readers use `page`.
     pub fn fetch(&self, options: &Value) -> Value {
+        debug_assert_eq!(self.base, 0, "timeline rows are not all resident");
+        self.fetch_resident(options)
+    }
+    fn page_request<'a>(&self, options: &'a Value) -> PageRequest<'a> {
         let direction = options["direction"].as_str().unwrap_or("tail");
         let cursor = options.get("cursor").filter(|c| !c.is_null());
         let stale = cursor.is_some_and(|c| c["epoch"].as_str() != Some(&self.epoch));
@@ -361,11 +443,79 @@ impl Timeline {
             .as_f64()
             .map(|n| n.floor().max(0.0) as usize)
             .unwrap_or(200);
+        PageRequest {
+            direction,
+            stale,
+            gap,
+            mode,
+            cursor: cursor_seq,
+            limit,
+        }
+    }
+    fn fetch_resident(&self, options: &Value) -> Value {
+        let request = self.page_request(options);
         let max = self.next_seq - 1;
         let min = self.min_seq;
-        let (rows, start, end, older, newer) = self.select_page(mode, cursor_seq, limit, min, max);
-        json!({"epoch":self.epoch,"direction":direction,"reset":stale||gap,"staleCursor":stale,"gap":gap,
+        let (rows, start, end, older, newer) =
+            self.select_page(request.mode, request.cursor, request.limit, min, max);
+        json!({"epoch":self.epoch,"direction":request.direction,"reset":request.stale||request.gap,"staleCursor":request.stale,"gap":request.gap,
             "window":{"minSeq":min,"maxSeq":max,"nextSeq":self.next_seq},"hasOlder":older,"hasNewer":newer,"startSeq":start,"endSeq":end,"rows":rows})
+    }
+    /// The page answered by resident rows alone, when no stored row can be
+    /// selected or change its bounds; otherwise `None`.
+    fn resident_page(&self, options: &Value) -> Option<Value> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let request = self.page_request(options);
+        let (min, max) = (self.min_seq, self.next_seq - 1);
+        let tail = match request.mode {
+            "after" => {
+                // A stored row is eligible only through a range reaching `start`.
+                let start = min.max(request.cursor.unwrap_or(min - 1) + 1);
+                if self.evicted_seq_end >= start {
+                    return None;
+                }
+                false
+            }
+            "before" => {
+                let end = max.min(request.cursor.unwrap_or(max + 1) - 1);
+                if end >= min {
+                    // Stored rows precede every resident row; more resident
+                    // candidates than the limit leave them unselected.
+                    let eligible = self
+                        .rows
+                        .iter()
+                        .filter(|row| num(row, "seqStart") <= end)
+                        .count();
+                    if request.limit == 0 || eligible <= request.limit {
+                        return None;
+                    }
+                }
+                false
+            }
+            _ => {
+                if request.limit == 0 || self.rows.len() < request.limit {
+                    return None;
+                }
+                let mut begin = self.rows.len() - request.limit;
+                for i in (0..begin).rev() {
+                    if num(&self.rows[i], "seqEnd") >= num(&self.rows[begin], "seqStart") {
+                        begin = i;
+                    }
+                }
+                // A stored row joins the tail only when it ends inside it.
+                if self.evicted_seq_end >= num(&self.rows[begin], "seqStart") {
+                    return None;
+                }
+                true
+            }
+        };
+        let mut page = self.fetch_resident(options);
+        if tail {
+            page["hasOlder"] = json!(true);
+        }
+        Some(page)
     }
     fn select_page(
         &self,
@@ -475,31 +625,39 @@ impl Timeline {
     /// instead of reading child transcripts.
     pub fn subagent_card_logs(
         &self,
-    ) -> (
+    ) -> Result<(
         serde_json::Map<String, Value>,
         serde_json::Map<String, Value>,
-    ) {
+    )> {
         let mut logs = serde_json::Map::new();
         let mut entries = serde_json::Map::new();
-        for item in self.rows.iter().map(|row| &row["item"]) {
-            if item["type"] != "tool_call" || item["detail"]["type"] != "sub_agent" {
-                continue;
+        self.scan(&["tool_call"], |row| {
+            let item = &row["item"];
+            if item["detail"]["type"] != "sub_agent" {
+                return Ok(true);
             }
             let (Some(call), Some(log)) = (
                 item["callId"].as_str(),
                 item["detail"]["log"].as_str().filter(|log| !log.is_empty()),
             ) else {
-                continue;
+                return Ok(true);
             };
             logs.insert(call.to_owned(), json!(log));
             if let Some(recorded) = item["metadata"]["subagentLog"].as_array() {
                 entries.insert(call.to_owned(), json!(recorded));
             }
-        }
-        (logs, entries)
+            Ok(true)
+        })?;
+        Ok((logs, entries))
     }
+    /// An agent's projection: the bounded recent tail of its checkpoint.
     pub fn load(path: &Path, agent_id: &str) -> Result<Self> {
         storage::load(path, agent_id)
+    }
+    /// An existing checkpoint as one read-only snapshot with no resident rows.
+    /// Saved readers page, scan and search it without hydrating history.
+    pub fn open_saved(path: &Path, agent_id: &str) -> Result<Self> {
+        storage::open_saved(path, agent_id)
     }
     /// One page of an existing checkpoint, read without hydrating it.
     pub fn fetch_saved(path: &Path, agent_id: &str, options: &Value) -> Result<Value> {

@@ -711,11 +711,10 @@ impl AgentManager {
         let Some(client_id) = client_id else {
             return Ok(());
         };
+        let lookup = client_id.to_owned();
         if cell
-            .timeline
-            .lock()
-            .map_err(|_| anyhow!("Timeline lock poisoned"))?
-            .submitted_user_message(client_id)
+            .read_timeline(move |timeline| timeline.submitted_user_message(&lookup))
+            .await?
             .is_some()
         {
             return Ok(());
@@ -1484,17 +1483,15 @@ impl AgentManager {
                 let requested = required(&input, "messageId")?;
                 // agent-manager.ts rewind: a daemon-submitted prompt rewinds through its
                 // provider id; any other id is the provider's own message id.
+                let wanted = requested.to_owned();
                 let submitted = cell
-                    .timeline
-                    .lock()
-                    .map_err(|_| anyhow!("Timeline lock poisoned"))?
-                    .rows()
-                    .into_iter()
-                    .find(|row| {
-                        row["item"]["type"] == "user_message"
-                            && text(&row["item"], "messageId") == Some(requested)
-                            && text(&row["item"], "clientMessageId") == Some(requested)
-                    });
+                    .read_timeline(move |timeline| {
+                        timeline.find_row(&["user_message"], |row| {
+                            text(&row["item"], "messageId") == Some(wanted.as_str())
+                                && text(&row["item"], "clientMessageId") == Some(wanted.as_str())
+                        })
+                    })
+                    .await?;
                 let provider_id = match &submitted {
                     Some(row) => text(row, "providerMessageId")
                         .ok_or_else(|| {
