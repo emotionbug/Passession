@@ -742,6 +742,92 @@ impl AgentManager {
             .join("agent-timelines")
             .join(format!("{id}.sqlite3")))
     }
+    /// Coalesced text/tool events share one durable projection transaction.
+    pub(super) async fn apply_timeline_batch(
+        &self,
+        id: &str,
+        cell: &Arc<AgentCell>,
+        mut events: Vec<Value>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let _resident = cell.activity.gate.clone().read_owned().await;
+        if cell.unloaded.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        cell.activity.touch();
+        for event in &mut events {
+            // This path deliberately excludes user echoes and notification
+            // envelopes, which have additional per-event admission semantics.
+            if event["type"] != "timeline"
+                || !matches!(
+                    text(&event["item"], "type"),
+                    Some("assistant_message" | "reasoning" | "tool_call")
+                )
+            {
+                bail!("Invalid coalesced timeline event");
+            }
+            event["item"] = timeline::limit_item_content(event["item"].take());
+        }
+        {
+            let mut stage = cell.stage.lock().await;
+            if let Some(stage) = stage.as_mut() {
+                stage
+                    .push(json!({"type":"__timeline_batch","events":events}))
+                    .await?;
+                return Ok(());
+            }
+        }
+        let _commit = cell.commit.lock().await;
+        let (mut snapshot, ready) = {
+            let data = cell.data.lock().await;
+            (data.snapshot.clone(), data.ready)
+        };
+        for event in &mut events {
+            if text(event, "turnId").is_none()
+                && let Some(turn) = text(&snapshot, "activeTurnId")
+            {
+                event["turnId"] = json!(turn);
+            }
+        }
+        let entries = events
+            .iter()
+            .map(|event| (event["item"].clone(), event.clone()))
+            .collect();
+        let timeline = cell.timeline.clone();
+        let path = self.timeline_path(id)?;
+        let owned_id = id.to_owned();
+        let persistent = snapshot["internal"] != true;
+        let rows = tokio::task::spawn_blocking(move || {
+            let mut timeline = timeline
+                .lock()
+                .map_err(|_| anyhow!("Timeline lock poisoned"))?;
+            if persistent {
+                timeline.append_batch_persisted(&path, &owned_id, entries)
+            } else {
+                Ok(entries
+                    .into_iter()
+                    .map(|(item, options)| timeline.append(item, &options))
+                    .collect())
+            }
+        })
+        .await??;
+        snapshot["updatedAt"] = json!(now());
+        snapshot["status"] = snapshot["lifecycle"].clone();
+        if ready {
+            self.persist_snapshot(&mut snapshot, true).await?;
+        }
+        cell.data.lock().await.snapshot = snapshot.clone();
+        if ready {
+            self.publish_state(&snapshot);
+            for (event, row) in events.into_iter().zip(rows) {
+                self.publish_stream(id, cell, event, Some(row)).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn append_to_cell(
         &self,
         id: &str,
@@ -829,6 +915,12 @@ impl AgentManager {
         mut event: Value,
         from_history: bool,
     ) -> Result<()> {
+        if event["type"] == "__timeline_batch" {
+            let Value::Array(events) = event["events"].take() else {
+                bail!("Invalid staged timeline batch");
+            };
+            return self.apply_timeline_batch(id, cell, events).await;
+        }
         let _resident = cell.activity.gate.clone().read_owned().await;
         if cell.unloaded.load(Ordering::Acquire) {
             return Ok(());

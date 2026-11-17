@@ -678,6 +678,15 @@ impl Timeline {
     ) -> Result<Value> {
         storage::append(self, path, agent_id, item, options)
     }
+    /// Atomically commits one coalescer flush before any source row is published.
+    pub(super) fn append_batch_persisted(
+        &mut self,
+        path: &Path,
+        agent_id: &str,
+        entries: Vec<(Value, Value)>,
+    ) -> Result<Vec<Value>> {
+        storage::append_batch(self, path, agent_id, entries)
+    }
 }
 
 pub fn limit_item_content(mut item: Value) -> Value {

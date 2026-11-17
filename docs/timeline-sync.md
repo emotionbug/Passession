@@ -28,8 +28,9 @@ prefix of the incoming text. Matching identities alone cannot authorize shorteni
 live text; a stale snapshot retains the canonical projection.
 
 Per-agent projection checkpoints live in `agent-timelines/{id}.sqlite3`. A retained SQLite
-connection commits the changed projected row and sequence metadata together using WAL and
-`synchronous=FULL` before publishing the event. Failed commits restore the in-memory projection;
+connection commits every changed projected row of a coalescer flush and its sequence metadata
+together in one WAL transaction using `synchronous=FULL`, before publishing any event of that
+flush. A failed commit restores the in-memory projection of the whole flush and publishes nothing;
 full provider replay replaces the checkpoint in one transaction. The checkpoint never replaces
 provider history as the transcript authority.
 

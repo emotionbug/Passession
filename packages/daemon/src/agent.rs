@@ -761,7 +761,15 @@ impl AgentManager {
                 } else {
                     flushed.extend(coalescer.flush_all(now_ms));
                 }
-                let result=async {for output in flushed{let mut event=json!({"type":"timeline","provider":output["provider"],"item":output["item"]});if let Some(turn)=output.get("turnId"){event["turnId"]=turn.clone();}manager.apply_event(&id,&current,event,false).await?;}
+                let result=async {
+                    let events = flushed.into_iter().map(|output| {
+                        let mut event = json!({"type":"timeline","provider":output["provider"],"item":output["item"]});
+                        if let Some(turn) = output.get("turnId") {
+                            event["turnId"] = turn.clone();
+                        }
+                        event
+                    }).collect();
+                    manager.apply_timeline_batch(&id, &current, events).await?;
                     if let Some(event)=direct {
                         if matches!(text(&event,"type"),Some("__barrier"|"__release_stage")){
                             if event["type"]=="__release_stage" {

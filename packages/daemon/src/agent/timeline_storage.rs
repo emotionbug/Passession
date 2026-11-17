@@ -189,13 +189,7 @@ impl Store {
 
     /// One stored row selected by `sql` with `params`, and its position.
     fn find(&self, sql: &str, params: impl rusqlite::Params) -> Result<Option<(usize, Value)>> {
-        let mut statement = self.connection.prepare_cached(sql)?;
-        let mut rows = statement.query(params)?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        let position = usize::try_from(row.get::<_, i64>(0)?)?;
-        Ok(Some((position, decode(row.get_ref(1)?.as_str()?)?)))
+        find_row(&self.connection, sql, params)
     }
 
     /// Stored rows before `end` in position order, filtered to at most two
@@ -222,6 +216,20 @@ impl Store {
         }
         Ok(true)
     }
+}
+
+fn find_row(
+    connection: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Option<(usize, Value)>> {
+    let mut statement = connection.prepare_cached(sql)?;
+    let mut rows = statement.query(params)?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let position = usize::try_from(row.get::<_, i64>(0)?)?;
+    Ok(Some((position, decode(row.get_ref(1)?.as_str()?)?)))
 }
 
 fn decode(encoded: &str) -> Result<Value> {
@@ -893,14 +901,122 @@ pub(super) fn append(
     project_row(timeline, row)
 }
 
+/// Only changed resident rows are retained for rollback, not the whole tail.
+struct RowUndo {
+    len: usize,
+    row: Option<(usize, Value, Option<u64>)>,
+    identity: Option<(String, Option<usize>)>,
+    submitted: Option<(String, Option<usize>)>,
+    next_seq: i64,
+    min_seq: i64,
+}
+
+impl RowUndo {
+    fn restore(self, timeline: &mut Timeline) {
+        timeline.rows.truncate(self.len);
+        timeline.sizes.truncate(self.len);
+        if let Some((index, row, size)) = self.row {
+            timeline.rows[index] = row;
+            if let Some(size) = size {
+                timeline.sizes[index] = size;
+            }
+        }
+        timeline.next_seq = self.next_seq;
+        timeline.min_seq = self.min_seq;
+        for (map, entry) in [
+            (&mut timeline.identities, self.identity),
+            (&mut timeline.submitted, self.submitted),
+        ] {
+            if let Some((id, position)) = entry {
+                if let Some(position) = position {
+                    map.insert(id, position);
+                } else {
+                    map.remove(&id);
+                }
+            }
+        }
+    }
+}
+
+/// A flush is one FULL transaction, including its final sequence metadata.
+pub(super) fn append_batch(
+    timeline: &mut Timeline,
+    path: &Path,
+    agent_id: &str,
+    entries: Vec<(Value, Value)>,
+) -> Result<Vec<Value>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    ensure_storage(timeline, path, agent_id)?;
+    let mut store = timeline
+        .storage
+        .take()
+        .context("Timeline storage missing")?;
+    let old_next = timeline.next_seq;
+    let old_min = timeline.min_seq;
+    let old_evicted = timeline.evicted_seq_end;
+    let old_revision = timeline.native_revision.take();
+    let mut undo = Vec::with_capacity(entries.len());
+    let result = (|| {
+        let transaction = store.connection.transaction()?;
+        let mut rows = Vec::with_capacity(entries.len());
+        for (item, options) in entries {
+            let row = timeline.source_row(item, &options);
+            rows.push(project_row_with(
+                timeline,
+                row,
+                Some((&transaction, &mut undo)),
+            )?);
+        }
+        transaction
+            .prepare_cached(UPDATE_METADATA)?
+            .execute(params![timeline.epoch, timeline.next_seq, timeline.min_seq])?;
+        transaction.commit()?;
+        Ok(rows)
+    })();
+    timeline.storage = Some(store);
+    match result {
+        Ok(rows) => {
+            timeline.trim();
+            Ok(rows)
+        }
+        Err(error) => {
+            for change in undo.into_iter().rev() {
+                change.restore(timeline);
+            }
+            timeline.next_seq = old_next;
+            timeline.min_seq = old_min;
+            timeline.evicted_seq_end = old_evicted;
+            timeline.native_revision = old_revision;
+            Err(error)
+        }
+    }
+}
 fn project_row(timeline: &mut Timeline, row: Value) -> Result<Value> {
+    project_row_with(timeline, row, None)
+}
+
+fn project_row_with(
+    timeline: &mut Timeline,
+    row: Value,
+    mut batch: Option<(&Connection, &mut Vec<RowUndo>)>,
+) -> Result<Value> {
     let id = super::identity(&row["item"]);
     // A lifecycle update of a tool or plugin row older than the resident tail
     // merges into its stored row in place; the tail is unchanged.
     let stored = match &id {
-        Some(id) if timeline.base > 0 && !timeline.identities.contains_key(id) => timeline
-            .store()?
-            .find(&FIND_IDENTITY, params![id, timeline.base as i64])?,
+        Some(id) if timeline.base > 0 && !timeline.identities.contains_key(id) => {
+            let connection = match &batch {
+                Some((connection, _)) => *connection,
+                None => &timeline.store()?.connection,
+            };
+            find_row(
+                connection,
+                &FIND_IDENTITY,
+                params![id, timeline.base as i64],
+            )?
+        }
         _ => None,
     };
     if let Some((position, mut stored)) = stored
@@ -909,7 +1025,14 @@ fn project_row(timeline: &mut Timeline, row: Value) -> Result<Value> {
         timeline.next_seq += 1;
         let committed = serde_json::to_string(&stored)
             .map_err(anyhow::Error::from)
-            .and_then(|encoded| commit_row(timeline, position, &encoded));
+            .and_then(|encoded| {
+                write_projected_row(
+                    timeline,
+                    position,
+                    &encoded,
+                    batch.as_ref().map(|(connection, _)| *connection),
+                )
+            });
         if let Err(error) = committed {
             timeline.next_seq -= 1;
             return Err(error);
@@ -935,44 +1058,45 @@ fn project_row(timeline: &mut Timeline, row: Value) -> Result<Value> {
                 None
             }
         });
-    let old_row = candidate.map(|index| (index, timeline.rows[index].clone()));
+    let old_row = candidate.map(|index| {
+        (
+            index,
+            timeline.rows[index].clone(),
+            timeline.sizes.get(index).copied(),
+        )
+    });
     let submitted_id = (row["item"]["type"] == "user_message")
         .then(|| row["item"]["clientMessageId"].as_str().map(str::to_owned))
         .flatten();
     let old_submitted = submitted_id
         .as_ref()
         .and_then(|id| timeline.submitted.get(id).copied());
+    let undo = RowUndo {
+        len: old_len,
+        row: old_row,
+        identity: id.map(|id| (id, old_identity)),
+        submitted: submitted_id.map(|id| (id, old_submitted)),
+        next_seq: old_next,
+        min_seq: old_min,
+    };
     timeline.next_seq += 1;
     let position = timeline.append_row(row.clone());
     let index = position - timeline.base;
     let committed = serde_json::to_string(&timeline.rows[index])
         .map_err(anyhow::Error::from)
         .and_then(|encoded| {
-            commit_row(timeline, position, &encoded).map(|()| encoded.len() as u64)
+            write_projected_row(
+                timeline,
+                position,
+                &encoded,
+                batch.as_ref().map(|(connection, _)| *connection),
+            )
+            .map(|()| encoded.len() as u64)
         });
     let size = match committed {
         Ok(size) => size,
         Err(error) => {
-            timeline.rows.truncate(old_len);
-            if let Some((index, row)) = old_row {
-                timeline.rows[index] = row;
-            }
-            timeline.next_seq = old_next;
-            timeline.min_seq = old_min;
-            if let Some(id) = id {
-                if let Some(position) = old_identity {
-                    timeline.identities.insert(id, position);
-                } else {
-                    timeline.identities.remove(&id);
-                }
-            }
-            if let Some(id) = submitted_id {
-                if let Some(position) = old_submitted {
-                    timeline.submitted.insert(id, position);
-                } else {
-                    timeline.submitted.remove(&id);
-                }
-            }
+            undo.restore(timeline);
             return Err(error);
         }
     };
@@ -983,8 +1107,29 @@ fn project_row(timeline: &mut Timeline, row: Value) -> Result<Value> {
             timeline.sizes[index] = size;
         }
     }
-    timeline.trim();
+    if let Some((_, changes)) = batch.as_mut() {
+        changes.push(undo);
+    } else {
+        timeline.trim();
+    }
     Ok(row)
+}
+
+fn write_projected_row(
+    timeline: &mut Timeline,
+    position: usize,
+    encoded: &str,
+    batch: Option<&Connection>,
+) -> Result<()> {
+    if let Some(connection) = batch {
+        connection
+            .prepare_cached(UPSERT_ROW)?
+            .execute(params![position as i64, encoded])?;
+        timeline.native_revision = None;
+        Ok(())
+    } else {
+        commit_row(timeline, position, encoded)
+    }
 }
 
 pub(super) fn enrich(
@@ -1033,4 +1178,198 @@ pub(super) fn enrich(
         }
     }
     Ok(Some(timeline.rows[index].clone()))
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use crate::agent::timeline::StreamCoalescer;
+    use std::ffi::{c_int, c_void};
+
+    #[derive(Default)]
+    struct CommitState {
+        attempts: usize,
+        reject: bool,
+    }
+
+    // The safe rusqlite hooks API is an optional feature. Keep this test-only
+    // hook alive until it is unregistered, before its owning timeline is dropped.
+    struct CommitHook {
+        database: *mut rusqlite::ffi::sqlite3,
+        state: Box<CommitState>,
+    }
+
+    impl CommitHook {
+        fn install(timeline: &mut Timeline, reject: bool) -> Self {
+            unsafe extern "C" fn commit(state: *mut c_void) -> c_int {
+                let state = unsafe { &mut *state.cast::<CommitState>() };
+                state.attempts += 1;
+                i32::from(state.reject)
+            }
+            let mut state = Box::new(CommitState {
+                attempts: 0,
+                reject,
+            });
+            let database = unsafe { timeline.storage.as_mut().unwrap().connection.handle() };
+            unsafe {
+                rusqlite::ffi::sqlite3_commit_hook(
+                    database,
+                    Some(commit),
+                    (&mut *state as *mut CommitState).cast(),
+                );
+            }
+            Self { database, state }
+        }
+    }
+
+    impl Drop for CommitHook {
+        fn drop(&mut self) {
+            unsafe {
+                rusqlite::ffi::sqlite3_commit_hook(self.database, None, std::ptr::null_mut());
+            }
+        }
+    }
+
+    fn memory(timeline: &Timeline) -> Value {
+        json!({
+            "epoch": timeline.epoch,
+            "rows": timeline.rows,
+            "sizes": timeline.sizes,
+            "base": timeline.base,
+            "evicted": timeline.evicted_seq_end,
+            "identities": timeline.identities,
+            "submitted": timeline.submitted,
+            "next": timeline.next_seq,
+            "min": timeline.min_seq,
+            "revision": timeline.native_revision,
+            "dirty": timeline.storage_dirty,
+        })
+    }
+
+    #[test]
+    fn coalescer_flush_commits_all_rows_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("timeline.sqlite3");
+        let mut timeline = Timeline::load(&path, "agent").unwrap();
+        timeline.persist(&path, "agent").unwrap();
+        let mut coalescer = StreamCoalescer::new(60);
+        let event = |item| json!({"type":"timeline","provider":"omp","turnId":"turn","item":item});
+        coalescer.handle(
+            "agent",
+            &event(json!({"type":"assistant_message","text":"initial"})),
+            0,
+        );
+        for item in [
+            json!({"type":"assistant_message","text":"reply"}),
+            json!({"type":"reasoning","text":"thought"}),
+            json!({"type":"tool_call","callId":"tool","status":"running"}),
+        ] {
+            assert!(
+                coalescer
+                    .handle("agent", &event(item), 1)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let entries: Vec<_> = coalescer
+            .flush_due(61)
+            .into_iter()
+            .map(|event| (event["item"].clone(), event))
+            .collect();
+        assert_eq!(entries.len(), 3);
+        let hook = CommitHook::install(&mut timeline, false);
+        let rows = timeline
+            .append_batch_persisted(&path, "agent", entries)
+            .unwrap();
+        assert_eq!(hook.state.attempts, 1);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["seq"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(timeline.next_seq(), 4);
+        let synchronous: i64 = timeline
+            .storage
+            .as_ref()
+            .unwrap()
+            .connection
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2);
+        assert_eq!(
+            Timeline::load(&path, "agent").unwrap().all_rows().unwrap(),
+            timeline.all_rows().unwrap()
+        );
+    }
+
+    #[test]
+    fn rejected_batch_commit_restores_every_row_and_projection_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("timeline.sqlite3");
+        let mut seed = Timeline::new();
+        let options = json!({"timestamp":"2026-01-01T00:00:00.000Z"});
+        seed.append(
+            json!({"type":"tool_call","callId":"old","status":"running"}),
+            &options,
+        );
+        for index in 0..300 {
+            seed.append(json!({"type":"user_message","text":"hello","clientMessageId":format!("client-{index}")}), &options);
+        }
+        seed.append(
+            json!({"type":"assistant_message","text":"before"}),
+            &options,
+        );
+        seed.persist(&path, "agent").unwrap();
+        let mut timeline = Timeline::load(&path, "agent").unwrap();
+        assert!(timeline.base > 0);
+        certify(&mut timeline, Some(json!({"revision":"before"}))).unwrap();
+        let before = memory(&timeline);
+        let before_rows = timeline.all_rows().unwrap();
+        let mut hook = CommitHook::install(&mut timeline, true);
+        let entries = [
+            json!({"type":"tool_call","callId":"old","status":"completed"}),
+            json!({"type":"assistant_message","text":" changed"}),
+            json!({"type":"tool_call","callId":"new","status":"running"}),
+            json!({"type":"tool_call","callId":"new","status":"completed"}),
+            json!({"type":"user_message","text":"new","clientMessageId":"new-client"}),
+        ]
+        .into_iter()
+        .map(|item| (item, options.clone()))
+        .collect();
+        assert!(
+            timeline
+                .append_batch_persisted(&path, "agent", entries)
+                .is_err()
+        );
+        assert_eq!(hook.state.attempts, 1);
+        assert_eq!(memory(&timeline), before);
+        let saved = Timeline::load(&path, "agent").unwrap();
+        assert_eq!(saved.all_rows().unwrap(), before_rows);
+        assert_eq!(saved.next_seq, timeline.next_seq);
+        assert_eq!(saved.native_revision, timeline.native_revision);
+        // The connection and projection remain usable after the rejected COMMIT.
+        hook.state.reject = false;
+        timeline
+            .append_batch_persisted(
+                &path,
+                "agent",
+                vec![
+                    (
+                        json!({"type":"tool_call","callId":"old","status":"completed"}),
+                        options.clone(),
+                    ),
+                    (
+                        json!({"type":"assistant_message","text":" committed"}),
+                        options,
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(hook.state.attempts, 2);
+        assert_eq!(
+            Timeline::load(&path, "agent").unwrap().all_rows().unwrap(),
+            timeline.all_rows().unwrap()
+        );
+    }
 }
