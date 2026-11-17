@@ -1104,7 +1104,7 @@ fn image(
     link: Option<&(String, FileLinkSourceType)>,
 ) -> f64 {
     let owner = d.result_owner(cx);
-    let state = images::image(
+    let state = images::fitted_image(
         cx,
         opts.core,
         opts.host_id,
@@ -1112,6 +1112,7 @@ fn image(
         url,
         opts.key,
         owner,
+        w,
     );
     match state {
         ImageState::Loading => 320.0,

@@ -1,11 +1,12 @@
 //! Off-thread image decoding (raster via `image`, SVG via `resvg`) and GUI-thread textures, plus
 //! the material file icon cache (Flutter `MaterialFileIcon`, `SvgPicture`, `Image.memory`).
-//! Decoding never runs on the GUI thread; finished pixels arrive through a `ToUISender`
+//! Decoding never runs on the GUI thread: a fixed pair of worker threads, shared with assistant
+//! images, takes jobs in submission order; finished pixels arrive through a `ToUISender`
 //! (Signal wake) and become textures in [`poll`].
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use makepad_widgets::image_cache::ImageBuffer;
 use makepad_widgets::*;
@@ -20,7 +21,7 @@ pub struct Decoded {
 }
 
 /// The largest side a decoded image keeps (textures above this are downscaled).
-const MAX_SIDE: u32 = 4096;
+pub const MAX_SIDE: u32 = 4096;
 
 pub fn is_svg(bytes: &[u8], mime: &str) -> bool {
     if mime.split(';').next().map(str::trim) == Some("image/svg+xml") {
@@ -35,32 +36,65 @@ pub fn is_svg(bytes: &[u8], mime: &str) -> bool {
 /// `min_side` (for crisp icons) and at most [`MAX_SIDE`].
 pub fn decode(bytes: &[u8], mime: &str, min_side: u32) -> Result<Decoded, String> {
     if is_svg(bytes, mime) {
-        return decode_svg(bytes, min_side);
+        return decode_svg(bytes, |w, h| (min_side as f32 / w.max(h)).max(1.0));
     }
-    let image = ::image::load_from_memory(bytes).map_err(|error| error.to_string())?;
-    let image = if image.width() > MAX_SIDE || image.height() > MAX_SIDE {
-        image.resize(MAX_SIDE, MAX_SIDE, ::image::imageops::FilterType::Triangle)
-    } else {
-        image
-    };
-    let rgba = image.to_rgba8();
-    Ok(Decoded {
-        width: rgba.width() as usize,
-        height: rgba.height() as usize,
-        rgba: rgba.into_raw(),
-    })
+    decode_raster(bytes, MAX_SIDE, MAX_SIDE).map(|(decoded, _)| decoded)
 }
 
-fn decode_svg(bytes: &[u8], min_side: u32) -> Result<Decoded, String> {
+/// Decodes `bytes` to fit inside `max_width` x `max_height` pixels (each at most [`MAX_SIDE`]):
+/// rasters only shrink, SVGs render at the scale that fills the box. The flag tells whether the
+/// pixels are the source's full resolution (a raster that already fit), so a larger box could
+/// not sharpen them.
+pub fn decode_to_fit(
+    bytes: &[u8],
+    mime: &str,
+    max_width: u32,
+    max_height: u32,
+) -> Result<(Decoded, bool), String> {
+    let (max_width, max_height) = (max_width.clamp(1, MAX_SIDE), max_height.clamp(1, MAX_SIDE));
+    if is_svg(bytes, mime) {
+        let decoded = decode_svg(bytes, |w, h| {
+            (max_width as f32 / w).min(max_height as f32 / h)
+        })?;
+        return Ok((decoded, false));
+    }
+    decode_raster(bytes, max_width, max_height)
+}
+
+fn decode_raster(bytes: &[u8], max_width: u32, max_height: u32) -> Result<(Decoded, bool), String> {
+    let image = ::image::load_from_memory(bytes).map_err(|error| error.to_string())?;
+    let fits = image.width() <= max_width && image.height() <= max_height;
+    let image = if fits {
+        image
+    } else {
+        // Keeps the aspect ratio, as large as fits the box.
+        image.resize(
+            max_width,
+            max_height,
+            ::image::imageops::FilterType::Triangle,
+        )
+    };
+    let rgba = image.into_rgba8();
+    Ok((
+        Decoded {
+            width: rgba.width() as usize,
+            height: rgba.height() as usize,
+            rgba: rgba.into_raw(),
+        },
+        fits,
+    ))
+}
+
+/// Renders an SVG at `scale(width, height)` of its intrinsic size, the longer side capped at
+/// [`MAX_SIDE`].
+fn decode_svg(bytes: &[u8], scale: impl Fn(f32, f32) -> f32) -> Result<Decoded, String> {
     use resvg::{tiny_skia, usvg};
     let options = usvg::Options::default();
     let tree = usvg::Tree::from_data(bytes, &options).map_err(|error| error.to_string())?;
     let size = tree.size();
     let (w, h) = (size.width().max(1.0), size.height().max(1.0));
     let longer = w.max(h);
-    let scale = (min_side as f32 / longer)
-        .max(1.0)
-        .min(MAX_SIDE as f32 / longer);
+    let scale = scale(w, h).min(MAX_SIDE as f32 / longer);
     let (pw, ph) = ((w * scale).ceil() as u32, (h * scale).ceil() as u32);
     let mut pixmap = tiny_skia::Pixmap::new(pw.max(1), ph.max(1)).ok_or("Invalid SVG size")?;
     resvg::render(
@@ -79,10 +113,71 @@ fn decode_svg(bytes: &[u8], min_side: u32) -> Result<Decoded, String> {
         }
     }
     Ok(Decoded {
-        width: pw as usize,
-        height: ph as usize,
+        width: pw.max(1) as usize,
+        height: ph.max(1) as usize,
         rgba,
     })
+}
+
+type DecodeJob = Box<dyn FnOnce() + Send>;
+
+struct DecodeQueue {
+    jobs: VecDeque<(u64, DecodeJob)>,
+    next: u64,
+    workers: usize,
+}
+
+/// Worker threads decoding images; started on first use and kept for the process.
+const DECODE_WORKERS: usize = 2;
+static DECODE_QUEUE: Mutex<DecodeQueue> = Mutex::new(DecodeQueue {
+    jobs: VecDeque::new(),
+    next: 0,
+    workers: 0,
+});
+static DECODE_READY: Condvar = Condvar::new();
+
+/// Queues decoding work behind earlier jobs; returns its tag for [`cancel_decode`].
+pub fn spawn_decode(job: impl FnOnce() + Send + 'static) -> u64 {
+    let mut queue = DECODE_QUEUE.lock().unwrap();
+    queue.next += 1;
+    let tag = queue.next;
+    queue.jobs.push_back((tag, Box::new(job)));
+    if queue.workers < DECODE_WORKERS
+        && std::thread::Builder::new()
+            .name("paseo-image-decode".into())
+            .spawn(decode_worker)
+            .is_ok()
+    {
+        queue.workers += 1;
+    }
+    drop(queue);
+    DECODE_READY.notify_one();
+    tag
+}
+
+/// Drops a queued job that has not started; a running one finishes.
+pub fn cancel_decode(tag: u64) {
+    DECODE_QUEUE
+        .lock()
+        .unwrap()
+        .jobs
+        .retain(|(queued, _)| *queued != tag);
+}
+
+fn decode_worker() {
+    loop {
+        let job = {
+            let mut queue = DECODE_QUEUE.lock().unwrap();
+            loop {
+                if let Some((_, job)) = queue.jobs.pop_front() {
+                    break job;
+                }
+                queue = DECODE_READY.wait(queue).unwrap();
+            }
+        };
+        // A panicking decoder must not take the worker with it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+    }
 }
 
 pub fn texture(cx: &mut Cx, decoded: &Decoded) -> Option<Texture> {
@@ -189,13 +284,11 @@ pub fn request(key: &str, bytes: Arc<Vec<u8>>, mime: &str, min_side: u32) {
         let sender = cache.receiver.sender();
         let key = key.to_owned();
         let mime = mime.to_owned();
-        std::thread::Builder::new()
-            .name("paseo-files-image".into())
-            .spawn(move || {
-                let result = decode(&bytes, &mime, min_side);
-                let _ = sender.send(Job { key, result });
-            })
-            .ok();
+        spawn_decode(move || {
+            let result = std::panic::catch_unwind(|| decode(&bytes, &mime, min_side))
+                .unwrap_or_else(|_| Err("Invalid image data".to_owned()));
+            let _ = sender.send(Job { key, result });
+        });
     });
 }
 

@@ -8,6 +8,8 @@ Links must retain their context: relative file links resolve against the documen
 
 Use native theme/text styles and preserve copy/selection, code formatting, lists, tables and long-content scrolling. Chat keeps stable row identity and source-indexed selection while its `PortalList` virtualizes rows. File preview shares the editing session's remote content; switching presentation must not create a second save owner. Keep error states visible for failed file/image acquisition. Do not fabricate a successful preview for unsupported content.
 
+Inline images are acquired through `timeline::images::fitted_image` at the available width × 320 px × DPI scale; a larger box re-decodes in the background while the current texture stays visible. The lightbox and avatars use `image()` at full quality (4096 px cap). The cache holds at most 500 acquisitions and 100 MiB of decoded pixels, evicting the least recently used ready image first. At most four acquisitions fetch or decode at once, and decodes share the two Files image workers.
+
 ## Streaming work
 
 Assistant messages retain grapheme-safe paced reveal rather than waiting to

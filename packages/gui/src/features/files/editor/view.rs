@@ -1,7 +1,8 @@
 //! The native source editor (Flutter `FilePanel._source` TextField + `_SourceLineNumbers` +
 //! `SourceController`): monospace rows with an optional wrap, a line-number gutter, syntax
 //! colouring from the worker, selection, IME commits, clipboard, undo/redo and keyboard
-//! navigation. Only visible rows are laid out; row geometry is cached per text revision.
+//! navigation. Only visible rows are laid out; row geometry is cached per text revision and
+//! row layouts only near the viewport.
 //!
 //! The editor is not a widget: its owner forwards hits inside the editor rect and draws it into
 //! a rect, so one widget area serves the whole file view.
@@ -71,6 +72,15 @@ struct Geometry {
     starts: HashMap<usize, Vec<usize>>,
 }
 
+/// Source-to-display byte map of one laid-out row (empty without tabs).
+type TabMap = Rc<[(usize, usize)]>;
+
+/// A laid-out visual row and its source-to-display byte map (empty without tabs).
+struct RowLayout {
+    laid: Rc<LaidoutText>,
+    map: TabMap,
+}
+
 pub struct SourceEditor {
     pub buffer: TextBuffer,
     pub read_only: bool,
@@ -85,7 +95,8 @@ pub struct SourceEditor {
     char_width: f64,
     char_width_size: f64,
     geometry: Geometry,
-    layouts: HashMap<(usize, usize), Rc<LaidoutText>>,
+    /// Laid-out visual rows near the viewport, keyed by (line, row within line).
+    layouts: HashMap<(usize, usize), RowLayout>,
     layouts_key: (u64, u64, u64, bool, usize, bool),
     /// The owner widget's keyboard focus area, distinct from IME caret geometry.
     ime_area: Area,
@@ -488,13 +499,12 @@ impl SourceEditor {
         line: usize,
         row: usize,
         highlighted: Option<&Highlighted>,
-    ) -> (Rc<LaidoutText>, Vec<(usize, usize)>, usize) {
+    ) -> (Rc<LaidoutText>, TabMap, usize) {
         let (start, end) = self.row_range(line, row);
-        let row_text = self.buffer.text()[start..end].to_owned();
-        let (display_text, map) = display(&row_text);
-        if let Some(laid) = self.layouts.get(&(line, row)) {
-            return (laid.clone(), map, start);
+        if let Some(cached) = self.layouts.get(&(line, row)) {
+            return (cached.laid.clone(), cached.map.clone(), start);
         }
+        let (display_text, map) = display(&self.buffer.text()[start..end]);
         let fg = look.palette.foreground;
         let mut spans = Vec::new();
         let line_start = self.buffer.line_start(line);
@@ -550,7 +560,14 @@ impl SourceEditor {
             });
         }
         let laid = kit.layout_rich(cx, &display_text, &spans, None, 1.0);
-        self.layouts.insert((line, row), laid.clone());
+        let map: TabMap = map.into();
+        self.layouts.insert(
+            (line, row),
+            RowLayout {
+                laid: laid.clone(),
+                map: map.clone(),
+            },
+        );
         (laid, map, start)
     }
 
@@ -744,6 +761,15 @@ impl SourceEditor {
         let first = (((self.scroll.y - top) / line_height).floor().max(0.0)) as usize;
         let visible = (content.size.y / line_height).ceil() as usize + 2;
         let last = (first + visible).min(total);
+        // Layouts stay for the visible rows, a screen above and below, and the caret row.
+        let head_row = self.row_of(self.buffer.selection.head);
+        let keep = first.saturating_sub(visible)..last + visible;
+        let prefix = &self.geometry.prefix;
+        self.layouts.retain(|&(line, row), _| {
+            prefix
+                .get(line)
+                .is_some_and(|before| keep.contains(&(before + row)) || before + row == head_row)
+        });
         let sel = self.buffer.selection;
         let selection_color = with_alpha(p.accent, 0.35);
         let mut caret_rect = None;
