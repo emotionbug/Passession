@@ -17,8 +17,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use makepad_widgets::makepad_draw::text::fallback::{FallbackRequests, MissingGlyph};
 use makepad_widgets::makepad_draw::text::font::FontId;
@@ -75,10 +74,6 @@ impl FontRoles {
 const ROLES: usize = 5;
 /// UI primary and eager Hangul fallback; all other scripts resolve on demand.
 const SLOTS: usize = 2;
-/// How long the first frame may wait for system fonts before painting with the
-/// bundled ones (applied on a later signal instead).
-pub const STARTUP_BUDGET: Duration = Duration::from_millis(300);
-
 /// Line metrics in ems, as `Font::{ascender,descender,line_gap}_in_ems` report them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Metrics {
@@ -151,22 +146,6 @@ impl SystemFontState {
         if let Err(error) = spawned {
             log!("system fonts: worker did not start ({error}); keeping bundled fonts");
             self.pending = None;
-        }
-    }
-
-    /// Startup: waits up to `budget` so the first frame already uses system
-    /// fonts; a later [`Self::poll`] applies a slower result.
-    pub fn settle(&mut self, cx: &mut Cx, roles: &FontRoles, budget: Duration) {
-        let Some(receiver) = &self.pending else {
-            return;
-        };
-        match receiver.recv_timeout(budget) {
-            Ok(resolved) => {
-                self.pending = None;
-                self.apply(cx, roles, resolved);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => self.pending = None,
         }
     }
 

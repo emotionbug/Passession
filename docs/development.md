@@ -121,7 +121,7 @@ The theme's five text families (`THEME_FONT_REGULAR`, `_BOLD`, `_ITALIC`, `_BOLD
 
 Positive and negative discoveries belong to the current appearance/preference epoch. Refreshing it permits newly installed or changed fonts to resolve, including a different file under the same family name. Pending discovery and per-family Unicode deduplication are bounded; overflow retries without permanently excluding characters, and unavailable characters eventually stop requesting work.
 
-Completed discovery invalidates synchronous and asynchronous layouts, typography-dependent caches and wrapped diff row heights. System faces get ascender/descender adjustments to fit the primary face's line height. The first frame waits up to 300 ms for startup resolution; later results trigger relayout. `system fonts: …` and `system font fallback: …` log the chosen sources. Accessibility text scale still owns size changes.
+Completed discovery invalidates synchronous and asynchronous layouts, typography-dependent caches and wrapped diff row heights. System faces get ascender/descender adjustments to fit the primary face's line height. The first frame draws immediately with the bundled fonts; when discovery completes, text is laid out again with the system fonts. `system fonts: …` and `system font fallback: …` log the chosen sources. Accessibility text scale still owns size changes.
 
 ## Source ownership
 

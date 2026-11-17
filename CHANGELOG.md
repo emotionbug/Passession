@@ -6,6 +6,7 @@
 
 - Compile Windows x64 and macOS arm64 release builds on Linux. The Native Release workflow cross-compiles the daemon, app, Tailscale library and update helper on Ubuntu with a pinned toolchain (`cargo xtask cross-tools`: the MSVC CRT and Windows SDK through xwin, Apple's macOS 15.5 SDK) and hands the unsigned, hash-listed files to a short job on Windows or macOS. That job only signs, adds the C runtime, builds the installer or app bundle, notarizes, and on Windows runs the COM and helper smoke tests, which are also compiled on Linux. In the last release the Windows job spent 20 minutes and the macOS job 15 minutes compiling.
 - Stop waking the Linux app 125 times a second while idle. An X11 window polled for background work every 8 ms; background work now wakes it directly.
+- Draw the app's first frame without waiting up to 300 ms for system fonts. It starts with the bundled fonts and switches when system fonts are found. Each daemon message is now parsed once instead of twice.
 
 ### Removed
 

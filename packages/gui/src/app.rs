@@ -496,12 +496,9 @@ impl AppMain for App {
             let preferences = runtime.ui.state.get("preferences").unwrap_or(&Value::Null);
             self.system_fonts.request(preferences, refresh_appearance);
         }
-        // The first frame waits briefly for system fonts; a slower worker
-        // result arrives with a later signal (one relayout).
-        if matches!(event, Event::Startup) {
-            self.system_fonts
-                .settle(cx, &self.font_roles, fonts::STARTUP_BUDGET);
-        } else if matches!(event, Event::Signal) {
+        // Paint with bundled fonts immediately; discovery signals apply system
+        // faces and invalidate retained layouts through the normal late-font path.
+        if matches!(event, Event::Signal) {
             self.system_fonts.poll(cx, &self.font_roles);
         }
         let batch = !runtime.ui.events.is_empty();

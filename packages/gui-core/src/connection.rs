@@ -16,7 +16,7 @@ use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use paseo_client::{
-    DaemonClient,
+    DaemonClient, IncomingFrame,
     crypto::SecurityMode,
     transport::{
         HostFrame,
@@ -269,7 +269,7 @@ const REJECTIONS: [&str; 3] = [
 struct Pump {
     raw: Raw,
     outgoing: mpsc::Receiver<HostFrame>,
-    client_in: mpsc::Sender<anyhow::Result<HostFrame>>,
+    client_in: mpsc::Sender<anyhow::Result<IncomingFrame>>,
     core: mpsc::UnboundedSender<Inbound>,
     control: mpsc::UnboundedReceiver<Control>,
     cancel: CancellationToken,
@@ -331,7 +331,7 @@ impl Pump {
                             }
                             self.liveness.failures.set(0);
                             let _ = self.core.send(Inbound::Binary(bytes.clone()));
-                            if self.client_in.send(Ok(HostFrame::Binary(bytes))).await.is_err() {
+                            if self.client_in.send(Ok(HostFrame::Binary(bytes).into())).await.is_err() {
                                 break Ok(());
                             }
                         }
@@ -365,7 +365,7 @@ impl Pump {
                                 _ => continue,
                             }
                             self.liveness.failures.set(0);
-                            if self.client_in.send(Ok(HostFrame::Text(text))).await.is_err() {
+                            if self.client_in.send(Ok(IncomingFrame::Json(root))).await.is_err() {
                                 break Ok(());
                             }
                         }

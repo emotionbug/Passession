@@ -252,6 +252,20 @@ pub struct DaemonClient {
     reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
     transport: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
+/// Input to the SDK reader. Pumps that inspect JSON envelopes can transfer the
+/// parsed value instead of making the reader parse the same text again.
+#[derive(Debug)]
+pub enum IncomingFrame {
+    Json(Value),
+    Raw(HostFrame),
+}
+
+impl From<HostFrame> for IncomingFrame {
+    fn from(frame: HostFrame) -> Self {
+        Self::Raw(frame)
+    }
+}
+
 pub struct ClientEvents<T: Clone> {
     receiver: broadcast::Receiver<T>,
     cancel: CancellationToken,
@@ -330,9 +344,10 @@ impl DaemonClient {
     }
     /// Attach an owned transport, including a native plugin host IPC bridge.
     /// The pump must honor cancellation and acknowledge `HostFrame::Flush`.
-    pub async fn from_transport(
+    /// Incoming frames may be raw transport frames or already-parsed envelopes.
+    pub async fn from_transport<F: Into<IncomingFrame> + Send + 'static>(
         outgoing: tokio::sync::mpsc::Sender<HostFrame>,
-        incoming: tokio::sync::mpsc::Receiver<Result<HostFrame>>,
+        incoming: tokio::sync::mpsc::Receiver<Result<F>>,
         cancel: CancellationToken,
         task: tokio::task::JoinHandle<()>,
         client_id: &str,
@@ -349,9 +364,9 @@ impl DaemonClient {
         )
         .await
     }
-    async fn from_parts(
+    async fn from_parts<F: Into<IncomingFrame> + Send + 'static>(
         sender: ClientSender,
-        mut incoming: tokio::sync::mpsc::Receiver<Result<HostFrame>>,
+        mut incoming: tokio::sync::mpsc::Receiver<Result<F>>,
         cancel: CancellationToken,
         transport: tokio::task::JoinHandle<()>,
         hello: Value,
@@ -372,12 +387,17 @@ impl DaemonClient {
             let mut ready = Some(ready_tx);
             let outcome:Result<()>=async {
                 loop { let frame=tokio::select!{biased;frame=incoming.recv()=>frame.ok_or_else(||ClientError::new("DAEMON_CONNECTION_LOST","Daemon connection closed"))??,_=state.cancel.cancelled()=>bail!("Daemon connection closed")};
-                    let text=match frame {HostFrame::Text(text)=>text,HostFrame::Binary(bytes)=>{let _=state.binary.send(bytes);continue;},HostFrame::Close{reason,..}=>bail!("Daemon connection closed: {reason}"),HostFrame::Flush(reply)=>{let _=reply.send(Err(anyhow!("Invalid inbound flush barrier")));continue;}};
-                    let wire:Value=serde_json::from_str(&text)?;
+                    let mut wire = match frame.into() {
+                        IncomingFrame::Json(wire) => wire,
+                        IncomingFrame::Raw(HostFrame::Text(text)) => serde_json::from_str::<Value>(&text)?,
+                        IncomingFrame::Raw(HostFrame::Binary(bytes)) => { let _ = state.binary.send(bytes); continue; }
+                        IncomingFrame::Raw(HostFrame::Close { reason, .. }) => bail!("Daemon connection closed: {reason}"),
+                        IncomingFrame::Raw(HostFrame::Flush(reply)) => { let _ = reply.send(Err(anyhow!("Invalid inbound flush barrier"))); continue; }
+                    };
                     if wire["type"]=="hello.rejected" {let (code,message)=match wire["reason"].as_str(){Some("password_required")=>("AUTH_REQUIRED","Password required"),Some("incorrect_password")=>("AUTH_FAILED","Incorrect password"),_=>("INCOMPATIBLE_PROTOCOL","Incompatible protocol version")};return Err(ClientError::new(code,message).into());}
                     if wire["type"]=="pong" {continue;}
                     ensure!(wire["type"]=="session","Invalid daemon message envelope");
-                    let message=wire.get("message").cloned().ok_or_else(||anyhow!("Missing daemon session message"))?;
+                    let message=wire.get_mut("message").map(Value::take).ok_or_else(||anyhow!("Missing daemon session message"))?;
                     if message["type"]=="status" && message["payload"]["status"]=="server_info" {
                         ensure!(message["payload"]["protocolVersion"].as_u64().is_none_or(|v|v==1),"Incompatible protocol version");
                         *state.info.write().unwrap()=message["payload"].clone();if let Some(ready)=ready.take(){let _=ready.send(Ok(()));}
@@ -1015,6 +1035,115 @@ mod tests {
         assert!(request.await.is_err());
         assert!(shared.pending.lock().unwrap().is_empty());
     }
+    fn incoming_json(text: &str, parsed: bool) -> IncomingFrame {
+        if parsed {
+            IncomingFrame::Json(serde_json::from_str(text).unwrap())
+        } else {
+            HostFrame::Text(text.into()).into()
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_and_parsed_transports_keep_message_routing() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for parsed in [false, true] {
+                let cancel = CancellationToken::new();
+                let stop = cancel.clone();
+                let (outgoing, mut outbound) = tokio::sync::mpsc::channel(8);
+                let (inbound, incoming) = tokio::sync::mpsc::channel(8);
+                let task = tokio::spawn(async move {
+                    assert!(matches!(outbound.recv().await, Some(HostFrame::Text(_))));
+                    inbound.send(Ok(incoming_json(
+                        r#"{"type":"session","message":{"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":"srv"}}}"#,
+                        parsed,
+                    ))).await.unwrap();
+                    assert!(matches!(outbound.recv().await, Some(HostFrame::Text(_))));
+                    for text in [
+                        r#"{"type":"pong"}"#,
+                        r#"{"type":"session","message":{"type":"wrong","payload":{"requestId":"one","value":0}}}"#,
+                        r#"{"type":"session","message":{"type":"notice","payload":{"text":"quoted \"text\" and 한글"}}}"#,
+                        r#"{"type":"session","message":{"type":"expected","payload":{"requestId":"one","value":1}}}"#,
+                    ] {
+                        inbound.send(Ok(incoming_json(text, parsed))).await.unwrap();
+                    }
+                    inbound.send(Ok(HostFrame::Binary(bytes::Bytes::from_static(b"\xff\0")).into())).await.unwrap();
+                    stop.cancelled().await;
+                });
+                let client = DaemonClient::from_transport(
+                    outgoing, incoming, cancel, task, "test", "cli", Duration::from_secs(1),
+                ).await.unwrap();
+                assert_eq!(client.server_info()["serverId"], "srv");
+                let mut events = client.subscribe();
+                let mut binary = client.subscribe_binary();
+                let response = client.request(
+                    json!({"type":"request","requestId":"one"}), "expected", Duration::from_secs(1),
+                ).await.unwrap();
+                assert_eq!(response["value"], 1);
+                for kind in ["wrong", "notice", "expected"] {
+                    let event = events.recv().await.unwrap();
+                    assert_eq!(event["type"], kind);
+                    if kind == "notice" {
+                        assert_eq!(event["payload"]["text"], "quoted \"text\" and 한글");
+                    }
+                }
+                assert!(matches!(events.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+                assert_eq!(binary.recv().await.unwrap().as_ref(), b"\xff\0");
+                client.close().await;
+            }
+        }).await.expect("transport routing stalled");
+    }
+
+    #[tokio::test]
+    async fn raw_and_parsed_transports_keep_handshake_errors() {
+        for parsed in [false, true] {
+            for (text, expected) in [
+                (
+                    r#"{"type":"hello.rejected","reason":"password_required"}"#,
+                    "Password required",
+                ),
+                (
+                    r#"{"type":"hello.rejected","reason":"incorrect_password"}"#,
+                    "Incorrect password",
+                ),
+                (
+                    r#"{"type":"hello.rejected","reason":"incompatible_protocol"}"#,
+                    "Incompatible protocol version",
+                ),
+                (r#"{"type":"invalid"}"#, "Invalid daemon message envelope"),
+                (r#"{"type":"session"}"#, "Missing daemon session message"),
+                (
+                    r#"{"type":"session","message":{"type":"status","payload":{"status":"server_info","protocolVersion":2}}}"#,
+                    "Incompatible protocol version",
+                ),
+            ] {
+                let cancel = CancellationToken::new();
+                let stop = cancel.clone();
+                let (outgoing, mut outbound) = tokio::sync::mpsc::channel(1);
+                let (inbound, incoming) = tokio::sync::mpsc::channel(1);
+                let task = tokio::spawn(async move {
+                    assert!(matches!(outbound.recv().await, Some(HostFrame::Text(_))));
+                    inbound.send(Ok(incoming_json(text, parsed))).await.unwrap();
+                    stop.cancelled().await;
+                });
+                let result = DaemonClient::from_transport(
+                    outgoing,
+                    incoming,
+                    cancel,
+                    task,
+                    "test",
+                    "cli",
+                    Duration::from_secs(1),
+                )
+                .await;
+                let error = match result {
+                    Ok(_) => panic!("invalid handshake accepted"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.to_string(), expected);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn disconnection_drains_buffered_events_then_closes_subscription() {
         let (sender, receiver) = broadcast::channel(2);
