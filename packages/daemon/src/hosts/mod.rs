@@ -885,6 +885,7 @@ fn client_capabilities() -> Value {
         "timeline_notifications",
         "plugin_timeline_items",
         "workspace_setup_observation",
+        "checkout_observation",
         "workspace_setup_blocked",
     ];
     Value::Object(

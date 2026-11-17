@@ -225,6 +225,15 @@
             {
               "type": "object",
               "properties": {
+                "type": { "const": "checkout.observe.request" },
+                "cwd": { "type": "string" },
+                "requestId": { "type": "string" }
+              },
+              "required": ["type", "cwd", "requestId"]
+            },
+            {
+              "type": "object",
+              "properties": {
                 "type": {
                   "type": "string",
                   "const": "hosts.list.request"

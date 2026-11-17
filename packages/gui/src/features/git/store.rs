@@ -67,6 +67,7 @@ pub struct CheckoutState {
     current_read: Option<(u64, u64)>,
     /// The state's own reload awaiting `(seq, generation)`.
     reload_wait: Option<(u64, u64)>,
+    observation: Option<RequestId>,
 }
 
 impl CheckoutState {
@@ -87,6 +88,7 @@ impl CheckoutState {
             reads: HashMap::new(),
             current_read: None,
             reload_wait: None,
+            observation: None,
         }
     }
 
@@ -262,7 +264,11 @@ impl GitStore {
         let events = std::mem::take(&mut ui.events);
         for core_event in &events {
             match core_event {
-                CoreEvent::Connected { host_id, .. } => {
+                CoreEvent::Connected {
+                    host_id,
+                    server_info,
+                    ..
+                } => {
                     self.connected.insert(host_id.clone(), true);
                     let keys: Vec<CheckoutKey> = self
                         .checkouts
@@ -271,6 +277,9 @@ impl GitStore {
                         .cloned()
                         .collect();
                     for key in keys {
+                        if server_info["features"]["checkoutObservation"] == true {
+                            self.observe_checkout(&key);
+                        }
                         self.reload(cx, &key);
                     }
                 }
@@ -345,6 +354,9 @@ impl GitStore {
             .entry(host_id.to_owned())
             .or_insert_with(|| host::connected(ui, host_id));
         if created && host::connected(ui, host_id) {
+            if host::supports(ui, host_id, "checkoutObservation") {
+                self.observe_checkout(&checkout);
+            }
             self.reload(cx, &checkout);
         }
     }
@@ -354,6 +366,11 @@ impl GitStore {
         if let Some(state) = self.checkouts.get_mut(&checkout) {
             state.refs = state.refs.saturating_sub(1);
             if state.refs == 0 {
+                if let Some(id) = state.observation.take()
+                    && let Some(core) = &self.core
+                {
+                    core.cancel_request(&id);
+                }
                 self.checkouts.remove(&checkout);
                 self.pending.retain(|_, pending| match pending {
                     Pending::StatusRead { key, .. } | Pending::PrStatus { key, .. } => {
@@ -362,6 +379,20 @@ impl GitStore {
                     _ => true,
                 });
             }
+        }
+    }
+
+    fn observe_checkout(&mut self, key: &CheckoutKey) {
+        let Some(core) = &self.core else { return };
+        let Some(state) = self.checkouts.get_mut(key) else {
+            return;
+        };
+        if state.observation.is_none() {
+            state.observation = Some(core.observe(
+                &key.0,
+                json!({"type":"checkout.observe.request","cwd":key.1}),
+                "checkout.observe.response",
+            ));
         }
     }
 

@@ -178,6 +178,7 @@ pub fn inbound(operation: &str) -> Option<&'static [&'static str]> {
         | "register_push_token"
         | "stash_list_request"
         | "checkout.diff.get.request"
+        | "checkout.observe.request"
         | "subscribe_checkout_diff_request"
         | "subscribe_terminal_request"
         | "subscribe_terminals_request"

@@ -26,6 +26,7 @@ const POLL_BASE: Duration = Duration::from_secs(5);
 const POLL_MAX: Duration = Duration::from_secs(60);
 const RECOVERY_BASE: Duration = Duration::from_secs(30);
 const RECOVERY_MAX: Duration = Duration::from_secs(300);
+const RELEASE_GRACE: Duration = Duration::from_secs(30);
 
 fn setup_limit() -> &'static Semaphore {
     static LIMIT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
@@ -82,6 +83,7 @@ struct Watch {
     established: Instant,
     poll_at: Instant,
     poll_interval: Duration,
+    directories: HashSet<PathBuf>,
 }
 #[derive(Default)]
 struct Pending {
@@ -96,8 +98,65 @@ struct CheckoutClock {
 }
 
 impl GitService {
-    /// Retain exactly once per workspace registration or diff subscription.
-    /// Ordinary snapshot reads do not implicitly create permanent demand.
+    pub fn observe_legacy_client(&self, context: &crate::transport::RequestContext) {
+        // COMPAT(checkoutObservation): added in v0.13.35, remove after 2027-05-17 once native clients advertise checkout_observation.
+        if crate::transport::has_capability(context.capabilities(), "checkout_observation") {
+            return;
+        }
+        let context = context.clone();
+        let weak = self.app.clone();
+        tokio::spawn(async move {
+            let cancel = context.cancellation();
+            let mut held = HashSet::new();
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                let Some(app) = weak.upgrade() else { break };
+                let workspaces = if context.allows("workspace.read") {
+                    match app.projects.list_workspaces().await {
+                        Ok(workspaces) => workspaces,
+                        Err(error) => {
+                            tracing::debug!(%error, "Legacy checkout demand unavailable");
+                            continue;
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                let desired: HashSet<PathBuf> = workspaces
+                    .iter()
+                    .filter(|workspace| workspace["archivedAt"].is_null())
+                    .filter_map(|workspace| workspace["cwd"].as_str().map(PathBuf::from))
+                    .collect();
+                let added: Vec<_> = desired.difference(&held).cloned().collect();
+                for cwd in added {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    if let Err(error) = app.git.retain_observation(&cwd).await {
+                        tracing::debug!(%error, cwd=%cwd.display(), "Legacy checkout observation unavailable");
+                    } else {
+                        held.insert(cwd);
+                    }
+                }
+                let removed: Vec<_> = held.difference(&desired).cloned().collect();
+                for cwd in removed {
+                    let _ = app.git.release_observation(&cwd).await;
+                    held.remove(&cwd);
+                }
+            }
+            if let Some(app) = weak.upgrade() {
+                for cwd in held {
+                    let _ = app.git.release_observation(&cwd).await;
+                }
+            }
+        });
+    }
+
+    /// Retain once per presented checkout or diff subscription.
     pub async fn retain_observation(&self, cwd: &Path) -> Result<()> {
         let _permit = tokio::select! { _ = self.cancel.cancelled() => bail!("Git service stopped"), permit = setup_limit().acquire() => permit? };
         let key = self.key(cwd).await?;
@@ -129,6 +188,22 @@ impl GitService {
     }
 
     pub async fn release_observation(&self, cwd: &Path) -> Result<()> {
+        let app = self.app.clone();
+        let cwd = cwd.to_owned();
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(RELEASE_GRACE) => {}
+            }
+            if let Some(app) = app.upgrade() {
+                let _ = app.git.release_observation_now(&cwd).await;
+            }
+        });
+        Ok(())
+    }
+
+    async fn release_observation_now(&self, cwd: &Path) -> Result<()> {
         // Remembered aliases allow release after a symlink or checkout is removed.
         let key = tokio::fs::canonicalize(cwd)
             .await
@@ -288,6 +363,7 @@ impl GitService {
             known_files: HashMap::new(),
             next_fetch: Instant::now(),
             next_reensure: Instant::now(),
+            tree_dirty: true,
             fetch_task: None,
         };
         tokio::spawn(actor.run());
@@ -348,6 +424,7 @@ struct Actor {
     known_files: HashMap<PathBuf, HashSet<PathBuf>>,
     next_fetch: Instant,
     next_reensure: Instant,
+    tree_dirty: bool,
     fetch_task: Option<tokio::task::JoinHandle<bool>>,
 }
 impl Drop for Actor {
@@ -366,6 +443,7 @@ impl Actor {
             .clone()
     }
     async fn run(mut self) {
+        self.next_reensure = Instant::now() + REENSURE;
         self.reconcile().await;
         while !self.cancel.is_cancelled() {
             if self.demands().is_empty() {
@@ -373,6 +451,7 @@ impl Actor {
             }
             let now = Instant::now();
             if self.next_reensure <= now {
+                self.tree_dirty = true;
                 self.reconcile().await;
                 self.next_reensure = now + REENSURE;
             }
@@ -447,6 +526,11 @@ impl Actor {
                         Ok(event) if !matches!(event.kind,EventKind::Access(_)) => {
                             let removed=matches!(event.kind,EventKind::Remove(_)) && event.paths.contains(&root);
                             if removed{self.mark_failed(&root);}
+                            if matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_)))
+                                || event.paths.iter().any(|path| path.file_name().is_some_and(|name| name == ".gitignore" || name == "exclude" || name == "config" || name == "config.worktree"))
+                            {
+                                self.next_reensure = self.next_reensure.min(Instant::now() + DEBOUNCE);
+                            }
                             self.queue_root(&root,removed,&event.paths);
                         },
                         Ok(_) => {},
@@ -461,11 +545,19 @@ impl Actor {
 
     async fn reconcile(&mut self) {
         let demands = self.demands();
+        let tree_dirty = std::mem::take(&mut self.tree_dirty);
         let mut desired = BTreeMap::new();
         if demands.values().any(|demand| demand.is_git) {
             desired.insert(self.common.clone(), Kind::Common);
         }
         for demand in demands.values() {
+            if !self.clocks.contains_key(&demand.root) {
+                self.queue(&demand.root, true, &[]);
+                if let Some(clock) = self.clocks.get_mut(&demand.root) {
+                    clock.due = Some(Instant::now());
+                }
+                self.next_fetch = Instant::now();
+            }
             desired.insert(demand.root.clone(), Kind::Worktree);
             if demand.is_git && demand.git_dir != self.common {
                 desired.insert(demand.git_dir.clone(), Kind::Private);
@@ -475,14 +567,67 @@ impl Actor {
         self.known_files
             .retain(|root, _| desired.contains_key(root));
         self.watches.retain(|root, _| desired.contains_key(root));
+        // Bootstrap status/fetch before watcher setup, which can require a large
+        // non-ignored inventory or a slow native watcher liveness check.
+        self.refresh_ready().await;
+        if self.next_fetch <= Instant::now() && self.fetch_task.is_none() {
+            self.start_fetch();
+            self.next_fetch = Instant::now() + FETCH_INTERVAL;
+        }
         for (root, kind) in desired {
             let now = Instant::now();
+            if self.watches.get(&root).is_some_and(|watch| {
+                (watch.watcher.is_some() && !tree_dirty)
+                    || (watch.watcher.is_none() && watch.retry_at > now)
+            }) {
+                continue;
+            }
+            let directories = if kind == Kind::Worktree
+                && demands
+                    .values()
+                    .any(|demand| demand.root == root && demand.is_git)
+            {
+                let Some(app) = self.app.upgrade() else {
+                    return;
+                };
+                let Ok(env) = app.git.environment() else {
+                    return;
+                };
+                match super::watch_tree::directories(&root, &env, self.cancel.child_token()).await {
+                    Ok(directories) => directories,
+                    Err(error) => {
+                        tracing::debug!(%error, path=%root.display(), "Git watch inventory unavailable; polling checkout");
+                        self.mark_failed(&root);
+                        self.watches.entry(root).or_insert_with(|| Watch {
+                            kind,
+                            watcher: None,
+                            failed: Arc::new(AtomicBool::new(false)),
+                            retry_at: now + RECOVERY_BASE,
+                            attempts: 1,
+                            established: now,
+                            poll_at: now + POLL_BASE,
+                            poll_interval: POLL_BASE,
+                            directories: HashSet::new(),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                HashSet::from([root.clone()])
+            };
             let existing = self.watches.get(&root);
-            if existing.is_some_and(|w| w.watcher.is_some() || w.retry_at > now) {
+            if existing.is_some_and(|w| {
+                (w.watcher.is_some() && w.directories == directories)
+                    || (w.watcher.is_none() && w.retry_at > now)
+            }) {
                 continue;
             }
             let attempts = existing.map(|w| w.attempts).unwrap_or(0);
             let poll_interval = existing.map(|w| w.poll_interval).unwrap_or(POLL_BASE);
+            // Replacing the owner avoids redundant explicit unwatch calls for
+            // paths the native backend has already removed.
+            self.watches.remove(&root);
+            let open_directories = directories.clone();
             let events = self.events.clone();
             let watched = root.clone();
             let overflow = self.overflow.clone();
@@ -528,7 +673,13 @@ impl Actor {
                                 overflow.store(true, Ordering::Release);
                             }
                         })?;
-                    watcher.watch(&open_root, RecursiveMode::Recursive)?;
+                    if kind == Kind::Worktree {
+                        for directory in &open_directories {
+                            watcher.watch(directory, RecursiveMode::NonRecursive)?;
+                        }
+                    } else {
+                        watcher.watch(&open_root, RecursiveMode::Recursive)?;
+                    }
                     let mut created = false;
                     let verification = (|| -> std::io::Result<()> {
                         let mut file = std::fs::OpenOptions::new()
@@ -580,6 +731,7 @@ impl Actor {
                     established: now,
                     poll_at: now + POLL_BASE,
                     poll_interval,
+                    directories,
                 },
             );
         }
@@ -874,7 +1026,7 @@ fn metadata_effect(path: &Path, common: bool) -> Effect {
     if common
         && (matches!(
             path.as_str(),
-            "packed-refs" | "config" | "refs/heads" | "refs/remotes" | "reftable"
+            "packed-refs" | "config" | "info/exclude" | "refs/heads" | "refs/remotes" | "reftable"
         ) || path.starts_with("refs/heads/")
             || path.starts_with("refs/remotes/")
             || path.starts_with("reftable/"))

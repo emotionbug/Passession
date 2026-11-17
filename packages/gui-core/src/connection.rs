@@ -32,7 +32,7 @@ use crate::{CoreError, host_config};
 
 /// Hello capabilities of the Flutter client (`client.dart` hello + `AppStore._newClient`).
 /// Consumers are ported from that client, so the daemon must produce the same shapes.
-const CAPABILITIES: [&str; 13] = [
+const CAPABILITIES: [&str; 14] = [
     "hello_rejection",
     "owned_subscriptions",
     "selective_agent_timeline",
@@ -46,6 +46,7 @@ const CAPABILITIES: [&str; 13] = [
     "reasoning_merge_enum",
     "timeline_notifications",
     "workspace_setup_observation",
+    "checkout_observation",
 ];
 
 pub(crate) const CLIENT_TYPE: &str = "mobile";

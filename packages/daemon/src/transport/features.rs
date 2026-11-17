@@ -17,6 +17,7 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
         "directorySync",
         "workspaceSetupRun",
         "workspaceSetupObservation",
+        "checkoutObservation",
         "workspaceSortTimes",
         "providersSnapshot",
         "providersSnapshotCwd",

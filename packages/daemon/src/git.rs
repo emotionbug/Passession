@@ -2,12 +2,14 @@ pub mod command;
 pub mod diff;
 mod facts;
 pub mod forge;
+mod head;
 mod metadata;
 #[cfg(test)]
 mod mutation_tests;
 mod mutations;
 mod observation;
 mod scheduler;
+mod watch_tree;
 
 use crate::{state::AppState, transport::RequestContext};
 use anyhow::{Result, anyhow, bail};
@@ -73,6 +75,7 @@ pub struct GitService {
     pub forge: forge::ForgeEngine,
     observers: Mutex<HashMap<PathBuf, observation::Observation>>,
     forge_observation: Mutex<Option<observation::ForgeObservation>>,
+    head_cache: head::HeadCache,
     cancel: CancellationToken,
 }
 impl GitService {
@@ -84,6 +87,7 @@ impl GitService {
             forge: forge::ForgeEngine::new(),
             observers: Mutex::new(HashMap::new()),
             forge_observation: Mutex::new(None),
+            head_cache: Default::default(),
             cancel: CancellationToken::new(),
         }
     }

@@ -115,13 +115,16 @@ pub fn project_descriptor(record: &Value) -> Value {
 }
 
 fn checkout_placement(workspace: &Value, git: &Value) -> Value {
-    if text(workspace, "kind") == "directory" {
+    if !git["isGit"]
+        .as_bool()
+        .unwrap_or(text(workspace, "kind") != "directory")
+    {
         return json!({"cwd":workspace["cwd"],"isGit":false,"currentBranch":null,
             "remoteUrl":null,"worktreeRoot":null,"isPaseoOwnedWorktree":false,"mainRepoRoot":null});
     }
     json!({
         "cwd": workspace["cwd"], "isGit": true,
-        "currentBranch": nonnull(&workspace["branch"], &git["currentBranch"]),
+        "currentBranch": git.get("currentBranch").unwrap_or(&workspace["branch"]),
         "remoteUrl": null,
         "worktreeRoot": nonnull(&workspace["worktreeRoot"], nonnull(&git["repoRoot"], &workspace["cwd"])),
         "isPaseoOwnedWorktree": enabled(workspace,"isPaseoOwnedWorktree") && !workspace["mainRepoRoot"].is_null(),
@@ -421,33 +424,15 @@ async fn build_entries_ref(
         }
         let id = text(workspace, "workspaceId");
         let cwd = text(workspace, "cwd");
-        if text(workspace, "kind") != "directory" && !snapshots.contains_key(cwd) {
-            let snapshot = match app
-                .git
-                .snapshot(Path::new(cwd), false, app.cancel.child_token())
-                .await
-            {
-                Ok(snapshot) => Some(snapshot),
-                Err(error) => {
-                    if app.cancel.is_cancelled() {
-                        return Err(error);
-                    }
-                    // A checkout observation failure does not erase durable workspace identity.
-                    tracing::warn!(cwd, %error, "Workspace checkout observation unavailable");
-                    app.git.cached_snapshot(Path::new(cwd)).await
-                }
-            };
+        if !snapshots.contains_key(cwd) {
+            let snapshot = Some(app.git.directory_snapshot(Path::new(cwd)).await);
             snapshots.insert(cwd, snapshot);
         }
         let (scripts, setup) = tokio::try_join!(
             app.terminals.script_list(id),
             app.terminals.setup_status(id)
         )?;
-        let snapshot = if text(workspace, "kind") == "directory" {
-            None
-        } else {
-            snapshots.get(cwd).and_then(Option::as_ref)
-        };
+        let snapshot = snapshots.get(cwd).and_then(Option::as_ref);
         let mut descriptor = base_descriptor(workspace, project, snapshot, scripts, setup.as_ref());
         descriptor["lastUserMessageAt"] = message_times.get(id).map_or(Value::Null, |at| json!(at));
         let mut contribution = Contributions {
@@ -756,14 +741,10 @@ pub async fn descriptor(app: &AppState, workspace: &Value, project: &Value) -> R
 }
 
 pub async fn placement(app: &AppState, workspace: &Value, project: &Value) -> Result<Value> {
-    let snapshot = if text(workspace, "kind") == "directory" {
-        Value::Null
-    } else {
-        app.git
-            .cached_snapshot(Path::new(text(workspace, "cwd")))
-            .await
-            .unwrap_or(Value::Null)
-    };
+    let snapshot = app
+        .git
+        .directory_snapshot(Path::new(text(workspace, "cwd")))
+        .await;
     Ok(
         json!({"projectKey":project["projectId"],"projectName":project_name(project),
         "workspaceName":workspace_name(workspace),"checkout":checkout_placement(workspace,&snapshot["git"])}),
@@ -1159,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_preserves_stored_branch_and_title_over_live_checkout() {
+    fn placement_uses_current_branch_and_preserves_title() {
         let workspace = json!({"workspaceId":"a","projectId":"p","kind":"worktree","cwd":"/worktree",
             "branch":"saved","title":"Human title","displayName":"saved","isPaseoOwnedWorktree":true,
             "mainRepoRoot":"/main","worktreeRoot":"/worktree","createdAt":"created"});
@@ -1168,7 +1149,7 @@ mod tests {
             "forge":{"featuresEnabled":true,"pullRequest":{"url":"https://forge/pr/1"},"error":null,"forge":"gitlab"}});
         let entry = base_descriptor(&workspace, Some(&project), Some(&snapshot), vec![], None);
         assert_eq!(entry["name"], "Human title");
-        assert_eq!(entry["project"]["checkout"]["currentBranch"], "saved");
+        assert_eq!(entry["project"]["checkout"]["currentBranch"], "live");
         assert_eq!(entry["gitRuntime"]["currentBranch"], "live");
         assert_eq!(
             entry["githubRuntime"]["pullRequest"]["url"],

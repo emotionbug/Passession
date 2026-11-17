@@ -23,6 +23,7 @@ impl GitService {
             return Ok(true);
         }
         let response = match kind {
+            "checkout.observe.request" => "checkout.observe.response",
             "checkout_status_request" => "checkout_status_response",
             "validate_branch_request" => "validate_branch_response",
             "branch_suggestions_request" => "branch_suggestions_response",
@@ -71,6 +72,38 @@ impl GitService {
             PathBuf::from(raw_cwd)
         };
         let cancel = context.cancellation();
+        if kind == "checkout.observe.request" {
+            if !context.is_modern()
+                || !crate::transport::has_capability(context.capabilities(), "checkout_observation")
+            {
+                bail!("Checkout observation requires owned subscriptions");
+            }
+            let owner = context.begin_subscription("checkout", None, None)?;
+            if let Err(error) = self.retain_observation(&cwd).await {
+                owner.release().await?;
+                return Err(error);
+            }
+            let bootstrap = async {
+                context.send(json!({"type":"checkout.observe.response","payload":{
+                    "cwd":raw_cwd,"subscriptionId":owner.response_id(),"requestId":message["requestId"]
+                }})).await?;
+                owner.activate().await
+            }.await;
+            if let Err(error) = bootstrap {
+                self.release_observation(&cwd).await?;
+                owner.release().await?;
+                return Err(error);
+            }
+            let app = self.app.clone();
+            tokio::spawn(async move {
+                owner.cancellation().cancelled().await;
+                if let Some(app) = app.upgrade() {
+                    let _ = app.git.release_observation(&cwd).await;
+                }
+                let _ = owner.release().await;
+            });
+            return Ok(true);
+        }
         if kind == "subscribe_checkout_diff_request" {
             self.subscribe_diff(context, message, &cwd).await?;
             return Ok(true);

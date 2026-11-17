@@ -174,9 +174,6 @@ impl ProjectService {
                         self.emit_workspace_hook("workspace.archived", &archived)
                             .await;
                     }
-                    app.git
-                        .release_observation(Path::new(text(workspace, "cwd")?))
-                        .await?;
                     app.terminals.remove_workspace_runtime(id);
                     self.runtime_ports.release_plan(id);
                     self.publish_workspace(id).await?;
@@ -192,18 +189,12 @@ impl ProjectService {
             }
             let root = text(project, "rootPath")?;
             if !checkouts.contains_key(root) {
-                match app
-                    .git
-                    .snapshot(Path::new(root), true, app.cancel.child_token())
-                    .await
-                {
-                    Ok(snapshot) => {
-                        let mut checkout = snapshot["git"].clone();
-                        checkout["worktreeRoot"] = checkout["repoRoot"].clone();
+                match app.git.placement_facts(Path::new(root)).await {
+                    Ok(checkout) => {
                         checkouts.insert(root.into(), checkout);
                     }
                     Err(error) => {
-                        tracing::warn!(%error,"Skipped project reconciliation after Git read failed");
+                        tracing::warn!(%error,"Skipped project reconciliation after metadata read failed");
                         continue;
                     }
                 }
@@ -219,14 +210,21 @@ impl ProjectService {
             } else {
                 "non_git"
             };
-            let key = store::derive_project_key(
-                root,
-                checkout["remoteUrl"].as_str(),
-                checkout["worktreeRoot"].as_str(),
-                checkout["mainRepoRoot"].as_str(),
-                identity["serverId"].as_str(),
-            )
-            .await?;
+            let key = if checkout["isGit"] == true
+                && checkout["remoteConfigComplete"] != true
+                && let Some(key) = project["projectKey"].as_str()
+            {
+                key.to_owned()
+            } else {
+                store::derive_project_key(
+                    root,
+                    checkout["remoteUrl"].as_str(),
+                    checkout["worktreeRoot"].as_str(),
+                    checkout["mainRepoRoot"].as_str(),
+                    identity["serverId"].as_str(),
+                )
+                .await?
+            };
             let project_changed = project["kind"] != kind || project["projectKey"] != key;
             if project_changed
                 && let Some(updated) = self
@@ -250,28 +248,27 @@ impl ProjectService {
                 let id = text(workspace, "workspaceId")?;
                 let cwd = text(workspace, "cwd")?;
                 if !checkouts.contains_key(cwd) {
-                    match app
-                        .git
-                        .checkout(Path::new(cwd), app.cancel.child_token())
-                        .await
-                    {
+                    match app.git.placement_facts(Path::new(cwd)).await {
                         Ok(checkout) => {
                             checkouts.insert(cwd.into(), checkout);
                         }
                         Err(error) => {
-                            tracing::warn!(%error,"Skipped workspace reconciliation after Git read failed");
+                            tracing::warn!(%error,"Skipped workspace reconciliation after metadata read failed");
                             continue;
                         }
                     }
                 }
-                let observed = &checkouts[cwd];
+                let mut observed = checkouts[cwd].clone();
+                if observed["isPaseoOwnedWorktree"].is_null() {
+                    observed["isPaseoOwnedWorktree"] = workspace["isPaseoOwnedWorktree"].clone();
+                }
                 if observed["isGit"] != true
                     && inspect(Path::new(cwd)).await != DirectoryObservation::Present
                 {
                     continue;
                 }
                 let update =
-                    store::reconcile_workspace_placement(workspace, Some(observed), &now());
+                    store::reconcile_workspace_placement(workspace, Some(&observed), &now());
                 if let Some(update) = &update {
                     self.storage()
                         .await?

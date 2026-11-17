@@ -55,15 +55,6 @@ impl ProjectService {
         Ok(())
     }
     pub async fn start_observations(&self) -> Result<()> {
-        let app = self.app()?;
-        for workspace in self.list_workspaces().await? {
-            if workspace["archivedAt"].is_null() {
-                let cwd = Path::new(text(&workspace, "cwd")?);
-                if let Err(error) = app.git.retain_observation(cwd).await {
-                    tracing::warn!(%error,cwd=%cwd.display(),"Workspace observation unavailable");
-                }
-            }
-        }
         self.start_reconciliation().await
     }
     pub async fn teardown_path_environment(
@@ -156,10 +147,6 @@ impl ProjectService {
                 let id = text(&workspace, "workspaceId")?;
                 let project_id = text(&workspace, "projectId")?;
                 self.storage().await?.remove_workspace(id).await?;
-                self.app()?
-                    .git
-                    .release_observation(Path::new(text(&workspace, "cwd")?))
-                    .await?;
                 if !self
                     .list_workspaces()
                     .await?
@@ -458,9 +445,6 @@ impl ProjectService {
             .upsert_workspace(record.clone())
             .await?;
         self.emit_workspace_hook("workspace.created", &record).await;
-        if let Err(error) = self.app()?.git.retain_observation(&cwd).await {
-            tracing::warn!(%error,"Created workspace observation unavailable");
-        }
         self.publish_workspace(&id).await?;
         if input["deferName"] != true
             && let Some(context) = input.get("firstAgentContext")
@@ -616,13 +600,6 @@ impl ProjectService {
             .await?
             .upsert_workspace(workspace.clone())
             .await?;
-        if let Err(error) = app
-            .git
-            .retain_observation(Path::new(text(&workspace, "cwd")?))
-            .await
-        {
-            tracing::warn!(%error,"Restored workspace observation unavailable");
-        }
         self.publish_project(&project).await?;
         self.publish_workspace(&id).await?;
         Ok(workspace)
@@ -671,7 +648,6 @@ impl ProjectService {
                 if let Err(error)=app.terminals.kill_workspace(id).await{tracing::warn!(%error,workspace_id=id,"Workspace terminal archive failed");}
                 self.storage().await?.archive_workspace(id,&now(),auto_url).await?;
                 if let Some(archived)=self.workspace(id).await?{self.emit_workspace_hook("workspace.archived",&archived).await;}
-                if let Err(error)=app.git.release_observation(Path::new(text(&workspace,"cwd")?)).await{tracing::warn!(%error,"Failed to release workspace observation");}
             }
             self.runtime_ports.release_plan(id);
             app.terminals.remove_workspace_runtime(id);
