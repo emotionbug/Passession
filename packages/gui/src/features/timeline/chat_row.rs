@@ -11,7 +11,7 @@ use super::permission;
 use super::rows::{RowContext, RowItem, RowKind, draw_row};
 use super::scrollbar;
 use crate::common::widgets::PTextFieldWidgetRefExt;
-use crate::common::{UiContext, UiEffect};
+use crate::common::{FileLinkIntent, UiContext, UiEffect};
 use makepad_widgets::makepad_draw::event::{DigitDevice, TAP_COUNT_DISTANCE, TouchState};
 use makepad_widgets::scroll_bars::TouchScroll;
 use makepad_widgets::*;
@@ -43,7 +43,11 @@ pub struct ChatRowEvent {
 #[derive(Clone, Debug)]
 pub enum RowEventKind {
     /// A tap on a hit target; `rect` is its absolute rect (menu anchors).
-    Tap { target: HitTarget, rect: Rect },
+    Tap {
+        target: HitTarget,
+        rect: Rect,
+        intent: FileLinkIntent,
+    },
     /// The question card's primary button on its last question / dismiss.
     Answer { key: String, dismiss: bool },
     /// Content-signed edge movement while a row-owned selection handle is captured.
@@ -876,7 +880,16 @@ impl Widget for ChatRow {
                     {
                         self.clear_selection(cx);
                         if !self.tap_local(cx, scope, &target) {
-                            self.post(cx, RowEventKind::Tap { target, rect });
+                            let intent =
+                                FileLinkIntent::from_pointer(e.modifiers, e.device.is_touch());
+                            self.post(
+                                cx,
+                                RowEventKind::Tap {
+                                    target,
+                                    rect,
+                                    intent,
+                                },
+                            );
                         }
                     }
                     self.area.redraw(cx);

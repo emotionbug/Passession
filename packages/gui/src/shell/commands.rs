@@ -18,7 +18,8 @@ use crate::common::overlay::{
     self as overlay_api, MenuEntry, MenuItem, MenuOptions, OverlayKind, OverlayRequest, SHELL_OWNER,
 };
 use crate::common::{
-    MAIN_WINDOW_ID, PanelTarget, Route, TabPlacement, UiContext, UiEffect, json as j, tr, tr_args,
+    FileLinkIntent, MAIN_WINDOW_ID, PanelTarget, Route, TabPlacement, UiContext, UiEffect,
+    host_record, json as j, tr, tr_args,
 };
 use crate::shell::hosts::{self, parent_agent_id};
 use crate::shell::layout::{Axis, CompactDestination, Direction};
@@ -152,6 +153,13 @@ pub enum ShellAsync {
         project_id: String,
         data: Result<String, String>,
     },
+}
+
+#[derive(Debug)]
+pub struct PendingFileLink {
+    target: PanelTarget,
+    placement: TabPlacement,
+    server_id: String,
 }
 
 /// Pending project icon picks by platform request id.
@@ -1628,6 +1636,31 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
             workspace_id,
             path,
         } => open_file(shell, cx, ui, &host_id, &workspace_id, &path, false),
+        UiEffect::OpenFileLink {
+            target,
+            placement,
+            intent,
+        } => {
+            if intent == FileLinkIntent::Reveal
+                && let Some(server_id) = file_link_host(&ui.state, &target.server_id)
+            {
+                if let Some(handle) = paseo_gui_platform::platform() {
+                    let request = handle.desktop_invoke("desktop_daemon_status", json!({}));
+                    shell.data.file_links.insert(
+                        request,
+                        PendingFileLink {
+                            target,
+                            placement,
+                            server_id: server_id.to_owned(),
+                        },
+                    );
+                } else {
+                    open_tab(shell, cx, ui, target, placement);
+                }
+            } else {
+                open_tab(shell, cx, ui, target, placement);
+            }
+        }
         UiEffect::OpenFileBeside {
             host_id,
             workspace_id,
@@ -1708,6 +1741,34 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
         }
         UiEffect::Redraw => shell.redraw(cx),
     }
+}
+
+fn file_link_host<'a>(state: &'a Value, host_id: &str) -> Option<&'a str> {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        return None;
+    }
+    let record = host_record(state, host_id)?;
+    record.get("serverId")?.as_str().filter(|id| !id.is_empty())
+}
+
+fn verified_file_link_path(
+    state: &Value,
+    target: &PanelTarget,
+    expected_server: &str,
+    status: &Value,
+) -> Option<std::path::PathBuf> {
+    // Ownership is not locality: manually started daemons also live on this machine.
+    // Require its native desktop-host identity, then recheck the target mapping.
+    let server = file_link_host(state, &target.server_id)?;
+    if server != expected_server || status.get("serverId")?.as_str()? != server {
+        return None;
+    }
+    let path = target
+        .data
+        .get("path")
+        .or_else(|| target.data.get("reveal"))?
+        .as_str()?;
+    Some(std::path::Path::new(&target.cwd).join(path))
 }
 
 /// `Route::Files { path }`: `None` explorer, a trailing `/` reveals that folder, else a file.
@@ -4178,6 +4239,33 @@ pub fn handle_platform_actions(
                 if permissions::on_completed(shell, cx, ui, request, &result) {
                     continue;
                 }
+                if let Some(pending) = shell.data.file_links.remove(&request) {
+                    let PendingFileLink {
+                        target,
+                        placement,
+                        server_id,
+                    } = pending;
+                    let path = match result {
+                        Ok(PlatformValue::Json(status)) => {
+                            verified_file_link_path(&ui.state, &target, &server_id, &status)
+                        }
+                        _ => None,
+                    };
+                    if let Some(path) = path
+                        && let Some(handle) = paseo_gui_platform::platform()
+                    {
+                        shell.data.file_reveals.insert(handle.reveal_path(&path));
+                    } else {
+                        open_tab(shell, cx, ui, target, placement);
+                    }
+                    continue;
+                }
+                if shell.data.file_reveals.remove(&request) {
+                    if let Err(error) = result {
+                        toast(shell, cx, error.message, true);
+                    }
+                    continue;
+                }
                 if let Some(index) = shell
                     .data
                     .revoking
@@ -4550,5 +4638,94 @@ pub fn overlay_press(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, pr
     match press {
         Press::Click(id, modifiers) => click(shell, cx, ui, &id, modifiers),
         Press::Secondary(id, abs) => secondary(shell, cx, ui, &id, abs),
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "android", target_os = "ios"))))]
+mod file_link_tests {
+    use super::*;
+    use crate::features::timeline::links::{
+        AssistantFileLinkSource, FileLinkSourceType, Resolution, classify_for_resolution,
+        normalize_inline_path_target,
+    };
+
+    #[test]
+    fn native_file_link_accepts_manual_local_daemon_but_rejects_remote_identity() {
+        let state = json!({"hosts": [
+            {"serverId": "local", "isLocal": false, "config": {"id": "saved"}},
+            {"serverId": "remote", "isLocal": false},
+            {"serverId": "tunnel", "isLocal": true},
+        ]});
+        let cwd = if cfg!(target_os = "windows") {
+            "C:/work"
+        } else {
+            "/work"
+        };
+        let target = PanelTarget::new("file", "saved", "workspace", cwd)
+            .with_data(json!({"path": "한글 문서.rs", "line": 12}));
+        let status = json!({"serverId": "local", "desktopManaged": false});
+        assert_eq!(
+            verified_file_link_path(&state, &target, "local", &status),
+            Some(std::path::Path::new(cwd).join("한글 문서.rs")),
+        );
+        for server in ["remote", "tunnel", "missing"] {
+            let other = target.copy_with_server(server);
+            assert_eq!(
+                verified_file_link_path(&state, &other, server, &status),
+                None
+            );
+        }
+        // A saved connection is retargeted while its status request is in flight.
+        let changed = json!({"hosts": [
+            {"serverId": "replacement", "isLocal": true, "config": {"id": "saved"}},
+        ]});
+        assert_eq!(
+            verified_file_link_path(
+                &changed,
+                &target,
+                "local",
+                &json!({"serverId": "replacement"})
+            ),
+            None,
+        );
+        assert_eq!(
+            verified_file_link_path(&state, &target, "local", &json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn native_file_link_decodes_unicode_spaces_and_removes_line_suffix() {
+        let cwd = if cfg!(target_os = "windows") {
+            "C:/work"
+        } else {
+            "/work"
+        };
+        let state = json!({"hosts": [{"serverId": "local", "isLocal": true}]});
+        let source = AssistantFileLinkSource {
+            href: "src/%ED%95%9C%EA%B8%80%20%EB%AC%B8%EC%84%9C.rs#L12-L14".into(),
+            text: None,
+            kind: FileLinkSourceType::Markdown,
+        };
+        let Resolution::File(parsed) = classify_for_resolution(&source, Some(cwd)) else {
+            panic!("explicit workspace file must resolve directly");
+        };
+        assert_eq!((parsed.line_start, parsed.line_end), (Some(12), Some(14)));
+        let (_, path) = normalize_inline_path_target(&parsed.path, Some(cwd)).unwrap();
+        let target = PanelTarget::new("file", "local", "workspace", cwd)
+            .with_data(json!({"path": path.unwrap()}));
+        assert_eq!(
+            verified_file_link_path(&state, &target, "local", &json!({"serverId": "local"})),
+            Some(std::path::Path::new(cwd).join("src/한글 문서.rs")),
+        );
+        let external = AssistantFileLinkSource {
+            href: "https://example.com/src/file.rs#L12".into(),
+            text: None,
+            kind: FileLinkSourceType::Markdown,
+        };
+        assert!(matches!(
+            classify_for_resolution(&external, Some(cwd)),
+            Resolution::External(_)
+        ));
     }
 }

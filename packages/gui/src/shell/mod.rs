@@ -301,6 +301,8 @@ pub struct Data {
     pub closing: Option<commands::Closing>,
     pub quit_token: Option<u64>,
     pub close_request: Option<paseo_gui_platform::PlatformRequestId>,
+    pub file_links: HashMap<paseo_gui_platform::PlatformRequestId, commands::PendingFileLink>,
+    pub file_reveals: HashSet<paseo_gui_platform::PlatformRequestId>,
     /// Host removals waiting for their push revocation (request, host, 2.5 s bound).
     pub revoking: Vec<(paseo_gui_platform::PlatformRequestId, String, Timer)>,
     /// A route this window opens once its host is known (New Window with a route).

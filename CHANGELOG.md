@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Reveal local file links in the system file manager with Ctrl+click on Windows/Linux or Command+click on macOS, including conversation links and Markdown previews. Plain clicks and remote files stay inside Passession.
+
 ### Fixed
 
 - Restore native word, line and document navigation, Shift selection and modified deletion in input fields and source editors. Windows/Linux use Ctrl for words; macOS uses Option for words and Command for line/document navigation.

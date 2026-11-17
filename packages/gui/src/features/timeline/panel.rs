@@ -34,7 +34,7 @@ use crate::common::overlay::{self, MenuEntry, MenuItem, MenuOptions, TapTarget, 
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics};
-use crate::common::{PanelTarget, TabPlacement, UiContext, UiEffect};
+use crate::common::{FileLinkIntent, PanelTarget, TabPlacement, UiContext, UiEffect};
 use crate::features::composer::ComposerPanelWidgetRefExt;
 use makepad_widgets::scroll_bars::TouchScroll;
 use makepad_widgets::*;
@@ -1925,6 +1925,7 @@ impl ChatPanel {
         href: &str,
         text: &str,
         kind: FileLinkSourceType,
+        intent: FileLinkIntent,
     ) {
         let Some(target) = self.target.clone() else {
             return;
@@ -1943,7 +1944,7 @@ impl ChatPanel {
                     ui.push(UiEffect::OpenExternal { url });
                 }
             }
-            Resolution::File(path) => self.open_inline_path(cx, ui, path),
+            Resolution::File(path) => self.open_inline_path(cx, ui, path, intent),
             Resolution::NeedsLookup {
                 query,
                 token,
@@ -1957,13 +1958,13 @@ impl ChatPanel {
                     "matchMode": "suffix",
                     "limit": 1,
                 });
-                let encoded = json!({"raw": path.raw, "path": path.path, "lineStart": path.line_start, "lineEnd": path.line_end});
                 self.with_session(cx, ui, |s, io| {
                     s.host_request(
                         io,
                         ActionKind::LookupFile {
                             token,
-                            target: encoded,
+                            target: path,
+                            intent,
                         },
                         "directory_suggestions_request",
                         "directory_suggestions_response",
@@ -1975,7 +1976,13 @@ impl ChatPanel {
     }
 
     /// path-open.ts createInlinePathOpener.open.
-    fn open_inline_path(&mut self, cx: &mut Cx, ui: &mut UiContext, target: InlinePathTarget) {
+    fn open_inline_path(
+        &mut self,
+        cx: &mut Cx,
+        ui: &mut UiContext,
+        target: InlinePathTarget,
+        intent: FileLinkIntent,
+    ) {
         let Some(chat) = self.target.clone() else {
             return;
         };
@@ -1995,15 +2002,14 @@ impl ChatPanel {
             && !root.trim().is_empty()
         {
             // A workspace folder (even one with a dot) reveals in the explorer.
-            let encoded =
-                json!({"file": file, "lineStart": target.line_start, "lineEnd": target.line_end});
             let fields = json!({"cwd": root, "path": file, "mode": "list"});
             self.with_session(cx, ui, |s, io| {
                 s.host_request(
                     io,
                     ActionKind::ProbeFolder {
                         generation,
-                        target: encoded,
+                        target: target.with_path(file.clone()),
+                        intent,
                     },
                     "file_explorer_request",
                     "file_explorer_response",
@@ -2018,6 +2024,7 @@ impl ChatPanel {
             &directory,
             target.line_start,
             target.line_end,
+            intent,
         );
     }
 
@@ -2028,6 +2035,7 @@ impl ChatPanel {
         directory: &str,
         line_start: Option<i64>,
         line_end: Option<i64>,
+        intent: FileLinkIntent,
     ) {
         let Some(chat) = self.target.clone() else {
             return;
@@ -2035,9 +2043,10 @@ impl ChatPanel {
         let Some(file) = file else {
             let target = PanelTarget::new("files", &chat.host_id, &chat.workspace_id, chat.cwd())
                 .with_data(json!({"path": directory}));
-            ui.push(UiEffect::OpenTab {
+            ui.push(UiEffect::OpenFileLink {
                 target,
                 placement: TabPlacement::Explorer,
+                intent,
             });
             return;
         };
@@ -2056,13 +2065,14 @@ impl ChatPanel {
         let side =
             get(get(&self.host.preferences, "openInSidePane"), "chatFiles").as_bool() == Some(true);
         let compact = crate::common::is_compact_width(self.content_rect.size.x);
-        ui.push(UiEffect::OpenTab {
+        ui.push(UiEffect::OpenFileLink {
             target,
             placement: if !compact && side {
                 TabPlacement::Beside
             } else {
                 TabPlacement::Main
             },
+            intent,
         });
     }
 
@@ -2560,7 +2570,11 @@ impl ChatPanel {
                 self.delete_run.completed += ids.len();
                 self.delete_next(cx, ui);
             }
-            ActionKind::LookupFile { token, target } => {
+            ActionKind::LookupFile {
+                token,
+                target,
+                intent,
+            } => {
                 let root = self
                     .target
                     .as_ref()
@@ -2586,34 +2600,33 @@ impl ChatPanel {
                     });
                 match found {
                     Some(path) => {
-                        let lookup = InlinePathTarget {
-                            raw: str_of(get(&target, "raw")).to_owned(),
-                            path: str_of(get(&target, "path")).to_owned(),
-                            line_start: get(&target, "lineStart").as_i64(),
-                            line_end: get(&target, "lineEnd").as_i64(),
-                        };
-                        self.open_inline_path(cx, ui, lookup.with_path(path));
+                        self.open_inline_path(cx, ui, target.with_path(path), intent);
                     }
                     None => {
                         self.show_failure(ta("common.errors.noFileFound", &[("token", &token)]))
                     }
                 }
             }
-            ActionKind::ProbeFolder { generation, target } => {
+            ActionKind::ProbeFolder {
+                generation,
+                target,
+                intent,
+            } => {
                 if OPEN_GENERATION.with(Cell::get) != generation {
                     return;
                 }
-                let file = str_of(get(&target, "file")).to_owned();
+                let file = &target.path;
                 let directory = matches!(&result, Ok(r) if get(r, "error").is_null() && !get(r, "directory").is_null());
                 if directory {
-                    self.finish_open(ui, None, &file, None, None);
+                    self.finish_open(ui, None, file, None, None, intent);
                 } else {
                     self.finish_open(
                         ui,
-                        Some(&file),
+                        Some(file),
                         "",
-                        get(&target, "lineStart").as_i64(),
-                        get(&target, "lineEnd").as_i64(),
+                        target.line_start,
+                        target.line_end,
+                        intent,
                     );
                 }
             }
@@ -2885,8 +2898,14 @@ impl ChatPanel {
                     response,
                 );
             }
-            RowEventKind::Tap { target, rect } => match target {
-                HitTarget::Link { href, kind, text } => self.open_link(cx, ui, &href, &text, kind),
+            RowEventKind::Tap {
+                target,
+                rect,
+                intent,
+            } => match target {
+                HitTarget::Link { href, kind, text } => {
+                    self.open_link(cx, ui, &href, &text, kind, intent)
+                }
                 HitTarget::OpenFile(path) => {
                     let target = InlinePathTarget {
                         raw: path.clone(),
@@ -2894,7 +2913,7 @@ impl ChatPanel {
                         line_start: None,
                         line_end: None,
                     };
-                    self.open_inline_path(cx, ui, target);
+                    self.open_inline_path(cx, ui, target, intent);
                 }
                 HitTarget::Image { key } => {
                     self.modal = Some(Modal::Lightbox {
@@ -3585,6 +3604,10 @@ impl Widget for ChatPanel {
                             kind: RowEventKind::Tap {
                                 target: HitTarget::OpenFile(path),
                                 rect: Rect::default(),
+                                intent: FileLinkIntent::from_pointer(
+                                    e.modifiers,
+                                    e.device.is_touch(),
+                                ),
                             },
                         });
                     }

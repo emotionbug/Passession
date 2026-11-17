@@ -365,6 +365,32 @@ pub enum TabPlacement {
     ExplorerBackground,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileLinkIntent {
+    Internal,
+    Reveal,
+}
+
+impl FileLinkIntent {
+    pub fn from_pointer(modifiers: KeyModifiers, touch: bool) -> Self {
+        let primary = if cfg!(target_os = "macos") {
+            modifiers.logo && !modifiers.control
+        } else {
+            modifiers.control && !modifiers.logo
+        };
+        let desktop = cfg!(any(
+            target_os = "linux",
+            target_os = "windows",
+            target_os = "macos"
+        ));
+        if desktop && !touch && primary && !modifiers.alt && !modifiers.shift {
+            Self::Reveal
+        } else {
+            Self::Internal
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiEffect {
     Navigate(Route),
@@ -386,6 +412,11 @@ pub enum UiEffect {
         host_id: String,
         workspace_id: String,
         path: String,
+    },
+    OpenFileLink {
+        target: PanelTarget,
+        placement: TabPlacement,
+        intent: FileLinkIntent,
     },
     SetCloseGuard {
         owner: String,
@@ -626,4 +657,61 @@ pub fn tooltip_with_shortcut(label: &str, help_id: &str) -> String {
         label.to_string(),
         crate::shell::shortcuts::current_label_for_help_id(help_id),
     )
+}
+
+#[cfg(test)]
+mod file_link_tests {
+    use super::*;
+
+    #[test]
+    fn file_link_modifier_does_not_turn_touch_or_altgr_into_native_open() {
+        let primary = if cfg!(target_os = "macos") {
+            KeyModifiers {
+                logo: true,
+                ..Default::default()
+            }
+        } else {
+            KeyModifiers {
+                control: true,
+                ..Default::default()
+            }
+        };
+        let expected = if cfg!(any(target_os = "android", target_os = "ios")) {
+            FileLinkIntent::Internal
+        } else {
+            FileLinkIntent::Reveal
+        };
+        assert_eq!(FileLinkIntent::from_pointer(primary, false), expected);
+        for (modifiers, touch) in [
+            (KeyModifiers::default(), false),
+            (primary, true),
+            (
+                KeyModifiers {
+                    alt: true,
+                    ..primary
+                },
+                false,
+            ),
+            (
+                KeyModifiers {
+                    shift: true,
+                    ..primary
+                },
+                false,
+            ),
+            (
+                KeyModifiers {
+                    logo: true,
+                    control: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(
+                FileLinkIntent::from_pointer(modifiers, touch),
+                FileLinkIntent::Internal
+            );
+        }
+    }
 }

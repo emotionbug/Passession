@@ -16,6 +16,15 @@ The main navigation tree remains host → directory → session, including exist
 
 Files are read/written through the daemon. Markdown and source editing share the same remote identity and revision. Git Log opens historical commit details and lazy patch bodies. The working-tree Changes view and session added/deleted-line badge are removed.
 
+Plain file-link clicks in conversations and Markdown previews stay inside the app.
+Ctrl+click on Windows/Linux or Command+click on macOS reveals a local file in the OS
+file manager (opens a directory directly). Carry this intent through asynchronous
+path lookup. Native reveal requires the target host's server ID to match the
+machine's local daemon; lifecycle ownership and a loopback connection alone cannot
+prove locality (loopback may be an SSH tunnel).
+Remote links retain their internal target and placement. External URLs and touch
+activation keep their existing behavior.
+
 Commit lists uncommitted files with checkboxes and a multiline message editor. A checked file commits its complete current working-tree contents, not only its staged hunks. The daemon uses a temporary index and preserves unrelated staging and working files; normal Git hooks and signing still apply. Refresh preserves exclusions and does not automatically select newly appearing files. Failure retains the message and selection; an explicit refresh is required before retrying, and an unknown outcome is never automatically replayed. Older hosts without `gitSelectedCommit` expose an unavailable state rather than falling back to committing every file.
 
 Git action retry resumes the unfinished steps only. Refresh repository state after failure; when the daemon reports an unknown mutation outcome, require inspection of that state rather than automatically resubmitting an operation that may already have succeeded.

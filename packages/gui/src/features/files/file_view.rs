@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::common::overlay::{self, MenuEntry, MenuItem};
 use crate::common::paint::{Font, HitMap};
-use crate::common::{UiContext, UiEffect, clock};
+use crate::common::{FileLinkIntent, PanelTarget, TabPlacement, UiContext, UiEffect, clock};
 use crate::theme::{self, Palette, Typography, with_alpha};
 
 use super::editor::buffer::{find_matches, match_len};
@@ -601,7 +601,7 @@ impl FileView {
     }
 
     /// Flutter `_link`.
-    fn open_link(&mut self, ui: &mut UiContext, href: &str) {
+    fn open_link(&mut self, ui: &mut UiContext, href: &str, intent: FileLinkIntent) {
         let Some(target) = self.target.clone() else {
             return;
         };
@@ -632,18 +632,34 @@ impl FileView {
             return;
         };
         let fragment = href.split_once('#').map(|(_, f)| f).unwrap_or("");
-        let suffix = match parse_link_fragment(fragment) {
-            Some((line, Some(column))) => format!("#L{line}:{column}"),
-            Some((line, None)) => format!("#L{line}"),
-            None => String::new(),
+        let location = parse_link_fragment(fragment);
+        let (target, placement) = if location.is_none() && path.ends_with('/') {
+            (
+                PanelTarget::new("files", &target.host_id, &target.workspace_id, &target.cwd)
+                    .with_data(json!({ "reveal": path })),
+                TabPlacement::Explorer,
+            )
+        } else {
+            let mut data = json!({ "path": path });
+            if let Some((line, column)) = location {
+                data["line"] = json!(line);
+                data["location"] = json!(match column {
+                    Some(column) => format!("L{line}:{column}"),
+                    None => format!("L{line}"),
+                });
+            }
+            (
+                PanelTarget::new("file", &target.host_id, &target.workspace_id, &target.cwd)
+                    .with_id(&path)
+                    .with_data(data),
+                TabPlacement::Main,
+            )
         };
-        host::open_file(
-            ui,
-            &target.host_id,
-            &target.workspace_id,
-            &format!("{path}{suffix}"),
-            false,
-        );
+        ui.push(UiEffect::OpenFileLink {
+            target,
+            placement,
+            intent,
+        });
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1610,7 +1626,11 @@ impl FileView {
                 if self.preview_drag
                     && let PreviewEvent::Link(href) = self.markdown.handle_hit(cx, self.area, hit)
                 {
-                    self.open_link(ui, &href);
+                    self.open_link(
+                        ui,
+                        &href,
+                        FileLinkIntent::from_pointer(fe.modifiers, fe.device.is_touch()),
+                    );
                 }
                 if self.pressed == Some(Hot::FindField) {
                     self.query.handle_hit(cx, kit, hit);

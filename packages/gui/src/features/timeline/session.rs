@@ -9,7 +9,7 @@
 
 use super::fold::TimelineFold;
 use super::json::*;
-use crate::common::UiEffect;
+use crate::common::{FileLinkIntent, UiEffect};
 use makepad_widgets::{Cx, Timer};
 use paseo_gui_core::{CoreError, CoreHandle, RequestId};
 use serde_json::{Value, json};
@@ -165,11 +165,13 @@ pub enum ActionKind {
     },
     LookupFile {
         token: String,
-        target: Value,
+        target: super::links::InlinePathTarget,
+        intent: FileLinkIntent,
     },
     ProbeFolder {
         generation: u64,
-        target: Value,
+        target: super::links::InlinePathTarget,
+        intent: FileLinkIntent,
     },
 }
 
