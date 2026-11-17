@@ -613,24 +613,26 @@ mod tests {
         manager.disconnect().unwrap();
     }
     #[test]
-    fn start_reports_a_lease_held_by_another_handle() {
+    fn state_lease_excludes_other_handles_until_it_is_closed() {
         let directory = tempfile::tempdir().unwrap();
-        let held = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(directory.path().join("runtime.lock"))
-            .unwrap();
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.path().join("runtime.lock"))
+                .unwrap()
+        };
+        let held = open();
+        let other = open();
         try_lock_state(&held).unwrap();
-        let error = Manager::new(Arc::new(LockedKeyStore))
-            .start(Config {
-                state_dir: directory.path().into(),
-                hostname: "passession-test".into(),
-                control_url: Some("http://127.0.0.1:1".into()),
-            })
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("in use by another process"));
+        assert_eq!(
+            try_lock_state(&other).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(held);
+        try_lock_state(&other).unwrap();
     }
     #[test]
     fn control_url_policy() {
