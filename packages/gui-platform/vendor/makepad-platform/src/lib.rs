@@ -38,6 +38,9 @@ mod window;
 mod pass;
 mod texture;
 mod cursor;
+mod pointer;
+#[cfg(any(target_os = "windows", all(target_os = "linux", not(linux_direct), not(target_env = "ohos")), test))]
+mod cursor_tone;
 mod macos_menu;
 mod animator;
 mod gpu_info;

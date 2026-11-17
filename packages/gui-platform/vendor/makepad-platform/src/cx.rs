@@ -84,6 +84,8 @@ pub struct Cx {
     pub(crate) keyboard_window: Option<crate::window::WindowId>,
     pub(crate) keyboard_event_window: Option<crate::window::WindowId>,
     pub fingers: CxFingers,
+    /// Paseo: pointer shape resolution and hover re-tests (`crate::pointer`).
+    pub (crate) pointer: crate::pointer::CxPointer,
     pub (crate) ime_area: Area,
     /// Height of the caret in `ime_area`, for platforms that size the input method's
     /// composition window to the text (Windows); 0 when the caller gave only a point.
@@ -292,6 +294,7 @@ impl Cx {
             keyboard_window: None,
             keyboard_event_window: None,
             fingers: Default::default(),
+            pointer: Default::default(),
             drag_drop: Default::default(),
             ime_area: Default::default(),
             ime_caret_height: 0.0,

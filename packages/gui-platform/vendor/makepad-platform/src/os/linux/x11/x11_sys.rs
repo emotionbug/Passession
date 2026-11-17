@@ -242,12 +242,38 @@ pub const XK_Down: u32 = 65364;
 pub const XK_Up: u32 = 65362;
     
 
+/// Paseo: one frame of an Xcursor theme image; `pixels` are premultiplied ARGB.
+#[repr(C)]
+pub struct XcursorImage {
+    pub version: c_uint,
+    pub size: c_uint,
+    pub width: c_uint,
+    pub height: c_uint,
+    pub xhot: c_uint,
+    pub yhot: c_uint,
+    pub delay: c_uint,
+    pub pixels: *mut c_uint,
+}
+
+/// Paseo: the frames of one (possibly animated) Xcursor theme cursor.
+#[repr(C)]
+pub struct XcursorImages {
+    pub nimage: c_int,
+    pub images: *mut *mut XcursorImage,
+    pub name: *mut c_char,
+}
+
 #[link(name = "Xcursor")]
 extern "C" {
     pub fn XcursorLibraryLoadCursor(
         dpy: *mut Display,
         file: *const c_char,
     ) -> Cursor;
+    pub fn XcursorGetTheme(dpy: *mut Display) -> *mut c_char;
+    pub fn XcursorGetDefaultSize(dpy: *mut Display) -> c_int;
+    pub fn XcursorLibraryLoadImages(file: *const c_char, theme: *const c_char, size: c_int) -> *mut XcursorImages;
+    pub fn XcursorImagesLoadCursor(dpy: *mut Display, images: *const XcursorImages) -> Cursor;
+    pub fn XcursorImagesDestroy(images: *mut XcursorImages);
 }
 
 #[link(name = "X11")]

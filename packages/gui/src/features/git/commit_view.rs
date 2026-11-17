@@ -1832,7 +1832,7 @@ impl CommitView {
         let font_size = crate::theme::Typography::pt(ui_px(13.0));
         let foreground = colors.foreground;
         let muted = colors.muted;
-        input.apply_over(cx, live! { draw_text: { color: (foreground), color_empty: (muted), text_style: { font_size: (font_size) } } });
+        input.apply_over(cx, live! { draw_text: { color: (foreground), color_empty: (muted), text_style: { font_size: (font_size) } } draw_cursor: { color: (foreground) } });
         input.set_empty_text(cx, t("workspace.git.commit.messagePlaceholder"));
         input.set_is_read_only(cx, self.commit.is_some());
         let _ = input.draw_walk(

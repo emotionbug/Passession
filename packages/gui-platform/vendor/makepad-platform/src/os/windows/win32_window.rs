@@ -527,7 +527,7 @@ impl Win32Window {
                     window.last_mouse_pos,
                     Self::get_key_modifiers()
                 );
-                with_win32_app(|app| app.current_cursor = Some(MouseCursor::Hidden));
+                with_win32_app(|app| app.mouse_cursor_left());
             },
             WM_MOUSEWHEEL => {
                 let delta = (wparam.0 >> 16) as u16 as i16 as f64;

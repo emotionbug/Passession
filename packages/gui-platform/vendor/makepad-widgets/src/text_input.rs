@@ -1756,6 +1756,8 @@ impl Widget for TextInput {
         match hit {
             Hit::FingerHoverIn(_) => {
                 self.animator_play(cx, id!(hover.on));
+                // Paseo: upstream left the arrow over editable text.
+                cx.set_cursor(MouseCursor::Text);
             }
             Hit::FingerHoverOut(_) => {
                 self.animator_play(cx, id!(hover.off));

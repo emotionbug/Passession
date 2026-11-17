@@ -46,7 +46,11 @@ use {
                         PeekMessageW,
                         SetTimer,
                         KillTimer,
-                        ShowCursor,
+                        HCURSOR,
+                        ICONINFO,
+                        GetIconInfo,
+                        CreateIconIndirect,
+                        DestroyCursor,
                         SetCursor,
                         LoadCursorW,
                         IsProcessDPIAware,
@@ -85,7 +89,19 @@ use {
                     MonitorFromWindow,
                     GetDeviceCaps,
                     MONITOR_DEFAULTTONEAREST,
-                    LOGPIXELSX
+                    LOGPIXELSX,
+                    ReleaseDC,
+                    HBITMAP,
+                    BITMAP,
+                    BITMAPINFO,
+                    BITMAPINFOHEADER,
+                    BI_RGB,
+                    DIB_RGB_COLORS,
+                    GetDIBits,
+                    GetObjectW,
+                    CreateDIBSection,
+                    CreateBitmap,
+                    DeleteObject,
                 },
                 Foundation::{
                     COLORREF,
@@ -171,6 +187,14 @@ pub fn set_dark_appearance(dark: bool) {
             let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
+    // Paseo: the cursor's tone follows the theme at once, without waiting for a shape change.
+    WIN32_APP.with(|app| {
+        if let Ok(mut app) = app.try_borrow_mut() {
+            if let Some(app) = app.as_mut() {
+                app.retone_mouse_cursor();
+            }
+        }
+    });
 }
 pub const TRUE: BOOL = BOOL(1);
 
@@ -213,6 +237,10 @@ pub struct Win32App {
     pub event_flow: EventFlow,
     pub dpi_functions: DpiFunctions,
     pub current_cursor: Option<MouseCursor>,
+    /// Paseo: the cursor handle on screen for `current_cursor` and the theme tone.
+    shown_cursor: Option<ShownCursor>,
+    /// Paseo: the pointer left the windows (`WM_MOUSELEAVE`) and no `WM_SETCURSOR` came since.
+    pointer_outside: bool,
     pub currently_clicked_window_id: Option<WindowId >,
     pub start_dragging_items: Option<Vec<DragItem >>,
     pub is_dragging_internal: Cell<bool>,
@@ -304,6 +332,8 @@ impl Win32App {
             timers: Vec::new(),
             dpi_functions: DpiFunctions::new(),
             current_cursor: None,
+            shown_cursor: None,
+            pointer_outside: true,
             currently_clicked_window_id: None,
             is_dragging_internal: Cell::new(false),
         };
@@ -570,34 +600,199 @@ impl Win32App {
     }
     
     pub fn set_mouse_cursor(&mut self, cursor: MouseCursor) {
-        if self.current_cursor.is_none() || self.current_cursor.unwrap() != cursor {
-            let win32_cursor = win32_cursor_id(cursor);
+        if self.current_cursor != Some(cursor) {
             self.current_cursor = Some(cursor);
-            unsafe {
-                if win32_cursor == PCWSTR::null() {
-                    ShowCursor(false);
-                }
-                else {
-                    SetCursor(Some(LoadCursorW(None, win32_cursor).unwrap()));
-                    ShowCursor(true);
-                }
+            // Outside the windows the shape waits for `WM_SETCURSOR`; setting it now would
+            // change the pointer over another application.
+            if !self.pointer_outside {
+                self.apply_mouse_cursor();
             }
-            //TODO
         }
     }
 
     /// Paseo: re-sets the app's cursor after the native frame showed its own (`WM_SETCURSOR`
-    /// over the client area). Only the cursor shape changes; the show count is untouched.
+    /// over the client area).
     pub fn reapply_mouse_cursor(&mut self) {
-        let cursor = *self.current_cursor.get_or_insert(MouseCursor::Default);
-        let win32_cursor = win32_cursor_id(cursor);
+        self.pointer_outside = false;
+        self.current_cursor.get_or_insert(MouseCursor::Default);
+        self.apply_mouse_cursor();
+    }
+
+    /// Paseo: `WM_MOUSELEAVE`; upstream recorded `Hidden` here to force the next shape,
+    /// which `reapply_mouse_cursor` then showed as no pointer at all on re-entry.
+    pub fn mouse_cursor_left(&mut self) {
+        self.pointer_outside = true;
+    }
+
+    /// Paseo: shows `current_cursor` in the theme's tone. `Hidden` is a null cursor rather
+    /// than `ShowCursor`, whose display count upstream raised on every shape change, so
+    /// hiding never took effect again.
+    fn apply_mouse_cursor(&mut self) {
+        let cursor = self.current_cursor.unwrap_or(MouseCursor::Default);
+        let id = win32_cursor_id(cursor);
         unsafe {
-            if win32_cursor == PCWSTR::null() {
+            if id == PCWSTR::null() {
                 SetCursor(None);
+                return;
             }
-            else if let Ok(handle) = LoadCursorW(None, win32_cursor) {
-                SetCursor(Some(handle));
+            let tone = DARK_CAPTION.load(Ordering::Relaxed);
+            if let Some(shown) = self.shown_cursor.as_ref().filter(|s| s.cursor == cursor && s.tone == tone) {
+                SetCursor(Some(shown.handle));
+                return;
             }
+            let Ok(system) = LoadCursorW(None, id) else { return };
+            let toned = if tone == 0 { None } else { toned_system_cursor(system, tone == 2) };
+            let shown = ShownCursor { cursor, tone, handle: toned.unwrap_or(system), owned: toned.is_some() };
+            SetCursor(Some(shown.handle));
+            if let Some(previous) = self.shown_cursor.replace(shown) {
+                if previous.owned {
+                    let _ = DestroyCursor(previous.handle);
+                }
+            }
+        }
+    }
+}
+
+/// Paseo: a system cursor as shown, possibly a recoloured copy this app owns.
+struct ShownCursor {
+    cursor: MouseCursor,
+    tone: u8,
+    handle: HCURSOR,
+    owned: bool,
+}
+
+/// Paseo: a copy of a system cursor recoloured to contrast with the theme
+/// (`cursor_tone`), or `None` when it already contrasts or cannot be read. The copy keeps
+/// the system image's size, so the user's pointer size and the system scaling apply.
+unsafe fn toned_system_cursor(system: HCURSOR, dark_theme: bool) -> Option<HCURSOR> {
+    let mut info = ICONINFO::default();
+    unsafe {
+        GetIconInfo(system.into(), &mut info).ok()?;
+        let toned = toned_cursor_from(&info, dark_theme);
+        if !info.hbmColor.is_invalid() {
+            let _ = DeleteObject(info.hbmColor.into());
+        }
+        if !info.hbmMask.is_invalid() {
+            let _ = DeleteObject(info.hbmMask.into());
+        }
+        toned
+    }
+}
+
+unsafe fn toned_cursor_from(info: &ICONINFO, dark_theme: bool) -> Option<HCURSOR> {
+    // Read as 32 bits per pixel, a set mask bit is white.
+    let set = |pixel: u32| pixel & 0x00ff_ffff != 0;
+    let (width, mask_height, mask) = unsafe { bitmap_pixels(info.hbmMask)? };
+    let (height, mut pixels) = if info.hbmColor.is_invalid() {
+        // Monochrome: the AND mask stacked over the XOR mask.
+        let height = mask_height / 2;
+        let mut pixels = Vec::with_capacity(width * height);
+        for i in 0..width * height {
+            pixels.push(match (set(mask[i]), set(mask[width * height + i])) {
+                (false, false) => 0xff00_0000,
+                (false, true) => 0xffff_ffff,
+                (true, false) => 0,
+                // Inverts the screen beneath, which contrasts with any theme.
+                (true, true) => return None,
+            });
+        }
+        (height, pixels)
+    } else {
+        let (color_width, height, mut pixels) = unsafe { bitmap_pixels(info.hbmColor)? };
+        if color_width != width || pixels.len() > mask.len() {
+            return None;
+        }
+        if pixels.iter().all(|pixel| pixel >> 24 == 0) {
+            // No alpha channel: the AND mask marks the transparent pixels.
+            for (pixel, &bit) in pixels.iter_mut().zip(&mask) {
+                if !set(bit) {
+                    *pixel |= 0xff00_0000;
+                } else if *pixel & 0x00ff_ffff != 0 {
+                    return None;
+                }
+            }
+        }
+        (height, pixels)
+    };
+    if !crate::cursor_tone::tone_for_theme(&mut pixels, width, height, crate::cursor_tone::PixelAlpha::Straight, dark_theme) {
+        return None;
+    }
+    unsafe { create_cursor(width, height, &pixels, info.xHotspot, info.yHotspot) }
+}
+
+fn dib_info(width: usize, height: usize) -> BITMAPINFO {
+    BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            // Negative: rows run top to bottom.
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// A bitmap's pixels as top-down 0xAARRGGBB.
+unsafe fn bitmap_pixels(bitmap: HBITMAP) -> Option<(usize, usize, Vec<u32>)> {
+    let mut header = BITMAP::default();
+    let size = mem::size_of::<BITMAP>() as i32;
+    if unsafe { GetObjectW(bitmap.into(), size, Some(&mut header as *mut BITMAP as *mut c_void)) } == 0 {
+        return None;
+    }
+    if header.bmWidth <= 0 || header.bmHeight <= 0 {
+        return None;
+    }
+    let (width, height) = (header.bmWidth as usize, header.bmHeight as usize);
+    let mut info = dib_info(width, height);
+    let mut pixels = vec![0u32; width * height];
+    let rows = unsafe {
+        let dc = GetDC(None);
+        let rows = GetDIBits(dc, bitmap, 0, height as u32, Some(pixels.as_mut_ptr() as *mut c_void), &mut info, DIB_RGB_COLORS);
+        ReleaseDC(None, dc);
+        rows
+    };
+    (rows == height as i32).then_some((width, height, pixels))
+}
+
+unsafe fn create_cursor(width: usize, height: usize, pixels: &[u32], x_hotspot: u32, y_hotspot: u32) -> Option<HCURSOR> {
+    let info = dib_info(width, height);
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    unsafe {
+        let color = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
+        // Windows draws by the alpha channel; the AND mask matches it for anything that
+        // reads the mask instead (set bits are transparent; rows are word aligned).
+        let stride = width.div_ceil(16) * 2;
+        let mut mask_bits = vec![0u8; stride * height];
+        for (i, pixel) in pixels.iter().enumerate() {
+            if pixel >> 24 < 0x80 {
+                let (x, y) = (i % width, i / width);
+                mask_bits[y * stride + x / 8] |= 0x80 >> (x % 8);
+            }
+        }
+        let mask = CreateBitmap(width as i32, height as i32, 1, 1, Some(mask_bits.as_ptr() as *const c_void));
+        let icon = CreateIconIndirect(&ICONINFO {
+            fIcon: FALSE,
+            xHotspot: x_hotspot,
+            yHotspot: y_hotspot,
+            hbmMask: mask,
+            hbmColor: color,
+        });
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        icon.ok().map(|icon| HCURSOR(icon.0))
+    }
+}
+
+impl Win32App {
+    /// Paseo: a theme change re-tones the cursor at once while the pointer is over a window.
+    fn retone_mouse_cursor(&mut self) {
+        if !self.pointer_outside {
+            self.apply_mouse_cursor();
         }
     }
 }

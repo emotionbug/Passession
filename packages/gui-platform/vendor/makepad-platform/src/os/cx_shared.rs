@@ -308,6 +308,7 @@ impl Cx {
             }
             return;
         }
+        self.pointer_event_starting(event);
         if self.route_text_handle_event(event) {
             self.keyboard.text_selection_outside_tap = None;
             self.inner_key_focus_change();
@@ -320,6 +321,7 @@ impl Cx {
         self.inner_key_focus_change();
         self.handle_triggers();
         self.handle_actions();
+        self.pointer_event_finished(event);
     }
 
     fn dismiss_text_selection_for_event(&mut self, event: &Event) {
@@ -406,9 +408,12 @@ impl Cx {
         let mut draw_event = DrawEvent::default();
         std::mem::swap(&mut draw_event, &mut self.new_draw_event);
         self.in_draw_event = true;
+        let started = std::time::Instant::now();
 
         self.call_event_handler(&Event::Draw(draw_event));
         self.in_draw_event = false;
+        // Paseo: what the frame moved under a still pointer is hovered (`crate::pointer`).
+        self.rehover_after_draw(started);
     }
 
     pub (crate) fn call_next_frame_event(&mut self, time: f64) {

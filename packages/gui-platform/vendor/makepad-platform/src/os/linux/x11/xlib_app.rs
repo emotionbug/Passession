@@ -68,6 +68,8 @@ pub fn set_dark_appearance(dark: bool) {
     for window in windows {
         apply_theme_variant(app.display, window);
     }
+    // The pointer's tone follows the theme at once, without waiting for a shape change.
+    app.show_mouse_cursor();
     unsafe {x11_sys::XFlush(app.display);}
 }
 
@@ -88,8 +90,13 @@ pub struct XlibApp {
     pub event_callback: Option<Box<dyn FnMut(&mut XlibApp, XlibEvent) -> EventFlow >>,
     //pub free_timers: Vec<usize>,
     pub event_flow: EventFlow,
+    /// The shape the app asked for.
     pub current_cursor: MouseCursor,
-    pub internal_cursor: MouseCursor,
+    /// Paseo: the resize shape of the window edge under the pointer, which wins over the
+    /// app's shape while the pointer is on the edge.
+    pub edge_cursor: Option<MouseCursor>,
+    /// Paseo: the shape and theme tone defined on the windows; `None` re-defines it.
+    pub shown_cursor: Option<(MouseCursor, u8)>,
     pub atoms: XlibAtoms,
     pub dnd: Dnd,
     pub next_keypress_is_repeat: bool,
@@ -125,7 +132,8 @@ impl XlibApp {
                 event_flow: EventFlow::Poll,
                 //free_timers: Vec::new(),
                 current_cursor: MouseCursor::Default,
-                internal_cursor: MouseCursor::Default,
+                edge_cursor: None,
+                shown_cursor: None,
                 dnd: Dnd::new(display),
                 next_keypress_is_repeat: false,
             }
@@ -357,35 +365,35 @@ impl XlibApp {
                         let window_size = window.last_window_geom.inner_size;
                         if pos.x >= 0.0 && pos.x < 10.0 && pos.y >= 0.0 && pos.y < 10.0 {
                             window.last_nc_mode = Some(_NET_WM_MOVERESIZE_SIZE_TOPLEFT);
-                            self.set_internal_mouse_cursor(MouseCursor::NwResize);
+                            self.set_edge_cursor(Some(MouseCursor::NwResize));
                         }
                         else if pos.x >= 0.0 && pos.x < 10.0 && pos.y >= window_size.y - 10.0 {
                             window.last_nc_mode = Some(_NET_WM_MOVERESIZE_SIZE_BOTTOMLEFT);
-                            self.set_internal_mouse_cursor(MouseCursor::SwResize);
+                            self.set_edge_cursor(Some(MouseCursor::SwResize));
                         }
                         else if pos.x >= 0.0 && pos.x < 5.0 {
                             window.last_nc_mode = Some(_NET_WM_MOVERESIZE_SIZE_LEFT);
-                            self.set_internal_mouse_cursor(MouseCursor::WResize);
+                            self.set_edge_cursor(Some(MouseCursor::WResize));
                         }
                         else if pos.x >= window_size.x - 10.0 && pos.y >= 0.0 && pos.y < 10.0 {
                             window.last_nc_mode = Some(_NET_WM_MOVERESIZE_SIZE_TOPRIGHT);
-                            self.set_internal_mouse_cursor(MouseCursor::NeResize);
+                            self.set_edge_cursor(Some(MouseCursor::NeResize));
                         }
                         else if pos.x >= window_size.x - 10.0 && pos.y >= window_size.y - 10.0 {
                             window.last_nc_mode = Some(_NET_WM_MOVERESIZE_SIZE_BOTTOMRIGHT);
-                            self.set_internal_mouse_cursor(MouseCursor::SeResize);
+                            self.set_edge_cursor(Some(MouseCursor::SeResize));
                         }
                         else if pos.x >= window_size.x - 5.0 {
                             window.last_nc_mode = Some(_NET_WM_MOVERESIZE_SIZE_RIGHT);
-                            self.set_internal_mouse_cursor(MouseCursor::EResize);
+                            self.set_edge_cursor(Some(MouseCursor::EResize));
                         }
                         else if pos.y <= 5.0 {
                             window.last_nc_mode = Some(_NET_WM_MOVERESIZE_SIZE_TOP);
-                            self.set_internal_mouse_cursor(MouseCursor::NResize);
+                            self.set_edge_cursor(Some(MouseCursor::NResize));
                         }
                         else if pos.y > window_size.y - 5.0 {
                             window.last_nc_mode = Some(_NET_WM_MOVERESIZE_SIZE_BOTTOM);
-                            self.set_internal_mouse_cursor(MouseCursor::SResize);
+                            self.set_edge_cursor(Some(MouseCursor::SResize));
                         }
                         else {
                             match response.get() {
@@ -396,7 +404,7 @@ impl XlibApp {
                                     window.last_nc_mode = None;
                                 }
                             }
-                            self.restore_mouse_cursor(self.current_cursor);
+                            self.set_edge_cursor(None);
                         }
                     }
                 },
@@ -805,13 +813,41 @@ impl XlibApp {
         self.timers.time_now()
     }
     
+    /// Paseo: loads the first named cursor of the user's Xcursor theme at the user's size,
+    /// recoloured to contrast with the app theme (`cursor_tone`). Without theme images the
+    /// core X cursor of that name is used as it is.
     pub fn load_first_cursor(&self, names: &[&[u8]]) -> Option<c_ulong> {
+        let tone = DARK_APPEARANCE.load(std::sync::atomic::Ordering::Relaxed);
         unsafe {
+            let theme = x11_sys::XcursorGetTheme(self.display);
+            let size = x11_sys::XcursorGetDefaultSize(self.display);
             for name in names {
-                let cursor = x11_sys::XcursorLibraryLoadCursor(
-                    self.display,
-                    name.as_ptr() as *const c_char,
-                );
+                let name = name.as_ptr() as *const c_char;
+                let images = x11_sys::XcursorLibraryLoadImages(name, theme, size);
+                if images.is_null() {
+                    let cursor = x11_sys::XcursorLibraryLoadCursor(self.display, name);
+                    if cursor != 0 {
+                        return Some(cursor)
+                    }
+                    continue;
+                }
+                if tone != 0 {
+                    let frames = std::slice::from_raw_parts((*images).images, (*images).nimage.max(0) as usize);
+                    // All frames of an animation take the tone their first frame needs.
+                    let mut invert = None;
+                    for &frame in frames {
+                        let (width, height) = ((*frame).width as usize, (*frame).height as usize);
+                        let pixels = std::slice::from_raw_parts_mut((*frame).pixels, width * height);
+                        let tone_dark = tone == 2;
+                        match invert {
+                            None => invert = Some(crate::cursor_tone::tone_for_theme(pixels, width, height, crate::cursor_tone::PixelAlpha::Premultiplied, tone_dark)),
+                            Some(true) => crate::cursor_tone::invert_neutral(pixels, crate::cursor_tone::PixelAlpha::Premultiplied),
+                            Some(false) => {}
+                        }
+                    }
+                }
+                let cursor = x11_sys::XcursorImagesLoadCursor(self.display, images);
+                x11_sys::XcursorImagesDestroy(images);
                 if cursor != 0 {
                     return Some(cursor)
                 }
@@ -820,25 +856,27 @@ impl XlibApp {
         return None
     }
 
-    pub fn set_internal_mouse_cursor(&mut self, cursor: MouseCursor) {
-        if self.internal_cursor != cursor {
-            self.internal_cursor = cursor.clone();
-            self.set_mouse_cursor_(cursor);
-        }
-    }
-
-    pub fn restore_mouse_cursor(&mut self, cursor: MouseCursor) {
-        self.set_mouse_cursor_(cursor);
-    }
-
     pub fn set_mouse_cursor(&mut self, cursor: MouseCursor) {
-        if self.current_cursor != cursor {
-            self.current_cursor = cursor.clone();
-            self.set_mouse_cursor_(cursor);
-        }
+        self.current_cursor = cursor;
+        self.show_mouse_cursor();
     }
 
-    fn set_mouse_cursor_(&mut self, cursor: MouseCursor) {
+    /// Paseo: the window edge's resize shape while the pointer is on it, else `None`.
+    pub fn set_edge_cursor(&mut self, cursor: Option<MouseCursor>) {
+        self.edge_cursor = cursor;
+        self.show_mouse_cursor();
+    }
+
+    /// Paseo: defines the edge's or the app's shape on every window, once per change of
+    /// shape or theme tone. Upstream reloaded the theme files on every pointer motion and
+    /// skipped an edge shape it had shown before, so re-entering an edge kept the app's.
+    pub fn show_mouse_cursor(&mut self) {
+        let cursor = self.edge_cursor.unwrap_or(self.current_cursor);
+        let shown = (cursor, DARK_APPEARANCE.load(std::sync::atomic::Ordering::Relaxed));
+        if self.shown_cursor == Some(shown) {
+            return;
+        }
+        self.shown_cursor = Some(shown);
         let x11_cursor = match cursor {
             MouseCursor::Hidden => {
                 return;

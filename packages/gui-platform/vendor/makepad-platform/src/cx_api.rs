@@ -432,6 +432,8 @@ impl Cx {
     }
 
     pub fn set_cursor(&mut self, cursor: MouseCursor) {
+        // Paseo: a request during a mouse move keeps the default arrow away (`crate::pointer`).
+        self.pointer.requested = true;
         // down cursor overrides the hover cursor
         if let Some(p) = self.platform_ops.iter_mut().find(|p| match p {
             CxOsOp::SetCursor(_) => true,

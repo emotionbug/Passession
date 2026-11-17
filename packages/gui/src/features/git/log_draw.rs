@@ -484,6 +484,7 @@ impl LogView {
                 cx,
                 live! {
                     draw_text: { color: (foreground), color_empty: (muted), text_style: { font_size: (font_size) } }
+                    draw_cursor: { color: (foreground) }
                 },
             );
             input.set_empty_text(cx, placeholder);

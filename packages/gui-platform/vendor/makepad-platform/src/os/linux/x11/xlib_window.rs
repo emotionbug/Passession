@@ -209,6 +209,8 @@ impl XlibWindow {
             self.attributes = Some(attributes);
             self.visual_info = Some(visual_info);
             self.window = Some(window);
+            // Paseo: the next pointer motion defines the current shape on this window too.
+            get_xlib_app_global().shown_cursor = None;
             self.xic = (!xic.is_null()).then_some(xic);
             self.last_window_geom = self.get_window_geom();
             

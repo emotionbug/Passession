@@ -1349,7 +1349,6 @@ impl Widget for RadioButton {
                 self.animator_play(cx, id!(hover.on));
             }
             Hit::FingerHoverOut(_) => {
-                cx.set_cursor(MouseCursor::Arrow);
                 self.animator_play(cx, id!(hover.off));
             },
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
