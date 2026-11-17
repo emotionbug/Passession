@@ -213,6 +213,9 @@ impl Mapper {
     pub fn pending_permissions(&self) -> Vec<Value> {
         self.permissions.pending()
     }
+    pub fn has_pending_permissions(&self) -> bool {
+        self.permissions.has_pending()
+    }
     pub fn permission_response(&mut self, id: &str, response: &Value) -> anyhow::Result<Value> {
         self.permissions.respond(id, response)
     }

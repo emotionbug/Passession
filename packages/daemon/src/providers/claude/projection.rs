@@ -146,6 +146,11 @@ impl Projection {
     pub fn is_compacting(&self) -> bool {
         self.compacting
     }
+    pub fn has_unterminated_tasks(&self) -> bool {
+        self.tasks
+            .values()
+            .any(|task| !matches!(task.status.as_str(), "completed" | "failed" | "canceled"))
+    }
     pub fn next_foreground_turn_id(&mut self) -> String {
         self.next_turn_id("foreground")
     }
@@ -3041,6 +3046,10 @@ mod tests {
             json!({"Which stores?":"SQLite, local, Redis"})
         );
         assert!(native["updatedInput"].get("selections").is_none());
-        assert!(native["updatedInput"]["questions"][0].get("allowOther").is_none());
+        assert!(
+            native["updatedInput"]["questions"][0]
+                .get("allowOther")
+                .is_none()
+        );
     }
 }

@@ -54,6 +54,9 @@ impl Permissions {
     pub fn pending(&self) -> Vec<Value> {
         self.requests.clone()
     }
+    pub fn has_pending(&self) -> bool {
+        !self.requests.is_empty()
+    }
     pub fn drain(&mut self) -> Vec<Value> {
         std::mem::take(&mut self.responses)
     }

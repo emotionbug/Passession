@@ -198,6 +198,9 @@ impl Router {
                 .collect::<Vec<_>>()
         )
     }
+    pub fn has_pending_calls(&self) -> bool {
+        !self.pending.lock().unwrap().is_empty()
+    }
     pub fn handle(self: &Arc<Self>, frame: &Value) -> bool {
         match frame["type"].as_str() {
             Some("host_tool_call") => {

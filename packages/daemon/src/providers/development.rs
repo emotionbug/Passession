@@ -343,6 +343,16 @@ impl AgentSession for Session {
             json!({"provider":"mock","model":self.inner.state.lock().unwrap().model,"env":{},"sessionKey":self.inner.usage_key}),
         )
     }
+    async fn unload_readiness(&self) -> UnloadReadiness {
+        let state = self.inner.state.lock().unwrap();
+        if state.closed {
+            UnloadReadiness::Unknown
+        } else if state.active.is_some() || !state.permissions.is_empty() {
+            UnloadReadiness::Busy
+        } else {
+            UnloadReadiness::Ready
+        }
+    }
     async fn start_turn(&self, prompt: Value, options: Value) -> Result<Value> {
         let gate = self.inner.gate.lock().await;
         let turn = {

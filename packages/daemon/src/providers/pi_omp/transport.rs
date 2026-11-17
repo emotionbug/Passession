@@ -336,6 +336,11 @@ impl Transport {
             let _ = reply.send(Err(anyhow!(error.to_owned())));
         }
     }
+    pub fn is_running(&self) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && !self.exited.load(Ordering::Acquire)
+            && !self.cancel.is_cancelled()
+    }
     pub async fn negotiate(&self, timeout: Duration) -> Result<()> {
         let mut ready = self.ready.subscribe();
         let frame = tokio::time::timeout(timeout, async {

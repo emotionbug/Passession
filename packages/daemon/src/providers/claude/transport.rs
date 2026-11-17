@@ -106,6 +106,10 @@ impl Transport {
         Ok((this, rx))
     }
 
+    pub fn has_pending_requests(&self) -> bool {
+        !self.pending.lock().unwrap().is_empty()
+    }
+
     pub async fn request(&self, request: Value, timeout: Duration) -> Result<Value> {
         if self.stop.is_cancelled() {
             bail!("Claude transport is closed");

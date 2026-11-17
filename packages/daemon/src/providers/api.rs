@@ -353,6 +353,13 @@ pub fn subagent_row(
     serde_json::json!({"type":"provider_subagent","provider":provider,"event":event})
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnloadReadiness {
+    Ready,
+    Busy,
+    Unknown,
+}
+
 /// Values retain the existing agent-sdk-types.ts shapes, including opaque native
 /// persistence handles and provider-specific metadata. Unsupported operations
 /// must agree with the adapter's actual advertised capabilities.
@@ -371,6 +378,13 @@ pub trait AgentSession: Send + Sync {
     async fn steer_active_turn(&self, prompt: Value, options: Value) -> Result<Value>;
     async fn stream_history(&self, sink: EventSink) -> Result<HistoryCoverage>;
     async fn runtime_info(&self) -> Result<Value>;
+    /// Ready only when the provider positively knows it owns no running or queued
+    /// work (foreground turn, compaction, queued messages, background jobs/tasks/
+    /// shells, pending host-tool calls, pending permissions) AND its durable
+    /// session can be resumed later. Never blocks on a model call.
+    async fn unload_readiness(&self) -> UnloadReadiness {
+        UnloadReadiness::Unknown
+    }
     async fn available_modes(&self) -> Result<Vec<Value>>;
     async fn current_mode(&self) -> Result<Option<String>>;
     async fn set_mode(&self, mode: &str) -> Result<Option<Value>>;

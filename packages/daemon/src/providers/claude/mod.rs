@@ -7,7 +7,7 @@ mod transport;
 
 use super::api::{
     AgentProvider, AgentSession, EventSink, HistoryCoverage, ImportedSession, LaunchContext,
-    ProviderSpec, RewindTarget, SubagentHistory, SubagentHistoryRequest,
+    ProviderSpec, RewindTarget, SubagentHistory, SubagentHistoryRequest, UnloadReadiness,
 };
 use crate::providers::registry::catalog::{
     memo::{self, Loaded, Memo},
@@ -1083,6 +1083,33 @@ impl AgentSession for ClaudeSession {
         Some(
             json!({"provider":self.spec.id,"model":state.config["model"],"env":self.env,"sessionKey":self.usage_key}),
         )
+    }
+
+    async fn unload_readiness(&self) -> UnloadReadiness {
+        let state = self.state.lock().unwrap();
+        let Some(runtime) = state.runtime.as_ref().filter(|_| !state.closed) else {
+            return UnloadReadiness::Unknown;
+        };
+        if state.active_turn.is_some()
+            || state.main_running
+            || state.interrupt_pending
+            || !state.unstarted.is_empty()
+            || !state.clearing_steers.is_empty()
+            || !state.permissions.is_empty()
+            || state.projection.active_turn_id().is_some()
+            || state.projection.is_autonomous()
+            || state.projection.is_compacting()
+            || state.projection.has_unterminated_tasks()
+            || runtime.has_pending_requests()
+        {
+            return UnloadReadiness::Busy;
+        }
+        // task_started deliberately omits local_bash, skip_transcript and other
+        // filtered tasks from the projection's declaration table. Neither a main
+        // result nor an empty visible task table proves those tasks have ended.
+        // Until all native task lifetimes are tracked, even a persisted idle
+        // session cannot positively authorize unloading.
+        UnloadReadiness::Unknown
     }
 
     async fn start_turn(&self, prompt: Value, options: Value) -> Result<Value> {

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::providers::api::{
     AgentSession, EventSink, HistoryCoverage, LaunchContext, PromptAck, PromptAckFuture,
-    PromptDeliveryError, ProviderSpec, RewindTarget,
+    PromptDeliveryError, ProviderSpec, RewindTarget, UnloadReadiness,
 };
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -97,6 +97,7 @@ pub struct Session {
     history_events: Option<(Vec<Value>, bool)>,
     initial_history: Mutex<Option<(Vec<Value>, bool)>>,
     original_persistence: Option<Value>,
+    persistence_enabled: bool,
 }
 impl Inner {
     fn runtime(&self) -> Result<Arc<Transport>> {
@@ -752,6 +753,34 @@ impl Inner {
         Ok(())
     }
 }
+fn runtime_unload_readiness(
+    native: &Value,
+    adapter_busy: bool,
+    resumable: bool,
+) -> UnloadReadiness {
+    if adapter_busy
+        || native["isStreaming"].as_bool() == Some(true)
+        || native["isCompacting"].as_bool() == Some(true)
+        || native["queuedMessageCount"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+        || native["hasPendingAsyncWork"].as_bool() == Some(true)
+        || native["isSettled"].as_bool() == Some(false)
+    {
+        UnloadReadiness::Busy
+    } else if resumable
+        && native["isStreaming"].as_bool() == Some(false)
+        && native["isCompacting"].as_bool() == Some(false)
+        && native["queuedMessageCount"].as_u64() == Some(0)
+        && native["hasPendingAsyncWork"].as_bool() == Some(false)
+        && native["isSettled"].as_bool() == Some(true)
+    {
+        UnloadReadiness::Ready
+    } else {
+        UnloadReadiness::Unknown
+    }
+}
+
 /// The acknowledgement, not a successful command alone, proves delta support.
 fn delta_updates_supported(result: Result<Value>) -> Result<bool> {
     match result {
@@ -1070,6 +1099,14 @@ impl Session {
             });
         }
         Ok(Arc::new(Self {
+            persistence_enabled: config["internal"] != true
+                && config["persistSession"] != false
+                && options["persistSession"] != false
+                && !inner
+                    .spec
+                    .command
+                    .iter()
+                    .any(|arg| arg == "--no-session" || arg.starts_with("--no-session=")),
             inner,
             capabilities: catalog::session_capabilities(
                 omp,
@@ -1308,6 +1345,52 @@ impl AgentSession for Session {
             usage["model"] = json!(model);
         }
         Some(usage)
+    }
+    async fn unload_readiness(&self) -> UnloadReadiness {
+        if self.inner.closed.load(Ordering::Acquire) || self.history_events.is_some() {
+            return UnloadReadiness::Unknown;
+        }
+        let Ok(_operation) = self.inner.operation.try_lock() else {
+            return UnloadReadiness::Busy;
+        };
+        let Ok(runtime) = self.inner.runtime() else {
+            return UnloadReadiness::Unknown;
+        };
+        let Ok((_, native)) = runtime
+            .request_with_timeout(json!({"type":"get_state"}), Some(Duration::from_secs(2)))
+            .await
+        else {
+            return UnloadReadiness::Unknown;
+        };
+        if !runtime.is_running() || self.inner.closed.load(Ordering::Acquire) {
+            return UnloadReadiness::Unknown;
+        }
+        let state = self.inner.state.lock().unwrap();
+        if state.dead {
+            return UnloadReadiness::Unknown;
+        }
+        let adapter_busy = state.active.is_some()
+            || state.mapper.active_turn_id().is_some()
+            || state.settling
+            || state.mapper.has_pending_permissions()
+            || !state.extension_results.is_empty()
+            || self.inner.manual_compaction.load(Ordering::Acquire)
+            || self
+                .inner
+                .host_tools
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|router| router.has_pending_calls());
+        // The handle persisted by describe_persistence must name this same file.
+        let resumable = self.persistence_enabled
+            && state.native["sessionId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && native["sessionFile"].as_str().is_some_and(|path| {
+                !path.is_empty() && state.native["sessionFile"].as_str() == Some(path)
+            });
+        runtime_unload_readiness(&native, adapter_busy, resumable)
     }
     async fn start_turn(&self, prompt: Value, options: Value) -> Result<Value> {
         self.prompt(prompt, options, None).await
@@ -1919,6 +2002,43 @@ impl AgentSession for Session {
 #[cfg(test)]
 mod message_update_tests {
     use super::*;
+
+    #[test]
+    fn omp_unload_requires_settled_runtime_and_resumable_adapter() {
+        let ready = json!({"isStreaming":false,"isCompacting":false,"queuedMessageCount":0,
+            "hasPendingAsyncWork":false,"isSettled":true});
+        assert_eq!(
+            runtime_unload_readiness(&ready, false, true),
+            UnloadReadiness::Ready
+        );
+        assert_eq!(
+            runtime_unload_readiness(&ready, true, true),
+            UnloadReadiness::Busy
+        );
+        assert_eq!(
+            runtime_unload_readiness(&ready, false, false),
+            UnloadReadiness::Unknown
+        );
+        for (field, busy) in [
+            ("isStreaming", json!(true)),
+            ("isCompacting", json!(true)),
+            ("queuedMessageCount", json!(1)),
+            ("hasPendingAsyncWork", json!(true)),
+            ("isSettled", json!(false)),
+        ] {
+            let mut native = ready.clone();
+            native[field] = busy;
+            assert_eq!(
+                runtime_unload_readiness(&native, false, true),
+                UnloadReadiness::Busy
+            );
+            native.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                runtime_unload_readiness(&native, false, true),
+                UnloadReadiness::Unknown
+            );
+        }
+    }
 
     #[test]
     fn omp_delta_negotiation_requires_echo_and_preserves_full_snapshot_output() {
