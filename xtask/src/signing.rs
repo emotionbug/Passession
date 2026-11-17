@@ -359,10 +359,10 @@ pub fn sign_windows(files: &[PathBuf], stage: &Path) -> Result<()> {
     Ok(())
 }
 
-fn host_arch() -> Result<(&'static str, u16)> {
-    match env::consts::ARCH {
-        "x86_64" => Ok(("x64", 0x8664)),
-        "aarch64" => Ok(("arm64", 0xaa64)),
+fn target_arch() -> Result<(&'static str, u16)> {
+    match crate::common::BuildTarget::current()?.arch {
+        "x64" => Ok(("x64", 0x8664)),
+        "arm64" => Ok(("arm64", 0xaa64)),
         arch => bail!("Unsupported Windows runtime architecture: {arch}"),
     }
 }
@@ -565,7 +565,7 @@ fn runtime_dlls(crt: &Path, destination: &Path, machine: u16) -> Result<Vec<Path
 }
 
 pub fn windows_runtime(destination: &Path, standalone: bool) -> Result<()> {
-    let (arch, machine) = host_arch()?;
+    let (arch, machine) = target_arch()?;
     let redist = if let Some(path) = setting("VCToolsRedistDir") {
         PathBuf::from(path)
     } else {

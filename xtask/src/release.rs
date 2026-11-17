@@ -18,7 +18,9 @@ pub(super) const CLIENT_APP_ID: &str = "sh.paseo.sessions.desktop";
 pub(super) const DAEMON: &str = "rust";
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct Target {
-    pub runner: &'static str,
+    #[serde(rename = "runner")]
+    pub compile_runner: &'static str,
+    pub finalizer: Option<&'static str>,
     pub platform: &'static str,
     pub arch: &'static str,
     pub desktop: bool,
@@ -28,59 +30,74 @@ impl Target {
     pub fn id(self) -> String {
         format!("{}-{}", self.platform, self.arch)
     }
+    fn matrix_entry(self) -> Result<Value> {
+        let mut entry = serde_json::to_value(self)?;
+        let id = self.id();
+        entry["triple"] = json!(common::BuildTarget::parse(&id)?.triple);
+        entry["id"] = json!(id);
+        Ok(entry)
+    }
 }
 pub(super) const TARGETS: [Target; 8] = [
     Target {
-        runner: "ubuntu-24.04",
+        compile_runner: "ubuntu-24.04",
+        finalizer: None,
         platform: "linux",
         arch: "x64",
         desktop: true,
         format: "",
     },
     Target {
-        runner: "ubuntu-24.04-arm",
+        compile_runner: "ubuntu-24.04-arm",
+        finalizer: None,
         platform: "linux",
         arch: "arm64",
         desktop: true,
         format: "",
     },
     Target {
-        runner: "macos-15",
+        compile_runner: "ubuntu-24.04",
+        finalizer: Some("macos-15"),
         platform: "macos",
         arch: "arm64",
         desktop: true,
         format: "",
     },
     Target {
-        runner: "macos-15-intel",
+        compile_runner: "macos-15-intel",
+        finalizer: None,
         platform: "macos",
         arch: "x64",
         desktop: true,
         format: "",
     },
     Target {
-        runner: "windows-latest",
+        compile_runner: "ubuntu-24.04",
+        finalizer: Some("windows-latest"),
         platform: "windows",
         arch: "x64",
         desktop: true,
         format: "",
     },
     Target {
-        runner: "windows-11-arm",
+        compile_runner: "windows-11-arm",
+        finalizer: None,
         platform: "windows",
         arch: "arm64",
         desktop: true,
         format: "",
     },
     Target {
-        runner: "ubuntu-24.04",
+        compile_runner: "ubuntu-24.04",
+        finalizer: None,
         platform: "android",
         arch: "arm64",
         desktop: false,
         format: "apk",
     },
     Target {
-        runner: "macos-15",
+        compile_runner: "macos-15",
+        finalizer: None,
         platform: "ios",
         arch: "arm64",
         desktop: false,
@@ -93,6 +110,19 @@ pub(super) fn target(id: &str) -> Result<Target> {
         .copied()
         .find(|t| t.id() == id)
         .context("Unknown release target")
+}
+
+fn finalize_matrix(entries: &[Value]) -> Value {
+    let include: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry["finalizer"].is_string())
+        .map(|entry| {
+            let mut entry = entry.clone();
+            entry["runner"] = entry["finalizer"].clone();
+            entry
+        })
+        .collect();
+    json!({"include": include})
 }
 pub(super) fn var(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.into())
@@ -258,8 +288,12 @@ fn plan(
             .chain(recovery.iter().cloned())
             .collect()
     };
+    let entries = selected
+        .iter()
+        .map(|target| target.matrix_entry())
+        .collect::<Result<Vec<_>>>()?;
     Ok(
-        json!({"sourceTag":source,"releaseTag":format!("v{v}"),"version":v.to_string(),"channel":channel(&v),"prerelease":!v.pre.is_empty(),"publish":publish,"mode":mode,"matrix":{"include":selected},"recovery":recovery,"expected":expected,"createRelease":(["all","desktop","android","linux-windows-x64-android",X64_ANDROID_MACOS_ARM64].contains(&selection))}),
+        json!({"sourceTag":source,"releaseTag":format!("v{v}"),"version":v.to_string(),"channel":channel(&v),"prerelease":!v.pre.is_empty(),"publish":publish,"mode":mode,"finalize":finalize_matrix(&entries),"matrix":{"include":entries},"recovery":recovery,"expected":expected,"createRelease":(["all","desktop","android","linux-windows-x64-android",X64_ANDROID_MACOS_ARM64].contains(&selection))}),
     )
 }
 
@@ -376,7 +410,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 .iter()
                 .filter(|id| !recovered.contains(id))
                 .map(|id| {
-                    let mut value = serde_json::to_value(target(id)?)?;
+                    let mut value = target(id)?.matrix_entry()?;
                     let decision = component_plan
                         .targets
                         .iter()
@@ -387,6 +421,7 @@ pub fn run(args: &[String]) -> Result<()> {
                     Ok(value)
                 })
                 .collect::<Result<_>>()?;
+            p["finalize"] = finalize_matrix(&matrix);
             p["matrix"] = json!({"include":matrix});
             p["expected"] = json!(changed);
             p["recovery"] = json!(
@@ -448,6 +483,48 @@ mod tests {
             assert_eq!(p["recovery"].as_array().unwrap().len(), 1);
             assert!(plan("v0.13.1", id, "build", true, "", "workflow_dispatch").is_err());
         }
+    }
+    #[test]
+    fn cross_targets_split_only_proven_recipes() {
+        let p = plan("v0.13.4", "all", "build", false, "", "workflow_dispatch").unwrap();
+        let entries = p["matrix"]["include"].as_array().unwrap();
+        for entry in entries {
+            let id = entry["id"].as_str().unwrap();
+            assert_eq!(
+                entry["triple"],
+                common::BuildTarget::parse(id).unwrap().triple
+            );
+            match id {
+                "windows-x64" | "macos-arm64" => {
+                    assert_eq!(entry["runner"], "ubuntu-24.04");
+                    assert_eq!(
+                        entry["finalizer"],
+                        if id == "windows-x64" {
+                            "windows-latest"
+                        } else {
+                            "macos-15"
+                        }
+                    );
+                }
+                _ => assert!(entry["finalizer"].is_null()),
+            }
+        }
+        let finalizers = p["finalize"]["include"].as_array().unwrap();
+        assert_eq!(finalizers.len(), 2);
+        for entry in finalizers {
+            assert_eq!(entry["runner"], entry["finalizer"]);
+        }
+        let mut entry = target("windows-x64").unwrap().matrix_entry().unwrap();
+        entry["components"] = json!(["app", "daemon"]);
+        entry["package"] = json!(true);
+        let finalize = finalize_matrix(&[entry]);
+        assert_eq!(finalize["include"][0]["id"], "windows-x64");
+        assert_eq!(
+            finalize["include"][0]["components"],
+            json!(["app", "daemon"])
+        );
+        assert_eq!(finalize["include"][0]["package"], true);
+        assert_eq!(finalize_matrix(&[]), json!({"include":[]}));
     }
     #[test]
     fn publication_only_requires_prior_run() {

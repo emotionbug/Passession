@@ -231,7 +231,9 @@ pub fn configure(command: &mut Command) -> Result<()> {
             command.env("CARGO_INCREMENTAL", "0");
         }
     }
-    if env::var("PASEO_FAST_LINKER").as_deref() == Ok("1") {
+    if env::var("PASEO_FAST_LINKER").as_deref() == Ok("1")
+        && !crate::common::BuildTarget::current()?.is_cross()?
+    {
         ensure!(
             cfg!(target_os = "linux") && cfg!(target_env = "gnu"),
             "PASEO_FAST_LINKER supports native Linux GNU targets only"

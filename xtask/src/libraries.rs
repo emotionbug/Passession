@@ -142,6 +142,12 @@ fn relocate_elf(file: &Path, destination: &Path) -> Result<bool> {
 /// `dlopened` names sonames the payload loads at runtime (absent from
 /// `DT_NEEDED`); they and their own dependencies join the closure.
 fn bundle(root: &Path, destination: &Path, notices: &Path, dlopened: &[&str]) -> Result<()> {
+    ensure!(
+        host_platform()? == "linux"
+            && BuildTarget::current()?.platform == "linux"
+            && !BuildTarget::current()?.is_cross()?,
+        "System library completion requires the native Linux target host"
+    );
     fs::create_dir_all(destination)?;
     fs::create_dir_all(notices)?;
     let root = fs::canonicalize(root)?;
@@ -274,8 +280,8 @@ pub const LINUX_DLOPENED: [&str; 5] = [
     "libfontconfig.so.1",
 ];
 
-/// Host path of a system soname for the build architecture, from the
-/// dynamic linker cache.
+/// Native packaging-host path of a system soname for the selected target
+/// architecture, from the dynamic linker cache.
 fn system_library(soname: &str) -> Result<PathBuf> {
     let output = Command::new("ldconfig")
         .arg("-p")

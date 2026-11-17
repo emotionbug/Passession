@@ -136,17 +136,7 @@ pub(crate) fn supported(target: &str) -> Vec<ComponentId> {
     }
 }
 fn triple(target: &str) -> Result<&'static str> {
-    Ok(match target {
-        "linux-x64" => "x86_64-unknown-linux-gnu",
-        "linux-arm64" => "aarch64-unknown-linux-gnu",
-        "windows-x64" => "x86_64-pc-windows-msvc",
-        "windows-arm64" => "aarch64-pc-windows-msvc",
-        "macos-x64" => "x86_64-apple-darwin",
-        "macos-arm64" => "aarch64-apple-darwin",
-        "android-arm64" => "aarch64-linux-android",
-        "ios-arm64" => "aarch64-apple-ios",
-        _ => bail!("Unsupported component target {target}"),
-    })
+    Ok(common::BuildTarget::parse(target)?.triple)
 }
 fn command(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = Command::new("git").args(args).current_dir(root).output()?;
@@ -268,7 +258,7 @@ fn within(path: &str, directory: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 fn metadata(root: &Path, target: &str) -> Result<Value> {
-    let out = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let out = common::command(common::cargo())?
         .args([
             "metadata",
             "--locked",
@@ -302,7 +292,7 @@ fn compilation_features(
         ComponentId::Daemon => "paseo-daemon",
         _ => return Ok(None),
     };
-    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let output = common::command(common::cargo())?
         .args([
             "tree",
             "--locked",
@@ -478,11 +468,14 @@ fn component_inputs(
             || path.starts_with(".github/actions/setup-")
             || path == ".github/workflows/desktop-release.yml"
             || path.starts_with("xtask/src/components/")
+            || path.starts_with("xtask/src/cross_tools/")
             || [
                 "xtask/Cargo.toml",
                 "xtask/src/main.rs",
                 "xtask/src/common.rs",
                 "xtask/src/components.rs",
+                "xtask/src/cross.rs",
+                "xtask/src/cross_tools.rs",
                 "xtask/src/notices.rs",
                 "xtask/src/signing.rs",
                 "LICENSE",
@@ -746,14 +739,18 @@ pub(crate) fn validate_inputs(plan: &Plan, target: &TargetPlan) -> Result<()> {
     release::remote::authenticate_reuse(target)
 }
 fn options(args: &[String]) -> Result<BTreeMap<String, String>> {
-    ensure!(
-        args.len().is_multiple_of(2),
-        "Every planner flag requires a value"
-    );
     let mut values = BTreeMap::new();
-    for pair in args.chunks_exact(2) {
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let value = if flag == "--no-prior" {
+            String::new()
+        } else {
+            args.next()
+                .context("Every planner flag except --no-prior requires a value")?
+                .clone()
+        };
         ensure!(
-            values.insert(pair[0].clone(), pair[1].clone()).is_none(),
+            values.insert(flag.clone(), value).is_none(),
             "Duplicate planner option"
         );
     }
@@ -766,15 +763,23 @@ pub(crate) fn dispatch(command_name: &str, args: &[String]) -> Result<()> {
             ensure!(
                 options
                     .keys()
-                    .all(|k| ["--output", "--targets", "--prior-tag"].contains(&k.as_str())),
+                    .all(|k| ["--output", "--targets", "--prior-tag", "--no-prior"]
+                        .contains(&k.as_str())),
                 "Unknown component planner flag"
             );
             let targets = options
                 .get("--targets")
                 .map(|s| s.split(',').map(str::to_owned).collect())
                 .unwrap_or_else(|| release::TARGETS.iter().map(|t| t.id()).collect::<Vec<_>>());
-            let (prior, hashes) =
-                release::remote::prior_inventory(options.get("--prior-tag").map(String::as_str))?;
+            ensure!(
+                !(options.contains_key("--no-prior") && options.contains_key("--prior-tag")),
+                "--no-prior and --prior-tag are mutually exclusive"
+            );
+            let (prior, hashes) = if options.contains_key("--no-prior") {
+                (None, BTreeMap::new())
+            } else {
+                release::remote::prior_inventory(options.get("--prior-tag").map(String::as_str))?
+            };
             let plan = create(&targets, prior.as_ref(), &hashes)?;
             let path = PathBuf::from(
                 options
@@ -985,6 +990,25 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn no_prior_planner_flag_needs_no_value() {
+        let parsed = options(
+            &[
+                "--no-prior",
+                "--targets",
+                "windows-x64",
+                "--output",
+                "plan.json",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(parsed.contains_key("--no-prior"));
+        assert_eq!(parsed["--targets"], "windows-x64");
+        assert!(options(&["--targets".to_owned()]).is_err());
+        assert!(options(&["--no-prior".to_owned(), "--no-prior".to_owned()]).is_err());
+    }
+
     #[test]
     fn selective_decisions_preserve_original_sources_and_packages() {
         let (inputs, prior) = fixture();

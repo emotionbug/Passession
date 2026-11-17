@@ -1,0 +1,39 @@
+{
+  "manifestVersion": "1.1",
+  "info": {
+    "id": "VisualStudio.17.Release/17.14.45+37906.3",
+    "buildBranch": "d17.14",
+    "buildVersion": "17.14.37906.3",
+    "commitId": "2feaecfdd5c7a4ca43d6977bdbb2d9f8252f4a0f",
+    "communityOrLowerFlightId": "9116197f1c7d4a3",
+    "localBuild": "build-lab",
+    "manifestName": "VisualStudio.17.Release",
+    "manifestType": "channel",
+    "productDisplayVersion": "17.14.45",
+    "productLine": "Dev17",
+    "productLineVersion": "2022",
+    "productMilestone": "RTW",
+    "productMilestoneIsPreRelease": "False",
+    "productName": "Visual Studio",
+    "productPatchVersion": "45",
+    "productPreReleaseMilestoneSuffix": "1.0",
+    "productSemanticVersion": "17.14.45+37906.3",
+    "professionalOrGreaterFlightId": "9435383f06734e8",
+    "qBuildSessionId": "8aa54e09-ec13-f68f-3fa7-d6fb77cda550"
+  },
+  "channelItems": [
+    {
+      "id": "Microsoft.VisualStudio.Manifests.VisualStudio",
+      "version": "17.14.37906.3",
+      "type": "Manifest",
+      "payloads": [
+        {
+          "fileName": "VisualStudio.vsman",
+          "sha256": "da49c304df0fff4e75c20849171840a06840e845ce814104d709dfb5cd461668",
+          "size": 30447538,
+          "url": "https://download.visualstudio.microsoft.com/download/pr/95995f57-8355-4ff5-8d90-a7e1669fb3b3/da49c304df0fff4e75c20849171840a06840e845ce814104d709dfb5cd461668/VisualStudio.vsman"
+        }
+      ]
+    }
+  ]
+}

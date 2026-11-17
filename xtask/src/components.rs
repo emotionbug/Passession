@@ -1,4 +1,4 @@
-//! Independent component compilation and authenticated release-plan execution.
+//! Independent raw compilation, plan-bound handoff and native release finalization.
 mod build;
 pub(crate) mod plan;
 

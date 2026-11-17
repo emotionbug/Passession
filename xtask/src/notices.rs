@@ -1,4 +1,4 @@
-use crate::common::{read_json, root, write_json};
+use crate::common::{BuildTarget, cargo, command, read_json, root, write_json};
 use anyhow::{Context, Result, bail, ensure};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -7,7 +7,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 use walkdir::WalkDir;
 
@@ -66,17 +65,6 @@ fn text(path: &Path) -> Result<String> {
         path.display()
     );
     Ok(value)
-}
-fn host_target(os: &str, arch: &str) -> Result<&'static str> {
-    match (os, arch) {
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
-        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
-        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
-        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
-        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
-        _ => bail!("Unsupported native Cargo host: {os}-{arch}"),
-    }
 }
 
 struct Notice {
@@ -709,13 +697,9 @@ fn native_document(metadata: &Value, root: &str, manifest: &Value) -> Result<Val
     )
 }
 
-pub fn host_triple() -> Result<&'static str> {
-    host_target(std::env::consts::OS, std::env::consts::ARCH)
-}
-
 /// Resolved Cargo metadata as seen by one compilation target.
 pub fn cargo_metadata(target: &str) -> Result<Value> {
-    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let output = command(cargo())?
         .args([
             "metadata",
             "--locked",
@@ -744,7 +728,7 @@ fn supplements(root: &Path) -> Result<Vec<Value>> {
 
 pub fn collect(directory: &Path) -> Result<()> {
     let root = root()?;
-    let metadata = cargo_metadata(host_triple()?)?;
+    let metadata = cargo_metadata(BuildTarget::current()?.triple)?;
     let mut document = collect_document(&metadata, "paseo-daemon", BOUNDARY, &supplements(&root)?)?;
     document["nativeBuilds"] = native_document(
         &metadata,
@@ -1253,16 +1237,6 @@ mod tests {
         let source = fs::read_to_string(&path).unwrap();
         fs::write(path, source.replace('\n', "\r\n")).unwrap();
         assert!(validate_embedded_inventory(directory.path(), &inventory).is_err());
-    }
-
-    #[test]
-    fn supported_hosts_are_explicit() {
-        for os in ["linux", "macos", "windows"] {
-            for arch in ["x86_64", "aarch64"] {
-                assert!(host_target(os, arch).is_ok());
-            }
-        }
-        assert!(host_target("linux", "arm").is_err());
     }
 
     #[test]

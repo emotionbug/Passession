@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     env, fs,
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     thread,
@@ -322,6 +322,53 @@ fn plist_set(plist: &Path, key: &str, kind: &str, value: &str) -> Result<()> {
         .arg(plist))
 }
 
+/// The desktop template is rendered XML, so identifier validation needs no
+/// native plist tooling. Mobile plist editing remains on its native path.
+fn desktop_plist_identifier(plist: &str) -> Option<&str> {
+    plist
+        .split_once("<key>CFBundleIdentifier</key>")?
+        .1
+        .trim_start()
+        .strip_prefix("<string>")?
+        .split_once("</string>")
+        .map(|(value, _)| value)
+}
+
+/// ICNS supports PNG payloads directly, without conversion by macOS iconutil.
+fn write_icns(iconset: &Path, destination: &Path) -> Result<()> {
+    let mut output = fs::File::create(destination)?;
+    output.write_all(b"icns\0\0\0\0")?;
+    let mut length = 8_u32;
+    for (name, kind) in [
+        ("icon_16x16.png", b"icp4"),
+        ("icon_16x16@2x.png", b"ic11"),
+        ("icon_32x32.png", b"icp5"),
+        ("icon_32x32@2x.png", b"ic12"),
+        ("icon_128x128.png", b"ic07"),
+        ("icon_128x128@2x.png", b"ic13"),
+        ("icon_256x256.png", b"ic08"),
+        ("icon_256x256@2x.png", b"ic14"),
+        ("icon_512x512.png", b"ic09"),
+        ("icon_512x512@2x.png", b"ic10"),
+    ] {
+        let path = iconset.join(name);
+        let mut input = fs::File::open(&path)
+            .with_context(|| format!("Reading desktop icon {}", path.display()))?;
+        let chunk_length = u32::try_from(input.metadata()?.len())?
+            .checked_add(8)
+            .context("ICNS icon exceeds the container size limit")?;
+        length = length
+            .checked_add(chunk_length)
+            .context("ICNS container exceeds the size limit")?;
+        output.write_all(kind)?;
+        output.write_all(&chunk_length.to_be_bytes())?;
+        std::io::copy(&mut input, &mut output)?;
+    }
+    output.seek(SeekFrom::Start(4))?;
+    output.write_all(&length.to_be_bytes())?;
+    Ok(())
+}
+
 /// Cargo feature of `paseo-gui` that compiles the in-process desktop lifecycle
 /// driver used by `tools/native-desktop-smoke`. Never part of a package.
 pub const SMOKE_FEATURE: &str = "desktop-smoke";
@@ -366,10 +413,20 @@ fn build_desktop_app(
     identity: &Identity,
     smoke: bool,
 ) -> Result<PathBuf> {
+    let selected = BuildTarget::current()?;
+    ensure!(
+        selected.platform == target,
+        "Desktop platform {target} does not match selected build target {}",
+        selected.id()
+    );
     let mut cargo = command(cargo())?;
     cargo
         .args(["build", "--locked", "-p", "paseo-gui", "--bin", CARGO_BIN])
+        .env_remove("CARGO_BUILD_TARGET")
         .env("MAKEPAD_PACKAGE_DIR", "makepad");
+    if selected.is_cross()? {
+        cargo.args(["--target", selected.triple]);
+    }
     if smoke {
         cargo
             .arg("--features")
@@ -383,13 +440,18 @@ fn build_desktop_app(
             .env("MACOSX_DEPLOYMENT_TARGET", MACOS_MINIMUM);
     }
     run(&mut cargo)?;
-    let compiled = target_root()?
-        .join(mode)
-        .join(format!("{CARGO_BIN}{}", env::consts::EXE_SUFFIX));
+    let compiled = cargo_output(mode)?.join(format!(
+        "{CARGO_BIN}{}",
+        if selected.platform == "windows" {
+            ".exe"
+        } else {
+            ""
+        }
+    ));
     build::assert_architecture(&compiled)?;
     let output = gui_output()?
         .join("desktop")
-        .join(format!("{target}-{}", arch()?))
+        .join(selected.id())
         .join(if smoke {
             format!("smoke-{mode}")
         } else {
@@ -408,32 +470,27 @@ fn build_desktop_app(
     if target == "macos" {
         let template = fs::read_to_string(packaging()?.join("desktop/macos/Info.plist"))?;
         let build_number = identity.build_number.to_string();
-        text(
-            &bundle.join("Contents/Info.plist"),
-            substitute(
-                &template,
-                &[
-                    ("PASEO_VERSION", identity.version.as_str()),
-                    ("PASEO_BUILD_NUMBER", build_number.as_str()),
-                    ("MACOS_MINIMUM", MACOS_MINIMUM),
-                ],
-            )?,
-            0o644,
+        let plist = substitute(
+            &template,
+            &[
+                ("PASEO_VERSION", identity.version.as_str()),
+                ("PASEO_BUILD_NUMBER", build_number.as_str()),
+                ("MACOS_MINIMUM", MACOS_MINIMUM),
+            ],
         )?;
         ensure!(
-            plist_value(&bundle.join("Contents/Info.plist"), "CFBundleIdentifier")?
-                == DESKTOP_APP_ID,
+            desktop_plist_identifier(&plist) == Some(DESKTOP_APP_ID),
             "macOS Info.plist template lost the {DESKTOP_APP_ID} bundle identifier"
         );
+        text(&bundle.join("Contents/Info.plist"), plist, 0o644)?;
         text(&bundle.join("Contents/PkgInfo"), "APPL????", 0o644)?;
         fs::create_dir_all(&resources)?;
-        run(command("iconutil")?
-            .args(["-c", "icns"])
-            .arg(packaging()?.join("desktop/macos/AppIcon.iconset"))
-            .arg("-o")
-            .arg(resources.join("AppIcon.icns")))?;
+        write_icns(
+            &packaging()?.join("desktop/macos/AppIcon.iconset"),
+            &resources.join("AppIcon.icns"),
+        )?;
     }
-    let metadata = notices::cargo_metadata(notices::host_triple()?)?;
+    let metadata = notices::cargo_metadata(selected.triple)?;
     let packaged = stage_resources(&metadata, &resources)?;
     stage_notices(&metadata, &packaged, target, &resources, "")?;
     // A smoke bundle carries a test driver: it gets no build descriptor, so
@@ -441,8 +498,8 @@ fn build_desktop_app(
     if !smoke {
         fs::create_dir_all(release()?)?;
         write_json(
-            &release()?.join(format!("build-{target}-{}.json", arch()?)),
-            &json!({"version":identity.version,"platform":target,"arch":arch()?,"mode":mode,"output":bundle.strip_prefix(gui_output()?)?.to_string_lossy().replace('\\', "/")}),
+            &release()?.join(format!("build-{}.json", selected.id())),
+            &json!({"version":identity.version,"platform":target,"arch":selected.arch,"mode":mode,"output":bundle.strip_prefix(gui_output()?)?.to_string_lossy().replace('\\', "/")}),
         )?;
     }
     Ok(bundle)
@@ -744,7 +801,7 @@ fn build_android_native(
 ) -> Result<()> {
     let sdk = android_sdk()?;
     let ndk = android_ndk(&sdk)?;
-    let host = match platform()? {
+    let host = match host_platform()? {
         "linux" => "linux-x86_64",
         "macos" => "darwin-x86_64",
         _ => "windows-x86_64",
@@ -975,8 +1032,11 @@ fn build_ios_native(
     simulator: bool,
     selected_tailnet: Option<&Path>,
 ) -> Result<PathBuf> {
-    ensure!(platform()? == "macos", "iOS builds require macOS and Xcode");
-    let triple = match (simulator, arch()?) {
+    ensure!(
+        host_platform()? == "macos",
+        "iOS builds require macOS and Xcode"
+    );
+    let triple = match (simulator, host_arch()?) {
         (false, _) => "aarch64-apple-ios",
         (true, "arm64") => "aarch64-apple-ios-sim",
         (true, _) => bail!(
@@ -1406,12 +1466,12 @@ fn run_ios(app: &Path, simulator: bool, device: &str) -> Result<()> {
 
 pub fn build_gui(args: &[String]) -> Result<()> {
     supervise_subprocesses()?;
-    let mut lease = crate::build_cache::acquire()?;
     let mut target = None;
     let mut mode = "release";
     let mut launch = false;
     let mut smoke = false;
     let mut device = None;
+    let mut cross = None;
     let mut android_arch = None;
     let mut format = "apk";
     let mut explicit_format = false;
@@ -1421,7 +1481,7 @@ pub fn build_gui(args: &[String]) -> Result<()> {
             "--debug" => mode = "debug",
             "--run" => launch = true,
             "--smoke" => smoke = true,
-            "--device" | "--arch" | "--profile" | "--format" => {
+            "--device" | "--arch" | "--profile" | "--format" | "--cross" => {
                 let option = &args[index];
                 index += 1;
                 let value = args
@@ -1430,6 +1490,7 @@ pub fn build_gui(args: &[String]) -> Result<()> {
                     .context("Missing option value")?;
                 match option.as_str() {
                     "--device" => device = Some(value.as_str()),
+                    "--cross" => cross = Some(BuildTarget::parse(value)?),
                     "--arch" => android_arch = Some(value.as_str()),
                     "--profile" => mode = value,
                     "--format" => {
@@ -1444,16 +1505,48 @@ pub fn build_gui(args: &[String]) -> Result<()> {
         }
         index += 1;
     }
-    let target = target.unwrap_or(platform()?);
-    let desktop = matches!(target, "linux" | "macos" | "windows");
+    let current = BuildTarget::current()?;
     ensure!(
-        desktop || matches!(target, "android" | "ios"),
-        "Unknown GUI platform: {target}"
+        cross.is_none_or(|target| matches!(target.platform, "linux" | "macos" | "windows")),
+        "--cross requires a desktop build target"
     );
+    let requested = target.unwrap_or(cross.map_or(current.platform, |target| target.platform));
+    let selected = match requested {
+        "android" | "ios" => None,
+        "linux" | "macos" | "windows" => Some(BuildTarget::parse(&format!(
+            "{requested}-{}",
+            cross.map_or(current.arch, |target| target.arch)
+        ))?),
+        id => {
+            let selected = BuildTarget::parse(id)?;
+            ensure!(
+                matches!(selected.platform, "linux" | "macos" | "windows"),
+                "Unknown GUI platform: {id}"
+            );
+            Some(selected)
+        }
+    };
     ensure!(
-        !desktop || target == platform()?,
-        "Desktop builds require a native host of the target platform"
+        cross.is_none() || selected == cross,
+        "--cross target must match the requested GUI platform"
     );
+    let desktop = selected.is_some();
+    let target = selected.map_or(requested, |selected| selected.platform);
+    let build_target = selected.unwrap_or(BuildTarget::host()?);
+    ensure!(
+        !launch || !desktop || cross.is_none() && !build_target.is_cross()?,
+        "--run requires a native desktop build target"
+    );
+    if build_target != current {
+        let mut child = command(env::current_exe()?)?;
+        child.arg("build-gui").args(args);
+        if desktop {
+            child.env("PASEO_BUILD_TARGET", build_target.id());
+        } else {
+            child.env_remove("PASEO_BUILD_TARGET");
+        }
+        return run(&mut child);
+    }
     ensure!(
         env::var_os("CARGO_BUILD_TARGET").is_none(),
         "CARGO_BUILD_TARGET is not supported; xtask selects the GUI target"
@@ -1492,6 +1585,7 @@ pub fn build_gui(args: &[String]) -> Result<()> {
         mode == "release" || env::var("PASEO_NATIVE_RELEASE").as_deref() != Ok("1"),
         "PASEO_NATIVE_RELEASE=1 requires a release GUI build"
     );
+    let mut lease = crate::build_cache::acquire()?;
     require_zig()?;
     let identity = Identity::resolve(target)?;
     match target {
@@ -1529,10 +1623,20 @@ pub fn build_gui(args: &[String]) -> Result<()> {
             }
         }
         _ => {
-            let bundle = build_desktop(target, mode, &identity, smoke)?;
+            let raw = cross.is_some() || build_target.is_cross()?;
+            let bundle = if raw {
+                build_desktop_app(target, mode, &identity, smoke)?
+            } else {
+                build_desktop(target, mode, &identity, smoke)?
+            };
             println!(
-                "GUI {target} {mode}{}: {}",
+                "GUI {target} {mode}{}{}: {}",
                 if smoke { " smoke" } else { "" },
+                if raw {
+                    " raw app (native finalization required)"
+                } else {
+                    ""
+                },
                 bundle.display()
             );
             lease.release_target();
@@ -1669,6 +1773,64 @@ pub(crate) fn component_package_mobile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn icns_embeds_every_png_with_big_endian_lengths() {
+        use base64::Engine;
+        let directory = tempfile::tempdir().unwrap();
+        let iconset = directory.path().join("AppIcon.iconset");
+        fs::create_dir(&iconset).unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
+            .unwrap();
+        let icons = [
+            ("icon_16x16.png", b"icp4"),
+            ("icon_16x16@2x.png", b"ic11"),
+            ("icon_32x32.png", b"icp5"),
+            ("icon_32x32@2x.png", b"ic12"),
+            ("icon_128x128.png", b"ic07"),
+            ("icon_128x128@2x.png", b"ic13"),
+            ("icon_256x256.png", b"ic08"),
+            ("icon_256x256@2x.png", b"ic14"),
+            ("icon_512x512.png", b"ic09"),
+            ("icon_512x512@2x.png", b"ic10"),
+        ];
+        for (name, _) in icons {
+            fs::write(iconset.join(name), &png).unwrap();
+        }
+        let destination = directory.path().join("AppIcon.icns");
+        write_icns(&iconset, &destination).unwrap();
+        let icns = fs::read(destination).unwrap();
+        assert_eq!(&icns[..4], b"icns");
+        assert_eq!(
+            u32::from_be_bytes(icns[4..8].try_into().unwrap()) as usize,
+            icns.len()
+        );
+        let mut offset = 8;
+        for (_, kind) in icons {
+            assert_eq!(&icns[offset..offset + 4], kind);
+            let length =
+                u32::from_be_bytes(icns[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            assert_eq!(length, png.len() + 8);
+            assert_eq!(&icns[offset + 8..offset + length], png);
+            offset += length;
+        }
+        assert_eq!(offset, icns.len());
+    }
+
+    #[test]
+    fn desktop_plist_identifier_reads_rendered_text() {
+        assert_eq!(
+            desktop_plist_identifier(
+                "<dict><key>CFBundleIdentifier</key>\n  <string>sh.paseo.sessions.desktop</string></dict>"
+            ),
+            Some(DESKTOP_APP_ID)
+        );
+        assert_eq!(
+            desktop_plist_identifier("<key>CFBundleIdentifier</key><integer>1</integer>"),
+            None
+        );
+    }
+
     #[test]
     fn credentials_restore_existing_and_remove_temporary_files() {
         let directory = tempfile::tempdir().unwrap();

@@ -52,19 +52,236 @@ fn selected(target: &TargetPlan, mut compile: impl FnMut(ComponentId) -> Result<
     Ok(())
 }
 
-pub(crate) fn run(args: &[String]) -> Result<()> {
-    let [option, path, target_option, target_name] = args else {
-        bail!("Usage: cargo xtask components build --plan PATH --target ID");
-    };
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HandoffFile {
+    sha256: String,
+    executable: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HandoffComponent {
+    identity: ComponentIdentity,
+    files: BTreeMap<String, HandoffFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Handoff {
+    schema_version: u32,
+    target: String,
+    version: String,
+    source_sha: String,
+    plan_digest: String,
+    components: BTreeMap<ComponentId, HandoffComponent>,
+}
+
+fn plan_digest(plan: &Plan) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(plan)?)))
+}
+
+fn compiled_identity(
+    plan: &Plan,
+    target: &TargetPlan,
+    id: ComponentId,
+) -> Result<ComponentIdentity> {
+    Ok(ComponentIdentity {
+        version: plan.version.clone(),
+        source_sha: plan.source_sha.clone(),
+        input_hash: target
+            .inputs
+            .get(&id)
+            .context("Plan lacks a selected component fingerprint")?
+            .clone(),
+        abi_version: id.initial_abi_version(),
+    })
+}
+
+fn handoff_files(root: &Path) -> Result<BTreeMap<String, HandoffFile>> {
+    let mut files = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry?;
+        ensure!(
+            entry.file_type().is_dir() || entry.file_type().is_file(),
+            "Handoff contains a link or non-regular member: {}",
+            entry.path().display()
+        );
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let name = entry
+            .path()
+            .strip_prefix(root)?
+            .to_str()
+            .context("Non-UTF-8 handoff path")?
+            .replace('\\', "/");
+        safe_member(&name)?;
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            entry.metadata()?.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
+        files.insert(
+            name,
+            HandoffFile {
+                sha256: sha256_file(entry.path())?,
+                executable,
+            },
+        );
+    }
+    Ok(files)
+}
+
+fn write_handoff(
+    output: &Path,
+    plan: &Plan,
+    target: &TargetPlan,
+    objects: &BTreeMap<ComponentId, PathBuf>,
+) -> Result<()> {
     ensure!(
-        option == "--plan" && target_option == "--target",
-        "Expected --plan PATH --target ID"
+        !output.exists(),
+        "Handoff destination already exists: {}",
+        output.display()
     );
+    let parent = output.parent().context("Missing handoff parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".handoff-")
+        .tempdir_in(parent)?;
+    let mut components = BTreeMap::new();
+    for id in &target.build {
+        let object = temporary.path().join(format!("objects/{id}"));
+        copy_tree(&objects[id], &object)?;
+        components.insert(
+            *id,
+            HandoffComponent {
+                identity: compiled_identity(plan, target, *id)?,
+                files: handoff_files(&object)?,
+            },
+        );
+    }
+    let manifest = Handoff {
+        schema_version: 1,
+        target: target.target.clone(),
+        version: plan.version.clone(),
+        source_sha: plan.source_sha.clone(),
+        plan_digest: plan_digest(plan)?,
+        components,
+    };
+    write_json(
+        &temporary.path().join("handoff.json"),
+        &serde_json::to_value(manifest)?,
+    )?;
+    fs::rename(temporary.path(), output)?;
+    Ok(())
+}
+
+fn verify_handoff(root: &Path, plan: &Plan, target: &TargetPlan) -> Result<Handoff> {
+    let path = root.join("handoff.json");
+    ensure!(
+        fs::metadata(&path)?.len() <= 32 * 1024 * 1024,
+        "Handoff manifest exceeds limit"
+    );
+    let manifest: Handoff = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        manifest.schema_version == 1
+            && manifest.target == target.target
+            && manifest.version == plan.version
+            && manifest.source_sha == plan.source_sha
+            && manifest.plan_digest == plan_digest(plan)?,
+        "Handoff does not match the persisted plan"
+    );
+    ensure!(
+        manifest.components.keys().copied().collect::<BTreeSet<_>>()
+            == target.build.iter().copied().collect(),
+        "Handoff component selection does not match plan"
+    );
+    let mut expected = BTreeMap::new();
+    for (id, component) in &manifest.components {
+        ensure!(
+            component.identity == compiled_identity(plan, target, *id)?,
+            "Handoff compiled identity does not match plan"
+        );
+        ensure!(!component.files.is_empty(), "Empty handoff component");
+        for (name, file) in &component.files {
+            safe_member(name)?;
+            expected.insert(format!("objects/{id}/{name}"), &file.sha256);
+        }
+    }
+    // Permissions are restored from the manifest after transfer: artifact upload
+    // services can discard Unix executable bits. File bytes remain immutable.
+    let actual = handoff_files(root)?;
+    let actual: BTreeMap<_, _> = actual
+        .iter()
+        .filter(|(name, _)| name.as_str() != "handoff.json")
+        .map(|(name, file)| (name.clone(), &file.sha256))
+        .collect();
+    ensure!(
+        actual == expected,
+        "Handoff contains changed, missing or extra files"
+    );
+    Ok(manifest)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Both,
+    Compile,
+    Finalize,
+}
+
+pub(crate) fn run(args: &[String]) -> Result<()> {
+    let mut path = None;
+    let mut target_name = None;
+    let mut step = Stage::Both;
+    let mut handoff = None;
+    let mut options = args.chunks_exact(2);
+    for pair in &mut options {
+        match pair[0].as_str() {
+            "--plan" if path.is_none() => path = Some(pair[1].as_str()),
+            "--target" if target_name.is_none() => target_name = Some(pair[1].as_str()),
+            "--stage" if step == Stage::Both => {
+                step = match pair[1].as_str() {
+                    "compile" => Stage::Compile,
+                    "finalize" => Stage::Finalize,
+                    _ => bail!("Expected --stage compile|finalize"),
+                }
+            }
+            "--handoff" if handoff.is_none() => handoff = Some(absolute(&pair[1])?),
+            _ => bail!("Unknown or repeated component build option {}", pair[0]),
+        }
+    }
+    ensure!(
+        options.remainder().is_empty(),
+        "Component build options need values"
+    );
+    let path = path.context("Expected --plan PATH")?;
+    let target_name = target_name.context("Expected --target ID")?;
+    let build_target = BuildTarget::parse(target_name)?;
+    // Select the target before any worker threads exist, without mutating the
+    // process environment. Compiler children inherit the same explicit identity.
+    if matches!(build_target.platform, "linux" | "windows" | "macos")
+        && env::var("PASEO_BUILD_TARGET").as_deref() != Ok(target_name)
+    {
+        return crate::common::run(
+            command(env::current_exe()?)?
+                .args(["components", "build"])
+                .args(args)
+                .env("PASEO_BUILD_TARGET", target_name),
+        );
+    }
     let plan = plan::read(Path::new(path))?;
     let target = plan
         .targets
         .iter()
-        .find(|entry| entry.target == *target_name)
+        .find(|entry| entry.target == target_name)
         .context("Target is not in the persisted plan")?;
     plan::validate_inputs(&plan, target)?;
     if target.build.is_empty() && !target.package {
@@ -77,11 +294,21 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     );
     let (os, cpu) = target.target.split_once('-').context("Invalid target")?;
     if matches!(os, "linux" | "macos" | "windows") {
+        let native = os == host_platform()? && cpu == host_arch()?;
         ensure!(
-            os == platform()? && cpu == arch()?,
-            "Desktop component builds require their exact native host"
+            native
+                || step == Stage::Compile
+                    && host_platform()? == "linux"
+                    && matches!(os, "macos" | "windows"),
+            "Finalization and combined builds require the exact native target host; cross compilation requires --stage compile on Linux"
+        );
+    } else if step == Stage::Finalize {
+        ensure!(
+            host_platform()? == if os == "ios" { "macos" } else { "linux" },
+            "Mobile finalization requires its native packaging host"
         );
     }
+    let handoff = handoff.unwrap_or(root()?.join(format!("artifacts/handoff-{}", target.target)));
     let _lease = crate::build_cache::acquire()?;
     supervise_subprocesses()?;
     fs::create_dir_all(release()?)?;
@@ -92,8 +319,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         .tempdir_in(&work)?;
     let mut objects = BTreeMap::new();
     let mut refs = target.reuse.clone();
-    let needs_reuse =
-        target.package || target.build.contains(&ComponentId::App) && matches!(os, "macos" | "ios");
+    let verified = if step == Stage::Finalize {
+        Some(verify_handoff(&handoff, &plan, target)?)
+    } else {
+        None
+    };
+    let needs_reuse = step != Stage::Compile
+        && (target.package
+            || target.build.contains(&ComponentId::App) && matches!(os, "macos" | "ios"));
     if needs_reuse {
         let mut extracted = BTreeMap::<String, PathBuf>::new();
         for (id, reference) in &target.reuse {
@@ -110,54 +343,75 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             objects.insert(*id, object);
         }
     }
-    selected(target, |id| {
-        let identity = ComponentIdentity {
-            version: plan.version.clone(),
-            source_sha: plan.source_sha.clone(),
-            input_hash: target
-                .inputs
-                .get(&id)
-                .context("Plan lacks a selected component fingerprint")?
-                .clone(),
-            abi_version: id.initial_abi_version(),
-        };
-        let object = stage.path().join(format!("build-{id}"));
-        fs::create_dir(&object)?;
-        let mut process = command(env::current_exe()?)?;
-        process
-            .args(["components", "compile", &target.target, id.as_str()])
-            .arg(&object)
-            .env("PASEO_NATIVE_RELEASE", "1")
-            .env("PASEO_RELEASE_CHANNEL", &plan.channel)
-            .env("PASEO_UPDATE_REPOSITORY", REPOSITORY)
-            .env("PASEO_VERSION", &identity.version)
-            .env("PASEO_DAEMON_VERSION", &identity.version)
-            .env("PASEO_BUILD_SOURCE_SHA", &identity.source_sha)
-            .env("PASEO_COMPONENT_VERSION", &identity.version)
-            .env("PASEO_COMPONENT_SOURCE_SHA", &identity.source_sha)
-            .env("PASEO_COMPONENT_INPUT_HASH", &identity.input_hash)
-            .env("PASEO_COMPONENT_ABI", identity.abi_version.to_string());
-        if os == "ios" && id == ComponentId::App {
-            process.arg(
-                objects
-                    .get(&ComponentId::Tailnet)
-                    .context("iOS requires a staged tailnet component")?,
-            );
+    if let Some(manifest) = verified {
+        for (id, component) in &manifest.components {
+            let object = stage.path().join(format!("build-{id}"));
+            copy_tree(&handoff.join(format!("objects/{id}")), &object)?;
+            for (name, file) in &component.files {
+                chmod(
+                    &object.join(name),
+                    if file.executable { 0o755 } else { 0o644 },
+                )?;
+            }
+            objects.insert(*id, object);
         }
-        crate::common::run(&mut process)?;
-        objects.insert(id, object.clone());
-        if os == "macos" && matches!(id, ComponentId::Tailnet | ComponentId::App) {
-            // Raw compile identity is preserved while the signed cohort is
-            // assembled below, including when only one member was compiled.
+    } else {
+        selected(target, |id| {
+            let identity = compiled_identity(&plan, target, id)?;
+            let object = stage.path().join(format!("build-{id}"));
+            fs::create_dir(&object)?;
+            let mut process = command(env::current_exe()?)?;
+            process
+                .args(["components", "compile", &target.target, id.as_str()])
+                .arg(&object)
+                .env("PASEO_NATIVE_RELEASE", "1")
+                .env("PASEO_RELEASE_CHANNEL", &plan.channel)
+                .env("PASEO_UPDATE_REPOSITORY", REPOSITORY)
+                .env("PASEO_VERSION", &identity.version)
+                .env("PASEO_DAEMON_VERSION", &identity.version)
+                .env("PASEO_BUILD_SOURCE_SHA", &identity.source_sha)
+                .env("PASEO_COMPONENT_VERSION", &identity.version)
+                .env("PASEO_COMPONENT_SOURCE_SHA", &identity.source_sha)
+                .env("PASEO_COMPONENT_INPUT_HASH", &identity.input_hash)
+                .env("PASEO_COMPONENT_ABI", identity.abi_version.to_string());
+            if matches!(os, "linux" | "windows" | "macos") {
+                process.env("PASEO_BUILD_TARGET", &target.target);
+            }
+            if os == "ios" && id == ComponentId::App {
+                process.arg(
+                    objects
+                        .get(&ComponentId::Tailnet)
+                        .context("iOS requires a staged tailnet component")?,
+                );
+            }
+            crate::common::run(&mut process)?;
             write_json(
                 &object.join("compiled-identity.json"),
                 &serde_json::to_value(&identity)?,
             )?;
+            objects.insert(id, object);
+            Ok(())
+        })?;
+        if step == Stage::Compile {
+            write_handoff(&handoff, &plan, target, &objects)?;
             return Ok(());
         }
-        let reference = archive_component(&object, &plan, target, id, identity)?;
+    }
+    selected(target, |id| {
+        let object = &objects[&id];
+        finish_component(object, os, id)?;
+        if os == "macos" && matches!(id, ComponentId::Tailnet | ComponentId::App) {
+            return Ok(());
+        }
+        remove_if_exists(&object.join("compiled-identity.json"))?;
+        let reference = archive_component(
+            object,
+            &plan,
+            target,
+            id,
+            compiled_identity(&plan, target, id)?,
+        )?;
         refs.insert(id, reference);
-        // Non-cohort objects are finalized independently and never relabeled.
         Ok(())
     })?;
     let mut inventory = TargetInventory {
@@ -329,10 +583,6 @@ pub(crate) fn compile(args: &[String]) -> Result<()> {
         args.len() == 3 || args.len() == 4,
         "Internal component compiler arguments invalid"
     );
-    ensure!(
-        env::var_os("CARGO_BUILD_TARGET").is_none(),
-        "Component plan selects the exact target; unset CARGO_BUILD_TARGET"
-    );
     let (os, cpu) = args[0]
         .split_once('-')
         .context("Invalid component target")?;
@@ -354,8 +604,8 @@ pub(crate) fn compile(args: &[String]) -> Result<()> {
     );
     if matches!(os, "linux" | "windows" | "macos") {
         ensure!(
-            platform()? == os && arch()? == cpu,
-            "Component target must match host"
+            BuildTarget::current()? == BuildTarget::parse(&args[0])?,
+            "Compiler target selection disagrees with component plan"
         );
     }
     match id {
@@ -365,12 +615,11 @@ pub(crate) fn compile(args: &[String]) -> Result<()> {
                 "Mobile packages never contain daemons"
             );
             daemon::build_native("release", false)?;
-            daemon::bundle_runtime(&output, "release", "standalone-archive")?;
+            daemon::bundle_raw_runtime(&output, "release", "standalone-archive")?;
             write_json(
                 &output.join("desktop-runtime.json"),
                 &json!({"schemaVersion":1,"executable":executable(),"cliShimPath":executable(),"workingDirectory":".","environment":{}}),
             )?;
-            daemon::finish_standalone_runtime(&output, output.parent().context("Missing stage")?)?;
         }
         ComponentId::UpdateHelper => {
             let built = app_updater::desktop(os)?;
@@ -380,12 +629,6 @@ pub(crate) fn compile(args: &[String]) -> Result<()> {
                 &output.join("THIRD-PARTY-NOTICES.txt"),
             )?;
             copy_tree(&root()?.join("LICENSE"), &output.join("LICENSE"))?;
-            finish_image(
-                &output,
-                &output.join(app_updater::executable_name(os)),
-                os,
-                false,
-            )?;
         }
         ComponentId::Tailnet if matches!(os, "linux" | "macos" | "windows") => {
             let built = tailnet::desktop(os, "13.0")?;
@@ -396,18 +639,37 @@ pub(crate) fn compile(args: &[String]) -> Result<()> {
                 0o644,
             )?;
             copy_tree(&root()?.join("LICENSE"), &output.join("LICENSE"))?;
-            if os != "macos" {
-                finish_image(&output, &output.join(tailnet::library_name(os)?), os, false)?;
-            }
         }
         ComponentId::App | ComponentId::Tailnet => {
             gui::component_compile(os, cpu, id, &output, args.get(3).map(Path::new))?;
-            if matches!(os, "linux" | "windows") && id == ComponentId::App {
-                finish_image(&output, &output.join(gui::desktop_executable(os)), os, true)?;
-            }
         }
     }
     Ok(())
+}
+
+fn finish_component(object: &Path, os: &str, id: ComponentId) -> Result<()> {
+    match id {
+        ComponentId::Daemon => {
+            daemon::finish_standalone_runtime(object, object.parent().context("Missing stage")?)
+        }
+        ComponentId::UpdateHelper => finish_image(
+            object,
+            &object.join(app_updater::executable_name(os)),
+            os,
+            false,
+        ),
+        ComponentId::Tailnet if matches!(os, "linux" | "windows") => {
+            let image = object.join(tailnet::library_name(os)?);
+            if os == "windows" {
+                signing::require_system_imports(&image)?;
+            }
+            finish_image(object, &image, os, false)
+        }
+        ComponentId::App if matches!(os, "linux" | "windows") => {
+            finish_image(object, &object.join(gui::desktop_executable(os)), os, true)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn finish_image(root: &Path, image: &Path, os: &str, app: bool) -> Result<()> {
@@ -913,6 +1175,61 @@ mod tests {
             atomic_groups: vec![],
             packages: vec![],
         }
+    }
+
+    fn handoff_fixture(work: &Path) -> Result<(Plan, PathBuf)> {
+        let mut selected = target(vec![ComponentId::Daemon]);
+        selected.inputs.insert(ComponentId::Daemon, "2".repeat(64));
+        let plan = Plan {
+            schema_version: 1,
+            version: "1.2.3".into(),
+            source_sha: "1".repeat(40),
+            channel: "stable".into(),
+            targets: vec![selected],
+            no_changes: false,
+            retained_targets: BTreeMap::new(),
+        };
+        let object = work.join("raw");
+        fs::create_dir(&object)?;
+        text(&object.join("paseo"), "fixture image", 0o755)?;
+        text(&object.join("LICENSE"), "fixture license", 0o644)?;
+        let output = work.join("handoff");
+        write_handoff(
+            &output,
+            &plan,
+            &plan.targets[0],
+            &BTreeMap::from([(ComponentId::Daemon, object)]),
+        )?;
+        Ok((plan, output))
+    }
+
+    #[test]
+    fn handoff_rejects_changed_missing_and_extra_files() -> Result<()> {
+        for change in ["changed", "missing", "extra"] {
+            let work = tempfile::tempdir()?;
+            let (plan, output) = handoff_fixture(work.path())?;
+            verify_handoff(&output, &plan, &plan.targets[0])?;
+            let image = output.join("objects/daemon/paseo");
+            match change {
+                "changed" => fs::write(image, "tampered")?,
+                "missing" => fs::remove_file(image)?,
+                _ => fs::write(output.join("extra"), "unexpected")?,
+            }
+            assert!(
+                verify_handoff(&output, &plan, &plan.targets[0]).is_err(),
+                "{change}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_rejects_plan_mismatch() -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let (mut plan, output) = handoff_fixture(work.path())?;
+        plan.targets[0].package_input_hash = "3".repeat(64);
+        assert!(verify_handoff(&output, &plan, &plan.targets[0]).is_err());
+        Ok(())
     }
     #[test]
     fn no_change_invokes_no_compiler() {

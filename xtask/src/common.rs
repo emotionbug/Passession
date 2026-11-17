@@ -70,7 +70,72 @@ pub fn version() -> Result<String> {
     Ok(value.to_owned())
 }
 
+/// The build identity is independent of the machine running xtask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildTarget {
+    pub platform: &'static str,
+    pub arch: &'static str,
+    pub triple: &'static str,
+}
+
+impl BuildTarget {
+    pub fn parse(id: &str) -> Result<Self> {
+        let (platform, arch, triple) = match id {
+            "linux-x64" => ("linux", "x64", "x86_64-unknown-linux-gnu"),
+            "linux-arm64" => ("linux", "arm64", "aarch64-unknown-linux-gnu"),
+            "windows-x64" => ("windows", "x64", "x86_64-pc-windows-msvc"),
+            "windows-arm64" => ("windows", "arm64", "aarch64-pc-windows-msvc"),
+            "macos-x64" => ("macos", "x64", "x86_64-apple-darwin"),
+            "macos-arm64" => ("macos", "arm64", "aarch64-apple-darwin"),
+            "android-arm64" => ("android", "arm64", "aarch64-linux-android"),
+            "ios-arm64" => ("ios", "arm64", "aarch64-apple-ios"),
+            _ => bail!("Unsupported build target {id}"),
+        };
+        Ok(Self {
+            platform,
+            arch,
+            triple,
+        })
+    }
+
+    pub fn host() -> Result<Self> {
+        Self::parse(&format!("{}-{}", host_platform()?, host_arch()?))
+    }
+
+    fn select(value: Option<&str>) -> Result<Self> {
+        match value {
+            Some(value) => Self::parse(value),
+            None => Self::host(),
+        }
+    }
+
+    pub fn current() -> Result<Self> {
+        let value = env::var("PASEO_BUILD_TARGET");
+        match value {
+            Ok(value) => Self::select(Some(&value)),
+            Err(env::VarError::NotPresent) => Self::select(None),
+            Err(error) => Err(error).context("Invalid PASEO_BUILD_TARGET"),
+        }
+    }
+
+    pub fn id(self) -> String {
+        format!("{}-{}", self.platform, self.arch)
+    }
+
+    pub fn is_cross(self) -> Result<bool> {
+        Ok(self != Self::host()?)
+    }
+}
+
 pub fn platform() -> Result<&'static str> {
+    Ok(BuildTarget::current()?.platform)
+}
+
+pub fn arch() -> Result<&'static str> {
+    Ok(BuildTarget::current()?.arch)
+}
+
+pub fn host_platform() -> Result<&'static str> {
     match env::consts::OS {
         "linux" => Ok("linux"),
         "macos" => Ok("macos"),
@@ -79,7 +144,7 @@ pub fn platform() -> Result<&'static str> {
     }
 }
 
-pub fn arch() -> Result<&'static str> {
+pub fn host_arch() -> Result<&'static str> {
     match env::consts::ARCH {
         "x86_64" => Ok("x64"),
         "aarch64" => Ok("arm64"),
@@ -88,11 +153,23 @@ pub fn arch() -> Result<&'static str> {
 }
 
 pub fn executable() -> &'static str {
-    if cfg!(windows) { "paseo.exe" } else { "paseo" }
+    match platform().expect("Invalid PASEO_BUILD_TARGET") {
+        "windows" => "paseo.exe",
+        _ => "paseo",
+    }
 }
 /// Cargo's managed shared cache, or the caller's explicit CARGO_TARGET_DIR.
 pub fn target_root() -> Result<PathBuf> {
     crate::build_cache::target_root()
+}
+pub fn cargo_output(profile: &str) -> Result<PathBuf> {
+    let target = BuildTarget::current()?;
+    let root = target_root()?;
+    Ok(if target.is_cross()? {
+        root.join(target.triple).join(profile)
+    } else {
+        root.join(profile)
+    })
 }
 /// Source-bound GUI bundles, APK/iOS work directories and Gradle state.
 pub fn gui_output() -> Result<PathBuf> {
@@ -116,6 +193,13 @@ pub fn command(program: impl AsRef<OsStr>) -> Result<Command> {
     command.current_dir(root()?);
     if program == cargo().as_os_str() {
         crate::build_cache::configure(&mut command)?;
+        // PASEO_BUILD_TARGET is the sole target selector. Do not let Cargo's
+        // ambient default silently change native output paths or identities.
+        command.env_remove("CARGO_BUILD_TARGET");
+        let target = BuildTarget::current()?;
+        if target.is_cross()? && matches!(target.platform, "linux" | "macos" | "windows") {
+            crate::cross::apply(&mut command, &target)?;
+        }
     }
     Ok(command)
 }
@@ -480,6 +564,26 @@ mod tests {
         assert_eq!(ready, "ready\n");
         cancel_child(&mut child, Duration::from_millis(20))?;
         assert_eq!(child.wait()?.signal(), Some(libc::SIGKILL));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn build_target_environment_selection() -> Result<()> {
+        // Exercise the exact selector used by PASEO_BUILD_TARGET without
+        // mutating process-global environment underneath parallel tests.
+        assert_eq!(BuildTarget::select(None)?, BuildTarget::host()?);
+        let target = BuildTarget::select(Some("windows-arm64"))?;
+        assert_eq!(
+            (target.platform, target.arch, target.triple),
+            ("windows", "arm64", "aarch64-pc-windows-msvc")
+        );
+        assert!(BuildTarget::select(Some("windows-unknown")).is_err());
+        assert!(BuildTarget::select(Some("")).is_err());
         Ok(())
     }
 }

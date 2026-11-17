@@ -171,6 +171,10 @@ const DEBIAN_RECOMMENDS: &str = "libxss1, libsm6, libice6, libfontconfig1";
 
 pub fn desktop(args: &[String]) -> Result<()> {
     ensure!(
+        !BuildTarget::current()?.is_cross()?,
+        "Desktop packaging requires the target host; finalize raw components natively first"
+    );
+    ensure!(
         args.len() <= 1
             && args
                 .first()
@@ -187,6 +191,10 @@ pub(crate) fn desktop_input(
     components: bool,
     bootstrap: Option<&Path>,
 ) -> Result<()> {
+    ensure!(
+        !BuildTarget::current()?.is_cross()?,
+        "Desktop packaging requires the target host"
+    );
     fs::create_dir_all(release()?)?;
     let stage = tempfile::Builder::new()
         .prefix("paseo-gui-package-")
@@ -507,6 +515,10 @@ pub(crate) fn archive(runtime: &Path, output: &Path, zip: bool) -> Result<()> {
 
 pub fn daemon(args: &[String]) -> Result<()> {
     ensure!(
+        !BuildTarget::current()?.is_cross()?,
+        "Daemon packaging requires the target host; finalize raw components natively first"
+    );
+    ensure!(
         args.is_empty(),
         "Usage: cargo xtask package-daemon (native release host required)"
     );
@@ -515,7 +527,7 @@ pub fn daemon(args: &[String]) -> Result<()> {
         .prefix("paseo-daemon-package-")
         .tempdir()?;
     let runtime = stage.path().join("runtime");
-    build::bundle_runtime(&runtime, "release", "standalone-archive")?;
+    build::bundle_raw_runtime(&runtime, "release", "standalone-archive")?;
     build::finish_standalone_runtime(&runtime, stage.path())?;
     build::validate_runtime(&runtime, "standalone-archive", "release")?;
     let format = if platform()? == "windows" {

@@ -68,7 +68,13 @@ pub fn directory(profile: &str) -> Result<PathBuf> {
         matches!(profile, "debug" | "dev-fast" | "release"),
         "Unknown native build profile: {profile}"
     );
-    Ok(root()?.join(".dev/build/native").join(profile))
+    let target = BuildTarget::current()?;
+    let directory = root()?.join(".dev/build/native");
+    Ok(if target.is_cross()? {
+        directory.join(target.id()).join(profile)
+    } else {
+        directory.join(profile)
+    })
 }
 
 /// Decode the binary header, not a filename or `file` utility's textual guess.
@@ -79,8 +85,9 @@ pub fn assert_architecture(path: &Path) -> Result<()> {
     input
         .read_exact(&mut header)
         .with_context(|| format!("Truncated native binary {}", path.display()))?;
-    let cpu = arch()?;
-    let valid = match platform()? {
+    let target = BuildTarget::current()?;
+    let cpu = target.arch;
+    let valid = match target.platform {
         "linux" => {
             header[..6] == [0x7f, b'E', b'L', b'F', 2, 1]
                 && u16::from_le_bytes([header[18], header[19]])
@@ -111,23 +118,55 @@ pub fn assert_architecture(path: &Path) -> Result<()> {
     };
     ensure!(
         valid,
-        "Expected a native {}-{cpu} binary: {}",
-        platform()?,
+        "Expected a {}-{cpu} binary: {}",
+        target.platform,
         path.display()
     );
     Ok(())
 }
 
 pub fn build_daemon(args: &[String]) -> Result<()> {
-    let profile = match args {
-        [] => "dev-fast",
-        [option] if option == "--release" => "release",
-        [option, profile] if option == "--profile" => profile.as_str(),
-        _ => {
-            bail!("Usage: cargo xtask build-daemon [--release | --profile dev-fast|debug|release]")
+    let mut profile = None;
+    let mut selected = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--release" => {
+                ensure!(profile.is_none(), "Select one daemon build profile");
+                profile = Some("release");
+            }
+            "--profile" => {
+                ensure!(profile.is_none(), "Select one daemon build profile");
+                index += 1;
+                profile = Some(args.get(index).context("Missing --profile value")?.as_str());
+            }
+            "--cross" => {
+                ensure!(selected.is_none(), "Select one --cross target");
+                index += 1;
+                selected = Some(BuildTarget::parse(
+                    args.get(index).context("Missing --cross target")?,
+                )?);
+            }
+            other => bail!(
+                "Unknown build-daemon argument {other}; usage: cargo xtask build-daemon [--release | --profile dev-fast|debug|release] [--cross TARGET]"
+            ),
         }
-    };
-    build_native(profile, false)
+        index += 1;
+    }
+    let current = BuildTarget::current()?;
+    let selected = selected.unwrap_or(current);
+    ensure!(
+        matches!(selected.platform, "linux" | "macos" | "windows"),
+        "Daemon builds require a desktop target"
+    );
+    if selected != current {
+        return run(command(env::current_exe()?)?
+            .arg("build-daemon")
+            .args(args)
+            .env("PASEO_BUILD_TARGET", selected.id()));
+    }
+    let _lease = crate::build_cache::acquire()?;
+    build_native(profile.unwrap_or("dev-fast"), false)
 }
 
 pub fn build_native(profile: &str, container: bool) -> Result<()> {
@@ -135,12 +174,7 @@ pub fn build_native(profile: &str, container: bool) -> Result<()> {
 }
 
 fn build_native_command(profile: &str, container: bool) -> Result<()> {
-    platform()?;
-    arch()?;
-    ensure!(
-        env::var_os("CARGO_BUILD_TARGET").is_none(),
-        "Build native runtimes on their target host; CARGO_BUILD_TARGET is not supported"
-    );
+    let target = BuildTarget::current()?;
     require_zig()?;
     let release = env::var("PASEO_NATIVE_RELEASE").as_deref() == Ok("1");
     ensure!(
@@ -184,6 +218,7 @@ fn build_native_command(profile: &str, container: bool) -> Result<()> {
     let mut cargo = command(cargo())?;
     cargo
         .args(["build", "--locked", "-p", "paseo-daemon", "--bin", "paseo"])
+        .env_remove("CARGO_BUILD_TARGET")
         .env(
             "PASEO_DAEMON_VERSION",
             identity["version"]
@@ -195,6 +230,9 @@ fn build_native_command(profile: &str, container: bool) -> Result<()> {
         "--profile",
         if profile == "debug" { "dev" } else { profile },
     ]);
+    if target.is_cross()? {
+        cargo.args(["--target", target.triple]);
+    }
     if !release {
         for key in [
             "PASEO_NATIVE_RELEASE",
@@ -208,9 +246,7 @@ fn build_native_command(profile: &str, container: bool) -> Result<()> {
     fs::create_dir_all(&directory)?;
     let executable = directory.join(executable());
     copy_tree(
-        &target_root()?
-            .join(profile)
-            .join(crate::common::executable()),
+        &cargo_output(profile)?.join(crate::common::executable()),
         &executable,
     )?;
     assert_architecture(&executable)?;
@@ -253,7 +289,7 @@ pub fn read_native_build(profile: &str, require_release: bool) -> Result<NativeB
             && identity["platform"] == platform()?
             && identity["arch"] == arch()?
             && identity["executableSha256"] == sha256_file(&executable)?,
-        "Native build identity does not match executable/version/host target; run cargo xtask build-daemon"
+        "Native build identity does not match executable/version/selected target; run cargo xtask build-daemon"
     );
     ensure!(
         identity["profile"] == profile,
@@ -284,6 +320,19 @@ pub fn read_native_build(profile: &str, require_release: bool) -> Result<NativeB
 }
 
 pub fn bundle_runtime(destination: &Path, profile: &str, kind: &str) -> Result<()> {
+    ensure!(
+        !BuildTarget::current()?.is_cross()?,
+        "Runtime completion requires the target host; compile raw components for native finalize"
+    );
+    bundle_raw_runtime(destination, profile, kind)?;
+    if platform()? == "linux" {
+        finish_linux_runtime(&absolute(destination)?)?;
+    }
+    Ok(())
+}
+
+/// Stage target binaries and provenance without host-native dependency completion.
+pub fn bundle_raw_runtime(destination: &Path, profile: &str, kind: &str) -> Result<()> {
     ensure!(
         matches!(
             kind,
@@ -336,9 +385,6 @@ pub fn bundle_runtime(destination: &Path, profile: &str, kind: &str) -> Result<(
             &destination.join("desktop-runtime.json"),
             &json!({"schemaVersion":1,"executable":executable(),"cliShimPath":executable(),"workingDirectory":".","environment":{}}),
         )?;
-    }
-    if platform()? == "linux" {
-        libraries::native(&destination)?;
     }
     copy_tree(&root()?.join("LICENSE"), &destination.join("LICENSE"))?;
     text(
@@ -402,10 +448,25 @@ pub fn validate_runtime(runtime: &Path, kind: &str, profile: &str) -> Result<Val
     Ok(identity)
 }
 
+fn finish_linux_runtime(runtime: &Path) -> Result<()> {
+    libraries::native(runtime)?;
+    text(
+        &runtime.join("THIRD-PARTY-NOTICES.txt"),
+        notices::render_runtime(runtime)?,
+        0o644,
+    )?;
+    refresh_runtime_hash(runtime)
+}
+
 /// Platform completion shared by official standalone archives and
-/// standalone-local runtimes: CRT payload, code signature and final hash.
+/// standalone-local runtimes: shared libraries, CRT payload, signature and final hash.
 pub fn finish_standalone_runtime(runtime: &Path, stage: &Path) -> Result<()> {
+    ensure!(
+        !BuildTarget::current()?.is_cross()?,
+        "Runtime completion requires the target host"
+    );
     match platform()? {
+        "linux" => finish_linux_runtime(runtime)?,
         "macos" => signing::sign_mac(runtime, stage, false)?,
         "windows" => {
             signing::windows_runtime(runtime, true)?;
@@ -425,6 +486,10 @@ pub fn refresh_runtime_hash(runtime: &Path) -> Result<()> {
 }
 
 pub fn stage_command(args: &[String]) -> Result<()> {
+    ensure!(
+        !BuildTarget::current()?.is_cross()?,
+        "Runtime staging requires the target host; compile raw components for native finalize"
+    );
     let Some((destination, options)) = args.split_first() else {
         bail!(
             "Usage: cargo xtask stage-runtime DESTINATION [--profile dev-fast|debug|release] [--kind desktop-bundled|standalone-archive|standalone-local|container]"
@@ -448,7 +513,11 @@ pub fn stage_command(args: &[String]) -> Result<()> {
         chunks.remainder().is_empty(),
         "stage-runtime option requires a value"
     );
-    bundle_runtime(Path::new(destination), profile, kind)?;
+    if kind == STANDALONE_LOCAL {
+        bundle_raw_runtime(Path::new(destination), profile, kind)?;
+    } else {
+        bundle_runtime(Path::new(destination), profile, kind)?;
+    }
     if kind == STANDALONE_LOCAL {
         // Complete it exactly like the official standalone archive payload, so
         // `paseo daemon update --from DESTINATION` receives a full runtime.
@@ -465,7 +534,7 @@ pub fn stage_command(args: &[String]) -> Result<()> {
 
 pub fn container_runtime(args: &[String]) -> Result<()> {
     ensure!(
-        platform()? == "linux" && args.len() == 1,
+        host_platform()? == "linux" && !BuildTarget::current()?.is_cross()? && args.len() == 1,
         "Usage: cargo xtask container-runtime DESTINATION (Linux host required)"
     );
     ensure!(
@@ -473,7 +542,8 @@ pub fn container_runtime(args: &[String]) -> Result<()> {
         "Container staging must use its freshly built executable; unset PASEO_NATIVE_EXECUTABLE"
     );
     build_native("release", true)?;
-    bundle_runtime(Path::new(&args[0]), "release", "container")
+    let runtime = Path::new(&args[0]);
+    bundle_runtime(runtime, "release", "container")
 }
 
 #[cfg(test)]
@@ -511,7 +581,7 @@ mod tests {
         let path = directory.path().join("binary");
         fs::write(&path, b"MZ").unwrap();
         assert!(assert_architecture(&path).is_err());
-        if cfg!(target_os = "linux") {
+        if platform().unwrap() == "linux" {
             let mut bytes = [0_u8; 64];
             bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
             let machine: u16 = if arch().unwrap() == "x64" { 183 } else { 62 };

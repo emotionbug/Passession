@@ -1,0 +1,202 @@
+[
+  {
+    "path": "xwin-cache/dl/Microsoft.VC.14.44.17.14.CRT.Headers.base.vsix",
+    "sha256": "852382a9aa73502b7849c1bcadfb603ba7175c4e8b60e6aba03c7de711d4ece5",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/c610cd8c-801b-44b8-a80a-82cc382aeb43/852382a9aa73502b7849c1bcadfb603ba7175c4e8b60e6aba03c7de711d4ece5/Microsoft.VC.14.44.17.14.CRT.Headers.base.vsix"
+  },
+  {
+    "path": "xwin-cache/dl/Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base.vsix",
+    "sha256": "f01f701a7bcd9587a340898c851424f6a52bb913a70c185ff0d5bf0288c5831a",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/67cf767c-5e71-47c2-a54a-cd5631e28942/f01f701a7bcd9587a340898c851424f6a52bb913a70c185ff0d5bf0288c5831a/Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base.vsix"
+  },
+  {
+    "path": "xwin-cache/dl/Microsoft.VC.14.44.17.14.CRT.x64.Store.base.vsix",
+    "sha256": "9135b03c0df53c7a0aa9bef7230a1c2ff4263a0ee7baa7e419d034f484f6bb56",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/67cf767c-5e71-47c2-a54a-cd5631e28942/9135b03c0df53c7a0aa9bef7230a1c2ff4263a0ee7baa7e419d034f484f6bb56/Microsoft.VC.14.44.17.14.CRT.x64.Store.base.vsix"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_headers/07a57cdb41ba28cced14005f087267be.cab",
+    "sha256": "1ce4cd97ce82e7b00882deb7b0e1e57399ec6f432ed08d84ae3caca1945aeccd",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/07a57cdb41ba28cced14005f087267be.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_headers/2e876dd22fa5e6785f137e3422dd50ec.cab",
+    "sha256": "e1b42d05fb550f843ef12767dacea7e4c1056de690202cf645d28b5b1ffdb352",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/2e876dd22fa5e6785f137e3422dd50ec.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_headers/4fe4c8b88812f5339018c0eef95acdb9.cab",
+    "sha256": "10f4d14676576f731cd9841be48b7dd1a468f087399c84da22fcf4d011aa35aa",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/4fe4c8b88812f5339018c0eef95acdb9.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_headers.msi",
+    "sha256": "a5eb35e4e836294000a72d92d18bb974de35441b1ba6ef6ff3e6a35fb39c702f",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/Windows%20SDK%20Desktop%20Headers%20x86-x86_en-us.msi"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_libs_x86_64/58314d0646d7e1a25e97c902166c3155.cab",
+    "sha256": "5af04452d9edf7222379c4e4c921c8fb5b44432768ee6250160b817efe151a79",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/58314d0646d7e1a25e97c902166c3155.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_libs_x86_64.msi",
+    "sha256": "07b8711bd09a5d393b44acd893c5a4fb22fb5b209b537fe955d9e4eaa78e1cb5",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/Windows%20SDK%20Desktop%20Libs%20x64-x86_en-us.msi"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_headers/766c0ffd568bbb31bf7fb6793383e24a.cab",
+    "sha256": "b48082170e255d12da08a2ad924cbc0ad165e748bf0ff3f294760ef0f7c02499",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/766c0ffd568bbb31bf7fb6793383e24a.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_headers/8125ee239710f33ea485965f76fae646.cab",
+    "sha256": "651a4af712b84feb5ed1e6d49e2e5e7ab24cc4e1395922840a950c21a90dcd7b",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/8125ee239710f33ea485965f76fae646.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_headers/c0aa6d435b0851bf34365aadabd0c20f.cab",
+    "sha256": "ef6463de6a8620229c66a6d31437cdf881efc6e4862a1f9da0976268e4e89436",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/c0aa6d435b0851bf34365aadabd0c20f.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_headers.msi",
+    "sha256": "f03974f3b8ab3539b7242a8b97b2b75faf777685eb507c0bf26b5e45638e65e1",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/Windows%20SDK%20for%20Windows%20Store%20Apps%20Headers-x86_en-us.msi"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_headers_onecoreuap/e89e3dcbb016928c7e426238337d69eb.cab",
+    "sha256": "7981480b62cab7b75f8827cc92e4a53ecb39fe2abbde30fd76ac24a7f80c4bb6",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/e89e3dcbb016928c7e426238337d69eb.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_headers_onecoreuap.msi",
+    "sha256": "000706c5007e2427b9b1b6ced1fa21851e17ee53434bdb9897aa46565d172eed",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/Windows%20SDK%20for%20Windows%20Store%20Apps%20Headers%20OnecoreUap-x86_en-us.msi"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_libs/05047a45609f311645eebcac2739fc4c.cab",
+    "sha256": "73da9b2dba27bdcc4dc3edb93c6d3b2d9105507628a941e4566f9d7fd68a9d85",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/05047a45609f311645eebcac2739fc4c.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_libs/13d68b8a7b6678a368e2d13ff4027521.cab",
+    "sha256": "e748753d8a519dab087464334f029faead4529ae76e6a83bf9bcf19b551b5321",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/13d68b8a7b6678a368e2d13ff4027521.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_libs/463ad1b0783ebda908fd6c16a4abfe93.cab",
+    "sha256": "a3f558196dced66916937dd4011780ebf066027a29e2263750b205e550be6dfa",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/463ad1b0783ebda908fd6c16a4abfe93.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_libs/5a22e5cde814b041749fb271547f4dd5.cab",
+    "sha256": "a145dbce9edf79f6028bf58e67d0f9680be1c080df49a26cea0cc695f8ce8d74",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/5a22e5cde814b041749fb271547f4dd5.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_libs/e10768bb6e9d0ea730280336b697da66.cab",
+    "sha256": "6dd0a318402f912c017f6916c33db4eb82d508b718e30e1ae23987d5db1b6a12",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/e10768bb6e9d0ea730280336b697da66.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_libs/f9b24c8280986c0683fbceca5326d806.cab",
+    "sha256": "e5254718441412b551fc53efb164dce9e8d0ed9eed356e22d02482d6bb786513",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/f9b24c8280986c0683fbceca5326d806.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_store_libs.msi",
+    "sha256": "6e178ba010e8217ec34bedd636190e2b1eacc17c49029989a447b1a1cbc7ac72",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/Windows%20SDK%20for%20Windows%20Store%20Apps%20Libs-x86_en-us.msi"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_uap_headers/f2e05dfd38ed343d3de77209cf3ecdae.cab",
+    "sha256": "ea067294bf3e4a9ec59520831235a74897210d70ed892f2c5bcf24e2cca6ad8a",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/f2e05dfd38ed343d3de77209cf3ecdae.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_uap_headers.msi",
+    "sha256": "32592494e62b3dea15a0f1a66084dc2a3b06cb1ad06b9bcb3af2f8b3f69151da",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/Windows%20SDK%20OnecoreUap%20Headers%20x86-x86_en-us.msi"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_x64_headers/d1de88680a8e53fe75e01e94dc0ed767.cab",
+    "sha256": "974ff1a4a295a18de7f1e17f86ee8fbd0ee2873370a71ce560e221814e6121ab",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/d1de88680a8e53fe75e01e94dc0ed767.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_x64_headers.msi",
+    "sha256": "86b2ff056ac52d45cf66bed5989ec4093a495c3ff57de6bbf196ec44d93cbee0",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/Windows%20SDK%20Desktop%20Headers%20x64-x86_en-us.msi"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_x64_uap_headers/b0656253ef2f688d2982eafa2e73f621.cab",
+    "sha256": "03f88492c804dbbabf257d905662353522329f988ee9c2e9f1b6d48fcb44db5a",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/b0656253ef2f688d2982eafa2e73f621.cab"
+  },
+  {
+    "path": "xwin-cache/dl/Win11SDK_10.0.26100_x64_uap_headers.msi",
+    "sha256": "cb9a16e3f2ebd361a2f9203db795e321ef55f1149842f86e940ccef52c1e5fe2",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8d9439fc-b60d-44e9-88b6-bae33b111f88/Win11Sdk/Sept2026Servicing26100/WindowsSDK261009457/Installers/Windows%20SDK%20OnecoreUap%20Headers%20x64-x86_en-us.msi"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/16ab2ea2187acffa6435e334796c8c89.cab",
+    "sha256": "fd8099addd4b177bc38e1c25ead2f1237a3b92979c2b7083eb756c7ff4549f83",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8c0441e7-98ee-40ae-9a5a-127bcd5f4c52/a4e7a0a15baf966e92c612347f058e7d/16ab2ea2187acffa6435e334796c8c89.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/2868a02217691d527e42fe0520627bfa.cab",
+    "sha256": "351c9fb52417528084206c13fde01992031e2a79fbbe94e808963ed6470610af",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8c0441e7-98ee-40ae-9a5a-127bcd5f4c52/0c73cc42594f36fcb900543d5ae1c5d4/2868a02217691d527e42fe0520627bfa.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/6ee7bbee8435130a869cf971694fd9e2.cab",
+    "sha256": "96d28a324939c9a6bbceb3acfa1061525a0e63ad95ae286a5778ed3e8ae366fa",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/fa0c8bc3-bd08-4c37-a465-4d6b8c951bf6/65b6615dbccc5ab984a6602bccc2fddf/6ee7bbee8435130a869cf971694fd9e2.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/78fa3c824c2c48bd4a49ab5969adaaf7.cab",
+    "sha256": "f4737a26feb8b380788379b2a7710ad306bfb1bf13f5177361f2a0b29dc25737",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/7d9e4bde-cfb6-4a65-9cf1-8c013670a545/c83ab50003c24faecb1712c036583913/78fa3c824c2c48bd4a49ab5969adaaf7.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/7afc7b670accd8e3cc94cfffd516f5cb.cab",
+    "sha256": "495312c864a202eb3301cc63e919f5e83d14c8cde07bf9ebf8054332fa9c7c25",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/4a925113-4714-47d1-8e22-1d149bb57d9f/f0aa309e7ce05004accdc494ea5be759/7afc7b670accd8e3cc94cfffd516f5cb.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/80dcdb79b8a5960a384abe5a217a7e3a.cab",
+    "sha256": "37af50386bf3b5afc2f4117af9988c0bec85e65ae5a9c3a6f0e83eda3a1cd168",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/7d9e4bde-cfb6-4a65-9cf1-8c013670a545/bb8935c38f52f40c6ff4499e5ce22636/80dcdb79b8a5960a384abe5a217a7e3a.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/96076045170fe5db6d5dcf14b6f6688e.cab",
+    "sha256": "a8ec9e2ff216856ad9fdcd6516092c08f33adefbfdc696113f6f31552e7cf138",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/8c0441e7-98ee-40ae-9a5a-127bcd5f4c52/c01c850a877e91acdac97a613c6ba339/96076045170fe5db6d5dcf14b6f6688e.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/a1e2a83aa8a71c48c742eeaff6e71928.cab",
+    "sha256": "c777aea86b4126c90b7ae9017a2bf753f57b9dd450761db7d312d5bd8f5874fa",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/7d9e4bde-cfb6-4a65-9cf1-8c013670a545/c1b2fdd6a1d50f343b8ed11484250233/a1e2a83aa8a71c48c742eeaff6e71928.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/b2f03f34ff83ec013b9e45c7cd8e8a73.cab",
+    "sha256": "d0edd2447f7314f283f61b3db56eb65e01ca2b6f24bd4be52aaa285466fbc1ff",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/4a925113-4714-47d1-8e22-1d149bb57d9f/6d97f0ae0c61820e66c6ac988de5f096/b2f03f34ff83ec013b9e45c7cd8e8a73.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/beb5360d2daaa3167dea7ad16c28f996.cab",
+    "sha256": "3120fb967c9bd33edf5e44370a52708f27c1e249e39bad07f9cb745d094de7fb",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/4a925113-4714-47d1-8e22-1d149bb57d9f/8ab6a768c40050b35631171e8506e5e2/beb5360d2daaa3167dea7ad16c28f996.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt/f9ff50431335056fb4fbac05b8268204.cab",
+    "sha256": "212c2e08ca3aafb8111f780de5b97d5d921b7e0c4346f1455434907c263eb414",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/7d9e4bde-cfb6-4a65-9cf1-8c013670a545/e30af4713083de082115ef655cc31621/f9ff50431335056fb4fbac05b8268204.cab"
+  },
+  {
+    "path": "xwin-cache/dl/ucrt.msi",
+    "sha256": "54448641eef058318b540188245a62982f97ccc462c0c1c1cf3c6d771e26f214",
+    "url": "https://download.visualstudio.microsoft.com/download/pr/fb762014-2a36-4840-8a24-7ff61d1ee019/975874342d151b32b3f4e0eac90db7c8/universal%20crt%20headers%20libraries%20and%20sources-x86_en-us.msi"
+  }
+]

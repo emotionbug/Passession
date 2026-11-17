@@ -19,13 +19,18 @@ pub fn executable_name(platform: &str) -> &'static str {
 }
 
 pub fn desktop(platform: &str) -> Result<PathBuf> {
+    let target = BuildTarget::current()?;
+    ensure!(
+        platform == target.platform,
+        "Updater platform must match the build target"
+    );
     let goos = match platform {
         "linux" => "linux",
         "macos" => "darwin",
         "windows" => "windows",
         _ => bail!("Application updater is desktop-only"),
     };
-    let goarch = match arch()? {
+    let goarch = match target.arch {
         "x64" => "amd64",
         "arm64" => "arm64",
         _ => bail!("Unsupported desktop updater architecture"),
@@ -38,13 +43,14 @@ pub fn desktop(platform: &str) -> Result<PathBuf> {
     );
     let go = which::which(env::var_os("GO").unwrap_or_else(|| "go".into()))
         .context("Install Go 1.27.4 or set GO to the pinned toolchain")?;
-    let (modules, go_cache) = tailnet::go_caches()?;
-    let directory = target_root()?
-        .join("paseo-app-updater")
-        .join(format!("{platform}-{}", arch()?));
+    let (modules, go_cache) = tailnet::go_caches(target.triple)?;
+    let directory = target_root()?.join("paseo-app-updater").join(target.triple);
     fs::create_dir_all(&directory)?;
-    let command = || {
-        let mut command = Command::new(&go);
+    let command = || -> Result<Command> {
+        let mut command = crate::common::command(&go)?;
+        if target.is_cross()? {
+            crate::cross::apply(&mut command, &target)?;
+        }
         command
             .current_dir(&source)
             .env("GOTOOLCHAIN", "local")
@@ -60,10 +66,10 @@ pub fn desktop(platform: &str) -> Result<PathBuf> {
             .env_remove("GOEXPERIMENT")
             .env_remove("GOAMD64")
             .env_remove("GOARM64");
-        command
+        Ok(command)
     };
     ensure!(
-        capture(command().args(["env", "GOVERSION"]))? == pin,
+        capture(command()?.args(["env", "GOVERSION"]))? == pin,
         "Desktop updater requires exactly {pin}"
     );
     let mut sources = BTreeMap::new();
@@ -87,7 +93,7 @@ pub fn desktop(platform: &str) -> Result<PathBuf> {
     }
     let stamps = crate::components::compiler_stamps()?;
     let inputs = json!({"sources":sources,"go":pin,"goSha256":sha256_file(&go)?,
-        "platform":platform,"arch":goarch,"stamps":stamps,
+        "platform":target.platform,"arch":target.arch,"target":target.triple,"goarch":goarch,"stamps":stamps,
         "licenseSha256":sha256_file(&root()?.join("LICENSE"))?,
         "pipeline":hex::encode(Sha256::digest(concat!(include_str!("app_updater.rs"), include_str!("notices.rs")).as_bytes()))});
     let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&inputs)?));
@@ -114,7 +120,7 @@ pub fn desktop(platform: &str) -> Result<PathBuf> {
         },
         crate::components::go_stamps(&stamps)
     );
-    run(command()
+    run(command()?
         .args([
             "build",
             "-mod=readonly",
@@ -127,7 +133,7 @@ pub fn desktop(platform: &str) -> Result<PathBuf> {
         .arg(&binary)
         .arg("."))?;
     build::assert_architecture(&binary)?;
-    let goroot = capture(command().args(["env", "GOROOT"]))?;
+    let goroot = capture(command()?.args(["env", "GOROOT"]))?;
     let rendered = crate::notices::render_go_helper(Path::new(&goroot), &pin)?;
     text(&notice, rendered, 0o644)?;
     copy_tree(&binary, &output)?;

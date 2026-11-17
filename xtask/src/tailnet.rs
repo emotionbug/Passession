@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -33,6 +35,7 @@ pub fn library_name(platform: &str) -> Result<&'static str> {
 }
 
 struct Target {
+    desktop: Option<BuildTarget>,
     triple: String,
     platform: &'static str,
     goos: &'static str,
@@ -61,16 +64,40 @@ fn architecture(arch: &str) -> Result<(&'static str, &'static str)> {
     }
 }
 
+fn target_command(program: impl AsRef<OsStr>, target: Option<&BuildTarget>) -> Result<Command> {
+    let mut command = crate::common::command(program)?;
+    if let Some(target) = target
+        && target.is_cross()?
+    {
+        crate::cross::apply(&mut command, target)?;
+    }
+    Ok(command)
+}
+
+fn command_env(command: &Command, name: &str) -> Option<OsString> {
+    command
+        .get_envs()
+        .find_map(|(key, value)| (key == name).then_some(value))
+        .map(|value| value.map(OsStr::to_owned))
+        .unwrap_or_else(|| env::var_os(name))
+}
+
 pub fn desktop(platform: &str, minimum: &str) -> Result<NativeBuild> {
-    let platform = match platform {
-        "linux" => "linux",
-        "macos" => "macos",
-        "windows" => "windows",
-        _ => bail!("Desktop native host required"),
-    };
-    let (goarch, cpu) = architecture(arch()?)?;
+    let desktop = BuildTarget::current()?;
+    ensure!(
+        platform == desktop.platform,
+        "Tailnet platform must match the build target"
+    );
+    let platform = desktop.platform;
+    ensure!(
+        matches!(platform, "linux" | "macos" | "windows"),
+        "Desktop native target required"
+    );
+    let (goarch, cpu) = architecture(desktop.arch)?;
+    let cross = desktop.is_cross()?;
     let mut target = Target {
-        triple: notices::host_triple()?.to_owned(),
+        desktop: Some(desktop),
+        triple: desktop.triple.to_owned(),
         platform,
         goos: if platform == "macos" {
             "darwin"
@@ -84,7 +111,52 @@ pub fn desktop(platform: &str, minimum: &str) -> Result<NativeBuild> {
         ldflags: String::new(),
         sdk: String::new(),
     };
-    if platform == "macos" {
+    if cross {
+        let configured = target_command("go", Some(&desktop))?;
+        // Keep Go's compiler separate from target-qualified Rust C compilers:
+        // Windows Go cgo uses Zig GNU, while Rust/Ghostty use the MSVC ABI.
+        let compiler = command_env(&configured, "PASEO_CROSS_GO_CC")
+            .context("Cross Tailscale requires a provisioned PASEO_CROSS_GO_CC wrapper")?;
+        target.compiler = which::which(&compiler)
+            .context("Cross Tailscale PASEO_CROSS_GO_CC must name an executable wrapper")?;
+        for name in ["CFLAGS", "CGO_CFLAGS"] {
+            if let Some(flags) = command_env(&configured, name) {
+                target.cflags.push(' ');
+                target
+                    .cflags
+                    .push_str(flags.to_str().context("Cross C flags are not UTF-8")?);
+            }
+        }
+        for name in ["LDFLAGS", "CGO_LDFLAGS"] {
+            if let Some(flags) = command_env(&configured, name) {
+                target.ldflags.push(' ');
+                target
+                    .ldflags
+                    .push_str(flags.to_str().context("Cross linker flags are not UTF-8")?);
+            }
+        }
+        if platform == "macos" {
+            if let Some(sdk) = command_env(&configured, "SDKROOT") {
+                target.sdk = sdk
+                    .to_str()
+                    .context("Cross SDKROOT is not UTF-8")?
+                    .to_owned();
+                let flags = format!(" -isysroot {}", quote(Path::new(&sdk))?);
+                target.cflags.push_str(&flags);
+                target.ldflags.push_str(&flags);
+            }
+            let flags = format!(" -mmacosx-version-min={minimum}");
+            target.cflags.push_str(&flags);
+            target.ldflags.push_str(&flags);
+            target
+                .ldflags
+                .push_str(" -Wl,-install_name,@rpath/libpaseo_tailscale.dylib");
+        } else if platform == "linux" {
+            target
+                .ldflags
+                .push_str(" -Wl,-soname,libpaseo_tailscale.so");
+        }
+    } else if platform == "macos" {
         let sdk = capture(command("xcrun")?.args(["--sdk", "macosx", "--show-sdk-path"]))?;
         target.compiler = PathBuf::from(capture(
             command("xcrun")?.args(["--sdk", "macosx", "--find", "clang"]),
@@ -134,6 +206,7 @@ pub fn android(triple: &str, compiler: &Path, ndk: &Path) -> Result<NativeBuild>
         (compiler.to_owned(), String::new())
     };
     build(Target {
+        desktop: None,
         triple: triple.into(),
         platform: "android",
         goos: "android",
@@ -163,6 +236,7 @@ pub fn ios(triple: &str, simulator: bool, minimum: &str) -> Result<NativeBuild> 
     };
     let flags = format!("-isysroot {} -target {target}", quote(Path::new(&sdk))?);
     build(Target {
+        desktop: None,
         triple: triple.into(),
         platform: "ios",
         goos: "ios",
@@ -190,10 +264,11 @@ pub(crate) fn pinned_go(source: &Path) -> Result<String> {
 }
 
 /// Go module and build caches as `(GOMODCACHE, GOCACHE)`. Local builds keep them
-/// beside the Go outputs in Cargo's target directory. CI sets absolute
-/// `GOMODCACHE`/`GOCACHE` elsewhere: its Rust cache prunes and restores the target
-/// directory, which collides with Go's read-only module tree.
-pub(crate) fn go_caches() -> Result<(PathBuf, PathBuf)> {
+/// beside the Go outputs in Cargo's target directory, partitioned by target
+/// triple. CI sets absolute `GOMODCACHE`/`GOCACHE` elsewhere: its Rust cache
+/// prunes and restores the target directory, which collides with Go's read-only
+/// module tree.
+pub(crate) fn go_caches(triple: &str) -> Result<(PathBuf, PathBuf)> {
     let cache = target_root()?.join("paseo-tailnet");
     let pick = |name: &str, default: PathBuf| {
         env::var_os(name)
@@ -203,7 +278,7 @@ pub(crate) fn go_caches() -> Result<(PathBuf, PathBuf)> {
     };
     Ok((
         pick("GOMODCACHE", cache.join("modules")),
-        pick("GOCACHE", cache.join("go-cache")),
+        pick("GOCACHE", cache.join("go-cache").join(triple)),
     ))
 }
 
@@ -214,9 +289,9 @@ fn build(target: Target) -> Result<NativeBuild> {
     )?;
     let pin = pinned_go(&source)?;
     let directory = target_root()?.join("paseo-tailnet").join(&target.triple);
-    let (modules, go_cache) = go_caches()?;
+    let (modules, go_cache) = go_caches(&target.triple)?;
     fs::create_dir_all(&directory)?;
-    let mut base = Command::new(&go);
+    let mut base = target_command(&go, target.desktop.as_ref())?;
     base.current_dir(&source)
         .env("GOTOOLCHAIN", "local")
         .env("GOENV", "off")
@@ -233,14 +308,23 @@ fn build(target: Target) -> Result<NativeBuild> {
             format!("{}{}", quote(&target.compiler)?, target.compiler_args),
         )
         .env("CGO_CFLAGS", &target.cflags)
-        .env("CGO_CPPFLAGS", "")
-        .env("CGO_CXXFLAGS", &target.cflags)
         .env("CGO_LDFLAGS", &target.ldflags)
         .env_remove("GOEXPERIMENT")
         .env_remove("GOAMD64")
         .env_remove("GOARM64");
-    let command = || {
-        let mut result = Command::new(base.get_program());
+    let cross = target
+        .desktop
+        .map(BuildTarget::is_cross)
+        .transpose()?
+        .unwrap_or(false);
+    if !cross {
+        base.env("CGO_CPPFLAGS", "")
+            .env("CGO_CXXFLAGS", &target.cflags);
+    } else if command_env(&base, "CGO_CXXFLAGS").is_none() {
+        base.env("CGO_CXXFLAGS", &target.cflags);
+    }
+    let command = || -> Result<Command> {
+        let mut result = target_command(base.get_program(), target.desktop.as_ref())?;
         result.current_dir(&source);
         for (name, value) in base.get_envs() {
             if let Some(value) = value {
@@ -249,15 +333,15 @@ fn build(target: Target) -> Result<NativeBuild> {
                 result.env_remove(name);
             }
         }
-        result
+        Ok(result)
     };
-    let toolchain = capture(command().args(["env", "GOVERSION"]))?;
+    let toolchain = capture(command()?.args(["env", "GOVERSION"]))?;
     ensure!(
         toolchain == pin,
         "Embedded Tailscale requires {pin}; {} reports {toolchain}",
         go.display()
     );
-    let mut compiler_command = crate::common::command(&target.compiler)?;
+    let mut compiler_command = target_command(&target.compiler, target.desktop.as_ref())?;
     if target.compiler_args.starts_with(" cc ") {
         compiler_command.arg("cc");
     }
@@ -289,6 +373,10 @@ fn build(target: Target) -> Result<NativeBuild> {
         "compilerSha256": sha256_file(&target.compiler)?, "compilerVersion": compiler_version,
         "compilerArgs": target.compiler_args, "cflags": target.cflags,
         "ldflags": target.ldflags, "sdk": target.sdk, "goTags": GO_TAGS,
+        "environment": base.get_envs().map(|(name, value)| (
+            name.to_string_lossy().into_owned(),
+            value.map(|value| value.to_string_lossy().into_owned())
+        )).collect::<BTreeMap<_, _>>(),
         "stamps": stamps,
         "pipeline": hex::encode(Sha256::digest(concat!(include_str!("tailnet.rs"), include_str!("notices.rs")).as_bytes())),
     });
@@ -318,7 +406,7 @@ fn build(target: Target) -> Result<NativeBuild> {
     } else {
         ("-buildmode=c-shared", "-s -w ")
     };
-    let packages = capture(command().args([
+    let packages = capture(command()?.args([
         "list",
         "-mod=readonly",
         GO_TAGS,
@@ -348,12 +436,12 @@ fn build(target: Target) -> Result<NativeBuild> {
             modules.insert(format!("{name}@{version}"), PathBuf::from(directory));
         }
     }
-    run(command().args(["mod", "verify"]))?;
-    let goroot = capture(command().args(["env", "GOROOT"]))?;
+    run(command()?.args(["mod", "verify"]))?;
+    let goroot = capture(command()?.args(["env", "GOROOT"]))?;
     let rendered = notices::render_go(&modules, &source, Path::new(&goroot), &pin)?;
     let temporary = tempfile::tempdir_in(&directory)?;
     let output = temporary.path().join(library_name(target.platform)?);
-    run(command()
+    run(command()?
         .args([
             "build",
             "-mod=readonly",
@@ -376,9 +464,6 @@ fn build(target: Target) -> Result<NativeBuild> {
     );
     if matches!(target.platform, "linux" | "macos" | "windows") {
         crate::build::assert_architecture(&output)?;
-    }
-    if target.platform == "windows" {
-        crate::signing::require_system_imports(&output)?;
     }
     copy_tree(&output, &library)?;
     text(&notice_path, &rendered, 0o644)?;
