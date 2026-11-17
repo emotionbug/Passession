@@ -13,8 +13,8 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Mutex,
-    time::Duration,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, SystemTime},
 };
 
 pub(super) fn session_roots(
@@ -115,20 +115,53 @@ fn normalize(name: &str) -> &str {
     name.strip_prefix("functions.").unwrap_or(name)
 }
 
+type SharedIndex = Arc<Mutex<Option<Index>>>;
+
 pub(super) struct History {
     path: PathBuf,
-    names: HashSet<String>,
-    identities: HashSet<String>,
-    recorded: Mutex<HashSet<String>>,
+    names: Arc<HashSet<String>>,
+    identities: Arc<HashSet<String>>,
+    index: SharedIndex,
     complete: bool,
 }
 
 impl History {
-    pub async fn load(home: &Path, roots: Vec<PathBuf>) -> Self {
+    pub async fn load(home: &Path, mut roots: Vec<PathBuf>) -> Self {
+        static INDEXES: LazyLock<Mutex<HashMap<PathBuf, SharedIndex>>> =
+            LazyLock::new(Mutex::default);
         let path = home.join("omp-host-tool-history.sqlite3");
         let timelines = home.join("agent-timelines");
+        roots.sort();
+        roots.dedup();
+        let index = INDEXES
+            .lock()
+            .unwrap()
+            .entry(path.clone())
+            .or_default()
+            .clone();
+        let shared = index.clone();
         let target = path.clone();
-        let result = tokio::task::spawn_blocking(move || load(&target, &timelines, &roots)).await;
+        let result = tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut slot = shared.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|index| index.replaced(&target).unwrap_or(true))
+            {
+                *slot = None;
+            }
+            if slot.is_none() {
+                *slot = Some(Index::new(&target)?);
+            }
+            let index = slot.as_mut().unwrap();
+            match index.update(&timelines, &roots) {
+                Ok(complete) => Ok((index.names.clone(), index.identities.clone(), complete)),
+                Err(error) => {
+                    *slot = None;
+                    Err(error)
+                }
+            }
+        })
+        .await;
         let (names, identities, complete) = match result {
             Ok(Ok(snapshot)) => snapshot,
             error => {
@@ -136,34 +169,48 @@ impl History {
                     ?error,
                     "OMP host tool history unavailable; retaining essential catalog until coverage recovers"
                 );
-                (HashSet::new(), HashSet::new(), false)
+                (Arc::default(), Arc::default(), false)
             }
         };
         Self {
             path,
             names,
-            recorded: Mutex::new(identities.clone()),
             identities,
+            index,
             complete,
         }
     }
 
     pub async fn record(&self, identity: &str) -> Result<()> {
-        if self.recorded.lock().unwrap().contains(identity) {
-            return Ok(());
-        }
         let path = self.path.clone();
+        let shared = self.index.clone();
         let owned = identity.to_owned();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let connection = open(&path)?;
-            connection.execute(
-                "INSERT OR IGNORE INTO identities(name) VALUES (?1)",
-                [&owned],
-            )?;
+            let mut slot = shared.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|index| index.replaced(&path).unwrap_or(true))
+            {
+                *slot = None;
+            }
+            if slot.is_none() {
+                *slot = Some(Index::new(&path)?);
+            }
+            let index = slot.as_mut().unwrap();
+            if !index.identities.contains(&owned) {
+                let transaction = index
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO identities(name) VALUES (?1)",
+                    [&owned],
+                )?;
+                transaction.commit()?;
+                index.refresh()?;
+            }
             Ok(())
         })
         .await??;
-        self.recorded.lock().unwrap().insert(identity.to_owned());
         Ok(())
     }
 }
@@ -197,84 +244,290 @@ fn open(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
-type Snapshot = (HashSet<String>, HashSet<String>, bool);
-
-fn load(path: &Path, timelines: &Path, roots: &[PathBuf]) -> Result<Snapshot> {
-    let mut connection = open(path)?;
-    // One transaction serializes concurrent launches and commits the union with
-    // its source cursors. Readers of source databases use independent snapshots.
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut complete = true;
-    let mut files = Vec::new();
-    discover(timelines, "sqlite3", false, &mut files, &mut complete);
-    discover(timelines, "json", false, &mut files, &mut complete);
-    for root in roots {
-        discover(root, "jsonl", true, &mut files, &mut complete);
-    }
-    files.sort();
-    files.dedup();
-    for file in files {
-        let result = match file.extension().and_then(|extension| extension.to_str()) {
-            Some("sqlite3") => scan_timeline(&transaction, &file),
-            Some("json") => scan_legacy_timeline(&transaction, &file),
-            _ => scan_session(&transaction, &file),
-        };
-        if let Err(error) = result {
-            complete = false;
-            tracing::warn!(path = %file.display(), %error, "OMP host tool history is partial; source will be retried");
-        }
-    }
-    let names = read_set(&transaction, "SELECT name FROM names")?;
-    let identities = read_set(&transaction, "SELECT name FROM identities")?;
-    transaction.commit()?;
-    if !complete {
-        tracing::warn!(
-            "OMP host tool history coverage is partial; retaining essential catalog until coverage recovers"
-        );
-    }
-    Ok((names, identities, complete))
+#[derive(Clone, PartialEq, Eq)]
+struct Stamp {
+    modified: SystemTime,
+    created: Option<SystemTime>,
+    length: u64,
+    #[cfg(unix)]
+    identity: (u64, u64),
 }
 
-fn discover(
-    root: &Path,
-    extension: &str,
-    recursive: bool,
-    files: &mut Vec<PathBuf>,
-    complete: &mut bool,
-) {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => {
-            *complete = false;
-            tracing::warn!(path = %root.display(), %error, "OMP host tool history directory unreadable");
-            return;
-        }
+fn stamp(path: &Path) -> Result<Option<Stamp>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
-    for entry in entries {
-        let result = entry.and_then(|entry| Ok((entry.file_type()?, entry.path())));
-        match result {
-            Ok((kind, path)) if recursive && kind.is_dir() => {
-                discover(&path, extension, true, files, complete)
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Ok(Some(Stamp {
+        modified: metadata.modified()?,
+        length: metadata.len(),
+        created: metadata.created().ok(),
+        #[cfg(unix)]
+        identity: (metadata.dev(), metadata.ino()),
+    }))
+}
+
+struct Directory {
+    stamp: Option<Stamp>,
+    files: Vec<PathBuf>,
+    children: Vec<PathBuf>,
+}
+
+#[derive(PartialEq, Eq)]
+struct SourceStamp {
+    file: Stamp,
+    wal: Option<Stamp>,
+}
+
+struct Source {
+    stamp: SourceStamp,
+    complete: bool,
+}
+
+/// One index per daemon home serializes launches and durable calls, while each
+/// runtime keeps immutable load-mode snapshots. Only metadata is polled: source
+/// bodies and directory listings are revisited when their stamps change.
+struct Index {
+    connection: Connection,
+    names: Arc<HashSet<String>>,
+    identities: Arc<HashSet<String>>,
+    name_row: i64,
+    identity_row: i64,
+    database: Stamp,
+    data_version: Option<i64>,
+    directories: HashMap<PathBuf, Arc<Directory>>,
+    sources: HashMap<PathBuf, Source>,
+    #[cfg(test)]
+    source_scans: usize,
+    #[cfg(test)]
+    refreshes: usize,
+}
+
+impl Index {
+    fn new(path: &Path) -> Result<Self> {
+        let mut index = Self {
+            connection: open(path)?,
+            database: stamp(path)?.context("OMP host tool history database disappeared")?,
+            names: Arc::default(),
+            identities: Arc::default(),
+            name_row: 0,
+            identity_row: 0,
+            data_version: None,
+            directories: HashMap::new(),
+            sources: HashMap::new(),
+            #[cfg(test)]
+            source_scans: 0,
+            #[cfg(test)]
+            refreshes: 0,
+        };
+        index.refresh()?;
+        Ok(index)
+    }
+
+    fn replaced(&self, path: &Path) -> Result<bool> {
+        let Some(current) = stamp(path)? else {
+            return Ok(true);
+        };
+        #[cfg(unix)]
+        return Ok(current.identity != self.database.identity);
+        #[cfg(not(unix))]
+        Ok(current.created != self.database.created)
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        // Sample before the read transaction: a concurrent commit after the
+        // snapshot must still invalidate the next registration.
+        self.data_version = None;
+        let version = self
+            .connection
+            .pragma_query_value(None, "data_version", |row| row.get(0))?;
+        let transaction = self.connection.transaction()?;
+        let (names, name_row) = additions(
+            &transaction,
+            "SELECT rowid,name FROM names WHERE rowid > ?1 ORDER BY rowid",
+            self.name_row,
+        )?;
+        let (identities, identity_row) = additions(
+            &transaction,
+            "SELECT rowid,name FROM identities WHERE rowid > ?1 ORDER BY rowid",
+            self.identity_row,
+        )?;
+        transaction.commit()?;
+        if !names.is_empty() {
+            Arc::make_mut(&mut self.names).extend(names);
+        }
+        if !identities.is_empty() {
+            Arc::make_mut(&mut self.identities).extend(identities);
+        }
+        self.name_row = name_row;
+        self.identity_row = identity_row;
+        self.data_version = Some(version);
+        #[cfg(test)]
+        {
+            self.refreshes += 1;
+        }
+        Ok(())
+    }
+
+    fn update(&mut self, timelines: &Path, roots: &[PathBuf]) -> Result<bool> {
+        let mut changed = Vec::new();
+        let mut complete = true;
+        self.discover(timelines, false, &mut changed, &mut complete);
+        for root in roots {
+            self.discover(root, true, &mut changed, &mut complete);
+        }
+        changed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        changed.dedup_by(|left, right| left.0 == right.0);
+        if !changed.is_empty() {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut scanned = Vec::with_capacity(changed.len());
+            for (file, stamp) in changed {
+                let result = match file.extension().and_then(|extension| extension.to_str()) {
+                    Some("sqlite3") => scan_timeline(&transaction, &file),
+                    Some("json") => scan_legacy_timeline(&transaction, &file),
+                    _ => scan_session(&transaction, &file),
+                };
+                let succeeded = result.is_ok();
+                if let Err(error) = result {
+                    complete = false;
+                    tracing::warn!(path = %file.display(), %error, "OMP host tool history is partial; source will be retried");
+                }
+                scanned.push((
+                    file,
+                    Source {
+                        stamp,
+                        complete: succeeded,
+                    },
+                ));
             }
-            Ok((kind, path))
-                if kind.is_file() && path.extension().is_some_and(|ext| ext == extension) =>
+            transaction.commit()?;
+            #[cfg(test)]
             {
-                files.push(path)
+                self.source_scans += scanned.len();
             }
-            Ok(_) => {}
+            self.sources.extend(scanned);
+            self.refresh()?;
+        } else {
+            let version: i64 = self
+                .connection
+                .pragma_query_value(None, "data_version", |row| row.get(0))?;
+            if Some(version) != self.data_version {
+                self.refresh()?;
+            }
+        }
+        if !complete {
+            tracing::warn!(
+                "OMP host tool history coverage is partial; retaining essential catalog until coverage recovers"
+            );
+        }
+        Ok(complete)
+    }
+
+    fn discover(
+        &mut self,
+        root: &Path,
+        recursive: bool,
+        changed: &mut Vec<(PathBuf, SourceStamp)>,
+        complete: &mut bool,
+    ) {
+        let result = self.directory(root);
+        let directory = match result {
+            Ok(directory) => directory,
             Err(error) => {
                 *complete = false;
-                tracing::warn!(path = %root.display(), %error, "OMP host tool history entry unreadable");
+                tracing::warn!(path = %root.display(), %error, "OMP host tool history directory unreadable");
+                return;
+            }
+        };
+        for path in &directory.files {
+            let extension = path.extension().and_then(|value| value.to_str());
+            let included = if recursive {
+                extension == Some("jsonl")
+            } else {
+                matches!(extension, Some("sqlite3" | "json"))
+            };
+            if !included {
+                continue;
+            }
+            let result = (|| -> Result<Option<SourceStamp>> {
+                let Some(file) = stamp(path)? else {
+                    return Ok(None);
+                };
+                let wal = if extension == Some("sqlite3") {
+                    stamp(&path.with_extension("sqlite3-wal"))?
+                } else {
+                    None
+                };
+                Ok(Some(SourceStamp { file, wal }))
+            })();
+            match result {
+                Ok(Some(stamp)) => {
+                    let unchanged = self
+                        .sources
+                        .get(path)
+                        .is_some_and(|source| source.complete && source.stamp == stamp);
+                    if !unchanged {
+                        changed.push((path.clone(), stamp));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    *complete = false;
+                    tracing::warn!(path = %path.display(), %error, "OMP host tool history source unreadable");
+                }
+            }
+        }
+        if recursive {
+            for child in &directory.children {
+                self.discover(child, true, changed, complete);
             }
         }
     }
+
+    fn directory(&mut self, path: &Path) -> Result<Arc<Directory>> {
+        let stamp = stamp(path)?;
+        if let Some(directory) = self.directories.get(path)
+            && directory.stamp == stamp
+        {
+            return Ok(directory.clone());
+        }
+        let mut directory = Directory {
+            stamp,
+            files: Vec::new(),
+            children: Vec::new(),
+        };
+        if directory.stamp.is_some() {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    directory.children.push(entry.path());
+                } else if kind.is_file() {
+                    directory.files.push(entry.path());
+                }
+            }
+        }
+        let directory = Arc::new(directory);
+        self.directories.insert(path.to_owned(), directory.clone());
+        Ok(directory)
+    }
 }
 
-fn read_set(transaction: &Transaction<'_>, sql: &str) -> Result<HashSet<String>> {
+fn additions(transaction: &Transaction<'_>, sql: &str, after: i64) -> Result<(Vec<String>, i64)> {
     let mut statement = transaction.prepare(sql)?;
-    let rows = statement.query_map([], |row| row.get(0))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let mut rows = statement.query([after])?;
+    let mut last = after;
+    let mut names = Vec::new();
+    while let Some(row) = rows.next()? {
+        last = row.get(0)?;
+        names.push(row.get(1)?);
+    }
+    Ok((names, last))
 }
 
 fn cursor(transaction: &Transaction<'_>, path: &Path) -> Result<Option<String>> {

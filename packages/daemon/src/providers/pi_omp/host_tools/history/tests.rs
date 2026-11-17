@@ -135,6 +135,75 @@ async fn concurrent_persist_reload_and_next_launch_keep_current_catalog_fixed() 
 }
 
 #[tokio::test]
+async fn repeated_registration_reuses_index_and_reads_only_changed_sources() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let root = home.path().join("sessions");
+    fs::create_dir(&root)?;
+    let file = root.join("native.jsonl");
+    session(
+        &file,
+        json!([{"type":"toolCall","id":"initial","name":"initial","arguments":{}}]),
+    )?;
+    let first = History::load(home.path(), vec![root.clone()]).await;
+    assert!(first.complete);
+    let counts = || {
+        let slot = first.index.lock().unwrap();
+        let index = slot.as_ref().unwrap();
+        (index.source_scans, index.refreshes)
+    };
+    let initial_counts = counts();
+    let (second, concurrent) = tokio::join!(
+        History::load(home.path(), vec![root.clone()]),
+        History::load(home.path(), vec![root.clone()]),
+    );
+    assert!(second.complete && concurrent.complete);
+    assert!(Arc::ptr_eq(&first.index, &second.index));
+    assert!(Arc::ptr_eq(&first.names, &second.names));
+    assert!(Arc::ptr_eq(&second.names, &concurrent.names));
+    assert_eq!(counts(), initial_counts);
+
+    let identity = json!(["native", "used"]).to_string();
+    first.record(&identity).await?;
+    let after_call = counts();
+    let reused = History::load(home.path(), vec![root.clone()]).await;
+    assert!(reused.identities.contains(&identity));
+    assert!(!first.identities.contains(&identity));
+    assert_eq!(counts(), after_call);
+
+    let mut writer = fs::OpenOptions::new().append(true).open(&file)?;
+    writeln!(
+        writer,
+        "{}",
+        json!({"type":"message","message":{"role":"assistant","content":[
+            {"type":"toolCall","id":"appended","name":"appended","arguments":{}}
+        ]}})
+    )?;
+    let appended = History::load(home.path(), vec![root.clone()]).await;
+    assert!(appended.names.contains("initial"));
+    assert!(appended.names.contains("appended"));
+    assert_eq!(counts().0, initial_counts.0 + 1);
+
+    let other_root = home.path().join("other-sessions");
+    fs::create_dir(&other_root)?;
+    session(
+        &other_root.join("other.jsonl"),
+        json!([{"type":"toolCall","id":"other","name":"other","arguments":{}}]),
+    )?;
+    let expanded = History::load(home.path(), vec![other_root.clone(), root.clone()]).await;
+    assert!(expanded.complete);
+    assert!(expanded.names.contains("other"));
+    assert_eq!(counts().0, initial_counts.0 + 2);
+
+    let before_external = counts();
+    let database = Connection::open(&first.path)?;
+    database.execute("INSERT INTO names(name) VALUES ('external')", [])?;
+    let external = History::load(home.path(), vec![root, other_root]).await;
+    assert!(external.names.contains("external"));
+    assert_eq!(counts(), (before_external.0, before_external.1 + 1));
+    Ok(())
+}
+
+#[tokio::test]
 async fn incremental_sources_include_updated_old_rows_and_appended_calls() -> Result<()> {
     let home = tempfile::tempdir()?;
     let path = timeline(
