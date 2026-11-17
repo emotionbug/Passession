@@ -216,3 +216,48 @@ fn aliased_roots_stage_once_and_restore_relative_skill_symlinks() -> Result<()> 
     assert!(targets.roots[1].join("paseo/SKILL.md").is_file());
     Ok(())
 }
+
+#[tokio::test]
+async fn request_during_background_maintenance_observes_reconciled_files() -> Result<()> {
+    use super::{Operation, SkillsService};
+    use crate::state::AppState;
+    use std::sync::Arc;
+
+    let temporary = tempfile::tempdir()?;
+    let home = temporary.path().join("daemon");
+    let user_home = temporary.path().join("user");
+    let executable = temporary.path().join("bin/paseo");
+    let app = AppState::new(home, user_home, executable);
+    fs::create_dir_all(temporary.path().join("bin/skills"))?;
+    app.config.initialize_with_overrides(&json!({})).await?;
+    let targets = super::targets(&app);
+    fs::create_dir_all(targets.source.join("paseo"))?;
+    fs::write(targets.source.join("paseo/SKILL.md"), "old bundle")?;
+    install(&targets)?;
+    fs::write(targets.source.join("paseo/SKILL.md"), "new bundle")?;
+
+    let service = Arc::new(SkillsService::new(Arc::downgrade(&app)));
+    let queue = service.queue.clone().lock_owned().await;
+    let maintenance = {
+        let service = service.clone();
+        tokio::spawn(async move { service.initialize().await })
+    };
+    let request = {
+        let service = service.clone();
+        tokio::spawn(async move { service.execute(Operation::Status).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!maintenance.is_finished());
+    assert!(!request.is_finished());
+    drop(queue);
+    let status = request.await??;
+    maintenance.await??;
+    assert_eq!(status["state"], "up-to-date");
+    for root in &targets.roots {
+        assert_eq!(
+            fs::read_to_string(root.join("paseo/SKILL.md"))?,
+            "new bundle"
+        );
+    }
+    Ok(())
+}

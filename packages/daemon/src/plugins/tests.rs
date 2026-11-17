@@ -210,3 +210,48 @@ fn log_tail_bounds_entries_and_utf8_without_losing_sequence() {
     assert!(message.len() <= 16384);
     assert!(message.chars().all(|character| character == '한'));
 }
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_handshakes_publish_in_configured_order() {
+    let service = PluginService::new(Weak::new());
+    let completed = Mutex::new(Vec::new());
+    // Deliberately use non-lexical configuration order and reverse completion.
+    let configured = [("z-first", 30), ("a-second", 20), ("m-third", 10)];
+    let startups = stream::iter(configured)
+        .map(|(id, delay)| {
+            let completed = &completed;
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                completed.lock().unwrap().push(id);
+                (
+                    id.to_owned(),
+                    Ok(PreparedPlugin {
+                        directory: PathBuf::new(),
+                        manifest: json!({"id":id}),
+                        metadata: json!({}),
+                        worker: None,
+                    }),
+                )
+            }
+        })
+        .buffered(STARTUP_CONCURRENCY)
+        .inspect(|(id, _)| {
+            let loaded = service.loaded.read().unwrap();
+            match id.as_str() {
+                "z-first" => assert!(loaded.is_empty()),
+                "a-second" => {
+                    assert!(loaded.contains_key("z-first"));
+                    assert!(!loaded.contains_key("m-third"));
+                }
+                "m-third" => assert_eq!(loaded.len(), 2),
+                _ => unreachable!(),
+            }
+        });
+    service.publish_startups(startups).await;
+    assert_eq!(
+        *completed.lock().unwrap(),
+        ["m-third", "a-second", "z-first"]
+    );
+    assert_eq!(service.loaded.read().unwrap().len(), 3);
+    assert!(service.errors.read().unwrap().is_empty());
+}

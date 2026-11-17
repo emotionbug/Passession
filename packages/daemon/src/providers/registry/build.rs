@@ -203,32 +203,9 @@ pub(super) fn entries(
         if resolved.iter().any(|entry| entry.definition["id"] == id) {
             bail!("Plugin provider '{id}' conflicts with a built-in provider");
         }
-        let configured = overrides.get(&id);
-        if definition["requiresConfiguration"] == true && configured.is_none() {
-            continue;
+        if let Some(entry) = plugin_definition(definition, is_external, config)? {
+            resolved.push(entry);
         }
-        if configured
-            .and_then(|value| value["extends"].as_str())
-            .is_some_and(|extends| !extends.is_empty())
-        {
-            continue;
-        }
-        let family = if is_external {
-            id.clone()
-        } else {
-            definition["nativeFamily"]
-                .as_str()
-                .context("Native plugin family is missing")?
-                .to_owned()
-        };
-        resolved.push(registered(
-            definition,
-            family,
-            &settings[&id],
-            &overrides[&id],
-            "custom",
-            is_external.then_some(id),
-        ));
     }
     if let Some(overrides) = overrides.as_object() {
         for (id, override_value) in overrides {
@@ -306,6 +283,93 @@ pub(super) fn entries(
             resolved.push(entry);
         }
     }
+    instantiate(app, resolved, previous, &environment)
+}
+
+// Startup already owns the built-in/native/derived registry. Resolve and create
+// only newly published external contributions, retaining every existing entry.
+pub(super) fn plugin_entries(
+    app: &AppState,
+    config: &Value,
+    mut previous: Vec<Arc<ProviderEntry>>,
+    definitions: Vec<Value>,
+) -> Result<BuiltEntries> {
+    let mut resolved = Vec::new();
+    for definition in definitions {
+        if let Some(entry) = plugin_definition(definition, true, config)? {
+            let id = &entry.definition["id"];
+            if previous
+                .iter()
+                .any(|old| old.definition["id"] == *id && old.identity["external"].is_null())
+            {
+                bail!("Plugin provider '{id}' conflicts with an existing provider");
+            }
+            resolved.push(entry);
+        }
+    }
+    let mut built = instantiate(app, resolved, &previous, &app.config.environment())?;
+    // A worker failure may have already refreshed external contributions while
+    // startup was publishing them. Reuse those entries, without duplicating them.
+    previous.retain(|entry| entry.identity["external"].is_null());
+    // Full configuration builds place external contributions before derived
+    // overrides; retain that same catalog ordering without rebuilding them.
+    let insertion = previous
+        .iter()
+        .position(|entry| {
+            entry.source == "custom"
+                && config["providerOverrides"][&entry.spec.id]["extends"]
+                    .as_str()
+                    .is_some_and(|base| !base.is_empty())
+        })
+        .unwrap_or(previous.len());
+    let mut entries = previous;
+    entries.splice(insertion..insertion, built.entries);
+    built.entries = entries;
+    Ok(built)
+}
+
+fn plugin_definition(
+    definition: Value,
+    external: bool,
+    config: &Value,
+) -> Result<Option<Resolved>> {
+    let id = definition["id"]
+        .as_str()
+        .context("Plugin provider id is missing")?
+        .to_owned();
+    let overrides = &config["providerOverrides"];
+    let configured = overrides.get(&id);
+    if (definition["requiresConfiguration"] == true && configured.is_none())
+        || configured
+            .and_then(|value| value["extends"].as_str())
+            .is_some_and(|base| !base.is_empty())
+    {
+        return Ok(None);
+    }
+    let family = if external {
+        id.clone()
+    } else {
+        definition["nativeFamily"]
+            .as_str()
+            .context("Native plugin family is missing")?
+            .to_owned()
+    };
+    Ok(Some(registered(
+        definition,
+        family,
+        &config["agentProviderSettings"][&id],
+        &overrides[&id],
+        "custom",
+        external.then_some(id),
+    )))
+}
+
+fn instantiate(
+    app: &AppState,
+    resolved: Vec<Resolved>,
+    previous: &[Arc<ProviderEntry>],
+    environment: &BTreeMap<String, String>,
+) -> Result<BuiltEntries> {
     let mut entries = Vec::with_capacity(resolved.len());
     let mut muse = Vec::new();
     for resolved in resolved {
@@ -326,7 +390,7 @@ pub(super) fn entries(
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
-            default_command(&resolved.family, &resolved.definition, &environment)
+            default_command(&resolved.family, &resolved.definition, environment)
         };
         let env = resolved.runtime["env"]
             .as_object()
@@ -418,4 +482,38 @@ pub(super) fn entries(
         }));
     }
     Ok(BuiltEntries { entries, muse })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_plugin_merge_reuses_the_existing_registry() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let app = AppState::new(
+            temporary.path().join("daemon"),
+            temporary.path().join("user"),
+            temporary.path().join("bin/paseo"),
+        );
+        app.config.initialize_with_overrides(&json!({})).await?;
+        let config = app.config.snapshot();
+        let initial = entries(&app, &config, &[])?;
+        let previous = initial.entries.clone();
+        // Invalid built-in command data would fail a second full resolution;
+        // the startup merge must not inspect or recreate the early registry.
+        let mut next = config;
+        next["providerOverrides"]["claude"] = json!({"command":[1]});
+        let merged = plugin_entries(&app, &next, initial.entries, Vec::new())?;
+        assert_eq!(merged.entries.len(), previous.len());
+        assert!(
+            merged
+                .entries
+                .iter()
+                .zip(&previous)
+                .all(|(new, old)| Arc::ptr_eq(new, old))
+        );
+        assert!(merged.muse.is_empty());
+        Ok(())
+    }
 }

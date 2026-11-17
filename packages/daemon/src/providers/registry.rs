@@ -59,6 +59,24 @@ impl ProviderRegistry {
         self.apply_config(&app.config.snapshot(), &json!({})).await
     }
 
+    /// Complete startup without resolving or constructing the early registry again.
+    pub async fn initialize_plugins(&self) -> Result<()> {
+        let _transaction = self.transaction.lock().await;
+        let app = self.app.upgrade().context("Daemon is shutting down")?;
+        if app.cancel.is_cancelled() {
+            bail!("Daemon is shutting down");
+        }
+        let definitions = app.plugins.registered_providers();
+        if definitions.is_empty() {
+            return Ok(());
+        }
+        let previous = self.entries();
+        let built = build::plugin_entries(&app, &app.config.snapshot(), previous, definitions)?;
+        self.install(built);
+        self.catalogs.registry_changed().await;
+        Ok(())
+    }
+
     pub async fn apply_config(&self, next: &Value, _previous: &Value) -> Result<()> {
         let _transaction = self.transaction.lock().await;
         let app = self.app.upgrade().context("Daemon is shutting down")?;
@@ -66,19 +84,22 @@ impl ProviderRegistry {
             bail!("Daemon is shutting down");
         }
         let previous = self.entries();
-        let build::BuiltEntries { entries, muse } = build::entries(&app, next, &previous)?;
-        {
-            let mut state = self.state.write().unwrap();
-            for entry in &entries {
-                if !previous.iter().any(|old| Arc::ptr_eq(old, entry)) {
-                    state.owned.push(entry.client.clone());
-                }
-            }
-            state.entries = entries;
-            state.muse.extend(muse);
-        }
+        let built = build::entries(&app, next, &previous)?;
+        self.install(built);
         self.catalogs.registry_changed().await;
         Ok(())
+    }
+
+    fn install(&self, built: build::BuiltEntries) {
+        let build::BuiltEntries { entries, muse } = built;
+        let mut state = self.state.write().unwrap();
+        for entry in &entries {
+            if !state.entries.iter().any(|old| Arc::ptr_eq(old, entry)) {
+                state.owned.push(entry.client.clone());
+            }
+        }
+        state.entries = entries;
+        state.muse.extend(muse);
     }
 
     pub(crate) fn entries(&self) -> Vec<Arc<ProviderEntry>> {

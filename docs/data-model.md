@@ -174,7 +174,9 @@ Single file, validated with `PersistedConfigSchema`.
 `agents.skills.selection` is the daemon host's orchestration-skill preference. Missing means
 `{ mode: "all" }`. Installed state is not persisted; the daemon derives it from the shared
 `~/.agents/skills` and Claude skill directories and keeps config plus filesystem convergence behind
-one serialized owner. Codex discovers the shared directory.
+one serialized owner. Codex discovers the shared directory. Startup reconciliation runs in the
+background after the daemon is ready; a skills request waits for it (or runs it first) through the
+same owner, so no request sees a half-reconciled directory.
 
 `paseo reload` reads and validates this file once inside the daemon. That snapshot drives resolution,
 classification, application, and reload bookkeeping. `DaemonConfigStore` owns applying runtime-safe

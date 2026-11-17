@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Weak},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::{state::AppState, transport::RequestContext};
 
@@ -20,6 +20,7 @@ use crate::{state::AppState, transport::RequestContext};
 pub struct SkillsService {
     app: Weak<AppState>,
     queue: Arc<Mutex<()>>,
+    maintained: Arc<OnceCell<()>>,
 }
 
 impl SkillsService {
@@ -27,16 +28,12 @@ impl SkillsService {
         Self {
             app,
             queue: Arc::new(Mutex::new(())),
+            maintained: Arc::new(OnceCell::new()),
         }
     }
 
     pub async fn initialize(&self) -> Result<()> {
-        // The source treats startup maintenance as best-effort. An invalid owned
-        // recovery journal remains in place and subsequent requests report it.
-        if let Err(error) = self.execute(Operation::AutoUpdate).await {
-            tracing::error!(error = %error, "Failed to maintain orchestration skills at startup");
-        }
-        Ok(())
+        self.enqueue(None).await.map(|_| ())
     }
 
     pub async fn handle(&self, context: &RequestContext, message: &Value) -> Result<bool> {
@@ -60,44 +57,28 @@ impl SkillsService {
     }
 
     async fn execute(&self, operation: Operation) -> Result<Value> {
+        self.enqueue(Some(operation)).await
+    }
+
+    async fn enqueue(&self, operation: Option<Operation>) -> Result<Value> {
         let app = self.app.upgrade().context("Daemon is shutting down")?;
         let queue = self.queue.clone();
+        let maintained = self.maintained.clone();
         tokio::spawn(async move {
             let _guard = queue.lock().await;
-            let configured = app.config.mutable_snapshot();
-            let previous = files::selection(&configured["skills"]["selection"]);
-            let targets = targets(&app);
-            let recovery_targets = targets.clone();
-            let committed = previous.clone();
-            blocking(move || transaction::recover(&recovery_targets, &committed)).await?;
-            match operation {
-                Operation::Save {
-                    selection: next,
-                    confirmed,
-                } => save(&app, targets, previous, next, confirmed).await,
-                operation => {
-                    let selected = previous.clone();
-                    let status = blocking(move || {
-                        if matches!(operation, Operation::Uninstall) {
-                            return files::uninstall(&targets, &selected);
-                        }
-                        let status = files::status(&targets, &selected)?;
-                        let apply = matches!(operation, Operation::Reconcile)
-                            || (matches!(operation, Operation::AutoUpdate)
-                                && status.state == "drift");
-                        if !apply {
-                            return Ok(status);
-                        }
-                        let ops: Vec<_> = status
-                            .ops
-                            .into_iter()
-                            .filter(|op| op.kind != "delete")
-                            .collect();
-                        files::apply(&targets, &selected, &ops)
-                    })
-                    .await?;
-                    snapshot(status, previous)
+            // Requests arriving before the background task runs perform the same
+            // maintenance first. Neither cancellation nor scheduling can expose
+            // a partially reconciled filesystem to a subsequent operation.
+            maintained.get_or_init(|| async {
+                // Preserve best-effort startup behavior: invalid recovery journals
+                // remain in place and the requested operation reports the error.
+                if let Err(error) = run(&app, Operation::AutoUpdate).await {
+                    tracing::error!(%error, "Failed to maintain orchestration skills at startup");
                 }
+            }).await;
+            match operation {
+                Some(operation) => run(&app, operation).await,
+                None => Ok(Value::Null),
             }
         })
         .await
@@ -114,6 +95,43 @@ enum Operation {
         selection: Value,
         confirmed: Vec<String>,
     },
+}
+
+async fn run(app: &AppState, operation: Operation) -> Result<Value> {
+    let configured = app.config.mutable_snapshot();
+    let previous = files::selection(&configured["skills"]["selection"]);
+    let targets = targets(app);
+    let recovery_targets = targets.clone();
+    let committed = previous.clone();
+    blocking(move || transaction::recover(&recovery_targets, &committed)).await?;
+    match operation {
+        Operation::Save {
+            selection: next,
+            confirmed,
+        } => save(app, targets, previous, next, confirmed).await,
+        operation => {
+            let selected = previous.clone();
+            let status = blocking(move || {
+                if matches!(operation, Operation::Uninstall) {
+                    return files::uninstall(&targets, &selected);
+                }
+                let status = files::status(&targets, &selected)?;
+                let apply = matches!(operation, Operation::Reconcile)
+                    || (matches!(operation, Operation::AutoUpdate) && status.state == "drift");
+                if !apply {
+                    return Ok(status);
+                }
+                let ops: Vec<_> = status
+                    .ops
+                    .into_iter()
+                    .filter(|op| op.kind != "delete")
+                    .collect();
+                files::apply(&targets, &selected, &ops)
+            })
+            .await?;
+            snapshot(status, previous)
+        }
+    }
 }
 
 async fn blocking<T: Send + 'static>(

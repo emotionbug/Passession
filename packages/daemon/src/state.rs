@@ -111,10 +111,7 @@ impl AppState {
         // Extension startup may call domain APIs through its prepared in-process channel.
         self.starting(PLUGINS)?;
         self.plugins.initialize().await?;
-        let configuration = self.config.snapshot();
-        self.providers
-            .apply_config(&configuration, &configuration)
-            .await?;
+        self.providers.initialize_plugins().await?;
         self.projects.start_observations().await?;
         self.starting(AUTOMATION)?;
         self.automation.initialize().await?;
@@ -325,6 +322,7 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
             .context("Daemon identity is missing")?;
         crate::daemon_control::publish_worker_ready(&listen, server_id)?;
         tracing::info!(%listen,%server_id,version=crate::VERSION,"Paseo native daemon ready");
+        app.automation.start_background_maintenance();
         app.cancel.cancelled().await;
         Ok(())
     }

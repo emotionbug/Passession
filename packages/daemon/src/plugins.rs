@@ -16,6 +16,7 @@ use crate::{
     transport::RequestContext,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{Stream, StreamExt, stream};
 pub(crate) use lifecycle::WORKSPACE_CREATE_FIELDS;
 use managed::ManagedSources;
 pub(crate) use managed::split_source_reference;
@@ -70,6 +71,15 @@ const RESERVED_USAGE: &[&str] = &[
     "opencode-go",
     "zai",
 ];
+
+const STARTUP_CONCURRENCY: usize = 8;
+
+struct PreparedPlugin {
+    directory: PathBuf,
+    manifest: Value,
+    metadata: Value,
+    worker: Option<Arc<PluginWorker>>,
+}
 
 struct LoadedPlugin {
     worker: Option<Arc<PluginWorker>>,
@@ -155,19 +165,50 @@ impl PluginService {
         if next["pluginsEnabled"] == true
             && let Some(sources) = sources
         {
-            for (id, source) in sources {
-                if source["enabled"] == false || self.loaded.read().unwrap().contains_key(id) {
-                    continue;
-                }
-                if let Err(error) = self.start_plugin(id, source).await {
-                    self.record_failure(id, error.to_string());
-                }
-                self.changed(id).await;
-            }
+            // Preparation includes the handshake, but publication (including
+            // duplicate contribution checks and errors) retains configured order.
+            // Owned inputs keep the stream `Send` for spawned config reloads.
+            let pending: Vec<(String, Value)> = {
+                let loaded = self.loaded.read().unwrap();
+                sources
+                    .iter()
+                    .filter(|(id, source)| source["enabled"] != false && !loaded.contains_key(*id))
+                    .map(|(id, source)| (id.clone(), source.clone()))
+                    .collect()
+            };
+            let startups = stream::iter(pending)
+                .map(|(id, source)| async move {
+                    let prepared = self.prepare_plugin(&id, &source).await;
+                    (id, prepared)
+                })
+                .buffered(STARTUP_CONCURRENCY);
+            self.publish_startups(startups).await;
         }
         Ok(())
     }
+    async fn publish_startups(
+        &self,
+        startups: impl Stream<Item = (String, Result<PreparedPlugin>)>,
+    ) {
+        tokio::pin!(startups);
+        while let Some((id, prepared)) = startups.next().await {
+            let result = match prepared {
+                Ok(prepared) => self.publish_prepared(&id, prepared).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                self.record_failure(&id, error.to_string());
+            }
+            self.changed(&id).await;
+        }
+    }
+
     async fn start_plugin(&self, id: &str, source: &Value) -> Result<()> {
+        self.publish_prepared(id, self.prepare_plugin(id, source).await?)
+            .await
+    }
+
+    async fn prepare_plugin(&self, id: &str, source: &Value) -> Result<PreparedPlugin> {
         manifest::validate_id(id)?;
         if is_builtin(id) {
             bail!("Plugin ID \"{id}\" is reserved for a built-in plugin");
@@ -186,28 +227,35 @@ impl PluginService {
         manifest::check_compatibility(&manifest)?;
         self.append_log(id, "stdout", "[paseo] Loading plugin");
         let worker = PluginWorker::start(self.app.clone(), id, &directory, &settings, env).await?;
-        let result = self
-            .publish(id, directory, manifest, Some(worker.clone()))
-            .await;
+        let metadata = worker.metadata.read().unwrap().clone();
+        Ok(PreparedPlugin {
+            directory,
+            manifest,
+            metadata,
+            worker: Some(worker),
+        })
+    }
+
+    async fn publish_prepared(&self, id: &str, prepared: PreparedPlugin) -> Result<()> {
+        let worker = prepared.worker.clone();
+        let result = self.publish(id, prepared).await;
         if let Err(error) = result {
-            let _ = worker.shutdown().await;
+            if let Some(worker) = worker {
+                let _ = worker.shutdown().await;
+            }
             return Err(error);
         }
         self.errors.write().unwrap().remove(id);
         self.append_log(id, "stdout", "[paseo] Plugin ready");
         Ok(())
     }
-    async fn publish(
-        &self,
-        id: &str,
-        directory: PathBuf,
-        manifest: Value,
-        worker: Option<Arc<PluginWorker>>,
-    ) -> Result<()> {
-        let metadata = worker
-            .as_ref()
-            .map(|worker| worker.metadata.read().unwrap().clone())
-            .unwrap_or_else(|| json!({}));
+    async fn publish(&self, id: &str, prepared: PreparedPlugin) -> Result<()> {
+        let PreparedPlugin {
+            directory,
+            manifest,
+            metadata,
+            worker,
+        } = prepared;
         let mut providers = metadata["providers"]
             .as_array()
             .cloned()

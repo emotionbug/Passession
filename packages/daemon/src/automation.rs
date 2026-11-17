@@ -43,6 +43,7 @@ pub struct AutomationService {
     stop: CancellationToken,
     timer: Mutex<Option<JoinHandle<()>>>,
     skills: skills::SkillsService,
+    skills_maintenance: StdMutex<Option<JoinHandle<()>>>,
 }
 
 struct Reservation {
@@ -164,6 +165,7 @@ impl AutomationService {
             running: Arc::new(StdMutex::new(HashSet::new())),
             stop: CancellationToken::new(),
             timer: Mutex::new(None),
+            skills_maintenance: StdMutex::new(None),
         }
     }
     fn app(&self) -> Result<Arc<AppState>> {
@@ -193,7 +195,6 @@ impl AutomationService {
         }
         self.recover().await?;
         self.sweep_orphans().await?;
-        self.skills.initialize().await?;
         let app = self.app.clone();
         let stop = self.stop.clone();
         *timer = Some(tokio::spawn(async move {
@@ -314,9 +315,28 @@ impl AutomationService {
         }));
         Ok(())
     }
+    pub fn start_background_maintenance(&self) {
+        let mut task = self.skills_maintenance.lock().unwrap();
+        if task.is_some() || self.stop.is_cancelled() {
+            return;
+        }
+        let app = self.app.clone();
+        *task = Some(tokio::spawn(async move {
+            if let Some(app) = app.upgrade()
+                && let Err(error) = app.automation.skills.initialize().await
+            {
+                tracing::error!(%error, "Skills maintenance task failed");
+            }
+        }));
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.stop.cancel();
         if let Some(task) = self.timer.lock().await.take() {
+            task.await?;
+        }
+        let maintenance = self.skills_maintenance.lock().unwrap().take();
+        if let Some(task) = maintenance {
             task.await?;
         }
         Ok(())
