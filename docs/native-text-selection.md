@@ -6,6 +6,27 @@ Selection must remain usable while scrolling, changing pane width and opening/cl
 
 Keep selection offsets in source text, not in a previous frame's glyph rectangles. Chat paints selection after the current row layout so resizing follows reflow; the source editor keeps buffer selection separate from cached visible-row geometry. Preserve code whitespace and Unicode boundaries when mapping hits to source and copying. Scrolling a code block or detail body must not also scroll the outer timeline.
 
+Desktop input fields and source editors share native editing commands rather than
+interpreting modifiers independently:
+
+| Action | Windows / Linux | macOS |
+| --- | --- | --- |
+| Word movement / selection | Ctrl+Left/Right, with Shift to extend | Option+Left/Right, with Shift to extend |
+| Line start / end | Home / End | Command+Left/Right |
+| Document start / end | Ctrl+Home/End | Command+Up/Down, or Home/End |
+| Word deletion | Ctrl+Backspace/Delete | Option+Backspace/Delete |
+| Line deletion | — | Command+Backspace/Delete |
+
+Line movement follows visual rows in wrapped inputs and logical lines in the source
+editor. Leave AltGr, mixed modifiers and unimplemented paragraph shortcuts to their
+OS/IME owner. Composition, read-only/password restrictions and existing undo groups
+still apply; autocomplete accepts only unmodified arrows.
+
+Wrapped inputs never scroll horizontally. A soft wrap can leave trailing spaces
+beyond the viewport's measured advance width; revealing a caret in that whitespace
+must not shift every row left and clip its leading glyph. Keep the original source
+and selection geometry instead of deleting spaces or adding compensating padding.
+
 Android uses the system floating text-action toolbar (`ActionMode.TYPE_FLOATING`), not automatic copy on release. Editable fields expose Paste when the clipboard contains text, Select All, and Copy/Cut only when their capabilities permit them; read-only content exposes Copy and Select All. Password fields do not expose their contents through Copy/Cut. The Rust owner performs each selected action through its existing editing/undo model. JNI clipboard and editor strings preserve UTF-16, including Hangul and supplementary characters.
 
 The shared selection registry fences native actions by owner and request token. A pointer down outside the owner clears the previous selection and toolbar before dispatching that same pointer event normally; it must still activate the clicked control. Focus loss, owner disposal, source replacement and app deactivation also invalidate stale actions. A held text drag retains selection ownership instead of starting parent scrolling.

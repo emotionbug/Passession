@@ -865,6 +865,80 @@ pub struct TextInput {
      }
  }
 
+/// Native editing intent shared by widgets and manually drawn editors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextInputMotion {
+    Left, Right, WordLeft, WordRight, NextWord,
+    LineStart, LineEnd, DocumentStart, DocumentEnd, Up, Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextInputKeyCommand {
+    Move(TextInputMotion),
+    Delete(TextInputMotion),
+}
+
+impl TextInputKeyCommand {
+    pub fn resolve(key: KeyCode, modifiers: KeyModifiers, apple: bool) -> Option<Self> {
+        use TextInputMotion::*;
+        let KeyModifiers { control, alt, logo, shift } = modifiers;
+        // Exact modifiers leave AltGr, window-manager shortcuts and unimplemented
+        // paragraph/scroll commands with their owner instead of editing the draft.
+        let plain = !control && !alt && !logo;
+        let word = if apple { alt && !control && !logo } else { control && !alt && !logo };
+        let command = apple && logo && !control && !alt;
+        let motion = match key {
+            KeyCode::ArrowLeft if plain => Left,
+            KeyCode::ArrowRight if plain => Right,
+            KeyCode::ArrowLeft if word => WordLeft,
+            KeyCode::ArrowRight if word => if apple { WordRight } else { NextWord },
+            KeyCode::ArrowLeft if command => LineStart,
+            KeyCode::ArrowRight if command => LineEnd,
+            KeyCode::ArrowUp if command => DocumentStart,
+            KeyCode::ArrowDown if command => DocumentEnd,
+            KeyCode::ArrowUp if plain => Up,
+            KeyCode::ArrowDown if plain => Down,
+            KeyCode::Home if plain => if apple { DocumentStart } else { LineStart },
+            KeyCode::End if plain => if apple { DocumentEnd } else { LineEnd },
+            KeyCode::Home if !apple && word => DocumentStart,
+            KeyCode::End if !apple && word => DocumentEnd,
+            KeyCode::Backspace if plain => return Some(Self::Delete(Left)),
+            KeyCode::Delete if plain && !shift => return Some(Self::Delete(Right)),
+            KeyCode::Backspace if word && !shift => return Some(Self::Delete(WordLeft)),
+            KeyCode::Delete if word && !shift => return Some(Self::Delete(WordRight)),
+            KeyCode::Backspace if command && !shift => return Some(Self::Delete(LineStart)),
+            KeyCode::Delete if command && !shift => return Some(Self::Delete(LineEnd)),
+            _ => return None,
+        };
+        Some(Self::Move(motion))
+    }
+}
+
+/// Word targets stay on grapheme boundaries and stop at paragraph breaks.
+pub fn text_input_word_boundary(text: &str, index: usize, motion: TextInputMotion) -> usize {
+    use TextInputMotion::*;
+    if motion == WordLeft {
+        let start = text[..index].rfind('\n').map_or(0, |at| at + 1);
+        if start == index { return prev_grapheme_boundary(text, index); }
+        return text[start..index].split_word_bound_indices().rev()
+            .find(|(_, word)| !word.chars().all(char::is_whitespace))
+            .map_or(start, |(at, _)| start + at);
+    }
+    let mut end = text[index..].find('\n').map_or(text.len(), |at| index + at);
+    if end > index && text.as_bytes()[end - 1] == b'\r' { end -= 1; }
+    if index == end { return next_grapheme_boundary(text, index); }
+    let mut segments = text[index..end].split_word_bound_indices();
+    if motion == NextWord {
+        // Ctrl+Right on Windows/Linux lands at the next word's start.
+        segments.next();
+        segments.find(|(_, word)| !word.chars().all(char::is_whitespace))
+            .map_or(end, |(at, _)| index + at)
+    } else {
+        segments.find(|(_, word)| !word.chars().all(char::is_whitespace))
+            .map_or(end, |(at, word)| index + at + word.len())
+    }
+}
+
 impl TextInput {
     pub fn is_password(&self) -> bool {
         self.is_password
@@ -1243,7 +1317,14 @@ impl TextInput {
     fn update_text_scroll(&mut self, viewport: DVec2, content: DVec2, reveal: bool) {
         self.reveal_cursor |= self.text_viewport != Some(viewport);
         self.text_viewport = Some(viewport);
-        self.text_scroll_max = dvec2((content.x - viewport.x).max(0.0), (content.y - viewport.y).max(0.0));
+        // Soft wrapping hangs breakable whitespace beyond the viewport. Those
+        // advances are selectable source, not horizontal scroll extent: revealing
+        // them would shift every wrapped row and clip its first visible glyph.
+        let wrap = self.layout_metrics.as_ref().is_some_and(|metrics| metrics.wrap);
+        self.text_scroll_max = dvec2(
+            if wrap { 0.0 } else { (content.x - viewport.x).max(0.0) },
+            (content.y - viewport.y).max(0.0),
+        );
         self.text_scroll.x = self.text_scroll.x.clamp(0.0, self.text_scroll_max.x);
         self.text_scroll.y = self.text_scroll.y.clamp(0.0, self.text_scroll_max.y);
         if self.reveal_cursor && reveal {
@@ -1305,6 +1386,80 @@ impl TextInput {
             self.draw_selection.draw_abs(cx, selected);
         }
         self.draw_selection.end_many_instances(cx);
+    }
+
+    fn keyboard_target(&mut self, cx: &mut Cx, motion: TextInputMotion) -> Result<Cursor, ()> {
+        use TextInputMotion::*;
+        let index = self.selection.cursor.index;
+        let target = match motion {
+            Left => prev_grapheme_boundary(&self.text, index),
+            Right => next_grapheme_boundary(&self.text, index),
+            WordLeft if self.is_password => 0,
+            WordRight | NextWord if self.is_password => self.text.len(),
+            WordLeft | WordRight | NextWord => text_input_word_boundary(&self.text, index, motion),
+            DocumentStart => 0,
+            DocumentEnd => self.text.len(),
+            LineStart | LineEnd => {
+                self.ensure_text_layout(cx)?;
+                let position = self.cursor_to_position(self.cursor())?;
+                return self.position_to_cursor(CursorPosition {
+                    row_index: position.row_index,
+                    x_in_lpxs: if motion == LineStart { 0.0 } else { f32::MAX },
+                });
+            }
+            Up | Down => {
+                self.ensure_text_layout(cx)?;
+                let position = self.cursor_to_position(self.cursor())?;
+                let last = self.laidout_text.as_ref().ok_or(())?.rows.len() - 1;
+                let row_index = if motion == Up {
+                    position.row_index.saturating_sub(1)
+                } else {
+                    (position.row_index + 1).min(last)
+                };
+                return self.position_to_cursor(CursorPosition { row_index, ..position });
+            }
+        };
+        Ok(Cursor { index: target, prefer_next_row: target <= index })
+    }
+
+    fn handle_edit_key(&mut self, cx: &mut Cx, command: TextInputKeyCommand, shift: bool, scope: &Scope) {
+        if self.ime_composing { return; }
+        match command {
+            TextInputKeyCommand::Move(motion) => {
+                let selected = self.selection.anchor.index != self.selection.cursor.index;
+                let cursor = if selected && !shift && motion == TextInputMotion::Left {
+                    self.selection.start()
+                } else if selected && !shift && motion == TextInputMotion::Right {
+                    self.selection.end()
+                } else {
+                    let Ok(cursor) = self.keyboard_target(cx, motion) else { return; };
+                    cursor
+                };
+                self.reset_blink_timer(cx);
+                self.set_cursor(cx, cursor, shift);
+            }
+            TextInputKeyCommand::Delete(motion) if !self.is_read_only => {
+                let mut start = self.selection.start().index;
+                let mut end = self.selection.end().index;
+                if start == end {
+                    let Ok(cursor) = self.keyboard_target(cx, motion) else { return; };
+                    start = start.min(cursor.index);
+                    end = end.max(cursor.index);
+                }
+                if start == end { return; }
+                let kind = match motion {
+                    TextInputMotion::Left => EditKind::Backspace,
+                    TextInputMotion::Right => EditKind::Delete,
+                    _ => EditKind::Other,
+                };
+                self.reset_blink_timer(cx);
+                self.create_or_extend_edit_group(kind);
+                self.apply_edit(cx, Edit { start, end, replace_with: String::new() });
+                self.draw_bg.redraw(cx);
+                cx.widget_action(self.widget_uid(), &scope.path, TextInputAction::Changed(self.text.clone()));
+            }
+            _ => {}
+        }
     }
 
     pub fn move_cursor_left(&mut self, cx: &mut Cx, keep_selection: bool) {
@@ -1754,6 +1909,12 @@ impl Widget for TextInput {
         let hit = event.hits(cx, self.draw_bg.area());
         self.handle_text_scroll(cx, event, &hit);
         let touch_focus = self.touch_focus_hit(&hit);
+        let edit_command = match &hit {
+            Hit::KeyDown(event) if !self.ime_composing => TextInputKeyCommand::resolve(
+                event.key_code, event.modifiers, cfg!(target_vendor = "apple"),
+            ),
+            _ => None,
+        };
         match hit {
             Hit::FingerHoverIn(_) => {
                 // Paseo: upstream left the arrow over editable text.
@@ -1774,61 +1935,8 @@ impl Widget for TextInput {
                 self.draw_bg.redraw(cx);
                 cx.widget_action(uid, &scope.path, TextInputAction::KeyFocusLost);
             }
-            Hit::KeyDown(KeyEvent {
-                key_code: KeyCode::ArrowLeft,
-                modifiers: KeyModifiers {
-                    shift: keep_selection,
-                    logo: false,
-                    alt: false,
-                    control: false
-                },
-                ..
-            }) => {
-                self.reset_blink_timer(cx);
-                self.move_cursor_left(cx, keep_selection);
-            }
-            Hit::KeyDown(KeyEvent {
-                key_code: KeyCode::ArrowRight,
-                modifiers: KeyModifiers {
-                    shift: keep_selection,
-                    logo: false,
-                    alt: false,
-                    control: false
-                },
-                ..
-            }) => {
-                self.reset_blink_timer(cx);
-                self.move_cursor_right(cx, keep_selection);
-            }
-            Hit::KeyDown(KeyEvent {
-                key_code: KeyCode::ArrowUp,
-                modifiers: KeyModifiers {
-                    shift: keep_selection,
-                    logo: false,
-                    alt: false,
-                    control: false
-                },
-                ..
-            }) => {
-                self.reset_blink_timer(cx);
-                if self.move_cursor_up(cx, keep_selection).is_err() {
-                    warning!("can't move cursor because layout was invalidated by earlier event");
-                }
-            },
-            Hit::KeyDown(KeyEvent {
-                key_code: KeyCode::ArrowDown,
-                modifiers: KeyModifiers {
-                    shift: keep_selection,
-                    logo: false,
-                    alt: false,
-                    control: false
-                },
-                ..
-            }) => {
-                self.reset_blink_timer(cx);
-                if self.move_cursor_down(cx, keep_selection).is_err() {
-                    warning!("can't move cursor because layout was invalidated by earlier event");
-                }
+            Hit::KeyDown(event) if edit_command.is_some() => {
+                self.handle_edit_key(cx, edit_command.unwrap(), event.modifiers.shift, scope);
             }
             Hit::KeyDown(KeyEvent {
                 key_code: KeyCode::KeyA,
@@ -1912,50 +2020,6 @@ impl Widget for TextInput {
                 ..
             }) => {
                 cx.widget_action(uid, &scope.path, TextInputAction::Escaped);
-            }
-            Hit::KeyDown(KeyEvent {
-                key_code: KeyCode::Backspace,
-                ..
-            }) if !self.is_read_only => {
-                self.reset_blink_timer(cx);
-                let mut start = self.selection.start().index;
-                let end = self.selection.end().index;
-                if start == end {
-                    start = prev_grapheme_boundary(&self.text, start);
-                }
-                self.create_or_extend_edit_group(EditKind::Backspace);
-                self.apply_edit(
-                    cx,
-                    Edit {
-                        start,
-                        end,
-                        replace_with: String::new(),
-                    }
-                );
-                self.draw_bg.redraw(cx);
-                cx.widget_action(uid, &scope.path, TextInputAction::Changed(self.text.clone()));
-            }
-            Hit::KeyDown(KeyEvent {
-                key_code: KeyCode::Delete,
-                ..
-            }) if !self.is_read_only => {
-                self.reset_blink_timer(cx);
-                let start = self.selection.start().index;
-                let mut end = self.selection.end().index;
-                if start == end {
-                    end = next_grapheme_boundary(&self.text, end);
-                }
-                self.create_or_extend_edit_group(EditKind::Delete);
-                self.apply_edit(
-                    cx,
-                    Edit {
-                        start,
-                        end,
-                        replace_with: String::new(),
-                    }
-                );
-                self.draw_bg.redraw(cx);
-                cx.widget_action(uid, &scope.path, TextInputAction::Changed(self.text.clone()));
             }
             Hit::KeyDown(KeyEvent {
                 key_code: KeyCode::KeyZ,
@@ -2460,6 +2524,66 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 }
 
 #[cfg(test)]
+mod clipping_tests {
+    use super::*;
+    use crate::makepad_draw::text::{
+        font::FontId,
+        fonts::Fonts,
+        loader::{FontDefinition, FontFamilyDefinition},
+    };
+    use std::{cell::RefCell, sync::Arc};
+
+    #[test]
+    fn wrapped_whitespace_does_not_scroll_line_starts_out_of_view() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fonts = Fonts::new(&mut cx, Default::default());
+        let font = FontId::from("input-clipping-test");
+        fonts.define_font(font, FontDefinition {
+            data: Arc::new(include_bytes!("../resources/LiberationMono-Regular.ttf").to_vec()),
+            index: 0, variations: Vec::new(), ascender_fudge_in_ems: 0.0, descender_fudge_in_ems: 0.0,
+        });
+        fonts.define_font_family(0.into(), FontFamilyDefinition { font_ids: vec![font] });
+        cx.set_global(Rc::new(RefCell::new(fonts)));
+        let mut input = TextInput::new(&mut cx);
+        input.draw_text.text_style.font_size = 12.0;
+        input.draw_text.font_scale = 1.0;
+        let text = "word   next";
+        input.set_text(&mut cx, text);
+        let width = input.layout_display_text(&mut cx, "word", None, false).size_in_lpxs.width + 0.01;
+        let viewport = dvec2(width as f64, 20.0);
+        let content = |input: &TextInput| {
+            let size = input.laidout_text.as_ref().unwrap().size_in_lpxs;
+            dvec2(size.width as f64, size.height as f64)
+        };
+
+        // An unwrapped field still reveals its end by scrolling horizontally.
+        input.update_text_layout(&mut cx, Some(width), false);
+        input.set_cursor(&mut cx, Cursor { index: text.len(), prefer_next_row: false }, false);
+        input.update_text_scroll(viewport, content(&input), true);
+        assert!(input.text_scroll.x > 0.0);
+
+        // Reflow clears that offset. Moving to the end of the first visual row
+        // must not reveal its hanging spaces at the expense of every row's ink.
+        input.update_text_layout(&mut cx, Some(width), true);
+        let first = &input.laidout_text.as_ref().unwrap().rows[0];
+        assert_eq!(first.text.as_str(), "word   ");
+        assert!(first.width_in_lpxs > width);
+        input.set_cursor(&mut cx, Cursor { index: 7, prefer_next_row: false }, false);
+        input.update_text_scroll(viewport, content(&input), true);
+        assert_eq!(input.text_scroll.x, 0.0);
+        assert_eq!(input.text_scroll_max.x, 0.0);
+        input.set_cursor(&mut cx, Cursor { index: 0, prefer_next_row: true }, true);
+        assert_eq!(input.selected_text(), "word   ");
+
+        // Vertical caret reveal remains active in a height-constrained editor.
+        input.set_cursor(&mut cx, Cursor { index: text.len(), prefer_next_row: false }, false);
+        input.update_text_scroll(viewport, content(&input), true);
+        assert!(input.text_scroll.y > 0.0);
+        assert_eq!(input.text_scroll.x, 0.0);
+    }
+}
+
+#[cfg(test)]
 mod touch_focus_tests {
     use super::*;
     use crate::makepad_draw::event::{FingerLongPressEvent, TouchUpdateEvent};
@@ -2846,5 +2970,129 @@ mod keyboard_edit_tests {
         assert!(input.ime_composing);
         assert_eq!(input.selection.cursor.index, 4);
         assert_eq!(input.text, "WWWW iiiii");
+    }
+
+    fn native_key(cx: &mut Cx, input: &mut TextInput, key: KeyCode, modifiers: KeyModifiers, apple: bool) {
+        if let Some(command) = TextInputKeyCommand::resolve(key, modifiers, apple) {
+            input.handle_edit_key(cx, command, modifiers.shift, &Scope::empty());
+        }
+    }
+
+    #[test]
+    fn native_word_keys_select_delete_and_undo_unicode() {
+        for apple in [false, true] {
+            let (mut cx, mut input) = editor();
+            let word = KeyModifiers { alt: apple, control: !apple, ..Default::default() };
+            input.set_text(&mut cx, "한글 cafe\u{301} 👩‍💻 tail");
+            native_key(&mut cx, &mut input, KeyCode::ArrowRight, word, apple);
+            assert_eq!(input.cursor().index, if apple { "한글".len() } else { "한글 ".len() });
+            input.set_cursor(&mut cx, Cursor { index: "한글 cafe\u{301}".len(), prefer_next_row: false }, false);
+            native_key(&mut cx, &mut input, KeyCode::ArrowLeft, KeyModifiers { shift: true, ..word }, apple);
+            assert_eq!(input.selected_text(), "cafe\u{301}");
+            native_key(&mut cx, &mut input, KeyCode::Backspace, word, apple);
+            assert_eq!(input.text, "한글  👩‍💻 tail");
+            assert!(input.undo(&mut cx));
+            assert_eq!(input.selected_text(), "cafe\u{301}");
+            assert!(input.redo(&mut cx));
+            assert_eq!(input.text, "한글  👩‍💻 tail");
+            input.set_text(&mut cx, "한글 👩‍💻");
+            input.set_cursor(&mut cx, Cursor { index: input.text.len(), prefer_next_row: false }, false);
+            native_key(&mut cx, &mut input, KeyCode::Backspace, word, apple);
+            assert_eq!(input.text, "한글 ");
+            assert!(input.undo(&mut cx));
+            assert_eq!(input.text, "한글 👩‍💻");
+            native_key(&mut cx, &mut input, KeyCode::ArrowLeft, KeyModifiers::default(), apple);
+            assert_eq!(input.cursor().index, "한글 ".len());
+            native_key(&mut cx, &mut input, KeyCode::Delete, word, apple);
+            assert_eq!(input.text, "한글 ");
+        }
+    }
+
+    #[test]
+    fn native_line_document_selection_and_deletion() {
+        for apple in [false, true] {
+            let (mut cx, mut input) = editor();
+            input.set_text(&mut cx, "first\n한글 text\nlast");
+            input.set_cursor(&mut cx, Cursor { index: "first\n한글".len(), prefer_next_row: false }, false);
+            let line = KeyModifiers { logo: apple, ..Default::default() };
+            native_key(&mut cx, &mut input, if apple { KeyCode::ArrowLeft } else { KeyCode::Home }, line, apple);
+            assert_eq!(input.cursor().index, "first\n".len());
+            native_key(&mut cx, &mut input, if apple { KeyCode::ArrowRight } else { KeyCode::End },
+                KeyModifiers { shift: true, ..line }, apple);
+            assert_eq!(input.selected_text(), "한글 text");
+            native_key(&mut cx, &mut input, KeyCode::ArrowLeft, KeyModifiers::default(), apple);
+            assert_eq!(input.cursor().index, "first\n".len());
+            let document = KeyModifiers { logo: apple, control: !apple, ..Default::default() };
+            native_key(&mut cx, &mut input, if apple { KeyCode::ArrowDown } else { KeyCode::End }, document, apple);
+            assert_eq!(input.cursor().index, input.text.len());
+            native_key(&mut cx, &mut input, if apple { KeyCode::ArrowUp } else { KeyCode::Home },
+                KeyModifiers { shift: true, ..document }, apple);
+            assert_eq!(input.selected_text(), "first\n한글 text\nlast");
+        }
+        let (mut cx, mut input) = editor();
+        input.set_text(&mut cx, "first\n한글 text\nlast");
+        input.set_cursor(&mut cx, Cursor { index: "first\n한글".len(), prefer_next_row: false }, false);
+        let command = KeyModifiers { logo: true, ..Default::default() };
+        native_key(&mut cx, &mut input, KeyCode::Backspace, command, true);
+        assert_eq!(input.text, "first\n text\nlast");
+        native_key(&mut cx, &mut input, KeyCode::Delete, command, true);
+        assert_eq!(input.text, "first\n\nlast");
+        assert!(input.undo(&mut cx));
+        assert_eq!(input.text, "first\n text\nlast");
+        assert!(input.undo(&mut cx));
+        assert_eq!(input.text, "first\n한글 text\nlast");
+    }
+
+    #[test]
+    fn native_edit_keys_preserve_ime_readonly_password_and_reserved_chords() {
+        let (mut cx, mut input) = editor();
+        let draft = "한글 secret";
+        let ctrl = KeyModifiers { control: true, ..Default::default() };
+        input.set_text(&mut cx, draft);
+        input.set_cursor(&mut cx, Cursor { index: draft.len(), prefer_next_row: false }, false);
+        for apple in [false, true] {
+            for modifiers in [
+                KeyModifiers { control: true, alt: true, ..Default::default() },
+                KeyModifiers { control: true, logo: true, ..Default::default() },
+            ] {
+                for key in [KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::Home, KeyCode::Backspace, KeyCode::Delete] {
+                    native_key(&mut cx, &mut input, key, modifiers, apple);
+                    assert_eq!((input.text.as_str(), input.cursor().index), (draft, draft.len()));
+                }
+            }
+        }
+        input.ime_composing = true;
+        native_key(&mut cx, &mut input, KeyCode::ArrowLeft, ctrl, false);
+        native_key(&mut cx, &mut input, KeyCode::Backspace, ctrl, false);
+        assert_eq!((input.text.as_str(), input.cursor().index), (draft, draft.len()));
+        input.ime_composing = false;
+        input.set_is_read_only(&mut cx, true);
+        native_key(&mut cx, &mut input, KeyCode::Backspace, ctrl, false);
+        assert_eq!(input.text, draft);
+        native_key(&mut cx, &mut input, KeyCode::ArrowLeft, ctrl, false);
+        assert_eq!(input.cursor().index, "한글 ".len());
+        input.set_is_read_only(&mut cx, false);
+        input.set_is_password(&mut cx, true);
+        input.set_cursor(&mut cx, Cursor { index: draft.len(), prefer_next_row: false }, false);
+        native_key(&mut cx, &mut input, KeyCode::ArrowLeft, KeyModifiers { shift: true, ..ctrl }, false);
+        assert_eq!(input.selected_text(), draft);
+        assert!(!input.text_action_capabilities().copy);
+        native_key(&mut cx, &mut input, KeyCode::Backspace, ctrl, false);
+        assert_eq!(input.text, "");
+        assert!(input.undo(&mut cx));
+        assert_eq!(input.text, draft);
+    }
+
+    #[test]
+    fn native_word_delete_preserves_crlf_graphemes() {
+        let (mut cx, mut input) = editor();
+        input.set_text(&mut cx, "한글\r\n👩‍💻");
+        let ctrl = KeyModifiers { control: true, ..Default::default() };
+        native_key(&mut cx, &mut input, KeyCode::Delete, ctrl, false);
+        assert_eq!(input.text, "\r\n👩‍💻");
+        native_key(&mut cx, &mut input, KeyCode::Delete, ctrl, false);
+        assert_eq!(input.text, "👩‍💻");
+        assert!(input.undo(&mut cx));
+        assert_eq!(input.text, "\r\n👩‍💻");
     }
 }

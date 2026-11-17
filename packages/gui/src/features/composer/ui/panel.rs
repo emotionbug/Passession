@@ -817,7 +817,10 @@ impl ComposerPanel {
                 KeyCode::ReturnKey | KeyCode::NumpadEnter => Some(NavKey::Enter),
                 _ => None,
             };
-            if let Some(nav) = nav.filter(|_| !ke.modifiers.shift) {
+            if let Some(nav) = nav.filter(|_| {
+                let m = ke.modifiers;
+                !m.shift && !m.alt && !m.control && !m.logo
+            }) {
                 match self.ctl().autocomplete.handle_key(nav, ke.is_repeat) {
                     AutocompleteKey::Ignored => {}
                     AutocompleteKey::Moved | AutocompleteKey::Escape => {

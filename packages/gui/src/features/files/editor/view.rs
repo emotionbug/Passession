@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use makepad_widgets::makepad_draw::text::layouter::LaidoutText;
+use makepad_widgets::text_input::{TextInputKeyCommand, TextInputMotion};
 use makepad_widgets::*;
 
 use crate::common::paint::Font;
@@ -1331,116 +1332,72 @@ impl SourceEditor {
     fn handle_key(&mut self, cx: &mut Cx, kit: &mut Kit, look: &EditorLook, ke: &KeyEvent) {
         let m = ke.modifiers;
         let primary = m.is_primary();
-        let word = if cfg!(target_vendor = "apple") {
-            m.alt
-        } else {
-            m.control
-        };
-        let line_jump = cfg!(target_vendor = "apple") && m.logo;
         let extend = m.shift;
-        let head = self.buffer.selection.head;
         let editable = !self.read_only;
         let mut keep_preferred = false;
-        match ke.key_code {
-            KeyCode::ArrowLeft => {
-                let sel = self.buffer.selection;
-                let target = if !extend && !sel.is_empty() && !word && !line_jump {
-                    sel.start()
-                } else if line_jump {
-                    self.buffer.line_start(self.buffer.line_of(head))
-                } else if word {
-                    self.buffer.word_left(head)
-                } else {
-                    self.buffer.prev(head)
-                };
-                self.buffer.move_head(target, extend);
-            }
-            KeyCode::ArrowRight => {
-                let sel = self.buffer.selection;
-                let target = if !extend && !sel.is_empty() && !word && !line_jump {
-                    sel.end()
-                } else if line_jump {
-                    self.buffer.line_end(self.buffer.line_of(head))
-                } else if word {
-                    self.buffer.word_right(head)
-                } else {
-                    self.buffer.next(head)
-                };
-                self.buffer.move_head(target, extend);
-            }
-            KeyCode::ArrowUp => {
-                if line_jump {
-                    self.buffer.move_head(0, extend);
-                } else {
-                    self.row_move(cx, kit, look, -1, extend);
-                    keep_preferred = true;
-                }
-            }
-            KeyCode::ArrowDown => {
-                if line_jump {
-                    let len = self.buffer.len();
-                    self.buffer.move_head(len, extend);
-                } else {
-                    self.row_move(cx, kit, look, 1, extend);
-                    keep_preferred = true;
-                }
-            }
-            KeyCode::Home => {
-                let target = if primary {
-                    0
-                } else {
-                    self.buffer.line_start(self.buffer.line_of(head))
-                };
-                self.buffer.move_head(target, extend);
-            }
-            KeyCode::End => {
-                let target = if primary {
-                    self.buffer.len()
-                } else {
-                    self.buffer.line_end(self.buffer.line_of(head))
-                };
-                self.buffer.move_head(target, extend);
-            }
-            KeyCode::PageUp | KeyCode::PageDown => {
-                let rows = (self.content_rect.size.y / self.line_height(look))
-                    .floor()
-                    .max(1.0) as isize;
-                let rows = if ke.key_code == KeyCode::PageUp {
-                    -rows
-                } else {
-                    rows
-                };
-                self.scroll_by(look, dvec2(0.0, rows as f64 * self.line_height(look)));
-                self.row_move(cx, kit, look, rows, extend);
-                keep_preferred = true;
-            }
-            KeyCode::KeyA if primary => {
-                let len = self.buffer.len();
-                self.buffer.set_selection(Selection {
-                    anchor: 0,
-                    head: len,
-                });
+        let command = TextInputKeyCommand::resolve(ke.key_code, m, cfg!(target_vendor = "apple"));
+        if let Some(command) = command {
+            if self.buffer.is_composing() {
                 return;
             }
-            KeyCode::KeyZ if primary && editable => {
-                if m.shift {
-                    self.buffer.redo();
-                } else {
-                    self.buffer.undo();
+            match command {
+                TextInputKeyCommand::Move(TextInputMotion::Up | TextInputMotion::Down) => {
+                    self.row_move(
+                        cx,
+                        kit,
+                        look,
+                        if ke.key_code == KeyCode::ArrowUp {
+                            -1
+                        } else {
+                            1
+                        },
+                        extend,
+                    );
+                    keep_preferred = true;
                 }
+                _ => self.buffer.handle_edit_key(command, extend, editable),
             }
-            KeyCode::KeyY if primary && editable && !cfg!(target_vendor = "apple") => {
-                self.buffer.redo();
+        } else {
+            match ke.key_code {
+                KeyCode::PageUp | KeyCode::PageDown if !m.alt && !m.control && !m.logo => {
+                    let rows = (self.content_rect.size.y / self.line_height(look))
+                        .floor()
+                        .max(1.0) as isize;
+                    let rows = if ke.key_code == KeyCode::PageUp {
+                        -rows
+                    } else {
+                        rows
+                    };
+                    self.scroll_by(look, dvec2(0.0, rows as f64 * self.line_height(look)));
+                    self.row_move(cx, kit, look, rows, extend);
+                    keep_preferred = true;
+                }
+                KeyCode::KeyA if primary => {
+                    let len = self.buffer.len();
+                    self.buffer.set_selection(Selection {
+                        anchor: 0,
+                        head: len,
+                    });
+                    return;
+                }
+                KeyCode::KeyZ if primary && editable => {
+                    if m.shift {
+                        self.buffer.redo();
+                    } else {
+                        self.buffer.undo();
+                    }
+                }
+                KeyCode::KeyY if primary && editable && !cfg!(target_vendor = "apple") => {
+                    self.buffer.redo();
+                }
+                KeyCode::ReturnKey | KeyCode::NumpadEnter if editable && !primary => {
+                    self.buffer.insert("\n", EditKind::Other);
+                }
+                KeyCode::Tab if editable && !primary && !m.shift => {
+                    self.buffer.insert("\t", EditKind::Insert);
+                }
+                _ => return,
             }
-            KeyCode::Backspace if editable => self.buffer.backspace(word),
-            KeyCode::Delete if editable => self.buffer.delete(word),
-            KeyCode::ReturnKey | KeyCode::NumpadEnter if editable && !primary => {
-                self.buffer.insert("\n", EditKind::Other);
-            }
-            KeyCode::Tab if editable && !primary && !m.shift => {
-                self.buffer.insert("\t", EditKind::Insert);
-            }
-            _ => return,
         }
         if !keep_preferred {
             self.preferred_x = None;

@@ -121,6 +121,16 @@ last viewport before resolving rows. Input events may arrive between an edit
 (including paste/undo/redo) and its paint; Arrow Down previously unwrapped the
 missing layout, while Arrow Up discarded the movement.
 
+`TextInputKeyCommand` resolves exact native modifiers once for TextInput and the
+GUI's manual source editors. Word targets preserve Unicode graphemes; movement,
+selection and deletion use the existing history and composition ownership.
+See `docs/native-text-selection.md` for the OS key contract.
+
+Wrapped layouts have zero horizontal scroll extent. The layouter intentionally
+allows trailing breakable spaces beyond the wrap width; treating their advance as
+horizontal overflow shifted all painted row starts under the left clip. Unwrapped
+horizontal and multiline vertical scrolling retain their existing bounds.
+
 A focused editor also reveals its existing caret when its viewport changes,
 including keyboard-height changes without a width change. This updates scroll
 only, not text, selection, composition or undo groups. An unchanged viewport

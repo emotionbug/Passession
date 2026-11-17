@@ -3,6 +3,7 @@
 //! inset, optional trailing status text.
 
 use makepad_widgets::makepad_draw::event::DigitId;
+use makepad_widgets::text_input::TextInputKeyCommand;
 use makepad_widgets::*;
 
 use crate::common::paint::Font;
@@ -488,49 +489,26 @@ impl TextField {
                     self.cancel_selection_handles(cx);
                 }
                 let m = ke.modifiers;
-                let word = if cfg!(target_vendor = "apple") {
-                    m.alt
+                let command =
+                    TextInputKeyCommand::resolve(ke.key_code, m, cfg!(target_vendor = "apple"));
+                if let Some(command) = command {
+                    self.buffer.handle_edit_key(command, m.shift, true);
                 } else {
-                    m.control
-                };
-                let head = self.buffer.selection.head;
-                match ke.key_code {
-                    KeyCode::ReturnKey | KeyCode::NumpadEnter => {
-                        return FieldEvent::Submitted { shift: m.shift };
-                    }
-                    KeyCode::Escape => return FieldEvent::Escaped,
-                    KeyCode::ArrowLeft => {
-                        let target = if word {
-                            self.buffer.word_left(head)
-                        } else {
-                            self.buffer.prev(head)
-                        };
-                        self.buffer.move_head(target, m.shift);
-                    }
-                    KeyCode::ArrowRight => {
-                        let target = if word {
-                            self.buffer.word_right(head)
-                        } else {
-                            self.buffer.next(head)
-                        };
-                        self.buffer.move_head(target, m.shift);
-                    }
-                    KeyCode::Home => self.buffer.move_head(0, m.shift),
-                    KeyCode::End => {
-                        let len = self.buffer.len();
-                        self.buffer.move_head(len, m.shift);
-                    }
-                    KeyCode::Backspace => self.buffer.backspace(word),
-                    KeyCode::Delete => self.buffer.delete(word),
-                    KeyCode::KeyA if m.is_primary() => self.select_all(),
-                    KeyCode::KeyZ if m.is_primary() => {
-                        if m.shift {
-                            self.buffer.redo();
-                        } else {
-                            self.buffer.undo();
+                    match ke.key_code {
+                        KeyCode::ReturnKey | KeyCode::NumpadEnter => {
+                            return FieldEvent::Submitted { shift: m.shift };
                         }
+                        KeyCode::Escape => return FieldEvent::Escaped,
+                        KeyCode::KeyA if m.is_primary() => self.select_all(),
+                        KeyCode::KeyZ if m.is_primary() => {
+                            if m.shift {
+                                self.buffer.redo();
+                            } else {
+                                self.buffer.undo();
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             Hit::TextIme(edit) => self.buffer.apply_ime(edit, true),

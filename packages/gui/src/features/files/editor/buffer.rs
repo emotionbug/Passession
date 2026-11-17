@@ -4,6 +4,7 @@
 //! char boundaries.
 
 use makepad_widgets::event::TextImeEvent;
+use makepad_widgets::text_input::{TextInputKeyCommand, TextInputMotion, text_input_word_boundary};
 use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -326,32 +327,49 @@ impl TextBuffer {
         }
     }
 
-    pub fn backspace(&mut self, word: bool) {
-        let (start, end) = (self.selection.start(), self.selection.end());
-        if start != end {
-            self.replace(start, end, "", EditKind::Backspace);
-            return;
-        }
-        let from = if word {
-            self.word_left(start)
-        } else {
-            prev_grapheme(&self.text, start)
-        };
-        self.replace(from, start, "", EditKind::Backspace);
+    pub fn is_composing(&self) -> bool {
+        self.ime_composing
     }
 
-    pub fn delete(&mut self, word: bool) {
-        let (start, end) = (self.selection.start(), self.selection.end());
-        if start != end {
-            self.replace(start, end, "", EditKind::Delete);
+    /// Apply source-indexed commands; the view owns vertical visual-row movement.
+    pub fn handle_edit_key(&mut self, command: TextInputKeyCommand, extend: bool, editable: bool) {
+        use TextInputMotion::*;
+        if self.ime_composing {
             return;
         }
-        let to = if word {
-            self.word_right(end)
-        } else {
-            next_grapheme(&self.text, end)
+        let (motion, delete) = match command {
+            TextInputKeyCommand::Move(motion) => (motion, false),
+            TextInputKeyCommand::Delete(motion) if editable => (motion, true),
+            _ => return,
         };
-        self.replace(end, to, "", EditKind::Delete);
+        let head = self.selection.head;
+        let target = match motion {
+            Left if !delete && !extend && !self.selection.is_empty() => self.selection.start(),
+            Right if !delete && !extend && !self.selection.is_empty() => self.selection.end(),
+            Left => self.prev(head),
+            Right => self.next(head),
+            WordLeft | WordRight | NextWord => text_input_word_boundary(&self.text, head, motion),
+            LineStart => self.line_start(self.line_of(head)),
+            LineEnd => self.line_end(self.line_of(head)),
+            DocumentStart => 0,
+            DocumentEnd => self.len(),
+            Up | Down => return,
+        };
+        if !delete {
+            self.move_head(target, extend);
+            return;
+        }
+        let (start, end) = if self.selection.is_empty() {
+            (head.min(target), head.max(target))
+        } else {
+            (self.selection.start(), self.selection.end())
+        };
+        let kind = match motion {
+            Left => EditKind::Backspace,
+            Right => EditKind::Delete,
+            _ => EditKind::Other,
+        };
+        self.replace(start, end, "", kind);
     }
 
     pub fn undo(&mut self) -> bool {
@@ -396,37 +414,6 @@ impl TextBuffer {
 
     pub fn next(&self, offset: usize) -> usize {
         next_grapheme(&self.text, offset)
-    }
-
-    /// The start of the word before `offset` (skipping whitespace), stopping at line starts.
-    pub fn word_left(&self, offset: usize) -> usize {
-        let line = self.line_of(offset);
-        let start = self.line_start(line);
-        if offset == start {
-            return prev_grapheme(&self.text, offset);
-        }
-        let mut result = start;
-        for (index, word) in self.text[start..offset].split_word_bound_indices() {
-            if !word.chars().all(char::is_whitespace) {
-                result = start + index;
-            }
-        }
-        result
-    }
-
-    /// The end of the word after `offset`, stopping at line ends.
-    pub fn word_right(&self, offset: usize) -> usize {
-        let line = self.line_of(offset);
-        let end = self.line_end(line);
-        if offset >= end {
-            return next_grapheme(&self.text, offset);
-        }
-        for (index, word) in self.text[offset..end].split_word_bound_indices() {
-            if !word.chars().all(char::is_whitespace) {
-                return offset + index + word.len();
-            }
-        }
-        end
     }
 
     /// The word around `offset` (double click).
@@ -701,7 +688,11 @@ mod tests {
         for c in ["a", "b", "c"] {
             buffer.insert(c, EditKind::Insert);
         }
-        buffer.backspace(false);
+        buffer.handle_edit_key(
+            TextInputKeyCommand::Delete(TextInputMotion::Left),
+            false,
+            true,
+        );
         assert_eq!(buffer.text(), "ab");
         assert!(buffer.undo());
         assert_eq!(buffer.text(), "abc");
@@ -717,5 +708,85 @@ mod tests {
         assert_eq!(find_matches("Foo foo", "foo", true), vec![4]);
         assert_eq!(find_matches("aaaa", "aa", true), vec![0, 2]);
         assert_eq!(match_len("ÉCOLE", 0, "éc", false), "ÉC".len());
+    }
+
+    #[test]
+    fn native_edit_keys_preserve_source_selection_history_and_ime() {
+        use makepad_widgets::{KeyCode, KeyModifiers};
+        for apple in [false, true] {
+            let word = KeyModifiers {
+                alt: apple,
+                control: !apple,
+                ..Default::default()
+            };
+            let key = |buffer: &mut TextBuffer, code, modifiers: KeyModifiers, editable| {
+                if let Some(command) = TextInputKeyCommand::resolve(code, modifiers, apple) {
+                    buffer.handle_edit_key(command, modifiers.shift, editable);
+                }
+            };
+            let mut buffer = TextBuffer::new("한글 👩‍💻\nlast".into());
+            buffer.move_head("한글 👩‍💻".len(), false);
+            key(
+                &mut buffer,
+                KeyCode::ArrowLeft,
+                KeyModifiers {
+                    shift: true,
+                    ..word
+                },
+                true,
+            );
+            assert_eq!(buffer.selected_text(), "👩‍💻");
+            key(&mut buffer, KeyCode::Backspace, word, false);
+            assert_eq!(buffer.text(), "한글 👩‍💻\nlast");
+            key(&mut buffer, KeyCode::Backspace, word, true);
+            assert_eq!(buffer.text(), "한글 \nlast");
+            assert!(buffer.undo());
+            assert_eq!(buffer.selected_text(), "👩‍💻");
+            key(
+                &mut buffer,
+                KeyCode::ArrowRight,
+                KeyModifiers::default(),
+                true,
+            );
+            assert_eq!(buffer.selection, Selection::caret("한글 👩‍💻".len()));
+            key(
+                &mut buffer,
+                KeyCode::ArrowLeft,
+                KeyModifiers {
+                    control: true,
+                    alt: true,
+                    ..Default::default()
+                },
+                true,
+            );
+            assert_eq!(buffer.selection, Selection::caret("한글 👩‍💻".len()));
+            buffer.ime_composing = true;
+            key(&mut buffer, KeyCode::Backspace, word, true);
+            assert_eq!(buffer.text(), "한글 👩‍💻\nlast");
+            buffer.ime_composing = false;
+            key(
+                &mut buffer,
+                if apple {
+                    KeyCode::ArrowLeft
+                } else {
+                    KeyCode::Home
+                },
+                KeyModifiers {
+                    logo: apple,
+                    ..Default::default()
+                },
+                true,
+            );
+            assert_eq!(buffer.selection, Selection::caret(0));
+            key(&mut buffer, KeyCode::ArrowRight, word, true);
+            assert_eq!(
+                buffer.selection.head,
+                if apple {
+                    "한글".len()
+                } else {
+                    "한글 ".len()
+                }
+            );
+        }
     }
 }
