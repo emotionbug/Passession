@@ -140,6 +140,14 @@ impl ComposerPanel {
             .outline(cx, r, fill, look.p.border_accent, 1.0, 8.0);
     }
 
+    /// Closes a non-modal popover drawn over `r`: its hit area, declared a floating surface so
+    /// nothing it covers takes the pointer there (`overlay::float`).
+    fn popover_hit(&mut self, cx: &mut Cx2d, r: Rect) {
+        self.overlay_bg.draw_abs(cx, r);
+        crate::common::overlay::float(self.overlay_bg.area());
+        self.st.overlay_rect = Some(r);
+    }
+
     /// components/ui/autocomplete-popover.tsx: 12px above the input card, as wide as it,
     /// ≤220 tall, best match nearest the input; a detail card above for a described command.
     fn draw_suggestions(&mut self, cx: &mut Cx2d, look: &Look) {
@@ -183,8 +191,7 @@ impl ComposerPanel {
                 muted,
                 &message,
             );
-            self.overlay_bg.draw_abs(cx, r);
-            self.st.overlay_rect = Some(r);
+            self.popover_hit(cx, r);
             return;
         }
         let describe = |option: &crate::features::composer::autocomplete::AutocompleteOption| {
@@ -326,8 +333,7 @@ impl ComposerPanel {
             self.st.hits.push(visible, item);
         }
         cx.end_turtle();
-        self.overlay_bg.draw_abs(cx, whole);
-        self.st.overlay_rect = Some(whole);
+        self.popover_hit(cx, whole);
     }
 
     fn draw_tooltip(&mut self, cx: &mut Cx2d, look: &Look, text: &str, anchor: Rect) {
@@ -605,8 +611,7 @@ impl ComposerPanel {
             (r.size.y - pad * 2.0).max(0.0),
         );
         self.draw_context_body(cx, look, body, Details::CARD, h - pad * 2.0);
-        self.overlay_bg.draw_abs(cx, r);
-        self.st.overlay_rect = Some(r);
+        self.popover_hit(cx, r);
     }
 
     fn scrim(&mut self, cx: &mut Cx2d, look: &Look, size: DVec2) {

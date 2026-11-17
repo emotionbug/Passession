@@ -200,6 +200,34 @@ their displacement; a stationary hold cancels motion, while a late release
 does not dilute a genuine recent flick with a synthetic zero-velocity sample.
 Reversal and boundary termination discard velocity in the previous direction.
 
+## Wheel under a pointer shield
+
+`ScrollBar::handle_scroll_event` (`src/scroll_bar.rs`) and `TextInput`'s wheel
+handler (`src/text_input.rs`) read `Event::Scroll` positions directly instead of
+through `hits`, so the platform's pointer shields (see the adjacent
+makepad-platform `VENDORED.md`) did not reach them: a wheel over a popover
+scrolled the page or field underneath. Both now ask `Cx::pointer_shielded` for
+their own area first. `PortalList` scrolls through `hits` and needed no change.
+
+## Pointer shapes
+
+`TextInput` requests `MouseCursor::Text` on hover-in. `RadioButton` no longer
+resets the cursor on hover-out, which could overwrite the newly hovered
+control's request. Shared shape resolution lives in makepad-platform.
+
+## Rows that fit the viewport
+
+`PortalList` computes `fits_viewport` only when every row in its range was
+laid out and their total size fits within half a pixel. A partially drawn long
+list during pull-down does not count as fitting. Fitting rows rest at their
+configured top or bottom edge, report the end reached, draw no scrollbar and
+leave wheel and touch movement to an enclosing scroller. They neither start
+nor continue pull-down or fling motion. Previously a bottom-aligned short
+list's positive offset became an 80px drag jump and a bounce that never settled.
+The `scroll_anchor_tests` cover both alignment edges and incomplete layouts;
+`touch_scroll_tests` cover drag and release when content is shorter than its
+viewport.
+
 ## Final-position list painting
 
 `PortalList::begin_measurement` opts into an exact extent-only pass, followed by

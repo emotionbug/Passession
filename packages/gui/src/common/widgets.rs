@@ -244,6 +244,8 @@ live_design! {
     use crate::theme::*;
     use crate::common::paint::PaseoPainter;
 
+    pub PointerShield = {{PointerShield}} {}
+
     pub SurfaceBase = {{Surface}} {}
     pub Surface = <SurfaceBase> {
         show_bg: true,
@@ -477,6 +479,38 @@ pub enum SurfaceAction {
     SecondaryClicked(DVec2),
     HoverChanged(bool),
     None,
+}
+
+/// A pane-local cover. Its own draw list keeps the covered siblings outside the
+/// shared pointer shield while controls inside it keep receiving input.
+#[derive(Live, LiveHook, Widget)]
+pub struct PointerShield {
+    #[deref]
+    view: View,
+    #[rust(DrawList2d::new(cx))]
+    draw_list: DrawList2d,
+    #[rust]
+    draw_state: DrawStateWrap<()>,
+}
+
+impl Widget for PointerShield {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if self.draw_state.begin(cx, ()) {
+            // Clear even when hidden: an old cover area must not keep shielding.
+            self.draw_list.begin_always(cx);
+        }
+        self.view.draw_walk(cx, scope, walk)?;
+        if self.view.visible {
+            super::overlay::float(self.view.area());
+        }
+        self.draw_list.end(cx);
+        self.draw_state.end();
+        DrawStep::done()
+    }
 }
 
 /// View with a palette-driven background/border and optional hover/press highlight.

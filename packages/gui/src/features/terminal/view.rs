@@ -781,6 +781,7 @@ impl Widget for WaTerminalView {
         if let Event::Scroll(scroll) = event
             && !scroll.handled_y.get()
             && area.clipped_rect(cx).contains(scroll.abs)
+            && !cx.pointer_shielded(area, scroll.abs)
         {
             // The wheel over a full-screen program scrolls the program, not the scrollback.
             let route = self.wheel_route();

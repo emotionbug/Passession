@@ -8,7 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use makepad_widgets::{DVec2, Rect};
+use makepad_widgets::{Area, Cx, DVec2, Rect};
 use serde_json::Value;
 
 use crate::common::UiContext;
@@ -294,6 +294,7 @@ thread_local! {
     static TOOLTIPS: RefCell<Vec<TooltipRequest>> = const { RefCell::new(Vec::new()) };
     static ANSWERS: RefCell<Vec<(String, u64, Value)>> = const { RefCell::new(Vec::new()) };
     static WINDOW_MODALS: RefCell<Vec<WindowModalOwner>> = const { RefCell::new(Vec::new()) };
+    static FLOATS: RefCell<Vec<Float>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Full-window modal slot (Flutter `showModalBottomSheet` covering the whole window, shell
@@ -359,6 +360,121 @@ pub fn window_modal_accepts_owner(window: &str, owner: u64) -> bool {
             .rev()
             .find(|modal| modal.window == window)
             .is_none_or(|modal| modal.widget == owner)
+    })
+}
+
+/// A surface drawn above content: a popover, or the sheet holding a window's modal slot.
+struct Float {
+    area: Area,
+    modal: Option<u64>,
+}
+
+/// Declares a floating surface: a popover, hover card or panel that a feature paints above
+/// content its owner is not dispatched before (the composer's suggestions over the message
+/// list). Call it each time the surface is drawn, with the hit area that covers it.
+///
+/// While the surface stays drawn, a pointer inside `area` reaches only that area and what is
+/// drawn in its draw list: the shell declares the window's floating surfaces as pointer
+/// shields before it dispatches panels and chrome ([`shield_content`]). A press, hover, wheel
+/// or touch scroll there never reaches a widget underneath, including one that hits with
+/// capture overload. Handlers that test raw event positions ask `Cx::pointer_shielded`.
+///
+/// Nothing is undone by hand: a surface redrawn without the area, detached with its layer or
+/// dropped stops shielding.
+pub fn float(area: Area) {
+    FLOATS.with(|floats| {
+        let mut floats = floats.borrow_mut();
+        if !floats.iter().any(|float| float.area == area) {
+            floats.push(Float { area, modal: None });
+        }
+    });
+}
+
+/// Declares the backdrop of a full-window sheet that holds the modal slot as `owner`
+/// ([`set_window_modal`]). Call it each time the open sheet is drawn.
+///
+/// While that sheet is the top one of its window, the pointer reaches only what is drawn in
+/// the backdrop's draw list: the page, panes and popovers behind it get no press, hover or
+/// wheel, also where the sheet has no use for them.
+pub fn modal_float(owner: u64, area: Area) {
+    FLOATS.with(|floats| {
+        let mut floats = floats.borrow_mut();
+        floats.retain(|float| float.modal != Some(owner));
+        floats.push(Float {
+            area,
+            modal: Some(owner),
+        });
+    });
+}
+
+/// Shell, around the dispatch of `window`, which `anchor` is drawn in. While `content_on_top`,
+/// the window's drawn floating surfaces shield the pointer for the panels and chrome
+/// dispatched next: the top modal sheet and cards inside it, or the page's popovers otherwise.
+/// Without it (a shell layer owns the input, or the dispatch is over) nothing does.
+pub(crate) fn shield_content(cx: &mut Cx, window: &str, anchor: Area, content_on_top: bool) {
+    let shields = if content_on_top {
+        let top = WINDOW_MODALS.with(|modals| {
+            let modals = modals.borrow();
+            modals
+                .iter()
+                .rev()
+                .find(|modal| modal.window == window)
+                .map(|modal| modal.widget)
+        });
+        FLOATS.with(|floats| {
+            let mut floats = floats.borrow_mut();
+            floats.retain(|float| float_drawn(cx, float.area));
+            let pass = float_pass(cx, anchor);
+            let in_window = |float: &&Float| pass.is_some() && float_pass(cx, float.area) == pass;
+            if let Some(owner) = top {
+                // Keep pane-local cards inside the top modal above its backdrop. Popovers
+                // left painted in the page behind it must not punch holes in the modal.
+                let backdrop = floats
+                    .iter()
+                    .filter(in_window)
+                    .find(|float| float.modal == Some(owner))
+                    .map(|float| float.area);
+                backdrop
+                    .into_iter()
+                    .chain(floats.iter().filter(in_window).filter_map(|float| {
+                        (float.modal.is_none()
+                            && backdrop.is_some_and(|area| cx.area_drawn_within(float.area, area)))
+                        .then_some(float.area)
+                    }))
+                    .collect()
+            } else {
+                floats
+                    .iter()
+                    .filter(in_window)
+                    .filter(|float| float.modal.is_none())
+                    .map(|float| float.area)
+                    .collect()
+            }
+        })
+    } else {
+        Vec::new()
+    };
+    cx.set_pointer_shields(shields);
+}
+
+fn float_pass(cx: &Cx, area: Area) -> Option<makepad_widgets::PassId> {
+    cx.draw_lists.checked_index(area.draw_list_id()?)?.pass_id
+}
+
+/// The area is current, and its draw list was painted with the list it nests in: the rule by
+/// which Makepad's overlay keeps or prunes a retained child, so a surface shields exactly
+/// while it is shown.
+fn float_drawn(cx: &Cx, area: Area) -> bool {
+    let list = area
+        .draw_list_id()
+        .filter(|_| area.is_valid(cx))
+        .and_then(|id| cx.draw_lists.checked_index(id));
+    list.is_some_and(|list| {
+        list.codeflow_parent_id.is_none_or(|parent| {
+            cx.draw_lists
+                .checked_index(parent)
+                .is_some_and(|parent| parent.redraw_id == list.redraw_id)
+        })
     })
 }
 
@@ -777,6 +893,69 @@ pub fn result_of(command: &crate::common::UiCommand) -> Option<(u64, &Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modal_keeps_nested_cards_shielded_without_reviving_the_page_popover() {
+        use makepad_widgets::{CxRectArea, LiveNew, Pass, RectArea};
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let pass = Pass::new(&mut cx);
+        let lists: Vec<_> = (0..5).map(|_| cx.draw_lists.alloc()).collect();
+        let mut areas = Vec::new();
+        for (index, (x, width)) in [
+            (0.0, 100.0),
+            (0.0, 100.0),
+            (0.0, 100.0),
+            (40.0, 20.0),
+            (45.0, 5.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let list = &mut cx.draw_lists[lists[index].id()];
+            list.pass_id = Some(pass.pass_id());
+            list.rect_areas.push(CxRectArea {
+                rect: Rect {
+                    pos: DVec2 { x, y: 0.0 },
+                    size: DVec2 { x: width, y: 100.0 },
+                },
+                draw_clip: (DVec2::default(), DVec2 { x: 100.0, y: 100.0 }),
+            });
+            areas.push(Area::Rect(RectArea {
+                draw_list_id: lists[index].id(),
+                rect_id: 0,
+                redraw_id: list.redraw_id,
+            }));
+        }
+        let [page, behind, modal, card, control] = areas[..] else {
+            unreachable!()
+        };
+        cx.draw_lists[lists[3].id()].codeflow_parent_id = Some(lists[2].id());
+        cx.draw_lists[lists[4].id()].codeflow_parent_id = Some(lists[3].id());
+        WINDOW_MODALS.with(|modals| {
+            *modals.borrow_mut() = vec![WindowModalOwner {
+                window: "main".into(),
+                widget: 1,
+                tab: Some("tab".into()),
+            }];
+        });
+        FLOATS.with(|floats| floats.borrow_mut().clear());
+        float(behind);
+        float(card);
+        modal_float(1, modal);
+        shield_content(&mut cx, "main", page, true);
+
+        let outside_card = DVec2 { x: 10.0, y: 5.0 };
+        assert!(cx.pointer_shielded(page, outside_card));
+        assert!(!cx.pointer_shielded(modal, outside_card));
+        let inside_card = DVec2 { x: 47.0, y: 5.0 };
+        assert!(cx.pointer_shielded(modal, inside_card));
+        assert!(!cx.pointer_shielded(control, inside_card));
+
+        shield_content(&mut cx, "main", page, false);
+        release_window_modal("main", 1);
+        FLOATS.with(|floats| floats.borrow_mut().clear());
+    }
 
     #[test]
     fn backdrop_requires_same_target_valid_release_and_cannot_replay() {

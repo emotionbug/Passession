@@ -494,9 +494,9 @@ pub fn tick(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, ui: &mut UiConte
             page.reset();
         }
     }
-    // A shell modal (menu, dialog, sheet) above the page owns pointer and keyboard input; the
-    // page's timers and fetches keep running.
-    let covered = shell.data.overlays.is_modal() && is_input(event);
+    // A modal layer above the page owns pointer and keyboard input; the page's timers and
+    // fetches keep running.
+    let covered = shell.pages_covered() && is_input(event);
     match if covered {
         None
     } else {

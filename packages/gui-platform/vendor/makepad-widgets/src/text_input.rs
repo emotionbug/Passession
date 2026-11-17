@@ -1536,6 +1536,7 @@ impl TextInput {
         if let Event::Scroll(scroll) = event {
             if !scroll.handled_y.get()
                 && self.draw_bg.area().clipped_rect(cx).contains(scroll.abs)
+                && !cx.pointer_shielded(self.draw_bg.area(), scroll.abs)
             {
                 self.touch_scroll.reset();
                 if self.scroll_text(cx, scroll.scroll.y) {
@@ -1755,9 +1756,9 @@ impl Widget for TextInput {
         let touch_focus = self.touch_focus_hit(&hit);
         match hit {
             Hit::FingerHoverIn(_) => {
-                self.animator_play(cx, id!(hover.on));
                 // Paseo: upstream left the arrow over editable text.
                 cx.set_cursor(MouseCursor::Text);
+                self.animator_play(cx, id!(hover.on));
             }
             Hit::FingerHoverOut(_) => {
                 self.animator_play(cx, id!(hover.off));

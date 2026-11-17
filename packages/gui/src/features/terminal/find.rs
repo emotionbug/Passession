@@ -23,21 +23,24 @@ live_design! {
     // 4px gap, border, 8px radius; the panel narrows it to the pane.
     pub WaPaneFind = <View> {
         width: Fill, height: Fit, align: { x: 1.0 }, padding: 8., visible: false
-        find_bar = <Surface> {
-            width: 340., height: Fit, flow: Right, spacing: 4., padding: 6.
-            align: { y: 0.5 }
-            role: Surface1, border_role: Border, radius: 8.
-            field = <Surface> {
-                width: Fill, height: 28., flow: Right, spacing: 8.
-                padding: { left: 8., right: 8. }
+        find_bar = <PointerShield> {
+            width: 340., height: Fit
+            content = <Surface> {
+                width: Fill, height: Fit, flow: Right, spacing: 4., padding: 6.
                 align: { y: 0.5 }
-                role: Surface2, border_role: BorderAccent, radius: 6., border_width: 0.
-                query = <WaBareInput> { input = { padding: 0. } }
-                match_status = <View> { width: Fit, height: Fit, text = <WaSmallFit> {} }
+                role: Surface1, border_role: Border, radius: 8.
+                field = <Surface> {
+                    width: Fill, height: 28., flow: Right, spacing: 8.
+                    padding: { left: 8., right: 8. }
+                    align: { y: 0.5 }
+                    role: Surface2, border_role: BorderAccent, radius: 6., border_width: 0.
+                    query = <WaBareInput> { input = { padding: 0. } }
+                    match_status = <View> { width: Fit, height: Fit, text = <WaSmallFit> {} }
+                }
+                find_previous = <WaToolButton> { icon: "arrow-up" }
+                find_next = <WaToolButton> { icon: "arrow-down" }
+                find_close = <WaToolButton> { icon: "x" }
             }
-            find_previous = <WaToolButton> { icon: "arrow-up" }
-            find_next = <WaToolButton> { icon: "arrow-down" }
-            find_close = <WaToolButton> { icon: "x" }
         }
     }
 }

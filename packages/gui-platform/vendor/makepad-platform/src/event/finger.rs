@@ -326,6 +326,9 @@ pub struct CxFingers {
     tap: CxDigitTap,
     hovers: Vec<CxDigitHover>,
     sweep_lock: Option<Area>,
+    /// Areas painted above the content being dispatched, lowest first
+    /// (`Cx::set_pointer_shields`).
+    shields: Vec<Area>,
 }
 
 impl CxFingers {
@@ -371,6 +374,11 @@ impl CxFingers {
         }
         if self.sweep_lock == Some(old_area) {
             self.sweep_lock = Some(new_area);
+        }
+        for shield in &mut self.shields {
+            if *shield == old_area {
+                *shield = new_area;
+            }
         }
     }
     
@@ -806,6 +814,53 @@ impl HitOptions {
     }
 }
 
+impl Cx {
+    /// Declares the areas painted above the content that is dispatched next, lowest
+    /// first; an empty list ends the scope.
+    ///
+    /// Dispatch order is not paint order: a popover's owner can be reached after the
+    /// content the popover covers, and capture overload only adds a second capture, so
+    /// both would act on one press. While a shield is declared, a pointer that starts,
+    /// hovers, sweeps in or scrolls inside the topmost shield under it reaches only that
+    /// area and the areas drawn inside its draw list; `hits` reports nothing to every
+    /// other area, capture overload included. A capture taken outside the shield keeps
+    /// its moves and its release.
+    pub fn set_pointer_shields(&mut self, shields: Vec<Area>) {
+        self.fingers.shields = shields;
+    }
+
+    /// Whether a pointer at `abs` is over a shield that `area` is not part of. `hits`
+    /// applies this itself; handlers that test raw event positions call it.
+    pub fn pointer_shielded(&self, area: Area, abs: DVec2) -> bool {
+        let shield = self.fingers.shields.iter().rev().find(|shield| {
+            shield.is_valid(self) && shield.clipped_rect(self).contains(abs)
+        });
+        shield.is_some_and(|shield| !self.area_drawn_within(area, *shield))
+    }
+
+    /// `area` is `owner`, or is drawn in `owner`'s draw list or one nested in it.
+    pub fn area_drawn_within(&self, area: Area, owner: Area) -> bool {
+        if area == owner {
+            return true;
+        }
+        let (Some(mut list), Some(owner_list)) = (area.draw_list_id(), owner.draw_list_id())
+        else {
+            return false;
+        };
+        // Draw lists nest a few levels; the bound only guards a broken parent chain.
+        for _ in 0..64 {
+            if list == owner_list {
+                return true;
+            }
+            match self.draw_lists.checked_index(list).and_then(|list| list.codeflow_parent_id) {
+                Some(parent) => list = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+}
+
 impl Event{
     pub fn unhandle(&self, cx:&mut Cx, area:&Area){
         match self{
@@ -934,7 +989,7 @@ impl Event {
                 let digit_id = live_id!(mouse).into();
                 
                 let rect = area.clipped_rect(&cx);
-                if hit_test(e.abs, &rect, &options.margin) {
+                if hit_test(e.abs, &rect, &options.margin) && !cx.pointer_shielded(area, e.abs) {
                     let device = DigitDevice::Mouse {
                         button: MouseButton::PRIMARY,
                     };
@@ -976,6 +1031,10 @@ impl Event {
                                 });
                             }
                             
+                            if cx.pointer_shielded(area, t.abs) {
+                                continue;
+                            }
+
                             if !options.capture_overload && !t.handled.get().is_empty() {
                                 continue;
                             }
@@ -1032,8 +1091,10 @@ impl Event {
                             
                             //let handled_area = t.handled.get();
                             if !options.sweep_area.is_empty() {
+                                let shielded = cx.pointer_shielded(area, t.abs);
                                 if let Some(capture) = cx.fingers.find_digit_capture(digit_id) {
                                     if capture.switch_capture.is_none()
+                                        && !shielded
                                         && hit_test(t.abs, &rect, &options.margin)
                                     {
                                         if t.handled.get().is_empty() {
@@ -1127,8 +1188,10 @@ impl Event {
                     };
                     //let handled_area = e.handled.get();
                     if !options.sweep_area.is_empty() {
+                        let shielded = cx.pointer_shielded(area, e.abs);
                         if let Some(capture) = cx.fingers.find_digit_capture(digit_id) {
                             if capture.switch_capture.is_none()
+                                && !shielded
                                 && hit_test(e.abs, &rect, &options.margin) {
                                 if e.handled.get().is_empty() {
                                     e.handled.set(area);
@@ -1209,6 +1272,8 @@ impl Event {
                     };
                     
                     let handled_area = e.handled.get();
+                    let over = hit_test(e.abs, &rect, &options.margin)
+                        && !cx.pointer_shielded(area, e.abs);
                     
                     let fhe = FingerHoverEvent {
                         window_id: e.window_id,
@@ -1222,7 +1287,7 @@ impl Event {
                     
                     if hover_last == area {
                         
-                        if (handled_area.is_empty() || handled_area == area) && hit_test(e.abs, &rect, &options.margin) {
+                        if (handled_area.is_empty() || handled_area == area) && over {
                             e.handled.set(area);
                             cx.fingers.new_hover_area(digit_id, area);
                             return Hit::FingerHoverOver(fhe)
@@ -1232,7 +1297,7 @@ impl Event {
                         }
                     }
                     else {
-                        if (handled_area.is_empty() || handled_area == area) && hit_test(e.abs, &rect, &options.margin) {
+                        if (handled_area.is_empty() || handled_area == area) && over {
                             //let any_captured = cx.fingers.get_digit_for_captured_area(area);
                             cx.fingers.new_hover_area(digit_id, area);
                             e.handled.set(area);
@@ -1279,7 +1344,7 @@ impl Event {
                 }
                 
                 let rect = area.clipped_rect(&cx);
-                if !hit_test(e.abs, &rect, &options.margin) {
+                if !hit_test(e.abs, &rect, &options.margin) || cx.pointer_shielded(area, e.abs) {
                     return Hit::Nothing
                 }
                 
@@ -1512,5 +1577,150 @@ mod paseo_touch_tests {
         assert!(fingers.captures.iter().all(|capture| !release(capture, 0.0).was_tap()));
         fingers.process_touch_update_end(&touches);
         assert!(fingers.captures.is_empty());
+    }
+
+    /// A hit rectangle `x..x + width` on the row `y = 0..10` of `list`.
+    fn rect_area(cx: &mut Cx, list: &crate::draw_list::DrawList, x: f64, width: f64) -> Area {
+        let draw_list = &mut cx.draw_lists[list.id()];
+        draw_list.rect_areas.push(crate::draw_list::CxRectArea {
+            rect: Rect { pos: dvec2(x, 0.0), size: dvec2(width, 10.0) },
+            draw_clip: (dvec2(-1e6, -1e6), dvec2(1e6, 1e6)),
+        });
+        Area::Rect(crate::area::RectArea {
+            draw_list_id: list.id(),
+            rect_id: draw_list.rect_areas.len() - 1,
+            redraw_id: draw_list.redraw_id,
+        })
+    }
+
+    fn touches(uid: u64, x: f64, state: TouchState) -> Event {
+        Event::TouchUpdate(TouchUpdateEvent {
+            time: 0.1, cancelled: false,
+            window_id: crate::window::CxWindowPool::id_zero(),
+            modifiers: KeyModifiers::default(),
+            touches: vec![touch(uid, x, state)],
+        })
+    }
+
+    fn end_touches(cx: &mut Cx, event: &Event) {
+        let Event::TouchUpdate(update) = event else { unreachable!() };
+        cx.fingers.process_touch_update_end(&update.touches);
+    }
+
+    /// Content `0..100`, a popover `40..60` drawn over it in its own list, and a control
+    /// `45..50` drawn in a list nested in the popover's.
+    struct Shielded {
+        cx: Cx,
+        content: Area,
+        popover: Area,
+        nested: Area,
+        _lists: [crate::draw_list::DrawList; 3],
+    }
+
+    fn shielded() -> Shielded {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let lists = [cx.draw_lists.alloc(), cx.draw_lists.alloc(), cx.draw_lists.alloc()];
+        cx.draw_lists[lists[1].id()].codeflow_parent_id = Some(lists[0].id());
+        cx.draw_lists[lists[2].id()].codeflow_parent_id = Some(lists[1].id());
+        let content = rect_area(&mut cx, &lists[0], 0.0, 100.0);
+        let popover = rect_area(&mut cx, &lists[1], 40.0, 20.0);
+        let nested = rect_area(&mut cx, &lists[2], 45.0, 5.0);
+        cx.set_pointer_shields(vec![popover]);
+        Shielded { cx, content, popover, nested, _lists: lists }
+    }
+
+    #[test]
+    fn press_inside_a_shield_reaches_only_the_surface_that_owns_it() {
+        let Shielded { mut cx, content, popover, nested, _lists } = shielded();
+        // Content dispatched first cannot take the press, with or without capture overload.
+        let down = touches(1, 55.0, TouchState::Start);
+        assert!(matches!(down.hits(&mut cx, content), Hit::Nothing));
+        assert!(matches!(down.hits_with_capture_overload(&mut cx, content, true), Hit::Nothing));
+        assert!(matches!(down.hits(&mut cx, popover), Hit::FingerDown(_)));
+        let up = touches(1, 55.0, TouchState::Stop);
+        assert!(matches!(up.hits(&mut cx, content), Hit::Nothing));
+        assert!(matches!(up.hits(&mut cx, popover), Hit::FingerUp(_)));
+        end_touches(&mut cx, &up);
+
+        // A control drawn inside the popover's own draw list is part of it.
+        let down = touches(2, 47.0, TouchState::Start);
+        assert!(matches!(down.hits(&mut cx, content), Hit::Nothing));
+        assert!(matches!(down.hits(&mut cx, nested), Hit::FingerDown(_)));
+        let up = touches(2, 47.0, TouchState::Stop);
+        end_touches(&mut cx, &up);
+
+        let window_id = crate::window::CxWindowPool::id_zero();
+        let click = Event::MouseDown(MouseDownEvent {
+            abs: dvec2(55.0, 0.0), button: MouseButton::PRIMARY, window_id,
+            modifiers: KeyModifiers::default(), handled: Cell::new(Area::Empty), time: 0.3,
+        });
+        assert!(matches!(click.hits_with_capture_overload(&mut cx, content, true), Hit::Nothing));
+        assert!(matches!(click.hits(&mut cx, popover), Hit::FingerDown(_)));
+        cx.fingers.release_digit(live_id!(mouse).into());
+
+        let wheel = Event::Scroll(ScrollEvent {
+            window_id, scroll: dvec2(0.0, 10.0), abs: dvec2(55.0, 0.0),
+            modifiers: KeyModifiers::default(), handled_x: Cell::new(false),
+            handled_y: Cell::new(false), is_mouse: true, time: 0.4,
+        });
+        assert!(matches!(wheel.hits(&mut cx, content), Hit::Nothing));
+        assert!(matches!(wheel.hits(&mut cx, popover), Hit::FingerScroll(_)));
+        assert!(cx.pointer_shielded(content, dvec2(55.0, 0.0)));
+        assert!(!cx.pointer_shielded(popover, dvec2(55.0, 0.0)));
+        assert!(!cx.pointer_shielded(content, dvec2(10.0, 0.0)));
+    }
+
+    #[test]
+    fn content_keeps_its_own_gestures_around_a_shield() {
+        let Shielded { mut cx, content, popover, _lists, .. } = shielded();
+        // A press beside the popover is the content's, and stays its own when the finger
+        // moves over the popover before lifting.
+        let down = touches(1, 10.0, TouchState::Start);
+        assert!(matches!(down.hits(&mut cx, content), Hit::FingerDown(_)));
+        let drag = touches(1, 55.0, TouchState::Move);
+        assert!(matches!(drag.hits(&mut cx, content), Hit::FingerMove(_)));
+        assert!(matches!(drag.hits(&mut cx, popover), Hit::Nothing));
+        let up = touches(1, 55.0, TouchState::Stop);
+        assert!(matches!(up.hits(&mut cx, content), Hit::FingerUp(_)));
+        assert!(matches!(up.hits(&mut cx, popover), Hit::Nothing));
+        end_touches(&mut cx, &up);
+
+        // Hover leaves the content when the pointer moves onto the popover.
+        let mouse = live_id!(mouse).into();
+        let hover = |x: f64| Event::MouseMove(MouseMoveEvent {
+            abs: dvec2(x, 0.0), window_id: crate::window::CxWindowPool::id_zero(),
+            modifiers: KeyModifiers::default(), time: 0.5, handled: Cell::new(Area::Empty),
+        });
+        assert!(matches!(hover(10.0).hits(&mut cx, content), Hit::FingerHoverIn(_)));
+        cx.fingers.cycle_hover_area(mouse);
+        let over_popover = hover(55.0);
+        assert!(matches!(over_popover.hits(&mut cx, content), Hit::FingerHoverOut(_)));
+        assert!(matches!(over_popover.hits(&mut cx, popover), Hit::FingerHoverIn(_)));
+
+        // A shield that is no longer drawn, or an ended scope, shields nothing.
+        let stale = Area::Rect(crate::area::RectArea { redraw_id: 99, ..match popover {
+            Area::Rect(rect) => rect,
+            _ => unreachable!(),
+        } });
+        cx.set_pointer_shields(vec![stale]);
+        assert!(!cx.pointer_shielded(content, dvec2(55.0, 0.0)));
+        cx.set_pointer_shields(Vec::new());
+        let down = touches(2, 55.0, TouchState::Start);
+        assert!(matches!(down.hits(&mut cx, content), Hit::FingerDown(_)));
+    }
+
+    #[test]
+    fn topmost_shield_owns_the_pointer_where_two_overlap() {
+        let Shielded { mut cx, content, popover, nested, _lists } = shielded();
+        // `nested` (45..50) declared above `popover` (40..60).
+        cx.set_pointer_shields(vec![popover, nested]);
+        let over_both = touches(1, 47.0, TouchState::Start);
+        assert!(matches!(over_both.hits(&mut cx, content), Hit::Nothing));
+        assert!(matches!(over_both.hits(&mut cx, popover), Hit::Nothing));
+        assert!(matches!(over_both.hits(&mut cx, nested), Hit::FingerDown(_)));
+        end_touches(&mut cx, &touches(1, 47.0, TouchState::Stop));
+        let beside = touches(2, 55.0, TouchState::Start);
+        assert!(matches!(beside.hits(&mut cx, nested), Hit::Nothing));
+        assert!(matches!(beside.hits(&mut cx, popover), Hit::FingerDown(_)));
     }
 }

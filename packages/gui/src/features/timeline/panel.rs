@@ -441,6 +441,10 @@ pub struct ChatPanel {
     #[rust(DrawList2d::new(cx))]
     overlay_list: DrawList2d,
     #[rust(DrawList2d::new(cx))]
+    cover_list: DrawList2d,
+    #[rust]
+    cover_area: Area,
+    #[rust(DrawList2d::new(cx))]
     find_list: DrawList2d,
     #[rust(DrawList2d::new(cx))]
     modal_list: DrawList2d,
@@ -3350,7 +3354,7 @@ impl Widget for ChatPanel {
             if modal_open {
                 swallow_scroll = true;
                 self.modal_scroll(cx, se.abs, se.scroll);
-            } else if self.stream_rect.contains(se.abs) {
+            } else if self.stream_rect.contains(se.abs) && !cx.pointer_shielded(self.area, se.abs) {
                 let list = self.list.as_portal_list();
                 let first = list.first_id();
                 let count = list.visible_items() + 2;
@@ -3375,7 +3379,8 @@ impl Widget for ChatPanel {
             let reader_input = match event {
                 Event::MouseDown(e)
                     if self.stream_rect.contains(e.abs)
-                        && e.abs.x >= self.stream_rect.pos.x + self.stream_rect.size.x - 16.0 =>
+                        && e.abs.x >= self.stream_rect.pos.x + self.stream_rect.size.x - 16.0
+                        && !cx.pointer_shielded(self.area, e.abs) =>
                 {
                     // Focus only the scrollbar gutter, not selectable rows or
                     // their inputs, so Home/End navigate the list afterwards.
@@ -3433,6 +3438,8 @@ impl Widget for ChatPanel {
         };
         let area = if modal_open {
             self.modal_area
+        } else if !self.cover_area.is_empty() {
+            self.cover_area
         } else {
             self.area
         };
@@ -3646,6 +3653,7 @@ impl Widget for ChatPanel {
         let texture_revision = crate::features::composer::texture_revision();
         let rect = cx.turtle().rect();
         self.content_rect = rect;
+        self.cover_area = Area::Empty;
         if let Some(ui) = scope.data.get::<UiContext>() {
             self.refresh_host(ui);
         }
@@ -4054,6 +4062,16 @@ impl Widget for ChatPanel {
                     rect.size.x,
                 );
             }
+            let covered = history_overlay || self.archiving;
+            if covered {
+                // Keep the cover outside every underlying input's draw list.
+                // The toast remains in this layer, above history sync but below archiving.
+                self.cover_list.begin_always(cx);
+                d.kit.begin_layer(cx);
+                cx.add_aligned_rect_area(&mut self.cover_area, rect);
+                overlay::float(self.cover_area);
+                find_field_rect = None;
+            }
             if history_overlay {
                 chrome::history_overlay(cx, &mut d, rect);
             }
@@ -4062,6 +4080,9 @@ impl Widget for ChatPanel {
             }
             if self.archiving {
                 chrome::archiving_overlay(cx, &mut d, rect);
+            }
+            if covered {
+                self.cover_list.end(cx);
             }
             animating |= d.animating;
         }
@@ -4129,6 +4150,7 @@ impl Widget for ChatPanel {
                 &host_label_fn,
             );
             cx.end_turtle_with_area(&mut self.modal_area);
+            overlay::modal_float(self.widget_uid().0, self.modal_area);
             cx.end_pass_sized_turtle();
             self.modal_list.end(cx);
         } else {

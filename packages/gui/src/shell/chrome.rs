@@ -2315,9 +2315,14 @@ fn pane_at(shell: &PaseoShell, abs: DVec2) -> Option<String> {
 /// Pane focus follows a press anywhere in a pane, including content that captures the press
 /// itself (terminal, editor, chat). Runs before panels see the event. A mouse focuses on press;
 /// a touch only on a tap released in the pane it started in, so drags never retarget the pane.
-pub(crate) fn observe_pane_focus(shell: &mut PaseoShell, event: &Event) {
+/// A press on a floating surface belongs to that surface, whichever pane lies under it.
+pub(crate) fn observe_pane_focus(shell: &mut PaseoShell, cx: &Cx, event: &Event) {
     const TAP_SLOP: f64 = 12.0;
     let window = shell.data.os_window;
+    let area = shell.data.overlays.area;
+    let pane_at = |shell: &PaseoShell, abs: DVec2| {
+        pane_at(shell, abs).filter(|_| !cx.pointer_shielded(area, abs))
+    };
     match event {
         Event::MouseDown(e) if Some(e.window_id) == window && !e.button.is_secondary() => {
             if let Some(pane) = pane_at(shell, e.abs) {

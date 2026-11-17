@@ -111,11 +111,11 @@ thread_local! {
 }
 
 /// Wheel and touch scrolling of the welcome body (shell window events). Only while the welcome
-/// screen is what the content area shows and no shell modal covers it.
+/// screen is what the content area shows and no modal layer covers it.
 pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, state: &serde_json::Value) {
     let shown = hosts::hosts(state).is_empty()
         && !matches!(shell.data.page, Some(Page::Settings { .. }))
-        && !shell.data.overlays.is_modal();
+        && !shell.pages_covered();
     let window = shell.data.window_id.clone();
     let hit = if shown && matches!(event, Event::TouchUpdate(_) | Event::LongPress(_)) {
         event.hits(cx, shell.layers.bg)

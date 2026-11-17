@@ -71,6 +71,7 @@ enum Hot {
     FontMinus,
     FontPlus,
     SettingsClose,
+    SettingsCard,
     TransferCancel(u64),
     Editor,
     Preview,
@@ -85,7 +86,7 @@ impl Hot {
     fn is_settings_card(&self) -> bool {
         matches!(
             self,
-            Hot::Card
+            Hot::SettingsCard
                 | Hot::SetWrap
                 | Hot::SetHighlight
                 | Hot::FontMinus
@@ -1407,9 +1408,11 @@ impl FileView {
                     }
                     Some(Hot::Preview) if self.markdown.is_link(fe.abs) => MouseCursor::Hand,
                     Some(Hot::Preview) => MouseCursor::Text,
-                    Some(Hot::Image) | Some(Hot::Scrim) | Some(Hot::Card) | None => {
-                        MouseCursor::Default
-                    }
+                    Some(Hot::Image)
+                    | Some(Hot::Scrim)
+                    | Some(Hot::Card)
+                    | Some(Hot::SettingsCard)
+                    | None => MouseCursor::Default,
                     Some(_) => MouseCursor::Hand,
                 };
                 cx.set_cursor(cursor);
@@ -1868,6 +1871,7 @@ impl FileView {
             | Hot::Editor
             | Hot::Preview
             | Hot::Image
+            | Hot::SettingsCard
             | Hot::Card => {}
         }
     }
@@ -2905,7 +2909,7 @@ impl FileView {
             h,
         );
         kit.outline(cx, card, p.dialog, p.border, 1.0, 12.0);
-        self.hits.push(card, Hot::Card);
+        self.hits.push(card, Hot::SettingsCard);
         kit.text_in(
             cx,
             rect(

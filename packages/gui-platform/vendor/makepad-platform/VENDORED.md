@@ -266,6 +266,60 @@ reproduced this on startup. Source recompilation now proceeds without clearing
 the cache manually. Failed and retired linked programs use `glDeleteProgram`,
 not the shader-object deletion API.
 
+## Pointer shape and contrast
+
+`src/pointer.rs`, called by `os/cx_shared.rs`, resolves a move to the default
+arrow when the newly hovered area asks for no shape. The previous area keeps
+its shape only while it remains hovered. Release, wheel and keyboard input
+re-test the last pointer position after the next drawn frame and frames started
+within 300 ms, unless a button is held or the pointer is outside the window.
+`Cx::refresh_hover()` requests the same for changes outside input dispatch.
+
+`src/cursor_tone.rs` inverts neutral body pixels when the system pointer's fill
+matches the app theme. Coloured parts, shadows and already contrasting images
+remain unchanged. X11 uses the user's Xcursor images and size; Windows copies
+the stock cursor with `GetIconInfo`/`GetDIBits`/`CreateIconIndirect`.
+X11 caches the current shape and tone and restores resize-edge cursors on
+re-entry. Windows keeps the requested shape across `WM_MOUSELEAVE`, uses a null
+cursor for `Hidden` instead of unbalanced `ShowCursor` calls, and defers shape
+changes while the pointer is outside the app.
+
+## Windows geometry during callbacks
+
+`Win32App::do_callback` queues nested focus and geometry notifications until
+the current callback returns, coalescing each window's pending geometry to
+its latest size. `MoveWindow`, `ShowWindow` and DPI changes synchronously send
+`WM_SIZE`; upstream dropped these notifications inside callbacks and retained
+the old drawing size. The posted-size workaround in `restore` and `maximize`
+is removed. `d3d11.rs` allocates and compares rounded physical pixel sizes,
+including DPI, rather than comparing logical sizes alone.
+
+## Pointer shields
+
+Makepad hit-tests in dispatch order, not paint order: the first area that
+contains a press takes it, and `capture_overload` only adds a second capture
+(`CxFingers::capture_digit` pushes), so the area underneath still receives the
+release and acts as well. A popover whose owner is dispatched after the content
+it covers therefore could not own its own taps, hover or wheel.
+
+`event/finger.rs` adds `Cx::set_pointer_shields(Vec<Area>)` (lowest first; an
+empty list ends the scope) and `Cx::pointer_shielded(area, abs)`. While shields
+are declared, a touch or mouse press, hover, sweep take-over or scroll inside the
+topmost valid shield under the pointer is reported only to that area and to areas
+whose draw list is the shield's or nests in it (`codeflow_parent_id`); every
+other `hits*` call gets `Hit::Nothing`, capture overload included. Captures taken
+outside a shield keep their moves and release; with no shield declared nothing
+changes. Shields follow redraw area remapping. Handlers that read raw event
+positions call `pointer_shielded` themselves.
+
+Passession declares them in one place: features register popovers with
+`common::overlay::float` and full-window sheets with `modal_float`, and the shell
+installs the drawn ones of its window around the dispatch of panels and chrome
+(`docs/floating-panels.md`). The
+`paseo_touch_tests` shield cases cover press, capture overload, release, a
+nested list, mouse, wheel, hover hand-over, a gesture begun outside, stale
+shields and stacked shields.
+
 ## Adjacent shader compiler patch
 
 The root also patches `makepad-shader-compiler 1.0.0` from the published archive,

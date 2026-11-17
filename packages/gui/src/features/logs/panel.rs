@@ -63,7 +63,7 @@ live_design! {
                 }
                 find_wrap = <WaPaneFind> {}
                 // Original attach overlay: a dimmed surface with a small muted spinner.
-                attach = <View> {
+                attach = <PointerShield> {
                     width: Fill, height: Fill, visible: false
                     show_bg: true, draw_bg: { color: #00000029 }
                     align: { x: 0.5, y: 0.5 }

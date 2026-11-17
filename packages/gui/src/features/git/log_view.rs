@@ -1486,7 +1486,14 @@ impl LogView {
     }
 
     fn region_at(&self, point: DVec2) -> Option<Region> {
-        // The branches drawer lies over the other regions.
+        // The open branches drawer and its scrim cover the other regions.
+        if !self.wide && self.drawer_open {
+            return self
+                .branches
+                .area
+                .contains(point)
+                .then_some(Region::Branches);
+        }
         [
             (Region::Branches, self.branches.area),
             (Region::Sheet, self.sheet.area),

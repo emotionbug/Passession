@@ -411,6 +411,14 @@ impl PaseoShell {
         self.data.window_id == MAIN_WINDOW_ID || self.data.window_id.is_empty()
     }
 
+    /// A modal layer covers the window's pages: a shell dialog, menu or sheet, a panel's
+    /// full-window sheet or the Command Center.
+    pub(crate) fn pages_covered(&self) -> bool {
+        self.data.overlays.is_modal()
+            || self.data.command_center_open
+            || overlay_api::window_modal_open(&self.data.window_id)
+    }
+
     /// Hover/press feedback changed for these shell hit ids: repaints only the layers that
     /// drew them. An id no retained layer owns repaints every shell-owned layer.
     pub(crate) fn redraw_hit_owners(&self, cx: &mut Cx, ids: &[Option<&str>]) {
@@ -815,12 +823,13 @@ impl Widget for PaseoShell {
             self.layers.sidebar.invalidate(cx);
         }
 
-        // Standalone tool-call sheets (timeline, drawn above the shell overlays) take input first;
-        // while one is open the shell overlays, shortcuts, chrome and panels get no input events.
-        let tool_sheet =
-            crate::features::timeline::handle_tool_call_sheets(cx, event, &self.data.window_id);
+        // The toast is painted last, above even standalone tool-call sheets.
+        let toast_input = overlays::handle_toast(self, cx, event);
+        // Tool-call sheets otherwise take input before the shell's modal stack and content.
+        let tool_sheet = !toast_input
+            && crate::features::timeline::handle_tool_call_sheets(cx, event, &self.data.window_id);
         let input = crate::common::is_user_input(event);
-        let locked = input && (tool_sheet || shell_modal);
+        let locked = input && (toast_input || tool_sheet || shell_modal);
         // A panel's full-window sheet (`overlay::set_window_modal`) owns the window's input:
         // panels still dispatch (the sheet lives in one), the shell's chrome does not. Shell
         // overlays opened above it (its confirm dialogs) still take input first.
@@ -831,6 +840,7 @@ impl Widget for PaseoShell {
         // The compact explorer's controls own input before its full-window
         // backdrop. Dispatch only that root, not the conversation underneath.
         let explorer_input = input
+            && !toast_input
             && self.data.compact
             && self.data.chrome.explorer_position > 0.0
             && !tool_sheet
@@ -843,12 +853,23 @@ impl Widget for PaseoShell {
         }
 
         // Modal overlays get the event first and lock the sweep for the content below.
-        let modal = if tool_sheet || window_modal || (command_center && !shell_modal) {
+        let modal = if toast_input || tool_sheet || window_modal || (command_center && !shell_modal)
+        {
             true
         } else {
             overlays::handle_event(self, cx, event, scope)
         };
         let modal = shell_modal || modal;
+        // Feature surfaces painted above the panels and the chrome own the pointer inside
+        // them: popovers, and the full-window sheet a panel holds. The shell's own layers
+        // were dispatched before and need no shield.
+        let shell_owns = tool_sheet || shell_modal || (modal && !window_modal && !command_center);
+        overlay_api::shield_content(
+            cx,
+            &self.data.window_id,
+            self.data.overlays.area,
+            input && !shell_owns,
+        );
         let sidebar_blocked = !chrome::sidebar_visible(self)
             || self.data.app_inactive
             || modal
@@ -872,7 +893,7 @@ impl Widget for PaseoShell {
             key_consumed = commands::handle_shortcut(self, cx, ui, key);
         }
         if !modal && !locked {
-            chrome::observe_pane_focus(self, event);
+            chrome::observe_pane_focus(self, cx, event);
         }
         if !key_consumed && !locked && !explorer_input {
             self.dispatch_panels(cx, event, scope, window_modal);
@@ -921,6 +942,7 @@ impl Widget for PaseoShell {
         // and consume animation frames even when a modal temporarily owns input.
         self.data.overlays.sync_focus(cx);
         chrome::animate_explorer(self, cx, event);
+        overlay_api::shield_content(cx, &self.data.window_id, self.data.overlays.area, false);
         // Any recorded layout change (tabs, focus, splits, destinations) is shell chrome.
         if self.data.layout.revision != self.data.presented_layout {
             self.data.presented_layout = self.data.layout.revision;

@@ -254,6 +254,8 @@ pub fn non_ready(cx: &mut Cx2d, d: &mut Draw, view: &NonReady, rect: Rect) {
 
 /// historySyncOverlay: surface0 over the dock with the large spinner.
 pub fn history_overlay(cx: &mut Cx2d, d: &mut Draw, rect: Rect) {
+    // Only controls painted above the cover may remain hit targets.
+    d.canvas.hits.clear();
     d.kit.rect(cx, rect, d.look.palette.surface0, 0.0);
     spinner(cx, d, rect.center(), 24.0, d.look.palette.muted);
 }
@@ -488,6 +490,7 @@ pub fn archived_callout(
 
 /// archivingOverlay: an 86% near-black scrim with spinner, title, subtitle.
 pub fn archiving_overlay(cx: &mut Cx2d, d: &mut Draw, rect: Rect) {
+    d.canvas.hits.clear();
     let p = d.look.palette;
     d.kit.rect(cx, rect, rgba(0xdb080a0e), 0.0);
     let size = base(d);

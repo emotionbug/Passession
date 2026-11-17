@@ -192,10 +192,10 @@ pub struct ToastAction {
     pub fix: crate::shell::permissions::Fix,
 }
 
-/// A press on the toast.
+/// Pointer ownership of the toast above all other shell surfaces.
 enum ToastPress {
-    /// Not on the toast (or no press).
     None,
+    Captured,
     Dismissed,
     Action(crate::shell::permissions::Fix),
 }
@@ -533,21 +533,45 @@ fn dismiss_toast(overlays: &mut Overlays, cx: &mut Cx) {
     }
 }
 
-/// Pointer input on the toast: hovering pauses its timer, a click or tap dismisses it or runs
-/// its action. A press on the toast must not reach the content below.
-fn toast_input(overlays: &mut Overlays, cx: &mut Cx, event: &Event) -> ToastPress {
+/// The toast is drawn above tool sheets, window modals and the Command Center.
+/// Dispatch it before those surfaces; only pointer events on its visible body are owned.
+pub fn handle_toast(shell: &mut PaseoShell, cx: &mut Cx, event: &Event) -> bool {
+    match toast_input(&mut shell.data.overlays, cx, event, shell.data.os_window) {
+        ToastPress::None => false,
+        ToastPress::Captured | ToastPress::Dismissed => true,
+        ToastPress::Action(fix) => {
+            crate::shell::permissions::fix(fix);
+            true
+        }
+    }
+}
+
+fn toast_input(
+    overlays: &mut Overlays,
+    cx: &mut Cx,
+    event: &Event,
+    window: Option<WindowId>,
+) -> ToastPress {
     let Some(toast) = overlays.toast.as_mut() else {
         return ToastPress::None;
     };
+    if !overlays.area.is_valid(cx) {
+        return ToastPress::None;
+    }
     let (at, press) = match event {
-        Event::MouseMove(e) => (Some(e.abs), false),
-        Event::MouseLeave(_) => (None, false),
-        Event::MouseDown(e) => (Some(e.abs), true),
-        Event::TouchUpdate(e) => {
-            let started = e
-                .touches
-                .iter()
-                .find(|t| matches!(t.state, makepad_widgets::event::TouchState::Start));
+        Event::MouseMove(e) if Some(e.window_id) == window => (Some(e.abs), false),
+        Event::MouseLeave(e) if Some(e.window_id) == window => (None, false),
+        Event::MouseDown(e) if Some(e.window_id) == window => (Some(e.abs), true),
+        Event::Scroll(e) if Some(e.window_id) == window && toast.rect.contains(e.abs) => {
+            e.handled_x.set(true);
+            e.handled_y.set(true);
+            return ToastPress::Captured;
+        }
+        Event::TouchUpdate(e) if Some(e.window_id) == window && !e.cancelled => {
+            let started = e.touches.iter().find(|t| {
+                matches!(t.state, makepad_widgets::event::TouchState::Start)
+                    && toast.rect.contains(t.abs)
+            });
             match started {
                 Some(touch) => (Some(touch.abs), true),
                 None => return ToastPress::None,
@@ -566,7 +590,6 @@ fn toast_input(overlays: &mut Overlays, cx: &mut Cx, event: &Event) -> ToastPres
             .filter(|_| at.is_some_and(|at| toast.action_rect.contains(at)))
             .map(|action| action.fix);
         dismiss_toast(overlays, cx);
-        cx.sweep_lock(overlays.area);
         return match action {
             Some(fix) => ToastPress::Action(fix),
             None => ToastPress::Dismissed,
@@ -584,7 +607,12 @@ fn toast_input(overlays: &mut Overlays, cx: &mut Cx, event: &Event) -> ToastPres
         toast.started = now;
         toast.paused = false;
     }
-    ToastPress::None
+    if inside {
+        cx.set_cursor(MouseCursor::Hand);
+        ToastPress::Captured
+    } else {
+        ToastPress::None
+    }
 }
 
 pub fn handle_timers(overlays: &mut Overlays, cx: &mut Cx, event: &Event) {
@@ -2476,14 +2504,6 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     if stale != area {
         cx.sweep_unlock(stale);
     }
-    match toast_input(&mut shell.data.overlays, cx, event) {
-        ToastPress::None => {}
-        ToastPress::Dismissed => return true,
-        ToastPress::Action(fix) => {
-            crate::shell::permissions::fix(fix);
-            return true;
-        }
-    }
     let explorer_open = shell.data.compact && shell.data.chrome.explorer_position > 0.0;
     if !shell.data.overlays.is_modal() && !explorer_open {
         shell.data.overlays.touch_scroll.reset();
@@ -3231,6 +3251,67 @@ pub fn body_spec(ui: &Ui) -> TextSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toast_only_owns_wheel_inside_its_window() {
+        use makepad_widgets::{CxRectArea, RectArea, event::ScrollEvent};
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let list = cx.draw_lists.alloc();
+        let body = Rect {
+            pos: dvec2(20.0, 20.0),
+            size: dvec2(80.0, 40.0),
+        };
+        cx.draw_lists[list.id()].rect_areas.push(CxRectArea {
+            rect: body,
+            draw_clip: (DVec2::default(), dvec2(100.0, 100.0)),
+        });
+        let mut overlays = Overlays {
+            area: Area::Rect(RectArea {
+                draw_list_id: list.id(),
+                rect_id: 0,
+                redraw_id: cx.draw_lists[list.id()].redraw_id,
+            }),
+            ..Default::default()
+        };
+        overlays.toast = Some(Toast {
+            message: "Copied".into(),
+            error: false,
+            action: None,
+            timer: Timer::empty(),
+            remaining: 3.0,
+            started: 0.0,
+            paused: false,
+            rect: body,
+            action_rect: Rect::default(),
+        });
+        let window = WindowId(1, 0);
+        for (event_window, x, owned) in [
+            (window, 30.0, true),
+            (window, 10.0, false),
+            (WindowId(2, 0), 30.0, false),
+        ] {
+            let event = Event::Scroll(ScrollEvent {
+                window_id: event_window,
+                abs: dvec2(x, 30.0),
+                scroll: dvec2(4.0, 40.0),
+                modifiers: Default::default(),
+                handled_x: Default::default(),
+                handled_y: Default::default(),
+                is_mouse: true,
+                time: 0.0,
+            });
+            let result = toast_input(&mut overlays, &mut cx, &event, Some(window));
+            assert_eq!(matches!(result, ToastPress::Captured), owned);
+            let Event::Scroll(scroll) = event else {
+                unreachable!()
+            };
+            assert_eq!(
+                (scroll.handled_x.get(), scroll.handled_y.get()),
+                (owned, owned)
+            );
+        }
+    }
 
     fn key(code: KeyCode, shift: bool) -> KeyEvent {
         KeyEvent {

@@ -18,6 +18,23 @@ Outside dismissal is a release action. The press and valid release must resolve 
 
 Covered fields may draw but must not autofocus. Closing an owner releases its editor and restores only a still-valid originating focus target; a newer focus request wins. Release the modal sweep lock when the final modal closes. Keep geometry within the keyboard-adjusted viewport even when it is smaller than the preferred popup minimum; clipped content needs a scrollable body rather than offscreen actions.
 
+## Popovers over content
+
+Dispatch order is not paint order. A feature's popover (the composer's suggestions, its context card) is painted in an overlay list above content that is dispatched before its owner: the message list, a parent's chrome, the shell's header. Makepad gives a press to the first area that contains it, and `hits_with_capture_overload` only adds a second capture, so without more both the popover and the control behind it act on one tap, a drag on the popover scrolls the list behind, and the content keeps the hover.
+
+Declare such a surface once, when drawing it: `common::overlay::float(area)` with the hit area that covers it. The shell installs the drawn floating surfaces of its window as pointer shields (`Cx::set_pointer_shields`, vendored makepad-platform) for the dispatch of panels and chrome, after its own overlays have taken their input. Inside a shield a press, hover, sweep or scroll reaches only the surface's area and what is drawn in its draw list; every other `hits*` call reports nothing, so no per-widget "is a popup open" flag is needed. A surface stops shielding when it is redrawn without the area, detached with its layer, or dropped.
+
+A full-window sheet declares its backdrop with `common::overlay::modal_float(owner, area)`, using its window-modal owner id. While that sheet is on top, only its backdrop and floating cards drawn inside it shield input; popovers behind it cannot interfere. The sweep lock alone does not protect against scrollers reading raw wheel positions. `WaModal` and timeline sheets declare their backdrops. A sheet without a registered backdrop keeps its own input rules.
+
+For a pane-local loading/disconnected cover or a search card, wrap the painted surface in `common::widgets::PointerShield`. It owns a separate always-redrawn draw list, registers the visible area and invalidates it when hidden. Wrap the card itself, not a transparent positioning container. Its controls keep receiving input while underlying siblings do not; non-input updates continue.
+
+Rules that follow:
+
+- Do not rely on capture overload, dispatch order or a parent's rectangle test to keep a popover's taps to itself. Register the popover.
+- A handler that tests a raw `Event::Scroll`, `Event::MouseDown` or touch position against a rectangle bypasses hit testing. It must also ask `cx.pointer_shielded(own_area, abs)`.
+- A tooltip or other surface that takes no input is not registered: the pointer passes through it.
+- A modal surface still claims the window-modal slot or the shell's stack: that is what keeps keys, shortcuts and the shell's chrome away. The shield only adds the pointer and the wheel.
+
 ## Verification
 
 Test opening, closing, cancellation, rapid repeated triggers, host changes, resize/rotation, keyboard motion, safe-area insets and long labels on the actual native platform. A Linux screenshot does not prove Android/iOS native presenter behavior. See [mobile testing](mobile-testing.md), [menus](menus.md), and [testing](testing.md).

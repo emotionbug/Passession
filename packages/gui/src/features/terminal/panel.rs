@@ -65,15 +65,18 @@ live_design! {
                 output = <WaTerminalView> {}
                 find_wrap = <WaPaneFind> {}
                 // Original `centerState`: muted, centred, 16px side padding.
-                disconnected = <Surface> {
+                disconnected = <PointerShield> {
                     width: Fill, height: Fill, visible: false
-                    role: Surface0
-                    align: { x: 0.5, y: 0.5 }
-                    padding: { left: 16., right: 16. }
-                    text = <WaMuted> { width: Fit }
+                    content = <Surface> {
+                        width: Fill, height: Fill
+                        role: Surface0
+                        align: { x: 0.5, y: 0.5 }
+                        padding: { left: 16., right: 16. }
+                        text = <WaMuted> { width: Fit }
+                    }
                 }
                 // Original attach overlay: a dimmed surface with a small muted spinner.
-                attach = <View> {
+                attach = <PointerShield> {
                     width: Fill, height: Fill, visible: false
                     show_bg: true, draw_bg: { color: #00000029 }
                     align: { x: 0.5, y: 0.5 }

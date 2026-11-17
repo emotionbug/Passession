@@ -2232,6 +2232,8 @@ impl Widget for WaModal {
         cx.end_turtle();
         self.draw_bg.end(cx);
         if self.opened {
+            // The page and panes behind this sheet get no pointer or wheel while it is on top.
+            overlay::modal_float(self.widget_uid().0, self.draw_bg.area());
             cx.end_pass_sized_turtle();
         } else {
             cx.end_turtle();
