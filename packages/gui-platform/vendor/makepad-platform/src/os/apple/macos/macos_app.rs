@@ -1,11 +1,12 @@
 use crate::file_dialogs::FileDialog;
+use crate::os::window_state::{PendingWindowState, WindowStateChange};
 
 use {
     std::{
         rc::Rc,
         cell::RefCell,
         time::Instant,
-        collections::{HashMap, VecDeque},
+        collections::HashMap,
         os::raw::c_void,
     },
     crate::{
@@ -140,7 +141,7 @@ pub struct MacosApp {
     pasteboard: ObjcId,
     startup_focus_hack_ran: bool,
     event_callback: Option<Box<dyn FnMut(MacosEvent) -> EventFlow >>,
-    pending_window_focus: VecDeque<(WindowId, bool)>,
+    pending_window_state: PendingWindowState,
     event_flow: EventFlow,
     
     pub cursors: HashMap<MouseCursor, ObjcId>,
@@ -172,7 +173,7 @@ impl MacosApp {
                 event_flow: EventFlow::Poll,
                 last_key_mod: KeyModifiers {..Default::default()},
                 event_callback: Some(event_callback),
-                pending_window_focus: VecDeque::new(),
+                pending_window_state: PendingWindowState::default(),
                 cursors: HashMap::new(),
                 current_cursor: MouseCursor::Default,
                 //current_ns_event: None,
@@ -640,27 +641,25 @@ impl MacosApp {
                     }
                     break;
                 }
-                let Some((window_id, focused)) = with_macos_app(|app| app.pending_window_focus.pop_front()) else {
+                let Some(pending) = with_macos_app(|app| app.pending_window_state.pop_front()) else {
                     break;
                 };
-                event = if focused {
-                    MacosEvent::AppGotFocus(window_id)
-                } else {
-                    MacosEvent::AppLostFocus(window_id)
+                event = match pending {
+                    WindowStateChange::Focus(window_id, true) => MacosEvent::AppGotFocus(window_id),
+                    WindowStateChange::Focus(window_id, false) => MacosEvent::AppLostFocus(window_id),
+                    WindowStateChange::Geometry(change) => MacosEvent::WindowGeomChange(change),
                 };
             }
             with_macos_app(|app| app.event_callback = Some(callback));
         } else {
-            // Native activation can synchronously change focus during a Cx callback.
-            // Defer only focus; query and clipboard callbacks must stay synchronous.
-            let focus = match event {
-                MacosEvent::AppGotFocus(window_id) => Some((window_id, true)),
-                MacosEvent::AppLostFocus(window_id) => Some((window_id, false)),
-                _ => None,
-            };
-            if let Some(focus) = focus {
-                with_macos_app(|app| app.pending_window_focus.push_back(focus));
-            }
+            // AppKit setFrame/activation can synchronously notify during a Cx callback.
+            // Drag, clipboard and window queries still require synchronous answers.
+            with_macos_app(|app| match event {
+                MacosEvent::AppGotFocus(window_id) => app.pending_window_state.focus(window_id, true),
+                MacosEvent::AppLostFocus(window_id) => app.pending_window_state.focus(window_id, false),
+                MacosEvent::WindowGeomChange(change) => app.pending_window_state.geometry(change),
+                _ => (),
+            });
         }
     }
     /*

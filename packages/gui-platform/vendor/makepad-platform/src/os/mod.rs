@@ -5,6 +5,9 @@ pub mod cx_native;
 #[macro_use]
 pub mod cx_shared;
 
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
+pub(crate) mod window_state;
+
 pub mod cx_stdin;
 
 #[cfg(any(target_os = "macos", target_os="ios", target_os="tvos"))]

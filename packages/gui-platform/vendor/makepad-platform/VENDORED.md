@@ -284,15 +284,20 @@ re-entry. Windows keeps the requested shape across `WM_MOUSELEAVE`, uses a null
 cursor for `Hidden` instead of unbalanced `ShowCursor` calls, and defers shape
 changes while the pointer is outside the app.
 
-## Windows geometry during callbacks
+## Native geometry during callbacks
 
-`Win32App::do_callback` queues nested focus and geometry notifications until
-the current callback returns, coalescing each window's pending geometry to
-its latest size. `MoveWindow`, `ShowWindow` and DPI changes synchronously send
-`WM_SIZE`; upstream dropped these notifications inside callbacks and retained
-the old drawing size. The posted-size workaround in `restore` and `maximize`
-is removed. `d3d11.rs` allocates and compares rounded physical pixel sizes,
-including DPI, rather than comparing logical sizes alone.
+`os/window_state.rs` keeps nested focus and geometry notifications until the native
+callback returns. Windows and macOS share this queue; repeated geometry retains
+the original old state and the latest size, position and DPI for each window.
+Focus order is preserved. Drag, clipboard and window-query callbacks still require
+synchronous answers and do not enter this queue.
+
+Windows `MoveWindow`, `ShowWindow` and DPI changes synchronously send `WM_SIZE`;
+AppKit `setFrame` can likewise notify during platform operations. Dropping those
+notifications leaves the app drawing at its previous size. The Windows posted-size
+workaround in `restore` and `maximize` is removed. `d3d11.rs` allocates and compares
+rounded physical pixel sizes including DPI. Metal already compares scaled sizes;
+X11 delivers resize notifications later through `ConfigureNotify`.
 
 ## Pointer shields
 
