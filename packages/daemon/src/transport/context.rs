@@ -50,6 +50,7 @@ pub(crate) struct Source {
     pub cancel: CancellationToken,
     pub modern: bool,
     pub routed: AtomicBool,
+    pub legacy_hub: AtomicBool,
     pub sender: mpsc::Sender<QueuedFrame>,
     pub queued: Arc<AtomicUsize>,
     handshake_pending: AtomicBool,
@@ -146,6 +147,7 @@ impl RequestContext {
             cancel,
             modern,
             routed: AtomicBool::new(routed),
+            legacy_hub: AtomicBool::new(false),
             app_version,
             activity: RwLock::new(Value::Null),
             sender,
@@ -302,10 +304,17 @@ impl RequestContext {
         } else {
             legacy_message(&mut message);
         }
-        self.queue(OutboundFrame::Text(serde_json::to_string(
-            &json!({"type":"session","message":message}),
-        )?))
-        .await
+        self.queue(OutboundFrame::Text(self.encode_session(message)?))
+            .await
+    }
+    fn encode_session(&self, message: Value) -> Result<String> {
+        if self.source.legacy_hub.load(Ordering::Acquire) {
+            Ok(serde_json::to_string(&message)?)
+        } else {
+            Ok(serde_json::to_string(
+                &json!({"type":"session","message":message}),
+            )?)
+        }
     }
     pub async fn send_flushed(&self, message: Value) -> Result<()> {
         self.send(message).await?;
@@ -643,10 +652,8 @@ impl RequestContext {
             }
             None => json!({"type":"status","payload":{"status":"error","message":error}}),
         };
-        self.queue(OutboundFrame::Text(serde_json::to_string(
-            &json!({"type":"session","message":reply}),
-        )?))
-        .await
+        self.queue(OutboundFrame::Text(self.encode_session(reply)?))
+            .await
     }
     pub(crate) fn register_events(
         &self,
@@ -731,6 +738,12 @@ impl RequestContext {
                 .collect::<Vec<_>>()
         };
         let mut notified = false;
+        let attention = matches!(
+            category.as_str(),
+            "agent_attention_required" | "terminal_attention_required"
+        );
+        // Legacy event owners on one socket share wire bytes except notification eligibility.
+        let mut legacy_frames: [Option<String>; 2] = [None, None];
         for (state, notifications) in &owners {
             let subscription = OwnedSubscription {
                 context: Self {
@@ -739,18 +752,34 @@ impl RequestContext {
                 },
                 state: state.clone(),
             };
-            let mut projected = message.clone();
-            if matches!(
-                category.as_str(),
-                "agent_attention_required" | "terminal_attention_required"
-            ) {
-                let should_notify = projected["payload"]["shouldNotify"].as_bool() == Some(true)
-                    && *notifications
-                    && !notified;
-                projected["payload"]["shouldNotify"] = Value::Bool(should_notify);
-                notified |= should_notify;
+            let should_notify = attention
+                && message["payload"]["shouldNotify"].as_bool() == Some(true)
+                && *notifications
+                && !notified;
+            notified |= should_notify;
+            if !self.is_modern() && owners.len() > 1 {
+                subscription.context.ensure_outbound(&message)?;
+                let cached = &mut legacy_frames[usize::from(should_notify)];
+                let text = if let Some(text) = cached {
+                    text.clone()
+                } else {
+                    let mut projected = message.clone();
+                    if attention {
+                        projected["payload"]["shouldNotify"] = Value::Bool(should_notify);
+                    }
+                    legacy_message(&mut projected);
+                    let text = self.encode_session(projected)?;
+                    *cached = Some(text.clone());
+                    text
+                };
+                subscription.deliver(OutboundFrame::Text(text)).await?;
+            } else {
+                let mut projected = message.clone();
+                if attention {
+                    projected["payload"]["shouldNotify"] = Value::Bool(should_notify);
+                }
+                subscription.emit(projected).await?;
             }
-            subscription.emit(projected).await?;
         }
         if owners.is_empty()
             && !self.is_modern()
@@ -759,10 +788,8 @@ impl RequestContext {
             self.ensure_outbound(&message)?;
             let mut message = message;
             legacy_message(&mut message);
-            self.queue(OutboundFrame::Text(serde_json::to_string(
-                &json!({"type":"session","message":message}),
-            )?))
-            .await?;
+            self.queue(OutboundFrame::Text(self.encode_session(message)?))
+                .await?;
         }
         Ok(())
     }
@@ -814,9 +841,7 @@ impl OwnedSubscription {
         } else {
             legacy_message(&mut message);
         }
-        let frame = OutboundFrame::Text(serde_json::to_string(
-            &json!({"type":"session","message":message}),
-        )?);
+        let frame = OutboundFrame::Text(self.context.encode_session(message)?);
         self.deliver(frame).await
     }
     pub async fn emit_binary(&self, bytes: Bytes) -> Result<()> {

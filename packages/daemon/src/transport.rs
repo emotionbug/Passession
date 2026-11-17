@@ -184,7 +184,9 @@ impl TransportService {
         *self.keypair.write().unwrap() = Some(keypair);
         *self.config.write().unwrap() = config;
         let mut credential_bytes = [0u8; 32];
-        rand::rngs::OsRng.unwrap_err().fill_bytes(&mut credential_bytes);
+        rand::rngs::OsRng
+            .unwrap_err()
+            .fill_bytes(&mut credential_bytes);
         let credential = URL_SAFE_NO_PAD.encode(credential_bytes);
         storage::write_private(
             &home.join("local-credential"),
@@ -340,11 +342,11 @@ impl TransportService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (mut sink, mut stream) = socket.split();
+        let (sink, mut stream) = socket.split();
         let cancel = cancel.child_token();
         let (incoming, inbound) = mpsc::channel(1);
-        let (outbound, mut outgoing) = mpsc::channel::<OutboundFrame>(1);
-        let (control, mut controls) = mpsc::channel(1);
+        let (outbound, outgoing) = mpsc::channel::<OutboundFrame>(256);
+        let (control, controls) = mpsc::channel(1);
         let reading = async {
             let result = async {
                 loop {
@@ -365,28 +367,7 @@ impl TransportService {
             result
         };
         let writing = async {
-            let result = async {
-                let mut control_open = true;
-                loop {
-                    let frame = tokio::select! { biased;
-                        _ = cancel.cancelled() => break,
-                        frame = controls.recv(), if control_open => { match frame { Some(frame) => Some(frame), None => {control_open=false;continue;} } },
-                        frame = outgoing.recv() => frame,
-                    };
-                    let Some(frame) = frame else { break; }; let close = matches!(frame,OutboundFrame::Close {..});
-                    let message = match frame {
-                        OutboundFrame::Text(v) => Message::Text(v.into()), OutboundFrame::Binary(v) => Message::Binary(v), OutboundFrame::Ping(v) => Message::Ping(v), OutboundFrame::Pong(v) => Message::Pong(v),
-                        OutboundFrame::Close {code,reason} => Message::Close(Some(CloseFrame {code:code.into(),reason:reason.into()})),
-                        OutboundFrame::Flush(acknowledge) => {
-                            let flushed = tokio::select! { _ = cancel.cancelled() => Err(anyhow!("Physical source closed before flush")), result = sink.flush() => result.map_err(Into::into) };
-                            let failed = flushed.is_err(); let _ = acknowledge.send(flushed); if failed { break; } continue;
-                        }
-                    };
-                    tokio::select! { _ = cancel.cancelled() => break, result = sink.send(message) => result? };
-                    if close { break; }
-                }
-                Ok::<(),anyhow::Error>(())
-            }.await;
+            let result = write_socket(sink, outgoing, controls, &cancel).await;
             cancel.cancel();
             result
         };
@@ -560,12 +541,19 @@ impl TransportService {
                 app_version: hello["appVersion"].as_str().map(str::to_owned),
                 cancel: source_cancel,
             });
+            context
+                .source
+                .legacy_hub
+                .store(legacy_hub, std::sync::atomic::Ordering::Release);
             session.sources.insert(
                 context.source_id().to_owned(),
                 Arc::downgrade(&context.source),
             );
             (context, output)
         };
+        if let Some(app) = self.app.upgrade() {
+            app.git.observe_legacy_client(&context);
+        }
         let mut source_guard = SourceGuard {
             transport: self,
             context: &context,
@@ -575,20 +563,42 @@ impl TransportService {
         let writer_cancel = context.cancellation();
         let output_sender = outbound.clone();
         let writer = tokio::spawn(async move {
-            loop {
-                tokio::select! { biased; _ = writer_cancel.cancelled() => break, queued = output.recv() => {
-                    let Some(mut queued) = queued else { break; };
-                    let mut frame = std::mem::replace(&mut queued.frame, OutboundFrame::Pong(Bytes::new()));
-                    let drain = !matches!(frame,OutboundFrame::Flush(_) | OutboundFrame::Close {..});
-                    if legacy_hub && let OutboundFrame::Text(text) = &mut frame && let Ok(mut envelope) = serde_json::from_str::<Value>(text) && envelope["type"] == "session" { *text = envelope["message"].take().to_string(); }
-                    tokio::select! { _ = writer_cancel.cancelled() => break, result = output_sender.send(frame) => if result.is_err() { writer_cancel.cancel(); break; } }
-                    if drain {
-                        let (acknowledge, flushed) = tokio::sync::oneshot::channel();
-                        tokio::select! { _ = writer_cancel.cancelled() => break, result = output_sender.send(OutboundFrame::Flush(acknowledge)) => if result.is_err() { writer_cancel.cancel(); break; } }
-                        let result = tokio::select! { _ = writer_cancel.cancelled() => break, result = flushed => result };
-                        if !matches!(result,Ok(Ok(()))) { writer_cancel.cancel(); break; }
+            // Keep byte reservations until this whole drain reaches the physical writer.
+            let mut batch = Vec::with_capacity(256);
+            'writing: loop {
+                let first = tokio::select! { biased;
+                    _ = writer_cancel.cancelled() => break,
+                    queued = output.recv() => match queued { Some(queued) => queued, None => break },
+                };
+                let count = (output.len() + 1).min(256);
+                let mut next = Some(first);
+                for _ in 0..count {
+                    let Some(mut queued) = next.take().or_else(|| output.try_recv().ok()) else {
+                        break;
+                    };
+                    let frame =
+                        std::mem::replace(&mut queued.frame, OutboundFrame::Pong(Bytes::new()));
+                    let close = matches!(frame, OutboundFrame::Close { .. });
+                    batch.push(queued);
+                    tokio::select! { biased;
+                        _ = writer_cancel.cancelled() => break 'writing,
+                        result = output_sender.send(frame) => if result.is_err() { writer_cancel.cancel(); break 'writing; },
                     }
-                } }
+                    if close {
+                        break 'writing;
+                    }
+                }
+                let (acknowledge, flushed) = tokio::sync::oneshot::channel();
+                tokio::select! { biased;
+                    _ = writer_cancel.cancelled() => break,
+                    result = output_sender.send(OutboundFrame::Flush(acknowledge)) => if result.is_err() { writer_cancel.cancel(); break; },
+                }
+                let result = tokio::select! { biased; _ = writer_cancel.cancelled() => break, result = flushed => result };
+                if !matches!(result, Ok(Ok(()))) {
+                    writer_cancel.cancel();
+                    break;
+                }
+                batch.clear();
             }
         });
         let result = async {
@@ -1146,6 +1156,91 @@ pub fn extract_http_bearer_token(value: &str) -> Option<&str> {
 fn relay_config(config: &Value) -> Value {
     json!({"enabled":config["relayEnabled"],"endpoint":config["relayEndpoint"],"publicEndpoint":config["relayPublicEndpoint"],"useTls":config["relayUseTls"],"publicUseTls":config["relayPublicUseTls"],"requireProtectedSecurity":config["relayRequireProtectedSecurity"]})
 }
+async fn write_socket<S>(
+    mut sink: S,
+    mut outgoing: mpsc::Receiver<OutboundFrame>,
+    mut controls: mpsc::Receiver<OutboundFrame>,
+    cancel: &CancellationToken,
+) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut control_open = true;
+    let mut acknowledgements = Vec::new();
+    loop {
+        let frame = tokio::select! { biased;
+            _ = cancel.cancelled() => return Ok(()),
+            frame = controls.recv(), if control_open => match frame {
+                Some(frame) => Some(frame),
+                None => { control_open = false; continue; },
+            },
+            frame = outgoing.recv() => frame,
+        };
+        let Some(mut frame) = frame else {
+            return Ok(());
+        };
+        // A finite drain prevents a continuously refilled queue from postponing flushes.
+        let count = outgoing.len() + controls.len() + 1;
+        let mut dirty = false;
+        let mut close = false;
+        let result = async {
+            for index in 0..count {
+                let message = match frame {
+                    OutboundFrame::Text(text) => Some(Message::Text(text.into())),
+                    OutboundFrame::Binary(bytes) => Some(Message::Binary(bytes)),
+                    OutboundFrame::Ping(bytes) => Some(Message::Ping(bytes)),
+                    OutboundFrame::Pong(bytes) => Some(Message::Pong(bytes)),
+                    OutboundFrame::Close { code, reason } => {
+                        close = true;
+                        Some(Message::Close(Some(CloseFrame {
+                            code: code.into(),
+                            reason: reason.into(),
+                        })))
+                    }
+                    OutboundFrame::Flush(acknowledge) => {
+                        acknowledgements.push(acknowledge);
+                        None
+                    }
+                };
+                if let Some(message) = message {
+                    tokio::select! { biased;
+                        _ = cancel.cancelled() => bail!("Physical source closed before flush"),
+                        result = sink.feed(message) => result?,
+                    }
+                    dirty = true;
+                }
+                if close || index + 1 == count {
+                    break;
+                }
+                frame = match controls.try_recv().or_else(|_| outgoing.try_recv()) {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                };
+            }
+            if dirty {
+                tokio::select! { biased;
+                    _ = cancel.cancelled() => bail!("Physical source closed before flush"),
+                    result = sink.flush() => result?,
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        for acknowledge in acknowledgements.drain(..) {
+            let flushed = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| anyhow!("{error:#}"));
+            let _ = acknowledge.send(flushed);
+        }
+        result?;
+        if close {
+            return Ok(());
+        }
+    }
+}
+
 async fn send_close(outbound: &mpsc::Sender<OutboundFrame>, code: u16, reason: &str) {
     let mut reason = reason.to_owned();
     while reason.len() > 123 {
@@ -1397,3 +1492,112 @@ fn render_qr(url: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[tokio::test]
+async fn socket_drain_preserves_order_and_acknowledges_after_batch_flush() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    #[derive(Default)]
+    struct Writes {
+        messages: Vec<Message>,
+        flushes: usize,
+        allow_flush: bool,
+        waiter: Option<Waker>,
+    }
+    struct Sink(Arc<Mutex<Writes>>);
+    impl futures_util::Sink<Message> for Sink {
+        type Error = std::io::Error;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, message: Message) -> std::io::Result<()> {
+            self.0.lock().unwrap().messages.push(message);
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let mut writes = self.0.lock().unwrap();
+            if !writes.allow_flush {
+                writes.waiter = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            writes.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    let writes = Arc::new(Mutex::new(Writes::default()));
+    let (outbound, outgoing) = mpsc::channel(8);
+    let (control, controls) = mpsc::channel(1);
+    let (acknowledge_first, mut first) = tokio::sync::oneshot::channel();
+    let (acknowledge_last, mut last) = tokio::sync::oneshot::channel();
+    outbound
+        .try_send(OutboundFrame::Text("first".into()))
+        .unwrap();
+    outbound
+        .try_send(OutboundFrame::Flush(acknowledge_first))
+        .unwrap();
+    outbound
+        .try_send(OutboundFrame::Binary(Bytes::from_static(b"second")))
+        .unwrap();
+    outbound
+        .try_send(OutboundFrame::Ping(Bytes::from_static(b"ping")))
+        .unwrap();
+    outbound
+        .try_send(OutboundFrame::Flush(acknowledge_last))
+        .unwrap();
+    outbound
+        .try_send(OutboundFrame::Close {
+            code: 1000,
+            reason: "done".into(),
+        })
+        .unwrap();
+    control
+        .try_send(OutboundFrame::Pong(Bytes::from_static(b"priority")))
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let mut writing = Box::pin(write_socket(
+        Sink(writes.clone()),
+        outgoing,
+        controls,
+        &cancel,
+    ));
+    assert!(futures_util::poll!(&mut writing).is_pending());
+    assert!(matches!(
+        first.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        last.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    {
+        let mut writes = writes.lock().unwrap();
+        assert_eq!(writes.flushes, 0);
+        assert_eq!(
+            writes.messages,
+            vec![
+                Message::Pong(Bytes::from_static(b"priority")),
+                Message::Text("first".into()),
+                Message::Binary(Bytes::from_static(b"second")),
+                Message::Ping(Bytes::from_static(b"ping")),
+                Message::Close(Some(CloseFrame {
+                    code: 1000.into(),
+                    reason: "done".into()
+                })),
+            ]
+        );
+        writes.allow_flush = true;
+        writes.waiter.take().unwrap().wake();
+    }
+    writing.await.unwrap();
+    first.await.unwrap().unwrap();
+    last.await.unwrap().unwrap();
+    assert_eq!(writes.lock().unwrap().flushes, 1);
+}
