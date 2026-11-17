@@ -28,6 +28,7 @@ mod listing;
 pub mod notifications;
 pub mod receipts;
 mod runtime;
+mod state_publications;
 pub mod storage;
 pub mod timeline;
 mod wire;
@@ -207,6 +208,7 @@ pub struct AgentManager {
     /// Per-parent gates: child reads shared, parent start/replay exclusive.
     child_read_gates: Mutex<HashMap<String, Weak<RwLock<()>>>>,
     events: broadcast::Sender<Arc<Value>>,
+    publications: state_publications::StatePublications,
     closing: AtomicBool,
     idle_unload: idle_unload::IdleUnload,
 }
@@ -232,9 +234,13 @@ impl AgentManager {
             child_replays: history_read::ReplayWaiters::default(),
             child_read_gates: Mutex::new(HashMap::new()),
             events,
+            publications: state_publications::StatePublications::default(),
             closing: AtomicBool::new(false),
             idle_unload: idle_unload::IdleUnload::default(),
         }
+    }
+    fn publish_state(&self, snapshot: &Value) {
+        self.publications.publish(snapshot, &self.events);
     }
     pub(super) fn app(&self) -> Result<Arc<AppState>> {
         self.app
@@ -289,6 +295,8 @@ impl AgentManager {
     }
     // Catalogs are read per parent on demand; unrelated corruption cannot abort startup.
     async fn restore_persisted_state(&self) -> Result<()> {
+        use futures_util::StreamExt;
+        let mut changed = Vec::new();
         for mut record in self.storage()?.list().await? {
             let interrupted = matches!(
                 text(&record, "lastStatus"),
@@ -302,8 +310,19 @@ impl AgentManager {
             if interrupted || transient {
                 // Recovery is not new user activity. Keep timestamps, attention,
                 // provider identity and history intact while discarding view-only state.
-                self.storage()?.upsert(record.clone()).await?;
+                changed.push(record);
             }
+        }
+        let storage = self.storage()?;
+        let writes = futures_util::stream::iter(
+            changed
+                .into_iter()
+                .map(|record| async move { storage.upsert(record).await }),
+        )
+        .buffered(8);
+        tokio::pin!(writes);
+        while let Some(result) = writes.next().await {
+            result?;
         }
         Ok(())
     }
@@ -868,9 +887,7 @@ impl AgentManager {
             snapshot["activeTurn"] = Value::Null;
             snapshot["pendingPermissions"] = json!([]);
             runtime::transition_attention(None, snapshot);
-            let _ = self
-                .events
-                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
+            self.publish_state(snapshot);
         }
         if let Some(session) = session
             && let Err(close_error) = session.close().await
@@ -881,8 +898,8 @@ impl AgentManager {
             cell.data.lock().await.session = Some(session);
         }
     }
-    /// Non-activity writes preserve both durable activity stamps and the live
-    /// snapshot, even when an older record uses different values for the two.
+    /// Non-activity writes preserve both in-memory activity stamps and the live
+    /// snapshot; pending activity is included in every durable write.
     async fn persist_snapshot(&self, snapshot: &mut Value, record_activity: bool) -> Result<()> {
         object(snapshot).remove("snapshotAvailability");
         if record_activity {
@@ -957,7 +974,12 @@ impl AgentManager {
             object(metadata).remove("daemonAppendSystemPrompt");
             strip_config_internal_servers(metadata);
         }
-        self.storage()?.upsert(record).await
+        if record_activity {
+            self.storage()?.upsert_activity(record).await?;
+        } else {
+            self.storage()?.upsert(record).await?;
+        }
+        Ok(())
     }
     async fn commit_snapshot(
         &self,
@@ -1004,9 +1026,7 @@ impl AgentManager {
             data.snapshot = snapshot.clone();
         }
         if ready {
-            let _ = self
-                .events
-                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
+            self.publish_state(&snapshot);
         }
         Ok(())
     }

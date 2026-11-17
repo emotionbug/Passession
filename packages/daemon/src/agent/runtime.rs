@@ -314,9 +314,7 @@ impl AgentManager {
             cell.activity.touch();
             data.snapshot = snapshot.clone();
         }
-        let _ = self
-            .events
-            .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
+        self.publish_state(&snapshot);
         Ok(snapshot)
     }
     pub(super) async fn resume(
@@ -1198,10 +1196,11 @@ impl AgentManager {
             self.persist_snapshot(&mut snapshot, !from_history).await?;
         }
         cell.data.lock().await.snapshot = snapshot.clone();
+        if ready && from_history {
+            self.publications.note_snapshot(&snapshot);
+        }
         if ready && !from_history {
-            let _ = self
-                .events
-                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
+            self.publish_state(&snapshot);
             for (stream, row) in streams {
                 self.publish_stream(id, cell, stream, Some(row)).await?;
             }

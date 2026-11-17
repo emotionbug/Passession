@@ -272,6 +272,12 @@ impl AppState {
         {
             failure = Some(error);
         }
+        if let Some(storage) = self.agents.storage.get()
+            && let Err(error) = storage.flush_all().await
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
         match failure {
             Some(error) => Err(error),
             None => Ok(()),

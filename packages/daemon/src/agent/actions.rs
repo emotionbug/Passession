@@ -787,9 +787,7 @@ impl AgentManager {
                 self.persist_snapshot(&mut snapshot, touch).await?;
             }
             cell.data.lock().await.snapshot = snapshot.clone();
-            let _ = self
-                .events
-                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
+            self.publish_state(&snapshot);
             (snapshot, attention.filter(|_| ready))
         };
         if let Some(reason) = attention {
@@ -1120,6 +1118,7 @@ impl AgentManager {
                 self.storage()?.upsert(original).await?;
             } else {
                 self.storage()?.remove(&id).await?;
+                self.publications.remove(&id);
             }
         }
         result
@@ -1196,6 +1195,7 @@ impl AgentManager {
             }
             if action == "delete" {
                 self.storage()?.remove(id).await?;
+                self.publications.remove(id);
                 let app = self.app()?;
                 for path in [
                     self.timeline_path(id)?,
@@ -1352,9 +1352,7 @@ impl AgentManager {
                 }
             }
             self.persist_snapshot(&mut snapshot, touch).await?;
-            let _ = self
-                .events
-                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
+            self.publish_state(&snapshot);
             return Ok(snapshot);
         }
         let cell = self.ensure_loaded(id).await?;
@@ -1574,9 +1572,7 @@ impl AgentManager {
                 self.close_cell(id, &cell).await?;
             }
         }
-        let _ = self
-            .events
-            .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
+        self.publish_state(&snapshot);
         Ok(json!({"unarchived":true}))
     }
     async fn archive(&self, actor: &Value, id: &str) -> Result<Value> {
@@ -1617,9 +1613,7 @@ impl AgentManager {
                 snapshot["status"] = json!("idle");
             }
             self.persist_snapshot(&mut snapshot, false).await?;
-            let _ = self
-                .events
-                .send(Arc::new(json!({"type":"agent_state","agent":snapshot})));
+            self.publish_state(&snapshot);
         }
         if let Some(handle) = snapshot.get("persistence").filter(|v| v.is_object())
             && let Ok(factory) = self.app()?.providers.get(required(&snapshot, "provider")?)

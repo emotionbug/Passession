@@ -559,6 +559,7 @@ impl AgentManager {
             {
                 failure = Some(error);
             }
+            self.publications.remove(id);
         }
         if let Some(error) = failure {
             Err(error)

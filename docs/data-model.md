@@ -70,6 +70,11 @@ The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` b
 
 Each agent is stored as a separate JSON file, grouped by project directory.
 
+Only `updatedAt` and `lastActivityAt` are written behind: they are flushed at most every five
+seconds and before unload, shutdown or archive, or with the next durable change. Every other field
+is written and fsynced as soon as it changes, and an unchanged record is not rewritten. After a
+crash only those two activity timestamps may be up to five seconds old.
+
 | Field                | Type                                     | Description                                                                                                                                                                                                                                                                                                                                                                         |
 | -------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `id`                 | `string`                                 | UUID, primary key                                                                                                                                                                                                                                                                                                                                                                   |

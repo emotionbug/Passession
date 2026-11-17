@@ -41,6 +41,16 @@ pub(super) async fn handle(
                     } else {
                         HashMap::new()
                     };
+                    let sent = if owner.is_some() {
+                        payload["entries"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|entry| (text(&entry["agent"], "id").to_owned(), entry.clone()))
+                            .collect()
+                    } else {
+                        HashMap::new()
+                    };
                     if let Some(owner) = &owner {
                         payload["subscriptionId"] = json!(owner.response_id());
                     }
@@ -62,6 +72,7 @@ pub(super) async fn handle(
                             events.expect("subscription receiver"),
                             request.clone(),
                             stamps,
+                            sent,
                         )?;
                     }
                 }
@@ -320,6 +331,7 @@ fn follow(
     mut events: tokio::sync::broadcast::Receiver<std::sync::Arc<Value>>,
     request: Value,
     mut stamps: HashMap<String, String>,
+    mut sent: HashMap<String, Value>,
 ) -> Result<()> {
     let app = std::sync::Arc::downgrade(&manager.app()?);
     tokio::spawn(async move {
@@ -405,6 +417,11 @@ fn follow(
                 let visible = entry.as_ref().is_none_or(|entry| {
                     provider_visible(owner.context(), text(&entry["agent"], "provider"))
                 });
+                let unchanged =
+                    matches && visible && !remember_entry(&mut sent, &id, entry.as_ref().unwrap());
+                if !matches {
+                    sent.remove(&id);
+                }
                 let payload = app.agents.directory_sync.sequence_agent_update(
                     payload,
                     entry,
@@ -412,7 +429,7 @@ fn follow(
                     request.get("sync").is_some(),
                     filter["includeBackground"] == true,
                 )?;
-                if visible {
+                if visible && !unchanged {
                     owner
                         .emit(json!({"type":"agent_update","payload":payload}))
                         .await
@@ -428,6 +445,14 @@ fn follow(
         let _ = owner.release().await;
     });
     Ok(())
+}
+
+fn remember_entry(sent: &mut HashMap<String, Value>, id: &str, entry: &Value) -> bool {
+    if sent.get(id) == Some(entry) {
+        return false;
+    }
+    sent.insert(id.to_owned(), entry.clone());
+    true
 }
 
 fn sort_value(agent: &Value, key: &str) -> Value {
@@ -617,6 +642,17 @@ pub(crate) async fn legacy_attention_eligible(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unchanged_agent_and_project_upserts_are_skipped() {
+        let mut sent = HashMap::new();
+        let mut entry = json!({"agent":{"id":"a","title":"A"},"project":{"projectName":"P"}});
+        assert!(remember_entry(&mut sent, "a", &entry));
+        assert!(!remember_entry(&mut sent, "a", &entry));
+        entry["project"]["projectName"] = json!("Renamed");
+        assert!(remember_entry(&mut sent, "a", &entry));
+        entry["agent"]["title"] = json!("Renamed");
+        assert!(remember_entry(&mut sent, "a", &entry));
+    }
     #[test]
     fn cursor_tiebreaker_avoids_losing_equal_timestamps() {
         let entries = vec![

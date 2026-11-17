@@ -261,6 +261,7 @@ impl AgentManager {
         }
         // New work, viewers and event applications cannot cross the exclusive
         // gate. A failed close leaves the same owner installed for a later retry.
+        self.storage()?.flush(id).await?;
         session.close().await?;
         cell.unloaded.store(true, Ordering::Release);
         {

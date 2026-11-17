@@ -77,6 +77,10 @@ The core hydrates project, workspace and agent directories independently, exposi
 and errors while retaining previous rows. Live directory updates remain ordered behind the relevant
 baselines, including workspace changes that also affect projects. Request/ACK waiting is distinct
 from the agent's actual activity; stale/offline snapshots do not animate as current running state.
+The daemon publishes an agent's state as soon as a displayed field changes; changes to only
+`updatedAt`/`lastActivityAt` are sent at most once per second per agent, always ending with the
+latest value. Directory followers skip agent and project upserts whose serialized form is
+unchanged.
 
 The app admits at most 64 queued core events in one dispatch, taking a finite queue snapshot
 under one lock. A nonempty batch arms a 1/60-second continuation timer; incoming signals cannot

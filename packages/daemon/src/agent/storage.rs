@@ -1,8 +1,11 @@
+use super::state_publications::same_content;
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard, RwLock};
 
@@ -28,7 +31,8 @@ impl KeyLocks {
 }
 
 /// Commit a private file in its own directory, then fsync the containing directory.
-/// Callers only publish cache/observer changes after this succeeds.
+/// Durable field changes are published only after this succeeds; activity-only
+/// stamps are explicitly cached until their bounded flush.
 pub(super) async fn atomic_json(path: &Path, value: &Value) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     atomic_bytes(path, &bytes).await
@@ -79,6 +83,9 @@ struct Records {
     paths: HashMap<String, HashSet<PathBuf>>,
     deleting: HashSet<String>,
     execution_owners: HashMap<(String, String), String>,
+    owner_keys: HashMap<String, (String, String)>,
+    dirty_activity: HashSet<String>,
+    activity_timers: HashSet<String>,
     workspaces: HashMap<String, HashSet<String>>,
 }
 impl Records {
@@ -97,9 +104,10 @@ impl Records {
                     .insert(id.clone());
             }
         }
-        self.execution_owners.retain(|_, owner| owner != &id);
+        self.remove_execution_owner(&id);
         if let Some(key) = execution_key(&value["owner"]) {
-            self.execution_owners.insert(key, id.clone());
+            self.execution_owners.insert(key.clone(), id.clone());
+            self.owner_keys.insert(id.clone(), key);
         }
         if !self.values.contains_key(&id) {
             self.order.push(id.clone());
@@ -110,6 +118,16 @@ impl Records {
             .or_default()
             .insert(path.clone());
         self.current_paths.insert(id, path);
+    }
+    fn remove_execution_owner(&mut self, id: &str) {
+        if let Some(key) = self.owner_keys.remove(id)
+            && self
+                .execution_owners
+                .get(&key)
+                .is_some_and(|owner| owner == id)
+        {
+            self.execution_owners.remove(&key);
+        }
     }
     fn remove_workspace_member(&mut self, id: &str) {
         if let Some(workspace) = self
@@ -126,17 +144,18 @@ impl Records {
     }
 }
 
+#[derive(Clone)]
 pub struct AgentStorage {
     directory: PathBuf,
-    records: OnceCell<RwLock<Records>>,
-    mutations: KeyLocks,
+    records: Arc<OnceCell<RwLock<Records>>>,
+    mutations: Arc<KeyLocks>,
 }
 impl AgentStorage {
     pub fn new(home: PathBuf) -> Self {
         Self {
             directory: home.join("agents"),
-            records: OnceCell::new(),
-            mutations: KeyLocks::default(),
+            records: Arc::new(OnceCell::new()),
+            mutations: Arc::new(KeyLocks::default()),
         }
     }
     async fn records(&self) -> Result<&RwLock<Records>> {
@@ -182,7 +201,9 @@ impl AgentStorage {
                     paths.sort();
                     files.extend(paths);
                 }
-                for path in files {
+                // Buffered reads overlap I/O while yielding in sorted path order:
+                // the last duplicate still wins, independent of completion order.
+                let reads = stream::iter(files.into_iter().map(|path| async move {
                     let record = async {
                         let mut value: Value =
                             serde_json::from_slice(&tokio::fs::read(&path).await?)?;
@@ -190,6 +211,11 @@ impl AgentStorage {
                         Ok::<_, anyhow::Error>(value)
                     }
                     .await;
+                    (path, record)
+                }))
+                .buffered(8);
+                tokio::pin!(reads);
+                while let Some((path, record)) = reads.next().await {
                     match record {
                         Ok(value) => {
                             records.insert(value["id"].as_str().unwrap().to_owned(), value, path)
@@ -264,6 +290,12 @@ impl AgentStorage {
     where
         F: FnOnce(Option<&Value>) -> Result<Value> + Send,
     {
+        self.mutate_record(id, mutation, false).await
+    }
+    async fn mutate_record<F>(&self, id: &str, mutation: F, defer_activity: bool) -> Result<()>
+    where
+        F: FnOnce(Option<&Value>) -> Result<Value> + Send,
+    {
         let records = self.records().await?;
         let _guard = self.mutations.lock(id).await;
         let (mut record, previous) = {
@@ -284,6 +316,25 @@ impl AgentStorage {
             .directory
             .join(project_directory(record["cwd"].as_str().unwrap()))
             .join(format!("{id}.json"));
+        {
+            let mut records = records.write().await;
+            if let Some(existing) = records.values.get(id) {
+                if existing == &record
+                    && !records.dirty_activity.contains(id)
+                    && previous.as_ref() == Some(&path)
+                {
+                    return Ok(());
+                }
+                if defer_activity && same_content(existing, &record) {
+                    records.values.insert(id.to_owned(), record);
+                    records.dirty_activity.insert(id.to_owned());
+                    if records.activity_timers.insert(id.to_owned()) {
+                        self.schedule_activity_flush(id.to_owned());
+                    }
+                    return Ok(());
+                }
+            }
+        }
         atomic_json(&path, &record).await?;
         let mut removed_previous = None;
         if let Some(previous) = previous.filter(|previous| previous != &path) {
@@ -304,6 +355,61 @@ impl AgentStorage {
             paths.remove(&previous);
         }
         records.insert(id.to_owned(), record, path);
+        records.dirty_activity.remove(id);
+        Ok(())
+    }
+    fn schedule_activity_flush(&self, id: String) {
+        let storage = self.clone();
+        let mut deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep_until(deadline).await;
+                let result = storage.flush(&id).await;
+                if let Err(error) = &result {
+                    tracing::error!(agent_id=%id, %error, "Failed to flush agent activity");
+                }
+                let Ok(records) = storage.records().await else {
+                    break;
+                };
+                let mut records = records.write().await;
+                if result.is_err() || !records.dirty_activity.contains(&id) {
+                    records.activity_timers.remove(&id);
+                    break;
+                }
+                deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            }
+        });
+    }
+    /// Only the two activity stamps may lag disk. Every other (including opaque
+    /// future) record field remains write-through and includes pending activity.
+    pub(super) async fn upsert_activity(&self, record: Value) -> Result<()> {
+        let id = record["id"]
+            .as_str()
+            .context("Agent record id must be a string")?
+            .to_owned();
+        self.mutate_record(&id, |_| Ok(record), true).await
+    }
+    pub async fn flush(&self, id: &str) -> Result<()> {
+        self.mutate(id, |record| {
+            record
+                .cloned()
+                .with_context(|| format!("Agent {id} not found"))
+        })
+        .await
+    }
+    pub async fn flush_all(&self) -> Result<()> {
+        let ids: Vec<_> = self
+            .records()
+            .await?
+            .read()
+            .await
+            .dirty_activity
+            .iter()
+            .cloned()
+            .collect();
+        for id in ids {
+            self.flush(&id).await?;
+        }
         Ok(())
     }
     pub async fn set_title(&self, id: &str, title: &str) -> Result<()> {
@@ -362,10 +468,12 @@ impl AgentStorage {
         records.order.retain(|value| value != id);
         records.current_paths.remove(id);
         records.paths.remove(id);
-        records.execution_owners.retain(|_, owner| owner != id);
+        records.remove_execution_owner(id);
+        records.dirty_activity.remove(id);
         Ok(())
     }
 }
+
 fn execution_key(owner: &Value) -> Option<(String, String)> {
     if owner["kind"].as_str()? != "daemon" {
         return None;
@@ -637,6 +745,184 @@ fn collapse_separators(value: &str, colons: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn record(id: &str) -> Value {
+        json!({"id":id,"provider":"custom","cwd":"/project","createdAt":"old",
+            "updatedAt":"original","lastActivityAt":"original","lastStatus":"running","title":"old","labels":{}})
+    }
+    async fn on_disk(home: &Path, id: &str) -> Result<Value> {
+        Ok(serde_json::from_slice(
+            &tokio::fs::read(home.join("agents/project").join(format!("{id}.json"))).await?,
+        )?)
+    }
+    #[tokio::test]
+    async fn activity_stays_in_memory_until_flush_and_durable_changes_write_through() -> Result<()>
+    {
+        let home = tempfile::tempdir()?;
+        let storage = AgentStorage::new(home.path().to_owned());
+        let original = record("agent");
+        storage.upsert(original.clone()).await?;
+        let mut latest = original.clone();
+        latest["updatedAt"] = json!("activity");
+        latest["lastActivityAt"] = json!("activity");
+        storage.upsert_activity(latest.clone()).await?;
+        assert_eq!(storage.get("agent").await?, Some(latest.clone()));
+        assert_eq!(
+            on_disk(home.path(), "agent").await?,
+            storage_record(original.clone())
+        );
+        storage.flush("agent").await?;
+        assert_eq!(
+            on_disk(home.path(), "agent").await?["updatedAt"],
+            "activity"
+        );
+        latest["updatedAt"] = json!("new activity");
+        latest["lastActivityAt"] = json!("new activity");
+        storage.upsert_activity(latest.clone()).await?;
+        latest["title"] = json!("durable title");
+        storage.upsert_activity(latest.clone()).await?;
+        assert_eq!(
+            on_disk(home.path(), "agent").await?["title"],
+            "durable title"
+        );
+        assert_eq!(
+            on_disk(home.path(), "agent").await?["updatedAt"],
+            "new activity"
+        );
+        assert!(
+            !storage
+                .records()
+                .await?
+                .read()
+                .await
+                .dirty_activity
+                .contains("agent")
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn activity_timer_flushes_at_five_seconds_without_more_events() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let storage = AgentStorage::new(home.path().to_owned());
+        let mut latest = record("agent");
+        storage.upsert(latest.clone()).await?;
+        tokio::time::pause();
+        latest["updatedAt"] = json!("latest");
+        storage.upsert_activity(latest).await?;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(4_999)).await;
+        assert!(
+            storage
+                .records()
+                .await?
+                .read()
+                .await
+                .dirty_activity
+                .contains("agent")
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while storage
+                .records()
+                .await?
+                .read()
+                .await
+                .dirty_activity
+                .contains("agent")
+            {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        assert_eq!(on_disk(home.path(), "agent").await?["updatedAt"], "latest");
+        Ok(())
+    }
+    fn storage_record(mut value: Value) -> Value {
+        validate_record(&mut value).unwrap();
+        value
+    }
+    #[test]
+    fn record_indexes_preserve_duplicate_owner_and_moved_path_semantics() {
+        let mut records = Records::default();
+        for index in 0..1_000 {
+            let id = format!("agent-{index}");
+            let mut value = record(&id);
+            value["owner"] = json!({"kind":"daemon","daemonId":"d","executionId":id});
+            value["workspaceId"] = json!("original");
+            records.insert(
+                id.clone(),
+                value,
+                PathBuf::from(format!("original/{id}.json")),
+            );
+        }
+        assert_eq!(records.values.len(), 1_000);
+        assert_eq!(records.owner_keys.len(), 1_000);
+        assert_eq!(records.execution_owners.len(), 1_000);
+        let mut replacement = record("agent-0");
+        replacement["owner"] = json!({"kind":"daemon","daemonId":"d","executionId":"new"});
+        replacement["workspaceId"] = json!("moved");
+        records.insert(
+            "agent-0".to_owned(),
+            replacement.clone(),
+            PathBuf::from("moved/agent-0.json"),
+        );
+        assert_eq!(records.values.len(), 1_000);
+        assert_eq!(records.order.len(), 1_000);
+        assert_eq!(records.order[0], "agent-0");
+        assert_eq!(records.values["agent-0"], replacement);
+        assert_eq!(records.paths["agent-0"].len(), 2);
+        assert_eq!(
+            records.current_paths["agent-0"],
+            PathBuf::from("moved/agent-0.json")
+        );
+        assert!(
+            !records
+                .execution_owners
+                .contains_key(&("d".into(), "agent-0".into()))
+        );
+        assert_eq!(
+            records.execution_owners[&("d".into(), "new".into())],
+            "agent-0"
+        );
+        assert!(!records.workspaces["original"].contains("agent-0"));
+        assert!(records.workspaces["moved"].contains("agent-0"));
+        // A later record may take an execution key; updating its former owner
+        // must not remove that later record's index entry.
+        let mut shared = record("other");
+        shared["owner"] = replacement["owner"].clone();
+        records.insert("other".into(), shared, PathBuf::from("other.json"));
+        replacement["owner"]["executionId"] = json!("newer");
+        records.insert(
+            "agent-0".into(),
+            replacement,
+            PathBuf::from("moved/agent-0.json"),
+        );
+        assert_eq!(
+            records.execution_owners[&("d".into(), "new".into())],
+            "other"
+        );
+    }
+    #[tokio::test]
+    async fn concurrent_load_keeps_sorted_duplicate_winner_and_unchanged_files() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let mut first = record("same");
+        first["title"] = json!("first");
+        let mut last = first.clone();
+        last["title"] = json!("last");
+        let first_path = home.path().join("agents/a/same.json");
+        let last_path = home.path().join("agents/z/same.json");
+        atomic_json(&first_path, &first).await?;
+        atomic_json(&last_path, &last).await?;
+        let before = tokio::fs::metadata(&last_path).await?.modified()?;
+        let storage = AgentStorage::new(home.path().to_owned());
+        assert_eq!(storage.list().await?, vec![storage_record(last)]);
+        assert_eq!(tokio::fs::metadata(&last_path).await?.modified()?, before);
+        assert_eq!(storage.records().await?.read().await.paths["same"].len(), 2);
+        storage.remove("same").await?;
+        assert!(!first_path.exists() && !last_path.exists());
+        Ok(())
+    }
     #[test]
     fn portable_project_directory_names() {
         for (cwd, expected) in [
