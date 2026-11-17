@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Resume or retry a host update after reopening the app instead of failing with "Selected host update failed: …". The saved update request is stored as JSON text, and reading it back used the whole text as the operation ID, which the daemon rejected as not a UUID. Saved requests are now read as requests, and a saved record whose ID the daemon can never accept is discarded.
+
 ## 0.13.35 - 2026-11-17
 
 ### Added

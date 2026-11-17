@@ -161,18 +161,41 @@ pub fn update_operation_key(server_id: &str) -> String {
     format!("paseo.daemonUpdate.operation.{server_id}")
 }
 
-/// Read old ID-only records as well as a flushed, retryable submit request.
-pub fn stored_update_operation(state: &Value, server_id: &str) -> Option<String> {
+/// The core keeps objects as their JSON text (Flutter key-value convention), so
+/// a string is a saved submit request when it parses to an object and an old
+/// ID-only record otherwise.
+fn stored_update_record(state: &Value, server_id: &str) -> Option<Value> {
     let record = get(state, "prefs").get(update_operation_key(server_id))?;
+    if let Some(text) = record.as_str()
+        && let Ok(object @ Value::Object(_)) = serde_json::from_str(text)
+    {
+        return Some(object);
+    }
+    Some(record.clone())
+}
+
+/// The saved operation ID, or `None` when it is missing or not a UUID the
+/// daemon can observe (such a record can only fail; drop it).
+pub fn stored_update_operation(state: &Value, server_id: &str) -> Option<String> {
+    let record = stored_update_record(state, server_id)?;
     record
         .as_str()
         .or_else(|| record["operationId"].as_str())
-        .filter(|id| !id.is_empty())
+        .filter(|id| uuid::Uuid::parse_str(id.trim()).is_ok_and(|id| !id.is_nil()))
         .map(String::from)
 }
 
+/// Whether a saved record exists that [`stored_update_operation`] rejects.
+pub fn has_unusable_update_record(state: &Value, server_id: &str) -> bool {
+    get(state, "prefs")
+        .get(update_operation_key(server_id))
+        .is_some_and(|record| !record.is_null())
+        && stored_update_operation(state, server_id).is_none()
+}
+
 pub fn stored_update_request(state: &Value, server_id: &str) -> Option<Value> {
-    let record = get(state, "prefs").get(update_operation_key(server_id))?;
+    stored_update_operation(state, server_id)?;
+    let record = stored_update_record(state, server_id)?;
     if !record.is_object()
         || record["operationId"].as_str().is_none_or(str::is_empty)
         || record["source"] != "release"
@@ -184,14 +207,20 @@ pub fn stored_update_request(state: &Value, server_id: &str) -> Option<Value> {
         if selected.is_empty()
             || selected.len() > 4
             || selected.iter().enumerate().any(|(index, id)| {
-                id.as_str().is_none_or(|id| {
-                    !super::model::daemon_update::COMPONENT_IDS.contains(&id)
-                }) || selected[..index].contains(id)
+                id.as_str()
+                    .is_none_or(|id| !super::model::daemon_update::COMPONENT_IDS.contains(&id))
+                    || selected[..index].contains(id)
             })
-            || record["expectedRelease"]["version"].as_str().is_none_or(str::is_empty)
-            || record["expectedRelease"]["manifestSha512"].as_str().is_none_or(|pin| pin.len() != 88)
+            || record["expectedRelease"]["version"]
+                .as_str()
+                .is_none_or(str::is_empty)
+            || record["expectedRelease"]["manifestSha512"]
+                .as_str()
+                .is_none_or(|pin| pin.len() != 88)
             || !record["forceRunning"].is_boolean()
-            || record["idleTimeoutMs"].as_u64().is_none_or(|timeout| timeout == 0)
+            || record["idleTimeoutMs"]
+                .as_u64()
+                .is_none_or(|timeout| timeout == 0)
         {
             return None;
         }
@@ -499,45 +528,68 @@ pub fn project_name(project: &Value) -> String {
 mod update_restore_tests {
     use super::*;
 
+    const OP_A: &str = "0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11";
+    const OP_B: &str = "6d1f3a2b-8c4e-4f1a-9b7d-2e5c8a0f4d33";
+
+    /// Preferences hold objects as JSON text, exactly as the core stores them.
+    fn saved(record: &Value) -> Value {
+        json!(record.to_string())
+    }
+
     #[test]
     fn restores_exact_host_request_and_legacy_ids_without_cross_wiring() {
-        let request = json!({"operationId":"op-a","source":"release","targetKind":"app",
+        let request = json!({"operationId":OP_A,"source":"release","targetKind":"app",
             "forceRunning":false,"idleTimeoutMs":300_000,
             "selectedComponents":["daemon","update-helper"],
             "expectedRelease":{"version":"2.0.0","manifestSha512":"A".repeat(88)}});
         let mut state = json!({"prefs":{}});
-        state["prefs"][update_operation_key("host-a")] = request.clone();
-        state["prefs"][update_operation_key("host-b")] = json!("op-b");
+        state["prefs"][update_operation_key("host-a")] = saved(&request);
+        state["prefs"][update_operation_key("host-b")] = json!(OP_B);
+        state["prefs"][update_operation_key("host-d")] = json!("op-d");
         assert_eq!(
             stored_update_operation(&state, "host-a").as_deref(),
-            Some("op-a")
+            Some(OP_A)
         );
         assert_eq!(stored_update_request(&state, "host-a"), Some(request));
         assert_eq!(
             stored_update_operation(&state, "host-b").as_deref(),
-            Some("op-b")
+            Some(OP_B)
         );
         assert_eq!(stored_update_request(&state, "host-b"), None);
         assert_eq!(stored_update_operation(&state, "host-c"), None);
+        assert!(!has_unusable_update_record(&state, "host-c"));
+        // A non-UUID ID can never be observed by the daemon: drop it.
+        assert_eq!(stored_update_operation(&state, "host-d"), None);
+        assert!(has_unusable_update_record(&state, "host-d"));
+        assert!(!has_unusable_update_record(&state, "host-a"));
     }
 
     #[test]
     fn incomplete_desktop_approval_keeps_id_for_observation_but_never_reconstructs_submit() {
-        let request = json!({"operationId":"op-a","source":"release","targetKind":"app",
+        let request = json!({"operationId":OP_A,"source":"release","targetKind":"app",
             "forceRunning":true,"idleTimeoutMs":300_000,"selectedComponents":["daemon"],
             "expectedRelease":{"version":"2.0.0","manifestSha512":"A".repeat(88)}});
-        for field in ["selectedComponents", "expectedRelease", "forceRunning", "idleTimeoutMs"] {
+        for field in [
+            "selectedComponents",
+            "expectedRelease",
+            "forceRunning",
+            "idleTimeoutMs",
+        ] {
             let mut partial = request.clone();
             partial.as_object_mut().unwrap().remove(field);
             let mut state = json!({"prefs":{}});
-            state["prefs"][update_operation_key("host")] = partial;
-            assert_eq!(stored_update_operation(&state, "host").as_deref(), Some("op-a"));
+            state["prefs"][update_operation_key("host")] = saved(&partial);
+            assert_eq!(
+                stored_update_operation(&state, "host").as_deref(),
+                Some(OP_A)
+            );
             assert!(stored_update_request(&state, "host").is_none(), "{field}");
         }
-        for selected in [json!([]), json!(["daemon","daemon"]), json!(["unknown"])] {
+        for selected in [json!([]), json!(["daemon", "daemon"]), json!(["unknown"])] {
+            let mut invalid = request.clone();
+            invalid["selectedComponents"] = selected;
             let mut state = json!({"prefs":{}});
-            state["prefs"][update_operation_key("host")] = request.clone();
-            state["prefs"][update_operation_key("host")]["selectedComponents"] = selected;
+            state["prefs"][update_operation_key("host")] = saved(&invalid);
             assert!(stored_update_request(&state, "host").is_none());
         }
     }

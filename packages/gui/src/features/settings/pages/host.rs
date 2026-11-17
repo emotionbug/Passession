@@ -872,6 +872,9 @@ pub fn ensure_update_card(s: &mut Settings, env: &mut Env, host: &HostView) {
         return;
     }
     if c.operation_id.is_none() {
+        if host::has_unusable_update_record(&env.ctx.state, &host.server_id) {
+            host::clear_update_operation(&env.ctx.core, &host.server_id);
+        }
         c.operation_id = host::stored_update_operation(&env.ctx.state, &host.server_id);
         c.submit_request = host::stored_update_request(&env.ctx.state, &host.server_id);
         c.app_update = c
