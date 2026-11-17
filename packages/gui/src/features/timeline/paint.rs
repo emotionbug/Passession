@@ -50,8 +50,11 @@ pub struct RowState {
     /// Measured timeline rows publish prepared snapshots only during measurement.
     pub managed_preparation: bool,
     pub preparing: bool,
-    pub markdown_worker: super::markdown::worker::MarkdownWorker,
-    pub markdown_presentation: super::markdown::view::MarkdownPresentation,
+    pub presentation: RowPresentation,
+    /// Eviction never invalidates the retained intrinsic height or selection.
+    pub presentation_restoring: bool,
+    pub measured_width: f64,
+    pub presentation_used: u64,
     /// Expanded badges / cards by key (tool, thinking, plan, group…).
     pub expanded: HashMap<String, bool>,
     /// Horizontal / vertical scroll offsets of code panes and capped details.
@@ -62,7 +65,6 @@ pub struct RowState {
     pub extent_y: HashMap<String, f64>,
     /// Copy glyph shows a check for 1.5s (`TurnCopyButton`).
     pub copied: HashMap<String, f64>,
-    pub response_copy: super::layout::ResponseCopyCache,
     pub hovered: bool,
     pub hover_link: Option<std::sync::Arc<str>>,
     pub hover_hit: Option<String>,
@@ -70,18 +72,8 @@ pub struct RowState {
     pub dragging_bar: Option<String>,
     /// Paced reveal of streaming text by key.
     pub reveals: HashMap<String, Reveal>,
-    /// Parsed Markdown keyed by source text hash.
-    pub markdown: HashMap<u64, Rc<Vec<super::markdown::model::Block>>>,
-    /// Stable split head cache (streaming).
-    pub stable_head: Option<(u64, Rc<Vec<super::markdown::model::Block>>)>,
-    /// Prepared paragraph geometry retained by immutable parsed-block identity.
-    pub markdown_paragraphs: super::markdown::view::ParagraphCache,
-    /// Only the current growing parse is retained, never older live snapshots.
-    pub markdown_tail: Option<(u64, Rc<Vec<super::markdown::model::Block>>)>,
-    /// Worker results belong to this exact row and sequential code-block key.
-    pub fence_highlights: HashMap<String, super::highlight::FenceRequest>,
-    pub mermaid: HashMap<String, super::mermaid::Request>,
     pub selection: Option<(usize, usize)>,
+    pub selection_source: Option<u64>,
     /// Permission card / question form state.
     pub permission: Option<super::permission::CardState>,
     /// Keys of pending menus (rewind / fork) that keep their glyph active.
@@ -93,7 +85,59 @@ pub struct RowState {
     pub find_y: Option<f64>,
 }
 
+/// Disposable content ownership, separate from persistent interaction state.
+#[derive(Default)]
+pub struct RowPresentation {
+    pub markdown_worker: super::markdown::worker::MarkdownWorker,
+    pub markdown_presentation: super::markdown::view::MarkdownPresentation,
+    pub response_copy: super::layout::ResponseCopyCache,
+    pub markdown: HashMap<u64, Rc<Vec<super::markdown::model::Block>>>,
+    pub stable_head: Option<(u64, Rc<Vec<super::markdown::model::Block>>)>,
+    pub markdown_paragraphs: super::markdown::view::ParagraphCache,
+    pub markdown_tail: Option<(u64, Rc<Vec<super::markdown::model::Block>>)>,
+    pub fence_highlights: HashMap<String, super::highlight::FenceRequest>,
+    pub mermaid: HashMap<String, super::mermaid::Request>,
+}
+
+impl std::ops::Deref for RowState {
+    type Target = RowPresentation;
+    fn deref(&self) -> &Self::Target {
+        &self.presentation
+    }
+}
+
+impl std::ops::DerefMut for RowState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.presentation
+    }
+}
+
 impl RowState {
+    pub fn evict_presentation(&mut self) {
+        self.presentation = RowPresentation::default();
+        self.presentation_restoring = true;
+        self.reveals.clear();
+        self.extent_x.clear();
+        self.extent_y.clear();
+        self.hover_link = None;
+        self.hover_hit = None;
+        self.invalidate();
+    }
+
+    pub fn preparing_height(&mut self, height: f64, width: f64, pending: bool) -> f64 {
+        let height = if self.presentation_restoring && pending && self.measured_width == width {
+            self.height.max(height)
+        } else {
+            height
+        };
+        if !pending {
+            self.presentation_restoring = false;
+        }
+        self.measured_width = width;
+        self.height = height;
+        height
+    }
+
     pub fn invalidate(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }
@@ -171,4 +215,27 @@ impl Draw<'_> {
 
 pub fn now_seconds() -> f64 {
     crate::common::clock::now_ms() as f64 / 1000.0
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn eviction_and_restore_preserve_measured_height_and_interaction() {
+        let mut state = RowState::default();
+        state.preparing_height(512.0, 600.0, false);
+        state.expanded.insert("thinking".into(), true);
+        state.selection = Some((4, 10));
+        state.selection_source = Some(123);
+        state.markdown.insert(1, Rc::new(Vec::new()));
+        state.evict_presentation();
+        assert!(state.markdown.is_empty());
+        assert_eq!(state.preparing_height(0.0, 600.0, true), 512.0);
+        assert_eq!(state.preparing_height(512.0, 600.0, false), 512.0);
+        assert!(!state.presentation_restoring);
+        assert_eq!(state.expanded.get("thinking"), Some(&true));
+        assert_eq!(state.selection, Some((4, 10)));
+        assert_eq!(state.selection_source, Some(123));
+    }
 }

@@ -20,6 +20,7 @@
 - Stop periodic daemon work while idle. Idle OpenCode sessions no longer wake every 25 ms, finished OMP subagents are no longer re-read every 250 ms, schedules wake at their next due time instead of rereading every schedule file each second, and publishing one workspace reads only that workspace's agents, terminals and subagents.
 - Stop periodic app work while idle. Connection probes sleep until the next one is due, and unchanged Tailscale status no longer republishes the app state.
 - Enable only the Tokio features the daemon and client use instead of `full`.
+- Bound the memory of long conversations and stream replies with less work. Rows far from the viewport drop their parsed Markdown, paragraph layout and code highlighting, keeping at most 128 rows plus the visible ones, and rebuild them when scrolled back without moving the page; heights, expansion and selection are kept. While a reply streams, finished blocks and their laid-out paragraphs are reused and only the growing tail is parsed again, falling back to a full parse when earlier text could change (link references, raw HTML, an open code fence or an edit that is not an append).
 
 ### Fixed
 

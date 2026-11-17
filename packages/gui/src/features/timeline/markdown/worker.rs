@@ -1,5 +1,6 @@
 //! Small live revisions follow the reveal clock without a worker round trip.
-//! Larger documents capture bounded chunks for whole-document worker parsing.
+//! Stable Markdown prefixes retain parsed blocks; only the mutable tail is
+//! captured, parsed and flattened again. Unsafe context uses a full parse.
 //! A captured revision finishes before newer demand replaces it.
 
 use super::super::links::FileLinkSourceType;
@@ -57,46 +58,97 @@ pub struct SemanticParagraph {
     pub link_max_ends: Arc<[usize]>,
 }
 
-/// Inline allocations are immutable and stay at the same addresses when the
-/// worker's Vec<Block> moves into this Rc. This owner keeps all index keys alive.
+/// Immutable chunks keep paragraph addresses and geometry reusable across
+/// append revisions; the prefix spine never retains superseded open tails.
+pub struct ParsedChunk {
+    pub blocks: Rc<Vec<Block>>,
+    pub codes: HashMap<usize, Arc<SemanticParagraph>>,
+    pub paragraphs: HashMap<ParagraphKey, Arc<SemanticParagraph>>,
+}
+
+pub struct ParsedPrefix {
+    pub previous: Option<Rc<ParsedPrefix>>,
+    pub chunk: Rc<ParsedChunk>,
+}
+
+impl Drop for ParsedPrefix {
+    fn drop(&mut self) {
+        // Evicting a response with many incremental boundaries must not
+        // recursively destroy an arbitrarily deep persistent spine.
+        let mut previous = self.previous.take();
+        while let Some(node) = previous {
+            match Rc::try_unwrap(node) {
+                Ok(mut node) => previous = node.previous.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 pub struct ParsedSnapshot {
     pub revision: u64,
     pub epoch: u64,
-    pub source: Arc<str>,
+    pub source: Rc<Value>,
     pub replaces_previous: bool,
     pub find_pattern: Option<String>,
     pub interactive: bool,
-    pub codes: HashMap<usize, Arc<SemanticParagraph>>,
-    pub blocks: Rc<Vec<Block>>,
-    pub paragraphs: HashMap<ParagraphKey, Arc<SemanticParagraph>>,
+    pub prefix: Option<Rc<ParsedPrefix>>,
+    pub tail: Rc<ParsedChunk>,
+    pub stable_end: usize,
+}
+
+impl ParsedSnapshot {
+    pub fn source_text(&self) -> &str {
+        entry_text(&self.source)
+    }
+
+    pub fn chunks(&self) -> Vec<Rc<ParsedChunk>> {
+        let mut chunks = Vec::new();
+        let mut prefix = self.prefix.as_ref();
+        while let Some(node) = prefix {
+            chunks.push(node.chunk.clone());
+            prefix = node.previous.as_ref();
+        }
+        chunks.reverse();
+        chunks.push(self.tail.clone());
+        chunks
+    }
+}
+
+struct ParsedPart {
+    blocks: Vec<Block>,
+    codes: HashMap<usize, Arc<SemanticParagraph>>,
+    paragraphs: HashMap<ParagraphKey, Arc<SemanticParagraph>>,
+}
+
+impl From<ParsedPart> for ParsedChunk {
+    fn from(part: ParsedPart) -> Self {
+        Self {
+            blocks: Rc::new(part.blocks),
+            codes: part.codes,
+            paragraphs: part.paragraphs,
+        }
+    }
 }
 
 struct ParsedDocument {
     revision: u64,
     epoch: u64,
-    source: Arc<str>,
     replaces_previous: bool,
     find_pattern: Option<String>,
     interactive: bool,
-    codes: HashMap<usize, Arc<SemanticParagraph>>,
-    blocks: Vec<Block>,
-    paragraphs: HashMap<ParagraphKey, Arc<SemanticParagraph>>,
+    stable: Option<ParsedPart>,
+    tail: ParsedPart,
+    start: usize,
+    stable_end: usize,
 }
 
-impl From<ParsedDocument> for ParsedSnapshot {
-    fn from(document: ParsedDocument) -> Self {
-        Self {
-            revision: document.revision,
-            epoch: document.epoch,
-            source: document.source,
-            replaces_previous: document.replaces_previous,
-            find_pattern: document.find_pattern,
-            interactive: document.interactive,
-            codes: document.codes,
-            blocks: Rc::new(document.blocks),
-            paragraphs: document.paragraphs,
-        }
-    }
+fn entry_text(entry: &Value) -> &str {
+    entry
+        .get("item")
+        .and_then(|item| item.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
 }
 
 #[derive(Clone)]
@@ -114,11 +166,7 @@ impl Demand {
     }
 
     fn text(&self) -> &str {
-        self.entry
-            .get("item")
-            .and_then(|item| item.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
+        entry_text(&self.entry)
     }
 }
 
@@ -128,6 +176,8 @@ struct Capture {
     // A linked list avoids reallocating an ever-growing descriptor vector on
     // the event thread. The worker joins chunks into its own contiguous buffer.
     chunks: LinkedList<String>,
+    start: usize,
+    replaces_previous: bool,
 }
 
 struct ParseRequest {
@@ -136,7 +186,8 @@ struct ParseRequest {
     root: Option<String>,
     linkify: bool,
     find: Option<Regex>,
-    previous: Option<Arc<str>>,
+    start: usize,
+    replaces_previous: bool,
     result: mpsc::SyncSender<ParsedDocument>,
     chunks: LinkedList<String>,
     bytes: usize,
@@ -146,16 +197,41 @@ struct ParseRequest {
 }
 
 fn parse_document(request: &mut ParseRequest) -> ParsedDocument {
-    let mut text = String::with_capacity(request.bytes);
+    let mut text = String::with_capacity(request.bytes - request.start);
     for chunk in std::mem::take(&mut request.chunks) {
         text.push_str(&chunk);
     }
-    let end = revealed_end(&text, request.reveal_bytes, request.live);
-    let replaces_previous = request
-        .previous
-        .as_ref()
-        .is_some_and(|old| !text.starts_with(old.as_ref()));
-    let blocks = model::parse(&text[..end], request.root.as_deref(), request.linkify);
+    let end = revealed_end(
+        &text,
+        request.reveal_bytes.saturating_sub(request.start),
+        request.live,
+    );
+    let text = &text[..end];
+    let split = if incremental_safe(text) {
+        model::markdown_stable_split(text)
+    } else {
+        None
+    };
+    let stable = split.map(|split| parse_part(&text[..split], request));
+    let tail = parse_part(&text[split.unwrap_or(0)..], request);
+    ParsedDocument {
+        revision: request.revision,
+        epoch: request.epoch,
+        replaces_previous: request.replaces_previous,
+        stable,
+        tail,
+        start: request.start,
+        stable_end: request.start + split.unwrap_or(0),
+        interactive: request.interactive,
+        find_pattern: request
+            .find
+            .as_ref()
+            .map(|pattern| pattern.as_str().to_owned()),
+    }
+}
+
+fn parse_part(text: &str, request: &ParseRequest) -> ParsedPart {
+    let blocks = model::parse(text, request.root.as_deref(), request.linkify);
     let mut paragraphs = HashMap::new();
     let mut codes = HashMap::new();
     collect_blocks(&blocks, &mut paragraphs, &mut codes);
@@ -169,20 +245,38 @@ fn parse_document(request: &mut ParseRequest) -> ParsedDocument {
                 .into();
         }
     }
-    ParsedDocument {
-        revision: request.revision,
-        epoch: request.epoch,
-        source: Arc::from(text),
-        replaces_previous,
+    ParsedPart {
         blocks,
         paragraphs,
         codes,
-        interactive: request.interactive,
-        find_pattern: request
-            .find
-            .as_ref()
-            .map(|pattern| pattern.as_str().to_owned()),
     }
+}
+
+/// References can retroactively resolve earlier prose. HTML normalization and
+/// open fences also require full context; never promote those documents.
+fn incremental_safe(text: &str) -> bool {
+    static CONTEXT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]\n]+\]:").unwrap());
+    if text.contains('<') || CONTEXT.is_match(text) {
+        return false;
+    }
+    let mut fence: Option<(u8, usize)> = None;
+    for line in text.lines() {
+        let line = line.trim_start();
+        let byte = line.as_bytes().first().copied().unwrap_or(0);
+        let len = line.bytes().take_while(|b| *b == byte).count();
+        if matches!(byte, b'`' | b'~') && len >= 3 {
+            match fence {
+                Some((open, count))
+                    if open == byte && len >= count && line[len..].trim().is_empty() =>
+                {
+                    fence = None
+                }
+                None => fence = Some((byte, len)),
+                _ => {}
+            }
+        }
+    }
+    fence.is_none()
 }
 
 struct ParserMailbox {
@@ -331,8 +425,9 @@ impl MarkdownWorker {
         {
             let finished = self.active.take();
             if document.epoch == self.epoch {
-                self.completed = finished;
-                self.candidate = Some(Rc::new(document.into()));
+                let finished = finished.expect("active Markdown demand");
+                self.candidate = Some(self.snapshot(document, &finished));
+                self.completed = Some(finished);
             }
         }
         if self.active.is_none() && self.capture.is_none() && self.candidate.is_none() {
@@ -342,17 +437,31 @@ impl MarkdownWorker {
                 .as_ref()
                 .is_some_and(|done| done.same(latest))
             {
+                let previous = self.published.as_ref();
+                let replaces_previous = previous.is_some_and(|old| {
+                    !Rc::ptr_eq(&latest.entry, &old.source)
+                        && !latest.text().starts_with(old.source_text())
+                });
+                let start = previous
+                    .filter(|old| {
+                        !replaces_previous
+                            && latest.bytes >= old.stable_end
+                            && incremental_safe(&latest.text()[old.stable_end..])
+                    })
+                    .map_or(0, |old| old.stable_end);
                 self.capture = Some(Capture {
                     demand: latest.clone(),
-                    offset: 0,
+                    offset: start,
                     chunks: LinkedList::new(),
+                    start,
+                    replaces_previous,
                 });
             }
         }
         if let Some(capture) = &mut self.capture {
             let text = capture.demand.text();
-            // Capture complete context so both inline and worker parsing choose
-            // the same grapheme-safe paced prefix.
+            // Retain complete tail context for grapheme-safe reveal; the
+            // stable prefix is owned by immutable parsed chunks, not copied.
             let target = text.len();
             let mut end = capture.offset.saturating_add(CAPTURE_BYTES).min(target);
             while !text.is_char_boundary(end) {
@@ -370,7 +479,7 @@ impl MarkdownWorker {
                 let parser = self.parser.get_or_insert_with(ParserMailbox::new);
                 // Queue saturation retains the completed bounded capture; it
                 // never blocks the UI or restarts source copying.
-                let interactive = capture.offset <= INTERACTIVE_SOURCE_BYTES
+                let interactive = capture.offset - capture.start <= INTERACTIVE_SOURCE_BYTES
                     && (capture.demand.live
                         || self
                             .published
@@ -382,10 +491,8 @@ impl MarkdownWorker {
                     root: self.root.clone(),
                     linkify: self.linkify,
                     find: self.find.clone(),
-                    previous: self
-                        .published
-                        .as_ref()
-                        .map(|snapshot| snapshot.source.clone()),
+                    start: capture.start,
+                    replaces_previous: capture.replaces_previous,
                     result: parser.send.clone(),
                     chunks: capture.chunks,
                     bytes: capture.offset,
@@ -394,7 +501,8 @@ impl MarkdownWorker {
                     interactive,
                 };
                 if interactive {
-                    self.candidate = Some(Rc::new(parse_document(&mut request).into()));
+                    let document = parse_document(&mut request);
+                    self.candidate = Some(self.snapshot(document, &capture.demand));
                     self.completed = Some(capture.demand);
                     return self.is_pending();
                 }
@@ -405,6 +513,8 @@ impl MarkdownWorker {
                             demand: capture.demand,
                             offset: capture.offset,
                             chunks: request.chunks,
+                            start: request.start,
+                            replaces_previous: request.replaces_previous,
                         });
                     }
                     Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -414,6 +524,31 @@ impl MarkdownWorker {
             }
         }
         self.is_pending()
+    }
+
+    fn snapshot(&self, document: ParsedDocument, demand: &Demand) -> Rc<ParsedSnapshot> {
+        let mut prefix = if document.start > 0 {
+            self.published.as_ref().and_then(|old| old.prefix.clone())
+        } else {
+            None
+        };
+        if let Some(stable) = document.stable {
+            prefix = Some(Rc::new(ParsedPrefix {
+                previous: prefix,
+                chunk: Rc::new(stable.into()),
+            }));
+        }
+        Rc::new(ParsedSnapshot {
+            revision: document.revision,
+            epoch: document.epoch,
+            source: demand.entry.clone(),
+            replaces_previous: document.replaces_previous,
+            find_pattern: document.find_pattern,
+            interactive: document.interactive,
+            prefix,
+            tail: Rc::new(document.tail.into()),
+            stable_end: document.stable_end,
+        })
     }
 
     /// The row returns to the screen after it was hidden: text received
@@ -783,13 +918,17 @@ mod tests {
         let snapshot = Rc::new(ParsedSnapshot {
             revision: 7,
             epoch: 0,
-            source: Arc::from("old"),
+            source: message("old"),
             replaces_previous: false,
             find_pattern: None,
-            codes: HashMap::new(),
             interactive: false,
-            blocks: Rc::new(Vec::new()),
-            paragraphs: HashMap::new(),
+            prefix: None,
+            stable_end: 0,
+            tail: Rc::new(ParsedChunk {
+                blocks: Rc::new(Vec::new()),
+                codes: HashMap::new(),
+                paragraphs: HashMap::new(),
+            }),
         });
         let mut worker = MarkdownWorker {
             owner: Some(("row".into(), "host".into(), "agent".into())),
@@ -970,6 +1109,58 @@ mod tests {
             !worker.update(OWNER, complete, false, OPTIONS, 0.0),
             "a published document stops scheduling frames"
         );
-        assert_eq!(&*worker.published().unwrap().source, source);
+        assert_eq!(worker.published().unwrap().source_text(), source);
+    }
+
+    #[test]
+    fn incremental_prefix_reuse_matches_full_parse() {
+        for revisions in [
+            vec![
+                "# Heading\n\nstable **bold**\n\nopen",
+                "# Heading\n\nstable **bold**\n\nopen tail\n\nnext",
+                "# Heading\n\nstable **bold**\n\nopen tail\n\nnext 👩🏽‍💻\n\nlast",
+            ],
+            vec![
+                "[target]\n\nold\n\nnew",
+                "[target]\n\nold\n\nnew\n\n[target]: https://example.com",
+            ],
+            vec![
+                "head\n\nbody\n\nlast",
+                "head\n\nbody\n\nlast\n\n```rs\nlet a = 1;",
+                "head\n\nbody\n\nlast\n\n```rs\nlet a = 1;\n```\n\nend",
+            ],
+            vec![
+                "head\n\nbody\n\nlast",
+                "head\n\nbody\n\nlast\n\n<div>\nHTML\n</div>",
+            ],
+            vec!["head\n\nbody\n\nlast", "edited\n\nbody\n\nlast"],
+            vec![
+                "head\n\n| a | b |\n| - | - |\n| x | y |",
+                "head\n\n| a | b |\n| - | - |\n| x | y |\n\nend",
+            ],
+        ] {
+            let mut worker = MarkdownWorker::default();
+            let mut previous: Option<Rc<ParsedSnapshot>> = None;
+            for (index, source) in revisions.iter().enumerate() {
+                worker.release_backlog();
+                worker.update(OWNER, message(source), index == 0, OPTIONS, index as f64);
+                let candidate = worker.candidate().expect("small revision parsed inline");
+                let chunks = candidate.chunks();
+                let actual: Vec<Block> = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.blocks.iter().cloned())
+                    .collect();
+                assert_eq!(actual, model::parse(source, None, true), "{source}");
+                if index == 1 && revisions[0].starts_with("# Heading") {
+                    let old = previous.as_ref().unwrap();
+                    assert!(
+                        Rc::ptr_eq(&old.chunks()[0].blocks, &candidate.chunks()[0].blocks,),
+                        "stable blocks must retain paragraph identity"
+                    );
+                }
+                assert!(worker.publish(candidate.revision));
+                previous = Some(candidate);
+            }
+        }
     }
 }

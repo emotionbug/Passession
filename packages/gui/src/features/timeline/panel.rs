@@ -594,6 +594,8 @@ pub struct ChatPanel {
     #[rust]
     row_states: HashMap<String, Rc<RefCell<RowState>>>,
     #[rust]
+    presentation_clock: u64,
+    #[rust]
     ctx: Option<Rc<RowContext>>,
     #[rust(true)]
     sticky: bool,
@@ -1005,6 +1007,31 @@ impl ChatPanel {
 
     fn row_state(&mut self, id: &str) -> Rc<RefCell<RowState>> {
         self.row_states.entry(id.to_owned()).or_default().clone()
+    }
+
+    fn trim_row_presentations(&mut self, visible: &HashSet<String>) {
+        // Keep nearby recently visited rows warm, but never evict a row in the
+        // current measurement/final-paint pass, even in a very tall viewport.
+        let mut resident: Vec<_> = self
+            .row_states
+            .iter()
+            .filter_map(|(id, state)| {
+                let state = state.borrow();
+                (state.presentation_used != 0 && !visible.contains(id))
+                    .then(|| (state.presentation_used, id.clone()))
+            })
+            .collect();
+        resident.sort_unstable_by_key(|(used, _)| *used);
+        let evict = resident
+            .len()
+            .saturating_sub(128usize.saturating_sub(visible.len()));
+        for (_, id) in resident.into_iter().take(evict) {
+            if let Some(state) = self.row_states.get(&id) {
+                let mut state = state.borrow_mut();
+                state.evict_presentation();
+                state.presentation_used = 0;
+            }
+        }
     }
 
     // ── snapshots ───────────────────────────────────────────────────────
@@ -4164,6 +4191,7 @@ impl Widget for ChatPanel {
                     portal.set_first_id_and_scroll(self.items.len().saturating_sub(1), 0.0);
                     portal.set_tail_range(true);
                 }
+                let mut presented = HashSet::new();
                 while list_ref.draw_walk(cx, scope, walk).is_step() {
                     let Some(mut list) = portal.borrow_mut() else {
                         break;
@@ -4177,6 +4205,10 @@ impl Widget for ChatPanel {
                         let widget = list.item(cx, index, live_id!(Row));
                         if let Some(ctx) = &self.ctx {
                             let state = self.row_states.entry(item.id.clone()).or_default().clone();
+                            self.presentation_clock =
+                                self.presentation_clock.wrapping_add(1).max(1);
+                            state.borrow_mut().presentation_used = self.presentation_clock;
+                            presented.insert(item.id.clone());
                             widget.as_chat_row().set_model(
                                 cx,
                                 RowModel {
@@ -4202,6 +4234,7 @@ impl Widget for ChatPanel {
                         }
                     }
                 }
+                self.trim_row_presentations(&presented);
                 if self.reader_scrolled {
                     // Only layout can determine whether the reader reached the
                     // newest edge. Scroll actions arrive before that layout.

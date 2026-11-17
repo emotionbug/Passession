@@ -232,7 +232,7 @@ impl ChatRow {
             self.cache.animating = d.animating;
             height
         };
-        state.height = height;
+        let height = state.preparing_height(height, width, self.cache.animating);
         state.preparing = false;
         self.kit.dry = kit_dry;
         self.canvas.dry = canvas_dry;
@@ -255,8 +255,19 @@ impl ChatRow {
                 && old.ctx.agent_id == model.ctx.agent_id
         });
         if !same_owner {
+            // Recycled widgets surrender native gesture ownership, not the
+            // previous row's source-indexed selection anchors.
+            let old_selection = self.model.as_ref().map(|old| {
+                let state = old.state.borrow();
+                (old.state.clone(), state.selection, state.selection_source)
+            });
             self.clear_selection(cx);
-            model.state.borrow_mut().selection = None;
+            if let Some((old, selection, source)) = old_selection {
+                let mut old = old.borrow_mut();
+                old.selection = selection;
+                old.selection_source = source;
+            }
+            self.selection_source = model.state.borrow().selection_source;
         }
         let unchanged = same_owner
             && self.model.as_ref().is_some_and(|old| {
@@ -585,11 +596,14 @@ impl ChatRow {
     }
 
     fn set_selection(&mut self, cx: &mut Cx, selection: Option<(usize, usize)>) {
-        if let Some(model) = &self.model {
-            model.state.borrow_mut().selection = selection;
-        }
         self.canvas.selection = selection;
-        self.selection_source = self.canvas.selection_source_hash();
+        let source = self.canvas.selection_source_hash();
+        if let Some(model) = &self.model {
+            let mut state = model.state.borrow_mut();
+            state.selection = selection;
+            state.selection_source = source;
+        }
+        self.selection_source = source;
         if selection.is_some() {
             cx.claim_text_selection(self.area);
         } else {
@@ -987,13 +1001,20 @@ impl Widget for ChatRow {
                 width,
             );
             let animating = d.animating;
+            let h = if state.presentation_restoring && state.measured_width == width {
+                state.height.max(h)
+            } else {
+                h
+            };
             state.height = h;
             if let Some(y) = state.find_y {
                 state.find_y = Some(y - origin.y);
             }
             (h, field, animating)
         };
-        if self.selection_source != self.canvas.selection_source_hash() {
+        if !model.state.borrow().presentation_restoring
+            && self.selection_source != self.canvas.selection_source_hash()
+        {
             self.clear_selection(cx);
         }
         // Selection from this frame's runs. Appended after the text, it still

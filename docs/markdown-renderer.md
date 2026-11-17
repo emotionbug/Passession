@@ -69,6 +69,20 @@ batch even when no row/window is drawing. Signals cannot bypass that cadence.
 Font-face initialization and allocation are not claimed to have a strict
 wall-clock bound.
 
+A new revision of a streaming message reuses the parsed blocks and laid-out
+paragraphs of its stable prefix: blocks that end before the last block
+boundary that later text cannot change. Only the tail is captured, parsed and
+laid out again. A revision that is not an append of the previous source
+(checked once per revision), link reference definitions, raw HTML or an open
+code fence fall back to whole-document preparation. The reused prefix must
+produce exactly what a full parse would.
+
+Row presentation (parsed snapshot, paragraph layouts, fence highlights) is
+disposable and kept for at most 128 rows plus the visible set, least recently
+shown first out. Interaction state (measured height, expansion, selection
+anchors) is kept separately, so an evicted row re-prepares on return without
+moving the scroll position.
+
 Chat fences and read/write source previews preserve their shared highlighting
 worker and existing 100,000-byte syntax-color limit. Tool previews retain their
 plain-text pending behavior. An assistant candidate waits for available syntax

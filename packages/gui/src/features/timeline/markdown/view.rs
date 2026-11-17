@@ -13,7 +13,9 @@ use super::super::images::{self, ImageState};
 use super::super::links::FileLinkSourceType;
 use super::super::paint::{Draw, Look};
 use super::model::{AlertKind, Block, Inline, ListItem, Style};
-use super::worker::{INTERACTIVE_SOURCE_BYTES, ParagraphKey, ParsedSnapshot, SemanticParagraph};
+use super::worker::{
+    INTERACTIVE_SOURCE_BYTES, ParagraphKey, ParsedChunk, ParsedSnapshot, SemanticParagraph,
+};
 use makepad_widgets::makepad_draw::text::AsyncLayout;
 use makepad_widgets::makepad_draw::text::layouter::{LaidoutText, Span as FontSpan};
 use makepad_widgets::makepad_draw::text::selection::Cursor;
@@ -22,6 +24,7 @@ use makepad_widgets::*;
 use paseo_gui_core::CoreHandle;
 use pulldown_cmark::Alignment;
 use regex::Regex;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -111,11 +114,14 @@ struct CachedParagraph {
 /// Soft allowance of one document preparation pass, checked between paragraphs.
 const PREPARATION_PASS: Duration = Duration::from_millis(4);
 
+/// Paragraph cache key: inline run address, wrap width bits, line height bits, bold.
+type LayoutCacheKey = (usize, u64, u64, bool);
+
 #[derive(Default)]
 pub struct ParagraphCache {
     owner: Option<Rc<Vec<Block>>>,
-    snapshot: Option<Rc<ParsedSnapshot>>,
-    entries: HashMap<(usize, u64, u64, bool), CachedParagraph>,
+    snapshot: Option<Rc<ParsedChunk>>,
+    entries: Rc<RefCell<HashMap<LayoutCacheKey, CachedParagraph>>>,
     pending: bool,
     advance_available: bool,
     advance_deadline: Option<Instant>,
@@ -146,6 +152,7 @@ impl ParagraphCache {
 
     pub(super) fn set_owner(&mut self, owner: Option<Rc<Vec<Block>>>) -> Option<Rc<Vec<Block>>> {
         self.entries
+            .borrow_mut()
             .retain(|_, entry| entry.owner.strong_count() > 0);
         std::mem::replace(&mut self.owner, owner)
     }
@@ -153,6 +160,7 @@ impl ParagraphCache {
 
 struct DocumentLayout {
     snapshot: Rc<ParsedSnapshot>,
+    chunks: Vec<Rc<ParsedChunk>>,
     look: Look,
     theme_epoch: u64,
     width: f64,
@@ -225,16 +233,31 @@ pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f6
                 .as_ref()
                 .is_some_and(|doc| doc.matches(&candidate, d.look, w, opts, theme_epoch));
             if !current && !pending {
+                let entries = presentation
+                    .published
+                    .as_ref()
+                    .filter(|doc| {
+                        doc.look == d.look
+                            && doc.theme_epoch == theme_epoch
+                            && doc.width == w
+                            && doc.font_size == opts.font_size
+                            && doc.occurrence == opts.find.as_ref().map(|find| find.occurrence)
+                    })
+                    .map(|doc| doc.cache.entries.clone())
+                    .unwrap_or_default();
+                entries
+                    .borrow_mut()
+                    .retain(|_, entry| entry.owner.strong_count() > 0);
                 presentation.preparing = Some(DocumentLayout {
                     snapshot: candidate.clone(),
+                    chunks: candidate.chunks(),
                     look: d.look,
                     theme_epoch,
                     width: w,
                     font_size: opts.font_size,
                     occurrence: opts.find.as_ref().map(|find| find.occurrence),
                     cache: ParagraphCache {
-                        owner: Some(candidate.blocks.clone()),
-                        snapshot: Some(candidate),
+                        entries,
                         ..Default::default()
                     },
                 });
@@ -245,6 +268,13 @@ pub fn draw_worker(cx: &mut Cx2d, d: &mut Draw, opts: &mut MdOpts, x: f64, y: f6
             if !preparing.cache.pending {
                 d.state.markdown_worker.publish(preparing.snapshot.revision);
                 presentation.published = Some(preparing);
+                if let Some(published) = &presentation.published {
+                    published
+                        .cache
+                        .entries
+                        .borrow_mut()
+                        .retain(|_, entry| entry.owner.strong_count() > 0);
+                }
                 presentation.reprepare_published = false;
             } else {
                 presentation.preparing = Some(preparing);
@@ -311,17 +341,30 @@ fn draw_document(
         && doc.snapshot.find_pattern.as_deref()
             == opts.find.as_ref().map(|find| find.pattern.as_str());
     std::mem::swap(&mut d.state.markdown_paragraphs, &mut doc.cache);
-    let height = draw_blocks(
-        cx,
-        d,
-        opts,
-        &doc.snapshot.blocks,
-        x,
-        y,
-        doc.width,
-        doc.look.palette.foreground,
-        false,
-    );
+    let mut height = 0.0;
+    let mut has_blocks = false;
+    for chunk in &doc.chunks {
+        if chunk.blocks.is_empty() {
+            continue;
+        }
+        if has_blocks {
+            height += block_gap(d.look.compact);
+        }
+        has_blocks = true;
+        d.state.markdown_paragraphs.owner = Some(chunk.blocks.clone());
+        d.state.markdown_paragraphs.snapshot = Some(chunk.clone());
+        height += draw_blocks(
+            cx,
+            d,
+            opts,
+            &chunk.blocks,
+            x,
+            y + height,
+            doc.width,
+            doc.look.palette.foreground,
+            false,
+        );
+    }
     if !current_find {
         d.state.find_y = previous_find_y;
     }
@@ -359,8 +402,8 @@ fn prepare_paragraph(
         para.bold,
     );
     if d.state.markdown_paragraphs.frozen {
-        let entry = d.state.markdown_paragraphs.entries.get(&key)?;
-        let prepared = entry.prepared.clone()?;
+        let entries = d.state.markdown_paragraphs.entries.borrow();
+        let prepared = entries.get(&key)?.prepared.clone()?;
         find_in_matches(opts, &prepared.rich.find_matches);
         return Some(prepared);
     }
@@ -384,7 +427,7 @@ fn prepare_paragraph(
         height,
     };
     let pattern = opts.find.as_ref().map(|find| find.pattern.as_str());
-    if let Some(cached) = d.state.markdown_paragraphs.entries.get(&key)
+    if let Some(cached) = d.state.markdown_paragraphs.entries.borrow().get(&key)
         && cached.len == inlines.len()
         && cached.style == style
         && cached.pattern.as_deref() == pattern
@@ -410,7 +453,7 @@ fn prepare_paragraph(
     }
     let prepared = prepare_legacy(cx, d, opts, rich, w, height);
     if let Some(owner) = &d.state.markdown_paragraphs.owner {
-        d.state.markdown_paragraphs.entries.insert(
+        d.state.markdown_paragraphs.entries.borrow_mut().insert(
             key,
             CachedParagraph {
                 owner: Rc::downgrade(owner),
@@ -456,6 +499,7 @@ fn prepare_semantic(
             .state
             .markdown_paragraphs
             .entries
+            .borrow()
             .get(&key)?
             .prepared
             .clone()?;
@@ -476,6 +520,7 @@ fn prepare_semantic(
         .state
         .markdown_paragraphs
         .entries
+        .borrow_mut()
         .remove(&key)
         .unwrap_or_else(|| CachedParagraph {
             owner: d
@@ -657,7 +702,11 @@ fn prepare_semantic(
     }
     let prepared = entry.prepared.clone();
     d.state.markdown_paragraphs.pending |= prepared.is_none();
-    d.state.markdown_paragraphs.entries.insert(key, entry);
+    d.state
+        .markdown_paragraphs
+        .entries
+        .borrow_mut()
+        .insert(key, entry);
     prepared
 }
 
@@ -2214,7 +2263,7 @@ mod font_epoch_tests {
 
     #[test]
     fn installed_font_arrival_invalidates_an_unchanged_published_document() {
-        let source: Arc<str> = "```\n守护进程 Հայերեն 𐐀\n```".into();
+        let source = Rc::new(serde_json::json!({"item": {"text": "```\n守护进程 Հայերեն 𐐀\n```"}}));
         let snapshot = Rc::new(ParsedSnapshot {
             revision: 1,
             epoch: 1,
@@ -2222,9 +2271,13 @@ mod font_epoch_tests {
             replaces_previous: false,
             find_pattern: None,
             interactive: true,
-            codes: HashMap::new(),
-            blocks: Rc::new(Vec::new()),
-            paragraphs: HashMap::new(),
+            prefix: None,
+            stable_end: 0,
+            tail: Rc::new(ParsedChunk {
+                blocks: Rc::new(Vec::new()),
+                codes: HashMap::new(),
+                paragraphs: HashMap::new(),
+            }),
         });
         let look = Look {
             palette: crate::theme::current_palette(),
@@ -2246,6 +2299,7 @@ mod font_epoch_tests {
         };
         let published = DocumentLayout {
             snapshot: snapshot.clone(),
+            chunks: snapshot.chunks(),
             look,
             theme_epoch: 7,
             width: 320.0,
