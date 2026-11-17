@@ -6,6 +6,7 @@
 
 - Stop migrating, importing or cleaning up data and settings written by earlier releases. This breaks compatibility with state that 0.13.36 and earlier left behind:
   - The app no longer imports preferences left by the retired Flutter app (macOS/iOS NSUserDefaults, Android `FlutterSharedPreferences.xml`), reads flat saved-host rows or a layout embedded in `state.json`, drops retired tab kinds from saved layouts, renames old English default titles, restores update records that hold only an operation ID, or falls back to `~/.local/share/paseo_sessions` on Linux.
+  - The daemon ignores the retired settings `daemon.allowedHosts` (use `daemon.hostnames`), `daemon.browserTools`, `features.webUi`, `features.dictation`, `features.voiceMode` and top-level `providers` instead of converting or removing them, no longer converts old provider command objects, and no longer loads agent records stored directly under `agents/` or version-1 worktree metadata.
 
 ### Fixed
 

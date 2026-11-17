@@ -15,35 +15,16 @@ pub fn defaults() -> Value {
 }
 
 pub fn normalize_persisted(mut value: Value) -> Result<Value> {
-    remove_at(&mut value, &["daemon"], "browserTools");
-    remove_at(&mut value, &["features"], "webUi");
-    remove_at(&mut value, &["features"], "dictation");
-    remove_at(&mut value, &["features"], "voiceMode");
-    // Top-level providers configured retired speech services, not agent providers.
-    remove_at(&mut value, &[], "providers");
-    // Account quota is now a built-in source. Retire only its executable
-    // registration, never the OMP profiles, managed login or plugin settings.
-    remove_at(&mut value, &["plugins"], "omp-kiro");
-    if let Some(providers) = value.pointer_mut("/agents/providers") {
-        migrate_providers(providers)?;
-    }
-    visit(Node::Write(&mut value), Kind::Persisted).context("Invalid persisted config")?;
-    if let Some(daemon) = value.get_mut("daemon").and_then(Value::as_object_mut)
-        && let Some(allowed_hosts) = daemon.remove("allowedHosts")
-    {
-        daemon.entry("hostnames").or_insert(allowed_hosts);
-    }
+    visit(&mut value, Kind::Persisted).context("Invalid persisted config")?;
     Ok(value)
 }
 
 pub fn normalize_patch(mut value: Value) -> Result<Value> {
-    remove_at(&mut value, &[], "browserTools");
-    remove_at(&mut value, &["plugins"], "omp-kiro");
-    visit(Node::Write(&mut value), Kind::Patch).context("Invalid daemon config patch")?;
+    visit(&mut value, Kind::Patch).context("Invalid daemon config patch")?;
     // Internal setters share this normalization path but use the full mutable
     // config's strict skills schema; the public patch schema leaves it unknown.
     if let Some(skills) = value.get_mut("skills") {
-        visit(Node::Write(skills), Kind::Skills).context("skills")?;
+        visit(skills, Kind::Skills).context("skills")?;
     }
     Ok(value)
 }
@@ -51,7 +32,7 @@ pub fn normalize_patch(mut value: Value) -> Result<Value> {
 /// ProviderOverrideSchema alone: map-level provider-ID/extends checks belong to
 /// normalize_persisted. Unknown override/model/policy properties are stripped.
 pub fn normalize_provider(mut value: Value) -> Result<Value> {
-    visit(Node::Write(&mut value), Kind::Provider)?;
+    visit(&mut value, Kind::Provider)?;
     Ok(value)
 }
 
@@ -73,19 +54,6 @@ pub fn validate_persisted_path(field: &str) -> Result<()> {
             .with_context(|| format!("Unknown configuration path: {field}. Replace its containing object with JSON for dynamic keys."))?;
     }
     Ok(())
-}
-
-fn remove_at(value: &mut Value, path: &[&str], key: &str) {
-    let mut cursor = value;
-    for part in path {
-        let Some(child) = cursor.get_mut(*part) else {
-            return;
-        };
-        cursor = child;
-    }
-    if let Some(object) = cursor.as_object_mut() {
-        object.remove(key);
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -146,8 +114,6 @@ enum Kind {
     PatchModel,
     PatchMetadata,
     PatchGenerationProvider,
-    LegacyProvider,
-    LegacyCommand,
 }
 
 #[derive(Clone, Copy)]
@@ -164,7 +130,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
     use Unknown::*;
     Some(match kind {
         Persisted => (
-            Strict,
+            Strip,
             &[
                 ("$schema", Text, false),
                 ("version", Version, false),
@@ -180,11 +146,10 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
             ],
         ),
         Daemon => (
-            Strict,
+            Strip,
             &[
                 ("listen", Text, false),
                 ("hostnames", Hosts, false),
-                ("allowedHosts", Hosts, false),
                 ("trustedProxies", Hosts, false),
                 ("mcp", Mcp, false),
                 ("git", Git, false),
@@ -318,7 +283,7 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
             ],
         ),
         SkillSelection => (Strict, &[("mode", Enum(&["all"]), true)]),
-        Features => (Strict, &[]),
+        Features => (Strip, &[]),
         Log => (
             Strict,
             &[
@@ -449,53 +414,14 @@ fn shape(kind: Kind, value: &Value) -> Option<(Unknown, &'static [Field])> {
                 ("thinkingOptionId", Nonempty, false),
             ],
         ),
-        LegacyProvider => (
-            Strip,
-            &[
-                ("command", LegacyCommand, false),
-                ("env", Record(&Text), false),
-                ("disallowedTools", Array(&Text), false),
-            ],
-        ),
-        LegacyCommand => match value.get("mode").and_then(Value::as_str) {
-            Some("append") => (
-                Strip,
-                &[
-                    ("mode", Enum(&["append"]), true),
-                    ("args", Array(&Text), false),
-                ],
-            ),
-            Some("replace") => (
-                Strip,
-                &[
-                    ("mode", Enum(&["replace"]), true),
-                    ("argv", NonemptyArray(&Nonempty), true),
-                ],
-            ),
-            _ => (Strip, &[("mode", Enum(&["default"]), true)]),
-        },
         _ => return None,
     })
 }
 
-// A shared walker validates borrowed patches and normalizes owned JSON without
-// cloning secrets or conflating absent, null, and false values.
-enum Node<'a> {
-    Read(&'a Value),
-    Write(&'a mut Value),
-}
-impl Node<'_> {
-    fn value(&self) -> &Value {
-        match self {
-            Self::Read(value) => value,
-            Self::Write(value) => value,
-        }
-    }
-}
-
-fn visit(mut node: Node<'_>, kind: Kind) -> Result<()> {
-    if let Some((unknown, fields)) = shape(kind, node.value()) {
-        let object = node.value().as_object().context("Expected object")?;
+// Normalize owned JSON without cloning secrets or conflating absent, null, and false values.
+fn visit(value: &mut Value, kind: Kind) -> Result<()> {
+    if let Some((unknown, fields)) = shape(kind, value) {
+        let object = value.as_object_mut().context("Expected object")?;
         if matches!(unknown, Unknown::Strict) {
             for key in object.keys() {
                 if !fields.iter().any(|(name, _, _)| key == name) {
@@ -508,38 +434,24 @@ fn visit(mut node: Node<'_>, kind: Kind) -> Result<()> {
                 bail!("{name}: Required");
             }
         }
-        match &mut node {
-            Node::Read(value) => {
-                for (name, child_kind, _) in fields {
-                    if let Some(child) = value.get(*name) {
-                        visit(Node::Read(child), *child_kind)
-                            .with_context(|| (*name).to_owned())?;
-                    }
-                }
-            }
-            Node::Write(value) => {
-                let object = value.as_object_mut().expect("checked object");
-                if matches!(unknown, Unknown::Strip) {
-                    object.retain(|key, _| fields.iter().any(|(name, _, _)| key == name));
-                }
-                for (name, child_kind, _) in fields {
-                    if let Some(child) = object.get_mut(*name) {
-                        visit(Node::Write(child), *child_kind)
-                            .with_context(|| (*name).to_owned())?;
-                    }
-                }
-                // Zod 4 applies defaults inside optional fields, including
-                // MutableMetadataGenerationConfigSchema.partial().
-                if matches!(kind, Kind::PatchMetadata) {
-                    object
-                        .entry("providers")
-                        .or_insert_with(|| Value::Array(Vec::new()));
-                }
+        if matches!(unknown, Unknown::Strip) {
+            object.retain(|key, _| fields.iter().any(|(name, _, _)| key == name));
+        }
+        for (name, child_kind, _) in fields {
+            if let Some(child) = object.get_mut(*name) {
+                visit(child, *child_kind).with_context(|| (*name).to_owned())?;
             }
         }
+        // Zod 4 applies defaults inside optional fields, including
+        // MutableMetadataGenerationConfigSchema.partial().
+        if matches!(kind, Kind::PatchMetadata) {
+            object
+                .entry("providers")
+                .or_insert_with(|| Value::Array(Vec::new()));
+        }
         if matches!(kind, Kind::ServicePorts)
-            && node.value().get("range").is_none()
-            && node.value().get("portScript").is_none()
+            && object.get("range").is_none()
+            && object.get("portScript").is_none()
         {
             bail!("Expected range or portScript");
         }
@@ -548,29 +460,12 @@ fn visit(mut node: Node<'_>, kind: Kind) -> Result<()> {
     use Kind::*;
     match kind {
         Array(child_kind) | NonemptyArray(child_kind) => {
-            let array = node.value().as_array().context("Expected array")?;
+            let array = value.as_array_mut().context("Expected array")?;
             if matches!(kind, NonemptyArray(_)) && array.is_empty() {
                 bail!("Array must contain at least 1 element(s)");
             }
-            match node {
-                Node::Read(value) => {
-                    for (index, child) in
-                        value.as_array().expect("checked array").iter().enumerate()
-                    {
-                        visit(Node::Read(child), *child_kind).with_context(|| index.to_string())?;
-                    }
-                }
-                Node::Write(value) => {
-                    for (index, child) in value
-                        .as_array_mut()
-                        .expect("checked array")
-                        .iter_mut()
-                        .enumerate()
-                    {
-                        visit(Node::Write(child), *child_kind)
-                            .with_context(|| index.to_string())?;
-                    }
-                }
+            for (index, child) in array.iter_mut().enumerate() {
+                visit(child, *child_kind).with_context(|| index.to_string())?;
             }
         }
         Record(_) | ProviderMap | Plugins => {
@@ -579,7 +474,7 @@ fn visit(mut node: Node<'_>, kind: Kind) -> Result<()> {
                 ProviderMap => Provider,
                 _ => Plugin,
             };
-            let object = node.value().as_object().context("Expected object")?;
+            let object = value.as_object_mut().context("Expected object")?;
             if matches!(kind, ProviderMap | Plugins) {
                 for key in object.keys() {
                     if !valid_id(key) {
@@ -590,26 +485,17 @@ fn visit(mut node: Node<'_>, kind: Kind) -> Result<()> {
                     }
                 }
             }
-            match &mut node {
-                Node::Read(value) => {
-                    for (key, child) in value.as_object().expect("checked object") {
-                        visit(Node::Read(child), child_kind).with_context(|| key.clone())?;
-                    }
-                }
-                Node::Write(value) => {
-                    for (key, child) in value.as_object_mut().expect("checked object") {
-                        visit(Node::Write(child), child_kind).with_context(|| key.clone())?;
-                    }
-                }
+            for (key, child) in object.iter_mut() {
+                visit(child, child_kind).with_context(|| key.clone())?;
             }
             if matches!(kind, ProviderMap) {
-                refine_providers(node.value().as_object().expect("checked object"))?;
+                refine_providers(object)?;
             }
         }
         _ => {
-            validate_leaf(node.value(), kind)?;
+            validate_leaf(value, kind)?;
             if matches!(kind, Trimmed | PortRange)
-                && let Node::Write(Value::String(text)) = node
+                && let Value::String(text) = value
             {
                 let trimmed = js_trim(text);
                 if trimmed.len() != text.len() {
@@ -757,53 +643,6 @@ fn refine_providers(providers: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
-fn is_legacy(value: &Value) -> bool {
-    value
-        .get("command")
-        .and_then(Value::as_object)
-        .and_then(|command| command.get("mode"))
-        .is_some_and(Value::is_string)
-}
-
-fn migrate_providers(value: &mut Value) -> Result<()> {
-    let Some(providers) = value.as_object_mut() else {
-        return Ok(());
-    };
-    // The TS preprocessor migrates all legacy entries only when the entire
-    // legacy map parses. Otherwise the modern schema rejects the original data.
-    for entry in providers.values().filter(|entry| is_legacy(entry)) {
-        if visit(Node::Read(entry), Kind::LegacyProvider).is_err() {
-            return Ok(());
-        }
-    }
-    providers.retain(|_, entry| {
-        if !is_legacy(entry) {
-            return true;
-        }
-        let old = entry.as_object_mut().expect("legacy object");
-        let command = old.remove("command").expect("legacy command");
-        if command.get("mode").and_then(Value::as_str) == Some("append") {
-            return false;
-        }
-        let env = old.remove("env");
-        old.clear();
-        if command.get("mode").and_then(Value::as_str) == Some("replace") {
-            let mut command = command;
-            let argv = command
-                .as_object_mut()
-                .expect("legacy command")
-                .remove("argv")
-                .expect("validated argv");
-            old.insert("command".to_owned(), argv);
-        }
-        if let Some(env) = env {
-            old.insert("env".to_owned(), env);
-        }
-        true
-    });
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,50 +653,6 @@ mod tests {
         assert_eq!(normalize_persisted(defaults()).unwrap(), defaults());
         assert!(normalize_persisted(json!({"daemon": null})).is_err());
         assert!(normalize_persisted(json!({"daemon": {"mcp": {"enabled": null}}})).is_err());
-    }
-
-    #[test]
-    fn removed_fields_are_discarded_and_hosts_migrated() {
-        let value = normalize_persisted(json!({
-            "daemon": {"allowedHosts": ["localhost"], "browserTools": null},
-            "features": {"webUi": "obsolete"},
-        }))
-        .unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "daemon": {"hostnames": ["localhost"]}, "features": {},
-            })
-        );
-        assert_eq!(
-            normalize_persisted(json!({"daemon": {"hostnames": [], "allowedHosts": true}}))
-                .unwrap(),
-            json!({"daemon": {"hostnames": []}})
-        );
-    }
-
-    #[test]
-    fn legacy_append_is_dropped_and_replace_preserves_env() {
-        let value = normalize_persisted(json!({"agents": {"providers": {
-            "claude": {"command": {"mode": "append", "args": ["--flag"]}, "env": {"TOKEN": "secret"}},
-            "codex": {"command": {"mode": "replace", "argv": ["binary", "argument"]}, "env": {"TOKEN": "secret"}, "disallowedTools": ["x"]},
-            "pi": {"command": {"mode": "default"}},
-            "omp": {"enabled": false, "options": {"mode": null}}
-        }}})).unwrap();
-        assert_eq!(
-            value["agents"]["providers"],
-            json!({
-                "codex": {"command": ["binary", "argument"], "env": {"TOKEN": "secret"}},
-                "pi": {}, "omp": {"enabled": false, "options": {"mode": null}}
-            })
-        );
-        assert!(
-            normalize_persisted(json!({"agents": {"providers": {
-                "claude": {"command": {"mode": "append", "args": [2]}},
-                "codex": {"command": {"mode": "default"}}
-            }}}))
-            .is_err()
-        );
     }
 
     #[test]
@@ -873,7 +668,10 @@ mod tests {
     #[test]
     fn strict_passthrough_and_strip_are_distinct() {
         assert!(normalize_persisted(json!({"daemon": {"git": {"future": true}}})).is_err());
-        assert!(normalize_persisted(json!({"future": true})).is_err());
+        assert_eq!(
+            normalize_persisted(json!({"future": true})).unwrap(),
+            json!({})
+        );
         let value = normalize_persisted(json!({
             "daemon": {"mcp": {"future": null}},
             "pluginRegistries": {"opaque": {"authorization": "private", "future": true}},
@@ -888,10 +686,8 @@ mod tests {
             value["agents"]["providers"]["pi"],
             json!({"paseoTools": {"enabled": false}})
         );
-        let value = normalize_patch(
-            json!({"browserTools": true, "mcp": {"enabled": "passthrough"},
-            "providers": {"any.key": {"command": null, "paseoTools": {"future": true}}}}),
-        )
+        let value = normalize_patch(json!({"mcp": {"enabled": "passthrough"},
+            "providers": {"any.key": {"command": null, "paseoTools": {"future": true}}}}))
         .unwrap();
         assert_eq!(
             value,

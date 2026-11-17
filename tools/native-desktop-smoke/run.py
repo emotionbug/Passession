@@ -40,7 +40,7 @@ try:
             environment[key] = str(directory)
         environment.update({'PATH': '/usr/bin:/bin', 'GDK_BACKEND': 'x11', 'XDG_SESSION_TYPE': 'x11', 'XDG_CURRENT_DESKTOP': 'PaseoSmoke', 'GIO_USE_VFS': 'local', 'GTK_USE_PORTAL': '0', 'GSETTINGS_BACKEND': 'memory', 'NO_AT_BRIDGE': '1', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PASEO_DESKTOP_SMOKE_PROOF': str(case), 'PASEO_SMOKE_PANEL': panel, 'PASEO_SMOKE_LOGOUT': logout, 'PASEO_DESKTOP_RUNTIME': str(runtime / 'desktop-runtime.json')})
         environment['PASEO_SMOKE_OPENBOX'] = options.openbox
-        config = {'version': 1, 'daemon': {'listen': '127.0.0.1:0', 'relay': {'enabled': False}, 'mcp': {'enabled': False}, 'enableTerminalAgentHooks': False}, 'pluginsEnabled': False, 'agents': {'providers': {name: {'enabled': False} for name in ['claude', 'codex', 'copilot', 'opencode', 'pi', 'omp']}}, 'features': {'dictation': {'enabled': False}, 'voiceMode': {'enabled': False}}}
+        config = {'version': 1, 'daemon': {'listen': '127.0.0.1:0', 'relay': {'enabled': False}, 'mcp': {'enabled': False}, 'enableTerminalAgentHooks': False}, 'pluginsEnabled': False, 'agents': {'providers': {name: {'enabled': False} for name in ['claude', 'codex', 'copilot', 'opencode', 'pi', 'omp']}}}
         (state / 'paseo/config.json').write_text(json.dumps(config))
         try:
             with (case / 'harness.log').open('w') as log:

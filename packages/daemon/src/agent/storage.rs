@@ -143,7 +143,6 @@ impl AgentStorage {
         self.records
             .get_or_try_init(|| async {
                 let mut records = Records::default();
-                let mut root_files = Vec::new();
                 let mut directories = Vec::new();
                 let mut entries = match tokio::fs::read_dir(&self.directory).await {
                     Ok(entries) => entries,
@@ -156,14 +155,10 @@ impl AgentStorage {
                     let kind = entry.file_type().await?;
                     if kind.is_dir() {
                         directories.push(entry.path());
-                    } else if kind.is_file()
-                        && entry.path().extension().is_some_and(|e| e == "json")
-                    {
-                        root_files.push(entry.path());
                     }
                 }
-                root_files.sort();
                 directories.sort();
+                let mut files = Vec::new();
                 for directory in directories {
                     let mut nested = match tokio::fs::read_dir(&directory).await {
                         Ok(entries) => entries,
@@ -171,7 +166,7 @@ impl AgentStorage {
                             tracing::warn!(
                                 ?error,
                                 ?directory,
-                                "Skipping unreadable legacy agent directory"
+                                "Skipping unreadable agent directory"
                             );
                             continue;
                         }
@@ -185,9 +180,9 @@ impl AgentStorage {
                         }
                     }
                     paths.sort();
-                    root_files.extend(paths);
+                    files.extend(paths);
                 }
-                for path in root_files {
+                for path in files {
                     let record = async {
                         let mut value: Value =
                             serde_json::from_slice(&tokio::fs::read(&path).await?)?;
@@ -654,13 +649,14 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn legacy_duplicates_are_removed_and_opaque_fields_survive() -> Result<()> {
+    async fn moved_records_are_removed_and_opaque_fields_survive() -> Result<()> {
         let home = tempfile::tempdir()?;
         let original = json!({"id":"agent", "provider":"custom", "cwd":"/project", "createdAt":"2026-01-01", "updatedAt":"2026-01-01", "config":{"providerOptions":{"opaque":null}}, "persistence":{"provider":"custom","sessionId":"session","nativeHandle":{"nested":[null,1]},"metadata":{"opaque":null}}, "future": {"x":null}});
-        atomic_json(&home.path().join("agents/agent.json"), &original).await?;
-        atomic_json(&home.path().join("agents/legacy/agent.json"), &original).await?;
+        atomic_json(&home.path().join("agents/previous/agent.json"), &original).await?;
         let storage = AgentStorage::new(home.path().to_owned());
         storage.set_title("agent", "new").await?;
+        assert!(!home.path().join("agents/previous/agent.json").exists());
+        assert!(home.path().join("agents/project/agent.json").exists());
         let record = storage.get("agent").await?.unwrap();
         assert_eq!(record["persistence"], original["persistence"]);
         assert_eq!(record["future"], original["future"]);

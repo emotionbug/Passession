@@ -42,7 +42,7 @@ Minimal example that configures listening address, hostnames, and MCP:
 }
 ```
 
-`daemon.hostnames` is the primary field. The old `daemon.allowedHosts` name still works as a deprecated alias for backward compatibility.
+`daemon.hostnames` is the only hostname field. The old `daemon.allowedHosts` name is ignored; move its entries to `daemon.hostnames`.
 
 ## Apply changes
 
@@ -86,7 +86,7 @@ See [Providers](/docs/providers) for the mental model and [Supported providers](
 
 ## Removed speech settings
 
-Speech recognition, voice conversations and TTS are no longer supported. Legacy top-level `providers`, `features.dictation` and `features.voiceMode` settings are discarded during configuration normalization. This does not remove agent configuration under `agents.providers`.
+Speech recognition, voice conversations and TTS are no longer supported. Legacy top-level `providers`, `features.dictation` and `features.voiceMode` settings are ignored. This does not affect agent configuration under `agents.providers`.
 
 ## Native clients
 

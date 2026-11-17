@@ -323,7 +323,6 @@ async fn stored_receipts_replay_and_versionless_records_are_errors() -> Result<(
     tokio::fs::create_dir_all(&directory).await?;
     let request = json!({"prompt":"hello"});
     let fingerprint = digest(&request)?;
-    // Receipts written by earlier native daemons also carry a `state` field.
     for (id, phase, dismissed) in [
         ("submitted", "submitted", false),
         ("dismissed", "outcome_unknown", true),
@@ -332,7 +331,7 @@ async fn stored_receipts_replay_and_versionless_records_are_errors() -> Result<(
             directory.join(format!("{}.json", send_key(id)?)),
             serde_json::to_vec(&json!({
                 "version":2,"fingerprint":fingerprint,"agentId":"agent","messageId":id,
-                "state":"pending","phase":phase,"revision":2,"dismissed":dismissed,
+                "phase":phase,"revision":2,"dismissed":dismissed,
                 "result":null,"error":null,"updatedAt":null,"correlation":null,"ackPending":false
             }))?,
         )

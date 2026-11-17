@@ -1,4 +1,4 @@
-use super::{schema, storage, transactions};
+use super::{storage, transactions};
 use serde_json::json;
 
 #[test]
@@ -8,6 +8,44 @@ fn malformed_persisted_configuration_is_not_replaced() {
     std::fs::write(&path, "{\"daemon\":").unwrap();
     assert!(storage::read(home.path(), true, true).is_err());
     assert_eq!(std::fs::read_to_string(path).unwrap(), "{\"daemon\":");
+}
+
+#[test]
+fn unknown_persisted_settings_do_not_block_loading_or_change_current_settings() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.json");
+    let plugins =
+        json!({"omp-kiro":{"source":"directory","path":"/plugins/omp-kiro","enabled":false}});
+    let original = json!({
+        "version":1,
+        "daemon":{"listen":"127.0.0.1:6767","hostnames":["current.example"],"allowedHosts":["old.example"],"browserTools":null},
+        "features":{"dictation":null,"voiceMode":true,"webUi":{"enabled":true}},
+        "providers":{"old":{"apiKey":"unused"}},
+        "plugins":plugins,
+        "agents":{"providers":{"claude":{"enabled":false}}}
+    });
+    std::fs::write(&path, original.to_string()).unwrap();
+    let loaded = storage::read(home.path(), false, false).unwrap();
+    assert_eq!(
+        loaded,
+        json!({
+            "version":1,
+            "daemon":{"listen":"127.0.0.1:6767","hostnames":["current.example"]},
+            "features":{},
+            "plugins":plugins,
+            "agents":{"providers":{"claude":{"enabled":false}}}
+        })
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original.to_string());
+    let resolved = super::resolve::resolve(
+        home.path(),
+        home.path(),
+        &loaded,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(resolved["providerOverrides"], loaded["agents"]["providers"]);
+    assert_eq!(resolved["plugins"], plugins);
 }
 
 #[test]
@@ -40,57 +78,6 @@ fn provider_removal_prunes_metadata_without_touching_profiles() {
 }
 
 #[test]
-fn removed_frontend_settings_do_not_survive_normalization() {
-    let normalized = schema::normalize_persisted(json!({"daemon":{"browserTools":{"enabled":true}},"features":{"webUi":{"enabled":true}},"pluginsEnabled":false})).unwrap();
-    assert!(normalized["daemon"].get("browserTools").is_none());
-    assert!(normalized["features"].get("webUi").is_none());
-    assert_eq!(normalized["pluginsEnabled"], false);
-}
-
-#[test]
-fn retired_service_settings_migrate_without_changing_agent_providers() {
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("config.json");
-    let providers = json!({"claude":{"env":{"OPENAI_API_KEY":"agent-key"},"enabled":false}});
-    let legacy = json!({
-        "providers": {
-            "openai": {"apiKey":"retired-key","stt":{"model":"retired-model"}},
-            "local": {"modelsDir":"/retired-models"}
-        },
-        "features": {
-            "dictation": {"enabled":true,"stt":{"provider":"retired-provider"}},
-            "voiceMode": {"enabled":true,"tts":{"speed":"retired-value"}}
-        },
-        "agents": {"providers":providers}
-    });
-    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-    let persisted = storage::read(home.path(), false, false).unwrap();
-    assert!(persisted.get("providers").is_none());
-    assert_eq!(persisted["features"], json!({}));
-    assert_eq!(persisted["agents"]["providers"], providers);
-    let environment = std::collections::BTreeMap::from([
-        (
-            "PASEO_DICTATION_STT_PROVIDER".to_owned(),
-            "retired-provider".to_owned(),
-        ),
-        (
-            "PASEO_VOICE_LOCAL_TTS_SPEED".to_owned(),
-            "retired-value".to_owned(),
-        ),
-        ("OPENAI_API_KEY".to_owned(), "retired-key".to_owned()),
-    ]);
-    let resolved =
-        super::resolve::resolve(home.path(), home.path(), &persisted, &environment).unwrap();
-    assert_eq!(resolved["providerOverrides"], providers);
-    assert!(resolved.get("speech").is_none());
-    assert!(resolved.get("openai").is_none());
-    assert!(resolved.get("voiceLlmProvider").is_none());
-    assert_eq!(resolved["configReload"]["env"], json!({}));
-    storage::save(home.path(), &persisted).unwrap();
-    assert_eq!(storage::read(home.path(), false, false).unwrap(), persisted);
-}
-
-#[test]
 fn plugin_opt_out_survives_config_updates_and_reload() {
     let home = tempfile::tempdir().unwrap();
     let environment = std::collections::BTreeMap::new();
@@ -118,49 +105,6 @@ fn plugin_opt_out_survives_config_updates_and_reload() {
     let resolved = resolve(&enabled);
     assert_eq!(resolved["pluginsEnabled"], true);
     assert_eq!(resolved["plugins"]["held"]["enabled"], false);
-}
-
-#[test]
-fn retired_kiro_plugin_registration_preserves_profiles_and_private_state() {
-    let home = tempfile::tempdir().unwrap();
-    let settings = home.path().join("plugin-settings/omp-kiro/state.json");
-    let auth = home.path().join("managed-auth.sqlite3");
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(&settings, b"retained-plugin-settings").unwrap();
-    std::fs::write(&auth, b"retained-managed-login").unwrap();
-    let original = json!({
-        "pluginsEnabled":false,
-        "plugins":{
-            "omp-kiro":{"source":"directory","path":"/old/omp-kiro","enabled":true},
-            "other":{"source":"directory","path":"/other","enabled":false}
-        },
-        "agents":{"providers":{"kiro-omp-http":{
-            "extends":"omp","label":"Kiro HTTP (OMP)","enabled":true,
-            "env":{"OMP_KIRO_AUTH_FILE":auth}
-        }}}
-    });
-    std::fs::write(home.path().join("config.json"), original.to_string()).unwrap();
-    let loaded = storage::read(home.path(), false, false).unwrap();
-    assert!(loaded["plugins"].get("omp-kiro").is_none());
-    assert_eq!(loaded["plugins"]["other"], original["plugins"]["other"]);
-    assert_eq!(loaded["agents"], original["agents"]);
-    assert_eq!(loaded["pluginsEnabled"], false);
-    let patch = transactions::supported_patch(
-        json!({"plugins":original["plugins"],"pluginsEnabled":false}),
-        false,
-    )
-    .unwrap();
-    let next = transactions::persist_patch(&loaded, &patch, &[]).unwrap();
-    storage::save(home.path(), &next).unwrap();
-    let saved = storage::read(home.path(), false, false).unwrap();
-    assert!(saved["plugins"].get("omp-kiro").is_none());
-    assert_eq!(saved["plugins"]["other"], original["plugins"]["other"]);
-    assert_eq!(saved["agents"], original["agents"]);
-    assert_eq!(
-        std::fs::read(settings).unwrap(),
-        b"retained-plugin-settings"
-    );
-    assert_eq!(std::fs::read(auth).unwrap(), b"retained-managed-login");
 }
 
 #[test]

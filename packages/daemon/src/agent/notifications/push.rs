@@ -393,15 +393,14 @@ mod tests {
         assert!(service.inner.sources.lock().unwrap().is_empty());
     }
     #[test]
-    fn subscriptions_load_deduplicated_and_retired_token_arrays_grant_no_lease() {
+    fn subscriptions_load_deduplicated() {
         let leases = load_leases(&json!({
             "subscriptions":[
                 {"token":" a ","expiresAt":"2020-01-01T00:00:00Z"},
                 {"token":"a","expiresAt":"2021-01-01T00:00:00Z"},
                 {"token":"","expiresAt":"2021-01-01T00:00:00Z"},
                 {"token":"no-expiry"}
-            ],
-            "tokens":["b"]
+            ]
         }));
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].token, "a");

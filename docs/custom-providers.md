@@ -475,12 +475,6 @@ credentials, purchase credits or change billing. See the OMP extension's
 [authentication guide](https://github.com/emotionbug/omp-kiro#credential-storage-and-migration)
 for login and custom-store alignment.
 
-On upgrade, configuration normalization retires `plugins.omp-kiro` before any
-external worker starts; the next configuration save removes that stale entry
-from disk. It does not delete the checkout, plugin settings, managed login,
-OMP profiles or conversation history. The old native usage executable and
-`--usage-only`/`--enable-plugins` setup paths are no longer needed.
-
 
 #### Other Pi-compatible forks
 

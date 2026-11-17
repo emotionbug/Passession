@@ -189,7 +189,7 @@ snapshot so a mixed edit can apply its live subset and still name the paths that
   version: 1,
   daemon: {
     listen: "127.0.0.1:6767",
-    hostnames: true | string[],   // legacy alias `allowedHosts` is migrated on load
+    hostnames: true | string[],
     trustedProxies: true | string[], // defaults to ["loopback"]; Express proxy names/CIDRs
     mcp: { enabled: boolean, injectIntoAgents: boolean },
     git: { maxProcessesPerSecond: number, maxProcessConcurrency: number },
@@ -329,10 +329,6 @@ Environment variables override `config.json`:
 `PASEO_GIT_MAX_PROCESS_CONCURRENCY` wins when it and the legacy alias are both set. Run `paseo reload`
 after changing `config.json`. Environment changes require a daemon restart; the launch environment
 remains authoritative during reload.
-
-### Removed speech settings
-
-Legacy top-level `providers` speech settings and `features.dictation`/`features.voiceMode` are discarded during configuration normalization. Agent provider settings under `agents.providers` remain independent and are preserved.
 
 ---
 

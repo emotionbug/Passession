@@ -40,7 +40,7 @@ Paseo 默认使用 `~/.paseo` 作为主目录。配置文件是：
 }
 ```
 
-`daemon.hostnames` 是主要字段。旧的 `daemon.allowedHosts` 名称作为已弃用的别名仍然可用，以保持向后兼容。
+`daemon.hostnames` 是唯一的主机名字段。旧的 `daemon.allowedHosts` 名称会被忽略，请把其中的条目移到 `daemon.hostnames`。
 
 ## 应用更改 {#apply-changes}
 
@@ -84,7 +84,7 @@ Agent Provider，包括 Paseo 自带的一等 Provider 和你在 `agents.provide
 
 ## 已移除的语音设置 {#removed-speech-settings}
 
-不再支持语音识别、语音对话和 TTS。配置规范化会丢弃旧的顶层 `providers`、`features.dictation` 和 `features.voiceMode` 设置，不会移除 `agents.providers` 下的 Agent 配置。
+不再支持语音识别、语音对话和 TTS。旧的顶层 `providers`、`features.dictation` 和 `features.voiceMode` 设置会被忽略，不影响 `agents.providers` 下的 Agent 配置。
 
 ## 原生客户端 {#native-clients}
 

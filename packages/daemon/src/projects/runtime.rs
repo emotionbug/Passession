@@ -780,13 +780,12 @@ pub fn create_worktree_change_request_hint(input: &Value) -> Result<Value> {
     Ok(Value::Object(result))
 }
 
-/// Like the source Zod object schemas, rejects explicit null optional fields and
-/// strips unknown fields (including v2-only fields when the version is 1).
+/// Rejects explicit null optional fields and strips unknown fields.
 pub(crate) fn parse_metadata(input: &Value) -> Result<Value> {
     let version = input
         .get("version")
         .and_then(Value::as_f64)
-        .filter(|v| *v == 1.0 || *v == 2.0)
+        .filter(|v| *v == 2.0)
         .ok_or_else(|| anyhow!("Invalid worktree metadata version"))? as u64;
     let mut output =
         json!({"version": version, "baseRefName": nonempty_string(input, "baseRefName")?});
@@ -796,26 +795,24 @@ pub(crate) fn parse_metadata(input: &Value) -> Result<Value> {
     if let Some(hint) = input.get("changeRequestLookupTarget") {
         output["changeRequestLookupTarget"] = create_worktree_change_request_hint(hint)?;
     }
-    if version == 2 {
-        if let Some(auto_name) = input.get("firstAgentBranchAutoName") {
-            let status = nonempty_string(auto_name, "status")?;
-            if !matches!(status, "pending" | "attempted") {
-                bail!("Invalid first-agent branch auto-name status");
-            }
-            let mut value = json!({"status": status, "placeholderBranchName": nonempty_string(auto_name, "placeholderBranchName")?});
-            if status == "attempted" {
-                value["attemptedAt"] =
-                    Value::String(nonempty_string(auto_name, "attemptedAt")?.to_owned());
-            }
-            output["firstAgentBranchAutoName"] = value;
+    if let Some(auto_name) = input.get("firstAgentBranchAutoName") {
+        let status = nonempty_string(auto_name, "status")?;
+        if !matches!(status, "pending" | "attempted") {
+            bail!("Invalid first-agent branch auto-name status");
         }
-        if let Some(runtime) = input.get("runtime") {
-            let port = runtime
-                .get("worktreePort")
-                .ok_or_else(|| anyhow!("Invalid worktree metadata runtime"))?;
-            positive_integer(port, "worktreePort")?;
-            output["runtime"] = json!({"worktreePort": port});
+        let mut value = json!({"status": status, "placeholderBranchName": nonempty_string(auto_name, "placeholderBranchName")?});
+        if status == "attempted" {
+            value["attemptedAt"] =
+                Value::String(nonempty_string(auto_name, "attemptedAt")?.to_owned());
         }
+        output["firstAgentBranchAutoName"] = value;
+    }
+    if let Some(runtime) = input.get("runtime") {
+        let port = runtime
+            .get("worktreePort")
+            .ok_or_else(|| anyhow!("Invalid worktree metadata runtime"))?;
+        positive_integer(port, "worktreePort")?;
+        output["runtime"] = json!({"worktreePort": port});
     }
     Ok(output)
 }
@@ -965,23 +962,22 @@ mod tests {
     }
 
     #[test]
-    fn metadata_null_unknown_and_legacy_hint_semantics() -> Result<()> {
-        let v1 =
-            parse_metadata(&json!({"version":1,"baseRefName":"main","runtime":null,"unknown":7}))?;
-        assert!(v1.get("runtime").is_none());
-        assert!(v1.get("unknown").is_none());
-        assert!(parse_metadata(&json!({"version":1,"baseRefName":"main","baseRef":null})).is_err());
+    fn metadata_null_unknown_and_hint_semantics() -> Result<()> {
+        let metadata = parse_metadata(&json!({"version":2,"baseRefName":"main","unknown":7}))?;
+        assert!(metadata.get("runtime").is_none());
+        assert!(metadata.get("unknown").is_none());
+        assert!(parse_metadata(&json!({"version":2,"baseRefName":"main","baseRef":null})).is_err());
         assert!(
             parse_metadata(
                 &json!({"version":2,"baseRefName":"main","runtime":{"worktreePort":1.5}})
             )
             .is_err()
         );
-        let legacy = json!({"changeRequestLookupTarget":{"headRef":"feature","headRepositoryOwner":" Some-Owner "}});
+        let hint = json!({"changeRequestLookupTarget":{"headRef":"feature","headRepositoryOwner":" Some-Owner "}});
         assert!(
-            worktree_change_request_hint_for_branch(Some(&legacy), "some-owner/feature").is_some()
+            worktree_change_request_hint_for_branch(Some(&hint), "some-owner/feature").is_some()
         );
-        assert!(worktree_change_request_hint_for_branch(Some(&legacy), "feature").is_none());
+        assert!(worktree_change_request_hint_for_branch(Some(&hint), "feature").is_none());
         let pinned =
             json!({"changeRequestLookupTarget":{"headRef":"feature","localBranchName":"local"}});
         assert!(worktree_change_request_hint_for_branch(Some(&pinned), "feature").is_none());
