@@ -313,16 +313,24 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
             }
         }
     });
-    let result:Result<()>=async {
+    let result: Result<()> = async {
         app.initialize(&options).await?;
-        let listen=app.transport.listen_string().context("Daemon listener is not ready")?;
-        let identity=app.transport.identity();
-        let server_id=identity["serverId"].as_str().context("Daemon identity is missing")?;
-        crate::daemon_control::publish_worker_ready(&listen,server_id)?;
+        let listen = app
+            .transport
+            .listen_string()
+            .context("Daemon listener is not ready")?;
+        let identity = app.transport.identity();
+        let server_id = identity["serverId"]
+            .as_str()
+            .context("Daemon identity is missing")?;
+        crate::daemon_control::publish_worker_ready(&listen, server_id)?;
         tracing::info!(%listen,%server_id,version=crate::VERSION,"Paseo native daemon ready");
+        let home = app.home.clone();
+        tokio::task::spawn_blocking(move || crate::maintenance::cleanup(&home));
         app.cancel.cancelled().await;
         Ok(())
-    }.await;
+    }
+    .await;
     signal.abort();
     let _ = signal.await;
     let exit = app.settle_exit();

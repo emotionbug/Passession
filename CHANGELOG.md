@@ -28,6 +28,7 @@
 - Write daemon socket output in batches: each writer drains its queued frames and flushes once instead of flushing after every frame, keeping message order, control-frame priority, backpressure and flush acknowledgements. Legacy Hub events are no longer parsed and re-serialized for every socket.
 - Build the sidebar's project and session list only when a host's directory, a filter, the search or the held order changes, instead of re-sorting every project's sessions on each draw. Activity updates find the visible sessions they touch from that index.
 - Ping hosts every 30 seconds instead of every 10 while the mobile app is in the background, the slowest rate that keeps the daemon's 45-second connection lease, and verify every connection immediately when the app returns. The desktop app keeps its normal rate, including when hidden to the tray.
+- Remove files the daemon no longer reads, once per start: retired `agent-timelines/<id>.json` checkpoints that have a SQLite replacement, and daemon logs with the old `YYYYMMDD-HHMM-NN-daemon.log` names.
 
 ### Fixed
 

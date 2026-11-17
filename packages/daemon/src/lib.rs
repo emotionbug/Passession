@@ -8,7 +8,9 @@ pub fn component_identity() -> paseo_protocol::components::ComponentIdentity {
     paseo_protocol::components::ComponentIdentity {
         version: VERSION.into(),
         source_sha: option_env!("PASEO_BUILD_SOURCE_SHA").unwrap_or("").into(),
-        input_hash: option_env!("PASEO_COMPONENT_INPUT_HASH").unwrap_or("").into(),
+        input_hash: option_env!("PASEO_COMPONENT_INPUT_HASH")
+            .unwrap_or("")
+            .into(),
         abi_version: 1,
     }
 }
@@ -28,6 +30,7 @@ pub mod files;
 pub mod git;
 pub mod json;
 pub mod logging;
+mod maintenance;
 pub mod mcp;
 pub mod mcp_client;
 pub mod plugins;
