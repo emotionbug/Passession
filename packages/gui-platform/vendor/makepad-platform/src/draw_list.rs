@@ -49,19 +49,135 @@ impl DrawList {
     pub fn id(&self) -> DrawListId {DrawListId(self.0.id, self.0.generation)}
 }
 
+/// Window overlay strata. Within a stratum, codeflow children paint after their owners.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OverlayRank {
+    #[default]
+    Pane,
+    Shell,
+    Cursor,
+}
+
 #[derive(Default)]
-pub struct CxDrawListPool(pub (crate) IdPool<CxDrawList>);
+pub struct CxDrawListPool {
+    pool: IdPool<CxDrawList>,
+    // Reused for composition of each window's overlay.
+    overlay_order: Vec<OverlayEntry>,
+}
+
+struct OverlayEntry {
+    id: DrawListId,
+    redraw_id: u64,
+    first_child: Option<usize>,
+    next: Option<usize>,
+}
 impl CxDrawListPool {
     pub fn alloc(&mut self) -> DrawList {
-        DrawList(self.0.alloc())
+        DrawList(self.pool.alloc())
     }
     
     pub fn checked_index(&self, index: DrawListId)->Option<&CxDrawList>{
-        let d = &self.0.pool[index.0];
+        let d = &self.pool.pool[index.0];
         if d.generation != index.1 {
             return None
         }
         return Some(&d.item)
+    }
+
+    /// Turns overlay submissions into paint order: ranks first, then a stable traversal
+    /// of each rank's codeflow forest. A renewed ancestor brings its cached descendants
+    /// with it. An overlay can raise its own rank but cannot paint below an ancestor.
+    pub fn compose_overlays(&mut self, overlay: DrawListId, root: DrawListId) {
+        self.overlay_order.clear();
+        let len = self[overlay].draw_items.len();
+        for i in 0..len {
+            let item = &self[overlay].draw_items[i];
+            let Some(id) = item.sub_list().filter(|&id| self.checked_index(id).is_some()) else {
+                continue;
+            };
+            let redraw_id = item.redraw_id;
+            self[id].overlay_order_index = self.overlay_order.len();
+            self.overlay_order.push(OverlayEntry {
+                id,
+                redraw_id,
+                first_child: None,
+                next: None,
+            });
+        }
+
+        let mut ranks = [None; OverlayRank::Cursor as usize + 1];
+        // Link in reverse submission order so siblings and unrelated roots keep their order.
+        for index in (0..self.overlay_order.len()).rev() {
+            let id = self.overlay_order[index].id;
+            let Some((parent, rank)) = self.overlay_position(id, root) else {
+                continue; // A detached subtree can keep unchanged paint IDs internally.
+            };
+            let first = match parent {
+                Some(parent) => &mut self.overlay_order[parent].first_child,
+                None => &mut ranks[rank as usize],
+            };
+            let next = first.replace(index);
+            self.overlay_order[index].next = next;
+        }
+
+        let mut written = 0;
+        for first in ranks {
+            self.write_overlay_branch(overlay, first, &mut written);
+        }
+        let list = &mut self[overlay];
+        list.draw_items.used = written;
+        list.find_appendable_draw_shader_id.truncate(written);
+    }
+
+    fn overlay_position(
+        &self,
+        id: DrawListId,
+        root: DrawListId,
+    ) -> Option<(Option<usize>, OverlayRank)> {
+        let rank = self[id].overlay_rank;
+        let mut ancestor_rank = OverlayRank::Pane;
+        let mut closest = None;
+        let mut current = id;
+        for _ in 0..self.pool.pool.len() {
+            let list = self.checked_index(current)?;
+            let parent_id = list.codeflow_parent_id?;
+            let parent = self.checked_index(parent_id)?;
+            if list.codeflow_parent_redraw_id != parent.redraw_id {
+                return None;
+            }
+            if parent_id == root {
+                return Some((
+                    if rank <= ancestor_rank { closest } else { None },
+                    rank.max(ancestor_rank),
+                ));
+            }
+            let index = parent.overlay_order_index;
+            if self.overlay_order.get(index).is_some_and(|entry| entry.id == parent_id) {
+                closest = closest.or(Some(index));
+                ancestor_rank = ancestor_rank.max(parent.overlay_rank);
+            }
+            current = parent_id;
+        }
+        None
+    }
+
+    fn write_overlay_branch(
+        &mut self,
+        overlay: DrawListId,
+        mut next: Option<usize>,
+        written: &mut usize,
+    ) {
+        while let Some(index) = next {
+            let OverlayEntry { id, redraw_id, first_child, next: sibling } = self.overlay_order[index];
+            let item = &mut self[overlay].draw_items[*written];
+            if item.sub_list() != Some(id) {
+                item.kind = CxDrawKind::SubList(id);
+                item.redraw_id = redraw_id;
+            }
+            *written += 1;
+            self.write_overlay_branch(overlay, first_child, written);
+            next = sibling;
+        }
     }
 }
 
@@ -69,7 +185,7 @@ impl std::ops::Index<DrawListId> for CxDrawListPool {
     
     type Output = CxDrawList;
     fn index(&self, index: DrawListId) -> &Self::Output {
-        let d = &self.0.pool[index.0];
+        let d = &self.pool.pool[index.0];
         if d.generation != index.1 {
             error!("Drawlist id generation wrong index: {} current gen:{} in pointer:{}", index.0, d.generation, index.1)
         }
@@ -79,7 +195,7 @@ impl std::ops::Index<DrawListId> for CxDrawListPool {
 
 impl std::ops::IndexMut<DrawListId> for CxDrawListPool {
     fn index_mut(&mut self, index: DrawListId) -> &mut Self::Output {
-        let d = &mut self.0.pool[index.0];
+        let d = &mut self.pool.pool[index.0];
         if d.generation != index.1 {
             error!("Drawlist id generation wrong {} {} {}", index.0, d.generation, index.1)
         }
@@ -287,6 +403,10 @@ pub struct CxDrawList {
     pub debug_id: LiveId,
     
     pub codeflow_parent_id: Option<DrawListId>, // the id of the parent we nest in, codeflow wise
+    /// The parent's paint that last attached this list, including cached replays.
+    pub codeflow_parent_redraw_id: u64,
+    pub overlay_rank: OverlayRank,
+    overlay_order_index: usize,
     
     pub redraw_id: u64,
     pub pass_id: Option<PassId>,
@@ -468,17 +588,6 @@ impl CxDrawList {
         self.append_sub_list(redraw_id, sub_list_id);
     }
     
-    pub fn clear_sub_list(&mut self, sub_list_id: DrawListId) {
-        // set our subview to empty
-        for i in 0..self.draw_items.len(){
-            let item = &mut self.draw_items[i];
-            if let Some(check_id) = item.kind.sub_list(){
-                if check_id == sub_list_id{
-                    item.kind = CxDrawKind::Empty;
-                }
-            }
-        }
-    }
     /*
     pub fn get_local_scroll(&self) -> Vec2 {
         let xs = if self.no_v_scroll {0.} else {self.snapped_scroll.x};

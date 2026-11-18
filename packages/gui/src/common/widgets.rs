@@ -500,7 +500,7 @@ impl Widget for PointerShield {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         if self.draw_state.begin(cx, ()) {
-            // Clear even when hidden: an old cover area must not keep shielding.
+            // Keep the cover and its controls in a distinct subtree from covered siblings.
             self.draw_list.begin_always(cx);
         }
         self.view.draw_walk(cx, scope, walk)?;

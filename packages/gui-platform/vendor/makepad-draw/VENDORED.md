@@ -171,13 +171,15 @@ skip when the file is absent; no font resources are added.
 
 ## Retained list release
 
-`DrawList2d::release` detaches a retained list that a frame did not open. It
-clears the list's items under the current redraw id and resets its dirty-check
-rect. Overlay children recorded by the list's last draw then fail the
-`Overlay::prune_stale_sublists` parent check and are removed. The next
-`begin_maybe` repaints the list instead of replaying it. The client's retained
-shell layers (`packages/gui/src/common/layer.rs`) release a pane or page that is
-hidden for a frame.
+`DrawList2d::release` detaches a retained list and clears its paint and dirty
+rect, so the next `begin_maybe` repaints instead of replaying. At `Overlay::end`
+the platform draw-list pool checks each overlay's complete attachment chain to
+the current window root, pruning released branches even when all internal
+paint IDs are still current. Cached children follow a resubmitted ancestor in
+paint order, including through ordinary draw lists. Pane overlays composite
+before shell overlays and the window cursor; a nested overlay inherits its
+ancestor's rank unless it explicitly uses a higher one. Composition reuses a
+scratch buffer and does not move GPU resources.
 
 ## Standard rustybuzz, ttf-parser and PNG
 

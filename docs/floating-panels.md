@@ -26,7 +26,7 @@ Declare such a surface once, when drawing it: `common::overlay::float(area)` wit
 
 A full-window sheet declares its backdrop with `common::overlay::modal_float(owner, area)`, using its window-modal owner id. While that sheet is on top, only its backdrop and floating cards drawn inside it shield input; popovers behind it cannot interfere. The sweep lock alone does not protect against scrollers reading raw wheel positions. `WaModal` and timeline sheets declare their backdrops. A sheet without a registered backdrop keeps its own input rules.
 
-For a pane-local loading/disconnected cover or a search card, wrap the painted surface in `common::widgets::PointerShield`. It owns a separate always-redrawn draw list, registers the visible area and invalidates it when hidden. Wrap the card itself, not a transparent positioning container. Its controls keep receiving input while underlying siblings do not; non-input updates continue.
+For a pane-local loading/disconnected cover or a search card, wrap the painted surface in `common::widgets::PointerShield`. It owns a separate draw list and registers the visible area. Pointer shields follow every attachment up the draw-list tree: a cached cover stays active while replayed, but stops shielding as soon as a frame omits its branch. Wrap the card itself, not a transparent positioning container. Its controls keep receiving input while underlying siblings do not; non-input updates continue.
 
 Rules that follow:
 

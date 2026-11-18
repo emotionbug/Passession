@@ -5833,6 +5833,98 @@ impl ChatPanelRef {
 }
 
 #[cfg(test)]
+mod modal_layer_tests {
+    use super::*;
+
+    #[test]
+    fn cached_tool_sheet_stays_above_streaming_subagent() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_draw::live_design(&mut cx);
+        makepad_draw::shader::draw_trapezoid::DrawTrapezoidVector::register_main_module(&mut cx);
+        cx.live_expand();
+        let pass = Pass::new(&mut cx);
+        let size = dvec2(100.0, 100.0);
+        pass.set_size(&mut cx, size);
+        let bounds = rect_xywh(0.0, 0.0, size.x, size.y);
+        let viewport = rect_xywh(0.0, 20.0, size.x, 80.0);
+        let overlay = Overlay::new(&mut cx);
+        let mut window = DrawList2d::new(&mut cx);
+        let mut subagent = DrawList2d::new(&mut cx);
+        let mut subagent_content = DrawList2d::new(&mut cx);
+        let mut stream = DrawList2d::new(&mut cx);
+        let mut tool = DrawList2d::new(&mut cx);
+        let mut tool_content = DrawList2d::new(&mut cx);
+        // A retained list with a draw item can replay rather than repaint.
+        let mut detail = DrawList2d::new(&mut cx);
+        let mut detail_area = Area::Empty;
+        let window_id = window.draw_list_id();
+        let stream_id = stream.draw_list_id();
+        let detail_id = detail.draw_list_id();
+
+        fn paint_order(cx: &Cx, id: DrawListId, order: &mut Vec<DrawListId>) {
+            order.push(id);
+            let items = &cx.draw_lists[id].draw_items;
+            for i in 0..items.len() {
+                if let Some(child) = items[i].sub_list() {
+                    paint_order(cx, child, order);
+                }
+            }
+        }
+
+        // Open both sheets, repaint just the parent window, then repaint the child's stream.
+        // Neither subsequent repaint should change sheet order or repaint the tool itself.
+        for (dirty, draws_stream) in [(detail_id, true), (window_id, false), (stream_id, true)] {
+            {
+                let event = DrawEvent {
+                    draw_lists: vec![dirty],
+                    ..Default::default()
+                };
+                let mut draw = CxDraw::new(&mut cx, &event);
+                draw.begin_pass(&pass, Some(1.0));
+                window.begin_always(&mut draw);
+                let mut cx = Cx2d::new(&mut draw);
+                overlay.begin(&mut cx);
+                subagent.begin_overlay_last(&mut cx);
+                cx.begin_pass_sized_turtle(Layout::flow_overlay());
+                let repaint = subagent_content
+                    .begin(&mut cx, Walk::abs_rect(bounds))
+                    .is_ok();
+                assert_eq!(repaint, draws_stream);
+                if repaint {
+                    cx.begin_turtle(Walk::abs_rect(viewport), Layout::flow_overlay());
+                    stream.begin_always(&mut cx);
+                    stream.end(&mut cx);
+                    tool.begin_overlay_last(&mut cx);
+                    cx.begin_pass_sized_turtle(Layout::flow_overlay());
+                    if tool_content.begin(&mut cx, Walk::abs_rect(bounds)).is_ok() {
+                        assert_eq!(dirty, detail_id);
+                        detail.begin_always(&mut cx);
+                        cx.add_aligned_rect_area(&mut detail_area, bounds);
+                        detail.end(&mut cx);
+                        tool_content.end(&mut cx);
+                    }
+                    cx.end_pass_sized_turtle();
+                    tool.end(&mut cx);
+                    cx.end_turtle();
+                    subagent_content.end(&mut cx);
+                }
+                cx.end_pass_sized_turtle();
+                subagent.end(&mut cx);
+                overlay.end(&mut cx);
+                window.end(&mut cx);
+                cx.end_pass(&pass);
+            }
+
+            let mut order = Vec::new();
+            paint_order(&cx, window_id, &mut order);
+            order.retain(|id| *id == stream_id || *id == detail_id);
+            assert_eq!(order, [stream_id, detail_id], "dirty list: {dirty:?}");
+            assert_eq!(detail_area.clipped_rect(&cx), bounds);
+        }
+    }
+}
+
+#[cfg(test)]
 mod reading_hold_tests {
     use super::*;
 

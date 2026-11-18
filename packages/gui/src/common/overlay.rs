@@ -461,21 +461,30 @@ fn float_pass(cx: &Cx, area: Area) -> Option<makepad_widgets::PassId> {
     cx.draw_lists.checked_index(area.draw_list_id()?)?.pass_id
 }
 
-/// The area is current, and its draw list was painted with the list it nests in: the rule by
-/// which Makepad's overlay keeps or prunes a retained child, so a surface shields exactly
-/// while it is shown.
+/// The area itself can remain valid after the drawing that attached its subtree is gone.
+/// Check every attachment, not just the first parent (e.g. a hidden terminal cover's
+/// wrapper and cached contents can both keep their last paint).
 fn float_drawn(cx: &Cx, area: Area) -> bool {
-    let list = area
+    let Some(mut list) = area
         .draw_list_id()
+        .and_then(|id| cx.draw_lists.checked_index(id))
         .filter(|_| area.is_valid(cx))
-        .and_then(|id| cx.draw_lists.checked_index(id));
-    list.is_some_and(|list| {
-        list.codeflow_parent_id.is_none_or(|parent| {
-            cx.draw_lists
-                .checked_index(parent)
-                .is_some_and(|parent| parent.redraw_id == list.redraw_id)
-        })
-    })
+    else {
+        return false;
+    };
+    for _ in 0..64 {
+        let Some(parent) = list.codeflow_parent_id else {
+            return true;
+        };
+        let Some(parent) = cx.draw_lists.checked_index(parent) else {
+            return false;
+        };
+        if parent.redraw_id != list.codeflow_parent_redraw_id {
+            return false;
+        }
+        list = parent;
+    }
+    false
 }
 
 /// Claim dismissal before dispatching to children; a handled Back or repeat must not
@@ -955,6 +964,74 @@ mod tests {
         shield_content(&mut cx, "main", page, false);
         release_window_modal("main", 1);
         FLOATS.with(|floats| floats.borrow_mut().clear());
+    }
+
+    #[test]
+    fn detached_terminal_cover_no_longer_shields_the_session_list() {
+        use makepad_widgets::{
+            Cx2d, CxDraw, DrawEvent, DrawList, DrawListExt, Layout, LiveNew, Pass, dvec2,
+        };
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_widgets::makepad_draw::live_design(&mut cx);
+        makepad_widgets::makepad_draw::shader::draw_trapezoid::DrawTrapezoidVector::register_main_module(
+            &mut cx,
+        );
+        cx.live_expand();
+        let pass = Pass::new(&mut cx);
+        let size = dvec2(100.0, 100.0);
+        pass.set_size(&mut cx, size);
+        let mut root = DrawList::new(&mut cx);
+        let mut sidebar = DrawList::new(&mut cx);
+        let mut terminal = DrawList::new(&mut cx);
+        let mut wrapper = DrawList::new(&mut cx);
+        let mut cover = DrawList::new(&mut cx);
+        let mut paint = |cx: &mut Cx, terminal: Option<&mut DrawList>| {
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            root.begin_always(&mut draw);
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_sized_turtle(size, Layout::default());
+            let rect = Rect {
+                pos: DVec2::default(),
+                size,
+            };
+            let mut sidebar_area = Area::Empty;
+            sidebar.begin_always(&mut cx);
+            cx.add_aligned_rect_area(&mut sidebar_area, rect);
+            sidebar.end(&mut cx);
+            // On the second frame the root draws again, replaying the unchanged terminal.
+            if let Some(terminal) = terminal
+                && terminal.begin_maybe(&mut cx, false).is_ok()
+            {
+                wrapper.begin_always(&mut cx);
+                cover.begin_always(&mut cx);
+                let mut cover_area = Area::Empty;
+                cx.add_aligned_rect_area(&mut cover_area, rect);
+                float(cover_area);
+                cover.end(&mut cx);
+                wrapper.end(&mut cx);
+                terminal.end(&mut cx);
+            }
+            cx.end_pass_sized_turtle();
+            root.end(&mut cx);
+            cx.end_pass(&pass);
+            sidebar_area
+        };
+        let point = dvec2(10.0, 10.0);
+        for _ in 0..2 {
+            let sidebar_area = paint(&mut cx, Some(&mut terminal));
+            shield_content(&mut cx, "main", sidebar_area, true);
+            assert!(cx.pointer_shielded(sidebar_area, point));
+        }
+
+        // Closing omits the whole terminal branch. The nested wrapper and cover
+        // still have matching old paints, even if the lists have been pooled.
+        drop(terminal);
+        let sidebar_area = paint(&mut cx, None);
+        shield_content(&mut cx, "main", sidebar_area, true);
+        assert!(!cx.pointer_shielded(sidebar_area, point));
     }
 
     #[test]

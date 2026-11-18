@@ -232,7 +232,7 @@ impl Window {
         
         // lets draw our cursor
         if let OsType::LinuxDirect = cx.os_type() {
-            self.cursor_draw_list.begin_overlay_last(cx);
+            self.cursor_draw_list.begin_overlay_last_ranked(cx, OverlayRank::Cursor);
             self.draw_cursor.draw_abs(cx, Rect {
                 pos: self.last_mouse_pos,
                 size: self.mouse_cursor_size

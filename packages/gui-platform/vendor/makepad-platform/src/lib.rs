@@ -145,7 +145,8 @@ pub use {
             CxDrawCall,
             DrawList,
             DrawListId,
-            CxDrawListPool
+            CxDrawListPool,
+            OverlayRank,
         },
         cx::{
             Cx,

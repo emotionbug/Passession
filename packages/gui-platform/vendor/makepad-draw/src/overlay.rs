@@ -68,28 +68,7 @@ impl Overlay {
         let parent_id = cx.draw_list_stack.last().cloned().unwrap();
         let redraw_id = cx.redraw_id;
         cx.draw_lists[parent_id].append_sub_list(redraw_id, self.draw_list.id());
-        
-        self.prune_stale_sublists(&mut cx.draw_lists);
-    }
-
-    fn prune_stale_sublists(&self, draw_lists: &mut CxDrawListPool) {
-        // Unlike ordinary draw lists, the overlay retains its children across
-        // redraws. A dropped widget's slot may now belong to another generation,
-        // whose redraw id and parent cannot validate the old retained reference.
-        for i in 0..draw_lists[self.draw_list.id()].draw_items.len() {
-            if let Some(sub_id) = draw_lists[self.draw_list.id()].draw_items[i].sub_list() {
-                let stale = match draw_lists.checked_index(sub_id) {
-                    None => true,
-                    Some(sub_list) => sub_list.codeflow_parent_id.is_some_and(|parent_id| {
-                        draw_lists.checked_index(parent_id)
-                            .map_or(true, |parent| parent.redraw_id != sub_list.redraw_id)
-                    }),
-                };
-                if stale {
-                    draw_lists[self.draw_list.id()].clear_sub_list(sub_id);
-                }
-            }
-        }
+        cx.draw_lists.compose_overlays(self.draw_list.id(), parent_id);
     }
 }
 
@@ -97,6 +76,19 @@ impl Overlay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attach(lists: &mut CxDrawListPool, parent: DrawListId, child: DrawListId, redraw: u64) {
+        let parent_redraw = lists[parent].redraw_id;
+        let list = &mut lists[child];
+        list.codeflow_parent_id = Some(parent);
+        list.codeflow_parent_redraw_id = parent_redraw;
+        list.clear_draw_items(redraw);
+    }
+
+    fn order(lists: &CxDrawListPool, overlay: DrawListId) -> Vec<DrawListId> {
+        let items = &lists[overlay].draw_items;
+        (0..items.len()).map(|i| items[i].sub_list().unwrap()).collect()
+    }
 
     #[test]
     fn reused_overlay_child_does_not_retain_the_previous_generation() {
@@ -106,8 +98,7 @@ mod tests {
         let child = draw_lists.alloc();
         let stale_id = child.id();
         draw_lists[parent.id()].clear_draw_items(7);
-        draw_lists[stale_id].codeflow_parent_id = Some(parent.id());
-        draw_lists[stale_id].clear_draw_items(7);
+        attach(&mut draw_lists, parent.id(), stale_id, 7);
         draw_lists[overlay.draw_list.id()].store_sub_list(7, stale_id);
 
         drop(child);
@@ -116,16 +107,12 @@ mod tests {
         assert_ne!(replacement.id().generation(), stale_id.generation());
         // The replacement has matching redraw metadata, so comparing only that
         // metadata would keep both generations of the same pool slot.
-        draw_lists[replacement.id()].codeflow_parent_id = Some(parent.id());
-        draw_lists[replacement.id()].clear_draw_items(7);
+        attach(&mut draw_lists, parent.id(), replacement.id(), 7);
         draw_lists[overlay.draw_list.id()].store_sub_list(7, replacement.id());
 
-        overlay.prune_stale_sublists(&mut draw_lists);
+        draw_lists.compose_overlays(overlay.draw_list.id(), parent.id());
 
-        let items = &draw_lists[overlay.draw_list.id()].draw_items;
-        assert_eq!(items.len(), 2);
-        assert!(items[0].kind.is_empty());
-        assert_eq!(items[1].sub_list(), Some(replacement.id()));
+        assert_eq!(order(&draw_lists, overlay.draw_list.id()), [replacement.id()]);
         assert_eq!(draw_lists[replacement.id()].redraw_id, 7);
     }
 
@@ -133,12 +120,13 @@ mod tests {
     fn reused_codeflow_parent_cannot_keep_an_orphaned_overlay_child() {
         let mut draw_lists = CxDrawListPool::default();
         let overlay = Overlay { draw_list: draw_lists.alloc() };
+        let root = draw_lists.alloc();
         let parent = draw_lists.alloc();
         let stale_parent_id = parent.id();
         let child = draw_lists.alloc();
-        draw_lists[stale_parent_id].clear_draw_items(7);
-        draw_lists[child.id()].codeflow_parent_id = Some(stale_parent_id);
-        draw_lists[child.id()].clear_draw_items(7);
+        draw_lists[root.id()].clear_draw_items(7);
+        attach(&mut draw_lists, root.id(), stale_parent_id, 7);
+        attach(&mut draw_lists, stale_parent_id, child.id(), 7);
         draw_lists[overlay.draw_list.id()].store_sub_list(7, child.id());
 
         drop(parent);
@@ -147,37 +135,94 @@ mod tests {
         assert_ne!(replacement.id().generation(), stale_parent_id.generation());
         draw_lists[replacement.id()].clear_draw_items(7);
 
-        overlay.prune_stale_sublists(&mut draw_lists);
+        draw_lists.compose_overlays(overlay.draw_list.id(), root.id());
 
-        assert!(draw_lists[overlay.draw_list.id()].draw_items[0].kind.is_empty());
+        assert!(order(&draw_lists, overlay.draw_list.id()).is_empty());
         assert_eq!(draw_lists[child.id()].redraw_id, 7);
         assert_eq!(draw_lists[replacement.id()].redraw_id, 7);
     }
 
     #[test]
-    fn cached_overlay_survives_until_its_live_parent_redraws_without_it() {
+    fn cached_overlay_survives_replay_but_not_detachment_of_its_subtree() {
         let mut draw_lists = CxDrawListPool::default();
         let overlay = Overlay { draw_list: draw_lists.alloc() };
+        let root = draw_lists.alloc();
         let parent = draw_lists.alloc();
+        let intermediate = draw_lists.alloc();
         let child = draw_lists.alloc();
-        draw_lists[parent.id()].clear_draw_items(7);
-        draw_lists[child.id()].codeflow_parent_id = Some(parent.id());
-        draw_lists[child.id()].clear_draw_items(7);
-        // A newer window frame must not discard a still-cached subtree.
-        draw_lists[overlay.draw_list.id()].clear_draw_items(8);
+        draw_lists[root.id()].clear_draw_items(7);
+        attach(&mut draw_lists, root.id(), parent.id(), 7);
+        attach(&mut draw_lists, parent.id(), intermediate.id(), 7);
+        attach(&mut draw_lists, intermediate.id(), child.id(), 7);
         draw_lists[overlay.draw_list.id()].store_sub_list(7, child.id());
 
-        overlay.prune_stale_sublists(&mut draw_lists);
-        assert_eq!(draw_lists[overlay.draw_list.id()].draw_items[0].sub_list(), Some(child.id()));
+        // A newer window frame can reattach the parent without repainting its contents.
+        draw_lists[root.id()].clear_draw_items(8);
+        draw_lists[parent.id()].codeflow_parent_redraw_id = 8;
 
-        draw_lists[parent.id()].clear_draw_items(8);
-        overlay.prune_stale_sublists(&mut draw_lists);
-        assert!(draw_lists[overlay.draw_list.id()].draw_items[0].kind.is_empty());
+        draw_lists.compose_overlays(overlay.draw_list.id(), root.id());
+        assert_eq!(order(&draw_lists, overlay.draw_list.id()), [child.id()]);
 
-        // The same live overlay can be attached again when it is drawn.
-        draw_lists[child.id()].clear_draw_items(8);
-        draw_lists[overlay.draw_list.id()].store_sub_list(8, child.id());
-        overlay.prune_stale_sublists(&mut draw_lists);
-        assert_eq!(draw_lists[overlay.draw_list.id()].draw_items[0].sub_list(), Some(child.id()));
+        // The window omits the parent. The child's immediate attachment is still current.
+        draw_lists[root.id()].clear_draw_items(9);
+        draw_lists.compose_overlays(overlay.draw_list.id(), root.id());
+        assert!(order(&draw_lists, overlay.draw_list.id()).is_empty());
+
+        attach(&mut draw_lists, root.id(), parent.id(), 10);
+        attach(&mut draw_lists, parent.id(), intermediate.id(), 10);
+        attach(&mut draw_lists, intermediate.id(), child.id(), 10);
+        draw_lists[overlay.draw_list.id()].store_sub_list(10, child.id());
+        draw_lists.compose_overlays(overlay.draw_list.id(), root.id());
+        assert_eq!(order(&draw_lists, overlay.draw_list.id()), [child.id()]);
+    }
+
+    #[test]
+    fn overlay_promotions_stay_within_their_rank_and_keep_branches_together() {
+        let mut lists = CxDrawListPool::default();
+        let handles: [_; 12] = std::array::from_fn(|_| lists.alloc());
+        let [root, overlay, parent, intermediate, child, left, right, chrome, shell, shell_child,
+            cursor, new_child] = handles.each_ref().map(DrawList::id);
+
+        lists[root].clear_draw_items(7);
+        for id in [left, parent, right, chrome] {
+            attach(&mut lists, root, id, 7);
+        }
+        attach(&mut lists, parent, intermediate, 7);
+        attach(&mut lists, intermediate, child, 7);
+        for id in [shell, cursor] {
+            attach(&mut lists, chrome, id, 7);
+        }
+        attach(&mut lists, shell, shell_child, 7);
+        lists[shell].overlay_rank = OverlayRank::Shell;
+        lists[cursor].overlay_rank = OverlayRank::Cursor;
+        for id in [left, parent, child, right, shell, shell_child, cursor] {
+            lists[overlay].store_sub_list_last(7, id);
+        }
+        lists.compose_overlays(overlay, root);
+        assert_eq!(order(&lists, overlay), [left, parent, child, right, shell, shell_child, cursor]);
+
+        // Repaint only the pane overlay and replay its cached content; shell and cursor
+        // are replayed through chrome without resubmitting their overlay lists.
+        lists[root].clear_draw_items(8);
+        for id in [left, right, chrome, intermediate] {
+            lists[id].codeflow_parent_redraw_id = 8;
+        }
+        attach(&mut lists, root, parent, 8);
+        lists[overlay].store_sub_list_last(8, parent);
+        lists.compose_overlays(overlay, root);
+        let promoted = [left, right, parent, child, shell, shell_child, cursor];
+        assert_eq!(order(&lists, overlay), promoted);
+
+        // Reuse can submit a descendant in a hole below its parent. It still composes on top.
+        lists[overlay].store_sub_list_last(8, left);
+        attach(&mut lists, intermediate, new_child, 8);
+        lists[overlay].store_sub_list(8, new_child);
+        lists.compose_overlays(overlay, root);
+        assert_eq!(order(&lists, overlay), [right, parent, new_child, child, left, shell, shell_child, cursor]);
+
+        lists[parent].clear_draw_items(9);
+        lists[parent].codeflow_parent_id = None;
+        lists.compose_overlays(overlay, root);
+        assert_eq!(order(&lists, overlay), [right, left, shell, shell_child, cursor]);
     }
 }

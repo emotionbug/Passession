@@ -71,6 +71,8 @@ Feature code keeps the ordinary Makepad contract: when a widget's own data chang
 - a shell action names its region (chrome, sidebar, page, sessions, overlays or one pane root); there is no "repaint the whole shell" call, and layout changes recompose the chrome while retained layers compare their own geometry;
 - a core `State` publication changes what the layer presents (`common::state_delta`).
 
+Window overlays composite in rank order: pane overlays below shell dialogs and toasts, then the window cursor. Within a rank, a retained overlay always paints after its codeflow ancestors, so repainting a sheet cannot cover its still-retained children. Hiding a layer also detaches the overlays below it.
+
 The core publishes `CoreState`: small sections and host records as JSON, plus shared `prefs`, `layouts` and per-host `DirectorySnapshot`s whose rows are `Arc` values changed copy-on-write. A publication copies pointers for everything that did not change, and `revisions` names what did. The app classifies each publication once per batch from those revisions:
 
 - Preferences, storage, session, the host set, host record content and directory content repaint the layers that present them.

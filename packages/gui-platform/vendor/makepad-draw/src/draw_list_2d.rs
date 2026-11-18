@@ -77,6 +77,7 @@ impl DrawListExt for DrawList{
                 
         // set nesting draw list id for incremental repaint scanning
         cx.cx.draw_lists[self.id()].codeflow_parent_id = codeflow_parent_id;
+        cx.cx.draw_lists[self.id()].codeflow_parent_redraw_id = redraw_id;
                 
         // check redraw status
         if cx.cx.draw_lists[self.id()].draw_items.len() != 0 && !will_redraw {
@@ -179,14 +180,18 @@ impl LiveApply for DrawList2d {
 
 impl DrawList2d {
     pub fn begin_overlay_last(&mut self, cx: &mut Cx2d) {
-        self.begin_overlay_inner(cx, true)
+        self.begin_overlay_last_ranked(cx, OverlayRank::Pane)
+    }
+
+    pub fn begin_overlay_last_ranked(&mut self, cx: &mut Cx2d, rank: OverlayRank) {
+        self.begin_overlay_inner(cx, true, rank)
     }
     
     pub fn begin_overlay_reuse(&mut self, cx: &mut Cx2d) {
-        self.begin_overlay_inner(cx, false)
+        self.begin_overlay_inner(cx, false, OverlayRank::Pane)
     }
     
-    pub fn begin_overlay_inner(&mut self, cx: &mut Cx2d, always_last:bool) {
+    fn begin_overlay_inner(&mut self, cx: &mut Cx2d, always_last: bool, rank: OverlayRank) {
         let pass_id = cx.pass_stack.last().unwrap().pass_id;
         let redraw_id = cx.cx.redraw_id;
         
@@ -205,6 +210,8 @@ impl DrawList2d {
         cx.nav_list_item_push(codeflow_parent_id, NavItem::Child(self.draw_list.id()));
         
         cx.cx.draw_lists[self.draw_list.id()].codeflow_parent_id = Some(codeflow_parent_id);
+        cx.cx.draw_lists[self.draw_list.id()].codeflow_parent_redraw_id = redraw_id;
+        cx.cx.draw_lists[self.draw_list.id()].overlay_rank = rank;
         if cx.passes[pass_id].main_draw_list_id.unwrap() == self.draw_list.id() {
             cx.passes[pass_id].paint_dirty = true;
         }
@@ -221,12 +228,12 @@ impl DrawList2d {
         self.begin_maybe(cx, will_redraw)
     }
 
-    /// Detaches a retained list that is not drawn this frame. Its items are cleared under
-    /// the current redraw id: overlay children recorded by its last draw no longer match
-    /// it and are pruned, and its next `begin_maybe` repaints instead of replaying.
+    /// Detaches a retained list, discarding its paint and descendant overlays.
     pub fn release(&mut self, cx: &mut CxDraw) {
         let redraw_id = cx.cx.redraw_id;
-        cx.cx.draw_lists[self.draw_list.id()].clear_draw_items(redraw_id);
+        let list = &mut cx.cx.draw_lists[self.draw_list.id()];
+        list.codeflow_parent_id = None;
+        list.clear_draw_items(redraw_id);
         cx.nav_list_clear(self.draw_list.id());
         self.dirty_check_rect = Rect::default();
     }

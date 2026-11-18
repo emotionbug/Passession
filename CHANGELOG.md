@@ -27,6 +27,8 @@
 
 - Show the same name for a host everywhere. The sidebar replaced a saved label that only repeated the endpoint or server ID with the daemon's hostname, but Settings (including the host's overview), the chat subtitle, workspace creation and other views showed the stored label or server ID, so one host appeared under two names. All of them now use one rule: a custom label wins, otherwise the daemon's hostname; rename fields still edit the stored label.
 - Finish a daemon update in Settings instead of staying on "Verifying the host's actual components…" with a spinning Update button. After the daemon reported the update as committed, the card asked the restarted daemon again and waited for a match that could stay out of reach. It now trusts the replacement worker and image the daemon already verified and recorded, shows the result, and clears the saved update. Reopening the Version page after an update shows its result too.
+- Keep the session list tappable after closing a terminal tab on Android. The closed terminal's invisible touch shield stayed active over the full screen, because the shield only checked whether its immediate parent was still drawn. It now checks every parent, and closing a terminal also releases its focus and selection.
+- Stop sheets and popups flickering while something under them updates, such as a subagent's window with a tool detail open on a phone. Overlays were stacked in the order they were last drawn, so when only the lower one redrew it jumped above the one opened on top of it, and the next redraw swapped them back. Every overlay now stays above the overlay it was opened from, unrelated overlays keep their order, and panel overlays never cover the app's dialogs, toasts or the cursor.
 
 ## 0.13.36 - 2026-11-17
 

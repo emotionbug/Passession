@@ -748,7 +748,9 @@ fn overlay_ui(shell: &mut PaseoShell) -> Ui<'_> {
 
 pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, window: Rect) {
     shell.data.overlays.sync_focus(cx);
-    shell.overlay_list.begin_overlay_last(cx);
+    shell
+        .overlay_list
+        .begin_overlay_last_ranked(cx, OverlayRank::Shell);
     cx.begin_turtle(Walk::abs_rect(window), Layout::default());
     shell.data.overlays.hits.clear();
     shell.data.overlays.tooltips.clear();
