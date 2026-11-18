@@ -342,13 +342,78 @@ impl WaTerminalView {
 
     pub fn blur(&mut self, cx: &mut Cx) {
         self.focus_requested = false;
-        self.show_ime = false;
+        self.reset_input(cx);
         cx.clear_key_focus_if(self.draw_hit.area());
+    }
+
+    pub fn detach_input(&mut self, cx: &mut Cx) {
+        self.blur(cx);
+        cx.stop_timer(std::mem::take(&mut self.resize_timer));
+    }
+
+    fn reset_input(&mut self, cx: &mut Cx) {
+        self.show_ime = false;
+        self.has_focus = false;
+        self.preedit.clear();
+        self.replaced.clear();
+        self.ime_reset |= ANDROID;
+        self.suppress_text = false;
+        self.touch_pan = None;
+        self.scroll_bars.cancel_touch_scroll();
+        self.selection.clear(cx, self.draw_hit.area());
+        cx.clear_text_input(self.draw_hit.area());
     }
 
     pub fn show_keyboard(&mut self, cx: &mut Cx) {
         self.show_ime = true;
-        self.focus(cx);
+        let area = self.draw_hit.area();
+        if area.is_valid(cx) {
+            // An explicit tap re-arms Android's IME, even if the terminal still
+            // has key focus after a system keyboard dismissal.
+            self.focus_requested = false;
+            cx.set_key_focus(area);
+            self.redraw(cx);
+        } else {
+            self.focus(cx);
+        }
+    }
+
+    fn sync_text_input(
+        &mut self,
+        cx: &mut Cx,
+        area: Area,
+        caret_size: Option<DVec2>,
+        mobile: bool,
+    ) {
+        if !self.has_focus || (!mobile && caret_size.is_none()) {
+            return;
+        }
+        if std::mem::take(&mut self.ime_reset) {
+            self.ime.reset();
+            self.ime_text.clear();
+            self.ime_text.push_str(IME_SENTINEL);
+            self.ime_selection = (IME_SENTINEL.len(), IME_SENTINEL.len());
+        }
+        cx.update_terminal_text_input(
+            area,
+            self.ime_id,
+            &self.ime_text,
+            self.ime_selection.0,
+            self.ime_selection.1,
+        );
+        if !mobile || self.show_ime {
+            if let Some(size) = caret_size {
+                cx.show_text_ime_caret(
+                    self.ime_caret,
+                    Rect {
+                        pos: DVec2::default(),
+                        size,
+                    },
+                );
+            } else {
+                cx.show_text_ime(area, DVec2::default());
+            }
+        }
     }
 
     pub fn hide_keyboard(&mut self, cx: &mut Cx) {
@@ -595,11 +660,7 @@ impl Widget for WaTerminalView {
                 self.redraw(cx);
             }
             Hit::KeyFocusLost(_) => {
-                self.has_focus = false;
-                self.show_ime = false;
-                self.preedit.clear();
-                self.suppress_text = false;
-                self.selection.clear(cx, area);
+                self.reset_input(cx);
                 if let Some(ui) = scope.data.get_mut::<UiContext>() {
                     ui.push(UiEffect::SetFocusScope {
                         owner: uid,
@@ -619,7 +680,9 @@ impl Widget for WaTerminalView {
                 }
             }
             Hit::FingerDown(down) => {
-                cx.set_key_focus(area);
+                if !down.device.is_touch() {
+                    cx.set_key_focus(area);
+                }
                 self.selection.dragging = false;
                 let primary = if APPLE {
                     down.modifiers.logo
@@ -693,7 +756,7 @@ impl Widget for WaTerminalView {
             }
             Hit::FingerUp(up) => {
                 self.touch_pan = None;
-                if up.device.is_touch() && up.was_tap() && !self.selection.dragging {
+                if up.device.is_touch() && up.is_over && up.was_tap() && !self.selection.dragging {
                     self.selection.clear(cx, area);
                     if let Some(url) = self.link_at(cx, up.abs) {
                         // Tapping a link opens it (phones have no Ctrl/Cmd+click).
@@ -1037,35 +1100,12 @@ impl Widget for WaTerminalView {
                 self.resize_timer = cx.start_timeout(RESIZE_DEBOUNCE);
             }
         }
-        if self.has_focus
-            && let Some(caret) = caret
-        {
-            // Input methods place their candidate window at the cursor; Android edits a
-            // hidden editor (`ImeBridge`) republished here, with a pending reset first.
+        if let Some(caret) = caret.filter(|_| self.has_focus) {
             cx.add_aligned_rect_area(&mut self.ime_caret, caret);
-            if std::mem::take(&mut self.ime_reset) {
-                self.ime.reset();
-                self.ime_text = IME_SENTINEL.to_owned();
-                self.ime_selection = (IME_SENTINEL.len(), IME_SENTINEL.len());
-            }
-            cx.update_terminal_text_input(
-                area,
-                self.ime_id,
-                &self.ime_text,
-                self.ime_selection.0,
-                self.ime_selection.1,
-            );
-            if !MOBILE || self.show_ime {
-                // `ime_caret` covers the caret cell: desktop input methods compose over it.
-                cx.show_text_ime_caret(
-                    self.ime_caret,
-                    Rect {
-                        pos: dvec2(0.0, 0.0),
-                        size: caret.size,
-                    },
-                );
-            }
         }
+        // The native editor does not depend on a painted cursor; it can be offscreen
+        // when the user taps from scrollback.
+        self.sync_text_input(cx, area, caret.map(|rect| rect.size), MOBILE);
         self.selection
             .draw_overlays(cx, area, origin, (width, height), true);
         if (resized || self.scroll_bars.get_scroll_pos() != scroll)
@@ -1095,6 +1135,75 @@ impl WaTerminalViewRef {
 mod tests {
     use super::*;
     use paseo_terminal::Run;
+
+    #[test]
+    fn terminal_tap_requests_ime_even_without_a_painted_cursor() {
+        use makepad_widgets::{
+            CxRectArea, RectArea,
+            event::{TouchPoint, TouchState, TouchUpdateEvent},
+        };
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        crate::app::App::register_main_module(&mut cx);
+        crate::app::live_design(&mut cx);
+        cx.live_expand();
+        let list = cx.draw_lists.alloc();
+        let rect = Rect {
+            pos: dvec2(10.0, 10.0),
+            size: dvec2(100.0, 100.0),
+        };
+        cx.draw_lists[list.id()].rect_areas.push(CxRectArea {
+            rect,
+            draw_clip: (DVec2::default(), dvec2(200.0, 200.0)),
+        });
+        let area = Area::Rect(RectArea {
+            draw_list_id: list.id(),
+            rect_id: 0,
+            redraw_id: cx.draw_lists[list.id()].redraw_id,
+        });
+        let mut view = WaTerminalView::new(&mut cx);
+        view.draw_hit.draw_vars.area = area;
+        let touch = |state, time| {
+            Event::TouchUpdate(TouchUpdateEvent {
+                window_id: WindowId(0, 0),
+                time,
+                cancelled: false,
+                modifiers: KeyModifiers::default(),
+                touches: vec![TouchPoint {
+                    state,
+                    abs: dvec2(30.0, 30.0),
+                    uid: 1,
+                    time,
+                    rotation_angle: 0.0,
+                    force: 0.0,
+                    radius: DVec2::default(),
+                    handled: Default::default(),
+                    sweep_lock: Default::default(),
+                }],
+            })
+        };
+        let scope = &mut Scope::empty();
+        view.handle_event(&mut cx, &touch(TouchState::Start, 0.0), scope);
+        assert!(!view.keyboard_requested());
+        assert!(!cx.clear_key_focus_if(area));
+        view.handle_event(&mut cx, &touch(TouchState::Stop, 0.1), scope);
+        assert!(view.keyboard_requested());
+        assert!(cx.clear_key_focus_if(area), "the tap requested key focus");
+        view.handle_event(
+            &mut cx,
+            &Event::KeyFocus(KeyFocusEvent {
+                prev: Area::Empty,
+                focus: area,
+            }),
+            scope,
+        );
+        view.sync_text_input(&mut cx, area, None, true);
+        assert_eq!(cx.get_ime_area_rect(), rect);
+        cx.set_key_focus(area);
+        view.detach_input(&mut cx);
+        assert!(!view.keyboard_requested());
+        assert!(!cx.clear_key_focus_if(area));
+    }
 
     #[test]
     fn cursor_cells_know_wide_glyphs() {

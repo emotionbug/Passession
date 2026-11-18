@@ -260,6 +260,12 @@ impl App {
             if let Some(platform) = runtime.platform.as_mut() {
                 platform.observe_core_event(event);
             }
+            if let CoreEvent::Response {
+                request_id, result, ..
+            } = event
+            {
+                runtime.ui.terminal_terminations.settle(request_id, result);
+            }
             if let CoreEvent::State { state } = &event {
                 let delta = StateDelta::between(&runtime.published, state);
                 runtime.ui.state_delta.merge(delta);
@@ -519,6 +525,7 @@ impl AppMain for App {
             window.handle_event(cx, event, &mut Scope::with_data(&mut runtime.ui));
         }
         runtime.ui.events.clear();
+        runtime.ui.terminal_terminations.finish_batch();
         runtime.ui.state_delta = StateDelta::default();
 
         if !runtime.window_ready {

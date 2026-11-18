@@ -4,7 +4,7 @@
 //! shell-owned menu and dialog answer.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use makepad_widgets::*;
 use paseo_gui_core::CoreError;
@@ -53,6 +53,90 @@ pub struct Closing {
     /// Remove the tabs (tab close) or only ask their guards (window close, quit, archive).
     pub remove: bool,
     pub after: AfterClose,
+}
+
+/// Unlike tab-local requests, a kill belongs to the app: all windows must see
+/// its result, even when the window that confirmed it closed in the meantime.
+#[derive(Default)]
+pub(crate) struct TerminalTerminations {
+    pending: HashMap<String, TerminalKill>,
+    retired: HashMap<String, HashSet<String>>,
+    pub(crate) removed_this_batch: bool,
+    errors: HashMap<String, Vec<String>>,
+}
+
+struct TerminalKill {
+    window: String,
+    host: String,
+    terminal: String,
+}
+
+impl TerminalTerminations {
+    pub(crate) fn settle(&mut self, id: &str, result: &Result<Value, CoreError>) {
+        let Some(kill) = self.pending.remove(id) else {
+            return;
+        };
+        let error = match result {
+            Ok(body)
+                if body["success"] == true
+                    && body["terminalId"] == kill.terminal
+                    && body["error"].is_null() =>
+            {
+                // Daemon terminal IDs aren't reused. Keep the retirement for this app
+                // session so older snapshots, even from another window, cannot revive it.
+                self.retired
+                    .entry(kill.host)
+                    .or_default()
+                    .insert(kill.terminal);
+                self.removed_this_batch = true;
+                None
+            }
+            Ok(body) if body["error"].is_null() => Some(tr("workspace.terminal.terminateFailed")),
+            _ => response_message(result),
+        };
+        let Some(error) = error else {
+            return;
+        };
+        let window = if super::window_state(&kill.window) == Some(WindowState::Visible) {
+            kill.window
+        } else {
+            super::window_states()
+                .into_iter()
+                .find(|(_, state)| *state == WindowState::Visible)
+                .map_or(kill.window, |(id, _)| id)
+        };
+        self.errors.entry(window).or_default().push(error);
+    }
+
+    pub(crate) fn finish_batch(&mut self) {
+        self.removed_this_batch = false;
+        self.errors.clear();
+    }
+
+    pub(crate) fn retired(&self, host: &str) -> Option<&HashSet<String>> {
+        self.retired.get(host)
+    }
+
+    fn is_retired(&self, host: &str, terminal: &str) -> bool {
+        self.retired(host).is_some_and(|ids| ids.contains(terminal))
+    }
+
+    pub(crate) fn tab_keys(&self, layout: &super::layout::Layout) -> Vec<String> {
+        layout
+            .tabs
+            .iter()
+            .filter(|tab| self.removes(tab))
+            .map(PanelTarget::key)
+            .collect()
+    }
+
+    fn removes(&self, tab: &PanelTarget) -> bool {
+        matches!(tab.kind.as_str(), "terminal" | "execution_log")
+            && tab
+                .id
+                .as_deref()
+                .is_some_and(|id| self.is_retired(&tab.server_id, id))
+    }
 }
 
 /// Why a host is being chosen (`_chooseHost` / `showHostChooser` callers).
@@ -108,6 +192,11 @@ pub enum ShellOverlay {
     /// `handleCloseTerminalTab`: closing a live terminal tab kills its daemon terminal.
     CloseTerminal {
         key: String,
+        host_id: String,
+        terminal_id: String,
+    },
+    TerminalMenu(PanelTarget),
+    TerminateTerminal {
         host_id: String,
         terminal_id: String,
     },
@@ -403,6 +492,9 @@ pub fn open_tab(
     target: PanelTarget,
     placement: TabPlacement,
 ) {
+    if ui.terminal_terminations.removes(&target) {
+        return;
+    }
     mark_child_tab_open(shell, ui, &target);
     match placement {
         TabPlacement::Main => shell.data.layout.open(target, false),
@@ -826,6 +918,9 @@ fn advance_closing(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
         if kills_terminals
             && target.kind == "terminal"
             && let Some(terminal_id) = target.id.clone().filter(|id| !id.is_empty())
+            && !ui
+                .terminal_terminations
+                .is_retired(&target.server_id, &terminal_id)
         {
             check_terminal_close(shell, cx, ui, key, &target, terminal_id);
             return;
@@ -907,33 +1002,76 @@ fn confirm_terminal_close(
     );
 }
 
-/// The confirmed terminal tab leaves the layout, then its daemon terminal is killed; a failed
-/// kill stays silent like the original's `killTerminal(..).catch(invalidate)`.
-fn close_terminal_confirmed(
-    shell: &mut PaseoShell,
-    cx: &mut Cx,
-    ui: &mut UiContext,
-    key: &str,
-    host_id: &str,
-    terminal_id: &str,
-) {
-    remove_tab(shell, cx, ui, key);
-    request(
+fn confirm_terminal_termination(shell: &mut PaseoShell, cx: &mut Cx, target: PanelTarget) {
+    let Some(terminal_id) = target
+        .id
+        .filter(|id| !id.is_empty() && target.kind == "terminal")
+    else {
+        return;
+    };
+    confirm(
         shell,
-        ui,
-        host_id,
-        json!({ "type": "kill_terminal_request", "terminalId": terminal_id }),
-        "kill_terminal_response",
-        Pending::Silent,
+        cx,
+        &tr("workspace.terminal.terminateTitle"),
+        &tr("workspace.terminal.terminateMessage"),
+        &tr("workspace.terminal.terminate"),
+        true,
+        ShellOverlay::TerminateTerminal {
+            host_id: target.server_id,
+            terminal_id,
+        },
     );
-    advance_closing(shell, cx, ui);
+}
+
+/// A confirmed kill belongs to the app until the daemon answers. The explicit
+/// Terminate action does not change any view before then.
+fn kill_terminal(shell: &PaseoShell, ui: &mut UiContext, host: String, terminal: String) {
+    let terminations = &mut ui.terminal_terminations;
+    if terminations.is_retired(&host, &terminal)
+        || terminations
+            .pending
+            .values()
+            .any(|kill| kill.host == host && kill.terminal == terminal)
+    {
+        return;
+    }
+    let id = ui.core.request(
+        &host,
+        json!({ "type": "kill_terminal_request", "terminalId": terminal }),
+        "kill_terminal_response",
+    );
+    terminations.pending.insert(
+        id,
+        TerminalKill {
+            window: shell.data.window_id.clone(),
+            host,
+            terminal,
+        },
+    );
+}
+
+pub(crate) fn apply_terminal_terminations(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
+    if ui.terminal_terminations.removed_this_batch {
+        for key in ui.terminal_terminations.tab_keys(&shell.data.layout) {
+            remove_tab(shell, cx, ui, &key);
+        }
+    }
+    if let Some(errors) = ui
+        .terminal_terminations
+        .errors
+        .remove(&shell.data.window_id)
+    {
+        for error in errors {
+            toast(shell, cx, error, true);
+        }
+    }
 }
 
 /// `_removeTab` plus the shell's release work and the child-tab label (`_closeWorkspaceTab`).
 fn remove_tab(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, key: &str) {
     let target = shell.data.layout.target(key).cloned();
     if let Some(panel) = shell.data.panels.remove(key) {
-        panels::release(cx, ui, &panel);
+        panels::release(cx, ui, &panel, &mut shell.data.focus_scope);
     }
     shell.data.layout.close_tab(key);
     shell.data.dirty.remove(key);
@@ -1634,6 +1772,11 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
         UiEffect::CloseTab { tab_key } => {
             close_tabs(shell, cx, ui, vec![tab_key], true, AfterClose::Nothing)
         }
+        UiEffect::OpenTerminalMenu { tab_key, anchor } => {
+            if let Some(target) = shell.data.layout.target(&tab_key).cloned() {
+                terminal_menu(shell, cx, target, anchor);
+            }
+        }
         UiEffect::Toast { message, is_error } => toast(shell, cx, message, is_error),
         UiEffect::OpenExternal { url } => {
             if platform::open_external(&url).is_none() {
@@ -1705,7 +1848,7 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
                 return;
             }
             if let Some(panel) = shell.data.panels.remove(&tab_key) {
-                panels::release(cx, ui, &panel);
+                panels::release(cx, ui, &panel, &mut shell.data.focus_scope);
             }
             shell.data.dirty.remove(&tab_key);
             mark_child_tab_open(shell, ui, &target);
@@ -2129,7 +2272,7 @@ pub fn on_response(
                     .any(|t| j::text(t, "id") == terminal_id),
                 Err(_) => true,
             };
-            if live {
+            if live && !ui.terminal_terminations.is_retired(&host_id, &terminal_id) {
                 confirm_terminal_close(shell, cx, key, host_id, terminal_id);
             } else {
                 remove_tab(shell, cx, ui, &key);
@@ -2395,6 +2538,10 @@ fn click_prefixed(
                 shell.data.layout.show_sidebar(true, false);
             }
         }
+    } else if let Some(rest) = id.strip_prefix("sidetermmenu:") {
+        if let Some(row) = sidebar::find_terminal(&shell.data.sidebar.terminals, state, rest) {
+            terminal_menu(shell, cx, row.target(), anchor_of(shell, id));
+        }
     } else if let Some(rest) = id.strip_prefix("sessionedit:")
         && let Some((sid, agent)) = find_session(state, rest)
     {
@@ -2438,6 +2585,13 @@ pub fn secondary(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &s
         if let Some((sid, agent)) = find_session(&state, rest) {
             session_menu(shell, cx, &state, &sid, agent, point(abs), false);
         }
+    } else if let Some(rest) = id
+        .strip_prefix("sideterm:")
+        .or_else(|| id.strip_prefix("sidetermmenu:"))
+    {
+        if let Some(row) = sidebar::find_terminal(&shell.data.sidebar.terminals, &state, rest) {
+            terminal_menu(shell, cx, row.target(), point(abs));
+        }
     } else if id.starts_with("hist:row:") {
         history::secondary(shell, cx, ui, id);
     }
@@ -2461,6 +2615,28 @@ fn find_session(state: &paseo_gui_core::CoreState, rest: &str) -> Option<(String
 
 // ---------------------------------------------------------------------------------------------
 // Menus
+
+fn terminate_terminal_item() -> MenuEntry {
+    MenuItem::new("terminate", tr("workspace.terminal.terminate"))
+        .icon("square-x")
+        .destructive(true)
+        .entry()
+}
+
+fn terminal_menu(shell: &mut PaseoShell, cx: &mut Cx, target: PanelTarget, anchor: Rect) {
+    if target.kind != "terminal" || target.id.as_ref().is_none_or(String::is_empty) {
+        return;
+    }
+    menu(
+        shell,
+        cx,
+        anchor,
+        target.title.clone(),
+        vec![terminate_terminal_item()],
+        MenuOptions::default(),
+        ShellOverlay::TerminalMenu(target),
+    );
+}
 
 /// Original desktop tab menu (`buildWorkspaceTabMenuEntries`).
 fn tab_menu(
@@ -2595,6 +2771,9 @@ fn tab_menu(
         ));
     }
     entries.push(item("close", tr("workspace.tabs.menu.close"), "x"));
+    if target.kind == "terminal" && !id.is_empty() {
+        entries.push(terminate_terminal_item());
+    }
     let title = chrome::kind_label(&target);
     let options = MenuOptions {
         align_end: !from_pointer,
@@ -2691,6 +2870,7 @@ fn tab_menu_result(
         return;
     }
     match value {
+        "terminate" => confirm_terminal_termination(shell, cx, target),
         "resume" => copy_resume_command(shell, cx, ui, &target),
         "agentId" => copy(
             shell,
@@ -4146,9 +4326,24 @@ pub fn shell_overlay_result(
             terminal_id,
         } => {
             if confirmed {
-                close_terminal_confirmed(shell, cx, ui, &key, &host_id, &terminal_id);
+                remove_tab(shell, cx, ui, &key);
+                kill_terminal(shell, ui, host_id, terminal_id);
+                advance_closing(shell, cx, ui);
             } else {
                 abort_closing(shell);
+            }
+        }
+        ShellOverlay::TerminalMenu(target) => {
+            if value == "terminate" {
+                confirm_terminal_termination(shell, cx, target);
+            }
+        }
+        ShellOverlay::TerminateTerminal {
+            host_id,
+            terminal_id,
+        } => {
+            if confirmed {
+                kill_terminal(shell, ui, host_id, terminal_id);
             }
         }
         ShellOverlay::BulkClose { keys, after } => {
@@ -4784,5 +4979,82 @@ mod file_link_tests {
             classify_for_resolution(&external, Some(cwd)),
             Resolution::External(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod terminal_termination_tests {
+    use super::*;
+    use crate::shell::layout::Layout;
+
+    fn pending_kill() -> TerminalTerminations {
+        let mut terminations = TerminalTerminations::default();
+        terminations.pending.insert(
+            "kill-request".into(),
+            TerminalKill {
+                window: MAIN_WINDOW_ID.into(),
+                host: "host".into(),
+                terminal: "terminal-id".into(),
+            },
+        );
+        terminations
+    }
+
+    #[test]
+    fn terminal_termination_closes_all_matching_views_across_layouts() {
+        let terminal =
+            PanelTarget::new("terminal", "host", "workspace", "/work").with_id("terminal-id");
+        let other_scope =
+            PanelTarget::new("terminal", "host", "other", "/work").with_id("terminal-id");
+        let log =
+            PanelTarget::new("execution_log", "host", "workspace", "/work").with_id("terminal-id");
+        let other_host =
+            PanelTarget::new("terminal", "other-host", "workspace", "/work").with_id("terminal-id");
+        let unrelated =
+            PanelTarget::new("agent", "host", "workspace", "/work").with_id("terminal-id");
+        let mut first = Layout::default();
+        first.open(terminal.clone(), false);
+        first.open(other_scope, true);
+        first.open(unrelated.clone(), false);
+        let mut second = Layout::default();
+        second.open(log, false);
+        second.open(other_host.clone(), true);
+        second.open_explorer(terminal, false);
+
+        let mut terminations = pending_kill();
+        terminations.settle(
+            "kill-request",
+            &Ok(json!({"success": true, "terminalId": "terminal-id"})),
+        );
+        assert!(terminations.removed_this_batch);
+        assert!(terminations.is_retired("host", "terminal-id"));
+        for layout in [&mut first, &mut second] {
+            let keys = terminations.tab_keys(layout);
+            assert_eq!(keys.len(), 2);
+            for key in keys {
+                layout.close_tab(&key);
+            }
+            assert!(layout.explorer_tabs.is_empty());
+        }
+        assert_eq!(first.tabs, vec![unrelated]);
+        assert_eq!(second.tabs, vec![other_host]);
+    }
+
+    #[test]
+    fn terminal_termination_failure_does_not_retire_terminal() {
+        for response in [
+            Ok(json!({"success": false, "terminalId": "terminal-id"})),
+            Err(CoreError {
+                code: "handler_error".into(),
+                message: "process did not stop".into(),
+                outcome_unknown: false,
+            }),
+        ] {
+            let mut terminations = pending_kill();
+            terminations.settle("kill-request", &response);
+            assert!(!terminations.removed_this_batch);
+            assert!(terminations.retired("host").is_none());
+            assert_eq!(terminations.errors[MAIN_WINDOW_ID].len(), 1);
+        }
     }
 }

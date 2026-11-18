@@ -518,6 +518,9 @@ impl PaseoShell {
             self.data.layout = Layout::restore(&saved);
         }
         self.data.layout.dirty = false;
+        for key in ui.terminal_terminations.tab_keys(&self.data.layout) {
+            self.data.layout.close_tab(&key);
+        }
     }
 
     fn schedule_save(&mut self, cx: &mut Cx) {
@@ -879,6 +882,7 @@ impl Widget for PaseoShell {
         }
         if !ui.events.is_empty() {
             self.handle_core_batch(cx, ui);
+            commands::apply_terminal_terminations(self, cx, ui);
             if sidebar::sync_terminals(&mut self.data.sidebar, ui) {
                 self.data.sidebar.tree_layer.invalidate(cx);
             }

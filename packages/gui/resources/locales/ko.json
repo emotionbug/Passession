@@ -1014,6 +1014,11 @@
       "copy": "선택 영역 또는 전체 출력 복사",
       "exitedWithCode": "터미널이 종료되었습니다 (종료 코드 {{code}})",
       "newTerminal": "새 터미널",
+      "menu": "터미널 작업",
+      "terminate": "터미널 종료",
+      "terminateTitle": "터미널을 종료할까요?",
+      "terminateMessage": "실행 중인 프로세스가 즉시 중지되며 모든 창에서 이 터미널이 제거됩니다.",
+      "terminateFailed": "터미널을 종료하지 못했습니다.",
       "createFailed": "새 터미널을 시작하지 못했습니다: {{reason}}"
     },
     "executionLog": {

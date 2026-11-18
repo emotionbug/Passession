@@ -1012,6 +1012,11 @@
       "copy": "Copy selection or all output",
       "exitedWithCode": "Terminal exited with code {{code}}",
       "newTerminal": "New terminal",
+      "menu": "Terminal actions",
+      "terminate": "Terminate terminal",
+      "terminateTitle": "Terminate terminal?",
+      "terminateMessage": "Running processes will stop immediately and the terminal will be removed from all windows.",
+      "terminateFailed": "Couldn't terminate the terminal.",
       "createFailed": "Couldn't start a new terminal: {{reason}}"
     },
     "executionLog": {

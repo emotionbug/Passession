@@ -606,6 +606,7 @@ pub fn pointer_on_tree(hover: Option<&str>) -> bool {
             "session:",
             "sessionedit:",
             "sideterm:",
+            "sidetermmenu:",
             "project:",
             "projplus:",
             "host:",
@@ -645,8 +646,8 @@ pub type TerminalDirectories = HashMap<(String, String), TerminalDirectory>;
 
 impl TerminalDirectory {
     /// Applies a `terminals_changed` list; true when the rows changed.
-    fn apply(&mut self, listed: &[Value]) -> bool {
-        let next = merge_terminals(&self.terminals, listed);
+    fn apply(&mut self, listed: &[Value], retired: Option<&HashSet<String>>) -> bool {
+        let next = merge_terminals(&self.terminals, listed, retired);
         if next == self.terminals {
             return false;
         }
@@ -657,18 +658,33 @@ impl TerminalDirectory {
 
 /// The listed terminals in first-seen order: known ones keep their place (with fresh fields),
 /// new ones follow in list order, gone ones drop.
-fn merge_terminals(previous: &[Value], listed: &[Value]) -> Vec<Value> {
+fn merge_terminals(
+    previous: &[Value],
+    listed: &[Value],
+    retired: Option<&HashSet<String>>,
+) -> Vec<Value> {
+    let active = |t: &&Value| {
+        let id = j::text(t, "id");
+        !id.is_empty() && retired.is_none_or(|retired| !retired.contains(id))
+    };
     let same = |a: &Value, b: &Value| j::text(a, "id") == j::text(b, "id");
     let mut next: Vec<Value> = previous
         .iter()
+        .filter(active)
         .filter_map(|old| listed.iter().find(|t| same(t, old)).cloned())
         .collect();
-    for terminal in listed {
-        if !j::text(terminal, "id").is_empty() && !next.iter().any(|t| same(t, terminal)) {
+    for terminal in listed.iter().filter(active) {
+        if !next.iter().any(|t| same(t, terminal)) {
             next.push(terminal.clone());
         }
     }
     next
+}
+
+fn retire_terminal_rows(rows: &mut Vec<Value>, retired: &HashSet<String>) -> bool {
+    let before = rows.len();
+    rows.retain(|row| !retired.contains(j::text(row, "id")));
+    rows.len() != before
 }
 
 /// Workspaces whose terminals the sidebar lists, as (host, workspace, directory): every
@@ -741,14 +757,24 @@ pub fn sync_terminals(sidebar: &mut SidebarState, ui: &UiContext) -> bool {
                 }
             });
     }
-    for dir in sidebar.terminals.values_mut() {
+    for ((host, _), dir) in &mut sidebar.terminals {
+        let retired = ui.terminal_terminations.retired(host);
+        if let Some(retired) = retired
+            && ui.terminal_terminations.removed_this_batch
+        {
+            changed |= retire_terminal_rows(&mut dir.terminals, retired);
+        }
         for item in dir.observation.take(&ui.events) {
             changed |= match item {
-                ObsEvent::Snapshot { payload, .. } => dir.apply(j::array(&payload, "terminals")),
-                ObsEvent::Event(message) if j::text(&message, "type") == "terminals_changed" => {
-                    dir.apply(j::array(j::object(&message, "payload"), "terminals"))
+                ObsEvent::Snapshot { payload, .. } => {
+                    dir.apply(j::array(&payload, "terminals"), retired)
                 }
-                ObsEvent::Failed(_) | ObsEvent::RestoreFailed(_) => dir.apply(&[]),
+                ObsEvent::Event(message) if j::text(&message, "type") == "terminals_changed" => dir
+                    .apply(
+                        j::array(j::object(&message, "payload"), "terminals"),
+                        retired,
+                    ),
+                ObsEvent::Failed(_) | ObsEvent::RestoreFailed(_) => dir.apply(&[], retired),
                 ObsEvent::Event(_) => false,
             };
         }
@@ -1651,7 +1677,8 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
                     ui.fill(cx, row, p.border, 6.0);
                 }
                 let attention = !j::text(&terminal.activity, "attentionReason").is_empty();
-                let slots = session_metrics.layout(row, 12.0, 14.0, 0.0, 8.0);
+                let trailing = if ui.compact { 36.0 } else { 20.0 };
+                let slots = session_metrics.layout(row, 12.0, 14.0, trailing, 8.0);
                 ui.icon(
                     cx,
                     slots.leading,
@@ -1681,6 +1708,15 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
                     ),
                 );
                 ui.hit(row, format!("sideterm:{sid}:{}", terminal.id));
+                toolbar_button(
+                    &mut ui,
+                    cx,
+                    slots.trailing.pos.x + slots.trailing.size.x - 20.0,
+                    row.pos.y + (row.size.y - 20.0) * 0.5,
+                    &format!("sidetermmenu:{sid}:{}", terminal.id),
+                    "ellipsis",
+                    &tr("workspace.terminal.menu"),
+                );
             }
         }
         let project_list_loading = host.loading()
@@ -2041,10 +2077,31 @@ mod tests {
             json!({"id": "a", "name": "renamed"}),
             json!({"id": ""}),
         ];
-        let merged = merge_terminals(&previous, &listed);
+        let merged = merge_terminals(&previous, &listed, None);
         assert_eq!(
             merged,
             vec![json!({"id": "a", "name": "renamed"}), json!({"id": "c"})]
+        );
+    }
+
+    #[test]
+    fn terminal_termination_removes_sidebar_row_before_directory_refresh() {
+        let closed = json!({"id": "closed"});
+        let live = json!({"id": "live"});
+        let stale_snapshot = vec![closed.clone(), live.clone()];
+        let mut displayed = stale_snapshot.clone();
+        // A rejection adds no retirement and leaves the same live rows.
+        assert_eq!(
+            merge_terminals(&displayed, &stale_snapshot, None),
+            displayed
+        );
+
+        let retired = HashSet::from(["closed".to_owned()]);
+        assert!(retire_terminal_rows(&mut displayed, &retired));
+        assert_eq!(displayed, vec![live]);
+        assert_eq!(
+            merge_terminals(&displayed, &stale_snapshot, Some(&retired)),
+            displayed,
         );
     }
 

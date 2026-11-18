@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Terminate a terminal from its header menu, its tab menu on desktop, or its row in the sidebar. After you confirm and the daemon has stopped it, every window closes the terminal and its sidebar row disappears; if it could not be stopped, an error is shown and the terminal stays. Going back from a terminal on a phone still leaves it running. The daemon now removes a terminal only after it has actually stopped.
+
 ### Changed
 
 - Compile Windows x64 and macOS arm64 release builds on Linux. The Native Release workflow cross-compiles the daemon, app, Tailscale library and update helper on Ubuntu with a pinned toolchain (`cargo xtask cross-tools`: the MSVC CRT and Windows SDK through xwin, Apple's macOS 15.5 SDK) and hands the unsigned, hash-listed files to a short job on Windows or macOS. That job only signs, adds the C runtime, builds the installer or app bundle, notarizes, and on Windows runs the COM and helper smoke tests, which are also compiled on Linux. In the last release the Windows job spent 20 minutes and the macOS job 15 minutes compiling.
@@ -27,6 +31,7 @@
 
 - Show the same name for a host everywhere. The sidebar replaced a saved label that only repeated the endpoint or server ID with the daemon's hostname, but Settings (including the host's overview), the chat subtitle, workspace creation and other views showed the stored label or server ID, so one host appeared under two names. All of them now use one rule: a custom label wins, otherwise the daemon's hostname; rename fields still edit the stored label.
 - Finish a daemon update in Settings instead of staying on "Verifying the host's actual components…" with a spinning Update button. After the daemon reported the update as committed, the card asked the restarted daemon again and waited for a match that could stay out of reach. It now trusts the replacement worker and image the daemon already verified and recorded, shows the result, and clears the saved update. Reopening the Version page after an update shows its result too.
+- Open the keyboard when you tap a terminal tab on Android. The tap focused nothing the keyboard could attach to, and the keyboard was also tied to the terminal's drawn cursor.
 - Keep the session list tappable after closing a terminal tab on Android. The closed terminal's invisible touch shield stayed active over the full screen, because the shield only checked whether its immediate parent was still drawn. It now checks every parent, and closing a terminal also releases its focus and selection.
 - Stop sheets and popups flickering while something under them updates, such as a subagent's window with a tool detail open on a phone. Overlays were stacked in the order they were last drawn, so when only the lower one redrew it jumped above the one opened on top of it, and the next redraw swapped them back. Every overlay now stays above the overlay it was opened from, unrelated overlays keep their order, and panel overlays never cover the app's dialogs, toasts or the cursor.
 

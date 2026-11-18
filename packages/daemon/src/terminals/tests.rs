@@ -29,6 +29,39 @@ async fn shell(home: &tempfile::TempDir, args: Vec<String>) -> Arc<Terminal> {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn failed_terminal_kill_keeps_live_record_without_notifying_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let terminal = shell(&home, vec![]).await;
+    let service = TerminalService::new(Weak::new());
+    service
+        .terminals
+        .write()
+        .unwrap()
+        .insert(terminal.id.clone(), terminal.clone());
+    let mut changed = service.changed.subscribe();
+    let error = service
+        .finish_kill(&terminal.id, Err(anyhow!("process did not stop")), false)
+        .unwrap_err();
+    assert_eq!(error.to_string(), "process did not stop");
+    let still_live = service.live_for_workspace(&terminal.workspace_id);
+    assert_eq!(still_live.len(), 1);
+    assert_eq!(still_live[0]["id"], terminal.id);
+    assert!(matches!(
+        changed.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+
+    service.kill_with_policy(&terminal.id, false).await.unwrap();
+    assert!(
+        service
+            .live_for_workspace(&terminal.workspace_id)
+            .is_empty()
+    );
+    changed.try_recv().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn real_pty_has_terminal_descriptors_and_drains_final_capture() {
     let home = tempfile::tempdir().unwrap();
     let terminal = shell(

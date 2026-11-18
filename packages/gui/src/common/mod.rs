@@ -117,6 +117,7 @@ pub struct UiContext {
     pub commands: Vec<UiCommand>,
     pub layout: Rc<LayoutSnapshot>,
     pub server_infos: Rc<HashMap<String, Value>>,
+    pub(crate) terminal_terminations: crate::shell::commands::TerminalTerminations,
 }
 
 impl UiContext {
@@ -136,6 +137,7 @@ impl UiContext {
             commands: Vec::new(),
             layout: Rc::new(LayoutSnapshot::default()),
             server_infos: Rc::new(HashMap::new()),
+            terminal_terminations: Default::default(),
         }
     }
 
@@ -442,6 +444,10 @@ pub enum UiEffect {
     },
     CloseTab {
         tab_key: String,
+    },
+    OpenTerminalMenu {
+        tab_key: String,
+        anchor: Rect,
     },
     Toast {
         message: String,

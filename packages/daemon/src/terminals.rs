@@ -370,17 +370,26 @@ impl TerminalService {
             .map(|terminal| terminal.info())
             .collect()
     }
-    /// `killTerminalAndWait`: an unknown id is a no-op, and the session is removed
-    /// even when waiting for termination fails.
+    /// Owner cleanup forgets the terminal even if stopping it fails.
     pub async fn kill(&self, id: &str) -> Result<()> {
+        self.kill_with_policy(id, true).await
+    }
+
+    async fn kill_with_policy(&self, id: &str, remove_on_failure: bool) -> Result<()> {
         let terminal = { self.terminals.read().unwrap().get(id).cloned() };
         if let Some(terminal) = terminal {
             let result = terminal.terminate().await;
-            self.terminals.write().unwrap().remove(id);
-            let _ = self.changed.send(());
-            result?;
+            self.finish_kill(id, result, remove_on_failure)?;
         }
         Ok(())
+    }
+
+    fn finish_kill(&self, id: &str, result: Result<()>, remove_on_failure: bool) -> Result<()> {
+        if result.is_ok() || remove_on_failure {
+            self.terminals.write().unwrap().remove(id);
+            let _ = self.changed.send(());
+        }
+        result
     }
     pub async fn kill_terminal_for_close(&self, id: &str) -> Result<Value> {
         self.kill(id).await?;
@@ -578,8 +587,10 @@ impl TerminalService {
                     .await?;
             }
             "kill_terminal_request" => {
-                let success = self.kill(required(message, "terminalId")?).await.is_ok();
-                context.send(json!({"type":"kill_terminal_response","payload":{"terminalId":message["terminalId"],"success":success,"requestId":message["requestId"]}})).await?;
+                // The user's terminal remains available if the stop was rejected.
+                let terminal_id = required(message, "terminalId")?;
+                self.kill_with_policy(terminal_id, false).await?;
+                context.send(json!({"type":"kill_terminal_response","payload":{"terminalId":terminal_id,"success":true,"requestId":message["requestId"]}})).await?;
             }
             "terminal.rename.request" => {
                 let title = required(message, "title")?.trim();

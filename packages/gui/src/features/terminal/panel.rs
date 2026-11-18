@@ -22,7 +22,7 @@ use crate::common::{PanelTarget, UiContext, UiEffect};
 use crate::features::composer::ops;
 use crate::features::workspace::host;
 use crate::features::workspace::i18n::{t, ta};
-use crate::features::workspace::kit::{WaButtonWidgetExt, ellipsize};
+use crate::features::workspace::kit::{WaButtonWidgetExt, WaInputWidgetExt, ellipsize};
 use crate::features::workspace::rpc::{Pending, object_of, str_of, str_or};
 
 live_design! {
@@ -58,6 +58,7 @@ live_design! {
                     width: Fit, height: Fit, flow: Right, spacing: 1., align: { y: 0.5 }
                     toggle_find = <WaToolButton> { icon: "search" }
                     copy = <WaToolButton> { icon: "copy" }
+                    terminal_menu = <WaToolButton> { icon: "ellipsis" }
                 }
             }
             <WaRule> {}
@@ -191,6 +192,16 @@ impl TerminalPanel {
         self.view.wa_terminal_view(id!(output))
     }
 
+    fn detach_input(&mut self, cx: &mut Cx) -> [WidgetUid; 2] {
+        let output = self.output();
+        if let Some(mut view) = output.borrow_mut() {
+            view.detach_input(cx);
+        }
+        let query = self.view.wa_input(id!(find_wrap.find_bar.query));
+        query.input().release_focus(cx);
+        [output.widget_uid(), query.widget_uid()]
+    }
+
     /// A fresh stream for the target.
     fn open_session(&mut self, cx: &mut Cx, ctx: &UiContext) {
         self.session_opened = true;
@@ -264,9 +275,6 @@ impl TerminalPanel {
                 let connected = self.connected;
                 if let Some(session) = view.session.as_mut() {
                     session.set_visible(&core, visible, connected);
-                }
-                if !visible {
-                    view.blur(cx);
                 }
                 self.focus_dirty = true;
                 presentation_changed = true;
@@ -528,6 +536,16 @@ impl TerminalPanel {
                 view.paste(cx, &ctx.core, text);
             }
         }
+        let menu = self.view.wa_button(id!(terminal_menu));
+        if menu.clicked(actions)
+            && let Some(target) = &self.target
+            && !target.tab_key.is_empty()
+        {
+            ctx.push(UiEffect::OpenTerminalMenu {
+                tab_key: target.tab_key.clone(),
+                anchor: menu.area().rect(cx),
+            });
+        }
         if self.view.wa_button(id!(copy)).clicked(actions)
             && let Some(text) = output.borrow_mut().map(|mut view| view.copy_text())
             && !text.is_empty()
@@ -691,6 +709,16 @@ impl TerminalPanel {
         find.set_enabled(cx, facts.has_session);
         find.set_selected(cx, self.find.open);
         find.set_tooltip(cx, &t("paneFind.title"));
+        let menu = self.view.wa_button(id!(terminal_menu));
+        menu.set_tooltip(cx, &t("workspace.terminal.menu"));
+        menu.set_enabled(
+            cx,
+            !facts.exited
+                && self
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| !t.terminal_id.is_empty()),
+        );
         let body_width = self.view.widget(id!(body)).area().rect(cx).size.x;
         if self.view.widget(id!(find_wrap)).visible() != self.find.open {
             self.view.area().redraw(cx);
@@ -879,6 +907,14 @@ impl TerminalPanelRef {
         inner.present(cx);
     }
 
+    /// The shell removes the widget without delivering a later focus-loss event.
+    pub fn release(&self, cx: &mut Cx) -> Option<[WidgetUid; 2]> {
+        let mut inner = self.borrow_mut()?;
+        cx.stop_timer(std::mem::take(&mut inner.hidden_screen_timer));
+        inner.find.close(cx);
+        Some(inner.detach_input(cx))
+    }
+
     /// Hidden tabs release their stream; visible ones attach. Applied on the next dispatch,
     /// which carries the core handle.
     pub fn set_visible_terminal(&self, cx: &mut Cx, visible: bool) {
@@ -889,6 +925,9 @@ impl TerminalPanelRef {
             return;
         }
         inner.hidden = !visible;
+        if !visible {
+            inner.detach_input(cx);
+        }
         cx.stop_timer(inner.hidden_screen_timer);
         inner.hidden_screen_timer = if visible {
             Timer::default()

@@ -284,8 +284,21 @@ pub fn set_activity(cx: &mut Cx, panel: &mut Panel, visible: bool, focused: bool
     }
 }
 
-/// Tab close: ends the selective subscription and create handoff of chat tabs.
-pub fn release(cx: &mut Cx, ui: &UiContext, panel: &Panel) {
+/// Tab close: release terminal input or a chat tab's selective subscription and create handoff.
+pub fn release(
+    cx: &mut Cx,
+    ui: &UiContext,
+    panel: &Panel,
+    focus_scope: &mut super::shortcuts::FocusScope,
+) {
+    if panel.kind == RootKind::Terminal {
+        if let Some(owners) = panel.widget.as_terminal_panel().release(cx) {
+            for owner in owners {
+                focus_scope.update(owner, None);
+            }
+        }
+        return;
+    }
     let target = &panel.target;
     if panel.kind != RootKind::Chat {
         return;
