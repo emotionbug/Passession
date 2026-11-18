@@ -200,13 +200,13 @@ EGL vendor. Windows reports DXGI adapter description, D3D feature level and WARP
 selection; Metal reports the selected device name. The same info reaches the
 existing client diagnostics report and flags known CPU renderers.
 
-## macOS IOSurface presentation
+## Apple IOSurface presentation
 
-`os/apple/macos/metal_surface.rs` owns the macOS window presenter. It wraps
-three row-aligned BGRA IOSurfaces as `BGRA8Unorm` Metal render targets.
+`os/apple/surface_present.rs` owns the ring, damage repair, pixel oracle and
+surface lifetime for the macOS and iOS window presenters. It wraps three
+row-aligned BGRA IOSurfaces as `BGRA8Unorm` Metal render targets.
 Unified-memory GPUs use shared storage without a presentation copy; discrete
-GPUs use managed storage and synchronize it before publication. iOS
-continues to use `MTKView`.
+Mac GPUs use managed storage and synchronize it before publication.
 
 The plain CALayer's IOSurfaces carry `kIOSurfaceColorSpace` set to serialized
 device RGB, preserving the unmanaged premultiplied SDR values originally
@@ -214,10 +214,10 @@ displayed by the untagged Metal drawable layer.
 Labeling those values with the calibrated window/screen profile caused visible
 color changes on a P3 Mac display; leaving the IOSurface untagged did too. The
 native probe matched the nil-colorspace drawable with explicit device RGB.
-`contentsScale` is the native backing scale. The unflipped hosted view uses
-top-left gravity and unflipped texture contents. Size, scale, display/profile
-changes, fullscreen and wake discard the ring; a new Metal device also gets
-new textures and clear state.
+`contentsScale` is the native backing scale. Each platform sets top-left image
+placement in its view's coordinates. Size, scale, screen changes and lifecycle
+transitions invalidate the ring; a new Metal device also gets new textures and
+clear state.
 
 One window frame can be in flight. The Metal completion handler releases GPU
 reads and posts a coalesced main-thread wake on steady-state frames.
@@ -241,6 +241,18 @@ encoding and GPU completion, so large windows can resize slower. The old
 ring is discarded, not reused: Metal retains in-flight textures and Core
 Animation retains submitted contents for as long as either needs them.
 
+On iOS 15 or newer, the UIKit content view hosts a plain `CALayer` and keeps
+the same touch handlers, long-press recognizer and keyboard bridge. The
+`CADisplayLink` requests the screen's refresh rate up to 120 Hz, pauses when
+no animation or repaint is ready, and does not run in the background.
+Metal completion posts to the main queue; actual view bounds, traits and safe
+area changes trigger a full draw in the UIKit layout transaction. On suspend,
+the renderer waits for the previously submitted work and invalidates history;
+it never submits a fence command while backgrounded. A memory warning also
+clears layer contents and drops the ring and window depth attachment.
+Serialized device RGB matched the old Mac drawable on P3; iPhone compositor
+color/orientation parity needs native verification.
+
 The backend-neutral `damage.rs` history is shared with EGL. Only a successfully
 published frame advances the logical scene and history. A partial repair loads
 and stores color and depth, scissor-clears both, and replays intersecting draw
@@ -249,9 +261,10 @@ must still represent the previous scene outside the repair; a changed depth
 resource forces full repair. The optional Metal pixel oracle uses independent
 scratch attachments, the same encoder inputs, and fenced readback; it rejects
 the candidate and disables partial repair for that window on mismatch.
-`PASEO_FULL_REDRAW=1` also disables partial repair without changing presenters. See
-[development](../../../../docs/development.md#macos-iosurface-verification)
-for switches, Mac runtime scenarios, and timing/trace fields.
+`PASEO_FULL_REDRAW=1` also disables partial repair without changing presenters.
+See development's [macOS](../../../../docs/development.md#macos-iosurface-verification)
+and [iOS](../../../../docs/development.md#ios-iosurface-verification) verification
+procedures for switches, native regression scenarios and timing/trace fields.
 
 ## Android Surface lifetime
 

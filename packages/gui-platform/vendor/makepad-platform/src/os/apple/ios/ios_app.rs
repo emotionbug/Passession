@@ -1,3 +1,6 @@
+use super::ios_surface::{DisplayLink, SurfaceMetrics};
+use std::collections::VecDeque;
+
 use {
     crate::{
         area::Area, event::{
@@ -28,11 +31,11 @@ pub fn with_ios_app<R>(f: impl FnOnce(&mut IosApp) -> R) -> R {
     })
 }
 
-pub fn init_ios_app_global(metal_device: ObjcId, event_callback: Box<dyn FnMut(IosEvent) -> EventFlow>) {
+pub fn init_ios_app_global(event_callback: Box<dyn FnMut(IosEvent) -> EventFlow>) {
     unsafe {
         IOS_CLASSES = Box::into_raw(Box::new(IosClasses::new()));
         IOS_APP.with(|app| {
-            *app.borrow_mut() = Some(IosApp::new(metal_device, event_callback));
+            *app.borrow_mut() = Some(IosApp::new(event_callback));
         })
     }
 }
@@ -53,8 +56,7 @@ pub struct IosTimer {
 
 pub struct IosClasses {
     pub app_delegate: *const Class,
-    pub mtk_view: *const Class,
-    pub mtk_view_delegate: *const Class,
+    pub view: *const Class,
     pub gesture_recognizer_handler: *const Class,
     pub textfield_delegate: *const Class,
     pub timer_delegate: *const Class,
@@ -63,8 +65,7 @@ impl IosClasses {
     pub fn new() -> Self {
         Self {
             app_delegate: define_ios_app_delegate(),
-            mtk_view: define_mtk_view(),
-            mtk_view_delegate: define_mtk_view_delegate(),
+            view: define_ios_view(),
             gesture_recognizer_handler: define_gesture_recognizer_handler(),
             textfield_delegate: define_textfield_delegate(),
             timer_delegate: define_ios_timer_delegate()
@@ -79,47 +80,42 @@ pub struct IosApp {
     timers: Vec<IosTimer>,
     touches: Vec<TouchPoint>,
     pub last_window_geom: WindowGeom,
-    metal_device: ObjcId,
-    first_draw: bool,
-    pub mtk_view: Option<ObjcId>,
+    pub(super) view: ObjcId,
+    pub(super) surface_active: bool,
+    pub(super) surface_metrics: Option<SurfaceMetrics>,
+    display_link: Option<DisplayLink>,
+    pending_lifecycle: VecDeque<IosEvent>,
+    layout_pending: bool,
     pub textfield: Option<ObjcId>,
     event_callback: Option<Box<dyn FnMut(IosEvent) -> EventFlow >>,
-    event_flow: EventFlow,
     pasteboard: ObjcId
 }
 
 impl IosApp {
-    pub fn new(metal_device: ObjcId, event_callback: Box<dyn FnMut(IosEvent) -> EventFlow>) -> IosApp {
+    pub fn new(event_callback: Box<dyn FnMut(IosEvent) -> EventFlow>) -> IosApp {
         unsafe {
-            
-            // Construct the bits that are shared between windows
-            //let ns_app: ObjcId = msg_send![class!(UIApplication), sharedApplication];
-            //let app_delegate_instance: ObjcId = msg_send![get_ios_class_global().app_delegate, new];
-            //if ns_app == nil{
-            //   panic!();
-            //}
-            //let () = msg_send![ns_app, setDelegate: app_delegate_instance];
-            
             let pasteboard: ObjcId = msg_send![class!(UIPasteboard), generalPasteboard];
             IosApp {
                 virtual_keyboard_event: None,
                 touches: Vec::new(),
                 last_window_geom: WindowGeom::default(),
-                metal_device,
-                first_draw: true,
-                mtk_view: None,
+                view: nil,
+                surface_active: false,
+                surface_metrics: None,
+                display_link: None,
+                pending_lifecycle: VecDeque::new(),
+                layout_pending: false,
                 textfield: None,
                 time_start: Instant::now(),
                 timer_delegate_instance: msg_send![get_ios_class_global().timer_delegate, new],
                 timers: Vec::new(),
-                event_flow: EventFlow::Poll,
                 event_callback: Some(event_callback),
                 pasteboard,
             }
         }
     }
     
-    pub fn did_finish_launching_with_options(&mut self) {
+    pub fn did_finish_launching_with_options(&mut self, delegate: ObjcId) {
         unsafe {
             let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
             let screen_rect: NSRect = msg_send![main_screen, bounds];
@@ -127,15 +123,12 @@ impl IosApp {
             let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
             let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
             
-            let mtk_view_obj: ObjcId = msg_send![get_ios_class_global().mtk_view, alloc];
-            let mtk_view_obj: ObjcId = msg_send![mtk_view_obj, initWithFrame: screen_rect];
-            
-            let mtk_view_dlg_obj: ObjcId = msg_send![get_ios_class_global().mtk_view_delegate, alloc];
-            let mtk_view_dlg_obj: ObjcId = msg_send![mtk_view_dlg_obj, init];
+            let view: ObjcId = msg_send![get_ios_class_global().view, alloc];
+            let view: ObjcId = msg_send![view, initWithFrame: screen_rect];
 
             // Instantiate a long-press gesture recognizer and our delegate,
             // set that delegate to be the target of the "gesture recognized" action,
-            // and add the gesture recognizer to our MTKView subclass.
+            // and add the gesture recognizer to the content view.
             let gesture_recognizer_handler_obj: ObjcId = msg_send![get_ios_class_global().gesture_recognizer_handler, alloc];
             let gesture_recognizer_handler_obj: ObjcId = msg_send![gesture_recognizer_handler_obj, init];
             let gesture_recognizer_obj: ObjcId = msg_send![class!(UILongPressGestureRecognizer), alloc];
@@ -145,21 +138,16 @@ impl IosApp {
                 action: sel!(handleLongPressGesture: gestureRecognizer:)
             ];
             // Set `cancelsTouchesInView` to NO so that the gesture recognizer doesn't prevent
-            // later touch events from being sent to the MTKView *after* it has recognized its gesture.
+            // later touch events from being sent to the view after recognizing its gesture.
             let () = msg_send!(gesture_recognizer_obj, setCancelsTouchesInView: NO);
-            let () = msg_send![mtk_view_obj, addGestureRecognizer: gesture_recognizer_obj];
+            let () = msg_send![view, addGestureRecognizer: gesture_recognizer_obj];
             
             let view_ctrl_obj: ObjcId = msg_send![class!(UIViewController), alloc];
             let view_ctrl_obj: ObjcId = msg_send![view_ctrl_obj, init];
             
-            let () = msg_send![view_ctrl_obj, setView: mtk_view_obj];
-            
-            let () = msg_send![mtk_view_obj, setPreferredFramesPerSecond: 120];
-            let () = msg_send![mtk_view_obj, setDelegate: mtk_view_dlg_obj];
-            let () = msg_send![mtk_view_obj, setDevice: self.metal_device];
-            let () = msg_send![mtk_view_obj, setUserInteractionEnabled: YES];
-            let () = msg_send![mtk_view_obj, setAutoResizeDrawable: YES];
-            let () = msg_send![mtk_view_obj, setMultipleTouchEnabled: YES];
+            let () = msg_send![view_ctrl_obj, setView: view];
+            let () = msg_send![view, setUserInteractionEnabled: YES];
+            let () = msg_send![view, setMultipleTouchEnabled: YES];
             
             let textfield_dlg: ObjcId = msg_send![get_ios_class_global().textfield_delegate, alloc];
             let textfield_dlg: ObjcId = msg_send![textfield_dlg, init];
@@ -173,7 +161,7 @@ impl IosApp {
             let () = msg_send![textfield, setDelegate: textfield_dlg];
             // to make backspace work - with empty text there is no event on text removal
             let () = msg_send![textfield, setText: str_to_nsstring("x")];
-            let () = msg_send![mtk_view_obj, addSubview: textfield];
+            let () = msg_send![view, addSubview: textfield];
             
             let notification_center: ObjcId = msg_send![class!(NSNotificationCenter), defaultCenter];
             let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardDidChangeFrame:) name: UIKeyboardDidChangeFrameNotification object: nil];
@@ -183,74 +171,89 @@ impl IosApp {
             let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardDidHide:) name: UIKeyboardDidHideNotification object: nil];
             let () = msg_send![notification_center, addObserver: textfield_dlg selector: sel!(keyboardWillHide:) name: UIKeyboardWillHideNotification object: nil];
             
-            let () = msg_send![window_obj, addSubview: mtk_view_obj];
+            let () = msg_send![window_obj, addSubview: view];
             
             let () = msg_send![window_obj, setRootViewController: view_ctrl_obj];
-            
-            //let () = msg_send![view_ctrl_obj, beginAppearanceTransition: true animated: false];
-            //let () = msg_send![view_ctrl_obj, endAppearanceTransition];
             
             let () = msg_send![window_obj, makeKeyAndVisible];
             
             self.textfield = Some(textfield);
-            self.mtk_view = Some(mtk_view_obj);
+            self.view = view;
+            self.display_link = Some(DisplayLink::new(self.timer_delegate_instance));
+
+            // This bundle uses the UIApplicationDelegate lifecycle. Also honor
+            // the hosting scene's notifications if UIKit supplies a windowScene.
+            for (name, selector) in [
+                ("UISceneDidActivateNotification", sel!(surfaceSceneActivated:)),
+                ("UISceneWillDeactivateNotification", sel!(surfaceSceneSuspended:)),
+                ("UISceneDidEnterBackgroundNotification", sel!(surfaceSceneSuspended:)),
+            ] {
+                let () = msg_send![notification_center, addObserver: delegate selector: selector name: str_to_nsstring(name) object: nil];
+            }
         }
     }
     
-    pub fn draw_size_will_change() {
-        Self::check_window_geom();
-    }
-    
-    pub fn check_window_geom() {
-        let main_screen: ObjcId = unsafe {msg_send![class!(UIScreen), mainScreen]};
-        let screen_rect: NSRect = unsafe {msg_send![main_screen, bounds]};
-        let dpi_factor: f64 = unsafe {msg_send![main_screen, scale]};
-        let new_size = dvec2(screen_rect.size.width as f64, screen_rect.size.height as f64);
-        
-        let new_geom = WindowGeom {
-            xr_is_presenting: false,
-            is_topmost: false,
-            is_fullscreen: true,
-            can_fullscreen: false,
-            inner_size: new_size,
-            outer_size: new_size,
-            dpi_factor,
-            position: dvec2(0.0, 0.0)
-        };
-        
-        let first_draw = with_ios_app(|app| app.first_draw);
-        if first_draw {
-            with_ios_app(|app| app.update_geom(new_geom.clone()));
-            IosApp::do_callback(
-                IosEvent::Init,
-            );
-        }
-        
-        let old_geom = with_ios_app(|app| app.update_geom(new_geom.clone()));
-        if let Some(old_geom) = old_geom {
-            IosApp::do_callback(
-                IosEvent::WindowGeomChange(WindowGeomChangeEvent {
-                    window_id: CxWindowPool::id_zero(),
-                    old_geom,
-                    new_geom
-                }), 
-            );
+    pub(super) fn set_surface_active(active: bool) {
+        let changed = with_ios_app(|app| {
+            if app.surface_active == active { return false; }
+            app.surface_active = active;
+            if !active {
+                if let Some(link) = &mut app.display_link { link.set_running(false); }
+            }
+            true
+        });
+        if changed {
+            Self::do_callback(if active { IosEvent::SurfaceResumed } else { IosEvent::SurfaceSuspended });
+            if active { Self::surface_frame(false); }
         }
     }
-    
-    fn update_geom(&mut self, new_geom: WindowGeom)->Option<WindowGeom>{
-        if self.first_draw || new_geom != self.last_window_geom{
-            let old_geom = self.last_window_geom.clone();
-            self.last_window_geom = new_geom;
-            return Some(old_geom);
-        }
-        None
+
+    pub(super) fn surface_scene_changed(notification: ObjcId, active: bool) {
+        let ours = with_ios_app(|app| unsafe {
+            let window: ObjcId = msg_send![app.view, window];
+            let scene: ObjcId = msg_send![window, windowScene];
+            let subject: ObjcId = msg_send![notification, object];
+            scene != nil && scene == subject
+        });
+        if ours { Self::set_surface_active(active); }
     }
-    
-    pub fn draw_in_rect() {
-        Self::check_window_geom();
-        with_ios_app(|app| app.first_draw = false);
-        IosApp::do_callback(IosEvent::Paint);
+
+    pub(super) fn surface_frame(display_tick: bool) {
+        let update = IOS_APP.with(|cell| {
+            // UIKit can run layout synchronously from makeKeyAndVisible (during
+            // launch) or during a Rust callback that updates the native view.
+            let mut app = cell.try_borrow_mut().ok()?;
+            let app = app.as_mut()?;
+            if !app.surface_active || app.view == nil { return None; }
+            if app.event_callback.is_none() {
+                app.layout_pending = true;
+                return None;
+            }
+            // UIKit notifications drive geometry; do not re-read traits, safe
+            // area and window bounds on every animation tick.
+            if display_tick && app.surface_metrics.is_some() { return Some((false, None)); }
+            let metrics = SurfaceMetrics::get(app.view)?;
+            let first = app.surface_metrics.is_none();
+            let change = (app.surface_metrics.as_ref() != Some(&metrics)).then(|| {
+                if let Some(link) = &mut app.display_link { link.set_screen(metrics.screen); }
+                let old_geom = std::mem::replace(&mut app.last_window_geom, metrics.geom.clone());
+                let change = WindowGeomChangeEvent {
+                    window_id: CxWindowPool::id_zero(), old_geom, new_geom: metrics.geom.clone(),
+                };
+                app.surface_metrics = Some(metrics);
+                change
+            });
+            Some((first, change))
+        });
+        let Some((first, change)) = update else { return; };
+        if first { Self::do_callback(IosEvent::Init); }
+        let changed = change.is_some();
+        if let Some(change) = change { Self::do_callback(IosEvent::WindowGeomChange(change)); }
+        if changed {
+            Self::do_callback(IosEvent::SurfaceLayout);
+        } else if display_tick {
+            Self::do_callback(IosEvent::DisplayFrame);
+        }
     }
     
     pub fn update_touch(&mut self, uid: u64, abs: DVec2, state: TouchState) {
@@ -324,22 +327,29 @@ impl IosApp {
         let () = unsafe {msg_send![textfield, resignFirstResponder]};
     }
     
-    pub fn do_callback(event: IosEvent) {
-        let cb = with_ios_app(|app| app.event_callback.take());
-        if let Some(mut callback) = cb {
-            let event_flow = callback(event);
-            let mtk_view = with_ios_app(|app| app.mtk_view.unwrap());
-            with_ios_app(|app| app.event_flow = event_flow);
-            
-            if let EventFlow::Wait = event_flow {
-                let () = unsafe {msg_send![mtk_view, setPaused: YES]};
+    pub fn do_callback(mut event: IosEvent) {
+        let callback = with_ios_app(|app| app.event_callback.take());
+        let Some(mut callback) = callback else {
+            if matches!(event, IosEvent::SurfaceResumed | IosEvent::SurfaceSuspended | IosEvent::SurfaceMemoryWarning) {
+                with_ios_app(|app| app.pending_lifecycle.push_back(event));
             }
-            else {
-                let () = unsafe {msg_send![mtk_view, setPaused: NO]};
-            }
-            
-            with_ios_app(|app| app.event_callback = Some(callback));
+            return;
+        };
+        loop {
+            let flow = callback(event);
+            let pending = with_ios_app(|app| {
+                if let Some(link) = &mut app.display_link {
+                    link.set_running(app.surface_active && matches!(flow, EventFlow::Poll));
+                }
+                app.pending_lifecycle.pop_front()
+            });
+            if let Some(pending) = pending { event = pending; } else { break; }
         }
+        let layout_pending = with_ios_app(|app| {
+            app.event_callback = Some(callback);
+            std::mem::take(&mut app.layout_pending)
+        });
+        if layout_pending { Self::surface_frame(false); }
     }
     
     
@@ -426,10 +436,6 @@ impl IosApp {
         }
     }
     
-    pub fn send_paint_event() {
-        IosApp::do_callback(IosEvent::Paint);
-    }
-
     pub fn copy_to_clipboard(&self, content: &str) {
         unsafe {
             let nsstring = str_to_nsstring(content);

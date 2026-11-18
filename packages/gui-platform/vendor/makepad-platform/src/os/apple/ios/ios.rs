@@ -15,12 +15,13 @@ use {
                     ios_app::{IosApp, init_ios_app_global,with_ios_app}
                 },
                 url_session::{AppleHttpRequests},
+                surface_present::{SurfacePresenter, transaction},
             },
             apple_classes::init_apple_classes_global,
             apple_media::CxAppleMedia,
             metal::{MetalCx, DrawPassMode},
         },
-        pass::{CxPassParent},
+        pass::{CxPassParent, PassId},
         thread::SignalToUI,
         window::CxWindowPool,
         event::{
@@ -41,9 +42,8 @@ impl Cx {
         //let cx = Rc::new(RefCell::new(self));
         //crate::log!("Makepad iOS application started.");
         //let metal_windows = Rc::new(RefCell::new(Vec::new()));
-        let device = metal_cx.borrow().device;
         init_apple_classes_global();
-        init_ios_app_global(device, Box::new({
+        init_ios_app_global(Box::new({
             let cx = cx.clone();
             move | event | {
                 let mut cx_ref = cx.borrow_mut();
@@ -64,26 +64,81 @@ impl Cx {
         IosApp::event_loop();
     }
 
-    pub (crate) fn handle_repaint(&mut self, metal_cx: &mut MetalCx) {
-        let mut passes_todo = Vec::new();
+    fn repaint_ios_surface(&mut self, metal_cx: &mut MetalCx, display_tick: bool, layout: bool) {
+        let Some((view, key)) = with_ios_app(|app| {
+            if !app.surface_active { return None; }
+            app.surface_metrics.as_ref().map(|metrics| (app.view, metrics.key(metal_cx.device)))
+        }) else { return; };
+
+        let mut surface = self.os.surface.take().unwrap_or_else(|| super::ios_surface::presenter(view));
+        if surface.key_changed(key) {
+            surface.invalidate();
+        } else if let Err(reason) = surface.present(view, self.frame_trace.as_deref()) {
+            surface.retry_present(reason);
+            self.repaint_windows();
+        }
+        let started = self.frame_trace.as_ref().map(|_| Instant::now());
+        let mut rendered = 0;
+        let mut passes_todo = std::mem::take(&mut self.os.passes_todo);
         self.compute_pass_repaint_order(&mut passes_todo);
         self.repaint_id += 1;
-        for pass_id in &passes_todo {
-            self.passes[*pass_id].set_time(with_ios_app(|app| app.time_now() as f32));
-            match self.passes[*pass_id].parent.clone() {
-                CxPassParent::Xr => {}
-                CxPassParent::Window(_window_id) => {
-                    let mtk_view = with_ios_app(|app| app.mtk_view.unwrap());
-                    self.draw_pass(*pass_id, metal_cx, DrawPassMode::MTKView(mtk_view));
+        let now = with_ios_app(|app| app.time_now() as f32);
+        for &pass in &passes_todo {
+            self.passes[pass].set_time(now);
+            match self.passes[pass].parent {
+                CxPassParent::Xr => (),
+                CxPassParent::Window(_) => {
+                    let result = surface.acquire(key, display_tick, true, self.frame_trace.as_deref());
+                    let result = result.and_then(|slot| {
+                        let Some(slot) = slot else { return Ok(()); };
+                        self.draw_surface_pass(pass, metal_cx, &mut surface, slot, key.size, layout)?;
+                        rendered += 1;
+                        if layout {
+                            surface.present(view, self.frame_trace.as_deref())?;
+                        }
+                        Ok(())
+                    });
+                    if let Err(reason) = result {
+                        surface.retry_frame(key, reason);
+                        self.passes[pass].paint_dirty = true;
+                    }
                 }
-                CxPassParent::Pass(_) => {
-                    self.draw_pass(*pass_id, metal_cx, DrawPassMode::Texture);
-                },
-                CxPassParent::None => {
-                    self.draw_pass(*pass_id, metal_cx, DrawPassMode::Texture);
+                CxPassParent::Pass(_) | CxPassParent::None => {
+                    self.draw_pass(pass, metal_cx, DrawPassMode::Texture);
+                    rendered += 1;
                 }
             }
         }
+        self.os.passes_todo = passes_todo;
+        self.os.surface = Some(surface);
+        if let (Some(trace), Some(started)) = (&self.frame_trace, started) {
+            trace.render(rendered, started.elapsed());
+        }
+    }
+
+    fn present_ios_surface(&mut self) {
+        let view = with_ios_app(|app| app.surface_active.then_some(app.view));
+        let Some(view) = view else { return; };
+        let Some(surface) = &mut self.os.surface else { return; };
+        if let Err(reason) = surface.present(view, self.frame_trace.as_deref()) {
+            surface.retry_present(reason);
+            self.repaint_windows();
+        }
+    }
+
+    fn ios_surface_frame(&mut self, metal_cx: &mut MetalCx, display_tick: bool, layout: bool) {
+        if !with_ios_app(|app| app.surface_active) { return; }
+        if display_tick && !self.new_next_frames.is_empty() {
+            let time_now = with_ios_app(|app| app.time_now());
+            self.call_next_frame_event(time_now);
+        }
+        if self.need_redrawing() {
+            self.call_draw_event();
+            // A synchronous UIKit callback can suspend the app during Draw.
+            if !with_ios_app(|app| app.surface_active) { return; }
+            self.mtl_compile_shaders(metal_cx);
+        }
+        self.repaint_ios_surface(metal_cx, display_tick, layout);
     }
 
     pub(crate) fn handle_networking_events(&mut self) {
@@ -103,16 +158,9 @@ impl Cx {
         metal_cx: &mut MetalCx,
     ) -> EventFlow {
 
-        self.handle_platform_ops(metal_cx);
+        self.handle_platform_ops();
 
-        // send a mouse up when dragging starts
-
-        let mut paint_dirty = false;
         match &event {
-            IosEvent::KeyDown(_) |
-            IosEvent::KeyUp(_) |
-            IosEvent::TextInput(_) => {
-            }
             IosEvent::Timer(te) => {
                 if te.timer_id == 0 {
                     let vk = with_ios_app(|app| app.virtual_keyboard_event.take());
@@ -140,7 +188,6 @@ impl Cx {
             _ => ()
         }
 
-        //self.process_desktop_pre_event(&mut event);
         match event {
             IosEvent::VirtualKeyboard(vk)=>{
                 self.call_event_handler(&Event::VirtualKeyboard(vk));
@@ -151,33 +198,40 @@ impl Cx {
                 self.call_event_handler(&Event::Startup);
                 self.redraw_all();
             }
-            IosEvent::AppGotFocus => { // repaint all window passes. Metal sometimes doesnt flip buffers when hidden/no focus
-                paint_dirty = true;
-                self.call_event_handler(&Event::AppGotFocus);
+            IosEvent::SurfaceResumed => {
+                if with_ios_app(|app| app.surface_metrics.is_some()) {
+                    self.call_event_handler(&Event::AppGotFocus);
+                    self.redraw_all();
+                    self.repaint_windows();
+                }
             }
-            IosEvent::AppLostFocus => {
+            IosEvent::SurfaceSuspended => {
+                metal_cx.drain_surface_queue();
+                if let Some(surface) = &mut self.os.surface { surface.invalidate(); }
                 self.call_event_handler(&Event::AppLostFocus);
             }
-            IosEvent::WindowGeomChange(re) => { // do this here because mac
-                let window_id = CxWindowPool::id_zero();
-                let window = &mut self.windows[window_id];
+            IosEvent::SurfaceMemoryWarning => {
+                metal_cx.drain_surface_queue();
+                if let Some(surface) = &mut self.os.surface { surface.purge(); }
+                let window = CxWindowPool::id_zero();
+                if self.windows.is_valid(window) {
+                    if let Some(pass) = self.windows[window].main_pass_id {
+                        self.evict_metal_window_depth(pass);
+                    }
+                }
+                self.repaint_windows();
+            }
+            IosEvent::WindowGeomChange(re) => {
+                let window = &mut self.windows[re.window_id];
+                window.os_dpi_factor = Some(re.new_geom.dpi_factor);
                 window.window_geom = re.new_geom.clone();
                 self.call_event_handler(&Event::WindowGeomChange(re));
                 self.redraw_all();
+                self.repaint_windows();
             }
-            IosEvent::Paint => {
-                if self.new_next_frames.len() != 0 {
-                    let time_now = with_ios_app(|app| app.time_now());
-                    self.call_next_frame_event(time_now);
-                }
-                if self.need_redrawing() {
-                    self.call_draw_event();
-                    self.mtl_compile_shaders(&metal_cx);
-                }
-                // ok here we send out to all our childprocesses
-                self.handle_repaint(metal_cx);
-                
-            }
+            IosEvent::SurfaceLayout => transaction(|| self.ios_surface_frame(metal_cx, false, true)),
+            IosEvent::DisplayFrame => self.ios_surface_frame(metal_cx, true, false),
+            IosEvent::SurfaceReady => self.present_ios_surface(),
             IosEvent::TouchUpdate(e)=>{
                 self.fingers.process_touch_update_start(e.time, &e.touches);
                 let e = Event::TouchUpdate(e);
@@ -233,19 +287,23 @@ impl Cx {
             }
         }
 
-        if self.any_passes_dirty() || self.need_redrawing() || self.new_next_frames.len() != 0 || paint_dirty|| self.demo_time_repaint{
+        let waiting_for_gpu = self.os.surface.as_ref().is_some_and(SurfacePresenter::frame_in_flight);
+        let repaint = !waiting_for_gpu && (self.any_passes_dirty() || self.demo_time_repaint)
+            || self.os.surface.as_ref().is_some_and(SurfacePresenter::needs_display_tick);
+        if repaint || self.need_redrawing() || !self.new_next_frames.is_empty() {
             EventFlow::Poll
         } else {
             EventFlow::Wait
         }
     }
 
-    fn handle_platform_ops(&mut self, _metal_cx: &MetalCx){
+    fn handle_platform_ops(&mut self) {
         while let Some(op) = self.platform_ops.pop() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     let window = &mut self.windows[window_id];
                     window.window_geom = with_ios_app(|app| app.last_window_geom.clone());
+                    window.os_dpi_factor = Some(window.window_geom.dpi_factor);
                     window.is_created = true;
                 },
                 CxOsOp::ShowTextIME(_area, _pos) => {
@@ -343,5 +401,7 @@ pub struct CxOs {
     pub (crate) draw_calls_done: usize,
     pub (crate) network_response: NetworkResponseChannel,
     pub (crate) http_requests: AppleHttpRequests,
+    surface: Option<SurfacePresenter>,
+    passes_todo: Vec<PassId>,
 }
 

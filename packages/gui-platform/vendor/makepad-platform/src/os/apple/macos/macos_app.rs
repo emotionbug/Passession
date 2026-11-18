@@ -33,7 +33,7 @@ extern "C" fn display_link_tick(
     0
 }
 
-pub(super) fn post_surface_ready() {
+pub(in crate::os::apple) fn post_surface_ready() {
     // An immutable, application-defined event needs no new payload for each frame.
     let event = SURFACE_READY_EVENT.load(Ordering::Acquire);
     if event.is_null() || SURFACE_READY_QUEUED.swap(true, Ordering::AcqRel) { return; }

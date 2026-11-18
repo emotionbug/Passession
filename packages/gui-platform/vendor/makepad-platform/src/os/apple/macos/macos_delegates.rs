@@ -688,7 +688,7 @@ pub fn define_cocoa_view_class() -> *const Class {
                 // Couple the new view geometry and completed IOSurface to this
                 // AppKit resize step. AppKit may also call displayLayer:; the
                 // second notification has no new geometry to repaint.
-                super::metal_surface::transaction(|| {
+                crate::os::apple::surface_present::transaction(|| {
                     let () = msg_send![super (this, superclass), setFrameSize: size];
                     get_cocoa_window(this).send_resize_event();
                 });

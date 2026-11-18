@@ -1,5 +1,5 @@
 //! Conservative paint damage from the *render* tree, independent of pending GPU uploads.
-#![cfg_attr(not(any(target_os = "linux", target_os = "android", target_os = "windows", target_os = "macos")), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", target_os = "android", target_os = "windows", target_os = "macos", target_os = "ios")), allow(dead_code))]
 use crate::{
     cx::Cx,
     draw_list::{CxDrawListUniforms, DrawListId},
@@ -10,7 +10,7 @@ use crate::{
 };
 use std::cell::Cell;
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android", target_os = "macos", target_os = "ios"))]
 pub(crate) fn force_full_redraw() -> bool {
     static FULL_REDRAW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("PASEO_FULL_REDRAW").is_some_and(|value| value == "1")
@@ -67,7 +67,7 @@ impl DamageRect {
     }
 
     /// Origin and size, as EGL damage and Metal scissors take them.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android", test))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios", target_os = "android", test))]
     pub fn egl(self) -> [i32; 4] {
         [self.x0, self.y0, self.x1 - self.x0, self.y1 - self.y0]
     }
@@ -76,7 +76,7 @@ impl DamageRect {
 /// The changes between successfully presented frames, not the repairs used to
 /// bring individual buffers up to date. Age one means the immediately previous
 /// presentation. Zero/negative age or missing history requires a full repair.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios", target_os = "android", test))]
 #[derive(Clone, Default)]
 pub(crate) struct DamageHistory {
     frames: [DamageRect; 4],
@@ -84,7 +84,7 @@ pub(crate) struct DamageHistory {
     len: usize,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios", target_os = "android", test))]
 impl DamageHistory {
     pub fn repair(&self, age: i32, current: DamageRect) -> Option<DamageRect> {
         let count = usize::try_from(age.checked_sub(1)?).ok()?;

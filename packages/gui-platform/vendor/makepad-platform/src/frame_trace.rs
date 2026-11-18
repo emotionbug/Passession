@@ -117,8 +117,8 @@ impl FrameTrace {
         *self.sample.lock().unwrap().next_frame_requests.entry(owner).or_default() += 1;
     }
 
-    /// Native render/present time; reported by the X11 and macOS window loops.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Native render/present time reported by the X11 and Apple window loops.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     pub(crate) fn render(&self, passes: usize, elapsed: Duration) {
         let mut sample = self.sample.lock().unwrap();
         sample.render_passes += passes;
@@ -132,14 +132,14 @@ impl FrameTrace {
         sample.texture_upload_bytes += width as u64 * height as u64 * bytes_per_pixel as u64;
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn surface_deferred(&self, reuse_wait: bool) {
         let mut sample = self.sample.lock().unwrap();
         sample.surface_deferred += 1;
         sample.surface_reuse_waits += usize::from(reuse_wait);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn surface_presented(
         &self, [width, height]: [i32; 2], repair: crate::damage::DamageRect, elapsed: Duration,
     ) {

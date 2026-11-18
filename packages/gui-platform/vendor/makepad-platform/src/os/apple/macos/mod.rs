@@ -5,7 +5,6 @@ pub mod macos_app;
 pub mod macos_delegates;
 pub mod macos_event;
 pub mod macos_window;
-pub(crate) mod metal_surface;
 mod file_drag;
 mod key_equivalent;
 pub use self::macos::*;

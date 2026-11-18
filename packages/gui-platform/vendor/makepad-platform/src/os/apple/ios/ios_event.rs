@@ -20,10 +20,13 @@ use {
 #[derive(Debug, Clone)]
 pub enum IosEvent {
     Init,
-    AppGotFocus,
-    AppLostFocus,
     WindowGeomChange(WindowGeomChangeEvent),
-    Paint,
+    DisplayFrame,
+    SurfaceLayout,
+    SurfaceReady,
+    SurfaceResumed,
+    SurfaceSuspended,
+    SurfaceMemoryWarning,
     VirtualKeyboard(VirtualKeyboardEvent),
     MouseDown(MouseDownEvent),
     MouseUp(MouseUpEvent),

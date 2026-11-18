@@ -186,9 +186,9 @@ check the active X11 display; two short-lived probe windows appear in sequence.
 ### Window damage verification
 
 Set `PASEO_FULL_REDRAW=1` before launching the app to bypass retained window
-damage on EGL and Windows or force full repair on macOS. On X11 `render_frames`
-counts repaint iterations with work; a frame can include several
-`render_passes` during a transition.
+damage on EGL and Windows or force full repair on macOS and iOS. On X11
+`render_frames` counts repaint iterations with work; a frame can include
+several `render_passes` during a transition.
 `render_ms / render_frames` includes time spent in presentation and should
 not be interpreted as GPU execution time.
 
@@ -262,6 +262,50 @@ resize waits on the UI thread for GPU completion and needs a fresh surface
 at each new size; at high resolutions this can lower throughput. Use Instruments
 or a high-speed camera for true GPU time and display latency. The steady-state
 path has no intentional extra display tick after completion.
+
+#### iOS IOSurface verification
+
+IOSurface is the iOS presenter (minimum iOS 15). Build and install a development
+app as described under [development commands](#development-commands). Then quit
+and relaunch it with `PASEO_DAMAGE_ORACLE=1` and `PASEO_FRAME_TRACE=1`; leave
+`PASEO_FULL_REDRAW` unset. In an Xcode Run scheme, set these under **Arguments →
+Environment Variables**. For an already-installed build:
+
+```sh
+# Booted simulator; SIMCTL_CHILD_ passes environment values to the app.
+SIMCTL_CHILD_PASEO_DAMAGE_ORACLE=1 SIMCTL_CHILD_PASEO_FRAME_TRACE=1 \
+  xcrun simctl launch --terminate-running-process --console-pty \
+  booted sh.paseo.sessions
+
+# Physical device, using its devicectl identifier.
+xcrun devicectl device process launch --device <device-id> --terminate-existing --console \
+  --environment-variables '{"PASEO_DAMAGE_ORACLE":"1","PASEO_FRAME_TRACE":"1"}' \
+  sh.paseo.sessions
+```
+
+1. Watch an idle window and a running spinner. Type and delete with the keyboard
+   open and closed; fling-scroll a long list, open and dismiss sheets, and
+   navigate in compact width. Check safe areas, touch/long-press, and IME input.
+2. Rotate with the keyboard hidden and shown. On iPad, resize in Split View or
+   Stage Manager and cross the compact breakpoint. Expect a sharp full repaint
+   at changed sizes, no stretching or inversion, and partial matches afterward.
+3. Background during a fling or spinner; return to the app and confirm a full
+   first repaint. Trigger a memory warning (Simulator: **Debug → Simulate Memory
+   Warning**) and verify surfaces are rebuilt with a full repair. Use Instruments
+   to check for no renderer GPU submissions in the background or during idle.
+4. Use physical hardware to verify orientation, transparency, and color parity
+   against a prior build, especially on a P3 screen. The oracle compares Metal
+   pixels, not Core Animation's composited output. Repeat with ProMotion at up
+   to 120 Hz (actual rate is chosen by iOS).
+
+Report device/OS, scale and refresh rate, `result=equal` counts by age, mismatch
+and retry diagnostics, deferred frames, and results after each lifecycle change.
+For performance, relaunch twice with the oracle unset and trace enabled: first
+with default retained repair, then with `PASEO_FULL_REDRAW=1`. Compare
+`surface_presents / interval`, `surface_repair_pct`, `surface_reuse_waits`,
+`surface_publish_ms / surface_presents`, upload bytes, and GPU time/energy in
+Instruments. `surface_presents` counts submissions, not scanout. The display link
+should pause once no animation, repaint, or surface reuse wait remains.
 
 ### UI motion
 

@@ -1,5 +1,8 @@
 //! Main-thread ownership of retained Metal window buffers.
-use super::macos_app::post_surface_ready;
+#[cfg(target_os = "ios")]
+use super::ios::ios_surface::post_surface_ready;
+#[cfg(target_os = "macos")]
+use super::macos::macos_app::post_surface_ready;
 use crate::{
     damage::{DamageFrame, DamageHistory, DamageRect},
     frame_trace::FrameTrace,
@@ -48,9 +51,15 @@ extern "C" {
     fn CGColorSpaceCopyPropertyList(space: ObjcId) -> ObjcId;
 }
 
-#[link(name = "QuartzCore", kind = "framework")]
-extern "C" {
-    static kCAGravityTopLeft: ObjcId;
+pub(crate) fn new_layer() -> RcObjcId {
+    unsafe {
+        let layer = RcObjcId::from_owned(NonNull::new(msg_send![class!(CALayer), new]).unwrap());
+        if let Some(background) = NonNull::new(CGColorCreateGenericRGB(0.0, 0.0, 0.0, 1.0)) {
+            let background = OwnedCf(background);
+            let () = msg_send![layer.as_id(), setBackgroundColor: background.as_id()];
+        }
+        layer
+    }
 }
 
 static ORACLE: LazyLock<bool> = LazyLock::new(|| {
@@ -126,6 +135,7 @@ pub(crate) struct SurfacePresenter {
 
 struct Ring {
     key: SurfaceKey,
+    #[cfg(target_os = "macos")]
     storage: MTLStorageMode,
     surfaces: [Option<Surface>; 3],
     descriptor: RcObjcId,
@@ -170,23 +180,7 @@ impl SurfaceCompletion {
 }
 
 impl SurfacePresenter {
-    pub(crate) fn new(view: ObjcId) -> Self {
-        let layer = unsafe {
-            let layer = RcObjcId::from_owned(NonNull::new(msg_send![class!(CALayer), new]).unwrap());
-            let () = msg_send![layer.as_id(), setDelegate: view];
-            // Keep stale contents at native size if rendering must be retried.
-            let () = msg_send![layer.as_id(), setContentsGravity: kCAGravityTopLeft];
-            let () = msg_send![layer.as_id(), setNeedsDisplayOnBoundsChange: YES];
-            let () = msg_send![layer.as_id(), setAutoresizingMask: (1usize << 4) | (1 << 1)];
-            if let Some(background) = NonNull::new(CGColorCreateGenericRGB(0.0, 0.0, 0.0, 1.0)) {
-                let background = OwnedCf(background);
-                let () = msg_send![layer.as_id(), setBackgroundColor: background.as_id()];
-            }
-            let () = msg_send![view, setLayer: layer.as_id()];
-            let () = msg_send![view, setWantsLayer: YES];
-            let () = msg_send![view, setLayerContentsPlacement: 11usize]; // TopLeft
-            layer
-        };
+    pub(crate) fn new(layer: RcObjcId) -> Self {
         Self {
             layer, clear: None, ring: None, history: DamageHistory::default(),
             scene: DamageFrame::default(), waiting_since: None, deferred: false,
@@ -202,6 +196,24 @@ impl SurfacePresenter {
         self.scene.invalidate();
         self.waiting_since = None;
         self.deferred = false;
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn purge(&mut self) {
+        self.invalidate();
+        transaction(|| unsafe {
+            let () = msg_send![self.layer.as_id(), setContents: nil];
+        });
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn frame_in_flight(&self) -> bool {
+        self.ring.as_ref().is_some_and(|ring| ring.pending.is_some())
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn key_changed(&self, key: SurfaceKey) -> bool {
+        self.ring.as_ref().is_some_and(|ring| ring.key != key)
     }
 
     pub(crate) fn retry_frame(&mut self, key: SurfaceKey, reason: &'static str) {
@@ -242,6 +254,7 @@ impl SurfacePresenter {
         ring.fallback_depth.as_ref().map(RcObjcId::as_id)
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn detach(&self) {
         transaction(|| unsafe {
             let () = msg_send![self.layer.as_id(), setDelegate: nil];
@@ -356,6 +369,7 @@ impl SurfacePresenter {
         });
         SurfacePaint {
             texture: ring.surfaces[slot].as_ref().unwrap().texture.as_id(),
+            #[cfg(target_os = "macos")]
             storage: ring.storage,
             repair: partial.then(|| (&self.scene, repair, self.clear.as_ref().unwrap())),
             oracle,
@@ -364,7 +378,7 @@ impl SurfacePresenter {
         }
     }
 
-    /// Call only on AppKit's thread. A command buffer's *scheduled* notification
+    /// Call only on the main thread. A command buffer's *scheduled* notification
     /// is not a texture fence. Completion guarantees shared texture visibility.
     pub(crate) fn present(&mut self, view: ObjcId, trace: Option<&FrameTrace>) -> Result<bool, &'static str> {
         let Some(ring) = self.ring.as_mut() else { return Ok(false); };
@@ -417,8 +431,12 @@ impl Ring {
     fn new(key: SurfaceKey) -> Option<Self> {
         unsafe {
             if key.size.iter().any(|&axis| !(1..=16384).contains(&axis)) { return None; }
+            #[cfg(target_os = "macos")]
             let unified: BOOL = msg_send![key.device, hasUnifiedMemory];
+            #[cfg(target_os = "macos")]
             let storage = if unified == YES { MTLStorageMode::Shared } else { MTLStorageMode::Managed };
+            #[cfg(target_os = "ios")]
+            let storage = MTLStorageMode::Shared;
             // Match CAMetalLayer.colorspace == nil: the shader's SDR channel
             // values are unmanaged device RGB. A calibrated window/screen profile
             // reinterprets those values and visibly changes colors on a P3 screen.
@@ -428,7 +446,9 @@ impl Ring {
                 key.size, MTLPixelFormat::BGRA8Unorm, storage,
             ))?);
             Some(Self {
-                key, storage, profile, descriptor, surfaces: [None, None, None], next: 0, front: None,
+                key, profile, descriptor, surfaces: [None, None, None], next: 0, front: None,
+                #[cfg(target_os = "macos")]
+                storage,
                 presented: 0, observed: 0, pending: None, depth_baseline: None,
                 completion: Arc::default(), oracle: None, fallback_depth: None,
             })
@@ -494,6 +514,7 @@ mod tests {
 
 pub(crate) struct SurfacePaint<'a> {
     pub(crate) texture: ObjcId,
+    #[cfg(target_os = "macos")]
     pub(crate) storage: MTLStorageMode,
     pub(crate) repair: Option<(&'a DamageFrame, DamageRect, &'a RepairClear)>,
     pub(crate) oracle: Option<&'a Oracle>,

@@ -45,13 +45,13 @@ use crate::{
     metal_xpc::store_xpc_service_texture
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::{
     damage::{force_full_redraw, DamageFrame, DamageRect},
-    os::apple::macos::metal_surface::{SurfaceCompletion, SurfacePresenter},
+    os::apple::surface_present::{SurfaceCompletion, SurfacePresenter},
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 type DamageCursor<'a> = Option<(&'a DamageFrame, DamageRect, usize)>;
 
 struct MetalDraw<'a> {
@@ -60,7 +60,7 @@ struct MetalDraw<'a> {
     zbias: f32,
     zbias_step: f32,
     gpu_read_guards: &'a mut Vec<MetalRwLockGpuReadGuard>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     damage: DamageCursor<'a>,
 }
 
@@ -93,7 +93,7 @@ impl Cx {
                 };
 
                 // Match DamageFrame's paint ordinal, including uncompiled shaders.
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 let culled = if let Some((frame, repair, ordinal)) = &mut draw.damage {
                     let culled = frame.should_cull(*ordinal, *repair);
                     *ordinal += 1;
@@ -112,7 +112,7 @@ impl Cx {
                 // A skipped draw must still consume its original depth bias.
                 draw_call.draw_call_uniforms.set_zbias(draw.zbias);
                 draw.zbias += draw.zbias_step;
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if culled { continue; }
                 let MetalDraw { encoder, metal_cx, gpu_read_guards, .. } = draw;
                 let encoder = *encoder;
@@ -291,11 +291,13 @@ impl Cx {
         
         let pool: ObjcId = unsafe {msg_send![class!(NSAutoreleasePool), new]};
         
-        let render_pass_descriptor: ObjcId = if let DrawPassMode::MTKView(view) = mode {
-            unsafe{msg_send![view, currentRenderPassDescriptor]}
-        }
-        else{
-            unsafe {msg_send![class!(MTLRenderPassDescriptorInternal), renderPassDescriptor]}
+        let render_pass_descriptor: ObjcId = match mode {
+            #[cfg(target_os = "tvos")]
+            DrawPassMode::MTKView(view) => unsafe { msg_send![view, currentRenderPassDescriptor] },
+            #[cfg(target_os = "ios")]
+            _ => unsafe { msg_send![class!(MTLRenderPassDescriptor), renderPassDescriptor] },
+            #[cfg(not(target_os = "ios"))]
+            _ => unsafe { msg_send![class!(MTLRenderPassDescriptorInternal), renderPassDescriptor] },
         };
         
         let dpi_factor = self.passes[pass_id].dpi_factor.unwrap();
@@ -315,21 +317,23 @@ impl Cx {
         
         self.passes[pass_id].set_dpi_factor(dpi_factor);
         
-        if let DrawPassMode::MTKView(_) = mode{
-            let color_attachments:ObjcId = unsafe{msg_send![render_pass_descriptor, colorAttachments]};
-            let color_attachment:ObjcId = unsafe{msg_send![color_attachments, objectAtIndexedSubscript: 0]};
-            let color = self.passes[pass_id].clear_color;
-            unsafe {
-                let () = msg_send![color_attachment, setLoadAction: MTLLoadAction::Clear];
-                let () = msg_send![color_attachment, setClearColor: MTLClearColor {
-                    red: color.x as f64,
-                    green: color.y as f64,
-                    blue: color.z as f64,
-                    alpha: color.w as f64
-                }];
+        match mode {
+            #[cfg(target_os = "tvos")]
+            DrawPassMode::MTKView(_) => {
+                let color_attachments: ObjcId = unsafe { msg_send![render_pass_descriptor, colorAttachments] };
+                let color_attachment: ObjcId = unsafe { msg_send![color_attachments, objectAtIndexedSubscript: 0] };
+                let color = self.passes[pass_id].clear_color;
+                unsafe {
+                    let () = msg_send![color_attachment, setLoadAction: MTLLoadAction::Clear];
+                    let () = msg_send![color_attachment, setClearColor: MTLClearColor {
+                        red: color.x as f64,
+                        green: color.y as f64,
+                        blue: color.z as f64,
+                        alpha: color.w as f64
+                    }];
+                }
             }
-        } 
-        else {
+            _ => {
             for (index, color_texture) in self.passes[pass_id].color_textures.iter().enumerate() {
                 let color_attachments: ObjcId = unsafe {msg_send![render_pass_descriptor, colorAttachments]};
                 let color_attachment: ObjcId = unsafe {msg_send![color_attachments, objectAtIndexedSubscript: index as u64]};
@@ -337,7 +341,7 @@ impl Cx {
                 let cxtexture = &mut self.textures[color_texture.texture.texture_id()];
                 let size = dpi_factor * pass_rect.size; 
                 cxtexture.update_render_target(metal_cx, size.x as usize, size.y as usize);
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 cxtexture.mark_content_changed();
                 
                 let is_initial = cxtexture.take_initial();
@@ -383,13 +387,14 @@ impl Cx {
                     }
                 }
             }
+            }
         }
         // attach depth texture
         if let Some(depth_texture) = &self.passes[pass_id].depth_texture {
             let cxtexture = &mut self.textures[depth_texture.texture_id()];
             let size = dpi_factor * pass_rect.size;
             cxtexture.update_depth_stencil(metal_cx, size.x as usize, size.y as usize);
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             cxtexture.mark_content_changed();
             let is_initial = cxtexture.take_initial();
             
@@ -438,7 +443,7 @@ impl Cx {
         let mut draw = MetalDraw {
             encoder, metal_cx, zbias: 0.0, zbias_step: self.passes[pass_id].zbias_step,
             gpu_read_guards: &mut gpu_read_guards,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             damage: None,
         };
         self.render_view(pass_id, draw_list_id, &mut draw);
@@ -447,6 +452,7 @@ impl Cx {
         
         
         match mode {
+            #[cfg(target_os = "tvos")]
             DrawPassMode::MTKView(view)=>{
                 let drawable:ObjcId = unsafe {msg_send![view, currentDrawable]};
                 let first_texture: ObjcId = unsafe {msg_send![drawable, texture]};
@@ -456,6 +462,8 @@ impl Cx {
             }
             DrawPassMode::Texture => {
                 self.commit_command_buffer(None, None, command_buffer, gpu_read_guards);
+                #[cfg(target_os = "ios")]
+                metal_cx.track_surface_queue(command_buffer);
             }
             DrawPassMode::StdinMain(stdin_frame, kind_id) => {
                 let main_texture = &self.passes[pass_id].color_textures[0];
@@ -472,12 +480,16 @@ impl Cx {
         let () = unsafe {msg_send![pool, release]};
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn draw_surface_pass(
         &mut self, pass_id: PassId, metal_cx: &MetalCx, presenter: &mut SurfacePresenter,
         slot: usize, size: [i32; 2], sync: bool,
     ) -> Result<(), &'static str> {
+        #[cfg(target_os = "macos")]
         let pass_rect = self.get_pass_rect(pass_id, 1.0).ok_or("missing Metal window pass bounds")?;
+        #[cfg(target_os = "ios")]
+        let pass_rect = self.get_pass_rect(pass_id, self.passes[pass_id].dpi_factor.ok_or("missing Metal window scale")?)
+            .ok_or("missing Metal window pass bounds")?;
         let pass = &mut self.passes[pass_id];
         let Some(root) = pass.main_draw_list_id else { return Err("missing Metal window draw list"); };
         let Some(dpi) = pass.dpi_factor else { return Err("missing Metal window scale"); };
@@ -581,6 +593,7 @@ impl Cx {
             let () = unsafe { msg_send![encoder, endEncoding] };
             if !oracle.encode_readback(command, paint.texture, size) { return Err("Metal oracle blit unavailable"); }
         }
+        #[cfg(target_os = "macos")]
         if paint.storage == MTLStorageMode::Managed {
             // A discrete GPU's managed texture can have a separate GPU copy.
             // Synchronize the IOSurface backing before handing it to CA.
@@ -598,12 +611,24 @@ impl Cx {
         };
         self.passes[pass_id].paint_dirty = false;
         self.commit_metal_command(screenshot, None, command, paint.guards, Some((paint.completion, !sync)));
+        #[cfg(target_os = "ios")]
+        metal_cx.track_surface_queue(command);
         if sync {
-            // Metal waits for both the GPU and its completion handlers. The
-            // resize callback will publish in the enclosing AppKit transaction.
+            // Metal waits for the GPU and its completion handlers. The caller
+            // publishes in the enclosing native layout transaction.
             let () = unsafe { msg_send![command, waitUntilCompleted] };
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn evict_metal_window_depth(&mut self, pass: PassId) {
+        if let Some(depth) = &self.passes[pass].depth_texture {
+            let texture = &mut self.textures[depth.texture_id()];
+            texture.os.texture = None;
+            texture.alloc = None;
+            texture.mark_content_changed();
+        }
     }
 
     fn metal_depth_state(&mut self, pass_id: PassId, metal_cx: &MetalCx) -> ObjcId {
@@ -648,6 +673,7 @@ impl Cx {
             unsafe{
                 let blit_encoder: ObjcId = msg_send![command_buffer, blitCommandEncoder];
                 let () = msg_send![blit_encoder, copyFromTexture: in_texture toTexture:texture];
+                #[cfg(target_os = "macos")]
                 let () = msg_send![blit_encoder, synchronizeTexture: texture slice:0 level:0];
                 let () = msg_send![blit_encoder, endEncoding];
             };
@@ -663,7 +689,7 @@ impl Cx {
         
     fn commit_command_buffer(&self, screenshot_info: Option<ScreenshotInfo>, stdin_frame: Option<PresentableDraw>, command_buffer: ObjcId, gpu_read_guards: Vec<MetalRwLockGpuReadGuard>) {
         self.commit_metal_command(screenshot_info, stdin_frame, command_buffer, gpu_read_guards,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             None,
         );
     }
@@ -674,7 +700,7 @@ impl Cx {
         stdin_frame: Option<PresentableDraw>,
         command_buffer: ObjcId,
         gpu_read_guards: Vec<MetalRwLockGpuReadGuard>,
-        #[cfg(target_os = "macos")] surface_completion: Option<(Arc<SurfaceCompletion>, bool)>,
+        #[cfg(any(target_os = "macos", target_os = "ios"))] surface_completion: Option<(Arc<SurfaceCompletion>, bool)>,
     ) {
         let gpu_read_guards = Mutex::new(Some(gpu_read_guards));
         let screenshot_info =  Mutex::new(screenshot_info);
@@ -684,13 +710,13 @@ impl Cx {
         let () = unsafe {msg_send![
             command_buffer,
             addCompletedHandler: &objc_block!(move | command_buffer: ObjcId | {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 let completed = surface_completion.as_ref().is_none_or(|_| {
                     // MTLCommandBufferStatusCompleted (4) is the only successful terminal state.
                     let status: usize = unsafe { msg_send![command_buffer, status] };
                     status == 4
                 });
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                 let completed = true;
                 // alright lets grab a texture if need be
                 if let Some(sf) = &*screenshot_info.lock().unwrap(){
@@ -731,7 +757,7 @@ impl Cx {
                 }));
                 
                 let guards = gpu_read_guards.lock().unwrap().take().unwrap();
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 if let Some((completion, wake)) = &surface_completion {
                     completion.complete(completed, guards, *wake);
                     return;
@@ -817,13 +843,16 @@ struct ScreenshotInfo{
 
 pub enum DrawPassMode {
     Texture,
+    #[cfg(target_os = "tvos")]
     MTKView(ObjcId),
     StdinMain(PresentableDraw, usize),
 }
 
 pub struct MetalCx {
     pub device: ObjcId,
-    command_queue: ObjcId
+    command_queue: ObjcId,
+    #[cfg(target_os = "ios")]
+    last_surface_command: std::cell::RefCell<Option<RcObjcId>>,
 }
 
 
@@ -846,6 +875,20 @@ pub struct SlErr {
 }*/
 
 impl MetalCx {
+    #[cfg(target_os = "ios")]
+    fn track_surface_queue(&self, command: ObjcId) {
+        *self.last_surface_command.borrow_mut() = NonNull::new(command).map(RcObjcId::from_unowned);
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn drain_surface_queue(&self) {
+        // Wait on work already committed to the queue; don't submit a sentinel
+        // command after UIKit has entered the background.
+        if let Some(command) = self.last_surface_command.borrow_mut().take() {
+            let () = unsafe { msg_send![command.as_id(), waitUntilCompleted] };
+        }
+    }
+
     
     pub(crate) fn new(info: &mut crate::gpu_info::GpuInfo) -> MetalCx {
         let device = get_default_metal_device().expect("Cannot get default metal device");
@@ -857,7 +900,9 @@ impl MetalCx {
         });
         MetalCx {
             command_queue: unsafe {msg_send![device, newCommandQueue]},
-            device: device
+            device,
+            #[cfg(target_os = "ios")]
+            last_surface_command: Default::default(),
         }
     }
 }

@@ -18,13 +18,33 @@ pub fn define_ios_app_delegate() -> *const Class {
     let mut decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
     
     extern "C" fn did_finish_launching_with_options(
-        _: &Object,
+        this: &Object,
         _: Sel,
         _: ObjcId,
         _: ObjcId,
     ) -> BOOL {
-        with_ios_app(|app| app.did_finish_launching_with_options());
+        with_ios_app(|app| app.did_finish_launching_with_options(std::ptr::from_ref(this).cast_mut()));
         YES
+    }
+
+    extern "C" fn app_active(_: &Object, _: Sel, _: ObjcId) {
+        IosApp::set_surface_active(true);
+    }
+
+    extern "C" fn app_inactive(_: &Object, _: Sel, _: ObjcId) {
+        IosApp::set_surface_active(false);
+    }
+
+    extern "C" fn memory_warning(_: &Object, _: Sel, _: ObjcId) {
+        IosApp::do_callback(super::ios_event::IosEvent::SurfaceMemoryWarning);
+    }
+
+    extern "C" fn scene_active(_: &Object, _: Sel, notification: ObjcId) {
+        IosApp::surface_scene_changed(notification, true);
+    }
+
+    extern "C" fn scene_inactive(_: &Object, _: Sel, notification: ObjcId) {
+        IosApp::surface_scene_changed(notification, false);
     }
     
     unsafe {
@@ -33,15 +53,41 @@ pub fn define_ios_app_delegate() -> *const Class {
             did_finish_launching_with_options
             as extern "C" fn(&Object, Sel, ObjcId, ObjcId) -> BOOL,
         );
+        decl.add_method(sel!(applicationDidBecomeActive:), app_active as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(applicationWillResignActive:), app_inactive as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(applicationDidEnterBackground:), app_inactive as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(applicationDidReceiveMemoryWarning:), memory_warning as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(surfaceSceneActivated:), scene_active as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(surfaceSceneSuspended:), scene_inactive as extern "C" fn(&Object, Sel, ObjcId));
     }
     
     return decl.register();
 }
 
-pub fn define_mtk_view() -> *const Class {
-    let mut decl = ClassDecl::new("MakepadView", class!(MTKView)).unwrap();
+pub fn define_ios_view() -> *const Class {
+    let mut decl = ClassDecl::new("MakepadView", class!(UIView)).unwrap();
     extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
         YES
+    }
+
+    extern "C" fn layout_subviews(this: &Object, _: Sel) {
+        unsafe { let () = msg_send![super (this, class!(UIView)), layoutSubviews]; }
+        IosApp::surface_frame(false);
+    }
+
+    extern "C" fn safe_area_changed(this: &Object, _: Sel) {
+        unsafe { let () = msg_send![super (this, class!(UIView)), safeAreaInsetsDidChange]; }
+        IosApp::surface_frame(false);
+    }
+
+    extern "C" fn traits_changed(this: &Object, _: Sel, prior: ObjcId) {
+        unsafe { let () = msg_send![super (this, class!(UIView)), traitCollectionDidChange: prior]; }
+        IosApp::surface_frame(false);
+    }
+
+    extern "C" fn moved_to_window(this: &Object, _: Sel) {
+        unsafe { let () = msg_send![super (this, class!(UIView)), didMoveToWindow]; }
+        IosApp::surface_frame(false);
     }
     
     fn on_touch(this: &Object, event: ObjcId, state: TouchState) {
@@ -87,6 +133,10 @@ pub fn define_mtk_view() -> *const Class {
     
     unsafe {
         decl.add_method(sel!(isOpaque), yes as extern "C" fn(&Object, Sel) -> BOOL);
+        decl.add_method(sel!(layoutSubviews), layout_subviews as extern "C" fn(&Object, Sel));
+        decl.add_method(sel!(safeAreaInsetsDidChange), safe_area_changed as extern "C" fn(&Object, Sel));
+        decl.add_method(sel!(traitCollectionDidChange:), traits_changed as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(didMoveToWindow), moved_to_window as extern "C" fn(&Object, Sel));
         decl.add_method(
             sel!(touchesBegan: withEvent:),
             touches_began as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
@@ -107,33 +157,6 @@ pub fn define_mtk_view() -> *const Class {
     
     return decl.register();
 }
-
-pub fn define_mtk_view_delegate() -> *const Class {
-    let mut decl = ClassDecl::new("MakepadViewDlg", class!(NSObject)).unwrap();
-    
-    extern "C" fn draw_in_rect(_this: &Object, _: Sel, _: ObjcId) {
-        IosApp::draw_in_rect();
-    }
-    
-    extern "C" fn draw_size_will_change(_this: &Object, _: Sel, _: ObjcId, _: ObjcId) {
-        crate::log!("Draw size will change");
-        IosApp::draw_size_will_change();
-    }
-    unsafe {
-        decl.add_method(
-            sel!(drawInMTKView:),
-            draw_in_rect as extern "C" fn(&Object, Sel, ObjcId),
-        );
-        decl.add_method(
-            sel!(mtkView: drawableSizeWillChange:),
-            draw_size_will_change as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
-        );
-    }
-    
-    decl.add_ivar::<*mut c_void>("display_ptr");
-    return decl.register();
-}
-
 /// Defines a class that acts as the target "receiver" for the long press gesture recognizer's
 /// "gesture recognized" action.
 pub fn define_gesture_recognizer_handler() -> *const Class {
@@ -156,8 +179,7 @@ pub fn define_gesture_recognizer_handler() -> *const Class {
                 IosApp::send_long_press(location_in_view, uid);
             }
             // Note: in `did_finish_launching_with_options()`, we set gesture recognizer's `cancelTouchesInView` property
-            // to `NO`, which means that the gesture recognizer will still allow Makepad's MTKView
-            // to continue receiving touch events even after the long-press gesture has been recognized.
+            // to `NO`, so the content view continues receiving touch events.
             // Thus, we don't need to handle the UIGestureRecognizerStateChanged or UIGestureRecognizerStateEnded
             // states here, as they'll be handled by the `on_touch` function above, as normal.
         }
@@ -179,8 +201,8 @@ pub fn define_ios_timer_delegate() -> *const Class {
         IosApp::send_timer_received(nstimer);
     }
     
-    extern "C" fn received_live_resize(_this: &Object, _: Sel, _nstimer: ObjcId) {
-        IosApp::send_paint_event();
+    extern "C" fn display_frame(_: &Object, _: Sel, _: ObjcId) {
+        IosApp::surface_frame(true);
     }
     
     let superclass = class!(NSObject);
@@ -189,7 +211,7 @@ pub fn define_ios_timer_delegate() -> *const Class {
     // Add callback methods
     unsafe {
         decl.add_method(sel!(receivedTimer:), received_timer as extern "C" fn(&Object, Sel, ObjcId));
-        decl.add_method(sel!(receivedLiveResize:), received_live_resize as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(displayFrame:), display_frame as extern "C" fn(&Object, Sel, ObjcId));
     }
     
     return decl.register();
@@ -234,9 +256,11 @@ pub fn define_textfield_delegate() -> *const Class {
     }
     
     extern "C" fn keyboard_did_change_frame(_: &Object, _: Sel, _notif: ObjcId) {
+        IosApp::surface_frame(false);
     }
     
     extern "C" fn keyboard_will_change_frame(_: &Object, _: Sel, _notif: ObjcId) {
+        IosApp::surface_frame(false);
     }
     
     extern "C" fn keyboard_will_hide(_: &Object, _: Sel, notif: ObjcId) {
@@ -296,10 +320,6 @@ pub fn define_textfield_delegate() -> *const Class {
     }
     
     unsafe {
-        /*decl.add_method(
-            sel!(drawInMTKView:),
-            draw_in_rect as extern "C" fn(&Object, Sel, ObjcId),
-        );*/
         decl.add_method(sel!(keyboardDidChangeFrame:), keyboard_did_change_frame as extern "C" fn(&Object, Sel, ObjcId),);
         decl.add_method(sel!(keyboardWillChangeFrame:), keyboard_will_change_frame as extern "C" fn(&Object, Sel, ObjcId),);
         decl.add_method(sel!(keyboardWillShow:), keyboard_will_show as extern "C" fn(&Object, Sel, ObjcId),);

@@ -2,6 +2,8 @@
 pub mod apple_util;
 pub mod apple_sys;
 pub mod metal;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) mod surface_present;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

@@ -1,4 +1,9 @@
-use super::metal_surface::{SurfaceKey, SurfacePresenter};
+use crate::os::apple::surface_present::{self, SurfaceKey, SurfacePresenter};
+
+#[link(name = "QuartzCore", kind = "framework")]
+extern "C" {
+    static kCAGravityTopLeft: ObjcId;
+}
 
 use {
     std::{
@@ -72,7 +77,18 @@ impl MetalWindow {
         let mut cocoa_window = Box::new(MacosWindow::new(window_id));
         
         cocoa_window.init(title, inner_size, position);
-        let surface = SurfacePresenter::new(cocoa_window.view);
+        let layer = surface_present::new_layer();
+        let view = cocoa_window.view;
+        unsafe {
+            let () = msg_send![layer.as_id(), setDelegate: view];
+            let () = msg_send![layer.as_id(), setContentsGravity: kCAGravityTopLeft];
+            let () = msg_send![layer.as_id(), setNeedsDisplayOnBoundsChange: YES];
+            let () = msg_send![layer.as_id(), setAutoresizingMask: (1usize << 4) | (1 << 1)];
+            let () = msg_send![view, setLayer: layer.as_id()];
+            let () = msg_send![view, setWantsLayer: YES];
+            let () = msg_send![view, setLayerContentsPlacement: 11usize]; // TopLeft
+        }
+        let surface = SurfacePresenter::new(layer);
         
         MetalWindow {
             window_id,
