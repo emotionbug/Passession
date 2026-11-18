@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.42 - 2026-11-18
+
 ### Added
 
 - Animate moving between screens on phones and narrow windows. Opening a session from the menu slides it in, and going back to the menu slides it out; detail views (files, diffs, subagents, logs) and the file explorer do the same. A transition that is interrupted turns around from where it is, and a window resize ends it at its destination.

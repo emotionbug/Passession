@@ -1,0 +1,14 @@
+Added
+- Screens slide between the menu, a session and its details.
+
+Changed
+- Material-style animations that only move drawn layers.
+- Only changed parts of the screen are redrawn, at the display rate.
+- Chat search jumps to the first match at once; long chats open faster.
+- Find in files and terminals reuses results.
+
+Fixed
+- The picture returns after Android resets graphics.
+- Update checks no longer hit GitHub's rate limit.
+
+Full notes: https://github.com/emotionbug/Passession/releases
