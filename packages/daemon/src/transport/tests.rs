@@ -52,6 +52,47 @@ fn permission_arrays_are_alternatives_and_unknown_operations_fail_closed() {
     ));
 }
 
+fn schema_message_types(schema: &str) -> Vec<String> {
+    let schema: Value = serde_json::from_str(schema).unwrap();
+    schema["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|variant| {
+            variant["properties"]["type"]["const"]
+                .as_str()
+                .expect("every wire variant names its type")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// A message the protocol declares but the permission table omits fails closed at send time,
+/// which silently broke checkout observation; every declared session message needs an entry.
+#[test]
+fn every_declared_session_message_has_a_permission_entry() {
+    let missing: Vec<_> = schema_message_types(include_str!(
+        "../../../protocol/schema/session-outbound.json"
+    ))
+    .into_iter()
+    .filter(|kind| permissions::outbound(kind).is_none())
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "outbound without permission: {missing:?}"
+    );
+    let missing: Vec<_> = schema_message_types(include_str!(
+        "../../../protocol/schema/session-inbound.json"
+    ))
+    .into_iter()
+    .filter(|kind| permissions::inbound(kind).is_none())
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "inbound without permission: {missing:?}"
+    );
+}
+
 #[tokio::test]
 async fn replies_require_request_type_id_and_original_live_source() {
     let (old, mut old_output) = make_source("old", true);

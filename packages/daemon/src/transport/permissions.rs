@@ -345,6 +345,7 @@ pub fn outbound(operation: &str) -> Option<&'static [&'static str]> {
         | "checkout.forge.get_check_details.response"
         | "checkout.github.get_check_details.response"
         | "checkout.log.response"
+        | "checkout.observe.response"
         | "checkout.refresh.response"
         | "checkout.refs.response"
         | "checkout_diff_update"

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Update Git status in the app live again. Since 0.13.36 the daemon refused to send its reply to the app's Git observation request, because that reply was missing from the daemon's list of allowed messages, so the app only saw Git changes when it asked again. A test now checks that every message in the protocol has a permission entry.
+
 ## 0.13.37 - 2026-11-18
 
 ### Added
