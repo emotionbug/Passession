@@ -45,6 +45,7 @@ impl CxTexturePool {
         let cx_texture = CxTexture {
             format: requested_format,
             alloc: None,
+            visual_revision: crate::damage::next_resource_revision(),
             ..Default::default()
         };
 
@@ -193,21 +194,80 @@ impl TextureUpdated {
     }
 
     pub fn update(self, dirty_rect: Option<RectUsize>) -> Self {
-        let new = match dirty_rect {
+        match dirty_rect {
+            Some(rect) if rect.size.width == 0 || rect.size.height == 0 => self,
             Some(dirty_rect) => match self {
                 TextureUpdated::Empty => TextureUpdated::Partial(dirty_rect),
                 TextureUpdated::Partial(rect) => 
-                TextureUpdated::Partial(rect.union(dirty_rect)),
+                    TextureUpdated::Partial(rect.union(dirty_rect)),
                 TextureUpdated::Full => TextureUpdated::Full,
             },
             None => TextureUpdated::Full,
-        };
-        if let TextureUpdated::Partial(p) = new{
-            if p.size == SizeUsize::new(0,0){
-                return TextureUpdated::Empty
-            }
         }
-        new
+    }
+}
+
+/// A borrowed rectangle from a CPU-backed texture, with the original row pitch.
+/// `bytes` starts at the first dirty pixel and ends at the last one.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct VecTextureUpload<'a> {
+    pub rect: RectUsize,
+    pub bytes: &'a [u8],
+    pub bytes_per_pixel: usize,
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    pub row_length: usize,
+    pub row_stride: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TextureFormat {
+    pub(crate) fn vec_upload(&self, updated: TextureUpdated, reallocate: bool) -> Option<VecTextureUpload<'_>> {
+        // Only called with slices of initialized primitive pixels (u8, u32 or f32).
+        unsafe fn bytes<T>(pixels: &[T]) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast(), std::mem::size_of_val(pixels)) }
+        }
+
+        let (width, height) = self.vec_width_height().unwrap();
+        let (bytes, bytes_per_pixel, row_length) = match self {
+            Self::VecBGRAu8_32 { data, .. } | Self::VecMipBGRAu8_32 { data, .. } =>
+                (unsafe { bytes(data.as_deref()?) }, 4, width),
+            Self::VecRGBAf32 { data, .. } => (unsafe { bytes(data.as_deref()?) }, 16, width),
+            Self::VecRf32 { data, .. } => (unsafe { bytes(data.as_deref()?) }, 4, width),
+            Self::VecRu8 { data, unpack_row_length, .. } =>
+                (data.as_deref()?, 1, unpack_row_length.unwrap_or(width)),
+            Self::VecRGu8 { data, unpack_row_length, .. } =>
+                (data.as_deref()?, 2, unpack_row_length.unwrap_or(width)),
+            _ => unreachable!(),
+        };
+        assert!(row_length >= width, "texture row length is smaller than its width");
+
+        let rect = match updated {
+            TextureUpdated::Empty => return None,
+            TextureUpdated::Partial(rect) if !reallocate => rect,
+            _ => RectUsize::new(PointUsize::new(0, 0), SizeUsize::new(width, height)),
+        };
+        let PointUsize { x, y } = rect.origin;
+        let SizeUsize { width: w, height: h } = rect.size;
+        assert!(x <= width && w <= width - x && y <= height && h <= height - y,
+            "texture upload rectangle is out of bounds");
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        // Validate the range before handing a pointer and stride to a driver.
+        let row_stride = row_length.checked_mul(bytes_per_pixel).expect("texture row too wide");
+        let end = (y + h - 1).checked_mul(row_stride)
+            .and_then(|last_row| last_row.checked_add((x + w) * bytes_per_pixel))
+            .expect("texture too large");
+        let start = y * row_stride + x * bytes_per_pixel;
+        Some(VecTextureUpload {
+            rect,
+            bytes: &bytes[start..end],
+            bytes_per_pixel,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            row_length,
+            row_stride,
+        })
     }
 }
 
@@ -285,6 +345,7 @@ impl CxTexture{
         initial
     }
         
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn alloc_vec(&mut self)->bool{
         if let Some(alloc) = self.format.as_vec_alloc(){
             if self.alloc.is_none() || self.alloc.as_ref().unwrap() != &alloc{
@@ -549,8 +610,8 @@ impl Texture {
         &cx.textures[self.texture_id()].animation
     }
         
-    pub fn get_format<'a>(&self, cx: &'a mut Cx) -> &'a mut TextureFormat {
-        &mut cx.textures[self.texture_id()].format
+    pub fn get_format<'a>(&self, cx: &'a Cx) -> &'a TextureFormat {
+        &cx.textures[self.texture_id()].format
     }
 
     pub fn take_vec_u32(&self, cx: &mut Cx) -> Vec<u32> {
@@ -575,6 +636,7 @@ impl Texture {
             std::mem::swap(data, vec)
         }
         *updated = updated.update(None);
+        cx_texture.mark_content_changed();
     }
 
     pub fn put_back_vec_u32(&self, cx: &mut Cx, new_data: Vec<u32>, dirty_rect: Option<RectUsize>) {
@@ -586,6 +648,9 @@ impl Texture {
         //assert!(data.is_none(), "image data not taken or already put back");
         *data = Some(new_data);
         *updated = updated.update(dirty_rect);
+        if dirty_rect.is_none_or(|rect| rect.size.width != 0 && rect.size.height != 0) {
+            cx_texture.mark_content_changed();
+        }
     }
 
     pub fn take_vec_u8(&self, cx: &mut Cx) -> Vec<u8> {
@@ -608,6 +673,9 @@ impl Texture {
         assert!(data.is_none(), "image data not taken or already put back");
         *data = Some(new_data);
         *updated = updated.update(dirty_rect);
+        if dirty_rect.is_none_or(|rect| rect.size.width != 0 && rect.size.height != 0) {
+            cx_texture.mark_content_changed();
+        }
     }
             
     pub fn take_vec_f32(&self, cx: &mut Cx) -> Vec<f32> {
@@ -630,6 +698,9 @@ impl Texture {
         assert!(data.is_none(), "image data not taken or already put back");
         *data = Some(new_data);
         *updated = updated.update(dirty_rect);
+        if dirty_rect.is_none_or(|rect| rect.size.width != 0 && rect.size.height != 0) {
+            cx_texture.mark_content_changed();
+        }
     }
 }
 
@@ -638,6 +709,51 @@ pub struct CxTexture {
     pub (crate) format: TextureFormat,
     pub (crate) alloc: Option<TextureAlloc>,
     pub (crate) animation: Option<TextureAnimation>,
+    pub(crate) visual_revision: u64,
     pub os: CxOsTexture,
     pub previous_platform_resource: Option<CxOsTexture>,
+}
+
+impl CxTexture {
+    pub(crate) fn mark_content_changed(&mut self) {
+        self.visual_revision = crate::damage::next_resource_revision();
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn texture_upload_uses_strided_rg_rows_and_full_bytes_on_reallocation() {
+        let dirty = TextureUpdated::Partial(RectUsize::new(
+            PointUsize::new(2, 1),
+            SizeUsize::new(3, 2),
+        ));
+        let format = TextureFormat::VecRGu8 {
+            width: 5,
+            height: 3,
+            data: Some((0..34).collect()),
+            unpack_row_length: Some(6),
+            updated: dirty,
+        };
+        let partial = format.vec_upload(dirty, false).unwrap();
+        assert_eq!(partial.row_stride, 12);
+        assert_eq!(partial.bytes_per_pixel, 2);
+        assert_eq!(partial.bytes, (16..34).collect::<Vec<_>>());
+        let full = format.vec_upload(dirty, true).unwrap();
+        assert_eq!(full.rect.size, SizeUsize::new(5, 3));
+        assert_eq!(full.bytes, (0..34).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn texture_upload_empty_rectangle_does_not_expand_pending_dirty_bounds() {
+        let rect = RectUsize::new(PointUsize::new(2, 3), SizeUsize::new(1, 2));
+        let zero = RectUsize::new(PointUsize::new(0, 0), SizeUsize::new(0, 4));
+        let TextureUpdated::Partial(updated) = TextureUpdated::Empty.update(Some(rect)).update(Some(zero)) else {
+            panic!("a pending upload was lost");
+        };
+        assert_eq!((updated.origin.x, updated.origin.y), (2, 3));
+        assert_eq!(updated.size, rect.size);
+    }
 }

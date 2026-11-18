@@ -311,6 +311,7 @@ pub struct CxDrawShaderMapping {
     pub draw_call_uniforms: DrawShaderInputs,
     pub pass_uniforms: DrawShaderInputs,
     pub textures: Vec<DrawShaderTextureInput>,
+    pub(crate) fragments_bounded_by_clip: bool,
     pub uses_time: bool,
     pub instance_enums: Vec<usize>,
     pub rect_pos: Option<usize>,
@@ -411,6 +412,7 @@ impl CxDrawShaderMapping {
         CxDrawShaderMapping {
             const_table,
             uses_time: draw_shader_def.uses_time.get(),
+            fragments_bounded_by_clip: false,
             flags: draw_shader_def.flags,
             geometries,
             instances,

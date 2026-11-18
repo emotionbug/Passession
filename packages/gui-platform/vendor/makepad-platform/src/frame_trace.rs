@@ -41,7 +41,10 @@ struct Sample {
     layers: BTreeMap<Owner, (usize, usize)>,
     actions: usize,
     render_passes: usize,
+    render_frames: usize,
     render_time: Duration,
+    texture_uploads: usize,
+    texture_upload_bytes: u64,
 }
 
 pub(crate) struct FrameTrace {
@@ -112,7 +115,14 @@ impl FrameTrace {
     pub(crate) fn render(&self, passes: usize, elapsed: Duration) {
         let mut sample = self.sample.lock().unwrap();
         sample.render_passes += passes;
+        sample.render_frames += usize::from(passes != 0);
         sample.render_time += elapsed;
+    }
+
+    pub(crate) fn texture_upload(&self, width: usize, height: usize, bytes_per_pixel: usize) {
+        let mut sample = self.sample.lock().unwrap();
+        sample.texture_uploads += 1;
+        sample.texture_upload_bytes += width as u64 * height as u64 * bytes_per_pixel as u64;
     }
 }
 
@@ -153,10 +163,11 @@ impl Sample {
         let draw_time = self.events.get("Draw").map_or(Duration::ZERO, |cost| cost.time);
         let all_event_time: Duration = self.events.values().map(|cost| cost.time).sum();
         eprintln!(
-            "PASEO_FRAME_TRACE t={:.3}s interval={:.3}s draw={} render_passes={} next_frame={} timer={} signal={} actions={}/{} event_ms={:.3} draw_ms={:.3} render_ms={:.3} events=[{}] timers=[{}] next_frame_requests=[{}] layers=[{}] redraw=[{}]",
-            since_start.as_secs_f64(), interval.as_secs_f64(), event("Draw"), self.render_passes,
+            "PASEO_FRAME_TRACE t={:.3}s interval={:.3}s draw={} render_passes={} render_frames={} next_frame={} timer={} signal={} actions={}/{} event_ms={:.3} draw_ms={:.3} render_ms={:.3} texture_uploads={} texture_upload_bytes={} events=[{}] timers=[{}] next_frame_requests=[{}] layers=[{}] redraw=[{}]",
+            since_start.as_secs_f64(), interval.as_secs_f64(), event("Draw"), self.render_passes, self.render_frames,
             event("NextFrame"), event("Timer"), event("Signal"), event("Actions"), self.actions,
             ms(all_event_time - draw_time), ms(draw_time), ms(self.render_time),
+            self.texture_uploads, self.texture_upload_bytes,
             series(self.events.iter().map(|(name, cost)| format!("{name}={cost}"))),
             series(self.timers.iter().map(|(owner, cost)| {
                 owner.map_or_else(|| format!("unknown={cost}"), |owner| format!("{owner}={cost}"))

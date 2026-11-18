@@ -19,7 +19,7 @@ pub struct FontAtlas<T> {
 #[derive(Clone, Debug)]
 struct AtlasPage<T> {
     image: Image<T>,
-    dirty_rect: Rect<usize>,
+    dirty_rect: Option<Rect<usize>>,
     current_point: Point<usize>,
     current_row_height: usize,
 }
@@ -28,7 +28,7 @@ impl<T: Clone + Default> AtlasPage<T> {
     fn new(size: Size<usize>) -> Self {
         Self {
             image: Image::new(size),
-            dirty_rect: Rect::ZERO,
+            dirty_rect: None,
             current_point: Point::ZERO,
             current_row_height: 0,
         }
@@ -48,7 +48,7 @@ impl<T: Clone + Default> AtlasPage<T> {
         self.current_point = Point::new(origin.x + size.width, origin.y);
         self.current_row_height = row_height.max(size.height);
         let rect = Rect::new(origin, size);
-        self.dirty_rect = self.dirty_rect.union(rect);
+        self.dirty_rect = Some(self.dirty_rect.map_or(rect, |dirty| dirty.union(rect)));
         Some(rect)
     }
 }
@@ -85,7 +85,7 @@ impl<T: Clone + Default> FontAtlas<T> {
 
     pub fn take_dirty_image(&mut self, page: usize) -> Subimage<'_, T> {
         let page = self.pages[page].as_mut().unwrap();
-        let dirty_rect = std::mem::replace(&mut page.dirty_rect, Rect::ZERO);
+        let dirty_rect = page.dirty_rect.take().unwrap_or(Rect::ZERO);
         page.image.subimage(dirty_rect)
     }
 
@@ -179,6 +179,25 @@ mod tests {
 
     fn key(id: GlyphId, size: usize) -> GlyphImageKey {
         GlyphImageKey { font_id: FontId::from("atlas-page-test"), glyph_id: id, size: Size::new(size, size) }
+    }
+
+    #[test]
+    fn glyph_dirty_rect_covers_only_new_glyphs_after_upload() {
+        let mut atlas = GrayscaleAtlas::new(Size::new(8, 8));
+        atlas.get_or_allocate_glyph_image(key(1, 3)).unwrap();
+        assert_eq!(atlas.take_dirty_image(0).bounds(), Rect::from(Size::new(3, 3)));
+        atlas.get_or_allocate_glyph_image(key(2, 2)).unwrap();
+        atlas.get_or_allocate_glyph_image(key(3, 3)).unwrap();
+        assert_eq!(
+            atlas.take_dirty_image(0).bounds(),
+            Rect::new(Point::new(3, 0), Size::new(5, 3)),
+        );
+        atlas.get_or_allocate_glyph_image(key(4, 2)).unwrap();
+        assert_eq!(
+            atlas.take_dirty_image(0).bounds(),
+            Rect::new(Point::new(0, 3), Size::new(2, 2)),
+        );
+        assert_eq!(atlas.take_dirty_image(0).bounds(), Rect::ZERO);
     }
 
     #[test]

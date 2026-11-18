@@ -702,7 +702,8 @@ impl<'a,'b> Cx2d<'a,'b> {
                 AlignEntry::Area(Area::Instance(inst)) => {
                     let draw_list = &mut self.cx.cx.draw_lists[inst.draw_list_id];
                     let draw_item = &mut draw_list.draw_items[inst.draw_item_id];
-                    let draw_call = draw_item.draw_call().unwrap();
+                    let draw_call = draw_item.kind.draw_call_mut().unwrap();
+                    draw_call.mark_instances_changed();
                     let sh = &self.cx.cx.draw_shaders[draw_call.draw_shader.draw_shader_id];
                     let inst_buf = draw_item.instances.as_mut().unwrap();
                     for i in 0..inst.instance_count {
@@ -804,7 +805,8 @@ impl<'a,'b> Cx2d<'a,'b> {
                 AlignEntry::Area(Area::Instance(inst)) => if let Some((clip0, clip1)) = self.turtle_clips.last(){
                     let draw_list = &mut self.cx.cx.draw_lists[inst.draw_list_id];
                     let draw_item = &mut draw_list.draw_items[inst.draw_item_id];
-                    let draw_call = draw_item.draw_call().unwrap();
+                    let draw_call = draw_item.kind.draw_call_mut().unwrap();
+                    draw_call.mark_instances_changed();
                     let sh = &self.cx.cx.draw_shaders[draw_call.draw_shader.draw_shader_id];
                     let inst_buf = draw_item.instances.as_mut().unwrap();
                     for i in 0..inst.instance_count {

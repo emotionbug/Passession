@@ -23,6 +23,7 @@ live_design!{
         varying tex_coord1: vec2
         varying clipped: vec2
         varying world: vec4,
+        fn clip_bounds_contract(self) {}
         fn clip_and_transform_vertex(self, rect_pos: vec2, rect_size: vec2) -> vec4 {
             let clipped: vec2 = clamp(
                 clamp(

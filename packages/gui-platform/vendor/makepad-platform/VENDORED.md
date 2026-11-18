@@ -143,13 +143,44 @@ instead of unwrapping it. The colour is cosmetic; Wine's DXGI returns `E_NOTIMPL
 and the unwrap aborted window creation there, so the Windows build could not be
 exercised under Wine.
 
+## Native renderer identity and animation pacing
+
+X11 and Android request EGL swap interval 1 after each new window surface
+becomes current. X11 dispatches `NextFrame` before each window repaint and
+normally relies on swap backpressure. Software EGL (for example, llvmpipe on
+Xvfb) or a rejected swap interval uses a display-rate deadline in the existing
+X11/timer `select` wait. The fallback uses the XRandR screen rate when available,
+otherwise 60 Hz. The optional XRandR library stays loaded until after
+`XCloseDisplay`, which invokes registered extension callbacks. Android
+also keeps its existing Choreographer (or timer) wake.
+
+Windows queues sync-interval-1 presentation with a maximum frame latency of
+one where supported. The next animation tick inherits the swap's backpressure;
+without a window submission, it waits for the compositor instead. Minimized or
+hidden windows skip rendering; `DXGI_STATUS_OCCLUDED` suspends submissions for
+that swap chain until a periodic `DXGI_PRESENT_TEST` succeeds. Device setup tries
+hardware adapters first, then the WARP software driver, and reports a startup
+error if neither succeeds.
+
+On macOS, a CoreVideo display link targets the key window's screen (otherwise
+the first window's screen). It coalesces ticks onto the AppKit event queue only
+while `NextFrame` work is pending. Input and resize paints do not advance
+animations themselves. If CoreVideo cannot start, the existing timer supplies
+animation ticks capped at 60 Hz.
+
+`gpu_info.rs` stores and logs the actual native API/renderer once during
+initialization. EGL also reports GL vendor/version, shading-language version and
+EGL vendor. Windows reports DXGI adapter description, D3D feature level and WARP
+selection; Metal reports the selected device name. The same info reaches the
+existing client diagnostics report and flags known CPU renderers.
+
 ## Android Surface lifetime
 
 `os/linux/android/android.rs` gates drawing and `SurfaceTexture.updateTexImage`
 on a live window Surface. `SurfaceDestroyed` unbinds EGL, but queued RenderLoop
 messages and background model updates can still arrive. Those events must not
 consume redraw/next-frame work, clear upload dirty bits or allocate GPU objects
-until `update_surface` has made the retained EGL context current again.
+until a native window surface has made the EGL context current again.
 
 The installed 0.13.10 APK's crash PC `0x27bebe8` is the indirect
 `glDrawElementsInstanced` call. The device's Adreno stack then copies from null
@@ -158,6 +189,17 @@ reproduced the missing-context state corruption: the old path cached `Some(0)`
 and cleared upload state; the gated path deferred work and uploaded after
 restoration. This establishes the lifecycle defect, not the device's missing
 pre-crash event sequence or an on-device confirmation of the fix.
+
+Android chooses a window config with RGB8 and 24-bit depth, preferring no alpha
+or stencil; Quest's OpenXR window requires alpha and pbuffer support instead.
+Both paths reject MSAA for the window surface. A bad surface is re-created with
+the retained context when the native window is still valid. On context loss the
+GL backend forgets old names without deleting them in the new context, preserves
+CPU data, and re-creates textures, geometry, instance/uniform buffers, VAOs,
+programs and offscreen targets on the next draw. It repaints capture passes so
+they repopulate the new render targets. Producer-owned Android video decoders
+bound to the lost context are stopped; their external textures cannot be carried
+into the new context.
 
 ## Android activity lifecycle (one native app per process)
 
@@ -598,3 +640,56 @@ Three changes are not mechanical:
   null `HWND` 0.56 returned on failure.
 
 `winrt_midi.rs` stores the WinRT event token as the `i64` 0.61 returns.
+
+## CPU-backed texture uploads
+
+Upstream Makepad [disabled GL partial uploads globally in `f10203851d27`](https://github.com/makepad/makepad/commit/f10203851d27a6b10f37bc79db32e631e2ead582),
+following a simulator-only workaround; the commit did not diagnose the failure.
+The disabled path relied on GLES3 unpack row/skip enums even in GLES2, assumed
+rows were as wide as the texture, and used bytes per pixel as unpack alignment
+(16 is not a legal alignment). It also left the unpack state changed.
+
+`texture.rs` now computes a validated source range and row pitch for a dirty
+rectangle, or the entire texture for a new allocation. GL allocates with
+`glTexImage2D`, then uses `glTexSubImage2D` at unchanged dimensions and format.
+It aligns byte textures to 1, restores unpack state, and uses row length only
+on profiles that support it. GLES2 packs strided rows into reusable scratch.
+The OpenHarmony simulator converts BGRA to RGBA in scratch instead of
+mutating the retained texture pixels.
+
+D3D11 creates a default-usage texture and view once per allocation and uses
+`UpdateSubresource` with a destination box. Metal calls `replaceRegion` for the
+dirty region. Both point to the first dirty pixel with the original source
+row pitch. Frame tracing reports submitted upload count and texel bytes on
+these three backends.
+
+## Retained window damage
+
+`damage.rs` compares the ordered render tree with the last successful present,
+including old/new bounds, draw-list transform/clip/shift, rebuild and retained
+instance/uniform revisions, texture/geometry content, and broad invalidations.
+Resource uploads cannot accidentally acknowledge visual damage. Clip-bounded
+vertex paths opt in by source, and unsupported transforms, changed unknown
+lists, time-varying or external pixels, and unclassified repaint requests fall
+back to rendering the full window. An unchanged draw with unknown bounds is
+replayed inside the repair scissor.
+
+X11 and Android keep a bounded EGLSurface-owned damage history. The acquired
+buffer's age selects the repair region, which limits the color/depth clear
+and draw submission. `EGL_KHR_partial_update`, when available, receives the
+repair region; `eglSwapBuffersWithDamageKHR/EXT` instead receives the delta
+from the immediately preceding presentation. Age zero, an insufficient
+history, resize, expose/recreation, failed binding or presentation never
+use assumed backbuffer contents. Culling preserves depth-bias order.
+
+Windows uses flip-sequential `Present1` dirty rectangles with D3D11.1
+`ClearView` and a scissor. DXGI reconciles old backbuffer contents outside
+the rect; no additional window-sized copy is submitted. Without `ClearView`
+support (or if flip-sequential creation fails), the regular flip-discard
+path is retained. Metal still renders directly to a fresh drawable: a
+persistent BGRA8 target would allocate another 3.06 MB at 850×900 and a
+full drawable copy would read and write 6.12 MB per frame (367 MB/s at
+60 Hz), even if the only change is a small indicator. There is no Metal
+runtime measurement supporting that cost.
+
+See the development guide for the Linux same-frame pixel oracle.

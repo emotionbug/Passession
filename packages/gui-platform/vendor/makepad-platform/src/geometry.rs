@@ -126,6 +126,7 @@ impl Geometry{
         let cxgeom = &mut cx.geometries[self.geometry_id()];
         cxgeom.indices = indices;
         cxgeom.vertices = vertices;
+        cxgeom.visual_revision = crate::damage::next_resource_revision();
         cxgeom.dirty = true;
     }
 }
@@ -135,6 +136,7 @@ pub struct CxGeometry{
     pub indices: Vec<u32>,
     pub vertices: Vec<f32>,
     pub dirty: bool,
+    pub(crate) visual_revision: u64,
     pub os: CxOsGeometry
 }
 

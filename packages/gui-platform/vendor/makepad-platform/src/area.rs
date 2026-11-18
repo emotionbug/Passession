@@ -380,7 +380,7 @@ impl Area {
                 }
                 let draw_item = &mut cxview.draw_items[inst.draw_item_id];
                 //log!("{:?}", draw_item.kind.sub_list().is_some());
-                let draw_call = draw_item.kind.draw_call().unwrap();
+                let draw_call = draw_item.kind.draw_call_mut().unwrap();
                 if cx.draw_shaders.generation != draw_call.draw_shader.draw_shader_generation {
                     return;
                 }
@@ -393,6 +393,10 @@ impl Area {
                 if let Some(rect_size) = sh.mapping.rect_size {
                     buf[inst.instance_offset + rect_size + 0] = rect.size.x as f32;
                     buf[inst.instance_offset + rect_size + 1] = rect.size.y as f32;
+                }
+                draw_call.mark_instances_changed();
+                if let Some(pass_id) = cxview.pass_id {
+                    cx.passes[pass_id].paint_dirty = true;
                 }
             },
             Area::Rect(ra) => {
@@ -472,7 +476,7 @@ impl Area {
                     }
                     
                     cx.passes[draw_list.pass_id.unwrap()].paint_dirty = true;
-                    draw_call.uniforms_dirty = true;
+                    draw_call.mark_uniforms_changed();
                     
                     return Some(
                         DrawWriteRef {
@@ -488,7 +492,7 @@ impl Area {
                     }
                     
                     cx.passes[draw_list.pass_id.unwrap()].paint_dirty = true;
-                    draw_call.instance_dirty = true;
+                    draw_call.mark_instances_changed();
                     if inst.instance_count == 0 {
                         return None
                     }

@@ -14,6 +14,7 @@ use {
         },
         makepad_live_tokenizer::{LiveErrorOrigin, live_error_origin},
         makepad_shader_compiler::*,
+        makepad_shader_compiler::shader_ast::{FnPtr, Ident},
         makepad_live_id::*,
         makepad_math::*,
         cx::Cx,
@@ -341,6 +342,19 @@ impl DrawVars {
                     let live_registry = live_registry_rc.borrow();
                     let class_node = live_registry.ptr_to_node(draw_shader_ptr.0);
                     
+                    // The marker belongs to the audited vertex implementation, not to the
+                    // Rust class. Inheritance may replace vertex or any callee independently.
+                    let definition = &cx.shader_registry.draw_shader_defs[&draw_shader_ptr];
+                    let source_file = |function: FnPtr| {
+                        live_registry.ptr_to_node(function.0).origin.token_id()?.file_id()
+                    };
+                    mapping.fragments_bounded_by_clip = cx.shader_registry
+                        .draw_shader_method_ptr_from_ident(definition, Ident(live_id!(clip_bounds_contract)))
+                        .and_then(source_file)
+                        .is_some_and(|file| {
+                            definition.vertex_fns.borrow().iter()
+                                .all(|function| source_file(*function) == Some(file))
+                        });
                     let shader_type_name = match &class_node.value {
                         LiveValue::Class {live_type, ..} => {
                             // lets get the type name
@@ -409,7 +423,7 @@ impl DrawVars {
                                     instances[input.offset + i + j * stride] = inst_slice[input.offset + i]
                                 }
                             }
-                            draw_call.instance_dirty = true;
+                            draw_call.mark_instances_changed();
                         }
                     }
                     for input in &sh.mapping.user_uniforms.inputs {
@@ -420,7 +434,7 @@ impl DrawVars {
                                 draw_call.user_uniforms[input.offset + i] = self.user_uniforms[input.offset + i]
                             }
                         }
-                        draw_call.uniforms_dirty = true;
+                        draw_call.mark_uniforms_changed();
                     }
                     node_iter = nodes.next_child(node_index);
                 }
@@ -465,7 +479,7 @@ impl DrawVars {
                         }
                     }
                 }
-                draw_call.instance_dirty = true;
+                draw_call.mark_instances_changed();
                 cx.passes[draw_list.pass_id.unwrap()].paint_dirty = true;
             }
         }
@@ -495,7 +509,7 @@ impl DrawVars {
                         }
                     }
                 }
-                draw_call.instance_dirty = true;
+                draw_call.mark_instances_changed();
                 cx.passes[draw_list.pass_id.unwrap()].paint_dirty = true;
             }
         }
@@ -526,7 +540,7 @@ impl DrawVars {
                                 instances[input.offset + i + j * stride] = v[i]
                             }
                         }
-                        draw_call.instance_dirty = true;
+                        draw_call.mark_instances_changed();
                     }
                     return
                 }
@@ -535,7 +549,7 @@ impl DrawVars {
                         for i in 0..input.slots {
                             draw_call.user_uniforms[input.offset + i] = v[i]
                         }
-                        draw_call.uniforms_dirty = true;
+                        draw_call.mark_uniforms_changed();
                         return
                     }
                 }

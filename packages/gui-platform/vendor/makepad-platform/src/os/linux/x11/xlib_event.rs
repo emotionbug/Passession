@@ -25,6 +25,9 @@ pub enum XlibEvent {
     AppGotFocus(WindowId),
     AppLostFocus(WindowId),
     WindowGeomChange(WindowGeomChangeEvent),
+    Expose(WindowId),
+    #[cfg(debug_assertions)]
+    DamageOracleTouch(crate::event::TouchUpdateEvent),
     WindowClosed(WindowClosedEvent),
     Paint,
     Wake,

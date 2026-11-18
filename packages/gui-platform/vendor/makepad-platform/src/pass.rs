@@ -296,6 +296,7 @@ pub struct CxPass {
     pub main_draw_list_id: Option<DrawListId>,
     pub parent: CxPassParent,
     pub paint_dirty: bool,
+    pub(crate) damage_epoch: u64,
     pub pass_rect: Option<CxPassRect>,
     pub view_shift: DVec2,
     pub view_scale: DVec2,
@@ -323,6 +324,7 @@ impl Default for CxPass {
             view_scale: dvec2(1.0,1.0),
             parent: CxPassParent::None,
             paint_dirty: false,
+            damage_epoch: 0,
             pass_rect: None,
             os: CxOsPass::default()
         }

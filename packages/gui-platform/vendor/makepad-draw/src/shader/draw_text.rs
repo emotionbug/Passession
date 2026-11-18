@@ -42,6 +42,7 @@ live_design! {
         varying pos: vec2
         varying t: vec2
         varying world: vec4
+        fn clip_bounds_contract(self) {}
         
         fn vertex(self) -> vec4 {
             let p = mix(self.rect_pos, self.rect_pos + self.rect_size, self.geom_pos);

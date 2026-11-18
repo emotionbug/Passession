@@ -36,7 +36,13 @@ impl Cx {
         cx.borrow_mut().self_ref = Some(cx.clone());
         cx.borrow_mut().os_type = OsType::Windows;
         
-        let d3d11_cx = Rc::new(RefCell::new(D3d11Cx::new()));
+        let d3d11_cx = match D3d11Cx::new(&mut cx.borrow_mut().gpu_info) {
+            Ok(device) => Rc::new(RefCell::new(device)),
+            Err(error) => {
+                crate::error!("Could not initialize D3D11 (including WARP): {error}");
+                return;
+            }
+        };
 
         // hack: store ID3D11Device in CxOs, so texture-related operations become possible on the makepad/studio side, yet don't completely destroy the code there
         cx.borrow_mut().os.d3d11_device = Some(d3d11_cx.borrow().device.clone());
@@ -149,16 +155,38 @@ impl Cx {
                 }
             }
             Win32Event::Paint => {
+                for window in d3d11_windows.iter_mut() {
+                    let was_drawable = window.drawable;
+                    window.update_drawable();
+                    if window.drawable && !was_drawable {
+                        if let Some(pass) = self.windows[window.window_id].main_pass_id {
+                            self.repaint_pass_and_child_passes(pass);
+                        }
+                    }
+                }
+                if !d3d11_windows.iter().any(|window| window.drawable) {
+                    return EventFlow::Wait;
+                }
                 if self.new_next_frames.len() != 0 {
+                    // A continuously drawing animation inherits backpressure
+                    // from the previous sync-interval-1 Present. An animation
+                    // tick which submitted no window has no such backpressure.
+                    if !self.os.presented_last_paint {
+                        if unsafe { crate::windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
+                            std::thread::sleep(std::time::Duration::from_millis(17));
+                        }
+                    }
                     self.call_next_frame_event(with_win32_app(|app| app.time_now()));
                 }
                 if self.need_redrawing() {
                     self.call_draw_event();
                     self.hlsl_compile_shaders(&d3d11_cx);
                 }
-                // ok here we send out to all our childprocesses
-                
+                self.os.presented_last_paint = false;
                 self.handle_repaint(d3d11_windows, d3d11_cx);
+                if self.new_next_frames.is_empty() && !self.need_redrawing() && self.platform_ops.is_empty() {
+                    return EventFlow::Wait;
+                }
             }
             Win32Event::MouseDown(e) => {
                 self.fingers.process_tap_count(
@@ -265,20 +293,11 @@ impl Cx {
                 }
                 self.handle_networking_events();
                 
-                self.win32_event_callback(Win32Event::Paint, d3d11_cx, d3d11_windows);
-                
-                return EventFlow::Wait;
+                return self.win32_event_callback(Win32Event::Paint, d3d11_cx, d3d11_windows);
             }
         }
         
-        return EventFlow::Poll;
-        /*
-        if self.any_passes_dirty() || self.need_redrawing() || self.new_next_frames.len() != 0 || paint_dirty {
-            EventFlow::Poll
-        } else {
-            EventFlow::Wait
-        }*/
-        
+        EventFlow::Poll
     }
     
     pub (crate) fn handle_repaint(&mut self, d3d11_windows: &mut Vec<D3d11Window>, d3d11_cx: &mut D3d11Cx) {
@@ -292,9 +311,13 @@ impl Cx {
                 CxPassParent::Xr => {}
                 CxPassParent::Window(window_id) => {
                     if let Some(window) = d3d11_windows.iter_mut().find( | w | w.window_id == window_id) {
+                        if !window.drawable {
+                            continue;
+                        }
                         //let dpi_factor = window.window_geom.dpi_factor;                        
                         window.resize_buffers(&d3d11_cx);
-                        self.draw_pass_to_window(*pass_id, false, window, d3d11_cx);
+                        self.draw_pass_to_window(*pass_id, true, window, d3d11_cx);
+                        self.os.presented_last_paint |= window.drawable;
                     }
                 }
                 CxPassParent::Pass(_) => {
@@ -524,6 +547,7 @@ pub struct CxOs {
     pub (crate) start_time: Option<Instant>,
     pub (crate) media: CxWindowsMedia,
     pub (crate) d3d11_device: Option<ID3D11Device>,
+    presented_last_paint: bool,
     pub (crate) network_response: NetworkResponseChannel,
     /// The focused editor mirrored for inline input-method composition.
     pub (crate) ime: ImeComposer,

@@ -32,6 +32,7 @@ mod draw_shader;
 mod draw_list;
 mod draw_vars;
 
+mod damage;
 mod id_pool;
 pub mod event;
 mod area;

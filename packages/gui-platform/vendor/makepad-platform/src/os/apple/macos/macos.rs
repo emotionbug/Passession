@@ -141,7 +141,7 @@ impl Cx {
         
         cx.borrow_mut().self_ref = Some(cx.clone());
         cx.borrow_mut().os_type = OsType::Macos;
-        let metal_cx: Rc<RefCell<MetalCx >> = Rc::new(RefCell::new(MetalCx::new()));
+        let metal_cx = Rc::new(RefCell::new(MetalCx::new(&mut cx.borrow_mut().gpu_info)));
         
         // store device object ID for double buffering
         cx.borrow_mut().os.metal_device = Some(metal_cx.borrow().device);
@@ -273,10 +273,7 @@ impl Cx {
                         self.redraw_all();
                     }
                     self.handle_networking_events();
-                    self.cocoa_event_callback(MacosEvent::Paint, metal_cx, metal_windows);
-
-                    // block till the next timer
-                    return EventFlow::Wait;
+                    return self.cocoa_event_callback(MacosEvent::Paint, metal_cx, metal_windows);
                 }
             }
             _ => ()
@@ -340,18 +337,19 @@ impl Cx {
                     }
                 }
             }
-            MacosEvent::Paint => {
-                if self.new_next_frames.len() != 0 {
+            MacosEvent::Paint | MacosEvent::DisplayFrame => {
+                if matches!(event, MacosEvent::DisplayFrame) && !self.new_next_frames.is_empty() {
                     self.call_next_frame_event(with_macos_app(|app| app.time_now()));
                 }
                 if self.need_redrawing() {
                     self.call_draw_event();
                     self.mtl_compile_shaders(&metal_cx);
                 }
-                // ok here we send out to all our childprocesses
-                //self.demo_time_repaint = false;
+                let screen = (!self.new_next_frames.is_empty())
+                    .then(|| Self::animation_screen(metal_windows));
+                with_macos_app(|app| app.set_animation_screen(screen));
                 self.handle_repaint(metal_windows, metal_cx);
-                
+                return EventFlow::Wait;
             }
             MacosEvent::MouseDown(mut e) => {
                 self.dpi_override_scale(&mut e.abs, e.window_id);
@@ -447,6 +445,27 @@ impl Cx {
         //} else {
          //   EventFlow::Wait
        // }
+    }
+
+    fn animation_screen(windows: &[MetalWindow]) -> ObjcId {
+        unsafe {
+            let mut first = nil;
+            for window in windows {
+                let native = window.cocoa_window.window;
+                let screen: ObjcId = msg_send![native, screen];
+                if screen == nil {
+                    continue;
+                }
+                let is_key: BOOL = msg_send![native, isKeyWindow];
+                if is_key == YES {
+                    return screen;
+                }
+                if first == nil {
+                    first = screen;
+                }
+            }
+            first
+        }
     }
     
     fn dpi_override_scale(&self, pos:&mut DVec2, window_id:WindowId){

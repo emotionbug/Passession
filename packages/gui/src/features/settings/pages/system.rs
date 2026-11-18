@@ -481,10 +481,23 @@ fn run_diagnostic(s: &mut Settings, env: &mut Env) {
     }
     s.diagnostics.running = true;
     let hosts = env.hosts();
+    let renderer = env.cx.gpu_info().native_renderer.as_ref().map(|gpu| {
+        json!({
+            "api": gpu.api,
+            "renderer": gpu.renderer,
+            "vendor": gpu.vendor,
+            "version": gpu.version,
+            "shadingLanguageVersion": gpu.shading_language_version,
+            "eglVendor": gpu.egl_vendor,
+            "warp": gpu.warp,
+            "software": gpu.software,
+        })
+    });
     let report = json!({
         "client": {
             "version": platform::app_version(),
             "platform": platform::platform_name(),
+            "gpu": renderer,
         },
         "hosts": hosts.iter().map(|h| {
             let mut entry = json!({

@@ -65,7 +65,6 @@ use {
                         IDC_SIZENS,
                         IDC_SIZENESW,
                         IDC_SIZENWSE,
-                        WM_QUIT,
                         CS_HREDRAW,
                         CS_VREDRAW,
                         CS_OWNDC,
@@ -350,13 +349,11 @@ impl Win32App {
                     EventFlow::Wait => {
                         let mut msg = std::mem::MaybeUninit::uninit();
                         let ret = GetMessageW(msg.as_mut_ptr(), None, 0, 0);
-                        let msg = msg.assume_init();
-                        if ret == FALSE {
-                            // Only happens if the message is `WM_QUIT`.
-                            debug_assert_eq!(msg.message, WM_QUIT);
-                            with_win32_app(|app| app.event_flow = EventFlow::Exit);
+                        if ret.0 <= 0 {
+                            break;
                         }
                         else {
+                            let msg = msg.assume_init();
                             let _ = TranslateMessage(&msg);
                             DispatchMessageW(&msg);
                             if !with_win32_app(|app| app.was_signal_poll()) {
@@ -367,16 +364,16 @@ impl Win32App {
                     EventFlow::Poll => {
                         let mut msg = std::mem::MaybeUninit::uninit();
                         let ret = PeekMessageW(msg.as_mut_ptr(), None, 0, 0, PM_REMOVE);
-                        let msg = msg.assume_init();
                         if ret == FALSE {
                             Win32App::do_callback(Win32Event::Paint)
                         }
                         else {
+                            let msg = msg.assume_init();
                             let _ = TranslateMessage(&msg);
                             DispatchMessageW(&msg);
                         }
                     }
-                    EventFlow::Exit => panic!()
+                    EventFlow::Exit => break,
                 }
                 Win32App::poll_start_drag_drop();
             }

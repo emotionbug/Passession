@@ -698,6 +698,12 @@ impl Cx {
         if let Some(trace) = &self.frame_trace {
             trace.redraw(std::panic::Location::caller());
         }
+        for pass_id in self.passes.id_iter() {
+            let pass = &mut self.passes[pass_id];
+            if matches!(pass.parent, CxPassParent::Window(_)) {
+                pass.damage_epoch = pass.damage_epoch.wrapping_add(1);
+            }
+        }
         self.new_draw_event.redraw_all = true;
     }
 

@@ -11,6 +11,7 @@ use {
     },
     self::super::super::{
         dma_buf,
+        egl_damage::{EglWindowDamage, Surface},
         egl_sys::{self, LibEgl},
         gl_sys,
         gl_sys::LibGl,
@@ -19,7 +20,7 @@ use {
         cx::Cx,
         window::WindowId,
         makepad_math::DVec2,
-        pass::{PassClearColor, PassClearDepth, PassId},
+        pass::PassId,
         event::*,
         texture::{CxTexture, Texture},
     },
@@ -32,62 +33,29 @@ impl Cx {
         pass_id: PassId,
         opengl_window: &mut OpenglWindow,
     ) {
-        let draw_list_id = self.passes[pass_id].main_draw_list_id.unwrap();
-        
-        self.setup_render_pass(pass_id);
-        
-        let gl = self.os.gl();
-                
-        let egl_surface = opengl_window.egl_surface;
-        
-        self.passes[pass_id].paint_dirty = false;
-
-        let pix_width = opengl_window.window_geom.inner_size.x * opengl_window.window_geom.dpi_factor;
-        let pix_height = opengl_window.window_geom.inner_size.y * opengl_window.window_geom.dpi_factor;
-        unsafe {
-            let opengl_cx = self.os.opengl_cx.as_ref().unwrap();
-            (opengl_cx.libegl.eglMakeCurrent.unwrap())(opengl_cx.egl_display, egl_surface, egl_surface, opengl_cx.egl_context);
-            (gl.glViewport)(0, 0, pix_width.floor() as i32, pix_height.floor() as i32);
+        let opengl_cx = self.os.opengl_cx.as_ref().unwrap();
+        let surface = opengl_window.egl_surface;
+        let current = unsafe {
+            (opengl_cx.libegl.eglMakeCurrent.unwrap())(opengl_cx.egl_display, surface, surface, opengl_cx.egl_context)
+        } != 0;
+        if !current {
+            opengl_window.damage.invalidate();
+            self.passes[pass_id].paint_dirty = false;
+            return;
         }
-        
-        let clear_color = if self.passes[pass_id].color_textures.len() == 0 {
-            self.passes[pass_id].clear_color 
+        if self.setup_render_pass(pass_id).is_none() {
+            opengl_window.damage.invalidate();
+            return;
         }
-        else {
-            match self.passes[pass_id].color_textures[0].clear_color {
-                PassClearColor::InitWith(color) => color,
-                PassClearColor::ClearWith(color) => color
-            }
-        };
-        let clear_depth = match self.passes[pass_id].clear_depth {
-            PassClearDepth::InitWith(depth) => depth,
-            PassClearDepth::ClearWith(depth) => depth
-        };
-        
-        if !self.passes[pass_id].dont_clear {
-            unsafe {
-                (gl.glBindFramebuffer)(gl_sys::FRAMEBUFFER, 0);
-                (gl.glClearDepthf)(clear_depth as f32);
-                (gl.glClearColor)(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
-                (gl.glClear)(gl_sys::COLOR_BUFFER_BIT | gl_sys::DEPTH_BUFFER_BIT);
-            }
-        }
-        Self::set_default_depth_and_blend_mode(self.os.gl());
-        
-        let mut zbias = 0.0;
-        let zbias_step = self.passes[pass_id].zbias_step;
-        
-        self.render_view(
-            pass_id,
-            draw_list_id,
-            &mut zbias,
-            zbias_step,
-        );
-
-        unsafe {
-            let opengl_cx = self.os.opengl_cx.as_ref().unwrap();
-            (opengl_cx.libegl.eglSwapBuffers.unwrap())(opengl_cx.egl_display, egl_surface);
-        }
+        let geom = &opengl_window.window_geom;
+        let size = [
+            (geom.inner_size.x * geom.dpi_factor).floor() as i32,
+            (geom.inner_size.y * geom.dpi_factor).floor() as i32,
+        ];
+        let clear = self.gl_window_clear(pass_id);
+        let mut frame = opengl_window.damage.prepare(&self.os.opengl_cx.as_ref().unwrap().surface(surface), self, pass_id, size, clear);
+        opengl_window.damage.render(self, pass_id, clear, &mut frame);
+        opengl_window.damage.present(&self.os.opengl_cx.as_ref().unwrap().surface(surface), frame);
     }
 
     pub fn share_texture_for_presentable_image(
@@ -293,6 +261,10 @@ pub struct OpenglCx {
 }
 
 impl OpenglCx {
+    fn surface(&self, surface: egl_sys::EGLSurface) -> Surface<'_> {
+        Surface { egl: &self.libegl, display: self.egl_display, surface }
+    }
+
     pub unsafe fn from_egl_platform_display<T>(
         egl_platform: egl_sys::EGLenum,
         egl_platform_display: *mut T,
@@ -395,6 +367,10 @@ impl OpenglCx {
         }
     }
 
+    pub(crate) fn record_renderer(&self, info: &mut crate::gpu_info::GpuInfo) {
+        super::super::opengl::record_gl_renderer(info, &self.libgl, &self.libegl, self.egl_display);
+    }
+
     pub fn make_current(&self) {
         unsafe {
             (self.libegl.eglMakeCurrent.unwrap())(
@@ -416,6 +392,8 @@ pub struct OpenglWindow {
     pub cal_size: DVec2,
     pub xlib_window: Box<XlibWindow>,
     pub egl_surface: egl_sys::EGLSurface,
+    pub(crate) swap_interval_set: bool,
+    pub(crate) damage: EglWindowDamage,
 }
 
 impl OpenglWindow {
@@ -478,6 +456,17 @@ impl OpenglWindow {
         };
         assert!(!egl_surface.is_null(), "eglCreateWindowSurface failed");
 
+        let swap_interval_set = unsafe {
+            assert_ne!(
+                (opengl_cx.libegl.eglMakeCurrent.unwrap())(
+                    opengl_cx.egl_display, egl_surface, egl_surface, opengl_cx.egl_context,
+                ),
+                0,
+                "eglMakeCurrent failed for the new X11 window surface",
+            );
+            egl_sys::set_window_swap_interval(&opengl_cx.libegl, opengl_cx.egl_display)
+        };
+
         OpenglWindow {
             first_draw: true,
             window_id,
@@ -486,6 +475,8 @@ impl OpenglWindow {
             window_geom: xlib_window.get_window_geom(),
             xlib_window,
             egl_surface,
+            swap_interval_set,
+            damage: EglWindowDamage::default(),
         }
     }
     

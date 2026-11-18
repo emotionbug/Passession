@@ -9,6 +9,7 @@ use crate::{
     draw_list::DrawListId,
     event::WindowGeom,
     cx::Cx,
+    damage::{DamageFrame, DamageRect},
     draw_shader::CxDrawShaderMapping,
     pass::{PassClearColor, PassClearDepth, PassId},
     window::WindowId,
@@ -23,12 +24,14 @@ use crate::{
             PCSTR,
             //ComInterface,
             Interface,
+            HRESULT,
         },
         Win32::{
             Foundation::{
                 HMODULE,
                 HANDLE,
                 S_FALSE,
+                RECT,
             },
             Graphics::{
                 Direct3D11::{
@@ -36,11 +39,14 @@ use crate::{
                     D3D11_BIND_VERTEX_BUFFER,
                     D3D11_VIEWPORT,
                     D3D11_BUFFER_DESC,
+                    D3D11_BOX,
                     D3D11_USAGE_DEFAULT,
                     D3D11_BIND_CONSTANT_BUFFER,
                     D3D11_RESOURCE_MISC_FLAG,
                     D3D11_SUBRESOURCE_DATA,
                     D3D11_CREATE_DEVICE_FLAG,
+                    D3D11_FEATURE_D3D11_OPTIONS,
+                    D3D11_FEATURE_DATA_D3D11_OPTIONS,
                     D3D11_SDK_VERSION,
                     D3D11_BIND_FLAG,
                     D3D11_BIND_SHADER_RESOURCE,
@@ -77,6 +83,7 @@ use crate::{
                     D3D11_QUERY_EVENT,
                     ID3D11Device,
                     ID3D11DeviceContext,
+                    ID3D11DeviceContext1,
                     ID3D11RenderTargetView,
                     ID3D11Texture2D,
                     ID3D11ShaderResourceView,
@@ -97,20 +104,29 @@ use crate::{
                     ID3DBlob,
                     D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
                     D3D_DRIVER_TYPE_UNKNOWN,
+                    D3D_DRIVER_TYPE_WARP,
+                    D3D_DRIVER_TYPE,
                     D3D_FEATURE_LEVEL_11_0,
                 },
                 Dxgi::{
                     IDXGIFactory2,
                     IDXGIResource,
                     IDXGISwapChain1,
+                    IDXGIAdapter,
+                    IDXGIAdapter1,
+                    IDXGIDevice1,
+                    DXGI_ADAPTER_FLAG_SOFTWARE,
+                    DXGI_PRESENT_TEST,
                     CreateDXGIFactory2,
                     DXGI_CREATE_FACTORY_FLAGS,
                     DXGI_PRESENT,
+                    DXGI_PRESENT_PARAMETERS,
                     DXGI_SWAP_CHAIN_FLAG,
                     DXGI_SWAP_CHAIN_DESC1,
                     DXGI_USAGE_RENDER_TARGET_OUTPUT,
                     DXGI_SCALING_NONE,
                     DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
                     DXGI_RGBA,
                     Common::{
                         DXGI_FORMAT,
@@ -142,7 +158,8 @@ impl Cx {
         draw_list_id: DrawListId,
         zbias: &mut f32,
         zbias_step: f32,
-        d3d11_cx: &D3d11Cx
+        d3d11_cx: &D3d11Cx,
+        damage: &mut Option<(&DamageFrame, DamageRect, usize)>,
     ) {
         // tad ugly otherwise the borrow checker locks 'self' and we can't recur
         let draw_items_len = self.draw_lists[draw_list_id].draw_items.len();
@@ -160,6 +177,7 @@ impl Cx {
                     zbias,
                     zbias_step,
                     d3d11_cx,
+                    damage,
                 );
             }
             else {
@@ -170,6 +188,11 @@ impl Cx {
                 } else {
                     continue;
                 };
+                let cull = damage.as_mut().is_some_and(|(frame, rect, ordinal)| {
+                    let cull = frame.should_cull(*ordinal, *rect);
+                    *ordinal += 1;
+                    cull
+                });
                 let sh = &self.draw_shaders[draw_call.draw_shader.draw_shader_id];
                 if sh.os_shader_id.is_none() { // shader didnt compile somehow
                     continue;
@@ -177,22 +200,23 @@ impl Cx {
                 if sh.mapping.uses_time {
                     self.demo_time_repaint = true;
                 }
+                let bias = *zbias;
+                *zbias += zbias_step;
+                if cull || draw_item.instances.as_ref().unwrap().is_empty() {
+                    continue;
+                }
                 let shp = &self.draw_shaders.os_shaders[sh.os_shader_id.unwrap()];
 
                 if draw_call.instance_dirty {
                     draw_call.instance_dirty = false;
-                    if draw_item.instances.as_ref().unwrap().len() == 0 {
-                        continue;
-                    }
                     // update the instance buffer data
                     draw_item.os.inst_vbuf.update_with_f32_vertex_data(d3d11_cx, draw_item.instances.as_ref().unwrap());
                 }
                 
-                // update the zbias uniform if we have it.
-                draw_call.draw_call_uniforms.set_zbias(*zbias);
-                *zbias += zbias_step;
+                let bias_changed = draw_call.draw_call_uniforms.draw_zbias != bias;
+                draw_call.draw_call_uniforms.set_zbias(bias);
                 
-                if draw_call.uniforms_dirty {
+                if draw_call.uniforms_dirty || bias_changed {
                     draw_call.uniforms_dirty = false;
                     draw_item.os.draw_call_uniforms.update_with_f32_constant_data(d3d11_cx, draw_call.draw_call_uniforms.as_slice());
                     
@@ -273,9 +297,7 @@ impl Cx {
                         );
                     }
                     else if cxtexture.format.is_vec(){
-                        cxtexture.update_vec_texture(
-                            d3d11_cx,
-                        );
+                        cxtexture.update_vec_texture(d3d11_cx, self.frame_trace.as_deref());
                     }
                     unsafe {
                         if let Some(sr) = &cxtexture.os.shader_resource_view {
@@ -308,8 +330,7 @@ impl Cx {
         self.textures[_texture.texture_id()].os.shared_handle
     }
 
-    pub fn setup_pass_render_targets(&mut self, pass_id: PassId, first_target: &Option<ID3D11RenderTargetView >, d3d11_cx: &D3d11Cx) {
-        
+    fn prepare_pass_view(&mut self, pass_id: PassId) -> (Rect, f64) {
         let dpi_factor = self.passes[pass_id].dpi_factor.unwrap();
         
         let pass_rect = self.get_pass_rect(pass_id, dpi_factor).unwrap();
@@ -317,6 +338,17 @@ impl Cx {
         self.passes[pass_id].paint_dirty = false;
 
         self.passes[pass_id].set_dpi_factor(dpi_factor);
+        (pass_rect, dpi_factor)
+    }
+
+    fn setup_pass_render_targets(
+        &mut self,
+        pass_id: PassId,
+        first_target: Option<&ID3D11RenderTargetView>,
+        d3d11_cx: &D3d11Cx,
+        (pass_rect, dpi_factor): (Rect, f64),
+        scissor: Option<(&ID3D11DeviceContext1, RECT)>,
+    ) {
         
         let viewport = D3D11_VIEWPORT {
             Width: (pass_rect.size.x * dpi_factor) as f32,
@@ -339,13 +371,21 @@ impl Cx {
             color_textures.push(Some(render_target.clone()));
             let color = self.passes[pass_id].clear_color;
             let color = [color.x, color.y, color.z, color.w];
-            unsafe {d3d11_cx.context.ClearRenderTargetView(first_target.as_ref().unwrap(), &color)}
+            unsafe {
+                if let Some((context, rect)) = scissor {
+                    context.ClearView(render_target, &color, Some(&[rect]));
+                    context.RSSetScissorRects(Some(&[rect]));
+                } else {
+                    d3d11_cx.context.ClearRenderTargetView(render_target, &color);
+                }
+            }
         }
         else {
             for color_texture in self.passes[pass_id].color_textures.iter() {
                 let cxtexture = &mut self.textures[color_texture.texture.texture_id()];
                 let size = pass_rect.size * dpi_factor;
                 cxtexture.update_render_target(d3d11_cx, size.x as usize, size.y as usize);
+                cxtexture.mark_content_changed();
                 let is_initial = cxtexture.take_initial();
                 let render_target = cxtexture.os.render_target_view.clone();
                 color_textures.push(Some(render_target.clone().unwrap()));
@@ -405,7 +445,7 @@ impl Cx {
         }
         
         // create depth, blend and raster states
-        self.passes[pass_id].os.set_states(d3d11_cx);
+        self.passes[pass_id].os.set_states(d3d11_cx, scissor.is_some());
         
         let cxpass = &mut self.passes[pass_id];
         
@@ -413,39 +453,79 @@ impl Cx {
     }
     
     pub fn draw_pass_to_window(&mut self, pass_id: PassId, vsync: bool, d3d11_window: &mut D3d11Window, d3d11_cx: &D3d11Cx) {
-        // let time1 = Cx::profile_time_ns();
-        let draw_list_id = self.passes[pass_id].main_draw_list_id.unwrap();
-        
-        self.setup_pass_render_targets(pass_id, &d3d11_window.render_target_view, d3d11_cx);
-        
-        let mut zbias = 0.0;
-        let zbias_step = self.passes[pass_id].zbias_step;
-        
-        self.render_view(
-            pass_id,
-            draw_list_id,
-            &mut zbias,
-            zbias_step,
-            d3d11_cx
-        );
-        d3d11_window.present(vsync);
+        let root = self.passes[pass_id].main_draw_list_id.unwrap();
+        let view = self.prepare_pass_view(pass_id);
+        let color = self.passes[pass_id].clear_color;
+        let pixels = view.0.size * view.1;
+        let size = [pixels.x.round() as i32, pixels.y.round() as i32];
+        let full = DamageRect::full(size);
+        let eligible = d3d11_window.alloc_size == Some((size[0] as u32, size[1] as u32))
+            && !full.is_empty()
+            && !d3d11_window.is_in_resize
+            && self.passes[pass_id].depth_texture.is_none();
+        let mut logical = full;
+        let mut scissor_rect = None;
+        if let Some(damage) = &mut d3d11_window.damage {
+            if eligible {
+                logical = damage.frame.collect(self, pass_id, root, size, [color.x.to_bits(), color.y.to_bits(), color.z.to_bits(), color.w.to_bits(), 0]);
+                if logical != full {
+                    scissor_rect = Some(RECT {
+                        left: logical.x0, top: size[1] - logical.y1,
+                        right: logical.x1, bottom: size[1] - logical.y0,
+                    });
+                }
+            } else {
+                damage.frame.invalidate();
+            }
+        }
+        let damage = d3d11_window.damage.as_ref();
+        let scissor = scissor_rect.zip(damage).map(|(rect, damage)| (&damage.context, rect));
+        let target = d3d11_window.render_target_view.as_ref();
+        let step = self.passes[pass_id].zbias_step;
+        self.setup_pass_render_targets(pass_id, target, d3d11_cx, view, scissor);
+        let mut replay = scissor_rect.zip(damage).map(|(_, damage)| (&damage.frame, logical, 0));
+        self.render_view(pass_id, root, &mut 0.0, step, d3d11_cx, &mut replay);
+        if let Some(mut rect) = scissor_rect {
+            // DXGI reconciles differences outside the declared region with the
+            // previous flip-sequential presentation. Only these pixels are written.
+            let parameters = DXGI_PRESENT_PARAMETERS {
+                DirtyRectsCount: 1, pDirtyRects: &mut rect, ..Default::default()
+            };
+            let result = unsafe { d3d11_window.swap_chain.Present1(u32::from(vsync), DXGI_PRESENT(0), &parameters) };
+            if result.is_err() {
+                // An implementation rejecting dirty presents must not see a
+                // partially rendered buffer through the ordinary full present.
+                self.setup_pass_render_targets(pass_id, target, d3d11_cx, view, None);
+                self.render_view(pass_id, root, &mut 0.0, step, d3d11_cx, &mut None);
+                d3d11_window.damage = None;
+                d3d11_window.present(vsync);
+            } else {
+                d3d11_window.present_result(result);
+            }
+        } else {
+            d3d11_window.present(vsync);
+        }
+        if let Some(damage) = &mut d3d11_window.damage {
+            if eligible && !d3d11_window.occluded { damage.frame.commit(); }
+        }
         if d3d11_window.first_draw {
             d3d11_window.win32_window.show();
             d3d11_window.first_draw = false;
         }
-        //println!("{}", (Cx::profile_time_ns() - time1)as f64 / 1000.0);
     }
     
     pub fn draw_pass_to_texture(&mut self, pass_id: PassId,  d3d11_cx: &D3d11Cx,texture_id: Option<TextureId>) {
         // let time1 = Cx::profile_time_ns();
         let draw_list_id = self.passes[pass_id].main_draw_list_id.unwrap();
+        let view = self.prepare_pass_view(pass_id);
         
         if let Some(texture_id) = texture_id{
             let render_target_view = self.textures[texture_id].os.render_target_view.clone();
-            self.setup_pass_render_targets(pass_id, &render_target_view, d3d11_cx);
+            self.textures[texture_id].mark_content_changed();
+            self.setup_pass_render_targets(pass_id, render_target_view.as_ref(), d3d11_cx, view, None);
         }
         else{
-            self.setup_pass_render_targets(pass_id, &None, d3d11_cx);
+            self.setup_pass_render_targets(pass_id, None, d3d11_cx, view, None);
         }
             
         let mut zbias = 0.0;
@@ -456,6 +536,7 @@ impl Cx {
             &mut zbias,
             zbias_step,
             &d3d11_cx,
+            &mut None,
         );
     }
     
@@ -513,6 +594,27 @@ fn texture_pixel_to_dx11_pixel(pix:&TexturePixel)->DXGI_FORMAT{
     }   
 }
 
+struct DxgiDamage {
+    frame: DamageFrame,
+    context: ID3D11DeviceContext1,
+}
+
+impl DxgiDamage {
+    fn new(cx: &D3d11Cx) -> Option<Self> {
+        if crate::damage::force_full_redraw() { return None; }
+        let mut options = D3D11_FEATURE_DATA_D3D11_OPTIONS::default();
+        unsafe {
+            cx.device.CheckFeatureSupport(
+                D3D11_FEATURE_D3D11_OPTIONS,
+                (&mut options as *mut D3D11_FEATURE_DATA_D3D11_OPTIONS).cast(),
+                std::mem::size_of_val(&options) as u32,
+            ).ok()?;
+        }
+        options.ClearView.as_bool().then(|| cx.context.cast().ok()).flatten()
+            .map(|context| Self { frame: DamageFrame::default(), context })
+    }
+}
+
 pub struct D3d11Window {
     pub window_id: WindowId,
     pub is_in_resize: bool,
@@ -524,6 +626,10 @@ pub struct D3d11Window {
     pub alloc_size: Option<(u32, u32)>,
     pub first_draw: bool,
     pub swap_chain: IDXGISwapChain1,
+    pub(crate) drawable: bool,
+    occluded: bool,
+    next_visibility_probe: Option<std::time::Instant>,
+    damage: Option<DxgiDamage>,
 }
 
 impl D3d11Window {
@@ -537,7 +643,8 @@ impl D3d11Window {
         let wg = win32_window.get_window_geom();
         let (width, height) = swap_chain_pixels(&wg);
         
-        let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
+        let mut damage = DxgiDamage::new(d3d11_cx);
+        let mut sc_desc = DXGI_SWAP_CHAIN_DESC1 {
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
             BufferCount: 2,
             Width: width,
@@ -552,13 +659,20 @@ impl D3d11Window {
         };
         
         unsafe {
-            let swap_chain = d3d11_cx.factory.CreateSwapChainForHwnd(
-                &d3d11_cx.device,
-                win32_window.hwnd,
-                &sc_desc,
-                None,
-                None,
-            ).unwrap();
+            let create = |description: &DXGI_SWAP_CHAIN_DESC1| d3d11_cx.factory.CreateSwapChainForHwnd(
+                &d3d11_cx.device, win32_window.hwnd, description, None, None,
+            );
+            let sequential = if damage.is_some() {
+                sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+                create(&sc_desc).ok()
+            } else {
+                None
+            };
+            let swap_chain = sequential.unwrap_or_else(|| {
+                damage = None;
+                sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+                create(&sc_desc).unwrap()
+            });
             
             let swap_texture = swap_chain.GetBuffer(0).unwrap();
             let mut render_target_view = None;
@@ -581,6 +695,10 @@ impl D3d11Window {
                 swap_texture: Some(swap_texture),
                 render_target_view: render_target_view,
                 swap_chain: swap_chain,
+                drawable: true,
+                occluded: false,
+                next_visibility_probe: None,
+                damage,
             }
         }
     }
@@ -601,11 +719,14 @@ impl D3d11Window {
         if self.alloc_size == Some((width, height)) {
             return
         }
+        if let Some(damage) = &mut self.damage { damage.frame.invalidate(); }
         self.alloc_size = Some((width, height));
         self.swap_texture = None;
         self.render_target_view = None;
         
         unsafe {
+            // An occluded present need not release the previous OM binding.
+            d3d11_cx.context.OMSetRenderTargets(None, None);
             self.swap_chain.ResizeBuffers(
                 2,
                 width,
@@ -623,8 +744,41 @@ impl D3d11Window {
         }
     }
     
+    pub(crate) fn update_drawable(&mut self) {
+        use crate::windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+        let (width, height) = swap_chain_pixels(&self.window_geom);
+        if width == 0 || height == 0 || (!self.first_draw && unsafe {
+            IsIconic(self.win32_window.hwnd).as_bool() || !IsWindowVisible(self.win32_window.hwnd).as_bool()
+        }) {
+            if let Some(damage) = &mut self.damage { damage.frame.invalidate(); }
+            self.drawable = false;
+            return;
+        }
+        if self.occluded {
+            let now = std::time::Instant::now();
+            if self.next_visibility_probe.is_none_or(|deadline| now >= deadline) {
+                let test = unsafe { self.swap_chain.Present(0, DXGI_PRESENT_TEST) };
+                self.occluded = test != crate::windows::Win32::Foundation::S_OK;
+                self.next_visibility_probe = Some(now + std::time::Duration::from_millis(100));
+            }
+        }
+        self.drawable = !self.occluded;
+    }
+
     pub fn present(&mut self, vsync: bool) {
-        unsafe {self.swap_chain.Present(if vsync {1}else {0}, DXGI_PRESENT(0)).unwrap()};
+        let result = unsafe { self.swap_chain.Present(u32::from(vsync), DXGI_PRESENT(0)) };
+        self.present_result(result);
+    }
+
+    fn present_result(&mut self, result: HRESULT) {
+        if result == crate::windows::Win32::Foundation::DXGI_STATUS_OCCLUDED {
+            if let Some(damage) = &mut self.damage { damage.frame.invalidate(); }
+            self.occluded = true;
+            self.drawable = false;
+            self.next_visibility_probe = None;
+        } else {
+            result.unwrap();
+        }
     }
     
 }
@@ -667,42 +821,68 @@ pub struct D3d11Cx {
 
 impl D3d11Cx {
     
-    pub fn new() -> D3d11Cx {
+    pub fn new(info: &mut crate::gpu_info::GpuInfo) -> crate::windows::core::Result<Self> {
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-            let adapter = factory.EnumAdapters(0).unwrap();
-            let mut device: Option<ID3D11Device> = None;
-            let mut context: Option<ID3D11DeviceContext> = None;
-            let mut query: Option<ID3D11Query> = None;
-            D3D11CreateDevice(
-                &adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_FLAG(0),
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context)
-            ).unwrap();
-
-            let device = device.unwrap();
-            let context = context.unwrap();
-
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let mut hardware = None;
+            let mut index = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(index) {
+                index += 1;
+                if adapter.GetDesc1().is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                    continue;
+                }
+                match Self::create_device(Some(&adapter), D3D_DRIVER_TYPE_UNKNOWN) {
+                    Ok(pair) => {
+                        hardware = Some(pair);
+                        break;
+                    }
+                    Err(err) => crate::warning!("Could not initialize D3D11 hardware adapter {}: {err}", index - 1),
+                }
+            }
+            let (device, context, warp) = match hardware {
+                Some((device, context)) => (device, context, false),
+                None => {
+                    crate::warning!("No usable D3D11 hardware adapter; falling back to WARP software rendering");
+                    let (device, context) = Self::create_device(None, D3D_DRIVER_TYPE_WARP)?;
+                    (device, context, true)
+                }
+            };
+            let dxgi = device.cast::<IDXGIDevice1>()?;
+            if let Err(err) = dxgi.SetMaximumFrameLatency(1) {
+                crate::warning!("Could not limit D3D11 frame latency: {err}");
+            }
+            let desc = dxgi.GetAdapter()?.cast::<IDXGIAdapter1>()?.GetDesc1()?;
+            let len = desc.Description.iter().position(|&ch| ch == 0).unwrap_or(desc.Description.len());
+            let level = device.GetFeatureLevel().0;
+            info.record_native_renderer(crate::gpu_info::GpuRenderer {
+                api: "D3D11",
+                renderer: String::from_utf16_lossy(&desc.Description[..len]),
+                version: Some(format!("feature level {}.{}", level >> 12, (level >> 8) & 0xf)),
+                warp: Some(warp),
+                software: warp || desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+                ..Default::default()
+            });
+            let mut query = None;
             device.CreateQuery(&D3D11_QUERY_DESC {
                 Query: D3D11_QUERY_EVENT,
                 MiscFlags: 0,
-            },Some(&mut query)).unwrap();
-
-            let query = query.unwrap();
-
-            D3d11Cx {
-                device,
-                context,
-                factory,
-                query,
-            }
+            }, Some(&mut query))?;
+            Ok(Self { device, context, factory, query: query.ok_or(crate::windows::Win32::Foundation::E_FAIL)? })
         }
+    }
+
+    unsafe fn create_device(
+        adapter: Option<&IDXGIAdapter>, driver: D3D_DRIVER_TYPE,
+    ) -> crate::windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
+        let mut device = None;
+        let mut context = None;
+        D3D11CreateDevice(
+            adapter, driver, HMODULE::default(), D3D11_CREATE_DEVICE_FLAG(0),
+            Some(&[D3D_FEATURE_LEVEL_11_0]), D3D11_SDK_VERSION,
+            Some(&mut device), None, Some(&mut context),
+        )?;
+        use crate::windows::Win32::Foundation::E_FAIL;
+        Ok((device.ok_or(E_FAIL)?, context.ok_or(E_FAIL)?))
     }
 
     pub fn start_querying(&self) {
@@ -823,65 +1003,73 @@ pub struct CxOsTexture {
 
 impl CxTexture {
     
-    pub fn update_vec_texture(
+    fn update_vec_texture(
         &mut self,
         d3d11_cx: &D3d11Cx,
+        trace: Option<&crate::frame_trace::FrameTrace>,
     ) {
-        // TODO maybe we can update the data instead of making a new texture?
-        if self.alloc_vec(){}
-        if !self.take_updated().is_empty() {
-            fn get_descs(format: DXGI_FORMAT, width: usize, height: usize, bpp: usize, data: *const std::ffi::c_void)->(D3D11_SUBRESOURCE_DATA,D3D11_TEXTURE2D_DESC) {
-                let sub_data = D3D11_SUBRESOURCE_DATA {
-                    pSysMem: data,
-                    SysMemPitch: (width * bpp) as u32,
-                    SysMemSlicePitch: 0
-                };
-                                            
-                let texture_desc = D3D11_TEXTURE2D_DESC {
-                    Width: width as u32,
-                    Height: height as u32,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: format,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0
-                    },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    CPUAccessFlags: 0,
-                    MiscFlags: 0,
-                };
-                (sub_data,texture_desc)
-            }
-            
-            let (sub_data, texture_desc) = match &self.format{
-                TextureFormat::VecBGRAu8_32{width, height, data, ..}=>{
-                    get_descs(DXGI_FORMAT_B8G8R8A8_UNORM, *width, *height, 4, data.as_ref().unwrap().as_ptr() as *const _)
-                }
-                TextureFormat::VecRGBAf32{width, height, data, ..}=>{
-                    get_descs(DXGI_FORMAT_R32G32B32A32_FLOAT, *width, *height, 16, data.as_ref().unwrap().as_ptr() as *const _)
-                }
-                TextureFormat::VecRu8{width, height, data, ..}=>{
-                    get_descs(DXGI_FORMAT_R8_UNORM, *width, *height, 1, data.as_ref().unwrap().as_ptr() as *const _)
-                }
-                TextureFormat::VecRGu8{width, height, data, ..}=>{
-                    get_descs(DXGI_FORMAT_R8G8_UNORM, *width, *height, 1, data.as_ref().unwrap().as_ptr() as *const _)
-                }
-                TextureFormat::VecRf32{width, height, data, ..}=>{
-                    get_descs(DXGI_FORMAT_R32_FLOAT, *width, *height, 4, data.as_ref().unwrap().as_ptr() as *const _)
-                }
-                _=>panic!()
+        let updated = self.updated();
+        if updated.is_empty() {
+            return;
+        }
+
+        let alloc = self.format.as_vec_alloc().unwrap();
+        let reallocate = self.alloc.as_ref() != Some(&alloc) || self.os.texture.is_none();
+        let Some(upload) = self.format.vec_upload(updated, reallocate) else { return };
+        assert!(!matches!(self.format, TextureFormat::VecMipBGRAu8_32 { .. }),
+            "mipmapped vector textures are not supported on D3D11");
+        let data = upload.bytes.as_ptr().cast();
+        let row_pitch = u32::try_from(upload.row_stride).expect("D3D11 texture row too wide");
+
+        if reallocate {
+            let sub_data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: data,
+                SysMemPitch: row_pitch,
+                SysMemSlicePitch: 0,
             };
-                                        
-            let mut texture = None;
-            unsafe {d3d11_cx.device.CreateTexture2D(&texture_desc, Some(&sub_data), Some(&mut texture)).unwrap()};
-            let resource: ID3D11Resource = texture.clone().unwrap().cast().unwrap();
+            let texture_desc = D3D11_TEXTURE2D_DESC {
+                Width: alloc.width as u32,
+                Height: alloc.height as u32,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: texture_pixel_to_dx11_pixel(&alloc.pixel),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut texture: Option<ID3D11Texture2D> = None;
+            unsafe { d3d11_cx.device.CreateTexture2D(&texture_desc, Some(&sub_data), Some(&mut texture)).unwrap() };
             let mut shader_resource_view = None;
-            unsafe {d3d11_cx.device.CreateShaderResourceView(&resource, None, Some(&mut shader_resource_view)).unwrap()};
+            unsafe {
+                d3d11_cx.device.CreateShaderResourceView(
+                    texture.as_ref().unwrap(), None, Some(&mut shader_resource_view),
+                ).unwrap();
+            }
             self.os.texture = texture;
             self.os.shader_resource_view = shader_resource_view;
+            self.alloc = Some(alloc);
+        } else {
+            let end = upload.rect.max();
+            let region = D3D11_BOX {
+                left: upload.rect.origin.x as u32,
+                top: upload.rect.origin.y as u32,
+                front: 0,
+                right: end.x as u32,
+                bottom: end.y as u32,
+                back: 1,
+            };
+            unsafe {
+                d3d11_cx.context.UpdateSubresource(
+                    self.os.texture.as_ref().unwrap(), 0, Some(&region), data, row_pitch, 0,
+                );
+            }
         }
+        if let Some(trace) = trace {
+            trace.texture_upload(upload.rect.size.width, upload.rect.size.height, upload.bytes_per_pixel);
+        }
+        self.take_updated();
     }
     
     pub fn update_render_target(
@@ -1040,7 +1228,7 @@ impl CxTexture {
 }
 
 impl CxOsPass {
-    pub fn set_states(&mut self, d3d11_cx: &D3d11Cx,) {
+    fn set_states(&mut self, d3d11_cx: &D3d11Cx, scissor: bool) {
         
         if self.blend_state.is_none() {
             
@@ -1059,7 +1247,8 @@ impl CxOsPass {
             unsafe {d3d11_cx.device.CreateBlendState(&blend_desc, Some(&mut self.blend_state)).unwrap()}
         }
         
-        if self.raster_state.is_none() {
+        let raster_state = if scissor { &mut self.scissor_state } else { &mut self.raster_state };
+        if raster_state.is_none() {
             let raster_desc = D3D11_RASTERIZER_DESC {
                 AntialiasedLineEnable: FALSE,
                 CullMode: D3D11_CULL_NONE,
@@ -1069,10 +1258,10 @@ impl CxOsPass {
                 FillMode: D3D11_FILL_SOLID,
                 FrontCounterClockwise: FALSE,
                 MultisampleEnable: FALSE,
-                ScissorEnable: FALSE,
+                ScissorEnable: if scissor { TRUE } else { FALSE },
                 SlopeScaledDepthBias: 0.0,
             };
-            unsafe {d3d11_cx.device.CreateRasterizerState(&raster_desc, Some(&mut self.raster_state)).unwrap()}
+            unsafe {d3d11_cx.device.CreateRasterizerState(&raster_desc, Some(raster_state)).unwrap()}
         }
         
         if self.depth_stencil_state.is_none() {
@@ -1100,7 +1289,7 @@ impl CxOsPass {
         }
         
         unsafe {
-            d3d11_cx.context.RSSetState(self.raster_state.as_ref().unwrap());
+            d3d11_cx.context.RSSetState(raster_state.as_ref().unwrap());
             let blend_factor = [0., 0., 0., 0.];
             d3d11_cx.context.OMSetBlendState(self.blend_state.as_ref().unwrap(), Some(&blend_factor), 0xffffffff);
             d3d11_cx.context.OMSetDepthStencilState(self.depth_stencil_state.as_ref().unwrap(), 0);
@@ -1113,6 +1302,7 @@ pub struct CxOsPass {
     pass_uniforms: D3d11Buffer,
     blend_state: Option<ID3D11BlendState >,
     raster_state: Option<ID3D11RasterizerState >,
+    scissor_state: Option<ID3D11RasterizerState>,
     depth_stencil_state: Option<ID3D11DepthStencilState >
 }
 

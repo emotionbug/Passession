@@ -157,6 +157,64 @@ fewer actual draws or events. This is wall-clock timing, not a CPU profile.
 Without the opt-in, no reporter starts and the hooks do not sample clocks or
 collect data.
 
+Check the `GPU renderer:` startup line or **Settings → Diagnostics → Run
+diagnostic** (`client.gpu`) for the actual renderer and its software-rendering
+flag. On X11, compare `next_frame` and `render_passes` during active animation
+against the display's refresh rate. A software EGL session can report a paced
+fallback instead of blocking in the swap; a lower `render_ms` in that case moves
+the wait into the event loop and does not by itself measure GPU work.
+
+On GL, D3D11, and Metal, `texture_uploads` and `texture_upload_bytes` count
+CPU-backed texture transfers and submitted texel bytes (not row padding,
+driver staging, mip generation, or render-target allocation). A new glyph
+atlas page is still initialized in full; later glyphs upload the page's
+combined dirty rectangle.
+
+Use the Linux X11 glyph probe to compare newly rendered grayscale and color
+glyphs against full atlas updates and report bytes per glyph. It uses a private
+D-Bus session and no daemon. Run it from the repository root:
+
+```sh
+cargo build -p paseo-gui-platform --example glyph_upload_probe
+xvfb-run -a python3 tools/glyph-upload-probe.py target/debug/examples/glyph_upload_probe
+```
+
+Pass `--mesa-gles 2.0` to exercise the scratch-row path, and `--emoji-font PATH`
+if Noto Color Emoji is not installed at the default path. Omit `xvfb-run` to
+check the active X11 display; two short-lived probe windows appear in sequence.
+
+### Window damage verification
+
+Set `PASEO_FULL_REDRAW=1` before launching the app to bypass retained window
+damage on EGL and Windows. On X11 `render_frames` counts repaint iterations
+with work; a frame can include several `render_passes` during a transition.
+`render_ms / render_frames` includes time spent in presentation and should
+not be interpreted as GPU execution time.
+
+On Linux, build a debug client and daemon. The pixel oracle requires Python
+with Pillow, X11, and a private `dbus-run-session`:
+
+```sh
+cargo build --locked -p paseo-gui --bin paseo-sessions -p paseo-daemon --bin paseo
+xvfb-run -a -s '-screen 0 1280x1000x24 -nolisten tcp' \
+  dbus-run-session -- env PASEO_ORACLE_PRIVATE_BUS=1 \
+  python3 scripts/damage-oracle.py --app target/debug/paseo-sessions \
+    --cli target/debug/paseo --log target/damage-oracle.log
+```
+
+The harness uses an ephemeral loopback daemon and temporary HOME, Paseo,
+and XDG state. Omit `xvfb-run` to exercise the actual X11 driver; the test
+briefly focuses and operates only its own window. `--screenshots DIR` saves
+that window's scripted UI stages. The app's `PASEO_VERIFY_DAMAGE=1`
+oracle compares each partial frame's pre-swap RGBA pixels against a full
+render of the *same* retained frame, with the same animation time. It
+presents the full reference if the pixels differ. Full fallbacks already
+execute the reference path; the harness fails if it only observed those.
+An opt-in debug-only X11 event feeds the fixture's touchscreen gesture
+through the regular `TouchUpdate` and inertia paths.
+Use `--profile` and then `--profile --full` for uncaptured spinner and sheet
+wall-clock timings. Do not use oracle readbacks to measure cost.
+
 ### UI motion
 
 First-party motion lives in `common::transition`. Choose an `Intent` for a bounded

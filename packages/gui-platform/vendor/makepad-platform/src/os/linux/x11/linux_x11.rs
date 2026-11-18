@@ -62,8 +62,13 @@ impl Cx {
         });
         
         if is_stdin_loop {
-            cx.borrow_mut().in_makepad_studio = true;
-            return cx.borrow_mut().stdin_event_loop();
+            let mut cx = cx.borrow_mut();
+            let cx = &mut *cx;
+            let gl = cx.os.opengl_cx.as_ref().unwrap();
+            gl.make_current();
+            gl.record_renderer(&mut cx.gpu_info);
+            cx.in_makepad_studio = true;
+            return cx.stdin_event_loop();
         }
         
         cx.borrow_mut().call_event_handler(&Event::Startup);
@@ -106,10 +111,11 @@ impl Cx {
                         re.new_geom.dpi_factor = dpi_override;
                     }
                     
+                    window.damage.invalidate();
                     window.window_geom = re.new_geom.clone();
                     self.windows[re.window_id].window_geom = re.new_geom.clone();
                     // redraw just this windows root draw list
-                    if re.old_geom.inner_size != re.new_geom.inner_size {
+                    if re.old_geom.inner_size != re.new_geom.inner_size || re.old_geom.dpi_factor != re.new_geom.dpi_factor {
                         if let Some(main_pass_id) = self.windows[re.window_id].main_pass_id {
                             self.redraw_pass_and_child_passes(main_pass_id);
                         }
@@ -117,6 +123,16 @@ impl Cx {
                 }
                 // ok lets not redraw all, just this window
                 self.call_event_handler(&Event::WindowGeomChange(re));
+            }
+            XlibEvent::Expose(window_id) => {
+                if let Some(window) = opengl_windows.iter_mut().find(|w| w.window_id == window_id) {
+                    window.damage.invalidate();
+                    if let Some(pass_id) = self.windows[window_id].main_pass_id {
+                        if self.passes[pass_id].main_draw_list_id.is_some() {
+                            self.passes[pass_id].paint_dirty = true;
+                        }
+                    }
+                }
             }
             XlibEvent::WindowClosed(wc) => {
                 let window_id = wc.window_id;
@@ -134,7 +150,11 @@ impl Cx {
             }
             XlibEvent::Paint => {
                 if self.new_next_frames.len() != 0 {
-                    self.call_next_frame_event(xlib_app.time_now());
+                    let now = xlib_app.time_now();
+                    if !xlib_app.admit_animation_frame(now) {
+                        return EventFlow::Wait;
+                    }
+                    self.call_next_frame_event(now);
                 }
                 if self.need_redrawing() {
                     self.call_draw_event();
@@ -176,6 +196,17 @@ impl Cx {
             }
             XlibEvent::Scroll(e) => {
                 self.call_event_handler(&Event::Scroll(e.into()))
+            }
+            #[cfg(debug_assertions)]
+            XlibEvent::DamageOracleTouch(mut e) => {
+                let dpi = self.windows[e.window_id].window_geom.dpi_factor;
+                for touch in &mut e.touches { touch.abs /= dpi; }
+                self.fingers.process_touch_update_start(e.time, &e.touches);
+                let event = Event::TouchUpdate(e);
+                self.call_event_handler(&event);
+                if let Event::TouchUpdate(e) = event {
+                    self.fingers.process_touch_update_end(&e.touches);
+                }
             }
             XlibEvent::WindowDragQuery(e) => {
                 self.call_event_handler(&Event::WindowDragQuery(e))
@@ -289,6 +320,12 @@ impl Cx {
                         window.create_position,
                         &window.create_title,
                     );
+                    self.os.opengl_cx.as_ref().unwrap().record_renderer(&mut self.gpu_info);
+                    if !opengl_window.swap_interval_set
+                        || self.gpu_info.native_renderer.as_ref().is_some_and(|gpu| gpu.software)
+                    {
+                        xlib_app.enable_frame_rate_fallback();
+                    }
                     window.window_geom = opengl_window.window_geom.clone();
                     opengl_windows.push(opengl_window);
                     window.is_created = true;

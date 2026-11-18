@@ -16,6 +16,8 @@ pub mod openxr_input;
 #[cfg(target_env="ohos")]
 pub mod open_harmony;
 
+#[cfg(not(any(linux_direct, target_env = "ohos")))]
+pub(crate) mod egl_damage;
 pub mod egl_sys;
 #[macro_use]
 pub mod gl_sys;

@@ -1,5 +1,52 @@
 use crate::file_dialogs::FileDialog;
 use crate::os::window_state::{PendingWindowState, WindowStateChange};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// CVDisplayLink supports the macOS 13 deployment target. Its callback runs on
+// a CoreVideo thread and only posts an event; all UI work stays on AppKit.
+type DisplayLinkRef = *mut c_void;
+type DisplayLinkCallback = extern "C" fn(
+    DisplayLinkRef, *const c_void, *const c_void, u64, *mut u64, *mut c_void,
+) -> CVReturn;
+
+#[link(name = "CoreVideo", kind = "framework")]
+extern "C" {
+    fn CVDisplayLinkCreateWithCGDisplay(display_id: u32, link: *mut DisplayLinkRef) -> CVReturn;
+    fn CVDisplayLinkSetOutputCallback(link: DisplayLinkRef, callback: DisplayLinkCallback, data: *mut c_void) -> CVReturn;
+    fn CVDisplayLinkStart(link: DisplayLinkRef) -> CVReturn;
+    fn CVDisplayLinkStop(link: DisplayLinkRef) -> CVReturn;
+    fn CVDisplayLinkRelease(link: DisplayLinkRef);
+}
+
+const DISPLAY_FRAME_SUBTYPE: i16 = 0x5046;
+static DISPLAY_FRAME_QUEUED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn display_link_tick(
+    _: DisplayLinkRef, _: *const c_void, _: *const c_void, _: u64, _: *mut u64, _: *mut c_void,
+) -> CVReturn {
+    if DISPLAY_FRAME_QUEUED.swap(true, Ordering::AcqRel) {
+        return 0;
+    }
+    unsafe {
+        let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];
+        let event: ObjcId = msg_send![
+            class!(NSEvent),
+            otherEventWithType: NSEventType::NSApplicationDefined
+            location: NSPoint { x: 0., y: 0. }
+            modifierFlags: 0u64
+            timestamp: 0f64
+            windowNumber: 0u64
+            context: nil
+            subtype: DISPLAY_FRAME_SUBTYPE
+            data1: 0u64
+            data2: 0u64
+        ];
+        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+        let () = msg_send![ns_app, postEvent: event atStart: NO];
+        let () = msg_send![pool, release];
+    }
+    0
+}
 
 use {
     std::{
@@ -143,6 +190,9 @@ pub struct MacosApp {
     event_callback: Option<Box<dyn FnMut(MacosEvent) -> EventFlow >>,
     pending_window_state: PendingWindowState,
     event_flow: EventFlow,
+    animation_screen: Option<ObjcId>,
+    display_link: DisplayLinkRef,
+    fallback_frame_at: f64,
     
     pub cursors: HashMap<MouseCursor, ObjcId>,
     pub current_cursor: MouseCursor,
@@ -171,6 +221,9 @@ impl MacosApp {
                 timers: Vec::new(),
                 cocoa_windows: Vec::new(),
                 event_flow: EventFlow::Poll,
+                animation_screen: None,
+                display_link: std::ptr::null_mut(),
+                fallback_frame_at: 0.0,
                 last_key_mod: KeyModifiers {..Default::default()},
                 event_callback: Some(event_callback),
                 pending_window_state: PendingWindowState::default(),
@@ -179,6 +232,57 @@ impl MacosApp {
                 //current_ns_event: None,
             }
         }
+    }
+
+    pub(crate) fn set_animation_screen(&mut self, screen: Option<ObjcId>) {
+        if self.animation_screen == screen {
+            return;
+        }
+        unsafe {
+            if !self.display_link.is_null() {
+                CVDisplayLinkStop(self.display_link);
+                CVDisplayLinkRelease(self.display_link);
+                self.display_link = std::ptr::null_mut();
+            }
+            // Retain cached identity across display changes; never dereference a
+            // stale NSScreen or allocate its deviceDescription on every frame.
+            if let Some(previous) = self.animation_screen.filter(|screen| *screen != nil) {
+                let () = msg_send![previous, release];
+            }
+            self.animation_screen = screen;
+            let Some(screen) = screen else { return };
+            let mut display = CGMainDisplayID();
+            if screen != nil {
+                let _: ObjcId = msg_send![screen, retain];
+                let description: ObjcId = msg_send![screen, deviceDescription];
+                let key = str_to_nsstring("NSScreenNumber");
+                let number: ObjcId = msg_send![description, objectForKey: key];
+                if number != nil {
+                    display = msg_send![number, unsignedIntValue];
+                }
+            }
+            let mut link = std::ptr::null_mut();
+            if CVDisplayLinkCreateWithCGDisplay(display, &mut link) != 0
+                || CVDisplayLinkSetOutputCallback(link, display_link_tick, std::ptr::null_mut()) != 0
+                || CVDisplayLinkStart(link) != 0
+            {
+                if !link.is_null() {
+                    CVDisplayLinkRelease(link);
+                }
+                self.fallback_frame_at = self.time_now();
+                crate::warning!("Could not start CVDisplayLink for display {display}; using paced timer");
+                return;
+            }
+            self.display_link = link;
+        }
+    }
+
+    fn needs_fallback_frame(&mut self, now: f64) -> bool {
+        if self.animation_screen.is_none() || !self.display_link.is_null() || now < self.fallback_frame_at {
+            return false;
+        }
+        self.fallback_frame_at = now + 1.0 / 60.0;
+        true
     }
     pub fn init_quit_menu(&mut self){
         self.update_macos_menu(
@@ -392,6 +496,16 @@ impl MacosApp {
 
     unsafe fn process_ns_event(ns_event: ObjcId) {
         let ev_type: NSEventType = msg_send![ns_event, type];
+        if ev_type == NSEventType::NSApplicationDefined {
+            let subtype: i16 = msg_send![ns_event, subtype];
+            if subtype == DISPLAY_FRAME_SUBTYPE {
+                DISPLAY_FRAME_QUEUED.store(false, Ordering::Release);
+                if with_macos_app(|app| !app.display_link.is_null()) {
+                    Self::do_callback(MacosEvent::DisplayFrame);
+                }
+                return;
+            }
+        }
         // sendEvent can invoke responder/IME callbacks or change/close the key window.
         // Preserve the event's own source, never a later key window or widget focus.
         let window_id = match ev_type {
@@ -759,6 +873,9 @@ impl MacosApp {
                 }
                 
                 MacosApp::do_callback(MacosEvent::Timer(TimerEvent {time:Some(time), timer_id: timer_id}));
+                if timer_id == 0 && with_macos_app(|app| app.needs_fallback_frame(time)) {
+                    MacosApp::do_callback(MacosEvent::DisplayFrame);
+                }
                 // break the eventloop if its in blocked mode
                 unsafe {
                     let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];

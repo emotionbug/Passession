@@ -111,13 +111,13 @@ pub const PROGRAM_BINARY_LENGTH: GLenum = 0x8741;
 pub const NO_ERROR: GLenum = 0x0;
 pub const UNPACK_ALIGNMENT: GLenum = 0x0CF5;
 pub const UNPACK_ROW_LENGTH: GLenum = 0x0CF2;
-pub const UNPACK_SKIP_PIXELS: GLenum = 0x0CF4;
-pub const UNPACK_SKIP_ROWS: GLenum = 0x0CF3;
 pub const DRAW_FRAMEBUFFER:GLenum = 0x8CA9;
 pub const TEXTURE_EXTERNAL_OES: GLenum = 0x8D65;
 pub const EXTENSIONS: GLenum = 0x1F03;
 pub const VENDOR: GLenum = 0x1F00;
 pub const RENDERER: GLenum = 0x1F01;
+pub const VERSION: GLenum = 0x1F02;
+pub const SHADING_LANGUAGE_VERSION: GLenum = 0x8B8C;
 pub const SCISSOR_TEST: GLenum = 0x0C11;
 pub const CULL_FACE:GLenum = 0x0B44;
 pub const DONT_CARE:GLenum = 0x1100;
@@ -190,6 +190,7 @@ pub type TglFramebufferTextureMultiviewOVR = unsafe extern "C" fn(target:GLenum 
 pub type TglColorMask = unsafe extern "C" fn(r: GLboolean, g:GLboolean, b:GLboolean, a:GLboolean);
 pub type TglDepthMask = unsafe extern "C" fn(d: GLboolean);
 pub type TglScissor = unsafe extern "C" fn(x:GLint, y:GLint, width:GLsizei, height:GLsizei);
+pub type TglReadPixels = unsafe extern "C" fn(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, *mut raw::c_void);
 
 pub type TglInvalidateFramebuffer = unsafe extern "C" fn(target:GLenum, num_attachments:GLsizei, attachments: *const GLenum);
 pub type TglDebugMessageCallback = unsafe extern "C" fn(ptr: TglDebugMessageCallbackFn, param: *const raw::c_void);
@@ -218,6 +219,8 @@ pub type TglDebugMessageControl = unsafe extern "C" fn(
     enabled: GLboolean);
     
 pub struct LibGl{
+    pub(crate) version_supports_row_length: std::cell::OnceCell<bool>,
+    pub(crate) upload_scratch: std::cell::RefCell<Vec<u8>>,
     pub glGenVertexArrays: TglGenVertexArrays,
     pub glBindVertexArray: TglBindVertexArray,
     pub glBindBuffer: TglBindBuffer,
@@ -284,6 +287,7 @@ pub struct LibGl{
     pub glColorMask: TglColorMask,
     pub glDepthMask: TglDepthMask,
     pub glScissor: TglScissor,
+    pub glReadPixels: TglReadPixels,
     pub glInvalidateFramebuffer: TglInvalidateFramebuffer,
     pub glDebugMessageCallback: TglDebugMessageCallback,
     pub glGetDebugMessageLog: TglGetDebugMessageLog,
@@ -336,6 +340,8 @@ impl LibGl{
     where F: FnMut(&[&'static str]) -> *const raw::c_void
     {
         Ok(Self{
+            version_supports_row_length: Default::default(),
+            upload_scratch: Default::default(),
             glGenVertexArrays: load!(loadfn, TglGenVertexArrays, "glGenVertexArrays", "glGenVertexArraysAPPLE", "glGenVertexArraysOES")?,
             glBindVertexArray: load!(loadfn, TglBindVertexArray, "glBindVertexArray", "glBindVertexArrayOES")?,
             glBindBuffer: load!(loadfn, TglBindBuffer, "glBindBuffer", "glBindBufferARB")?,
@@ -402,6 +408,7 @@ impl LibGl{
             glColorMask: load!(loadfn, TglColorMask, "glColorMask")?,
             glDepthMask: load!(loadfn, TglDepthMask, "glDepthMask")?,
             glScissor: load!(loadfn, TglScissor, "glScissor")?,
+            glReadPixels: load!(loadfn, TglReadPixels, "glReadPixels")?,
             glInvalidateFramebuffer: load!(loadfn, TglInvalidateFramebuffer, "glInvalidateFramebuffer")?,
             glDebugMessageCallback: load!(loadfn, TglDebugMessageCallback, "glDebugMessageCallback")?,
             glGetDebugMessageLog: load!(loadfn, TglGetDebugMessageLog, "glGetDebugMessageLog")?,

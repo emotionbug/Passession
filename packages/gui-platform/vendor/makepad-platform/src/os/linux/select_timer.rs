@@ -28,6 +28,10 @@ impl SelectTimers {
     }
     
     pub fn select(&mut self, read_fds: &[c_int]) {
+        self.select_until(read_fds, None);
+    }
+
+    pub fn select_until(&mut self, read_fds: &[c_int], deadline: Option<f64>) {
         let mut fds = mem::MaybeUninit::uninit();
         unsafe {
             libc_sys::FD_ZERO(fds.as_mut_ptr());
@@ -39,17 +43,19 @@ impl SelectTimers {
                 libc_sys::FD_SET(fd, fds.as_mut_ptr());
             }
         }
-        // If there are any timers, we set the timeout for select to the `delta_timeout`
-        // of the first timer that should be fired. Otherwise, we set the timeout to
-        // None, so that select will block indefinitely.
-        let mut timeout = self.timers.front().map(|timer| 
+        let now = self.time_now();
+        let timer_delay = self.timers.front().map(|timer| timer.delta_timeout - (now - self.select_time));
+        let delay = match (timer_delay, deadline.map(|deadline| deadline - now)) {
+            (Some(timer), Some(frame)) => Some(timer.min(frame)),
+            (timer, frame) => timer.or(frame),
+        };
+        let mut timeout = delay.map(|delay| {
+            let micros = (delay.max(0.0) * 1_000_000.0).ceil() as u64;
             libc_sys::timeval {
-                // `tv_sec` is in seconds, so take the integer part of `delta_timeout`
-                tv_sec: timer.delta_timeout.trunc() as libc_sys::time_t,
-                // `tv_usec` is in microseconds, so take the fractional part of
-                // `delta_timeout` 1000000.0.
-                tv_usec: (timer.delta_timeout.fract() * 1000_000.0) as libc_sys::time_t,
-            });
+                tv_sec: (micros / 1_000_000) as libc_sys::time_t,
+                tv_usec: (micros % 1_000_000) as libc_sys::suseconds_t,
+            }
+        });
         let _nfds = unsafe {libc_sys::select(
             read_fds.iter().copied().max().map_or(0, |fd| fd + 1),
             fds.as_mut_ptr(),

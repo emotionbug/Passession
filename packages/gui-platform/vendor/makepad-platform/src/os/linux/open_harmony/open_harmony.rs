@@ -384,6 +384,7 @@ impl Cx {
             {
                 panic!();
             }
+            super::super::opengl::record_gl_renderer(&mut cx.gpu_info, &libgl, &libegl, egl_display);
 
             cx.os.display = Some(CxOhosDisplay {
                 libegl,

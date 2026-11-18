@@ -219,9 +219,7 @@ impl Cx {
                         );
                     }
                     else if cxtexture.format.is_vec(){
-                        cxtexture.update_vec_texture(
-                            metal_cx,
-                        );
+                        cxtexture.update_vec_texture(metal_cx, self.frame_trace.as_deref());
                     }
                     
                     if let Some(texture) = cxtexture.os.texture.as_ref() {
@@ -716,8 +714,14 @@ pub struct SlErr {
 
 impl MetalCx {
     
-    pub (crate) fn new() -> MetalCx {
+    pub(crate) fn new(info: &mut crate::gpu_info::GpuInfo) -> MetalCx {
         let device = get_default_metal_device().expect("Cannot get default metal device");
+        let name: ObjcId = unsafe { msg_send![device, name] };
+        info.record_native_renderer(crate::gpu_info::GpuRenderer {
+            api: "Metal",
+            renderer: nsstring_to_string(name),
+            ..Default::default()
+        });
         MetalCx {
             command_queue: unsafe {msg_send![device, newCommandQueue]},
             device: device
@@ -963,10 +967,19 @@ impl CxTexture {
     fn update_vec_texture(
         &mut self,
         metal_cx: &MetalCx,
+        trace: Option<&crate::frame_trace::FrameTrace>,
     ) {
-        if self.alloc_vec() {
-            let alloc = self.alloc.as_ref().unwrap();
-            
+        let updated = self.updated();
+        if updated.is_empty() {
+            return;
+        }
+
+        let alloc = self.format.as_vec_alloc().unwrap();
+        let reallocate = self.alloc.as_ref() != Some(&alloc) || self.os.texture.is_none();
+        let Some(upload) = self.format.vec_upload(updated, reallocate) else { return };
+        assert!(!matches!(self.format, TextureFormat::VecMipBGRAu8_32 { .. }),
+            "mipmapped vector textures are not supported on Metal");
+        if reallocate {
             let descriptor = RcObjcId::from_owned(NonNull::new(unsafe {
                 msg_send![class!(MTLTextureDescriptor), new]
             }).unwrap());
@@ -979,44 +992,25 @@ impl CxTexture {
             let _: () = unsafe{msg_send![descriptor.as_id(), setPixelFormat: texture_pixel_to_mtl_pixel(&alloc.pixel)]};
             let texture:ObjcId = unsafe{msg_send![metal_cx.device, newTextureWithDescriptor: descriptor]};
             self.os.texture = Some(RcObjcId::from_owned(NonNull::new(texture).unwrap()));
+            self.alloc = Some(alloc);
         }
-        let update = self.take_updated();
-        if update.is_empty(){
-            return;
-        }
-        fn update_data(texture:&Option<RcObjcId>, width: usize, height: usize, bpp: u64, data: *const std::ffi::c_void){
 
-            let region = MTLRegion {
-                origin: MTLOrigin {x: 0, y: 0, z: 0},
-                size: MTLSize {width: width as u64, height: height as u64, depth: 1}
-            };
-                                            
-            let () = unsafe {msg_send![
-                texture.as_ref().unwrap().as_id(),
-                replaceRegion: region
-                mipmapLevel: 0
-                withBytes: data
-                bytesPerRow: (width as u64) * bpp
-            ]};
+        let rect = upload.rect;
+        let region = MTLRegion {
+            origin: MTLOrigin { x: rect.origin.x as u64, y: rect.origin.y as u64, z: 0 },
+            size: MTLSize { width: rect.size.width as u64, height: rect.size.height as u64, depth: 1 },
+        };
+        let _: () = unsafe { msg_send![
+            self.os.texture.as_ref().unwrap().as_id(),
+            replaceRegion: region
+            mipmapLevel: 0
+            withBytes: upload.bytes.as_ptr()
+            bytesPerRow: upload.row_stride as u64
+        ] };
+        if let Some(trace) = trace {
+            trace.texture_upload(rect.size.width, rect.size.height, upload.bytes_per_pixel);
         }
-        match &self.format{
-            TextureFormat::VecBGRAu8_32{width, height, data, ..}=>{
-                update_data(&self.os.texture, *width, *height, 4,  data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void);
-            }
-            TextureFormat::VecRGBAf32{width, height, data, ..}=>{
-                update_data(&self.os.texture, *width, *height, 16,  data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void);
-            }
-            TextureFormat::VecRu8{width, height, data, ..}=>{
-                update_data(&self.os.texture, *width, *height, 1,  data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void);
-            }
-            TextureFormat::VecRGu8{width, height, data, ..}=>{
-                update_data(&self.os.texture, *width, *height, 2,  data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void);
-            }
-            TextureFormat::VecRf32{width, height, data, ..}=>{
-                update_data(&self.os.texture, *width, *height, 4,  data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void);
-            }
-            _=>panic!()
-        }
+        self.take_updated();
     }
     
     #[cfg(target_os = "macos")]

@@ -23,7 +23,7 @@ use {
     },
     self::super::super::{
         openxr::{CxOpenXr, CxOpenXrOptions},
-        gl_sys,
+        egl_damage::{EglWindowDamage, Surface},
         gl_sys::LibGl,
         //libc_sys,
     },
@@ -67,7 +67,7 @@ use {
         cx::{Cx, OsType},
         gpu_info::GpuPerformance,
         os::cx_native::EventFlow,
-        pass::{PassClearColor, PassClearDepth, PassId},
+        pass::PassId,
         web_socket::WebSocketMessage,
     },
     makepad_http::websocket::ServerWebSocket as WebSocketImpl,
@@ -144,38 +144,19 @@ impl Cx {
             FromJavaMessage::BackPressed => {
                 self.call_event_handler(&Event::BackPressed { handled: Cell::new(false)});
             }
-            FromJavaMessage::SurfaceCreated {window} => unsafe {
-                self.os.display.as_mut().unwrap().update_surface(window);
-            },
-            FromJavaMessage::SurfaceDestroyed => unsafe {
+            FromJavaMessage::SurfaceCreated {window} => self.set_android_window(window),
+            FromJavaMessage::SurfaceDestroyed => {
                 let owner = self.keyboard.text_selection;
                 self.clear_text_selection(owner);
                 self.clear_key_focus_if(owner);
-                self.os.display.as_mut().unwrap().destroy_surface();
+                self.set_android_window(egl_sys::null_mut());
             },
             FromJavaMessage::SurfaceChanged {
                 window,
                 width,
                 height,
             } => {
-                
-                if self.os.in_xr_mode && self.os.openxr.session.is_none(){
-                    if self.os.openxr.libxr.is_none(){
-                        let activity_handle = makepad_android_state::get_activity();
-                        self.os.openxr.create_instance(activity_handle).ok();
-                    }                    
-                    if let Err(e) = self.os.openxr.create_session(self.os.display.as_ref().unwrap(),CxOpenXrOptions{
-                        buffer_scale: 1.5,
-                        multisamples: 4,
-                        remove_hands_from_depth: false
-                    },&self.os_type){
-                        crate::error!("OpenXR create_xr_session failed: {}", e);
-                    }
-                }
-                
-                unsafe {
-                    self.os.display.as_mut().unwrap().update_surface(window);
-                }
+                self.set_android_window(window);
                 
                 self.os.display_size = dvec2(width as f64, height as f64);
                 let window_id = CxWindowPool::id_zero();
@@ -495,6 +476,99 @@ impl Cx {
         }
     }
 
+    fn set_android_window(&mut self, window: *mut ndk_sys::ANativeWindow) {
+        let error = unsafe { self.os.display.as_mut().unwrap().set_window(window) };
+        if error == Some(egl_sys::EGL_CONTEXT_LOST) {
+            self.invalidate_android_context();
+        }
+        self.restore_android_surface();
+    }
+
+    fn invalidate_android_context(&mut self) {
+        let display = self.os.display.as_mut().unwrap();
+        unsafe { let _ = display.destroy_surface(); }
+        if self.os.openxr.session.is_some() {
+            // Drop the XR session bound to the lost EGL context before creating
+            // another one. No context is current when releasing its old names.
+            let _ = self.os.openxr.destroy_instance(&display.libgl);
+        }
+        unsafe { display.destroy_context(); }
+        // Producer-owned video surfaces cannot be read with the new context.
+        // Stop those decoders; normal TextureHandleReady supplies new GL names.
+        if !self.os.video_surfaces.is_empty() {
+            let env = unsafe { attach_jni_env() };
+            for (id, decoder) in self.os.video_surfaces.drain() {
+                unsafe {
+                    android_jni::to_java_cleanup_video_playback_resources(env, id);
+                    android_jni::to_java_cleanup_video_decoder_ref(env, decoder);
+                }
+            }
+        }
+        self.invalidate_gl_resources();
+    }
+
+    fn restore_android_surface(&mut self) {
+        let display = self.os.display.as_mut().unwrap();
+        if display.window.is_null() || !display.surface.is_null() {
+            return;
+        }
+        let mut result = unsafe { display.create_surface() };
+        if result == Err(egl_sys::EGL_CONTEXT_LOST) {
+            self.invalidate_android_context();
+            result = unsafe { self.os.display.as_mut().unwrap().create_surface() };
+            if result == Err(egl_sys::EGL_CONTEXT_LOST) {
+                self.invalidate_android_context();
+            }
+        }
+        if let Err(error) = result {
+            // An Android callback may have been queued while the drawable was
+            // being destroyed. Wait for the next native window notification.
+            crate::warning!("Cannot bind Android EGL surface (EGL error {error:#x}); waiting for a new native window");
+            return;
+        }
+        self.redraw_all();
+        let display = self.os.display.as_ref().unwrap();
+        super::super::opengl::record_gl_renderer(&mut self.gpu_info, &display.libgl, &display.libegl, display.egl_display);
+        if self.os.in_xr_mode && self.os.openxr.session.is_none() {
+            if self.os.openxr.instance.is_none() {
+                let activity = makepad_android_state::get_activity();
+                if let Err(error) = self.os.openxr.create_instance(activity) {
+                    crate::error!("OpenXR init failed: {error}");
+                    return;
+                }
+            }
+            if let Err(error) = self.os.openxr.create_session(display, CxOpenXrOptions {
+                buffer_scale: 1.5, multisamples: 4, remove_hands_from_depth: false,
+            }, &self.os_type) {
+                crate::error!("OpenXR create_xr_session failed: {error}");
+            }
+        }
+    }
+
+    fn handle_egl_swap_failure(&mut self, pass_id: PassId) {
+        let display = self.os.display.as_mut().unwrap();
+        let error = unsafe { (display.libegl.eglGetError.unwrap())() };
+        crate::warning!("Android EGL present failed: {error:#x}");
+        match error {
+            egl_sys::EGL_CONTEXT_LOST => self.invalidate_android_context(),
+            egl_sys::EGL_BAD_SURFACE => {
+                if unsafe { display.destroy_surface() } == Some(egl_sys::EGL_CONTEXT_LOST) {
+                    self.invalidate_android_context();
+                }
+            }
+            _ => {
+                // Don't repeatedly rasterize against an unusable surface.
+                if unsafe { display.destroy_surface() } == Some(egl_sys::EGL_CONTEXT_LOST) {
+                    self.invalidate_android_context();
+                }
+                self.repaint_pass(pass_id);
+                return;
+            }
+        }
+        self.repaint_pass(pass_id);
+        self.restore_android_surface();
+    }
+
     pub(crate) fn handle_drawing(&mut self) {
         // SurfaceDestroyed unbinds the EGL context, but a queued RenderLoop can
         // still arrive. Do not consume redraws/next frames or cache GPU objects
@@ -619,7 +693,7 @@ impl Cx {
             unsafe {attach_jni_env()};
             let mut cx = startup();
             cx.android_load_dependencies();
-            let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
+            let libegl = LibEgl::try_load().expect("Cant load LibEGL");
             
             cx.os.activity_thread_id = Some(activity_thread_id);
             cx.os.render_thread_id = Some(unsafe { libc_sys::gettid() as u64 });
@@ -631,6 +705,10 @@ impl Cx {
                         cx.os.dpi_factor = params.density;
                         cx.os_type = OsType::Android(params);
                     }
+                    Ok(FromJavaMessage::SurfaceCreated { window }) if !window.is_null() => unsafe {
+                        // Startup waits for SurfaceChanged (the first dimensions).
+                        ndk_sys::ANativeWindow_release(window);
+                    },
                     Ok(FromJavaMessage::SurfaceChanged {
                         window,
                         width,
@@ -643,20 +721,10 @@ impl Cx {
                 }
             };
             
-            // SAFETY:
-            // The LibEgl instance (libegl) has been properly loaded and initialized earlier.
-            // We're not requesting a robust context (false), which is usually fine for most applications.
-            #[cfg(not(quest))]
-            let (egl_context, egl_config, egl_display) = unsafe {egl_sys::create_egl_context(
-                &mut libegl,
-                std::ptr::null_mut(),/* EGL_DEFAULT_DISPLAY */
-            ).expect("Cant create EGL context")};
-            
-            #[cfg(quest)]
-            let (egl_context, egl_config, egl_display) = unsafe {egl_sys::create_egl_context_openxr(
-                &mut libegl,
-                std::ptr::null_mut(),/* EGL_DEFAULT_DISPLAY */
-            ).expect("Cant create EGL context")};
+            let (egl_context, egl_config, egl_display) = unsafe {
+                egl_sys::create_egl_context(&libegl, egl_sys::null_mut())
+                    .expect("Cannot create Android EGL context")
+            };
             
             // SAFETY: This is loading OpenGL function pointers. It's safe as long as we have a valid EGL context.
             let libgl = LibGl::try_load(| s | {
@@ -670,23 +738,6 @@ impl Cx {
                 0 as _
             }).expect("Cant load openGL functions");
             
-            // SAFETY: This creates an EGL surface. It's safe as long as we have valid EGL display, config, and window.
-            //libgl.enable_debugging();
-            
-            let surface = unsafe {(libegl.eglCreateWindowSurface.unwrap())(
-                egl_display,
-                egl_config,
-                window as _,
-                std::ptr::null_mut(),
-            )};
-
-            if unsafe {(libegl.eglMakeCurrent.unwrap())(egl_display, surface, surface, egl_context)} == 0 {
-                panic!();
-            }
-            
-            //libgl.enable_debugging();
-
-            //cx.maybe_warn_hardware_support();
 
             cx.os.display = Some(CxAndroidDisplay {
                 libegl,
@@ -694,25 +745,19 @@ impl Cx {
                 egl_display,
                 egl_config,
                 egl_context,
-                surface,
-                window
+                surface: egl_sys::EGL_NO_SURFACE,
+                window: egl_sys::null_mut(),
+                damage: EglWindowDamage::default(),
             });
+            cx.set_android_window(window);
             
             cx.main_loop(from_java_rx);
             cx.stop_studio_websocket();
             
-            let display = cx.os.display.take().unwrap();
-
-            // SAFETY: These calls clean up EGL resources. They're safe as long as we have valid EGL objects.
+            let mut display = cx.os.display.take().unwrap();
             unsafe {
-                (display.libegl.eglMakeCurrent.unwrap())(
-                    display.egl_display,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                (display.libegl.eglDestroySurface.unwrap())(display.egl_display, display.surface);
-                (display.libegl.eglDestroyContext.unwrap())(display.egl_display, display.egl_context);
+                display.set_window(egl_sys::null_mut());
+                display.destroy_context();
                 (display.libegl.eglTerminate.unwrap())(display.egl_display);
             }
             // Paseo: the loop only quits on the live activity's final destroy.
@@ -805,57 +850,21 @@ impl Cx {
         &mut self,
         pass_id: PassId,
     ) {
-        let draw_list_id = self.passes[pass_id].main_draw_list_id.unwrap();
-
-        self.setup_render_pass(pass_id);
-
-        // keep repainting in a loop
-        self.passes[pass_id].paint_dirty = false;
-        //let panning_offset = if self.os.keyboard_visible {self.os.keyboard_panning_offset} else {0};
-
-        let gl = self.os.gl();
-        unsafe {
-            (gl.glViewport)(0, 0, self.os.display_size.x as i32, self.os.display_size.y as i32);
+        if self.setup_render_pass(pass_id).is_none() {
+            return;
         }
-
-        let clear_color = if self.passes[pass_id].color_textures.len() == 0 {
-            self.passes[pass_id].clear_color
+        let size = [self.os.display_size.x as i32, self.os.display_size.y as i32];
+        let clear = self.gl_window_clear(pass_id);
+        let display = self.os.display.as_mut().unwrap();
+        let mut damage = std::mem::take(&mut display.damage);
+        let mut frame = damage.prepare(&self.os.display.as_ref().unwrap().egl_surface(), self, pass_id, size, clear);
+        damage.render(self, pass_id, clear, &mut frame);
+        let display = self.os.display.as_mut().unwrap();
+        let presented = damage.present(&display.egl_surface(), frame);
+        display.damage = damage;
+        if !presented {
+            self.handle_egl_swap_failure(pass_id);
         }
-        else {
-            match self.passes[pass_id].color_textures[0].clear_color {
-                PassClearColor::InitWith(color) => color,
-                PassClearColor::ClearWith(color) => color
-            }
-        };
-        let clear_depth = match self.passes[pass_id].clear_depth {
-            PassClearDepth::InitWith(depth) => depth,
-            PassClearDepth::ClearWith(depth) => depth
-        };
-
-        if !self.passes[pass_id].dont_clear {
-            unsafe {
-                //(gl.glBindFramebuffer)(gl_sys::FRAMEBUFFER, 0);
-                (gl.glClearDepthf)(clear_depth as f32);
-                (gl.glClearColor)(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
-                (gl.glClear)(gl_sys::COLOR_BUFFER_BIT | gl_sys::DEPTH_BUFFER_BIT);
-            }
-        }
-        Self::set_default_depth_and_blend_mode(gl);
-
-        let mut zbias = 0.0;
-        let zbias_step = self.passes[pass_id].zbias_step;
-
-        self.render_view(
-            pass_id,
-            draw_list_id,
-            &mut zbias,
-            zbias_step,
-        );
-
-        //to_java.swap_buffers();
-        //unsafe {
-        //direct_app.drm.swap_buffers_and_wait(&direct_app.egl);
-        //}
     }
 
     pub (crate) fn handle_repaint(&mut self) {
@@ -877,10 +886,8 @@ impl Cx {
                     Cx::send_studio_message(AppToStudio::GPUSample(GPUSample{
                         start, end 
                     }));
-                    unsafe {
-                        if let Some(display) = &mut self.os.display { 
-                            (display.libegl.eglSwapBuffers.unwrap())(display.egl_display, display.surface);
-                        }
+                    if self.os.display.as_ref().unwrap().surface.is_null() {
+                        break;
                     }
                 }
                 CxPassParent::Pass(_) => {
@@ -1318,6 +1325,7 @@ pub struct CxAndroidDisplay {
     pub egl_context: egl_sys::EGLContext,
     surface: egl_sys::EGLSurface,
     window: *mut ndk_sys::ANativeWindow,
+    damage: EglWindowDamage,
     //event_handler: Box<dyn EventHandler>,
 }
 
@@ -1356,43 +1364,64 @@ impl CxOs{
 }
 
 impl CxAndroidDisplay {
-    unsafe fn destroy_surface(&mut self) {
-        (self.libegl.eglMakeCurrent.unwrap())(
-            self.egl_display,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        (self.libegl.eglDestroySurface.unwrap())(self.egl_display, self.surface);
-        self.surface = std::ptr::null_mut();
+    fn egl_surface(&self) -> Surface<'_> {
+        Surface { egl: &self.libegl, display: self.egl_display, surface: self.surface }
     }
 
-    unsafe fn update_surface(&mut self, window: *mut ndk_sys::ANativeWindow) {
+    unsafe fn destroy_surface(&mut self) -> Option<egl_sys::EGLint> {
+        self.damage.invalidate();
+        if self.surface.is_null() {
+            return None;
+        }
+        let result = (self.libegl.eglMakeCurrent.unwrap())(
+            self.egl_display, egl_sys::EGL_NO_SURFACE, egl_sys::EGL_NO_SURFACE, egl_sys::EGL_NO_CONTEXT,
+        );
+        let error = (result == 0).then(|| (self.libegl.eglGetError.unwrap())());
+        (self.libegl.eglDestroySurface.unwrap())(self.egl_display, self.surface);
+        self.surface = egl_sys::EGL_NO_SURFACE;
+        error
+    }
+
+    unsafe fn set_window(&mut self, window: *mut ndk_sys::ANativeWindow) -> Option<egl_sys::EGLint> {
+        // SurfaceCreated and SurfaceChanged each deliver an acquired reference.
+        // Keep the bound surface when Android repeats the same native window.
+        if !window.is_null() && window == self.window {
+            ndk_sys::ANativeWindow_release(window);
+            return None;
+        }
+        let error = self.destroy_surface();
         if !self.window.is_null() {
             ndk_sys::ANativeWindow_release(self.window);
         }
         self.window = window;
-        if self.surface.is_null() == false {
-            self.destroy_surface();
+        error
+    }
+
+    unsafe fn destroy_context(&mut self) {
+        if !self.egl_context.is_null() {
+            (self.libegl.eglDestroyContext.unwrap())(self.egl_display, self.egl_context);
+            self.egl_context = egl_sys::EGL_NO_CONTEXT;
         }
+    }
 
-        self.surface = (self.libegl.eglCreateWindowSurface.unwrap())(
-            self.egl_display,
-            self.egl_config,
-            window as _,
-            std::ptr::null_mut(),
-        );
-        if self.surface.is_null(){
-            return
+    unsafe fn create_surface(&mut self) -> Result<(), egl_sys::EGLint> {
+        if self.egl_context.is_null() {
+            self.egl_context = egl_sys::create_android_gl_context(&self.libegl, self.egl_display, self.egl_config)
+                .map_err(|_| (self.libegl.eglGetError.unwrap())())?;
         }
-
-        let res = (self.libegl.eglMakeCurrent.unwrap())(
-            self.egl_display,
-            self.surface,
-            self.surface,
-            self.egl_context,
+        let surface = (self.libegl.eglCreateWindowSurface.unwrap())(
+            self.egl_display, self.egl_config, self.window as _, std::ptr::null_mut(),
         );
-
-        assert!(res != 0);
+        if surface.is_null() {
+            return Err((self.libegl.eglGetError.unwrap())());
+        }
+        if (self.libegl.eglMakeCurrent.unwrap())(self.egl_display, surface, surface, self.egl_context) == 0 {
+            let error = (self.libegl.eglGetError.unwrap())();
+            (self.libegl.eglDestroySurface.unwrap())(self.egl_display, surface);
+            return Err(error);
+        }
+        self.surface = surface;
+        egl_sys::set_window_swap_interval(&self.libegl, self.egl_display);
+        Ok(())
     }
 }

@@ -75,6 +75,20 @@ impl CxDrawListPool {
     pub fn alloc(&mut self) -> DrawList {
         DrawList(self.pool.alloc())
     }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn invalidate_gl_resources(&mut self) {
+        for list in &mut self.pool.pool {
+            list.os = Default::default();
+            // Include unused entries: subsequent draws can reuse these slots.
+            for item in &mut list.draw_items.buffer {
+                item.os = Default::default();
+                if let Some(call) = item.kind.draw_call_mut() {
+                    call.uniforms_dirty = true;
+                }
+            }
+        }
+    }
     
     pub fn checked_index(&self, index: DrawListId)->Option<&CxDrawList>{
         let d = &self.pool.pool[index.0];
@@ -307,6 +321,7 @@ pub struct CxDrawCall {
     pub texture_slots: [Option<Texture>; DRAW_CALL_TEXTURE_SLOTS],
     pub instance_dirty: bool,
     pub uniforms_dirty: bool,
+    pub(crate) visual_revision: u64,
 }
 
 impl CxDrawCall {
@@ -321,7 +336,21 @@ impl CxDrawCall {
             texture_slots: draw_vars.texture_slots.clone(),
             instance_dirty: true,
             uniforms_dirty: true,
+            visual_revision: 0,
         }
+    }
+}
+
+impl CxDrawCall {
+    /// Instance uploads and presentation are consumed independently (including by different passes).
+    pub fn mark_instances_changed(&mut self) {
+        self.instance_dirty = true;
+        self.visual_revision = self.visual_revision.wrapping_add(1);
+    }
+
+    pub fn mark_uniforms_changed(&mut self) {
+        self.uniforms_dirty = true;
+        self.visual_revision = self.visual_revision.wrapping_add(1);
     }
 }
 

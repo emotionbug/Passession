@@ -35,6 +35,9 @@ impl DrawListExt for DrawList{
                 return
             }*/
             cx.draw_lists[draw_list_id].draw_list_uniforms.view_transform = *mat;
+            if let Some(pass_id) = cx.draw_lists[draw_list_id].pass_id {
+                cx.passes[pass_id].paint_dirty = true;
+            }
             let draw_items_len = cx.draw_lists[draw_list_id].draw_items.len();
             for draw_item_id in 0..draw_items_len {
                 if let Some(sub_list_id) = cx.draw_lists[draw_list_id].draw_items[draw_item_id].sub_list() {

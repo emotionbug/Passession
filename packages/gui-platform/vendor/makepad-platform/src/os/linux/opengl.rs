@@ -7,10 +7,11 @@ use {
         draw_shader::{CxDrawShaderMapping, DrawShaderTextureInput}, 
         event::{Event, TextureHandleReadyEvent}, 
         makepad_live_id::*, 
+        damage::{DamageFrame, DamageRect},
         makepad_math::{DVec2, Vec4}, 
         makepad_shader_compiler::generate_glsl, 
         pass::{PassClearColor, PassClearDepth, PassId}, 
-        texture::{CxTexture, Texture, TextureFormat, TexturePixel, TextureUpdated}
+        texture::{CxTexture, Texture, TextureFormat, TexturePixel}
     }, 
     std::{
         ffi::{c_char, CStr}, fs::{remove_file, File}, io::prelude::*, mem, ptr
@@ -18,6 +19,35 @@ use {
 };
 
 impl Cx {
+    /// Invalidate GL names without deleting them: the old context already owns
+    /// their destruction and the new context may reuse the same numeric names.
+    #[cfg(target_os = "android")]
+    pub(crate) fn invalidate_gl_resources(&mut self) {
+        for texture in &mut self.textures.0.pool {
+            texture.os = Default::default();
+            texture.previous_platform_resource = None;
+            texture.alloc = None;
+            if texture.format.is_vec() {
+                texture.set_updated(crate::texture::TextureUpdated::Full);
+            }
+        }
+        for geometry in &mut self.geometries.0.pool {
+            geometry.os = Default::default();
+        }
+        self.draw_lists.invalidate_gl_resources();
+        for shader in &mut self.draw_shaders.os_shaders {
+            shader.gl_shader = Default::default();
+            shader.live_uniforms = Default::default();
+        }
+        for pass in &mut self.passes.0.pool {
+            let variant = pass.os.shader_variant;
+            pass.os = CxOsPass { shader_variant: variant, ..Default::default() };
+            pass.paint_dirty |= pass.main_draw_list_id.is_some();
+        }
+        // Redraw widgets as well so active layer captures can be regenerated.
+        self.redraw_all();
+    }
+
     
     pub (crate) fn render_view(
         &mut self,
@@ -25,6 +55,17 @@ impl Cx {
         draw_list_id: DrawListId,
         zbias: &mut f32,
         zbias_step: f32,
+    ) {
+        self.render_view_inner(pass_id, draw_list_id, zbias, zbias_step, &mut None);
+    }
+
+    fn render_view_inner(
+        &mut self,
+        pass_id: PassId,
+        draw_list_id: DrawListId,
+        zbias: &mut f32,
+        zbias_step: f32,
+        damage: &mut Option<(&DamageFrame, DamageRect, usize)>,
     ) {
         let mut to_dispatch = Vec::new();
         //self.draw_lists[draw_list_id].draw_list_uniforms.view_transform = Mat4::identity();
@@ -39,11 +80,12 @@ impl Cx {
         
         for draw_item_id in 0..draw_items_len {
             if let Some(sub_list_id) = self.draw_lists[draw_list_id].draw_items[draw_item_id].kind.sub_list() {
-                self.render_view(
+                self.render_view_inner(
                     pass_id,
                     sub_list_id,
                     zbias,
                     zbias_step,
+                    damage,
                 );
             }
             else {
@@ -58,6 +100,11 @@ impl Cx {
                     continue;
                 };
                 
+                let cull = damage.as_mut().is_some_and(|(frame, rect, ordinal)| {
+                    let cull = frame.should_cull(*ordinal, *rect);
+                    *ordinal += 1;
+                    cull
+                });
                 let sh = &self.draw_shaders.shaders[draw_call.draw_shader.draw_shader_id];
                 if sh.os_shader_id.is_none() { // shader didnt compile somehow
                     continue;
@@ -66,6 +113,11 @@ impl Cx {
                     self.demo_time_repaint = true;
                 }
                 let shp = &mut self.draw_shaders.os_shaders[sh.os_shader_id.unwrap()];
+                if cull {
+                    // Bias depends on traversal order, not the subset submitted.
+                    *zbias += zbias_step;
+                    continue;
+                }
                 
                 let shader_variant = self.passes[pass_id].os.shader_variant;
                                  
@@ -222,7 +274,7 @@ impl Cx {
                         let cxtexture = &mut self.textures[texture_id];
 
                         if cxtexture.format.is_vec(){
-                            cxtexture.update_vec_texture(gl, &self.os_type);
+                            cxtexture.update_vec_texture(gl, self.frame_trace.as_deref());
                         } else if cxtexture.format.is_video() {
                             let is_initial_setup = cxtexture.setup_video_texture(gl);
                             if is_initial_setup {
@@ -312,6 +364,50 @@ impl Cx {
         Some((pass_rect.size, dpi_factor))
     }
 
+    pub(crate) fn gl_window_clear(&self, pass_id: PassId) -> (Vec4, f32) {
+        let pass = &self.passes[pass_id];
+        let color = match pass.color_textures.first().map(|target| &target.clear_color) {
+            Some(PassClearColor::InitWith(color) | PassClearColor::ClearWith(color)) => *color,
+            None => pass.clear_color,
+        };
+        let depth = match pass.clear_depth {
+            PassClearDepth::InitWith(depth) | PassClearDepth::ClearWith(depth) => depth,
+        };
+        (color, depth)
+    }
+
+    pub(crate) fn render_gl_window(
+        &mut self,
+        pass_id: PassId,
+        size: [i32; 2],
+        (color, depth): (Vec4, f32),
+        repair: Option<(&DamageFrame, DamageRect)>,
+    ) {
+        let pass = &self.passes[pass_id];
+        let root = pass.main_draw_list_id.unwrap();
+        let zbias_step = pass.zbias_step;
+        let gl = self.os.gl();
+        unsafe {
+            (gl.glBindFramebuffer)(gl_sys::FRAMEBUFFER, 0);
+            (gl.glViewport)(0, 0, size[0], size[1]);
+            if let Some((_, rect)) = repair {
+                let [x, y, w, h] = rect.egl();
+                (gl.glScissor)(x, y, w, h);
+                (gl.glEnable)(gl_sys::SCISSOR_TEST);
+            }
+            if !pass.dont_clear {
+                (gl.glClearDepthf)(depth);
+                (gl.glClearColor)(color.x, color.y, color.z, color.w);
+                (gl.glClear)(gl_sys::COLOR_BUFFER_BIT | gl_sys::DEPTH_BUFFER_BIT);
+            }
+        }
+        Self::set_default_depth_and_blend_mode(gl);
+        self.render_view_inner(pass_id, root, &mut 0.0, zbias_step, &mut repair.map(|(frame, rect)| (frame, rect, 0)));
+        if repair.is_some() {
+            unsafe { (self.os.gl().glDisable)(gl_sys::SCISSOR_TEST); }
+        }
+    }
+
     pub fn draw_pass_to_texture(
         &mut self,
         pass_id: PassId,
@@ -372,6 +468,7 @@ impl Cx {
                     clear_flags |= gl_sys::COLOR_BUFFER_BIT;
                 }
             }
+            self.textures[color_texture.texture.texture_id()].mark_content_changed();
             if let Some(gl_texture) = self.textures[color_texture.texture.texture_id()].os.gl_texture {
                 unsafe {
                     (gl.glFramebufferTexture2D)(gl_sys::FRAMEBUFFER, gl_sys::COLOR_ATTACHMENT0 + index as u32, gl_sys::TEXTURE_2D, gl_texture, 0);
@@ -1127,6 +1224,35 @@ fn get_gl_string(gl: &LibGl, key: gl_sys::GLenum) -> String {
     }
 }
 
+/// Read implementation strings only after this thread has made its GL context current.
+pub(crate) fn record_gl_renderer(
+    info: &mut crate::gpu_info::GpuInfo,
+    gl: &LibGl,
+    egl: &super::egl_sys::LibEgl,
+    display: super::egl_sys::EGLDisplay,
+) {
+    if info.native_renderer.is_some() {
+        return;
+    }
+    let egl_vendor = unsafe {
+        let ptr = (egl.eglQueryString.unwrap())(display, super::egl_sys::EGL_VENDOR);
+        (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    };
+    let version = get_gl_string(gl, gl_sys::VERSION);
+    if version.is_empty() {
+        return; // No current context.
+    }
+    info.record_native_renderer(crate::gpu_info::GpuRenderer {
+        api: "OpenGL ES",
+        renderer: get_gl_string(gl, gl_sys::RENDERER),
+        vendor: Some(get_gl_string(gl, gl_sys::VENDOR)),
+        version: Some(version),
+        shading_language_version: Some(get_gl_string(gl, gl_sys::SHADING_LANGUAGE_VERSION)),
+        egl_vendor,
+        ..Default::default()
+    });
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct OpenglAttribute {
     pub name:String,
@@ -1224,164 +1350,141 @@ impl CxOsDrawCall {
 pub struct CxOsTexture {
     pub gl_texture: Option<u32>,
     pub gl_renderbuffer: Option<u32>,
+    vec_mip_level: Option<Option<usize>>,
 }
 
 impl CxTexture {
 
-    /// Updates or creates a texture based on the current texture format.
-    ///
-    /// This method optimizes texture management by:
-    /// 1. Reusing existing OpenGL textures when possible.
-    /// 2. Using `glTexSubImage2D` for updates when dimensions haven't changed.
-    /// 3. Falling back to `glTexImage2D` for new textures or when dimensions change.
-    ///
-    /// Internal workings:
-    /// - If a previous platform resource exists, it's reused to avoid unnecessary allocations.
-    /// - If no texture exists, a new OpenGL texture is generated.
-    /// - The method checks current texture dimensions to decide between `glTexSubImage2D` (update) 
-    ///   and `glTexImage2D` (new allocation).
-    ///
-    /// Note: This method assumes that the texture format doesn't change between updates. 
-    /// This is safe because when allocating textures at the Cx level, there are compatibility checks.
-    pub fn update_vec_texture(&mut self, gl: &LibGl, _os_type: &OsType) {
-        let mut needs_realloc = false;
-        if self.alloc_vec() {
-            if let Some(previous) = self.previous_platform_resource.take() {
-                self.os = previous;
-            } 
-            if self.os.gl_texture.is_none() {
-                unsafe {
-                    let mut gl_texture = std::mem::MaybeUninit::uninit();
-                    (gl.glGenTextures)(1, gl_texture.as_mut_ptr());
-                    self.os.gl_texture = Some(gl_texture.assume_init());
-                }
-            }
-            needs_realloc = true;
-        }
-    
-        let updated = self.take_updated();
+    fn update_vec_texture(&mut self, gl: &LibGl, trace: Option<&crate::frame_trace::FrameTrace>) {
+        let updated = self.updated();
         if updated.is_empty() {
             return;
         }
-        
-        unsafe {
-            (gl.glBindTexture)(gl_sys::TEXTURE_2D, self.os.gl_texture.unwrap());
-            (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_WRAP_S, gl_sys::CLAMP_TO_EDGE as i32);
-            (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_WRAP_T, gl_sys::CLAMP_TO_EDGE as i32);
-    
-            // Set texture parameters based on the format
-            let (width, height, internal_format, format, data_type, data, bytes_per_pixel, use_mipmaps) = match &mut self.format {
-                TextureFormat::VecBGRAu8_32{width, height, data, ..} => {
-                    let (internal_format, format) = {
-                        #[cfg(ohos_sim)] {
-                            // The OHOS emulators only support RGBA texture formats, so we swap the `R` and `B` channels.
-                            // TODO: test this on *real* OHOS hardware, it may behave differently.
-                            for p in data.as_mut().unwrap() {
-                                let orig = *p;
-                                *p = *p & 0xFF00FF00 | (orig & 0x000000FF) << 16 | (orig & 0x00FF0000) >> 16;
-                            }
-                            (gl_sys::RGBA, gl_sys::RGBA)
-                        }
-                        #[cfg(not(ohos_sim))] {
-                            // The default for all other devices: use the BGRA texture format
-                            (gl_sys::BGRA, gl_sys::BGRA)
-                        }
-                    };
 
-                    (*width, *height, internal_format, format, gl_sys::UNSIGNED_BYTE, data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void, 4, false)
-                }
-                TextureFormat::VecMipBGRAu8_32{width, height, data, max_level: _, ..} => 
-                    (*width, *height, gl_sys::BGRA, gl_sys::BGRA, gl_sys::UNSIGNED_BYTE, data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void, 4, true),
-                TextureFormat::VecRGBAf32{width, height, data, ..} => 
-                    (*width, *height, gl_sys::RGBA, gl_sys::RGBA, gl_sys::FLOAT, data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void, 16, false),
-                TextureFormat::VecRu8{width, height, data, unpack_row_length, ..} => {
-                    //(gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, 1);
-                    if let Some(row_length) = unpack_row_length {
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, *row_length as i32);
-                    }
-                    (*width, *height, gl_sys::R8, gl_sys::RED, gl_sys::UNSIGNED_BYTE, data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void, 1, false)
-                },
-                TextureFormat::VecRGu8{width, height, data, unpack_row_length, ..} => {
-                    //(gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, 1);
-                    if let Some(row_length) = unpack_row_length {
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, *row_length as i32);
-                    }
-                    (*width, *height, gl_sys::RG, gl_sys::RG, gl_sys::UNSIGNED_BYTE, data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void, 2, false)
-                },
-                TextureFormat::VecRf32{width, height, data, ..} => 
-                    (*width, *height, gl_sys::RED, gl_sys::RED, gl_sys::FLOAT, data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void, 4, false),
-                _ => panic!("Unsupported texture format"),
-            };
+        let alloc = self.format.as_vec_alloc().unwrap();
+        let mip_level = match &self.format {
+            TextureFormat::VecMipBGRAu8_32 { max_level, .. } => Some(*max_level),
+            _ => None,
+        };
+        let reallocate = self.alloc.as_ref() != Some(&alloc)
+            || self.os.gl_texture.is_none()
+            || self.os.vec_mip_level.is_some() != mip_level.is_some();
+        let Some(upload) = self.format.vec_upload(updated, reallocate) else { return };
+        let rect = upload.rect;
+        let supports_row_length = *gl.version_supports_row_length.get_or_init(|| {
+            let version = unsafe { (gl.glGetString)(gl_sys::VERSION) }.cast::<c_char>();
+            if version.is_null() {
+                return false;
+            }
+            let version = unsafe { CStr::from_ptr(version) }.to_bytes();
+            // EGL can return a newer context than requested, and symbols may be
+            // exported even when the current context doesn't support their enums.
+            !version.starts_with(b"OpenGL ES 2.")
+                && !version.starts_with(b"OpenGL ES-CM ") && !version.starts_with(b"OpenGL ES-CL ")
+        });
+        let swap_bgra = cfg!(ohos_sim) && alloc.pixel == TexturePixel::BGRAu8;
+        let (internal_format, format, data_type) = match alloc.pixel {
+            TexturePixel::BGRAu8 if swap_bgra => (gl_sys::RGBA, gl_sys::RGBA, gl_sys::UNSIGNED_BYTE),
+            TexturePixel::BGRAu8 => (gl_sys::BGRA, gl_sys::BGRA, gl_sys::UNSIGNED_BYTE),
+            TexturePixel::RGBAf32 => (gl_sys::RGBA, gl_sys::RGBA, gl_sys::FLOAT),
+            TexturePixel::Ru8 => (
+                if supports_row_length { gl_sys::R8 } else { gl_sys::RED },
+                gl_sys::RED, gl_sys::UNSIGNED_BYTE,
+            ),
+            TexturePixel::RGu8 => (gl_sys::RG, gl_sys::RG, gl_sys::UNSIGNED_BYTE),
+            TexturePixel::Rf32 => (gl_sys::RED, gl_sys::RED, gl_sys::FLOAT),
+            _ => unreachable!(),
+        };
 
-            // Partial texture updates don't (yet) work on OHOS simulators/emulators.
-            
-            // DISABLE PARTIAL TEXTURE UPDATES ENTIRELY. Its broken.
-            const DO_PARTIAL_TEXTURE_UPDATES: bool = false;//cfg!(not(ohos_sim));
-
-            match updated {
-                TextureUpdated::Partial(rect) if DO_PARTIAL_TEXTURE_UPDATES => {
-                    if needs_realloc {
-                        (gl.glTexImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            internal_format as i32,
-                            width as i32, height as i32,
-                            0,
-                            format,
-                            data_type,
-                            0 as *const _
-                        );
-                    }
-
-                    (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, bytes_per_pixel);
-                    (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                    (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, rect.origin.x as i32);
-                    (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS,rect.origin.y as i32);
-                    (gl.glTexSubImage2D)(
-                        gl_sys::TEXTURE_2D,
-                        0,
-                        rect.origin.x as i32,
-                        rect.origin.y as i32 ,
-                        rect.size.width as i32,
-                        rect.size.height as i32,
-                        format,
-                        data_type,
-                        data
-                    );
-                },
-                // Note: this `Partial(_)` case will only match if `DO_PARTIAL_TEXTURE_UPDATES` is false.
-                TextureUpdated::Partial(_) | TextureUpdated::Full => {
-                    (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, bytes_per_pixel);
-                    (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                    (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
-                    (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
-                    (gl.glTexImage2D)(
-                        gl_sys::TEXTURE_2D,
-                        0,
-                        internal_format as i32,
-                        width as i32, height as i32,
-                        0,
-                        format,
-                        data_type,
-                        data
-                    );
-                },
-                TextureUpdated::Empty => panic!("already asserted that updated is not empty"),
-            };
-    
-            (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_MIN_FILTER, if use_mipmaps { gl_sys::LINEAR_MIPMAP_LINEAR } else { gl_sys::LINEAR } as i32);
-            (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_MAG_FILTER, gl_sys::LINEAR as i32);
-
-            if use_mipmaps {
-                if let TextureFormat::VecMipBGRAu8_32{max_level, ..} = &self.format {
-                    (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_BASE_LEVEL, 0);
-                    (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_MAX_LEVEL, max_level.unwrap_or(1000) as i32);
-                    (gl.glGenerateMipmap)(gl_sys::TEXTURE_2D);
+        let row_bytes = rect.size.width * upload.bytes_per_pixel;
+        let has_row_padding = rect.size.height > 1 && upload.row_stride != row_bytes;
+        // GLES2 has no core UNPACK_ROW_LENGTH. The OHOS simulator also needs
+        // BGRA converted to RGBA without ever mutating the retained CPU atlas.
+        let use_row_length = has_row_padding && supports_row_length && !swap_bgra;
+        let mut scratch;
+        let bytes = if swap_bgra || (has_row_padding && !use_row_length) {
+            scratch = gl.upload_scratch.borrow_mut();
+            scratch.clear();
+            scratch.reserve(row_bytes * rect.size.height);
+            for row in upload.bytes.chunks(upload.row_stride) {
+                scratch.extend_from_slice(&row[..row_bytes]);
+            }
+            if swap_bgra {
+                for pixel in scratch.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
                 }
             }
+            scratch.as_slice()
+        } else {
+            upload.bytes
+        };
 
+        unsafe {
+            if self.os.gl_texture.is_none() {
+                if let Some(previous) = self.previous_platform_resource.take() {
+                    self.os = previous;
+                }
+                if self.os.gl_texture.is_none() {
+                    let mut texture = 0;
+                    (gl.glGenTextures)(1, &mut texture);
+                    self.os.gl_texture = Some(texture);
+                }
+            }
+            (gl.glBindTexture)(gl_sys::TEXTURE_2D, self.os.gl_texture.unwrap());
+
+            let unaligned = upload.bytes_per_pixel < 4;
+            if unaligned {
+                (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, 1);
+            }
+            if use_row_length {
+                let row_length = i32::try_from(upload.row_length).expect("GL texture row too wide");
+                (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, row_length);
+            }
+
+            if reallocate {
+                (gl.glTexImage2D)(
+                    gl_sys::TEXTURE_2D, 0, internal_format as i32,
+                    rect.size.width as i32, rect.size.height as i32,
+                    0, format, data_type, bytes.as_ptr().cast(),
+                );
+            } else {
+                (gl.glTexSubImage2D)(
+                    gl_sys::TEXTURE_2D, 0, rect.origin.x as i32, rect.origin.y as i32,
+                    rect.size.width as i32, rect.size.height as i32,
+                    format, data_type, bytes.as_ptr().cast(),
+                );
+            }
+
+            if use_row_length {
+                (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, 0);
+            }
+            if unaligned {
+                (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, 4);
+            }
+
+            if reallocate {
+                (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_WRAP_S, gl_sys::CLAMP_TO_EDGE as i32);
+                (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_WRAP_T, gl_sys::CLAMP_TO_EDGE as i32);
+                let min_filter = if mip_level.is_some() { gl_sys::LINEAR_MIPMAP_LINEAR } else { gl_sys::LINEAR };
+                (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_MIN_FILTER, min_filter as i32);
+                (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_MAG_FILTER, gl_sys::LINEAR as i32);
+            }
+            if let Some(max_level) = mip_level {
+                if supports_row_length && (reallocate || self.os.vec_mip_level != mip_level) {
+                    (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_BASE_LEVEL, 0);
+                    (gl.glTexParameteri)(gl_sys::TEXTURE_2D, gl_sys::TEXTURE_MAX_LEVEL, max_level.unwrap_or(1000) as i32);
+                }
+                (gl.glGenerateMipmap)(gl_sys::TEXTURE_2D);
+            }
             (gl.glBindTexture)(gl_sys::TEXTURE_2D, 0);
         }
+        if let Some(trace) = trace {
+            trace.texture_upload(rect.size.width, rect.size.height, upload.bytes_per_pixel);
+        }
+
+        self.os.vec_mip_level = mip_level;
+        self.alloc = Some(alloc);
+        self.take_updated();
     }
     
     pub fn setup_video_texture(&mut self, gl: &LibGl) -> bool {

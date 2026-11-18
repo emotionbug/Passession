@@ -14,6 +14,10 @@ pub const EGL_WINDOW_BIT: u32 = 4;
 pub const EGL_OPENGL_ES2_BIT: u32 = 4;
 
 pub const EGL_SUCCESS: u32 = 12288;
+pub const EGL_BAD_SURFACE: EGLint = 0x300D;
+pub const EGL_CONTEXT_LOST: EGLint = 0x300E;
+pub const EGL_VENDOR: EGLint = 0x3053;
+pub const EGL_SAMPLE_BUFFERS: u32 = 0x3032;
 pub const EGL_ALPHA_SIZE: u32 = 12321;
 pub const EGL_BLUE_SIZE: u32 = 12322;
 pub const EGL_GREEN_SIZE: u32 = 12323;
@@ -373,6 +377,15 @@ impl LibEgl {
     }
 }
 
+/// Must be called with this window surface current on the render thread.
+pub(crate) unsafe fn set_window_swap_interval(egl: &LibEgl, display: EGLDisplay) -> bool {
+    if (egl.eglSwapInterval.unwrap())(display, 1) == 0 {
+        crate::warning!("eglSwapInterval(1) failed: {:#x}", (egl.eglGetError.unwrap())());
+        return false;
+    }
+    true
+}
+
 #[derive(Debug)]
 pub enum EglError {
     NoDisplay,
@@ -383,200 +396,122 @@ pub enum EglError {
 
 pub struct Egl {}
 
-#[cfg(target_os="android")]
-pub unsafe fn create_egl_context(
-    egl: &mut LibEgl,
-    display: *mut std::ffi::c_void,
-) -> Result<(EGLContext, EGLConfig, EGLDisplay), EglError> {
-
-    let display = (egl.eglGetDisplay.unwrap())(display as _);
-    if display == /* EGL_NO_DISPLAY */ null_mut() {
-        return Err(EglError::NoDisplay);
+#[cfg(any(test, target_os = "android"))]
+fn android_config_rank(
+    [r, g, b, alpha, depth, stencil, samples, sample_buffers]: [i32; 8],
+    alpha_needed: i32,
+    depth_needed: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    if r < 8 || g < 8 || b < 8 || alpha < alpha_needed || depth < depth_needed
+        || samples != 0 || sample_buffers != 0
+    {
+        return None;
     }
-
-    if (egl.eglInitialize.unwrap())(display, null_mut(), null_mut()) == 0 {
-        return Err(EglError::InitializeFailed);
-    }
-
-    #[rustfmt::skip]
-    let cfg_attributes = vec![
-        EGL_SURFACE_TYPE,
-        EGL_WINDOW_BIT,
-        EGL_RED_SIZE,
-        8,
-        EGL_GREEN_SIZE,
-        8,
-        EGL_BLUE_SIZE,
-        8,
-        EGL_ALPHA_SIZE,
-        0,
-        EGL_DEPTH_SIZE,
-        24,
-        EGL_STENCIL_SIZE,
-        0,
-        EGL_NONE,
-    ];
-    let mut available_cfgs: Vec<EGLConfig> = vec![null_mut(); 32];
-    let mut cfg_count = 0;
-
-    (egl.eglChooseConfig.unwrap())(
-        display,
-        cfg_attributes.as_ptr() as _,
-        available_cfgs.as_ptr() as _,
-        32,
-        &mut cfg_count as *mut _ as *mut _,
-    );
-    assert!(cfg_count > 0);
-    assert!(cfg_count <= 32);
-    
-    // find config with 8-bit rgb buffer if available, ndk sample does not trust egl spec
-    let mut config: EGLConfig = null_mut();
-    let mut exact_cfg_found = false;
-    for c in &mut available_cfgs[0..cfg_count] {
-        let mut r: i32 = 0;
-        let mut g: i32 = 0;
-        let mut b: i32 = 0;
-        let mut a: i32 = 0;
-        let mut d: i32 = 0;
-        if (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_RED_SIZE as _, &mut r) == 1
-            && (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_GREEN_SIZE as _, &mut g) == 1
-            && (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_BLUE_SIZE as _, &mut b) == 1
-            && (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_ALPHA_SIZE as _, &mut a) == 1
-            && (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_DEPTH_SIZE as _, &mut d) == 1
-            && r == 8
-            && g == 8
-            && b == 8
-            && a == 0
-            && d == 16
-        {
-            exact_cfg_found = true;
-            config = *c;
-            break;
-        }
-    }
-    if !exact_cfg_found {
-        config = available_cfgs[0];
-    }
-    #[cfg(use_gles_3)]
-    let ctx_attributes = vec![EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE];
-    #[cfg(not(use_gles_3))]
-    let ctx_attributes = vec![EGL_CONTEXT_MAJOR_VERSION, 2, EGL_NONE];
-        
-    let context = (egl.eglCreateContext.unwrap())(
-        display,
-        config,
-        /* EGL_NO_CONTEXT */ null_mut(),
-        ctx_attributes.as_ptr() as _,
-    );
-    if context.is_null() {
-        return Err(EglError::CreateContextFailed);
-    }
-    
-    return Ok((context, config, display));
+    // EGL's chooser uses minima; zero does not exclude unused attributes.
+    Some((r + g + b - 24, depth - depth_needed, stencil, alpha - alpha_needed))
 }
 
-#[cfg(target_os="android")]
-pub unsafe fn create_egl_context_openxr(
-    egl: &mut LibEgl,
-    display: *mut std::ffi::c_void,
+#[cfg(target_os = "android")]
+pub unsafe fn create_egl_context(
+    egl: &LibEgl,
+    native_display: *mut std::ffi::c_void,
 ) -> Result<(EGLContext, EGLConfig, EGLDisplay), EglError> {
-    
-    let display = (egl.eglGetDisplay.unwrap())(display as _);
-    if display == /* EGL_NO_DISPLAY */ null_mut() {
+    let display = (egl.eglGetDisplay.unwrap())(native_display as _);
+    if display.is_null() {
         return Err(EglError::NoDisplay);
     }
-    
     if (egl.eglInitialize.unwrap())(display, null_mut(), null_mut()) == 0 {
         return Err(EglError::InitializeFailed);
     }
-    
-    
-    #[rustfmt::skip]
-    let cfg_attributes = vec![
-        EGL_RED_SIZE,
-        8,
-        EGL_GREEN_SIZE,
-        8,
-        EGL_BLUE_SIZE,
-        8,
-        EGL_ALPHA_SIZE,
-        8,
-        EGL_DEPTH_SIZE,
-        0,
-        EGL_STENCIL_SIZE,
-        0,
-        EGL_SAMPLES,
-        0,
-        EGL_NONE,
-    ];
-    let mut available_cfgs: Vec<EGLConfig> = vec![null_mut(); 1024];
-    let mut cfg_count = 0;
-    
-    (egl.eglGetConfigs.unwrap())(
-         display,
-         available_cfgs.as_ptr() as _,
-         available_cfgs.len() as _,
-         &mut cfg_count as *mut _ as *mut _,
-    );
-    /*
-    (egl.eglChooseConfig.unwrap())(
-        display,
-        cfg_attributes.as_ptr() as _,
-        available_cfgs.as_ptr() as _,
-        32,
-        &mut cfg_count as *mut _ as *mut _,
-    );
-    assert!(cfg_count > 0);
-    assert!(cfg_count <= 32);
-      */  
-    // find config with 8-bit rgb buffer if available, ndk sample does not trust egl spec
-    let mut config: EGLConfig = null_mut();
-    let mut exact_cfg_found = false;
-        
-    
-    for c in &mut available_cfgs[0..cfg_count] {
-        let mut value = 0u32;
-        (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_RENDERABLE_TYPE as _, &mut value as *mut _ as *mut _); 
-        if (value & EGL_OPENGL_ES3_BIT_KHR) != EGL_OPENGL_ES3_BIT_KHR{
-            continue;
+    let result = (|| {
+        if (egl.eglBindAPI.unwrap())(EGL_OPENGL_ES_API) == 0 {
+            return Err(EglError::InitializeFailed);
         }
-        (egl.eglGetConfigAttrib.unwrap())(display, *c, EGL_SURFACE_TYPE as _, &mut value as *mut _ as *mut _); 
-        if (value & (EGL_WINDOW_BIT | EGL_PBUFFER_BIT)) != (EGL_WINDOW_BIT | EGL_PBUFFER_BIT) {
-            continue;
+        let xr = cfg!(quest);
+        let renderable = if cfg!(any(use_gles_3, quest)) { EGL_OPENGL_ES3_BIT_KHR } else { EGL_OPENGL_ES2_BIT };
+        // OpenXR uses alpha, pbuffers and its own depth targets. Ordinary views
+        // are opaque and keep 24-bit window depth for UI Z ordering.
+        let alpha = if xr { 8 } else { 0 };
+        let depth = if xr { 0 } else { 24 };
+        let surface_type = EGL_WINDOW_BIT | if xr { EGL_PBUFFER_BIT } else { 0 };
+        let attributes = [
+            EGL_SURFACE_TYPE as i32, surface_type as i32,
+            EGL_RENDERABLE_TYPE as i32, renderable as i32,
+            EGL_RED_SIZE as i32, 8, EGL_GREEN_SIZE as i32, 8, EGL_BLUE_SIZE as i32, 8,
+            EGL_ALPHA_SIZE as i32, alpha, EGL_DEPTH_SIZE as i32, depth,
+            EGL_SAMPLE_BUFFERS as i32, 0, EGL_SAMPLES as i32, 0, EGL_NONE as i32,
+        ];
+        let choose = egl.eglChooseConfig.unwrap();
+        let get = egl.eglGetConfigAttrib.unwrap();
+        let mut count = 0;
+        if choose(display, attributes.as_ptr(), null_mut(), 0, &mut count) == 0 || count <= 0 {
+            return Err(EglError::ChooseConfigFailed);
         }
-        
-        let mut j = 0;
-        while cfg_attributes[j] != EGL_NONE{
-            let mut value = 0u32;
-            (egl.eglGetConfigAttrib.unwrap())(display, *c, cfg_attributes[j] as _, &mut value as *mut _ as *mut _); 
-            if value != cfg_attributes[j+1]{
-                crate::log!("FAILED AT {} {} {}", value, cfg_attributes[j+1], j);
-                break; 
+        let mut configs = vec![null_mut(); count as usize];
+        if choose(display, attributes.as_ptr(), configs.as_mut_ptr(), count, &mut count) == 0 {
+            return Err(EglError::ChooseConfigFailed);
+        }
+        let keys = [EGL_RED_SIZE, EGL_GREEN_SIZE, EGL_BLUE_SIZE, EGL_ALPHA_SIZE,
+                    EGL_DEPTH_SIZE, EGL_STENCIL_SIZE, EGL_SAMPLES, EGL_SAMPLE_BUFFERS];
+        let mut best = None;
+        for &config in configs.iter().take(count as usize) {
+            let mut values = [0; 8];
+            if keys.iter().zip(&mut values).all(|(&key, value)| get(display, config, key as i32, value) != 0) {
+                if let Some(rank) = android_config_rank(values, alpha, depth) {
+                    if best.is_none_or(|(previous, _)| rank < previous) {
+                        best = Some((rank, config));
+                    }
+                    if rank == (0, 0, 0, 0) {
+                        break;
+                    }
+                }
             }
-            j+=2;
         }
-        if cfg_attributes[j] == EGL_NONE{
-            exact_cfg_found = true;
-            config = *c;
-            break;
-        }
+        let config = best.ok_or(EglError::ChooseConfigFailed)?.1;
+        let context = create_android_gl_context(egl, display, config)?;
+        Ok((context, config, display))
+    })();
+    if result.is_err() {
+        (egl.eglTerminate.unwrap())(display);
     }
-    
-    if !exact_cfg_found {
-        config = available_cfgs[0];
-    }
-    let ctx_attributes = vec![EGL_CONTEXT_MAJOR_VERSION, 3, EGL_NONE];
-    let context = (egl.eglCreateContext.unwrap())(
-        display,
-        config,
-        /* EGL_NO_CONTEXT */ null_mut(),
-        ctx_attributes.as_ptr() as _,
-    );
+    result
+}
+
+#[cfg(target_os = "android")]
+pub(crate) unsafe fn create_android_gl_context(
+    egl: &LibEgl, display: EGLDisplay, config: EGLConfig,
+) -> Result<EGLContext, EglError> {
+    let version = if cfg!(any(use_gles_3, quest)) { 3 } else { 2 };
+    let attributes = [EGL_CONTEXT_MAJOR_VERSION as i32, version, EGL_NONE as i32];
+    let context = (egl.eglCreateContext.unwrap())(display, config, EGL_NO_CONTEXT, attributes.as_ptr());
     if context.is_null() {
         return Err(EglError::CreateContextFailed);
     }
-        
-    return Ok((context, config, display));
+    Ok(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::android_config_rank;
+
+    #[test]
+    fn ranks_opaque_configs_and_rejects_msaa_or_insufficient_depth() {
+        let rank = |format| android_config_rank(format, 0, 24);
+        let exact = rank([8, 8, 8, 0, 24, 0, 0, 0]).unwrap();
+        assert!(exact < rank([8, 8, 8, 8, 24, 0, 0, 0]).unwrap());
+        assert!(exact < rank([8, 8, 8, 0, 24, 8, 0, 0]).unwrap());
+        assert!(exact < rank([8, 8, 8, 0, 32, 0, 0, 0]).unwrap());
+        assert_eq!(rank([8, 8, 8, 0, 24, 0, 4, 1]), None);
+        assert_eq!(rank([8, 8, 8, 0, 16, 0, 0, 0]), None);
+        assert_eq!(rank([5, 6, 5, 0, 24, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn xr_requires_rgba_and_prefers_depthless_surface() {
+        let rank = |format| android_config_rank(format, 8, 0);
+        assert_eq!(rank([8, 8, 8, 8, 0, 0, 0, 0]), Some((0, 0, 0, 0)));
+        assert_eq!(rank([8, 8, 8, 0, 0, 0, 0, 0]), None);
+    }
 }
 
 

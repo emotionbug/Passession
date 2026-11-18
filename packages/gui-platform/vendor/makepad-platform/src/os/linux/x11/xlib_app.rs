@@ -15,6 +15,7 @@ use {
         xdnd::{Dnd, DndStep},
         super::select_timer::SelectTimers,
         super::libc_sys,
+        super::module_loader::ModuleLoader,
     },
     crate::{
         makepad_math::DVec2,
@@ -82,6 +83,10 @@ pub struct XlibApp {
     pub window_map: HashMap<c_ulong, *mut XlibWindow>,
 
     pub timers: SelectTimers,
+    fallback_frame_period: Option<f64>,
+    randr_module: Option<ModuleLoader>,
+    next_frame_at: f64,
+    frame_wait_until: Option<f64>,
 
     pub last_scroll_time: f64,
     pub last_click_time: f64,
@@ -99,6 +104,8 @@ pub struct XlibApp {
     pub atoms: XlibAtoms,
     pub dnd: Dnd,
     pub next_keypress_is_repeat: bool,
+    #[cfg(debug_assertions)]
+    damage_oracle_touch_atom: Option<x11_sys::Atom>,
 }
 
 impl XlibApp {
@@ -125,6 +132,10 @@ impl XlibApp {
                 last_click_pos: (0, 0),
                 window_map: HashMap::new(),
                 timers: SelectTimers::new(),
+                fallback_frame_period: None,
+                randr_module: None,
+                next_frame_at: 0.0,
+                frame_wait_until: None,
                 event_flow: EventFlow::Poll,
                 //free_timers: Vec::new(),
                 current_cursor: MouseCursor::Default,
@@ -132,8 +143,56 @@ impl XlibApp {
                 shown_cursor: None,
                 dnd: Dnd::new(display),
                 next_keypress_is_repeat: false,
+                #[cfg(debug_assertions)]
+                damage_oracle_touch_atom: std::env::var_os("PASEO_DAMAGE_ORACLE_TOUCH")
+                    .filter(|value| value == "1")
+                    .map(|_| x11_sys::XInternAtom(display, c"PASEO_DAMAGE_ORACLE_TOUCH".as_ptr(), 0)),
             }
         }
+    }
+
+    pub(crate) fn enable_frame_rate_fallback(&mut self) {
+        if self.fallback_frame_period.is_some() {
+            return;
+        }
+        let rate = self.randr_refresh_rate().unwrap_or(60);
+        self.fallback_frame_period = Some(1.0 / f64::from(rate));
+        crate::log!("X11: using a {rate} Hz fallback for unsynchronized animation frames");
+    }
+
+    fn randr_refresh_rate(&mut self) -> Option<i16> {
+        // Xvfb typically has no refresh rate, and libXrandr is optional.
+        // Keep it loaded even if the query fails: Xlib caches extension
+        // callbacks that it may invoke later from XCloseDisplay.
+        self.randr_module = ModuleLoader::load("libXrandr.so.2").ok();
+        let randr = self.randr_module.as_ref()?;
+        let get_info: unsafe extern "C" fn(*mut x11_sys::Display, c_ulong) -> *mut c_void =
+            randr.get_symbol("XRRGetScreenInfo").ok()?;
+        let refresh: unsafe extern "C" fn(*mut c_void) -> i16 =
+            randr.get_symbol("XRRConfigCurrentRate").ok()?;
+        let free: unsafe extern "C" fn(*mut c_void) =
+            randr.get_symbol("XRRFreeScreenConfigInfo").ok()?;
+        unsafe {
+            let root = x11_sys::XRootWindow(self.display, x11_sys::XDefaultScreen(self.display));
+            let config = get_info(self.display, root);
+            if config.is_null() {
+                return None;
+            }
+            let rate = refresh(config);
+            free(config);
+            (rate > 0).then_some(rate)
+        }
+    }
+
+    pub(crate) fn admit_animation_frame(&mut self, now: f64) -> bool {
+        let Some(period) = self.fallback_frame_period else { return true };
+        if now < self.next_frame_at {
+            self.frame_wait_until = Some(self.next_frame_at);
+            return false;
+        }
+        self.frame_wait_until = None;
+        self.next_frame_at = now + period;
+        true
     }
     
     pub unsafe fn event_loop_poll(&mut self) {
@@ -631,6 +690,33 @@ impl XlibApp {
                 },
                 x11_sys::ClientMessage => {
                     let event = event.xclient;
+                    // XTEST has no touch events. The debug-only pixel test feeds
+                    // one finger through the same dispatcher as platform touch.
+                    #[cfg(debug_assertions)]
+                    if self.damage_oracle_touch_atom == Some(event.message_type) && event.format == 32 {
+                        if let Some(window) = self.window_map.get(&event.window) {
+                            let [phase, x, y, ..] = event.data.l;
+                            let state = match phase {
+                                0 => TouchState::Start,
+                                1 => TouchState::Move,
+                                2 => TouchState::Stop,
+                                _ => continue,
+                            };
+                            let time = self.time_now();
+                            self.do_callback(XlibEvent::DamageOracleTouch(TouchUpdateEvent {
+                                time,
+                                cancelled: false,
+                                window_id: (**window).window_id,
+                                modifiers: Default::default(),
+                                touches: vec![TouchPoint {
+                                    state, time, uid: 1, abs: DVec2 { x: x as f64, y: y as f64 },
+                                    rotation_angle: 0.0, force: 1.0, radius: DVec2::default(),
+                                    handled: Cell::default(), sweep_lock: Cell::default(),
+                                }],
+                            }));
+                        }
+                        continue;
+                    }
                     // WM_DELETE_WINDOW is a request, not permission to destroy
                     // the window. Match the close protocol before giving the app
                     // a chance to run its document and application close guards.
@@ -659,12 +745,12 @@ impl XlibApp {
                     self.dnd_step(step);
                 },
                 x11_sys::Expose => {
-                    /* 
-                    (glx.glXMakeCurrent)(display, window, context);
-                    gl::ClearColor(1.0, 0.0, 0.0, 1.0);
-                    gl::Clear(gl::COLOR_BUFFER_BIT);
-                    (glx.glXSwapBuffers)(display, window);
-                    */
+                    let event = event.xexpose;
+                    if event.count == 0 {
+                        if let Some(window) = self.window_map.get(&event.window) {
+                            self.do_callback(XlibEvent::Expose((**window).window_id));
+                        }
+                    }
                 },
                 x11_sys::VisibilityNotify => {
                     let event = event.xvisibility;
@@ -704,7 +790,14 @@ impl XlibApp {
                 match self.event_flow {
                     EventFlow::Exit => break,
                     EventFlow::Wait => {
-                        self.timers.select(&[self.display_fd, wake.fd()]);
+                        if x11_sys::XPending(self.display) == 0 {
+                            let fds = [self.display_fd, wake.fd()];
+                            if let Some(deadline) = self.frame_wait_until.take() {
+                                self.timers.select_until(&fds, Some(deadline));
+                            } else {
+                                self.timers.select(&fds);
+                            }
+                        }
                         self.event_flow = EventFlow::Poll;
                     }
                     EventFlow::Poll => self.event_loop_poll(),
@@ -791,6 +884,7 @@ impl XlibApp {
             unsafe {x11_sys::XCloseDisplay(self.display)};
             self.display = ptr::null_mut();
         }
+        self.randr_module = None;
     }
     
     pub fn start_timer(&mut self, id: u64, timeout: f64, repeats: bool) {

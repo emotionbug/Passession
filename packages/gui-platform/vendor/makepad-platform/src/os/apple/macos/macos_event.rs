@@ -29,6 +29,7 @@ pub enum MacosEvent {
     WindowGeomChange(WindowGeomChangeEvent),
     WindowClosed(WindowClosedEvent),
     Paint,
+    DisplayFrame,
     
     MouseDown(MouseDownEvent),
     MouseUp(MouseUpEvent),

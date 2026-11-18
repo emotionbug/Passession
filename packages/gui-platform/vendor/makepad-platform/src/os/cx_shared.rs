@@ -123,6 +123,7 @@ impl Cx {
             match self.passes[pass_id].parent {
                 CxPassParent::Window(_) => {
                     self.passes[pass_id].paint_dirty = true;
+                    self.passes[pass_id].damage_epoch = self.passes[pass_id].damage_epoch.wrapping_add(1);
                 },
                 _ => ()
             }

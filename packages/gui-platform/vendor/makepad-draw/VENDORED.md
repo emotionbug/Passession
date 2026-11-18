@@ -189,6 +189,13 @@ shift, so a retained viewport can scroll without moving or re-emitting any
 instances. `DrawText::draw_areas` exposes the latest draw's glyph batches for
 retained color updates across atlas pages.
 
+The quad, text, and icon vertex implementations opt in to conservative
+fragment bounds. `DrawColor` and first-party shaders that inherit these
+vertex functions without replacing any of their callees inherit that
+guarantee. The terminal's synthesized italic shader shears after clipping
+and does not. Alignment edits mark both upload dirtiness and retained paint
+revision; view transforms schedule a repaint of their owning pass.
+
 ## Standard rustybuzz, ttf-parser and PNG
 
 `Cargo.toml` and `Cargo.toml.orig` replace `makepad-rustybuzz` 0.8.0, Makepad's
@@ -203,3 +210,10 @@ glyph_outline,glyph_raster_image,shaper}.rs` and `paseo_font_tests.rs` drop the
 `Decoder::new` takes a `Cursor` over the glyph bytes, and `output_buffer_size`
 now returns `Option`; a bitmap glyph whose decoded size does not fit `usize`
 panics with a message, as other glyph PNG decode failures already do.
+
+## Glyph-atlas dirty rectangles
+
+Each atlas page accumulates a bounding box beginning at the first glyph added
+since the last upload, not at `(0, 0)`. Taking that box resets it to empty.
+Later uploads of a single glyph touch only its region, even on a partially
+filled page; texture creation still initializes the full page.

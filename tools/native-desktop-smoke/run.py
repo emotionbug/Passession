@@ -113,6 +113,8 @@ try:
                 PASEO_SMOKE_OPENBOX=options.openbox, PASEO_DESKTOP_RUNTIME=str(runtime / 'desktop-runtime.json'),
                 GDK_BACKEND='x11', XDG_SESSION_TYPE='x11', XDG_CURRENT_DESKTOP='PaseoSmoke',
                 GIO_USE_VFS='local', GTK_USE_PORTAL='0', GSETTINGS_BACKEND='memory', NO_AT_BRIDGE='1',
+                # Cover the XRandR pacing fallback and its lifetime through XCloseDisplay.
+                LIBGL_ALWAYS_SOFTWARE='1',
             )
             home = environment['PASEO_HOME']
             with (case / 'foreground-daemon.log').open('w') as log:

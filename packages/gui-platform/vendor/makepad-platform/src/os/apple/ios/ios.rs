@@ -37,7 +37,7 @@ impl Cx {
     pub fn event_loop(cx:Rc<RefCell<Cx>>) {
         cx.borrow_mut().self_ref = Some(cx.clone());
         cx.borrow_mut().os_type = OsType::Ios;
-        let metal_cx: Rc<RefCell<MetalCx >> = Rc::new(RefCell::new(MetalCx::new()));
+        let metal_cx = Rc::new(RefCell::new(MetalCx::new(&mut cx.borrow_mut().gpu_info)));
         //let cx = Rc::new(RefCell::new(self));
         //crate::log!("Makepad iOS application started.");
         //let metal_windows = Rc::new(RefCell::new(Vec::new()));
