@@ -10,8 +10,8 @@ use super::paint::{Draw, Look};
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::widgets::{
-    RowMetrics, STATUS_BUCKET_ORDER, StatusBucket, derive_status_bucket, paint_status_badge,
-    paint_status_ring, status_dot_color,
+    RowMetrics, STATUS_BUCKET_ORDER, StatusBucket, derive_status_bucket, paint_static_status_badge,
+    status_dot_color,
 };
 use makepad_widgets::*;
 use serde_json::Value;
@@ -300,7 +300,6 @@ fn subagent_segments(rows: &[SubagentRow]) -> Vec<(Option<StatusBucket>, String)
 fn pill(
     cx: &mut Cx2d,
     d: &mut Draw,
-    painter: &mut Painter,
     x: f64,
     y: f64,
     height: f64,
@@ -308,6 +307,7 @@ fn pill(
     segments: &[(Option<StatusBucket>, String)],
     open: bool,
     id: &str,
+    anchor: &mut Area,
 ) -> f64 {
     let p = d.look.palette;
     let size = d.look.ui(12.0);
@@ -322,6 +322,11 @@ fn pill(
     let w = total.min(max_w);
     let hovered = d.state.hover_hit.as_deref() == Some(id);
     let r = rect_xywh(x, y, w, height);
+    let border = if !d.look.compact && cx.has_key_focus(*anchor) {
+        p.foreground
+    } else {
+        p.border_accent
+    };
     d.kit.bordered(
         cx,
         r,
@@ -331,7 +336,7 @@ fn pill(
             p.surface1
         },
         height * 0.5,
-        p.border_accent,
+        border,
         1.0,
     );
     cx.begin_turtle(
@@ -347,10 +352,9 @@ fn pill(
     for ((bucket, text), sw) in segments.iter().zip(&widths) {
         if let Some(bucket) = bucket {
             let center = dvec2(sx + 3.0, y + height * 0.5);
-            if *bucket == StatusBucket::Running {
-                paint_status_ring(painter, cx, center, &p, None);
-                d.animating = true;
-            } else if let Some(color) = status_dot_color(&p, *bucket, true) {
+            // A status rollup is not a loading indicator. Do not redraw the
+            // retained track layer on every frame while work is running.
+            if let Some(color) = status_dot_color(&p, *bucket, true) {
                 d.kit.rect(
                     cx,
                     rect_xywh(center.x - 3.0, center.y - 3.0, 6.0, 6.0),
@@ -375,27 +379,27 @@ fn pill(
     }
     cx.end_turtle();
     d.canvas.add_hit(r, HitTarget::Chrome(id.to_owned()));
+    cx.add_aligned_rect_area(anchor, r);
     w
 }
 
-/// The track bar resting `pill_clearance` above `bottom`; returns pill rects.
+/// The track bar resting `pill_clearance` above `bottom`; records the drawn triggers.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_bar(
     cx: &mut Cx2d,
     d: &mut Draw,
-    painter: &mut Painter,
     model: &TrackModel,
     open: Option<TrackPanel>,
     x: f64,
     bottom: f64,
     w: f64,
     height: f64,
-) -> Vec<(TrackPanel, Rect)> {
+    anchors: &mut [Area; 2],
+) {
     let outer = (w - 32.0).min(d.look.typo.content_max_width);
     let bx = x + (w - outer) * 0.5;
     let y = bottom - pill_clearance(d.look.compact) - height;
     let mut cursor = bx;
-    let mut out = Vec::new();
     let pills = (!model.tasks.is_empty()) as usize
         + (!model.rows.is_empty() || model.delete != DeleteFinished::Idle) as usize;
     let avail = (outer - 4.0 * pills.saturating_sub(1) as f64).max(80.0);
@@ -420,7 +424,6 @@ pub fn draw_bar(
         let pw = pill(
             cx,
             d,
-            painter,
             cursor,
             y,
             height,
@@ -428,16 +431,17 @@ pub fn draw_bar(
             &[(None, label)],
             open == Some(TrackPanel::Tasks),
             "track:tasks",
+            &mut anchors[TrackPanel::Tasks as usize],
         );
-        out.push((TrackPanel::Tasks, rect_xywh(cursor, y, pw, height)));
         cursor += pw + 4.0;
+    } else {
+        anchors[TrackPanel::Tasks as usize] = Area::Empty;
     }
     if !model.rows.is_empty() || model.delete != DeleteFinished::Idle {
         let segments = subagent_segments(model.rows);
-        let pw = pill(
+        pill(
             cx,
             d,
-            painter,
             cursor,
             y,
             height,
@@ -445,10 +449,11 @@ pub fn draw_bar(
             &segments,
             open == Some(TrackPanel::Subagents),
             "track:subagents",
+            &mut anchors[TrackPanel::Subagents as usize],
         );
-        out.push((TrackPanel::Subagents, rect_xywh(cursor, y, pw, height)));
+    } else {
+        anchors[TrackPanel::Subagents as usize] = Area::Empty;
     }
-    out
 }
 
 /// Panel rows (ComposerTrackRow): returns the content height.
@@ -647,16 +652,14 @@ fn panel_rows(
                         svg.as_deref(),
                         p.muted,
                     );
-                    if paint_status_badge(
+                    paint_static_status_badge(
                         painter,
                         cx,
                         icon_rect,
                         Some(row.bucket()),
                         &p,
                         if hovered_row { p.surface2 } else { p.surface1 },
-                    ) {
-                        d.animating = true;
-                    }
+                    );
                 }
                 let actions_visible = compact || d.look.mobile || hovered_row;
                 let text_x = slots.title.pos.x;
@@ -730,19 +733,18 @@ pub fn draw_panel(
     icon: &mut DrawIcon,
     model: &TrackModel,
     panel: TrackPanel,
-    anchor: Rect,
+    anchor: Option<Rect>,
     area: Rect,
     bottom_inset: f64,
-) {
+) -> Option<Rect> {
     let p = d.look.palette;
-    let title = t(match panel {
-        TrackPanel::Tasks => "message.todo.title",
-        TrackPanel::Subagents => "subagents.title",
-    });
-    // Scrim closes the panel.
-    d.canvas
-        .add_hit(area, HitTarget::Chrome("track-close".into()));
     if d.look.compact {
+        let title = t(match panel {
+            TrackPanel::Tasks => "message.todo.title",
+            TrackPanel::Subagents => "subagents.title",
+        });
+        d.canvas
+            .add_hit(area, HitTarget::Chrome("track-close".into()));
         d.kit.rect(cx, area, rgba(0x73000000), 0.0);
         let w = area.size.x;
         let content =
@@ -832,8 +834,9 @@ pub fn draw_panel(
                 max: max_y,
             }),
         );
-        return;
+        return None;
     }
+    let anchor = anchor?;
     let max_w = (area.size.x - 16.0).clamp(0.0, 620.0);
     let w = 280.0f64.min(max_w).max(max_w.min(420.0));
     let content = d.measure(|d| panel_rows(cx, d, painter, icon, model, panel, 0.0, 0.0, w));
@@ -860,7 +863,6 @@ pub fn draw_panel(
     };
     d.kit.rect(cx, r.translate(dvec2(0.0, 4.0)), shadow, 8.0);
     d.kit.bordered(cx, r, p.surface1, 8.0, p.border_accent, 1.0);
-    d.canvas.add_hit(r, HitTarget::Chrome("track-panel".into()));
     let key = "track-panel:y".to_owned();
     let max_y = (content + 8.0 - h).max(0.0);
     d.state.extent_y.insert(key.clone(), max_y);
@@ -881,7 +883,7 @@ pub fn draw_panel(
             width: Size::Fixed(w),
             height: Size::Fixed(h.max(1.0)),
         },
-        Layout::default(),
+        Layout::default().with_clip(true, true),
     );
     d.canvas.push_clip(r);
     panel_rows(cx, d, painter, icon, model, panel, x, y + 4.0 - sy, w);
@@ -899,6 +901,7 @@ pub fn draw_panel(
             max: max_y,
         }),
     );
+    Some(r)
 }
 
 #[cfg(test)]

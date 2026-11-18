@@ -1937,19 +1937,30 @@ pub fn paint_status_badge(
     p: &Palette,
     backdrop: Vec4,
 ) -> bool {
+    if bucket == Some(StatusBucket::Running) {
+        let center = icon_rect.pos
+            + icon_rect.size
+            + dvec2(2.0 - STATUS_DOT_SIZE * 0.5, 2.0 - STATUS_DOT_SIZE * 0.5);
+        paint_status_ring(painter, cx, center, p, Some(backdrop));
+        return true;
+    }
+    paint_static_status_badge(painter, cx, icon_rect, bucket, p, backdrop);
+    false
+}
+
+/// Static variant for retained panels that should not schedule another frame.
+pub fn paint_static_status_badge(
+    painter: &mut Painter,
+    cx: &mut Cx2d,
+    icon_rect: Rect,
+    bucket: Option<StatusBucket>,
+    p: &Palette,
+    backdrop: Vec4,
+) {
     let right = icon_rect.pos.x + icon_rect.size.x;
     let bottom = icon_rect.pos.y + icon_rect.size.y;
     match bucket {
-        Some(StatusBucket::Running) => {
-            let offset = -2.0 - (STATUS_RING_FRAME_SIZE - STATUS_DOT_SIZE) * 0.5;
-            let center = dvec2(
-                right - offset - STATUS_RING_FRAME_SIZE * 0.5,
-                bottom - offset - STATUS_RING_FRAME_SIZE * 0.5,
-            );
-            paint_status_ring(painter, cx, center, p, Some(backdrop));
-            true
-        }
-        Some(bucket @ (StatusBucket::Failed | StatusBucket::Attention)) => {
+        Some(bucket @ (StatusBucket::Running | StatusBucket::Failed | StatusBucket::Attention)) => {
             let color = status_dot_color(p, bucket, false).unwrap_or(p.running);
             let center = dvec2(
                 right + 2.0 - STATUS_DOT_SIZE * 0.5,
@@ -1957,7 +1968,6 @@ pub fn paint_status_badge(
             );
             painter.dot(cx, center, STATUS_DOT_SIZE, backdrop);
             painter.dot(cx, center, STATUS_DOT_SIZE - 2.0, color);
-            false
         }
         Some(StatusBucket::NeedsInput) => {
             let fill = status_dot_color(p, StatusBucket::NeedsInput, false).unwrap_or(p.warning);
@@ -1978,9 +1988,8 @@ pub fn paint_status_badge(
                 STATUS_ALERT_SIZE,
                 p.surface0,
             );
-            false
         }
-        _ => false,
+        _ => {}
     }
 }
 

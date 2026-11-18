@@ -30,7 +30,9 @@ use super::session::{
 use super::store::with_store;
 use super::tracks::{self, DeleteFinished, SubagentRow, TrackModel, TrackPanel};
 use crate::common::file_drop::FileDropZone;
-use crate::common::overlay::{self, MenuEntry, MenuItem, MenuOptions, TapTarget, WindowModal};
+use crate::common::overlay::{
+    self, AnchoredPopover, MenuEntry, MenuItem, MenuOptions, TapTarget, WindowModal,
+};
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
 use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics};
@@ -668,7 +670,11 @@ pub struct ChatPanel {
 
     // Tracks.
     #[rust]
-    track_anchors: Vec<(TrackPanel, Rect)>,
+    track_anchors: [Area; 2],
+    #[rust]
+    track_popover: Option<AnchoredPopover>,
+    #[rust]
+    track_popover_area: Area,
     #[rust]
     delete_status: DeleteFinished,
     #[rust]
@@ -734,6 +740,8 @@ pub struct ChatPanel {
     modal_horizontal_scroll: TouchScroll,
     #[rust]
     pressed: TapTarget<HitTarget>,
+    #[rust]
+    modal_pressed: TapTarget<HitTarget>,
     /// The owning subagent sheet, assigned by its dispatcher before child input.
     #[rust]
     input_parent: Option<u64>,
@@ -847,6 +855,7 @@ impl ChatPanel {
     }
 
     fn reset_session_state(&mut self, cx: &mut Cx) {
+        self.pressed.cancel();
         self.dismiss_modal(cx);
         self.snap = None;
         self.snapshot_stale = true;
@@ -888,6 +897,7 @@ impl ChatPanel {
             if visible {
                 self.release_reveal_backlog();
             } else {
+                self.pressed.cancel();
                 self.dismiss_modal(cx);
             }
             self.redraw_session(cx);
@@ -909,14 +919,30 @@ impl ChatPanel {
         }
     }
 
-    fn sync_window_modal(&mut self, ui: &UiContext) {
+    fn input_is_modal(&self) -> bool {
+        self.modal.is_some() && self.track_popover.is_none()
+    }
+
+    fn reconcile_track_popover(&mut self, cx: &mut Cx) {
+        if self.track_popover.as_ref().is_some_and(|p| !p.is_open()) {
+            self.dismiss_modal(cx);
+        }
+    }
+
+    fn sync_window_modal(&mut self, cx: &mut Cx, ui: &UiContext) {
+        let composer_modal = self.composer.as_composer_panel().captures_input();
+        if !matches!(self.modal, Some(Modal::Track(_))) {
+            self.track_popover = None;
+        } else if composer_modal && self.track_popover.is_some() {
+            self.dismiss_modal(cx);
+        }
         let was_open = self.window_modal.is_some();
-        let open = self.visible
-            && (self.modal.is_some() || self.composer.as_composer_panel().captures_input());
+        let open = self.visible && (self.input_is_modal() || composer_modal);
         let owner = self.widget_uid().0;
         WindowModal::sync(&mut self.window_modal, ui, owner, open);
         if was_open != self.window_modal.is_some() {
             self.pressed.cancel();
+            self.modal_pressed.cancel();
             self.modal_touch_scroll.reset();
             self.modal_horizontal_scroll.reset();
         }
@@ -935,14 +961,20 @@ impl ChatPanel {
             })
     }
 
-    fn modal_tap_target(&self, abs: DVec2) -> Option<HitTarget> {
-        self.chrome_hit(abs).or_else(|| {
+    fn modal_tap_target(&self, abs: DVec2, surface: bool) -> Option<HitTarget> {
+        self.chrome_hit(abs, surface).or_else(|| {
             (matches!(self.modal, Some(Modal::Lightbox { .. })) && self.modal_rect.contains(abs))
                 .then(|| HitTarget::Chrome("scrim".into()))
         })
     }
 
     fn dismiss_modal(&mut self, cx: &mut Cx) {
+        self.track_popover = None;
+        self.track_popover_area = Area::Empty;
+        self.modal_pressed.cancel();
+        if self.bar_drag.as_ref().is_some_and(|(_, modal)| *modal) {
+            self.bar_drag = None;
+        }
         self.modal_touch_scroll.reset();
         self.modal_horizontal_scroll.reset();
         if let Some(panel) = self.sheet_panel.take() {
@@ -954,7 +986,6 @@ impl ChatPanel {
         self.modal = None;
         self.window_modal = None;
         self.modal_state = RowState::default();
-        self.pressed.cancel();
         self.lightbox_drag = None;
         self.redraw_modal(cx);
         self.redraw_chrome_part(cx, TRACKS);
@@ -3082,7 +3113,7 @@ impl ChatPanel {
         let row = event.row;
         match event.kind {
             RowEventKind::SelectionScroll { delta } => {
-                if self.modal.is_none()
+                if !self.input_is_modal()
                     && self.items.iter().any(|item| item.id == row)
                     && self
                         .row_states
@@ -3355,8 +3386,24 @@ impl ChatPanel {
     }
 
     fn open_track(&mut self, cx: &mut Cx, ui: &mut UiContext, panel: TrackPanel) {
+        if !self.look(self.content_rect.size.x).compact {
+            AnchoredPopover::toggle(
+                &mut self.track_popover,
+                cx,
+                self.track_anchors[panel as usize],
+            );
+            if self.track_popover.is_none() {
+                self.dismiss_modal(cx);
+                return;
+            }
+        }
+        self.track_popover_area = Area::Empty;
         self.modal = Some(Modal::Track(panel));
         self.modal_state = RowState::default();
+        self.modal_pressed.cancel();
+        self.modal_touch_scroll.reset();
+        self.modal_horizontal_scroll.reset();
+        self.redraw_modal(cx);
         self.redraw_chrome_part(cx, TRACKS);
         if panel == TrackPanel::Subagents {
             self.ensure_providers(cx, ui);
@@ -3524,7 +3571,16 @@ impl Widget for ChatPanel {
             self.modal_texture_wait = None;
             self.redraw_modal(cx);
         }
-        let modal_open = self.modal.is_some();
+        self.reconcile_track_popover(cx);
+        let modal_open = self.input_is_modal();
+        if let Event::KeyFocus(e) = event
+            && self
+                .track_anchors
+                .iter()
+                .any(|area| !area.is_empty() && (*area == e.focus || *area == e.prev))
+        {
+            self.redraw_chrome_part(cx, TRACKS);
+        }
         let modal_input = crate::common::is_user_input(event);
         if matches!(event, Event::Foreground | Event::Resume) {
             self.release_reveal_backlog();
@@ -3535,6 +3591,7 @@ impl Widget for ChatPanel {
         ) || matches!(event, Event::TouchUpdate(update) if update.cancelled)
         {
             self.pressed.cancel();
+            self.modal_pressed.cancel();
             self.modal_touch_scroll.reset();
             self.modal_horizontal_scroll.reset();
             self.lightbox_drag = None;
@@ -3546,6 +3603,7 @@ impl Widget for ChatPanel {
                 .is_some_and(|ui| !self.modal_branch_accepts_input(&ui.window_id))
         {
             self.pressed.cancel();
+            self.modal_pressed.cancel();
             self.modal_touch_scroll.reset();
             self.modal_horizontal_scroll.reset();
             return;
@@ -3560,7 +3618,7 @@ impl Widget for ChatPanel {
         {
             self.composer.handle_event(cx, event, scope);
             if let Some(ui) = scope.data.get::<UiContext>() {
-                self.sync_window_modal(ui);
+                self.sync_window_modal(cx, ui);
             }
             return;
         }
@@ -3572,7 +3630,7 @@ impl Widget for ChatPanel {
         let child_owns_input = child.as_ref().is_some_and(|panel| {
             panel.as_chat_panel().borrow().is_some_and(|p| {
                 let composer = p.composer.as_composer_panel();
-                p.modal.is_some()
+                p.input_is_modal()
                     || composer.captures_input()
                     || composer.consumes_escape(cx, event)
             })
@@ -3592,7 +3650,7 @@ impl Widget for ChatPanel {
                 && let Some(ui) = scope.data.get_mut::<UiContext>()
             {
                 self.close_modal(cx, ui);
-                self.sync_window_modal(ui);
+                self.sync_window_modal(cx, ui);
             }
             return;
         }
@@ -3608,6 +3666,21 @@ impl Widget for ChatPanel {
         if let Event::KeyDown(ke) = event {
             self.last_shift = ke.modifiers.shift;
         }
+        if !modal_open
+            && self.painted_look.is_some_and(|look| !look.compact)
+            && let Event::KeyDown(key) = event
+            && matches!(key.key_code, KeyCode::ReturnKey | KeyCode::Space)
+            && key.modifiers == KeyModifiers::default()
+            && let Some(panel) = [TrackPanel::Tasks, TrackPanel::Subagents]
+                .into_iter()
+                .find(|panel| cx.has_key_focus(self.track_anchors[*panel as usize]))
+            && let Some(ui) = scope.data.get_mut::<UiContext>()
+        {
+            if !key.is_repeat {
+                self.open_track(cx, ui, panel);
+            }
+            return;
+        }
         // Wheel over a row's inner scroll region (code panes, capped details)
         // moves that region instead of the stream.
         let mut swallow_scroll = false;
@@ -3615,7 +3688,11 @@ impl Widget for ChatPanel {
             self.modal_touch_scroll.reset();
             self.modal_horizontal_scroll.reset();
             self.pressed.cancel();
-            if modal_open {
+            self.modal_pressed.cancel();
+            let over_popover = self.track_popover.is_some()
+                && self.track_popover_area.clipped_rect(cx).contains(se.abs)
+                && !cx.pointer_shielded(self.track_popover_area, se.abs);
+            if modal_open || over_popover {
                 swallow_scroll = true;
                 self.modal_scroll(cx, se.abs, se.scroll);
             } else if self.stream_rect.contains(se.abs) && !cx.pointer_shielded(self.area, se.abs) {
@@ -3677,45 +3754,21 @@ impl Widget for ChatPanel {
         if self.find_open && !block_pointer {
             self.find_field.handle_event(cx, event, scope);
         }
-        // Chrome over the stream and modal surfaces claim pointer events
-        // only where they have a target (or everywhere while a modal shows).
-        let find_field_rect = if self.find_open {
-            self.find_field_rect
+        // Modal hit testing covers its backdrop; an anchored popover only hits the card.
+        // Releasing an outside click can still activate its original press target.
+        let hit = if modal_open {
+            let rect = self.modal_rect;
+            let child =
+                matches!(self.modal, Some(Modal::Subagent { .. })).then_some(self.sheet_content);
+            event.hits_with_test(cx, self.modal_area, |abs, _, _| {
+                rect.contains(abs) && !child.is_some_and(|r| r.contains(abs))
+            })
+        } else if self.track_popover.is_some() {
+            event.hits(cx, self.track_popover_area)
         } else {
-            None
+            Hit::Nothing
         };
-        let overlay_rects: Vec<Rect> = self
-            .overlay_canvas
-            .hits
-            .iter()
-            .map(|(r, _)| r.translate(self.overlay_canvas.origin))
-            .collect();
-        let modal_block = match &self.modal {
-            None => None,
-            Some(Modal::Subagent { .. }) => Some(Some(self.sheet_content)),
-            Some(_) => Some(None),
-        };
-        let panel_rect = if modal_open {
-            self.modal_rect
-        } else {
-            self.content_rect
-        };
-        let area = if modal_open {
-            self.modal_area
-        } else if !self.cover_area.is_empty() {
-            self.cover_area
-        } else {
-            self.area
-        };
-        let hit = event.hits_with_test(cx, area, move |abs, _, _| match modal_block {
-            Some(Some(content)) => panel_rect.contains(abs) && !content.contains(abs),
-            Some(None) => panel_rect.contains(abs),
-            None => {
-                !find_field_rect.is_some_and(|f| f.contains(abs))
-                    && overlay_rects.iter().any(|r| r.contains(abs))
-            }
-        });
-        if !modal_open
+        if self.modal.is_none()
             || matches!(self.modal, Some(Modal::Lightbox { .. }))
             || self.bar_drag.is_some()
         {
@@ -3728,158 +3781,34 @@ impl Widget for ChatPanel {
                 .handle_axis_event(cx, event, &hit, Vec2Index::X);
             let origin = self.modal_touch_scroll.origin();
             if let Some(delta) = dy {
-                self.pressed.cancel();
+                self.modal_pressed.cancel();
                 if !self.modal_scroll(cx, origin, dvec2(0.0, delta)) {
                     self.modal_touch_scroll.stop_at_edge();
                 }
             }
             if let Some(delta) = dx {
-                self.pressed.cancel();
+                self.modal_pressed.cancel();
                 if !self.modal_scroll(cx, origin, dvec2(delta, 0.0)) {
                     self.modal_horizontal_scroll.stop_at_edge();
                 }
             }
         }
-        let mut chrome_tap: Option<String> = None;
-        match hit {
-            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => self.chrome_hover(cx, Some(e.abs)),
-            Hit::FingerHoverOut(_) => self.chrome_hover(cx, None),
-            Hit::FingerDown(e) => {
-                self.bar_drag = None;
-                let target = self.chrome_hit(e.abs);
-                if let Some(target) = &target {
-                    let modal = self.modal.is_some();
-                    let (canvas, state) = if modal {
-                        (&self.modal_canvas, &mut self.modal_state)
-                    } else {
-                        (&self.overlay_canvas, &mut self.chrome_state)
-                    };
-                    if let Some(drag) =
-                        super::scrollbar::BarDrag::press(target, e.abs - canvas.origin, state)
-                    {
-                        if drag.vertical && drag.key == "sheet:y" {
-                            state.expanded.insert("sheet:detached".into(), true);
-                        }
-                        self.bar_drag = Some((drag, modal));
-                        if modal {
-                            self.redraw_modal(cx);
-                        } else {
-                            self.redraw_chrome(cx);
-                        }
-                    }
-                }
-                if self.bar_drag.is_some() {
-                    self.pressed.cancel();
-                } else {
-                    if let Some(Modal::Lightbox { .. }) = &self.modal
-                        && (target.is_none()
-                            || matches!(&target, Some(HitTarget::Chrome(id)) if id == "lightbox:image"))
-                    {
-                        self.lightbox_drag = Some(e.abs);
-                    }
-                    let target = self.modal_tap_target(e.abs);
-                    self.pressed.press(target);
-                }
-            }
-            Hit::FingerMove(e) => {
-                if let Some((drag, modal)) = &self.bar_drag {
-                    let (canvas, state) = if *modal {
-                        (&self.modal_canvas, &mut self.modal_state)
-                    } else {
-                        (&self.overlay_canvas, &mut self.chrome_state)
-                    };
-                    if drag.drag_to(e.abs - canvas.origin, state) {
-                        if *modal {
-                            self.redraw_modal(cx);
-                        } else {
-                            self.redraw_chrome(cx);
-                        }
-                    }
-                }
-                if let (Some(last), Some(Modal::Lightbox { offset, scale, .. })) =
-                    (self.lightbox_drag, &mut self.modal)
-                    && *scale > 1.0
-                {
-                    *offset += e.abs - last;
-                    self.lightbox_drag = Some(e.abs);
-                    self.redraw_modal(cx);
-                }
-            }
-            Hit::FingerLongPress(_) => self.pressed.cancel(),
-            Hit::FingerUp(e) => {
-                if let Some((_, modal)) = self.bar_drag.take() {
-                    let state = if modal {
-                        &mut self.modal_state
-                    } else {
-                        &mut self.chrome_state
-                    };
-                    state.dragging_bar = None;
-                    if modal {
-                        self.redraw_modal(cx);
-                    } else {
-                        self.redraw_chrome(cx);
-                    }
-                }
-                let dragged = self.lightbox_drag.take().is_some_and(|start| {
-                    (e.abs - e.abs_start).length() > 4.0 && start != e.abs_start
-                });
-                let target = self.modal_tap_target(e.abs);
-                let valid = e.is_over
-                    && !dragged
-                    && !e.has_long_press_occurred
-                    && (!e.device.is_touch() || e.was_tap());
-                if let Some(target) = self.pressed.release(target, valid) {
-                    if super::mermaid::tap(&mut self.modal_state, &target) {
-                        // Export owns its native completion, including after this sheet closes.
-                    } else if let HitTarget::Chrome(id) = target {
-                        if id == "outline"
-                            && let Some(RailEvent::Jump(seq)) = self.rail.tap(e.abs)
-                        {
-                            chrome_tap = Some(format!("outline:{seq}"));
-                        }
-                        if id != "outline"
-                            && id != "track-panel"
-                            && id != "lightbox:image"
-                            && id != "sheet:body"
-                        {
-                            chrome_tap = Some(id);
-                        }
-                    } else if let HitTarget::Copy { key, text } = target {
-                        cx.copy_to_clipboard(&text);
-                        self.modal_state.copied.insert(key, now_seconds());
-                    } else if let HitTarget::Toggle(key) = target {
-                        self.modal_state.toggle(&key);
-                    } else if let HitTarget::OpenFile(path) = target {
-                        // The row tap path opens it once the UiContext is at hand.
-                        let row = match &self.modal {
-                            Some(Modal::Sheet { row, .. }) => row.clone(),
-                            _ => String::new(),
-                        };
-                        cx.action(ChatRowEvent {
-                            panel: self.uid,
-                            row,
-                            kind: RowEventKind::Tap {
-                                target: HitTarget::OpenFile(path),
-                                rect: Rect::default(),
-                                intent: FileLinkIntent::from_pointer(
-                                    e.modifiers,
-                                    e.device.is_touch(),
-                                ),
-                            },
-                        });
-                    }
-                    if self.modal.is_some() {
-                        self.redraw_modal(cx);
-                    }
-                }
-            }
-            Hit::FingerScroll(e) => {
-                if let Some(Modal::Lightbox { .. }) = &self.modal {
-                    self.zoom(if e.scroll.y < 0.0 { 1.1 } else { 1.0 / 1.1 });
-                    self.redraw_modal(cx);
-                }
-            }
-            _ => {}
+        let mut chrome_tap = self.handle_chrome_hit(cx, hit, true);
+        if !modal_open {
+            let find_field = self.find_field_rect.filter(|_| self.find_open);
+            let area = if self.cover_area.is_empty() {
+                self.area
+            } else {
+                self.cover_area
+            };
+            let hit = event.hits_with_test(cx, area, |abs, _, _| {
+                !find_field.is_some_and(|r| r.contains(abs))
+                    && self
+                        .overlay_canvas
+                        .hit_at(abs - self.overlay_canvas.origin)
+                        .is_some()
+            });
+            chrome_tap = self.handle_chrome_hit(cx, hit, false).or(chrome_tap);
         }
         // Children: the stream and the composer.
         if !swallow_scroll && !block_pointer {
@@ -3928,7 +3857,7 @@ impl Widget for ChatPanel {
             .iter()
             .any(|e| matches!(e, UiEffect::SetFocusScope { scope: Some(s), .. } if s == "message-input"));
         self.ui_pass(cx, event, ui, chrome_tap, input_focused);
-        self.sync_window_modal(ui);
+        self.sync_window_modal(cx, ui);
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -3951,6 +3880,12 @@ impl Widget for ChatPanel {
             self.on_session_changed(cx, ui);
         }
         let look = self.look(rect.size.x);
+        self.reconcile_track_popover(cx);
+        if matches!(self.modal, Some(Modal::Track(_)))
+            && look.compact == self.track_popover.is_some()
+        {
+            self.dismiss_modal(cx);
+        }
         if self.painted_look != Some(look) {
             self.painted_look = Some(look);
             self.redraw_session(cx);
@@ -3962,6 +3897,9 @@ impl Widget for ChatPanel {
         let target = self.target.clone().unwrap_or_default();
         let non_ready = self.non_ready();
         if let Some(view) = non_ready {
+            if self.track_popover.is_some() {
+                self.dismiss_modal(cx);
+            }
             if let Some(center) = self.chrome_layers[NON_READY].paint(
                 cx,
                 &mut self.kit,
@@ -4294,6 +4232,15 @@ impl Widget for ChatPanel {
         };
         let can_detach = self.feature("agentDetach");
         let delete_status = self.delete_status;
+        if self.track_popover.is_some()
+            && match self.modal {
+                Some(Modal::Track(TrackPanel::Tasks)) => tasks.is_empty(),
+                Some(Modal::Track(TrackPanel::Subagents)) => rows.is_empty(),
+                _ => false,
+            }
+        {
+            self.dismiss_modal(cx);
+        }
         let open_track = match &self.modal {
             Some(Modal::Track(panel)) => Some(*panel),
             _ => None,
@@ -4347,23 +4294,21 @@ impl Widget for ChatPanel {
                 providers: &self.providers,
                 host_label: &host_label_fn,
             };
-            if let Some(anchors) = chrome_part!(TRACKS, stream_rect, |cx, d| {
+            chrome_part!(TRACKS, stream_rect, |cx, d| {
                 tracks::draw_bar(
                     cx,
                     d,
-                    &mut self.painter,
                     &model,
                     open_track,
                     stream_rect.pos.x,
                     stream_rect.pos.y + stream_rect.size.y,
                     stream_rect.size.x,
                     track_height,
-                )
-            }) {
-                self.track_anchors = anchors;
-            }
+                    &mut self.track_anchors,
+                );
+            });
         } else {
-            self.track_anchors.clear();
+            self.track_anchors = [Area::Empty; 2];
         }
         if jump_visible {
             let clearance = if tracks_visible {
@@ -4527,7 +4472,11 @@ impl Widget for ChatPanel {
                 self.modal_content_list.end(cx);
             }
             animating |= self.modal_animating;
-            overlay::modal_float(self.widget_uid().0, self.modal_area);
+            if let (Some(popup), Some(Modal::Track(panel))) = (&self.track_popover, &self.modal) {
+                popup.drawn(self.track_anchors[*panel as usize], self.track_popover_area);
+            } else if self.input_is_modal() {
+                overlay::modal_float(self.widget_uid().0, self.modal_area);
+            }
             cx.end_pass_sized_turtle();
             self.modal_list.end(cx);
         } else {
@@ -4770,8 +4719,8 @@ impl ChatPanel {
         }
     }
 
-    fn chrome_hit(&self, abs: DVec2) -> Option<HitTarget> {
-        if self.modal.is_some() {
+    fn chrome_hit(&self, abs: DVec2, surface: bool) -> Option<HitTarget> {
+        if surface {
             return self
                 .modal_canvas
                 .hit_at(abs - self.modal_canvas.origin)
@@ -4782,15 +4731,179 @@ impl ChatPanel {
             .cloned()
     }
 
-    fn chrome_hover(&mut self, cx: &mut Cx, abs: Option<DVec2>) {
+    fn handle_chrome_hit(&mut self, cx: &mut Cx, hit: Hit, modal: bool) -> Option<String> {
+        match hit {
+            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
+                self.chrome_hover(cx, Some(e.abs), modal);
+            }
+            Hit::FingerHoverOut(_) => self.chrome_hover(cx, None, modal),
+            Hit::FingerDown(e) => {
+                let target = self.modal_tap_target(e.abs, modal);
+                let (canvas, state, pressed) = if modal {
+                    (
+                        &self.modal_canvas,
+                        &mut self.modal_state,
+                        &mut self.modal_pressed,
+                    )
+                } else {
+                    (
+                        &self.overlay_canvas,
+                        &mut self.chrome_state,
+                        &mut self.pressed,
+                    )
+                };
+                let drag = target.as_ref().and_then(|target| {
+                    super::scrollbar::BarDrag::press(target, e.abs - canvas.origin, state)
+                });
+                if let Some(drag) = drag {
+                    if drag.vertical && drag.key == "sheet:y" {
+                        state.expanded.insert("sheet:detached".into(), true);
+                    }
+                    self.bar_drag = Some((drag, modal));
+                    pressed.cancel();
+                    if modal {
+                        self.redraw_modal(cx);
+                    } else {
+                        self.redraw_chrome(cx);
+                    }
+                } else {
+                    self.bar_drag = None;
+                    if modal
+                        && matches!(self.modal, Some(Modal::Lightbox { .. }))
+                        && matches!(&target, Some(HitTarget::Chrome(id)) if id == "scrim" || id == "lightbox:image")
+                    {
+                        self.lightbox_drag = Some(e.abs);
+                    }
+                    pressed.press(target);
+                }
+            }
+            Hit::FingerMove(e) => {
+                if let Some((drag, _)) = self
+                    .bar_drag
+                    .as_mut()
+                    .filter(|(_, surface)| *surface == modal)
+                {
+                    let (canvas, state) = if modal {
+                        (&self.modal_canvas, &mut self.modal_state)
+                    } else {
+                        (&self.overlay_canvas, &mut self.chrome_state)
+                    };
+                    if drag.drag_to(e.abs - canvas.origin, state) {
+                        if modal {
+                            self.redraw_modal(cx);
+                        } else {
+                            self.redraw_chrome(cx);
+                        }
+                    }
+                }
+                if modal
+                    && let (Some(last), Some(Modal::Lightbox { offset, scale, .. })) =
+                        (self.lightbox_drag, &mut self.modal)
+                    && *scale > 1.0
+                {
+                    *offset += e.abs - last;
+                    self.lightbox_drag = Some(e.abs);
+                    self.redraw_modal(cx);
+                }
+            }
+            Hit::FingerLongPress(_) => {
+                if modal {
+                    self.modal_pressed.cancel();
+                } else {
+                    self.pressed.cancel();
+                }
+            }
+            Hit::FingerUp(e) => {
+                if self
+                    .bar_drag
+                    .as_ref()
+                    .is_some_and(|(_, surface)| *surface == modal)
+                {
+                    self.bar_drag = None;
+                    if modal {
+                        self.modal_state.dragging_bar = None;
+                        self.redraw_modal(cx);
+                    } else {
+                        self.chrome_state.dragging_bar = None;
+                        self.redraw_chrome(cx);
+                    }
+                }
+                let dragged = modal
+                    && self.lightbox_drag.take().is_some_and(|start| {
+                        (e.abs - e.abs_start).length() > 4.0 && start != e.abs_start
+                    });
+                let target = self.modal_tap_target(e.abs, modal);
+                let valid = e.is_over
+                    && !dragged
+                    && !e.has_long_press_occurred
+                    && (!e.device.is_touch() || e.was_tap());
+                let pressed = if modal {
+                    &mut self.modal_pressed
+                } else {
+                    &mut self.pressed
+                };
+                let target = pressed.release(target, valid)?;
+                if modal {
+                    self.redraw_modal(cx);
+                }
+                if super::mermaid::tap(&mut self.modal_state, &target) {
+                    return None; // Export owns its native completion, even after the sheet closes.
+                }
+                match target {
+                    HitTarget::Chrome(id) => match id.as_str() {
+                        "outline" => {
+                            if let Some(RailEvent::Jump(seq)) = self.rail.tap(e.abs) {
+                                return Some(format!("outline:{seq}"));
+                            }
+                        }
+                        "track-panel" | "lightbox:image" | "sheet:body" => {}
+                        _ => return Some(id),
+                    },
+                    HitTarget::Copy { key, text } => {
+                        cx.copy_to_clipboard(&text);
+                        self.modal_state.copied.insert(key, now_seconds());
+                    }
+                    HitTarget::Toggle(key) => self.modal_state.toggle(&key),
+                    HitTarget::OpenFile(path) => {
+                        // The row tap path opens it once the UiContext is at hand.
+                        let row = match &self.modal {
+                            Some(Modal::Sheet { row, .. }) => row.clone(),
+                            _ => String::new(),
+                        };
+                        cx.action(ChatRowEvent {
+                            panel: self.uid,
+                            row,
+                            kind: RowEventKind::Tap {
+                                target: HitTarget::OpenFile(path),
+                                rect: Rect::default(),
+                                intent: FileLinkIntent::from_pointer(
+                                    e.modifiers,
+                                    e.device.is_touch(),
+                                ),
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Hit::FingerScroll(e) if modal && matches!(self.modal, Some(Modal::Lightbox { .. })) => {
+                self.zoom(if e.scroll.y < 0.0 { 1.1 } else { 1.0 / 1.1 });
+                self.redraw_modal(cx);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn chrome_hover(&mut self, cx: &mut Cx, abs: Option<DVec2>, surface: bool) {
         let now = now_seconds();
-        if self.modal.is_none() && self.rail.hover(abs, now) {
+        if !surface && self.rail.hover(abs, now) {
             self.redraw_chrome_part(cx, RAIL);
         }
         let key = abs
-            .and_then(|abs| self.chrome_hit(abs))
+            .and_then(|abs| self.chrome_hit(abs, surface))
             .map(|t| super::chat_row::hover_key(&t));
-        let state = if self.modal.is_some() {
+        let state = if surface {
             &mut self.modal_state
         } else {
             &mut self.chrome_state
@@ -4798,7 +4911,7 @@ impl ChatPanel {
         if state.hover_hit != key {
             let previous = std::mem::replace(&mut state.hover_hit, key.clone());
             state.hovered = abs.is_some();
-            if self.modal.is_some() {
+            if surface {
                 self.redraw_modal(cx);
             } else {
                 for layer in &self.chrome_layers {
@@ -5095,10 +5208,7 @@ impl ChatPanel {
 
         // Providers for the subagent facts line.
         if self.modal.is_none()
-            && self
-                .track_anchors
-                .iter()
-                .any(|(p, _)| *p == TrackPanel::Subagents)
+            && !self.track_anchors[TrackPanel::Subagents as usize].is_empty()
             && !self.providers_requested
             && self.subagent_rows().iter().any(|r| r.paseo)
         {
@@ -5221,17 +5331,8 @@ impl ChatPanel {
                 if *panel == TrackPanel::Subagents && rows.is_empty() {
                     return false;
                 }
-                let anchor = self
-                    .track_anchors
-                    .iter()
-                    .find(|(p, _)| p == panel)
-                    .map(|(_, r)| *r)
-                    .unwrap_or(rect_xywh(
-                        rect.pos.x + 16.0,
-                        rect.pos.y + rect.size.y - 48.0,
-                        120.0,
-                        32.0,
-                    ));
+                let trigger = self.track_anchors[*panel as usize];
+                let anchor = (!trigger.is_empty()).then(|| trigger.rect(cx));
                 let target = self.target.clone().unwrap_or_default();
                 let model = TrackModel {
                     tasks,
@@ -5253,7 +5354,7 @@ impl ChatPanel {
                     area: self.area,
                     animating: false,
                 };
-                tracks::draw_panel(
+                let popover = tracks::draw_panel(
                     cx,
                     &mut d,
                     &mut self.painter,
@@ -5265,6 +5366,9 @@ impl ChatPanel {
                     bottom_inset,
                 );
                 animating |= d.animating;
+                if let Some(rect) = popover {
+                    cx.add_aligned_rect_area(&mut self.track_popover_area, rect);
+                }
             }
             Modal::Sheet { row, kind, opened } => {
                 let item = self.items.iter().find(|i| i.id == *row).cloned();

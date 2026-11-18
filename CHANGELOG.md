@@ -9,6 +9,8 @@
 ### Fixed
 
 - Update Git status in the app live again. Since 0.13.36 the daemon refused to send its reply to the app's Git observation request, because that reply was missing from the daemon's list of allowed messages, so the app only saw Git changes when it asked again. A test now checks that every message in the protocol has a permission entry.
+- Stop the app slowing down when a subagent is shown as running but is not. The running marker on subagent rows redrew the whole subagent list on every frame, and repeated progress reports from OMP rewrote and re-sent unchanged subagent records. The marker is now static, unchanged reports are dropped, and the daemon settles a subagent that OMP no longer lists instead of leaving it running. Pi stops re-reading an unchanged run status file four times a second.
+- Make the task and subagent lists above the composer behave like desktop popovers on wide layouts. They took over the whole window's input: clicking the sidebar or header did nothing, switching from one list to the other took two clicks, scrolling outside the list was swallowed, Escape closed the list without returning focus, and switching windows left it open. Now only the list itself takes input: clicking outside closes it and still clicks what you pointed at, clicking the same button closes it, clicking the other button switches lists at once, Escape closes it and returns focus to its button, and it closes when the window loses focus. Phones and narrow windows keep the bottom sheets.
 
 ## 0.13.37 - 2026-11-18
 

@@ -944,6 +944,13 @@ impl Widget for PaseoShell {
         // them: popovers, and the full-window sheet a panel holds. The shell's own layers
         // were dispatched before and need no shield.
         let shell_owns = tool_sheet || shell_modal || (modal && !window_modal && !command_center);
+        let popover_key = overlay_api::handle_anchored_popover(
+            cx,
+            &self.data.window_id,
+            self.data.overlays.area,
+            event,
+            !shell_owns && !command_center,
+        );
         overlay_api::shield_content(
             cx,
             &self.data.window_id,
@@ -965,8 +972,9 @@ impl Widget for PaseoShell {
         }
 
         // Keyboard shortcuts (not while a modal overlay is open).
-        let mut key_consumed = false;
+        let mut key_consumed = popover_key;
         if !modal
+            && !key_consumed
             && let Event::KeyDown(key) = event
             && let Some(ui) = Self::ui(scope)
         {
@@ -1002,7 +1010,7 @@ impl Widget for PaseoShell {
                 widget.handle_event(cx, event, scope);
             }
         }
-        if !modal {
+        if !modal && !popover_key {
             chrome::handle_event(self, cx, event, scope);
         }
         if let Some(ui) = Self::ui(scope) {

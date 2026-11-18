@@ -8,7 +8,8 @@
 
 use std::cell::{Cell, RefCell};
 
-use makepad_widgets::{Area, Cx, DVec2, Rect};
+use makepad_widgets::event::{TAP_COUNT_DISTANCE, TouchState};
+use makepad_widgets::{Area, Cx, DVec2, Event, KeyCode, MouseButton, PassId, Rect};
 use serde_json::Value;
 
 use crate::common::UiContext;
@@ -295,6 +296,7 @@ thread_local! {
     static ANSWERS: RefCell<Vec<(String, u64, Value)>> = const { RefCell::new(Vec::new()) };
     static WINDOW_MODALS: RefCell<Vec<WindowModalOwner>> = const { RefCell::new(Vec::new()) };
     static FLOATS: RefCell<Vec<Float>> = const { RefCell::new(Vec::new()) };
+    static POPOVERS: RefCell<Vec<Popover>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Full-window modal slot (Flutter `showModalBottomSheet` covering the whole window, shell
@@ -407,49 +409,258 @@ pub fn modal_float(owner: u64, area: Area) {
     });
 }
 
+/// Lifetime of a light-dismiss popover. Each window pass can have one open.
+/// Only the drawn card shields the pointer; clicks outside are observed, not claimed.
+pub struct AnchoredPopover(u64);
+
+struct Popover {
+    id: u64,
+    pass: PassId,
+    trigger: Area,
+    body: Area,
+    press: Option<(PopoverPointer, DVec2)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PopoverPointer {
+    Mouse(MouseButton),
+    Touch(u64),
+}
+
+impl AnchoredPopover {
+    /// Run from the trigger's normal activation path. The window does not
+    /// light-dismiss on the invoker itself, so the second activation only closes.
+    pub fn toggle(slot: &mut Option<Self>, cx: &mut Cx, trigger: Area) {
+        let Some(pass) = float_pass(cx, trigger).filter(|_| float_drawn(cx, trigger)) else {
+            return;
+        };
+        let same = slot.as_ref().is_some_and(|owner| {
+            POPOVERS.with(|popovers| {
+                popovers
+                    .borrow()
+                    .iter()
+                    .any(|p| p.id == owner.0 && p.trigger == trigger)
+            })
+        });
+        if same {
+            *slot = None;
+            return;
+        }
+        let id = next_id();
+        POPOVERS.with(|popovers| {
+            let mut popovers = popovers.borrow_mut();
+            if let Some(index) = popovers.iter().position(|p| p.pass == pass) {
+                popovers.remove(index).redraw(cx);
+            }
+            popovers.push(Popover {
+                id,
+                pass,
+                trigger,
+                body: Area::Empty,
+                press: None,
+            });
+        });
+        cx.set_key_focus(trigger);
+        *slot = Some(Self(id));
+    }
+
+    pub fn is_open(&self) -> bool {
+        POPOVERS.with(|popovers| popovers.borrow().iter().any(|p| p.id == self.0))
+    }
+
+    /// Publish the current drawn areas, also when a retained layer is replayed.
+    pub fn drawn(&self, trigger: Area, body: Area) {
+        POPOVERS.with(|popovers| {
+            if let Some(p) = popovers.borrow_mut().iter_mut().find(|p| p.id == self.0) {
+                p.trigger = trigger;
+                p.body = body;
+            }
+        });
+    }
+}
+
+impl Drop for AnchoredPopover {
+    fn drop(&mut self) {
+        POPOVERS.with(|popovers| popovers.borrow_mut().retain(|p| p.id != self.0));
+    }
+}
+
+impl Popover {
+    fn redraw(&self, cx: &mut Cx) {
+        self.trigger.redraw(cx);
+        self.body.redraw(cx);
+    }
+
+    fn outside(&self, cx: &Cx, abs: DVec2) -> bool {
+        !self.trigger.clipped_rect(cx).contains(abs) && !self.body.clipped_rect(cx).contains(abs)
+    }
+
+    fn press(&mut self, cx: &Cx, pointer: PopoverPointer, abs: DVec2) {
+        self.press = self.outside(cx, abs).then_some((pointer, abs));
+    }
+
+    fn moved(&mut self, abs: DVec2) {
+        if self
+            .press
+            .is_some_and(|(_, start)| (start - abs).length() >= TAP_COUNT_DISTANCE)
+        {
+            self.press = None;
+        }
+    }
+
+    fn release(&mut self, cx: &Cx, pointer: PopoverPointer, abs: DVec2) -> bool {
+        if !self.press.is_some_and(|(pressed, _)| pressed == pointer) {
+            return false;
+        }
+        self.moved(abs);
+        self.press.take().is_some() && self.outside(cx, abs)
+    }
+
+    fn pointer_dismissed(&mut self, cx: &Cx, event: &Event) -> bool {
+        match event {
+            Event::MouseDown(e) => self.press(cx, PopoverPointer::Mouse(e.button), e.abs),
+            Event::MouseMove(e) => self.moved(e.abs),
+            Event::MouseUp(e) => return self.release(cx, PopoverPointer::Mouse(e.button), e.abs),
+            Event::TouchUpdate(e) => {
+                if let [touch] = e.touches.as_slice()
+                    && !e.cancelled
+                {
+                    let pointer = PopoverPointer::Touch(touch.uid);
+                    match touch.state {
+                        TouchState::Start => self.press(cx, pointer, touch.abs),
+                        TouchState::Move => self.moved(touch.abs),
+                        TouchState::Stop => return self.release(cx, pointer, touch.abs),
+                        TouchState::Stable => {}
+                    }
+                } else {
+                    self.press = None;
+                }
+            }
+            Event::Scroll(_)
+            | Event::LongPress(_)
+            | Event::MouseLeave(_)
+            | Event::TextHandle(_)
+            | Event::WindowGeomChange(_) => self.press = None,
+            _ => {}
+        }
+        false
+    }
+}
+
+/// Observe light dismissal for this window before its normal content dispatch.
+/// Only Escape is consumed; outside input still goes to the actual target.
+pub(crate) fn handle_anchored_popover(
+    cx: &mut Cx,
+    window: &str,
+    anchor: Area,
+    event: &Event,
+    content_on_top: bool,
+) -> bool {
+    let Some(pass) = float_pass(cx, anchor) else {
+        return false;
+    };
+    let deactivated = matches!(
+        event,
+        Event::AppLostFocus | Event::Background | Event::Pause
+    );
+    POPOVERS.with(|popovers| {
+        let mut popovers = popovers.borrow_mut();
+        let Some(index) = popovers.iter().position(|p| p.pass == pass) else {
+            return false;
+        };
+        let popup = &mut popovers[index];
+        if deactivated || !float_drawn(cx, popup.trigger) {
+            popovers.remove(index).redraw(cx);
+            return false;
+        }
+        let top = top_modal(window);
+        if !content_on_top
+            || (top.is_some()
+                && !modal_backdrop(cx, pass, top)
+                    .is_some_and(|area| cx.area_drawn_within(popup.trigger, area)))
+        {
+            popup.press = None;
+            return false;
+        }
+        let escape = matches!(event, Event::KeyDown(key) if key.key_code == KeyCode::Escape);
+        let close = match event {
+            Event::KeyDown(key) if escape => !key.is_repeat,
+            _ => popup.pointer_dismissed(cx, event),
+        };
+        if close {
+            let popup = popovers.remove(index);
+            if escape {
+                cx.set_key_focus(popup.trigger);
+            }
+            popup.redraw(cx);
+        }
+        escape
+    })
+}
+
+fn top_modal(window: &str) -> Option<u64> {
+    WINDOW_MODALS.with(|modals| {
+        modals
+            .borrow()
+            .iter()
+            .rev()
+            .find(|m| m.window == window)
+            .map(|m| m.widget)
+    })
+}
+
+fn modal_backdrop(cx: &Cx, pass: PassId, owner: Option<u64>) -> Option<Area> {
+    let owner = owner?;
+    FLOATS.with(|floats| {
+        floats.borrow().iter().find_map(|float| {
+            (float.modal == Some(owner)
+                && float_pass(cx, float.area) == Some(pass)
+                && float_drawn(cx, float.area))
+            .then_some(float.area)
+        })
+    })
+}
+
 /// Shell, around the dispatch of `window`, which `anchor` is drawn in. While `content_on_top`,
 /// the window's drawn floating surfaces shield the pointer for the panels and chrome
 /// dispatched next: the top modal sheet and cards inside it, or the page's popovers otherwise.
 /// Without it (a shell layer owns the input, or the dispatch is over) nothing does.
 pub(crate) fn shield_content(cx: &mut Cx, window: &str, anchor: Area, content_on_top: bool) {
     let shields = if content_on_top {
-        let top = WINDOW_MODALS.with(|modals| {
-            let modals = modals.borrow();
-            modals
-                .iter()
-                .rev()
-                .find(|modal| modal.window == window)
-                .map(|modal| modal.widget)
-        });
+        let top = top_modal(window);
         FLOATS.with(|floats| {
             let mut floats = floats.borrow_mut();
             floats.retain(|float| float_drawn(cx, float.area));
             let pass = float_pass(cx, anchor);
             let in_window = |float: &&Float| pass.is_some() && float_pass(cx, float.area) == pass;
-            if let Some(owner) = top {
-                // Keep pane-local cards inside the top modal above its backdrop. Popovers
-                // left painted in the page behind it must not punch holes in the modal.
-                let backdrop = floats
-                    .iter()
-                    .filter(in_window)
-                    .find(|float| float.modal == Some(owner))
-                    .map(|float| float.area);
-                backdrop
-                    .into_iter()
-                    .chain(floats.iter().filter(in_window).filter_map(|float| {
-                        (float.modal.is_none()
-                            && backdrop.is_some_and(|area| cx.area_drawn_within(float.area, area)))
-                        .then_some(float.area)
-                    }))
-                    .collect()
-            } else {
+            let backdrop = top.and_then(|owner| {
                 floats
                     .iter()
                     .filter(in_window)
-                    .filter(|float| float.modal.is_none())
+                    .find(|float| float.modal == Some(owner))
                     .map(|float| float.area)
-                    .collect()
-            }
+            });
+            // Retain only the top sheet's descendants; cards behind it must not punch holes.
+            let mut shields: Vec<_> = backdrop
+                .into_iter()
+                .chain(floats.iter().filter(in_window).filter_map(|float| {
+                    (float.modal.is_none()
+                        && (top.is_none()
+                            || backdrop.is_some_and(|area| cx.area_drawn_within(float.area, area))))
+                    .then_some(float.area)
+                }))
+                .collect();
+            POPOVERS.with(|popovers| {
+                if let Some(popup) = popovers.borrow().iter().find(|p| Some(p.pass) == pass)
+                    && float_drawn(cx, popup.trigger)
+                    && float_drawn(cx, popup.body)
+                    && (top.is_none()
+                        || backdrop.is_some_and(|a| cx.area_drawn_within(popup.body, a)))
+                {
+                    shields.push(popup.body);
+                }
+            });
+            shields
         })
     } else {
         Vec::new()
@@ -902,6 +1113,163 @@ pub fn result_of(command: &crate::common::UiCommand) -> Option<(u64, &Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_anchored_popover(test: impl FnOnce(&mut Cx, [Area; 3], Option<AnchoredPopover>)) {
+        use makepad_widgets::{CxRectArea, LiveNew, Pass, RectArea, dvec2};
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let pass = Pass::new(&mut cx);
+        let lists = std::array::from_fn::<_, 3, _>(|_| cx.draw_lists.alloc());
+        let areas = std::array::from_fn(|index| {
+            let (x, width) = [(0.0, 100.0), (10.0, 10.0), (25.0, 40.0)][index];
+            let list = &mut cx.draw_lists[lists[index].id()];
+            list.pass_id = Some(pass.pass_id());
+            list.rect_areas.push(CxRectArea {
+                rect: Rect {
+                    pos: dvec2(x, 0.0),
+                    size: dvec2(width, 100.0),
+                },
+                draw_clip: (dvec2(0.0, 0.0), dvec2(100.0, 100.0)),
+            });
+            Area::Rect(RectArea {
+                draw_list_id: lists[index].id(),
+                rect_id: 0,
+                redraw_id: list.redraw_id,
+            })
+        });
+        let mut slot = None;
+        let [page, trigger, body] = areas;
+        AnchoredPopover::toggle(&mut slot, &mut cx, trigger);
+        slot.as_ref().unwrap().drawn(trigger, body);
+        shield_content(&mut cx, "main", page, true);
+        test(&mut cx, areas, slot);
+    }
+
+    fn popup_mouse(x: f64, down: bool) -> Event {
+        use makepad_widgets::{MouseDownEvent, MouseUpEvent, WindowId, dvec2};
+        if down {
+            Event::MouseDown(MouseDownEvent {
+                abs: dvec2(x, 5.0),
+                button: MouseButton::PRIMARY,
+                window_id: WindowId(0, 0),
+                modifiers: Default::default(),
+                handled: Cell::new(Area::Empty),
+                time: 1.0,
+            })
+        } else {
+            Event::MouseUp(MouseUpEvent {
+                abs: dvec2(x, 5.0),
+                button: MouseButton::PRIMARY,
+                window_id: WindowId(0, 0),
+                modifiers: Default::default(),
+                time: 1.1,
+            })
+        }
+    }
+
+    #[test]
+    fn anchored_popover_outside_click_dismisses_on_release_and_reaches_its_target() {
+        use makepad_widgets::Hit;
+        with_anchored_popover(|cx, [page, trigger, _], slot| {
+            let popup = slot.unwrap();
+            let down = popup_mouse(80.0, true);
+            assert!(!handle_anchored_popover(cx, "main", page, &down, true));
+            assert!(popup.is_open());
+            assert!(matches!(down.hits(cx, page), Hit::FingerDown(_)));
+            cx.set_key_focus(page);
+
+            let up = popup_mouse(80.0, false);
+            assert!(!handle_anchored_popover(cx, "main", page, &up, true));
+            assert!(!popup.is_open());
+            assert!(matches!(up.hits(cx, page), Hit::FingerUp(hit) if hit.is_over));
+            assert!(!cx.clear_key_focus_if(trigger));
+            assert!(cx.clear_key_focus_if(page));
+        });
+    }
+
+    #[test]
+    fn anchored_popover_invoker_toggles_instead_of_reopening() {
+        with_anchored_popover(|cx, [page, trigger, _], mut slot| {
+            for event in [popup_mouse(15.0, true), popup_mouse(15.0, false)] {
+                assert!(!handle_anchored_popover(cx, "main", page, &event, true));
+                assert!(slot.as_ref().unwrap().is_open());
+            }
+            AnchoredPopover::toggle(&mut slot, cx, trigger);
+            assert!(slot.is_none());
+            AnchoredPopover::toggle(&mut slot, cx, trigger);
+            assert!(slot.unwrap().is_open());
+        });
+    }
+
+    #[test]
+    fn anchored_popover_escape_restores_trigger_focus_and_not_when_covered() {
+        use makepad_widgets::KeyEvent;
+        with_anchored_popover(|cx, [page, trigger, body], slot| {
+            let popup = slot.unwrap();
+            cx.set_key_focus(body);
+            let event = Event::KeyDown(KeyEvent {
+                key_code: KeyCode::Escape,
+                ..Default::default()
+            });
+            assert!(!handle_anchored_popover(cx, "main", page, &event, false));
+            assert!(popup.is_open());
+            assert!(handle_anchored_popover(cx, "main", page, &event, true));
+            assert!(!popup.is_open());
+            assert!(cx.clear_key_focus_if(trigger));
+        });
+    }
+
+    #[test]
+    fn anchored_popover_inside_input_is_shielded_and_does_not_dismiss() {
+        use makepad_widgets::event::ScrollEvent;
+        use makepad_widgets::{Hit, WindowId, dvec2};
+        with_anchored_popover(|cx, [page, _, body], slot| {
+            let popup = slot.unwrap();
+            let down = popup_mouse(26.0, true);
+            assert!(!handle_anchored_popover(cx, "main", page, &down, true));
+            assert!(matches!(down.hits(cx, page), Hit::Nothing));
+            assert!(matches!(down.hits(cx, body), Hit::FingerDown(_)));
+            let up = popup_mouse(26.0, false);
+            assert!(!handle_anchored_popover(cx, "main", page, &up, true));
+            assert!(matches!(up.hits(cx, body), Hit::FingerUp(hit) if hit.is_over));
+            for x in [26.0, 80.0] {
+                let scroll = Event::Scroll(ScrollEvent {
+                    abs: dvec2(x, 5.0),
+                    scroll: dvec2(0.0, 8.0),
+                    window_id: WindowId(0, 0),
+                    modifiers: Default::default(),
+                    handled_x: Cell::new(false),
+                    handled_y: Cell::new(false),
+                    is_mouse: true,
+                    time: 2.0,
+                });
+                assert!(!handle_anchored_popover(cx, "main", page, &scroll, true));
+                assert_eq!(cx.pointer_shielded(page, dvec2(x, 5.0)), x == 26.0);
+            }
+            assert!(popup.is_open());
+        });
+    }
+
+    #[test]
+    fn anchored_popover_ignores_drag_and_cross_boundary_release_but_closes_on_blur() {
+        with_anchored_popover(|cx, [page, _, _], slot| {
+            let popup = slot.unwrap();
+            for (start, end) in [(26.0, 23.0), (23.0, 26.0), (80.0, 90.0)] {
+                for event in [popup_mouse(start, true), popup_mouse(end, false)] {
+                    assert!(!handle_anchored_popover(cx, "main", page, &event, true));
+                    assert!(popup.is_open());
+                }
+            }
+            assert!(!handle_anchored_popover(
+                cx,
+                "main",
+                page,
+                &Event::AppLostFocus,
+                true
+            ));
+            assert!(!popup.is_open());
+        });
+    }
 
     #[test]
     fn modal_keeps_nested_cards_shielded_without_reviving_the_page_popover() {
