@@ -14,11 +14,13 @@
 
 use std::path::PathBuf;
 
+use makepad_widgets::makepad_draw::makepad_platform::makepad_shader_compiler::ShaderTy;
 use makepad_widgets::*;
 
 use crate::common::clock;
 use crate::common::paint::{Font, Painter, TextSpec, rect as rect_of};
 use crate::common::tr;
+use crate::common::transition::{Intent, Transition};
 use crate::theme;
 
 live_design! {
@@ -30,9 +32,6 @@ live_design! {
         painter: <PaseoPainter> {}
     }
 }
-
-/// `file-drop-backdrop.tsx` `withTiming(…, { duration: 150 })`.
-const FADE_SECONDS: f64 = 0.15;
 
 /// Where the zone is and whether accepted files hover over it
 /// (`use-drop-listeners.ts` `isDragging`).
@@ -105,13 +104,10 @@ pub struct FileDropZone {
     list: DrawList2d,
     #[rust]
     state: ZoneState,
-    /// The backdrop's opacity as last drawn, and when.
     #[rust]
-    shown: f64,
+    visibility: Transition,
     #[rust]
-    shown_at: f64,
-    #[rust]
-    next_frame: NextFrame,
+    backdrop: Area,
 }
 
 impl FileDropZone {
@@ -122,22 +118,65 @@ impl FileDropZone {
         event: &Event,
         accepts: bool,
     ) -> Option<Vec<PathBuf>> {
-        if self.next_frame.is_event(event).is_some() {
-            self.list.redraw(cx);
+        if self.visibility.advance(cx, event) && !self.backdrop.is_empty() {
+            self.update_opacity(cx, self.opacity());
+            if !self.visibility.is_moving() && !self.state.dragging {
+                // Stop rasterizing the pane-sized backdrop. The transparent
+                // text and rect are discarded on the next ordinary draw.
+                if let Some(size) = self.backdrop.get_write_ref(
+                    cx,
+                    live_id!(rect_size),
+                    ShaderTy::Vec2,
+                    "drop zone",
+                ) {
+                    size.buffer[..2].fill(0.0);
+                }
+                self.backdrop = Area::Empty;
+            }
         }
         let was = self.state.dragging;
         let files = self.state.route(event, accepts);
         if was != self.state.dragging {
-            self.shown_at = now();
-            self.list.redraw(cx);
+            let target = if self.state.dragging { 1.0 } else { 0.0 };
+            self.visibility
+                .retarget(cx, target, self.intent().resolve().spec);
+            if self.state.dragging && !self.backdrop.is_attached(cx) {
+                // Paint the backdrop once when it first becomes visible.
+                self.list.redraw(cx);
+            }
         }
         files
     }
 
-    /// The zone left the screen (its owner is hidden or gone): no drag belongs to it.
-    pub fn clear(&mut self) {
-        self.state = ZoneState::default();
-        self.shown = 0.0;
+    fn intent(&self) -> Intent {
+        if self.state.dragging {
+            Intent::Appear
+        } else {
+            Intent::Disappear
+        }
+    }
+
+    fn opacity(&self) -> f32 {
+        self.intent()
+            .resolve()
+            .sample(self.visibility.value(), self.state.rect.size)
+            .incoming
+            .opacity as f32
+    }
+
+    fn update_opacity(&self, cx: &mut Cx, opacity: f32) {
+        clock::write_instance(cx, self.backdrop, live_id!(opacity), opacity);
+        for text in [&self.painter.text_icon, &self.painter.text_medium] {
+            for area in text.draw_areas() {
+                if let Some(color) =
+                    area.get_write_ref(cx, live_id!(color), ShaderTy::Vec4, "drop label")
+                {
+                    for i in 0..color.repeat {
+                        color.buffer[i * color.stride + 3] = text.color.w * opacity;
+                    }
+                }
+            }
+        }
     }
 
     /// Sets the zone to `rect` and paints the backdrop over it: `surface0` at 70%, a 32px
@@ -145,22 +184,14 @@ impl FileDropZone {
     /// 8px apart, centred. Call after the owner's own content.
     pub fn draw(&mut self, cx: &mut Cx2d, rect: Rect) {
         self.state.rect = rect;
-        let target = if self.state.dragging { 1.0 } else { 0.0 };
-        let now = now();
-        let step = ((now - self.shown_at) / FADE_SECONDS).clamp(0.0, 1.0);
-        self.shown_at = now;
-        self.shown = if target > self.shown {
-            (self.shown + step).min(target)
-        } else {
-            (self.shown - step).max(target)
-        };
-        // The list is begun every frame so a drag can redraw it before it ever showed.
+        // The list is registered even while hidden, so drag entry can redraw
+        // it before it has any instances.
         self.list.begin_always(cx);
-        if self.shown > 0.0 {
+        self.backdrop = Area::Empty;
+        if self.state.dragging || self.visibility.is_moving() {
             let palette = theme::current_palette();
             let typography = theme::current_typography();
             self.painter.new_layer(cx);
-            self.painter.set_alpha(self.shown as f32);
             self.painter.fill(
                 cx,
                 rect,
@@ -170,6 +201,7 @@ impl FileDropZone {
                 },
                 0.0,
             );
+            self.backdrop = self.painter.draw_box.area();
             let spec = TextSpec::new(Font::Medium, typography.ui_size(14.0), palette.foreground);
             let label = tr("composer.attachments.dropFilesHere");
             let label_height = self.painter.line_height(cx, spec);
@@ -188,17 +220,12 @@ impl FileDropZone {
                 &label,
                 0.5,
             );
-            self.painter.set_alpha(1.0);
         }
         self.list.end(cx);
-        if self.shown != target {
-            self.next_frame = cx.new_next_frame();
+        if !self.backdrop.is_empty() {
+            self.update_opacity(cx, self.opacity());
         }
     }
-}
-
-fn now() -> f64 {
-    clock::now_ms() as f64 / 1000.0
 }
 
 #[cfg(test)]
@@ -246,6 +273,85 @@ mod tests {
             rect: rect_of(300.0, 40.0, 900.0, 800.0),
             dragging: false,
         }
+    }
+
+    #[test]
+    fn file_drop_motion_updates_retained_opacity_without_redrawing() {
+        use makepad_widgets::makepad_draw::CxDraw;
+
+        use crate::common::transition::{Spec, begin_event};
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_widgets::live_design(&mut cx);
+        crate::theme::live_design(&mut cx);
+        crate::common::paint::live_design(&mut cx);
+        super::live_design(&mut cx);
+        FileDropZone::register_main_module(&mut cx);
+        cx.live_expand();
+        cx.live_scan_dependencies();
+        cx.native_load_dependencies();
+        let mut zone = FileDropZone::new_local(&mut cx);
+        let bounds = pane().rect;
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(1600.0, 1000.0));
+        let mut root = DrawList2d::new(&mut cx);
+        let draw_event = DrawEvent::default();
+        let mut paint = |cx: &mut Cx, zone: &mut FileDropZone| {
+            let mut draw = CxDraw::new(cx, &draw_event);
+            draw.begin_pass(&pass, Some(1.0));
+            root.begin_always(&mut draw);
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_pass_sized_turtle(Layout::default());
+            zone.draw(&mut cx, bounds);
+            cx.end_pass_sized_turtle();
+            root.end(&mut cx);
+            cx.end_pass(&pass);
+        };
+        paint(&mut cx, &mut zone);
+        let (event, ..) = drag(bounds.center(), vec![file("/tmp/a.txt")]);
+        zone.handle_event(&mut cx, &event, true);
+        assert!(matches!(zone.intent(), Intent::Appear));
+        paint(&mut cx, &mut zone);
+        let backdrop = zone.backdrop;
+        let opacity = |cx: &Cx| {
+            backdrop
+                .get_read_ref(cx, live_id!(opacity), ShaderTy::Float)
+                .unwrap()
+                .buffer[0]
+        };
+        let duration = |intent: Intent| match intent.resolve().spec {
+            Spec::Tween(duration, _) => duration.as_secs_f64(),
+            Spec::Spring { .. } => panic!("file-drop fades are timed"),
+        };
+        let tick = |zone: &mut FileDropZone, cx: &mut Cx, time| {
+            cx.new_draw_event = DrawEvent::default();
+            let event = Event::NextFrame(NextFrameEvent {
+                frame: 0,
+                time,
+                set: [zone.visibility.scheduled_frame().unwrap()].into(),
+            });
+            begin_event(&event);
+            zone.handle_event(cx, &event, true);
+            assert!(!cx.new_draw_event.will_redraw());
+        };
+        let appear = duration(Intent::Appear);
+        assert_eq!(opacity(&cx), 0.0);
+        tick(&mut zone, &mut cx, 1.0);
+        tick(&mut zone, &mut cx, 1.0 + appear * 0.5);
+        assert!((0.0..1.0).contains(&opacity(&cx)) && opacity(&cx) > 0.0);
+        tick(&mut zone, &mut cx, 1.0 + appear * 1.01);
+        assert_eq!(opacity(&cx), 1.0);
+
+        zone.handle_event(&mut cx, &Event::DragEnd, true);
+        assert!(matches!(zone.intent(), Intent::Disappear));
+        let disappear = duration(Intent::Disappear);
+        tick(&mut zone, &mut cx, 2.0);
+        tick(&mut zone, &mut cx, 2.0 + disappear * 0.5);
+        assert!((0.0..1.0).contains(&opacity(&cx)) && opacity(&cx) > 0.0);
+        tick(&mut zone, &mut cx, 2.0 + disappear * 1.01);
+        assert_eq!(opacity(&cx), 0.0);
+        assert!(zone.visibility.scheduled_frame().is_none());
+        assert!(zone.backdrop.is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! tool_call_details.dart `showToolCallSheet` / `_showDetailSheet`: the
 //! compact-layout detail sheet — 50% scrim, surface2 sheet with 16px top
-//! radii sliding up over 250ms, the 32x4 handle, a header row (20px glyph,
+//! radii, the 32x4 handle, a header row (20px glyph,
 //! title, close) over a rule, and the detail body scrolling inside the 95%
 //! layout (overview sheets pinned to the newest call until scrolled).
 //!
@@ -16,14 +16,115 @@ use super::i18n::t;
 use super::paint::{Draw, Look, MOBILE, RowState, now_seconds};
 use super::rows::{SheetHeader, paint_glyph};
 use super::tools::{self, detail_blocks, detail_is_full_bleed};
-use crate::common::overlay::{TapTarget, take_dismissal};
+use crate::common::overlay::{self, DrawLayerScrim, TapTarget, take_dismissal};
+use crate::common::transition::{Intent, Transition};
 use makepad_widgets::*;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// showModalBottomSheet's enter transition.
-pub const OPEN_SECS: f64 = 0.25;
+#[derive(Default)]
+pub struct SheetMotion {
+    pub open: bool,
+    progress: Transition,
+    pub offset: DVec2,
+    pub scrim: Area,
+    cover: Area,
+}
+
+impl SheetMotion {
+    pub fn set_open(&mut self, cx: &mut Cx, open: bool) {
+        if !open && self.open && self.cover.is_valid(cx) {
+            self.cover.set_rect(cx, &Rect::default());
+            crate::common::clock::finish_draw(cx);
+        }
+        self.open = open;
+        self.progress.retarget(
+            cx,
+            if open { 1.0 } else { 0.0 },
+            self.intent().resolve().spec,
+        );
+    }
+
+    pub fn is_moving(&self) -> bool {
+        self.progress.is_moving()
+    }
+
+    pub fn advance(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        self.progress.advance(cx, event)
+    }
+
+    fn intent(&self) -> Intent {
+        if self.open {
+            Intent::OpenSheet
+        } else {
+            Intent::CloseSheet
+        }
+    }
+
+    pub fn mark_cover(&mut self, cx: &mut Cx2d, bounds: Rect, opaque: bool) {
+        self.cover = if opaque {
+            crate::common::clock::occlude(cx, Self::cover_rect(bounds))
+        } else {
+            Area::Empty
+        };
+        self.place_cover(cx, bounds);
+    }
+
+    fn cover_rect(bounds: Rect) -> Rect {
+        let start = bounds.size.y * 0.4 + 16.0;
+        rect_xywh(
+            bounds.pos.x,
+            bounds.pos.y + start,
+            bounds.size.x,
+            bounds.size.y - start,
+        )
+    }
+
+    fn place_cover(&self, cx: &mut Cx, bounds: Rect) {
+        if self.cover.is_valid(cx) {
+            let rect = if self.open && !self.is_moving() {
+                Self::cover_rect(bounds)
+            } else {
+                Rect::default()
+            };
+            self.cover.set_rect(cx, &rect);
+        }
+    }
+
+    pub fn finish_open(&self, cx: &mut Cx, bounds: Rect) {
+        if self.open && !self.is_moving() && self.cover.is_valid(cx) {
+            self.place_cover(cx, bounds);
+            crate::common::clock::finish_draw(cx);
+        }
+    }
+
+    pub fn compose(&mut self, cx: &mut Cx, list: &DrawList2d, bounds: Rect) {
+        let size = dvec2(bounds.size.x, bounds.size.y * 0.6);
+        let frame = self.intent().resolve().sample(self.progress.value(), size);
+        self.offset = frame.incoming.offset;
+        overlay::place_layer(
+            cx,
+            list,
+            Rect {
+                pos: self.offset,
+                size,
+            },
+            1.0,
+        );
+        overlay::update_scrim(cx, self.scrim, (0.5 * frame.scrim) as f32);
+    }
+
+    pub fn draw_scrim(&mut self, cx: &mut Cx2d, draw: &mut DrawLayerScrim, bounds: Rect) {
+        let frame = self
+            .intent()
+            .resolve()
+            .sample(self.progress.value(), bounds.size);
+        draw.color = vec4(0.0, 0.0, 0.0, (0.5 * frame.scrim) as f32);
+        draw.draw_abs(cx, bounds);
+        self.scrim = draw.area();
+    }
+}
 
 /// The header copy button's key in the sheet's `copied` state.
 const COPY_KEY: &str = "sheet:copy";
@@ -31,10 +132,10 @@ const COPY_KEY: &str = "sheet:copy";
 /// The sheet body painter: (cx, draw, x, y, width, fill height) → height.
 pub type SheetBody<'a> = &'a dyn Fn(&mut Cx2d, &mut Draw, f64, f64, f64, f64) -> f64;
 
-/// Paints the sheet over `rect`; `progress` is the open animation (0..1).
+/// Paints the sheet at its settled geometry over `rect`.
 /// `bottom_inset` is the system navigation inset inside `rect`'s bottom edge:
 /// the sheet's background covers it, the body ends above it.
-/// Registers `Chrome("scrim")`, `Chrome("sheet:body")`, `Chrome("sheet:close")`,
+/// Registers `Chrome("sheet:body")`, `Chrome("sheet:close")`,
 /// the header's `Copy` when it has text, and the body's `ScrollY("sheet:y")`.
 /// Returns the sheet rect.
 #[allow(clippy::too_many_arguments)]
@@ -44,23 +145,15 @@ pub fn paint_detail_sheet(
     rect: Rect,
     bottom_inset: f64,
     header: &SheetHeader,
-    progress: f64,
     pin_to_end: bool,
     body: SheetBody,
 ) -> Rect {
     let p = d.look.palette;
-    let eased = 1.0 - (1.0 - progress.clamp(0.0, 1.0)).powi(3);
-    d.kit.rect(
-        cx,
-        rect,
-        with_alpha(rgba(0xff000000), (0.5 * eased) as f32),
-        0.0,
-    );
     d.canvas.add_hit(rect, HitTarget::Chrome("scrim".into()));
     // DraggableScrollableSheet: laid out at 95%, resting at the 60% snap.
     let full = rect.size.y * 0.95;
     let rest = rect.size.y * 0.6;
-    let top = rect.pos.y + rect.size.y - rest * eased;
+    let top = rect.pos.y + rect.size.y - rest;
     let sheet = rect_xywh(rect.pos.x, top, rect.size.x, full);
     d.kit.rect_full(
         cx,
@@ -70,15 +163,6 @@ pub fn paint_detail_sheet(
         TRANSPARENT,
         0.0,
     );
-    if !d.dry() && p.surface2.w >= 1.0 {
-        let body = rect_xywh(
-            sheet.pos.x,
-            sheet.pos.y + 16.0,
-            sheet.size.x,
-            (rest * eased - 16.0).max(0.0),
-        );
-        crate::common::clock::occlude(cx, body);
-    }
     d.canvas
         .add_hit(sheet, HitTarget::Chrome("sheet:body".into()));
     // Gorhom handle: 32x4 zinc-600 with 10px insets.
@@ -217,9 +301,6 @@ pub fn paint_detail_sheet(
             max: max_y,
         }),
     );
-    if progress < 1.0 {
-        d.animating = true;
-    }
     sheet
 }
 
@@ -260,9 +341,8 @@ struct Standalone {
     id: u64,
     title: String,
     detail: Value,
-    opened: f64,
-    /// Drawn fully open (the open animation finished).
-    settled: bool,
+    motion: SheetMotion,
+    canvas: Canvas,
     state: RowState,
     paint: Option<DrawList2d>,
     touch_scroll: makepad_widgets::scroll_bars::TouchScroll,
@@ -274,10 +354,10 @@ struct Standalone {
 struct Layer {
     kit: Option<ChatKit>,
     list: Option<DrawList2d>,
-    canvas: Canvas,
+    scrim: Option<DrawLayerScrim>,
+    window: Rect,
     area: Area,
     sheets: Vec<Standalone>,
-    next_frame: NextFrame,
     painted_top: Option<u64>,
 }
 
@@ -304,15 +384,17 @@ pub fn show_tool_call_sheet(
             parent.tap.cancel();
         }
         let id = crate::common::overlay::next_id();
+        let mut motion = SheetMotion::default();
+        motion.set_open(cx, true);
         layer.sheets.push(Standalone {
             id,
             title: display_name.to_owned(),
             detail: detail.clone(),
-            opened: now_seconds(),
-            settled: false,
+            motion,
+            canvas: Canvas::default(),
             state: RowState::default(),
             paint: None,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             bar_drag: None,
             tap: TapTarget::default(),
         });
@@ -329,20 +411,20 @@ pub fn show_tool_call_sheet(
 /// Whether the sheet finished opening and was drawn fully open.
 pub fn tool_call_sheet_settled(id: u64) -> bool {
     LAYER.with(|layers| {
-        layers
-            .borrow()
-            .values()
-            .any(|layer| layer.sheets.iter().any(|s| s.id == id && s.settled))
+        layers.borrow().values().any(|layer| {
+            layer
+                .sheets
+                .iter()
+                .any(|s| s.id == id && s.motion.open && !s.motion.is_moving() && s.paint.is_some())
+        })
     })
 }
 
 pub fn close_tool_call_sheet(cx: &mut Cx, id: u64) {
     LAYER.with(|layers| {
         for layer in layers.borrow_mut().values_mut() {
-            let count = layer.sheets.len();
-            layer.sheets.retain(|sheet| sheet.id != id);
-            if layer.sheets.len() != count {
-                redraw_layer(cx, layer);
+            if let Some(index) = layer.sheets.iter().position(|sheet| sheet.id == id) {
+                close_standalone(cx, layer, index);
             }
         }
     });
@@ -359,6 +441,18 @@ fn top_index(layer: &Layer) -> Option<usize> {
     layer.sheets.len().checked_sub(1)
 }
 
+fn close_standalone(cx: &mut Cx, layer: &mut Layer, index: usize) {
+    let sheet = &mut layer.sheets[index];
+    sheet.motion.set_open(cx, false);
+    sheet.tap.cancel();
+    sheet.touch_scroll.reset();
+    sheet.bar_drag = None;
+    if !sheet.motion.is_moving() {
+        layer.sheets.remove(index);
+        redraw_layer(cx, layer);
+    }
+}
+
 /// Shell hook, before content dispatch: taps (close, scrim), wheel scrolling
 /// and Escape for the window's top standalone sheet. Returns true while one
 /// is open (the content below is modal-locked).
@@ -368,15 +462,29 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
         let Some(layer) = layers.get_mut(window_id) else {
             return false;
         };
-        if layer.next_frame.is_event(event).is_some() {
-            cx.redraw_area(layer.area);
+        let mut removed = false;
+        layer.sheets.retain_mut(|sheet| {
+            if sheet.motion.advance(cx, event)
+                && let Some(paint) = &sheet.paint
+            {
+                sheet.motion.compose(cx, paint, layer.window);
+                sheet.motion.finish_open(cx, layer.window);
+            }
+            let visible = sheet.motion.open || sheet.motion.is_moving();
+            removed |= !visible;
+            visible
+        });
+        if removed {
+            redraw_layer(cx, layer);
         }
         let Some(index) = top_index(layer) else {
             return false;
         };
+        if !layer.sheets[index].motion.open {
+            return true;
+        }
         if take_dismissal(event) {
-            layer.sheets.remove(index);
-            redraw_layer(cx, layer);
+            close_standalone(cx, layer, index);
             return true;
         }
         if matches!(
@@ -403,96 +511,99 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
         if layer.painted_top != Some(layer.sheets[index].id) {
             return true;
         }
-        let mut close = false;
+        let sheet = &mut layer.sheets[index];
+        let area = layer.area;
+        let offset = sheet.motion.offset;
+        let origin = sheet.canvas.origin + offset;
+        let redraw = |cx: &mut Cx, sheet: &Standalone| {
+            if let Some(paint) = &sheet.paint {
+                paint.redraw(cx);
+            }
+            cx.redraw_area(area);
+        };
         if let Event::Scroll(se) = event {
-            layer.sheets[index].touch_scroll.reset();
-            layer.sheets[index].tap.cancel();
-            if scroll_sheet(
-                &mut layer.sheets[index].state,
-                &layer.canvas,
-                se.abs,
-                se.scroll,
-            ) {
-                cx.redraw_area(layer.area);
+            sheet.touch_scroll.reset();
+            sheet.tap.cancel();
+            if scroll_sheet(&mut sheet.state, &sheet.canvas, se.abs - offset, se.scroll) {
+                redraw(cx, sheet);
             }
         }
-        let hit = event.hits(cx, layer.area);
-        // A diagram's bars remain usable in this standalone surface, including
-        // on phones where the enclosing sheet otherwise owns vertical drags.
+        let hit = event.hits(cx, area);
         if let Hit::FingerDown(e) = &hit {
-            let rel = e.abs - layer.canvas.origin;
-            if let Some(target) = layer.canvas.hit_at(rel).cloned()
-                && let Some(drag) =
-                    super::scrollbar::BarDrag::press(&target, rel, &mut layer.sheets[index].state)
+            let rel = e.abs - origin;
+            if let Some(target) = sheet.canvas.hit_at(rel)
+                && let Some(drag) = super::scrollbar::BarDrag::press(target, rel, &mut sheet.state)
             {
-                let sheet = &mut layer.sheets[index];
                 sheet.bar_drag = Some(drag);
                 sheet.touch_scroll.reset();
                 sheet.tap.cancel();
-                cx.redraw_area(layer.area);
+                redraw(cx, sheet);
                 return true;
             }
         }
-        if let Some(drag) = layer.sheets[index].bar_drag.clone() {
+        if let Some(drag) = &sheet.bar_drag {
             match &hit {
                 Hit::FingerMove(e) => {
                     if let (DigitDevice::Touch { uid }, Event::TouchUpdate(update)) =
                         (&e.device, event)
                         && let Some(touch) = update.touches.iter().find(|touch| touch.uid == *uid)
                     {
-                        touch.handled.set(layer.area);
+                        touch.handled.set(area);
                     }
-                    drag.drag_to(e.abs - layer.canvas.origin, &mut layer.sheets[index].state);
-                    cx.redraw_area(layer.area);
+                    drag.drag_to(e.abs - origin, &mut sheet.state);
+                    redraw(cx, sheet);
                     return true;
                 }
                 Hit::FingerUp(_) => {
-                    layer.sheets[index].bar_drag = None;
-                    layer.sheets[index].state.dragging_bar = None;
-                    cx.redraw_area(layer.area);
+                    sheet.bar_drag = None;
+                    sheet.state.dragging_bar = None;
+                    redraw(cx, sheet);
                     return true;
                 }
                 _ => {}
             }
         }
         let scroll_start = match &hit {
-            Hit::FingerDown(e) => layer
+            Hit::FingerDown(e) => sheet
                 .canvas
-                .scroll_region_at(e.abs - layer.canvas.origin, true)
+                .scroll_region_at(e.abs - origin, true)
                 .is_some(),
             _ => true,
         };
         if !scroll_start {
-            layer.sheets[index].touch_scroll.reset();
+            sheet.touch_scroll.reset();
         }
-        if scroll_start
-            && let Some(delta) = layer.sheets[index]
-                .touch_scroll
-                .handle_event(cx, event, &hit)
-        {
-            layer.sheets[index].tap.cancel();
-            let origin = layer.sheets[index].touch_scroll.origin();
+        if scroll_start && let Some(delta) = sheet.touch_scroll.handle_event(cx, event, &hit) {
+            sheet.tap.cancel();
             if scroll_sheet(
-                &mut layer.sheets[index].state,
-                &layer.canvas,
-                origin,
+                &mut sheet.state,
+                &sheet.canvas,
+                sheet.touch_scroll.origin() - offset,
                 dvec2(0.0, delta),
             ) {
-                cx.redraw_area(layer.area);
+                redraw(cx, sheet);
             } else {
-                layer.sheets[index].touch_scroll.stop_at_edge();
+                sheet.touch_scroll.stop_at_edge();
             }
         }
+        let tap_target = |abs: DVec2| {
+            sheet.canvas.hit_at(abs - origin).cloned().or_else(|| {
+                layer
+                    .window
+                    .contains(abs)
+                    .then(|| HitTarget::Chrome("scrim".into()))
+            })
+        };
+        let mut close = false;
         match hit {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
-                let hit = layer
+                let hit = sheet
                     .canvas
-                    .hit_at(e.abs - layer.canvas.origin)
+                    .hit_at(e.abs - origin)
                     .map(super::chat_row::hover_key);
-                let state = &mut layer.sheets[index].state;
-                if state.hover_hit != hit {
-                    state.hover_hit = hit.clone();
-                    cx.redraw_area(layer.area);
+                if sheet.state.hover_hit != hit {
+                    sheet.state.hover_hit = hit.clone();
+                    redraw(cx, sheet);
                 }
                 cx.set_cursor(if matches!(hit.as_deref(), Some("sheet:close")) {
                     MouseCursor::Hand
@@ -500,16 +611,11 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
                     MouseCursor::Default
                 });
             }
-            Hit::FingerDown(e) => {
-                layer.sheets[index]
-                    .tap
-                    .press(layer.canvas.hit_at(e.abs - layer.canvas.origin).cloned());
-            }
-            Hit::FingerLongPress(_) => layer.sheets[index].tap.cancel(),
+            Hit::FingerDown(e) => sheet.tap.press(tap_target(e.abs)),
+            Hit::FingerLongPress(_) => sheet.tap.cancel(),
             Hit::FingerUp(e) => {
-                let target = layer.canvas.hit_at(e.abs - layer.canvas.origin).cloned();
-                let released = layer.sheets[index].tap.release(
-                    target,
+                let released = sheet.tap.release(
+                    tap_target(e.abs),
                     e.is_over && e.was_tap() && !e.has_long_press_occurred,
                 );
                 match released {
@@ -517,20 +623,17 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
                         close = true
                     }
                     Some(target @ HitTarget::MermaidExport { .. }) => {
-                        super::mermaid::tap(&mut layer.sheets[index].state, &target);
-                        cx.redraw_area(layer.area);
+                        super::mermaid::tap(&mut sheet.state, &target);
+                        redraw(cx, sheet);
                     }
                     Some(HitTarget::Copy { key, text }) => {
                         cx.copy_to_clipboard(&text);
-                        layer.sheets[index]
-                            .state
-                            .copied
-                            .insert(key, std::time::Instant::now());
-                        cx.redraw_area(layer.area);
+                        sheet.state.copied.insert(key, std::time::Instant::now());
+                        redraw(cx, sheet);
                     }
                     Some(HitTarget::Toggle(key)) => {
-                        layer.sheets[index].state.toggle(&key);
-                        cx.redraw_area(layer.area);
+                        sheet.state.toggle(&key);
+                        redraw(cx, sheet);
                     }
                     _ => {}
                 }
@@ -538,8 +641,7 @@ pub fn handle_tool_call_sheets(cx: &mut Cx, event: &Event, window_id: &str) -> b
             _ => {}
         }
         if close {
-            layer.sheets.remove(index);
-            redraw_layer(cx, layer);
+            close_standalone(cx, layer, index);
         }
         true
     })
@@ -563,6 +665,9 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
         if layer.list.is_none() {
             layer.list = Some(DrawList2d::new(cx));
         }
+        let scrim = layer
+            .scrim
+            .get_or_insert_with(|| DrawLayerScrim::new_local(cx));
         let (Some(kit), Some(list)) = (layer.kit.as_mut(), layer.list.as_mut()) else {
             return;
         };
@@ -576,20 +681,25 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
             list_inset: if window.size.x < 720.0 { 12.0 } else { 16.0 },
             syntax: paseo_highlight::SyntaxThemeId::One,
         };
+        layer.window = window;
         list.begin_always(cx);
         // The layer's capture area is its own full-window turtle (stable across
         // redraws, unlike the first instance of a primitive drawn many times).
         cx.begin_turtle(Walk::abs_rect(window), Layout::default());
         let now = now_seconds();
-        let mut animating = false;
         for sheet in &mut layer.sheets {
             // Each sheet owns its own cover and paint order.
             let paint = sheet.paint.get_or_insert_with(|| DrawList2d::new(cx));
-            paint.begin_always(cx);
+            sheet.motion.draw_scrim(cx, scrim, window);
+            if paint.begin(cx, Walk::abs_rect(window)).is_err() {
+                sheet.motion.compose(cx, paint, window);
+                continue;
+            }
+            sheet
+                .motion
+                .mark_cover(cx, window, look.palette.surface2.w >= 1.0);
             kit.begin_layer(cx);
-            // Lower sheets paint normally, but only the top sheet contributes input.
-            layer.canvas.begin(window.pos);
-            let progress = ((now - sheet.opened) / OPEN_SECS).clamp(0.0, 1.0);
+            sheet.canvas.begin(window.pos);
             let glyph = tools::resolve_tool_call_icon(&sheet.title, Some(&sheet.detail), false);
             let detail = sheet.detail.clone();
             let tool_name = sheet.title.clone();
@@ -607,7 +717,7 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
             };
             let mut d = Draw {
                 kit: &mut *kit,
-                canvas: &mut layer.canvas,
+                canvas: &mut sheet.canvas,
                 look,
                 state: &mut sheet.state,
                 now,
@@ -624,7 +734,6 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
                 window,
                 bottom_inset,
                 &header,
-                progress,
                 false,
                 &|cx, d, x, y, w, fill| {
                     let blocks = detail_blocks(&detail, Some(&tool_name), None, &|k| t(k));
@@ -646,18 +755,11 @@ pub fn draw_tool_call_sheets(cx: &mut Cx2d, window_id: &str, window: Rect) {
                 },
             );
             paint.end(cx);
-            animating |= d.animating;
-            // Settled once a frame was drawn with the open animation finished.
-            if progress >= 1.0 {
-                sheet.settled = true;
-            }
+            sheet.motion.compose(cx, paint, window);
         }
         cx.end_turtle_with_area(&mut layer.area);
         list.end(cx);
         layer.painted_top = layer.sheets.last().map(|sheet| sheet.id);
-        if animating || layer.sheets.iter().any(|s| !s.settled) {
-            layer.next_frame = cx.new_next_frame();
-        }
     });
 }
 
@@ -689,11 +791,14 @@ mod tests {
             id,
             title: String::new(),
             detail: Value::Null,
-            opened: 0.0,
-            settled: false,
+            motion: SheetMotion {
+                open: true,
+                ..Default::default()
+            },
+            canvas: Canvas::default(),
             state: RowState::default(),
             paint: None,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             bar_drag: None,
             tap: TapTarget::default(),
         }

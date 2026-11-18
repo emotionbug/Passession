@@ -10,7 +10,7 @@ use chrono::{DateTime, Datelike, Local, Utc};
 use makepad_widgets::*;
 use serde_json::{Value, json};
 
-use crate::common::paint::{Font, rect};
+use crate::common::paint::{Font, HitViewport, rect};
 use crate::common::widgets::{
     PTextFieldWidgetRefExt, RowMetrics, StatusBucket, agent_live_status_bucket, paint_status_badge,
 };
@@ -46,7 +46,40 @@ pub struct SidebarState {
     pub(crate) tree_layer: crate::common::layer::Layer,
     pub(crate) footer_layer: crate::common::layer::Layer,
     header_bottom: f64,
+    tree_hits: HitViewport,
+    tree_band: TreeBand,
     motion: makepad_widgets::scroll_bars::TouchScroll,
+}
+
+/// A bounded strip of retained rows in content coordinates. Common drags and
+/// flings stay inside it; only crossing its edge needs newly exposed rows.
+#[derive(Default)]
+struct TreeBand {
+    top: f64,
+    bottom: f64,
+}
+
+impl TreeBand {
+    fn around(scroll: f64, height: f64) -> Self {
+        let overscan = height * 2.0;
+        Self {
+            top: (scroll - overscan).max(0.0),
+            bottom: scroll + height + overscan,
+        }
+    }
+
+    fn covers(&self, scroll: f64, height: f64, content_height: f64) -> bool {
+        self.top <= scroll && self.bottom >= (scroll + height).min(content_height)
+    }
+
+    fn rect(&self, viewport: Rect) -> Rect {
+        rect(
+            viewport.pos.x,
+            viewport.pos.y + self.top,
+            viewport.size.x,
+            self.bottom - self.top,
+        )
+    }
 }
 
 impl SidebarState {
@@ -63,13 +96,35 @@ impl SidebarState {
         self.motion.apply_delta(&mut self.scroll, delta, max)
     }
 
+    fn place_tree(&self, cx: &mut Cx) {
+        let shift = dvec2(0.0, -self.scroll);
+        self.tree_hits.place(self.viewport, shift);
+        self.tree_layer.place_viewport(cx, self.viewport, shift);
+        if !self
+            .tree_band
+            .covers(self.scroll, self.viewport.size.y, self.content_height)
+        {
+            self.tree_layer.invalidate(cx);
+        }
+    }
+
     /// True once this touch owns vertical scrolling, including at an edge.
-    pub fn touch_move(&mut self, abs: DVec2, time: f64) -> bool {
+    pub fn touch_move(&mut self, cx: &mut Cx, abs: DVec2, time: f64) -> bool {
         let Some(delta) = self.motion.move_to(abs, time) else {
             return false;
         };
-        self.scroll_by(delta);
+        if self.scroll_by(delta) {
+            self.place_tree(cx);
+        }
         true
+    }
+
+    fn advance(&mut self, cx: &mut Cx, event: &Event) {
+        if let Some(delta) = self.motion.frame(cx, event)
+            && self.scroll_by(delta)
+        {
+            self.place_tree(cx);
+        }
     }
 }
 
@@ -1149,6 +1204,9 @@ pub fn draw(
     let footer = rect(r.pos.x, r.pos.y + r.size.y - footer_h, r.size.x, footer_h);
     let list = rect(r.pos.x, y, r.size.x, (footer.pos.y - y).max(0.0));
     shell.data.sidebar.viewport = list;
+    shell
+        .painter
+        .fill(cx, list, theme::current_palette().sidebar, 0.0);
     let inputs = crate::common::layer::inputs((
         shell.data.layout.selected().map(PanelTarget::key),
         &shell.data.sidebar.query,
@@ -1161,16 +1219,22 @@ pub fn draw(
         &mut shell.data.hits,
         &mut shell.data.tooltips,
     ) {
+        let sidebar = &mut shell.data.sidebar;
+        sidebar.tree_band = TreeBand::around(sidebar.scroll, list.size.y);
+        let band = sidebar.tree_band.rect(list);
         shell
-            .painter
-            .fill(cx, list, theme::current_palette().sidebar, 0.0);
-        draw_tree(shell, cx, state, list);
+            .data
+            .hits
+            .set_viewport(Some(sidebar.tree_hits.clone()));
+        draw_tree(shell, cx, state, list, band);
+        shell.data.hits.set_viewport(None);
         shell
             .data
             .sidebar
             .tree_layer
             .end(cx, &shell.data.hits, &shell.data.tooltips);
     }
+    shell.data.sidebar.place_tree(cx);
     if shell.data.sidebar.footer_layer.begin(
         cx,
         footer,
@@ -1250,7 +1314,13 @@ fn index_hint(ui: &mut Ui, cx: &mut Cx2d, slot: Rect, index: usize) {
     ui.text_centered(cx, r, spec, &(index + 1).to_string());
 }
 
-fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::CoreState, list: Rect) {
+fn draw_tree(
+    shell: &mut PaseoShell,
+    cx: &mut Cx2d,
+    state: &paseo_gui_core::CoreState,
+    list: Rect,
+    band: Rect,
+) {
     let query = shell.data.sidebar.query.trim().to_lowercase();
     let host_count = hosts::hosts(state).len();
     // While the pointer rests on the tree, rows keep the order they were drawn in.
@@ -1263,15 +1333,17 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
         .tree(state, &query, holding.then_some(&held));
     let mut drawn_order: HashMap<String, Vec<String>> = HashMap::new();
     let selected = shell.data.layout.selected().cloned();
-    let scroll = shell.data.sidebar.scroll;
     let hints = shell.data.sidebar.modifier_held && !shell.data.compact;
     let reveal = shell.data.sidebar.reveal_host.take();
     let mut reveal_offset: Option<f64> = None;
     // The rows read the streams while `ui` borrows the shell; they go back after drawing.
     let terminals = std::mem::take(&mut shell.data.sidebar.terminals);
 
+    // Overscan can extend past the window's turtle. Isolate its alignment
+    // so only the movable draw-list viewport clips it to the screen.
+    cx.begin_pass_sized_turtle_no_clip(Layout::default());
     cx.begin_turtle(
-        Walk::abs_rect(list),
+        Walk::abs_rect(band),
         Layout {
             clip_x: true,
             clip_y: true,
@@ -1279,9 +1351,9 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
         },
     );
     let mut ui = make_ui(shell);
-    ui.hits.set_clip(Some(list));
+    ui.hits.set_clip(Some(band));
     let p = ui.p;
-    let mut y = list.pos.y - scroll;
+    let mut y = list.pos.y;
     let x0 = list.pos.x;
     let w = list.size.x;
     let group = ui.spec(Font::Medium, 14.0, p.muted);
@@ -1353,7 +1425,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
         // Host row.
         y += 8.0;
         if reveal.as_deref() == Some(sid) {
-            reveal_offset = Some((y - 8.0 + scroll - list.pos.y).max(0.0));
+            reveal_offset = Some((y - 8.0 - list.pos.y).max(0.0));
         }
         let row = rect(x0 + 8.0, y, w - 16.0, group_h);
         // A collapsed host still says how many of its sessions wait on the user.
@@ -1558,9 +1630,8 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
                 nav_index += 1;
                 let row = rect(x0 + 48.0, y, w - 56.0, session_h);
                 y += row.size.y;
-                // Clipping alone still shapes and paints every off-screen row
-                // on each touch move. Keep its extent, not its draw/hit work.
-                if row.pos.y + row.size.y <= list.pos.y || row.pos.y >= list.pos.y + list.size.y {
+                // Skip layout outside the retained strip, not at the transient viewport edge.
+                if row.pos.y + row.size.y <= band.pos.y || row.pos.y >= band.pos.y + band.size.y {
                     continue;
                 }
                 let agent_id = j::text(agent, "id");
@@ -1662,7 +1733,7 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
             for terminal in terms {
                 let row = rect(x0 + 48.0, y, w - 56.0, session_h);
                 y += row.size.y;
-                if row.pos.y + row.size.y <= list.pos.y || row.pos.y >= list.pos.y + list.size.y {
+                if row.pos.y + row.size.y <= band.pos.y || row.pos.y >= band.pos.y + band.size.y {
                     continue;
                 }
                 let is_selected = selected.as_ref().is_some_and(|t| {
@@ -1788,16 +1859,13 @@ fn draw_tree(shell: &mut PaseoShell, cx: &mut Cx2d, state: &paseo_gui_core::Core
     y += 8.0;
     ui.hits.set_clip(None);
     cx.end_turtle();
+    cx.end_pass_sized_turtle_no_clip();
     shell.data.sidebar.held = drawn_order;
     shell.data.sidebar.terminals = terminals;
-    shell.data.sidebar.content_height = y + scroll - list.pos.y;
+    shell.data.sidebar.content_height = y - list.pos.y;
     let max = (shell.data.sidebar.content_height - list.size.y).max(0.0);
-    if let Some(offset) = reveal_offset {
-        shell.data.sidebar.scroll = offset.min(max);
-        shell.data.sidebar.tree_layer.invalidate(cx);
-    } else if shell.data.sidebar.scroll > max {
-        shell.data.sidebar.scroll = max;
-    }
+    let sidebar = &mut shell.data.sidebar;
+    sidebar.scroll = reveal_offset.unwrap_or(sidebar.scroll).min(max);
 }
 
 fn draw_footer(shell: &mut PaseoShell, cx: &mut Cx2d, r: Rect) {
@@ -1879,7 +1947,7 @@ pub fn scroll(shell: &mut PaseoShell, cx: &mut Cx, delta: f64) {
     let s = &mut shell.data.sidebar;
     s.stop_motion();
     if s.scroll_by(delta) {
-        s.tree_layer.invalidate(cx);
+        s.place_tree(cx);
     }
 }
 
@@ -1891,14 +1959,7 @@ pub fn touch_up(shell: &mut PaseoShell, cx: &mut Cx, time: f64) -> bool {
 }
 
 pub fn animate(shell: &mut PaseoShell, cx: &mut Cx, event: &Event) {
-    let s = &mut shell.data.sidebar;
-    let Some(delta) = s.motion.frame(cx, event) else {
-        return;
-    };
-    let changed = s.scroll_by(delta);
-    if changed {
-        s.tree_layer.invalidate(cx);
-    }
+    shell.data.sidebar.advance(cx, event);
 }
 
 /// Search field changes (Event::Actions).
@@ -1913,6 +1974,7 @@ pub fn handle_actions(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, _ui: &
         shell.data.sidebar.stop_motion();
         shell.data.sidebar.query = text.trim().to_lowercase();
         shell.data.sidebar.scroll = 0.0;
+        shell.data.sidebar.place_tree(cx);
         shell.data.sidebar.tree_layer.invalidate(cx);
     }
 }
@@ -2001,6 +2063,87 @@ pub fn move_in_order(ui: &mut UiContext, field: &str, keys: &[String], key: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_fling_composes_retained_tree_and_hits_until_overscan_is_exhausted() {
+        use crate::common::paint::HitMap;
+        use crate::common::transition;
+        use makepad_widgets::makepad_draw::CxDraw;
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_widgets::makepad_draw::live_design(&mut cx);
+        crate::theme::live_design(&mut cx);
+        crate::theme::DrawBox::register_main_module(&mut cx);
+        cx.live_expand();
+        let mut background = crate::theme::DrawBox::new_local(&mut cx);
+        let viewport = rect(0.0, 30.0, 100.0, 100.0);
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(100.0, 200.0));
+        let mut window = DrawList2d::new(&mut cx);
+        let mut s = SidebarState {
+            content_height: 1000.0,
+            viewport,
+            tree_band: TreeBand::around(0.0, viewport.size.y),
+            motion: crate::common::widgets::touch_scroll(),
+            ..Default::default()
+        };
+        let mut hits = HitMap::default();
+        let mut tips = HashMap::new();
+        let row = "newly revealed row".to_owned();
+        {
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(&mut cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            window.begin_always(&mut draw);
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_pass_sized_turtle(Layout::flow_overlay());
+            assert!(
+                s.tree_layer
+                    .begin(&mut cx, viewport, 0, &mut hits, &mut tips)
+            );
+            // The row is below the viewport initially, but inside the retained band.
+            hits.set_viewport(Some(s.tree_hits.clone()));
+            let bounds = rect(0.0, 155.0, 100.0, 10.0);
+            hits.push(bounds, row.clone());
+            hits.set_viewport(None);
+            background.paint(&mut cx, bounds, vec4(1.0, 1.0, 1.0, 1.0), 0.0);
+            s.tree_layer.end(&mut cx, &hits, &tips);
+            s.place_tree(&mut cx);
+            cx.end_pass_sized_turtle();
+            window.end(&mut cx);
+            cx.end_pass(&pass);
+        }
+        let area = background.area();
+        let row_y = 155.0;
+        assert!(hits.rect_of(&row).is_none());
+        cx.new_draw_event = DrawEvent::default();
+        s.touch_down(dvec2(10.0, 90.0), 0.0);
+        assert!(s.touch_move(&mut cx, dvec2(10.0, 40.0), 0.05));
+        assert!(s.motion.release(0.06));
+        s.motion.schedule(&mut cx);
+        for time in [10.0, 10.016, 10.032, 10.048] {
+            let event = Event::NextFrame(NextFrameEvent {
+                frame: 0,
+                time,
+                set: [transition::request_frame(&mut cx)].into_iter().collect(),
+            });
+            transition::begin_event(&event);
+            s.advance(&mut cx, &event);
+            let hit = hits.rect_of(&row).unwrap();
+            assert_eq!(hits.at(hit.center()), Some(row.clone()));
+            assert!((hit.pos.y - (row_y - s.scroll)).abs() < 0.001);
+            assert!((area.clipped_rect(&cx).pos.y - hit.pos.y).abs() < 0.001);
+            assert!(
+                !cx.new_draw_event.will_redraw(),
+                "scroll requested tree paint"
+            );
+        }
+        assert!(s.scroll > 50.0);
+        assert!(s.scroll_by(300.0));
+        s.place_tree(&mut cx);
+        assert!(cx.new_draw_event.will_redraw(), "new strip needs one paint");
+        assert!(hits.rect_of(&row).is_none());
+    }
 
     fn published(mut value: Value) -> paseo_gui_core::CoreState {
         use paseo_gui_core::{CoreState, DirectorySnapshot};

@@ -4,55 +4,43 @@ pub mod buffer;
 pub mod field;
 pub mod view;
 
-use makepad_widgets::{Cx, Event, Timer};
+use std::time::Instant;
 
-/// Flutter `EditableText` caret blink: visible, then toggled every 500 ms while the caret is
-/// shown; typing or moving the caret shows it solid again. The timer is armed only by a draw
-/// that shows a caret, so an unfocused or hidden editor stops blinking after one tick.
+use makepad_widgets::{Area, Cx, Cx2d, LiveId, Rect, Vec4, live_id};
+
+use crate::common::{clock, paint::Painter};
+
+/// Focus/edits start with a solid caret; clock ticks only change its GPU instance.
 #[derive(Default)]
-pub struct Blink {
-    timer: Timer,
-    hidden: bool,
+struct Blink {
+    area: Area,
+    start: Option<Instant>,
 }
 
-/// `_kCursorBlinkHalfPeriod`.
-const BLINK_HALF_PERIOD: f64 = 0.5;
-
 impl Blink {
-    /// Whether the caret is in its visible phase.
-    pub fn visible(&self) -> bool {
-        !self.hidden
+    fn draw(&mut self, cx: &mut Cx2d, painter: &mut Painter, rect: Rect, color: Vec4) {
+        let now = Instant::now();
+        let start = *self.start.get_or_insert(now);
+        let brush = &mut painter.draw_box;
+        brush.opacity = clock::caret_opacity(start, now);
+        brush.paint(cx, rect, color, 0.0);
+        brush.opacity = 1.0;
+        self.area = brush.area();
+        clock::blink_caret(cx, self.area, start);
     }
 
-    /// A draw that shows the caret keeps the blink running.
-    pub fn arm(&mut self, cx: &mut Cx) {
-        if self.timer.is_empty() {
-            self.timer = cx.start_timeout(BLINK_HALF_PERIOD);
+    fn disarm(&mut self, cx: &mut Cx) {
+        clock::stop_caret_blink(cx, std::mem::take(&mut self.area));
+        self.start = None;
+    }
+
+    fn restart(&mut self, cx: &mut Cx) {
+        let start = Instant::now();
+        self.start = Some(start);
+        if self.area.is_attached(cx) {
+            clock::write_instance(cx, self.area, live_id!(opacity), 1.0);
+            clock::stop_caret_blink(cx, self.area);
+            clock::blink_caret(cx, self.area, start);
         }
-    }
-
-    /// No caret on screen (unfocused, read-only): stop and reset to visible.
-    pub fn disarm(&mut self, cx: &mut Cx) {
-        if !self.timer.is_empty() {
-            cx.stop_timer(self.timer);
-            self.timer = Timer::empty();
-        }
-        self.hidden = false;
-    }
-
-    /// Typing or a caret move: solid again, the next toggle a full half period later.
-    pub fn restart(&mut self, cx: &mut Cx) {
-        self.disarm(cx);
-    }
-
-    /// The blink timer fired: toggles the phase (the redraw re-arms it). Returns whether the
-    /// owner must redraw.
-    pub fn handle_event(&mut self, event: &Event) -> bool {
-        if self.timer.is_event(event).is_some() {
-            self.timer = Timer::empty();
-            self.hidden = !self.hidden;
-            return true;
-        }
-        false
     }
 }

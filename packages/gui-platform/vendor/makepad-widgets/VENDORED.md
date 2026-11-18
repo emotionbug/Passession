@@ -193,6 +193,12 @@ and exponential inertia, bounds and animation scheduling. Its first animation
 frame establishes the render-clock epoch independently of Android touch uptime.
 New touches, wheel input, long presses, pause and focus loss cancel motion.
 
+`FlingSpec` supplies decay and stop speed at controller construction. Paseo
+sets the per-OS spec and shared frame-request callback before constructing
+widgets; Makepad's internal scroll controllers pick these up through
+`TouchScroll::default()`. The standalone vendor defaults preserve its previous
+physics and scheduling without depending on the GUI crate.
+
 `ScrollBars`, `PortalList` and the app's manually drawn scroll surfaces consume
 this controller. PortalList's duplicate drag/flick samples and per-frame decay
 are removed; its separate smooth-scroll and pull-down behavior remains, with

@@ -7,6 +7,7 @@
 use super::canvas::{Canvas, ChatKit};
 use super::indicator::{Indicator, Indicators};
 use super::reveal::Reveal;
+use crate::common::transition::tokens;
 use crate::theme::{Palette, Typography};
 use makepad_widgets::*;
 use std::collections::{HashMap, HashSet};
@@ -209,7 +210,7 @@ impl Draw<'_> {
         if let Some(indicators) = &mut self.indicators {
             indicators.push(cx, indicator, clip);
         } else {
-            indicator.paint(cx, self.kit, clip, &mut Area::Empty);
+            indicator.paint(cx, self.kit, clip, &mut Area::Empty, None);
         }
     }
 
@@ -228,7 +229,7 @@ impl Draw<'_> {
         if self.dry() {
             return;
         }
-        if let Some(expiry) = self.state.copy_expiry(key, Duration::from_millis(1500)) {
+        if let Some(expiry) = self.state.copy_expiry(key, tokens::COPY_FEEDBACK) {
             self.indicator(
                 cx,
                 Indicator::Copy {

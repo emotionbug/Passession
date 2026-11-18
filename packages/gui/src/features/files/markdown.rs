@@ -595,7 +595,7 @@ impl Default for MarkdownPreview {
             owns_selection: false,
             dragging: false,
             thumb_drag: None,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             selection_handles: None,
             touch_selection: false,
             owner_draw_pos: DVec2::default(),

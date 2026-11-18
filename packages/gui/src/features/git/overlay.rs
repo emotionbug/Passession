@@ -287,7 +287,7 @@ impl<P> Default for OverlayHost<P> {
             scroll: 0.0,
             list_rect: Rect::default(),
             content_height: 0.0,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             locked: Area::Empty,
             window_modal: None,
             changed: false,

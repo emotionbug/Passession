@@ -596,7 +596,7 @@ impl CommitView {
             row_height: 28.0,
             offset: 0.0,
             max_scroll: 0.0,
-            touch_scroll: TouchScroll::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             sections: HashMap::new(),
             toolbar_actions: HashMap::new(),
             rows: HashMap::new(),

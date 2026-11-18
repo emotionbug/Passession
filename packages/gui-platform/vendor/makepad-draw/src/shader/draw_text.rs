@@ -45,8 +45,12 @@ live_design! {
         
         fn vertex(self) -> vec4 {
             let p = mix(self.rect_pos, self.rect_pos + self.rect_size, self.geom_pos);
-            let p_clipped = clamp(p, self.draw_clip.xy, self.draw_clip.zw);
-            let p_normalized: vec2 = (p_clipped - self.rect_pos) / self.rect_size;
+            let p_clipped = clamp(
+                clamp(p, self.draw_clip.xy, self.draw_clip.zw) + self.view_shift,
+                self.view_clip.xy,
+                self.view_clip.zw
+            );
+            let p_normalized: vec2 = (p_clipped - self.view_shift - self.rect_pos) / self.rect_size;
 
             self.pos = p_normalized;
             self.t = mix(self.t_min, self.t_max, p_normalized.xy);
@@ -154,6 +158,13 @@ impl LiveHook for DrawText {
 }
 
 impl DrawText {
+    /// The latest text draw's glyph instances, including every atlas page.
+    pub fn draw_areas(&self) -> impl Iterator<Item = Area> + '_ {
+        self.page_areas.iter().copied().chain(
+            self.page_areas.is_empty().then_some(self.draw_vars.area)
+        ).filter(|area| !area.is_empty())
+    }
+
     pub fn draw_abs(&mut self, cx: &mut Cx2d, pos: DVec2, text: &str) {
         let text = self.layout(cx, 0.0, 0.0, None, false, Align::default(), text);
         self.draw_text(cx, Point::new(pos.x as f32, pos.y as f32), &text);

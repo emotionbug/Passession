@@ -417,7 +417,7 @@ impl LogView {
             hits: Hits::default(),
             hovered: None,
             pressed: None,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             list: Scroller::default(),
             branches: Scroller::default(),
             files: Scroller::default(),

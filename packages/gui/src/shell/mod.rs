@@ -5,6 +5,7 @@
 pub mod activity;
 pub mod chrome;
 pub mod commands;
+mod compact;
 pub mod hosts;
 pub mod layout;
 pub mod overlays;
@@ -26,7 +27,10 @@ use paseo_gui_core::{CoreError, CoreEvent, RequestId};
 use serde_json::Value;
 
 use crate::common::layer::Layer;
-use crate::common::overlay::{self as overlay_api, OVERLAY_ACTION, OverlayRequest, SHELL_OWNER};
+use crate::common::overlay::{
+    self as overlay_api, DrawLayerScrim, DrawLayerTexture, OVERLAY_ACTION, OverlayRequest,
+    SHELL_OWNER,
+};
 use crate::common::paint::{HitMap, Painter};
 use crate::common::state_delta::StateDelta;
 use crate::common::{
@@ -45,6 +49,8 @@ live_design! {
     use link::shaders::*;
     use link::widgets::*;
     use crate::theme::*;
+    use crate::common::overlay::DrawLayerScrim;
+    use crate::common::overlay::DrawLayerTexture;
     use crate::common::paint::PaseoPainter;
     use crate::common::widgets::*;
     use crate::shell::panels::*;
@@ -54,6 +60,8 @@ live_design! {
         width: Fill, height: Fill,
         painter: <PaseoPainter> {}
         overlay_painter: <PaseoPainter> {}
+        overlay_composite: <DrawLayerTexture> {}
+        motion_scrim: <DrawLayerScrim> {}
         draw_icon: { fn get_color(self) -> vec4 { return self.color; } }
         overlay_icon: { fn get_color(self) -> vec4 { return self.color; } }
         templates: <PanelTemplates> {}
@@ -310,6 +318,7 @@ pub struct Data {
     pub overlays: overlays::Overlays,
     pub sidebar: sidebar::SidebarState,
     pub chrome: chrome::ChromeState,
+    compact_navigation: compact::Navigation,
     pub activity: activity::Activity,
     pub notification_permission: permissions::NotificationPermission,
     pub os_window: Option<WindowId>,
@@ -409,6 +418,10 @@ pub struct PaseoShell {
     #[live]
     overlay_painter: Painter,
     #[live]
+    overlay_composite: DrawLayerTexture,
+    #[live]
+    motion_scrim: DrawLayerScrim,
+    #[live]
     draw_icon: DrawIcon,
     #[live]
     overlay_icon: DrawIcon,
@@ -447,7 +460,11 @@ impl PaseoShell {
 
     pub(crate) fn invalidate_region(&self, cx: &mut Cx, region: ShellRegion<'_>) {
         match region {
-            ShellRegion::Chrome => self.layers.chrome.invalidate(cx),
+            ShellRegion::Chrome => {
+                self.layers.chrome.invalidate(cx);
+                self.data.compact_navigation.invalidate(cx);
+                self.data.chrome.invalidate_explorer(cx);
+            }
             ShellRegion::Sidebar => {
                 self.layers.sidebar.invalidate(cx);
                 self.data.sidebar.header_layer.invalidate(cx);
@@ -485,8 +502,9 @@ impl PaseoShell {
                 .hits
                 .since(0)
                 .iter()
-                .any(|(_, hit)| hit.as_str() == *id)
+                .any(|hit| hit.item.as_str() == *id)
             {
+                self.data.chrome.invalidate_explorer(cx);
                 self.invalidate_region(cx, ShellRegion::Overlays);
             } else if self.data.sidebar.tree_layer.owns_hit(id) {
                 self.data.sidebar.tree_layer.invalidate(cx);
@@ -501,6 +519,8 @@ impl PaseoShell {
                 .is_some_and(|page| page.redraw_hit(cx, id))
             {
                 // The history header or one retained visible row owns this hit.
+            } else if self.data.compact_navigation.owns_hit(id) {
+                self.data.compact_navigation.invalidate(cx);
             } else if let Some(layer) = [
                 &self.layers.chrome,
                 &self.layers.sidebar,
@@ -796,7 +816,7 @@ impl PaseoShell {
         let explorer_input = requires_visibility
             && !command_center_input
             && self.data.compact
-            && self.data.chrome.explorer_position > 0.0;
+            && self.data.chrome.explorer_visible();
         let modal_tab = window_modal
             .then(|| {
                 layout
@@ -969,6 +989,7 @@ impl PaseoShell {
         // Commands above can change the destination. Arm motion in the same event,
         // and consume animation frames even when a modal temporarily owns input.
         self.data.overlays.sync_focus(cx);
+        compact::animate(self, cx, event);
         chrome::animate_explorer(self, cx, event);
         chrome::sync_hidden(self, cx);
         overlay_api::shield_content(cx, &self.data.window_id, self.data.overlays.area, false);
@@ -1060,7 +1081,8 @@ impl Widget for PaseoShell {
         let explorer_input = input
             && !toast_input
             && self.data.compact
-            && self.data.chrome.explorer_position > 0.0
+            && self.data.chrome.explorer_visible()
+            && !self.data.chrome.explorer.is_moving()
             && !tool_sheet
             && !shell_modal
             && !window_modal
@@ -1078,6 +1100,8 @@ impl Widget for PaseoShell {
             overlays::handle_event(self, cx, event, scope)
         };
         let modal = shell_modal || modal;
+        let motion_blocks = input
+            && (self.data.compact_navigation.moving() || self.data.chrome.explorer.is_moving());
         // Feature surfaces painted above the panels and the chrome own the pointer inside
         // them: popovers, and the full-window sheet a panel holds. The shell's own layers
         // were dispatched before and need no shield.
@@ -1097,9 +1121,10 @@ impl Widget for PaseoShell {
         );
         let sidebar_blocked = !chrome::sidebar_visible(self)
             || self.data.app_inactive
+            || motion_blocks
             || modal
             || overlay_api::window_modal_open(&self.data.window_id)
-            || (self.data.compact && self.data.chrome.explorer_position > 0.0);
+            || (self.data.compact && self.data.chrome.explorer_visible());
         let fresh_pointer = matches!(event, Event::MouseDown(_) | Event::TextHandle(_))
             || matches!(event, Event::TouchUpdate(e) if e.touches.iter().any(|t| matches!(t.state, TouchState::Start)));
         if sidebar_blocked || fresh_pointer {
@@ -1118,10 +1143,10 @@ impl Widget for PaseoShell {
         {
             key_consumed = commands::handle_shortcut(self, cx, ui, key);
         }
-        if !modal && !locked {
+        if !modal && !locked && !motion_blocks {
             chrome::observe_pane_focus(self, cx, event);
         }
-        if !key_consumed && !locked && !explorer_input {
+        if !key_consumed && !locked && !explorer_input && (!motion_blocks || window_modal) {
             self.dispatch_panels(cx, event, scope, window_modal);
         }
         // Feature-owned modal/editor layers must see Back before shell navigation.
@@ -1134,16 +1159,26 @@ impl Widget for PaseoShell {
         {
             handled.set(true);
         }
+        if !modal
+            && !key_consumed
+            && self.data.compact
+            && matches!(event, Event::KeyDown(_))
+            && overlay_api::take_dismissal(event)
+            && let Some(ui) = Self::ui(scope)
+        {
+            key_consumed = commands::back(self, cx, ui);
+        }
         if !(matches!(event, Event::Timer(_))
             || locked
             || window_modal
             || explorer_input
             || key_consumed
+            || motion_blocks
             || input && command_center)
         {
             self.dispatch_header(cx, event, scope, None);
         }
-        if !modal && !popover_key {
+        if !modal && !popover_key && !motion_blocks && !key_consumed {
             chrome::handle_event(self, cx, event, scope);
         }
         self.finish_dispatch(cx, event, scope, overlay_key);
@@ -1155,11 +1190,21 @@ impl Widget for PaseoShell {
         if self.data.os_window.is_none() {
             self.data.os_window = cx.get_current_window_id();
         }
+        let geometry_changed = self.data.size != rect.size;
         self.data.size = rect.size;
         let compact = crate::common::is_compact_width(rect.size.x)
             || theme::MOBILE && rect.size.x < crate::common::COMPACT_WIDTH;
         if compact != self.data.compact {
             self.data.compact = compact;
+        }
+        if geometry_changed {
+            let explorer = compact
+                && self.data.page.is_none()
+                && self.data.layout.compact_destination == CompactDestination::Explorer;
+            self.data
+                .chrome
+                .explorer
+                .snap(if explorer { 1.0 } else { 0.0 });
         }
         set_compact_layout(compact);
         if let Some(ui) = Self::ui(scope) {
@@ -1167,7 +1212,12 @@ impl Widget for PaseoShell {
             ui.window_id.clone_from(&self.data.window_id);
             ui.layout = Rc::clone(&self.dispatch_layout().snapshot);
         }
-        chrome::draw(self, cx, scope, rect);
+        if compact && self.data.page.is_none() {
+            compact::draw(self, cx, scope, rect);
+        } else {
+            self.data.compact_navigation.clear(cx);
+            chrome::draw_live(self, cx, scope, rect, true);
+        }
         // The Command Center (its own overlay draw list) above the content; the shell overlay
         // layer below begins after it, so menus, dialogs and toasts stay on top.
         if self.data.command_center_open
@@ -1184,6 +1234,12 @@ impl Widget for PaseoShell {
             cx.end_turtle();
         }
         overlays::draw(self, cx, scope, rect);
+        if !self.data.compact_navigation.moving() {
+            self.layers.finish_frame(cx);
+            for panel in self.data.panels.values_mut() {
+                panel.layer.finish_frame(cx);
+            }
+        }
         DrawStep::done()
     }
 }
@@ -1256,7 +1312,7 @@ impl Data {
             layout: self.layout.revision,
             compact: self.compact,
             page: self.page.is_some(),
-            explorer_moving: self.chrome.explorer_position > 0.0,
+            explorer_moving: self.chrome.explorer_visible(),
         };
         if let Some(layout) = &self.dispatch_layout
             && layout.revision == revision

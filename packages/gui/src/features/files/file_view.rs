@@ -229,7 +229,7 @@ impl FileView {
             settings_open: false,
             settings_scroll: 0.0,
             settings_scroll_max: 0.0,
-            settings_touch: Default::default(),
+            settings_touch: crate::common::widgets::touch_scroll(),
             hits: HitMap::default(),
             hovered: None,
             pressed: None,
@@ -312,13 +312,13 @@ impl FileView {
         self.focus = Focus::None;
         if let Some(editor) = self.editor.as_mut() {
             editor.clear_selection(cx);
-            editor.focused = false;
+            editor.set_focused(cx, false);
         }
         self.markdown.clear_selection(cx);
         self.query.clear_selection(cx);
-        self.query.focused = false;
+        self.query.set_focused(cx, false);
         self.replacement.clear_selection(cx);
-        self.replacement.focused = false;
+        self.replacement.set_focused(cx, false);
         self.editor_drag = false;
         self.preview_drag = false;
         self.pressed = None;
@@ -345,11 +345,11 @@ impl FileView {
             }
         }
         self.focus = focus;
-        self.query.focused = focus == Focus::Find;
-        self.replacement.focused = focus == Focus::Replace;
+        self.query.set_focused(cx, focus == Focus::Find);
+        self.replacement.set_focused(cx, focus == Focus::Replace);
         let preview = self.preview_visible();
         if let Some(editor) = self.editor.as_mut() {
-            editor.focused = focus == Focus::Editor && !preview;
+            editor.set_focused(cx, focus == Focus::Editor && !preview);
         }
         if focus == Focus::None
             || (focus == Focus::Editor
@@ -1289,13 +1289,6 @@ impl FileView {
             self.pressed = None;
         }
         let mut changed = false;
-        if let Event::Timer(_) = event {
-            if let Some(editor) = self.editor.as_mut() {
-                changed |= editor.blink.handle_event(event);
-            }
-            changed |= self.query.blink.handle_event(event);
-            changed |= self.replacement.blink.handle_event(event);
-        }
         for event in &ui.events {
             let paseo_gui_core::CoreEvent::Response {
                 request_id, result, ..
@@ -2511,7 +2504,8 @@ impl FileView {
         }
         let look = self.editor_look(ui);
         if let Some(editor) = self.editor.as_mut() {
-            editor.focused = self.focus == Focus::Editor && cx.has_key_focus(widget_area);
+            let focused = self.focus == Focus::Editor && cx.has_key_focus(widget_area);
+            editor.set_focused(cx, focused);
             editor.draw(cx, kit, area, &look, widget_area);
             self.hits.push(area, Hot::Editor);
         }
@@ -2817,7 +2811,7 @@ impl FileView {
             )
         };
         let field = rect(x, y, field_right - x, row_h);
-        self.query.focused = self.focus == Focus::Find;
+        self.query.set_focused(cx, self.focus == Focus::Find);
         self.query.draw(
             cx,
             kit,
@@ -2837,7 +2831,8 @@ impl FileView {
                 right
             };
             let field = rect(x, y2, field_right - x, row_h);
-            self.replacement.focused = self.focus == Focus::Replace;
+            self.replacement
+                .set_focused(cx, self.focus == Focus::Replace);
             self.replacement.draw(
                 cx,
                 kit,

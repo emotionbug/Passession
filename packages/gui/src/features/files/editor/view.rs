@@ -89,7 +89,7 @@ pub struct SourceEditor {
     /// Highlight worker key (unique per editor instance).
     pub highlight_key: String,
     pub focused: bool,
-    pub blink: super::Blink,
+    blink: super::Blink,
     scroll: DVec2,
     viewport: Rect,
     char_width: f64,
@@ -252,7 +252,7 @@ impl SourceEditor {
             drag: None,
             touch_caret: None,
             thumb_drag: None,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             ime_last: None,
             show_actions: false,
             selection_invalidated: false,
@@ -284,6 +284,13 @@ impl SourceEditor {
             self.show_actions = false;
             self.selection_invalidated = true;
             self.touch_handles = false;
+        }
+    }
+
+    pub fn set_focused(&mut self, cx: &mut Cx, focused: bool) {
+        self.focused = focused;
+        if !focused {
+            self.blink.disarm(cx);
         }
     }
 
@@ -654,7 +661,7 @@ impl SourceEditor {
         self.scroll.y = self.scroll.y.clamp(0.0, max.y);
     }
 
-    /// Draws the editor into `area`. The caret does not blink, so an idle editor draws nothing.
+    /// Draws the editor into `area`; caret blink only updates retained paint.
     /// `ime_area` owns keyboard focus; the caret has separate IME avoidance geometry.
     pub fn draw(
         &mut self,
@@ -821,15 +828,8 @@ impl SourceEditor {
                 }
             }
         }
-        if caret_rect.is_some() {
-            self.blink.arm(cx);
-        } else {
-            self.blink.disarm(cx);
-        }
         if let Some(caret) = caret_rect {
-            if self.blink.visible() {
-                kit.fill(cx, caret, p.foreground, 0.0);
-            }
+            self.blink.draw(cx, &mut kit.painter, caret, p.foreground);
             // Keep KeyboardView avoidance local to the caret, not the entire pane.
             cx.add_aligned_rect_area(&mut self.ime_caret_area, caret);
             cx.update_text_input(
@@ -849,6 +849,8 @@ impl SourceEditor {
                     size: caret.size,
                 },
             );
+        } else {
+            self.blink.disarm(cx);
         }
         if self.focused
             && !self
@@ -1296,7 +1298,7 @@ impl SourceEditor {
                 }
             }
             Hit::KeyFocusLost(_) => {
-                self.focused = false;
+                self.set_focused(cx, false);
                 self.clear_selection(cx);
             }
             _ => {}
@@ -1307,7 +1309,7 @@ impl SourceEditor {
             cx.claim_text_selection(self.ime_area);
             self.owns_selection = true;
         }
-        if result.text_changed || result.selection_changed {
+        if self.focused && (result.text_changed || result.selection_changed) {
             self.blink.restart(cx);
         }
         if self.focused && !self.read_only {

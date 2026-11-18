@@ -318,7 +318,7 @@ impl PrView {
             hovered: None,
             hovered_region: None,
             pressed: None,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             bodies: HashMap::new(),
             body_rects: Vec::new(),
             body_hovered: None,
@@ -2550,14 +2550,11 @@ impl PrView {
             animating: false,
             indicators: None,
         };
+        // Static PR Markdown is laid out synchronously. Async assets and
+        // highlighting invalidate this retained list when their results arrive.
         let height = md::draw(
             cx, &mut d, &mut opts, body, pos.x, pos.y, width, false, false,
         );
-        if d.animating {
-            let mut redraw = Area::Empty;
-            cx.add_rect_area(&mut redraw, rect(pos.x, pos.y, width, height));
-            crate::common::clock::register_every(cx, redraw, crate::common::clock::MOTION_PERIOD);
-        }
         // Material's default selection colour: colorScheme.primary at 40%.
         let selection = with_alpha(look.palette.primary, 0.4);
         for r in entry.canvas.selection_rects() {

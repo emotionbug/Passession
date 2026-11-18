@@ -12,6 +12,7 @@ use paseo_gui_platform::{PermissionSettings, PlatformAction, PlatformEvent};
 use serde_json::{Map, Value, json};
 
 use crate::common::paint::{Font, rect};
+use crate::common::transition::tokens::COPY_FEEDBACK;
 use crate::common::{error_message, json as j, tr, tr_args};
 use crate::shell::hosts;
 use crate::shell::sheets::qr_code;
@@ -2196,8 +2197,7 @@ impl Sheet for PairingSheet {
             "copy" => {
                 if let Some(url) = self.offer.as_ref().map(|o| j::text(o, "url").to_string()) {
                     platform::copy_text(url);
-                    self.copied_until =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                    self.copied_until = Some(std::time::Instant::now() + COPY_FEEDBACK);
                 }
             }
             _ => {}

@@ -198,7 +198,7 @@ impl HistoryPage {
             scroll: 0.0,
             content_h: 0.0,
             viewport: Rect::default(),
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             fetch: None,
             header_layer: Default::default(),
             section_layers: HashMap::new(),

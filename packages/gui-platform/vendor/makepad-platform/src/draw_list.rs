@@ -537,6 +537,17 @@ impl CxDrawList {
         self.draw_items.push_item(redraw_id, CxDrawKind::SubList(sub_list_id));
         self.find_appendable_draw_shader_id.push(0);
     }
+
+    /// Omit a retained child from composition without discarding its paint or ancestry.
+    pub fn detach_sub_list(&mut self, sub_list_id: DrawListId) {
+        for index in (0..self.draw_items.len()).rev() {
+            let item = &mut self.draw_items[index];
+            if item.sub_list() == Some(sub_list_id) {
+                item.kind = CxDrawKind::Empty;
+                return;
+            }
+        }
+    }
     
     pub fn store_sub_list_last(&mut self, redraw_id: u64, sub_list_id: DrawListId) {
         // use an empty slot if we have them to insert our subview

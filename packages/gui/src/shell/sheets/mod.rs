@@ -209,10 +209,6 @@ pub enum SheetStyle {
     /// (`showDragHandle`); otherwise the sheet's own 36x4 surface2 handle with 10px margins.
     /// Wide layouts use [`SheetStyle::Adaptive`].
     Draggable { material_handle: bool },
-    /// `showGeneralDialog` bottom panel fading in over 200ms above a 35% scrim: surface2,
-    /// 16px top radius, 24/16/24 padding (≥24 at the bottom), a muted 40x4 handle 16px above
-    /// the body.
-    FadeBottom,
 }
 
 /// Shell operations a sheet asks for; applied after the sheet call returns.
@@ -308,7 +304,7 @@ impl SheetOps {
     }
 }
 
-pub trait Sheet {
+pub trait Sheet: std::any::Any {
     fn title(&self) -> String;
 
     /// Shows the leading back chevron; its click arrives as `click(.., "sheet:back", ..)`.
@@ -331,7 +327,7 @@ pub trait Sheet {
 
     /// The height of a footer pinned below the scrolling body (inside a top divider and
     /// 24/12/24/12 padding, plus the bottom inset on compact draggable sheets), drawn by
-    /// [`Sheet::draw_footer`] on every non-full-screen presentation except `FadeBottom`.
+    /// [`Sheet::draw_footer`] on non-full-screen presentations.
     fn footer_height(&self) -> f64 {
         0.0
     }
@@ -640,7 +636,7 @@ pub fn draw_widget(cx: &mut Cx2d, scope: &mut Scope, widget: &WidgetRef, r: Rect
 
 /// A small indeterminate ring (`CircularProgressIndicator`).
 pub fn spinner(ui: &mut Ui, cx: &mut Cx2d, r: Rect, color: Vec4) {
-    ui.painter.spinner(cx, r, color, [1.5, 0.25], 1_000.0);
+    ui.painter.spinner(cx, r, color, [1.5, 0.25]);
 }
 
 /// Original menu-style sheet row (`_item`): 16px leading slot, label, optional trailing glyph;

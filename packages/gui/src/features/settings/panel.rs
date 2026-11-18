@@ -245,7 +245,7 @@ pub struct SettingsPanel {
     overlay_area: Area,
     #[rust]
     window_modal: Option<WindowModal>,
-    #[rust]
+    #[rust(crate::common::widgets::touch_scroll())]
     touch_scroll: TouchScroll,
     /// The region the current touch gesture started on.
     #[rust]

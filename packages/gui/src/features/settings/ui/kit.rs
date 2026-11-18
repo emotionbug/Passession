@@ -11,6 +11,8 @@ use makepad_widgets::*;
 use super::draw::{Draws, Font, Icon, PaintInput};
 use super::field::{FieldHost, FieldSpec, Layer};
 use super::theme::{Palette, alpha};
+use crate::common::clock;
+use crate::common::transition::{Loop, LoopStyle};
 use crate::features::settings::rpc::{Handler, handler};
 
 /// Minimum phone touch target edge for settings controls.
@@ -487,7 +489,7 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
         );
     }
 
-    /// A Lucide glyph of `size` at `pos` (spinners are a 3/4 ring).
+    /// A Lucide glyph of `size` at `pos` (loading uses a native ring).
     pub fn icon(&mut self, icon: Icon, pos: DVec2, size: f64, color: Vec4) {
         let rect = Rect {
             pos,
@@ -501,14 +503,9 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
         } = self.d;
         retained.paint(self.cx, self.depth, input, |cx| {
             if icon == Icon::Spinner {
-                let (start, sweep) = spinner_arc(spinner_clock());
+                let (start, sweep) = INDETERMINATE_RING.ring(clock::now_ms() as f64);
                 let area = painter.ring(cx, rect, color, 1.5, sweep, start);
-                crate::common::clock::sample(
-                    cx,
-                    area,
-                    crate::common::clock::MOTION_PERIOD,
-                    update_spinner,
-                );
+                clock::sample(cx, area, INDETERMINATE_RING.cadence, update_spinner);
             } else {
                 painter.icon(cx, rect, icon.name(), size, color);
             }
@@ -2075,78 +2072,10 @@ impl<'u, 'a, 'b> Ui<'u, 'a, 'b> {
     }
 }
 
-// ------------------------------------------------------------ spinner
+const INDETERMINATE_RING: LoopStyle = Loop::IndeterminateRing.resolve();
 
-/// Seconds since the first spinner frame (the animation phase source).
-fn spinner_clock() -> f64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_secs_f64()
-}
-
-fn update_spinner(cx: &mut Cx, area: Area, _wall_ms: u128) -> bool {
-    use crate::common::clock::write_instance;
-    let (start, sweep) = spinner_arc(spinner_clock());
-    write_instance(cx, area, live_id!(rotation), start as f32)
-        && write_instance(cx, area, live_id!(progress), sweep as f32)
-}
-
-/// Flutter `Curves.fastOutSlowIn`: `Cubic(0.4, 0.0, 0.2, 1.0)`.
-fn fast_out_slow_in(t: f64) -> f64 {
-    let (x1, y1, x2, y2) = (0.4, 0.0, 0.2, 1.0);
-    let bezier = |a: f64, b: f64, m: f64| {
-        3.0 * a * (1.0 - m) * (1.0 - m) * m + 3.0 * b * (1.0 - m) * m * m + m * m * m
-    };
-    let (mut lo, mut hi) = (0.0, 1.0);
-    // Flutter's `Cubic.transform` bisects to 0.001 as well.
-    loop {
-        let mid = (lo + hi) / 2.0;
-        let x = bezier(x1, x2, mid);
-        if (t - x).abs() < 0.001 || hi - lo < 1e-6 {
-            return bezier(y1, y2, mid);
-        }
-        if x < t { lo = mid } else { hi = mid }
-    }
-}
-
-/// Flutter indeterminate `CircularProgressIndicator` at `t` seconds, as
-/// `(start, sweep)` in turns of the settings `DrawRing` (0 = bottom,
-/// clockwise). Flutter: 1333 ms head/tail cycle (head over the first half,
-/// tail over the second, both `fastOutSlowIn`), 2222 ms rotation, a quarter
-/// turn offset per cycle, arcs of up to 3/4 turn starting at the top.
-pub fn spinner_arc(t: f64) -> (f64, f64) {
-    use std::f64::consts::PI;
-    let path = (t / 1.333).fract();
-    let head = fast_out_slow_in((path / 0.5).min(1.0));
-    let tail = if path < 0.5 {
-        0.0
-    } else {
-        fast_out_slow_in((path - 0.5) / 0.5)
-    };
-    let rotation = (t / 2.222).fract();
-    let start = -PI / 2.0 + tail * 1.5 * PI + rotation * 2.0 * PI + path * 0.5 * PI;
-    let sweep = (head * 1.5 * PI - tail * 1.5 * PI).max(0.001);
-    // Flutter angles start at +x; the ring's start at +y (a quarter turn later).
-    ((start - PI / 2.0) / (2.0 * PI), sweep / (2.0 * PI))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spinner_follows_flutter_head_and_tail() {
-        // Cycle start: no sweep yet, the arc starts at the top (half a ring turn from +y).
-        let (start, sweep) = spinner_arc(0.0);
-        assert!(sweep < 0.001);
-        assert!((start + 0.5).abs() < 1e-9);
-        // Head done, tail not started: the full 3/4-turn arc.
-        let (_, sweep) = spinner_arc(1.333 * 0.5);
-        assert!((sweep - 0.75).abs() < 0.01);
-        // Tail catches up by the end of the cycle.
-        let (_, sweep) = spinner_arc(1.333 * 0.999);
-        assert!(sweep < 0.01);
-    }
+fn update_spinner(cx: &mut Cx, area: Area, wall_ms: u128) -> bool {
+    let (start, sweep) = INDETERMINATE_RING.ring(wall_ms as f64);
+    clock::write_instance(cx, area, live_id!(rotation), start as f32)
+        && clock::write_instance(cx, area, live_id!(progress), sweep as f32)
 }

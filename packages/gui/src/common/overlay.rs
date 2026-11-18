@@ -9,10 +9,206 @@
 use std::cell::{Cell, RefCell};
 
 use makepad_widgets::event::{TAP_COUNT_DISTANCE, TouchState};
-use makepad_widgets::{Area, Cx, DVec2, Event, KeyCode, MouseButton, PassId, Rect};
+use makepad_widgets::makepad_draw::makepad_platform::makepad_shader_compiler::ShaderTy;
+use makepad_widgets::*;
 use serde_json::Value;
 
 use crate::common::UiContext;
+
+live_design! {
+    use link::shaders::*;
+
+    pub DrawLayerScrim = {{DrawLayerScrim}} {
+        fn pixel(self) -> vec4 {
+            return vec4(0.0, 0.0, 0.0, self.color.w);
+        }
+    }
+
+    pub DrawLayerTexture = {{DrawLayerTexture}} {
+        texture image: texture2d
+        fn pixel(self) -> vec4 {
+            // The render target is already premultiplied.
+            return sample2d_rt(self.image, self.pos) * self.opacity;
+        }
+    }
+}
+
+#[derive(Live, LiveHook, LiveRegister)]
+#[repr(C)]
+pub struct DrawLayerScrim {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    pub color: Vec4,
+}
+
+#[derive(Live, LiveHook, LiveRegister)]
+#[repr(C)]
+pub struct DrawLayerTexture {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live(1.0)]
+    opacity: f32,
+}
+
+impl DrawLayerTexture {
+    pub fn draw_texture(
+        &mut self,
+        cx: &mut Cx2d,
+        rect: Rect,
+        texture: &Texture,
+        alpha: f32,
+    ) -> Area {
+        self.draw_vars.set_texture(0, texture);
+        self.new_draw_call(cx);
+        self.opacity = alpha;
+        self.draw_abs(cx, rect);
+        let area = self.area();
+        self.draw_vars.empty_texture(0);
+        area
+    }
+
+    /// Updates the composited quad, not the draw list that produced the texture.
+    pub fn update(cx: &mut Cx, area: Area, rect: Rect, alpha: f32) {
+        for (field, value) in [
+            (live_id!(rect_pos), rect.pos),
+            (live_id!(rect_size), rect.size),
+        ] {
+            if let Some(write) = area.get_write_ref(cx, field, ShaderTy::Vec2, "layer texture") {
+                write.buffer[..2].copy_from_slice(&[value.x as f32, value.y as f32]);
+            }
+        }
+        if let Some(write) =
+            area.get_write_ref(cx, live_id!(opacity), ShaderTy::Float, "layer texture")
+        {
+            write.buffer[0] = alpha;
+        }
+    }
+}
+
+/// A bounded offscreen layer for paint-only content. Hits and overlays must
+/// stay in the containing window pass, not in this texture's child pass.
+pub struct LayerTexture {
+    pass: Pass,
+    list: DrawList2d,
+    pub texture: Texture,
+    pub size: DVec2,
+}
+
+impl LayerTexture {
+    pub fn new(cx: &mut Cx) -> Self {
+        let pass = Pass::new(cx);
+        let texture = Texture::new_with_format(
+            cx,
+            TextureFormat::RenderBGRAu8 {
+                size: TextureSize::Auto,
+                initial: true,
+            },
+        );
+        pass.set_color_texture(cx, &texture, PassClearColor::ClearWith(Vec4::default()));
+        Self {
+            pass,
+            list: DrawList2d::new(cx),
+            texture,
+            size: DVec2::default(),
+        }
+    }
+
+    pub fn begin(&mut self, cx: &mut Cx2d, size: DVec2) {
+        let dpi = cx.current_dpi_factor();
+        self.size = (size * dpi).ceil() / dpi;
+        cx.make_child_pass(&self.pass);
+        cx.begin_pass(&self.pass, Some(dpi));
+        self.pass.set_size(cx, size);
+        // Pass IDs are pooled; a previous bounds capture may have used a shifted origin.
+        cx.set_pass_shift_scale(&self.pass, DVec2::default(), dvec2(1.0, 1.0));
+        self.list.begin_always(cx);
+        cx.begin_sized_turtle(self.size, Layout::flow_overlay());
+    }
+
+    pub fn end(&mut self, cx: &mut Cx2d) {
+        cx.end_pass_sized_turtle();
+        self.list.end(cx);
+        cx.end_pass(&self.pass);
+    }
+
+    /// Capture an already-painted, local-coordinate list without laying it out again.
+    pub fn capture(&mut self, cx: &mut Cx2d, size: DVec2, source: &DrawList2d) {
+        self.begin(cx, size);
+        cx.append_sub_draw_list(source);
+        self.end(cx);
+    }
+
+    /// Capture a window-coordinate subtree without altering its layout, hit areas, or ancestry.
+    pub(crate) fn capture_bounds(cx: &mut Cx2d, source: DrawListId, bounds: Rect) -> Self {
+        let mut layer = Self::new(cx);
+        layer.begin_bounds(cx, bounds);
+        let parent = cx.get_current_draw_list_id().expect("capture draw list");
+        let redraw_id = cx.redraw_id;
+        cx.draw_lists[parent].append_sub_list(redraw_id, source);
+        layer.end(cx);
+        layer
+    }
+
+    pub(crate) fn begin_bounds(&mut self, cx: &mut Cx2d, bounds: Rect) {
+        self.begin(cx, bounds.size);
+        cx.passes[self.pass.pass_id()].view_shift = bounds.pos;
+    }
+
+    /// A settled or detached surface no longer needs a render target.
+    pub fn detach(&self, cx: &mut Cx) {
+        self.pass.clear_color_textures(cx);
+        let pass = &mut cx.passes[self.pass.pass_id()];
+        pass.parent = CxPassParent::None;
+        pass.paint_dirty = false;
+        pass.main_draw_list_id = None;
+    }
+}
+
+/// Updates the color of a retained `DrawColor` scrim without drawing its content.
+pub(crate) fn update_scrim(cx: &mut Cx, area: Area, alpha: f32) {
+    if let Some(write) = area.get_write_ref(cx, live_id!(color), ShaderTy::Vec4, "sheet scrim") {
+        write.buffer[..4].copy_from_slice(&[0.0, 0.0, 0.0, alpha]);
+    }
+}
+
+/// Discard the texture reference held by a retired quad's retained draw call.
+pub(crate) fn release_layer_quad(cx: &mut Cx, area: Area) {
+    if let Area::Instance(area) = area
+        && let Some(list) = cx.draw_lists.checked_index(area.draw_list_id)
+        && list.redraw_id == area.redraw_id
+        && let Some(call) = cx.draw_lists[area.draw_list_id].draw_items[area.draw_item_id]
+            .kind
+            .draw_call_mut()
+    {
+        call.texture_slots[0] = None;
+    }
+}
+
+/// Affine composition of a paint-only list whose geometry starts at the origin.
+pub(crate) fn place_layer(cx: &mut Cx, list: &DrawList2d, rect: Rect, scale: f64) {
+    let mut transform = Mat4::identity();
+    transform.v[0] = scale as f32;
+    transform.v[5] = scale as f32;
+    transform.v[12] = rect.pos.x as f32;
+    transform.v[13] = rect.pos.y as f32;
+    list.set_view_transform(cx, &transform);
+    if let Some(pass) = cx.draw_lists[list.draw_list_id()].pass_id {
+        cx.repaint_pass(pass);
+    }
+}
+
+/// Position a layer in window coordinates and scale around its supplied pivot.
+pub(crate) fn layer_rect(
+    rect: Rect,
+    visual: crate::common::transition::Visual,
+    pivot: DVec2,
+) -> Rect {
+    Rect {
+        pos: rect.pos + visual.offset + (rect.size * pivot) * (1.0 - visual.scale),
+        size: rect.size * visual.scale,
+    }
+}
 
 pub const OVERLAY_ACTION: &str = "overlay.result";
 
@@ -417,6 +613,7 @@ struct Popover {
     id: u64,
     pass: PassId,
     trigger: Area,
+    peer: Area,
     body: Area,
     press: Option<(PopoverPointer, DVec2)>,
 }
@@ -428,40 +625,48 @@ enum PopoverPointer {
 }
 
 impl AnchoredPopover {
-    /// Run from the trigger's normal activation path. The window does not
-    /// light-dismiss on the invoker itself, so the second activation only closes.
-    pub fn toggle(slot: &mut Option<Self>, cx: &mut Cx, trigger: Area) {
-        let Some(pass) = float_pass(cx, trigger).filter(|_| float_drawn(cx, trigger)) else {
-            return;
-        };
-        let same = slot.as_ref().is_some_and(|owner| {
-            POPOVERS.with(|popovers| {
-                popovers
-                    .borrow()
-                    .iter()
-                    .any(|p| p.id == owner.0 && p.trigger == trigger)
-            })
-        });
-        if same {
-            *slot = None;
-            return;
-        }
-        let id = next_id();
-        POPOVERS.with(|popovers| {
+    /// Run from the trigger's normal activation path. Switching invokers
+    /// moves input ownership in place, independently of any retained paint.
+    /// `None` means the requested trigger was not drawn.
+    pub fn toggle(slot: &mut Option<Self>, cx: &mut Cx, trigger: Area) -> Option<bool> {
+        let pass = float_pass(cx, trigger).filter(|_| float_drawn(cx, trigger))?;
+        let id = POPOVERS.with(|popovers| {
             let mut popovers = popovers.borrow_mut();
             if let Some(index) = popovers.iter().position(|p| p.pass == pass) {
+                let popup = &mut popovers[index];
+                if slot.as_ref().is_some_and(|owner| owner.0 == popup.id) {
+                    if popup.trigger == trigger {
+                        popovers.remove(index);
+                        return None;
+                    }
+                    popup.trigger = trigger;
+                    popup.peer = Area::Empty;
+                    popup.body = Area::Empty;
+                    popup.press = None;
+                    return Some(popup.id);
+                }
                 popovers.remove(index).redraw(cx);
             }
+            let id = next_id();
             popovers.push(Popover {
                 id,
                 pass,
                 trigger,
+                peer: Area::Empty,
                 body: Area::Empty,
                 press: None,
             });
+            Some(id)
         });
+        let Some(id) = id else {
+            *slot = None;
+            return Some(false);
+        };
+        if slot.as_ref().is_none_or(|owner| owner.0 != id) {
+            *slot = Some(Self(id));
+        }
         cx.set_key_focus(trigger);
-        *slot = Some(Self(id));
+        Some(true)
     }
 
     pub fn is_open(&self) -> bool {
@@ -469,10 +674,11 @@ impl AnchoredPopover {
     }
 
     /// Publish the current drawn areas, also when a retained layer is replayed.
-    pub fn drawn(&self, trigger: Area, body: Area) {
+    pub fn drawn_with_peer(&self, trigger: Area, peer: Area, body: Area) {
         POPOVERS.with(|popovers| {
             if let Some(p) = popovers.borrow_mut().iter_mut().find(|p| p.id == self.0) {
                 p.trigger = trigger;
+                p.peer = peer;
                 p.body = body;
             }
         });
@@ -492,7 +698,9 @@ impl Popover {
     }
 
     fn outside(&self, cx: &Cx, abs: DVec2) -> bool {
-        !self.trigger.clipped_rect(cx).contains(abs) && !self.body.clipped_rect(cx).contains(abs)
+        ![self.trigger, self.peer, self.body]
+            .into_iter()
+            .any(|area| float_drawn(cx, area) && area.clipped_rect(cx).contains(abs))
     }
 
     fn press(&mut self, cx: &Cx, pointer: PopoverPointer, abs: DVec2) {
@@ -1140,7 +1348,9 @@ mod tests {
         let mut slot = None;
         let [page, trigger, body] = areas;
         AnchoredPopover::toggle(&mut slot, &mut cx, trigger);
-        slot.as_ref().unwrap().drawn(trigger, body);
+        slot.as_ref()
+            .unwrap()
+            .drawn_with_peer(trigger, Area::Empty, body);
         shield_content(&mut cx, "main", page, true);
         test(&mut cx, areas, slot);
     }
@@ -1170,7 +1380,7 @@ mod tests {
     #[test]
     fn anchored_popover_outside_click_dismisses_on_release_and_reaches_its_target() {
         use makepad_widgets::Hit;
-        with_anchored_popover(|cx, [page, trigger, _], slot| {
+        with_anchored_popover(|cx, [page, trigger, body], slot| {
             let popup = slot.unwrap();
             let down = popup_mouse(80.0, true);
             assert!(!handle_anchored_popover(cx, "main", page, &down, true));
@@ -1184,6 +1394,47 @@ mod tests {
             assert!(matches!(up.hits(cx, page), Hit::FingerUp(hit) if hit.is_over));
             assert!(!cx.clear_key_focus_if(trigger));
             assert!(cx.clear_key_focus_if(page));
+
+            // The closing card has not been redrawn away yet. Its pixels must
+            // not shield a second click, including inside its previous bounds.
+            assert!(float_drawn(cx, body));
+            for retained in [true, false] {
+                if !retained {
+                    let list = &mut cx.draw_lists[body.draw_list_id().unwrap()];
+                    list.clear_draw_items(list.redraw_id + 1);
+                }
+                let down = popup_mouse(30.0, true);
+                assert!(!handle_anchored_popover(cx, "main", page, &down, true));
+                shield_content(cx, "main", page, true);
+                assert!(matches!(down.hits(cx, page), Hit::FingerDown(_)));
+                let up = popup_mouse(30.0, false);
+                assert!(!cx.pointer_shielded(page, dvec2(30.0, 5.0)));
+                assert!(!handle_anchored_popover(cx, "main", page, &up, true));
+                assert!(matches!(up.hits(cx, page), Hit::FingerUp(hit) if hit.is_over));
+            }
+        });
+    }
+
+    #[test]
+    fn anchored_popover_peer_trigger_keeps_ownership_and_escape_returns_to_peer() {
+        use makepad_widgets::KeyEvent;
+        with_anchored_popover(|cx, [page, trigger, peer], mut slot| {
+            let popup = slot.as_ref().unwrap();
+            let owner = popup.0;
+            popup.drawn_with_peer(trigger, peer, Area::Empty);
+            for event in [popup_mouse(30.0, true), popup_mouse(30.0, false)] {
+                assert!(!handle_anchored_popover(cx, "main", page, &event, true));
+                assert!(slot.as_ref().unwrap().is_open());
+            }
+            assert_eq!(AnchoredPopover::toggle(&mut slot, cx, peer), Some(true));
+            assert_eq!(slot.as_ref().unwrap().0, owner);
+            let escape = Event::KeyDown(KeyEvent {
+                key_code: KeyCode::Escape,
+                ..Default::default()
+            });
+            assert!(handle_anchored_popover(cx, "main", page, &escape, true));
+            assert!(!slot.unwrap().is_open());
+            assert!(cx.clear_key_focus_if(peer));
         });
     }
 

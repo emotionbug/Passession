@@ -34,7 +34,7 @@ live_design!{
                 self.view_clip.xy,
                 self.view_clip.zw
             );
-            self.pos = (clipped - rect_pos) / rect_size
+            self.pos = (clipped - self.view_shift - rect_pos) / rect_size
             
             self.tex_coord1 = mix(
                 self.icon_t1.xy,

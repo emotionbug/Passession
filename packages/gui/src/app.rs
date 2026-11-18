@@ -128,6 +128,7 @@ pub struct App {
 
 impl LiveRegister for App {
     fn live_register(cx: &mut Cx) {
+        common::widgets::configure_touch_motion();
         makepad_widgets::live_design(cx);
         // Re-link `link::theme` to the Paseo copy (Hangul font fallback in every stock widget).
         crate::theme_makepad::live_design(cx);
@@ -488,6 +489,7 @@ fn dispatch_window(
 
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        common::transition::begin_event(event);
         cx.with_timer_owner(common::APP_TIMERS, |cx| self.dispatch_event(cx, event));
     }
 }

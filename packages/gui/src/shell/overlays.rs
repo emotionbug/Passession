@@ -3,13 +3,18 @@
 //! (`showToast`) and tooltips. Drawn into a last-overlay draw list; while a modal is open the
 //! sweep lock keeps the content below from reacting.
 
+use std::any::Any;
+
+use makepad_widgets::makepad_draw::makepad_platform::makepad_shader_compiler::ShaderTy;
 use makepad_widgets::*;
 use serde_json::{Value, json};
 
 use crate::common::overlay::{
-    MenuEntry, OverlayKind, OverlayRequest, SelectOption, Tip, fit_in_viewport, take_dismissal,
+    DrawLayerTexture, LayerTexture, MenuEntry, OverlayKind, OverlayRequest, SelectOption, Tip,
+    fit_in_viewport, take_dismissal,
 };
 use crate::common::paint::{Font, HitMap, TextSpec, inset, rect};
+use crate::common::transition::{Intent, Style, Transition};
 use crate::common::widgets::PTextFieldWidgetRefExt;
 use crate::common::{UiContext, tr};
 use crate::shell::PaseoShell;
@@ -95,67 +100,146 @@ pub enum Modal {
         scroll: f64,
         content_height: f64,
         viewport: Rect,
-        motion: SheetMotion,
+        drag: SheetDrag,
     },
 }
 
 /// Draggable extent snap points (`minChildSize .3`, `snapSizes [.6]`, `maxChildSize .9`).
 const DRAG_SNAPS: [f64; 3] = [0.3, 0.6, 0.9];
 
-/// Presentation state of a sheet: the draggable extent and its animation, the fade-in clock
-/// and an active vertical drag. Animations run on next-frame redraws only while moving.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SheetMotion {
-    /// Draggable: fraction of the window height shown.
-    pub extent: f64,
-    from: f64,
-    to: f64,
-    /// Animation start (seconds since app start); `None` when settled.
-    start: Option<f64>,
-    duration: f64,
-    /// FadeBottom: when the panel appeared.
-    opened: Option<f64>,
-    /// The window height the extent is a fraction of.
+/// Interactive geometry, separate from the sheet's presentation transition.
+#[derive(Default)]
+pub struct SheetDrag {
     window_h: f64,
-    /// The sheet surface last frame (window coordinates), for drags.
     frame: Rect,
-    /// Active vertical drag: last pointer y and total travel.
-    drag: Option<f64>,
+    last_y: Option<f64>,
     travel: f64,
 }
 
-impl SheetMotion {
-    fn animate(&mut self, now: f64, to: f64, duration: f64) {
-        self.from = self.extent;
-        self.to = to;
-        self.start = Some(now);
-        self.duration = duration;
-    }
-
-    /// Advances the extent animation (ease-out cubic); `true` while still moving.
-    fn step(&mut self, now: f64) -> bool {
-        let Some(start) = self.start else {
-            return false;
-        };
-        let t = ((now - start) / self.duration).clamp(0.0, 1.0);
-        let eased = 1.0 - (1.0 - t).powi(3);
-        self.extent = self.from + (self.to - self.from) * eased;
-        if t >= 1.0 {
-            self.start = None;
-            return false;
+fn nearest_snap(extent: f64) -> f64 {
+    DRAG_SNAPS.iter().copied().fold(DRAG_SNAPS[0], |best, s| {
+        if (s - extent).abs() < (best - extent).abs() {
+            s
+        } else {
+            best
         }
-        true
+    })
+}
+
+#[derive(Clone, Copy, Default)]
+enum ModalKind {
+    #[default]
+    Dialog,
+    Sheet,
+    Popover,
+}
+
+impl ModalKind {
+    fn style(self, opening: bool) -> Style {
+        match (self, opening) {
+            (Self::Dialog, true) => Intent::OpenDialog,
+            (Self::Dialog, false) => Intent::CloseDialog,
+            (Self::Sheet, true) => Intent::OpenSheet,
+            (Self::Sheet, false) => Intent::CloseSheet,
+            (Self::Popover, true) => Intent::OpenPopover,
+            (Self::Popover, false) => Intent::ClosePopover,
+        }
+        .resolve()
+    }
+}
+
+/// The modal stack owns input and workflow. This separate paint order also holds
+/// closing models to keep any draw lists and textures owned by their widgets alive.
+#[derive(Default)]
+struct ModalLayer {
+    id: u64,
+    list: Option<DrawList2d>,
+    texture: Option<(LayerTexture, Rect)>,
+    quad: Area,
+    kind: ModalKind,
+    scrim: Area,
+    bounds: Rect,
+    window: Rect,
+    inset_top: f64,
+    visibility: Transition,
+    extent: Transition,
+    layout_extent: Option<f64>,
+    pending_open: bool,
+    ready: bool,
+    closing: Option<Modal>,
+}
+
+impl ModalLayer {
+    fn set_open(&mut self, cx: &mut Cx, open: bool) {
+        self.pending_open = false;
+        self.visibility
+            .retarget(cx, if open { 1.0 } else { 0.0 }, self.kind.style(open).spec);
     }
 
-    /// The nearest snap point for a released drag.
-    fn snap(extent: f64) -> f64 {
-        DRAG_SNAPS.iter().copied().fold(DRAG_SNAPS[0], |best, s| {
-            if (s - extent).abs() < (best - extent).abs() {
-                s
-            } else {
-                best
+    fn release_texture(&mut self, cx: &mut Cx) {
+        if let Some((texture, _)) = self.texture.take() {
+            crate::common::overlay::release_layer_quad(cx, std::mem::take(&mut self.quad));
+            texture.detach(cx);
+        }
+    }
+
+    fn visible_extent(&self, extent: f64) -> f64 {
+        (self.window.size.y * extent)
+            .min(self.window.size.y - self.inset_top)
+            .max(0.0)
+    }
+
+    fn transform(&self) -> (DVec2, f64, f64, f32) {
+        let style = self.kind.style(self.closing.is_none());
+        let frame = style.sample(self.visibility.value(), self.bounds.size);
+        let mut offset = frame.incoming.offset;
+        if let Some(extent) = self.layout_extent {
+            offset.y += self.visible_extent(extent) - self.visible_extent(self.extent.value());
+        }
+        (
+            offset,
+            frame.incoming.scale,
+            frame.incoming.opacity,
+            frame.scrim as f32,
+        )
+    }
+
+    fn quad_rect(&self, bounds: Rect, offset: DVec2, scale: f64) -> Rect {
+        let center = self.bounds.pos + self.bounds.size * 0.5;
+        Rect {
+            pos: center + (bounds.pos - center) * scale + offset,
+            size: bounds.size * scale,
+        }
+    }
+
+    fn composite(&self, cx: &mut Cx) {
+        let (offset, scale, opacity, scrim) = self.transform();
+        if let Some((_, bounds)) = &self.texture {
+            DrawLayerTexture::update(
+                cx,
+                self.quad,
+                self.quad_rect(*bounds, offset, scale),
+                opacity as f32,
+            );
+        } else if let Some(list) = &self.list {
+            let offset = offset + (self.bounds.pos + self.bounds.size * 0.5) * (1.0 - scale);
+            list.set_view_transform(
+                cx,
+                &Mat4::scaled_translation(
+                    scale as f32,
+                    vec3(offset.x as f32, offset.y as f32, 0.0),
+                ),
+            );
+            if let Some(pass) = cx.draw_lists[list.id()].pass_id {
+                cx.repaint_pass(pass);
             }
-        })
+        }
+        if let Some(write) =
+            self.scrim
+                .get_write_ref(cx, live_id!(opacity), ShaderTy::Float, "scrim")
+        {
+            write.buffer[0] = scrim;
+        }
     }
 }
 
@@ -165,6 +249,68 @@ impl Modal {
             Modal::Menu(m) => m.id,
             Modal::Select(s) => s.id,
             Modal::Confirm { id, .. } | Modal::Prompt { id, .. } | Modal::Sheet { id, .. } => *id,
+        }
+    }
+
+    fn kind(&self, compact: bool) -> ModalKind {
+        match self {
+            Self::Menu(menu) if compact && menu.sheet => ModalKind::Sheet,
+            Self::Select(_) if compact => ModalKind::Sheet,
+            Self::Menu(_) | Self::Select(_) => ModalKind::Popover,
+            Self::Sheet { sheet, .. } if compact || sheet.style() == SheetStyle::FullScreen => {
+                ModalKind::Sheet
+            }
+            _ => ModalKind::Dialog,
+        }
+    }
+
+    fn scrim(&self, compact: bool) -> Vec4 {
+        match self {
+            Self::Menu(menu) if compact && menu.sheet => theme::current_palette().scrim,
+            Self::Select(_) if compact => theme::current_palette().scrim,
+            Self::Menu(_) | Self::Select(_) => Vec4::default(),
+            Self::Sheet { sheet, .. } if sheet.style() == SheetStyle::FullScreen => Vec4::default(),
+            _ => argb_scrim(compact),
+        }
+    }
+
+    fn same_presentation(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Sheet { sheet: a, .. }, Self::Sheet { sheet: b, .. }) => {
+                (&**a as &dyn Any).type_id() == (&**b as &dyn Any).type_id()
+                    && a.style() == b.style()
+            }
+            (Self::Menu(a), Self::Menu(b)) => {
+                a.owner == b.owner && a.title == b.title && a.anchor == b.anchor
+            }
+            (Self::Select(a), Self::Select(b)) => {
+                a.owner == b.owner && a.title == b.title && a.anchor == b.anchor
+            }
+            (
+                Self::Confirm {
+                    owner: a,
+                    title: at,
+                    ..
+                },
+                Self::Confirm {
+                    owner: b,
+                    title: bt,
+                    ..
+                },
+            )
+            | (
+                Self::Prompt {
+                    owner: a,
+                    title: at,
+                    ..
+                },
+                Self::Prompt {
+                    owner: b,
+                    title: bt,
+                    ..
+                },
+            ) => a == b && at == bt,
+            _ => false,
         }
     }
 }
@@ -200,10 +346,9 @@ enum ToastPress {
     Action(crate::shell::permissions::Fix),
 }
 
-#[derive(Default)]
 pub struct Overlays {
     pub stack: Vec<Modal>,
-    modal_lists: Vec<DrawList2d>,
+    layers: Vec<ModalLayer>,
     pub hits: HitMap<String>,
     pub pointer: Pointer,
     pub area: Area,
@@ -221,16 +366,146 @@ pub struct Overlays {
     pub locked: bool,
     /// The area the layer's sweep lock was last taken on.
     pub locked_area: Area,
-    /// Frames are needed only while a sheet actually slides or fades.
-    transition_frame: NextFrame,
     next_sheet: u64,
     focus: Area,
     focus_returns: Vec<(u64, Area)>,
 }
 
+impl Default for Overlays {
+    fn default() -> Self {
+        Self {
+            stack: Vec::new(),
+            layers: Vec::new(),
+            hits: HitMap::default(),
+            pointer: Pointer::default(),
+            area: Area::Empty,
+            touch_scroll: crate::common::widgets::touch_scroll(),
+            toast: None,
+            queued_toast: None,
+            tooltip: None,
+            tooltip_pending: None,
+            tooltip_timer: Timer::empty(),
+            tooltips: Default::default(),
+            tooltip_owner: None,
+            locked: false,
+            locked_area: Area::Empty,
+            next_sheet: 0,
+            focus: Area::Empty,
+            focus_returns: Vec::new(),
+        }
+    }
+}
+
 impl Overlays {
     pub(crate) fn presentation_key(&self) -> (usize, Option<u64>) {
         (self.stack.len(), self.stack.last().map(Modal::id))
+    }
+
+    fn retire(&mut self, cx: &mut Cx, modal: Modal) {
+        let Some(index) = self.layers.iter().position(|layer| layer.id == modal.id()) else {
+            return;
+        };
+        let layer = &mut self.layers[index];
+        let painted = layer.list.is_some() && layer.visibility.value() > 0.0;
+        if painted {
+            layer.closing = Some(modal);
+            layer.set_open(cx, false);
+        }
+        if !painted || !layer.visibility.is_moving() {
+            layer.release_texture(cx);
+            self.layers.remove(index);
+        }
+        self.area.redraw(cx);
+    }
+
+    fn advance(&mut self, cx: &mut Cx, event: &Event) {
+        if !matches!(event, Event::NextFrame(_)) {
+            return;
+        }
+        let mut redraw = false;
+        self.layers.retain_mut(|layer| {
+            let visibility_changed = layer.visibility.advance(cx, event);
+            let extent_changed = layer.extent.advance(cx, event);
+            if layer.closing.is_some() && !layer.visibility.is_moving() {
+                layer.release_texture(cx);
+                redraw = true;
+                return false;
+            }
+            if extent_changed && !layer.extent.is_moving() {
+                layer.layout_extent = Some(layer.extent.value());
+                redraw = true;
+            }
+            if visibility_changed && !layer.visibility.is_moving() {
+                // Release the snapshot and repaint live widgets at rest.
+                layer.release_texture(cx);
+                redraw = true;
+            }
+            if (visibility_changed || extent_changed) && !redraw {
+                layer.composite(cx);
+            }
+            true
+        });
+        if redraw {
+            self.area.redraw(cx);
+        }
+    }
+
+    fn push(&mut self, mut modal: Modal) {
+        let mut layer = self
+            .layers
+            .iter()
+            .rposition(|layer| {
+                layer
+                    .closing
+                    .as_ref()
+                    .is_some_and(|old| old.same_presentation(&modal))
+            })
+            .map(|index| self.layers.remove(index))
+            .unwrap_or_default();
+        layer.id = modal.id();
+        if let (
+            Some(Modal::Sheet {
+                content_height: previous,
+                ..
+            }),
+            Modal::Sheet { content_height, .. },
+        ) = (&layer.closing, &mut modal)
+        {
+            *content_height = *previous;
+        }
+        layer.closing = None;
+        layer.pending_open = true;
+        layer.ready = false;
+        self.layers.push(layer);
+        self.stack.push(modal);
+        self.touch_scroll.reset();
+        self.pointer = Pointer::default();
+        self.hits.clear();
+        self.tooltip = None;
+        self.tooltip_pending = None;
+    }
+
+    fn sync_motion(&mut self, cx: &mut Cx, compact: bool) {
+        for modal in &self.stack {
+            if let Some(layer) = self.layers.iter_mut().find(|layer| layer.id == modal.id()) {
+                layer.kind = modal.kind(compact);
+                if layer.pending_open {
+                    layer.release_texture(cx);
+                    layer.set_open(cx, true);
+                }
+            }
+        }
+    }
+
+    fn top_layer(&self) -> Option<&ModalLayer> {
+        let id = self.stack.last()?.id();
+        self.layers.iter().rev().find(|layer| layer.id == id)
+    }
+
+    fn top_waits_for_paint(&self) -> bool {
+        self.top_layer().is_some_and(|layer| {
+            !layer.ready || layer.visibility.is_moving() || layer.extent.is_moving()
+        })
     }
 
     /// Reconcile stack mutations before autofocus. Never restore a removed area or
@@ -278,8 +553,7 @@ impl Overlays {
     }
 
     pub fn open(&mut self, cx: &mut Cx, request: OverlayRequest, field_ptr: Option<LivePtr>) {
-        self.touch_scroll.reset();
-        self.pointer = Pointer::default();
+        // Build the model before attaching its presentation.
         let modal = match request.kind {
             OverlayKind::Menu {
                 title,
@@ -384,26 +658,20 @@ impl Overlays {
                 })
             }
         };
-        self.stack.push(modal);
-        self.tooltip = None;
-        self.tooltip_pending = None;
+        self.push(modal);
     }
 
     pub fn open_sheet(&mut self, sheet: Box<dyn Sheet>) -> u64 {
-        self.touch_scroll.reset();
-        self.pointer = Pointer::default();
         self.next_sheet += 1;
         let id = 1_000_000 + self.next_sheet;
-        self.stack.push(Modal::Sheet {
+        self.push(Modal::Sheet {
             id,
             sheet,
             scroll: 0.0,
             content_height: 0.0,
             viewport: Rect::default(),
-            motion: SheetMotion::default(),
+            drag: SheetDrag::default(),
         });
-        self.tooltip = None;
-        self.tooltip_pending = None;
         id
     }
 
@@ -440,8 +708,16 @@ impl Overlays {
         })
     }
 
-    fn remove(&mut self, cx: &mut Cx, index: usize) -> Modal {
-        let modal = self.stack.remove(index);
+    fn remove_with<R>(
+        &mut self,
+        cx: &mut Cx,
+        index: usize,
+        close: impl FnOnce(&mut Cx, &mut Modal) -> R,
+    ) -> R {
+        let mut modal = self.stack.remove(index);
+        self.touch_scroll.reset();
+        self.pointer = Pointer::default();
+        self.hits.clear();
         self.sync_focus(cx);
         match &modal {
             Modal::Prompt { field, .. } => field.as_ptext_field().release_focus(cx),
@@ -452,12 +728,19 @@ impl Overlays {
             }
             _ => {}
         }
-        modal
+        let result = close(cx, &mut modal);
+        self.retire(cx, modal);
+        result
     }
 
-    fn pop(&mut self, cx: &mut Cx) -> Option<Modal> {
-        let index = self.stack.len().checked_sub(1)?;
-        Some(self.remove(cx, index))
+    fn remove(&mut self, cx: &mut Cx, index: usize) {
+        self.remove_with(cx, index, |_, _| ());
+    }
+
+    fn pop(&mut self, cx: &mut Cx) {
+        if let Some(index) = self.stack.len().checked_sub(1) {
+            self.remove(cx, index);
+        }
     }
 }
 
@@ -640,8 +923,8 @@ pub fn handle_timers(overlays: &mut Overlays, cx: &mut Cx, event: &Event) {
     {
         overlays.touch_scroll.reset();
         overlays.pointer = Pointer::default();
-        if let Some(Modal::Sheet { motion, .. }) = overlays.stack.last_mut() {
-            motion.drag = None;
+        if let Some(Modal::Sheet { drag, .. }) = overlays.stack.last_mut() {
+            drag.last_y = None;
         }
     }
     if let Some(toast) = &overlays.toast
@@ -653,9 +936,7 @@ pub fn handle_timers(overlays: &mut Overlays, cx: &mut Cx, event: &Event) {
         overlays.tooltip = overlays.tooltip_pending.take();
         overlays.area.redraw(cx);
     }
-    if overlays.transition_frame.is_event(event).is_some() {
-        overlays.area.redraw(cx);
-    }
+    overlays.advance(cx, event);
 }
 
 /// Chrome hover → tooltip anchored to the hovered control after the theme's 500ms
@@ -749,17 +1030,8 @@ fn overlay_ui(shell: &mut PaseoShell) -> Ui<'_> {
 
 pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, window: Rect) {
     shell.data.overlays.sync_focus(cx);
-    shell
-        .overlay_list
-        .begin_overlay_last_ranked(cx, OverlayRank::Shell);
-    cx.begin_turtle(Walk::abs_rect(window), Layout::default());
-    shell.data.overlays.hits.clear();
-    shell.data.overlays.tooltips.clear();
-    // Full-window capture area for the overlay layer.
-    shell.data.overlays.area =
-        shell
-            .overlay_painter
-            .capture_box(cx, window, Vec4::default(), Vec4::default(), 0.0, 0.0);
+    shell.data.overlays.sync_motion(cx, shell.data.compact);
+    let full_window = window;
     // Overlay roots allocate their own system-bar padding. Only remove the
     // keyboard's additional coverage here; it may already be consumed natively.
     let insets = crate::shell::platform::safe_insets();
@@ -769,59 +1041,135 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, window: Re
         window.size.x,
         (window.size.y - (insets.bottom_occlusion() - insets.bottom)).max(0.0),
     );
+    for layer in &mut shell.data.overlays.layers {
+        if layer.window != window {
+            layer.release_texture(cx);
+        }
+    }
+    shell
+        .overlay_list
+        .begin_overlay_last_ranked(cx, OverlayRank::Shell);
+    cx.begin_turtle(Walk::abs_rect(full_window), Layout::default());
+    shell.data.overlays.hits.clear();
+    shell.data.overlays.tooltips.clear();
+    // Full-window capture area for the overlay layer.
+    shell.data.overlays.area = shell.overlay_painter.capture_box(
+        cx,
+        full_window,
+        Vec4::default(),
+        Vec4::default(),
+        0.0,
+        0.0,
+    );
 
     crate::shell::chrome::draw_compact_explorer(shell, cx, scope, window);
 
-    let count = shell.data.overlays.stack.len();
-    // Covers and indicators in separate sheets must have separate retained
-    // owners so the clock can distinguish paint above from paint below.
-    let mut lists = std::mem::take(&mut shell.data.overlays.modal_lists);
-    lists.resize_with(count, || DrawList2d::new(cx));
-    for (index, list) in lists.iter_mut().enumerate() {
-        list.begin_always(cx);
-        let top = index + 1 == count;
-        let p = theme::current_palette();
-        // Each modal draws above the one below it, text included.
-        new_layer(shell, cx);
-        // Scrim: menus and select popovers are transparent; dialogs and sheets dim the window.
-        let scrim = match &shell.data.overlays.stack[index] {
-            Modal::Menu(menu) => {
-                if shell.data.compact && menu.sheet {
-                    p.scrim
-                } else {
-                    Vec4::default()
-                }
-            }
-            Modal::Select(_) => {
-                if shell.data.compact {
-                    p.scrim
-                } else {
-                    Vec4::default()
-                }
-            }
-            Modal::Sheet { sheet, motion, .. } => match sheet.style() {
-                SheetStyle::FullScreen => Vec4::default(),
-                // `barrierColor: 0x59000000`, fading in with the panel.
-                SheetStyle::FadeBottom => with_alpha(
-                    theme::argb(0x59000000),
-                    0.35 * fade_progress(motion, cx.seconds_since_app_start()) as f32,
-                ),
-                _ => argb_scrim(shell.data.compact),
-            },
-            _ => argb_scrim(shell.data.compact),
+    let mut layers = std::mem::take(&mut shell.data.overlays.layers);
+    let top_id = shell.data.overlays.stack.last().map(Modal::id);
+    for layer in &mut layers {
+        let index = shell
+            .data
+            .overlays
+            .stack
+            .iter()
+            .position(|modal| modal.id() == layer.id);
+        let modal = match (index, &layer.closing) {
+            (Some(index), _) => &shell.data.overlays.stack[index],
+            (_, Some(modal)) => modal,
+            _ => continue,
         };
-        shell.overlay_painter.fill(cx, window, scrim, 0.0);
+        let scrim = modal.scrim(shell.data.compact);
+        let draggable = shell.data.compact
+            && matches!(
+                modal,
+                Modal::Sheet { sheet, .. } if matches!(sheet.style(), SheetStyle::Draggable { .. })
+            );
+        let top = top_id == Some(layer.id);
+        let motion = layer.visibility.is_moving() || layer.extent.is_moving();
+        let fading = layer.visibility.is_moving() && !matches!(layer.kind, ModalKind::Sheet);
+        new_layer(shell, cx);
+        layer.scrim = Area::Empty;
+        if scrim.w > 0.0 {
+            let draw = &mut shell.overlay_painter.draw_box;
+            draw.paint(cx, window, scrim, 0.0);
+            layer.scrim = draw.area();
+        }
         if top {
+            shell.data.overlays.hits.clear();
             shell
                 .data
                 .overlays
                 .hits
                 .push(window, "overlay:backdrop".into());
         }
-        draw_modal(shell, cx, scope, index, window, top);
-        list.end(cx);
+
+        layer.window = window;
+        layer.inset_top = insets.top;
+        if draggable && layer.layout_extent.is_none() {
+            layer.layout_extent = Some(DRAG_SNAPS[1]);
+            layer.extent.snap(DRAG_SNAPS[1]);
+        }
+
+        // Only input/layout mutations paint the source; NextFrame composites in `advance`.
+        let mut remeasure = false;
+        let parent = shell.overlay_list.id();
+        if layer.texture.is_none() {
+            let list = layer.list.get_or_insert_with(|| DrawList2d::new(cx));
+            if list.begin_maybe(cx, index.is_some()).is_ok() {
+                list.set_view_transform(cx, &Mat4::identity());
+                if let Some(index) = index {
+                    new_layer(shell, cx);
+                    let previous = sheet_height(&shell.data.overlays.stack[index]);
+                    layer.bounds = draw_modal(
+                        shell,
+                        cx,
+                        scope,
+                        index,
+                        window,
+                        layer.layout_extent.unwrap_or_default(),
+                        top,
+                        top && !motion,
+                    );
+                    remeasure = sheet_height(&shell.data.overlays.stack[index]) != previous;
+                }
+                list.end(cx);
+            }
+            if remeasure {
+                // One layout correction for measured content, not an animation tick.
+                // Do not snapshot an adaptive dialog with its guessed initial height.
+                cx.redraw_list_in_draw(parent);
+                if fading {
+                    cx.draw_lists[parent].detach_sub_list(list.id());
+                }
+            } else if fading {
+                // Keep child draw calls at settled window geometry. Draw only
+                // the bounded, composite quad into the window during a fade.
+                list.set_view_transform(cx, &Mat4::identity());
+                let bounds =
+                    crate::common::paint::intersect(inset(layer.bounds, -12.0, -12.0), window);
+                if bounds.size.x > 0.0 && bounds.size.y > 0.0 {
+                    let texture = LayerTexture::capture_bounds(cx, list.id(), bounds);
+                    layer.texture = Some((texture, bounds));
+                    cx.draw_lists[parent].detach_sub_list(list.id());
+                }
+            }
+        }
+        if let Some((texture, bounds)) = &layer.texture {
+            let (offset, scale, opacity, _) = layer.transform();
+            layer.quad = shell.overlay_composite.draw_texture(
+                cx,
+                layer.quad_rect(*bounds, offset, scale),
+                &texture.texture,
+                opacity as f32,
+            );
+            shell.overlay_composite.draw_vars.empty_texture(0);
+        }
+        if motion {
+            layer.composite(cx);
+        }
+        layer.ready = !motion && !remeasure;
     }
-    shell.data.overlays.modal_lists = lists;
+    shell.data.overlays.layers = layers;
     // Standalone tool-call sheets (timeline `showToolCallSheet`) above the modal stack.
     crate::features::timeline::draw_tool_call_sheets(cx, &shell.data.window_id, window);
     new_layer(shell, cx);
@@ -830,11 +1178,18 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, window: Re
     cx.end_turtle();
     shell.overlay_list.end(cx);
     shell.data.overlays.locked = shell.data.overlays.is_modal()
-        || (shell.data.compact && shell.data.chrome.explorer_position > 0.0);
+        || (shell.data.compact && shell.data.chrome.explorer_visible());
 }
 
 fn argb_scrim(compact: bool) -> Vec4 {
     theme::argb(if compact { 0x73000000 } else { 0x8c000000 })
+}
+
+fn sheet_height(modal: &Modal) -> Option<f64> {
+    match modal {
+        Modal::Sheet { content_height, .. } => Some(*content_height),
+        _ => None,
+    }
 }
 
 fn new_layer(shell: &mut PaseoShell, cx: &mut Cx2d) {
@@ -842,14 +1197,17 @@ fn new_layer(shell: &mut PaseoShell, cx: &mut Cx2d) {
     shell.overlay_icon.draw_vars.set_draw_call_group(group);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_modal(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
     scope: &mut Scope,
     index: usize,
     window: Rect,
+    extent: f64,
     top: bool,
-) {
+    autofocus: bool,
+) -> Rect {
     let compact = shell.data.compact;
     let mut modal = std::mem::replace(
         &mut shell.data.overlays.stack[index],
@@ -863,8 +1221,8 @@ fn draw_modal(
             ok_focused: true,
         },
     );
-    crate::shell::sheets::set_fields_active(top);
-    match &mut modal {
+    crate::shell::sheets::set_fields_active(autofocus);
+    let bounds = match &mut modal {
         Modal::Menu(menu) => draw_menu(shell, cx, menu, window, compact, top),
         Modal::Confirm {
             title,
@@ -873,19 +1231,17 @@ fn draw_modal(
             destructive,
             ok_focused,
             ..
-        } => {
-            draw_confirm(
-                shell,
-                cx,
-                window,
-                title,
-                message,
-                confirm_label,
-                *destructive,
-                *ok_focused,
-                top,
-            );
-        }
+        } => draw_confirm(
+            shell,
+            cx,
+            window,
+            title,
+            message,
+            confirm_label,
+            *destructive,
+            *ok_focused,
+            top,
+        ),
         Modal::Prompt {
             title,
             message,
@@ -895,7 +1251,7 @@ fn draw_modal(
             multiline,
             ..
         } => {
-            draw_prompt(
+            let bounds = draw_prompt(
                 shell,
                 cx,
                 scope,
@@ -907,28 +1263,30 @@ fn draw_modal(
                 *multiline,
                 top,
             );
-            if top && !*focused {
+            if autofocus && !*focused {
                 *focused = true;
                 field.as_ptext_field().set_key_focus(cx);
                 field.as_ptext_field().select_all(cx);
             }
+            bounds
         }
         Modal::Select(select) => {
-            draw_select(shell, cx, scope, select, window, compact, top);
+            let bounds = draw_select(shell, cx, scope, select, window, compact, top);
             // Original: the search field autofocuses on wide layouts only.
-            if top && !select.focused {
+            if autofocus && !select.focused {
                 select.focused = true;
                 if let Some(search) = select.search.as_ref().filter(|_| !compact) {
                     search.as_ptext_field().set_key_focus(cx);
                 }
             }
+            bounds
         }
         Modal::Sheet {
             sheet,
             scroll,
             content_height,
             viewport,
-            motion,
+            drag,
             ..
         } => {
             let state = scope
@@ -946,13 +1304,15 @@ fn draw_modal(
                 scroll,
                 content_height,
                 viewport,
-                motion,
+                drag,
+                extent,
                 top,
-            );
+            )
         }
-    }
+    };
     crate::shell::sheets::set_fields_active(true);
     shell.data.overlays.stack[index] = modal;
+    bounds
 }
 
 fn menu_rect(menu: &OpenMenu, window: Rect, height: f64) -> Rect {
@@ -980,7 +1340,7 @@ fn draw_menu(
     window: Rect,
     compact: bool,
     top: bool,
-) {
+) -> Rect {
     let sheet = compact && menu.sheet;
     let depth = menu.pages.len();
     let (page_title, entries) = menu.pages[depth - 1].clone();
@@ -1230,6 +1590,7 @@ fn draw_menu(
     }
     ui.hits.set_clip(None);
     cx.end_turtle();
+    outer
 }
 
 /// `_SelectList` retains 8px padding above and below the scaled text line.
@@ -1262,7 +1623,7 @@ fn draw_select(
     window: Rect,
     sheet: bool,
     top: bool,
-) {
+) -> Rect {
     let visible = select.visible();
     let line_h = super::chrome::text_line_height(20.0, 14.0);
     let search_h = if select.search.is_some() {
@@ -1271,7 +1632,7 @@ fn draw_select(
         0.0
     };
     let list_h = select_list_height(select, &visible, sheet);
-    let field_rect = {
+    let (field_rect, bounds) = {
         let mut ui = overlay_ui(shell);
         let p = ui.p;
         let (surface, mut y) = if sheet {
@@ -1489,13 +1850,14 @@ fn draw_select(
             }
         }
         cx.end_turtle();
-        field_rect
+        (field_rect, surface)
     };
     if let (Some(field), Some(r)) = (select.search.as_ref(), field_rect) {
         cx.begin_turtle(Walk::abs_rect(r), Layout::default());
         field.draw_all(cx, scope);
         cx.end_turtle();
     }
+    bounds
 }
 
 /// `_SelectItem`: 12/8 padding, surface1 while hovered or pressed, 16px leading slot, 14px
@@ -1589,7 +1951,7 @@ fn dialog_frame(
     compact: bool,
     top: bool,
     back: bool,
-) -> Rect {
+) -> (Rect, Rect) {
     let p = ui.p;
     let title_h = super::chrome::text_line_height(24.0, 14.0);
     let header_h = title_h + 33.0;
@@ -1707,11 +2069,14 @@ fn dialog_frame(
         frame.size.x,
         p.surface2,
     );
-    rect(
-        frame.pos.x,
-        frame.pos.y + header_h,
-        frame.size.x,
-        (frame.size.y - header_h).max(0.0),
+    (
+        rect(
+            frame.pos.x,
+            frame.pos.y + header_h,
+            frame.size.x,
+            (frame.size.y - header_h).max(0.0),
+        ),
+        outer,
     )
 }
 
@@ -1726,7 +2091,7 @@ fn draw_confirm(
     destructive: bool,
     ok_focused: bool,
     top: bool,
-) {
+) -> Rect {
     let compact = shell.data.compact;
     let mut ui = overlay_ui(shell);
     let p = ui.p;
@@ -1744,7 +2109,7 @@ fn draw_confirm(
         message,
     );
     let button_h = theme::control_height(ControlSize::Sm);
-    let body = dialog_frame(
+    let (body, bounds) = dialog_frame(
         &mut ui,
         cx,
         window,
@@ -1811,6 +2176,7 @@ fn draw_confirm(
             (button_h * 0.5 + 2.0).min(14.0),
         );
     }
+    bounds
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1825,9 +2191,9 @@ fn draw_prompt(
     confirm_label: &str,
     multiline: bool,
     top: bool,
-) {
+) -> Rect {
     let compact = shell.data.compact;
-    let (field_rect, scroll) = {
+    let (field_rect, scroll, bounds) = {
         let mut ui = overlay_ui(shell);
         let p = ui.p;
         let spec = ui.spec(Font::Regular, 14.0, p.muted);
@@ -1860,7 +2226,7 @@ fn draw_prompt(
             (20.0 + super::chrome::text_line_height(20.0, 14.0), 0.0)
         };
         let button_h = theme::control_height(ControlSize::Sm);
-        let body = dialog_frame(
+        let (body, bounds) = dialog_frame(
             &mut ui,
             cx,
             window,
@@ -1931,7 +2297,7 @@ fn draw_prompt(
             ControlSize::Sm,
             top,
         );
-        (field_rect, scroll)
+        (field_rect, scroll, bounds)
     };
     cx.begin_turtle(
         Walk::abs_rect(field_rect),
@@ -1944,6 +2310,7 @@ fn draw_prompt(
     );
     field.draw_all(cx, scope);
     cx.end_turtle();
+    bounds
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1956,18 +2323,19 @@ fn draw_sheet(
     scroll: &mut f64,
     content_height: &mut f64,
     viewport: &mut Rect,
-    motion: &mut SheetMotion,
+    drag: &mut SheetDrag,
+    extent: f64,
     top: bool,
-) {
+) -> Rect {
     let compact = shell.data.compact;
     let title = sheet.title();
     match sheet.style() {
         SheetStyle::FullScreen => {
             draw_full_screen_sheet(shell, cx, scope, window, sheet, &title, viewport, top);
-            return;
+            return window;
         }
         SheetStyle::Draggable { material_handle } if compact => {
-            draw_draggable_sheet(
+            return draw_draggable_sheet(
                 shell,
                 cx,
                 scope,
@@ -1978,24 +2346,10 @@ fn draw_sheet(
                 scroll,
                 content_height,
                 viewport,
-                motion,
+                drag,
+                extent,
                 top,
             );
-            return;
-        }
-        SheetStyle::FadeBottom => {
-            draw_fade_sheet(
-                shell,
-                cx,
-                scope,
-                window,
-                sheet,
-                content_height,
-                viewport,
-                motion,
-                top,
-            );
-            return;
         }
         _ => {}
     }
@@ -2013,9 +2367,9 @@ fn draw_sheet(
     } else {
         0.0
     };
-    let inner = {
+    let (inner, bounds) = {
         let mut ui = overlay_ui(shell);
-        let body = dialog_frame(
+        let (body, bounds) = dialog_frame(
             &mut ui,
             cx,
             window,
@@ -2046,7 +2400,7 @@ fn draw_sheet(
                 top,
             );
         }
-        inner
+        (inner, bounds)
     };
     *viewport = inner;
     let max = (*content_height + 48.0 - inner.size.y).max(0.0);
@@ -2077,15 +2431,8 @@ fn draw_sheet(
     cx.end_turtle();
     if (height - *content_height).abs() > 0.5 {
         *content_height = height;
-        shell.data.overlays.area.redraw(cx);
     }
-}
-
-/// How far a fading sheet has faded in (200ms `FadeTransition`).
-fn fade_progress(motion: &SheetMotion, now: f64) -> f64 {
-    motion
-        .opened
-        .map_or(0.0, |opened| ((now - opened) / 0.2).clamp(0.0, 1.0))
+    bounds
 }
 
 /// `SheetStyle::Draggable` on compact layouts.
@@ -2101,29 +2448,22 @@ fn draw_draggable_sheet(
     scroll: &mut f64,
     content_height: &mut f64,
     viewport: &mut Rect,
-    motion: &mut SheetMotion,
+    drag: &mut SheetDrag,
+    extent: f64,
     top: bool,
-) {
-    let now = cx.seconds_since_app_start();
-    if motion.extent == 0.0 && motion.start.is_none() {
-        // `showModalBottomSheet` enter: slide up to the initial .6 over 250ms.
-        motion.animate(now, 0.6, 0.25);
-    }
-    if motion.step(now) {
-        shell.data.overlays.transition_frame = cx.new_next_frame();
-    }
+) -> Rect {
     let insets = crate::shell::platform::safe_insets();
     // `useSafeArea`: never under the top inset.
     let max_h = window.size.y - insets.top;
-    let h = (window.size.y * motion.extent).min(max_h).max(0.0);
+    let h = (window.size.y * extent).min(max_h).max(0.0);
     let frame = rect(
         window.pos.x,
         window.pos.y + window.size.y - h,
         window.size.x,
         h,
     );
-    motion.frame = frame;
-    motion.window_h = window.size.y;
+    drag.frame = frame;
+    drag.window_h = window.size.y;
     let body = {
         let mut ui = overlay_ui(shell);
         let p = ui.p;
@@ -2232,100 +2572,8 @@ fn draw_draggable_sheet(
     cx.end_turtle();
     if (height - *content_height).abs() > 0.5 {
         *content_height = height;
-        shell.data.overlays.area.redraw(cx);
     }
-}
-
-/// `SheetStyle::FadeBottom`: a full-width surface2 panel at the bottom, fading in.
-#[allow(clippy::too_many_arguments)]
-fn draw_fade_sheet(
-    shell: &mut PaseoShell,
-    cx: &mut Cx2d,
-    scope: &mut Scope,
-    window: Rect,
-    sheet: &mut dyn Sheet,
-    content_height: &mut f64,
-    viewport: &mut Rect,
-    motion: &mut SheetMotion,
-    top: bool,
-) {
-    let now = cx.seconds_since_app_start();
-    let opened = *motion.opened.get_or_insert(now);
-    let t = ((now - opened) / 0.2).clamp(0.0, 1.0);
-    if t < 1.0 {
-        shell.data.overlays.transition_frame = cx.new_next_frame();
-    }
-    let insets = crate::shell::platform::safe_insets();
-    let bottom = if insets.bottom > 24.0 {
-        insets.bottom
-    } else {
-        24.0
-    };
-    let estimated = if *content_height > 0.0 {
-        *content_height
-    } else {
-        72.0
-    };
-    let h = 16.0 + 4.0 + 16.0 + estimated + bottom;
-    let frame = rect(
-        window.pos.x,
-        window.pos.y + window.size.y - h,
-        window.size.x,
-        h,
-    );
-    motion.frame = frame;
-    shell.overlay_painter.set_alpha(t as f32);
-    {
-        let mut ui = overlay_ui(shell);
-        let p = ui.p;
-        ui.fill(
-            cx,
-            rect(frame.pos.x, frame.pos.y, frame.size.x, frame.size.y + 16.0),
-            p.surface2,
-            16.0,
-        );
-        if t >= 1.0 && p.surface2.w >= 1.0 {
-            crate::common::clock::occlude(
-                cx,
-                rect(
-                    frame.pos.x,
-                    frame.pos.y + 16.0,
-                    frame.size.x,
-                    frame.size.y - 16.0,
-                ),
-            );
-        }
-        if top {
-            ui.hit(frame, "dialog:surface");
-        }
-        ui.fill(
-            cx,
-            rect(
-                frame.pos.x + frame.size.x * 0.5 - 20.0,
-                frame.pos.y + 16.0,
-                40.0,
-                4.0,
-            ),
-            with_alpha(p.muted, 0.3),
-            2.0,
-        );
-    }
-    let body = rect(
-        frame.pos.x + 24.0,
-        frame.pos.y + 16.0 + 4.0 + 16.0,
-        frame.size.x - 48.0,
-        estimated,
-    );
-    *viewport = body;
-    let height = {
-        let mut ui = overlay_ui(shell);
-        sheet.draw(cx, &mut ui, scope, body.pos.x, body.pos.y, body.size.x, top)
-    };
-    shell.overlay_painter.set_alpha(1.0);
-    if (height - *content_height).abs() > 0.5 {
-        *content_height = height;
-        shell.data.overlays.area.redraw(cx);
-    }
+    frame
 }
 
 /// A pushed full-screen route (`Scaffold(backgroundColor: surface0)`): the original
@@ -2546,7 +2794,7 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     if stale != area {
         cx.sweep_unlock(stale);
     }
-    let explorer_open = shell.data.compact && shell.data.chrome.explorer_position > 0.0;
+    let explorer_open = shell.data.compact && shell.data.chrome.explorer_visible();
     if !shell.data.overlays.is_modal() && !explorer_open {
         shell.data.overlays.touch_scroll.reset();
         // The last modal closed: release the layer's sweep lock, or every hover and click
@@ -2574,6 +2822,14 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     ) {
         return true;
     }
+    // The incoming surface uses settled geometry. Its backdrop owns input,
+    // but neither its fields nor its hit map handle positions until it settles.
+    if crate::common::is_user_input(event)
+        && (shell.data.overlays.top_waits_for_paint()
+            || (!shell.data.overlays.is_modal() && shell.data.chrome.explorer.is_moving()))
+    {
+        return true;
+    }
     if let Event::KeyDown(key) = event
         && modal_key(shell, cx, scope, key)
     {
@@ -2595,7 +2851,9 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 {
                     shell.data.overlays.pop(cx);
                     answer(shell, cx, scope, &owner, id, json!({ "text": text }));
-                    cx.sweep_lock(area);
+                    if shell.data.overlays.is_modal() || explorer_open {
+                        cx.sweep_lock(area);
+                    }
                     return true;
                 }
             }
@@ -2618,7 +2876,9 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             }
             _ => {}
         }
-        cx.sweep_lock(area);
+        if shell.data.overlays.is_modal() || explorer_open {
+            cx.sweep_lock(area);
+        }
         // Operations can close, replace or push a sheet. Never resolve this same
         // event against another owner's old hit map.
         if shell.data.overlays.stack.last().map(Modal::id) != Some(owner) {
@@ -2639,8 +2899,8 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
     }
     // Compact draggable sheets already combine resizing and scrolling below.
     let draggable = shell.data.overlays.stack.last().is_some_and(|top| {
-        matches!(top, Modal::Sheet { sheet, motion, .. }
-            if shell.data.compact && matches!(sheet.style(), SheetStyle::Draggable { .. }) && motion.window_h > 0.0)
+        matches!(top, Modal::Sheet { sheet, drag, .. }
+            if shell.data.compact && matches!(sheet.style(), SheetStyle::Draggable { .. }) && drag.window_h > 0.0)
     });
     if !draggable {
         let viewport = scroll_viewport(shell);
@@ -2696,67 +2956,85 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
 /// the pending tap. Returns `true` when the sheet was dismissed.
 fn drag_sheet(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, hit: &Hit) -> bool {
     let compact = shell.data.compact;
-    let now = cx.seconds_since_app_start();
+    let overlays = &mut shell.data.overlays;
     let mut cancel_tap = false;
     let mut dismiss = false;
     if matches!(hit, Hit::FingerLongPress(_)) {
-        if let Some(Modal::Sheet { motion, .. }) = shell.data.overlays.stack.last_mut() {
-            motion.drag = None;
+        if let Some(Modal::Sheet { drag, .. }) = overlays.stack.last_mut() {
+            drag.last_y = None;
         }
-        shell.data.overlays.pointer.pressed = None;
+        overlays.pointer.pressed = None;
         return false;
     }
     {
         let Some(Modal::Sheet {
+            id,
             sheet,
-            motion,
+            drag,
             scroll,
             content_height,
             viewport,
             ..
-        }) = shell.data.overlays.stack.last_mut()
+        }) = overlays.stack.last_mut()
         else {
             return false;
         };
         if !compact
             || !matches!(sheet.style(), SheetStyle::Draggable { .. })
-            || motion.window_h <= 0.0
+            || drag.window_h <= 0.0
         {
             return false;
         }
+        let Some(layer) = overlays
+            .layers
+            .iter_mut()
+            .rev()
+            .find(|layer| layer.id == *id)
+        else {
+            return false;
+        };
         match hit {
-            Hit::FingerDown(fe) if motion.frame.contains(fe.abs) => {
-                motion.drag = Some(fe.abs.y);
-                motion.travel = 0.0;
-                motion.start = None;
+            Hit::FingerDown(fe) if drag.frame.contains(fe.abs) => {
+                drag.last_y = Some(fe.abs.y);
+                drag.travel = 0.0;
             }
             Hit::FingerMove(fe) => {
-                let Some(last) = motion.drag else {
+                let Some(last) = drag.last_y else {
                     return false;
                 };
+                drag.last_y = Some(fe.abs.y);
                 let dy = fe.abs.y - last;
-                motion.drag = Some(fe.abs.y);
-                motion.travel += dy.abs();
-                cancel_tap = motion.travel > 8.0;
+                drag.travel += dy.abs();
+                cancel_tap = drag.travel > 8.0;
+                let extent = layer.extent.value();
                 let max_scroll = (*content_height + 4.0 + 32.0 - viewport.size.y).max(0.0);
-                if dy < 0.0 {
-                    let grow = (-dy / motion.window_h)
-                        .min(DRAG_SNAPS[2] - motion.extent)
-                        .max(0.0);
-                    motion.extent += grow;
-                    *scroll = (*scroll + (-dy - grow * motion.window_h)).min(max_scroll);
+                let extent = if dy < 0.0 {
+                    let grow = (-dy / drag.window_h).min(DRAG_SNAPS[2] - extent).max(0.0);
+                    *scroll = (*scroll + (-dy - grow * drag.window_h)).min(max_scroll);
+                    extent + grow
                 } else {
                     let back = dy.min(*scroll);
                     *scroll -= back;
-                    motion.extent = (motion.extent - (dy - back) / motion.window_h).max(0.0);
-                }
+                    (extent - (dy - back) / drag.window_h).max(0.0)
+                };
+                layer.layout_extent = Some(extent);
+                layer.extent.snap(extent);
             }
             Hit::FingerUp(_) => {
-                if motion.drag.take().is_some() && motion.travel > 8.0 {
-                    if motion.extent < DRAG_SNAPS[0] * 0.5 {
+                if drag.last_y.take().is_some() && drag.travel > 8.0 {
+                    let extent = layer.extent.value();
+                    if extent < DRAG_SNAPS[0] * 0.5 {
                         dismiss = true;
                     } else {
-                        motion.animate(now, SheetMotion::snap(motion.extent), 0.2);
+                        let target = nearest_snap(extent);
+                        layer
+                            .extent
+                            .retarget(cx, target, ModalKind::Sheet.style(true).spec);
+                        layer.layout_extent = Some(if layer.extent.is_moving() {
+                            target.max(extent)
+                        } else {
+                            target
+                        });
                     }
                 }
             }
@@ -3018,78 +3296,56 @@ fn answer(
 /// Closes every shell menu, dialog and sheet as if dismissed (owners get their cancel answer;
 /// sheets run `closed`). Used when a notification takes the user to a session.
 pub fn dismiss_all(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext) {
-    shell.data.overlays.touch_scroll.reset();
-    shell.data.overlays.pointer = Pointer::default();
     // An answer may open a follow-up (a close guard's next step); stop after a bounded number.
     for _ in 0..64 {
-        let Some(modal) = shell.data.overlays.pop(cx) else {
+        if !dismiss_one(shell, cx, Some(ui)) {
             break;
-        };
-        match modal {
-            Modal::Menu(menu) => {
-                shell.overlay_answer(cx, ui, &menu.owner, menu.id, json!({ "cancelled": true }))
-            }
-            Modal::Select(select) => shell.overlay_answer(
-                cx,
-                ui,
-                &select.owner,
-                select.id,
-                json!({ "cancelled": true }),
-            ),
-            Modal::Confirm { id, owner, .. } => {
-                shell.overlay_answer(cx, ui, &owner, id, json!({ "confirmed": false }))
-            }
-            Modal::Prompt { id, owner, .. } => {
-                shell.overlay_answer(cx, ui, &owner, id, json!({ "cancelled": true }))
-            }
-            Modal::Sheet { mut sheet, .. } => {
-                let mut ops = SheetOps::new(ui);
-                sheet.closed(cx, &mut ops);
-                crate::shell::sheets::apply_ops(shell, cx, ui, ops, None);
-            }
         }
     }
     shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
 }
 
 fn dismiss_top(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope) {
-    shell.data.overlays.touch_scroll.reset();
-    shell.data.overlays.pointer = Pointer::default();
-    let Some(modal) = shell.data.overlays.pop(cx) else {
-        return;
+    dismiss_one(shell, cx, scope.data.get_mut::<UiContext>());
+    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
+}
+
+fn dismiss_one(shell: &mut PaseoShell, cx: &mut Cx, ui: Option<&mut UiContext>) -> bool {
+    let Some(index) = shell.data.overlays.stack.len().checked_sub(1) else {
+        return false;
     };
-    match modal {
-        Modal::Menu(menu) => answer(
-            shell,
-            cx,
-            scope,
-            &menu.owner,
-            menu.id,
-            json!({ "cancelled": true }),
-        ),
-        Modal::Select(select) => answer(
-            shell,
-            cx,
-            scope,
-            &select.owner,
-            select.id,
-            json!({ "cancelled": true }),
-        ),
-        Modal::Confirm { id, owner, .. } => {
-            answer(shell, cx, scope, &owner, id, json!({ "confirmed": false }))
-        }
-        Modal::Prompt { id, owner, .. } => {
-            answer(shell, cx, scope, &owner, id, json!({ "cancelled": true }))
-        }
-        Modal::Sheet { mut sheet, .. } => {
-            if let Some(ui) = scope.data.get_mut::<UiContext>() {
-                let mut ops = SheetOps::new(ui);
-                sheet.closed(cx, &mut ops);
-                crate::shell::sheets::apply_ops(shell, cx, ui, ops, None);
+    let mut ops = ui.as_deref().map(SheetOps::new);
+    let reply = shell
+        .data
+        .overlays
+        .remove_with(cx, index, |cx, modal| match modal {
+            Modal::Menu(menu) => Some((menu.owner.clone(), menu.id, json!({ "cancelled": true }))),
+            Modal::Select(select) => Some((
+                select.owner.clone(),
+                select.id,
+                json!({ "cancelled": true }),
+            )),
+            Modal::Confirm { id, owner, .. } => {
+                Some((owner.clone(), *id, json!({ "confirmed": false })))
             }
+            Modal::Prompt { id, owner, .. } => {
+                Some((owner.clone(), *id, json!({ "cancelled": true })))
+            }
+            Modal::Sheet { sheet, .. } => {
+                if let Some(ops) = &mut ops {
+                    sheet.closed(cx, ops);
+                }
+                None
+            }
+        });
+    if let Some(ui) = ui {
+        if let Some((owner, id, result)) = reply {
+            shell.overlay_answer(cx, ui, &owner, id, result);
+        } else if let Some(ops) = ops {
+            crate::shell::sheets::apply_ops(shell, cx, ui, ops, None);
         }
     }
-    shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
+    true
 }
 
 fn click(shell: &mut PaseoShell, cx: &mut Cx, scope: &mut Scope, id: &str) {
@@ -3235,6 +3491,11 @@ fn sheet_event(
     };
     let sheet_id = *id;
     let flow = sheet.handle_event(cx, event, scope);
+    // Children may have their own frame-driven effects (e.g. a caret); let
+    // them request their own redraw. A navigation frame is not a data change.
+    if matches!(event, Event::NextFrame(_)) && matches!(flow, SheetFlow::Stay) {
+        return None;
+    }
     let (ops, after) = {
         let ui = scope.data.get_mut::<UiContext>()?;
         let mut ops = SheetOps::for_sheet(ui, sheet_id);
@@ -3293,6 +3554,204 @@ pub fn body_spec(ui: &Ui) -> TextSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_screen_sheet_transition_reuses_actual_draw_list() {
+        use makepad_widgets::makepad_draw::CxDraw;
+        use std::time::{Duration, Instant};
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        PaseoShell::register_main_module(&mut cx);
+        crate::app::live_design(&mut cx);
+        cx.live_expand();
+        cx.live_scan_dependencies();
+        cx.native_load_dependencies();
+        let mut shell = PaseoShell::new_local(&mut cx);
+        crate::shell::sheets::register_qr_ptr(shell.qr_scan);
+        let pass = Pass::new(&mut cx);
+        let window = rect(0.0, 0.0, 960.0, 640.0);
+        pass.set_size(&mut cx, window.size);
+        let mut root = DrawList2d::new(&mut cx);
+        let overlay = Overlay::new(&mut cx);
+        let mut paint = |cx: &mut Cx, shell: &mut PaseoShell| {
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            root.begin_always(&mut draw);
+            let mut cx = Cx2d::new(&mut draw);
+            overlay.begin(&mut cx);
+            cx.begin_pass_sized_turtle(Layout::flow_overlay());
+            super::draw(shell, &mut cx, &mut Scope::empty(), window);
+            cx.end_pass_sized_turtle();
+            overlay.end(&mut cx);
+            root.end(&mut cx);
+            cx.end_pass(&pass);
+        };
+        shell
+            .data
+            .overlays
+            .open_sheet(Box::new(crate::shell::sheets::host_dialog::ScanSheet::new()));
+        paint(&mut cx, &mut shell);
+        let layer = &shell.data.overlays.layers[0];
+        assert_eq!(layer.bounds, window);
+        assert!(layer.texture.is_none());
+        let list = layer.list.as_ref().unwrap().id();
+        let original_transform = cx.draw_lists[list].draw_list_uniforms.view_transform;
+        let trace =
+            std::env::var_os("PASEO_FRAME_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
+
+        for (opening, start) in [(true, 0.0), (false, 2.0)] {
+            if !opening {
+                shell.data.overlays.pop(&mut cx);
+                paint(&mut cx, &mut shell);
+                assert!(!shell.data.overlays.is_modal());
+            }
+            let redraw_id = cx.draw_lists[list].redraw_id;
+            let draw_count = cx.draw_lists[list].draw_items.len();
+            assert!(draw_count > 1);
+            let mut frames = 0;
+            let mut compose = Duration::ZERO;
+            while let Some(token) = shell
+                .data
+                .overlays
+                .layers
+                .first()
+                .and_then(|layer| layer.visibility.scheduled_frame())
+            {
+                let event = Event::NextFrame(makepad_widgets::event::NextFrameEvent {
+                    time: start + f64::from(frames) / 60.0,
+                    set: [token].into_iter().collect(),
+                    ..Default::default()
+                });
+                crate::common::transition::begin_event(&event);
+                let before = Instant::now();
+                shell.data.overlays.advance(&mut cx, &event);
+                compose += before.elapsed();
+                frames += 1;
+                assert!(frames < 60, "motion did not settle after 1s");
+                if !shell.data.overlays.layers.is_empty() {
+                    assert_eq!(cx.draw_lists[list].redraw_id, redraw_id);
+                    assert_eq!(cx.draw_lists[list].draw_items.len(), draw_count);
+                }
+            }
+            assert!(frames > 1);
+            if trace {
+                eprintln!(
+                    "PASEO_FRAME_TRACE headless ScanSheet {}: {frames} sampled frames, {:.4} ms/composition",
+                    if opening { "open" } else { "close" },
+                    compose.as_secs_f64() * 1000.0 / f64::from(frames),
+                );
+            }
+            if opening {
+                assert_ne!(
+                    cx.draw_lists[list].draw_list_uniforms.view_transform,
+                    original_transform,
+                );
+                paint(&mut cx, &mut shell);
+                assert!(!shell.data.overlays.top_waits_for_paint());
+            }
+        }
+        assert!(shell.data.overlays.layers.is_empty());
+    }
+
+    fn modal_transition_lifecycle(mut open: impl FnMut(&mut Overlays, &mut Cx) -> u64) {
+        fn tick(overlays: &mut Overlays, cx: &mut Cx, time: f64) {
+            let token = overlays.layers[0]
+                .visibility
+                .scheduled_frame()
+                .expect("moving");
+            let event = Event::NextFrame(makepad_widgets::event::NextFrameEvent {
+                time,
+                set: [token].into_iter().collect(),
+                ..Default::default()
+            });
+            crate::common::transition::begin_event(&event);
+            overlays.advance(cx, &event);
+        }
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut overlays = Overlays::default();
+        open(&mut overlays, &mut cx);
+        overlays.sync_motion(&mut cx, false);
+        assert!(overlays.top_waits_for_paint());
+        // Stand in for the retained layer attached on first paint. Cx can drive
+        // the registered transition events without a native rendering backend.
+        let list = DrawList2d::new(&mut cx);
+        let list_id = list.id();
+        overlays.layers[0].list = Some(list);
+        tick(&mut overlays, &mut cx, 0.0);
+        tick(&mut overlays, &mut cx, 0.06);
+        assert!((0.0..1.0).contains(&overlays.layers[0].visibility.value()));
+        tick(&mut overlays, &mut cx, 1.0);
+        assert_eq!(overlays.layers[0].visibility.value(), 1.0);
+        assert!(overlays.layers[0].visibility.scheduled_frame().is_none());
+
+        let probe = dvec2(5.0, 5.0);
+        overlays
+            .hits
+            .push(rect(0.0, 0.0, 10.0, 10.0), "old-sheet-hit".into());
+        assert!(overlays.hits.at(probe).is_some());
+        overlays.pop(&mut cx);
+        assert!(!overlays.is_modal());
+        assert!(overlays.top_layer().is_none());
+        assert!(overlays.hits.at(probe).is_none());
+        assert!(overlays.layers[0].closing.is_some());
+        tick(&mut overlays, &mut cx, 2.0);
+        tick(&mut overlays, &mut cx, 2.06);
+        let closing = overlays.layers[0].visibility.value();
+        assert!(closing > 0.0 && closing < 1.0);
+
+        let incoming = open(&mut overlays, &mut cx);
+        overlays.sync_motion(&mut cx, false);
+        let layer = overlays.top_layer().expect("reopened owner");
+        assert_eq!(overlays.layers.len(), 1);
+        assert_eq!(layer.id, incoming);
+        assert_eq!(layer.list.as_ref().unwrap().id(), list_id);
+        assert_eq!(layer.visibility.value(), closing);
+        assert!(overlays.top_waits_for_paint());
+        tick(&mut overlays, &mut cx, 2.06);
+        tick(&mut overlays, &mut cx, 3.0);
+        assert_eq!(overlays.layers[0].visibility.value(), 1.0);
+        assert!(overlays.layers[0].visibility.scheduled_frame().is_none());
+
+        overlays.pop(&mut cx);
+        tick(&mut overlays, &mut cx, 4.0);
+        tick(&mut overlays, &mut cx, 5.0);
+        assert!(overlays.layers.is_empty());
+        assert!(!overlays.is_modal());
+    }
+
+    #[test]
+    fn full_screen_sheet_transition_reverses_and_releases_input() {
+        modal_transition_lifecycle(|overlays, _| {
+            overlays.open_sheet(Box::new(crate::shell::sheets::host_dialog::ScanSheet::new()))
+        });
+    }
+
+    #[test]
+    fn small_dialog_transition_reverses_and_releases_input() {
+        let mut id = 0;
+        modal_transition_lifecycle(|overlays, cx| {
+            id += 1;
+            overlays.open(
+                cx,
+                OverlayRequest {
+                    id,
+                    owner: "test".into(),
+                    window: "main".into(),
+                    kind: OverlayKind::Confirm {
+                        title: "Remove host".into(),
+                        message: "Remove this host?".into(),
+                        confirm_label: "Remove".into(),
+                        destructive: true,
+                    },
+                },
+                None,
+            );
+            id
+        });
+    }
 
     #[test]
     fn toast_only_owns_wheel_inside_its_window() {

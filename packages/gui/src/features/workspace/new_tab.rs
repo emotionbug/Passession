@@ -32,7 +32,6 @@ use super::rpc::{
 use super::select::{
     Leading, SelectOption, SelectRequest, WaSelectWidgetExt, WaSelectWidgetRefExt,
 };
-use crate::common::clock;
 use crate::common::file_drop::FileDropZone;
 use crate::common::overlay::{self, MenuItem};
 use crate::common::paint::{Font, Painter, TextSpec, rect};
@@ -423,21 +422,11 @@ impl Widget for WaAttachmentPill {
                 self.paint_texts(cx, body, title_spec, sub_spec, &title, &subtitle);
             }
             PillBody::Pending { title, subtitle } => {
-                let area = self.painter.ring(
+                self.painter.spinner(
                     cx,
                     rect(body.pos.x + 12.0, body.pos.y + 15.0, 18.0, 18.0),
                     p.muted,
-                    2.0,
-                    0.3,
-                    clock::phase(900),
-                );
-                clock::spin(
-                    cx,
-                    area,
-                    live_id!(rotation),
-                    clock::RING_CADENCE,
-                    900.0,
-                    0.0,
+                    [2.0, 0.3],
                 );
                 self.paint_texts(cx, body, title_spec, sub_spec, &title, &subtitle);
             }

@@ -18,13 +18,13 @@ use super::permission::{self, AnswerField};
 use super::tools::{
     self, ToolGlyph, build_tool_call_presentation, detail_blocks, detail_is_full_bleed,
 };
+use crate::common::transition::tokens;
 use crate::common::widgets::{InlineMetrics, RowMetrics};
 use makepad_widgets::*;
 use paseo_gui_core::CoreHandle;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
 
 pub const STREAM_METADATA_SIZE: f64 = 13.0;
 
@@ -1562,31 +1562,13 @@ pub fn draw_badge(
     }
     if badge.loading {
         // Shimmer: a bright peak sweeping across the labels.
-        let duration = (1.25
-            + (badge.label.trim().chars().count()
-                + badge
-                    .secondary
-                    .as_deref()
-                    .map(|s| s.trim().chars().count())
-                    .unwrap_or(0)) as f64
-                * 0.008
-            - if badge.label.len() <= 12 { 0.25 } else { 0.0 })
-        .clamp(1.0, 2.3);
         let width = end_x - lx;
-        let peak = if look.mobile {
-            (width * 0.28).clamp(32.0, 120.0)
-        } else {
-            (width * 0.22).clamp(42.0, 120.0)
-        };
         if !d.dry() && width > 0.0 {
             d.indicator(
                 cx,
                 Indicator::Shimmer {
                     rect: rect_xywh(lx, y, width, header_h),
                     color: vec4(1.0, 1.0, 1.0, if look.dark() { 0.9 } else { 0.55 }),
-                    duration,
-                    peak,
-                    travel: width + if look.mobile { 2.0 * peak } else { peak },
                     label,
                     label_pos,
                     secondary,
@@ -1942,7 +1924,7 @@ fn footer(
                 let reveal_key = format!("stamp:{id}");
                 let swap = !duration.is_empty() && !stamp.is_empty();
                 let expiry = swap
-                    .then(|| d.state.copy_expiry(&reveal_key, Duration::from_secs(3)))
+                    .then(|| d.state.copy_expiry(&reveal_key, tokens::TIMESTAMP_PEEK))
                     .flatten();
                 let hovered = swap && d.state.hover_hit.as_deref() == Some(reveal_key.as_str());
                 let pos = dvec2(cursor, top + 4.0);

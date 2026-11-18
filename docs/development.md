@@ -157,6 +157,30 @@ fewer actual draws or events. This is wall-clock timing, not a CPU profile.
 Without the opt-in, no reporter starts and the hooks do not sample clocks or
 collect data.
 
+### UI motion
+
+First-party motion lives in `common::transition`. Choose an `Intent` for a bounded
+change (navigation, peer switch, cover, hover/press, disclosure, feedback, or settling
+position). `Intent::resolve` selects Material on Android, Cupertino on iOS, and the
+desktop style on macOS, Windows and Linux. Add a style by mapping the semantic intent
+to a shared timing spec and, where needed, a pure `Pattern`; use `resolve_for` to
+exercise every style family in tests. This is app-owned motion, not a native OS
+animation API; `Spec::IMMEDIATE` is available for intentional snap paths.
+
+Drive the intent through `Transition`; app dispatch coalesces its `NextFrame` requests
+onto one stream. On each wake update only the retained surface's transform/opacity or
+shader instance. Keep geometry at its settled position, and never run widget layout
+or text measurement, invalidate a child draw tree, or allocate on each tick. Prefer
+draw-list transforms; for subtree fades that must use an offscreen texture, capture
+once at the motion boundary, composite the cached image, and release it at settle.
+Keep input ownership independent of render retention and leave modal Back routing first.
+
+For repeating indicators use `Loop` timing/easing with the visibility-aware
+`common::clock` scheduler below, not `NextFrame`. The frame trace reports aggregate
+event, draw and render costs; compare a single motion window with an idle window and
+check the retained layer counters for unexpected paints. Texture memory estimates use
+physical pixel dimensions × bytes per pixel × number of simultaneous attachments.
+
 ### Indicator redraws
 
 Draw time-dependent GUI indicators through `common::clock`. Register a

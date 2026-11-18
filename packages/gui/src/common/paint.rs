@@ -6,12 +6,14 @@
 //! to resolve which item is under the pointer.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::rc::Rc;
 
 use makepad_widgets::makepad_draw::text::layouter::LaidoutText;
 use makepad_widgets::*;
 
 use crate::common::icons;
+use crate::common::transition::Loop;
 use crate::theme::{DrawBox, DrawRing, Typography};
 
 live_design! {
@@ -78,9 +80,6 @@ pub struct Painter {
     pub text_mono: DrawText,
     #[live]
     pub text_icon: DrawText,
-    /// Multiplies everything this painter draws (fade-in transitions); 1 when opaque.
-    #[rust(1.0)]
-    alpha: f32,
 }
 
 /// A text style for one call: font, size in logical px (already scaled) and colour.
@@ -155,20 +154,10 @@ impl Painter {
     }
 
     fn prepare(&mut self, spec: TextSpec) -> &mut DrawText {
-        let alpha = self.alpha;
         let drawer = self.drawer(spec.font);
         drawer.text_style.font_size = Typography::pt(spec.size);
-        drawer.color = Vec4 {
-            w: spec.color.w * alpha,
-            ..spec.color
-        };
+        drawer.color = spec.color;
         drawer
-    }
-
-    /// Fades everything drawn next by `alpha` (`FadeTransition`); reset to 1 afterwards.
-    pub fn set_alpha(&mut self, alpha: f32) {
-        self.alpha = alpha;
-        self.draw_box.opacity = alpha;
     }
 
     pub fn layout(
@@ -358,10 +347,7 @@ impl Painter {
         let glyph = icons::text(name);
         let drawer = &mut self.text_icon;
         drawer.text_style.font_size = Typography::pt(size);
-        drawer.color = Vec4 {
-            w: color.w * self.alpha,
-            ..color
-        };
+        drawer.color = color;
         let laid = drawer.layout(cx, 0.0, 0.0, None, false, Align::default(), &glyph);
         let w = laid.size_in_lpxs.width as f64;
         let h = laid.size_in_lpxs.height as f64;
@@ -483,10 +469,7 @@ impl Painter {
         progress: f64,
         rotation: f64,
     ) -> Area {
-        self.draw_ring.color = Vec4 {
-            w: color.w * self.alpha,
-            ..color
-        };
+        self.draw_ring.color = color;
         self.draw_ring.stroke = stroke as f32;
         self.draw_ring.progress = progress as f32;
         self.draw_ring.rotation = rotation as f32;
@@ -494,64 +477,70 @@ impl Painter {
         self.draw_ring.area()
     }
 
-    pub fn spinner(
+    pub fn spinner(&mut self, cx: &mut Cx2d, rect: Rect, color: Vec4, [stroke, sweep]: [f64; 2]) {
+        self.loading_ring(cx, rect, color, [stroke, sweep], Loop::Spinner);
+    }
+
+    pub fn loading_ring(
         &mut self,
         cx: &mut Cx2d,
         rect: Rect,
         color: Vec4,
         [stroke, sweep]: [f64; 2],
-        cycle_ms: f64,
+        token: Loop,
     ) {
         use super::clock;
-        let area = self.ring(
-            cx,
-            rect,
-            color,
-            stroke,
-            sweep,
-            clock::rotation(cycle_ms, 0.0),
-        );
-        clock::spin(
-            cx,
-            area,
-            live_id!(rotation),
-            clock::MOTION_PERIOD,
-            cycle_ms,
-            0.0,
-        );
+        let area = self.ring(cx, rect, color, stroke, sweep, clock::loop_phase(token));
+        clock::animate(cx, area, live_id!(rotation), token);
     }
 
-    pub fn loading_bar(
-        &mut self,
-        cx: &mut Cx2d,
-        rect: Rect,
-        color: Vec4,
-        cycle_ms: f64,
-        cadence: std::time::Duration,
-    ) {
+    pub fn loading_bar(&mut self, cx: &mut Cx2d, rect: Rect, color: Vec4) {
         use super::clock;
-        self.loading_bar.color = Vec4 {
-            w: color.w * self.alpha,
-            ..color
-        };
-        self.loading_bar.phase = clock::rotation(cycle_ms, 0.0) as f32;
+        self.loading_bar.color = color;
+        self.loading_bar.phase = clock::loop_phase(Loop::LoadingBar) as f32;
         self.loading_bar.draw_abs(cx, rect);
-        clock::spin(
+        clock::animate(
             cx,
             self.loading_bar.area(),
             live_id!(phase),
-            cadence,
-            cycle_ms,
-            0.0,
+            Loop::LoadingBar,
         );
+    }
+}
+
+/// Shared by a retained paint layer and its recorded hits. Moving the layer
+/// changes every hit's effective coordinates without rebuilding the hit map.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HitViewport(Rc<Cell<(Rect, DVec2)>>);
+
+impl HitViewport {
+    pub(crate) fn place(&self, clip: Rect, shift: DVec2) {
+        self.0.set((clip, shift));
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PaintedHit<T> {
+    rect: Rect,
+    pub(crate) item: T,
+    viewport: Option<HitViewport>,
+}
+
+impl<T> PaintedHit<T> {
+    fn visible_rect(&self) -> Rect {
+        self.viewport.as_ref().map_or(self.rect, |viewport| {
+            let (clip, shift) = viewport.0.get();
+            intersect(self.rect.translate(shift), clip)
+        })
     }
 }
 
 /// Rects painted for interactive items, resolved against pointer positions.
 #[derive(Clone, Debug)]
 pub struct HitMap<T: Clone> {
-    items: Vec<(Rect, T)>,
+    items: Vec<PaintedHit<T>>,
     clip: Option<Rect>,
+    viewport: Option<HitViewport>,
 }
 
 impl<T: Clone> Default for HitMap<T> {
@@ -559,6 +548,7 @@ impl<T: Clone> Default for HitMap<T> {
         Self {
             items: Vec::new(),
             clip: None,
+            viewport: None,
         }
     }
 }
@@ -567,11 +557,17 @@ impl<T: Clone + PartialEq> HitMap<T> {
     pub fn clear(&mut self) {
         self.items.clear();
         self.clip = None;
+        self.viewport = None;
     }
 
     /// Restricts following pushes to `clip` (scrolled list viewport).
     pub fn set_clip(&mut self, clip: Option<Rect>) {
         self.clip = clip;
+    }
+
+    /// Assigns a paint-coordinate viewport transform to subsequent hits.
+    pub(crate) fn set_viewport(&mut self, viewport: Option<HitViewport>) {
+        self.viewport = viewport;
     }
 
     pub fn push(&mut self, rect: Rect, item: T) {
@@ -580,7 +576,11 @@ impl<T: Clone + PartialEq> HitMap<T> {
             None => rect,
         };
         if rect.size.x > 0.0 && rect.size.y > 0.0 {
-            self.items.push((rect, item));
+            self.items.push(PaintedHit {
+                rect,
+                item,
+                viewport: self.viewport.clone(),
+            });
         }
     }
 
@@ -589,16 +589,20 @@ impl<T: Clone + PartialEq> HitMap<T> {
         self.items
             .iter()
             .rev()
-            .find(|(rect, _)| rect.contains(pos))
-            .map(|(_, item)| item.clone())
+            .find(|hit| {
+                let rect = hit.visible_rect();
+                rect.size.x > 0.0 && rect.size.y > 0.0 && rect.contains(pos)
+            })
+            .map(|hit| hit.item.clone())
     }
 
     pub fn rect_of(&self, item: &T) -> Option<Rect> {
         self.items
             .iter()
             .rev()
-            .find(|(_, it)| it == item)
-            .map(|(rect, _)| *rect)
+            .filter(|hit| &hit.item == item)
+            .map(PaintedHit::visible_rect)
+            .find(|rect| rect.size.x > 0.0 && rect.size.y > 0.0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -610,12 +614,12 @@ impl<T: Clone + PartialEq> HitMap<T> {
     }
 
     /// Items pushed after `mark` (a previous [`HitMap::len`]).
-    pub fn since(&self, mark: usize) -> &[(Rect, T)] {
+    pub(crate) fn since(&self, mark: usize) -> &[PaintedHit<T>] {
         self.items.get(mark..).unwrap_or_default()
     }
 
     /// Re-adds items recorded by an earlier frame, unclipped and in their original order.
-    pub fn replay(&mut self, items: &[(Rect, T)]) {
+    pub(crate) fn replay(&mut self, items: &[PaintedHit<T>]) {
         self.items.extend_from_slice(items);
     }
 }

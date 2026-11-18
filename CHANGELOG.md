@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- Animate moving between screens on phones and narrow windows. Opening a session from the menu slides it in, and going back to the menu slides it out; detail views (files, diffs, subagents, logs) and the file explorer do the same. A transition that is interrupted turns around from where it is, and a window resize ends it at its destination.
+
+### Changed
+
+- Move every animation in the app onto one shared motion library with a style per platform: Material-style motion on Android, iOS-style push and sheet motion on iOS, and short, subtle fades and slides on desktop. Screen changes, the Tasks and Subagents lists (desktop popovers now fade in place and crossfade when switching; phone sheets slide with a fading backdrop), sheets and dialogs, the file-drop overlay, carets, spinners, loading bars and status indicators, the prompt outline, and touch flings all use it. New animations pick a purpose (open a sheet, go back, switch between peers, and so on) rather than their own timing, so they look consistent and can be reused.
+- Run animations without laying out or redrawing the content they move. Each animation frame only moves or fades already-drawn layers, so content is laid out once per transition instead of on every frame, and nothing is drawn once motion stops. A phone-sized session push took 3 layout passes in total, at about 0.9 ms of app work per frame (debug build, software rendering). The menu now scrolls during a fling by moving its drawn rows instead of redrawing them on every frame.
+
 ### Fixed
 
 - Publish current installers with every release that changes the app, daemon, Tailnet or update helper. A release only rebuilt the Windows installer, Linux deb and AppImage when the packaging files changed, so 0.13.41 published none and pointed new installs at 0.13.40's installers, which installed a daemon without the tray icon. An installer now gets rebuilt whenever a component inside it is rebuilt.

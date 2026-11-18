@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::common::paint::{Font, TextSpec, rect};
 use crate::common::provider_icon::ProviderIcon;
+use crate::common::transition::{Intent, Transition};
 use crate::common::widgets::{StatusBucket, agent_live_status_bucket, paint_status_badge};
 use crate::common::{PanelTarget, Route, UiContext, icons, json as j, layer, tr, tr_args};
 use crate::shell::hosts::{self, Host};
@@ -36,19 +37,30 @@ pub struct ChromeState {
     pub header_git_w: f64,
     /// Active drag: (kind, id, origin abs, origin value).
     pub drag: Option<Drag>,
-    /// Compact explorer slide position 0..1 and the animation it is heading to.
-    pub explorer_position: f64,
-    pub explorer_target: f64,
-    pub explorer_anim: Option<NextFrame>,
-    pub explorer_anim_start: Option<(f64, f64, f64)>,
+    pub(crate) explorer: Transition,
+    explorer_layer: layer::Layer,
+    explorer_list: Option<DrawList2d>,
+    explorer_slot: Option<Slot>,
+    explorer_scrim: Area,
+    explorer_window: Rect,
     pub edge_start: Option<DVec2>,
     pub drop_pane: Option<String>,
     /// A touch that started in a pane: (touch id, pane, start) until it lifts as a tap.
     pub touch_focus: Option<(u64, String, DVec2)>,
     /// Regions the last chrome paint laid out, each painted into its own retained layer.
     pub slots: Vec<Slot>,
-    /// The compact Explorer is drawn inside the overlay layer: its root paints inline.
+    /// Route slots while laying out the Explorer toolbar.
     pub overlay_pass: bool,
+}
+
+impl ChromeState {
+    pub(crate) fn explorer_visible(&self) -> bool {
+        self.explorer.value() > 0.0 || self.explorer.is_moving()
+    }
+
+    pub(crate) fn invalidate_explorer(&self, cx: &mut Cx) {
+        self.explorer_layer.invalidate(cx);
+    }
 }
 
 /// A region laid out by the chrome paint that owns a retained layer (`common::layer`).
@@ -80,15 +92,6 @@ pub enum Drag {
         from_pane: String,
         start: DVec2,
         moving: bool,
-    },
-    /// Compact explorer horizontal pan.
-    ExplorerPan {
-        start_x: f64,
-        start_position: f64,
-        opening: bool,
-        last_x: f64,
-        last_time: f64,
-        velocity: f64,
     },
 }
 
@@ -226,7 +229,7 @@ pub(super) fn visible_tabs(data: &super::Data, explorer: Option<&str>) -> HashSe
             out.insert(key.clone());
         }
         if (layout.compact_destination == CompactDestination::Explorer
-            || data.chrome.explorer_position > 0.0)
+            || data.chrome.explorer_visible())
             && let Some(key) = explorer
         {
             out.insert(key.to_owned());
@@ -292,7 +295,13 @@ pub(crate) fn text_line_height(height: f64, font_size: f64) -> f64 {
 /// Composes one window from retained layers: the chrome, then the sidebar, pane-root and
 /// page layers it laid out. Only invalidated layers repaint; the others replay their retained
 /// draw calls and shell hit regions.
-pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
+pub(super) fn draw_live(
+    shell: &mut PaseoShell,
+    cx: &mut Cx2d,
+    scope: &mut Scope,
+    r: Rect,
+    retire_hidden: bool,
+) {
     shell.data.hits.clear();
     shell.data.tooltips.clear();
     // Safe-area and keyboard insets move the chrome without changing the window rect.
@@ -331,7 +340,7 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
             .end(cx, &shell.data.hits, &shell.data.tooltips);
     }
     let slots = shell.data.chrome.slots.clone();
-    if !slots.iter().any(|slot| matches!(slot, Slot::Sidebar(_))) {
+    if retire_hidden && !slots.iter().any(|slot| matches!(slot, Slot::Sidebar(_))) {
         shell.data.sidebar.viewport = Rect::default();
         shell.data.sidebar.header_layer.finish_frame(cx);
         shell.data.sidebar.tree_layer.finish_frame(cx);
@@ -339,10 +348,6 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect) {
     }
     for slot in slots {
         draw_slot(shell, cx, scope, slot);
-    }
-    shell.layers.finish_frame(cx);
-    for panel in shell.data.panels.values_mut() {
-        panel.layer.finish_frame(cx);
     }
 }
 
@@ -415,9 +420,9 @@ fn draw_chrome(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect
         return;
     }
     if compact {
-        draw_compact(shell, cx, scope, &state, content, page_shown);
+        draw_compact(shell, cx, &state, content, page_shown);
     } else {
-        draw_wide(shell, cx, scope, &state, content, page_shown);
+        draw_wide(shell, cx, &state, content, page_shown);
     }
 }
 
@@ -446,7 +451,7 @@ fn draw_slot(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, slot: Slo
                 shell.data.sidebar.footer_layer.finish_frame(cx);
             }
         }
-        Slot::Root { key, rect } => paint_root(shell, cx, scope, &key, rect, true),
+        Slot::Root { key, rect } => paint_root(shell, cx, scope, &key, rect),
         Slot::Page(r) => paint_page(shell, cx, scope, r),
         Slot::Sessions(r) => {
             if shell
@@ -937,7 +942,6 @@ fn draw_header_git(
 fn draw_wide(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
-    scope: &mut Scope,
     state: &paseo_gui_core::CoreState,
     content: Rect,
     page_shown: bool,
@@ -991,7 +995,7 @@ fn draw_wide(
         draw_page(shell, cx, main);
     } else {
         let tree = shell.data.layout.tree.clone();
-        draw_node(shell, cx, scope, state, &tree, main);
+        draw_node(shell, cx, state, &tree, main);
     }
     if explorer_visible {
         let handle = rect(main_right, content.pos.y, 5.0, content.size.y);
@@ -1003,7 +1007,6 @@ fn draw_wide(
         draw_pane(
             shell,
             cx,
-            scope,
             state,
             "explorer",
             &keys,
@@ -1017,7 +1020,6 @@ fn draw_wide(
 fn draw_node(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
-    scope: &mut Scope,
     state: &paseo_gui_core::CoreState,
     node: &Node,
     r: Rect,
@@ -1037,17 +1039,7 @@ fn draw_node(
             let id = pane.id.clone();
             let tabs = pane.tabs.clone();
             let selected = pane.selected.clone();
-            draw_pane(
-                shell,
-                cx,
-                scope,
-                state,
-                &id,
-                &tabs,
-                selected.as_deref(),
-                r,
-                false,
-            );
+            draw_pane(shell, cx, state, &id, &tabs, selected.as_deref(), r, false);
         }
         Node::Split {
             id,
@@ -1059,9 +1051,9 @@ fn draw_node(
             if let Some(maximized) = shell.data.layout.maximized_pane.clone() {
                 // Only the branch holding the maximized pane is shown, full size.
                 if first.contains_pane(&maximized) {
-                    draw_node(shell, cx, scope, state, first, r);
+                    draw_node(shell, cx, state, first, r);
                 } else {
-                    draw_node(shell, cx, scope, state, second, r);
+                    draw_node(shell, cx, state, second, r);
                 }
                 return;
             }
@@ -1082,11 +1074,11 @@ fn draw_node(
                     rect(r.pos.x, r.pos.y + a + 5.0, r.size.x, r.size.y - a - 5.0),
                 )
             };
-            draw_node(shell, cx, scope, state, first, r1);
+            draw_node(shell, cx, state, first, r1);
             shell.painter.fill(cx, handle, p.border, 0.0);
             shell.data.hits.push(handle, format!("split:{id}"));
             shell.data.chrome.splits.push((id.clone(), *axis, r));
-            draw_node(shell, cx, scope, state, second, r2);
+            draw_node(shell, cx, state, second, r2);
         }
     }
 }
@@ -1097,7 +1089,6 @@ fn draw_node(
 fn draw_pane(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
-    scope: &mut Scope,
     state: &paseo_gui_core::CoreState,
     pane_id: &str,
     keys: &[String],
@@ -1145,12 +1136,11 @@ fn draw_pane(
         draw_empty(shell, cx, content, has_sessions);
         return;
     };
-    place_root(shell, cx, scope, &key, content);
+    place_root(shell, cx, &key, content);
 }
 
-/// Mounts (first time) a tab root and lays it out in `r`: its own layer, or inline while the
-/// overlay draws the compact Explorer.
-fn place_root(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, key: &str, r: Rect) {
+/// Mounts a tab root on first use and queues its retained layer.
+fn place_root(shell: &mut PaseoShell, cx: &mut Cx2d, key: &str, r: Rect) {
     if !shell.data.panels.contains_key(key) {
         let Some(target) = shell.data.layout.target(key).cloned() else {
             return;
@@ -1173,7 +1163,10 @@ fn place_root(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, key: &st
         }
     }
     if shell.data.chrome.overlay_pass {
-        paint_root(shell, cx, scope, key, r, false);
+        shell.data.chrome.explorer_slot = Some(Slot::Root {
+            key: key.to_owned(),
+            rect: r,
+        });
     } else {
         shell.data.chrome.slots.push(Slot::Root {
             key: key.to_string(),
@@ -1182,15 +1175,8 @@ fn place_root(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, key: &st
     }
 }
 
-/// Draws a mounted tab root in `r`, in its retained layer when `layered`.
-fn paint_root(
-    shell: &mut PaseoShell,
-    cx: &mut Cx2d,
-    scope: &mut Scope,
-    key: &str,
-    r: Rect,
-    layered: bool,
-) {
+/// Draws a mounted tab root in its retained layer.
+fn paint_root(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, key: &str, r: Rect) {
     let focused = focused_tab(shell).as_deref() == Some(key);
     let app_active = !shell.data.app_inactive;
     let compact = shell.data.compact;
@@ -1219,25 +1205,19 @@ fn paint_root(
     }
     // Focus, activity and width class reach the root through `UiContext`, not its areas.
     let inputs = layer::inputs((focused, app_active, compact));
-    if !layered
-        || panel.layer.begin(
-            cx,
-            r,
-            inputs,
-            &mut shell.data.hits,
-            &mut shell.data.tooltips,
-        )
-    {
-        if layered {
-            // See `open_batches`; `panel` borrows `shell.data`.
-            shell.painter.draw_box.paint(cx, r, Vec4::default(), 0.0);
-        }
+    if panel.layer.begin(
+        cx,
+        r,
+        inputs,
+        &mut shell.data.hits,
+        &mut shell.data.tooltips,
+    ) {
+        // See `open_batches`; `panel` borrows `shell.data`.
+        shell.painter.draw_box.paint(cx, r, Vec4::default(), 0.0);
         cx.begin_turtle(Walk::abs_rect(r), Layout::default());
         widget.draw_walk_all(cx, scope, Walk::fill());
         cx.end_turtle();
-        if layered {
-            panel.layer.end(cx, &shell.data.hits, &shell.data.tooltips);
-        }
+        panel.layer.end(cx, &shell.data.hits, &shell.data.tooltips);
     }
     if let Some(ui) = scope.data.get_mut::<UiContext>() {
         ui.target = None;
@@ -1804,7 +1784,6 @@ fn paint_page(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: Rect)
 fn draw_compact(
     shell: &mut PaseoShell,
     cx: &mut Cx2d,
-    scope: &mut Scope,
     state: &paseo_gui_core::CoreState,
     content: Rect,
     page_shown: bool,
@@ -1823,7 +1802,6 @@ fn draw_compact(
             draw_pane(
                 shell,
                 cx,
-                scope,
                 state,
                 &pane.id,
                 &pane.tabs,
@@ -1843,69 +1821,101 @@ pub fn draw_compact_explorer(
     scope: &mut Scope,
     window: Rect,
 ) {
-    let position = shell.data.chrome.explorer_position;
-    if !shell.data.compact || position <= 0.0 {
+    if !shell.data.compact || !shell.data.chrome.explorer_visible() {
+        shell.data.chrome.explorer_layer.finish_frame(cx);
+        if let Some(list) = &mut shell.data.chrome.explorer_list {
+            list.release(cx);
+        }
+        shell.data.chrome.explorer_scrim = Area::Empty;
         return;
     }
-    let state = match scope.data.get::<UiContext>() {
-        Some(ui) => ui.state.clone(),
-        None => return,
+    let Some(state) = scope.data.get::<UiContext>().map(|ui| ui.state.clone()) else {
+        return;
     };
-    let p = theme::current_palette();
-    shell.overlay_painter.fill(
+    shell.data.chrome.explorer_window = window;
+    let visual = Intent::OpenExplorer
+        .resolve()
+        .sample(shell.data.chrome.explorer.value(), window.size);
+    shell.motion_scrim.new_draw_call(cx);
+    shell.motion_scrim.color = vec4(0.0, 0.0, 0.0, (visual.scrim * 0.5) as f32);
+    shell.motion_scrim.draw_abs(cx, window);
+    shell.data.chrome.explorer_scrim = shell.motion_scrim.area();
+    let mut list = shell
+        .data
+        .chrome
+        .explorer_list
+        .take()
+        .unwrap_or_else(|| DrawList2d::new(cx));
+    list.begin_always(cx);
+    let insets = crate::shell::platform::safe_insets();
+    let inputs = layer::inputs((
+        shell.data.layout.revision,
+        insets.left.to_bits(),
+        insets.right.to_bits(),
+        insets.top.to_bits(),
+        insets.bottom.to_bits(),
+    ));
+    std::mem::swap(&mut shell.painter, &mut shell.overlay_painter);
+    std::mem::swap(&mut shell.data.hits, &mut shell.data.overlays.hits);
+    std::mem::swap(&mut shell.data.tooltips, &mut shell.data.overlays.tooltips);
+    shell.data.hits.push(window, "compact:backdrop".to_owned());
+    if shell.data.chrome.explorer_layer.begin(
         cx,
         window,
-        with_alpha(vec4(0.0, 0.0, 0.0, 1.0), (0.5 * position) as f32),
-        0.0,
-    );
-    shell
-        .data
-        .overlays
-        .hits
-        .push(window, "compact:backdrop".to_string());
-    let insets = crate::shell::platform::safe_insets();
-    let x = window.pos.x + window.size.x * (1.0 - position);
-    let panel = rect(x, window.pos.y, window.size.x, window.size.y);
-    shell.overlay_painter.fill(cx, panel, p.sidebar, 0.0);
-    shell
-        .data
-        .overlays
-        .hits
-        .push(panel, "compact:panel".to_string());
-    let inner = rect(
-        panel.pos.x + insets.left,
-        panel.pos.y + insets.top + 8.0,
-        panel.size.x - insets.left - insets.right,
-        panel.size.y - insets.top - 8.0 - insets.bottom,
-    );
-    shell.data.chrome.explorer_rect = inner;
-    let (keys, selected) = explorer_keys(shell);
-    // The overlay repaints with every window composition while the chrome geometry is
-    // retained with the chrome layer: replace only the Explorer's own entries.
-    let chrome = &mut shell.data.chrome;
-    chrome.pane_rects.retain(|(pane, _)| pane != "explorer");
-    chrome.tab_bars.retain(|(pane, _)| pane != "explorer");
-    chrome.tab_rects.retain(|(pane, _, _)| pane != "explorer");
-    chrome.tab_overflow.retain(|(pane, _)| pane != "explorer");
-    chrome.overlay_pass = true;
-    // The compact Explorer's tab rail lives in the overlay layer's hit map.
+        inputs,
+        &mut shell.data.hits,
+        &mut shell.data.tooltips,
+    ) {
+        let p = theme::current_palette();
+        shell.painter.fill(cx, window, p.sidebar, 0.0);
+        shell.data.hits.push(window, "compact:panel".to_owned());
+        let inner = rect(
+            window.pos.x + insets.left,
+            window.pos.y + insets.top + 8.0,
+            window.size.x - insets.left - insets.right,
+            window.size.y - insets.top - 8.0 - insets.bottom,
+        );
+        let (keys, selected) = explorer_keys(shell);
+        let chrome = &mut shell.data.chrome;
+        chrome.explorer_rect = inner;
+        chrome.pane_rects.retain(|(pane, _)| pane != "explorer");
+        chrome.tab_bars.retain(|(pane, _)| pane != "explorer");
+        chrome.tab_rects.retain(|(pane, _, _)| pane != "explorer");
+        chrome.tab_overflow.retain(|(pane, _)| pane != "explorer");
+        chrome.explorer_slot = None;
+        chrome.overlay_pass = true;
+        draw_pane(
+            shell,
+            cx,
+            &state,
+            "explorer",
+            &keys,
+            selected.as_deref(),
+            inner,
+            true,
+        );
+        shell.data.chrome.overlay_pass = false;
+        shell
+            .data
+            .chrome
+            .explorer_layer
+            .end(cx, &shell.data.hits, &shell.data.tooltips);
+    }
+    if let Some(slot) = shell.data.chrome.explorer_slot.clone() {
+        draw_slot(shell, cx, scope, slot);
+    }
+    // During motion the unshifted hit geometry is deliberately never dispatched.
+    if shell.data.chrome.explorer.is_moving() {
+        shell.data.hits.clear();
+        shell.data.tooltips.clear();
+    }
+    std::mem::swap(&mut shell.data.tooltips, &mut shell.data.overlays.tooltips);
+    std::mem::swap(&mut shell.data.hits, &mut shell.data.overlays.hits);
     std::mem::swap(&mut shell.painter, &mut shell.overlay_painter);
-    let hits = std::mem::take(&mut shell.data.hits);
-    shell.data.hits = std::mem::take(&mut shell.data.overlays.hits);
-    draw_pane(
-        shell,
-        cx,
-        scope,
-        &state,
-        "explorer",
-        &keys,
-        selected.as_deref(),
-        inner,
-        true,
-    );
-    shell.data.chrome.overlay_pass = false;
-    shell.data.overlays.hits = std::mem::replace(&mut shell.data.hits, hits);
-    std::mem::swap(&mut shell.painter, &mut shell.overlay_painter);
+    shell.data.chrome.explorer_layer.finish_frame(cx);
+    list.end(cx);
+    shell.data.chrome.explorer_list = Some(list);
+    place_explorer(shell, cx);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1994,10 +2004,9 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
             shell.redraw_hit_owners(cx, &[previous.as_deref(), id.as_deref()]);
         }
         Hit::FingerMove(fe) => {
-            if fe.device.is_touch() && shell.data.sidebar.touch_move(fe.abs, fe.time) {
+            if fe.device.is_touch() && shell.data.sidebar.touch_move(cx, fe.abs, fe.time) {
                 let previous = shell.data.pointer.pressed.take();
                 shell.data.chrome.edge_start = None;
-                shell.data.sidebar.tree_layer.invalidate(cx);
                 shell.redraw_hit_owners(cx, &[previous.as_deref()]);
                 return;
             }
@@ -2029,7 +2038,9 @@ pub fn handle_event(shell: &mut PaseoShell, cx: &mut Cx, event: &Event, scope: &
                 if delta.x.abs() >= 80.0 && delta.x.abs() >= delta.y.abs() * 2.0 {
                     let layout = &mut shell.data.layout;
                     if delta.x > 0.0 && layout.compact_destination == CompactDestination::Agent {
-                        layout.show_sidebar(true, true);
+                        if let Some(ui) = scope.data.get_mut::<UiContext>() {
+                            commands::back(shell, cx, ui);
+                        }
                     } else if delta.x < 0.0
                         && layout.compact_destination == CompactDestination::Sidebar
                     {
@@ -2170,7 +2181,6 @@ fn update_drag(shell: &mut PaseoShell, _cx: &mut Cx, abs: DVec2, _time: f64) -> 
             });
             moving
         }
-        Drag::ExplorerPan { .. } => false,
     }
 }
 
@@ -2251,73 +2261,55 @@ fn finish_drag(shell: &mut PaseoShell, cx: &mut Cx, abs: DVec2) -> bool {
         }
         Drag::Tab { .. } => false,
         Drag::Split { .. } | Drag::Sidebar { .. } | Drag::Explorer { .. } => true,
-        Drag::ExplorerPan { .. } => true,
     }
 }
 
-/// 220ms `Cubic(0.25, 0.1, 0.25, 1)` slide of the compact Explorer towards its destination.
+fn place_explorer(shell: &PaseoShell, cx: &mut Cx) {
+    let chrome = &shell.data.chrome;
+    let visual = Intent::OpenExplorer
+        .resolve()
+        .sample(chrome.explorer.value(), chrome.explorer_window.size);
+    if let Some(list) = &chrome.explorer_list {
+        crate::common::overlay::place_layer(
+            cx,
+            list,
+            Rect {
+                pos: visual.incoming.offset,
+                size: chrome.explorer_window.size,
+            },
+            1.0,
+        );
+    }
+    crate::common::overlay::update_scrim(cx, chrome.explorer_scrim, (visual.scrim * 0.5) as f32);
+}
+
 pub(crate) fn animate_explorer(shell: &mut PaseoShell, cx: &mut Cx, event: &Event) {
-    let open =
-        shell.data.compact && shell.data.layout.compact_destination == CompactDestination::Explorer;
-    let target = if open { 1.0 } else { 0.0 };
-    let chrome = &mut shell.data.chrome;
-    if matches!(chrome.drag, Some(Drag::ExplorerPan { .. })) {
-        chrome.explorer_anim = None;
-        chrome.explorer_anim_start = None;
-        return;
-    }
-    if !shell.data.compact {
-        chrome.explorer_position = 0.0;
-        chrome.explorer_anim = None;
-        chrome.explorer_anim_start = None;
-        return;
-    }
-    // Keep the pending frame until it arrives; replacing its token here prevents
-    // the first animation frame from ever matching.
-    if (chrome.explorer_target - target).abs() > f64::EPSILON
-        || (chrome.explorer_anim.is_none()
-            && chrome.explorer_anim_start.is_none()
-            && (chrome.explorer_position - target).abs() > 1e-3)
-    {
-        chrome.explorer_target = target;
-        chrome.explorer_anim_start = None;
-        chrome.explorer_anim = Some(cx.new_next_frame());
-    }
-    if let Some(frame) = chrome.explorer_anim.and_then(|next| next.is_event(event)) {
-        chrome.explorer_anim = None;
-        let (start_time, from, to) = *chrome.explorer_anim_start.get_or_insert((
-            frame.time,
-            chrome.explorer_position,
-            chrome.explorer_target,
-        ));
-        let t = ((frame.time - start_time) / 0.22).clamp(0.0, 1.0);
-        chrome.explorer_position = from + (to - from) * cubic_ease(t);
-        if t < 1.0 {
-            chrome.explorer_anim = Some(cx.new_next_frame());
-        } else {
-            chrome.explorer_anim_start = None;
-            chrome.explorer_position = to;
+    let open = shell.data.compact
+        && shell.data.page.is_none()
+        && shell.data.layout.compact_destination == CompactDestination::Explorer;
+    let intent = if open {
+        Intent::OpenExplorer
+    } else {
+        Intent::CloseExplorer
+    };
+    let position = if open { 1.0 } else { 0.0 };
+    if !shell.data.compact || shell.data.page.is_some() {
+        if shell.data.chrome.explorer.snap(position) {
+            shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
         }
+        return;
+    }
+    let explorer = &mut shell.data.chrome.explorer;
+    let retargeted = explorer.retarget(cx, position, intent.resolve().spec);
+    if explorer.advance(cx, event) {
+        if explorer.is_moving() {
+            place_explorer(shell, cx);
+        } else {
+            shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
+        }
+    } else if retargeted {
         shell.invalidate_region(cx, crate::shell::ShellRegion::Overlays);
     }
-}
-
-/// `Cubic(0.25, 0.1, 0.25, 1)` evaluated at `t` by bisection on x.
-fn cubic_ease(t: f64) -> f64 {
-    let (x1, y1, x2, y2) = (0.25, 0.1, 0.25, 1.0);
-    let bezier = |a: f64, b: f64, s: f64| {
-        3.0 * a * s * (1.0 - s).powi(2) + 3.0 * b * s * s * (1.0 - s) + s * s * s
-    };
-    let (mut lo, mut hi) = (0.0, 1.0);
-    for _ in 0..24 {
-        let mid = (lo + hi) * 0.5;
-        if bezier(x1, x2, mid) < t {
-            lo = mid
-        } else {
-            hi = mid
-        }
-    }
-    bezier(y1, y2, (lo + hi) * 0.5)
 }
 
 fn pane_at(shell: &PaseoShell, abs: DVec2) -> Option<String> {

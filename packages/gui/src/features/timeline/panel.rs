@@ -28,13 +28,16 @@ use super::session::{
     ActionKind, ChatSession, Completion, Cursor, ExecutionStatus, Io, SessionKey, SyncStatus,
 };
 use super::store::with_store;
+use super::tool_sheet::SheetMotion;
 use super::tracks::{self, DeleteFinished, SubagentRow, TrackModel, TrackPanel};
 use crate::common::file_drop::FileDropZone;
 use crate::common::overlay::{
-    self, AnchoredPopover, MenuEntry, MenuItem, MenuOptions, TapTarget, WindowModal,
+    self, AnchoredPopover, DrawLayerScrim, DrawLayerTexture, LayerTexture, MenuEntry, MenuItem,
+    MenuOptions, TapTarget, WindowModal,
 };
 use crate::common::paint::Painter;
 use crate::common::provider_icon::ProviderIcon;
+use crate::common::transition::{Intent, Transition, Visual};
 use crate::common::widgets::{PTextFieldWidgetRefExt, RowMetrics};
 use crate::common::{FileLinkIntent, PanelTarget, TabPlacement, UiContext, UiEffect};
 use crate::features::composer::ComposerPanelWidgetRefExt;
@@ -54,6 +57,8 @@ live_design! {
     use crate::theme::*;
     use crate::common::paint::*;
     use crate::common::widgets::*;
+    use crate::common::overlay::DrawLayerScrim;
+    use crate::common::overlay::DrawLayerTexture;
     use crate::features::timeline::canvas::*;
     use crate::features::timeline::chat_row::*;
     use crate::features::composer::ui::panel::ComposerPanel;
@@ -68,6 +73,8 @@ live_design! {
         width: Fill, height: Fill
         kit: <ChatKit> {}
         modal_kit: <ChatKit> {}
+        track_composite: <DrawLayerTexture> {}
+        track_scrim: <DrawLayerScrim> {}
         painter: <PaseoPainter> {}
         provider_icon: {
             fn get_color(self) -> vec4 {
@@ -381,7 +388,6 @@ enum Modal {
     Sheet {
         row: String,
         kind: String,
-        opened: f64,
     },
     Usage,
     Lightbox {
@@ -395,6 +401,128 @@ enum Modal {
         tab: PanelTarget,
     },
 }
+
+/// The active identity stays separate from its retained outgoing pixels.
+#[derive(Default)]
+struct TrackMotion {
+    panel: Option<TrackPanel>,
+    anchor: Option<TrackPanel>,
+    compact: bool,
+    open: bool,
+    presence: Transition,
+    peer: Transition,
+    pair: Option<(TrackPanel, TrackPanel)>,
+}
+
+impl TrackMotion {
+    fn intent(&self) -> Intent {
+        match (self.compact, self.open) {
+            (true, true) => Intent::OpenSheet,
+            (true, false) => Intent::CloseSheet,
+            (false, true) => Intent::OpenPopover,
+            (false, false) => Intent::ClosePopover,
+        }
+    }
+
+    fn show(&mut self, cx: &mut Cx, panel: TrackPanel, compact: bool) {
+        let previous = self.panel.replace(panel);
+        if previous.is_none() {
+            self.anchor = Some(panel);
+        }
+        self.compact = compact;
+        self.open = true;
+        self.presence
+            .retarget(cx, 1.0, self.intent().resolve().spec);
+        if !compact && let Some(old) = previous {
+            if self.pair.is_none() && old != panel {
+                self.pair = Some((old, panel));
+                self.peer.snap(0.0);
+            }
+            if let Some((from, _)) = self.pair {
+                let target = if panel == from { 0.0 } else { 1.0 };
+                self.peer
+                    .retarget(cx, target, Intent::SwitchPeer.resolve().spec);
+            }
+        }
+    }
+
+    fn close(&mut self, cx: &mut Cx) {
+        self.open = false;
+        self.peer.snap(self.peer.value());
+        self.presence
+            .retarget(cx, 0.0, self.intent().resolve().spec);
+        if !self.presence.is_moving() {
+            *self = Self::default();
+        }
+    }
+
+    fn advance(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        let presence = self.presence.advance(cx, event);
+        let peer = self.peer.advance(cx, event);
+        presence || peer
+    }
+
+    fn needs_capture(&self) -> bool {
+        !self.compact && (self.presence.is_moving() || self.peer.is_moving())
+    }
+
+    fn visual(&self, panel: TrackPanel, size: DVec2) -> Visual {
+        let mut visual = self
+            .intent()
+            .resolve()
+            .sample(self.presence.value(), size)
+            .incoming;
+        if let Some((from, _)) = self.pair {
+            let peer = Intent::SwitchPeer.resolve().sample(self.peer.value(), size);
+            let peer = if panel == from {
+                peer.outgoing
+            } else {
+                peer.incoming
+            };
+            visual.offset += peer.offset;
+            visual.opacity *= peer.opacity;
+            visual.scale *= peer.scale;
+        }
+        visual
+    }
+}
+
+struct TrackLayer {
+    list: DrawList2d,
+    capture: Option<LayerTexture>,
+    layout: Option<tracks::PanelLayout>,
+    quad: Area,
+}
+
+impl TrackLayer {
+    fn new(cx: &mut Cx) -> Self {
+        Self {
+            list: DrawList2d::new(cx),
+            capture: None,
+            layout: None,
+            quad: Area::Empty,
+        }
+    }
+
+    fn paint_size(size: DVec2, compact: bool) -> DVec2 {
+        size + dvec2(0.0, if compact { 0.0 } else { 4.0 })
+    }
+
+    fn visual_rect(layout: &tracks::PanelLayout, visual: Visual, compact: bool) -> Rect {
+        let pivot = if compact || !layout.above { 0.0 } else { 1.0 };
+        overlay::layer_rect(layout.card, visual, dvec2(0.5, pivot))
+    }
+
+    fn release_capture(&mut self, cx: &mut Cx) {
+        overlay::release_layer_quad(cx, std::mem::take(&mut self.quad));
+        if let Some(capture) = self.capture.take() {
+            capture.detach(cx);
+        }
+    }
+}
+
+const TRACKS_PANELS: [TrackPanel; 2] = [TrackPanel::Tasks, TrackPanel::Subagents];
+const TRACK_SCRIM_ALPHA: f64 = 115.0 / 255.0;
 
 enum LightboxSource {
     Assistant { url: String, row: String },
@@ -608,9 +736,10 @@ pub struct ChatPanel {
     content_rect: Rect,
     #[rust]
     composer_h: f64,
-    /// Display-rate motion only during a modal sheet transition.
     #[rust]
-    transition_frame: NextFrame,
+    detail_motion: SheetMotion,
+    #[rust]
+    detail_area: Area,
     /// A row jump (seqStart, offset below the row top, find match) whose row
     /// is not in the stream model yet: applied after the next model rebuild.
     #[rust]
@@ -667,6 +796,34 @@ pub struct ChatPanel {
     // Tracks.
     #[rust]
     track_anchors: [Area; 2],
+    #[rust]
+    track_motion: TrackMotion,
+    #[rust]
+    track_layers: [Option<TrackLayer>; 2],
+    #[rust(DrawList2d::new(cx))]
+    track_overlay: DrawList2d,
+    #[live]
+    track_composite: DrawLayerTexture,
+    #[live]
+    track_scrim: DrawLayerScrim,
+    #[rust]
+    track_scrim_area: Area,
+    #[rust]
+    track_backdrop: Area,
+    #[rust]
+    track_hit_rect: Option<(Rect, f64)>,
+    #[rust]
+    track_painted_panel: Option<TrackPanel>,
+    #[rust]
+    track_dirty: Cell<bool>,
+    #[rust]
+    track_bounds: Rect,
+    #[rust]
+    track_anchor_rect: Option<Rect>,
+    #[rust]
+    track_inset: f64,
+    #[rust]
+    track_dpi: f64,
     #[rust]
     track_popover: Option<AnchoredPopover>,
     #[rust]
@@ -730,9 +887,9 @@ pub struct ChatPanel {
     /// A scroll bar thumb drag on the modal (true) or chrome canvas.
     #[rust]
     bar_drag: Option<(super::scrollbar::BarDrag, bool)>,
-    #[rust]
+    #[rust(crate::common::widgets::touch_scroll())]
     modal_touch_scroll: TouchScroll,
-    #[rust]
+    #[rust(crate::common::widgets::touch_scroll())]
     modal_horizontal_scroll: TouchScroll,
     #[rust]
     pressed: TapTarget<HitTarget>,
@@ -802,6 +959,7 @@ impl ChatPanel {
     }
 
     fn redraw_modal(&self, cx: &mut Cx) {
+        self.track_dirty.set(true);
         self.modal_content_list.redraw(cx);
         self.area.redraw(cx);
     }
@@ -891,6 +1049,7 @@ impl ChatPanel {
                 self.release_reveal_backlog();
             } else {
                 self.pressed.cancel();
+                self.rail.hide(cx);
                 self.dismiss_modal(cx);
             }
             self.redraw_session(cx);
@@ -913,21 +1072,25 @@ impl ChatPanel {
     }
 
     fn input_is_modal(&self) -> bool {
-        self.modal.is_some() && self.track_popover.is_none()
+        match self.modal {
+            Some(Modal::Sheet { .. }) => self.detail_motion.open,
+            Some(_) => self.track_popover.is_none(),
+            None => false,
+        }
     }
 
     fn reconcile_track_popover(&mut self, cx: &mut Cx) {
         if self.track_popover.as_ref().is_some_and(|p| !p.is_open()) {
-            self.dismiss_modal(cx);
+            self.close_track(cx);
         }
     }
 
     fn sync_window_modal(&mut self, cx: &mut Cx, ui: &UiContext) {
         let composer_modal = self.composer.as_composer_panel().captures_input();
         if !matches!(self.modal, Some(Modal::Track(_))) {
-            self.track_popover = None;
+            self.end_track_input(cx);
         } else if composer_modal && self.track_popover.is_some() {
-            self.dismiss_modal(cx);
+            self.close_track(cx);
         }
         let was_open = self.window_modal.is_some();
         let open = self.visible && (self.input_is_modal() || composer_modal);
@@ -956,14 +1119,62 @@ impl ChatPanel {
 
     fn modal_tap_target(&self, abs: DVec2, surface: bool) -> Option<HitTarget> {
         self.chrome_hit(abs, surface).or_else(|| {
-            (matches!(self.modal, Some(Modal::Lightbox { .. })) && self.modal_rect.contains(abs))
-                .then(|| HitTarget::Chrome("scrim".into()))
+            if surface && matches!(self.modal, Some(Modal::Track(_))) {
+                return (self.track_motion.compact && self.track_bounds.contains(abs))
+                    .then(|| HitTarget::Chrome("track-close".into()));
+            }
+            (surface
+                && matches!(
+                    self.modal,
+                    Some(Modal::Lightbox { .. } | Modal::Sheet { .. })
+                )
+                && self.modal_rect.contains(abs))
+            .then(|| HitTarget::Chrome("scrim".into()))
         })
     }
 
-    fn dismiss_modal(&mut self, cx: &mut Cx) {
+    fn end_track_input(&mut self, cx: &mut Cx) {
+        if !self.track_motion.open {
+            return;
+        }
+        self.track_motion.close(cx);
         self.track_popover = None;
+        self.track_hit_rect = None;
+        if self.track_motion.panel.is_none() {
+            self.reset_tracks(cx);
+        }
+        self.modal_pressed.cancel();
+        self.modal_touch_scroll.reset();
+        self.modal_horizontal_scroll.reset();
+        if self.bar_drag.as_ref().is_some_and(|(_, modal)| *modal) {
+            self.bar_drag = None;
+        }
+        self.area.redraw(cx);
+        self.redraw_chrome_part(cx, TRACKS);
+    }
+
+    fn close_track(&mut self, cx: &mut Cx) {
+        self.end_track_input(cx);
+        self.modal = None;
+        self.window_modal = None;
+    }
+
+    fn reset_tracks(&mut self, cx: &mut Cx) {
+        self.track_motion = TrackMotion::default();
+        self.track_popover = None;
+        self.track_hit_rect = None;
+        self.track_painted_panel = None;
         self.track_popover_area = Area::Empty;
+        self.track_backdrop = Area::Empty;
+        self.track_scrim_area = Area::Empty;
+        for mut layer in self.track_layers.iter_mut().filter_map(Option::take) {
+            layer.release_capture(cx);
+        }
+    }
+
+    fn dismiss_modal(&mut self, cx: &mut Cx) {
+        self.reset_tracks(cx);
+        self.detail_motion = SheetMotion::default();
         self.modal_pressed.cancel();
         if self.bar_drag.as_ref().is_some_and(|(_, modal)| *modal) {
             self.bar_drag = None;
@@ -2421,7 +2632,21 @@ impl ChatPanel {
     }
 
     fn close_modal(&mut self, cx: &mut Cx, _ui: &mut UiContext) {
-        self.dismiss_modal(cx);
+        if matches!(self.modal, Some(Modal::Track(_))) {
+            self.close_track(cx);
+        } else if matches!(self.modal, Some(Modal::Sheet { .. })) {
+            self.detail_motion.set_open(cx, false);
+            self.window_modal = None;
+            self.modal_pressed.cancel();
+            self.modal_touch_scroll.reset();
+            self.modal_horizontal_scroll.reset();
+            self.bar_drag = None;
+            if !self.detail_motion.is_moving() {
+                self.dismiss_modal(cx);
+            }
+        } else {
+            self.dismiss_modal(cx);
+        }
     }
 
     /// subagents/archive-subagent.ts requestArchiveSubagent.
@@ -3191,8 +3416,8 @@ impl ChatPanel {
                     self.modal = Some(Modal::Sheet {
                         row: row.clone(),
                         kind: kind.to_owned(),
-                        opened: now_seconds(),
                     });
+                    self.detail_motion.set_open(cx, true);
                     self.modal_state = RowState::default();
                 }
                 HitTarget::RewindMenu => {
@@ -3358,6 +3583,7 @@ impl ChatPanel {
                         if !self.opens_in_sheet(ui, &row) {
                             self.close_modal(cx, ui);
                         } else {
+                            self.end_track_input(cx);
                             self.modal = None;
                         }
                         self.open_subagent(cx, ui, &row);
@@ -3380,21 +3606,30 @@ impl ChatPanel {
     }
 
     fn open_track(&mut self, cx: &mut Cx, ui: &mut UiContext, panel: TrackPanel) {
-        if !self.look(self.content_rect.size.x).compact {
-            AnchoredPopover::toggle(
+        let compact = self.look(self.content_rect.size.x).compact;
+        if !compact {
+            match AnchoredPopover::toggle(
                 &mut self.track_popover,
                 cx,
                 self.track_anchors[panel as usize],
-            );
-            if self.track_popover.is_none() {
-                self.dismiss_modal(cx);
-                return;
+            ) {
+                Some(true) => {}
+                Some(false) => {
+                    self.close_track(cx);
+                    return;
+                }
+                None => return,
             }
         }
-        self.track_popover_area = Area::Empty;
+        let same_layer = self.track_painted_panel == Some(panel);
+        self.track_motion.show(cx, panel, compact);
+        self.track_hit_rect = None;
         self.modal = Some(Modal::Track(panel));
-        self.modal_state = RowState::default();
+        if !same_layer {
+            self.modal_state = RowState::default();
+        }
         self.modal_pressed.cancel();
+        self.bar_drag = None;
         self.modal_touch_scroll.reset();
         self.modal_horizontal_scroll.reset();
         self.redraw_modal(cx);
@@ -3537,12 +3772,20 @@ impl ChatPanel {
 
 impl Widget for ChatPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.rail.advance(cx, event);
         if self.target.is_none() {
             return;
         }
         let composer_visible = self.visible && self.composer_shown();
-        if self.visible && self.modal.is_some() && self.transition_frame.is_event(event).is_some() {
-            self.redraw_modal(cx);
+        self.advance_tracks(cx, event);
+        if self.detail_motion.advance(cx, event) && matches!(self.modal, Some(Modal::Sheet { .. }))
+        {
+            self.detail_motion
+                .compose(cx, &self.modal_content_list, self.modal_rect);
+            self.detail_motion.finish_open(cx, self.modal_rect);
+            if !self.detail_motion.open && !self.detail_motion.is_moving() {
+                self.dismiss_modal(cx);
+            }
         }
         if self
             .timeline_texture_wait
@@ -3677,6 +3920,7 @@ impl Widget for ChatPanel {
             self.pressed.cancel();
             self.modal_pressed.cancel();
             let over_popover = self.track_popover.is_some()
+                && self.track_hit_rect.is_some()
                 && self.track_popover_area.clipped_rect(cx).contains(se.abs)
                 && !cx.pointer_shielded(self.track_popover_area, se.abs);
             if modal_open || over_popover {
@@ -3747,10 +3991,17 @@ impl Widget for ChatPanel {
             let rect = self.modal_rect;
             let child =
                 matches!(self.modal, Some(Modal::Subagent { .. })).then_some(self.sheet_content);
-            event.hits_with_test(cx, self.modal_area, |abs, _, _| {
+            let (area, rect) = if matches!(self.modal, Some(Modal::Track(_))) {
+                (self.track_backdrop, self.track_bounds)
+            } else if matches!(self.modal, Some(Modal::Sheet { .. })) {
+                (self.detail_area, rect)
+            } else {
+                (self.modal_area, rect)
+            };
+            event.hits_with_test(cx, area, |abs, _, _| {
                 rect.contains(abs) && !child.is_some_and(|r| r.contains(abs))
             })
-        } else if self.track_popover.is_some() {
+        } else if self.track_popover.is_some() && self.track_hit_rect.is_some() {
             event.hits(cx, self.track_popover_area)
         } else {
             Hit::Nothing
@@ -3868,10 +4119,12 @@ impl Widget for ChatPanel {
         }
         let look = self.look(rect.size.x);
         self.reconcile_track_popover(cx);
-        if matches!(self.modal, Some(Modal::Track(_)))
-            && look.compact == self.track_popover.is_some()
-        {
-            self.dismiss_modal(cx);
+        if self.track_motion.panel.is_some() && look.compact != self.track_motion.compact {
+            if matches!(self.modal, Some(Modal::Track(_))) {
+                self.dismiss_modal(cx);
+            } else {
+                self.reset_tracks(cx);
+            }
         }
         if self.painted_look != Some(look) {
             self.painted_look = Some(look);
@@ -3883,9 +4136,11 @@ impl Widget for ChatPanel {
         let target = self.target.clone().unwrap_or_default();
         let non_ready = self.non_ready();
         if let Some(view) = non_ready {
-            if self.track_popover.is_some() {
+            if matches!(self.modal, Some(Modal::Track(_))) {
                 self.dismiss_modal(cx);
             }
+            self.reset_tracks(cx);
+            self.track_overlay.release(cx);
             if let Some(center) = self.chrome_layers[NON_READY].paint(
                 cx,
                 &mut self.kit,
@@ -4216,14 +4471,12 @@ impl Widget for ChatPanel {
         };
         let can_detach = self.feature("agentDetach");
         let delete_status = self.delete_status;
-        if self.track_popover.is_some()
-            && match self.modal {
-                Some(Modal::Track(TrackPanel::Tasks)) => tasks.is_empty(),
-                Some(Modal::Track(TrackPanel::Subagents)) => rows.is_empty(),
-                _ => false,
-            }
-        {
-            self.dismiss_modal(cx);
+        if match self.modal {
+            Some(Modal::Track(TrackPanel::Tasks)) => tasks.is_empty(),
+            Some(Modal::Track(TrackPanel::Subagents)) => rows.is_empty(),
+            _ => false,
+        } {
+            self.close_track(cx);
         }
         let open_track = match &self.modal {
             Some(Modal::Track(panel)) => Some(*panel),
@@ -4264,6 +4517,8 @@ impl Widget for ChatPanel {
             chrome_part!(RAIL, stream_rect, |cx, d| {
                 self.rail.draw(cx, d, stream_rect, prompts_active);
             });
+        } else {
+            self.rail.hide(cx);
         }
         if tracks_visible {
             let model = TrackModel {
@@ -4404,7 +4659,12 @@ impl Widget for ChatPanel {
         self.file_drop.draw(cx, rect);
 
         // ── modal surfaces ──────────────────────────────────────────────
-        if self.modal.is_some() {
+        if self.track_motion.panel.is_some() {
+            self.paint_tracks(cx, look, rect, &target, &tasks, &rows, &host_label_fn);
+        } else {
+            self.track_overlay.release(cx);
+        }
+        if self.modal.is_some() && !matches!(self.modal, Some(Modal::Track(_))) {
             self.modal_list.begin_overlay_last(cx);
             // Nested sheets escape their parent's content clip, and root
             // subagent sheets cover the shell header/sidebar as Flutter does.
@@ -4427,6 +4687,15 @@ impl Widget for ChatPanel {
                 0.0
             };
             self.modal_rect = bounds;
+            let detail = matches!(self.modal, Some(Modal::Sheet { .. }));
+            let detail_scrim = if detail {
+                self.detail_motion
+                    .draw_scrim(cx, &mut self.track_scrim, bounds);
+                cx.add_aligned_rect_area(&mut self.detail_area, bounds);
+                self.detail_motion.scrim
+            } else {
+                Area::Empty
+            };
             if self
                 .modal_content_list
                 .begin(cx, Walk::abs_rect(bounds))
@@ -4437,34 +4706,40 @@ impl Widget for ChatPanel {
                 cx.begin_turtle(Walk::abs_rect(bounds), Layout::default());
                 self.modal_kit.begin_layer(cx);
                 self.modal_canvas.begin(bounds.pos);
-                let moving = self.draw_modal(
-                    cx,
-                    scope,
-                    look,
-                    bounds,
-                    bottom_inset,
-                    &rows,
-                    &tasks,
-                    &host_label_fn,
-                );
+                self.draw_modal(cx, scope, look, bounds, bottom_inset);
                 self.modal_texture_wait = (crate::features::composer::texture_misses()
                     != texture_misses)
                     .then_some(texture_revision);
                 cx.end_turtle_with_area(&mut self.modal_area);
                 self.modal_content_list.end(cx);
-                if moving {
-                    self.transition_frame = cx.new_next_frame();
-                }
             }
-            if let (Some(popup), Some(Modal::Track(panel))) = (&self.track_popover, &self.modal) {
-                popup.drawn(self.track_anchors[*panel as usize], self.track_popover_area);
-            } else if self.input_is_modal() {
-                overlay::modal_float(self.widget_uid().0, self.modal_area);
+            if detail {
+                if matches!(self.modal, Some(Modal::Sheet { .. })) {
+                    self.detail_motion
+                        .compose(cx, &self.modal_content_list, bounds);
+                } else {
+                    // The backing tool row vanished while the modal was drawn.
+                    overlay::update_scrim(cx, detail_scrim, 0.0);
+                    self.area.redraw(cx);
+                }
+            } else {
+                self.modal_content_list
+                    .set_view_transform(cx, &Mat4::identity());
+            }
+            if self.input_is_modal() {
+                let area = if detail {
+                    self.detail_area
+                } else {
+                    self.modal_area
+                };
+                overlay::modal_float(self.widget_uid().0, area);
             }
             cx.end_pass_sized_turtle();
             self.modal_list.end(cx);
         } else {
-            self.modal_canvas.begin(rect.pos);
+            if !matches!(self.modal, Some(Modal::Track(_))) {
+                self.modal_canvas.begin(rect.pos);
+            }
             self.modal_content_list.release(cx);
         }
         cx.end_turtle_with_area(&mut self.area);
@@ -4699,11 +4974,25 @@ impl ChatPanel {
         }
     }
 
+    fn modal_content_pos(&self, abs: DVec2) -> Option<DVec2> {
+        if matches!(self.modal, Some(Modal::Track(_))) {
+            let (rect, scale) = self.track_hit_rect?;
+            return (self.track_bounds.contains(abs) && rect.contains(abs))
+                .then(|| (abs - rect.pos) / scale);
+        }
+        let shift = if matches!(self.modal, Some(Modal::Sheet { .. })) {
+            self.detail_motion.offset
+        } else {
+            DVec2::default()
+        };
+        Some(abs - self.modal_canvas.origin - shift)
+    }
+
     fn chrome_hit(&self, abs: DVec2, surface: bool) -> Option<HitTarget> {
         if surface {
             return self
                 .modal_canvas
-                .hit_at(abs - self.modal_canvas.origin)
+                .hit_at(self.modal_content_pos(abs)?)
                 .cloned();
         }
         self.overlay_canvas
@@ -4719,22 +5008,19 @@ impl ChatPanel {
             Hit::FingerHoverOut(_) => self.chrome_hover(cx, None, modal),
             Hit::FingerDown(e) => {
                 let target = self.modal_tap_target(e.abs, modal);
-                let (canvas, state, pressed) = if modal {
-                    (
-                        &self.modal_canvas,
-                        &mut self.modal_state,
-                        &mut self.modal_pressed,
-                    )
+                let pos = if modal {
+                    self.modal_content_pos(e.abs)
                 } else {
-                    (
-                        &self.overlay_canvas,
-                        &mut self.chrome_state,
-                        &mut self.pressed,
-                    )
+                    Some(e.abs - self.overlay_canvas.origin)
                 };
-                let drag = target.as_ref().and_then(|target| {
-                    super::scrollbar::BarDrag::press(target, e.abs - canvas.origin, state)
-                });
+                let (state, pressed) = if modal {
+                    (&mut self.modal_state, &mut self.modal_pressed)
+                } else {
+                    (&mut self.chrome_state, &mut self.pressed)
+                };
+                let drag = target
+                    .as_ref()
+                    .and_then(|target| super::scrollbar::BarDrag::press(target, pos?, state));
                 if let Some(drag) = drag {
                     if drag.vertical && drag.key == "sheet:y" {
                         state.expanded.insert("sheet:detached".into(), true);
@@ -4758,17 +5044,22 @@ impl ChatPanel {
                 }
             }
             Hit::FingerMove(e) => {
+                let pos = if modal {
+                    self.modal_content_pos(e.abs)
+                } else {
+                    Some(e.abs - self.overlay_canvas.origin)
+                };
                 if let Some((drag, _)) = self
                     .bar_drag
                     .as_mut()
                     .filter(|(_, surface)| *surface == modal)
                 {
-                    let (canvas, state) = if modal {
-                        (&self.modal_canvas, &mut self.modal_state)
+                    let state = if modal {
+                        &mut self.modal_state
                     } else {
-                        (&self.overlay_canvas, &mut self.chrome_state)
+                        &mut self.chrome_state
                     };
-                    if drag.drag_to(e.abs - canvas.origin, state) {
+                    if pos.is_some_and(|pos| drag.drag_to(pos, state)) {
                         if modal {
                             self.redraw_modal(cx);
                         } else {
@@ -4878,8 +5169,7 @@ impl ChatPanel {
     }
 
     fn chrome_hover(&mut self, cx: &mut Cx, abs: Option<DVec2>, surface: bool) {
-        let now = now_seconds();
-        if !surface && self.rail.hover(abs, now) {
+        if !surface && self.rail.hover(cx, abs) {
             self.redraw_chrome_part(cx, RAIL);
         }
         let key = abs
@@ -4921,7 +5211,9 @@ impl ChatPanel {
             self.redraw_modal(cx);
             return true;
         }
-        let rel = abs - self.modal_canvas.origin;
+        let Some(rel) = self.modal_content_pos(abs) else {
+            return false;
+        };
         let vertical = delta.x.abs() <= delta.y.abs();
         let amount = if vertical { delta.y } else { delta.x };
         // The deepest region that can still move takes the delta.
@@ -5287,45 +5579,101 @@ impl ChatPanel {
         }
     }
 
-    /// Track panels, compact detail sheets, the usage sheet, the image
-    /// lightbox and the subagent sheet. Returns whether it animates.
     #[allow(clippy::too_many_arguments)]
-    fn draw_modal(
+    fn paint_tracks(
         &mut self,
         cx: &mut Cx2d,
-        scope: &mut Scope,
         look: Look,
         rect: Rect,
-        bottom_inset: f64,
-        rows: &[SubagentRow],
+        target: &ChatTarget,
         tasks: &[Value],
+        rows: &[SubagentRow],
         host_label: &dyn Fn(&str) -> String,
-    ) -> bool {
-        let p = look.palette;
-        let Some(modal) = self.modal.take() else {
-            return false;
+    ) {
+        let Some(active) = self.track_motion.panel else {
+            return;
         };
-        let mut animating = false;
-        match &modal {
-            Modal::Track(panel) => {
-                // Deleting (or detaching) the last subagent leaves nothing to show: close the
-                // panel instead of leaving an empty sheet, as a row that left the stream does.
-                if *panel == TrackPanel::Subagents && rows.is_empty() {
-                    return false;
-                }
-                let trigger = self.track_anchors[*panel as usize];
-                let anchor = (!trigger.is_empty()).then(|| trigger.rect(cx));
-                let target = self.target.clone().unwrap_or_default();
+        self.track_overlay.begin_overlay_last(cx);
+        cx.begin_pass_sized_turtle(Layout::flow_overlay());
+        let compact = self.track_motion.compact;
+        let (bounds, bottom_inset) = if target.sheet {
+            (
+                Rect {
+                    pos: DVec2::default(),
+                    size: cx.current_pass_size(),
+                },
+                crate::shell::platform::safe_insets().bottom,
+            )
+        } else {
+            (rect, 0.0)
+        };
+        let anchor = self
+            .track_motion
+            .anchor
+            .map(|panel| self.track_anchors[panel as usize])
+            .filter(|area| area.is_valid(cx))
+            .unwrap_or(self.track_anchors[active as usize]);
+        let anchor = anchor.is_valid(cx).then(|| anchor.rect(cx));
+        let dpi = cx.current_dpi_factor();
+        let geometry_changed = (bounds, anchor, bottom_inset, dpi)
+            != (
+                self.track_bounds,
+                self.track_anchor_rect,
+                self.track_inset,
+                self.track_dpi,
+            );
+        self.track_bounds = bounds;
+        self.track_anchor_rect = anchor;
+        self.track_inset = bottom_inset;
+        self.track_dpi = dpi;
+        self.track_scrim_area = Area::Empty;
+        if compact {
+            self.track_scrim.color = vec4(0.0, 0.0, 0.0, self.track_scrim_alpha());
+            self.track_scrim.draw_abs(cx, bounds);
+            self.track_scrim_area = self.track_scrim.area();
+            if self.track_motion.open {
+                cx.add_aligned_rect_area(&mut self.track_backdrop, bounds);
+                overlay::modal_float(self.widget_uid().0, self.track_backdrop);
+            }
+        }
+
+        let capture = self.track_motion.needs_capture();
+        let previous = self
+            .track_motion
+            .pair
+            .map(|(a, b)| if active == a { b } else { a });
+        let can_detach = self.feature("agentDetach");
+        let dirty = self.track_dirty.get();
+        let incoming_needs_hits = self.track_painted_panel != Some(active);
+        let mut hit = None;
+        for panel in previous.into_iter().chain(std::iter::once(active)) {
+            let index = panel as usize;
+            let above = previous
+                .and_then(|other| self.track_layers[other as usize].as_ref())
+                .and_then(|layer| layer.layout.as_ref())
+                .map(|layout| layout.above);
+            let layer = self.track_layers[index].get_or_insert_with(|| TrackLayer::new(cx));
+            let repaint = panel == active
+                && self.track_motion.open
+                && (geometry_changed
+                    || layer.layout.is_none()
+                    || incoming_needs_hits
+                    || (dirty && !capture));
+            if repaint {
+                self.track_dirty.set(false);
+                let texture_misses = crate::features::composer::texture_misses();
+                let texture_revision = crate::features::composer::texture_revision();
                 let model = TrackModel {
                     tasks,
                     rows,
                     delete: self.delete_status,
                     can_delete_finished: !target.is_subagent(),
-                    can_detach: self.feature("agentDetach"),
+                    can_detach,
                     host_id: &target.host_id,
                     providers: &self.providers,
                     host_label,
                 };
+                self.modal_canvas.begin(DVec2::default());
                 let mut d = Draw {
                     kit: &mut self.modal_kit,
                     canvas: &mut self.modal_canvas,
@@ -5337,33 +5685,221 @@ impl ChatPanel {
                     animating: false,
                     indicators: None,
                 };
-                let popover = tracks::draw_panel(
+                layer.layout = tracks::measure_panel(
                     cx,
                     &mut d,
                     &mut self.painter,
                     &mut self.provider_icon,
                     &model,
-                    *panel,
+                    panel,
                     anchor,
-                    rect,
+                    bounds,
                     bottom_inset,
+                    above,
                 );
-                animating |= d.animating;
-                if let Some(rect) = popover {
-                    cx.add_aligned_rect_area(&mut self.track_popover_area, rect);
+                if let Some(layout) = &layer.layout {
+                    let size = TrackLayer::paint_size(layout.card.size, compact);
+                    if capture {
+                        layer
+                            .capture
+                            .get_or_insert_with(|| LayerTexture::new(cx))
+                            .begin(cx, size);
+                    }
+                    layer.list.begin_always(cx);
+                    cx.begin_sized_turtle(size, Layout::flow_overlay());
+                    d.kit.begin_layer(cx);
+                    tracks::draw_panel(
+                        cx,
+                        &mut d,
+                        &mut self.painter,
+                        &mut self.provider_icon,
+                        &model,
+                        panel,
+                        layout,
+                    );
+                    cx.end_pass_sized_turtle();
+                    layer.list.end(cx);
+                    if capture {
+                        layer.list.set_view_transform(cx, &Mat4::identity());
+                        layer.capture.as_mut().unwrap().end(cx);
+                    }
+                    self.track_painted_panel = Some(panel);
                 }
+                self.modal_texture_wait = (crate::features::composer::texture_misses()
+                    != texture_misses)
+                    .then_some(texture_revision);
             }
-            Modal::Sheet { row, kind, opened } => {
+            if !capture {
+                layer.release_capture(cx);
+            }
+            layer.quad = Area::Empty;
+            let Some(layout) = &layer.layout else {
+                continue;
+            };
+            let visual = self.track_motion.visual(panel, layout.card.size);
+            let body = TrackLayer::visual_rect(layout, visual, compact);
+            if capture {
+                let texture = layer.capture.get_or_insert_with(|| {
+                    layer.list.set_view_transform(cx, &Mat4::identity());
+                    let mut texture = LayerTexture::new(cx);
+                    texture.capture(
+                        cx,
+                        TrackLayer::paint_size(layout.card.size, compact),
+                        &layer.list,
+                    );
+                    texture
+                });
+                let output = Rect {
+                    pos: body.pos,
+                    size: texture.size * visual.scale,
+                };
+                layer.quad = self.track_composite.draw_texture(
+                    cx,
+                    output,
+                    &texture.texture,
+                    visual.opacity as f32,
+                );
+            } else {
+                if !repaint {
+                    // The retained card already exists; reattach without relayout.
+                    if layer.list.begin_maybe(cx, false).is_ok() {
+                        layer.list.end(cx);
+                    }
+                }
+                overlay::place_layer(cx, &layer.list, body, visual.scale);
+            }
+            if panel == active && self.track_motion.open {
+                hit = Some((body, visual.scale, visual.opacity));
+            }
+        }
+        if !compact && self.track_motion.open {
+            // Allocate once per structural draw, even when the first sample is transparent.
+            let rect = hit.map_or(Rect::default(), |(rect, _, _)| rect);
+            cx.add_aligned_rect_area(&mut self.track_popover_area, rect);
+        }
+        self.set_track_hit(hit);
+        cx.end_pass_sized_turtle();
+        self.track_overlay.end(cx);
+    }
+
+    fn track_scrim_alpha(&self) -> f32 {
+        (TRACK_SCRIM_ALPHA
+            * self
+                .track_motion
+                .intent()
+                .resolve()
+                .sample(self.track_motion.presence.value(), self.track_bounds.size)
+                .scrim) as f32
+    }
+
+    fn set_track_hit(&mut self, hit: Option<(Rect, f64, f64)>) {
+        self.track_hit_rect = hit
+            .filter(|_| self.track_motion.panel == self.track_painted_panel)
+            .filter(|(_, scale, alpha)| *alpha > 0.0 && *scale > 0.0)
+            .map(|(rect, scale, _)| (rect, scale));
+        if let Some(popup) = &self.track_popover
+            && let Some(panel) = self.track_motion.panel
+        {
+            let peer = TRACKS_PANELS[1 - panel as usize];
+            popup.drawn_with_peer(
+                self.track_anchors[panel as usize],
+                self.track_anchors[peer as usize],
+                if self.track_hit_rect.is_some() {
+                    self.track_popover_area
+                } else {
+                    Area::Empty
+                },
+            );
+        }
+    }
+
+    fn advance_tracks(&mut self, cx: &mut Cx, event: &Event) {
+        if !self.track_motion.advance(cx, event) {
+            return;
+        }
+        let Some(active) = self.track_motion.panel else {
+            return;
+        };
+        let mut hit = None;
+        for (panel, layer) in TRACKS_PANELS.into_iter().zip(&self.track_layers) {
+            let Some(layer) = layer else {
+                continue;
+            };
+            let Some(layout) = &layer.layout else {
+                continue;
+            };
+            let visual = self.track_motion.visual(panel, layout.card.size);
+            let body = TrackLayer::visual_rect(layout, visual, self.track_motion.compact);
+            if let Some(texture) = &layer.capture {
+                let output = Rect {
+                    pos: body.pos,
+                    size: texture.size * visual.scale,
+                };
+                DrawLayerTexture::update(cx, layer.quad, output, visual.opacity as f32);
+            } else if self.track_motion.compact && panel == active {
+                overlay::place_layer(cx, &layer.list, body, visual.scale);
+            }
+            if panel == active && self.track_motion.open {
+                hit = Some((body, visual.scale, visual.opacity));
+            }
+        }
+        if let Some((rect, _, _)) = hit
+            && self.track_popover_area.is_valid(cx)
+        {
+            self.track_popover_area.set_rect(cx, &rect);
+        }
+        self.set_track_hit(hit);
+        if self.track_motion.compact {
+            overlay::update_scrim(cx, self.track_scrim_area, self.track_scrim_alpha());
+        }
+        if !self.track_motion.open && !self.track_motion.presence.is_moving() {
+            self.reset_tracks(cx);
+            self.area.redraw(cx);
+        } else if !self.track_motion.needs_capture()
+            && (self.track_motion.pair.take().is_some()
+                || self.track_layers[active as usize]
+                    .as_ref()
+                    .is_some_and(|layer| layer.capture.is_some()))
+        {
+            if let Some(mut outgoing) = self.track_layers[1 - active as usize].take() {
+                outgoing.release_capture(cx);
+            }
+            if let Some(layer) = &mut self.track_layers[active as usize] {
+                layer.release_capture(cx);
+            }
+            self.area.redraw(cx);
+        }
+    }
+
+    /// Compact detail sheets, the usage sheet, the lightbox and the subagent sheet.
+    fn draw_modal(
+        &mut self,
+        cx: &mut Cx2d,
+        scope: &mut Scope,
+        look: Look,
+        rect: Rect,
+        bottom_inset: f64,
+    ) {
+        let p = look.palette;
+        let Some(modal) = self.modal.take() else {
+            return;
+        };
+        match &modal {
+            Modal::Track(_) => unreachable!("track lists paint in their own retained layer"),
+            Modal::Sheet { row, kind } => {
                 let item = self.items.iter().find(|i| i.id == *row).cloned();
                 // A row that left the stream closes its sheet.
                 let (Some(item), Some(ctx)) = (item, self.ctx.clone()) else {
-                    return false;
+                    self.detail_motion = SheetMotion::default();
+                    self.window_modal = None;
+                    return;
                 };
                 let Some(header) = rows::sheet_header(&ctx, &item, kind) else {
-                    return false;
+                    self.detail_motion = SheetMotion::default();
+                    self.window_modal = None;
+                    return;
                 };
-                let progress =
-                    ((now_seconds() - *opened) / super::tool_sheet::OPEN_SECS).clamp(0.0, 1.0);
+                self.detail_motion.mark_cover(cx, rect, p.surface2.w >= 1.0);
                 let mut d = Draw {
                     kit: &mut self.modal_kit,
                     canvas: &mut self.modal_canvas,
@@ -5382,13 +5918,11 @@ impl ChatPanel {
                     rect,
                     bottom_inset,
                     &header,
-                    progress,
                     kind == "group",
                     &|cx, d, x, y, w, fill| {
                         rows::sheet_body(cx, d, &ctx, &item, kind_ref, x, y, w, fill)
                     },
                 );
-                animating |= d.animating;
             }
             Modal::Usage => {
                 let agent = self
@@ -5408,7 +5942,6 @@ impl ChatPanel {
                     indicators: None,
                 };
                 usage_sheet(cx, &mut d, &agent, rect, bottom_inset);
-                animating |= d.animating;
             }
             Modal::Lightbox {
                 source,
@@ -5459,7 +5992,6 @@ impl ChatPanel {
                     indicators: None,
                 };
                 lightbox(cx, &mut d, rect, texture, *scale, *offset);
-                animating |= d.animating;
             }
             Modal::Subagent {
                 label, provider, ..
@@ -5571,7 +6103,6 @@ impl ChatPanel {
                     );
                     d.canvas.add_hit(r, HitTarget::Chrome(id.into()));
                 }
-                animating |= d.animating;
                 let content = rect_xywh(
                     sheet.pos.x,
                     sheet.pos.y + header_h,
@@ -5591,7 +6122,6 @@ impl ChatPanel {
             }
         }
         self.modal = Some(modal);
-        animating
     }
 }
 
@@ -5937,6 +6467,108 @@ impl ChatPanelRef {
 #[cfg(test)]
 mod modal_layer_tests {
     use super::*;
+
+    fn track_tick(motion: &mut TrackMotion, cx: &mut Cx, time: f64) -> bool {
+        let set = [
+            motion.presence.scheduled_frame(),
+            motion.peer.scheduled_frame(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let event = Event::NextFrame(NextFrameEvent {
+            frame: 0,
+            time,
+            set,
+        });
+        crate::common::transition::begin_event(&event);
+        motion.advance(cx, &event)
+    }
+
+    #[test]
+    fn track_popover_opens_switches_in_place_and_closes() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut motion = TrackMotion::default();
+        let size = dvec2(420.0, 100.0);
+        use TrackPanel::{Subagents, Tasks};
+
+        motion.show(&mut cx, Tasks, false);
+        assert_eq!(motion.visual(Tasks, size).opacity, 0.0);
+        assert!(motion.needs_capture());
+        track_tick(&mut motion, &mut cx, 0.0);
+        track_tick(&mut motion, &mut cx, 1.0);
+        assert_eq!(motion.visual(Tasks, size).opacity, 1.0);
+        assert!(!motion.needs_capture());
+
+        motion.show(&mut cx, Subagents, false);
+        assert_eq!(motion.panel, Some(Subagents));
+        assert_eq!(motion.anchor, Some(Tasks));
+        assert_eq!(motion.pair, Some((Tasks, Subagents)));
+        assert_eq!(motion.visual(Tasks, size).opacity, 1.0);
+        assert_eq!(motion.visual(Subagents, size).opacity, 0.0);
+        track_tick(&mut motion, &mut cx, 2.0);
+        track_tick(&mut motion, &mut cx, 2.05);
+        assert!(motion.visual(Tasks, size).opacity < 1.0);
+        let elapsed = motion.peer.value();
+        let outgoing = motion.visual(Tasks, size);
+        let incoming = motion.visual(Subagents, size);
+        motion.show(&mut cx, Tasks, false);
+        assert_eq!(motion.panel, Some(Tasks));
+        assert_eq!(motion.peer.value(), elapsed);
+        assert_eq!(motion.visual(Tasks, size), outgoing);
+        assert_eq!(motion.visual(Subagents, size), incoming);
+        track_tick(&mut motion, &mut cx, 2.05);
+        track_tick(&mut motion, &mut cx, 3.0);
+        assert_eq!(motion.visual(Tasks, size).opacity, 1.0);
+        assert_eq!(motion.visual(Subagents, size).opacity, 0.0);
+
+        motion.close(&mut cx);
+        assert!(!motion.open);
+        assert!(motion.needs_capture());
+        track_tick(&mut motion, &mut cx, 4.0);
+        track_tick(&mut motion, &mut cx, 5.0);
+        assert_eq!(motion.visual(Tasks, size).opacity, 0.0);
+        assert!(!motion.needs_capture());
+        assert!(motion.presence.scheduled_frame().is_none());
+        assert!(motion.peer.scheduled_frame().is_none());
+        assert!(!track_tick(&mut motion, &mut cx, 6.0));
+    }
+
+    #[test]
+    fn track_bottom_sheet_reopens_from_mid_close_without_jump_or_idle_frames() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut motion = TrackMotion::default();
+        let panel = TrackPanel::Tasks;
+        let size = dvec2(390.0, 200.0);
+
+        motion.show(&mut cx, panel, true);
+        assert_eq!(motion.visual(panel, size).offset.y, size.y);
+        assert!(!motion.needs_capture());
+        track_tick(&mut motion, &mut cx, 0.0);
+        track_tick(&mut motion, &mut cx, 1.0);
+        assert_eq!(motion.visual(panel, size).offset.y, 0.0);
+        assert!(motion.presence.scheduled_frame().is_none());
+
+        motion.close(&mut cx);
+        track_tick(&mut motion, &mut cx, 2.0);
+        track_tick(&mut motion, &mut cx, 2.08);
+        let closing = motion.visual(panel, size);
+        assert!((0.0..size.y).contains(&closing.offset.y));
+        assert!(!motion.open);
+        motion.show(&mut cx, panel, true);
+        assert!(motion.open);
+        assert_eq!(motion.visual(panel, size), closing);
+        track_tick(&mut motion, &mut cx, 2.08);
+        track_tick(&mut motion, &mut cx, 3.0);
+        assert_eq!(motion.visual(panel, size).offset.y, 0.0);
+
+        motion.close(&mut cx);
+        track_tick(&mut motion, &mut cx, 4.0);
+        track_tick(&mut motion, &mut cx, 5.0);
+        assert_eq!(motion.visual(panel, size).offset.y, size.y);
+        assert!(motion.presence.scheduled_frame().is_none());
+        assert!(!track_tick(&mut motion, &mut cx, 6.0));
+    }
 
     #[test]
     fn cached_tool_sheet_stays_above_streaming_subagent() {

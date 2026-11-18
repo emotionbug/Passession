@@ -31,17 +31,45 @@ live_design!{
 /// the end of the content. Owners apply bounds and call `stop_at_edge` when hit.
 /// `handle_hit` supports direct panning; call `frame` after input handling to
 /// enable release inertia and retain its frame token until the matching event.
-#[derive(Default)]
 pub struct TouchScroll {
     motion: TouchMotion,
     velocity: TouchVelocity,
     next_frame: Option<NextFrame>,
     origin: DVec2,
+    spec: FlingSpec,
+    request_frame: fn(&mut Cx) -> NextFrame,
 }
 
-// Makepad's 0.97 decay and 0.2px stop speed at 60Hz, expressed in seconds.
-const SCROLL_DECAY: f64 = 1.8275524490825144;
-const SCROLL_STOP_SPEED: f64 = 12.0;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlingSpec {
+    /// Exponential decay rate in inverse seconds.
+    pub decay: f64,
+    /// Minimum fling speed in logical pixels per second.
+    pub stop_speed: f64,
+}
+
+type TouchScrollDefaults = (FlingSpec, fn(&mut Cx) -> NextFrame);
+
+thread_local! {
+    // Makepad's 0.97 decay and 0.2px stop speed at 60Hz, expressed in seconds.
+    static TOUCH_SCROLL_DEFAULTS: std::cell::Cell<TouchScrollDefaults> =
+        const { std::cell::Cell::new((
+            FlingSpec { decay: 1.8275524490825144, stop_speed: 12.0 },
+            Cx::new_next_frame,
+        )) };
+}
+
+impl Default for TouchScroll {
+    fn default() -> Self {
+        let (spec, request_frame) = TOUCH_SCROLL_DEFAULTS.get();
+        Self::with_spec(spec, request_frame)
+    }
+}
+
+/// Configure subsequently constructed native widgets on the UI thread.
+pub fn set_touch_scroll_defaults(spec: FlingSpec, request_frame: fn(&mut Cx) -> NextFrame) {
+    TOUCH_SCROLL_DEFAULTS.set((spec, request_frame));
+}
 // Keep real motion samples, rather than warming a velocity filter up from rest.
 // 32 samples cover 100ms even at 240Hz without allocating during a gesture.
 const VELOCITY_WINDOW: f64 = 0.1;
@@ -141,6 +169,21 @@ enum TouchMotion {
 }
 
 impl TouchScroll {
+    pub fn with_spec(spec: FlingSpec, request_frame: fn(&mut Cx) -> NextFrame) -> Self {
+        Self {
+            motion: TouchMotion::Idle,
+            velocity: TouchVelocity::default(),
+            next_frame: None,
+            origin: DVec2::default(),
+            spec,
+            request_frame,
+        }
+    }
+
+    pub fn fling_spec(&self) -> FlingSpec {
+        self.spec
+    }
+
     pub fn reset(&mut self) {
         self.motion = TouchMotion::Idle;
         self.next_frame = None;
@@ -191,7 +234,7 @@ impl TouchScroll {
             return false;
         };
         let velocity = self.velocity.estimate(time);
-        if panning && velocity.abs() > SCROLL_STOP_SPEED {
+        if panning && velocity.abs() > self.spec.stop_speed {
             self.motion = TouchMotion::Fling { time: None, velocity };
         }
         panning
@@ -216,7 +259,8 @@ impl TouchScroll {
         changed
     }
 
-    fn advance(&mut self, time: f64) -> Option<f64> {
+    /// Step a released fling on a render frame supplied by the caller.
+    pub fn advance(&mut self, time: f64) -> Option<f64> {
         let TouchMotion::Fling { time: previous, velocity } = self.motion else {
             return None;
         };
@@ -225,11 +269,11 @@ impl TouchScroll {
             self.motion = TouchMotion::Fling { time: Some(time), velocity };
             return None;
         };
-        let remaining = (velocity.abs() / SCROLL_STOP_SPEED).ln() / SCROLL_DECAY;
         let elapsed = (time - previous).max(0.0);
-        let decay = (-SCROLL_DECAY * elapsed.min(remaining)).exp();
-        let delta = velocity * (1.0 - decay) / SCROLL_DECAY;
-        self.motion = if elapsed >= remaining {
+        let stop = self.spec.stop_speed / velocity.abs();
+        let decay = (-self.spec.decay * elapsed).exp().max(stop);
+        let delta = velocity * (1.0 - decay) / self.spec.decay;
+        self.motion = if decay == stop {
             TouchMotion::Idle
         } else {
             TouchMotion::Fling { time: Some(time), velocity: velocity * decay }
@@ -237,21 +281,28 @@ impl TouchScroll {
         Some(delta)
     }
 
-    pub fn frame(&mut self, cx: &mut Cx, event: &Event) -> Option<f64> {
+    pub fn cancel_for_event(&mut self, event: &Event) -> bool {
         let new_press = matches!(event, Event::MouseDown(_))
             || matches!(event, Event::TouchUpdate(update) if update.touches.iter().any(|touch| matches!(touch.state, TouchState::Start)));
-        if matches!(event, Event::Pause | Event::AppLostFocus | Event::LongPress(_))
+        let cancel = matches!(event, Event::Pause | Event::AppLostFocus | Event::LongPress(_))
             || matches!(event, Event::TouchUpdate(update) if update.cancelled)
-            || (self.is_flinging() && new_press)
-        {
+            || (self.is_flinging() && new_press);
+        if cancel {
             self.reset();
+        }
+        cancel
+    }
+
+    pub fn frame(&mut self, cx: &mut Cx, event: &Event) -> Option<f64> {
+        if self.cancel_for_event(event) {
             return None;
         }
-        let delta = if let Some(frame) = self.next_frame.and_then(|next| next.is_event(event)) {
-            self.next_frame = None;
-            self.advance(frame.time)
-        } else {
-            None
+        let delta = match event {
+            Event::NextFrame(frame) if self.next_frame.is_some_and(|next| frame.set.contains(&next)) => {
+                self.next_frame = None;
+                self.advance(frame.time)
+            }
+            _ => None,
         };
         self.schedule(cx);
         delta
@@ -259,7 +310,7 @@ impl TouchScroll {
 
     pub fn schedule(&mut self, cx: &mut Cx) {
         if self.is_flinging() && self.next_frame.is_none() {
-            self.next_frame = Some(cx.new_next_frame());
+            self.next_frame = Some((self.request_frame)(cx));
         }
     }
 

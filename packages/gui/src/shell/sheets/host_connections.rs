@@ -575,13 +575,7 @@ impl Sheet for ConnectionsSheet {
         y += 16.0;
         if self.busy {
             ui.fill(cx, rect(x, y, w, 2.0), p.surface2, 0.0);
-            ui.painter.loading_bar(
-                cx,
-                rect(x, y, w, 2.0),
-                p.accent,
-                1500.0,
-                crate::common::clock::MOTION_PERIOD,
-            );
+            ui.painter.loading_bar(cx, rect(x, y, w, 2.0), p.accent);
             y += 2.0 + 16.0;
         }
         if host.is_some() {

@@ -153,7 +153,7 @@ pub struct ChatRow {
     /// Absolute position and time of the pending touch.
     #[rust]
     drag_start: (DVec2, f64),
-    #[rust]
+    #[rust(crate::common::widgets::touch_scroll())]
     touch_scroll: TouchScroll,
     #[rust]
     last_width: f64,

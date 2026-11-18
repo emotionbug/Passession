@@ -317,23 +317,11 @@ impl Kit {
 
     /// Partial ring retained and rotated without invalidating file layout.
     pub fn spinner(&mut self, cx: &mut Cx2d, rect: Rect, color: Vec4) {
-        use crate::common::clock;
-        let area = self
-            .painter
-            .ring(cx, rect, color, 1.5, 0.7, clock::phase(900));
-        clock::spin(
-            cx,
-            area,
-            live_id!(rotation),
-            clock::RING_CADENCE,
-            900.0,
-            0.0,
-        );
+        self.painter.spinner(cx, rect, color, [1.5, 0.7]);
     }
 
     pub fn loading_bar(&mut self, cx: &mut Cx2d, rect: Rect, color: Vec4) {
-        self.painter
-            .loading_bar(cx, rect, color, 1200.0, crate::common::clock::RING_CADENCE);
+        self.painter.loading_bar(cx, rect, color);
     }
 }
 

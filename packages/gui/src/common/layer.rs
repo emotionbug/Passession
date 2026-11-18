@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use makepad_widgets::*;
 
-use super::paint::HitMap;
+use super::paint::{HitMap, PaintedHit};
 
 #[derive(Default)]
 pub struct Layer {
@@ -27,7 +27,7 @@ pub struct Layer {
     attached: bool,
     visited: bool,
     hit_mark: usize,
-    hits: Vec<(Rect, String)>,
+    hits: Vec<PaintedHit<String>>,
     tooltips: Vec<(String, String)>,
 }
 
@@ -42,7 +42,7 @@ impl Layer {
 
     /// Shell hit ids recorded by the last paint.
     pub fn owns_hit(&self, id: &str) -> bool {
-        self.hits.iter().any(|(_, hit)| hit == id)
+        self.hits.iter().any(|hit| hit.item == id)
     }
 
     /// Opens the layer at `rect`. `inputs` digests values the paint reads that do not reach it
@@ -91,10 +91,17 @@ impl Layer {
         self.hits.clear();
         self.hits.extend_from_slice(hits.since(self.hit_mark));
         self.tooltips.clear();
-        for (_, id) in &self.hits {
-            if let Some(tip) = tooltips.get(id) {
-                self.tooltips.push((id.clone(), tip.clone()));
+        for hit in &self.hits {
+            if let Some(tip) = tooltips.get(&hit.item) {
+                self.tooltips.push((hit.item.clone(), tip.clone()));
             }
+        }
+    }
+
+    /// Moves the existing draw calls inside a fixed viewport without a Draw event.
+    pub(crate) fn place_viewport(&self, cx: &mut Cx, clip: Rect, shift: DVec2) {
+        if let Some(list) = &self.list {
+            place_viewport(cx, list.id(), clip, shift);
         }
     }
 
@@ -111,6 +118,29 @@ impl Layer {
             self.hits.clear();
             self.tooltips.clear();
         }
+    }
+}
+
+/// Applies view uniforms to one paint-only draw list (not its child lists).
+pub(crate) fn place_viewport(cx: &mut Cx, id: DrawListId, clip: Rect, shift: DVec2) {
+    let list = &mut cx.draw_lists[id];
+    let uniforms = &mut list.draw_list_uniforms;
+    let end = clip.pos + clip.size;
+    let bounds = vec4(
+        clip.pos.x as f32,
+        clip.pos.y as f32,
+        end.x as f32,
+        end.y as f32,
+    );
+    let shift: Vec2 = shift.into();
+    if list.draw_list_has_clip && uniforms.view_clip == bounds && uniforms.view_shift == shift {
+        return;
+    }
+    list.draw_list_has_clip = true;
+    uniforms.view_clip = bounds;
+    uniforms.view_shift = shift;
+    if let Some(pass) = list.pass_id {
+        cx.repaint_pass(pass);
     }
 }
 

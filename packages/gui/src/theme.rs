@@ -102,8 +102,7 @@ pub struct DrawBox {
 }
 
 impl DrawBox {
-    /// Draws one box in absolute coordinates at the current `opacity` (1 unless a painter
-    /// fades, `Painter::set_alpha`).
+    /// Draws one box in absolute coordinates at the current `opacity`.
     pub fn paint(&mut self, cx: &mut Cx2d, rect: Rect, fill: Vec4, radius: f64) {
         self.color = fill;
         self.border_width = 0.0;

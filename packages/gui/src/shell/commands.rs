@@ -1073,6 +1073,9 @@ fn remove_tab(shell: &mut PaseoShell, cx: &mut Cx, ui: &UiContext, key: &str) {
     if let Some(panel) = shell.data.panels.remove(key) {
         shell.data.dispatch_layout = None;
         panels::release(cx, ui, &panel, &mut shell.data.focus_scope);
+        if shell.data.compact {
+            shell.data.compact_navigation.keep_closed(key, panel);
+        }
     }
     shell.data.layout.close_tab(key);
     shell.data.dirty.remove(key);
@@ -1858,6 +1861,9 @@ pub fn apply_effect(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, eff
             if let Some(panel) = shell.data.panels.remove(&tab_key) {
                 shell.data.dispatch_layout = None;
                 panels::release(cx, ui, &panel, &mut shell.data.focus_scope);
+                if shell.data.compact {
+                    shell.data.compact_navigation.keep_closed(&tab_key, panel);
+                }
             }
             shell.data.dirty.remove(&tab_key);
             mark_child_tab_open(shell, ui, &target);

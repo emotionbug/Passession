@@ -722,11 +722,17 @@ fn panel_rows(
     cy - y
 }
 
-/// Opens above the pill on wide layouts (12px offset, 280–620px wide, at most
-/// 440 tall) and as a bottom sheet on compact layouts, whose rows end
-/// `bottom_inset` (the system navigation inset inside `area`) above its edge.
+/// Settled placement; the owner composites this card without remeasuring it.
+pub struct PanelLayout {
+    pub card: Rect,
+    pub above: bool,
+    head: f64,
+    content: f64,
+    bottom_inset: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn draw_panel(
+pub fn measure_panel(
     cx: &mut Cx2d,
     d: &mut Draw,
     painter: &mut Painter,
@@ -736,24 +742,76 @@ pub fn draw_panel(
     anchor: Option<Rect>,
     area: Rect,
     bottom_inset: f64,
-) -> Option<Rect> {
+    above: Option<bool>,
+) -> Option<PanelLayout> {
+    let compact = d.look.compact;
+    let max_w = (area.size.x - 16.0).clamp(0.0, 420.0);
+    let w = if compact { area.size.x } else { max_w };
+    let content = d.measure(|d| panel_rows(cx, d, painter, icon, model, panel, 0.0, 0.0, w));
+    if compact {
+        let head = 24.0 + 16.0 + d.look.ui(14.0) * 1.3;
+        let h = (head + content + 4.0 + bottom_inset).min(area.size.y * 0.8);
+        return (h > 0.0 && w > 0.0).then_some(PanelLayout {
+            card: rect_xywh(area.pos.x, area.pos.y + area.size.y - h, w, h),
+            above: true,
+            head,
+            content,
+            bottom_inset,
+        });
+    }
+    let anchor = anchor?;
+    let wanted = (content + 8.0).min(440.0);
+    let top_space = (anchor.pos.y - 12.0 - (area.pos.y + 8.0)).max(0.0);
+    let bottom_y = anchor.pos.y + anchor.size.y + 12.0;
+    let bottom_space = (area.pos.y + area.size.y - 8.0 - bottom_y).max(0.0);
+    let above = above
+        .filter(|above| {
+            if *above {
+                top_space > 0.0
+            } else {
+                bottom_space > 0.0
+            }
+        })
+        .unwrap_or(wanted <= top_space || top_space >= bottom_space);
+    let (h, y) = if above {
+        let h = wanted.min(top_space);
+        (h, anchor.pos.y - 12.0 - h)
+    } else {
+        (wanted.min(bottom_space), bottom_y)
+    };
+    let x = anchor.pos.x.clamp(
+        area.pos.x + 8.0,
+        (area.pos.x + area.size.x - w - 8.0).max(area.pos.x + 8.0),
+    );
+    (h > 0.0 && w > 0.0).then_some(PanelLayout {
+        card: rect_xywh(x, y, w, h),
+        above,
+        head: 0.0,
+        content,
+        bottom_inset: 0.0,
+    })
+}
+
+/// Paints the card in texture-local coordinates, not its moving window rect.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_panel(
+    cx: &mut Cx2d,
+    d: &mut Draw,
+    painter: &mut Painter,
+    icon: &mut DrawIcon,
+    model: &TrackModel,
+    panel: TrackPanel,
+    layout: &PanelLayout,
+) {
     let p = d.look.palette;
     if d.look.compact {
         let title = t(match panel {
             TrackPanel::Tasks => "message.todo.title",
             TrackPanel::Subagents => "subagents.title",
         });
-        d.canvas
-            .add_hit(area, HitTarget::Chrome("track-close".into()));
-        d.kit.rect(cx, area, rgba(0x73000000), 0.0);
-        let w = area.size.x;
-        let content =
-            d.measure(|d| panel_rows(cx, d, painter, icon, model, panel, area.pos.x, 0.0, w));
-        let max_h = area.size.y * 0.8;
-        let head = 24.0 + 16.0 + d.look.ui(14.0) * 1.3;
-        let h = (head + content + 4.0 + bottom_inset).min(max_h);
-        let top = area.pos.y + area.size.y - h;
-        let sheet = rect_xywh(area.pos.x, top, w, h + 12.0);
+        let w = layout.card.size.x;
+        let h = layout.card.size.y;
+        let sheet = rect_xywh(0.0, 0.0, w, h + 12.0);
         d.kit.rect_full(
             cx,
             sheet,
@@ -766,7 +824,7 @@ pub fn draw_panel(
             .add_hit(sheet, HitTarget::Chrome("track-panel".into()));
         d.kit.rect(
             cx,
-            rect_xywh(area.pos.x + w * 0.5 - 18.0, top + 10.0, 36.0, 4.0),
+            rect_xywh(w * 0.5 - 18.0, 10.0, 36.0, 4.0),
             p.surface2,
             2.0,
         );
@@ -776,18 +834,18 @@ pub fn draw_panel(
             d.look.ui(14.0),
             1.3,
             p.foreground,
-            dvec2(area.pos.x + 12.0, top + 28.0),
+            dvec2(12.0, 28.0),
             &title,
             w - 24.0,
         );
         let body = rect_xywh(
-            area.pos.x,
-            top + head,
+            0.0,
+            layout.head,
             w,
-            (h - head - bottom_inset).max(0.0),
+            (h - layout.head - layout.bottom_inset).max(0.0),
         );
         let key = "track-panel:y".to_owned();
-        let max_y = (content + 4.0 - body.size.y).max(0.0);
+        let max_y = (layout.content + 4.0 - body.size.y).max(0.0);
         d.state.extent_y.insert(key.clone(), max_y);
         let sy = d
             .state
@@ -809,17 +867,7 @@ pub fn draw_panel(
             Layout::default(),
         );
         d.canvas.push_clip(body);
-        panel_rows(
-            cx,
-            d,
-            painter,
-            icon,
-            model,
-            panel,
-            area.pos.x,
-            body.pos.y - sy,
-            w,
-        );
+        panel_rows(cx, d, painter, icon, model, panel, 0.0, body.pos.y - sy, w);
         d.canvas.pop_clip();
         cx.end_turtle();
         super::scrollbar::draw(
@@ -834,28 +882,10 @@ pub fn draw_panel(
                 max: max_y,
             }),
         );
-        return None;
+        return;
     }
-    let anchor = anchor?;
-    let max_w = (area.size.x - 16.0).clamp(0.0, 620.0);
-    let w = 280.0f64.min(max_w).max(max_w.min(420.0));
-    let content = d.measure(|d| panel_rows(cx, d, painter, icon, model, panel, 0.0, 0.0, w));
-    // Above the pill unless the space below is larger and the content does
-    // not fit above; either way bounded by the chosen side's space.
-    let wanted = (content + 8.0).min(440.0);
-    let above = (anchor.pos.y - 12.0 - (area.pos.y + 8.0)).max(0.0);
-    let below = (area.pos.y + area.size.y - 8.0 - (anchor.pos.y + anchor.size.y + 12.0)).max(0.0);
-    let (h, y) = if wanted <= above || above >= below {
-        let h = wanted.min(above);
-        (h, anchor.pos.y - 12.0 - h)
-    } else {
-        (wanted.min(below), anchor.pos.y + anchor.size.y + 12.0)
-    };
-    let x = anchor.pos.x.clamp(
-        area.pos.x + 8.0,
-        (area.pos.x + area.size.x - w - 8.0).max(area.pos.x + 8.0),
-    );
-    let r = rect_xywh(x, y, w, h);
+    let DVec2 { x: w, y: h } = layout.card.size;
+    let r = rect_xywh(0.0, 0.0, w, h);
     let shadow = if d.look.dark() {
         rgba(0x33000000)
     } else {
@@ -864,7 +894,7 @@ pub fn draw_panel(
     d.kit.rect(cx, r.translate(dvec2(0.0, 4.0)), shadow, 8.0);
     d.kit.bordered(cx, r, p.surface1, 8.0, p.border_accent, 1.0);
     let key = "track-panel:y".to_owned();
-    let max_y = (content + 8.0 - h).max(0.0);
+    let max_y = (layout.content + 8.0 - h).max(0.0);
     d.state.extent_y.insert(key.clone(), max_y);
     let sy = d
         .state
@@ -886,7 +916,7 @@ pub fn draw_panel(
         Layout::default().with_clip(true, true),
     );
     d.canvas.push_clip(r);
-    panel_rows(cx, d, painter, icon, model, panel, x, y + 4.0 - sy, w);
+    panel_rows(cx, d, painter, icon, model, panel, 0.0, 4.0 - sy, w);
     d.canvas.pop_clip();
     cx.end_turtle();
     super::scrollbar::draw(
@@ -901,7 +931,6 @@ pub fn draw_panel(
             max: max_y,
         }),
     );
-    Some(r)
 }
 
 #[cfg(test)]

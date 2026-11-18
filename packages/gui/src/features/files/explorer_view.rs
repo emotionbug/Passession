@@ -76,7 +76,7 @@ impl Default for ExplorerView {
             list_rect: Rect::default(),
             row_height: 28.0,
             thumb_drag: None,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             row_rects: Vec::new(),
         }
     }

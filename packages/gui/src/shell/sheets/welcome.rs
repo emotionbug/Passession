@@ -98,7 +98,6 @@ fn failure_text(reason: &str) -> String {
 }
 
 /// Per-window scroll of the welcome body: it scrolls only when it is taller than the area.
-#[derive(Default)]
 struct WelcomeScroll {
     scroll: f64,
     max: f64,
@@ -246,7 +245,12 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     let max = (content_h + version_h - inner.size.y).max(0.0);
     let scroll = SCROLL.with(|scroll| {
         let mut scroll = scroll.borrow_mut();
-        let s = scroll.entry(window).or_default();
+        let s = scroll.entry(window).or_insert_with(|| WelcomeScroll {
+            scroll: 0.0,
+            max: 0.0,
+            viewport: Rect::default(),
+            touch: crate::common::widgets::touch_scroll(),
+        });
         s.viewport = area;
         s.max = max;
         s.scroll = s.scroll.clamp(0.0, max);

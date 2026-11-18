@@ -181,6 +181,14 @@ before shell overlays and the window cursor; a nested overlay inherits its
 ancestor's rank unless it explicitly uses a higher one. Composition reuses a
 scratch buffer and does not move GPU resources.
 
+## Retained viewport composition
+
+`DrawText` honors draw-list shift and clip uniforms, like `DrawQuad` and
+`DrawIcon`. All three evaluate local shape/texture coordinates before the
+shift, so a retained viewport can scroll without moving or re-emitting any
+instances. `DrawText::draw_areas` exposes the latest draw's glyph batches for
+retained color updates across atlas pages.
+
 ## Standard rustybuzz, ttf-parser and PNG
 
 `Cargo.toml` and `Cargo.toml.orig` replace `makepad-rustybuzz` 0.8.0, Makepad's

@@ -24,8 +24,7 @@ live_design!{
                 self.view_clip.xy,
                 self.view_clip.zw
             );
-            //clipped = self.geom_pos * rect_size + rect_pos;
-            self.pos = (clipped - rect_pos) / rect_size
+            self.pos = (clipped - self.view_shift - rect_pos) / rect_size
             self.world = self.view_transform * vec4(
                 clipped.x,
                 clipped.y,

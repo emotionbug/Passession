@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use makepad_widgets::makepad_draw::makepad_platform::makepad_shader_compiler::ShaderTy;
 use makepad_widgets::*;
 
-pub const RING_CADENCE: Duration = Duration::from_millis(125);
+use super::transition::Loop;
+
 const UNFOCUSED_PERIOD: Duration = Duration::from_millis(250);
 pub const MOTION_PERIOD: Duration = Duration::from_nanos(1_000_000_000 / 30);
 
@@ -22,9 +23,10 @@ struct Deadline {
 
 /// Only a surface that is guaranteed opaque may submit a cover. Use its
 /// conservative interior (exclude rounded corners), in the list that paints it.
-pub fn occlude(cx: &mut Cx2d, rect: Rect) {
+/// The returned area can track a retained cover's geometry without repainting.
+pub fn occlude(cx: &mut Cx2d, rect: Rect) -> Area {
     if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
-        return;
+        return Area::Empty;
     }
     let mut area = Area::Empty;
     cx.add_rect_area(&mut area, rect);
@@ -33,6 +35,7 @@ pub fn occlude(cx: &mut Cx2d, rect: Rect) {
             clock.borrow_mut().covers.insert(list, area);
         }
     });
+    area
 }
 
 #[derive(Default)]
@@ -96,12 +99,24 @@ impl PaintOrder {
 
 #[derive(Clone, Copy, Debug)]
 enum InstanceEffect {
-    Spin {
+    Cycle {
         field: LiveId,
-        cycle_ms: f64,
+        token: Loop,
         offset: f64,
     },
+    Caret {
+        start: Instant,
+    },
     Sample(fn(&mut Cx, Area, u128) -> bool),
+}
+
+impl InstanceEffect {
+    fn next_step(self, clock: &Clock, now: Instant, cadence: Duration) -> Instant {
+        match self {
+            Self::Caret { start } => caret_next_step(start, now, cadence),
+            _ => clock.next_step(now, cadence),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -237,7 +252,10 @@ impl Clock {
         schedule.ordered.clear();
         for (&target, entry) in &mut schedule.entries {
             if let Some(period) = entry.period {
-                entry.when = self.next_step(now, period);
+                entry.when = entry.effect.map_or_else(
+                    || self.next_step(now, period),
+                    |effect| effect.next_step(self, now, period),
+                );
             }
             schedule.ordered.insert((entry.when, target));
         }
@@ -254,16 +272,19 @@ impl Clock {
         }
         if let Some(effect) = entry.effect {
             let updated = match effect {
-                InstanceEffect::Spin {
+                InstanceEffect::Cycle {
                     field,
-                    cycle_ms,
+                    token,
                     offset,
                 } => write_instance(
                     cx,
                     entry.area,
                     field,
-                    rotation_at(wall_ms, cycle_ms, offset) as f32,
+                    (token.resolve().phase(wall_ms as f64) + offset).rem_euclid(1.0) as f32,
                 ),
+                InstanceEffect::Caret { start } => {
+                    write_instance(cx, entry.area, live_id!(opacity), caret_opacity(start, now))
+                }
                 InstanceEffect::Sample(sample) => sample(cx, entry.area, wall_ms),
             };
             if !updated {
@@ -271,7 +292,7 @@ impl Clock {
             }
             // Writing the GPU instance sets pass.paint_dirty, not a widget Draw.
             // This registration survives retained replay until the instance detaches.
-            entry.when = self.next_step(now, entry.period.unwrap());
+            entry.when = effect.next_step(self, now, entry.period.unwrap());
             self.schedule.insert(entry);
         } else {
             cx.redraw_area(entry.area);
@@ -331,13 +352,45 @@ pub fn register_until(cx: &mut Cx, area: Area, when: Instant) {
 }
 
 /// Drive a normalized phase on a retained float instance property.
-pub fn spin(cx: &mut Cx, area: Area, field: LiveId, period: Duration, phase_ms: f64, offset: f64) {
-    let effect = InstanceEffect::Spin {
+pub fn animate(cx: &mut Cx, area: Area, field: LiveId, token: Loop) {
+    animate_offset(cx, area, field, token, 0.0);
+}
+
+pub fn animate_offset(cx: &mut Cx, area: Area, field: LiveId, token: Loop, offset: f64) {
+    let effect = InstanceEffect::Cycle {
         field,
-        cycle_ms: phase_ms,
+        token,
         offset,
     };
-    schedule(cx, area, Some(period), None, Some(effect));
+    schedule(cx, area, Some(token.resolve().cadence), None, Some(effect));
+}
+
+/// A caret's phase is relative to the last edit/focus, not wall time.
+pub fn blink_caret(cx: &mut Cx, area: Area, start: Instant) {
+    let cadence = Loop::CaretBlink.resolve().cadence;
+    let effect = InstanceEffect::Caret { start };
+    let next = caret_next_step(start, Instant::now(), cadence);
+    schedule(cx, area, Some(cadence), Some(next), Some(effect));
+}
+
+pub fn stop_caret_blink(cx: &mut Cx, area: Area) {
+    if !area.is_empty() {
+        CLOCK.with(|clock| {
+            let mut clock = clock.borrow_mut();
+            let target = Target::Phase(area);
+            clock.schedule.remove(target);
+            clock.parked.remove(&target);
+            if !cx.in_draw_event() {
+                clock.arm(cx, Instant::now());
+            }
+        });
+    }
+}
+
+fn caret_next_step(start: Instant, now: Instant, cadence: Duration) -> Instant {
+    let elapsed = now.saturating_duration_since(start);
+    let remainder = elapsed.as_nanos() % cadence.as_nanos();
+    now + (cadence - Duration::from_nanos(remainder as u64))
 }
 
 /// Sample several animated properties without a widget draw (e.g. arc ends).
@@ -361,12 +414,18 @@ pub fn write_instance(cx: &mut Cx, area: Area, field: LiveId, value: f32) -> boo
     true
 }
 
-pub fn rotation(phase_ms: f64, offset: f64) -> f64 {
-    rotation_at(now_ms(), phase_ms, offset)
+pub fn loop_phase(token: Loop) -> f64 {
+    token.resolve().phase(now_ms() as f64)
 }
 
-fn rotation_at(wall_ms: u128, phase_ms: f64, offset: f64) -> f64 {
-    ((wall_ms as f64 % phase_ms) / phase_ms + offset).rem_euclid(1.0)
+pub fn caret_opacity(start: Instant, now: Instant) -> f32 {
+    let style = Loop::CaretBlink.resolve();
+    let elapsed = now.saturating_duration_since(start).as_nanos();
+    if elapsed % style.period.as_nanos() < style.cadence.as_nanos() {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// Minute/hour/day boundaries for relative age labels that become dates after a week.
@@ -461,11 +520,6 @@ pub fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-/// Phase in `0..1` of a `period_ms` cycle.
-pub fn phase(period_ms: u128) -> f64 {
-    (now_ms() % period_ms) as f64 / period_ms as f64
 }
 
 /// The displayed state and `register_every` share the same step grid.
@@ -614,7 +668,73 @@ mod paint_tests {
     use super::*;
 
     #[test]
-    fn indicator_clock_spin_does_not_invalidate_host_and_stops_under_opaque_cover() {
+    fn indicator_clock_caret_follows_its_token_without_redrawing() {
+        use makepad_widgets::makepad_draw::CxDraw;
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_widgets::makepad_draw::live_design(&mut cx);
+        crate::theme::live_design(&mut cx);
+        crate::theme::DrawBox::register_main_module(&mut cx);
+        cx.live_expand();
+        let mut caret = crate::theme::DrawBox::new_local(&mut cx);
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(50.0, 50.0));
+        let mut host = DrawList2d::new(&mut cx);
+        {
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(&mut cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            host.begin_always(&mut draw);
+            let mut draw = Cx2d::new(&mut draw);
+            draw.begin_pass_sized_turtle(Layout::default());
+            caret.paint(
+                &mut draw,
+                Rect {
+                    pos: dvec2(10.0, 10.0),
+                    size: dvec2(2.0, 12.0),
+                },
+                Vec4 {
+                    x: 1.0,
+                    y: 1.0,
+                    z: 1.0,
+                    w: 1.0,
+                },
+                0.0,
+            );
+            draw.end_pass_sized_turtle();
+            host.end(&mut draw);
+            draw.end_pass(&pass);
+        }
+
+        let area = caret.area();
+        let start = Instant::now();
+        let style = Loop::CaretBlink.resolve();
+        let opacity = |cx: &Cx| {
+            area.get_read_ref(cx, live_id!(opacity), ShaderTy::Float)
+                .unwrap()
+                .buffer[0]
+        };
+        assert_eq!(opacity(&cx), 1.0);
+        let mut clock = Clock::new();
+        let hidden_at = start + style.cadence;
+        clock.schedule.insert(Deadline {
+            when: hidden_at,
+            area,
+            period: Some(style.cadence),
+            effect: Some(InstanceEffect::Caret { start }),
+        });
+        cx.new_draw_event = DrawEvent::default();
+        for (when, alpha) in [(hidden_at, 0.0), (start + style.period, 1.0)] {
+            let entry = clock.schedule.pop_due(when).unwrap();
+            assert_eq!(entry.when, when);
+            clock.fire(&mut cx, entry, when, 0);
+            assert_eq!(opacity(&cx), alpha);
+            assert!(!cx.new_draw_event.will_redraw());
+        }
+    }
+
+    #[test]
+    fn indicator_clock_cycle_does_not_invalidate_host_and_stops_under_opaque_cover() {
         use makepad_widgets::makepad_draw::CxDraw;
 
         let mut cx = Cx::new(Box::new(|_, _| {}));
@@ -663,10 +783,10 @@ mod paint_tests {
         let entry = Deadline {
             when: now,
             area,
-            period: Some(MOTION_PERIOD),
-            effect: Some(InstanceEffect::Spin {
+            period: Some(Loop::Spinner.resolve().cadence),
+            effect: Some(InstanceEffect::Cycle {
                 field: live_id!(rotation),
-                cycle_ms: 900.0,
+                token: Loop::Spinner,
                 offset: 0.0,
             }),
         };
@@ -684,6 +804,19 @@ mod paint_tests {
         assert!(clock.schedule.next().is_some());
 
         clock.covers.insert(cover.id(), cover_area);
+        clock.finish_draw(&mut cx, now);
+        assert_eq!(clock.armed, None);
+        assert_eq!(clock.parked.len(), 1);
+
+        // Moving a retained cover away at the start of a close resumes the
+        // covered indicator without any host or cover layout.
+        cover_area.set_rect(&mut cx, &Rect::default());
+        clock.finish_draw(&mut cx, now);
+        assert_eq!(clock.armed, Some(now));
+        assert!(clock.parked.is_empty());
+
+        // Once the opening motion settles on the host again, park its loop.
+        cover_area.set_rect(&mut cx, &bounds);
         clock.finish_draw(&mut cx, now);
         assert_eq!(clock.armed, None);
         assert_eq!(clock.parked.len(), 1);

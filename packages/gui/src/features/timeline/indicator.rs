@@ -8,10 +8,12 @@ use makepad_widgets::makepad_draw::text::layouter::LaidoutText;
 use makepad_widgets::*;
 
 use crate::common::clock;
-use crate::theme::with_alpha;
+use crate::common::layer::place_viewport;
+use crate::common::transition::Loop;
 
 use super::canvas::{ChatKit, Font, rect_xywh};
 use super::format;
+use super::paint::MOBILE;
 
 pub(super) enum Indicator {
     Copy {
@@ -42,9 +44,6 @@ pub(super) enum Indicator {
     Shimmer {
         rect: Rect,
         color: Vec4,
-        duration: f64,
-        peak: f64,
-        travel: f64,
         label: Rc<LaidoutText>,
         label_pos: DVec2,
         secondary: Option<Rc<LaidoutText>>,
@@ -69,6 +68,7 @@ impl Indicator {
         kit: &mut ChatKit,
         clip: Option<Rect>,
         area: &mut Area,
+        shimmer_list: Option<&mut Option<DrawList2d>>,
     ) {
         if !area.is_empty() {
             clock::cancel(cx, *area);
@@ -84,7 +84,6 @@ impl Indicator {
         }
         let now = Instant::now();
         let mut until = None;
-        let mut every = None;
         match self {
             Self::Copy {
                 size,
@@ -103,9 +102,7 @@ impl Indicator {
                 until = copied.then_some(*expiry);
             }
             Self::Dots { color, .. } => {
-                const PERIOD: Duration = Duration::from_nanos(950_000_000 / 6);
-                draw_dots(cx, kit, rect.pos, *color, clock::step(PERIOD, 6));
-                every = Some(PERIOD);
+                *area = kit.thinking_dots.paint(cx, rect, *color);
             }
             Self::Elapsed {
                 started_ms,
@@ -157,42 +154,39 @@ impl Indicator {
             }
             Self::Shimmer {
                 color,
-                duration,
-                peak,
-                travel,
                 label,
                 label_pos,
                 secondary,
                 secondary_pos,
                 ..
             } => {
-                let phase = (super::paint::now_seconds() % duration) / duration;
-                let left = rect.pos.x - peak + travel * phase;
-                let x = left.max(rect.pos.x);
-                let width = (left + peak).min(rect.pos.x + rect.size.x) - x;
-                if width > 0.0 {
-                    let sweep = rect_xywh(x, rect.pos.y, width, rect.size.y);
-                    cx.begin_turtle(Walk::abs_rect(sweep), Layout::default());
-                    kit.draw_laidout(cx, Font::Regular, *color, *label_pos, label);
-                    if let Some(secondary) = secondary {
-                        kit.draw_laidout(cx, Font::Regular, *color, *secondary_pos, secondary);
-                    }
-                    cx.end_turtle();
+                // The parent clock anchor stays visible even when the moving
+                // clip on the child list is entirely outside the label.
+                let list = shimmer_list
+                    .expect("shimmer has a retained indicator layer")
+                    .get_or_insert_with(|| DrawList2d::new(cx));
+                list.begin_always(cx);
+                kit.draw_laidout(cx, Font::Regular, *color, *label_pos, label);
+                if let Some(secondary) = secondary {
+                    kit.draw_laidout(cx, Font::Regular, *color, *secondary_pos, secondary);
                 }
-                every = Some(clock::MOTION_PERIOD);
+                list.end(cx);
+                place_viewport(
+                    cx,
+                    list.id(),
+                    shimmer_clip(rect, clock::now_ms()),
+                    DVec2::default(),
+                );
+                cx.add_rect_area(area, rect);
+                clock::sample(cx, *area, Loop::Shimmer.resolve().cadence, sample_shimmer);
             }
         }
-        if every.is_some() || until.is_some() {
+        if let Some(when) = until {
             let bounds = clip.map_or(paint_bounds, |clip| {
                 paint_bounds.clip((clip.pos, clip.pos + clip.size))
             });
             cx.add_rect_area(area, bounds);
-            if let Some(period) = every {
-                clock::register_every(cx, *area, period);
-            }
-            if let Some(when) = until {
-                clock::register_until(cx, *area, when);
-            }
+            clock::register_until(cx, *area, when);
         }
         if clip.is_some() {
             cx.end_turtle();
@@ -208,6 +202,7 @@ pub(crate) struct Indicators {
 
 struct IndicatorLayer {
     list: DrawList2d,
+    shimmer: Option<DrawList2d>,
     area: Area,
     clip: Option<Rect>,
     paint: Indicator,
@@ -227,6 +222,7 @@ impl Indicators {
         } else {
             self.layers.push(IndicatorLayer {
                 list: DrawList2d::new(cx),
+                shimmer: None,
                 area: Area::Empty,
                 clip,
                 paint,
@@ -243,7 +239,13 @@ impl Indicators {
         for layer in &mut self.layers {
             let repaint = layer.dirty || cx.draw_event.draw_list_will_redraw(cx, layer.list.id());
             if layer.list.begin_maybe(cx, repaint).is_ok() {
-                layer.paint.paint(cx, kit, layer.clip, &mut layer.area);
+                layer.paint.paint(
+                    cx,
+                    kit,
+                    layer.clip,
+                    &mut layer.area,
+                    Some(&mut layer.shimmer),
+                );
                 layer.list.end(cx);
                 layer.dirty = false;
             }
@@ -260,35 +262,101 @@ fn duration_delay(elapsed_ms: i64) -> Duration {
     Duration::from_millis(next as u64)
 }
 
-fn draw_dots(cx: &mut Cx2d, kit: &mut ChatKit, pos: DVec2, color: Vec4, step: usize) {
-    const STATES: [[f32; 6]; 6] = [
-        [1.0, 0.0, 0.78, 0.0, 0.56, 0.34],
-        [0.78, 1.0, 0.56, 0.0, 0.34, 0.0],
-        [0.56, 0.78, 0.34, 1.0, 0.0, 0.0],
-        [0.34, 0.56, 0.0, 0.78, 0.0, 1.0],
-        [0.0, 0.34, 0.0, 0.56, 1.0, 0.78],
-        [0.0, 0.0, 1.0, 0.34, 0.78, 0.56],
-    ];
-    const SIZE: f64 = 14.0;
-    const GAP: f64 = 2.0;
-    const DOT: f64 = (SIZE - GAP * 2.0) / 3.0;
-    let ox = pos.x + (SIZE - (DOT * 2.0 + GAP)) * 0.5;
-    let oy = pos.y + (SIZE - (DOT * 3.0 + GAP)) * 0.5;
-    for (index, alpha) in STATES[step].iter().enumerate() {
-        let dx = (index % 2) as f64 * (DOT + GAP);
-        let dy = (index / 2) as f64 * (DOT + GAP);
-        kit.rect(
-            cx,
-            rect_xywh(ox + dx, oy + dy, DOT, DOT),
-            with_alpha(color, color.w * alpha),
-            DOT * 0.5,
-        );
+fn shimmer_clip(rect: Rect, now_ms: u128) -> Rect {
+    let width = rect.size.x;
+    let (peak, travel) = if MOBILE {
+        let peak = (width * 0.28).clamp(32.0, 120.0);
+        (peak, width + 2.0 * peak)
+    } else {
+        let peak = (width * 0.22).clamp(42.0, 120.0);
+        (peak, width + peak)
+    };
+    let phase = Loop::Shimmer.resolve().phase(now_ms as f64);
+    let left = rect.pos.x - peak + travel * phase;
+    crate::common::paint::intersect(rect_xywh(left, rect.pos.y, peak, rect.size.y), rect)
+}
+
+fn sample_shimmer(cx: &mut Cx, area: Area, now_ms: u128) -> bool {
+    let Some(owner) = area.draw_list_id() else {
+        return false;
+    };
+    let items = &cx.draw_lists[owner].draw_items;
+    if items.len() == 0 {
+        return false;
     }
+    let Some(list) = items[0].sub_list() else {
+        return false;
+    };
+    place_viewport(
+        cx,
+        list,
+        shimmer_clip(area.rect(cx), now_ms),
+        DVec2::default(),
+    );
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_indicators_keep_full_dots_bounds_and_move_only_the_shimmer_clip() {
+        use super::super::canvas::DrawThinkingDots;
+        use makepad_widgets::makepad_draw::CxDraw;
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_widgets::live_design(&mut cx);
+        crate::theme::live_design(&mut cx);
+        crate::features::files::live_design(&mut cx);
+        super::super::canvas::live_design(&mut cx);
+        DrawThinkingDots::register_main_module(&mut cx);
+        cx.live_expand();
+        let mut dots = DrawThinkingDots::new_local(&mut cx);
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(200.0, 100.0));
+        let mut row = DrawList2d::new(&mut cx);
+        let mut effect = DrawList2d::new(&mut cx);
+        let mut shimmer = DrawList2d::new(&mut cx);
+        let bounds = rect_xywh(15.0, 20.0, 100.0, 20.0);
+        let dots_bounds = rect_xywh(0.0, 20.0, 14.0, 14.0);
+        let mut anchor = Area::Empty;
+        let dots_area;
+        {
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(&mut cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            row.begin_always(&mut draw);
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_pass_sized_turtle(Layout::flow_overlay());
+            dots_area = dots.paint(&mut cx, dots_bounds, vec4(1.0, 1.0, 1.0, 1.0));
+            effect.begin_always(&mut cx);
+            shimmer.begin_always(&mut cx);
+            shimmer.end(&mut cx);
+            cx.add_rect_area(&mut anchor, bounds);
+            effect.end(&mut cx);
+            cx.end_pass_sized_turtle();
+            row.end(&mut cx);
+            cx.end_pass(&pass);
+        }
+        assert_eq!(dots_area.clipped_rect(&cx), dots_bounds);
+        clock::cancel(&mut cx, dots_area);
+
+        let period = Loop::Shimmer.resolve().period.as_millis();
+        let id = shimmer.id();
+        cx.new_draw_event = DrawEvent::default();
+        assert!(sample_shimmer(&mut cx, anchor, 0));
+        let start = cx.draw_lists[id].draw_list_uniforms.view_clip;
+        assert_eq!(start.x, start.z);
+        assert!(sample_shimmer(&mut cx, anchor, period / 2));
+        let middle = cx.draw_lists[id].draw_list_uniforms.view_clip;
+        assert!(start.x < middle.x && middle.x < middle.z);
+        assert!(middle.z <= (bounds.pos.x + bounds.size.x) as f32);
+        assert!(sample_shimmer(&mut cx, anchor, period));
+        assert_eq!(cx.draw_lists[id].draw_list_uniforms.view_clip, start);
+        assert_eq!(anchor.clipped_rect(&cx), bounds);
+        assert!(!cx.new_draw_event.will_redraw());
+    }
 
     #[test]
     fn indicator_clock_elapsed_follows_visible_boundaries() {

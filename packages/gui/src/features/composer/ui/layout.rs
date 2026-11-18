@@ -56,8 +56,7 @@ impl ComposerPanel {
     }
 
     pub(super) fn spinner(&mut self, cx: &mut Cx2d, r: Rect, color: Vec4) {
-        self.painter
-            .spinner(cx, r, color, [2.0, 0.7], 1_000.0 / 1.2);
+        self.painter.spinner(cx, r, color, [2.0, 0.7]);
     }
 
     pub(super) fn draw_composer(

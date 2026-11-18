@@ -2,7 +2,9 @@
 //! sized text in logical px, Lucide glyphs centred on a point, arcs, a
 //! spinner, clipping and a hit registry with clip rects.
 
+use crate::common::clock;
 use crate::common::paint::{Painter, TextSpec};
+use crate::common::transition::{Loop, LoopStyle};
 use crate::features::files::{DrawFilesImage, file_icon};
 use makepad_widgets::makepad_draw::text::layouter::LaidoutText;
 use makepad_widgets::*;
@@ -74,13 +76,15 @@ pub struct GitPaint {
     clips: Vec<Rect>,
 }
 
-fn pulse_opacity(wall_ms: u128) -> f32 {
-    let step = (wall_ms % 2_000) as f32 / 1_000.0;
-    0.8 - 0.4 * (step - 1.0).abs()
-}
+const SKELETON_PULSE: LoopStyle = Loop::SkeletonPulse.resolve();
 
 fn update_pulse(cx: &mut Cx, area: Area, wall_ms: u128) -> bool {
-    crate::common::clock::write_instance(cx, area, live_id!(opacity), pulse_opacity(wall_ms))
+    clock::write_instance(
+        cx,
+        area,
+        live_id!(opacity),
+        SKELETON_PULSE.pulse(wall_ms as f64) as f32,
+    )
 }
 
 pub fn transparent() -> Vec4 {
@@ -305,19 +309,18 @@ impl GitPaint {
     pub fn spinner(&mut self, cx: &mut Cx2d, center: DVec2, size: f64, color: Vec4) {
         let area = rect(center.x - size / 2.0, center.y - size / 2.0, size, size);
         self.painter
-            .spinner(cx, area, color, [(size / 9.0).max(1.5), 0.7], 1250.0);
+            .spinner(cx, area, color, [(size / 9.0).max(1.5), 0.7]);
     }
 
     pub fn pulse(&mut self, cx: &mut Cx2d, rect: Rect, color: Vec4, radius: f64) {
-        use crate::common::clock;
         let previous = self.painter.draw_box.opacity;
-        self.painter.draw_box.opacity = pulse_opacity(clock::now_ms());
+        self.painter.draw_box.opacity = SKELETON_PULSE.pulse(clock::now_ms() as f64) as f32;
         self.painter.fill(cx, rect, color, radius);
         self.painter.draw_box.opacity = previous;
         clock::sample(
             cx,
             self.painter.draw_box.area(),
-            clock::MOTION_PERIOD,
+            SKELETON_PULSE.cadence,
             update_pulse,
         );
     }

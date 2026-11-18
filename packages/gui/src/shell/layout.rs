@@ -447,6 +447,27 @@ impl Layout {
         }
     }
 
+    /// Sidebar is level zero; a tab adds one level for each detail opener.
+    pub(super) fn compact_depth(&self, key: Option<&str>) -> usize {
+        let Some(mut key) = key else { return 1 };
+        let mut depth = 1;
+        for _ in 0..self.openers.len() {
+            let Some(opener) = self.openers.get(key) else {
+                break;
+            };
+            depth += 1;
+            key = opener;
+        }
+        if depth == 1
+            && self
+                .target(key)
+                .is_some_and(|tab| is_detail_kind(&tab.kind))
+        {
+            return 2;
+        }
+        depth
+    }
+
     /// The detail tab compact Back closes before `handle_back` leaves the conversation.
     pub fn compact_back_tab(&self, compact: bool) -> Option<String> {
         if !compact || self.compact_destination != CompactDestination::Agent {

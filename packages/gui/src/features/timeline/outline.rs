@@ -1,6 +1,6 @@
 //! Port of `chrome/chat_outline.dart` (chat-outline/rail.web.tsx): a 36px
 //! rail 8px from the transcript's left edge spanning its middle 80%, one tick
-//! per user prompt; dock-style magnification after a 150ms hover intent with a
+//! per user prompt; dock-style magnification after a hover dwell with a
 //! 260x48 preview; hidden for fewer than two prompts, on Android/iOS and in
 //! panels narrower than 918px. Prompts come from
 //! `agent.timeline.list_prompts.request`.
@@ -8,8 +8,12 @@
 use super::canvas::*;
 use super::json::*;
 use super::paint::{Draw, MOBILE};
+use crate::common::clock;
+use crate::common::transition::{Intent, Spec, Transition, tokens};
+use makepad_widgets::makepad_draw::makepad_platform::makepad_shader_compiler::ShaderTy;
 use makepad_widgets::*;
 use serde_json::Value;
+use std::time::Instant;
 
 const RAIL_WIDTH: f64 = 36.0;
 const SLOT_HEIGHT: f64 = 8.0;
@@ -23,8 +27,6 @@ const PREVIEW_W: f64 = 260.0;
 const PREVIEW_H: f64 = 48.0;
 const PREVIEW_GAP: f64 = 4.0;
 const MAGNIFY_RADIUS: i64 = 3;
-/// AnimatedContainer 140ms easeOut.
-const EASE_SECS: f64 = 0.14;
 
 /// promptTickMagnification: a raised cosine, 1 under the pointer easing to 0
 /// three slots away.
@@ -63,14 +65,75 @@ pub struct Rail {
     pub loaded_for: Option<(String, String)>,
     hovered: Option<usize>,
     candidate: Option<usize>,
-    active: bool,
-    intent_deadline: Option<f64>,
+    intent_deadline: Option<Instant>,
     motion_anchor: Option<DVec2>,
-    /// Per tick: (width, height) as currently animated, and the last frame time.
-    anim: Vec<(f64, f64)>,
-    anim_at: f64,
+    ticks: Vec<Tick>,
+    moving: Vec<usize>,
+    area: Area,
     rail: Option<Rect>,
     slot: f64,
+}
+
+#[derive(Default)]
+struct Tick {
+    width: Transition,
+    height: Transition,
+    target: Option<DVec2>,
+    area: Area,
+    listed: bool,
+}
+
+impl Tick {
+    fn retarget(&mut self, cx: &mut Cx, target: DVec2, spec: Spec) {
+        match self.target.replace(target) {
+            None => {
+                self.width.snap(target.x);
+                self.height.snap(target.y);
+            }
+            Some(previous) => {
+                if previous.x != target.x {
+                    self.width.retarget(cx, target.x, spec);
+                }
+                if previous.y != target.y {
+                    self.height.retarget(cx, target.y, spec);
+                }
+            }
+        }
+    }
+
+    fn is_moving(&self) -> bool {
+        self.width.is_moving() || self.height.is_moving()
+    }
+
+    fn rect(&self, rail: Rect, slot: f64, index: usize) -> Rect {
+        let h = self.height.value();
+        rect_xywh(
+            rail.pos.x + 4.0,
+            rail.pos.y + slot * index as f64 + (slot - h) / 2.0,
+            self.width.value(),
+            h,
+        )
+    }
+
+    fn advance(&mut self, cx: &mut Cx, event: &Event, rail: Rect, slot: f64, index: usize) {
+        let width = self.width.advance(cx, event);
+        let height = self.height.advance(cx, event);
+        if !width && !height {
+            return;
+        }
+        let rect = self.rect(rail, slot, index);
+        for (field, value) in [
+            (live_id!(rect_pos), rect.pos),
+            (live_id!(rect_size), rect.size),
+        ] {
+            if let Some(write) = self
+                .area
+                .get_write_ref(cx, field, ShaderTy::Vec2, "outline tick")
+            {
+                write.buffer[..2].copy_from_slice(&[value.x as f32, value.y as f32]);
+            }
+        }
+    }
 }
 
 pub enum RailEvent {
@@ -82,29 +145,28 @@ impl Rail {
         self.prompts.len() >= 2 && supported() && width >= MIN_PANEL_WIDTH
     }
 
-    fn schedule_activation(&mut self, now: f64) {
-        if self.candidate.is_some() {
-            self.intent_deadline = Some(now + 0.15);
-        }
+    fn schedule_activation(&mut self, cx: &mut Cx, now: Instant) {
+        clock::cancel(cx, self.area);
+        let deadline = now + tokens::HOVER_DWELL;
+        self.intent_deadline = Some(deadline);
+        clock::register_until(cx, self.area, deadline);
     }
 
-    fn point_at(&mut self, index: usize, now: f64) {
+    fn point_at(&mut self, cx: &mut Cx, index: usize, now: Instant) {
         self.candidate = Some(index);
-        if self.active {
+        if self.hovered.is_some() {
             self.hovered = Some(index);
-            return;
-        }
-        if self.intent_deadline.is_none() {
-            self.schedule_activation(now);
+        } else if self.intent_deadline.is_none() {
+            self.schedule_activation(cx, now);
         }
     }
 
     /// hover-intent.ts: a pointer crossing the rail horizontally restarts the delay.
-    fn moved(&mut self, point: DVec2, now: f64) {
+    fn moved(&mut self, cx: &mut Cx, point: DVec2, now: Instant) {
         let Some(anchor) = self.motion_anchor else {
             return;
         };
-        if self.active {
+        if self.hovered.is_some() {
             return;
         }
         let (dx, dy) = (point.x - anchor.x, point.y - anchor.y);
@@ -116,38 +178,40 @@ impl Rail {
             return;
         }
         self.motion_anchor = Some(point);
-        self.schedule_activation(now);
+        self.schedule_activation(cx, now);
     }
 
-    pub fn leave(&mut self) {
-        self.intent_deadline = None;
+    fn leave(&mut self, cx: &mut Cx) {
+        if self.intent_deadline.take().is_some() {
+            clock::cancel(cx, self.area);
+        }
         self.candidate = None;
         self.motion_anchor = None;
-        self.active = false;
         self.hovered = None;
     }
 
     /// Pointer hover over the panel; returns true when a redraw is needed.
-    pub fn hover(&mut self, point: Option<DVec2>, now: f64) -> bool {
-        let Some(rail) = self.rail else { return false };
+    pub fn hover(&mut self, cx: &mut Cx, point: Option<DVec2>) -> bool {
+        let Some(rail) = self.rail.filter(|_| self.area.is_attached(cx)) else {
+            return false;
+        };
+        let now = Instant::now();
         match point.filter(|p| rail.contains(*p)) {
             Some(p) => {
                 if self.motion_anchor.is_none() {
                     self.motion_anchor = Some(p);
                 } else {
-                    self.moved(p, now);
+                    self.moved(cx, p, now);
                 }
                 let index = (((p.y - rail.pos.y) / self.slot.max(0.001)) as usize)
                     .min(self.prompts.len().saturating_sub(1));
                 let before = self.hovered;
-                self.point_at(index, now);
-                before != self.hovered || self.intent_deadline.is_some()
+                self.point_at(cx, index, now);
+                before != self.hovered
             }
             None => {
-                let had = self.hovered.is_some() || self.candidate.is_some();
-                if had || self.motion_anchor.is_some() {
-                    self.leave();
-                }
+                let had = self.hovered.is_some();
+                self.leave(cx);
                 had
             }
         }
@@ -169,22 +233,45 @@ impl Rail {
         self.rail.is_some_and(|r| r.contains(point))
     }
 
+    pub fn hide(&mut self, cx: &mut Cx) {
+        self.leave(cx);
+        self.area = Area::Empty;
+        self.rail = None;
+        self.moving.clear();
+        self.ticks.clear();
+    }
+
+    pub fn advance(&mut self, cx: &mut Cx, event: &Event) {
+        if self.moving.is_empty() || !matches!(event, Event::NextFrame(_)) {
+            return;
+        }
+        let Some(rail) = self.rail.filter(|_| self.area.is_attached(cx)) else {
+            self.hide(cx);
+            return;
+        };
+        self.moving.retain(|&index| {
+            let tick = &mut self.ticks[index];
+            tick.advance(cx, event, rail, self.slot, index);
+            tick.listed = tick.is_moving();
+            tick.listed
+        });
+    }
+
     /// Paints the rail inside `area` (the transcript rect); `active_seq` is the
     /// prompt being read. Intent waits a single deadline; motion ticks only while changing.
     pub fn draw(&mut self, cx: &mut Cx2d, d: &mut Draw, area: Rect, active_seq: Option<i64>) {
         if !self.visible(area.size.x) {
-            self.rail = None;
+            self.hide(cx);
             return;
         }
         let p = d.look.palette;
-        let now = d.now;
-        if let Some(deadline) = self.intent_deadline
-            && now >= deadline
-        {
-            self.intent_deadline = None;
-            self.active = true;
-            if self.candidate.is_some() {
+        self.area = d.area;
+        if let Some(deadline) = self.intent_deadline {
+            if Instant::now() >= deadline {
+                self.intent_deadline = None;
                 self.hovered = self.candidate;
+            } else {
+                clock::register_until(cx, self.area, deadline);
             }
         }
         let top = area.size.y * 0.1;
@@ -196,38 +283,29 @@ impl Rail {
         let rail = rect_xywh(area.pos.x + 8.0, rail_top, RAIL_WIDTH, rail_h);
         self.rail = Some(rail);
         self.slot = slot;
-        let dt = if self.anim_at > 0.0 {
-            (now - self.anim_at).max(0.0)
-        } else {
-            EASE_SECS
-        };
-        self.anim_at = now;
-        self.anim.resize(count, (RESTING_W, RESTING_H));
-        let mut moving = false;
-        let attention = self.hovered;
+        self.ticks.resize_with(count, Tick::default);
+        self.moving.retain(|&index| index < count);
+        let attention = self.hovered.filter(|&index| index < count);
+        let spec = Intent::Hover.resolve().spec;
         for (i, prompt) in self.prompts.iter().enumerate() {
             let active = Some(int_of(get(prompt, "seq"))) == active_seq;
             let m = attention
                 .map(|a| magnification(i as i64 - a as i64))
                 .unwrap_or(0.0);
             let resting = if active { ACTIVE_W } else { RESTING_W };
-            let target = (
-                resting + m * (MAGNIFIED_W - resting),
-                RESTING_H + m * (MAGNIFIED_H - RESTING_H),
+            let tick = &mut self.ticks[i];
+            tick.retarget(
+                cx,
+                dvec2(
+                    resting + m * (MAGNIFIED_W - resting),
+                    RESTING_H + m * (MAGNIFIED_H - RESTING_H),
+                ),
+                spec,
             );
-            let current = &mut self.anim[i];
-            // easeOut approach: close the remaining gap proportionally to elapsed time.
-            let k = (dt / EASE_SECS).clamp(0.0, 1.0);
-            let k = 1.0 - (1.0 - k).powi(2);
-            current.0 += (target.0 - current.0) * k;
-            current.1 += (target.1 - current.1) * k;
-            if (current.0 - target.0).abs() > 0.05 || (current.1 - target.1).abs() > 0.05 {
-                moving = true;
-            } else {
-                *current = target;
+            if !tick.listed && tick.is_moving() {
+                tick.listed = true;
+                self.moving.push(i);
             }
-            let (w, h) = *current;
-            let y = rail_top + slot * i as f64 + (slot - h) / 2.0;
             let color = if attention == Some(i) {
                 p.foreground
             } else if active {
@@ -236,10 +314,12 @@ impl Rail {
                 p.border_accent
             };
             d.kit
-                .rect(cx, rect_xywh(rail.pos.x + 4.0, y, w, h), color, h / 2.0);
+                .rect
+                .paint(cx, tick.rect(rail, slot, i), color, MAGNIFIED_H / 2.0);
+            tick.area = d.kit.rect.area();
         }
         d.canvas.add_hit(rail, HitTarget::Chrome("outline".into()));
-        if let Some(index) = attention.filter(|a| *a < count) {
+        if let Some(index) = attention {
             let text = str_of(get(&self.prompts[index], "preview"));
             let x = area.pos.x + 8.0 + RAIL_WIDTH + PREVIEW_GAP;
             let y = rail_top + slot * index as f64 + slot / 2.0 - PREVIEW_H / 2.0;
@@ -274,13 +354,81 @@ impl Rail {
             );
             cx.end_turtle();
         }
-        use crate::common::clock;
-        if moving {
-            clock::register_every(cx, d.area, clock::MOTION_PERIOD);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::transition;
+    use crate::theme::DrawBox;
+    use makepad_widgets::makepad_draw::CxDraw;
+
+    #[test]
+    fn outline_hover_updates_tick_instances_without_redrawing_the_preview() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_widgets::makepad_draw::live_design(&mut cx);
+        crate::theme::live_design(&mut cx);
+        DrawBox::register_main_module(&mut cx);
+        cx.live_expand();
+        let mut tick = DrawBox::new_local(&mut cx);
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(200.0, 100.0));
+        let mut list = DrawList2d::new(&mut cx);
+        let mut rail = Rail {
+            rail: Some(rect_xywh(8.0, 20.0, 36.0, 8.0)),
+            slot: SLOT_HEIGHT,
+            ticks: vec![Tick::default()],
+            ..Default::default()
+        };
+        let rest = dvec2(RESTING_W, RESTING_H);
+        let target = dvec2(MAGNIFIED_W, MAGNIFIED_H);
+        let spec = Intent::Hover.resolve().spec;
+        rail.ticks[0].retarget(&mut cx, rest, spec);
+        {
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(&mut cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            list.begin_always(&mut draw);
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_pass_sized_turtle(Layout::flow_overlay());
+            cx.add_rect_area(&mut rail.area, rail.rail.unwrap());
+            tick.paint(
+                &mut cx,
+                rail.ticks[0].rect(rail.rail.unwrap(), rail.slot, 0),
+                vec4(1.0, 1.0, 1.0, 1.0),
+                MAGNIFIED_H / 2.0,
+            );
+            rail.ticks[0].area = tick.area();
+            cx.end_pass_sized_turtle();
+            list.end(&mut cx);
+            cx.end_pass(&pass);
         }
-        if let Some(deadline) = self.intent_deadline {
-            let delay = std::time::Duration::from_secs_f64((deadline - now).max(0.0));
-            clock::register_until(cx, d.area, std::time::Instant::now() + delay);
+
+        rail.ticks[0].retarget(&mut cx, target, spec);
+        rail.ticks[0].listed = true;
+        rail.moving.push(0);
+        cx.new_draw_event = DrawEvent::default();
+        for (time, expected) in [(1.0, Some(rest)), (1.04, None), (2.0, Some(target))] {
+            let event = Event::NextFrame(NextFrameEvent {
+                frame: 0,
+                time,
+                set: [rail.ticks[0].width.scheduled_frame().unwrap()]
+                    .into_iter()
+                    .collect(),
+            });
+            transition::begin_event(&event);
+            rail.advance(&mut cx, &event);
+            let actual = tick.area().rect(&cx).size;
+            if let Some(expected) = expected {
+                assert_eq!(actual, expected);
+            } else {
+                assert!((RESTING_W..MAGNIFIED_W).contains(&actual.x));
+                assert!((RESTING_H..MAGNIFIED_H).contains(&actual.y));
+            }
+            assert!(!cx.new_draw_event.will_redraw());
         }
+        assert!(rail.moving.is_empty());
+        assert!(rail.ticks[0].width.scheduled_frame().is_none());
     }
 }

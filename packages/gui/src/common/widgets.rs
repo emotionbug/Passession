@@ -2,14 +2,66 @@
 //! repaints from the runtime [`Palette`] on every draw, so theme switches apply without
 //! reloading DSL. Use them in DSL with `use crate::common::widgets::*;`.
 
+use makepad_widgets::scroll_bars::{FlingSpec, TouchScroll, set_touch_scroll_defaults};
 use makepad_widgets::*;
 use serde_json::Value;
 
 use crate::common::paint::{Font, HitMap, Painter, TextSpec, rect};
+use crate::common::transition::{self, Fling, FlingStyle, Loop};
 use crate::common::{UiContext, UiEffect, clock};
 use crate::theme::{
     self, ControlSize, Palette, Typography, control_height, control_icon_size, fade,
 };
+
+fn vendor_fling(style: FlingStyle) -> FlingSpec {
+    FlingSpec {
+        decay: style.decay,
+        stop_speed: style.stop_speed,
+    }
+}
+
+/// Native ScrollBars, PortalList and TextInput inherit the same fling and frame
+/// admission as manually drawn scrollers.
+pub(crate) fn configure_touch_motion() {
+    set_touch_scroll_defaults(vendor_fling(Fling::resolve()), transition::request_frame);
+}
+
+pub(crate) fn touch_scroll() -> TouchScroll {
+    TouchScroll::with_spec(vendor_fling(Fling::resolve()), transition::request_frame)
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+    use crate::common::transition::StyleFamily;
+
+    #[test]
+    fn touch_scroll_uses_the_platform_fling_spec() {
+        configure_touch_motion();
+        let expected = vendor_fling(Fling::resolve());
+        assert_eq!(touch_scroll().fling_spec(), expected);
+        assert_eq!(TouchScroll::default().fling_spec(), expected);
+
+        let travel = |family| {
+            let spec = vendor_fling(Fling::resolve_for(family));
+            let mut scroll = TouchScroll::with_spec(spec, transition::request_frame);
+            scroll.begin(dvec2(0.0, 100.0), 0.0, true);
+            assert_eq!(scroll.move_to(dvec2(0.0, 50.0), 0.05), Some(50.0));
+            assert!(scroll.release(0.06));
+            assert_eq!(scroll.advance(10.0), None);
+            let delta = scroll.advance(20.0).unwrap();
+            assert!(!scroll.is_flinging());
+            assert!((delta - (1000.0 - spec.stop_speed) / spec.decay).abs() < 1e-10);
+            delta
+        };
+        let material = travel(StyleFamily::Material);
+        let cupertino = travel(StyleFamily::Cupertino);
+        let desktop = travel(StyleFamily::Desktop);
+        assert_ne!(material, cupertino);
+        assert_ne!(material, desktop);
+        assert_ne!(cupertino, desktop);
+    }
+}
 
 /// Measured line extents shared by custom-painted list rows. Measure once per
 /// style per draw; virtualized lists use `height` for culling and advancing too.
@@ -1007,17 +1059,8 @@ impl Widget for PButton {
                 icon_size,
             );
             if self.busy {
-                let area = self
-                    .painter
-                    .ring(cx, icon_rect, fg, 1.5, 0.25, clock::phase(900));
-                clock::spin(
-                    cx,
-                    area,
-                    live_id!(rotation),
-                    clock::RING_CADENCE,
-                    900.0,
-                    0.0,
-                );
+                self.painter
+                    .loading_ring(cx, icon_rect, fg, [1.5, 0.25], Loop::StatusRing);
             } else {
                 let icon = self.icon.as_ref().to_string();
                 self.painter.icon(cx, icon_rect, &icon, icon_size, fg);
@@ -1900,9 +1943,8 @@ pub const STATUS_RING_STROKE: f64 = 1.5;
 pub const STATUS_RING_SIZE: f64 =
     STATUS_FILLED_DOT_SIZE + (STATUS_RING_GAP + STATUS_RING_STROKE) * 2.0;
 pub const STATUS_RING_FRAME_SIZE: f64 = STATUS_RING_SIZE + 2.0;
-const RING_PERIOD_MS: f64 = 900.0;
 
-/// `StatusRing`: a 6px dot inside a 1.5px ring whose quarter turns every 900ms.
+/// A 6px dot inside a 1.5px ring with a rotating quarter arc.
 pub fn paint_status_ring(
     painter: &mut Painter,
     cx: &mut Cx2d,
@@ -1930,16 +1972,9 @@ pub fn paint_status_ring(
         theme::with_alpha(p.running, 0.9),
         STATUS_RING_STROKE,
         0.25,
-        clock::rotation(RING_PERIOD_MS, -0.25),
+        (clock::loop_phase(Loop::StatusRing) - 0.25).rem_euclid(1.0),
     );
-    clock::spin(
-        cx,
-        area,
-        live_id!(rotation),
-        clock::RING_CADENCE,
-        RING_PERIOD_MS,
-        -0.25,
-    );
+    clock::animate_offset(cx, area, live_id!(rotation), Loop::StatusRing, -0.25);
     painter.dot(cx, center, STATUS_FILLED_DOT_SIZE, p.running);
 }
 
@@ -2085,17 +2120,7 @@ impl Widget for Spinner {
             TextRole::Body => p.muted,
             role => role.color(&p),
         };
-        let area = self
-            .painter
-            .ring(cx, r, color, self.stroke, 0.3, clock::phase(900));
-        clock::spin(
-            cx,
-            area,
-            live_id!(rotation),
-            clock::RING_CADENCE,
-            900.0,
-            0.0,
-        );
+        self.painter.spinner(cx, r, color, [self.stroke, 0.3]);
         DrawStep::done()
     }
 }

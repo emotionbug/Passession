@@ -42,6 +42,29 @@ live_design! {
         }
     }
 
+    pub DrawThinkingDots = {{DrawThinkingDots}} {
+        fn pixel(self) -> vec4 {
+            // Six positions, clockwise around a two-by-three grid.
+            let p = self.pos * self.rect_size;
+            let first = vec2(4.333333, 1.666667);
+            let spacing = 5.333333;
+            let cell = clamp(floor((p - first) / spacing + vec2(0.5, 0.5)), vec2(0., 0.), vec2(1., 2.));
+            let order = 1.0 + cell.y;
+            if cell.x == 0.0 {
+                order = 6.0 - cell.y;
+                if cell.y == 0.0 {
+                    order = 0.0;
+                }
+            }
+            let delta = min(floor(self.phase * 6.0), 5.0) - order;
+            let age = delta - 6.0 * floor(delta / 6.0);
+            let wave = (1.0 - age * 0.22) * step(age, 3.0);
+            let aa = clamp(2.166667 - length(p - (first + cell * spacing)), 0., 1.);
+            let alpha = wave * aa * self.color.a;
+            return vec4(self.color.rgb * alpha, alpha);
+        }
+    }
+
     pub ChatKit = {{ChatKit}} {
         rect: <DrawBox> {}
         image: <DrawFilesImage> {}
@@ -70,6 +93,29 @@ pub struct DrawChatSpinner {
     pub thickness: f32,
     #[live]
     pub phase: f32,
+}
+
+#[derive(Live, LiveHook, LiveRegister)]
+#[repr(C)]
+pub struct DrawThinkingDots {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    color: Vec4,
+    #[live]
+    phase: f32,
+}
+
+impl DrawThinkingDots {
+    pub(super) fn paint(&mut self, cx: &mut Cx2d, rect: Rect, color: Vec4) -> Area {
+        use crate::common::{clock, transition::Loop};
+        self.color = color;
+        self.phase = Loop::ThinkingDots.resolve().phase(clock::now_ms() as f64) as f32;
+        self.draw_abs(cx, rect);
+        let area = self.area();
+        clock::animate(cx, area, live_id!(phase), Loop::ThinkingDots);
+        area
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +172,8 @@ pub struct ChatKit {
     pub image: DrawFilesImage,
     #[live]
     pub spinner: DrawChatSpinner,
+    #[live]
+    pub thinking_dots: DrawThinkingDots,
     #[live]
     pub logo: DrawIcon,
     #[live]
@@ -318,6 +366,7 @@ impl ChatKit {
             &mut self.rect.draw_vars,
             &mut self.image.draw_vars,
             &mut self.spinner.draw_vars,
+            &mut self.thinking_dots.draw_vars,
             &mut self.logo.draw_vars,
             &mut self.text_regular.draw_vars,
             &mut self.text_medium.draw_vars,
@@ -630,18 +679,11 @@ impl ChatKit {
             return;
         }
         self.spinner.color = color;
-        use crate::common::clock;
-        self.spinner.phase = clock::phase(1_000) as f32;
+        use crate::common::{clock, transition::Loop};
+        self.spinner.phase = Loop::Spinner.resolve().phase(clock::now_ms() as f64) as f32;
         self.spinner.thickness = (r.size.x / 9.0).max(1.5) as f32;
         self.spinner.draw_abs(cx, r);
-        clock::spin(
-            cx,
-            self.spinner.area(),
-            live_id!(phase),
-            clock::MOTION_PERIOD,
-            1_000.0,
-            0.0,
-        );
+        clock::animate(cx, self.spinner.area(), live_id!(phase), Loop::Spinner);
     }
 
     pub fn texture(&mut self, cx: &mut Cx2d, r: Rect, texture: &Texture, radius: f64) {

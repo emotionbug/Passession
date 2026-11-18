@@ -14,6 +14,7 @@ pub mod overlay;
 pub mod paint;
 pub mod provider_icon;
 pub mod state_delta;
+pub mod transition;
 pub mod widgets;
 
 use std::collections::HashMap;
@@ -68,6 +69,7 @@ pub fn host_display_name(host: &Value) -> &str {
 
 pub fn live_design(cx: &mut Cx) {
     paint::live_design(cx);
+    overlay::live_design(cx);
     file_drop::live_design(cx);
     widgets::live_design(cx);
     provider_icon::live_design(cx);

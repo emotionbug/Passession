@@ -26,7 +26,7 @@ pub enum FieldEvent {
 pub struct TextField {
     pub buffer: TextBuffer,
     pub focused: bool,
-    pub blink: super::Blink,
+    blink: super::Blink,
     scroll_x: f64,
     text_rect: Rect,
     font_size: f64,
@@ -99,6 +99,13 @@ impl TextField {
             anchor: 0,
             head: len,
         });
+    }
+
+    pub fn set_focused(&mut self, cx: &mut Cx, focused: bool) {
+        self.focused = focused;
+        if !focused {
+            self.blink.disarm(cx);
+        }
     }
 
     pub fn clear_selection(&mut self, cx: &mut Cx) {
@@ -234,11 +241,8 @@ impl TextField {
             kit.draw_laidout(cx, s, dvec2(x0, y), &laid);
         }
         if self.focused {
-            self.blink.arm(cx);
             let caret = rect(x0 + caret_x, y, 1.5, h.max(font_size * 1.2));
-            if self.blink.visible() {
-                kit.fill(cx, caret, p.foreground, 0.0);
-            }
+            self.blink.draw(cx, &mut kit.painter, caret, p.foreground);
             // KeyboardView avoids the supplied area's bottom, not the relative
             // caret position. Using the owner area would pan the whole file pane.
             cx.add_aligned_rect_area(&mut self.ime_caret_area, caret);
@@ -535,7 +539,7 @@ impl TextField {
                 }
             }
             Hit::KeyFocusLost(_) => {
-                self.focused = false;
+                self.set_focused(cx, false);
                 self.clear_selection(cx);
             }
             _ => {}
@@ -549,7 +553,9 @@ impl TextField {
         }
         if self.buffer.revision != revision || self.buffer.selection != selection {
             self.scroll_follows_anchor = false;
-            self.blink.restart(cx);
+            if self.focused {
+                self.blink.restart(cx);
+            }
         }
         if self.focused {
             cx.update_text_input(

@@ -10,8 +10,9 @@
 use makepad_widgets::*;
 
 use crate::common::paint::{Font, Painter, TextSpec, rect};
+use crate::common::transition::Loop;
 use crate::common::widgets::{PLabelWidgetExt, PLabelWidgetRefExt, TextRole};
-use crate::common::{UiContext, UiEffect, clock, overlay};
+use crate::common::{UiContext, UiEffect, overlay};
 use crate::theme::{
     self, ControlSize, Palette, control_height, control_icon_size, fade, with_alpha,
 };
@@ -782,26 +783,13 @@ impl Widget for WaButton {
                 } else {
                     icon_rect
                 };
-                let area = self.painter.ring(
-                    cx,
-                    ring,
-                    content,
-                    if self.kind == WaButtonKind::Submit {
-                        2.0
-                    } else {
-                        1.5
-                    },
-                    0.25,
-                    clock::phase(900),
-                );
-                clock::spin(
-                    cx,
-                    area,
-                    live_id!(rotation),
-                    clock::RING_CADENCE,
-                    900.0,
-                    0.0,
-                );
+                let stroke = if self.kind == WaButtonKind::Submit {
+                    2.0
+                } else {
+                    1.5
+                };
+                self.painter
+                    .loading_ring(cx, ring, content, [stroke, 0.25], Loop::StatusRing);
             } else if let Some(status) = self.dot {
                 self.painter.dot(
                     cx,

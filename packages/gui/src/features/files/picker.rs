@@ -275,7 +275,7 @@ impl Default for PickerView {
             list_rect: Rect::default(),
             row_height: 36.0,
             thumb_drag: None,
-            touch_scroll: Default::default(),
+            touch_scroll: crate::common::widgets::touch_scroll(),
             highlight: None,
             editing: false,
             field: TextField::new(""),
@@ -1138,7 +1138,7 @@ impl PickerView {
     fn end_edit(&mut self, cx: &mut Cx) {
         self.editing = false;
         self.field.clear_selection(cx);
-        self.field.focused = false;
+        self.field.set_focused(cx, false);
         self.focus_requested = false;
         cx.hide_text_ime();
     }
@@ -1545,7 +1545,7 @@ impl Widget for RemoteFolderPicker {
         let owner = self.owner();
         let uid = self.widget_uid();
         let mut action = None;
-        let mut changed = self.view.field.blink.handle_event(event);
+        let mut changed = false;
         if let Some(ui) = scope.data.get_mut::<UiContext>() {
             store::register_picker(&owner, &host_id);
             store::with(|s| {
