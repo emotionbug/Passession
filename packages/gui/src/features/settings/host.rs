@@ -119,10 +119,11 @@ pub fn hosts(state: &CoreState) -> Vec<HostView> {
             status: Status::parse(str_of(entry, "status")),
             server_info,
             error: error_text(get(entry, "error")),
-            local: !config
-                .get("localCredentialPath")
-                .map(Value::is_null)
-                .unwrap_or(true),
+            local: connections.iter().any(|config| {
+                config["localCredentialPath"]
+                    .as_str()
+                    .is_some_and(|path| !path.is_empty())
+            }),
             connections,
             projects: state
                 .directory(entry)

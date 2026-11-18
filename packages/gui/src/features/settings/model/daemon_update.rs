@@ -321,7 +321,7 @@ pub fn phase_key(phase: &str) -> &'static str {
         "activating" => "phaseActivating",
         "starting" => "phaseAppStarting",
         "verifying" | "checking" => "phaseVerifying",
-        "rolling_back" | "rolled_back" | "rolledBack" => "phaseRollingBack",
+        "rolling_back" | "rollingBack" | "rolled_back" | "rolledBack" => "phaseRollingBack",
         "committed" => "phaseComplete",
         _ => "phaseInstalling",
     }

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -26,8 +25,6 @@ const (
 	loadLibrarySearchSystem32 = 0x00000800
 	errorNotFound             = syscall.Errno(1168)
 	maxSignerCertificate      = 1 << 20
-	maxRegistryPathCharacters = 32767
-	installRegistryKey        = `Software\Paseo Sessions`
 )
 
 // WINTRUST_ACTION_GENERIC_VERIFY_V2, the Authenticode policy used by
@@ -35,7 +32,6 @@ const (
 var genericVerifyV2 = syscall.GUID{Data1: 0x00aac56b, Data2: 0xcd44, Data3: 0x11d0, Data4: [8]byte{0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee}}
 
 var loadLibraryEx = kernel32.NewProc("LoadLibraryExW")
-var expandEnvironment = kernel32.NewProc("ExpandEnvironmentStringsW")
 
 // WINTRUST_FILE_INFO
 type winTrustFileInfo struct {
@@ -318,105 +314,4 @@ func verifyCatalogSignature(p *wintrustProcs, name *uint16, file *os.File, algor
 		return true, 0, nil, err
 	}
 	return true, status, subject, nil
-}
-
-// checkRegisteredInstallation requires the NSIS-registered current-user
-// installation to be the update destination.
-func checkRegisteredInstallation(destination string) error {
-	registered, err := registeredInstallDirectory(installRegistryKey)
-	if err != nil {
-		return fmt.Errorf("registered installation unavailable: %w", err)
-	}
-	if !sameRegisteredInstallation(registered, destination) {
-		return errors.New("registered installation changed")
-	}
-	return nil
-}
-
-// sameRegisteredInstallation keeps the former rule
-// [IO.Path]::GetFullPath($root).TrimEnd('\') -ine $destination.TrimEnd('\'),
-// except that a relative root is never resolved against the helper directory.
-func sameRegisteredInstallation(registered, destination string) bool {
-	if !filepath.IsAbs(registered) {
-		return false
-	}
-	full, err := syscall.FullPath(registered)
-	if err != nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimRight(full, `\`), strings.TrimRight(destination, `\`))
-}
-
-// registeredInstallDirectory reads HKCU\<subkey>\InstallDir from the 64-bit
-// registry view, expanding REG_EXPAND_SZ as the PowerShell registry provider did.
-func registeredInstallDirectory(subkey string) (string, error) {
-	path, err := syscall.UTF16PtrFromString(subkey)
-	if err != nil {
-		return "", err
-	}
-	value, err := syscall.UTF16PtrFromString("InstallDir")
-	if err != nil {
-		return "", err
-	}
-	var key syscall.Handle
-	if err = syscall.RegOpenKeyEx(syscall.HKEY_CURRENT_USER, path, 0, syscall.KEY_QUERY_VALUE|syscall.KEY_WOW64_64KEY, &key); err != nil {
-		return "", err
-	}
-	defer syscall.RegCloseKey(key)
-	buffer := make([]uint16, 260)
-	for {
-		var kind uint32
-		size := uint32(len(buffer) * 2)
-		err = syscall.RegQueryValueEx(key, value, nil, &kind, (*byte)(unsafe.Pointer(&buffer[0])), &size)
-		if errors.Is(err, syscall.ERROR_MORE_DATA) {
-			if size > (maxRegistryPathCharacters+1)*2 {
-				return "", errors.New("registered installation path is too long")
-			}
-			buffer = make([]uint16, size/2+1)
-			continue
-		}
-		if err != nil {
-			return "", err
-		}
-		if kind != syscall.REG_SZ && kind != syscall.REG_EXPAND_SZ {
-			return "", errors.New("registered installation is not a string")
-		}
-		if size%2 != 0 || size > uint32(len(buffer)*2) {
-			return "", errors.New("malformed registered installation")
-		}
-		text := buffer[:size/2]
-		for len(text) > 0 && text[len(text)-1] == 0 {
-			text = text[:len(text)-1]
-		}
-		if slices.Contains(text, 0) {
-			return "", errors.New("malformed registered installation")
-		}
-		root := syscall.UTF16ToString(text)
-		if kind == syscall.REG_EXPAND_SZ {
-			return expandEnvironmentStrings(root)
-		}
-		return root, nil
-	}
-}
-
-func expandEnvironmentStrings(value string) (string, error) {
-	source, err := syscall.UTF16PtrFromString(value)
-	if err != nil {
-		return "", err
-	}
-	buffer := make([]uint16, 260)
-	for {
-		result, _, e := expandEnvironment.Call(uintptr(unsafe.Pointer(source)), uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
-		count := uint32(result) // DWORD characters, including the terminator
-		if count == 0 {
-			return "", e
-		}
-		if count <= uint32(len(buffer)) {
-			return syscall.UTF16ToString(buffer[:count]), nil
-		}
-		if count > maxRegistryPathCharacters+1 {
-			return "", errors.New("registered installation path is too long")
-		}
-		buffer = make([]uint16, count)
-	}
 }

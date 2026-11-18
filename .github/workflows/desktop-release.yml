@@ -411,7 +411,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --release -p paseo-gui-platform --lib share_item_resolves_across_apartments
-          cargo test --locked --release -p paseo-gui-platform --lib desktop_helper_starts_without_console_and_keeps_pipes
+          cargo test --locked --release -p paseo-gui-platform --lib desktop_daemon_cli_starts_without_console_and_captures_output
       - name: Build only planned components and changed OS packages
         if: ${{ !matrix.finalizer }}
         run: cargo xtask components build --plan artifacts/component-plan.json --target "${{ env.TARGET_ID }}"
@@ -507,7 +507,7 @@ jobs:
         # A filter that matches no test still exits 0; require exactly one pass.
         run: |
           set -euo pipefail
-          for test in share_item_resolves_across_apartments desktop_helper_starts_without_console_and_keeps_pipes; do
+          for test in share_item_resolves_across_apartments desktop_daemon_cli_starts_without_console_and_captures_output; do
             "artifacts/smoke-$TARGET_ID/windows-smoke.exe" "$test" | tee "$RUNNER_TEMP/smoke.log"
             grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/smoke.log"
           done

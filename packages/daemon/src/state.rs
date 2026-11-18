@@ -327,6 +327,11 @@ pub async fn run_daemon(home: PathBuf, options: Value) -> Result<i32> {
             .as_str()
             .context("Daemon identity is missing")?;
         crate::daemon_control::publish_worker_ready(&listen, server_id)?;
+        match tokio::fs::remove_file(app.home.join(crate::transport::MIGRATION_CREDENTIAL)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Cannot retire the migration credential"),
+        }
         tracing::info!(%listen,%server_id,version=crate::VERSION,"Paseo native daemon ready");
         app.automation.start_background_maintenance();
         app.cancel.cancelled().await;

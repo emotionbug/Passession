@@ -3,6 +3,9 @@
 //! daemon process tree and switch runtimes only through the real launch owner.
 //! The operation journal (native-update-operation.json) belongs to
 //! `daemon_admin::update_operation`; the selection here is not a second journal.
+mod ensure;
+pub(crate) use ensure::{ensure_daemon, registered_owner};
+
 use super::{
     DaemonInstance, StopOptions, error, identity, lock, read_daemon_instance, same_daemon_instance,
     stop_daemon_instance,
@@ -83,7 +86,29 @@ pub(crate) fn probe_report() -> Value {
         "version": crate::VERSION,
         "sourceSha": option_env!("PASEO_BUILD_SOURCE_SHA").unwrap_or(""),
         "controlProtocol": CONTROL_PROTOCOL,
+        "legacyMigrationCredential": true,
     })
+}
+
+fn clean_runtime_environment(command: &mut Command) {
+    // An installed daemon must not depend on the transient AppImage mount.
+    #[cfg(target_os = "linux")]
+    {
+        if let (Some(bundle), Some(path)) = (std::env::var_os("APPDIR"), std::env::var_os("PATH"))
+            && let Ok(search_path) = std::env::join_paths(
+                std::env::split_paths(&path).filter(|path| !path.starts_with(&bundle)),
+            )
+        {
+            command.env("PATH", search_path);
+        }
+        command
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .env_remove("APPDIR")
+            .env_remove("APPIMAGE");
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
 }
 
 async fn probe_executable(path: &Path) -> Result<Value> {
@@ -94,6 +119,7 @@ async fn probe_executable(path: &Path) -> Result<Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    clean_runtime_environment(&mut command);
     #[cfg(windows)]
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW: this probe has no interactive UI.
     let output = tokio::time::timeout(Duration::from_secs(20), command.output())
@@ -263,195 +289,6 @@ fn pinned_image(pid: u32, birth: &str) -> Result<(PathBuf, String)> {
     let digest = image_sha256(pid)?;
     alive()?;
     Ok((path, digest))
-}
-
-/// Canonical Windows paths cross the Rust/Go protocol without Win32's extended
-/// prefix. This changes representation only, never resolves links or `..`.
-pub(crate) fn desktop_protocol_path(path: &Path) -> std::borrow::Cow<'_, Path> {
-    #[cfg(windows)]
-    if let Some(text) = path.to_str() {
-        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-            return std::borrow::Cow::Owned(PathBuf::from(format!(r"\\{unc}")));
-        }
-        if let Some(disk) = text.strip_prefix(r"\\?\")
-            && disk.as_bytes().get(1) == Some(&b':')
-            && disk.as_bytes().get(2) == Some(&b'\\')
-        {
-            return std::borrow::Cow::Borrowed(Path::new(disk));
-        }
-    }
-    std::borrow::Cow::Borrowed(path)
-}
-
-/// The GUI/helper protocol uses the OS birth token without our internal prefix.
-pub(crate) fn verify_desktop_process(pid: u32, token: &str, executable: &Path) -> Result<()> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
-    let pids = [
-        sysinfo::Pid::from_u32(pid),
-        sysinfo::Pid::from_u32(std::process::id()),
-    ];
-    let mut processes = sysinfo::System::new();
-    processes.refresh_processes_specifics(
-        // sysinfo removes a duplicate PID during the same refresh pass.
-        ProcessesToUpdate::Some(if pids[0] == pids[1] {
-            &pids[..1]
-        } else {
-            &pids
-        }),
-        true,
-        ProcessRefreshKind::nothing().with_user(UpdateKind::Always),
-    );
-    let user = processes
-        .process(pids[1])
-        .and_then(|p| p.user_id())
-        .context("Cannot verify current process user")?;
-    ensure!(
-        processes.process(pids[0]).and_then(|p| p.user_id()) == Some(user),
-        "Desktop owner belongs to another user"
-    );
-    let identity = if cfg!(target_os = "linux") {
-        format!("linux:{token}")
-    } else if cfg!(target_os = "macos") {
-        format!("darwin:{token}")
-    } else if cfg!(windows) {
-        let ticks = token.parse::<u64>().context("Invalid GUI birth token")?;
-        format!(
-            "win32:{}",
-            ticks
-                .checked_add(504_911_232_000_000_000)
-                .context("Invalid GUI birth token")?
-        )
-    } else {
-        bail!("Desktop process identity is unsupported");
-    };
-    ensure!(
-        identity::start_identity(pid)?.as_deref() == Some(identity.as_str()),
-        "Desktop owner process changed"
-    );
-    ensure!(
-        executable.is_absolute()
-            && desktop_protocol_path(&image_path(pid)?) == desktop_protocol_path(executable),
-        "Desktop owner executable changed"
-    );
-    ensure!(
-        identity::start_identity(pid)?.as_deref() == Some(identity.as_str()),
-        "Desktop owner process changed"
-    );
-    Ok(())
-}
-
-fn desktop_process_binding(pid: u32, executable: &Path) -> Result<Value> {
-    let birth = identity::start_identity(pid)?.context("Desktop runtime process disappeared")?;
-    let token = if let Some(ticks) = birth.strip_prefix("win32:") {
-        ticks
-            .parse::<u64>()?
-            .checked_sub(504_911_232_000_000_000)
-            .context("Invalid Windows process birth")?
-            .to_string()
-    } else {
-        birth
-            .split_once(':')
-            .context("Invalid process birth identity")?
-            .1
-            .to_owned()
-    };
-    verify_desktop_process(pid, &token, executable)?;
-    Ok(
-        json!({"process":{"pid":pid,"birthToken":token},"executable":desktop_protocol_path(executable)}),
-    )
-}
-
-pub(crate) fn desktop_host_process() -> Result<Value> {
-    let executable = std::env::current_exe()?.canonicalize()?;
-    Ok(json!([desktop_process_binding(
-        std::process::id(),
-        &executable
-    )?]))
-}
-
-/// A failed worker startup still leaves an owned supervisor to stop. Only its
-/// direct same-image worker child is admitted; unrelated runtime images are not.
-pub(crate) fn desktop_partial_runtime_processes(
-    instance: &DaemonInstance,
-    executable: &Path,
-) -> Result<Value> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
-    ensure!(
-        identity::verified(instance)?,
-        "Desktop supervisor identity changed"
-    );
-    let host_pid = std::process::id();
-    ensure!(
-        instance.pid != host_pid
-            && process_facts(instance.pid, false)?.and_then(|facts| facts.parent) == Some(host_pid),
-        "Desktop supervisor is not owned by this host"
-    );
-    let mut processes = sysinfo::System::new();
-    processes.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    let mut result = vec![
-        desktop_process_binding(host_pid, executable)?,
-        desktop_process_binding(instance.pid, executable)?,
-    ];
-    for (pid, process) in processes.processes() {
-        if process.parent().map(|parent| parent.as_u32()) != Some(instance.pid) {
-            continue;
-        }
-        let pid = pid.as_u32();
-        let facts = process_facts(pid, false)?.context("Desktop worker changed during snapshot")?;
-        ensure!(
-            result.len() == 2
-                && facts.parent == Some(instance.pid)
-                && facts.cmd.iter().any(|argument| argument == "__worker"),
-            "Unrecognized child of the owned desktop supervisor"
-        );
-        result.push(desktop_process_binding(pid, executable)?);
-    }
-    ensure!(
-        identity::verified(instance)?,
-        "Desktop supervisor changed during snapshot"
-    );
-    Ok(json!(result))
-}
-
-/// Read-only, birth-pinned snapshot of the exact owned host/supervisor/worker cohort.
-pub(crate) fn desktop_runtime_processes(
-    instance: &DaemonInstance,
-    worker_pid: u32,
-    executable: &Path,
-) -> Result<Value> {
-    ensure!(
-        identity::verified(instance)?,
-        "Desktop supervisor identity changed"
-    );
-    let host_pid = std::process::id();
-    ensure!(
-        worker_pid > 1
-            && worker_pid != instance.pid
-            && worker_pid != host_pid
-            && instance.pid != host_pid,
-        "Invalid desktop runtime process family"
-    );
-    ensure!(
-        process_facts(instance.pid, false)?.and_then(|facts| facts.parent) == Some(host_pid)
-            && process_facts(worker_pid, false)?.and_then(|facts| facts.parent)
-                == Some(instance.pid),
-        "Desktop runtime process ancestry changed"
-    );
-    let mut result = Vec::with_capacity(3);
-    for pid in [host_pid, instance.pid, worker_pid] {
-        result.push(desktop_process_binding(pid, executable)?);
-    }
-    ensure!(
-        identity::verified(instance)?
-            && process_facts(worker_pid, false)?.and_then(|facts| facts.parent)
-                == Some(instance.pid),
-        "Desktop runtime changed during process snapshot"
-    );
-    Ok(json!(result))
 }
 
 fn is_paseo_run(cmd: &[String]) -> bool {
@@ -706,7 +543,7 @@ pub(crate) async fn discover_owner(home: &Path) -> Result<LaunchOwner> {
     })?;
     if instance.desktop_managed {
         return Err(unsupported(
-            "This daemon is managed by Paseo Desktop. Update Paseo Desktop on the host.",
+            "This daemon must be migrated with `paseo daemon ensure` before it can update independently.",
         ));
     }
     let server_id = match (&instance.listen, &instance.server_id) {
@@ -782,6 +619,110 @@ pub(crate) async fn discover_owner(home: &Path) -> Result<LaunchOwner> {
         service,
         launch,
     })
+}
+
+pub(crate) async fn legacy_migration_owner(
+    home: &Path,
+    instance: &DaemonInstance,
+    client: &paseo_client::DaemonClient,
+) -> Result<LaunchOwner> {
+    ensure!(
+        instance.desktop_managed
+            && instance.uid == identity::uid()
+            && instance.hostname == hostname::get()?.to_string_lossy()
+            && identity::verified(instance)?,
+        "Cannot verify the legacy desktop supervisor's identity"
+    );
+    let birth = instance
+        .process_start_identity
+        .clone()
+        .context("Missing supervisor identity")?;
+    let pid = instance.pid;
+    let (executable, executable_sha256) = blocking(move || {
+        let (image, digest) = pinned_image(pid, &birth)?;
+        ensure!(
+            image.file_name().and_then(|name| name.to_str()) == Some(EXECUTABLE)
+                && process_facts(pid, false)?.is_some_and(|facts| {
+                    facts.cmd.get(1).is_some_and(|arg| arg == "__supervisor")
+                }),
+            "Legacy daemon does not run as a native Paseo supervisor"
+        );
+        Ok((image, digest))
+    })
+    .await?;
+    let status = client.daemon_status(Duration::from_secs(5)).await?;
+    let server_id = instance
+        .server_id
+        .clone()
+        .context("Legacy daemon has no server ID")?;
+    ensure!(
+        status["serverId"] == server_id,
+        "Legacy daemon status identity changed"
+    );
+    let worker = status["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .context("Legacy daemon status has no worker PID")?;
+    ensure!(
+        blocking(move || Ok(process_facts(worker, false)?.and_then(|worker| worker.parent)))
+            .await?
+            == Some(pid),
+        "Legacy daemon worker does not belong to the pinned supervisor"
+    );
+    Ok(LaunchOwner {
+        kind: OwnerKind::Standalone,
+        home: home.to_owned(),
+        server_id,
+        version: status["version"]
+            .as_str()
+            .context("Legacy daemon version is missing")?
+            .to_owned(),
+        source_sha: status["sourceSha"].as_str().unwrap_or_default().to_owned(),
+        supervisor: instance.clone(),
+        executable,
+        executable_sha256,
+        service: None,
+        launch: None,
+    })
+}
+
+/// Verify the running runtime before advertising or preparing a release update.
+/// An `ensure` installation pins the whole runtime even when its preserved
+/// bundle metadata says `desktop-bundled`.
+pub(crate) async fn inspect_current_runtime(owner: &LaunchOwner) -> Result<RuntimeIdentity> {
+    let root = owner
+        .executable
+        .parent()
+        .context("Runtime root is missing")?;
+    if let Some(installation_root) = read_pointer(&owner.home)?
+        && let Some(selection) = Installation::at(installation_root, owner.home.clone())?.load()?
+        && selection.registration.is_some()
+    {
+        let runtime = selection.active;
+        ensure!(
+            runtime.root == root
+                && runtime.version == owner.version
+                && runtime.executable_sha256 == owner.executable_sha256
+                && selection.server_id == owner.server_id,
+            "Running daemon does not match its managed installation"
+        );
+        let (path, digest) = (runtime.root.clone(), runtime.tree_digest.clone());
+        blocking(move || {
+            ensure!(
+                crate::daemon_admin::updater::tree_digest(&path)? == digest,
+                "Installed runtime contents changed"
+            );
+            Ok(())
+        })
+        .await?;
+        return Ok(runtime);
+    }
+    let runtime = crate::daemon_admin::updater::inspect_runtime(root).await?;
+    ensure!(
+        runtime.version == owner.version && runtime.executable_sha256 == owner.executable_sha256,
+        "Running daemon differs from the installed runtime"
+    );
+    Ok(runtime)
 }
 
 /// A systemd user service owns the daemon only when its main process is the
@@ -941,6 +882,8 @@ pub(crate) struct Selection {
     /// Only while an update is in flight; committed updates keep no backup runtime.
     #[serde(default)]
     pub trial: Option<Trial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registration: Option<ensure::Registration>,
     #[serde(default)]
     pub service: Option<ServiceBinding>,
     /// Original runtime root the first active runtime was copied from; never modified.
@@ -1204,75 +1147,23 @@ impl Installation {
             .parent()
             .context("Running runtime has no root")?
             .to_owned();
-        ensure!(
-            !source.starts_with(&self.home) && !source.starts_with(&self.root),
-            "Running runtime overlaps the daemon home or installation store"
-        );
-        let staging = self.staging_path(&format!("adopt-{}", uuid::Uuid::new_v4().simple()))?;
-        let runtimes = self.private_child("runtimes")?;
-        let expected_sha = owner.executable_sha256.clone();
-        let (from, to) = (source.clone(), staging.clone());
-        let digest = blocking(move || {
-            ensure!(
-                sha256_file(&from.join(EXECUTABLE))? == expected_sha,
-                "Running image differs from its runtime file; refusing to adopt it"
-            );
-            let before = crate::daemon_admin::updater::tree_digest(&from)?;
-            ensure_capacity(&to, tree_size(&from)?)?;
-            copy_tree(&from, &to)?;
-            ensure!(
-                crate::daemon_admin::updater::tree_digest(&to)? == before
-                    && crate::daemon_admin::updater::tree_digest(&from)? == before,
-                "Running runtime changed while it was preserved"
-            );
-            Ok(before)
-        })
-        .await?;
-        let destination = runtimes.join(format!(
-            "adopted-{}",
-            &hex::encode(Sha256::digest(digest.as_bytes()))[..16]
-        ));
-        if destination.exists() {
-            let (path, expected) = (destination.clone(), digest.clone());
-            blocking(move || {
-                ensure!(
-                    crate::daemon_admin::updater::tree_digest(&path)? == expected,
-                    "Preserved runtime store entry was modified"
-                );
-                Ok(())
-            })
+        let preserved = self
+            .preserve_runtime(&source, Some(&owner.executable_sha256))
             .await?;
-            fs::remove_dir_all(staging.parent().context("Missing staging directory")?)?;
-        } else {
-            fs::rename(&staging, &destination)?;
-            sync_directory(&runtimes)?;
-            let _ = fs::remove_dir(staging.parent().context("Missing staging directory")?);
-        }
-        let (platform, arch) = host_platform()?;
-        let unmarked = RuntimeIdentity {
-            root: destination.clone(),
-            version: owner.version.clone(),
-            source_sha: owner.source_sha.clone(),
-            platform: platform.into(),
-            arch: arch.into(),
-            release: false,
-            executable_sha256: owner.executable_sha256.clone(),
-            tree_digest: digest.clone(),
-        };
-        // Accept marker provenance only when it is a strict standalone runtime
-        // describing exactly the running image; a desktop-bundled daemon has none.
-        let active = match crate::daemon_admin::updater::inspect_runtime(&destination).await {
+        // Only strict standalone markers can establish release provenance.
+        let active = match crate::daemon_admin::updater::inspect_runtime(&preserved.root).await {
             Ok(identity)
-                if identity.tree_digest == digest
-                    && identity.executable_sha256 == owner.executable_sha256
+                if identity.tree_digest == preserved.tree_digest
+                    && identity.executable_sha256 == preserved.executable_sha256
                     && identity.version == owner.version =>
             {
-                RuntimeIdentity {
-                    root: destination.clone(),
-                    ..identity
-                }
+                identity
             }
-            _ => unmarked,
+            _ => RuntimeIdentity {
+                version: owner.version.clone(),
+                source_sha: owner.source_sha.clone(),
+                ..preserved
+            },
         };
         let mut selection = Selection {
             schema_version: 1,
@@ -1282,11 +1173,81 @@ impl Installation {
             active,
             trial: None,
             service: None,
+            registration: None,
             adopted_from: Some(source),
             updated_at: String::new(),
         };
         self.write(&mut selection)?;
         Ok(selection)
+    }
+
+    /// Copy a complete runtime into the existing immutable runtime store. The
+    /// image digest pins adoption to the running executable when one is known.
+    async fn preserve_runtime(
+        &self,
+        source: &Path,
+        expected_sha: Option<&str>,
+    ) -> Result<RuntimeIdentity> {
+        ensure!(
+            !source.starts_with(&self.home)
+                && !self.home.starts_with(source)
+                && !source.starts_with(&self.root)
+                && !self.root.starts_with(source),
+            "Runtime overlaps the daemon home or installation store"
+        );
+        let staging = self.private_child("staging")?;
+        let runtimes = self.private_child("runtimes")?;
+        let from = source.to_owned();
+        let expected = expected_sha.map(str::to_owned);
+        let (root, executable_sha256, tree_digest) = blocking(move || {
+            let from_executable = from.join(EXECUTABLE);
+            ensure!(
+                fs::symlink_metadata(&from_executable)?.is_file(),
+                "Runtime has no native entry"
+            );
+            let digest = crate::daemon_admin::updater::tree_digest(&from)?;
+            let destination = runtimes.join(format!(
+                "preserved-{}",
+                &hex::encode(Sha256::digest(digest.as_bytes()))[..16]
+            ));
+            let verify = |root: &Path| -> Result<String> {
+                ensure!(
+                    crate::daemon_admin::updater::tree_digest(root)? == digest,
+                    "Preserved runtime does not match its source"
+                );
+                let sha = sha256_file(&root.join(EXECUTABLE))?;
+                ensure!(
+                    expected.as_ref().is_none_or(|expected| expected == &sha),
+                    "Running image differs from its runtime file; refusing to adopt it"
+                );
+                Ok(sha)
+            };
+            let executable_sha256 = if destination.exists() {
+                verify(&destination)?
+            } else {
+                let stage = tempfile::tempdir_in(staging)?;
+                ensure_capacity(stage.path(), tree_size(&from)?)?;
+                let copied = stage.path().join("runtime");
+                copy_tree(&from, &copied)?;
+                let sha = verify(&copied)?;
+                fs::rename(&copied, &destination)?;
+                sync_directory(&runtimes)?;
+                sha
+            };
+            Ok((destination, executable_sha256, digest))
+        })
+        .await?;
+        let (platform, arch) = host_platform()?;
+        Ok(RuntimeIdentity {
+            root,
+            version: String::new(),
+            source_sha: String::new(),
+            platform: platform.into(),
+            arch: arch.into(),
+            release: false,
+            executable_sha256,
+            tree_digest,
+        })
     }
 
     fn control_intact(&self, selection: &Selection) -> Result<bool> {
@@ -1813,6 +1774,10 @@ pub(crate) async fn bind_service(
     let selection = installation
         .load()?
         .context("Managed installation is not prepared")?;
+    if let Some(ensure::Registration::SystemdUser { unit, .. }) = &selection.registration {
+        ensure!(unit == &service.unit, "Registered systemd service changed");
+        return Ok(false); // Already launches through the fixed control entry.
+    }
     let content = drop_in_content(&selection.control.path, &owner.home);
     let directory = drop_in_directory(&service.unit)?;
     let path = directory.join(DROP_IN);
@@ -1906,6 +1871,12 @@ pub(crate) async fn restore_service(
     let Some(service) = &owner.service else {
         return Ok(());
     };
+    if installation
+        .load()?
+        .is_some_and(|selection| selection.registration.is_some())
+    {
+        return Ok(()); // Do not remove the registration's own ExecStart binding.
+    }
     let path = drop_in_directory(&service.unit)?.join(DROP_IN);
     match fs::read_to_string(&path) {
         Ok(content) => {
@@ -2025,6 +1996,7 @@ async fn run_standalone_launcher(
             .reopen()
             .context("Cannot open managed launcher diagnostics")?,
     );
+    command.kill_on_drop(true);
     let status = tokio::time::timeout(deadline, command.status())
         .await
         .map_err(|_| anyhow!("Standalone launcher did not finish before its deadline"))?
@@ -2632,7 +2604,14 @@ pub(crate) async fn run_launcher(home: &Path, standalone: bool) -> Result<i32> {
     let executor_alive = installation.try_lease()?.is_none();
     let home_arg = installation.home.to_string_lossy().into_owned();
     let args = match (&selection.service, standalone) {
-        (_, true) => vec!["daemon".into(), "start".into(), "--home".into(), home_arg],
+        (_, true) => vec![
+            "daemon".into(),
+            "start".into(),
+            "--timeout".into(),
+            "60".into(),
+            "--home".into(),
+            home_arg,
+        ],
         (Some(service), false) => service.launch_args.clone(),
         (None, false) => vec!["daemon".into(), "run".into(), "--home".into(), home_arg],
     };
@@ -2651,16 +2630,22 @@ pub(crate) async fn run_launcher(home: &Path, standalone: bool) -> Result<i32> {
                 continue;
             }
         }
+        let mut command = Command::new(&executable);
+        command
+            .args(&args)
+            .env("PASEO_CLI", &selection.control.path);
+        if selection.registration.is_some() {
+            clean_runtime_environment(&mut command);
+            command.env_remove("PASEO_SERVER_ID");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            let failure = std::process::Command::new(&executable).args(&args).exec();
+            let failure = command.into_std().exec();
             failures.push(format!("{}: {failure}", executable.display()));
         }
         #[cfg(not(unix))]
         {
-            let mut command = Command::new(&executable);
-            command.args(&args);
             #[cfg(windows)]
             if standalone {
                 command.creation_flags(0x08000000); // Background restart; foreground CLI keeps its console.
@@ -2722,11 +2707,55 @@ mod tests {
             active: runtime(&runtimes.join("old"), "1.0.0"),
             trial: None,
             service: None,
+            registration: None,
             adopted_from: None,
             updated_at: String::new(),
         };
         installation.write(&mut selection).unwrap();
         (base, installation, lease, selection)
+    }
+
+    #[tokio::test]
+    async fn standalone_updater_accepts_registered_bootstrap_bytes() -> Result<()> {
+        let (_base, installation, _lease, mut selection) = fixture();
+        let active = &mut selection.active;
+        fs::create_dir(&active.root)?;
+        let executable = active.root.join(EXECUTABLE);
+        fs::write(&executable, b"bootstrap image")?;
+        let marker = active.root.join("paseo-runtime.json");
+        fs::write(&marker, b"{\"installationKind\":\"desktop-bundled\"}")?;
+        active.executable_sha256 = sha256_file(&executable)?;
+        active.tree_digest = crate::daemon_admin::updater::tree_digest(&active.root)?;
+        let owner = LaunchOwner {
+            kind: OwnerKind::Standalone,
+            home: installation.home.clone(),
+            server_id: selection.server_id.clone(),
+            version: active.version.clone(),
+            source_sha: active.source_sha.clone(),
+            supervisor: lock::PidLock::acquire(&installation.home)?.instance.clone(),
+            executable,
+            executable_sha256: active.executable_sha256.clone(),
+            service: None,
+            launch: None,
+        };
+        installation.bind_home()?;
+        for registration in [
+            ensure::Registration::Detached,
+            ensure::Registration::SystemdUser {
+                unit: "paseo.service".into(),
+                unit_file: installation.root().join("paseo.service"),
+                reused: false,
+            },
+        ] {
+            selection.registration = Some(registration);
+            installation.write(&mut selection)?;
+            let inspected = inspect_current_runtime(&owner).await?;
+            assert_eq!(inspected.tree_digest, selection.active.tree_digest);
+            assert!(!inspected.release);
+        }
+        fs::write(marker, b"modified")?;
+        assert!(inspect_current_runtime(&owner).await.is_err());
+        Ok(())
     }
 
     #[test]

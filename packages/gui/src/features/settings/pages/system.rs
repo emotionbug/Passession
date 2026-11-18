@@ -1,24 +1,24 @@
-//! App pages from `settings_screen.dart`: Local daemon (`LocalDaemonSection`, desktop host),
-//! Notifications (every OS) and Diagnostics.
+//! Local daemon, notification and diagnostic settings.
 
 use serde_json::{Value, json};
 
 use crate::features::settings::host::Status;
 use crate::features::settings::i18n::{t, ta};
-use crate::features::settings::json::{get, is_true, scalar_text, str_of};
+use crate::features::settings::json::{get, scalar_text, str_of};
 use crate::features::settings::platform::{self, DESKTOP};
 use crate::features::settings::rpc::{Env, ReqError, handler};
 use crate::features::settings::state::Settings;
 use crate::features::settings::ui::draw::Icon;
-use crate::features::settings::ui::kit::{Ctl, Ui, Variant, button, row, small, switch};
+use crate::features::settings::ui::kit::{Ctl, Ui, Variant, button, row, switch};
 
 #[derive(Default)]
 pub struct LocalDaemonState {
     pub settings: Value,
     pub daemon: Value,
     pub loading: bool,
-    pub loaded: bool,
-    pub busy: bool,
+    pub(crate) loaded: bool,
+    saving: bool,
+    starting: bool,
     pub error: Option<String>,
 }
 
@@ -55,90 +55,76 @@ pub fn ensure_local_daemon(s: &mut Settings, env: &mut Env) {
 }
 
 fn load_local_daemon(s: &mut Settings, env: &mut Env) {
-    s.local_daemon.loading = true;
+    let state = &mut s.local_daemon;
+    state.loading = true;
+    s.desktop(env, "desktop_settings_get", json!({}), |s, env, result| {
+        match result {
+            Ok(settings) => s.local_daemon.settings = settings,
+            Err(error) => s.local_daemon.error = Some(error.text()),
+        }
+        refresh_local_daemon(s, env);
+    });
+}
+
+pub(crate) fn refresh_local_daemon(s: &mut Settings, env: &mut Env) {
+    s.desktop(env, "desktop_daemon_status", json!({}), |s, _, result| {
+        let state = &mut s.local_daemon;
+        state.loading = false;
+        state.loaded = true;
+        match result {
+            Ok(daemon) => state.daemon = daemon,
+            Err(error) => state.error = Some(error.text()),
+        }
+    });
+}
+
+fn set_local_autostart(s: &mut Settings, env: &mut Env, enabled: bool) {
+    let state = &mut s.local_daemon;
+    if !state.settings.is_object() || state.saving {
+        return;
+    }
+    state.saving = true;
+    state.error = None;
     s.desktop(
         env,
-        "desktop_settings_get",
-        json!({}),
-        |s, env, settings| match settings {
-            Err(error) => {
-                s.local_daemon.loading = false;
-                s.local_daemon.loaded = true;
-                s.local_daemon.error = Some(error.text());
-            }
-            Ok(settings) => s.desktop(
-                env,
-                "desktop_daemon_status",
-                json!({}),
-                move |s, _, daemon| {
-                    s.local_daemon.loading = false;
-                    s.local_daemon.loaded = true;
-                    match daemon {
-                        Ok(daemon) => {
-                            s.local_daemon.settings = settings;
-                            s.local_daemon.daemon = daemon;
-                            s.local_daemon.error = None;
-                        }
-                        Err(error) => s.local_daemon.error = Some(error.text()),
+        "desktop_settings_update",
+        json!({"patch": {"daemon": {"startDaemonIfNotRunning": enabled}}}),
+        move |s, env, result| {
+            let state = &mut s.local_daemon;
+            state.saving = false;
+            match result {
+                Ok(settings) => {
+                    state.settings = settings;
+                    if enabled {
+                        env.ctx.core.connect_local_daemon();
                     }
-                },
-            ),
+                }
+                Err(error) => state.error = Some(error.text()),
+            }
         },
     );
 }
 
-/// `_DesktopInvoke.run`: one operation at a time; failures land in `error`.
-fn run_local(s: &mut Settings, env: &mut Env, command: &'static str, args: Value, reload: bool) {
-    if s.local_daemon.busy {
+fn start_local_daemon(s: &mut Settings, env: &mut Env) {
+    let state = &mut s.local_daemon;
+    if state.starting || matches!(str_of(&state.daemon, "status"), "starting" | "running") {
         return;
     }
-    s.local_daemon.busy = true;
-    s.desktop(env, command, args, move |s, env, result| {
-        s.local_daemon.busy = false;
+    state.starting = true;
+    state.error = None;
+    s.desktop(env, "start_desktop_daemon", json!({}), |s, env, result| {
+        let state = &mut s.local_daemon;
+        state.starting = false;
         match result {
-            Ok(_) => {
-                s.local_daemon.error = None;
-                if reload {
-                    load_local_daemon(s, env);
-                }
-            }
-            Err(error) => s.local_daemon.error = Some(error.text()),
+            Ok(_) => env.ctx.core.connect_local_daemon(),
+            Err(error) => state.error = Some(error.text()),
         }
+        refresh_local_daemon(s, env);
     });
 }
 
-fn report_local(s: &mut Settings, env: &mut Env, command: &'static str, title: String) {
-    if s.local_daemon.busy {
-        return;
-    }
-    s.local_daemon.busy = true;
-    s.desktop(env, command, json!({}), move |s, _, result| {
-        s.local_daemon.busy = false;
-        match result {
-            Ok(report) => {
-                s.local_daemon.error = None;
-                s.report(title, &report);
-            }
-            Err(error) => s.local_daemon.error = Some(error.text()),
-        }
-    });
-}
-
-fn patch_daemon(patch: Value) -> crate::features::settings::rpc::Handler {
-    handler(move |s, env| {
-        run_local(
-            s,
-            env,
-            "desktop_settings_update",
-            json!({"patch": {"daemon": patch.clone()}}),
-            true,
-        )
-    })
-}
-
-pub fn draw_local_daemon(ui: &mut Ui, s: &Settings) {
+pub fn draw_local_daemon(ui: &mut Ui, s: &Settings, has_local_host: bool) {
     let state = &s.local_daemon;
-    let pal = ui.pal;
     ui.section_title(&t("desktop.daemon.title"), None, None);
     if state.loading && !state.loaded {
         ui.card_begin();
@@ -154,96 +140,81 @@ pub fn draw_local_daemon(ui: &mut Ui, s: &Settings) {
         return;
     }
     let daemon_settings = get(&state.settings, "daemon");
-    let running = str_of(&state.daemon, "status") == "running";
-    let owned = is_true(&state.daemon, "ownedByDesktop");
-    let pid = state
-        .daemon
-        .get("pid")
-        .filter(|p| !p.is_null())
-        .map(scalar_text);
-    let busy = state.busy;
+    let status = if state.starting {
+        "starting"
+    } else {
+        match str_of(&state.daemon, "status") {
+            status @ ("running" | "starting" | "stopped" | "failed") => status,
+            _ => "unknown",
+        }
+    };
+    let owner = match str_of(&state.daemon, "owner") {
+        "systemd-user" => Some("desktop.daemon.owner.service"),
+        "detached" => Some("desktop.daemon.owner.background"),
+        "desktop-legacy" => Some("desktop.daemon.owner.legacy"),
+        _ => None,
+    };
+    let enabled = daemon_settings["startDaemonIfNotRunning"]
+        .as_bool()
+        .unwrap_or(true);
+    let toggle = (state.settings.is_object() && !state.saving)
+        .then(|| handler(move |s, env| set_local_autostart(s, env, !enabled)));
     ui.card_begin();
-    let status = Ctl::Col(
-        vec![
-            Ctl::Label {
-                text: t(if running {
-                    "desktop.daemon.status.running"
-                } else {
-                    "desktop.daemon.status.notRunning"
-                }),
-                color: pal.muted,
-                size: 14.0,
-                font: crate::features::settings::ui::draw::Font::Regular,
-                max_w: 200.0,
-            },
-            small(
-                ta(
-                    "desktop.daemon.status.pid",
-                    &[("pid", pid.as_deref().unwrap_or("—"))],
-                ),
-                pal.muted,
-            ),
-        ],
-        0.0,
-        true,
+    ui.row(
+        row(t("desktop.daemon.autostart.title"))
+            .hint(t("desktop.daemon.autostart.hint"))
+            .control(switch("local.autostart", enabled, toggle)),
     );
+    let (label, action) = if status == "running" && !has_local_host {
+        (
+            "desktop.daemon.connect",
+            Some(handler(|_, env| env.ctx.core.connect_local_daemon())),
+        )
+    } else {
+        (
+            "desktop.daemon.startNow",
+            matches!(status, "stopped" | "failed" | "unknown").then(|| handler(start_local_daemon)),
+        )
+    };
+    let mut detail = t(&format!("desktop.daemon.status.{status}"));
+    if let Some(owner) = owner {
+        detail.push_str(" · ");
+        detail.push_str(&t(owner));
+    }
+    ui.card_row_separator();
     ui.row(
         row(t("desktop.daemon.status.title"))
-            .hint(t("desktop.daemon.status.builtInOnly"))
-            .error(state.error.clone())
-            .control(status),
+            .hint(detail)
+            .error(
+                state
+                    .error
+                    .clone()
+                    .or_else(|| state.daemon["error"].as_str().map(String::from)),
+            )
+            .control(
+                button("local.start", t(label), action)
+                    .loading(status == "starting")
+                    .ctl(),
+            ),
     );
-    let manage = daemon_settings
-        .get("manageBuiltInDaemon")
-        .and_then(Value::as_bool)
-        != Some(false);
-    let toggle_manage = (!busy).then(|| {
-        handler(move |s, env| {
-            if manage {
-                let confirmed = patch_daemon(json!({"manageBuiltInDaemon": false}));
-                s.confirm(
-                    t("desktop.daemon.management.pauseTitle"),
-                    t("desktop.daemon.management.pauseMessage"),
-                    t("desktop.daemon.management.pauseAndStop"),
-                    true,
-                    confirmed,
-                );
-            } else {
-                patch_daemon(json!({"manageBuiltInDaemon": true}))(s, env);
-            }
-        })
-    });
-    ui.row(
-        row(t("desktop.daemon.management.title"))
-            .hint(t("desktop.daemon.management.hint"))
-            .control(switch("local.manage", manage, toggle_manage)),
-    );
-    let keep = is_true(daemon_settings, "keepRunningAfterQuit");
-    ui.row(
-        row(t("desktop.daemon.keepRunning.title"))
-            .hint(t("desktop.daemon.keepRunning.hint"))
-            .control(switch(
-                "local.keep",
-                keep,
-                (!busy).then(|| patch_daemon(json!({"keepRunningAfterQuit": !keep}))),
-            )),
-    );
+    ui.card_row_separator();
     let log_hint = state
         .daemon
         .get("logPath")
         .filter(|p| !p.is_null())
         .map(scalar_text)
         .unwrap_or_else(|| t("desktop.daemon.logs.unavailable"));
-    let logs = (!busy).then(|| {
-        handler(|s, env| {
-            report_local(
-                s,
-                env,
-                "desktop_daemon_logs",
-                t("desktop.daemon.logs.modalTitle"),
-            )
-        })
-    });
+    let logs = Some(handler(|s, env| {
+        s.desktop(
+            env,
+            "desktop_daemon_logs",
+            json!({}),
+            |s, _, result| match result {
+                Ok(report) => s.report(t("desktop.daemon.logs.modalTitle"), &report),
+                Err(error) => s.local_daemon.error = Some(error.text()),
+            },
+        );
+    }));
     ui.row(
         row(t("desktop.daemon.logs.title")).hint(log_hint).control(
             button("local.logs", t("desktop.daemon.logs.open"), logs)
@@ -251,116 +222,8 @@ pub fn draw_local_daemon(ui: &mut Ui, s: &Settings) {
                 .ctl(),
         ),
     );
-    let status_report = (!busy).then(|| {
-        handler(|s, env| {
-            report_local(
-                s,
-                env,
-                "desktop_daemon_status",
-                t("desktop.daemon.fullStatus.modalTitle"),
-            )
-        })
-    });
-    ui.row(
-        row(t("desktop.daemon.fullStatus.title"))
-            .hint(t("desktop.daemon.fullStatus.hint"))
-            .control(
-                button(
-                    "local.status",
-                    t("desktop.daemon.fullStatus.view"),
-                    status_report,
-                )
-                .icon(Icon::Activity)
-                .ctl(),
-            ),
-    );
-    ui.card_end();
-    ui.gap(12.0);
-
-    ui.card_begin();
-    let label = if pid.is_none() {
-        t("desktop.daemon.status.notRunning")
-    } else {
-        t(if owned {
-            "desktop.daemon.lifecycle.owned"
-        } else {
-            "desktop.daemon.lifecycle.attached"
-        })
-    };
-    let version = state
-        .daemon
-        .get("version")
-        .filter(|v| !v.is_null())
-        .map(|v| format!("v{}", scalar_text(v)));
-    let mut buttons = Vec::new();
-    if !running {
-        let start = (!busy)
-            .then(|| handler(|s, env| run_local(s, env, "start_desktop_daemon", json!({}), true)));
-        buttons.push(button("local.start", t("settingsNative.startDaemon"), start).ctl());
-    }
-    // Restart lives once, in the host's danger zone (`restart.confirmTitle`).
-    if running && owned {
-        let ownership = t("desktop.daemon.lifecycle.ownedMessage");
-        let home = state
-            .daemon
-            .get("home")
-            .filter(|v| !v.is_null())
-            .map(scalar_text)
-            .unwrap_or_else(|| "—".into());
-        let message = ta(
-            "desktop.daemon.lifecycle.stopMessage",
-            &[
-                ("ownership", &ownership),
-                ("home", &home),
-                ("pid", pid.as_deref().unwrap_or("—")),
-            ],
-        );
-        let stop = (!busy).then(|| {
-            handler(move |s, _| {
-                let go = handler(|s, env| {
-                    run_local(
-                        s,
-                        env,
-                        "stop_desktop_daemon",
-                        json!({"reason": "settings"}),
-                        true,
-                    )
-                });
-                s.confirm(
-                    t("desktop.daemon.lifecycle.stopTitle"),
-                    message.clone(),
-                    t("desktop.daemon.lifecycle.stop"),
-                    true,
-                    go,
-                );
-            })
-        });
-        buttons.push(button("local.stop", t("desktop.daemon.lifecycle.stop"), stop).ctl());
-    }
-    ui.row(row(label).hint_opt(version).control(Ctl::Row(buttons, 8.0)));
     ui.card_end();
     ui.gap(24.0);
-}
-
-/// Remove-host flow for the local host: stop managing the built-in daemon first.
-pub fn disable_builtin_then(
-    s: &mut Settings,
-    env: &mut Env,
-    then: impl FnOnce(&mut Settings, &mut Env) + 'static,
-) {
-    if !platform::desktop_available() {
-        then(s, env);
-        return;
-    }
-    s.desktop(
-        env,
-        "desktop_settings_update",
-        json!({"patch": {"daemon": {"manageBuiltInDaemon": false}}}),
-        move |s, env, result| match result {
-            Ok(_) => then(s, env),
-            Err(error) => env.error(&error),
-        },
-    );
 }
 
 // ------------------------------------------------------------ notifications
@@ -752,4 +615,106 @@ pub fn draw_diagnostics(ui: &mut Ui, s: &Settings) {
     );
     ui.card_end();
     ui.gap(24.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use makepad_widgets::{Cx, Event};
+    use paseo_gui_core::{CoreConfig, GuiCore};
+    use paseo_gui_platform::{PlatformAction, PlatformValue};
+    use std::{fs, sync::Arc};
+
+    #[test]
+    fn local_daemon_toggle_only_persists_and_start_now_uses_ensure() {
+        let dir = std::env::temp_dir().join(format!("paseo-settings-{}", uuid::Uuid::new_v4()));
+        let core = GuiCore::start(
+            CoreConfig {
+                state_dir: dir.clone(),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut ctx = crate::common::UiContext::new(core.handle());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fields = Default::default();
+        let mut bridge = platform::Bridge::record_desktop();
+        let mut env = Env {
+            cx: &mut cx,
+            ctx: &mut ctx,
+            fields: &mut fields,
+            bridge: &mut bridge,
+        };
+        let mut s = Settings::default();
+        let reply = |s: &mut Settings, env: &mut Env, command: &str, args: Value, result: Value| {
+            let requests = env.bridge.desktop_requests.as_mut().unwrap();
+            assert_eq!(requests.len(), 1);
+            let (request, sent, sent_args) = requests.pop().unwrap();
+            assert_eq!(sent, command);
+            assert_eq!(sent_args, args);
+            let event = Event::Actions(vec![Box::new(PlatformAction::Completed {
+                request,
+                result: Ok(PlatformValue::Json(result)),
+            })]);
+            assert!(platform::handle_event(s, env, &event));
+        };
+        load_local_daemon(&mut s, &mut env);
+        let initial = json!({"daemon": {"startDaemonIfNotRunning": true}});
+        reply(
+            &mut s,
+            &mut env,
+            "desktop_settings_get",
+            json!({}),
+            initial.clone(),
+        );
+        reply(
+            &mut s,
+            &mut env,
+            "desktop_daemon_status",
+            json!({}),
+            json!({"status": "stopped", "owner": "detached"}),
+        );
+        assert!(s.local_daemon.loaded);
+
+        let disabled = json!({"daemon": {"startDaemonIfNotRunning": false}});
+        set_local_autostart(&mut s, &mut env, false);
+        assert_eq!(s.local_daemon.settings, initial);
+        reply(
+            &mut s,
+            &mut env,
+            "desktop_settings_update",
+            json!({"patch": disabled}),
+            disabled.clone(),
+        );
+        assert_eq!(s.local_daemon.settings, disabled);
+        assert!(env.bridge.desktop_requests.as_ref().unwrap().is_empty());
+
+        start_local_daemon(&mut s, &mut env);
+        start_local_daemon(&mut s, &mut env);
+        assert!(s.local_daemon.starting);
+        let running = json!({"status": "running", "owner": "detached"});
+        reply(
+            &mut s,
+            &mut env,
+            "start_desktop_daemon",
+            json!({}),
+            running.clone(),
+        );
+        reply(
+            &mut s,
+            &mut env,
+            "desktop_daemon_status",
+            json!({}),
+            running.clone(),
+        );
+        assert_eq!(s.local_daemon.daemon, running);
+        assert_eq!(s.local_daemon.settings, disabled);
+        assert!(!s.local_daemon.starting);
+
+        drop(core);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -32,6 +32,36 @@ impl Release {
         json!({"version":self.inventory.version,"manifestSha512":self.manifest_sha512})
     }
 }
+
+fn plan_app_updates(
+    target: &str,
+    current: &components::TargetInventory,
+    available: &components::TargetInventory,
+    selected: Option<&BTreeSet<ComponentId>>,
+) -> Result<components::ComponentUpdatePlan, PlatformError> {
+    let all_app_changes;
+    let selected = match selected {
+        Some(selected) if !selected.contains(&ComponentId::Daemon) => selected,
+        Some(_) => return Err(error("Daemon activation is not an app update.")),
+        None => {
+            all_app_changes = components::changed_components(current, available)
+                .into_iter()
+                .filter(|id| *id != ComponentId::Daemon)
+                .collect();
+            &all_app_changes
+        }
+    };
+    components::plan_updates(target, REPOSITORY, current, available, Some(selected))
+        .map_err(convert)
+}
+
+fn app_requirements(requirements: &BTreeMap<ComponentId, u32>) -> BTreeMap<ComponentId, u32> {
+    requirements
+        .iter()
+        .filter(|(id, _)| **id != ComponentId::Daemon)
+        .map(|(id, version)| (*id, *version))
+        .collect()
+}
 pub(crate) struct Updater {
     version: String,
     client: reqwest::Client,
@@ -41,8 +71,6 @@ pub(super) struct HelperPreparation<'a> {
     pub channel: &'a str,
     pub operation: &'a str,
     pub directory: &'a Path,
-    pub home: &'a Path,
-    pub server: &'a str,
     pub expected: &'a Value,
     pub selected: Option<&'a BTreeSet<ComponentId>>,
 }
@@ -72,18 +100,12 @@ impl Updater {
             "components":components.as_ref().ok().and_then(|v|v.as_ref()),"componentError":components.as_ref().err().map(|e|e.to_string()),
             "lastError":*self.last_error.lock().await})
     }
-    pub async fn check(&self, channel: &str, _manual: bool) -> Value {
-        match self.check_app_release(channel).await {
-            Ok(check) => {
-                json!({"hasUpdate":check["updateAvailable"],"readyToInstall":check["updateAvailable"],"currentVersion":self.version,"latestVersion":check["latest"]["version"].as_str().unwrap_or(&self.version),"body":null,"date":null,"errorMessage":check["supportError"]})
-            }
-            Err(e) => {
-                *self.last_error.lock().await = Some(e.message.clone());
-                json!({"hasUpdate":false,"readyToInstall":false,"currentVersion":self.version,"latestVersion":self.version,"body":null,"date":null,"errorMessage":e.message})
-            }
-        }
-    }
     pub async fn check_app_release(&self, channel: &str) -> Result<Value, PlatformError> {
+        let result = self.fetch_app_release(channel).await;
+        *self.last_error.lock().await = result.as_ref().err().map(|e| e.message.clone());
+        result
+    }
+    async fn fetch_app_release(&self, channel: &str) -> Result<Value, PlatformError> {
         let Some(store) = Store::discover().map_err(convert)? else {
             return Ok(
                 json!({"current":{"version":self.version,"sourceSha":option_env!("PASEO_BUILD_SOURCE_SHA").unwrap_or("")},"supported":false,"updateAvailable":false,"latest":null,"owner":{"kind":"desktopApp"},"supportError":"One-time packaged upgrade required: this installation has no component inventory.","checkError":null,"components":{},"componentRequirements":{},"availableComponents":[],"restartGroup":"none","atomicGroups":[]}),
@@ -97,16 +119,16 @@ impl Updater {
             .targets
             .get(&store.target)
             .ok_or_else(|| error("Collection has no inventory for this target"))?;
-        let plan = components::plan_updates(&store.target, REPOSITORY, &current, available, None)
-            .map_err(convert)?;
-        let changes:Vec<_>=plan.changed.iter().map(|id|json!({"id":id,"current":current.components[id].identity,"target":available.components[id].identity,"downloadSize":available.components[id].artifact.size,"artifactSha256":available.components[id].artifact.sha256,"activationOnly":current.components[id].identity==available.components[id].identity,"requires":available.components[id].requires})).collect();
+        let plan = plan_app_updates(&store.target, &current, available, None)?;
+        let changes:Vec<_>=plan.changed.iter().map(|id|json!({"id":id,"current":current.components[id].identity,"target":available.components[id].identity,"downloadSize":available.components[id].artifact.size,"artifactSha256":available.components[id].artifact.sha256,"activationOnly":current.components[id].identity==available.components[id].identity,"requires":app_requirements(&available.components[id].requires)})).collect();
         let requirements: BTreeMap<_, _> = current
             .components
             .iter()
-            .map(|(id, c)| (*id, &c.requires))
+            .filter(|(id, _)| **id != ComponentId::Daemon)
+            .map(|(id, c)| (*id, app_requirements(&c.requires)))
             .collect();
         Ok(
-            json!({"current":{"version":self.version,"sourceSha":option_env!("PASEO_BUILD_SOURCE_SHA").unwrap_or("")},"supported":true,"updateAvailable":!plan.changed.is_empty(),"latest":release.pin(),"owner":{"kind":"desktopApp"},"supportError":null,"checkError":null,"components":component_store::identities(&installed),"componentRequirements":requirements,"availableComponents":changes,"restartGroup":plan.restart_group,"atomicGroups":available.atomic_groups}),
+            json!({"current":{"version":self.version,"sourceSha":option_env!("PASEO_BUILD_SOURCE_SHA").unwrap_or("")},"supported":true,"updateAvailable":!plan.changed.is_empty(),"latest":release.pin(),"owner":{"kind":"desktopApp"},"supportError":null,"checkError":null,"components":component_store::app_identities(&installed),"componentRequirements":requirements,"availableComponents":changes,"restartGroup":plan.restart_group,"atomicGroups":available.atomic_groups}),
         )
     }
     pub(super) async fn prepare_helper(
@@ -117,8 +139,6 @@ impl Updater {
             channel,
             operation,
             directory,
-            home,
-            server,
             expected,
             selected,
         } = preparation;
@@ -142,9 +162,7 @@ impl Updater {
             .targets
             .get(&store.target)
             .ok_or_else(|| error("Collection target is missing"))?;
-        let plan =
-            components::plan_updates(&store.target, REPOSITORY, &current, available, selected)
-                .map_err(convert)?;
+        let plan = plan_app_updates(&store.target, &current, available, selected)?;
         let inventory_path = directory.join("inventory.json");
         write_private(&inventory_path, &release.bytes).await?;
         let mut target_components = selection.active.clone();
@@ -205,7 +223,7 @@ impl Updater {
             staged.insert(*id, archive);
         }
         Ok(
-            json!({"schemaVersion":2,"mode":"componentTransaction","operationId":operation,"operationDirectory":directory,"storeDirectory":store.directory,"baseRoot":store.base_root,"installationId":store.installation_id,"target":store.target,"inventoryPath":inventory_path,"manifestSha512":format!("{:x}",Sha512::digest(&release.bytes)),"currentGeneration":selection.generation,"current":selection.active,"targetComponents":target_components,"staged":staged,"restartGroup":plan.restart_group,"serverId":server,"daemonHome":home,"currentExecutable":component_store::canonical_path(std::env::current_exe()?).map_err(convert)?,"parentProcess":component_store::process_identity(std::process::id()).map_err(convert)?,"runtimeProcesses":[]}),
+            json!({"schemaVersion":2,"mode":"componentTransaction","operationId":operation,"operationDirectory":directory,"storeDirectory":store.directory,"baseRoot":store.base_root,"installationId":store.installation_id,"target":store.target,"inventoryPath":inventory_path,"manifestSha512":format!("{:x}",Sha512::digest(&release.bytes)),"currentGeneration":selection.generation,"current":selection.active,"targetComponents":target_components,"staged":staged,"restartGroup":plan.restart_group,"currentExecutable":component_store::canonical_path(std::env::current_exe()?).map_err(convert)?,"parentProcess":component_store::process_identity(std::process::id()).map_err(convert)?}),
         )
     }
     async fn validate_staged(
@@ -238,13 +256,9 @@ impl Updater {
         )
         .await?;
         match component.id {
-            ComponentId::Daemon | ComponentId::UpdateHelper => {
-                let argument = if component.id == ComponentId::Daemon {
-                    "component-identity"
-                } else {
-                    "--identity"
-                };
-                let output = command_output(&image, &[argument.as_ref()]).await?;
+            ComponentId::Daemon => return Err(error("Daemon activation is not an app update.")),
+            ComponentId::UpdateHelper => {
+                let output = command_output(&image, &["--identity".as_ref()]).await?;
                 let value = component_store::strict_json(output.as_bytes()).map_err(convert)?;
                 if value["schemaVersion"] != 1
                     || value["id"] != json!(component.id)

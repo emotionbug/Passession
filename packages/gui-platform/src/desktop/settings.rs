@@ -14,7 +14,7 @@ fn defaults() -> Map<String, Value> {
     match json!({
         "releaseChannel": "stable",
         "notifications": {"playSound": true},
-        "daemon": {"manageBuiltInDaemon": true, "keepRunningAfterQuit": false},
+        "daemon": {"startDaemonIfNotRunning": true},
     }) {
         Value::Object(map) => map,
         _ => unreachable!(),
@@ -29,10 +29,7 @@ fn merge(settings: &mut Map<String, Value>, patch: &Map<String, Value>) {
     }
     for (section, keys) in [
         ("notifications", &["playSound"][..]),
-        (
-            "daemon",
-            &["manageBuiltInDaemon", "keepRunningAfterQuit"][..],
-        ),
+        ("daemon", &["startDaemonIfNotRunning"][..]),
     ] {
         let source = patch.get(section).and_then(Value::as_object);
         let mut target = settings
@@ -52,7 +49,7 @@ fn merge(settings: &mut Map<String, Value>, patch: &Map<String, Value>) {
 }
 
 impl DesktopSettings {
-    /// Blocking: reads, normalizes and rewrites the document (worker or startup).
+    /// Blocking: reads and normalizes; the next patch persists known settings.
     pub fn load() -> anyhow::Result<Self> {
         let file = crate::paths::app_paths()
             .support_dir
@@ -66,18 +63,16 @@ impl DesktopSettings {
             Err(error) => return Err(error.into()),
         };
         let mut settings = defaults();
-        if let Some(saved) = document.get("settings").and_then(Value::as_object).cloned() {
-            merge(&mut settings, &saved);
+        if let Some(saved) = document.get("settings").and_then(Value::as_object) {
+            merge(&mut settings, saved);
         }
         document.insert("version".into(), 1.into());
         document.insert("settings".into(), Value::Object(settings));
-        let this = Self {
+        Ok(Self {
             file,
             document: Mutex::new(document),
             write: Mutex::new(()),
-        };
-        this.save()?;
-        Ok(this)
+        })
     }
 
     pub fn value(&self) -> Map<String, Value> {
@@ -98,11 +93,8 @@ impl DesktopSettings {
             .unwrap_or(default)
     }
 
-    pub fn managed(&self) -> bool {
-        self.flag("daemon", "manageBuiltInDaemon", true)
-    }
-    pub fn keep_running(&self) -> bool {
-        self.flag("daemon", "keepRunningAfterQuit", false)
+    pub fn start_daemon_if_not_running(&self) -> bool {
+        self.flag("daemon", "startDaemonIfNotRunning", true)
     }
     pub fn play_sound(&self) -> bool {
         self.flag("notifications", "playSound", true)
@@ -160,13 +152,13 @@ mod tests {
     #[test]
     fn merge_accepts_only_known_typed_keys() {
         let mut settings = defaults();
-        let patch = json!({"releaseChannel":"nightly","daemon":{"keepRunningAfterQuit":true,"manageBuiltInDaemon":"no","other":true},"notifications":{"playSound":false}});
+        let patch = json!({"releaseChannel":"nightly","daemon":{"keepRunningAfterQuit":true,"manageBuiltInDaemon":false,"other":true},"notifications":{"playSound":false}});
         merge(&mut settings, patch.as_object().unwrap());
         assert_eq!(settings["releaseChannel"], "stable");
-        assert_eq!(
-            settings["daemon"],
-            json!({"manageBuiltInDaemon":true,"keepRunningAfterQuit":true})
-        );
+        assert_eq!(settings["daemon"], json!({"startDaemonIfNotRunning":true}));
         assert_eq!(settings["notifications"], json!({"playSound":false}));
+        let patch = json!({"daemon":{"startDaemonIfNotRunning":false}});
+        merge(&mut settings, patch.as_object().unwrap());
+        assert_eq!(settings["daemon"], json!({"startDaemonIfNotRunning":false}));
     }
 }

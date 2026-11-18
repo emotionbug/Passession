@@ -117,7 +117,6 @@ pub(crate) fn prepare_process(_cx: &mut Cx) -> anyhow::Result<()> {
 pub(crate) fn capabilities() -> Capabilities {
     Capabilities {
         desktop_host: false,
-        tray: false,
         editors: false,
         updater: false,
         directory_picker: false,
@@ -296,12 +295,6 @@ pub(crate) fn report_error(_shared: &Arc<Shared>, message: &str) {
         message: message.to_owned(),
     });
 }
-
-/// iOS offers no background mode for an in-process tailnet node, so there is
-/// no background presence: the node and host links last only for the
-/// background-task grace before suspension (see `begin_background_grace`).
-/// The in-app Settings controls remain.
-pub(crate) fn set_tailnet_presence(_shared: &Arc<Shared>, _presence: Option<TailnetPresence>) {}
 
 /// iOS has no system Back; navigation stays inside the app.
 pub(crate) fn background_app(_cx: &mut Cx) {}

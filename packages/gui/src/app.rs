@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use makepad_widgets::*;
 use paseo_gui_core::{CoreConfig, CoreEvent, GuiCore};
+#[cfg(target_os = "android")]
 use paseo_gui_platform::{TailnetPresence, TailnetPresenceState};
 use serde_json::Value;
 
@@ -96,9 +97,10 @@ struct Runtime {
     system_dark: bool,
     theme_key: String,
     window_ready: bool,
-    /// The language the native application and tray menus were last built in.
+    /// The language the native application menu was last built in.
     menu_locale: &'static str,
-    /// The embedded Tailscale background presence last handed to the platform.
+    /// The embedded Tailscale presence last handed to the Android foreground service.
+    #[cfg(target_os = "android")]
     tailnet_presence: Option<TailnetPresence>,
     core_batch_timer: Timer,
     /// The core's last `State` publication: batch deltas compare publications, so a local
@@ -179,6 +181,7 @@ impl App {
             theme_key: String::new(),
             window_ready: false,
             menu_locale: "",
+            #[cfg(target_os = "android")]
             tailnet_presence: None,
             core_batch_timer: Timer::default(),
             published: Arc::new(paseo_gui_core::CoreState::default()),
@@ -241,7 +244,6 @@ impl App {
         if runtime.menu_locale != i18n::locale_tag() {
             runtime.menu_locale = i18n::locale_tag();
             update_native_menu(cx);
-            update_tray_labels();
         }
         if themed || localized {
             // Palette, typography and strings change every layer of every window.
@@ -388,18 +390,9 @@ fn update_native_menu(cx: &mut Cx) {
     let _ = cx;
 }
 
-/// Relabels the desktop tray's Open and Quit items in the active language.
-fn update_tray_labels() {
-    if let Some(platform) = paseo_gui_platform::platform() {
-        platform.set_tray_labels(
-            common::tr("shell.menu.openApp"),
-            common::tr("shell.menu.quitApp"),
-        );
-    }
-}
-
-/// The OS background presence of embedded Tailscale, labelled in the active language. None
+/// The Android notification's background presence, labelled in the active language. None
 /// while it is off, or when no platform secret store lets a node run.
+#[cfg(target_os = "android")]
 fn tailnet_presence(tailnet: &Value) -> Option<TailnetPresence> {
     if tailnet["enabled"] != true || tailnet["available"] != true {
         return None;
@@ -427,6 +420,7 @@ fn tailnet_presence(tailnet: &Value) -> Option<TailnetPresence> {
 }
 
 /// Hands the platform a presence only when it changed.
+#[cfg(target_os = "android")]
 fn sync_tailnet_presence(runtime: &mut Runtime) {
     let presence = tailnet_presence(runtime.ui.state.get("tailnet").unwrap_or(&Value::Null));
     if presence == runtime.tailnet_presence {
@@ -572,6 +566,7 @@ impl App {
         if appearance {
             Self::appearance(runtime, cx);
             // After `appearance`: a language change relabels the presence.
+            #[cfg(target_os = "android")]
             sync_tailnet_presence(runtime);
             // `uiFontFamily`/`monoFontFamily` or the OS fonts may have changed;
             // an unchanged request is a no-op.

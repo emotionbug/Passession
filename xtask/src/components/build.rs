@@ -474,6 +474,11 @@ fn finalize_mac(
         &old_app.join(gui::MACOS_BUNDLE),
         &cohort.join(gui::MACOS_BUNDLE),
     )?;
+    // A signed cohort may reuse an unchanged APP; preserve its declaration.
+    let marker = old_app.join("app-lifecycle-v1");
+    if marker.try_exists()? {
+        copy_tree(&marker, &cohort.join("app-lifecycle-v1"))?;
+    }
     let app = cohort.join(gui::MACOS_BUNDLE);
     let bin = app.join("Contents/MacOS");
     let native = objects
@@ -618,7 +623,7 @@ pub(crate) fn compile(args: &[String]) -> Result<()> {
             daemon::bundle_raw_runtime(&output, "release", "standalone-archive")?;
             write_json(
                 &output.join("desktop-runtime.json"),
-                &json!({"schemaVersion":1,"executable":executable(),"cliShimPath":executable(),"workingDirectory":".","environment":{}}),
+                &json!({"schemaVersion":1,"executable":executable(),"workingDirectory":".","environment":{}}),
             )?;
         }
         ComponentId::UpdateHelper => {
@@ -642,6 +647,9 @@ pub(crate) fn compile(args: &[String]) -> Result<()> {
         }
         ComponentId::App | ComponentId::Tailnet => {
             gui::component_compile(os, cpu, id, &output, args.get(3).map(Path::new))?;
+            if id == ComponentId::App && matches!(os, "linux" | "macos" | "windows") {
+                fs::write(output.join("app-lifecycle-v1"), b"independent-daemon\n")?;
+            }
         }
     }
     Ok(())

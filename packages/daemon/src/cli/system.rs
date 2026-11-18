@@ -124,4 +124,3 @@ pub(crate) fn set_path(value: &mut Value, path: &str, item: Option<Value>) -> Re
     }
     Ok(())
 }
-pub(crate) use daemon::{observe_status, restart_confirmed};

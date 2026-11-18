@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 
 use super::View;
 use crate::features::settings::i18n::{t, ta};
-use crate::features::settings::json::{is_true, scalar_text, str_of};
-use crate::features::settings::model::daemon_update::normalize_version;
+use crate::features::settings::json::str_of;
+use crate::features::settings::model::daemon_update::{self as du, normalize_version};
 use crate::features::settings::platform::{self, DESKTOP};
 use crate::features::settings::rpc::{Env, handler};
 use crate::features::settings::state::Settings;
@@ -18,10 +18,55 @@ pub struct AboutState {
     pub settings: Value,
     pub update: Value,
     pub checking: bool,
+    pub checked: bool,
     pub installing: bool,
+    pub check_error: Option<String>,
+    pub install_error: Option<String>,
+    pub operation: Value,
+    resumed: bool,
     pub busy: bool,
     pub error: Option<String>,
     pub loaded: bool,
+}
+
+impl AboutState {
+    pub(super) fn update_progress(&self) -> Option<String> {
+        let key = match du::outcome(&self.operation) {
+            du::Outcome::Committed => "phaseComplete",
+            du::Outcome::RolledBack => "rolledBackTitle",
+            du::Outcome::Failed => "requestFailedTitle",
+            du::Outcome::Running if self.operation.is_null() && self.installing => "phaseStarting",
+            du::Outcome::Running if self.installing => {
+                du::phase_key(str_of(&self.operation, "phase"))
+            }
+            du::Outcome::Running => return None,
+        };
+        Some(t(&format!("settings.host.daemon.update.{key}")))
+    }
+}
+
+const APP_UPDATE_KEY: &str = "paseo.desktopAppUpdate.operation";
+
+/// The immutable release pin and app-side components approved by the user.
+pub(super) fn app_approval(check: &Value) -> Option<Value> {
+    if !du::can_update_checked(check) {
+        return None;
+    }
+    let selected = du::changed_components(check);
+    if selected.is_empty()
+        || selected
+            .iter()
+            .any(|id| !matches!(id.as_str(), "app" | "tailnet" | "update-helper"))
+    {
+        return None;
+    }
+    Some(json!({
+        "expectedRelease": {
+            "version": check["latest"]["version"],
+            "manifestSha512": check["latest"]["manifestSha512"],
+        },
+        "selectedComponents": selected,
+    }))
 }
 
 fn version_label(version: Option<&str>) -> String {
@@ -37,7 +82,7 @@ pub fn ensure_about(s: &mut Settings, env: &mut Env, _v: &View) {
     }
     s.about.loaded = true;
     load(s, env);
-    check(s, env, false);
+    ensure_update(s, env);
 }
 
 fn load(s: &mut Settings, env: &mut Env) {
@@ -52,8 +97,35 @@ fn load(s: &mut Settings, env: &mut Env) {
     );
 }
 
-fn check(s: &mut Settings, env: &mut Env, manual: bool) {
+pub(super) fn ensure_update(s: &mut Settings, env: &mut Env) {
+    if !s.about.resumed {
+        s.about.resumed = true;
+        if let Some(id) = env
+            .ctx
+            .state
+            .prefs
+            .get(APP_UPDATE_KEY)
+            .and_then(Value::as_str)
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .filter(|id| !id.is_nil())
+        {
+            s.about.installing = true;
+            poll_update(s, env, id.to_string());
+        }
+    }
+    if !s.about.checked && !s.about.checking {
+        check(s, env, false);
+    }
+}
+
+pub(super) fn check(s: &mut Settings, env: &mut Env, manual: bool) {
+    if s.about.checking {
+        return;
+    }
     s.about.checking = true;
+    s.about.checked = true;
+    s.about.check_error = None;
+    s.about.update = Value::Null;
     s.desktop(
         env,
         "check_app_update",
@@ -62,23 +134,87 @@ fn check(s: &mut Settings, env: &mut Env, manual: bool) {
             s.about.checking = false;
             match result {
                 Ok(update) => s.about.update = update,
-                Err(error) if manual => s.about.error = Some(error.text()),
-                Err(_) => {}
+                Err(error) => s.about.check_error = Some(error.text()),
             }
         },
     );
 }
 
-fn install(s: &mut Settings, _env: &mut Env) {
-    let go = handler(|s, env| {
-        s.about.installing = true;
-        s.desktop(env, "install_app_update", json!({}), |s, _, result| {
-            s.about.installing = false;
-            match result {
-                Ok(report) => s.report(t("settings.about.updates.label"), &report),
-                Err(error) => s.about.error = Some(error.text()),
+pub(super) fn install_approved(s: &mut Settings, env: &mut Env, mut approval: Value) {
+    if s.about.installing {
+        return;
+    }
+    let id = approval["operationId"]
+        .as_str()
+        .map_or_else(du::new_operation_id, String::from);
+    approval["operationId"] = json!(id);
+    s.about.installing = true;
+    s.about.install_error = None;
+    s.about.operation = Value::Null;
+    s.save_flushed(
+        env,
+        &format!("prefs:{APP_UPDATE_KEY}"),
+        json!(id),
+        move |s, env, saved| {
+            if let Err(error) = saved {
+                s.about.installing = false;
+                s.about.install_error = Some(error.text());
+                return;
             }
-        });
+            s.desktop(
+                env,
+                "install_app_update",
+                approval,
+                move |s, env, result| {
+                    accept_operation(s, env, id, result);
+                },
+            );
+        },
+    );
+}
+
+fn poll_update(s: &mut Settings, env: &mut Env, id: String) {
+    s.desktop(
+        env,
+        "app_update_status",
+        json!({"operationId": id}),
+        move |s, env, result| accept_operation(s, env, id, result),
+    );
+}
+
+fn accept_operation(
+    s: &mut Settings,
+    env: &mut Env,
+    id: String,
+    result: Result<Value, crate::features::settings::rpc::ReqError>,
+) {
+    match result {
+        Ok(operation) if operation["operationId"] == id && operation["targetKind"] == "app" => {
+            let running = du::outcome(&operation) == du::Outcome::Running;
+            s.about.operation = operation;
+            if running {
+                s.after(env, 1.0, move |s, env| poll_update(s, env, id));
+                return;
+            }
+        }
+        Ok(_) => s.about.install_error = Some(t("settingsNative.identityChanged")),
+        Err(error) => s.about.install_error = Some(error.text()),
+    }
+    s.about.installing = false;
+    env.ctx
+        .core
+        .save_state(&format!("prefs:{APP_UPDATE_KEY}"), Value::Null);
+    check(s, env, false);
+}
+
+fn install(s: &mut Settings, _env: &mut Env) {
+    let Some(approved) = app_approval(&s.about.update) else {
+        return;
+    };
+    let go = handler(move |s, env| {
+        if app_approval(&s.about.update).as_ref() == Some(&approved) {
+            install_approved(s, env, approved.clone());
+        }
     });
     let message = format!(
         "{}\n{}",
@@ -119,7 +255,8 @@ pub fn draw_about(ui: &mut Ui, s: &Settings, v: &View) {
         } else {
             "stable"
         };
-        let enabled = !state.busy && state.settings.is_object();
+        let enabled =
+            !state.busy && !state.checking && !state.installing && state.settings.is_object();
         let segment = |id: &'static str| {
             let act = (enabled && channel != id).then(|| {
                 handler(move |s, env| {
@@ -131,9 +268,10 @@ pub fn draw_about(ui: &mut Ui, s: &Settings, v: &View) {
                         |s, env, result| {
                             s.about.busy = false;
                             match result {
-                                Ok(_) => {
+                                Ok(settings) => {
                                     s.about.error = None;
-                                    load(s, env);
+                                    s.about.settings = settings;
+                                    check(s, env, false);
                                 }
                                 Err(error) => s.about.error = Some(error.text()),
                             }
@@ -157,18 +295,13 @@ pub fn draw_about(ui: &mut Ui, s: &Settings, v: &View) {
                 .control(control),
         );
 
-        let latest = state
-            .update
-            .get("latestVersion")
-            .filter(|v| !v.is_null())
-            .map(scalar_text);
-        let ready = is_true(&state.update, "readyToInstall");
-        let has_update = is_true(&state.update, "hasUpdate") || ready;
+        let latest = state.update["latest"]["version"].as_str();
+        let has_update = app_approval(&state.update).is_some();
         let mut hint = Vec::new();
         if has_update {
             hint.push(ta(
                 "settings.about.updates.updateTo",
-                &[("version", &version_label(latest.as_deref()))],
+                &[("version", &version_label(latest))],
             ));
         } else if state.update.is_object()
             && !state
@@ -177,27 +310,22 @@ pub fn draw_about(ui: &mut Ui, s: &Settings, v: &View) {
                 .map(|m| m.is_empty())
                 .unwrap_or(true)
         {
-            let current = state
-                .update
-                .get("currentVersion")
-                .filter(|v| !v.is_null())
-                .map(scalar_text)
-                .or(client.clone());
-            hint.push(version_label(current.as_deref()));
+            let current = state.update["current"]["version"]
+                .as_str()
+                .or(client.as_deref());
+            hint.push(version_label(current));
         }
-        if ready {
-            hint.push(ta(
-                "settings.about.updates.readyToInstall",
-                &[("version", &version_label(latest.as_deref()))],
-            ));
+        if let Some(status) = state.update_progress() {
+            hint.push(status);
         }
-        let error = state.error.clone().or_else(|| {
-            state
-                .update
-                .get("errorMessage")
-                .filter(|v| !v.is_null())
-                .map(scalar_text)
-        });
+        let error = state
+            .install_error
+            .clone()
+            .or_else(|| state.check_error.clone())
+            .or_else(|| state.error.clone())
+            .or_else(|| state.update["checkError"].as_str().map(String::from))
+            .or_else(|| state.update["supportError"].as_str().map(String::from))
+            .or_else(|| state.operation["error"].as_str().map(String::from));
         let check_act =
             (!state.checking && !state.installing).then(|| handler(|s, env| check(s, env, true)));
         let check_label = if state.checking {
@@ -214,7 +342,7 @@ pub fn draw_about(ui: &mut Ui, s: &Settings, v: &View) {
             } else {
                 ta(
                     "settings.about.updates.updateTo",
-                    &[("version", &version_label(latest.as_deref()))],
+                    &[("version", &version_label(latest))],
                 )
             };
             buttons.push(

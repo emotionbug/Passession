@@ -62,7 +62,7 @@ func acquireLease(path string) (*os.File, error) {
 	}
 	if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, errors.New("another updater holds the operation/host lease")
+		return nil, errors.New("another updater holds the update lease")
 	}
 	return f, nil
 }
@@ -87,7 +87,4 @@ func exited(p processIdentity) bool {
 		return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)
 	}
 	return current.identity != p
-}
-func windowsInstallerCommand(r request) (*exec.Cmd, error) {
-	return nil, errors.New("Windows installer is not supported on this platform")
 }

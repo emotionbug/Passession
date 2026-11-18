@@ -4,13 +4,13 @@ use serde_json::json;
 #[test]
 fn native_lock_excludes_node_compatible_writer_before_any_worker_start() {
     let home = tempfile::tempdir().unwrap();
-    let mut lock = lock::PidLock::acquire(home.path(), true).unwrap();
+    let mut lock = lock::PidLock::acquire(home.path()).unwrap();
     let serialized: Value =
         serde_json::from_slice(&std::fs::read(home.path().join("paseo.pid")).unwrap()).unwrap();
     assert_eq!(serialized["pid"], std::process::id());
     assert!(serialized["startedAt"].is_string());
     assert_eq!(serialized["heartbeat"], true);
-    assert_eq!(serialized["desktopManaged"], true);
+    assert!(serialized.get("desktopManaged").is_none());
     assert!(serialized["processStartIdentity"].is_string());
     assert!(
         std::fs::OpenOptions::new()
@@ -19,7 +19,7 @@ fn native_lock_excludes_node_compatible_writer_before_any_worker_start() {
             .open(home.path().join("paseo.pid"))
             .is_err()
     );
-    assert!(lock::PidLock::acquire(home.path(), false).is_err());
+    assert!(lock::PidLock::acquire(home.path()).is_err());
     lock.publish(Some("127.0.0.1:4242".into()), Some("server".into()))
         .unwrap();
     assert_eq!(
@@ -33,7 +33,7 @@ fn native_lock_excludes_node_compatible_writer_before_any_worker_start() {
 #[test]
 fn legacy_live_lock_is_reachable_but_never_signal_authority() {
     let home = tempfile::tempdir().unwrap();
-    let guard = lock::PidLock::acquire(home.path(), false).unwrap();
+    let guard = lock::PidLock::acquire(home.path()).unwrap();
     let mut legacy = guard.instance.clone();
     legacy.process_start_identity = None;
     std::fs::write(
@@ -43,7 +43,7 @@ fn legacy_live_lock_is_reachable_but_never_signal_authority() {
     .unwrap();
     assert!(identity::owner_running(&legacy).unwrap());
     assert!(!identity::verified(&legacy).unwrap());
-    assert!(lock::PidLock::acquire(home.path(), false).is_err());
+    assert!(lock::PidLock::acquire(home.path()).is_err());
     drop(guard);
     assert!(home.path().join("paseo.pid").exists());
 }
@@ -51,7 +51,7 @@ fn legacy_live_lock_is_reachable_but_never_signal_authority() {
 #[test]
 fn reused_pid_and_prior_boot_are_not_live_owners() {
     let home = tempfile::tempdir().unwrap();
-    let guard = lock::PidLock::acquire(home.path(), false).unwrap();
+    let guard = lock::PidLock::acquire(home.path()).unwrap();
     let mut stale = guard.instance.clone();
     stale.process_start_identity = Some("not-the-process-birth-token".into());
     assert!(!identity::owner_running(&stale).unwrap());
@@ -71,7 +71,7 @@ fn reused_pid_and_prior_boot_are_not_live_owners() {
 #[test]
 fn release_and_heartbeat_refuse_changed_same_pid_instance() {
     let home = tempfile::tempdir().unwrap();
-    let guard = lock::PidLock::acquire(home.path(), false).unwrap();
+    let guard = lock::PidLock::acquire(home.path()).unwrap();
     let mut replacement = guard.instance.clone();
     replacement.started_at = "2000-01-01T00:00:00.000Z".into();
     std::fs::write(
@@ -91,7 +91,7 @@ fn release_and_heartbeat_refuse_changed_same_pid_instance() {
 #[tokio::test]
 async fn readiness_is_instance_pinned_cancellable_and_timeout_bounded() {
     let home = tempfile::tempdir().unwrap();
-    let mut guard = lock::PidLock::acquire(home.path(), false).unwrap();
+    let mut guard = lock::PidLock::acquire(home.path()).unwrap();
     let cancel = CancellationToken::new();
     let failure =
         wait_for_daemon_ready(home.path(), Duration::ZERO, Some(&guard.instance), &cancel)
@@ -133,7 +133,7 @@ async fn readiness_is_instance_pinned_cancellable_and_timeout_bounded() {
 fn invalid_nonempty_lock_is_not_silently_reclaimed() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("paseo.pid"), b"{broken").unwrap();
-    assert!(lock::PidLock::acquire(home.path(), false).is_err());
+    assert!(lock::PidLock::acquire(home.path()).is_err());
     assert_eq!(
         std::fs::read(home.path().join("paseo.pid")).unwrap(),
         b"{broken"
@@ -149,7 +149,7 @@ fn symlinked_pid_file_never_modifies_its_target() {
     let target = other.path().join("target");
     std::fs::write(&target, b"untouched").unwrap();
     symlink(&target, home.path().join("paseo.pid")).unwrap();
-    assert!(lock::PidLock::acquire(home.path(), false).is_err());
+    assert!(lock::PidLock::acquire(home.path()).is_err());
     assert_eq!(std::fs::read(target).unwrap(), b"untouched");
 }
 
@@ -299,33 +299,4 @@ async fn managed_entries_reject_unknown_arguments_before_any_effect() {
     assert!(!directory.path().join("native-installation.json").exists());
     assert!(!directory.path().join("paseo.pid").exists());
     assert_eq!(managed::probe_report()["version"], crate::VERSION);
-}
-
-#[cfg(windows)]
-#[test]
-fn desktop_paths_share_unprefixed_windows_protocol_representation() {
-    use std::path::Path;
-    for (native, wire) in [
-        (
-            r"\\?\C:\Users\owner\Passession",
-            r"C:\Users\owner\Passession",
-        ),
-        (
-            r"\\?\UNC\server\share\Passession",
-            r"\\server\share\Passession",
-        ),
-        (r"C:\Users\owner\Passession", r"C:\Users\owner\Passession"),
-    ] {
-        assert_eq!(
-            managed::desktop_protocol_path(Path::new(native)).as_ref(),
-            Path::new(wire)
-        );
-    }
-    // Representation normalization must not resolve traversal or device paths.
-    for untouched in [r"C:\owner\..\other", r"\\.\PhysicalDrive0"] {
-        assert_eq!(
-            managed::desktop_protocol_path(Path::new(untouched)).as_ref(),
-            Path::new(untouched)
-        );
-    }
 }

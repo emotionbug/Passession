@@ -193,7 +193,9 @@ pub(crate) enum Command {
         host_id: String,
     },
     RefreshHosts,
-    DiscoverLocalDaemon,
+    DiscoverLocalDaemon {
+        explicit: bool,
+    },
     SetAppVisible {
         visible: bool,
     },
@@ -390,7 +392,12 @@ impl CoreHandle {
     }
 
     pub fn discover_local_daemon(&self) {
-        self.send(Command::DiscoverLocalDaemon);
+        self.send(Command::DiscoverLocalDaemon { explicit: false });
+    }
+
+    /// Restore a previously removed local connection and discover the daemon.
+    pub fn connect_local_daemon(&self) {
+        self.send(Command::DiscoverLocalDaemon { explicit: true });
     }
 
     pub fn set_app_visible(&self, visible: bool) {

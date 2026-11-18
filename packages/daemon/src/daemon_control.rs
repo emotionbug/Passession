@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 use tokio::{process::Command, time::Instant};
@@ -155,13 +154,8 @@ pub struct StartOptions {
     pub home: PathBuf,
     pub options: Value,
     pub foreground: bool,
-    pub desktop_managed: bool,
     pub deployment: bool,
     pub timeout: Duration,
-    pub executable: Option<PathBuf>,
-    pub working_directory: Option<PathBuf>,
-    pub cli_shim_path: Option<PathBuf>,
-    pub on_acquired: Option<Arc<dyn Fn(DaemonInstance) + Send + Sync>>,
 }
 impl Default for StartOptions {
     fn default() -> Self {
@@ -169,13 +163,8 @@ impl Default for StartOptions {
             home: PathBuf::new(),
             options: serde_json::json!({}),
             foreground: false,
-            desktop_managed: false,
             deployment: false,
             timeout: Duration::from_secs(600),
-            executable: None,
-            working_directory: None,
-            cli_shim_path: None,
-            on_acquired: None,
         }
     }
 }
@@ -204,12 +193,7 @@ pub async fn start_daemon_instance(
             exit_code: None,
         });
     }
-    let executable = options
-        .executable
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(std::env::current_exe)?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("__supervisor")
         .arg("--home")
@@ -221,25 +205,11 @@ pub async fn start_daemon_instance(
         )
         .env_remove("PASEO_HOST")
         .env_remove("PASEO_NATIVE_SUPERVISOR")
-        .env_remove("PASEO_NATIVE_TOKEN")
-        .env_remove("PASEO_DESKTOP_MANAGED");
+        .env_remove("PASEO_NATIVE_TOKEN");
     if !options.deployment && !options.foreground {
         for key in MANAGED_SETTING_KEYS {
             command.env_remove(key);
         }
-    }
-    if options.desktop_managed {
-        command.env("PASEO_DESKTOP_MANAGED", "1");
-        // A selected component has its own native dependency closure. In particular,
-        // an external runtime must not load libraries from the GUI's AppImage mount.
-        #[cfg(target_os = "linux")]
-        command.env_remove("LD_LIBRARY_PATH").env_remove("LD_PRELOAD");
-    }
-    if let Some(cwd) = &options.working_directory {
-        command.current_dir(cwd);
-    }
-    if let Some(path) = &options.cli_shim_path {
-        command.env("PASEO_CLI", path);
     }
     if options.foreground {
         command
@@ -338,9 +308,6 @@ pub async fn start_daemon_instance(
                 });
             }
             if acquired.is_none() {
-                if let Some(callback) = &options.on_acquired {
-                    callback(instance.clone());
-                }
                 acquired = Some(instance.clone());
             }
             if instance.listen.as_ref().is_some_and(|s| !s.is_empty()) {

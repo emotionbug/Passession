@@ -2,7 +2,7 @@
 //! `tools/native-desktop-smoke/run.py`). Compiled only with the `desktop-smoke` feature and
 //! active only when `PASEO_DESKTOP_SMOKE_PROOF` is set. It replaces the Flutter
 //! `integration_test/desktop_lifecycle.dart` target and drives this process's real windows,
-//! close guards, tray and quit flows; the harness screenshots the phases it records.
+//! close guards and quit flows; the harness screenshots the phases it records.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -47,7 +47,6 @@ pub fn start(cx: &mut Cx) {
     };
     let driver = Driver {
         proof: PathBuf::from(proof),
-        panel: std::env::var("PASEO_SMOKE_PANEL").map_or(true, |v| v != "0"),
         logout: std::env::var("PASEO_SMOKE_LOGOUT").is_ok_and(|v| v == "1"),
         step: Step::Startup,
         deadline: Instant::now() + WAIT,
@@ -56,7 +55,7 @@ pub fn start(cx: &mut Cx) {
         daemon_request: None,
         daemon: None,
         next_query: None,
-        started_pid: Value::Null,
+        daemon_identity: None,
         errors: Vec::new(),
         present: None,
         sheet: None,
@@ -64,6 +63,8 @@ pub fn start(cx: &mut Cx) {
         restore_size: DVec2::default(),
         second: String::new(),
         quit_cancelled: false,
+        native_close_received: false,
+        quit_requested: false,
     };
     DRIVER.with(|d| *d.borrow_mut() = Some(driver));
 }
@@ -92,12 +93,11 @@ enum Step {
     SheetPresented,
     SheetCaptured,
     SheetRestored,
-    TrayHidden,
-    TrayDaemon,
     SecondOpen,
     GuardClose,
     GuardQuit,
     GuardDaemon,
+    GuardCaptured,
     PrimaryDormant,
     PrimaryReused,
     SecondTornDown,
@@ -108,14 +108,10 @@ enum Step {
     ReplacementDaemon,
     RetainPresented,
     RetainCaptured,
-    LastHidden,
-    LastDaemon,
-    LastPresented,
-    LastCaptured,
-    Activated,
-    ActivatedPresented,
-    ActivatedCaptured,
-    FinalHidden,
+    GuardedLastClose,
+    GuardedLastDaemon,
+    GuardedLastCaptured,
+    LastQuit,
     Done,
 }
 
@@ -129,7 +125,6 @@ struct Present {
 
 struct Driver {
     proof: PathBuf,
-    panel: bool,
     logout: bool,
     step: Step,
     deadline: Instant,
@@ -140,7 +135,7 @@ struct Driver {
     daemon_request: Option<PlatformRequestId>,
     daemon: Option<Value>,
     next_query: Option<Instant>,
-    started_pid: Value,
+    daemon_identity: Option<(u64, String)>,
     errors: Vec<String>,
     present: Option<Present>,
     sheet: Option<u64>,
@@ -148,6 +143,8 @@ struct Driver {
     restore_size: DVec2,
     second: String,
     quit_cancelled: bool,
+    native_close_received: bool,
+    quit_requested: bool,
 }
 
 impl Driver {
@@ -173,6 +170,10 @@ impl Driver {
                         PlatformAction::Event(PlatformEvent::QuitCancelled) => {
                             self.quit_cancelled = true
                         }
+                        PlatformAction::Event(PlatformEvent::QuitRequested {
+                            reason: QuitReason::Quit,
+                            ..
+                        }) if self.step == Step::LastQuit => self.quit_requested = true,
                         PlatformAction::Event(PlatformEvent::HostError { message }) => {
                             self.record("desktop-error", Value::String(message.clone()));
                             self.errors.push(message);
@@ -185,6 +186,17 @@ impl Driver {
                 if (ctx.shell)(MAIN_WINDOW_ID).and_then(|s| s.os_window()) == Some(e.window_id) {
                     self.main_size = e.new_geom.inner_size;
                 }
+            }
+            Event::WindowCloseRequested(e)
+                if matches!(self.step, Step::GuardedLastClose | Step::LastQuit)
+                    && (ctx.shell)(&self.second).and_then(|s| s.os_window())
+                        == Some(e.window_id) =>
+            {
+                require(
+                    !e.accept_close.get(),
+                    "Native close bypassed the shell's close flow",
+                )?;
+                self.native_close_received = true;
             }
             Event::Draw(_) => {
                 if let Some(present) = self.present.as_mut()
@@ -238,18 +250,31 @@ impl Driver {
                     return self.waiting("desktop daemon status");
                 };
                 if status.get("status").and_then(Value::as_str) != Some("running") {
-                    // A starting daemon reports `starting` first; ask again shortly.
+                    // The independent daemon must be ready for the app to discover it.
                     if Instant::now() > self.deadline {
                         return Err(format!(
-                            "Desktop coordinator failed to start native daemon: {status}"
+                            "Desktop did not observe the independent daemon: {status}"
                         ));
                     }
                     self.next_query = Some(Instant::now() + Duration::from_millis(500));
                     return Ok(false);
                 }
-                self.started_pid = status.get("pid").cloned().unwrap_or(Value::Null);
-                write_atomic(&self.proof, "started.json", status.to_string().as_bytes())
-                    .map_err(|e| format!("Writing started.json failed: {e}"))?;
+                let pid = status["pid"].as_u64().filter(|pid| *pid != 0);
+                let listen = status["listen"]
+                    .as_str()
+                    .filter(|listen| !listen.is_empty());
+                let (Some(pid), Some(listen)) = (pid, listen) else {
+                    return Err(format!(
+                        "Independent daemon has no PID or listener: {status}"
+                    ));
+                };
+                self.daemon_identity = Some((pid, listen.to_owned()));
+                write_atomic(
+                    &self.proof,
+                    "app-daemon-status.json",
+                    status.to_string().as_bytes(),
+                )
+                .map_err(|e| format!("Writing app-daemon-status.json failed: {e}"))?;
                 let windows = shell::window_states().len();
                 self.record(
                     "native-single-primary-user-engine",
@@ -326,35 +351,6 @@ impl Driver {
                 if !restored {
                     return self.waiting("restoring the window size");
                 }
-                if self.panel {
-                    main.request_close();
-                    self.go(Step::TrayHidden)
-                } else {
-                    self.open_second()
-                }
-            }
-            Step::TrayHidden => {
-                if shell::window_state(MAIN_WINDOW_ID) != Some(WindowState::Tray) {
-                    return self.waiting("primary window hidden to tray");
-                }
-                require(
-                    shell::window_states().len() == 1,
-                    "Closing the sole primary destroyed its window",
-                )?;
-                self.query_daemon();
-                self.go(Step::TrayDaemon)
-            }
-            Step::TrayDaemon => {
-                if !self.same_daemon("Closing the sole primary destroyed its engine or daemon")? {
-                    return self.waiting("desktop daemon status");
-                }
-                shell::platform::show_windows();
-                shell::set_tray_hidden(false);
-                require(
-                    self.visible(ctx, MAIN_WINDOW_ID),
-                    "Primary tray window did not restore",
-                )?;
-                self.record("primary-tray-hide-and-restore", Value::Null);
                 self.open_second()
             }
             Step::SecondOpen => {
@@ -387,8 +383,8 @@ impl Driver {
                     return self.waiting("dirty-document guard cancelling Quit");
                 }
                 require(
-                    self.visible(ctx, MAIN_WINDOW_ID),
-                    "Cancelled Quit hid the primary",
+                    self.visible(ctx, MAIN_WINDOW_ID) && self.visible(ctx, &self.second),
+                    "Cancelled Quit did not keep both windows visible",
                 )?;
                 self.query_daemon();
                 self.go(Step::GuardDaemon)
@@ -398,7 +394,13 @@ impl Driver {
                     return self.waiting("desktop daemon status");
                 }
                 CLOSE_GUARD.with(|g| g.set(false));
-                self.record("primary-close-and-quit-cancellation", Value::Null);
+                self.present(cx, "primary-close-and-quit-cancellation", Value::Null);
+                self.go(Step::GuardCaptured)
+            }
+            Step::GuardCaptured => {
+                if !self.captured("primary-close-and-quit-cancellation") {
+                    return self.waiting("capturing the guarded windows");
+                }
                 main.request_close();
                 self.go(Step::PrimaryDormant)
             }
@@ -486,99 +488,57 @@ impl Driver {
             }
             Step::RetainCaptured => {
                 if !self.captured("multiwindow-close-retains-daemon") {
-                    return self.waiting("capturing the retained window before hiding");
+                    return self.waiting("capturing the retained window");
                 }
-                let second = (ctx.shell)(&self.second).ok_or("The retained window is missing")?;
-                if !self.panel {
-                    // No tray to hide to: closing the last window quits and stops the daemon.
-                    self.record("expect-no-panel-quit", Value::Null);
-                    second.request_close();
-                    return self.go(Step::Done);
-                }
-                second.request_close();
-                self.go(Step::LastHidden)
-            }
-            Step::LastHidden => {
-                if shell::window_state(&self.second) != Some(WindowState::Tray) {
-                    return self.waiting("last user window hidden to tray");
-                }
-                self.query_daemon();
-                self.go(Step::LastDaemon)
-            }
-            Step::LastDaemon => {
-                if !self.same_daemon("Tray close stopped or replaced the daemon")? {
-                    return self.waiting("desktop daemon status");
-                }
-                // The hidden state shows nothing to draw: the next frame after hiding proves it.
-                self.present = Some(Present {
-                    phase: "last-window-hidden-to-tray",
-                    value: Value::Null,
-                    drawn: true,
-                });
-                cx.new_next_frame();
-                self.go(Step::LastPresented)
-            }
-            Step::LastPresented => {
-                if self.present.is_some() {
-                    return self.waiting("presenting the hidden window");
-                }
-                self.go(Step::LastCaptured)
-            }
-            Step::LastCaptured => {
-                if !self.captured("last-window-hidden-to-tray") {
-                    return self.waiting("capturing the hidden window");
-                }
-                write_atomic(
-                    &self.proof,
-                    "panel-command.json",
-                    br#"{"action":"activate"}"#,
-                )
-                .map_err(|e| format!("Writing panel-command.json failed: {e}"))?;
-                self.go(Step::Activated)
-            }
-            Step::Activated => {
-                if !self.visible(ctx, &self.second) {
-                    return self.waiting("real tray activation restores user window");
-                }
+                require(
+                    self.visible(ctx, &self.second),
+                    "The last user window is not visible",
+                )?;
                 require(
                     self.errors.is_empty(),
                     &format!("Desktop lifecycle failed: {:?}", self.errors),
                 )?;
-                self.present(
-                    cx,
-                    "tray-activation-restores-same-engine",
-                    Value::String(self.second.clone()),
-                );
-                self.go(Step::ActivatedPresented)
-            }
-            Step::ActivatedPresented => {
-                if self.present.is_some() {
-                    return self.waiting("presenting the restored window");
-                }
-                self.go(Step::ActivatedCaptured)
-            }
-            Step::ActivatedCaptured => {
-                if !self.captured("tray-activation-restores-same-engine") {
-                    return self.waiting("restoring the same rendered window");
-                }
                 if self.logout {
-                    let second =
-                        (ctx.shell)(&self.second).ok_or("The retained window is missing")?;
-                    second.request_close();
-                    return self.go(Step::FinalHidden);
+                    self.record("expect-session-logout-quit", Value::Null);
+                    self.session_command("logout")?;
+                    return self.go(Step::Done);
                 }
-                self.record("expect-real-tray-menu-quit", Value::Null);
-                write_atomic(&self.proof, "panel-command.json", br#"{"action":"quit"}"#)
-                    .map_err(|e| format!("Writing panel-command.json failed: {e}"))?;
-                self.go(Step::Done)
+                CLOSE_GUARD.with(|g| g.set(true));
+                self.session_command("close-last-window-with-guard")?;
+                self.go(Step::GuardedLastClose)
             }
-            Step::FinalHidden => {
-                if shell::window_state(&self.second) != Some(WindowState::Tray) {
-                    return self.waiting("hidden before logout");
+            Step::GuardedLastClose => {
+                if !self.native_close_received {
+                    return self.waiting("window manager close event for the guarded last window");
                 }
-                self.record("expect-session-logout-quit", Value::Null);
-                write_atomic(&self.proof, "panel-command.json", br#"{"action":"logout"}"#)
-                    .map_err(|e| format!("Writing panel-command.json failed: {e}"))?;
+                require(
+                    self.visible(ctx, &self.second),
+                    "Native close ignored the last window's dirty-document guard",
+                )?;
+                self.query_daemon();
+                self.go(Step::GuardedLastDaemon)
+            }
+            Step::GuardedLastDaemon => {
+                if !self.same_daemon("Guarded last-window close stopped or replaced the daemon")? {
+                    return self.waiting("desktop daemon status");
+                }
+                self.present(cx, "guarded-last-window-close", Value::Null);
+                self.go(Step::GuardedLastCaptured)
+            }
+            Step::GuardedLastCaptured => {
+                if !self.captured("guarded-last-window-close") {
+                    return self.waiting("capturing the guarded last window");
+                }
+                CLOSE_GUARD.with(|g| g.set(false));
+                self.native_close_received = false;
+                self.session_command("close-last-window")?;
+                self.go(Step::LastQuit)
+            }
+            Step::LastQuit => {
+                if !self.native_close_received || !self.quit_requested {
+                    return self.waiting("native last-window close to request guarded Quit");
+                }
+                self.record("expect-last-window-close-quit", Value::Null);
                 self.go(Step::Done)
             }
             Step::Done => Ok(false),
@@ -629,16 +589,26 @@ impl Driver {
         }
     }
 
-    /// `Some` once the queried status arrived: whether the daemon pid is still the started one.
+    /// Checks the observed running daemon still has its original PID and listen address.
     fn same_daemon(&mut self, message: &str) -> Result<bool, String> {
         let Some(status) = self.daemon.take() else {
             return Ok(false);
         };
         require(
-            status.get("pid") == Some(&self.started_pid) && !self.started_pid.is_null(),
+            status["status"] == "running"
+                && self.daemon_identity.as_ref().is_some_and(|(pid, listen)| {
+                    status["pid"].as_u64() == Some(*pid)
+                        && status["listen"].as_str() == Some(listen.as_str())
+                }),
             message,
         )?;
         Ok(true)
+    }
+
+    fn session_command(&self, action: &str) -> Result<(), String> {
+        let command = json!({ "action": action }).to_string();
+        write_atomic(&self.proof, "session-command.json", command.as_bytes())
+            .map_err(|e| format!("Writing session-command.json failed: {e}"))
     }
 
     fn present(&mut self, cx: &mut Cx, phase: &'static str, value: Value) {

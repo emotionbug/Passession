@@ -668,6 +668,14 @@ pub(super) fn identities(installed: &Installed) -> BTreeMap<ComponentId, Compone
         .collect()
 }
 
+pub(super) fn app_identities(installed: &Installed) -> BTreeMap<ComponentId, ComponentIdentity> {
+    installed
+        .iter()
+        .filter(|(id, _)| **id != ComponentId::Daemon)
+        .map(|(id, r)| (*id, r.component.identity.clone()))
+        .collect()
+}
+
 pub(super) fn process_identity(pid: u32) -> Result<serde_json::Value> {
     #[cfg(target_os = "linux")]
     let birth = {

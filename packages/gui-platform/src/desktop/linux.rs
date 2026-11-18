@@ -1,10 +1,7 @@
-//! Linux desktop integration (original my_application.cc, the Linux
-//! paseo_desktop_integrations plugin, flutter_local_notifications Linux and
-//! tray_manager). D-Bus runs on a dedicated runtime that lives for the process.
+//! Linux desktop integration. D-Bus runs on a dedicated runtime that lives for
+//! the process.
 
-use super::{
-    Activation, DesktopNotification, NativeSignal, TrayMenu, deliver, notification_clicked,
-};
+use super::{Activation, DesktopNotification, NativeSignal, deliver, notification_clicked};
 use crate::{
     Bootstrap,
     action::*,
@@ -241,7 +238,7 @@ pub(crate) fn start_lifecycle(shared: &Arc<Shared>) {
             xsmp::start().map_err(|_| {
                 PlatformError::new(
                     "logout_unavailable",
-                    "No GNOME SessionManager or usable XSMP session manager is available. Close-to-tray must stay disabled to avoid intercepting logout. XSMP needs libSM/libICE runtime libraries and SESSION_MANAGER.",
+                    "No GNOME SessionManager or usable XSMP session manager is available. XSMP needs libSM/libICE runtime libraries and SESSION_MANAGER.",
                 )
             })
         }
@@ -699,7 +696,6 @@ struct X11 {
     open_display: unsafe extern "C" fn(*const c_char) -> *mut c_void,
     close_display: unsafe extern "C" fn(*mut c_void) -> c_int,
     default_root: unsafe extern "C" fn(*mut c_void) -> c_ulong,
-    default_screen: unsafe extern "C" fn(*mut c_void) -> c_int,
     intern_atom: unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong,
     get_window_property: unsafe extern "C" fn(
         *mut c_void,
@@ -734,28 +730,13 @@ struct X11 {
         *mut *mut c_ulong,
         *mut c_uint,
     ) -> c_int,
-    withdraw: unsafe extern "C" fn(*mut c_void, c_ulong, c_int) -> c_int,
     map_raised: unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int,
-    move_window: unsafe extern "C" fn(*mut c_void, c_ulong, c_int, c_int) -> c_int,
     send_event: unsafe extern "C" fn(
         *mut c_void,
         c_ulong,
         c_int,
         c_long,
         *mut XClientMessageEvent,
-    ) -> c_int,
-    get_normal_hints:
-        unsafe extern "C" fn(*mut c_void, c_ulong, *mut XSizeHints, *mut c_long) -> c_int,
-    set_normal_hints: unsafe extern "C" fn(*mut c_void, c_ulong, *mut XSizeHints),
-    translate_coordinates: unsafe extern "C" fn(
-        *mut c_void,
-        c_ulong,
-        c_ulong,
-        c_int,
-        c_int,
-        *mut c_int,
-        *mut c_int,
-        *mut c_ulong,
     ) -> c_int,
     flush: unsafe extern "C" fn(*mut c_void) -> c_int,
     query_extension: unsafe extern "C" fn(
@@ -779,28 +760,6 @@ struct XClientMessageEvent {
     data: [c_long; 5],
 }
 
-/// Xutil.h `XSizeHints`; preserve existing size constraints when pinning position.
-#[repr(C)]
-#[derive(Default)]
-struct XSizeHints {
-    flags: c_long,
-    x: c_int,
-    y: c_int,
-    width: c_int,
-    height: c_int,
-    min_width: c_int,
-    min_height: c_int,
-    max_width: c_int,
-    max_height: c_int,
-    width_inc: c_int,
-    height_inc: c_int,
-    min_aspect: [c_int; 2],
-    max_aspect: [c_int; 2],
-    base_width: c_int,
-    base_height: c_int,
-    win_gravity: c_int,
-}
-
 impl X11 {
     fn load() -> Result<Self, String> {
         unsafe {
@@ -814,19 +773,13 @@ impl X11 {
                 open_display: symbol!(b"XOpenDisplay\0"),
                 close_display: symbol!(b"XCloseDisplay\0"),
                 default_root: symbol!(b"XDefaultRootWindow\0"),
-                default_screen: symbol!(b"XDefaultScreen\0"),
                 intern_atom: symbol!(b"XInternAtom\0"),
                 get_window_property: symbol!(b"XGetWindowProperty\0"),
                 free: symbol!(b"XFree\0"),
                 change_property: symbol!(b"XChangeProperty\0"),
                 query_tree: symbol!(b"XQueryTree\0"),
-                withdraw: symbol!(b"XWithdrawWindow\0"),
                 map_raised: symbol!(b"XMapRaised\0"),
-                move_window: symbol!(b"XMoveWindow\0"),
                 send_event: symbol!(b"XSendEvent\0"),
-                get_normal_hints: symbol!(b"XGetWMNormalHints\0"),
-                set_normal_hints: symbol!(b"XSetWMNormalHints\0"),
-                translate_coordinates: symbol!(b"XTranslateCoordinates\0"),
                 flush: symbol!(b"XFlush\0"),
                 query_extension: symbol!(b"XQueryExtension\0"),
                 _x11: library,
@@ -924,14 +877,13 @@ pub(crate) fn idle_milliseconds() -> Result<u64, PlatformError> {
     Ok(info.idle)
 }
 
-// ----- native windows (close-to-tray) -----
+// ----- native window activation -----
 
-/// Makepad 1.0.0 leaves `CxOsOp::HideWindow` unimplemented on X11, so the app's
-/// top-level windows are withdrawn/mapped directly, identified by WM_CLASS.
-#[derive(Default)]
-pub(crate) struct NativeWindows {
-    hidden: Vec<c_ulong>,
+pub(crate) fn show_windows() {
+    WindowActivation::show_all();
 }
+
+struct WindowActivation;
 
 fn wm_class() -> String {
     std::env::args_os()
@@ -945,11 +897,7 @@ fn wm_class() -> String {
         .unwrap_or_else(|| "Makepad".into())
 }
 
-impl NativeWindows {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+impl WindowActivation {
     fn property(
         display: &Display,
         window: c_ulong,
@@ -1051,80 +999,18 @@ impl NativeWindows {
         list
     }
 
-    fn preserve_position(display: &Display, window: c_ulong) {
-        let root = unsafe { (display.x.default_root)(display.raw) };
-        let mut hints = XSizeHints::default();
-        let (mut supplied, mut child) = (0, 0);
-        unsafe {
-            (display.x.get_normal_hints)(display.raw, window, &mut hints, &mut supplied);
-            if (display.x.translate_coordinates)(
-                display.raw,
-                window,
-                root,
-                0,
-                0,
-                &mut hints.x,
-                &mut hints.y,
-                &mut child,
-            ) != 0
-            {
-                // Withdrawing removes the WM's placement record. On remap, keep
-                // the client origin instead of letting it place a "new" window.
-                hints.flags |= (1 << 0) | (1 << 9); // USPosition | PWinGravity
-                hints.win_gravity = 10; // StaticGravity: client origin, not frame.
-                (display.x.set_normal_hints)(display.raw, window, &mut hints);
-            }
-        }
-    }
-
-    fn restore_position(display: &Display, window: c_ulong) {
-        let mut hints = XSizeHints::default();
-        let mut supplied = 0;
-        unsafe {
-            if (display.x.get_normal_hints)(display.raw, window, &mut hints, &mut supplied) != 0
-                && hints.flags & (1 << 0) != 0
-                && hints.flags & (1 << 9) != 0
-                && hints.win_gravity == 10
-            {
-                // Withdrawal reparents the client at the old frame origin.
-                // Modern WMs use that actual position, not the obsolete x/y
-                // hint fields. Restore the client origin before remapping.
-                (display.x.move_window)(display.raw, window, hints.x, hints.y);
-            }
-        }
-    }
-
-    pub fn hide_all(&mut self) {
-        let Ok(display) = Display::open() else { return };
-        let screen = unsafe { (display.x.default_screen)(display.raw) };
-        for window in Self::own_windows(&display) {
-            Self::preserve_position(&display, window);
-            unsafe { (display.x.withdraw)(display.raw, window, screen) };
-            if !self.hidden.contains(&window) {
-                self.hidden.push(window);
-            }
-        }
-        unsafe { (display.x.flush)(display.raw) };
-    }
-
-    /// Maps and activates the tray-hidden and visible windows. A notification's
+    /// Raises and activates the visible windows. A notification's
     /// activation token is handed to the WM as `_NET_STARTUP_ID` (mutter and KWin
     /// grant focus to a mapped window when it is set, and to a withdrawn one when
     /// it maps later, e.g. the dormant first window) and its `_TIME` stamps the
     /// activation request, so focus-stealing prevention does not just flash it.
-    pub fn show_all(&mut self) {
+    fn show_all() {
         let token = ACTIVATION_TOKEN.lock().unwrap().take();
         let Ok(display) = Display::open() else { return };
         let root = unsafe { (display.x.default_root)(display.raw) };
         let active =
             unsafe { (display.x.intern_atom)(display.raw, c"_NET_ACTIVE_WINDOW".as_ptr(), 0) };
-        let mut targets = std::mem::take(&mut self.hidden);
-        let hidden_count = targets.len();
-        for window in Self::own_windows(&display) {
-            if !targets.contains(&window) {
-                targets.push(window);
-            }
-        }
+        let targets = Self::own_windows(&display);
         if let Some(token) = token.as_deref() {
             let class = wm_class();
             let withdrawn: Vec<c_ulong> = Self::root_children(&display)
@@ -1136,10 +1022,7 @@ impl NativeWindows {
             }
         }
         let time = token.as_deref().map_or(0, startup_time);
-        for (index, window) in targets.into_iter().enumerate() {
-            if index < hidden_count {
-                Self::restore_position(&display, window);
-            }
+        for window in targets {
             unsafe { (display.x.map_raised)(display.raw, window) };
             // EWMH activation request (source indication 2 = pager/user action).
             let mut event = XClientMessageEvent {
@@ -1200,209 +1083,6 @@ mod activation_tests {
         assert_eq!(startup_time("5a1e9e0c-6f0b-4bde-a2c6-9f0a3b1d7e21"), 0);
         assert_eq!(startup_time("x_TIMEnot-a-number"), 0);
     }
-}
-
-// ----- tray -----
-
-#[derive(Default)]
-struct TrayModel {
-    menu: TrayMenu,
-}
-
-/// Localized labels are literal text: `_` would otherwise mark an access key.
-fn literal(text: &str) -> String {
-    text.replace('_', "__")
-}
-
-impl ksni::Tray for TrayModel {
-    fn id(&self) -> String {
-        crate::paths::DESKTOP_APP_ID.into()
-    }
-    fn title(&self) -> String {
-        "Passession".into()
-    }
-    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        match crate::image::decode_png_rgba(include_bytes!("../../assets/tray.png")) {
-            Ok((width, height, rgba)) => vec![ksni::Icon {
-                width: width as i32,
-                height: height as i32,
-                // ARGB32, network byte order.
-                data: rgba
-                    .chunks_exact(4)
-                    .flat_map(|p| [p[3], p[0], p[1], p[2]])
-                    .collect(),
-            }],
-            Err(_) => Vec::new(),
-        }
-    }
-    fn tool_tip(&self) -> ksni::ToolTip {
-        ksni::ToolTip {
-            title: "Passession".into(),
-            ..Default::default()
-        }
-    }
-    fn activate(&mut self, _x: i32, _y: i32) {
-        deliver(NativeSignal::TrayOpen);
-    }
-    /// The embedded Tailscale status and controls head the menu while it is enabled.
-    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::StandardItem;
-        let mut items = Vec::new();
-        if let Some(presence) = &self.menu.tailnet {
-            items.push(
-                StandardItem {
-                    label: literal(&format!("{}: {}", presence.title, presence.status)),
-                    enabled: false,
-                    ..Default::default()
-                }
-                .into(),
-            );
-            let (label, control) = match presence.state {
-                TailnetPresenceState::Paused => (&presence.resume, TailnetControl::Resume),
-                _ => (&presence.pause, TailnetControl::Pause),
-            };
-            items.push(
-                StandardItem {
-                    label: literal(label),
-                    activate: Box::new(move |_: &mut Self| {
-                        deliver(NativeSignal::TrayTailnet(control))
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            );
-            items.push(
-                StandardItem {
-                    label: literal(&presence.stop),
-                    activate: Box::new(|_: &mut Self| {
-                        deliver(NativeSignal::TrayTailnet(TailnetControl::Stop))
-                    }),
-                    ..Default::default()
-                }
-                .into(),
-            );
-            items.push(ksni::MenuItem::Separator);
-        }
-        items.push(
-            StandardItem {
-                label: literal(&self.menu.open),
-                activate: Box::new(|_: &mut Self| deliver(NativeSignal::TrayOpen)),
-                ..Default::default()
-            }
-            .into(),
-        );
-        items.push(ksni::MenuItem::Separator);
-        items.push(
-            StandardItem {
-                label: literal(&self.menu.quit),
-                activate: Box::new(|_: &mut Self| deliver(NativeSignal::TrayQuit)),
-                ..Default::default()
-            }
-            .into(),
-        );
-        items
-    }
-    fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
-        // Keep the service: a restarted panel re-registers the item.
-        true
-    }
-}
-
-pub(crate) struct Tray {
-    handle: Option<ksni::Handle<TrayModel>>,
-    /// The newest menu: each update task applies it whatever order the D-Bus
-    /// runtime runs them in.
-    menu: Arc<Mutex<TrayMenu>>,
-}
-
-/// Registers the StatusNotifierItem on the D-Bus runtime; the handle is stored
-/// on the GUI thread once the panel accepted it.
-pub(crate) fn create_tray(shared: &Arc<Shared>) {
-    use ksni::TrayMethods as _;
-    let shared = shared.clone();
-    BUS.spawn(async move {
-        let spawned =
-            tokio::time::timeout(Duration::from_secs(3), TrayModel::default().spawn()).await;
-        match spawned {
-            Ok(Ok(handle)) => {
-                let owner = shared.clone();
-                shared.on_main(move |_, state| {
-                    if state.desktop.tray.is_none() && !owner.desktop.quitting() {
-                        state.desktop.install_tray(Tray {
-                            handle: Some(handle),
-                            menu: Arc::default(),
-                        });
-                        owner
-                            .desktop
-                            .tray_created
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                })
-            }
-            Ok(Err(error)) => deliver(NativeSignal::TrayFailed(format!(
-                "Unable to create the system tray icon: {error}"
-            ))),
-            Err(_) => deliver(NativeSignal::TrayFailed(
-                "The system tray service did not respond.".into(),
-            )),
-        }
-    });
-}
-
-impl Tray {
-    pub fn poll(&mut self) {}
-
-    /// Live menu change through the StatusNotifierItem's `LayoutUpdated`.
-    pub fn set_menu(&mut self, menu: &TrayMenu) {
-        *self.menu.lock().unwrap() = menu.clone();
-        let Some(handle) = self.handle.clone() else {
-            return;
-        };
-        let latest = self.menu.clone();
-        BUS.spawn(async move {
-            handle
-                .update(move |model| model.menu = latest.lock().unwrap().clone())
-                .await;
-        });
-    }
-}
-
-impl Drop for Tray {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let awaiter = handle.shutdown();
-            BUS.spawn(awaiter);
-        }
-    }
-}
-
-/// A watcher without a registered panel host is not a usable tray.
-pub(crate) async fn tray_host_available() -> bool {
-    BUS.spawn(async {
-        let Ok(connection) = session().await else {
-            return false;
-        };
-        let Ok(proxy) = zbus::Proxy::new(
-            &connection,
-            "org.kde.StatusNotifierWatcher",
-            "/StatusNotifierWatcher",
-            "org.kde.StatusNotifierWatcher",
-        )
-        .await
-        else {
-            return false;
-        };
-        matches!(
-            tokio::time::timeout(
-                Duration::from_millis(1500),
-                proxy.get_property::<bool>("IsStatusNotifierHostRegistered")
-            )
-            .await,
-            Ok(Ok(true))
-        )
-    })
-    .await
-    .unwrap_or(false)
 }
 
 // ----- open / reveal / share -----

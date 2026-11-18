@@ -194,7 +194,7 @@ func acquireLease(path string) (*os.File, error) {
 	ok, _, e := lockFile.Call(f.Fd(), 0x2|0x1, 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
 	if ok == 0 {
 		f.Close()
-		return nil, fmt.Errorf("another updater holds the operation/host lease: %w", e)
+		return nil, fmt.Errorf("another updater holds the update lease: %w", e)
 	}
 	return f, nil
 }
@@ -223,14 +223,6 @@ func detach(cmd *exec.Cmd) {
 func hideWindow(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 }
-func windowsInstallerCommand(r request) (*exec.Cmd, error) {
-	cmd := exec.Command(r.StagedArtifact)
-	// NSIS /D is special: it consumes the unquoted remainder, and MUST be last.
-	// Request paths reject quotes/newlines; normal Command.Args quoting is wrong.
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000, CmdLine: syscall.EscapeArg(r.StagedArtifact) + " /S /D=" + r.Destination}
-	return cmd, nil
-}
-func appImageDescendant(child, ancestor processIdentity) bool { return false }
 func validateAppImageProcess(p processInfo, image string) error {
 	return errors.New("AppImage requires Linux")
 }

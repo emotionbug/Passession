@@ -29,8 +29,7 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
         "daemonConfigReload",
         "durableDaemonUpdates",
         "daemonUpdateCheck",
-        "desktopAppUpdates",
-        "desktopComponentUpdates",
+        "daemonSelfUpdate",
         "pushTokenRevocation",
         "plugins",
         "pluginManagement",
@@ -102,10 +101,6 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
     ] {
         result.insert(name.to_owned(), Value::Bool(true));
     }
-    result.insert(
-        "daemonSelfUpdate".into(),
-        json!(config["desktopManaged"].as_bool() != Some(true)),
-    );
     result.insert("hopliteProvider".into(), json!(hoplite));
     if config["relayEnabledMutable"].as_bool().unwrap_or(true) {
         result.insert("relayConfig".into(), Value::Bool(true));
@@ -117,10 +112,6 @@ pub fn features(config: &Value, hoplite: bool) -> Value {
 mod tests {
     #[test]
     fn selected_commit_capability_is_advertised() {
-        assert_eq!(
-            super::features(&serde_json::json!({}), false)["desktopAppUpdates"],
-            true
-        );
         assert_eq!(
             super::features(&serde_json::json!({}), false)["gitSelectedCommit"],
             true

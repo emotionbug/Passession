@@ -142,6 +142,31 @@ pub(super) async fn admit(operation: &mut Operation) -> Result<()> {
     save(operation).await
 }
 
+/// Migration temporarily uses the legacy drain's journal slot, without
+/// claiming to be an installed update or replacing previous update status.
+pub(super) async fn restore_migration(record: &Operation) -> Result<()> {
+    let home = &record.home;
+    match record.owner["previousOperationId"].as_str() {
+        Some(id) => {
+            validate_id(id)?;
+            let archived = history_path(home, id);
+            let previous = load(&archived, home)
+                .await?
+                .context("Archived update is missing")?;
+            ensure!(
+                previous.operation_id == id && previous.terminal(),
+                "Invalid previous update"
+            );
+            let bytes = serde_json::to_vec(&previous)?;
+            crate::transport::storage::write_private(&current_path(home), &bytes).await
+        }
+        None => {
+            tokio::fs::remove_file(current_path(home)).await?;
+            Ok(())
+        }
+    }
+}
+
 pub(super) async fn retained(home: &Path) -> Result<(Vec<String>, Vec<PathBuf>)> {
     let mut operations = Vec::new();
     let mut runtimes = Vec::new();

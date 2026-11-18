@@ -590,11 +590,28 @@ impl Widget for SettingsPanel {
             dirty |= self.handle_core(cx, ui);
         }
         dirty |= self.with_env(cx, ui, |s, env| platform::handle_event(s, env, event));
+        if self.st.local_daemon.loaded
+            && let Event::Actions(actions) = event
+        {
+            for action in actions {
+                if let Some(paseo_gui_platform::PlatformAction::Event(
+                    paseo_gui_platform::PlatformEvent::LocalDaemonStatus { status },
+                )) = action.downcast_ref::<paseo_gui_platform::PlatformAction>()
+                    && self.st.local_daemon.daemon != *status
+                {
+                    self.st.local_daemon.daemon = status.clone();
+                    dirty = true;
+                }
+            }
+        }
         if matches!(
             event,
             Event::Foreground | Event::Resume | Event::AppGotFocus
         ) {
             self.with_env(cx, ui, pages::system::refresh_notification_permission);
+            if self.st.local_daemon.loaded {
+                self.with_env(cx, ui, pages::system::refresh_local_daemon);
+            }
             self.with_env(cx, ui, pages::tailnet::refresh_background);
             dirty |= self.st.notifications.checking;
         }
@@ -1368,7 +1385,7 @@ fn sidebar_item(
 }
 
 /// Original `_sidebarBody`: App group, then the Host group (picker + host
-/// sections) or Add host / Enable built-in daemon.
+/// sections) or Add host / Start the local daemon.
 fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
     let pal = kit.pal;
     let current = s
@@ -1528,7 +1545,7 @@ fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
             items.push(add);
             if no_local {
                 items.push(
-                    item(t("settings.enableBuiltInDaemon"), nav("local-daemon"))
+                    item(t("desktop.daemon.title"), nav("local-daemon"))
                         .lead(super::ui::kit::Lead::Icon(Icon::Server, None)),
                 );
             }
@@ -1583,9 +1600,9 @@ fn draw_sidebar_body(kit: &mut Ui, s: &Settings, v: &View, mobile: bool) {
             sidebar_item(
                 kit,
                 r,
-                "side.builtIn",
+                "side.localDaemon",
                 Icon::Server,
-                &t("settings.enableBuiltInDaemon"),
+                &t("desktop.daemon.title"),
                 selected,
                 mobile,
                 nav("local-daemon"),

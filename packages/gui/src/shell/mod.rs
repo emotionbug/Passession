@@ -95,10 +95,8 @@ pub struct WindowRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowState {
     Visible,
-    /// Hidden to the tray; still logically open (activation shows it again).
-    Tray,
     /// The first window after the user closed it while others stayed open: hidden, not
-    /// destroyed (it carries the daemon and tray ownership), reused by the next New Window.
+    /// destroyed (it still handles application events), reused by the next New Window.
     Dormant,
 }
 
@@ -171,8 +169,7 @@ pub(crate) fn set_window_state(id: &str, state: WindowState) {
     });
 }
 
-/// Logically open windows (visible or hidden to the tray): close-to-tray / quit decisions and
-/// quit votes.
+/// Open windows are counted for close decisions and quit votes.
 pub(crate) fn open_windows() -> usize {
     WINDOW_STATES.with(|states| {
         states
@@ -181,20 +178,6 @@ pub(crate) fn open_windows() -> usize {
             .filter(|(_, s)| *s != WindowState::Dormant)
             .count()
     })
-}
-
-/// The platform hid (`true`) or showed (`false`) every logically open window.
-pub(crate) fn set_tray_hidden(hidden: bool) {
-    let (from, to) = if hidden {
-        (WindowState::Visible, WindowState::Tray)
-    } else {
-        (WindowState::Tray, WindowState::Visible)
-    };
-    WINDOW_STATES.with(|states| {
-        for entry in states.borrow_mut().iter_mut().filter(|(_, s)| *s == from) {
-            entry.1 = to;
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -333,7 +316,6 @@ pub struct Data {
     pub geometry_applied: bool,
     pub closing: Option<commands::Closing>,
     pub quit_token: Option<u64>,
-    pub close_request: Option<paseo_gui_platform::PlatformRequestId>,
     pub file_links: HashMap<paseo_gui_platform::PlatformRequestId, commands::PendingFileLink>,
     pub file_reveals: HashSet<paseo_gui_platform::PlatformRequestId>,
     /// Host removals waiting for their push revocation (request, host, 2.5 s bound).
@@ -1230,7 +1212,7 @@ impl PaseoShellRef {
         self.borrow().and_then(|shell| shell.data.os_window)
     }
 
-    /// Closes this window like its close button (guards, close-to-tray, dormant first window).
+    /// Closes this window like its close button, including the document guard.
     pub fn request_close(&self) {
         if let Some(mut shell) = self.borrow_mut() {
             shell.data.close_requested = true;

@@ -5,24 +5,14 @@ mod continuation;
 mod drain;
 mod execution;
 mod journal;
+mod migration;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use admission::submit;
-pub(crate) use drain::{announce as announce_app_admission, release as release_app_admission};
 pub(crate) use drain::{handle_drain, initialize as initialize_admission, wire_admission};
 pub(crate) use execution::{execute, recover_bootstrap};
-pub(crate) use journal::Lease as AdmissionLease;
-
-pub(crate) async fn ensure_app_cutover_allowed(home: &Path) -> Result<()> {
-    if journal::current(home)
-        .await?
-        .is_some_and(|operation| !operation.terminal())
-    {
-        bail!("Another native update operation is still active");
-    }
-    Ok(())
-}
+pub(crate) use migration::handover as migrate_desktop_legacy;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};

@@ -8,9 +8,8 @@ use tokio::{
     sync::mpsc,
 };
 
-/// Tokio's stdin uses a runtime-owned blocking task, which cannot be cancelled
-/// and can prevent the dedicated helper process from exiting after `close`.
-/// This detached reader is process-scoped instead; it never owns a daemon.
+/// Read from a process-scoped thread so runtime shutdown does not wait for an
+/// interactive stdin read to return after cancellation.
 pub(crate) struct Input {
     receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
     pending: Option<(Vec<u8>, usize)>,
@@ -19,7 +18,7 @@ impl Input {
     pub fn open() -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel(1);
         std::thread::Builder::new()
-            .name("desktop-helper-stdin".into())
+            .name("paseo-cli-stdin".into())
             .spawn(move || {
                 let stdin = io::stdin();
                 let mut stdin = stdin.lock();

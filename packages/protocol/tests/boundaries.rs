@@ -119,37 +119,6 @@ fn desktop_app_check_has_bounded_owner_without_runtime_paths() {
     assert!(parse_envelope(&bytes, Direction::Outbound).is_ok());
 }
 
-#[test]
-fn desktop_app_local_drain_roundtrips_and_requires_owner_token() {
-    for (kind, release) in [
-        ("daemon.appUpdate.drain", false),
-        ("daemon.appUpdate.drain.release", true),
-    ] {
-        let mut request = json!({"type":format!("{kind}.request"),"requestId":"drain",
-            "operationId":"op","ownerToken":"a".repeat(64)});
-        if !release {
-            request["forceRunning"] = json!(false);
-            request["idleTimeoutMs"] = json!(300_000);
-        }
-        let parsed = SessionMessage::parse(request.clone(), Direction::Inbound).unwrap();
-        let bytes = encode_envelope(&parsed.into_envelope(), Direction::Inbound).unwrap();
-        assert!(parse_envelope(&bytes, Direction::Inbound).is_ok());
-        request.as_object_mut().unwrap().remove("ownerToken");
-        assert!(validate_session(&request, Direction::Inbound).is_err());
-        let mut payload = json!({"requestId":"drain","operationId":"op"});
-        if release {
-            payload["released"] = json!(true);
-        } else {
-            payload["ready"] = json!(true);
-            payload["forced"] = json!(false);
-        }
-        let response = json!({"type":format!("{kind}.response"),"payload":payload});
-        let parsed = SessionMessage::parse(response, Direction::Outbound).unwrap();
-        let bytes = encode_envelope(&parsed.into_envelope(), Direction::Outbound).unwrap();
-        assert!(parse_envelope(&bytes, Direction::Outbound).is_ok());
-    }
-}
-
 fn component_identity(index: usize) -> Value {
     json!({"version":format!("1.0.{index}"),"sourceSha":format!("{index:040x}"),
         "inputHash":format!("{index:064x}"),"abiVersion":1})
@@ -157,7 +126,10 @@ fn component_identity(index: usize) -> Value {
 
 fn component_identities() -> Value {
     let mut identities = json!({});
-    for (index, id) in ["app", "daemon", "tailnet", "update-helper"].iter().enumerate() {
+    for (index, id) in ["app", "daemon", "tailnet", "update-helper"]
+        .iter()
+        .enumerate()
+    {
         identities[*id] = component_identity(index);
     }
     identities
@@ -174,8 +146,11 @@ fn desktop_component_submit_roundtrips_exact_selection_and_pinned_collection() {
     let bytes = encode_envelope(&parsed.into_envelope(), Direction::Inbound).unwrap();
     assert!(parse_envelope(&bytes, Direction::Inbound).is_ok());
     for selection in [
-        json!([]), json!(["daemon","daemon"]), json!(["desktop-host"]),
-        json!(["app","daemon","tailnet","update-helper","daemon"]), json!(null),
+        json!([]),
+        json!(["daemon", "daemon"]),
+        json!(["desktop-host"]),
+        json!(["app", "daemon", "tailnet", "update-helper", "daemon"]),
+        json!(null),
         json!([{"id":"daemon","path":"/private/runtime"}]),
     ] {
         let mut invalid = request.clone();
@@ -183,7 +158,10 @@ fn desktop_component_submit_roundtrips_exact_selection_and_pinned_collection() {
         assert!(validate_session(&invalid, Direction::Inbound).is_err());
     }
     let mut all_changed = request;
-    all_changed.as_object_mut().unwrap().remove("selectedComponents");
+    all_changed
+        .as_object_mut()
+        .unwrap()
+        .remove("selectedComponents");
     assert!(validate_session(&all_changed, Direction::Inbound).is_ok());
 }
 
@@ -207,19 +185,38 @@ fn desktop_component_check_roundtrips_independent_identities_dependency_and_atom
     for (pointer, value) in [
         ("/payload/components/app/sourceSha", json!("short")),
         ("/payload/components/daemon/inputHash", json!("short")),
-        ("/payload/availableComponents/0/requires", json!({"tailnet":0})),
-        ("/payload/availableComponents/0/target/abiVersion", json!(-1)),
+        (
+            "/payload/availableComponents/0/requires",
+            json!({"tailnet":0}),
+        ),
+        (
+            "/payload/availableComponents/0/target/abiVersion",
+            json!(-1),
+        ),
         ("/payload/restartGroup", json!("installer")),
     ] {
         let mut invalid = response.clone();
-        *invalid.pointer_mut(pointer).unwrap_or_else(|| panic!("missing {pointer}")) = value;
-        assert!(validate_session(&invalid, Direction::Outbound).is_err(), "{pointer}");
+        *invalid
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("missing {pointer}")) = value;
+        assert!(
+            validate_session(&invalid, Direction::Outbound).is_err(),
+            "{pointer}"
+        );
     }
-    for parent in ["/payload", "/payload/current", "/payload/components/app",
-        "/payload/availableComponents/0", "/payload/availableComponents/0/target"] {
+    for parent in [
+        "/payload",
+        "/payload/current",
+        "/payload/components/app",
+        "/payload/availableComponents/0",
+        "/payload/availableComponents/0/target",
+    ] {
         let mut invalid = response.clone();
         invalid.pointer_mut(parent).unwrap()["path"] = json!("/private/runtime");
-        assert!(validate_session(&invalid, Direction::Outbound).is_err(), "{parent}");
+        assert!(
+            validate_session(&invalid, Direction::Outbound).is_err(),
+            "{parent}"
+        );
     }
     let mut no_change = response;
     no_change["payload"]["updateAvailable"] = json!(false);
@@ -231,10 +228,16 @@ fn desktop_component_check_roundtrips_independent_identities_dependency_and_atom
 #[test]
 fn desktop_component_operation_roundtrips_restart_groups_and_observed_selection_without_paths() {
     for (selected, restart) in [
-        (vec!["update-helper"], "none"), (vec!["daemon"], "daemon"),
-        (vec!["app"], "gui"), (vec!["tailnet"], "gui"), (vec![], "none"),
+        (vec!["update-helper"], "none"),
+        (vec!["daemon"], "daemon"),
+        (vec!["app"], "gui"),
+        (vec!["tailnet"], "gui"),
+        (vec![], "none"),
     ] {
-        for kind in ["daemon.update.submit.response", "daemon.update.status.response"] {
+        for kind in [
+            "daemon.update.submit.response",
+            "daemon.update.status.response",
+        ] {
             let response = json!({"type":kind,"payload":{"requestId":"status",
                 "operation":{"operationId":"op","serverId":"host","targetKind":"app",
                     "phase":"committed","terminal":true,"accepted":true,"outcome":"committed",
@@ -245,12 +248,22 @@ fn desktop_component_operation_roundtrips_restart_groups_and_observed_selection_
                     "message":null,"error":null,"recoveryRequired":false,"actionRequired":null}}});
             let parsed = SessionMessage::parse(response.clone(), Direction::Outbound).unwrap();
             let bytes = encode_envelope(&parsed.into_envelope(), Direction::Outbound).unwrap();
-            assert!(parse_envelope(&bytes, Direction::Outbound).is_ok(), "{restart}");
-            for parent in ["/payload/operation", "/payload/operation/targetComponents/app",
-                "/payload/operation/observedComponents/daemon", "/payload/operation/expectedRelease"] {
+            assert!(
+                parse_envelope(&bytes, Direction::Outbound).is_ok(),
+                "{restart}"
+            );
+            for parent in [
+                "/payload/operation",
+                "/payload/operation/targetComponents/app",
+                "/payload/operation/observedComponents/daemon",
+                "/payload/operation/expectedRelease",
+            ] {
                 let mut invalid = response.clone();
                 invalid.pointer_mut(parent).unwrap()["ownerToken"] = json!("a".repeat(64));
-                assert!(validate_session(&invalid, Direction::Outbound).is_err(), "{parent}");
+                assert!(
+                    validate_session(&invalid, Direction::Outbound).is_err(),
+                    "{parent}"
+                );
             }
             let mut waiting = response;
             waiting["payload"]["operation"]["terminal"] = json!(false);

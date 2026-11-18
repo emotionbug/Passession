@@ -92,8 +92,10 @@ async fn stage(
                 .await?
             }
             UpdateSource::Release => {
+                let current = managed::inspect_current_runtime(&operation.launch_owner).await?;
                 super::super::updater::prepare_release(
                     &operation.launch_owner.executable,
+                    &current,
                     &destination,
                     operation.request.expected_release.as_ref(),
                 )
@@ -380,6 +382,9 @@ pub async fn recover_bootstrap(home: &Path) -> Result<()> {
     let Some(lease) = installation.try_lease()? else {
         return Ok(());
     };
+    if operation.owner["kind"] == super::migration::LEGACY {
+        return journal::restore_migration(&operation).await;
+    }
     let handoff = match operation.phase {
         Phase::Committed => {
             let candidate = operation

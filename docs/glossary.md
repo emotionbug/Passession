@@ -48,7 +48,7 @@ Use product terms consistently across the Rust daemon, Makepad client, CLI and e
 ## Runtime and distribution
 
 - **Native client** — Rust/Makepad on Linux, macOS, Windows, Android and iOS. Android/iOS connect remotely and do not ship a daemon.
-- **Native CLI** — The Rust `paseo` executable. Bare `paseo` opens chat; `paseo onboard` is explicit setup; `paseo daemon start` starts a managed instance.
+- **Native CLI** — The Rust `paseo` executable. Bare `paseo` opens chat; `paseo onboard` is explicit setup; `paseo daemon ensure` installs or starts an independent managed daemon.
 - **Backend extension** — Optional trusted native executable using bounded JSONL IPC and the Rust `paseo-plugin` SDK. Legacy JavaScript plugins require porting; executable React UI plugins are excluded.
 - **SDK** — The Rust `paseo-client` library, with shared wire types and relay cryptography in `paseo-protocol`.
 - **Build tooling** — Rust/Cargo, `cargo xtask` and target platform toolchains used to produce artifacts. Node/npm and Flutter/Dart are not Paseo build prerequisites.

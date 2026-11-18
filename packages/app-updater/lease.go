@@ -10,8 +10,8 @@ import (
 	"strings"
 )
 
-// Different daemon homes may use the same installed GUI. Lock both the host
-// (in main.go) and the installation, without requiring write access to /usr.
+// Serialize updates to the same installed GUI without requiring write access
+// to its installation directory.
 func acquireInstallationLease(root string) (*os.File, error) {
 	cache, err := os.UserCacheDir()
 	if err != nil {

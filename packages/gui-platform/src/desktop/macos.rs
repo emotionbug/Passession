@@ -1,6 +1,4 @@
-//! macOS desktop integration (original macos/Runner/AppDelegate.swift, the macOS
-//! paseo_desktop_integrations plugin, flutter_local_notifications macOS and
-//! tray_manager). Delegate methods are added to Makepad's `NSAppDelegate`.
+//! macOS desktop integration. Delegate methods are added to Makepad's `NSAppDelegate`.
 
 use super::{Activation, DesktopNotification, NativeSignal, deliver, notification_clicked};
 use crate::{
@@ -112,9 +110,8 @@ extern "C" fn should_terminate(_this: &AnyObject, _sel: Sel, _app: Id) -> usize 
         return 1;
     }
     if SHUTTING_DOWN.load(Ordering::SeqCst) {
-        // Logout/shutdown: defer (cancelling would abort the OS request) while
-        // the owned daemon is stopped off the main thread; the reply arrives
-        // through the main dispatch queue, which the modal wait services.
+        // Defer to let the app flush its state without cancelling OS shutdown.
+        // The reply arrives on the main dispatch queue.
         if let Some(platform) = crate::platform() {
             TERMINATION_PENDING.store(true, Ordering::SeqCst);
             super::request_quit(&platform.0, QuitReason::Shutdown, true);
@@ -369,60 +366,28 @@ pub(crate) fn idle_milliseconds() -> Result<u64, PlatformError> {
     Ok((seconds * 1000.0) as u64)
 }
 
-// ----- native windows (close-to-tray) -----
+// ----- native window activation -----
 
-#[derive(Default)]
-pub(crate) struct NativeWindows {
-    hidden: Vec<usize>,
-}
-
-impl NativeWindows {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn hide_all(&mut self) {
-        unsafe {
-            let app: Id = msg_send![class!(NSApplication), sharedApplication];
-            let windows: Id = msg_send![app, windows];
-            let count: usize = msg_send![windows, count];
-            for i in 0..count {
-                let window: Id = msg_send![windows, objectAtIndex: i];
-                let visible: bool = msg_send![window, isVisible];
-                if visible {
-                    let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
-                    self.hidden.push(window as usize);
-                }
+pub(crate) fn show_windows() {
+    unsafe {
+        let app: Id = msg_send![class!(NSApplication), sharedApplication];
+        let windows: Id = msg_send![app, windows];
+        let count: usize = msg_send![windows, count];
+        for i in 0..count {
+            let window: Id = msg_send![windows, objectAtIndex: i];
+            let visible: bool = msg_send![window, isVisible];
+            let minimized: bool = msg_send![window, isMiniaturized];
+            if minimized {
+                let _: () = msg_send![window, deminiaturize: std::ptr::null_mut::<AnyObject>()];
+            }
+            if visible || minimized {
+                let _: () =
+                    msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
             }
         }
-    }
-
-    pub fn show_all(&mut self) {
-        unsafe {
-            let app: Id = msg_send![class!(NSApplication), sharedApplication];
-            let windows: Id = msg_send![app, windows];
-            let count: usize = msg_send![windows, count];
-            let hidden = std::mem::take(&mut self.hidden);
-            for i in 0..count {
-                let window: Id = msg_send![windows, objectAtIndex: i];
-                let visible: bool = msg_send![window, isVisible];
-                let minimized: bool = msg_send![window, isMiniaturized];
-                if minimized {
-                    let _: () = msg_send![window, deminiaturize: std::ptr::null_mut::<AnyObject>()];
-                }
-                if visible || minimized || hidden.contains(&(window as usize)) {
-                    let _: () =
-                        msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
-                }
-            }
-            let _: () = msg_send![app, activateIgnoringOtherApps: true];
-        }
+        let _: () = msg_send![app, activateIgnoringOtherApps: true];
     }
 }
-
-// ----- tray -----
-
-pub(crate) use super::native_tray::{Tray, create_tray, tray_host_available};
 
 // ----- open / reveal / share -----
 

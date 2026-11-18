@@ -24,7 +24,6 @@ pub mod client;
 pub mod config;
 pub mod daemon_admin;
 pub mod daemon_control;
-pub mod desktop_host;
 pub mod directory_sync;
 pub mod files;
 pub mod git;

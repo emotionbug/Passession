@@ -20,7 +20,6 @@ pub(crate) fn prepare_process(_cx: &mut Cx) -> anyhow::Result<()> {
 pub(crate) fn capabilities() -> Capabilities {
     Capabilities {
         desktop_host: true,
-        tray: true,
         editors: true,
         updater: true,
         directory_picker: true,
@@ -34,12 +33,6 @@ pub(crate) fn capabilities() -> Capabilities {
 
 pub(crate) fn report_error(shared: &Arc<Shared>, message: &str) {
     shared.desktop.report(message);
-}
-
-/// The tray menu carries the presence; without a tray (none yet, or no
-/// StatusNotifier host on Linux) it is kept for a tray that appears later.
-pub(crate) fn set_tailnet_presence(shared: &Arc<Shared>, presence: Option<TailnetPresence>) {
-    shared.on_main(move |_, state| state.desktop.set_tailnet_presence(presence));
 }
 
 pub(crate) fn system_prefers_dark() -> bool {

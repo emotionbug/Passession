@@ -5481,30 +5481,6 @@
             {
               "type": "object",
               "properties": {
-                "type": { "type": "string", "const": "daemon.appUpdate.drain.request" },
-                "requestId": { "type": "string" },
-                "operationId": { "type": "string" },
-                "forceRunning": { "type": "boolean" },
-                "idleTimeoutMs": { "type": "integer", "minimum": 1 },
-                "ownerToken": { "type": "string", "minLength": 64, "maxLength": 64 }
-              },
-              "required": ["type", "requestId", "operationId", "forceRunning", "idleTimeoutMs", "ownerToken"],
-              "additionalProperties": false
-            },
-            {
-              "type": "object",
-              "properties": {
-                "type": { "type": "string", "const": "daemon.appUpdate.drain.release.request" },
-                "requestId": { "type": "string" },
-                "operationId": { "type": "string" },
-                "ownerToken": { "type": "string", "minLength": 64, "maxLength": 64 }
-              },
-              "required": ["type", "requestId", "operationId", "ownerToken"],
-              "additionalProperties": false
-            },
-            {
-              "type": "object",
-              "properties": {
                 "type": {
                   "type": "string",
                   "const": "daemon.update.status.request"

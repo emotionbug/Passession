@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use makepad_widgets::*;
 use paseo_gui_core::CoreError;
 use paseo_gui_platform::{
-    CloseDecision, PlatformAction, PlatformEvent, PlatformRoute, PlatformValue, QuitReason,
-    TailnetControl, WindowGeometry,
+    PlatformAction, PlatformEvent, PlatformRoute, PlatformValue, QuitReason, TailnetControl,
+    WindowGeometry,
 };
 use serde_json::{Map, Value, json};
 
@@ -1107,9 +1107,8 @@ fn finish_closing(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, after
                 toast(shell, cx, error, true);
                 return;
             }
-            match platform::window_close_requested(crate::shell::open_windows()) {
-                Some(request) => shell.data.close_request = Some(request),
-                None => close_os_window(shell, cx),
+            if !platform::window_close_requested(crate::shell::open_windows()) {
+                retire_window(shell, cx);
             }
         }
         AfterClose::Quit(token) => {
@@ -1142,10 +1141,13 @@ fn close_os_window(shell: &mut PaseoShell, cx: &mut Cx) {
     }
 }
 
-/// Original `_finishWindowClose`: other windows are destroyed; the first window carries daemon
-/// and tray ownership, so it is hidden and kept for the next New Window.
+/// Other windows are destroyed; the first handles application events and is
+/// kept for the next New Window.
 fn retire_window(shell: &mut PaseoShell, cx: &mut Cx) {
     if !shell.is_main() || !platform::desktop_host() {
+        // Retire logically now so two close requests in the same event batch
+        // cannot both conclude another window will remain open.
+        crate::shell::unregister_window(&shell.data.window_id);
         close_os_window(shell, cx);
         return;
     }
@@ -4524,20 +4526,6 @@ pub fn handle_platform_actions(
                     ui.core.remove_host(&host_id);
                     continue;
                 }
-                if shell.data.close_request == Some(request) {
-                    shell.data.close_request = None;
-                    match result {
-                        Ok(value) => match platform::close_decision(&value) {
-                            // The platform already hid every window (on the GUI thread).
-                            Some(CloseDecision::HideToTray) => crate::shell::set_tray_hidden(true),
-                            Some(CloseDecision::CloseWindow) | None => retire_window(shell, cx),
-                            // The platform already started the guarded quit (`QuitRequested`).
-                            Some(CloseDecision::QuitApplication) => {}
-                        },
-                        Err(error) => toast(shell, cx, error.message, true),
-                    }
-                    continue;
-                }
                 let pick = ICON_PICKS.with(|picks| picks.borrow_mut().remove(&request));
                 if let Some(pick) = pick {
                     if let Ok(PlatformValue::Files(files)) = result {
@@ -4558,21 +4546,18 @@ pub fn handle_platform_actions(
                 }
                 PlatformEvent::QuitRequested { token, reason } => {
                     match crate::shell::window_state(&shell.data.window_id) {
-                        // A dormant first window is not open: it has no say.
-                        Some(WindowState::Dormant) => {}
-                        state => {
+                        None | Some(WindowState::Dormant) => {}
+                        Some(WindowState::Visible) => {
                             let keys = guarded_keys(shell);
-                            if reason == QuitReason::RemoteAppUpdate {
-                                let allowed = keys.is_empty();
+                            if reason == QuitReason::AppUpdate {
                                 #[cfg(feature = "desktop-smoke")]
-                                let allowed = allowed && !crate::smoke::close_guard_refuses();
-                                vote_quit(token, allowed);
-                                continue;
-                            }
-                            if state == Some(WindowState::Tray) && !keys.is_empty() {
-                                // Dirty-document prompts must not be trapped in a hidden window.
-                                platform::show_windows();
-                                crate::shell::set_tray_hidden(false);
+                                let smoke_refuses = crate::smoke::close_guard_refuses();
+                                #[cfg(not(feature = "desktop-smoke"))]
+                                let smoke_refuses = false;
+                                if !keys.is_empty() || smoke_refuses {
+                                    vote_quit(token, false);
+                                    continue;
+                                }
                             }
                             close_tabs(shell, cx, ui, keys, false, AfterClose::Quit(token));
                         }
@@ -4580,7 +4565,6 @@ pub fn handle_platform_actions(
                 }
                 PlatformEvent::QuitReady if main => crate::shell::request_quit_now(),
                 PlatformEvent::QuitCancelled => {}
-                PlatformEvent::ShowWindow if main => crate::shell::set_tray_hidden(false),
                 PlatformEvent::OpenWindow { route } if main => {
                     crate::shell::request_window(WindowRequest { route })
                 }
@@ -4795,7 +4779,7 @@ pub fn handle_window_events(
         }
         Event::Background | Event::Pause | Event::AppLostFocus => {
             shell.data.app_inactive = true;
-            // Desktop tray windows keep their live attention-notification connection.
+            // Desktop windows keep their live attention-notification connection.
             if cfg!(any(target_os = "android", target_os = "ios"))
                 && matches!(event, Event::Background | Event::Pause)
             {

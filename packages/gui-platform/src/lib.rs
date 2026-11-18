@@ -1,8 +1,7 @@
 //! Desktop and mobile OS integration for the native Passession client.
 //!
 //! See `platform-api.md` in the migration state directory for the contract.
-//! Android and iOS are remote-only: no daemon, desktop-host, tray or updater
-//! code is compiled for them.
+//! Android and iOS are remote-only; no local daemon or updater code is linked.
 
 pub mod action;
 pub mod audio;
@@ -59,10 +58,9 @@ pub(crate) mod native {
 }
 
 pub use action::{
-    ClipboardContent, ClipboardImage, CloseDecision, EditorTarget, PermissionSettings,
-    PermissionState, PickedFile, PlatformAction, PlatformError, PlatformEvent, PlatformRequestId,
-    PlatformRoute, PlatformValue, QuitReason, SafeInsets, TailnetControl, TailnetPresence,
-    TailnetPresenceState,
+    ClipboardContent, ClipboardImage, EditorTarget, PermissionSettings, PermissionState,
+    PickedFile, PlatformAction, PlatformError, PlatformEvent, PlatformRequestId, PlatformRoute,
+    PlatformValue, QuitReason, SafeInsets, TailnetControl, TailnetPresence, TailnetPresenceState,
 };
 pub use notification_policy::{AttentionView, NotificationRequest};
 pub use platform::{

@@ -341,8 +341,8 @@ async fn handle(core: &Rc<Core>, command: Command) {
             None => core.error(Some(&host_id), crate::error::host_unknown(&host_id)),
         },
         Command::RefreshHosts => hosts::refresh_hosts(core).await,
-        Command::DiscoverLocalDaemon => {
-            hosts::discover_local_daemon(core).await;
+        Command::DiscoverLocalDaemon { explicit } => {
+            hosts::discover_local_daemon(core, explicit).await;
             hosts::refresh_hosts(core).await;
         }
         Command::SetAppVisible { visible } => hosts::set_app_visible(core, visible),

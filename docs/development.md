@@ -96,7 +96,9 @@ Only run the desktop target matching the host OS. iOS requires macOS. `cargo xta
 
 Every build passes the client's identity at compile time (`PASEO_VERSION`, `PASEO_RELEASE_CHANNEL`, `PASEO_UPDATE_REPOSITORY`, `PASEO_BUILD_NUMBER`, `PASEO_BUILD_SOURCE_SHA`). Staged desktop builds (`build-gui`, `dev app`) also set `MAKEPAD_PACKAGE_DIR=makepad`: Makepad then opens resources at `makepad/<crate>/resources/…` relative to the working directory on Linux and Windows (the client switches to its executable directory at startup) and relative to `Contents/Resources` on macOS (`MAKEPAD=apple_bundle`). Android and iOS always use `makepad/` inside the APK assets or app bundle.
 
-On Windows, the GUI uses the Windows subsystem and launches its `desktop-host` CLI helper with `CREATE_NO_WINDOW`; redirected standard streams alone do not prevent a console window. Managed executable probes and background restart launchers use the same flag, while foreground CLI launches keep their console. The release's Windows smoke job checks that the helper child has no console window and retains its stdin/stdout/stderr pipes; its console codepage is not a window-visibility signal.
+On Windows, the GUI uses the Windows subsystem and launches the bundled `daemon ensure` command with `CREATE_NO_WINDOW`; redirected standard streams alone do not prevent a console window. Managed executable probes and background restart launchers use the same flag, while foreground CLI launches keep their console. The daemon runs independently after the desktop exits.
+
+The release's Windows smoke job checks that the daemon CLI has no console window, sees EOF on stdin, and can write captured stdout and stderr.
 
 Makepad platform, draw, widgets, vector and shader compiler are patched through `packages/gui-platform/vendor/` and root `[patch.crates-io]`. Each crate retains its upstream license and `VENDORED.md` provenance. Platform carries Android API 24 compatibility, native lifecycle/input fixes, the packaged live-watcher guard and the `windows` 0.61 port; draw carries Unicode line breaking and runtime font families; widgets carries scrollbar and caret behavior and decodes images with `image`. Draw and vector use the standard `rustybuzz` 0.20, `ttf-parser` 0.25 and `resvg` 0.45 the client already resolves, rather than Makepad's forks or a second resvg stack. Keep changes in the existing copy, not a second framework fork. The source watcher is disabled when `MAKEPAD_PACKAGE_DIR` is set: staged builds have no live reload; plain `cargo run` keeps it.
 
@@ -125,8 +127,8 @@ Completed discovery invalidates synchronous and asynchronous layouts, typography
 
 ## Source ownership
 
-- Rust daemon: `packages/daemon/src`; CLI commands in `cli/`, providers in `providers/`, process ownership in `daemon_control/`, desktop IPC in `desktop_host/`.
-- Native client: `packages/gui` (Makepad shell, theme, common widgets, `src/features/*`), `packages/gui-core` (host connections, directory synchronization, persisted client state), `packages/gui-platform` (desktop host, updater, tray, notifications, pickers, audio, Android/iOS sources).
+- Rust daemon: `packages/daemon/src`; CLI commands in `cli/`, providers in `providers/`, installation and process ownership in `daemon_control/`.
+- Native client: `packages/gui` (Makepad shell, theme, common widgets, `src/features/*`), `packages/gui-core` (host connections, directory synchronization, persisted client state), `packages/gui-platform` (desktop activation, updater, notifications, pickers, audio, Android/iOS sources).
 - Embedded Tailscale: `packages/tailnet` (Rust lifecycle, portable Go/C engine, maintained tsnet source and encrypted state), OS credential providers in `packages/gui-platform`, transport and host policy in `packages/client` and `packages/gui-core`.
 - Terminal emulation: `packages/terminal` (`paseo-terminal`, Ghostty VT for daemon screens, terminal tabs and logs) and its vendored `libghostty-vt-sys` build-script patch under `vendor/`.
 - Native build, packaging and release: `xtask/src`; packaging resources, the Android Gradle project and vendored Makepad Android Java: `packaging/`.

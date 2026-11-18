@@ -49,6 +49,11 @@ pub fn command() -> Command {
         .subcommand(launch_options(
             Command::new("start").arg(option("timeout", "timeout")),
         ))
+        .subcommand(
+            Command::new("ensure")
+                .about("Install or start the independent local daemon if needed")
+                .arg(option("runtime", "runtime").value_name("DIRECTORY")),
+        )
         .subcommand(launch_options(Command::new("run")))
         .subcommand(Command::new("status"))
         .subcommand(
@@ -110,6 +115,25 @@ pub async fn execute(path: &[&str], m: &ArgMatches, ctx: &Context) -> Result<Out
         }
     }
     match path {
+        ["ensure"] => {
+            let result = control::managed::ensure_daemon(
+                &ctx.local_home()?,
+                string(m, "runtime").map(Path::new),
+                &ctx.cancel,
+            )
+            .await?;
+            let mut description = format!(
+                "Daemon {} ({}): PID {}, listening on {}",
+                result.state, result.owner, result.pid, result.listen,
+            );
+            if result.migration.is_some() {
+                description
+                    .push_str("\nMigration is pending; the existing daemon remains running.");
+            }
+            Ok(Output::new(serde_json::to_value(result)?)
+                .id("pid")
+                .human(description))
+        }
         ["start"] | ["run"] => {
             let home = ctx.local_home()?;
             let foreground = path[0] == "run";
@@ -760,6 +784,11 @@ pub(crate) async fn observe_status(
         }
         _ => json!({"host":target.description()}),
     };
+    if let (DaemonTarget::Instance { home }, Some(instance)) = (target, &instance)
+        && let Some(owner) = control::managed::registered_owner(home, instance).await
+    {
+        local["owner"] = json!(owner);
+    }
     if matches!(target, DaemonTarget::Instance { .. })
         && instance.as_ref().is_none_or(|i| i.listen.is_none())
     {

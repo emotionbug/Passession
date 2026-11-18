@@ -388,7 +388,6 @@ const LOCAL: &[(&str, &str, &str)] = &[
         "Revoke this hub relationship?",
         "이 허브 관계를 취소할까요?",
     ),
-    ("settingsNative.startDaemon", "Start daemon", "데몬 시작"),
     (
         "settingsNative.updateDiagnostics",
         "Update diagnostics",

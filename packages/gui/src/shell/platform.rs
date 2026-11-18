@@ -1,9 +1,9 @@
-//! The shell's one adapter to `paseo-gui-platform` (platform-api.md). Every call is
-//! non-blocking; results arrive as `PlatformAction`s in `Event::Actions`.
+//! The shell's adapter to `paseo-gui-platform`. Asynchronous results arrive as
+//! `PlatformAction`s in `Event::Actions`.
 
 use paseo_gui_platform::{
-    CloseDecision, PermissionSettings, PlatformAction, PlatformEvent, PlatformHandle,
-    PlatformRequestId, PlatformValue, QuitReason,
+    PermissionSettings, PlatformAction, PlatformEvent, PlatformHandle, PlatformRequestId,
+    QuitReason,
 };
 
 fn handle() -> Option<PlatformHandle> {
@@ -43,20 +43,11 @@ pub fn desktop_host() -> bool {
     handle().is_some_and(|h| h.capabilities().desktop_host)
 }
 
-pub fn window_close_requested(open_windows: usize) -> Option<PlatformRequestId> {
-    handle().map(|h| h.window_close_requested(open_windows))
+pub fn window_close_requested(open_windows: usize) -> bool {
+    handle().is_some_and(|h| h.window_close_requested(open_windows))
 }
 
-/// Shows every window the platform hid to the tray.
-pub fn show_windows() {
-    if let Some(h) = handle() {
-        h.show_windows();
-    }
-}
-
-/// Hides one window (the dormant first window) without destroying it; tray restore
-/// (`show_windows`) leaves it hidden. The platform resolves Makepad's top-level frame at
-/// call time (platform-api.md `PlatformHandle::hide_window`).
+/// Hides the dormant first window until a new-window request reuses it.
 pub fn hide_window(cx: &mut makepad_widgets::Cx, window: makepad_widgets::WindowId) {
     if let Some(h) = handle() {
         h.hide_window(cx, window);
@@ -133,13 +124,6 @@ pub fn actions(actions: &makepad_widgets::Actions) -> Vec<PlatformAction> {
         .iter()
         .filter_map(|action| action.downcast_ref::<PlatformAction>().cloned())
         .collect()
-}
-
-pub fn close_decision(value: &PlatformValue) -> Option<CloseDecision> {
-    match value {
-        PlatformValue::CloseDecision(decision) => Some(*decision),
-        _ => None,
-    }
 }
 
 pub type Event = PlatformEvent;

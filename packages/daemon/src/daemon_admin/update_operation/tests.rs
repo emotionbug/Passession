@@ -274,6 +274,54 @@ async fn paused_updates_allow_read_subscriptions_but_still_block_work() -> Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn legacy_migration_drain_remains_pending_while_agent_admission_is_active() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let user = tempfile::tempdir()?;
+    let app = crate::state::AppState::new(
+        home.path().to_owned(),
+        user.path().to_owned(),
+        std::env::current_exe()?,
+    );
+    let mut previous = fixture(home.path());
+    previous.phase = Phase::Committed;
+    journal::admit(&mut previous).await?;
+    let mut migration = fixture(home.path());
+    migration.owner = json!({"kind":migration::LEGACY,"previousOperationId":previous.operation_id});
+    migration.phase = Phase::Draining;
+    migration.request.idle_timeout_ms = 1;
+    migration.executor = Some(serde_json::to_value(
+        crate::daemon_control::managed::executor_identity()?,
+    )?);
+    journal::admit(&mut migration).await?;
+    let request =
+        json!({"type":"daemon.update.drain.request","operationId":migration.operation_id});
+    let running_work = app.agents.update_admission.enter()?;
+    let drained = drain::handle_drain(&app, &request).await?;
+    assert_eq!(drained["ready"], false);
+    assert_eq!(drained["forced"], false);
+    assert_eq!(drained["inflightAdmissions"], 1);
+    assert!(app.agents.update_admission.enter().is_err());
+    drop(running_work);
+    let drained = drain::handle_drain(&app, &request).await?;
+    assert_eq!(drained["ready"], true);
+    migration.phase = Phase::Failed;
+    journal::save(&mut migration).await?;
+    drain::handle_drain(
+        &app,
+        &json!({"type":"daemon.update.drain.release.request","operationId":migration.operation_id}),
+    )
+    .await?;
+    journal::restore_migration(&migration).await?;
+    assert!(app.agents.update_admission.enter().is_ok());
+    assert_eq!(
+        journal::current(home.path()).await?.unwrap().operation_id,
+        previous.operation_id
+    );
+    app.cancel.cancel();
+    Ok(())
+}
+
 fn runtime(root: &Path, version: &str) -> RuntimeIdentity {
     RuntimeIdentity {
         root: root.to_owned(),

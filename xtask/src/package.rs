@@ -66,7 +66,7 @@ fn build_input() -> Result<PathBuf> {
 /// Debian dependencies of the packaged ELF files, computed by dpkg-shlibdeps
 /// from their DT_NEEDED entries, plus what the client loads at runtime and so
 /// never appears in DT_NEEDED: Makepad's libEGL, `libX11` (idle time and
-/// close-to-tray withdraw), and xdg-utils for opening links and mail. The
+/// window activation), and xdg-utils for opening links and mail. The
 /// optional X11 idle-time and XSMP logout libraries are `DEBIAN_RECOMMENDS`
 /// (`libraries::LINUX_DLOPENED` lists the same sonames for the AppImage).
 fn debian_depends(payload: &Path) -> Result<String> {

@@ -84,6 +84,8 @@ fn error_text(error: &PlatformError) -> String {
 pub struct Bridge {
     failed: Vec<(PlatformRequestId, String)>,
     next_local: u64,
+    #[cfg(test)]
+    pub(super) desktop_requests: Option<Vec<(PlatformRequestId, String, Value)>>,
 }
 
 impl Bridge {
@@ -95,8 +97,23 @@ impl Bridge {
         id
     }
 
+    #[cfg(test)]
+    pub(super) fn record_desktop() -> Self {
+        Self {
+            desktop_requests: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
     /// Desktop host IPC command (`desktop_settings_get`, `start_desktop_daemon`, …).
     pub fn desktop(&mut self, command: &str, args: Value) -> PlatformRequestId {
+        #[cfg(test)]
+        if let Some(requests) = &mut self.desktop_requests {
+            self.next_local += 1;
+            let id = u64::MAX - self.next_local;
+            requests.push((id, command.to_owned(), args));
+            return id;
+        }
         match platform() {
             Some(handle) if DESKTOP && handle.capabilities().desktop_host => {
                 handle.desktop_invoke(command, args)

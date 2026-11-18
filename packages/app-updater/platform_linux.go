@@ -42,37 +42,6 @@ func inspectProcess(pid int) (processInfo, error) {
 	return processInfo{processIdentity{pid, fields[19]}, exe, st.Sys().(*syscall.Stat_t).Uid}, nil
 }
 
-func appImageDescendant(child, ancestor processIdentity) bool {
-	current, err := inspectProcess(child.PID)
-	if err != nil || current.identity != child {
-		return false
-	}
-	pid := child.PID
-	for range 32 {
-		if pid == ancestor.PID {
-			p, err := inspectProcess(pid)
-			return err == nil && p.identity == ancestor
-		}
-		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-		if err != nil {
-			return false
-		}
-		end := strings.LastIndexByte(string(b), ')')
-		if end < 0 {
-			return false
-		}
-		fields := strings.Fields(string(b[end+1:]))
-		if len(fields) < 2 {
-			return false
-		}
-		pid, err = strconv.Atoi(fields[1])
-		if err != nil || pid <= 1 {
-			return false
-		}
-	}
-	return false
-}
-
 func validateAppImageProcess(p processInfo, image string) error {
 	// APPIMAGE/APPDIR come from the bound local GUI process, never from request
 	// paths. Do not expose the remainder of its environment in logs or status.

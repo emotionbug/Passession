@@ -70,7 +70,7 @@ pub fn draw_section(ui: &mut Ui, s: &Settings, v: &View, section: &str) {
         return;
     }
     match section {
-        "local-daemon" => system::draw_local_daemon(ui, s),
+        "local-daemon" => system::draw_local_daemon(ui, s, v.hosts.iter().any(|host| host.local)),
         "notifications" => system::draw_notifications(ui, s),
         "diagnostics" => system::draw_diagnostics(ui, s),
         "about" => about::draw_about(ui, s, v),

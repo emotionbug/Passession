@@ -268,8 +268,8 @@ pub fn component_app(root: &Path) -> Result<()> {
     )
 }
 
-/// Libraries the desktop client opens with `dlopen` (paseo-gui-platform): X11
-/// idle time and close-to-tray withdraw (`libX11`, `libXss`) and XSMP logout
+/// Libraries the desktop client opens with `dlopen` (paseo-gui-platform): native
+/// window activation and idle time (`libX11`, `libXss`) and XSMP logout
 /// without a GNOME SessionManager (`libSM`, `libICE`), plus system-font discovery
 /// (`libfontconfig`). The Debian package declares the same set in `package.rs`.
 pub const LINUX_DLOPENED: [&str; 5] = [

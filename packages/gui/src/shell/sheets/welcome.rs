@@ -79,15 +79,15 @@ fn version_text() -> String {
     }
 }
 
-/// Desktop: the built-in daemon's start, shown above the connection methods while it is
-/// starting or after it failed (once it listens, its host appears and Welcome goes away).
+/// The daemon can be started here or automatically at launch. Connection
+/// methods remain available regardless of the local daemon's state.
 fn local_daemon() -> Option<LocalDaemon> {
     if MOBILE || !platform::desktop_host() {
         return None;
     }
     match paseo_gui_platform::desktop::local_daemon() {
-        state @ (LocalDaemon::Starting | LocalDaemon::Failed(_)) => Some(state),
-        _ => None,
+        LocalDaemon::Unavailable => None,
+        state => Some(state),
     }
 }
 
@@ -192,11 +192,13 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     let button_h = 16.0 + line + 16.0;
     let buttons_h =
         actions.len() as f64 * button_h + (actions.len().saturating_sub(1)) as f64 * 12.0;
-    // The daemon card: 16px padding around its text, plus the Retry / View logs row on failure.
+    // Reserve room for daemon actions when it is stopped or failed.
     let card_w = inner.size.x.min(420.0);
     let card_text_w = (card_w - 32.0 - 24.0).max(40.0);
     let daemon_text = match &daemon {
         Some(LocalDaemon::Starting) => tr("onboarding.daemon.starting"),
+        Some(LocalDaemon::Running) => tr("onboarding.daemon.running"),
+        Some(LocalDaemon::Idle) => tr("onboarding.daemon.stopped"),
         Some(LocalDaemon::Failed(reason)) => failure_text(reason),
         _ => String::new(),
     };
@@ -216,7 +218,14 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
     } else {
         0.0
     };
-    let daemon_buttons_h = if matches!(daemon, Some(LocalDaemon::Failed(_))) {
+    let daemon_action = match &daemon {
+        Some(LocalDaemon::Idle | LocalDaemon::Failed(_)) => {
+            Some(("welcome:daemonstart", "desktop.daemon.startNow"))
+        }
+        Some(LocalDaemon::Running) => Some(("welcome:daemonconnect", "desktop.daemon.connect")),
+        _ => None,
+    };
+    let daemon_buttons_h = if daemon_action.is_some() {
         12.0 + 32.0
     } else {
         0.0
@@ -348,7 +357,8 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
             LocalDaemon::Starting => {
                 crate::shell::sheets::spinner(&mut ui, cx, glyph, p.muted);
             }
-            _ => ui.icon(cx, glyph, "circle-alert", 16.0, p.danger),
+            LocalDaemon::Failed(_) => ui.icon(cx, glyph, "circle-alert", 16.0, p.danger),
+            _ => ui.icon(cx, glyph, "server", 16.0, p.muted),
         }
         ui.painter.paragraph(
             cx,
@@ -357,31 +367,31 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
             daemon_spec,
             &daemon_text,
         );
-        if matches!(state, LocalDaemon::Failed(_)) {
+        if let Some((action, label)) = daemon_action {
             let by = card.pos.y + 16.0 + daemon_text_h + 12.0;
-            let retry = tr("common.actions.retry");
-            let rw = ui.button_width(cx, &retry, Some("rotate-cw"), ControlSize::Sm);
+            let start = tr(label);
+            let rw = ui.button_width(cx, &start, None, ControlSize::Sm);
             let bx = card.pos.x + 16.0 + 24.0;
             ui.button(
                 cx,
                 rect(bx, by, rw, 32.0),
-                "welcome:daemonretry",
-                &retry,
-                Some("rotate-cw"),
+                action,
+                &start,
+                None,
                 Variant::Primary,
                 ControlSize::Sm,
                 true,
             );
-            let logs = tr("onboarding.daemon.viewLogs");
-            let lw = ui
-                .button_width(cx, &logs, Some("file-text"), ControlSize::Sm)
+            let settings = tr("onboarding.daemon.settings");
+            let sw = ui
+                .button_width(cx, &settings, None, ControlSize::Sm)
                 .min((card.pos.x + card.size.x - 16.0 - (bx + rw + 8.0)).max(0.0));
             ui.button(
                 cx,
-                rect(bx + rw + 8.0, by, lw, 32.0),
-                "welcome:daemonlogs",
-                &logs,
-                Some("file-text"),
+                rect(bx + rw + 8.0, by, sw, 32.0),
+                "welcome:daemonsettings",
+                &settings,
+                None,
                 Variant::Ghost,
                 ControlSize::Sm,
                 true,
@@ -455,20 +465,18 @@ pub fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, area: Rect) {
 }
 
 pub fn click(shell: &mut PaseoShell, cx: &mut Cx, ui: &mut UiContext, id: &str) {
-    let _ = ui;
     match id {
         "website" => {
             platform::open_external("https://paseo.sh");
         }
         "settings" => crate::shell::commands::open_settings(shell, cx, None, ""),
-        // Start the built-in daemon again; the card follows its state.
-        "daemonretry" => {
+        "daemonstart" => {
             if let Some(handle) = paseo_gui_platform::platform() {
                 handle.desktop_invoke("start_desktop_daemon", serde_json::json!({}));
             }
         }
-        // The local daemon settings page holds its log viewer.
-        "daemonlogs" => crate::shell::commands::open_settings(shell, cx, None, "local-daemon"),
+        "daemonconnect" => ui.core.connect_local_daemon(),
+        "daemonsettings" => crate::shell::commands::open_settings(shell, cx, None, "local-daemon"),
         "scan" | "direct" | "ssh" | "link" => {
             // One connection flow at a time (Flutter `_busy`).
             if shell.data.overlays.stack.is_empty() {

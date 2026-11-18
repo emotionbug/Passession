@@ -1,9 +1,9 @@
 # Architecture
 
-Paseo is a native client/server system. **Rust owns the daemon, the CLI and the Linux, macOS, Windows, Android and iOS clients** (Makepad 1.0.0 widgets). Desktop can run a local daemon. Mobile clients connect to a desktop/server daemon and do not ship or start one.
+Paseo is a native client/server system. **Rust owns the daemon, the CLI and the Linux, macOS, Windows, Android and iOS clients** (Makepad 1.0.0 widgets). Desktop can start an independent local daemon. Mobile clients connect to a desktop/server daemon and do not ship or start one.
 
 ```text
-Rust desktop client ── native desktop-host IPC ── Rust lifecycle/supervisor
+Rust desktop client ── optional `daemon ensure` ── Rust lifecycle/supervisor
        │                                            │
 Rust mobile client ── WebSocket / encrypted relay ── Rust daemon
 Rust CLI / external Rust SDK ─────────────────────┤
@@ -28,11 +28,11 @@ Paseo's runtime, SDKs and build tools require neither Node, Electron, nor Chromi
 | Files and Git               | `files/`, `git/`                                                                       | Remote picker, reads/writes, observation, Git facts and lazy diff bodies                  |
 | Terminals and scripts       | `terminals.rs`, `terminals/` | PTY lifecycle, interactive shells, service scripts, screen state and replayable output |
 | Automation and integrations | `automation/`, `mcp/`, `mcp_client/`, `hosts/`, `hub/`                                 | Schedules, MCP client/server, connected-host and Hub behavior                             |
-| Desktop lifecycle           | `desktop_host.rs`, `desktop_host/`, `daemon_control/`                                  | Structured IPC, process identity, ownership, supervisor and worker lifecycle              |
+| Daemon lifecycle            | `daemon_control/`                                                                      | Installation, launch owner, supervisor and worker lifecycle                               |
 | Client runtime              | `packages/gui-core/src`                                                                | Host connections, directory synchronization, persisted client state, request/event boundary |
 | Embedded tailnet             | `packages/tailnet`, `packages/client/src/transport`, `packages/gui-core/src/runtime` | App-owned libtailscale lifecycle, authenticated loopback transport, host routing and cancellation |
 | Client UI                   | `packages/gui/src` (`shell/`, `common/`, `features/*`)                                 | Makepad shell, navigation, tabs/windows, feature views and controllers                    |
-| Platform integration        | `packages/gui-platform/src`, `packages/gui-platform/{android,ios}`                     | Desktop host, updater, tray, notifications, pickers, audio, mobile bridges                |
+| Platform integration        | `packages/gui-platform/src`, `packages/gui-platform/{android,ios}`                     | Desktop activation, updater, notifications, pickers, audio, mobile bridges                |
 | Terminal emulation          | `packages/terminal`                                                                    | Ghostty VT engine shared by daemon screens, terminal tabs and logs                        |
 | Packaging                   | `xtask/src`, `packaging/`                                                              | Native runtime assets, installers, provenance, updates, attributions                      |
 
@@ -48,7 +48,7 @@ A client disconnect does not end a provider turn or archive a session. Daemon-ow
 
 Embedded Tailscale is a client transport, not an OS VPN or a replacement daemon. One app-owned node is shared across windows; `gui-platform` supplies its OS-backed encryption key, `paseo-tailnet` owns encrypted state and the pinned native engine, and `gui-core` owns host admission and lifecycle. Explicitly selected tailnet hosts cannot fall back to saved Normal/relay alternatives. Normal hosts and unrelated public HTTP remain usable at the same time. Host HTTP uses the same network boundary; daemon credentials are restricted to the admitted origin and never follow externally initiated redirect/icon chains.
 
-The node outlives focus changes: regaining focus keeps a responsive node and starts one only when none is running, and the 5 s status poll drops tailnet routes only after three consecutive transient failures (`Starting` during a network rebind, a stalled native call) or at once for a terminal state (sign-in, approval, stopped). A slow native close is waited out, and the next start waits for any drain still holding the state lease, so it never fails as "in use" or creates a second Go node. The lease is a non-blocking `flock` on Unix and `File::try_lock` elsewhere: Rust 1.93's `File::try_lock` and `File::lock` return `Unsupported` on Android, which would fail every start there. Only contention is reported as "in use"; any other lock failure is its own error. Pause disconnects the node until Resume without changing the saved setting, so a restarted app is not paused; Stop is Settings' disconnect and persists Embedded Tailscale off. While it is enabled, the app hands the platform a localized background presence with Pause/Resume and Stop: the Android foreground-service notification and the desktop tray menu. iOS has no background presence; its controls are in Settings. Entering the background begins one UIKit background task, ended on reactivation or by its expiration handler, so the node and host links survive the system-granted grace (about 30 s) and a quick app switch returns to a running node. iOS suspends the app after that grace; on return, the foreground `ensure` starts a node if none is running.
+The node outlives focus changes: regaining focus keeps a responsive node and starts one only when none is running, and the 5 s status poll drops tailnet routes only after three consecutive transient failures (`Starting` during a network rebind, a stalled native call) or at once for a terminal state (sign-in, approval, stopped). A slow native close is waited out, and the next start waits for any drain still holding the state lease, so it never fails as "in use" or creates a second Go node. The lease is a non-blocking `flock` on Unix and `File::try_lock` elsewhere: Rust 1.93's `File::try_lock` and `File::lock` return `Unsupported` on Android, which would fail every start there. Only contention is reported as "in use"; any other lock failure is its own error. Pause disconnects the node until Resume without changing the saved setting, so a restarted app is not paused; Stop is Settings' disconnect and persists Embedded Tailscale off. Android offers these controls in its foreground-service notification. Desktop and iOS expose them in Settings; quitting the desktop app ends its embedded node, not the local daemon. On iOS, entering the background begins one UIKit background task, ended on reactivation or expiration, so the node and host links survive the system-granted grace (about 30 s). iOS suspends the app after that grace; on return the foreground `ensure` starts a node if none is running.
 
 ## Client state and navigation
 
@@ -83,17 +83,13 @@ A pane that presents another agent's recency must invalidate itself.
 
 Results that arrive in the background must repaint only the owner that drew the waiting content, such as code highlighting, images, Mermaid diagrams and decoded attachments. Record that owner's draw list or area when drawing, or compare a revision in the owner's event handling. A stale or invisible result repaints nothing. `Cx::redraw_all` repaints every layer of every window. It is reserved for theme, font and locale changes, and the GUI crate's `clippy.toml` rejects any other use.
 
-## Desktop ownership
+## Desktop lifecycle
 
-The client talks to the Rust `desktop-host` process through structured IPC (`paseo-gui-platform`). Desktop lifecycle tracks the daemon's process-start identity and whether this application owns its supervisor. A pre-existing daemon is not treated as a child to kill on quit. Keep-running policy and owned-stop behavior are distinct from hiding or closing a window. A supervisor restart must not create a second competing daemon.
+At launch the desktop client may run the bundled CLI's `daemon ensure` command for its local daemon home. The CLI installs a durable runtime and starts it independently (a systemd user service when available on Linux, detached otherwise). The desktop observes existing local daemons without taking ownership and never stops them.
 
-All desktop windows live in one process and share one set of host connections; each window or pane keeps its own route and selection. A second launch forwards its arguments to the running primary process and exits. Closing a window or tab neither archives sessions nor stops a pre-existing daemon; owned-daemon cleanup runs only at application quit, after every document close guard has resolved.
+All desktop windows live in one process and share one set of host connections; each window or pane keeps its own route and selection. A second launch forwards arguments to the primary process and exits. Closing the last window runs guarded quit, including unsaved documents, and exits the process. The desktop has no tray; Embedded Tailscale controls are in Settings. Daemon updates use the launch owner; app, Tailscale and update-helper updates use the local desktop updater without a daemon handoff.
 
-Platform tray/menu/window behavior is native integration, not an Electron renderer feature. Runtime verification is platform-specific; Linux lifecycle evidence does not establish Windows or macOS execution.
-
-While Embedded Tailscale is enabled, the desktop tray menu (ksni on Linux, tray-icon on macOS/Windows) starts with its status and Pause/Resume and Stop controls; they reach the app as `PlatformEvent::TailnetControl`. A presence set before the tray exists is applied when the tray appears, and a Linux session without a StatusNotifier host simply has no tray. Hiding windows to the tray keeps the process, and with it the node, running. A notification click or agent link raises the app and routes into the first window; while that window is dormant it is reopened with the route instead of routing invisibly. On Linux the notification's `ActivationToken` becomes the window's `_NET_STARTUP_ID` and activation timestamp so focus-stealing prevention grants the raise; on Windows a refused `SetForegroundWindow` briefly attaches to the foreground thread's input.
-
-The app hands the tray its localized Open and Quit labels (`set_tray_labels`) at startup and on each language change. Until then they are English, and labels sent before the tray exists apply when it appears.
+A notification click or agent link raises the app and routes into the first window. While that window is dormant, it is reopened with the route rather than routing invisibly. On Linux the notification's `ActivationToken` becomes the window's `_NET_STARTUP_ID` and activation timestamp, so focus-stealing prevention can grant the raise. On Windows a refused `SetForegroundWindow` briefly attaches to the foreground thread's input. Runtime verification is platform-specific; Linux lifecycle evidence does not establish Windows or macOS execution.
 
 ## Terminals and excluded surfaces
 

@@ -1,4 +1,3 @@
-pub(crate) mod desktop_update;
 mod diagnostics;
 #[cfg(test)]
 mod tests;
@@ -43,8 +42,6 @@ impl DaemonAdminService {
                 | "daemon.update.status.request"
                 | "daemon.update.drain.request"
                 | "daemon.update.drain.release.request"
-                | "daemon.appUpdate.drain.request"
-                | "daemon.appUpdate.drain.release.request"
                 | "restart_server_request"
                 | "shutdown_server_request"
         ) {
@@ -77,7 +74,7 @@ impl DaemonAdminService {
             "daemon.update.submit.request"=>{
                 let admitted = async {
                     let submit = remote_submit_request(message)?;
-                    admit(&app, submit, message.get("targetKind").cloned(), selected_components(message)?).await
+                    admit(&app, submit).await
                 }.await;
                 match admitted{
                     Ok(operation)=>context.send(json!({"type":"daemon.update.submit.response","payload":{"requestId":request,"operation":operation}})).await?,
@@ -87,26 +84,11 @@ impl DaemonAdminService {
             "daemon.update.status.request"=>{
                 let observed=async{
                     let operation=update_operation_id(message["operationId"].as_str().unwrap_or(""))?;
-                    operation_status(&app, &operation).await
+                    update_operation::status(&app.home, &operation).await
                 }.await;
                 match observed{
                     Ok(operation)=>context.send(json!({"type":"daemon.update.status.response","payload":{"requestId":request,"operation":operation}})).await?,
                     Err(error)=>rpc_error(context,request,kind,&error).await?,
-                }
-            }
-            "daemon.appUpdate.drain.request"|"daemon.appUpdate.drain.release.request"=>{
-                let app = app.clone();
-                let message = message.clone();
-                // A disconnect cannot cancel a pause halfway through its cleanup.
-                let result = tokio::spawn(async move { desktop_update::handle_drain(&app, &message).await }).await;
-                match result {
-                    Ok(Ok(mut payload)) => {
-                        payload["requestId"] = json!(request);
-                        let response = format!("{}.response", kind.strip_suffix(".request").unwrap());
-                        context.send_flushed(json!({"type":response,"payload":payload})).await?;
-                    }
-                    Ok(Err(error)) => rpc_error(context, request, kind, &error).await?,
-                    Err(error) => rpc_error(context, request, kind, &error.into()).await?,
                 }
             }
             "daemon.update.drain.request"|"daemon.update.drain.release.request"=>{
@@ -160,6 +142,13 @@ pub(crate) fn update_terminal(operation: &Value) -> bool {
 /// file on the caller's computer, never one the daemon should read.
 fn remote_submit_request(message: &Value) -> Result<SubmitRequest> {
     let reject = |code: &str, text: &str| anyhow::Error::from(ClientError::new(code, text));
+    anyhow::ensure!(
+        message
+            .get("targetKind")
+            .is_none_or(|kind| kind == "daemon")
+            && message.get("selectedComponents").is_none_or(Value::is_null),
+        "This daemon endpoint updates only the daemon. Update the app from its local Settings."
+    );
     let operation_id = match message["operationId"].as_str() {
         Some(raw) => update_operation_id(raw)?,
         None => {
@@ -240,82 +229,12 @@ fn remote_submit_request(message: &Value) -> Result<SubmitRequest> {
     })
 }
 
-fn selected_components(message: &Value) -> Result<Option<std::collections::BTreeSet<paseo_protocol::components::ComponentId>>> {
-    let Some(value) = message.get("selectedComponents").filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
-    let invalid = || ClientError::new("INVALID_COMPONENT_SELECTION",
-        "selectedComponents must contain one to four distinct component IDs.");
-    let values = value.as_array().filter(|values| !values.is_empty() && values.len() <= 4)
-        .ok_or_else(invalid)?;
-    let mut selected = std::collections::BTreeSet::new();
-    for value in values {
-        let id = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
-        if !selected.insert(id) {
-            return Err(invalid().into());
-        }
-    }
-    Ok(Some(selected))
-}
-
-fn validate_target_kind(message: &Value, desktop: bool) -> Result<()> {
-    if let Some(kind) = message.get("targetKind") {
-        anyhow::ensure!(
-            kind == if desktop { "app" } else { "daemon" },
-            "Update target ownership changed; check this host again before submitting"
-        );
-    }
-    Ok(())
-}
-
-async fn operation_status(app: &AppState, id: &str) -> Result<Value> {
-    if desktop_update::desktop_managed(&app.home).await? {
-        let server = app.transport.identity()["serverId"]
-            .as_str()
-            .context("Missing server identity")?
-            .to_owned();
-        desktop_update::status(&app.home, &server, id).await
-    } else {
-        update_operation::status(&app.home, id).await
-    }
-}
-
 /// Read-only capability and release metadata. Ownership and network failures
 /// remain independent: an unsupported installation can still see the release.
 async fn check_update(app: &AppState) -> Value {
-    match desktop_update::desktop_managed(&app.home).await {
-        Ok(true) => {
-            let server = app.transport.identity()["serverId"]
-                .as_str()
-                .unwrap_or("")
-                .to_owned();
-            return match desktop_update::check(&app.home, &server).await {
-                Ok(result) => result,
-                Err(error) => json!({"serverId":server,"targetKind":"app",
-                    "current":null,
-                    "supported":false,"updateAvailable":false,"latest":null,"owner":{"kind":"desktopApp"},
-                    "supportError":bounded_update_error(&error),"checkError":null}),
-            };
-        }
-        Ok(false) => {}
-        Err(error) => {
-            return json!({"serverId":app.transport.identity()["serverId"],
-            "current":{"version":crate::VERSION,"sourceSha":option_env!("PASEO_BUILD_SOURCE_SHA").unwrap_or("")},
-            "supported":false,"updateAvailable":false,"latest":null,"owner":null,
-            "supportError":bounded_update_error(&error),"checkError":null});
-        }
-    }
     let ownership = tokio::time::timeout(Duration::from_secs(20), async {
         let owner = crate::daemon_control::managed::discover_owner(&app.home).await?;
-        let root = owner
-            .executable
-            .parent()
-            .context("Runtime root is missing")?;
-        let runtime = updater::inspect_runtime(root).await?;
-        anyhow::ensure!(
-            runtime.version == owner.version,
-            "Running version differs from installed runtime"
-        );
+        crate::daemon_control::managed::inspect_current_runtime(&owner).await?;
         Ok::<_, anyhow::Error>(owner.public_summary())
     });
     let (ownership, release) = tokio::join!(ownership, updater::check_release());
@@ -358,32 +277,12 @@ fn bounded_update_error(error: &anyhow::Error) -> String {
 /// Admission runs detached: transport aborts a request task when its session ends,
 /// and a disconnect must neither abandon a half-finished durable handoff nor reach
 /// the executor. Only the observer belongs to the request.
-async fn admit(
-    app: &AppState,
-    request: SubmitRequest,
-    target_kind: Option<Value>,
-    components: Option<std::collections::BTreeSet<paseo_protocol::components::ComponentId>>,
-) -> Result<Value> {
+async fn admit(app: &AppState, request: SubmitRequest) -> Result<Value> {
     let home = app.home.clone();
     let executable = app.executable.clone();
-    let server = app.transport.identity()["serverId"]
-        .as_str()
-        .context("Missing server identity")?
-        .to_owned();
-    tokio::spawn(async move {
-        let desktop = desktop_update::desktop_managed(&home).await?;
-        if let Some(kind) = target_kind {
-            validate_target_kind(&json!({"targetKind":kind}), desktop)?;
-        }
-        if desktop {
-            desktop_update::submit(&home, &server, request, components).await
-        } else {
-            anyhow::ensure!(components.is_none(), "Component selection requires a desktop owner");
-            update_operation::submit(&home, &executable, request).await
-        }
-    })
-    .await
-    .map_err(|error| anyhow!("Update admission task ended unexpectedly: {error}"))?
+    tokio::spawn(async move { update_operation::submit(&home, &executable, request).await })
+        .await
+        .map_err(|error| anyhow!("Update admission task ended unexpectedly: {error}"))?
 }
 
 async fn rpc_error(
@@ -417,7 +316,7 @@ async fn legacy_update(app: &AppState, context: &RequestContext, request: &str) 
         idle_timeout_ms: DEFAULT_UPDATE_IDLE_TIMEOUT.as_millis() as u64,
         force_running: false,
     };
-    let mut operation = match admit(app, submit, None, None).await {
+    let mut operation = match admit(app, submit).await {
         Ok(operation) => operation,
         Err(error) => {
             return context
@@ -450,7 +349,7 @@ async fn legacy_update(app: &AppState, context: &RequestContext, request: &str) 
             _ = cancel.cancelled() => return Ok(()),
             _ = tokio::time::sleep(LEGACY_OBSERVE_INTERVAL) => {}
         }
-        match operation_status(app, &operation_id).await {
+        match update_operation::status(&app.home, &operation_id).await {
             Ok(next) => {
                 operation = next;
                 failures = 0;
@@ -553,13 +452,15 @@ mod frontend_tests {
     use super::*;
 
     #[test]
-    fn submit_target_kind_cannot_cross_owner_types() {
-        assert!(validate_target_kind(&json!({}), false).is_ok());
-        assert!(validate_target_kind(&json!({"targetKind":"app"}), true).is_ok());
-        assert!(validate_target_kind(&json!({"targetKind":"daemon"}), false).is_ok());
-        assert!(validate_target_kind(&json!({"targetKind":"app"}), false).is_err());
-        assert!(validate_target_kind(&json!({"targetKind":"daemon"}), true).is_err());
-        assert!(validate_target_kind(&json!({"targetKind":"unknown"}), true).is_err());
+    fn remote_submit_accepts_only_daemon_updates() {
+        let id = "0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11";
+        assert!(remote_submit_request(&json!({"operationId":id})).is_ok());
+        assert!(remote_submit_request(&json!({"operationId":id,"targetKind":"daemon"})).is_ok());
+        assert!(remote_submit_request(&json!({"operationId":id,"targetKind":"app"})).is_err());
+        assert!(
+            remote_submit_request(&json!({"operationId":id,"selectedComponents":["daemon"]}))
+                .is_err()
+        );
     }
 
     #[test]

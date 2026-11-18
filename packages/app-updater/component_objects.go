@@ -746,7 +746,7 @@ func queryComponentHelper(r componentRequest, c installedComponent) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, componentImage(r, c), "--identity")
-	cmd.Env = updateEnvironment(os.Environ(), request{DaemonHome: r.DaemonHome}, "", false)
+	cmd.Env = scrubUpdateEnvironment(os.Environ(), 0)
 	var out boundedComponentOutput
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard
@@ -771,47 +771,4 @@ func queryComponentHelper(r componentRequest, c installedComponent) error {
 		return errors.New("selected helper identity/ABI mismatch")
 	}
 	return nil
-}
-
-func validateMountedComponentRuntime(r componentRequest, image string) error {
-	if runtime.GOOS != "linux" {
-		return errors.New("mounted runtime requires Linux AppImage")
-	}
-	parent, err := inspectProcess(r.ParentProcess.PID)
-	if err != nil || parent.identity != r.ParentProcess {
-		return errors.New("mounted runtime parent changed")
-	}
-	if err = validateAppImageProcess(parent, r.BaseRoot); err != nil {
-		return err
-	}
-	f, err := os.Open(fmt.Sprintf("/proc/%d/environ", r.ParentProcess.PID))
-	if err != nil {
-		return err
-	}
-	data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if len(data) > 1<<20 {
-		return errors.New("AppImage environment exceeds limit")
-	}
-	mount := ""
-	for _, entry := range strings.Split(string(data), "\x00") {
-		key, value, _ := strings.Cut(entry, "=")
-		if key == "APPDIR" {
-			mount = value
-		}
-	}
-	mount, err = filepath.EvalSymlinks(mount)
-	if err != nil || !within(mount, image) {
-		return errors.New("runtime is not in owning AppImage mount")
-	}
-	if actual, e := componentFileHash(image); e != nil || actual != r.Current["daemon"].Component.ExecutableSHA256 {
-		return errors.New("mounted runtime differs from selected component")
-	}
-	return boundLive(runtimeBinding{r.ParentProcess, r.CurrentExecutable})
 }

@@ -108,7 +108,6 @@ pub(super) fn strip_parent_environment(env: &mut std::collections::BTreeMap<Stri
         "CLAUDE_CODE_SSE_PORT",
         "CLAUDE_AGENT_SDK_VERSION",
         "PASEO_NODE_ENV",
-        "PASEO_DESKTOP_MANAGED",
         "PASEO_SUPERVISED",
         "ELECTRON_RUN_AS_NODE",
         "ELECTRON_NO_ATTACH_CONSOLE",

@@ -15,22 +15,6 @@ import (
 	"time"
 )
 
-// This file is part of the candidate's verified App object and is hashed in
-// component-build-app.json. The old GUI cannot opt into app-only health.
-const independentDaemonMarker = "app-lifecycle-v1"
-const independentDaemonMarkerContents = "independent-daemon\n"
-
-func (o *componentOperation) hasIndependentDaemonMarker() bool {
-	r := o.request
-	app := r.TargetComponents["app"]
-	if r.RestartGroup != "gui" || reflect.DeepEqual(app, r.Current["app"]) {
-		return false
-	}
-	path := filepath.Join(componentRoot(r, app), independentDaemonMarker)
-	marker, err := componentFileHash(path)
-	return err == nil && marker == "e1c70375f01b0f78b8e37512ad45ec4e4c83c223ec4cbfb80d619d005e74fcf8"
-}
-
 func runComponentRequest(path string) error {
 	var r componentRequest
 	raw, err := readJSON(path, &r)
@@ -45,11 +29,6 @@ func runComponentRequest(path string) error {
 		return err
 	}
 	defer operationLease.Close()
-	hostLease, err := acquireLease(filepath.Join(r.DaemonHome, ".desktop-update-install.lock"))
-	if err != nil {
-		return err
-	}
-	defer hostLease.Close()
 	installationLease, err := acquireInstallationLease(r.BaseRoot)
 	if err != nil {
 		return err
@@ -107,15 +86,11 @@ func runComponentRequest(path string) error {
 		return err
 	}
 	if r.RestartGroup != "none" {
-		if err = o.phase("waitingForParent", "Components prepared; waiting for authenticated owned-runtime handoff.", false); err != nil {
+		if err = o.phase("waitingForParent", "Components prepared; waiting for authenticated GUI handoff.", false); err != nil {
 			return err
 		}
 		if !o.awaitHandoff() {
-			recovery := exited(r.ParentProcess)
-			for _, binding := range r.RuntimeProcesses {
-				recovery = recovery || exited(binding.Process)
-			}
-			return o.fail("Owned-runtime handoff did not complete; selection unchanged. Any stopped runtime requires recovery.", recovery, nil)
+			return o.fail("GUI handoff did not complete; selection unchanged.", exited(r.ParentProcess), nil)
 		}
 	}
 	return o.activateAndCheck()
@@ -151,7 +126,7 @@ func (o *componentOperation) writeLeaseOwner() error {
 }
 func (o *componentOperation) prepare() error {
 	r := o.request
-	if err := boundLive(runtimeBinding{r.ParentProcess, r.CurrentExecutable}); err != nil {
+	if err := boundLive(r.ParentProcess, r.CurrentExecutable); err != nil {
 		return err
 	}
 	if !samePath(r.CurrentExecutable, componentImage(r, r.Current["app"])) {
@@ -167,16 +142,6 @@ func (o *componentOperation) prepare() error {
 		}
 		if actual, e := componentFileHash(r.CurrentExecutable); e != nil || actual != r.Current["app"].Component.ExecutableSHA256 {
 			return errors.New("mounted bootstrap app differs from selected object")
-		}
-	}
-	for _, binding := range r.RuntimeProcesses {
-		if err := boundLive(binding); err != nil {
-			return err
-		}
-		if !samePath(binding.Executable, componentImage(r, r.Current["daemon"])) {
-			if err := validateMountedComponentRuntime(r, binding.Executable); err != nil {
-				return err
-			}
 		}
 	}
 	if err := validatePinnedInventory(r); err != nil {
@@ -200,7 +165,6 @@ func (o *componentOperation) prepare() error {
 	if err := queryComponentHelper(r, r.TargetComponents["update-helper"]); err != nil {
 		return fmt.Errorf("selected helper identity query: %w", err)
 	}
-	o.journal.AppOnlyCandidate = o.hasIndependentDaemonMarker()
 	return o.persist()
 }
 func (o *componentOperation) authorized(name string) bool {
@@ -217,18 +181,7 @@ func (o *componentOperation) authorized(name string) bool {
 	return err == nil && ack.SchemaVersion == 2 && ack.OperationID == o.request.OperationID && ack.Nonce == o.journal.Status.Nonce
 }
 func (o *componentOperation) handoffCompleted() bool {
-	if !o.authorized("handoff.json") {
-		return false
-	}
-	for _, binding := range o.request.RuntimeProcesses {
-		if !exited(binding.Process) {
-			return false
-		}
-	}
-	if o.request.RestartGroup == "gui" {
-		return exited(o.request.ParentProcess)
-	}
-	return boundLive(runtimeBinding{o.request.ParentProcess, o.request.CurrentExecutable}) == nil
+	return o.authorized("handoff.json") && exited(o.request.ParentProcess)
 }
 func (o *componentOperation) awaitHandoff() bool {
 	return waitUntil(o.parentTimeout, o.interval, o.handoffCompleted)
@@ -264,13 +217,8 @@ func (o *componentOperation) activateAndCheck() error {
 		return o.beforeTrialFailure(err)
 	}
 	if o.request.RestartGroup == "none" {
-		if err := boundLive(runtimeBinding{o.request.ParentProcess, o.request.CurrentExecutable}); err != nil {
+		if err := boundLive(o.request.ParentProcess, o.request.CurrentExecutable); err != nil {
 			return o.fail("Owning GUI changed before helper activation.", false, err)
-		}
-		for _, binding := range o.request.RuntimeProcesses {
-			if err := boundLive(binding); err != nil {
-				return o.fail("Unchanged runtime changed before helper activation.", false, err)
-			}
 		}
 		if err := queryComponentHelper(o.request, o.request.TargetComponents["update-helper"]); err != nil {
 			return o.fail("Selected helper identity is not valid.", false, err)
@@ -287,20 +235,14 @@ func (o *componentOperation) activateAndCheck() error {
 		return err
 	}
 	o.journal.Step = "trial"
-	if o.request.RestartGroup == "gui" {
-		message := "Starting selected GUI with the original daemon home."
-		if o.journal.AppOnlyCandidate {
-			message = "Starting selected GUI without a daemon handoff."
-		}
-		if err := o.phase("starting", message, true); err != nil {
-			return err
-		}
-		if err := o.launch(o.request.TargetComponents); err != nil {
-			return o.rollback(err)
-		}
+	if err := o.phase("starting", "Starting the selected GUI.", true); err != nil {
+		return err
+	}
+	if err := o.launch(o.request.TargetComponents); err != nil {
+		return o.rollback(err)
 	}
 	o.journal.Step = "checking"
-	if err := o.phase("checking", "Waiting for independently authenticated component/runtime health.", true); err != nil {
+	if err := o.phase("checking", "Waiting for authenticated GUI component health.", true); err != nil {
 		return err
 	}
 	if waitUntil(o.healthTimeout, o.interval, func() bool { return o.checkHealth("health.json", o.request.TargetComponents) == nil }) {
@@ -364,11 +306,6 @@ func (o *componentOperation) pruneSuperseded(selected ...componentSet) error {
 	if !exited(r.ParentProcess) {
 		live["app"], live["tailnet"] = r.Current["app"], r.Current["tailnet"]
 	}
-	for _, binding := range r.RuntimeProcesses {
-		if !exited(binding.Process) {
-			live["daemon"], live["tailnet"] = r.Current["daemon"], r.Current["tailnet"]
-		}
-	}
 	err := pruneComponentStore(r, append(selected, live)...)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Desktop update helper: warning: cannot remove superseded component files:", err)
@@ -382,14 +319,7 @@ func (o *componentOperation) launch(set componentSet) error {
 	}
 	cmd := exec.Command(image)
 	cmd.Dir = filepath.Dir(image)
-	base := updateEnvironment(os.Environ(), request{DaemonHome: o.request.DaemonHome, OperationDirectory: o.request.OperationDirectory, OperationID: o.request.OperationID}, o.journal.Status.Nonce, true)
-	for _, value := range base {
-		key, _, _ := strings.Cut(value, "=")
-		if key != "PASEO_COMPONENT_STORE" && key != "PASEO_COMPONENT_BASE_ROOT" {
-			cmd.Env = append(cmd.Env, value)
-		}
-	}
-	cmd.Env = append(cmd.Env, "PASEO_COMPONENT_STORE="+o.request.StoreDirectory, "PASEO_COMPONENT_BASE_ROOT="+o.request.BaseRoot)
+	cmd.Env = o.launchEnvironment(os.Environ())
 	detach(cmd)
 	o.journal.LaunchPending = true
 	if err := o.persist(); err != nil {
@@ -401,7 +331,9 @@ func (o *componentOperation) launch(set componentSet) error {
 		return err
 	}
 	p, err := inspectProcess(cmd.Process.Pid)
-	_ = cmd.Process.Release()
+	// Reap an exiting GUI so its exact exit is observable during rollback.
+	// The detached child is free to outlive the helper on commit.
+	go func() { _ = cmd.Wait() }()
 	if err != nil {
 		return err
 	}
@@ -409,81 +341,54 @@ func (o *componentOperation) launch(set componentSet) error {
 	o.journal.LaunchPending = false
 	return o.persist()
 }
+func (o *componentOperation) launchEnvironment(base []string) []string {
+	r := o.request
+	return append(scrubUpdateEnvironment(base, 5),
+		"PASEO_UPDATE_OPERATION_DIRECTORY="+r.OperationDirectory,
+		"PASEO_UPDATE_OPERATION_ID="+r.OperationID,
+		"PASEO_UPDATE_NONCE="+o.journal.Status.Nonce,
+		"PASEO_COMPONENT_STORE="+r.StoreDirectory,
+		"PASEO_COMPONENT_BASE_ROOT="+r.BaseRoot,
+	)
+}
+
+func scrubUpdateEnvironment(base []string, extra int) []string {
+	out := make([]string, 0, len(base)+extra)
+	for _, value := range base {
+		key, _, _ := strings.Cut(value, "=")
+		if runtime.GOOS == "windows" {
+			key = strings.ToUpper(key)
+		}
+		if strings.HasPrefix(key, "PASEO_UPDATE_") || key == "PASEO_COMPONENT_STORE" || key == "PASEO_COMPONENT_BASE_ROOT" ||
+			key == "APPDIR" || key == "APPIMAGE" || strings.HasPrefix(key, "APPIMAGE_") || strings.HasPrefix(key, "LD_") {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
 func (o *componentOperation) checkHealth(name string, set componentSet) error {
 	p := filepath.Join(o.request.OperationDirectory, name)
 	if err := privatePath(p, false); err != nil {
 		return err
 	}
-	if name == "health.json" && o.journal.AppOnlyCandidate {
-		return o.checkAppOnlyHealth(p, set)
-	}
 	var h componentHealth
 	if _, err := readJSON(p, &h); err != nil {
 		return err
 	}
-	if h.SchemaVersion != 2 || h.OperationID != o.request.OperationID || h.Nonce != o.journal.Status.Nonce || h.ServerID != o.request.ServerID || h.DaemonHome != o.request.DaemonHome || !reflect.DeepEqual(h.Components, componentIdentities(set)) {
-		return errors.New("component health identity mismatch")
-	}
-	guiProcess, guiImage := o.journal.Launched, componentImage(o.request, set["app"])
-	if o.request.RestartGroup == "daemon" {
-		guiProcess, guiImage = o.request.ParentProcess, o.request.CurrentExecutable
-	}
-	if h.GUIProcess != guiProcess {
-		return errors.New("health GUI is not transaction-bound process")
-	}
-	if err := boundLive(runtimeBinding{h.GUIProcess, guiImage}); err != nil {
-		return err
-	}
-	if !samePath(h.DaemonExecutable, componentImage(o.request, set["daemon"])) || h.DaemonProcess.PID == h.GUIProcess.PID || len(h.RuntimeProcesses) == 0 || len(h.RuntimeProcesses) > 16 {
-		return errors.New("health runtime is not selected component")
-	}
-	seen := make(map[int]bool)
-	daemonFound := false
-	for _, binding := range h.RuntimeProcesses {
-		if seen[binding.Process.PID] || binding.Process.PID == h.GUIProcess.PID || !samePath(binding.Executable, h.DaemonExecutable) {
-			return errors.New("invalid health runtime binding")
-		}
-		seen[binding.Process.PID] = true
-		for _, old := range o.request.RuntimeProcesses {
-			if binding.Process == old.Process {
-				return errors.New("health retained a stopped old runtime")
-			}
-		}
-		if err := boundLive(binding); err != nil {
-			return err
-		}
-		if binding.Process == h.DaemonProcess {
-			daemonFound = true
-		}
-	}
-	if !daemonFound {
-		return errors.New("health daemon is not in owned runtime set")
-	}
-	return o.recordHealth(set, h)
-}
-
-func (o *componentOperation) checkAppOnlyHealth(path string, set componentSet) error {
-	var h struct {
-		SchemaVersion int                          `json:"schemaVersion"`
-		OperationID   string                       `json:"operationId"`
-		Nonce         string                       `json:"nonce"`
-		Components    map[string]componentIdentity `json:"components"`
-		GUIProcess    processIdentity              `json:"guiProcess"`
-	}
-	if _, err := readJSON(path, &h); err != nil {
-		return err
-	}
-	expected := componentIdentities(set)
-	delete(expected, "daemon")
-	if h.SchemaVersion != 2 || h.OperationID != o.request.OperationID || h.Nonce != o.journal.Status.Nonce || h.GUIProcess != o.journal.Launched || !reflect.DeepEqual(h.Components, expected) {
+	if h.SchemaVersion != 2 || h.OperationID != o.request.OperationID || h.Nonce != o.journal.Status.Nonce || h.GUIProcess != o.journal.Launched || len(h.Components) != len(appComponentIDs) {
 		return errors.New("app-only health identity mismatch")
 	}
-	if err := boundLive(runtimeBinding{h.GUIProcess, componentImage(o.request, set["app"])}); err != nil {
+	for _, id := range appComponentIDs {
+		if observed, ok := h.Components[id]; !ok || observed != set[id].Component.Identity {
+			return errors.New("app-only health component identity mismatch")
+		}
+	}
+	if err := boundLive(h.GUIProcess, componentImage(o.request, set["app"])); err != nil {
 		return err
 	}
-	// The legacy status format contains the entire immutable selection; that
-	// daemon entry is the verified bundled image, not a live process identity.
-	return o.recordHealth(set, componentHealth{SchemaVersion: 2, OperationID: h.OperationID, Nonce: h.Nonce, Components: componentIdentities(set), GUIProcess: h.GUIProcess})
+	return o.recordHealth(set, h)
 }
 
 func (o *componentOperation) recordHealth(set componentSet, h componentHealth) error {
@@ -495,51 +400,21 @@ func (o *componentOperation) recordHealth(set componentSet, h componentHealth) e
 	if err := queryComponentHelper(o.request, set["update-helper"]); err != nil {
 		return err
 	}
+	// The journal records the whole verified selection for store integrity.
+	// The unchanged daemon entry describes its bundled image, not a live process.
+	h.Components = componentIdentities(set)
 	o.journal.Health = &h
 	return o.persist()
 }
 func (o *componentOperation) stopTrial() bool {
-	if o.journal.LaunchPending {
+	if o.journal.LaunchPending || o.journal.Launched.PID <= 1 || o.journal.Launched.BirthToken == "" {
 		return false
 	}
 	if err := atomicJSON(filepath.Join(o.request.OperationDirectory, "stop.json"), map[string]any{"schemaVersion": 2, "operationId": o.request.OperationID, "nonce": o.journal.Status.Nonce, "restartGroup": o.request.RestartGroup}); err != nil {
 		return false
 	}
 	return waitUntil(o.stopTimeout, o.interval, func() bool {
-		p := filepath.Join(o.request.OperationDirectory, "stopped.json")
-		if err := privatePath(p, false); err != nil {
-			return false
-		}
-		var ack struct {
-			SchemaVersion    int              `json:"schemaVersion"`
-			OperationID      string           `json:"operationId"`
-			Nonce            string           `json:"nonce"`
-			RuntimeProcesses []runtimeBinding `json:"runtimeProcesses"`
-		}
-		if _, err := readJSON(p, &ack); err != nil || ack.SchemaVersion != 2 || ack.OperationID != o.request.OperationID || ack.Nonce != o.journal.Status.Nonce || len(ack.RuntimeProcesses) > 16 {
-			return false
-		}
-		if o.journal.AppOnlyCandidate {
-			return len(ack.RuntimeProcesses) == 0 && o.journal.Launched.PID != 0 && exited(o.journal.Launched)
-		}
-		seen := make(map[processIdentity]bool)
-		for _, binding := range ack.RuntimeProcesses {
-			if binding.Process.PID <= 1 || binding.Process.PID == o.request.ParentProcess.PID || binding.Process.PID == o.journal.Launched.PID || binding.Process.BirthToken == "" || seen[binding.Process] || !samePath(binding.Executable, componentImage(o.request, o.request.TargetComponents["daemon"])) || !exited(binding.Process) {
-				return false
-			}
-			seen[binding.Process] = true
-		}
-		if o.journal.Health != nil {
-			for _, binding := range o.journal.Health.RuntimeProcesses {
-				if !seen[binding.Process] {
-					return false
-				}
-			}
-		}
-		if o.request.RestartGroup == "gui" {
-			return o.journal.Launched.PID != 0 && exited(o.journal.Launched)
-		}
-		return boundLive(runtimeBinding{o.request.ParentProcess, o.request.CurrentExecutable}) == nil
+		return o.authorized("stopped.json") && exited(o.journal.Launched)
 	})
 }
 func (o *componentOperation) beforeTrialFailure(cause error) error {
@@ -549,16 +424,11 @@ func (o *componentOperation) beforeTrialFailure(cause error) error {
 	return o.restoreAndCheck(cause)
 }
 func (o *componentOperation) rollback(cause error) error {
-	if o.request.RestartGroup == "gui" && !o.journal.LaunchPending && o.journal.Launched.PID == 0 && exited(o.request.ParentProcess) {
-		for _, binding := range o.request.RuntimeProcesses {
-			if !exited(binding.Process) {
-				return o.fail("Original runtime is still live; restoration deferred.", true, cause)
-			}
-		}
+	if !o.journal.LaunchPending && o.journal.Launched.PID == 0 && o.handoffCompleted() {
 		return o.restoreAndCheck(cause)
 	}
 	if !o.stopTrial() {
-		return o.fail("Replacement runtime did not acknowledge a safe stop; prior selection and immutable objects retained for recovery.", true, cause)
+		return o.fail("Trial GUI did not acknowledge a safe stop and exit; prior selection and immutable objects retained for recovery.", true, cause)
 	}
 	return o.restoreAndCheck(cause)
 }
@@ -593,19 +463,17 @@ func (o *componentOperation) restoreAndCheck(cause error) error {
 	o.journal.Health = nil
 	o.journal.Launched = processIdentity{}
 	o.journal.Step = "restored"
-	if err := o.phase("rollingBack", "Previous coherent selection restored; waiting for original runtime health.", true); err != nil {
+	if err := o.phase("rollingBack", "Previous coherent selection restored; waiting for previous GUI health.", true); err != nil {
 		return err
 	}
-	if o.request.RestartGroup == "gui" {
-		if err := o.launch(o.journal.Original.Active); err != nil {
-			return o.fail("Previous component selection restored but GUI relaunch failed.", true, err)
-		}
+	if err := o.launch(o.journal.Original.Active); err != nil {
+		return o.fail("Previous component selection restored but GUI relaunch failed.", true, err)
 	}
 	if !waitUntil(o.healthTimeout, o.interval, func() bool { return o.checkHealth("rollback-health.json", o.journal.Original.Active) == nil }) {
-		return o.fail("Previous selection restored, but previous runtime readiness could not be confirmed.", true, cause)
+		return o.fail("Previous selection restored, but previous GUI readiness could not be confirmed.", true, cause)
 	}
 	o.journal.Step = "rolledBack"
-	return o.phase("rolledBack", "Previous coherent component selection and runtime health restored; update not committed.", false)
+	return o.phase("rolledBack", "Previous coherent component selection and GUI health restored; update not committed.", false)
 }
 func (o *componentOperation) recover() error {
 	if o.journal.Original.SchemaVersion != 1 || o.journal.Original.InstallationID != o.request.InstallationID || o.journal.Original.BaseRoot != o.request.BaseRoot || o.journal.Original.Target != o.request.Target || o.journal.Original.Generation != o.request.CurrentGeneration || o.journal.Original.Trial != nil || !reflect.DeepEqual(o.journal.Original.Active, o.request.Current) {
@@ -623,16 +491,10 @@ func (o *componentOperation) recover() error {
 	}
 	if o.journal.Step == "preparing" {
 		if o.request.RestartGroup != "none" && o.handoffCompleted() {
-			return o.restoreAndCheck(errors.New("interrupted after owned-runtime handoff"))
+			return o.restoreAndCheck(errors.New("interrupted after GUI handoff"))
 		}
-		recovery := false
-		if o.request.RestartGroup != "none" {
-			recovery = exited(o.request.ParentProcess)
-			for _, binding := range o.request.RuntimeProcesses {
-				recovery = recovery || exited(binding.Process)
-			}
-		}
-		return o.fail("Interrupted before activation; original selection retained. Any stopped runtime requires recovery.", recovery, nil)
+		recovery := o.request.RestartGroup != "none" && exited(o.request.ParentProcess)
+		return o.fail("Interrupted before activation; original selection retained.", recovery, nil)
 	}
 	if err == nil && s.Generation == o.request.CurrentGeneration+1 && s.Trial == nil && reflect.DeepEqual(s.Active, o.request.TargetComponents) && s.Previous == nil && (o.journal.Step == "committing" || o.journal.Step == "committed") {
 		// Commit was durable only after exact health (or a helper-only query). It
@@ -661,13 +523,13 @@ func (o *componentOperation) recover() error {
 		}
 		if o.checkHealth("rollback-health.json", o.journal.Original.Active) == nil {
 			o.journal.Step = "rolledBack"
-			return o.phase("rolledBack", "Recovered confirmed previous runtime.", false)
+			return o.phase("rolledBack", "Recovered confirmed previous GUI.", false)
 		}
-		return o.fail("Previous selection restored but runtime restart was interrupted; no launch replayed.", true, nil)
+		return o.fail("Previous selection restored but GUI restart was interrupted; no launch replayed.", true, nil)
 	}
 	if o.journal.Step == "activating" && ((err == nil && reflect.DeepEqual(s, o.journal.Original)) || (errors.Is(err, os.ErrNotExist) && o.journal.Original.Generation == 0)) {
 		if !o.handoffCompleted() {
-			return o.fail("Interrupted activation lacks proven stopped runtime handoff.", true, nil)
+			return o.fail("Interrupted activation lacks proven GUI handoff.", true, nil)
 		}
 		return o.restoreAndCheck(errors.New("interrupted before durable trial activation"))
 	}

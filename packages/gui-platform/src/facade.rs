@@ -226,8 +226,8 @@ pub mod notifications {
     }
 }
 
-/// The desktop host (built-in daemon, settings, updates). Mobile clients never
-/// manage a local daemon.
+/// The desktop host (local daemon start, settings, updates). Mobile clients
+/// never start a local daemon.
 pub mod desktop {
     use serde_json::Value;
 
@@ -256,12 +256,12 @@ pub mod desktop {
         }
     }
 
-    /// The built-in daemon as the first-run screen shows it.
+    /// The local daemon as the first-run screen shows it.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum LocalDaemon {
         /// Not a desktop host, or the platform layer did not start.
         Unavailable,
-        /// Not being started (management off) and no failure recorded.
+        /// Not being started (the start setting is off) and no failure recorded.
         Idle,
         /// Auto-start or a start command is waiting for the daemon's listen address.
         Starting,
@@ -271,7 +271,7 @@ pub mod desktop {
         Failed(String),
     }
 
-    /// Current built-in daemon state; cheap, safe to call while drawing.
+    /// Current local daemon state; cheap, safe to call while drawing.
     pub fn local_daemon() -> LocalDaemon {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {

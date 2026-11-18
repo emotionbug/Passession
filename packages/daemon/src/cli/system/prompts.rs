@@ -1,3 +1,4 @@
+mod input;
 mod password;
 use super::error;
 use anyhow::{Result, ensure};
@@ -5,9 +6,8 @@ pub(super) use password::read as password;
 use std::io::IsTerminal;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-static INPUT: tokio::sync::OnceCell<
-    tokio::sync::Mutex<tokio::io::BufReader<crate::desktop_host::input::Input>>,
-> = tokio::sync::OnceCell::const_new();
+static INPUT: tokio::sync::OnceCell<tokio::sync::Mutex<tokio::io::BufReader<input::Input>>> =
+    tokio::sync::OnceCell::const_new();
 
 pub(super) fn interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -28,7 +28,7 @@ pub(super) async fn text(
         let shared = INPUT
             .get_or_try_init(|| async {
                 Ok::<_, std::io::Error>(tokio::sync::Mutex::new(tokio::io::BufReader::new(
-                    crate::desktop_host::input::Input::open()?,
+                    input::Input::open()?,
                 )))
             })
             .await?;

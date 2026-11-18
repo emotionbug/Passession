@@ -359,6 +359,6 @@ from a cleared app state.
   app details and returning started the camera preview.
 
 Not covered: a logged-in tailnet and real host traffic, Android 12–14 and
-API 24–28, refused background starts, a picker opened by the app itself, and
-desktop tray menus (unit-tested only). macOS, iOS and the Windows
-`gui-platform` crate were type-checked on Linux; nothing ran on those systems.
+API 24–28, refused background starts, and a picker opened by the app itself.
+macOS, iOS and the Windows `gui-platform` crate were type-checked on Linux;
+nothing ran on those systems.

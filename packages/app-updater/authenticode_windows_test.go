@@ -5,11 +5,9 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 	"unsafe"
 )
 
@@ -128,90 +126,4 @@ func TestNativeAuthenticodeClassifiesUnsignedAndTamperedImages(t *testing.T) {
 	if err = verifyPublisherContinuity(invalid, unsigned, "installer", "installed app"); err == nil || !strings.Contains(err.Error(), "invalid installed app signature") {
 		t.Fatalf("tampered installation: %v", err)
 	}
-}
-
-func TestRegisteredInstallationReadsCurrentUserStringValues(t *testing.T) {
-	createKey := advapi32.NewProc("RegCreateKeyExW")
-	setValue := advapi32.NewProc("RegSetValueExW")
-	deleteKey := advapi32.NewProc("RegDeleteKeyW")
-	subkey := `Software\Paseo Sessions Updater Test ` + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	path, err := syscall.UTF16PtrFromString(subkey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var key syscall.Handle
-	// REG_OPTION_VOLATILE: the key cannot outlive this logon if cleanup fails.
-	if result, _, _ := createKey.Call(uintptr(syscall.HKEY_CURRENT_USER), uintptr(unsafe.Pointer(path)), 0, 0, 1, syscall.KEY_SET_VALUE, 0, uintptr(unsafe.Pointer(&key)), 0); uint32(result) != 0 {
-		t.Fatal(syscall.Errno(uint32(result)))
-	}
-	t.Cleanup(func() {
-		syscall.RegCloseKey(key)
-		deleteKey.Call(uintptr(syscall.HKEY_CURRENT_USER), uintptr(unsafe.Pointer(path)))
-	})
-	name, err := syscall.UTF16PtrFromString("InstallDir")
-	if err != nil {
-		t.Fatal(err)
-	}
-	set := func(kind uint32, data []byte) {
-		t.Helper()
-		var first *byte
-		if len(data) > 0 {
-			first = &data[0]
-		}
-		if result, _, _ := setValue.Call(uintptr(key), uintptr(unsafe.Pointer(name)), 0, uintptr(kind), uintptr(unsafe.Pointer(first)), uintptr(len(data))); uint32(result) != 0 {
-			t.Fatal(syscall.Errno(uint32(result)))
-		}
-	}
-	text := func(s string) []byte {
-		u, err := syscall.UTF16FromString(s)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return unsafe.Slice((*byte)(unsafe.Pointer(&u[0])), len(u)*2)
-	}
-
-	root := filepath.Join(t.TempDir(), "Paseo Sessions")
-	t.Setenv("PASEO_UPDATER_TEST_ROOT", root)
-	set(syscall.REG_EXPAND_SZ, text(`%PASEO_UPDATER_TEST_ROOT%\`))
-	registered, err := registeredInstallDirectory(subkey)
-	if err != nil || registered != root+`\` {
-		t.Fatalf("expanded install directory %q, %v", registered, err)
-	}
-	if !sameRegisteredInstallation(registered, strings.ToUpper(root)) {
-		t.Fatalf("%q does not match its own destination", registered)
-	}
-
-	set(syscall.REG_SZ, text(filepath.Join(root, "..", "Paseo Sessions")))
-	if registered, err = registeredInstallDirectory(subkey); err != nil || !sameRegisteredInstallation(registered, root) {
-		t.Fatalf("normalized install directory %q, %v", registered, err)
-	}
-
-	set(syscall.REG_SZ, text(root+" Old"))
-	if registered, err = registeredInstallDirectory(subkey); err != nil || sameRegisteredInstallation(registered, root) {
-		t.Fatalf("different install directory %q accepted, %v", registered, err)
-	}
-
-	set(syscall.REG_SZ, text(`Paseo Sessions`))
-	if registered, err = registeredInstallDirectory(subkey); err != nil || sameRegisteredInstallation(registered, filepath.Join(mustGetwd(t), "Paseo Sessions")) {
-		t.Fatalf("relative install directory %q accepted, %v", registered, err)
-	}
-
-	set(syscall.REG_SZ, append(text(root), text(`C:\Other`)...))
-	if registered, err = registeredInstallDirectory(subkey); err == nil {
-		t.Fatalf("embedded NUL install directory read as %q", registered)
-	}
-
-	set(syscall.REG_DWORD, []byte{1, 0, 0, 0})
-	if registered, err = registeredInstallDirectory(subkey); err == nil {
-		t.Fatalf("REG_DWORD install directory read as %q", registered)
-	}
-}
-
-func mustGetwd(t *testing.T) string {
-	t.Helper()
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return wd
 }

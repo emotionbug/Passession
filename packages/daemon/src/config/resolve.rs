@@ -40,7 +40,6 @@ const CONFIG_ENV: &[&str] = &[
     "PASEO_TRUSTED_PROXIES",
     "PORT",
     "PASEO_NODE_ENV",
-    "PASEO_DESKTOP_MANAGED",
 ];
 
 fn ev<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
@@ -269,7 +268,6 @@ pub fn resolve_with_options(
     let mut resolved = json!({
         "listen": present(cli, "/listen").cloned().unwrap_or_else(|| pick(env, "PASEO_LISTEN", persisted, "/daemon/listen", json!(format!("127.0.0.1:{}", ev(env,"PORT").unwrap_or("6767"))))),
         "paseoHome": home,
-        "desktopManaged": ev(env, "PASEO_DESKTOP_MANAGED") == Some("1"),
         "corsAllowedOrigins": cors(persisted, env),
         "hostnames": hostnames(persisted, env, cli),
         "trustedProxies": trusted_proxies(env).unwrap_or_else(|| defaulted(persisted, "/daemon/trustedProxies", json!(["loopback"]))),

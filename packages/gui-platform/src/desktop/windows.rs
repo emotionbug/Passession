@@ -1,6 +1,4 @@
-//! Windows desktop integration (original windows/runner/main.cpp + flutter_window,
-//! the Windows paseo_desktop_integrations plugin, flutter_local_notifications
-//! Windows and tray_manager).
+//! Windows desktop integration: activation, session lifecycle and native notifications.
 
 use super::{
     Activation, DesktopNotification, NativeSignal, deliver, notification_clicked,
@@ -56,10 +54,9 @@ use windows::{
                 DefWindowProcW, DestroyIcon, DispatchMessageW, EnumWindows, FindWindowW, GA_ROOT,
                 GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW,
                 GetWindowThreadProcessId, ICONINFO, IsIconic, IsWindowVisible, MSG,
-                RegisterClassExW, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
-                SendMessageTimeoutW, SetForegroundWindow, ShowWindow, TranslateMessage,
-                WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_COPYDATA, WM_ENDSESSION, WM_QUERYENDSESSION,
-                WNDCLASSEXW, WS_OVERLAPPED,
+                RegisterClassExW, SMTO_ABORTIFHUNG, SW_RESTORE, SW_SHOWNORMAL, SendMessageTimeoutW,
+                SetForegroundWindow, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP,
+                WM_COPYDATA, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSEXW, WS_OVERLAPPED,
             },
         },
     },
@@ -271,9 +268,8 @@ unsafe extern "system" fn window_proc(
         }
         WM_ENDSESSION if LIFECYCLE.load(Ordering::SeqCst) => {
             if wparam.0 != 0 {
-                // Windows may end the process when this returns: run the forced
-                // quit (stop the owned daemon unless keep-running) and wait for it
-                // within the OS deadline.
+                // Windows may end this process as soon as the callback returns.
+                // Wait for local quit preparation, bounded by the OS deadline.
                 if let Some(platform) = crate::platform() {
                     super::request_quit(&platform.0, QuitReason::Shutdown, true);
                     let (lock, ready) = &TERMINATION;
@@ -699,14 +695,12 @@ pub(crate) fn idle_milliseconds() -> Result<u64, PlatformError> {
     Ok(u64::from(now.wrapping_sub(info.dwTime)))
 }
 
-// ----- native windows (close-to-tray) -----
+// ----- native window activation -----
 
 /// This process's Makepad frame windows, resolved at every call (never
 /// cached from early initialization) and normalized to the top-level frame
-/// with `GetAncestor(GA_ROOT)`, so show/hide/restore/focus, the taskbar
-/// overlay and the share UI act on the frame that owns the taskbar button,
-/// not on a child/content HWND. (Makepad 1.0.0 leaves `CxOsOp::HideWindow`
-/// unimplemented on Windows.)
+/// with `GetAncestor(GA_ROOT)`, so activation, the taskbar overlay and share
+/// UI act on the frame that owns the taskbar button, not its content HWND.
 fn own_windows() -> Vec<HWND> {
     unsafe extern "system" fn collect(window: HWND, lparam: LPARAM) -> windows::core::BOOL {
         let list = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
@@ -730,52 +724,23 @@ fn own_windows() -> Vec<HWND> {
     list
 }
 
-#[derive(Default)]
-pub(crate) struct NativeWindows {
-    hidden: Vec<isize>,
-}
-
-impl NativeWindows {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn hide_all(&mut self) {
-        for window in own_windows() {
-            if unsafe { IsWindowVisible(window) }.as_bool() {
-                unsafe {
-                    let _ = ShowWindow(window, SW_HIDE);
-                }
-                self.hidden.push(window.0 as isize);
+/// Restores visible/minimized windows but not the dormant first window.
+pub(crate) fn show_windows() {
+    let mut first = None;
+    for window in own_windows() {
+        unsafe {
+            if IsIconic(window).as_bool() {
+                let _ = ShowWindow(window, SW_RESTORE);
+            } else if !IsWindowVisible(window).as_bool() {
+                continue;
             }
         }
+        first.get_or_insert(window);
     }
-
-    /// Restores the windows the tray hid plus any visible or minimized ones.
-    /// An invisible window the shell hid itself (the dormant first window,
-    /// `PlatformHandle::hide_window`) stays hidden, as on macOS and X11.
-    pub fn show_all(&mut self) {
-        let hidden = std::mem::take(&mut self.hidden);
-        let mut shown = Vec::new();
-        for window in own_windows() {
-            unsafe {
-                let iconic = IsIconic(window).as_bool();
-                let visible = IsWindowVisible(window).as_bool();
-                if iconic {
-                    let _ = ShowWindow(window, SW_RESTORE);
-                } else if hidden.contains(&(window.0 as isize)) {
-                    let _ = ShowWindow(window, SW_SHOW);
-                } else if !visible {
-                    continue;
-                }
-            }
-            shown.push(window);
-        }
-        if let Some(first) = shown.first() {
-            unsafe {
-                if GetForegroundWindow() != *first && !SetForegroundWindow(*first).as_bool() {
-                    take_foreground(*first);
-                }
+    if let Some(first) = first {
+        unsafe {
+            if GetForegroundWindow() != first && !SetForegroundWindow(first).as_bool() {
+                take_foreground(first);
             }
         }
     }
@@ -798,10 +763,6 @@ fn take_foreground(window: HWND) {
         }
     }
 }
-
-// ----- tray -----
-
-pub(crate) use super::native_tray::{Tray, create_tray, tray_host_available};
 
 // ----- open / reveal / share / editors -----
 

@@ -26,6 +26,6 @@ The SDK is an external protocol client and requires no Node runtime. Preserve re
 
 Record the source revision, executable and runtime-asset identity, selected home/endpoint, actual commands, responses, process lifecycle and failures. Real provider tests require real installed providers and credentials; controlled development providers do not establish provider interoperability.
 
-When testing persistence, restart the same isolated instance and read back through the public protocol. When testing desktop ownership, exercise the actual `paseo-gui-platform` daemon service → `paseo desktop-host` JSONL IPC: direct daemon commands do not prove desktop policy. Keep unowned daemons running and verify process-start identity before signalling anything.
+When testing persistence, restart the same isolated instance and read back through the public protocol. For `daemon ensure`, use an isolated home and installation store and inject a private fake `systemctl` via `PATH`; never contact the user's service manager. To prove desktop policy, launch the actual GUI and verify that a daemon remains running after the last window exits. Keep unrelated daemons running and verify process-start identity before signalling anything.
 
 Clean up only processes and files created by the test. A failure must still release owned resources without deleting unrelated user state. Do not commit throwaway scripts, credentials or model downloads. [Testing](testing.md) records the current native evidence and missing platform execution.

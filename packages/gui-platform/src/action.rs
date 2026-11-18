@@ -95,7 +95,6 @@ pub enum PlatformValue {
     Clipboard(ClipboardContent),
     EditorTargets(Vec<EditorTarget>),
     Permission(PermissionState),
-    CloseDecision(CloseDecision),
     IdleMilliseconds(u64),
 }
 
@@ -169,23 +168,11 @@ pub enum PermissionSettings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloseDecision {
-    /// The last open window hides; the tray keeps the app (and its daemon) alive.
-    HideToTray,
-    /// Other windows remain: run this window's close guard, then close it.
-    CloseWindow,
-    /// The last window without a usable tray: the guarded quit flow has started
-    /// (a `QuitRequested` event follows).
-    QuitApplication,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuitReason {
     Quit,
     Shutdown,
+    /// Component activation is refused when there are unsaved documents.
     AppUpdate,
-    /// Unattended update: dirty documents veto without opening a discard prompt.
-    RemoteAppUpdate,
 }
 
 impl QuitReason {
@@ -194,7 +181,6 @@ impl QuitReason {
             Self::Quit => "quit",
             Self::Shutdown => "shutdown",
             Self::AppUpdate => "app_update",
-            Self::RemoteAppUpdate => "remote_app_update",
         }
     }
 }
@@ -300,7 +286,7 @@ impl PlatformRoute {
 }
 
 /// What the embedded Tailscale connection is doing, for the OS background
-/// presence (Android foreground-service notification, desktop tray menu).
+/// presence (Android foreground-service notification).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailnetPresenceState {
     Connected,
@@ -340,15 +326,14 @@ pub enum PlatformEvent {
     ConnectionLink {
         url: String,
     },
-    ShowWindow,
     /// The guarded quit flow: run every window's close guard, then call
-    /// `PlatformHandle::respond_quit(token, allowed)`. Forced quits (OS shutdown,
-    /// update installation) skip this and go straight to `QuitReady`.
+    /// `PlatformHandle::respond_quit(token, allowed)`. Forced OS shutdown skips
+    /// this and goes straight to `QuitReady`.
     QuitRequested {
         token: u64,
         reason: QuitReason,
     },
-    /// The desktop-host helper is closed; call `cx.quit()`.
+    /// App quit preparation is complete; call `cx.quit()`.
     QuitReady,
     QuitCancelled,
     /// A later launch asked for a new window, optionally opening a route in it.

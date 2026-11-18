@@ -249,13 +249,6 @@ pub async fn run_args(mut args: Vec<String>) -> Result<i32> {
         );
         return Ok(0);
     }
-    if args.first().is_some_and(|s| s == "desktop-host") {
-        ensure!(
-            args.len() == 1,
-            "desktop-host accepts requests on stdin, not arguments"
-        );
-        return crate::desktop_host::run().await;
-    }
     #[cfg(windows)]
     if args.first().is_some_and(|s| s == "__paseo_pty_child") {
         return crate::terminals::windows::run_child();
@@ -345,7 +338,7 @@ pub async fn run_args(mut args: Vec<String>) -> Result<i32> {
             path.as_slice(),
             ["start"]
                 | ["onboard"]
-                | ["daemon", "start" | "run" | "set-password"]
+                | ["daemon", "start" | "run" | "ensure" | "set-password"]
                 | ["daemon", "config", ..]
         );
         let target = DaemonTarget::select(
@@ -386,6 +379,12 @@ pub async fn run_args(mut args: Vec<String>) -> Result<i32> {
         Ok(result) => {
             output::stdout(&result.render(&options)?)?;
             Ok(result.exit_code)
+        }
+        Err(error) if path == ["daemon", "ensure"] && format == Format::Json => {
+            output::stdout(
+                &serde_json::json!({"state":"failed","error":format!("{error:#}")}).to_string(),
+            )?;
+            Ok(1)
         }
         Err(error) => {
             output::error(&error, &options)?;

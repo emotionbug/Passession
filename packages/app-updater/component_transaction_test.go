@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -25,6 +27,10 @@ func init() {
 	if !strings.HasPrefix(role, "component-") {
 		return
 	}
+	if len(os.Args) == 3 && os.Args[1] == "--request" {
+		main()
+		os.Exit(0)
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		os.Exit(80)
@@ -41,7 +47,7 @@ func init() {
 		}{1, "update-helper", v})
 		os.Exit(0)
 	}
-	if role == "component-idle" || role == "component-daemon" {
+	if role == "component-idle" || role == "component-independent" {
 		time.Sleep(25 * time.Second)
 		os.Exit(0)
 	}
@@ -50,22 +56,17 @@ func init() {
 	}
 	directory := os.Getenv("PASEO_UPDATE_OPERATION_DIRECTORY")
 	var r componentRequest
-	if _, err = readJSON(filepath.Join(directory, "request.json"), &r); err != nil {
+	operationID, nonce := os.Getenv("PASEO_UPDATE_OPERATION_ID"), os.Getenv("PASEO_UPDATE_NONCE")
+	if _, err = readJSON(filepath.Join(directory, "request.json"), &r); err != nil ||
+		r.OperationID != operationID || r.StoreDirectory != os.Getenv("PASEO_COMPONENT_STORE") ||
+		r.BaseRoot != os.Getenv("PASEO_COMPONENT_BASE_ROOT") || !sha256Pattern.MatchString(nonce) {
 		os.Exit(83)
 	}
 	me, err := inspectProcess(os.Getpid())
 	if err != nil {
 		os.Exit(84)
 	}
-	var daemon *exec.Cmd
-	var binding runtimeBinding
 	lastPhase := ""
-	defer func() {
-		if daemon != nil {
-			_ = daemon.Process.Kill()
-			_ = daemon.Wait()
-		}
-	}()
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		var status componentStatus
@@ -73,11 +74,13 @@ func init() {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+		if status.OperationID != operationID || status.Nonce != nonce {
+			os.Exit(86)
+		}
 		if (status.Phase == "checking" || status.Phase == "rollingBack") && status.Phase != lastPhase {
-			if daemon != nil {
-				_ = daemon.Process.Kill()
-				_ = daemon.Wait()
-				daemon = nil
+			if status.Phase == "checking" && os.Getenv("PASEO_COMPONENT_HEALTH") == "unreported" {
+				lastPhase = status.Phase
+				continue
 			}
 			set := r.TargetComponents
 			name := "health.json"
@@ -85,67 +88,41 @@ func init() {
 				set = r.Current
 				name = "rollback-health.json"
 			}
-			actual := make(map[string]componentIdentity)
-			for id, c := range set {
+			actual := make(map[string]componentIdentity, len(appComponentIDs))
+			for _, id := range appComponentIDs {
 				var v componentIdentity
-				if _, err = readJSON(filepath.Join(componentRoot(r, c), "identity.json"), &v); err != nil {
+				if _, err = readJSON(filepath.Join(componentRoot(r, set[id]), "identity.json"), &v); err != nil {
 					os.Exit(87)
 				}
 				actual[id] = v
 			}
-			if _, err = os.Stat(filepath.Join(componentRoot(r, set["app"]), independentDaemonMarker)); err == nil && status.Phase == "checking" {
-				delete(actual, "daemon")
-				if os.Getenv("PASEO_COMPONENT_HEALTH") == "wrong" {
-					delete(actual, "app")
-				}
-				if err = atomicJSON(filepath.Join(directory, name), map[string]any{
-					"schemaVersion": 2, "operationId": r.OperationID, "nonce": status.Nonce,
-					"components": actual, "guiProcess": me.identity,
-				}); err != nil {
-					os.Exit(88)
-				}
-				lastPhase = status.Phase
-				continue
-			}
-			image := componentImage(r, set["daemon"])
-			daemon = exec.Command(image)
-			daemon.Env = append(os.Environ(), "PASEO_UPDATER_FIXTURE_ROLE=component-daemon")
-			if err = daemon.Start(); err != nil {
-				os.Exit(85)
-			}
-			dp, e := inspectProcess(daemon.Process.Pid)
-			if e != nil {
-				os.Exit(86)
-			}
-			binding = runtimeBinding{dp.identity, image}
-			server := r.ServerID
 			if (os.Getenv("PASEO_COMPONENT_HEALTH") == "wrong" || os.Getenv("PASEO_COMPONENT_HEALTH") == "refuse") && status.Phase == "checking" {
-				server = "wrong-server"
+				actual["app"] = componentFixtureIdentity("app", "9.0.0")
 			}
-			h := componentHealth{2, r.OperationID, status.Nonce, server, r.DaemonHome, actual, me.identity, dp.identity, image, []runtimeBinding{binding}}
+			h := componentHealth{2, operationID, nonce, actual, me.identity}
 			if err = atomicJSON(filepath.Join(directory, name), h); err != nil {
 				os.Exit(88)
 			}
 			lastPhase = status.Phase
 		}
-		if _, err = os.Lstat(filepath.Join(directory, "stop.json")); err == nil {
+		var stop struct {
+			SchemaVersion int    `json:"schemaVersion"`
+			OperationID   string `json:"operationId"`
+			Nonce         string `json:"nonce"`
+			RestartGroup  string `json:"restartGroup"`
+		}
+		if _, err = readJSON(filepath.Join(directory, "stop.json"), &stop); err == nil {
+			if stop.SchemaVersion != 2 || stop.OperationID != operationID || stop.Nonce != nonce || stop.RestartGroup != "gui" {
+				os.Exit(85)
+			}
 			if os.Getenv("PASEO_COMPONENT_HEALTH") == "refuse" {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			bindings := []runtimeBinding{}
-			if daemon != nil {
-				_ = daemon.Process.Kill()
-				_ = daemon.Wait()
-				daemon = nil
-				bindings = append(bindings, binding)
-			}
-			if err = atomicJSON(filepath.Join(directory, "stopped.json"), map[string]any{"schemaVersion": 2, "operationId": r.OperationID, "nonce": status.Nonce, "runtimeProcesses": bindings}); err != nil {
+			if err = atomicJSON(filepath.Join(directory, "stopped.json"), map[string]any{"schemaVersion": 2, "operationId": operationID, "nonce": nonce}); err != nil {
 				os.Exit(89)
 			}
-			if r.RestartGroup == "gui" {
-				os.Exit(0)
-			}
+			os.Exit(0)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -226,16 +203,18 @@ func componentFixture(t *testing.T, changed ...string) *componentOperation {
 	t.Setenv("PASEO_COMPONENT_FIXTURE", "1")
 	t.Setenv("PASEO_UPDATER_FIXTURE_ROLE", "component-gui")
 	base := canonicalTemp(t)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
 	root, store, home, opdir := filepath.Join(base, "installed"), filepath.Join(base, "store"), filepath.Join(base, "home"), filepath.Join(base, "operation")
 	for _, p := range []string{root, store, home, opdir} {
 		mustMkdir(t, p)
 	}
 	mustWrite(t, filepath.Join(home, "user-data"), []byte("preserve me"), 0600)
+	t.Setenv("PASEO_HOME", home)
 	target := "linux-x64"
 	if runtime.GOARCH == "arm64" {
 		target = "linux-arm64"
 	}
-	r := componentRequest{SchemaVersion: 2, Mode: "componentTransaction", OperationID: "11111111-1111-4111-8111-111111111111", OperationDirectory: opdir, StoreDirectory: store, BaseRoot: root, InstallationID: installationKey(root), Target: target, InventoryPath: filepath.Join(opdir, "inventory.json"), Current: componentSet{}, TargetComponents: componentSet{}, Staged: map[string]string{}, RestartGroup: "none", ServerID: "fixture-server", DaemonHome: home}
+	r := componentRequest{SchemaVersion: 2, Mode: "componentTransaction", OperationID: "11111111-1111-4111-8111-111111111111", OperationDirectory: opdir, StoreDirectory: store, BaseRoot: root, InstallationID: installationKey(root), Target: target, InventoryPath: filepath.Join(opdir, "inventory.json"), Current: componentSet{}, TargetComponents: componentSet{}, Staged: map[string]string{}, RestartGroup: "none"}
 	bootstrap := bootstrapComponents{SchemaVersion: 1, Target: target, Components: map[string]componentRef{}, Roots: map[string]string{}, Packages: []componentPackage{}}
 	inventory := componentInventory{SchemaVersion: 1, Version: "2.0.0", SourceSHA: strings.Repeat("b", 40), Channel: "stable", Targets: map[string]componentTarget{}}
 	available := componentTarget{Components: map[string]componentRef{}, Packages: []componentPackage{}, AtomicGroups: [][]string{}}
@@ -270,9 +249,6 @@ func componentFixture(t *testing.T, changed ...string) *componentOperation {
 			if err = atomicJSON(filepath.Join(candidate, "identity.json"), c.Identity); err != nil {
 				t.Fatal(err)
 			}
-			if id == "app" && os.Getenv("PASEO_COMPONENT_MARK_APP") == "1" {
-				mustWrite(t, filepath.Join(candidate, independentDaemonMarker), []byte(independentDaemonMarkerContents), 0600)
-			}
 			writeComponentFixtureDescriptor(t, candidate, c)
 			archive := filepath.Join(opdir, id+".zip")
 			zipComponentFixture(t, candidate, archive)
@@ -289,8 +265,6 @@ func componentFixture(t *testing.T, changed ...string) *componentOperation {
 			r.Staged[id] = archive
 			if id == "app" || id == "tailnet" {
 				r.RestartGroup = "gui"
-			} else if id == "daemon" && r.RestartGroup != "gui" {
-				r.RestartGroup = "daemon"
 			}
 		}
 		available.Components[id] = c
@@ -310,8 +284,6 @@ func componentFixture(t *testing.T, changed ...string) *componentOperation {
 	r.CurrentExecutable = componentImage(r, r.Current["app"])
 	parent, _ := fixtureProcess(t, r.CurrentExecutable, "component-idle")
 	r.ParentProcess = parent
-	dp, _ := fixtureProcess(t, componentImage(r, r.Current["daemon"]), "component-daemon")
-	r.RuntimeProcesses = []runtimeBinding{{dp, componentImage(r, r.Current["daemon"])}}
 	if err = atomicJSON(filepath.Join(opdir, "request.json"), r); err != nil {
 		t.Fatal(err)
 	}
@@ -326,9 +298,6 @@ func componentFixture(t *testing.T, changed ...string) *componentOperation {
 			var h componentHealth
 			if _, e := readJSON(filepath.Join(opdir, name), &h); e == nil {
 				killFixture(h.GUIProcess)
-				for _, binding := range h.RuntimeProcesses {
-					killFixture(binding.Process)
-				}
 			}
 		}
 		// Test-owned immutable payloads must become removable by t.TempDir.
@@ -358,41 +327,78 @@ func prepareComponentFixture(t *testing.T, o *componentOperation) {
 }
 func handoffComponentFixture(t *testing.T, o *componentOperation) {
 	t.Helper()
-	for _, binding := range o.request.RuntimeProcesses {
-		killFixture(binding.Process)
-	}
-	if o.request.RestartGroup == "gui" {
-		killFixture(o.request.ParentProcess)
-	}
+	killFixture(o.request.ParentProcess)
 	if err := atomicJSON(filepath.Join(o.request.OperationDirectory, "handoff.json"), map[string]any{"schemaVersion": 2, "operationId": o.request.OperationID, "nonce": o.journal.Status.Nonce}); err != nil {
 		t.Fatal(err)
 	}
 	if !o.awaitHandoff() {
-		t.Fatal("real owned process handoff failed")
+		t.Fatal("bound GUI handoff failed")
 	}
 }
-func startRetainedComponentGUI(t *testing.T, o *componentOperation) {
+
+func TestComponentHandoffAndRollbackRequireExactAckAndProcessExit(t *testing.T) {
+	o := componentFixture(t, "app")
+	o.parentTimeout = 30 * time.Millisecond
+	o.stopTimeout = o.parentTimeout
+	o.journal.Launched, _ = fixtureProcess(t, o.request.CurrentExecutable, "component-idle")
+	for _, point := range []struct {
+		name    string
+		process processIdentity
+		wait    func() bool
+	}{
+		{"handoff.json", o.request.ParentProcess, o.awaitHandoff},
+		{"stopped.json", o.journal.Launched, o.stopTrial},
+	} {
+		t.Run(point.name, func(t *testing.T) {
+			p := filepath.Join(o.request.OperationDirectory, point.name)
+			ack := map[string]any{"schemaVersion": 2, "operationId": o.request.OperationID, "nonce": o.journal.Status.Nonce}
+			writeAck := func() {
+				t.Helper()
+				if err := atomicJSON(p, ack); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeAck()
+			if point.wait() || exited(point.process) {
+				t.Fatal("ack accepted while its exact process was alive, or helper killed it")
+			}
+			killFixture(point.process)
+			if !waitUntil(time.Second, o.interval, func() bool { return exited(point.process) }) {
+				t.Fatal("fixture process failed to exit")
+			}
+			if err := os.Remove(p); err != nil {
+				t.Fatal(err)
+			}
+			if point.wait() {
+				t.Fatal("process exit alone authorized the transition")
+			}
+			for field, bad := range map[string]any{"schemaVersion": 1, "operationId": "another-operation", "nonce": "wrong"} {
+				good := ack[field]
+				ack[field] = bad
+				writeAck()
+				if point.wait() {
+					t.Fatalf("ack with incorrect %s authorized the transition", field)
+				}
+				ack[field] = good
+			}
+			writeAck()
+			if !point.wait() {
+				t.Fatal("exact ack and bound exit did not authorize the transition")
+			}
+		})
+	}
+}
+
+func independentComponentFixture(t *testing.T) processIdentity {
 	t.Helper()
-	// Replace the idle fixture before preparation, making this real process the
-	// exact long-lived owning GUI that survives daemon activation and rollback.
-	killFixture(o.request.ParentProcess)
-	cmd := exec.Command(o.request.CurrentExecutable)
-	cmd.Env = append(os.Environ(), "PASEO_UPDATER_FIXTURE_ROLE=component-gui", "PASEO_UPDATE_OPERATION_DIRECTORY="+o.request.OperationDirectory)
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	p, err := inspectProcess(cmd.Process.Pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	o.request.ParentProcess = p.identity
-	if err = atomicJSON(filepath.Join(o.request.OperationDirectory, "request.json"), o.request); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	image := filepath.Join(os.Getenv("PASEO_HOME"), "independent"+exeSuffix())
+	fixtureBinary(t, image)
+	p, _ := fixtureProcess(t, image, "component-independent")
+	return p
 }
 func TestComponentHelperOnlyCommitsWithoutStoppingEitherProcess(t *testing.T) {
 	o := componentFixture(t, "update-helper")
+	independent := independentComponentFixture(t)
 	prepareComponentFixture(t, o)
 	before, err := os.Stat(componentImage(o.request, o.request.Current["daemon"]))
 	if err != nil {
@@ -401,8 +407,8 @@ func TestComponentHelperOnlyCommitsWithoutStoppingEitherProcess(t *testing.T) {
 	if err = o.activateAndCheck(); err != nil {
 		t.Fatal(err)
 	}
-	if exited(o.request.ParentProcess) || exited(o.request.RuntimeProcesses[0].Process) {
-		t.Fatal("helper-only activation stopped live app/runtime")
+	if exited(o.request.ParentProcess) || exited(independent) {
+		t.Fatal("helper-only activation stopped the GUI or the independent process")
 	}
 	s, err := o.readSelection()
 	if err != nil {
@@ -422,62 +428,164 @@ func TestComponentHelperOnlyCommitsWithoutStoppingEitherProcess(t *testing.T) {
 		t.Fatal("commit omitted actual component identities")
 	}
 }
-func TestComponentDaemonOnlyRetainsGUIAndObservesIndependentIdentity(t *testing.T) {
-	o := componentFixture(t, "daemon")
-	startRetainedComponentGUI(t, o)
-	prepareComponentFixture(t, o)
-	handoffComponentFixture(t, o)
-	if err := o.activateAndCheck(); err != nil {
+func TestComponentGUIRestartCommitsWithoutStoppingIndependentProcess(t *testing.T) {
+	o := componentFixture(t, "app", "daemon")
+	// The authenticated release can advertise a different daemon; this app
+	// transaction must leave the installed daemon descriptor and object alone.
+	o.request.TargetComponents["daemon"] = o.request.Current["daemon"]
+	delete(o.request.Staged, "daemon")
+	independent := independentComponentFixture(t)
+	directory := o.request.OperationDirectory
+	requestPath := filepath.Join(directory, "request.json")
+	if err := atomicJSON(requestPath, o.request); err != nil {
 		t.Fatal(err)
 	}
-	if o.journal.Status.Phase != "committed" || exited(o.request.ParentProcess) {
-		t.Fatal("daemon-only did not retain exact GUI")
-	}
-	if o.journal.Health.Components["app"].Version != "1.0.0" || o.journal.Health.Components["daemon"].Version != "2.0.0" {
-		t.Fatal("component identities were incorrectly aligned")
-	}
-}
-func TestComponentGUIRestartLaunchesSelectedImageAndCommits(t *testing.T) {
-	o := componentFixture(t, "app")
-	prepareComponentFixture(t, o)
-	handoffComponentFixture(t, o)
-	if err := o.activateAndCheck(); err != nil {
+	exe, err := os.Executable()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if o.journal.Health == nil || o.journal.Health.GUIProcess != o.journal.Launched || o.journal.Health.Components["daemon"].Version != "1.0.0" {
-		t.Fatal("GUI health did not bind independent selected process/components")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "--request", requestPath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err = cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	defer func() {
+		if !waited {
+			cancel()
+			_ = cmd.Wait()
+		}
+		_, _ = readJSON(filepath.Join(directory, "journal.json"), &o.journal)
+	}()
+	var ready componentStatus
+	if !waitUntil(5*time.Second, o.interval, func() bool {
+		_, err := readJSON(filepath.Join(directory, "status.json"), &ready)
+		return err == nil && ready.Ready && ready.Phase == "waitingForParent"
+	}) {
+		cancel()
+		err = cmd.Wait()
+		waited = true
+		t.Fatalf("helper never became ready: %+v, %v, %s", ready, err, &stderr)
+	}
+	if ready.HelperProcess.PID != cmd.Process.Pid || !sha256Pattern.MatchString(ready.Nonce) {
+		t.Fatalf("helper readiness was not bound to the started process: %+v", ready)
+	}
+	if err = atomicJSON(filepath.Join(directory, "handoff.json"), map[string]any{
+		"schemaVersion": 2, "operationId": o.request.OperationID, "nonce": ready.Nonce,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	killFixture(o.request.ParentProcess)
+	err = cmd.Wait()
+	waited = true
+	if err != nil {
+		t.Fatalf("helper failed after GUI handoff: %v, %s", err, &stderr)
+	}
+	if _, err = readJSON(filepath.Join(directory, "journal.json"), &o.journal); err != nil {
+		t.Fatal(err)
+	}
+	expected := componentIdentities(o.request.TargetComponents)
+	var status componentStatus
+	if _, err := readJSON(filepath.Join(o.request.OperationDirectory, "status.json"), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.SchemaVersion != 2 || status.Phase != "committed" ||
+		!reflect.DeepEqual(status.ExpectedComponents, expected) || !reflect.DeepEqual(status.ObservedComponents, expected) ||
+		o.journal.Health == nil || o.journal.Health.GUIProcess != o.journal.Launched ||
+		!reflect.DeepEqual(o.journal.Health.Components, expected) {
+		t.Fatalf("commit did not bind live GUI health to the full verified set: %+v", status)
+	}
+	var live componentHealth
+	if _, err := readJSON(filepath.Join(o.request.OperationDirectory, "health.json"), &live); err != nil ||
+		live.Components["daemon"] != (componentIdentity{}) || len(live.Components) != len(appComponentIDs) {
+		t.Fatalf("live health did not contain exactly the app components: %+v, %v", live, err)
+	}
+	if exited(independent) {
+		t.Fatal("GUI activation stopped the independent process")
+	}
+	home := os.Getenv("PASEO_HOME")
+	if data, err := os.ReadFile(filepath.Join(home, "user-data")); err != nil || string(data) != "preserve me" {
+		t.Fatal("GUI activation modified inherited home data", err)
+	}
+	if _, err := os.Lstat(filepath.Join(home, ".desktop-update-install.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("GUI activation accessed the old daemon-home lease", err)
+	}
+	selection, err := o.readSelection()
+	if err != nil || selection.Generation != 1 || selection.Trial != nil || !reflect.DeepEqual(selection.Active, o.request.TargetComponents) {
+		t.Fatal("GUI activation did not commit the exact selection with unchanged daemon", err)
 	}
 }
 
-func TestComponentLegacyHandoffCanActivateIndependentDaemonApp(t *testing.T) {
-	for _, health := range []string{"ready", "wrong"} {
-		t.Run(health, func(t *testing.T) {
-			t.Setenv("PASEO_COMPONENT_MARK_APP", "1")
-			t.Setenv("PASEO_COMPONENT_HEALTH", health)
-			o := componentFixture(t, "app", "daemon")
-			prepareComponentFixture(t, o)
-			handoffComponentFixture(t, o)
-			err := o.activateAndCheck()
-			if health == "ready" {
-				if err != nil || o.journal.Status.Phase != "committed" || o.journal.Health == nil ||
-					o.journal.Health.GUIProcess != o.journal.Launched || o.journal.Health.DaemonProcess.PID != 0 ||
-					len(o.journal.Health.RuntimeProcesses) != 0 {
-					t.Fatalf("marked app did not commit without an owned daemon: phase=%s health=%+v error=%v", o.journal.Status.Phase, o.journal.Health, err)
+func TestComponentRejectsDaemonChangesAndLegacyRequests(t *testing.T) {
+	for _, kind := range []string{"daemon-only", "app-with-daemon", "daemon-root", "daemon-archive", "daemon-group", "schema-1", "legacy-fields", "command-field", "overlap", "archive-outside-operation"} {
+		t.Run(kind, func(t *testing.T) {
+			var o *componentOperation
+			switch kind {
+			case "daemon-only":
+				o = componentFixture(t, "daemon")
+				o.request.RestartGroup = "daemon"
+			case "app-with-daemon":
+				o = componentFixture(t, "app", "daemon")
+			default:
+				o = componentFixture(t, "app")
+			}
+			r := o.request
+			switch kind {
+			case "daemon-root":
+				daemon := r.Current["daemon"]
+				daemon.Root = "objects/" + daemon.Component.Artifact.SHA256
+				r.TargetComponents["daemon"] = daemon
+			case "daemon-archive":
+				r.Staged["daemon"] = r.Staged["app"]
+			case "daemon-group":
+				r.RestartGroup = "daemon"
+			case "schema-1":
+				r.SchemaVersion = 1
+				r.Mode = "appImageSwap"
+			case "overlap":
+				r.StoreDirectory = r.BaseRoot
+			case "archive-outside-operation":
+				r.Staged["app"] = filepath.Join(r.BaseRoot, "components.json")
+			}
+			p := filepath.Join(r.OperationDirectory, "request.json")
+			if kind == "legacy-fields" {
+				if err := atomicJSON(p, struct {
+					componentRequest
+					ServerID         string `json:"serverId"`
+					DaemonHome       string `json:"daemonHome"`
+					RuntimeProcesses []any  `json:"runtimeProcesses"`
+				}{r, "legacy", os.Getenv("PASEO_HOME"), []any{}}); err != nil {
+					t.Fatal(err)
 				}
-			} else if o.journal.Status.Phase != "rolledBack" || o.journal.Health == nil || o.journal.Health.DaemonProcess.PID == 0 {
-				t.Fatalf("invalid app-only health did not restore legacy GUI and runtime: phase=%s health=%+v error=%v", o.journal.Status.Phase, o.journal.Health, err)
+			} else if kind == "command-field" {
+				if err := atomicJSON(p, struct {
+					componentRequest
+					Command string `json:"command"`
+				}{r, "not-admitted"}); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := atomicJSON(p, r); err != nil {
+				t.Fatal(err)
+			}
+			if err := runComponentRequest(p); err == nil {
+				t.Fatal("invalid desktop update request was accepted")
+			}
+			if _, err := os.Lstat(filepath.Join(r.OperationDirectory, "journal.json")); !errors.Is(err, os.ErrNotExist) || exited(r.ParentProcess) {
+				t.Fatal("invalid request started the operation or stopped the parent GUI", err)
 			}
 		})
 	}
 }
 func TestComponentFailedHealthRestoresCoherentSelection(t *testing.T) {
-	for _, id := range []string{"app", "daemon"} {
-		t.Run(id, func(t *testing.T) {
-			o := componentFixture(t, id)
-			t.Setenv("PASEO_COMPONENT_HEALTH", "wrong")
-			if id == "daemon" {
-				startRetainedComponentGUI(t, o)
-			}
+	for _, health := range []string{"wrong", "unreported"} {
+		t.Run(health, func(t *testing.T) {
+			o := componentFixture(t, "app")
+			independent := independentComponentFixture(t)
+			t.Setenv("PASEO_COMPONENT_HEALTH", health)
+			o.healthTimeout = 500 * time.Millisecond
 			prepareComponentFixture(t, o)
 			handoffComponentFixture(t, o)
 			if err := o.activateAndCheck(); err != nil {
@@ -487,14 +595,12 @@ func TestComponentFailedHealthRestoresCoherentSelection(t *testing.T) {
 				t.Fatalf("unsafe/incomplete rollback: %+v", o.journal.Status)
 			}
 			s, err := o.readSelection()
-			if err != nil {
-				t.Fatal(err)
+			if err != nil || !reflect.DeepEqual(s, o.journal.Original) {
+				t.Fatal("failed health did not restore whole original selection", err)
 			}
-			if !reflect.DeepEqual(s, o.journal.Original) {
-				t.Fatal("failed health did not restore whole original selection")
-			}
-			if id == "daemon" && exited(o.request.ParentProcess) {
-				t.Fatal("daemon rollback killed retained GUI")
+			if o.journal.Health == nil || o.journal.Health.GUIProcess != o.journal.Launched ||
+				!reflect.DeepEqual(o.journal.Health.Components, componentIdentities(o.request.Current)) || exited(independent) {
+				t.Fatal("rollback did not prove restored GUI health or disturbed the independent process")
 			}
 		})
 	}
@@ -514,21 +620,21 @@ func TestComponentNoChangeDoesNotCreateSelectionOrObjects(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(o.request.StoreDirectory, "objects")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("no-change staged objects")
 	}
-	if exited(o.request.ParentProcess) || exited(o.request.RuntimeProcesses[0].Process) {
+	if exited(o.request.ParentProcess) {
 		t.Fatal("no-change stopped processes")
 	}
 }
 func TestComponentRejectsABIMismatchCorruptionAndWrongRestartBeforeStop(t *testing.T) {
 	for _, kind := range []string{"abi", "archive", "restart", "inventory", "reuse"} {
 		t.Run(kind, func(t *testing.T) {
-			o := componentFixture(t, "daemon")
+			o := componentFixture(t, "app")
 			switch kind {
 			case "abi":
-				c := o.request.TargetComponents["daemon"]
+				c := o.request.TargetComponents["app"]
 				c.Component.Identity.ABIVersion = 99
-				o.request.TargetComponents["daemon"] = c
+				o.request.TargetComponents["app"] = c
 			case "archive":
-				mustWrite(t, o.request.Staged["daemon"], []byte("bad"), 0600)
+				mustWrite(t, o.request.Staged["app"], []byte("bad"), 0600)
 			case "restart":
 				o.request.RestartGroup = "none"
 			case "inventory":
@@ -543,14 +649,14 @@ func TestComponentRejectsABIMismatchCorruptionAndWrongRestartBeforeStop(t *testi
 			if err == nil {
 				t.Fatal("invalid transaction accepted")
 			}
-			if exited(o.request.ParentProcess) || exited(o.request.RuntimeProcesses[0].Process) {
-				t.Fatal("preparation failure stopped unrelated runtime")
+			if exited(o.request.ParentProcess) {
+				t.Fatal("preparation failure stopped the GUI")
 			}
 		})
 	}
 }
 func TestComponentOrphanTrialWithoutStopAckIsNeverCommittedOrReplayed(t *testing.T) {
-	o := componentFixture(t, "daemon")
+	o := componentFixture(t, "app")
 	prepareComponentFixture(t, o)
 	s := o.journal.Original
 	s.Trial = &componentTrial{o.request.OperationID, o.request.TargetComponents}
@@ -572,8 +678,8 @@ func TestComponentOrphanTrialWithoutStopAckIsNeverCommittedOrReplayed(t *testing
 	if !reflect.DeepEqual(actual.Active, o.request.Current) || actual.Trial == nil {
 		t.Fatal("orphan recovery mutated active selection or discarded trial evidence")
 	}
-	if exited(o.request.ParentProcess) || exited(o.request.RuntimeProcesses[0].Process) {
-		t.Fatal("orphan recovery killed unproven process")
+	if exited(o.request.ParentProcess) {
+		t.Fatal("orphan recovery killed the unproven GUI")
 	}
 }
 func TestComponentUnrecordedLaunchRequiresRecovery(t *testing.T) {
@@ -621,18 +727,13 @@ func writeComponentFixtureDescriptor(t *testing.T, root string, c componentRef) 
 		t.Fatal(err)
 	}
 	d := componentBuildDescriptor{SchemaVersion: 1, ID: c.ID, Target: c.Target, Identity: c.Identity, Executable: c.Executable, ExecutableSHA256: c.ExecutableSHA256, Requires: c.Requires, Licenses: []string{}, Dependencies: map[string]string{"identity.json": hash}}
-	if os.Getenv("PASEO_COMPONENT_MARK_APP") == "1" && c.ID == "app" {
-		if hash, err := componentFileHash(filepath.Join(root, independentDaemonMarker)); err == nil {
-			d.Dependencies[independentDaemonMarker] = hash
-		}
-	}
 	if err = atomicJSON(filepath.Join(root, "component-build-"+c.ID+".json"), d); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestComponentSharedRuntimeAndTailnetChangesUseGUIRestart(t *testing.T) {
-	o := componentFixture(t, "daemon", "tailnet", "update-helper")
+func TestComponentTailnetAndHelperChangesUseGUIRestart(t *testing.T) {
+	o := componentFixture(t, "tailnet", "update-helper")
 	prepareComponentFixture(t, o)
 	handoffComponentFixture(t, o)
 	if o.request.RestartGroup != "gui" {
@@ -642,7 +743,7 @@ func TestComponentSharedRuntimeAndTailnetChangesUseGUIRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if o.journal.Status.Phase != "committed" || o.journal.Health.Components["app"].Version != "1.0.0" || o.journal.Health.Components["tailnet"].Version != "2.0.0" {
-		t.Fatal("shared runtime change lost independent identities")
+		t.Fatal("tailnet update lost independent component identities")
 	}
 }
 
@@ -676,9 +777,9 @@ func TestComponentExistingImmutableObjectIsReusedWithoutWrites(t *testing.T) {
 }
 
 func TestComponentCorruptObjectResourceIsRejectedBeforeActivation(t *testing.T) {
-	o := componentFixture(t, "daemon")
+	o := componentFixture(t, "update-helper")
 	prepareComponentFixture(t, o)
-	resource := filepath.Join(componentRoot(o.request, o.request.TargetComponents["daemon"]), "identity.json")
+	resource := filepath.Join(componentRoot(o.request, o.request.TargetComponents["update-helper"]), "identity.json")
 	if err := os.Chmod(resource, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -689,8 +790,14 @@ func TestComponentCorruptObjectResourceIsRejectedBeforeActivation(t *testing.T) 
 	if err := o.stageObjects(); err == nil {
 		t.Fatal("corrupt reused resource was accepted")
 	}
-	if exited(o.request.ParentProcess) || exited(o.request.RuntimeProcesses[0].Process) {
-		t.Fatal("corrupt reuse stopped current runtime")
+	if err := o.activateAndCheck(); err == nil || o.journal.Status.Phase != "failed" || o.journal.Status.RecoveryRequired {
+		t.Fatal("corrupted prepared image was allowed to activate")
+	}
+	if _, err := o.readSelection(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("invalid activation changed the selection", err)
+	}
+	if exited(o.request.ParentProcess) {
+		t.Fatal("corrupt reuse stopped the GUI")
 	}
 }
 
@@ -725,8 +832,59 @@ func TestComponentInterruptedTrialRecoversWithRealCooperativeProcesses(t *testin
 	}
 }
 
+func TestComponentRecoveryRejectsTamperedOriginalObjects(t *testing.T) {
+	o := componentFixture(t, "app")
+	prepareComponentFixture(t, o)
+	handoffComponentFixture(t, o)
+	trial := o.journal.Original
+	trial.Trial = &componentTrial{o.request.OperationID, o.request.TargetComponents}
+	if err := o.writeSelection(trial); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.launch(o.request.TargetComponents); err != nil {
+		t.Fatal(err)
+	}
+	o.journal.Step = "checking"
+	if err := o.phase("checking", "fixture interrupted trial", true); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, componentImage(o.request, o.request.Current["app"]), []byte("tampered previous app"), 0755)
+	if err := o.recover(); err == nil || !o.journal.Status.RecoveryRequired || o.journal.Status.Phase != "failed" {
+		t.Fatalf("recovery did not refuse changed original object: %+v, %v", o.journal.Status, err)
+	}
+	if selection, err := o.readSelection(); err != nil || !reflect.DeepEqual(selection, trial) {
+		t.Fatal("recovery altered selection after refusing tampered original object", err)
+	}
+}
+
+func TestComponentRecoveryConfirmsRestoredGUIWithoutLaunchingAgain(t *testing.T) {
+	o := componentFixture(t, "app")
+	prepareComponentFixture(t, o)
+	handoffComponentFixture(t, o)
+	if err := o.writeSelection(o.journal.Original); err != nil {
+		t.Fatal(err)
+	}
+	o.journal.Step = "restored"
+	if err := o.phase("rollingBack", "fixture interrupted restoration", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.launch(o.journal.Original.Active); err != nil {
+		t.Fatal(err)
+	}
+	restored := o.journal.Launched
+	if !waitUntil(o.healthTimeout, o.interval, func() bool {
+		return o.checkHealth("rollback-health.json", o.journal.Original.Active) == nil
+	}) {
+		t.Fatal("restored GUI never reported health")
+	}
+	if err := o.recover(); err != nil || o.journal.Status.Phase != "rolledBack" || o.journal.Launched != restored || exited(restored) {
+		t.Fatalf("recovery did not confirm the restored GUI without replay: %+v, %v", o.journal.Status, err)
+	}
+}
+
 func TestComponentTerminalRetryPinsCompleteRequestWithoutReplay(t *testing.T) {
 	o := componentFixture(t)
+	parent := o.request.ParentProcess
 	p := filepath.Join(o.request.OperationDirectory, "request.json")
 	if err := runComponentRequest(p); err != nil {
 		t.Fatal(err)
@@ -734,15 +892,15 @@ func TestComponentTerminalRetryPinsCompleteRequestWithoutReplay(t *testing.T) {
 	if err := runComponentRequest(p); err != nil {
 		t.Fatal(err)
 	}
-	o.request.ServerID = "another-server"
+	o.request.ParentProcess.BirthToken += "-different"
 	if err := atomicJSON(p, o.request); err != nil {
 		t.Fatal(err)
 	}
 	if err := runComponentRequest(p); err == nil {
 		t.Fatal("same UUID accepted a different request")
 	}
-	if exited(o.request.ParentProcess) || exited(o.request.RuntimeProcesses[0].Process) {
-		t.Fatal("terminal retry restarted runtime")
+	if exited(parent) {
+		t.Fatal("terminal retry interfered with the parent process")
 	}
 }
 
@@ -768,8 +926,8 @@ func TestComponentHelperQueryRejectsIncorrectActualABI(t *testing.T) {
 	if err := o.prepare(); err == nil {
 		t.Fatal("selected helper claimed ABI differs from descriptor but was accepted")
 	}
-	if exited(o.request.ParentProcess) || exited(o.request.RuntimeProcesses[0].Process) {
-		t.Fatal("helper ABI rejection stopped current processes")
+	if exited(o.request.ParentProcess) {
+		t.Fatal("helper ABI rejection stopped the GUI")
 	}
 }
 
@@ -929,7 +1087,7 @@ func nextComponentFixture(t *testing.T, o *componentOperation, id string) *compo
 	c.Artifact = componentArtifact{URL: "https://github.com/paseo/fixtures/releases/download/v3.0.0/" + id + ".zip", SHA256: archiveHash, Size: uint64(st.Size()), Format: "zip", OriginTag: "v3.0.0"}
 	r.TargetComponents[id] = installedComponent{c, "objects/" + archiveHash}
 	r.Staged = map[string]string{id: archive}
-	r.RestartGroup = map[string]string{"app": "gui", "tailnet": "gui", "daemon": "daemon", "update-helper": "none"}[id]
+	r.RestartGroup = map[string]string{"app": "gui", "tailnet": "gui", "update-helper": "none"}[id]
 	inventory, err := readComponentInventory(o.request.InventoryPath)
 	if err != nil {
 		t.Fatal(err)
@@ -943,8 +1101,7 @@ func nextComponentFixture(t *testing.T, o *componentOperation, id string) *compo
 		t.Fatal(err)
 	}
 	if r.RestartGroup == "gui" {
-		// The committed GUI and its daemon own the next handoff.
-		r.ParentProcess, r.RuntimeProcesses = o.journal.Launched, o.journal.Health.RuntimeProcesses
+		r.ParentProcess = o.journal.Launched
 		r.CurrentExecutable = componentImage(r, r.Current["app"])
 	}
 	if err = atomicJSON(filepath.Join(r.OperationDirectory, "request.json"), r); err != nil {
@@ -961,9 +1118,6 @@ func nextComponentFixture(t *testing.T, o *componentOperation, id string) *compo
 			var h componentHealth
 			if _, e := readJSON(filepath.Join(r.OperationDirectory, name), &h); e == nil {
 				killFixture(h.GUIProcess)
-				for _, binding := range h.RuntimeProcesses {
-					killFixture(binding.Process)
-				}
 			}
 		}
 	})

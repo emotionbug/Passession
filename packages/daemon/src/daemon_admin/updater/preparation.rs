@@ -150,11 +150,11 @@ fn classify_source(source: &Path) -> Result<(PathBuf, Option<&'static str>)> {
 /// Download, verify and stage the newest official release into `destination`.
 ///
 /// Repository, tag, source commit, manifest/asset digest, signature continuity
-/// and strictly-newer semver rules are unchanged. The installed runtime must
-/// itself be a verified standalone runtime; a local standalone may move to a
-/// genuine newer release without its own provenance being reinterpreted.
+/// and strictly-newer semver rules are unchanged. The caller verifies the
+/// running standalone or independently installed bootstrap runtime.
 pub async fn prepare_release(
     current_executable: &Path,
+    current: &RuntimeIdentity,
     destination: &Path,
     expected: Option<&ReleaseIdentity>,
 ) -> Result<RuntimeIdentity> {
@@ -164,9 +164,10 @@ pub async fn prepare_release(
     if current_executable.file_name() != Some(OsStr::new(executable_name(platform))) {
         bail!("Installed executable is not the standalone native runtime entry")
     }
-    let current = inspect_runtime(&current_root).await.context(
-        "The installed runtime is not a verified standalone runtime; update it from a complete local runtime first",
-    )?;
+    anyhow::ensure!(
+        current.root == current_root,
+        "Verified current runtime does not match the executable"
+    );
     let stage = Stage::begin(destination, &[current_root.as_path()])?;
     let client = http()?;
     let release = discover(&client).await?;

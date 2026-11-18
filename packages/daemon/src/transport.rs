@@ -15,6 +15,7 @@ pub use context::{
     MAX_BUFFERED_BYTES, MAX_FRAME_BYTES, OutboundFrame, OwnedOperation, OwnedSubscription,
     RequestContext, has_capability, message_type, request_id,
 };
+pub(crate) use identity::ensure_server_id;
 pub use identity::{generate_local_pairing_offer, hash_daemon_password, offline_pairing_offer};
 
 use crate::state::AppState;
@@ -42,6 +43,23 @@ use tokio_tungstenite::{
     tungstenite::{Message, protocol::CloseFrame},
 };
 use tokio_util::sync::CancellationToken;
+
+pub(crate) const MIGRATION_CREDENTIAL: &str = "native-migration-credential";
+
+pub(crate) async fn read_daemon_credential(path: &std::path::Path) -> Result<Option<String>> {
+    let Some(bytes) = storage::read_private(path).await? else {
+        return Ok(None);
+    };
+    let raw = std::str::from_utf8(&bytes)?.trim();
+    anyhow::ensure!(
+        raw.len() == 43
+            && raw
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        "Invalid local daemon credential"
+    );
+    Ok(Some(raw.to_owned()))
+}
 
 #[derive(Clone)]
 pub struct Admission {
@@ -183,11 +201,14 @@ impl TransportService {
         *self.identity.write().unwrap() = identity;
         *self.keypair.write().unwrap() = Some(keypair);
         *self.config.write().unwrap() = config;
-        let mut credential_bytes = [0u8; 32];
-        rand::rngs::OsRng
-            .unwrap_err()
-            .fill_bytes(&mut credential_bytes);
-        let credential = URL_SAFE_NO_PAD.encode(credential_bytes);
+        let credential = match read_daemon_credential(&home.join(MIGRATION_CREDENTIAL)).await? {
+            Some(preserved) => preserved,
+            None => {
+                let mut random = [0u8; 32];
+                rand::rngs::OsRng.unwrap_err().fill_bytes(&mut random);
+                URL_SAFE_NO_PAD.encode(random)
+            }
+        };
         storage::write_private(
             &home.join("local-credential"),
             format!("{credential}\n").as_bytes(),
@@ -1073,7 +1094,7 @@ impl TransportService {
             .ok_or_else(|| anyhow!("Daemon is shutting down"))?;
         let hoplite = app.providers.definition("hoplite").is_some();
         let maintenance = app.agents.update_admission.operation()?;
-        let mut message = json!({"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":identity["serverId"],"hostname":identity["label"],"version":crate::VERSION,"sourceId":context.actor_source_id(),"permissions":context.permissions(),"desktopManaged":config["desktopManaged"].as_bool().unwrap_or(false),"features":features::features(&config,hoplite),"capabilities":{}}});
+        let mut message = json!({"type":"status","payload":{"status":"server_info","protocolVersion":1,"serverId":identity["serverId"],"hostname":identity["label"],"version":crate::VERSION,"sourceId":context.actor_source_id(),"permissions":context.permissions(),"features":features::features(&config,hoplite),"capabilities":{}}});
         if let Some(operation_id) = maintenance {
             message["payload"]["daemonUpdate"] = json!({"operationId":operation_id,"active":true});
         }

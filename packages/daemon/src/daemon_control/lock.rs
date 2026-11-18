@@ -164,7 +164,7 @@ pub struct PidLock {
     pub instance: DaemonInstance,
 }
 impl PidLock {
-    pub fn acquire(home: &Path, desktop_managed: bool) -> Result<Self> {
+    pub fn acquire(home: &Path) -> Result<Self> {
         private_directory(home)?;
         let path = home.join("paseo.pid");
         if let Some(existing) = read(home)? {
@@ -201,7 +201,7 @@ impl PidLock {
             uid: identity::uid(),
             listen: None,
             server_id: None,
-            desktop_managed,
+            desktop_managed: false,
             heartbeat: true,
             boot_id: identity::boot_id(),
             process_start_identity: Some(

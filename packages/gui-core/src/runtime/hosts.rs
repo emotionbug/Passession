@@ -229,35 +229,32 @@ impl Host {
         }
     }
 
-    /// Flutter files `_localHost`: a desktop-managed daemon reached over a local socket.
+    /// Native filesystem access stays bound to the active local-credential
+    /// connection over IPC or loopback.
     fn is_local(&self) -> bool {
-        if host_config::uses_tailnet(&self.config.borrow()) {
-            return false;
-        }
-        if cfg!(any(target_os = "android", target_os = "ios")) || self.origin.is_some() {
-            return false;
-        }
-        if self.server_info.borrow()["desktopManaged"] != true {
-            return false;
-        }
         let config = self.config.borrow();
+        if cfg!(any(target_os = "android", target_os = "ios"))
+            || self.origin.is_some()
+            || !is_local_connection(&config)
+        {
+            return false;
+        }
         let endpoint = config["endpoint"].as_str().unwrap_or_default();
-        if endpoint.starts_with("unix:")
+        endpoint.starts_with("unix:")
             || endpoint.starts_with("pipe:")
             || endpoint.starts_with('/')
-        {
-            return true;
-        }
-        let candidate = if endpoint.contains("://") {
-            endpoint.to_owned()
-        } else {
-            format!("tcp://{endpoint}")
-        };
-        url::Url::parse(&candidate)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .is_some_and(|host| {
-                matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]" | "::1")
+            || endpoint.starts_with(r"\\.\pipe\")
+            || endpoint
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|address| address.ip().is_loopback())
+            || endpoint
+                .strip_prefix("localhost:")
+                .is_some_and(|port| port.parse::<u16>().is_ok())
+            || url::Url::parse(endpoint).is_ok_and(|url| {
+                matches!(
+                    url.host_str(),
+                    Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+                )
             })
     }
 
@@ -1072,6 +1069,9 @@ pub(crate) async fn remove_host(core: &Rc<Core>, id: &str) {
             store.suppressed.push(route);
         }
     }
+    if host.connections.borrow().iter().any(is_local_connection) {
+        suppress_local_daemon(core);
+    }
     core.hosts.borrow_mut().retain(|h| !Rc::ptr_eq(h, &host));
     host.link.borrow_mut().enabled = false;
     dispose_selector(&host);
@@ -1089,6 +1089,14 @@ pub(crate) async fn remove_connection(core: &Rc<Core>, id: &str, connection_id: 
     if host.connections.borrow().len() == 1 {
         remove_host(core, id).await;
         return;
+    }
+    if host
+        .connections
+        .borrow()
+        .iter()
+        .any(|connection| connection["id"] == connection_id && is_local_connection(connection))
+    {
+        suppress_local_daemon(core);
     }
     host.connections
         .borrow_mut()
@@ -1289,14 +1297,15 @@ pub(crate) async fn discover_routes(core: &Rc<Core>, origin: &Rc<Host>, director
     }
 }
 
-/// Flutter `_discoverLocalDaemon` (desktop only): the local daemon's `paseo.pid` names its
-/// listening socket; a saved host for that daemon gains the connection or credential path.
-pub(crate) async fn discover_local_daemon(core: &Rc<Core>) {
-    if cfg!(any(target_os = "android", target_os = "ios")) {
-        return;
-    }
-    let home = core
-        .config
+fn is_local_connection(config: &Value) -> bool {
+    !host_config::uses_tailnet(config)
+        && config["localCredentialPath"]
+            .as_str()
+            .is_some_and(|path| !path.is_empty())
+}
+
+fn daemon_home(core: &Core) -> Option<std::path::PathBuf> {
+    core.config
         .daemon_home
         .clone()
         .or_else(|| {
@@ -1304,10 +1313,44 @@ pub(crate) async fn discover_local_daemon(core: &Rc<Core>) {
                 .filter(|v| !v.is_empty())
                 .map(Into::into)
         })
-        .or_else(|| dirs::home_dir().map(|home| home.join(".paseo")));
-    let Some(home) = home else {
+        .or_else(|| dirs::home_dir().map(|home| home.join(".paseo")))
+}
+
+fn local_daemon_route(home: &std::path::Path) -> String {
+    format!("local-daemon:{}", home.display())
+}
+
+fn suppress_local_daemon(core: &Core) {
+    if let Some(home) = daemon_home(core) {
+        let route = local_daemon_route(&home);
+        let mut store = core.store.borrow_mut();
+        if !store.suppressed.contains(&route) {
+            store.suppressed.push(route);
+        }
+    }
+}
+
+/// Discover the configured daemon home. A removal suppresses automatic
+/// discovery, not auto-start; an explicit reconnect clears that preference.
+pub(crate) async fn discover_local_daemon(core: &Rc<Core>, explicit: bool) {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        return;
+    }
+    let Some(home) = daemon_home(core) else {
         return;
     };
+    let route = local_daemon_route(&home);
+    let suppressed = core.store.borrow().suppressed.contains(&route);
+    if suppressed {
+        if !explicit {
+            return;
+        }
+        core.store
+            .borrow_mut()
+            .suppressed
+            .retain(|key| key != &route);
+        save(core).await;
+    }
     let Ok(bytes) = tokio::fs::read(home.join("paseo.pid")).await else {
         return;
     };
@@ -1423,6 +1466,9 @@ pub(crate) async fn discover_local_daemon(core: &Rc<Core>) {
     });
     if let Some(path) = credential_path {
         config["localCredentialPath"] = path.into();
+    }
+    if !server_id.is_empty() {
+        config["expectedServerId"] = server_id.into();
     }
     let id = config["id"].as_str().unwrap_or_default().to_owned();
     let host = Host::new(
@@ -1564,7 +1610,7 @@ pub(crate) async fn initialize(core: &Rc<Core>) {
         core.error(None, error);
     }
     core.touch();
-    discover_local_daemon(core).await;
+    discover_local_daemon(core, false).await;
     ensure_default_endpoint(core).await;
     let hosts: Vec<Rc<Host>> = core.hosts.borrow().clone();
     for host in hosts {
@@ -1625,6 +1671,71 @@ mod tests {
         assert_eq!(reconnect_delay(4), Duration::from_millis(24_000));
         assert_eq!(reconnect_delay(5), Duration::from_millis(30_000));
         assert_eq!(reconnect_delay(40), Duration::from_millis(30_000));
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn local_daemon_removal_persists_without_touching_the_daemon() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dir = tempfile::tempdir().unwrap();
+                let home = dir.path().join("daemon");
+                let pid_file = home.join("paseo.pid");
+                let pid = json!({
+                    "pid": std::process::id(),
+                    "listen": "127.0.0.1:9",
+                    "serverId": "local-test",
+                });
+                tokio::fs::create_dir(&home).await.unwrap();
+                tokio::fs::write(&pid_file, pid.to_string()).await.unwrap();
+                tokio::fs::write(home.join("local-credential"), "a".repeat(43))
+                    .await
+                    .unwrap();
+                let open = || {
+                    Core::new(
+                        crate::CoreConfig {
+                            state_dir: dir.path().join("settings"),
+                            daemon_home: Some(home.clone()),
+                            default_endpoint: None,
+                            tailnet_key_store: None,
+                        },
+                        std::sync::Arc::new(crate::events::EventQueue::new(std::sync::Arc::new(
+                            || {},
+                        ))),
+                    )
+                };
+                let restore = async |core: &Rc<Core>| {
+                    // Exercise host storage without opening any sockets.
+                    core.closing.set(true);
+                    let paths = core.store.borrow().paths.clone();
+                    let (mut loaded, prefs) = store::load(paths).await;
+                    core.store.borrow_mut().apply_loaded(&mut loaded, prefs);
+                };
+                let core = open();
+                restore(&core).await;
+                discover_local_daemon(&core, false).await;
+                let id = core.hosts.borrow()[0].server_id();
+                remove_host(&core, &id).await;
+                assert!(core.hosts.borrow().is_empty());
+                assert_eq!(
+                    tokio::fs::read_to_string(&pid_file).await.unwrap(),
+                    pid.to_string()
+                );
+                drop(core);
+
+                let reopened = open();
+                restore(&reopened).await;
+                assert_eq!(
+                    reopened.store.borrow().suppressed,
+                    [local_daemon_route(&home)]
+                );
+                discover_local_daemon(&reopened, false).await;
+                assert!(reopened.hosts.borrow().is_empty());
+                discover_local_daemon(&reopened, true).await;
+                assert_eq!(reopened.hosts.borrow().len(), 1);
+                assert!(reopened.store.borrow().suppressed.is_empty());
+            })
+            .await;
     }
 
     #[tokio::test]

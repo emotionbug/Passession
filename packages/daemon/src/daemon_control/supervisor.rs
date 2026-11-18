@@ -440,9 +440,8 @@ async fn drain<R: AsyncRead + Unpin>(
 
 async fn run_supervisor(home: &Path, options: Value) -> Result<i32> {
     let owned_home = home.to_owned();
-    let desktop = std::env::var("PASEO_DESKTOP_MANAGED").ok().as_deref() == Some("1");
     let mut lock =
-        tokio::task::spawn_blocking(move || lock::PidLock::acquire(&owned_home, desktop)).await??;
+        tokio::task::spawn_blocking(move || lock::PidLock::acquire(&owned_home)).await??;
     let executable = std::env::current_exe()?.canonicalize()?;
     let log = Arc::new(DurableLog::new(home));
     let stop = CancellationToken::new();

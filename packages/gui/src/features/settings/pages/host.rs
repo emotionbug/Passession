@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::View;
+use super::about;
 use super::app::{Pick, select_ctl_lead};
 use crate::common::{Route, UiEffect};
 use crate::features::settings::host::{
@@ -365,7 +366,7 @@ pub fn draw_overview_page(ui: &mut Ui, s: &Settings, _v: &View, host: &HostView)
     ui.gap(24.0);
 
     if DESKTOP && host.local && platform::desktop_available() {
-        super::system::draw_local_daemon(ui, s);
+        super::system::draw_local_daemon(ui, s, true);
     }
     super::daemon::draw_host_config(ui, s, host);
     draw_danger_zone(ui, s, host);
@@ -500,8 +501,8 @@ pub fn draw_connections_page(ui: &mut Ui, s: &Settings, _v: &View, host: &HostVi
 
 // ------------------------------------------------------------ danger zone
 
-/// Remove-host confirmation (`settings.host.daemon.remove.*`); the local host
-/// also stops managing the built-in daemon first.
+/// Remove a saved connection after the shell's tab-close guards. The daemon
+/// lifecycle and the application start preference are unaffected.
 fn remove_host_handler(host: &HostView) -> crate::features::settings::rpc::Handler {
     let local = host.local;
     let id = host.server_id.clone();
@@ -509,29 +510,20 @@ fn remove_host_handler(host: &HostView) -> crate::features::settings::rpc::Handl
     handler(move |s, _| {
         let id = id.clone();
         let go = handler(move |s, env| {
-            let id = id.clone();
-            let finish = move |s: &mut Settings, env: &mut Env| {
-                // Flutter `removeHost`: the shell runs the host's tab close guards first.
-                env.ctx.effects.push(UiEffect::RemoveHost {
-                    host_id: id.clone(),
-                });
-                s.host = None;
-                s.section = if env.ctx.compact {
-                    None
-                } else {
-                    Some("general".into())
-                };
-                let section = s.section.clone().unwrap_or_default();
-                env.navigate(Route::Settings {
-                    host_id: None,
-                    page: section,
-                });
-            };
-            if local && DESKTOP {
-                super::system::disable_builtin_then(s, env, finish);
+            env.ctx.effects.push(UiEffect::RemoveHost {
+                host_id: id.clone(),
+            });
+            s.host = None;
+            s.section = if env.ctx.compact {
+                None
             } else {
-                finish(s, env);
-            }
+                Some("general".into())
+            };
+            let section = s.section.clone().unwrap_or_default();
+            env.navigate(Route::Settings {
+                host_id: None,
+                page: section,
+            });
         });
         let (title, message, action) = if local {
             (
@@ -914,6 +906,9 @@ pub fn reset_version_check(s: &mut Settings, server_id: &str) {
 
 pub fn ensure_version_page(s: &mut Settings, env: &mut Env, host: &HostView) {
     ensure_update_card(s, env, host);
+    if has_local_app(host) {
+        about::ensure_update(s, env);
+    }
     let c = card(s, &host.server_id);
     if host.connected() && !c.checked && !c.checking {
         check_version(s, env, host.server_id.clone());
@@ -1087,7 +1082,7 @@ fn submit(
     operation_id: String,
     deadline: Instant,
 ) {
-    let Some(fields) = card(s, &server_id).submit_request.clone() else {
+    let Some(mut fields) = card(s, &server_id).submit_request.clone() else {
         fail(
             s,
             &server_id,
@@ -1096,6 +1091,11 @@ fn submit(
         );
         return;
     };
+    // This is an app-local continuation, never part of the daemon wire request.
+    fields
+        .as_object_mut()
+        .unwrap()
+        .remove("afterDaemonAppUpdate");
     let sid = server_id.clone();
     let oid = operation_id.clone();
     update_request(
@@ -1299,6 +1299,17 @@ fn complete_operation(
     operation_id: &str,
     operation: Value,
 ) {
+    let app = if operation["targetKind"] != "app"
+        && env.host(server_id).is_some_and(|host| has_local_app(&host))
+    {
+        card(s, server_id)
+            .submit_request
+            .as_mut()
+            .and_then(|request| request.as_object_mut()?.remove("afterDaemonAppUpdate"))
+    } else {
+        None
+    };
+    let has_deferred_app = app.is_some();
     if !du::retain_operation(&operation) {
         host::clear_update_operation(&env.ctx.core, server_id);
         let c = card(s, server_id);
@@ -1330,6 +1341,9 @@ fn complete_operation(
             c.worker_version = str_of(get(&operation, "candidate"), "version").to_string();
             c.complete_note = note;
             reset_version_check(s, server_id);
+            if let Some(approved) = app {
+                about::install_approved(s, env, approved);
+            }
         }
         Outcome::RolledBack => fail(
             s,
@@ -1354,9 +1368,21 @@ fn complete_operation(
             ),
         ),
     }
+    if card(s, server_id).state == UpdatePhase::Failed && has_deferred_app {
+        s.about.install_error = Some(ut("appLocal.notStarted"));
+    }
 }
 
-fn start_update(s: &mut Settings, env: &mut Env, server_id: String) {
+fn has_local_app(host: &HostView) -> bool {
+    DESKTOP && host.local
+}
+
+fn start_update(
+    s: &mut Settings,
+    env: &mut Env,
+    server_id: String,
+    after_daemon_app_update: Option<Value>,
+) {
     let Some(host) = env.host(&server_id) else {
         return;
     };
@@ -1369,6 +1395,9 @@ fn start_update(s: &mut Settings, env: &mut Env, server_id: String) {
     }
     if let Some(operation) = card(s, &server_id).operation_id.clone() {
         durable_update(s, env, server_id, operation, true);
+        return;
+    }
+    if has_local_app(&host) && du::target_kind(&host.server_info) != "daemon" {
         return;
     }
     if du::supports_durable(&host.server_info) {
@@ -1400,6 +1429,9 @@ fn start_update(s: &mut Settings, env: &mut Env, server_id: String) {
             "expectedRelease": expected, "forceRunning": force, "idleTimeoutMs": 300_000});
         if c.app_update {
             request["selectedComponents"] = json!(c.selected_components);
+        }
+        if let Some(approved) = after_daemon_app_update {
+            request["afterDaemonAppUpdate"] = approved;
         }
         c.submit_request = Some(request);
         durable_update(s, env, server_id, operation, false);
@@ -1700,30 +1732,234 @@ fn draw_component_plan(ui: &mut Ui, host: &HostView, c: &UpdateCard, check: &Val
     ui.gap(24.0);
 }
 
-/// Host-owned release information, never inferred from the GUI's version.
+#[derive(Clone, Debug, PartialEq)]
+struct LocalUpdatePlan {
+    daemon: Option<Value>,
+    app: Option<Value>,
+    force: bool,
+}
+
+fn local_update_plan(
+    host: &HostView,
+    daemon: &UpdateCard,
+    app: &about::AboutState,
+) -> Option<LocalUpdatePlan> {
+    if !host.local
+        || daemon.checking
+        || daemon.state == UpdatePhase::Updating
+        || daemon.operation_id.is_some()
+        || host.maintenance_operation.is_some()
+        || app.checking
+        || app.installing
+        || !app.checked
+    {
+        return None;
+    }
+    let target = daemon
+        .check
+        .as_ref()
+        .filter(|check| {
+            host.connected()
+                && du::target_kind(&host.server_info) == "daemon"
+                && du::supports_durable(&host.server_info)
+                && du::can_update_host(&host.server_info, check)
+        })
+        .map(|check| check["latest"].clone());
+    let app = about::app_approval(&app.update);
+    (target.is_some() || app.is_some()).then_some(LocalUpdatePlan {
+        force: target.is_some() && daemon.force_running,
+        daemon: target,
+        app,
+    })
+}
+
+fn local_version_update(
+    host: &HostView,
+    c: &UpdateCard,
+    app: &about::AboutState,
+) -> Option<crate::features::settings::rpc::Handler> {
+    let id = host.server_id.clone();
+    if c.operation_id.is_some() {
+        return (host.connected()
+            && c.state != UpdatePhase::Updating
+            && !app.installing
+            && host
+                .maintenance_operation
+                .as_ref()
+                .is_none_or(|operation| c.operation_id.as_ref() == Some(operation)))
+        .then(|| handler(move |s, env| start_update(s, env, id.clone(), None)));
+    }
+    let plan = local_update_plan(host, c, app)?;
+    let label = host.label.clone();
+    Some(handler(move |s, _| {
+        let mut message = Vec::new();
+        if let Some(target) = &plan.daemon {
+            message.push(uta(
+                "approvedVersion",
+                &[("version", str_of(target, "version"))],
+            ));
+            message.push(ut(if plan.force {
+                "confirmInterrupt"
+            } else {
+                "confirmMessage"
+            }));
+        }
+        if let Some(app) = &plan.app {
+            let components = app["selectedComponents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(component_name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let version = str_of(&app["expectedRelease"], "version");
+            message.push(uta("appLocal.approvedVersion", &[("version", version)]));
+            message.push(uta("selectedComponents", &[("components", &components)]));
+            message.push(ut(if plan.daemon.is_some() {
+                "appLocal.confirmAfterDaemon"
+            } else {
+                "appLocal.confirm"
+            }));
+        }
+        let id = id.clone();
+        let approved = plan.clone();
+        s.confirm(
+            uta("confirmTitle", &[("name", &label)]),
+            message.join("\n"),
+            ut("confirm"),
+            plan.force,
+            handler(move |s, env| {
+                let Some(current) = env.host(&id) else {
+                    return;
+                };
+                let Some(c) = s.update_cards.get(&id) else {
+                    return;
+                };
+                if local_update_plan(&current, c, &s.about).as_ref() != Some(&approved) {
+                    return;
+                }
+                if approved.daemon.is_some() {
+                    let app = approved.app.clone().map(|mut request| {
+                        request["operationId"] = json!(du::new_operation_id());
+                        request
+                    });
+                    if app.is_some() {
+                        s.about.operation = Value::Null;
+                        s.about.install_error = None;
+                    }
+                    start_update(s, env, id.clone(), app);
+                } else if let Some(app) = &approved.app {
+                    about::install_approved(s, env, app.clone());
+                }
+            }),
+        );
+    }))
+}
+
+fn draw_local_app_versions(ui: &mut Ui, app: &about::AboutState, daemon: &UpdateCard) {
+    ui.card_row_separator();
+    let current = app.update["current"]["version"]
+        .as_str()
+        .map(String::from)
+        .or_else(platform::app_version)
+        .unwrap_or_else(|| t("settingsNative.unknownVersion"));
+    ui.row(row(ut("appLocal.current")).hint(current));
+    ui.card_row_separator();
+    let check_error = app
+        .check_error
+        .as_deref()
+        .or_else(|| app.update["checkError"].as_str())
+        .filter(|error| !error.is_empty());
+    let support_error = app.update["supportError"].as_str();
+    let latest = app.update["latest"]["version"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| {
+            if app.checking {
+                ut("checking")
+            } else if check_error.is_some_and(not_published) {
+                ut("notPublished")
+            } else if check_error.is_some() {
+                ut("checkFailed")
+            } else if support_error.is_some() {
+                ut("unsupportedTitle")
+            } else {
+                ut("notChecked")
+            }
+        });
+    let waiting_for_daemon = daemon.state == UpdatePhase::Updating
+        && daemon
+            .submit_request
+            .as_ref()
+            .is_some_and(|request| request["afterDaemonAppUpdate"].is_object());
+    let status = app.update_progress().or_else(|| {
+        if waiting_for_daemon {
+            Some(ut("appLocal.waitingForDaemon"))
+        } else if app.update["supported"] == true
+            && app.update["updateAvailable"] == false
+            && check_error.is_none()
+        {
+            Some(ut("appLocal.upToDate"))
+        } else {
+            None
+        }
+    });
+    let mut detail = latest;
+    if let Some(status) = status {
+        detail.push('\n');
+        detail.push_str(&status);
+    }
+    let error = app
+        .install_error
+        .as_deref()
+        .or_else(|| check_error.filter(|error| !not_published(error)))
+        .or_else(|| app.operation["error"].as_str())
+        .or(support_error)
+        .filter(|error| !error.is_empty())
+        .map(String::from);
+    ui.row(row(ut("appLocal.latest")).hint(detail).error(error));
+}
+
+/// The local host also shows the app release checked by this desktop.
 pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     let empty = UpdateCard::default();
     let c = s.update_cards.get(&host.server_id).unwrap_or(&empty);
-    let checked = c.check.as_ref();
+    let local_app = has_local_app(host);
+    let checked = c
+        .check
+        .as_ref()
+        .filter(|check| !local_app || check["targetKind"] != "app");
     let updating = c.state == UpdatePhase::Updating;
     let pending = c.operation_id.is_some();
     let durable = du::supports_durable(&host.server_info);
     let check_supported = du::supports_check(&host.server_info);
     let desktop_managed = host.server_info["desktopManaged"] == true;
-    let app_update = desktop_managed || c.app_update;
-    let component_update = desktop_managed && du::supports_app(&host.server_info);
+    let app_update = !local_app && (desktop_managed || c.app_update);
+    let component_update = !local_app && desktop_managed && du::supports_app(&host.server_info);
     let restart = du::restart_group(&c.selected_components);
     let selection_ready = !component_update
         || (!c.selected_components.is_empty()
             && checked.is_some_and(|check| du::selection_valid(check, &c.selected_components)));
-    let supported = if check_supported {
+    let supported = if local_app && desktop_managed {
+        false
+    } else if check_supported {
         checked.is_some_and(|v| du::can_update_host(&host.server_info, v))
     } else {
         !desktop_managed && (durable || host.feature("daemonSelfUpdate"))
     };
     let id = host.server_id.clone();
-    let refresh = (host.connected() && !c.checking && !updating)
-        .then(|| handler(move |s, env| check_version(s, env, id.clone())));
+    let checking = c.checking || (local_app && s.about.checking);
+    let installing = local_app && s.about.installing;
+    let refresh =
+        ((host.connected() || local_app) && !checking && !updating && !installing).then(|| {
+            handler(move |s, env| {
+                if local_app {
+                    about::check(s, env, true);
+                }
+                check_version(s, env, id.clone());
+            })
+        });
     ui.section_title(&t("settings.hostSections.version"), None, None);
     ui.card_begin();
     let current = if app_update && !checked.is_some_and(|v| v["targetKind"] == "app") {
@@ -1803,7 +2039,7 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
                 ut("check"),
                 refresh,
             )
-            .loading(c.checking)
+            .loading(checking)
             .ctl(),
         ),
     );
@@ -1818,7 +2054,10 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     }
     let support_error =
         support_error_text(checked.map(|v| str_of(v, "supportError")).unwrap_or(""));
-    if desktop_managed && !du::supports_app(&host.server_info) {
+    if local_app && desktop_managed {
+        ui.card_row_separator();
+        inset_warning(ui, &ut("unsupportedTitle"), &ut("appLocal.legacyDaemon"));
+    } else if desktop_managed && !du::supports_app(&host.server_info) {
         ui.card_row_separator();
         inset_warning(ui, &ut("unsupportedTitle"), &ut("appUpgradePrerequisite"));
     } else if !support_error.is_empty() {
@@ -1837,6 +2076,9 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
         } else {
             "upToDate"
         })));
+    }
+    if local_app {
+        draw_local_app_versions(ui, &s.about, c);
     }
     ui.card_end();
     ui.gap(24.0);
@@ -1888,20 +2130,21 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
             )),
     );
     ui.card_row_separator();
-    let id = host.server_id.clone();
-    let label = host.label.clone();
-    let target = checked.and_then(|v| v.get("latest")).cloned();
-    let approved_kind = du::target_kind(&host.server_info);
-    let selected = c.selected_components.clone();
     let force = c.force_running;
-    let act = (host.connected()
+    let remote_act = (!local_app
+        && host.connected()
         && !updating
         && !busy_elsewhere
         && (pending || (supported && selection_ready && (durable || force))))
         .then(|| {
+            let id = host.server_id.clone();
+            let label = host.label.clone();
+            let target = checked.and_then(|v| v.get("latest")).cloned();
+            let approved_kind = du::target_kind(&host.server_info);
+            let selected = c.selected_components.clone();
             handler(move |s, env| {
                 if pending {
-                    start_update(s, env, id.clone());
+                    start_update(s, env, id.clone(), None);
                     return;
                 }
                 let id = id.clone();
@@ -1923,7 +2166,7 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
                     {
                         return;
                     }
-                    start_update(s, env, id.clone());
+                    start_update(s, env, id.clone(), None);
                 });
                 let mut message = if component_update {
                     format!(
@@ -1976,6 +2219,11 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
                 );
             })
         });
+    let act = if local_app {
+        local_version_update(host, c, &s.about)
+    } else {
+        remote_act
+    };
     // The phase reads in the row hint; the button keeps its short label so a
     // narrow row does not squeeze the control.
     let button_label = if pending && !updating {
@@ -1986,18 +2234,30 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     let hint = if updating && !c.phase.is_empty() {
         c.phase.clone()
     } else {
-        ut(if app_update { "appHint" } else { "hint" })
+        ut(if local_app {
+            "appLocal.hint"
+        } else if app_update {
+            "appHint"
+        } else {
+            "hint"
+        })
     };
     ui.row(
-        row(ut(if app_update { "appTitle" } else { "title" }))
-            .hint(hint)
-            .control(
-                button(format!("host.{}.update", host.server_id), button_label, act)
-                    .icon(Icon::ArrowUpToLine)
-                    .size(BSize::Sm)
-                    .loading(updating)
-                    .ctl(),
-            ),
+        row(ut(if local_app {
+            "appLocal.title"
+        } else if app_update {
+            "appTitle"
+        } else {
+            "title"
+        }))
+        .hint(hint)
+        .control(
+            button(format!("host.{}.update", host.server_id), button_label, act)
+                .icon(Icon::ArrowUpToLine)
+                .size(BSize::Sm)
+                .loading(updating || installing)
+                .ctl(),
+        ),
     );
     if let Some(operation) = &c.operation_id {
         ui.card_row_separator();
@@ -2092,6 +2352,117 @@ pub fn picker_hint(host: &HostView) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn local_version_update_and_removal_use_separate_authorities() {
+        use makepad_widgets::Cx;
+        use paseo_gui_core::{CoreConfig, CoreState, GuiCore};
+        use std::{fs, sync::Arc};
+
+        let dir =
+            std::env::temp_dir().join(format!("paseo-local-version-{}", du::new_operation_id()));
+        let core = GuiCore::start(
+            CoreConfig {
+                state_dir: dir.clone(),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut ctx = crate::common::UiContext::new(core.handle());
+        ctx.state = Arc::new(CoreState::new(json!({"hosts": [{
+            "serverId": "local", "status": "connected",
+            "config": {
+                "id": "localhost",
+                "endpoint": "127.0.0.1:9",
+                "localCredentialPath": dir.join("daemon/local-credential"),
+            },
+            "serverInfo": {"serverId": "local", "features": {
+                "durableDaemonUpdates": true, "daemonUpdateCheck": true,
+            }},
+        }]})));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fields = Default::default();
+        let mut bridge = platform::Bridge::record_desktop();
+        let mut env = Env {
+            cx: &mut cx,
+            ctx: &mut ctx,
+            fields: &mut fields,
+            bridge: &mut bridge,
+        };
+        let mut s = Settings::default();
+        let host = env.host("local").unwrap();
+        let daemon_release = json!({"version": "2.0.0", "manifestSha512": "A".repeat(86) + "=="});
+        let app_release =
+            json!({"version": "3.0.0", "manifestSha512": format!("B{}==", "A".repeat(85))});
+        card(&mut s, "local").check = Some(json!({
+            "supported": true, "targetKind": "daemon", "updateAvailable": true,
+            "latest": daemon_release,
+        }));
+        s.about.checked = true;
+        s.about.update = json!({
+            "supported": true, "updateAvailable": true, "latest": app_release,
+            "availableComponents": [{"id": "app"}, {"id": "tailnet"}, {"id": "update-helper"}],
+        });
+        local_version_update(&host, &s.update_cards["local"], &s.about).unwrap()(&mut s, &mut env);
+        let SheetKind::Confirm(approval) = s.sheets.pop().unwrap().kind else {
+            panic!("update must request confirmation");
+        };
+        (approval.on_confirm)(&mut s, &mut env);
+        let request = s.update_cards["local"].submit_request.clone().unwrap();
+        assert_eq!(request["targetKind"], "daemon");
+        assert_eq!(request["expectedRelease"], daemon_release);
+        assert!(request.get("selectedComponents").is_none());
+        let app = &request["afterDaemonAppUpdate"];
+        assert_eq!(app["expectedRelease"], app_release);
+        assert_eq!(
+            app["selectedComponents"],
+            json!(["app", "tailnet", "update-helper"]),
+        );
+        assert!(!s.about.installing);
+        assert!(env.bridge.desktop_requests.as_ref().unwrap().is_empty());
+
+        let operation_id = request["operationId"].as_str().unwrap();
+        finish(
+            &mut s,
+            &mut env,
+            "local",
+            operation_id,
+            json!({
+                "operationId": operation_id, "serverId": "local", "targetKind": "daemon",
+                "phase": "committed", "terminal": true,
+                "candidate": {"version": "2.0.0", "executableSha256": "a".repeat(64)},
+                "worker": {"serverId": "local", "version": "2.0.0", "executableSha256": "a".repeat(64)},
+            }),
+        );
+        assert_eq!(s.update_cards["local"].state, UpdatePhase::Complete);
+        assert!(
+            s.about.installing,
+            "only a verified daemon commit advances the app update",
+        );
+
+        remove_host_handler(&host)(&mut s, &mut env);
+        let SheetKind::Confirm(removal) = s.sheets.pop().unwrap().kind else {
+            panic!("removal must request confirmation");
+        };
+        (removal.on_confirm)(&mut s, &mut env);
+        assert!(env.ctx.effects.iter().any(|effect| {
+            matches!(effect, UiEffect::RemoveHost { host_id } if host_id == "local")
+        }));
+        assert!(env.bridge.desktop_requests.as_ref().unwrap().is_empty());
+
+        drop(core);
+        let prefs = fs::read(dir.join("shared_preferences.json")).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        let prefs: Value = serde_json::from_slice(&prefs).unwrap();
+        assert_eq!(
+            prefs["flutter.paseo.desktopAppUpdate.operation"],
+            app["operationId"],
+        );
+    }
 
     #[test]
     fn restored_standalone_terminal_status_settles_card_and_clears_saved_approval() {

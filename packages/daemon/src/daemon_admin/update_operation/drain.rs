@@ -23,7 +23,6 @@ pub(crate) fn wire_admission(app: &AppState, message: &Value) -> Result<Option<W
             | "restart_server_request"
             | "shutdown_server_request"
     ) || kind.starts_with("daemon.update.")
-        || kind.starts_with("daemon.appUpdate.")
     {
         return Ok(None);
     }
@@ -51,7 +50,6 @@ pub(crate) async fn initialize(app: &Arc<AppState>) -> Result<()> {
     {
         pause(app, &operation)?;
     }
-    super::super::desktop_update::initialize(app).await?;
     Ok(())
 }
 

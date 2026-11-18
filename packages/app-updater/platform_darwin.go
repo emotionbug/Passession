@@ -45,7 +45,6 @@ func inspectProcess(pid int) (processInfo, error) {
 	}
 	return processInfo{processIdentity{pid, birth}, executable, uint32(uid)}, nil
 }
-func appImageDescendant(child, ancestor processIdentity) bool { return false }
 func validateAppImageProcess(p processInfo, image string) error {
 	return errors.New("AppImage requires Linux")
 }

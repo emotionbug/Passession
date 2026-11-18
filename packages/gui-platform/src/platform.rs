@@ -26,7 +26,6 @@ pub struct PlatformConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Capabilities {
     pub desktop_host: bool,
-    pub tray: bool,
     pub editors: bool,
     pub updater: bool,
     pub directory_picker: bool,
@@ -136,8 +135,6 @@ impl Shared {
 /// GUI-thread-only state (native objects that are not `Send`).
 pub(crate) struct PlatformState {
     pub audio: AudioEngine,
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    pub desktop: crate::desktop::DesktopMain,
 }
 
 pub struct Platform {
@@ -196,16 +193,16 @@ impl Platform {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             mobile: crate::mobile::MobileShared::new(),
         });
-        let mut state = PlatformState {
-            audio,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            desktop: crate::desktop::DesktopMain::default(),
-        };
+        let state = PlatformState { audio };
         let _ = HANDLE.set(PlatformHandle(shared.clone()));
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        crate::desktop::start(cx, &shared, &mut state, &config);
+        crate::desktop::start(&shared, &config);
         #[cfg(any(target_os = "android", target_os = "ios"))]
-        crate::mobile::start(cx, &shared, &mut state);
+        let state = {
+            let mut state = state;
+            crate::mobile::start(cx, &shared, &mut state);
+            state
+        };
         Ok(Platform { shared, state })
     }
 
@@ -224,7 +221,7 @@ impl Platform {
             _ => {}
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        crate::desktop::handle_event(cx, &self.shared, &mut self.state, event);
+        crate::desktop::handle_event(&self.shared);
         #[cfg(any(target_os = "android", target_os = "ios"))]
         crate::mobile::handle_event(cx, &self.shared, &mut self.state, event);
     }
@@ -468,9 +465,10 @@ impl PlatformHandle {
         native::report_error(self.shared(), message);
     }
 
-    /// Shows (`Some`) or removes (`None`) the OS background presence of the
+    /// Shows (`Some`) or removes (`None`) the Android background presence of the
     /// embedded Tailscale connection; its controls arrive as
     /// [`PlatformEvent::TailnetControl`](crate::PlatformEvent::TailnetControl).
+    #[cfg(target_os = "android")]
     pub fn set_tailnet_presence(&self, presence: Option<crate::action::TailnetPresence>) {
         native::set_tailnet_presence(self.shared(), presence);
     }
@@ -523,46 +521,24 @@ impl PlatformHandle {
         id
     }
 
-    pub fn window_close_requested(&self, open_windows: usize) -> PlatformRequestId {
-        let done = self.0.completion();
-        let id = done.id();
+    /// Returns true if closing this window requests a guarded application quit.
+    pub fn window_close_requested(&self, open_windows: usize) -> bool {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        crate::desktop::window_close_requested(self.shared(), open_windows, done);
+        {
+            crate::desktop::window_close_requested(self.shared(), open_windows)
+        }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
             let _ = open_windows;
-            done.ok(PlatformValue::CloseDecision(CloseDecision::CloseWindow));
+            false
         }
-        id
-    }
-
-    pub fn hide_windows(&self) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        self.0.on_main(|_, state| state.desktop.hide_windows());
-    }
-
-    pub fn show_windows(&self) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        self.0.on_main(|_, state| state.desktop.show_windows());
-    }
-
-    /// Localized labels for the desktop tray's Open and Quit items, kept for a
-    /// tray that appears later; English until the first call. Android and iOS
-    /// have no tray.
-    pub fn set_tray_labels(&self, open: String, quit: String) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        self.0
-            .on_main(move |_, state| state.desktop.set_tray_labels(open, quit));
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        let _ = (open, quit);
     }
 
     /// Hides one window without destroying it (the dormant first window kept
     /// for the next New Window). GUI thread. The op runs on Makepad's own
     /// top-level frame for `window` when the platform ops are processed
     /// (Windows: the `CreateWindowExW` frame HWND, resolved then, never a
-    /// cached child handle). Tray restore (`show_windows`) leaves it hidden;
-    /// routes from notification clicks and links reopen it instead.
+    /// cached child handle). Routes from notification clicks and links can reopen it.
     /// Android and iOS have one OS-owned window; there this does nothing.
     pub fn hide_window(&self, cx: &mut Cx, window: makepad_widgets::WindowId) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]

@@ -10,7 +10,7 @@ category: Orchestration
 
 The Rust Paseo CLI manages agents and daemon operations from your terminal. These instructions target the unpublished 0.13.1 source checkout; build the native runtime as described in [Updates](updates.md), not an old npm CLI package. Keep the executable with its generated adjacent assets.
 
-Bare `paseo` opens CLI chat. Use `paseo onboard` for explicit setup, then `paseo daemon start` and `paseo daemon status` for managed operation. The default home remains `~/.paseo`.
+Bare `paseo` opens CLI chat. Use `paseo onboard` for explicit setup, `paseo daemon start` to start a detached daemon, and `paseo daemon status` to see its state. The default home remains `~/.paseo`.
 
 > **Agent orchestration:** You can tell coding agents to use the Paseo CLI to spawn and manage other agents. Paseo recognizes the calling agent, so CLI-created workers get the same directory and parent defaults as MCP-created workers.
 
@@ -338,6 +338,27 @@ paseo daemon stop --home ~/paseo-test
 
 `start` runs in the background and reports the actual listening address and supervisor PID. It accepts only home selection and `--timeout <seconds>` (default 600). If waiting times out, the supervisor remains running: use the printed status, log, and stop instructions. A worker that exits before becoming ready makes startup fail.
 
+`paseo daemon ensure [--home <directory>] [--runtime <bundled-runtime-directory>] --json`
+installs or starts an independent daemon. Use the complete bundled runtime directory
+(including adjacent assets) for the first install; after that `--runtime` is unnecessary.
+If an independent daemon already runs for the home, `ensure` leaves it alone. Simultaneous
+requests for the same home share one installation. Success reports `state` (`installed`,
+`started`, or `running`), `owner`, `pid`, and `listen`, after the daemon publishes its listen
+address and local credential. Failure exits nonzero with `{"state":"failed","error":"…"}`.
+
+On Linux, a working systemd user manager starts the daemon through `paseo.service`
+(or a home-specific unit name if that name is taken). Paseo enables a new unit for
+subsequent logins. A recognized existing unit for the same home is reused through an
+ExecStart-only drop-in; its original unit file is not replaced. Linux without a
+working user manager, macOS, and Windows start a detached daemon without login
+autostart. On every platform the daemon keeps running when Passession exits.
+
+A daemon started by an older Passession is replaced only after its running work
+has drained and new work is paused. During active work `ensure` returns
+`owner: "desktop-legacy"` and `migration: "pending"` and leaves that daemon running.
+Run `ensure` again after work finishes. Migration keeps the same daemon home,
+server identity, database, and local credential.
+
 `restart` requests a replacement worker from the existing supervisor. It rereads the file and retains the supervisor's original environment and arguments. Success confirms a different ready worker, following a changed address for a home target. It never starts a stopped daemon or refreshes the supervisor binary. A timeout reports whether the request was acknowledged; it does not prove why reconnection failed.
 
 `stop --home` waits for that local supervisor to exit. On POSIX it signals the supervisor without contacting a TCP endpoint. On Windows it uses the ready daemon's shutdown RPC; an unbound instance requires explicit `--force`. `--force` permits forced process-tree cleanup after the graceful timeout (default 15 seconds). `stop --host` only reports **shutdown requested**; remote process exit is not verified. A service manager may start another instance after the captured supervisor exits.
@@ -399,12 +420,14 @@ provenance. Admission pins the input bytes; changing a directory or archive afte
 requires a new operation ID. Symlinked inputs, incomplete packages and insufficient space
 are rejected before the running daemon is stopped.
 
-Managed replacement currently supports a verified systemd user service or a detached
-standalone daemon. Foreground, desktop-owned and unrecognized launch owners are refused
-instead of silently starting an unmanaged replacement. On first migration, Paseo saves the
-original service configuration and installs an ExecStart-only drop-in pointing at a fixed
-launcher. Later updates select immutable runtimes without rewriting the service path.
-Migrating a daemon without drain support requires explicit `--force-running`.
+Managed replacement supports a verified systemd user service or a detached daemon.
+Installations created by `ensure` are compatible with daemon updates, even if the
+initial runtime came from a desktop bundle. Foreground and unrecognized launch
+owners are refused. An existing systemd service first adopted by the updater is
+switched to the fixed launcher through an ExecStart-only drop-in, preserving its
+original configuration. Later updates select immutable runtimes without rewriting the
+service path. Updating a standalone runtime that predates drain support requires
+explicit `--force-running`.
 
 The fixed launcher, `bin/paseo` in the installation store, is also the stable `paseo`
 command: every user command it receives runs the active runtime's CLI, so put it (or a

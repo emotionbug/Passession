@@ -6,16 +6,10 @@ use rand::{RngCore, TryRngCore};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-pub(super) async fn load(
-    home: &Path,
-    environment: &BTreeMap<String, String>,
-) -> Result<(Value, Arc<KeyPair>)> {
+pub(crate) async fn ensure_server_id(home: &Path, override_id: Option<&str>) -> Result<String> {
     let server_path = home.join("server-id");
     let stored = storage::read_private(&server_path).await?;
-    let override_id = environment
-        .get("PASEO_SERVER_ID")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
+    let override_id = override_id.map(str::trim).filter(|s| !s.is_empty());
     let server_id = if let Some(id) = override_id {
         if stored.is_none() {
             storage::write_private(&server_path, format!("{id}\n").as_bytes()).await?;
@@ -34,6 +28,15 @@ pub(super) async fn load(
         storage::write_private(&server_path, format!("{id}\n").as_bytes()).await?;
         id
     };
+    Ok(server_id)
+}
+
+pub(super) async fn load(
+    home: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<(Value, Arc<KeyPair>)> {
+    let server_id =
+        ensure_server_id(home, environment.get("PASEO_SERVER_ID").map(String::as_str)).await?;
     let key_path = home.join("daemon-keypair.json");
     let key = match storage::read_private(&key_path).await? {
         Some(bytes) => {

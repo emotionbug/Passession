@@ -61,7 +61,6 @@ pub(crate) fn os_app_paths() -> AppPaths {
 pub(crate) fn capabilities() -> Capabilities {
     Capabilities {
         desktop_host: false,
-        tray: false,
         editors: false,
         updater: false,
         directory_picker: false,

@@ -383,7 +383,7 @@ pub fn bundle_raw_runtime(destination: &Path, profile: &str, kind: &str) -> Resu
     if kind == "desktop-bundled" {
         write_json(
             &destination.join("desktop-runtime.json"),
-            &json!({"schemaVersion":1,"executable":executable(),"cliShimPath":executable(),"workingDirectory":".","environment":{}}),
+            &json!({"schemaVersion":1,"executable":executable(),"workingDirectory":".","environment":{}}),
         )?;
     }
     copy_tree(&root()?.join("LICENSE"), &destination.join("LICENSE"))?;

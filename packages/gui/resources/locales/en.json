@@ -223,7 +223,6 @@
       "toggleSidebar": "Toggle sidebar",
       "open": "Open menu",
       "close": "Close menu",
-      "openApp": "Open Passession",
       "quitApp": "Quit Passession",
       "file": "File",
       "newWindow": "New Window"
@@ -1986,67 +1985,37 @@
       "restore": "Restore window",
       "close": "Close window"
     },
-    "quitting": { "title": "Quitting Passession...", "detail": "Stopping the local daemon." },
     "daemon": {
-      "title": "Daemon",
-      "lifecycle": {
-        "owned": "Launched by Passession",
-        "attached": "Attached to an existing daemon",
-        "ownedMessage": "This daemon was started by Passession.",
-        "attachedMessage": "This daemon was not started by Passession.",
-        "stopTitle": "Stop local daemon?",
-        "stopMessage": "{{ownership}}\nHome: {{home}}\nSupervisor PID: {{pid}}\nRunning agent work will be interrupted.",
-        "stop": "Stop daemon",
-        "stopping": "Stopping…",
-        "stopFailed": "Unable to stop daemon",
-        "pauseAttached": "Pause automatic daemon management? The attached daemon will keep running.",
-        "pause": "Pause management",
-        "workerUpdated": "Worker updated to {{version}}",
-        "supervisorRefresh": "The running supervisor retains its original code. Its launcher must stop and start it to refresh the supervisor."
-      },
+      "title": "Local daemon",
+      "startNow": "Start now",
+      "connect": "Connect local daemon",
       "status": {
         "title": "Status",
-        "builtInOnly": "Only the built-in desktop daemon is shown here",
-        "running": "running",
-        "notRunning": "not running",
-        "pid": "PID {{pid}}"
+        "running": "Running",
+        "stopped": "Stopped",
+        "starting": "Starting…",
+        "failed": "Failed to start",
+        "unknown": "Status unavailable"
       },
-      "management": {
-        "title": "Manage built-in daemon",
-        "hint": "Let Passession start and stop the built-in daemon",
-        "pauseTitle": "Pause built-in daemon",
-        "pauseMessage": "This will stop the built-in daemon immediately. Running agents and terminals connected to the built-in daemon will be stopped.",
-        "pauseAndStop": "Pause and stop",
-        "registrationFailed": "Built-in daemon started, but Passession could not save the localhost connection. Toggle daemon management off and on again, or add localhost manually.",
-        "pausedStopFailed": "Built-in daemon management was paused, but Passession could not stop the daemon.",
-        "updateFailed": "Unable to update built-in daemon management."
+      "owner": {
+        "service": "System service",
+        "background": "Background process",
+        "legacy": "Started by a previous version of Passession"
       },
-      "keepRunning": {
-        "title": "Keep daemon running after quit",
-        "hint": "Daemon keeps running when you quit Passession"
+      "autostart": {
+        "title": "Start the local daemon if it is not running",
+        "hint": "Start the daemon when Passession opens. It keeps running when you close the app."
       },
       "logs": {
         "title": "Log file",
         "modalTitle": "Daemon logs",
         "unavailable": "Log path unavailable",
-        "empty": "(log file is empty)",
-        "copied": "Log path copied.",
-        "copyFailed": "Unable to copy log path.",
-        "open": "Open logs",
-        "copyPath": "Copy path"
+        "open": "Open logs"
       },
       "fullStatus": {
-        "title": "Full status",
         "modalTitle": "Daemon status",
-        "hint": "Runs `paseo daemon status` and shows the output",
-        "view": "View status",
-        "copied": "Status copied to clipboard.",
-        "fetchFailed": "Failed to fetch daemon status: {{message}}"
-      },
-      "advancedSettings": "Advanced settings",
-      "openAdvancedSettings": "Open advanced daemon settings",
-      "versionMismatch": "App and daemon versions don't match. Update both to the same version for the best experience.",
-      "loadFailed": "Unable to load desktop daemon status."
+        "view": "View status"
+      }
     },
     "updates": {
       "status": {
@@ -2078,7 +2047,7 @@
         "installingDescription": "Installing and restarting...",
         "versionReady": "{{version}} is ready to install.",
         "newVersionReady": "A new version is ready to install.",
-        "restartWarning": "Upgrading the app will stop running agents and close terminal sessions."
+        "restartWarning": "Passession may restart. The local daemon and its running agents will keep running."
       }
     },
     "settings": {
@@ -2186,9 +2155,11 @@
   "onboarding": {
     "daemonDocs": "Paseo daemon docs",
     "daemon": {
-      "starting": "Starting built-in daemon…",
-      "failed": "Built-in daemon failed: {{reason}}",
-      "viewLogs": "View logs"
+      "starting": "Starting the local daemon…",
+      "running": "The local daemon is running. Connect it here, or connect to another host below.",
+      "stopped": "The local daemon is stopped. Start it here, or connect to another host below.",
+      "failed": "Could not start the local daemon: {{reason}}",
+      "settings": "Daemon settings"
     },
     "title": "Welcome to Passession",
     "subtitle": "Connect your computer to get started",
@@ -2635,7 +2606,6 @@
     "hostPicker": { "switchHost": "Switch host", "local": "Local" },
     "backToWorkspace": "Back to sessions",
     "addHost": "Add host",
-    "enableBuiltInDaemon": "Enable built-in daemon",
     "projects": "Projects",
     "projectList": {
       "hostLoadFailed": "Couldn't load projects from host {{hostName}}: {{message}}",
@@ -2901,7 +2871,6 @@
       },
       "updates": {
         "label": "App updates",
-        "readyToInstall": "Ready to install: {{version}}",
         "installTitle": "Install desktop update",
         "installMessage": "This updates Passession on this computer",
         "installConfirm": "Install update",
@@ -3313,6 +3282,19 @@
           "appUpToDate": "All host components are current. Nothing will be downloaded or restarted.",
           "appTitle": "Update host components",
           "appHint": "Download and activate only the selected changed components on this host. Unchanged components keep their own versions and sources.",
+          "appLocal": {
+            "title": "Update this app and daemon",
+            "hint": "Apply available updates. The daemon and app are updated separately.",
+            "current": "Current desktop app version",
+            "latest": "Latest desktop app release",
+            "upToDate": "The desktop app is up to date.",
+            "approvedVersion": "Approved desktop app release: {{version}}",
+            "confirm": "The app may restart to apply its update. The local daemon will keep running.",
+            "confirmAfterDaemon": "The app update starts only after the daemon update succeeds. The app may restart without stopping the updated daemon.",
+            "waitingForDaemon": "Waiting for the daemon update to finish…",
+            "notStarted": "The app update did not start because the daemon update did not succeed.",
+            "legacyDaemon": "This daemon was started by a previous version of Passession. Daemon updates are available after it moves to an independent installation."
+          },
           "componentCohort": "Binary version and source are unchanged; activation is required with the signed container group.",
           "approvedAppVersion": "Approved collection release: {{version}}",
           "approvalMissing": "The complete saved approval is unavailable. This operation can only be observed; no replacement update request was submitted.",
@@ -3331,8 +3313,8 @@
           "componentDownload": "{{count}} changed components · {{bytes}} bytes",
           "restartGroup": "Restart scope",
           "restartNone": "No restart. The app and daemon remain running.",
-          "restartDaemon": "Drain running agents, then restart only this host's owned daemon. The app stays open.",
-          "restartGui": "Drain running agents, then restart this host's app and owned daemon. Unsaved documents block the update.",
+          "restartDaemon": "Wait for running agents, then restart this host's daemon. The app stays open.",
+          "restartGui": "Wait for running agents, then restart this host's app and daemon. Unsaved documents block the update.",
           "selectionInvalidTitle": "Incompatible component selection",
           "selectionInvalid": "Select the required dependency and atomic-group changes together. This partial selection cannot be applied.",
           "selectedComponents": "Selected components: {{components}}",
@@ -3388,10 +3370,10 @@
           "title": "Remove host",
           "localTitle": "Remove localhost connection",
           "hint": "Removes this host and its saved connections from this device",
-          "localHint": "Removes localhost from this device and stops the built-in daemon",
-          "localConfirmTitle": "Remove localhost connection and stop daemon?",
+          "localHint": "Removes the saved connection from this device. The daemon keeps running.",
+          "localConfirmTitle": "Remove localhost connection?",
           "confirmMessage": "Remove {{name}}? This will delete its saved connections.",
-          "localConfirmMessage": "This will remove the localhost connection, turn off built-in daemon management, and stop the managed daemon. Remote hosts remain connected.",
+          "localConfirmMessage": "This removes the saved connections to the local host. The daemon keeps running and your automatic start setting does not change.",
           "errorTitle": "Error",
           "errorMessage": "Unable to remove host",
           "localErrorMessage": "Unable to remove localhost connection"

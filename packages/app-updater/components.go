@@ -25,6 +25,7 @@ var componentInputHash = ""
 const componentHelperABI = 2
 
 var componentIDs = []string{"app", "daemon", "tailnet", "update-helper"}
+var appComponentIDs = [...]string{"app", "tailnet", "update-helper"}
 var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var sourcePattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var versionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
@@ -102,10 +103,6 @@ type componentSelection struct {
 	Previous       componentSet    `json:"previous"`
 	Trial          *componentTrial `json:"trial"`
 }
-type runtimeBinding struct {
-	Process    processIdentity `json:"process"`
-	Executable string          `json:"executable"`
-}
 type componentRequest struct {
 	SchemaVersion      int               `json:"schemaVersion"`
 	Mode               string            `json:"mode"`
@@ -122,11 +119,8 @@ type componentRequest struct {
 	TargetComponents   componentSet      `json:"targetComponents"`
 	Staged             map[string]string `json:"staged"`
 	RestartGroup       string            `json:"restartGroup"`
-	ServerID           string            `json:"serverId"`
-	DaemonHome         string            `json:"daemonHome"`
 	CurrentExecutable  string            `json:"currentExecutable"`
 	ParentProcess      processIdentity   `json:"parentProcess"`
-	RuntimeProcesses   []runtimeBinding  `json:"runtimeProcesses"`
 }
 type componentStatus struct {
 	SchemaVersion      int                          `json:"schemaVersion"`
@@ -143,16 +137,11 @@ type componentStatus struct {
 	ObservedComponents map[string]componentIdentity `json:"observedComponents,omitempty"`
 }
 type componentHealth struct {
-	SchemaVersion    int                          `json:"schemaVersion"`
-	OperationID      string                       `json:"operationId"`
-	Nonce            string                       `json:"nonce"`
-	ServerID         string                       `json:"serverId"`
-	DaemonHome       string                       `json:"daemonHome"`
-	Components       map[string]componentIdentity `json:"components"`
-	GUIProcess       processIdentity              `json:"guiProcess"`
-	DaemonProcess    processIdentity              `json:"daemonProcess"`
-	DaemonExecutable string                       `json:"daemonExecutable"`
-	RuntimeProcesses []runtimeBinding             `json:"runtimeProcesses"`
+	SchemaVersion int                          `json:"schemaVersion"`
+	OperationID   string                       `json:"operationId"`
+	Nonce         string                       `json:"nonce"`
+	Components    map[string]componentIdentity `json:"components"`
+	GUIProcess    processIdentity              `json:"guiProcess"`
 }
 type componentLeaseOwner struct {
 	SchemaVersion      int             `json:"schemaVersion"`
@@ -171,7 +160,6 @@ type componentJournal struct {
 	Launched         processIdentity    `json:"launched"`
 	LaunchPending    bool               `json:"launchPending"`
 	Health           *componentHealth   `json:"health,omitempty"`
-	AppOnlyCandidate bool               `json:"appOnlyCandidate,omitempty"`
 }
 type componentOperation struct {
 	request                                             componentRequest
@@ -283,18 +271,18 @@ func validateComponentRequest(r componentRequest, requestPath string) error {
 	if r.SchemaVersion != 2 || r.Mode != "componentTransaction" || !uuidPattern.MatchString(r.OperationID) || !digestPattern.MatchString(r.ManifestSHA512) || r.InstallationID != installationKey(r.BaseRoot) || r.CurrentGeneration == ^uint64(0) {
 		return errors.New("invalid component transaction identity")
 	}
-	if r.ServerID == "" || len(r.ServerID) > 256 || r.ParentProcess.PID <= 1 || r.ParentProcess.BirthToken == "" || len(r.ParentProcess.BirthToken) > 256 || len(r.RuntimeProcesses) > 16 {
-		return errors.New("invalid owning host/process")
+	if r.ParentProcess.PID <= 1 || r.ParentProcess.BirthToken == "" || len(r.ParentProcess.BirthToken) > 256 {
+		return errors.New("invalid owning GUI process")
 	}
 	prefix := map[string]string{"linux": "linux-", "windows": "windows-", "darwin": "macos-"}[runtime.GOOS]
 	arch := map[string]string{"amd64": "x64", "arm64": "arm64"}[runtime.GOARCH]
 	if prefix == "" || arch == "" || r.Target != prefix+arch {
 		return errors.New("component target is not this desktop platform/architecture")
 	}
-	if requestPath != filepath.Join(r.OperationDirectory, "request.json") || !within(r.OperationDirectory, r.InventoryPath) || len(r.Staged) > 4 {
+	if requestPath != filepath.Join(r.OperationDirectory, "request.json") || !within(r.OperationDirectory, r.InventoryPath) || len(r.Staged) > len(appComponentIDs) {
 		return errors.New("transaction paths are not bound")
 	}
-	for _, p := range []string{r.OperationDirectory, r.StoreDirectory, r.BaseRoot, r.DaemonHome, r.InventoryPath} {
+	for _, p := range []string{r.OperationDirectory, r.StoreDirectory, r.BaseRoot, r.InventoryPath} {
 		if err := cleanPath(p); err != nil {
 			return err
 		}
@@ -313,11 +301,8 @@ func validateComponentRequest(r componentRequest, requestPath string) error {
 	if err := privatePath(r.InventoryPath, false); err != nil {
 		return err
 	}
-	if err := ownedPath(r.DaemonHome); err != nil {
-		return err
-	}
-	if filepath.Dir(r.BaseRoot) == r.BaseRoot || within(r.BaseRoot, r.StoreDirectory) || within(r.StoreDirectory, r.BaseRoot) || samePath(r.BaseRoot, r.StoreDirectory) || within(r.BaseRoot, r.DaemonHome) || samePath(r.BaseRoot, r.DaemonHome) || within(r.StoreDirectory, r.DaemonHome) || samePath(r.StoreDirectory, r.DaemonHome) {
-		return errors.New("component storage overlaps application or daemon data")
+	if filepath.Dir(r.BaseRoot) == r.BaseRoot || within(r.BaseRoot, r.StoreDirectory) || within(r.StoreDirectory, r.BaseRoot) || samePath(r.BaseRoot, r.StoreDirectory) {
+		return errors.New("component storage overlaps the installed application")
 	}
 	if err := validateComponentSet(r.Current, r); err != nil {
 		return err
@@ -325,19 +310,22 @@ func validateComponentRequest(r componentRequest, requestPath string) error {
 	if err := validateComponentSet(r.TargetComponents, r); err != nil {
 		return err
 	}
+	if !reflect.DeepEqual(r.Current["daemon"], r.TargetComponents["daemon"]) {
+		return errors.New("desktop transactions cannot change the daemon component")
+	}
 	if !samePath(componentImage(r, r.Current["app"]), r.CurrentExecutable) {
 		st, err := os.Lstat(r.BaseRoot)
 		if runtime.GOOS != "linux" || err != nil || !st.Mode().IsRegular() {
 			return errors.New("parent is not selected app image")
 		}
 	}
-	changed := make(map[string]bool)
+	changed := 0
 	group := "none"
-	for _, id := range componentIDs {
+	for _, id := range appComponentIDs {
 		if reflect.DeepEqual(r.Current[id], r.TargetComponents[id]) {
 			continue
 		}
-		changed[id] = true
+		changed++
 		if r.TargetComponents[id].Root != "objects/"+r.TargetComponents[id].Component.Artifact.SHA256 {
 			return errors.New("changed component must use immutable object")
 		}
@@ -350,39 +338,24 @@ func validateComponentRequest(r componentRequest, requestPath string) error {
 		}
 		if id == "app" || id == "tailnet" {
 			group = "gui"
-		} else if id == "daemon" && group != "gui" {
-			group = "daemon"
 		}
 	}
-	if len(changed) != len(r.Staged) || group != r.RestartGroup {
+	if changed != len(r.Staged) || group != r.RestartGroup {
 		return errors.New("staged set or restart group does not match exact changes")
 	}
-	if group != "none" && len(r.RuntimeProcesses) == 0 {
-		return errors.New("runtime handoff requires bound owned processes")
-	}
-	if runtime.GOOS == "darwin" && changed["app"] != changed["tailnet"] {
+	_, appStaged := r.Staged["app"]
+	_, tailnetStaged := r.Staged["tailnet"]
+	if runtime.GOOS == "darwin" && appStaged != tailnetStaged {
 		return errors.New("signed macOS app/tailnet cohort must change together")
-	}
-	seen := make(map[int]bool)
-	for _, binding := range r.RuntimeProcesses {
-		if binding.Process.PID <= 1 || binding.Process.PID == r.ParentProcess.PID || binding.Process.BirthToken == "" || seen[binding.Process.PID] {
-			return errors.New("invalid runtime process binding")
-		}
-		if !samePath(binding.Executable, componentImage(r, r.Current["daemon"])) {
-			if runtime.GOOS != "linux" || samePath(r.CurrentExecutable, componentImage(r, r.Current["app"])) || !filepath.IsAbs(binding.Executable) || filepath.Clean(binding.Executable) != binding.Executable {
-				return errors.New("runtime image is not selected component")
-			}
-		}
-		seen[binding.Process.PID] = true
 	}
 	return nil
 }
-func boundLive(binding runtimeBinding) error {
-	p, err := inspectProcess(binding.Process.PID)
+func boundLive(process processIdentity, image string) error {
+	p, err := inspectProcess(process.PID)
 	if err != nil {
 		return err
 	}
-	if p.identity != binding.Process || !samePath(p.executable, binding.Executable) {
+	if p.identity != process || !samePath(p.executable, image) {
 		return errors.New("process birth/image binding changed")
 	}
 	return ownedProcess(p)
