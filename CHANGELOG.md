@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.38 - 2026-11-18
+
 ### Changed
 
 - Watch Git checkouts the way editors such as VS Code and JetBrains IDEs do. The daemon used to watch the whole `.git` folder including `objects/`, re-scan the entire working tree every 60 seconds, and on every edit list every file in the repository and rerun about eight Git commands plus a line count. Now it watches the Git folder's top level and only the ref folders in use, adds or drops a watch when a folder appears or disappears, checks only the changed paths against `.gitignore`, and refreshes with one `git status` limited to those paths. Branch, upstream and ahead/behind are re-read only when refs change, pull request status only when refs or config change, and line totals only when something asks for them. On a clone of this repository with a large ignored build folder: 647 → 381 watches; idle for 2 minutes 18 → 0 Git commands; 20 edits 61 → 19 Git commands, 0.89 → 0.18 CPU seconds, and the first update after 2.0 s instead of 3.1 s; a new folder with 50 files 24 → 2 Git commands.

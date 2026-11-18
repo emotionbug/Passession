@@ -1,0 +1,11 @@
+Changed
+- Status rings and spinners redraw only themselves, and stop while covered or hidden.
+- Git status updates use far fewer Git commands.
+
+Fixed
+- Git status updates live again.
+- No more slowdown from a subagent shown as running but not running.
+- The chat no longer redraws every five seconds while idle.
+- Task and subagent lists act like popovers on wide screens.
+
+Full notes: https://github.com/emotionbug/Passession/releases
