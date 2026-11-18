@@ -97,6 +97,22 @@ Missing text formats and failed locks do not dereference null or unwind through
 the window procedure. `GlobalUnlock` returning zero on the final successful
 unlock is not a Rust error to unwrap.
 
+## macOS input-method composition
+
+`NSTextInputClient` previously retained `setMarkedText` without notifying the
+editor, so Hangul appeared only after `insertText` committed it. Focused editors
+now mirror into a window-owned `ImeComposer`; marked replacements deliver
+`TextImeEvent` snapshots immediately, using Cocoa's UTF-16 replacement and
+selection ranges. `markedRange` and `selectedRange` describe that same mirror.
+`unmarkText` finishes the visible composition without inserting it again.
+
+Focus changes discard the old native composition and fence snapshots to their
+window and editor area. Programmatic discard suppresses re-entrant callbacks.
+Keys that began or continued composition stay with the input method, including
+the Return that commits a syllable, rather than reaching chat submission or
+editor navigation afterward. `ime_composer` tests cover Hangul steps, commit,
+unmark, cancellation, editor switches and supplementary Unicode ranges.
+
 ## Windows input-method composition
 
 Upstream ignored input-method compositions on Windows: the input method drew the

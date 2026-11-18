@@ -12,7 +12,7 @@ mod live_prims;
 mod cx;
 mod cx_api;
 mod frame_trace;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 mod ime_composer;
 
 pub mod action;

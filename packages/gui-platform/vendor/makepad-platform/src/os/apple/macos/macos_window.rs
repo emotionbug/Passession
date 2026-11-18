@@ -1,7 +1,7 @@
 use {
     std::{
         rc::Rc,
-        cell::Cell,
+        cell::{Cell, RefCell},
         os::raw::c_void,
     },
     crate::{
@@ -16,6 +16,7 @@ use {
             }
         },
         area::Area,
+        ime_composer::ImeComposer,
         event::{
             finger::MouseButton,
             ScrollEvent,
@@ -30,6 +31,7 @@ use {
             WindowCloseRequestedEvent,
             WindowClosedEvent,
             TextInputEvent,
+            TextImeEvent,
             DragItem,
         },
     }
@@ -41,6 +43,9 @@ pub struct MacosWindow {
     pub(crate) view: ObjcId,
     pub(crate) window: ObjcId,
     pub(crate) ime_spot: DVec2,
+    pub(crate) ime: Rc<RefCell<ImeComposer>>,
+    pub(crate) ime_discarding: bool,
+    pub(crate) ime_key_consumed: Rc<Cell<bool>>,
     pub(crate) is_fullscreen: bool,
     pub(crate) is_fullscreen_transitioning: bool,
     pub(crate) last_mouse_pos: DVec2,
@@ -73,6 +78,9 @@ impl MacosWindow {
                 backing_generation: 0,
                 last_window_geom: None,
                 ime_spot: DVec2::default(),
+                ime: Rc::default(),
+                ime_discarding: false,
+                ime_key_consumed: Rc::default(),
                 last_mouse_pos: DVec2::default(),
             }
         }
@@ -463,6 +471,21 @@ impl MacosWindow {
         }))
     }
     
+    pub(crate) fn send_text_ime(&mut self, event: TextImeEvent) {
+        let area = self.ime.borrow().area();
+        self.do_callback(MacosEvent::TextIme(self.window_id, area, event));
+    }
+
+    pub(crate) fn discard_marked_text(&mut self) {
+        self.ime_discarding = true;
+        unsafe {
+            let _: () = msg_send![self.view, unmarkText];
+            let context: ObjcId = msg_send![self.view, inputContext];
+            let _: () = msg_send![context, discardMarkedText];
+        }
+        self.ime_discarding = false;
+    }
+
     #[cfg(target_os = "macos")]
     pub fn start_dragging(&mut self,items: Vec<DragItem>) {
         let ns_event: ObjcId =  unsafe{

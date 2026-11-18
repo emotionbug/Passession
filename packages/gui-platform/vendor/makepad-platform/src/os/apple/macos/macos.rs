@@ -38,11 +38,13 @@ use {
         thread::SignalToUI,
         cx_stdin::PollTimers,
         window::WindowId,
+        area::Area,
         event::{
             WindowGeom,
             MouseButton,
             MouseUpEvent,
             Event,
+            TextImeEvent,
             NetworkResponseChannel
         },
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
@@ -178,6 +180,20 @@ impl MetalWindow {
 const KEEP_ALIVE_COUNT: usize = 5;
 
 impl Cx {
+    pub(crate) fn macos_update_text_input(&mut self, area: Area, editor: u64, text: &str, start: usize, end: usize) {
+        if !area.is_valid(self) || !self.has_key_focus(area) { return; }
+        let Some(window_id) = self.area_window_id(area) else { return; };
+        let Some((_, ime)) = self.os.text_inputs.iter().find(|(id, _)| *id == window_id) else { return; };
+        let interruption = ime.borrow_mut().publish(area, editor, text, start, end);
+        if interruption.cancel && !self.os.ime_cancel.contains(&window_id) { self.os.ime_cancel.push(window_id); }
+        if let Some(event) = interruption.notify { self.os.ime_notify.push((window_id, area, event)); }
+    }
+
+    pub(crate) fn macos_clear_text_input(&mut self, area: Area) {
+        for (window_id, ime) in &self.os.text_inputs {
+            if ime.borrow_mut().clear(area) && !self.os.ime_cancel.contains(window_id) { self.os.ime_cancel.push(*window_id); }
+        }
+    }
     
     pub fn event_loop(cx: Rc<RefCell<Cx >>) {
         
@@ -345,7 +361,8 @@ impl Cx {
             MacosEvent::Scroll(_) |
             MacosEvent::KeyDown(_, _) |
             MacosEvent::KeyUp(_, _) |
-            MacosEvent::TextInput(_, _) => {
+            MacosEvent::TextInput(_, _) |
+            MacosEvent::TextIme(_, _, _) => {
                 self.os.keep_alive_counter = KEEP_ALIVE_COUNT;
             }
             MacosEvent::Timer(te) => {
@@ -451,6 +468,9 @@ impl Cx {
                 self.call_event_handler(&Event::WindowClosed(wc));
                 
                 self.windows[window_id].is_created = false;
+                self.os.text_inputs.retain(|(id, _)| *id != window_id);
+                self.os.ime_cancel.retain(|id| *id != window_id);
+                self.os.ime_notify.retain(|(window, _, _)| *window != window_id);
                 if let Some(index) = metal_windows.iter().position( | w | w.window_id == window_id) {
                     metal_windows[index].use_drawable_layer();
                     metal_windows.remove(index);
@@ -537,6 +557,11 @@ impl Cx {
             MacosEvent::TextInput(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::TextInput(e))
             }
+            MacosEvent::TextIme(window_id, area, e) => {
+                if self.has_key_focus(area) && self.area_window_id(area) == Some(window_id) {
+                    self.call_window_event_handler(window_id, &Event::TextIme(e));
+                }
+            }
             MacosEvent::Drag(window_id, e) => {
                 self.call_window_event_handler(window_id, &Event::Drag(e));
                 self.drag_drop.cycle_drag();
@@ -620,6 +645,16 @@ impl Cx {
     }
     
     fn handle_platform_ops(&mut self, metal_windows: &mut Vec<MetalWindow>, metal_cx: &MetalCx)->EventFlow {
+        for window_id in std::mem::take(&mut self.os.ime_cancel) {
+            if let Some(window) = metal_windows.iter_mut().find(|w| w.window_id == window_id) {
+                window.cocoa_window.discard_marked_text();
+            }
+        }
+        for (window_id, area, event) in std::mem::take(&mut self.os.ime_notify) {
+            if self.has_key_focus(area) && self.os.text_inputs.iter().any(|(id, ime)| *id == window_id && ime.borrow().area() == area) {
+                self.call_window_event_handler(window_id, &Event::TextIme(event));
+            }
+        }
         while let Some(op) = self.platform_ops.pop() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
@@ -632,6 +667,7 @@ impl Cx {
                         &window.create_title
                     );
                     window.window_geom = metal_window.window_geom.clone();
+                    self.os.text_inputs.push((window_id, metal_window.cocoa_window.ime.clone()));
                     metal_windows.push(metal_window);
                     window.is_created = true;
                 },
@@ -819,6 +855,9 @@ impl CxOsApi for Cx {
 
 #[derive(Default)]
 pub struct CxOs {
+    pub(crate) text_inputs: Vec<(WindowId, Rc<RefCell<crate::ime_composer::ImeComposer>>)>,
+    pub(crate) ime_cancel: Vec<WindowId>,
+    pub(crate) ime_notify: Vec<(WindowId, Area, TextImeEvent)>,
     pub (crate) keep_alive_counter: usize,
     passes_todo: Vec<PassId>,
     pub (crate) media: CxAppleMedia,

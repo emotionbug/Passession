@@ -359,7 +359,7 @@ impl TextPasteShortcutEvent {
     }
 }
 
-/// Android full-editor snapshot. Offsets are UTF-16 code units.
+/// Full-editor input-method snapshot. Offsets are UTF-16 code units.
 #[derive(Clone, Debug)]
 pub struct TextImeEvent {
     pub session: u64,

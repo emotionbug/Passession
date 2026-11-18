@@ -496,13 +496,20 @@ pub fn define_cocoa_view_class() -> *const Class {
     
     // NSTextInput protocol
     extern "C" fn marked_range(this: &Object, _sel: Sel) -> NSRange {
+        let cw = get_cocoa_window(this);
+        if cw.ime.borrow().has_editor() {
+            return cw.ime.borrow().marked_range().map_or(
+                NSRange { location: i64::MAX as u64, length: 0 },
+                |(start, end)| NSRange { location: start as u64, length: (end - start) as u64 },
+            );
+        }
         unsafe {
             let marked_text: ObjcId = *this.get_ivar("markedText");
             let length = marked_text.length();
             if length >0 {
                 NSRange {
                     location: 0,
-                    length: length - 1
+                    length
                 }
             } else {
                 NSRange {
@@ -513,11 +520,9 @@ pub fn define_cocoa_view_class() -> *const Class {
         }
     }
     
-    extern "C" fn selected_range(_this: &Object, _sel: Sel) -> NSRange {
-        NSRange {
-            location: 0,
-            length: 1,
-        }
+    extern "C" fn selected_range(this: &Object, _sel: Sel) -> NSRange {
+        let (start, end) = get_cocoa_window(this).ime.borrow().selected_range();
+        NSRange { location: start as u64, length: (end - start) as u64 }
     }
     
     extern "C" fn has_marked_text(this: &Object, _sel: Sel) -> BOOL {
@@ -527,7 +532,14 @@ pub fn define_cocoa_view_class() -> *const Class {
         }
     }
     
-    extern "C" fn set_marked_text(this: &mut Object, _sel: Sel, string: ObjcId, _selected_range: NSRange, _replacement_range: NSRange) {
+    fn text_range(range: &NSRange) -> Option<(usize, usize)> {
+        (range.location < i64::MAX as u64).then(|| (
+            range.location as usize, range.location.saturating_add(range.length) as usize,
+        ))
+    }
+
+    extern "C" fn set_marked_text(this: &mut Object, _sel: Sel, string: ObjcId, selected: NSRange, replacement: NSRange) {
+        if get_cocoa_window(this).ime_discarding { return; }
         unsafe {
             let marked_text_ref: &mut ObjcId = this.get_mut_ivar("markedText");
             let _: () = msg_send![(*marked_text_ref), release];
@@ -539,6 +551,13 @@ pub fn define_cocoa_view_class() -> *const Class {
                 marked_text.init_with_string(string);
             };
             *marked_text_ref = marked_text;
+            let characters: ObjcId = msg_send![marked_text, string];
+            let text = nsstring_to_string(characters);
+            let end = text.encode_utf16().count();
+            let cw = get_cocoa_window(this);
+            let event = cw.ime.borrow_mut().replace(&text, text_range(&replacement), Some(text_range(&selected).unwrap_or((end, end))));
+            if let Some(event) = event { cw.send_text_ime(event); }
+            let _: () = msg_send![cw.view, setNeedsDisplay: YES];
         }
     }
     
@@ -547,8 +566,11 @@ pub fn define_cocoa_view_class() -> *const Class {
             let marked_text: ObjcId = *this.get_ivar("markedText");
             let mutable_string = marked_text.mutable_string();
             let _: () = msg_send![mutable_string, setString: get_apple_class_global().const_empty_string.as_id()];
-            let input_context: ObjcId = msg_send![this, inputContext];
-            let _: () = msg_send![input_context, discardMarkedText];
+            let cw = get_cocoa_window(this);
+            if !cw.ime_discarding {
+                let event = cw.ime.borrow_mut().finish();
+                if let Some(event) = event { cw.send_text_ime(event); }
+            }
         }
     }
     
@@ -587,6 +609,7 @@ pub fn define_cocoa_view_class() -> *const Class {
     
     extern "C" fn insert_text(this: &Object, _sel: Sel, string: ObjcId, replacement_range: NSRange) {
         let cw = get_cocoa_window(this);
+        if cw.ime_discarding { return; }
         unsafe {
             let has_attr = msg_send![string, isKindOfClass: class!(NSAttributedString)];
             let characters = if has_attr {
@@ -595,7 +618,9 @@ pub fn define_cocoa_view_class() -> *const Class {
                 string
             };
             let string = nsstring_to_string(characters);
-            cw.send_text_input(string, replacement_range.length != 0);
+            let event = cw.ime.borrow_mut().replace(&string, text_range(&replacement_range), None);
+            if let Some(event) = event { cw.send_text_ime(event); }
+            else { cw.send_text_input(string, replacement_range.length != 0); }
             let input_context: ObjcId = msg_send![this, inputContext];
             let () = msg_send![input_context, invalidateCharacterCoordinates];
             let () = msg_send![cw.view, setNeedsDisplay: YES];
@@ -608,10 +633,15 @@ pub fn define_cocoa_view_class() -> *const Class {
     }
     
     extern "C" fn key_down(this: &Object, _sel: Sel, event: ObjcId) {
-        let _cw = get_cocoa_window(this);
+        let consumed = get_cocoa_window(this).ime_key_consumed.clone();
         unsafe {
+            let before: BOOL = msg_send![this, hasMarkedText];
             let input_context: ObjcId = msg_send![this, inputContext];
-            let () = msg_send![input_context, handleEvent: event];
+            let _: BOOL = msg_send![input_context, handleEvent: event];
+            let after: BOOL = msg_send![this, hasMarkedText];
+            // A Return that confirms composition must not submit the draft;
+            // the same applies to IME-owned navigation and deletion keys.
+            consumed.set(before == YES || after == YES);
         }
     }
     

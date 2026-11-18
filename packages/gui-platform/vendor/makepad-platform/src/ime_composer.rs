@@ -6,12 +6,14 @@
 //! in their undo history. `ImeComposer` mirrors the focused editor as it was last
 //! published and turns each composition step into such a snapshot, so the text being
 //! composed appears in the editor at once instead of in the input method's own window.
+//! Cocoa uses the same mirror for marked-text replacements and unmark/commit.
 
 use crate::{area::Area, event::TextImeEvent};
 
 /// One composition message, already read from the input method. Public only because the
 /// public `Win32Event` carries it; the module itself is private.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[cfg(any(target_os = "windows", test))]
 pub struct CompositionUpdate {
     /// Text the input method committed (`GCS_RESULTSTR`).
     pub result: Option<String>,
@@ -55,6 +57,44 @@ impl<A: Copy + PartialEq + Default> ImeComposer<A> {
         self.editor.is_some()
     }
 
+    /// Cocoa replaces either an explicit document range, the marked text, or the
+    /// selection. A selected range inside the replacement marks it as composing.
+    /// All incoming ranges are UTF-16; the mirror retains UTF-8 byte boundaries.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn replace(&mut self, text: &str, replacement: Option<(usize, usize)>, selected: Option<(usize, usize)>) -> Option<TextImeEvent> {
+        self.editor?;
+        let (start, end) = replacement.map(|(start, end)| (
+            utf16_to_utf8(&self.text, start), utf16_to_utf8(&self.text, end),
+        )).or(self.composing).unwrap_or(self.selection);
+        let (start, end) = (start.min(end), start.max(end));
+        self.text.replace_range(start..end, text);
+        self.composing = selected.filter(|_| !text.is_empty()).map(|_| (start, start + text.len()));
+        self.selection = selected.map_or((start + text.len(), start + text.len()), |(anchor, cursor)| (
+            start + utf16_to_utf8(text, anchor), start + utf16_to_utf8(text, cursor),
+        ));
+        Some(self.snapshot())
+    }
+
+    /// `unmarkText` commits what is already visible; it does not insert it again.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn finish(&mut self) -> Option<TextImeEvent> {
+        self.composing.take()?;
+        Some(self.snapshot())
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub fn marked_range(&self) -> Option<(usize, usize)> {
+        self.composing.map(|(start, end)| (
+            self.text[..start].encode_utf16().count(), self.text[..end].encode_utf16().count(),
+        ))
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub fn selected_range(&self) -> (usize, usize) {
+        let (anchor, cursor) = self.selection;
+        (self.text[..anchor.min(cursor)].encode_utf16().count(), self.text[..anchor.max(cursor)].encode_utf16().count())
+    }
+
     /// Mirrors the focused editor as drawn. A snapshot from `compose` leaves the editor
     /// exactly as mirrored, so any other difference while composing (typing elsewhere, a
     /// click, filtered input, another editor) ends the composition where it stands.
@@ -94,6 +134,7 @@ impl<A: Copy + PartialEq + Default> ImeComposer<A> {
 
     /// Applies one composition message to the mirror and returns the snapshots to deliver,
     /// in order.
+    #[cfg(any(target_os = "windows", test))]
     pub fn compose(&mut self, update: CompositionUpdate) -> Vec<TextImeEvent> {
         let mut events = Vec::new();
         if self.editor.is_none() {
@@ -176,6 +217,66 @@ fn utf16_to_utf8(text: &str, units: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cocoa_marked_text_is_visible_at_each_hangul_step_and_commits_once() {
+        let mut ime = composer("A😀", 5, 5);
+        let mut editor = "A😀".to_owned();
+        for step in ["ㅎ", "하", "한"] {
+            let event = ime.replace(step, None, Some((1, 1))).unwrap();
+            assert_eq!(event.text, format!("A😀{step}"));
+            assert_eq!(event.composing, Some((3, 4)));
+            assert_eq!(ime.marked_range(), Some((3, 4)));
+            assert_eq!(ime.selected_range(), (4, 4));
+            apply(&mut editor, vec![event]);
+            assert!(!ime.publish(1, 7, &editor, editor.len(), editor.len()).cancel);
+        }
+        let event = ime.replace("한", None, None).unwrap();
+        assert_eq!((event.text.as_str(), event.composing), ("A😀한", None));
+        apply(&mut editor, vec![event]);
+        assert!(ime.finish().is_none());
+        apply(&mut editor, vec![ime.replace("ㄱ", None, Some((1, 1))).unwrap()]);
+        apply(&mut editor, vec![ime.replace("글", None, Some((1, 1))).unwrap()]);
+        let event = ime.finish().unwrap();
+        assert_eq!((event.text.as_str(), event.composing), ("A😀한글", None));
+        apply(&mut editor, vec![event]);
+        assert_eq!(editor, "A😀한글");
+        assert!(ime.marked_range().is_none());
+    }
+
+    #[test]
+    fn cocoa_replacement_and_marked_selection_use_document_utf16_ranges() {
+        let mut ime = composer("x😀old!", 8, 5);
+        let mut editor = "x😀old!".to_owned();
+        let event = ime.replace("ㅎ", None, Some((1, 1))).unwrap();
+        assert_eq!(event.text, "x😀ㅎ!");
+        apply(&mut editor, vec![event]);
+        let event = ime.replace("한😀", Some((3, 4)), Some((1, 3))).unwrap();
+        assert_eq!(event.text, "x😀한😀!");
+        assert_eq!(event.composing, Some((3, 6)));
+        assert_eq!(ime.selected_range(), (4, 6));
+        apply(&mut editor, vec![event]);
+        let event = ime.replace("한글", Some((3, 6)), None).unwrap();
+        apply(&mut editor, vec![event]);
+        assert_eq!(editor, "x😀한글!");
+        assert_eq!(ime.selected_range(), (5, 5));
+    }
+
+    #[test]
+    fn cocoa_cancel_and_editor_switch_do_not_restore_stale_composition() {
+        let mut ime = composer("ab", 2, 2);
+        ime.replace("ㅎ", None, Some((1, 1))).unwrap();
+        let event = ime.replace("", None, Some((0, 0))).unwrap();
+        assert_eq!((event.text.as_str(), event.composing), ("ab", None));
+        assert!(ime.finish().is_none());
+        ime.replace("ㅎ", None, Some((1, 1))).unwrap();
+        let interruption = ime.publish(2, 8, "other", 5, 5);
+        assert!(interruption.cancel && interruption.notify.is_none());
+        assert!(ime.finish().is_none());
+        assert_eq!(ime.replace("한", None, None).unwrap().text, "other한");
+        ime.clear(2);
+        assert!(ime.replace("stale", None, None).is_none());
+    }
 
     fn composing(text: &str) -> CompositionUpdate {
         CompositionUpdate { composition: Some(text.into()), ..Default::default() }

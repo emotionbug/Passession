@@ -41,6 +41,7 @@ pub enum MacosEvent {
     WindowDragQuery(WindowDragQueryEvent),
     WindowCloseRequested(WindowCloseRequestedEvent),
     TextInput(WindowId, TextInputEvent),
+    TextIme(WindowId, crate::area::Area, crate::event::TextImeEvent),
     TextPasteShortcut(WindowId, crate::event::TextPasteShortcutEvent),
     Drag(WindowId, DragEvent),
     Drop(WindowId, DropEvent),

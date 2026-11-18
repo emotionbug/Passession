@@ -314,13 +314,15 @@ impl Cx {
     }
 
     /// Publish the focused native editor. Selection offsets are UTF-8 bytes. Android
-    /// mirrors it in the input method; Windows composes into it inline.
+    /// mirrors it in the input method; Windows and macOS compose into it inline.
     pub fn update_text_input(&mut self, _area: Area, _editor: u64, _text: &str, _start: usize,
         _end: usize, _password: bool, _numeric: bool, _single_line: bool) {
         #[cfg(target_os = "android")]
         self.android_update_text_input(_area, _editor, _text, _start, _end, _password, _numeric, false, _single_line);
         #[cfg(target_os = "windows")]
         self.windows_update_text_input(_area, _editor, _text, _start, _end);
+        #[cfg(target_os = "macos")]
+        self.macos_update_text_input(_area, _editor, _text, _start, _end);
     }
 
     /// Publish a terminal's hidden editor: Android asks the input method for plain text
@@ -331,6 +333,8 @@ impl Cx {
         self.android_update_text_input(_area, _editor, _text, _start, _end, false, false, true, false);
         #[cfg(target_os = "windows")]
         self.windows_update_text_input(_area, _editor, _text, _start, _end);
+        #[cfg(target_os = "macos")]
+        self.macos_update_text_input(_area, _editor, _text, _start, _end);
     }
 
     pub fn clear_text_input(&mut self, _area: Area) {
@@ -339,6 +343,8 @@ impl Cx {
         self.android_clear_text_input(_area);
         #[cfg(target_os = "windows")]
         self.windows_clear_text_input(_area);
+        #[cfg(target_os = "macos")]
+        self.macos_clear_text_input(_area);
     }
 
     pub fn hide_text_ime(&mut self) {

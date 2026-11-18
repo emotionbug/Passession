@@ -76,7 +76,7 @@ unsafe fn post_frame_wake(event: ObjcId) {
 use {
     std::{
         rc::Rc,
-        cell::RefCell,
+        cell::{Cell, RefCell},
         time::Instant,
         collections::HashMap,
         os::raw::c_void,
@@ -510,7 +510,7 @@ impl MacosApp {
         (time_now.duration_since(self.time_start)).as_secs_f64() 
     }
     
-    unsafe fn event_window_id(ns_event: ObjcId) -> Option<WindowId> {
+    unsafe fn event_window_input(ns_event: ObjcId) -> Option<(WindowId, Rc<Cell<bool>>)> {
         let window: ObjcId = msg_send![ns_event, window];
         if window == nil {
             return None;
@@ -527,7 +527,8 @@ impl MacosApp {
         if ptr.is_null() {
             return None;
         }
-        Some((*(ptr as *const MacosWindow)).window_id)
+        let window = &*(ptr as *const MacosWindow);
+        Some((window.window_id, window.ime_key_consumed.clone()))
     }
 
     unsafe fn process_ns_event(ns_event: ObjcId) {
@@ -554,12 +555,14 @@ impl MacosApp {
         }
         // sendEvent can invoke responder/IME callbacks or change/close the key window.
         // Preserve the event's own source, never a later key window or widget focus.
-        let window_id = match ev_type {
+        let source = match ev_type {
             NSEventType::NSKeyDown | NSEventType::NSKeyUp | NSEventType::NSFlagsChanged => {
-                Self::event_window_id(ns_event)
+                Self::event_window_input(ns_event)
             }
             _ => None,
         };
+        let window_id = source.as_ref().map(|(window, _)| *window);
+        if let Some((_, consumed)) = &source { consumed.set(false); }
         
         let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
         let () = msg_send![ns_app, sendEvent: ns_event];
@@ -590,6 +593,7 @@ impl MacosApp {
                 }
             },
             NSEventType::NSKeyDown => {
+                if source.as_ref().is_some_and(|(_, consumed)| consumed.get()) { return; }
                 let Some(window_id) = window_id else { return };
                 if let Some(key_code) = get_event_keycode(ns_event) {
                     let modifiers = get_event_key_modifier(ns_event);
