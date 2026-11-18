@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.37 - 2026-11-18
+
 ### Added
 
 - Terminate a terminal from its header menu, its tab menu on desktop, or its row in the sidebar. After you confirm and the daemon has stopped it, every window closes the terminal and its sidebar row disappears; if it could not be stopped, an error is shown and the terminal stays. Going back from a terminal on a phone still leaves it running. The daemon now removes a terminal only after it has actually stopped.

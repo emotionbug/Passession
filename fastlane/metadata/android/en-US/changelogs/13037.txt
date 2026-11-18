@@ -1,0 +1,13 @@
+Added
+- Terminate a terminal from its header or sidebar menu.
+
+Fixed
+- Tapping a terminal opens the keyboard; closing it no longer blocks taps.
+- Settings no longer stays on "Verifying" after a daemon update.
+- Sheets no longer flicker while a subagent streams.
+- One host name everywhere.
+
+Removed
+- Old Flutter-era data and settings are no longer imported.
+
+Full notes: https://github.com/emotionbug/Passession/releases
