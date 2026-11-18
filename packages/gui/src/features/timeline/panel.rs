@@ -939,6 +939,11 @@ fn error_text(value: &Value) -> Option<String> {
 }
 
 impl ChatPanel {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn transcript_draw_list_id(&self) -> DrawListId {
+        self.timeline_list.id()
+    }
+
     fn redraw_timeline(&self, cx: &mut Cx) {
         self.timeline_list.redraw(cx);
     }

@@ -991,7 +991,7 @@ impl PaseoShell {
         self.data.overlays.sync_focus(cx);
         compact::animate(self, cx, event);
         chrome::animate_explorer(self, cx, event);
-        chrome::sync_hidden(self, cx);
+        chrome::sync_panel_activity(self, cx);
         overlay_api::shield_content(cx, &self.data.window_id, self.data.overlays.area, false);
         if self.data.layout.revision != self.data.presented_layout {
             self.data.presented_layout = self.data.layout.revision;
@@ -1378,5 +1378,46 @@ mod dispatch_tests {
         let after = window.dispatch_layout();
         assert!(!Rc::ptr_eq(&before.snapshot, &after.snapshot));
         assert!(Rc::ptr_eq(&after, &window.dispatch_layout()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compact_reentry_redraws_retained_transcript_on_first_frame() {
+        use crate::common::PanelTarget;
+        use crate::features::timeline::ChatPanelWidgetRefExt;
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        PaseoShell::register_main_module(&mut cx);
+        crate::app::live_design(&mut cx);
+        cx.live_expand();
+        cx.live_scan_dependencies();
+        cx.native_load_dependencies();
+        let mut shell = PaseoShell::new_local(&mut cx);
+        shell.data.compact = true;
+        let target = PanelTarget::agent("srv", "ws", "/w", "streaming", "");
+        let panel = panels::mount(&mut cx, &shell.templates, &target).unwrap();
+        let transcript = panel
+            .widget
+            .as_chat_panel()
+            .borrow()
+            .unwrap()
+            .transcript_draw_list_id();
+        shell.data.panels.insert(target.key(), panel);
+        shell.data.layout.open(target.clone(), false);
+        chrome::sync_panel_activity(&mut shell, &mut cx);
+        shell.data.layout.show_sidebar(true, true);
+        chrome::sync_panel_activity(&mut shell, &mut cx);
+
+        // Neither a new server event nor an animation tick should be needed.
+        cx.new_draw_event = DrawEvent::default();
+        shell.data.layout.open(target, false);
+        let overlay_key = shell.data.overlays.presentation_key();
+        shell.finish_dispatch(
+            &mut cx,
+            &Event::Actions(Vec::new()),
+            &mut Scope::empty(),
+            overlay_key,
+        );
+        assert!(cx.new_draw_event.draw_list_will_redraw(&cx, transcript));
     }
 }

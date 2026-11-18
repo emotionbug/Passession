@@ -155,6 +155,11 @@ impl LayerTexture {
         cx.passes[self.pass.pass_id()].view_shift = bounds.pos;
     }
 
+    /// The retained source changed without changing the capture bounds or texture.
+    pub(crate) fn repaint(&self, cx: &mut Cx) {
+        cx.repaint_pass(self.pass.pass_id());
+    }
+
     /// A settled or detached surface no longer needs a render target.
     pub fn detach(&self, cx: &mut Cx) {
         self.pass.clear_color_textures(cx);

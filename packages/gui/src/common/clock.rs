@@ -38,6 +38,12 @@ pub fn occlude(cx: &mut Cx2d, rect: Rect) -> Area {
     area
 }
 
+enum Visibility {
+    Visible,
+    Hidden,
+    Stale,
+}
+
 #[derive(Default)]
 struct PaintOrder {
     lists: HashMap<DrawListId, (DrawListId, usize)>,
@@ -49,6 +55,9 @@ impl PaintOrder {
         self.lists.clear();
         self.covers.clear();
         for area in covers.values() {
+            if !area.is_attached(cx) {
+                continue;
+            }
             let list = area.draw_list_id().unwrap();
             if !self.lists.contains_key(&list)
                 && let Some(pass) = cx.draw_lists[list].pass_id
@@ -75,6 +84,21 @@ impl PaintOrder {
             if let Some(child) = list.draw_items[index].sub_list() {
                 self.visit(cx, root, child);
             }
+        }
+    }
+
+    fn visibility(&self, cx: &Cx, area: Area) -> Visibility {
+        if area.is_attached(cx) {
+            if self.suppresses(cx, area) {
+                Visibility::Hidden
+            } else {
+                Visibility::Visible
+            }
+        } else if area.is_valid(cx) {
+            // A retained scene can reattach without painting its indicators again.
+            Visibility::Hidden
+        } else {
+            Visibility::Stale
         }
     }
 
@@ -263,12 +287,13 @@ impl Clock {
     }
 
     fn fire(&mut self, cx: &mut Cx, mut entry: Deadline, now: Instant, wall_ms: u128) {
-        if !entry.area.is_attached(cx) {
-            return;
-        }
-        if self.paint_order.suppresses(cx, entry.area) {
-            self.parked.insert(entry.target(), entry);
-            return;
+        match self.paint_order.visibility(cx, entry.area) {
+            Visibility::Visible => {}
+            Visibility::Hidden => {
+                self.parked.insert(entry.target(), entry);
+                return;
+            }
+            Visibility::Stale => return,
         }
         if let Some(effect) = entry.effect {
             let updated = match effect {
@@ -300,37 +325,35 @@ impl Clock {
     }
 
     fn finish_draw(&mut self, cx: &mut Cx, now: Instant) {
-        self.covers.retain(|_, area| area.is_attached(cx));
+        self.covers.retain(|_, area| area.is_valid(cx));
         if self.parked.is_empty() && self.schedule.entries.is_empty() {
             self.arm(cx, now);
             return;
         }
         self.paint_order.gather(cx, &self.covers);
         self.parked.retain(|&target, entry| {
-            if !entry.area.is_attached(cx) {
-                return false;
+            match self.paint_order.visibility(cx, entry.area) {
+                Visibility::Visible => {}
+                Visibility::Hidden => return true,
+                Visibility::Stale => return false,
             }
-            if self.paint_order.suppresses(cx, entry.area) {
-                return true;
-            }
-            // A retained area may have been covered for longer than its deadline.
-            // One immediate wake refreshes it without waiting for a new model draw.
+            // On reattachment or uncover, sample wall time before the next period.
             entry.when = now;
             self.schedule.ordered.insert((now, target));
             self.schedule.entries.insert(target, *entry);
             false
         });
         self.schedule.entries.retain(|&target, entry| {
-            let attached = entry.area.is_attached(cx);
-            let suppressed = attached && self.paint_order.suppresses(cx, entry.area);
-            if !attached || suppressed {
-                self.schedule.ordered.remove(&(entry.when, target));
-                if suppressed {
-                    self.parked.insert(target, *entry);
+            match self.paint_order.visibility(cx, entry.area) {
+                Visibility::Visible => true,
+                visibility => {
+                    self.schedule.ordered.remove(&(entry.when, target));
+                    if matches!(visibility, Visibility::Hidden) {
+                        self.parked.insert(target, *entry);
+                    }
+                    false
                 }
-                return false;
             }
-            true
         });
         self.arm(cx, now);
     }
@@ -666,6 +689,87 @@ mod tests {
 #[cfg(test)]
 mod paint_tests {
     use super::*;
+
+    #[test]
+    fn retained_elapsed_deadline_wakes_on_return_without_input() {
+        use makepad_widgets::makepad_draw::CxDraw;
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        makepad_widgets::makepad_draw::live_design(&mut cx);
+        crate::theme::live_design(&mut cx);
+        crate::theme::DrawBox::register_main_module(&mut cx);
+        cx.live_expand();
+        let pass = Pass::new(&mut cx);
+        pass.set_size(&mut cx, dvec2(100.0, 80.0));
+        let mut root = DrawList2d::new(&mut cx);
+        let mut scene = DrawList2d::new(&mut cx);
+        let mut label = DrawList2d::new(&mut cx);
+        let mut area = Area::Empty;
+        let event = DrawEvent::default();
+        {
+            let mut draw = CxDraw::new(&mut cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            root.begin_always(&mut draw);
+            scene.begin_always(&mut draw);
+            label.begin_always(&mut draw);
+            let mut draw = Cx2d::new(&mut draw);
+            draw.begin_pass_sized_turtle(Layout::default());
+            draw.add_rect_area(
+                &mut area,
+                Rect {
+                    pos: DVec2::default(),
+                    size: dvec2(40.0, 16.0),
+                },
+            );
+            draw.end_pass_sized_turtle();
+            label.end(&mut draw);
+            scene.end(&mut draw);
+            root.end(&mut draw);
+            draw.end_pass(&pass);
+        }
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let mut clock = Clock::new();
+        clock.schedule.insert(Deadline {
+            when: deadline,
+            area,
+            period: None,
+            effect: None,
+        });
+        clock.finish_draw(&mut cx, now);
+        assert_eq!(clock.armed, Some(deadline));
+
+        let mut show_scene = |cx: &mut Cx, show| {
+            let mut draw = CxDraw::new(cx, &event);
+            draw.begin_pass(&pass, Some(1.0));
+            root.begin_always(&mut draw);
+            if show {
+                assert!(scene.begin_maybe(&mut draw, false).is_err()); // retained replay
+            }
+            root.end(&mut draw);
+            draw.end_pass(&pass);
+        };
+        show_scene(&mut cx, false);
+        clock.finish_draw(&mut cx, now);
+        assert_eq!(clock.armed, None);
+
+        show_scene(&mut cx, true);
+        let returned = now + Duration::from_secs(4);
+        clock.finish_draw(&mut cx, returned);
+        let due = clock.schedule.pop_due(returned).expect("overdue label");
+        cx.new_draw_event = DrawEvent::default();
+        clock.fire(&mut cx, due, returned, 0);
+        assert!(cx.new_draw_event.draw_lists.contains(&label.id()));
+
+        // A due wake racing the hide must park too; a replaced label must not revive.
+        show_scene(&mut cx, false);
+        clock.fire(&mut cx, due, returned, 0);
+        assert!(clock.parked.contains_key(&due.target()));
+        label.release(&mut CxDraw::new(&mut cx, &event));
+        clock.finish_draw(&mut cx, returned);
+        assert!(clock.parked.is_empty());
+        assert_eq!(clock.armed, None);
+    }
 
     #[test]
     fn indicator_clock_caret_follows_its_token_without_redrawing() {

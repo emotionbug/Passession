@@ -73,7 +73,21 @@ struct OverlayEntry {
 }
 impl CxDrawListPool {
     pub fn alloc(&mut self) -> DrawList {
-        DrawList(self.pool.alloc())
+        let id = self.pool.alloc();
+        if id.generation != 0 {
+            // A new owner can reuse the backing buffers, not their paint or viewport.
+            let list = &mut self.pool.pool[id.id];
+            list.clear_draw_items(0);
+            list.draw_list_uniforms = CxDrawListUniforms::default();
+            list.draw_list_has_clip = false;
+            list.pass_id = None;
+            list.codeflow_parent_id = None;
+            list.codeflow_parent_redraw_id = 0;
+            list.overlay_rank = OverlayRank::default();
+            list.overlay_order_index = 0;
+            list.debug_id = LiveId::default();
+        }
+        DrawList(id)
     }
 
     #[cfg(target_os = "android")]
@@ -648,6 +662,29 @@ impl CxDrawList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recycled_list_does_not_clip_the_next_owners_hit_area() {
+        use crate::area::{Area, RectArea};
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let shimmer = DrawList::new(&mut cx);
+        let old = shimmer.id();
+        cx.draw_lists[old].draw_list_has_clip = true;
+        cx.draw_lists[old].draw_list_uniforms.view_clip = vec4(5.0, 0.0, 8.0, 20.0);
+        drop(shimmer);
+
+        let sheet = DrawList::new(&mut cx);
+        let id = sheet.id();
+        assert_eq!(old.index(), id.index());
+        let rect = Rect { pos: dvec2(20.0, 40.0), size: dvec2(100.0, 30.0) };
+        cx.draw_lists[id].rect_areas.push(CxRectArea {
+            rect, draw_clip: (rect.pos, rect.pos + rect.size),
+        });
+        let hit = Area::Rect(RectArea { draw_list_id: id, rect_id: 0, redraw_id: 0 });
+        assert_eq!(hit.clipped_rect(&cx), rect);
+        assert_eq!(cx.draw_lists[id].draw_list_uniforms.view_clip, CxDrawListUniforms::default().view_clip);
+    }
 
     #[test]
     fn draw_call_uniform_slice_covers_only_its_storage() {

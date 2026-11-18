@@ -1226,16 +1226,19 @@ fn paint_root(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, key: &st
     cx.set_timer_owner(previous);
 }
 
-/// Roots that were visible last frame but are hidden now get `set_visible(false)`.
-pub(super) fn sync_hidden(shell: &mut PaseoShell, cx: &mut Cx) {
+/// Activate retained panels before draw. Draw-list invalidations are ignored during
+/// paint, so waiting until then would capture the old transcript for the transition.
+pub(super) fn sync_panel_activity(shell: &mut PaseoShell, cx: &mut Cx) {
     let layout = shell.dispatch_layout();
     if !std::mem::take(&mut shell.data.visibility_sync_pending) {
         return;
     }
     for (key, panel) in shell.data.panels.iter_mut() {
-        if panel.visible && !layout.visible.contains(key) {
+        let visible = layout.visible.contains(key);
+        let focused = visible && layout.focused.as_ref() == Some(key);
+        if panel.visible != visible || panel.focused != focused {
             let previous = cx.set_timer_target(panel.widget.widget_uid().0);
-            panels::set_activity(cx, panel, false, false);
+            panels::set_activity(cx, panel, visible, focused);
             cx.set_timer_owner(previous);
         }
     }

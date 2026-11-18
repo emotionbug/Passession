@@ -1364,6 +1364,14 @@ fn draw_tree(
         },
     );
     let mut ui = make_ui(shell);
+    // Reserve the selection behind the tree. Icons can batch with an earlier
+    // host glyph; status badges must still paint over those icons.
+    let backdrop_group = ui.painter.new_layer(cx);
+    ui.painter
+        .draw_box
+        .draw_vars
+        .set_draw_call_group(live_id!(sidebar_foreground));
+    let mut selected_row = None;
     ui.hits.set_clip(Some(band));
     let p = ui.p;
     let mut y = list.pos.y;
@@ -1651,7 +1659,7 @@ fn draw_tree(
                     t.kind == "agent" && t.server_id == sid && t.id.as_deref() == Some(agent_id)
                 });
                 if is_selected {
-                    ui.fill(cx, row, p.border, 6.0);
+                    selected_row = Some(row);
                 }
                 let hovered =
                     ui.is_hover(&id) || ui.is_hover(&format!("sessionedit:{sid}:{agent_id}"));
@@ -1753,7 +1761,7 @@ fn draw_tree(
                         && t.id.as_deref() == Some(terminal.id.as_str())
                 });
                 if is_selected {
-                    ui.fill(cx, row, p.border, 6.0);
+                    selected_row = Some(row);
                 }
                 let attention = !j::text(&terminal.activity, "attentionReason").is_empty();
                 let trailing = if ui.compact { 36.0 } else { 20.0 };
@@ -1866,6 +1874,13 @@ fn draw_tree(
             true,
         );
         y += button_h + 16.0;
+    }
+    ui.painter
+        .draw_box
+        .draw_vars
+        .set_draw_call_group(backdrop_group);
+    if let Some(row) = selected_row {
+        ui.fill(cx, row, p.border, 6.0);
     }
     y += 8.0;
     ui.hits.set_clip(None);

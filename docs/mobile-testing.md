@@ -13,6 +13,9 @@ Start a disposable Rust daemon with `cargo xtask dev daemon` or an explicitly is
 Exercise compact and wide layouts, keyboard visible/hidden, rotation/resize, foreground/background, disconnect/reconnect, and persisted restart. Record the exact OS/device/build and whether it is a simulator/emulator or hardware.
 
 - Host → directory → session navigation, empty directories, collapse persistence, filtering and same-path isolation between hosts.
+- Select an idle session and return to the sidebar. The highlighted row must still show its chat outline. Switch to a running session and return: both rows must keep their outlines, with the running badge over the selected icon.
+- With a connected, streaming session at the latest message, open the sidebar. Have a distinctive new row arrive while the sidebar is visible, then immediately reselect the same session. Capture the transition: the first readable conversation frame should include that row, without scrolling or waiting for another event. Test reconnect separately.
+- Repeat the return with a running turn less than an hour old and no incoming messages. Without touching the screen, watch its elapsed label and activity dots for at least six seconds: the seconds must advance without a multi-second pause and catch-up jump.
 - Back from file explorer to session, session to sidebar, and leaving the app without stopping remote work.
 - Add Project through the selected daemon's remote folder browser.
 - Chat streaming, draft retention, Korean IME composition during streaming, permissions, session rename/import/history and closing a tab without archiving. Exercise composing-syllable replacement, backspace, selection, focus transfer and keyboard dismissal, not only pasted Korean text.

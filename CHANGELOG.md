@@ -4,7 +4,11 @@
 
 ### Fixed
 
-- Fix blank areas, leftover pieces of earlier screens, flicker, and animations that looked stuck until you scrolled on Android. On a OnePlus 15 (Adreno 840), redrawing only the changed parts of the screen left stale and missing regions, so Android draws the whole screen for every new frame again, as in 0.13.41. `adb shell setprop debug.paseo.partial_redraw 1` turns partial redraws back on for testing a device.
+- Show updates received while the session list was open as soon as the conversation slides back into view, instead of briefly showing the old transcript.
+- Resume elapsed-time labels and running indicators when returning to a session, without waiting for a scroll or another message.
+- Keep the chat icon visible on the highlighted sidebar row, including when the session is idle and has no status badge.
+- Fix recycled drawing layers carrying a previous animation's clip or position into new content. This could hide parts of a row or sheet and shrink its touch target even on a fully redrawn frame.
+- Android currently defaults to full redraws while partial presentation is tested across devices. Set `adb shell setprop debug.paseo.partial_redraw 1` and restart the app to enable partial redraws.
 
 ## 0.13.42 - 2026-11-18
 

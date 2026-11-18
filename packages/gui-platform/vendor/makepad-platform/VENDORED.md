@@ -783,13 +783,16 @@ from the immediately preceding presentation. Age zero, an insufficient
 history, resize, expose/recreation, failed binding or presentation never
 use assumed backbuffer contents. Culling preserves depth-bias order.
 
-Android uses the same code but repaints in full by default. On a OnePlus 15
-(Adreno) partial presentation left stale fragments and blank regions on
-screen; the device exposes `EGL_KHR_partial_update`, which no desktop Mesa
-driver used here exercises. `adb shell setprop debug.paseo.partial_redraw 1`
-re-enables partial repair and `debug.paseo.verify_damage 1` adds the
-same-frame pixel oracle (`paseo_damage` lines in logcat); restart the app
-after setting either. Verify on Adreno and Mali before making it the default.
+Draw-list pool slots retain backing buffers across allocations, but a new
+owner starts with no draw items, viewport, transform, or attachment. A stale
+viewport affects both painting and touch bounds; partial and full rendering
+of the same incorrect list can therefore agree pixel-for-pixel.
+
+Android uses the same EGL damage code but repaints in full by default.
+`adb shell setprop debug.paseo.partial_redraw 1` enables partial repair;
+`debug.paseo.verify_damage 1` adds the same-frame pixel comparison
+(`paseo_damage` in logcat). Restart the app after setting either. Verify on
+Adreno and Mali before enabling partial repair by default.
 
 Windows uses flip-sequential `Present1` dirty rectangles with D3D11.1
 `ClearView` and a scissor. DXGI reconciles old backbuffer contents outside

@@ -223,6 +223,7 @@ impl Navigation {
                     self.scenes.len() - 1
                 }
             });
+        self.scenes[self.target].chrome.invalidate(cx);
         self.scenes[self.target].to = Visual::default();
         self.textured =
             !matches!(style.pattern, Pattern::CupertinoPush { .. }) || self.scenes.len() > 2;
@@ -332,25 +333,33 @@ pub(super) fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: 
         backdrop.w = 1.0;
         shell.painter.fill(cx, r, backdrop, 0.0);
         let t = nav.transition.value();
-        for scene in &mut nav.scenes {
+        for (index, scene) in nav.scenes.iter_mut().enumerate() {
             let pose = scene.pose(t);
             let rect = layer_rect(r, pose, dvec2(0.5, 0.5));
             if scene.from.edge_shadow != 0.0 || scene.to.edge_shadow != 0.0 {
                 scene.shadow = draw_scrim(shell, cx, edge_rect(rect), pose.edge_shadow * 0.14);
             }
+            // Freeze the outgoing scene, not the conversation being opened. A
+            // reversal or a dirty child needs current paint; motion alone reuses it.
+            let paint = scene.list.as_ref().is_none_or(|list| {
+                index == nav.target
+                    && (!nav.ready || cx.draw_event.draw_list_will_redraw(cx, list.id()))
+            });
+            if paint {
+                paint_scene(shell, cx, scope, r, scene, false);
+            }
             if nav.textured {
-                if scene.texture.is_none() {
-                    if scene.list.is_none() {
-                        paint_scene(shell, cx, scope, r, scene, false);
-                        let parent = composition.draw_list_id();
-                        let source = scene.list.as_ref().unwrap().draw_list_id();
-                        cx.draw_lists[parent].detach_sub_list(source);
+                let list = scene.list.as_ref().unwrap();
+                if paint {
+                    cx.draw_lists[composition.draw_list_id()].detach_sub_list(list.id());
+                }
+                if let Some(texture) = &scene.texture {
+                    if paint {
+                        texture.repaint(cx);
                     }
-                    // Both surfaces already have retained window-coordinate draw calls. Replay
-                    // them into the offscreen target without remeasuring the widget tree.
-                    let list = scene.list.as_ref().unwrap();
+                } else {
                     list.set_view_transform(cx, &Mat4::identity());
-                    scene.texture = Some(LayerTexture::capture_bounds(cx, list.draw_list_id(), r));
+                    scene.texture = Some(LayerTexture::capture_bounds(cx, list.id(), r));
                 }
                 let texture = scene.texture.as_ref().unwrap();
                 scene.composite = shell.overlay_composite.draw_texture(
@@ -359,10 +368,8 @@ pub(super) fn draw(shell: &mut PaseoShell, cx: &mut Cx2d, scope: &mut Scope, r: 
                     &texture.texture,
                     pose.opacity as f32,
                 );
-            } else if let Some(list) = &scene.list {
-                cx.append_sub_draw_list(list);
-            } else {
-                paint_scene(shell, cx, scope, r, scene, false);
+            } else if !paint {
+                cx.append_sub_draw_list(scene.list.as_ref().unwrap());
             }
             if scene.from.dim != 0.0 || scene.to.dim != 0.0 {
                 scene.dim = draw_scrim(shell, cx, rect, pose.dim);
