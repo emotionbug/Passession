@@ -498,16 +498,11 @@ impl MacosWindow {
                 DragItem::FilePath{path, internal_id}=>{
                     let pasteboard_item: ObjcId = unsafe {msg_send![class!(NSPasteboardItem), new]};
                     let _: () = unsafe {
+                        let url = super::file_drag::to_url(&path, internal_id);
+                        let string: ObjcId = msg_send![url, absoluteString];
                         msg_send![
                             pasteboard_item,
-                            setString: str_to_nsstring(
-                                &if let Some(id) = internal_id{
-                                    format!("file://{}#makepad_internal_id={}", if path.len()==0{"makepad_internal_empty"}else {&path}, id.0)
-                                }
-                                else{
-                                    format!("file://{}",if path.len()==0{"makepad_internal_empty"}else {&path})
-                                }
-                            )
+                            setString: string
                             forType: NSPasteboardTypeFileURL
                         ]
                     };

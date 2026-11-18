@@ -605,7 +605,7 @@ nothing. They now call `XResizeWindow` and `XMoveWindow`, followed by `XFlush`.
 Resize uses logical size × DPI, matching window creation and `get_inner_size`;
 position remains in X11 pixels, matching creation and `get_position`.
 
-## Desktop file drops (X11, Windows)
+## Desktop file drops (X11, Windows, macOS)
 
 Dragging files from the desktop onto a window did not work on Linux at all and only
 partly on Windows.
@@ -645,10 +645,19 @@ effects, possibly *move*, as the result), and never sent `Event::DragEnd`. Now:
   the Drop;
 - `DragLeave` of any drag, and the end of a drop, produce `Event::DragEnd`.
 
-**Both**: a drag has one target window and its position is in that window's
+**macOS** (`os/apple/macos/file_drag.rs`, shared by the source and destination
+callbacks). NSURL's decoded filesystem path is used instead of stripping
+`file://` from `absoluteString`, which left Korean names percent-encoded and
+made attachment reads fail. Native file URLs also encode outgoing paths;
+internal IDs use the URL fragment separately from literal `#` in filenames.
+Native Foundation tests read real files with composed/decomposed Hangul,
+spaces, emoji, literal percent sequences and fragment-like names, and cover
+internal-ID and empty-path round trips.
+
+**Window routing**: a drag has one target window and its position is in that window's
 coordinates, so `Drag`/`Drop` are dispatched through `call_window_event_handler` and
 `Cx::drag_event_is_for_window` (`os/cx_shared.rs`) lets the adjacent widgets patch keep
-other windows from hit-testing them. macOS still broadcasts. X11 now cycles `drag_hits`
+other windows from hit-testing them. X11 now cycles `drag_hits`
 state after each drag event like the other desktops.
 
 ## Scoped timer delivery

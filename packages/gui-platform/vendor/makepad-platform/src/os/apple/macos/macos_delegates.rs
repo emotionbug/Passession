@@ -2,7 +2,6 @@ use {
     std::{
         sync::Arc,
         sync::Mutex,
-        ffi::CStr,
         os::raw::c_void,
     },
     crate::{
@@ -769,36 +768,8 @@ pub fn define_cocoa_view_class() -> *const Class {
         let mut items = Vec::with_capacity(count);
         for index in 0..count {
             let url: ObjcId = unsafe {msg_send![urls, objectAtIndex: index]};
-            let url: ObjcId = unsafe {msg_send![url, filePathURL]};
-            if url == nil {
-                continue;
-            }
-            let string: ObjcId = unsafe {msg_send![url, absoluteString]};
-            if string == nil {
-                continue;
-            }
-            let string = unsafe {CStr::from_ptr(msg_send![string, UTF8String])};
-            if let Ok(string) = string.to_str() {
-                // lets rip off file:// and #id
-                if let Some(string) = string.strip_prefix("file://") {
-                    let mut bits = string.split("#makepad_internal_id=");
-                    let path = bits.next().unwrap().to_string();
-                    let internal_id = if let Some(next) = bits.next() {
-                        if let Ok(id) = next.parse::<u64>() {
-                            Some(LiveId(id))
-                        }
-                        else {
-                            None
-                        }
-                    }
-                    else {
-                        None
-                    };
-                    items.push(DragItem::FilePath {
-                        internal_id,
-                        path: if path == "makepad_internal_empty" {"".to_string()}else {path}
-                    });
-                }
+            if let Some(item) = unsafe {super::file_drag::from_url(url)} {
+                items.push(item);
             }
             
         }
