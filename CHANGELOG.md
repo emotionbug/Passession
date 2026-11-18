@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Publish current installers with every release that changes the app, daemon, Tailnet or update helper. A release only rebuilt the Windows installer, Linux deb and AppImage when the packaging files changed, so 0.13.41 published none and pointed new installs at 0.13.40's installers, which installed a daemon without the tray icon. An installer now gets rebuilt whenever a component inside it is rebuilt.
+
 ## 0.13.41 - 2026-11-18
 
 ### Added

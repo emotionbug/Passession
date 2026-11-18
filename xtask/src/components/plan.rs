@@ -643,9 +643,15 @@ pub(crate) fn decide(
     let packages = prior.map(|p| p.packages.clone()).unwrap_or_default();
     let atomic_change =
         !atomic_groups.is_empty() && atomic_groups.iter().flatten().any(|id| build.contains(id));
+    // A package bundles exact component images, so a rebuilt image makes every
+    // package that contains it stale even when the packaging inputs are unchanged.
+    let bundled_change = packages
+        .iter()
+        .any(|package| package.components.keys().any(|id| build.contains(id)));
     let package = packages.is_empty()
         || prior_package_hash != Some(package_input_hash.as_str())
-        || atomic_change;
+        || atomic_change
+        || bundled_change;
     Ok(TargetPlan {
         target: target.into(),
         build: build.into_iter().collect(),
@@ -1034,12 +1040,33 @@ mod tests {
             )
             .unwrap();
             assert_eq!(plan.build, vec![id]);
-            assert!(!plan.package);
+            assert!(
+                plan.package,
+                "a rebuilt {id:?} makes the bundled package stale"
+            );
             assert_eq!(plan.packages, prior.packages);
             for (id, reference) in plan.reuse {
                 assert_eq!(reference, prior.components[&id]);
             }
         }
+        // A package that does not bundle the rebuilt component stays as it is.
+        let mut unbundled = prior.clone();
+        unbundled.packages[0]
+            .components
+            .remove(&ComponentId::Daemon);
+        let mut daemon_only = inputs.clone();
+        daemon_only.insert(ComponentId::Daemon, "f".repeat(64));
+        assert!(
+            !decide(
+                "linux-x64",
+                daemon_only,
+                "e".repeat(64),
+                Some(&unbundled),
+                Some(&"e".repeat(64)),
+            )
+            .unwrap()
+            .package
+        );
         let mut shared = inputs.clone();
         shared.insert(ComponentId::App, "f".repeat(64));
         shared.insert(ComponentId::Daemon, "f".repeat(64));
