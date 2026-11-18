@@ -81,6 +81,16 @@ source; it remains PTY input even when X11 clipboard replies arrive after later
 keys. Ordinary editors allow it by default. Menu, native text-action and IME
 paste delivery does not use this veto; serialized `TextInputEvent` is unchanged.
 
+### macOS Command key equivalents
+
+Owned-window Command keys check the native application menu before text-input
+dispatch. A handled menu key is not delivered again as a raw key (which could
+execute New Window twice). If the original equivalent is unmatched and carries
+non-ASCII input-source text, `key_equivalent.rs` retries the physical key's ASCII
+equivalent, so Korean `ㅂ` at Q can invoke Command-Q. The original equivalent
+retains priority; Latin layouts, ordinary composition and Control keys are not
+rewritten. AppKit panels retain their own responder/menu routing.
+
 ### Horizontal mouse wheel
 
 X11 button 4/5 and Windows `WM_MOUSEWHEEL` become horizontal scrolling while

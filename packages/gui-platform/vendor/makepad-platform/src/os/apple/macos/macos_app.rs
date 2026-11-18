@@ -563,6 +563,11 @@ impl MacosApp {
         };
         let window_id = source.as_ref().map(|(window, _)| *window);
         if let Some((_, consumed)) = &source { consumed.set(false); }
+        // Let the native menu consume a shortcut once, before the text input
+        // context or the app's raw-key handlers can interpret the same key.
+        if ev_type == NSEventType::NSKeyDown && source.is_some() && super::key_equivalent::perform(ns_event) {
+            return;
+        }
         
         let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
         let () = msg_send![ns_app, sendEvent: ns_event];
