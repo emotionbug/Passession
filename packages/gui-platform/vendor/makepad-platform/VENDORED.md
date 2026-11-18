@@ -382,6 +382,12 @@ implemented:
 
 `x11_sys.rs` gains the `XWithdrawWindow` and `XMapRaised` bindings.
 
+X11 `WM_DELETE_WINDOW` now dispatches `Event::WindowCloseRequested` and
+only destroys the window if the app accepts it. Previously every
+`WM_PROTOCOLS` client message bypassed the shell's close guard and destroyed
+the target. The Openbox smoke sends `_NET_CLOSE_WINDOW` and checks that a
+refusal leaves the window visible, then that closing the last window exits.
+
 ### macOS zoom and native fullscreen (PlatformNative)
 
 `MaximizeWindow` / `RestoreWindow` now use `isZoomed` and guarded `zoom:`,

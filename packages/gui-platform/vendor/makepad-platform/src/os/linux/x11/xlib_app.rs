@@ -631,10 +631,18 @@ impl XlibApp {
                 },
                 x11_sys::ClientMessage => {
                     let event = event.xclient;
-                    if event.message_type == self.atoms.wm_protocols {
+                    // WM_DELETE_WINDOW is a request, not permission to destroy
+                    // the window. Match the close protocol before giving the app
+                    // a chance to run its document and application close guards.
+                    if event.message_type == self.atoms.wm_protocols
+                        && event.format == 32
+                        && event.data.l[0] as x11_sys::Atom == self.atoms.wm_delete_window
+                    {
                         if let Some(window_ptr) = self.window_map.get(&event.window) {
                             let window = &mut (**window_ptr);
-                            window.close_window();
+                            if window.send_close_requested_event() {
+                                window.close_window();
+                            }
                         }
                     }
                     let step = if event.message_type == self.dnd.atoms.enter {
