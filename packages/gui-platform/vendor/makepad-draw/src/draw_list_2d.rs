@@ -20,7 +20,9 @@ pub trait DrawListExt{
     fn begin_maybe(&mut self, cx: &mut CxDraw, will_redraw: bool) -> Redrawing ;
     fn end(&mut self, cx: &mut CxDraw) ;
     fn get_view_transform(&self, cx: &Cx) -> Mat4;
+    #[track_caller]
     fn redraw(&self, cx: &mut Cx) ;
+    #[track_caller]
     fn redraw_self_and_children(&self, cx: &mut Cx);
 }
 

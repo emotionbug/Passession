@@ -33,6 +33,7 @@ pub struct Layer {
 
 impl Layer {
     /// Repaints the layer on the next frame.
+    #[track_caller]
     pub fn invalidate(&self, cx: &mut Cx) {
         if let Some(list) = &self.list {
             list.redraw(cx);
@@ -49,6 +50,7 @@ impl Layer {
     ///
     /// True: paint now, then close with [`Layer::end`]. False: the retained paint is still
     /// valid and its hit regions and tooltips were replayed into `hits`/`tooltips`.
+    #[track_caller]
     pub fn begin(
         &mut self,
         cx: &mut Cx2d,
@@ -65,8 +67,10 @@ impl Layer {
         let dirty = cx.will_redraw(list, Walk::abs_rect(rect));
         if list.begin_maybe(cx, dirty || inputs_changed).is_ok() {
             self.hit_mark = hits.len();
+            cx.frame_trace_layer(std::panic::Location::caller(), true);
             return true;
         }
+        cx.frame_trace_layer(std::panic::Location::caller(), false);
         hits.replay(&self.hits);
         for (id, tip) in &self.tooltips {
             tooltips.insert(id.clone(), tip.clone());

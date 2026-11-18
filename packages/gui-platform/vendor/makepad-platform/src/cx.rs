@@ -79,6 +79,7 @@ pub struct Cx {
     pub (crate) event_id: u64,
     pub (crate) timer_id: u64,
     pub (crate) next_frame_id: u64,
+    pub(crate) frame_trace: Option<Box<crate::frame_trace::FrameTrace>>,
     
     pub keyboard: CxKeyboard,
     pub(crate) keyboard_window: Option<crate::window::WindowId>,
@@ -289,6 +290,7 @@ impl Cx {
             repaint_id: 1,
             timer_id: 1,
             next_frame_id: 1,
+            frame_trace: crate::frame_trace::FrameTrace::new(),
             
             keyboard: Default::default(),
             keyboard_window: None,

@@ -145,6 +145,16 @@ Workspace setup and services remain daemon-side shell/PTY operations. The client
 
 Inspect the selected home's `daemon.log` and native CLI status. Keep diagnostic captures free of credentials and unrelated user state. A script or provider process is owned by the host daemon, never the mobile client.
 
+Set `PASEO_FRAME_TRACE=1` in the native client's environment to write a one-second
+frame summary to stderr, including when the window is idle. `event_ms` excludes
+Makepad `Draw` dispatch (`draw_ms`); on X11, `render_ms` separately measures native
+rendering and presentation. Timer totals use the caller that started each timer.
+Layer entries are keyed by the `Layer::begin` call site and report repaint/replay
+counts. Redraw and next-frame entries report requests, which may coalesce into
+fewer actual draws or events. This is wall-clock timing, not a CPU profile.
+Without the opt-in, no reporter starts and the hooks do not sample clocks or
+collect data.
+
 ## Checks
 
 See [testing](testing.md) for Rust, GUI, SDK, and real-runtime checks. Run the appropriate checks only when authorized by the assignment. A CI job definition, compilation, or a unit test is not an actual platform smoke test.

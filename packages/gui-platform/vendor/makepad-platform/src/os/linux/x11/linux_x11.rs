@@ -246,6 +246,7 @@ impl Cx {
     }
     
     pub (crate) fn handle_repaint(&mut self, opengl_windows: &mut Vec<OpenglWindow>) {
+        let trace_start = self.frame_trace.as_ref().map(|_| std::time::Instant::now());
         self.os.opengl_cx.as_ref().unwrap().make_current();
         let mut passes_todo = Vec::new();
         self.compute_pass_repaint_order(&mut passes_todo);
@@ -269,6 +270,9 @@ impl Cx {
                     self.draw_pass_to_texture(*pass_id, None);
                 }
             }
+        }
+        if let (Some(trace), Some(start)) = (&self.frame_trace, trace_start) {
+            trace.render(passes_todo.len(), start.elapsed());
         }
     }
     

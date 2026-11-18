@@ -214,6 +214,8 @@ impl Cx {
     
     pub (crate) fn inner_call_event_handler(&mut self, event: &Event) {
         self.event_id += 1;
+        let trace_start = self.frame_trace.as_ref().map(|_| std::time::Instant::now());
+        let timer_owner = self.frame_trace.as_mut().and_then(|trace| trace.timer_owner(event));
         if Cx::has_studio_web_socket(){
             let start = self.seconds_since_app_start();
             let mut event_handler = self.event_handler.take().unwrap();
@@ -231,6 +233,9 @@ impl Cx {
             let mut event_handler = self.event_handler.take().unwrap();
             event_handler(self, event);
             self.event_handler = Some(event_handler);
+        }
+        if let (Some(trace), Some(start)) = (&mut self.frame_trace, trace_start) {
+            trace.event(event, timer_owner, start.elapsed());
         }
 
         // Reset widget query invalidation after all views have processed it.

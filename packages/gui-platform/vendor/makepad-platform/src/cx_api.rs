@@ -453,8 +453,12 @@ impl Cx {
         self.fingers.sweep_unlock(value);
     }
 
+    #[track_caller]
     pub fn start_timeout(&mut self, interval: f64) -> Timer {
         self.timer_id += 1;
+        if let Some(trace) = &mut self.frame_trace {
+            trace.start_timer(self.timer_id, std::panic::Location::caller(), false);
+        }
         self.platform_ops.push(CxOsOp::StartTimer {
             timer_id: self.timer_id,
             interval,
@@ -463,8 +467,12 @@ impl Cx {
         Timer(self.timer_id)
     }
 
+    #[track_caller]
     pub fn start_interval(&mut self, interval: f64) -> Timer {
         self.timer_id += 1;
+        if let Some(trace) = &mut self.frame_trace {
+            trace.start_timer(self.timer_id, std::panic::Location::caller(), true);
+        }
         self.platform_ops.push(CxOsOp::StartTimer {
             timer_id: self.timer_id,
             interval,
@@ -475,6 +483,9 @@ impl Cx {
 
     pub fn stop_timer(&mut self, timer: Timer) {
         if timer.0 != 0 {
+            if let Some(trace) = &mut self.frame_trace {
+                trace.stop_timer(timer.0);
+            }
             self.platform_ops.push(CxOsOp::StopTimer(timer.0));
         }
     }
@@ -540,6 +551,7 @@ impl Cx {
         1.0
     }
 
+    #[track_caller]
     pub fn redraw_pass_and_parent_passes(&mut self, pass_id: PassId) {
         let mut walk_pass_id = pass_id;
         loop {
@@ -592,12 +604,20 @@ impl Cx {
         &self.passes[pass_id].debug_name
     }
 
+    #[track_caller]
     pub fn repaint_pass(&mut self, pass_id: PassId) {
+        if let Some(trace) = &self.frame_trace {
+            trace.redraw(std::panic::Location::caller());
+        }
         let cxpass = &mut self.passes[pass_id];
         cxpass.paint_dirty = true;
     }
 
+    #[track_caller]
     pub fn repaint_pass_and_child_passes(&mut self, pass_id: PassId) {
+        if let Some(trace) = &self.frame_trace {
+            trace.redraw(std::panic::Location::caller());
+        }
         let cxpass = &mut self.passes[pass_id];
         cxpass.paint_dirty = true;
         for sub_pass_id in self.passes.id_iter() {
@@ -609,6 +629,7 @@ impl Cx {
         }
     }
 
+    #[track_caller]
     pub fn redraw_pass_and_child_passes(&mut self, pass_id: PassId) {
         let cxpass = &self.passes[pass_id];
         if let Some(main_list_id) = cxpass.main_draw_list_id {
@@ -624,28 +645,36 @@ impl Cx {
         }
     }
 
+    #[track_caller]
     pub fn redraw_all(&mut self) {
+        if let Some(trace) = &self.frame_trace {
+            trace.redraw(std::panic::Location::caller());
+        }
         self.new_draw_event.redraw_all = true;
     }
 
+    #[track_caller]
     pub fn redraw_area(&mut self, area: Area) {
         if let Some(draw_list_id) = area.draw_list_id() {
             self.redraw_list(draw_list_id);
         }
     }
     
+    #[track_caller]
     pub fn redraw_area_in_draw(&mut self, area: Area) {
         if let Some(draw_list_id) = area.draw_list_id() {
             self.redraw_list_in_draw(draw_list_id);
         }
     }
     
+    #[track_caller]
     pub fn redraw_area_and_children(&mut self, area: Area) {
         if let Some(draw_list_id) = area.draw_list_id() {
             self.redraw_list_and_children(draw_list_id);
         }
     }
 
+    #[track_caller]
     pub fn redraw_list(&mut self, draw_list_id: DrawListId) {
         if self.in_draw_event{
             return
@@ -653,7 +682,11 @@ impl Cx {
         self.redraw_list_in_draw(draw_list_id);
     }
     
+    #[track_caller]
     pub fn redraw_list_in_draw(&mut self, draw_list_id: DrawListId) {
+        if let Some(trace) = &self.frame_trace {
+            trace.redraw(std::panic::Location::caller());
+        }
         if self
         .new_draw_event
         .draw_lists
@@ -666,9 +699,13 @@ impl Cx {
         self.new_draw_event.draw_lists.push(draw_list_id);
     }
 
+    #[track_caller]
     pub fn redraw_list_and_children(&mut self, draw_list_id: DrawListId) {
         if self.in_draw_event{
             return
+        }
+        if let Some(trace) = &self.frame_trace {
+            trace.redraw(std::panic::Location::caller());
         }
         if self
             .new_draw_event
@@ -746,7 +783,11 @@ impl Cx {
         self.keyboard.has_key_focus(focus_area)
     }
 
+    #[track_caller]
     pub fn new_next_frame(&mut self) -> NextFrame {
+        if let Some(trace) = &self.frame_trace {
+            trace.next_frame(std::panic::Location::caller());
+        }
         let res = NextFrame(self.next_frame_id);
         self.next_frame_id += 1;
         self.new_next_frames.insert(res);
