@@ -62,10 +62,15 @@ impl Owner {
         }
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error)
+            return Ok(());
         }
+        // Darwin excludes zombies from killpg's eligible targets and returns
+        // EPERM when only unreaped exits remain. Preserve real permission errors.
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EPERM) && group_exited(self.pid) {
+            return Ok(());
+        }
+        Err(error)
     }
 
     pub(super) async fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -107,6 +112,43 @@ impl Owner {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn group_exited(pid: libc::pid_t) -> bool {
+    let capacity = unsafe { libc::proc_listpgrppids(pid, std::ptr::null_mut(), 0) };
+    if capacity <= 0 {
+        return false;
+    }
+    let mut members = vec![0 as libc::pid_t; capacity as usize];
+    let Ok(size) = i32::try_from(std::mem::size_of_val(members.as_slice())) else {
+        return false;
+    };
+    let count = unsafe { libc::proc_listpgrppids(pid, members.as_mut_ptr().cast(), size) };
+    if count <= 0 || count as usize >= members.len() {
+        return false;
+    }
+    let members = &members[..count as usize];
+    members.contains(&pid)
+        && members.iter().all(|member| {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of_val(&info) as i32;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    *member,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&raw mut info).cast(),
+                    size,
+                )
+            };
+            if read == size {
+                info.pbi_status == libc::SZOMB
+            } else {
+                // proc_pidinfo omits exited processes, including zombies.
+                read == 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            }
+        })
 }
 
 impl Drop for Owner {

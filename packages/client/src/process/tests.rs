@@ -86,8 +86,33 @@ mod unix {
     }
 
     #[tokio::test]
+    async fn immediate_exit_preserves_output_status_and_reaps_the_child() {
+        for code in [0, 19] {
+            let output = run(
+                shell(&format!("printf 'version-output'; exit {code}")),
+                4096,
+                Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(output.stdout, b"version-output");
+            assert_eq!(output.status, code);
+
+            let (process, _stdout) = ManagedProcess::spawn(shell(&format!("exit {code}")))
+                .await
+                .unwrap();
+            let pid = process.id();
+            assert_eq!(process.wait().await.unwrap(), code);
+            assert_eq!(process.wait().await.unwrap(), code);
+            await_reaped(pid).await;
+        }
+    }
+
+    #[tokio::test]
     async fn arguments_are_literal_and_environment_and_cwd_are_applied() {
         let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
         let mut spec = shell("printf '%s\\0' \"$PWD\" \"$ONLY_CHILD\" \"$@\"");
         spec.args.extend(
             [
@@ -101,7 +126,7 @@ mod unix {
             ]
             .map(String::from),
         );
-        spec.cwd = Some(directory.path().to_path_buf());
+        spec.cwd = Some(cwd.clone());
         spec.clear_env = true;
         spec.env
             .insert("ONLY_CHILD".into(), "a secret value".into());
@@ -109,7 +134,7 @@ mod unix {
             .await
             .unwrap();
         let pieces = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
-        assert_eq!(pieces[0], directory.path().as_os_str().as_encoded_bytes());
+        assert_eq!(pieces[0], cwd.as_os_str().as_encoded_bytes());
         assert_eq!(pieces[1], b"a secret value");
         assert_eq!(pieces[2], b"space arg");
         assert_eq!(pieces[3], b"$(touch should-not-exist)");
