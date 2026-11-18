@@ -32,6 +32,20 @@ fn daemon_release_check_preserves_unknown_latest_and_rejects_path_pins() {
 }
 
 #[test]
+fn daemon_release_check_roundtrips_github_rate_limit() {
+    let response = json!({"type":"daemon.update.check.response","payload":{
+        "requestId":"check","serverId":"host","targetKind":"daemon",
+        "current":{"version":"1.0.0","sourceSha":""},
+        "latest":null,"supported":true,"updateAvailable":false,"owner":null,
+        "supportError":null,"checkError":"GitHub rate limit",
+        "checkErrorCode":"github_rate_limited","retryAt":"2026-11-18T16:37:00Z"
+    }});
+    let parsed = SessionMessage::parse(response, Direction::Outbound).unwrap();
+    let bytes = encode_envelope(&parsed.into_envelope(), Direction::Outbound).unwrap();
+    assert!(parse_envelope(&bytes, Direction::Outbound).is_ok());
+}
+
+#[test]
 fn desktop_app_update_roundtrips_pinned_target_and_authorization_status() {
     let mut submit = json!({"type":"daemon.update.submit.request","requestId":"submit",
         "operationId":"0f8b6c5e-2a71-4c5b-9a43-7f2a1d0c9e11","source":"release",

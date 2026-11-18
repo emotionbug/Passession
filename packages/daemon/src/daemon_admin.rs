@@ -237,7 +237,7 @@ async fn check_update(app: &AppState) -> Value {
         crate::daemon_control::managed::inspect_current_runtime(&owner).await?;
         Ok::<_, anyhow::Error>(owner.public_summary())
     });
-    let (ownership, release) = tokio::join!(ownership, updater::check_release());
+    let (ownership, release) = tokio::join!(ownership, updater::check_release(&app.home));
     let mut result = json!({
         "current": {"version": crate::VERSION,
             "sourceSha": option_env!("PASEO_BUILD_SOURCE_SHA").unwrap_or("")},
@@ -265,12 +265,18 @@ async fn check_update(app: &AppState) -> Value {
             );
             result["latest"] = json!(release.identity());
         }
-        Err(error) => result["checkError"] = json!(bounded_update_error(&error)),
+        Err(error) => {
+            result["checkError"] = json!(bounded_update_error(&error));
+            if let Some(rate_limit) = error.rate_limit() {
+                result["checkErrorCode"] = json!("github_rate_limited");
+                result["retryAt"] = json!(rate_limit.retry_at.to_rfc3339());
+            }
+        }
     }
     result
 }
 
-fn bounded_update_error(error: &anyhow::Error) -> String {
+fn bounded_update_error(error: &impl std::fmt::Display) -> String {
     format!("{error:#}").chars().take(1024).collect()
 }
 

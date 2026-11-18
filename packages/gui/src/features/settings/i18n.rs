@@ -473,4 +473,9 @@ const LOCAL: &[(&str, &str, &str)] = &[
     ("settingsNative.statusConnecting", "Connecting", "연결 중"),
     ("settingsNative.statusError", "Error", "오류"),
     ("settingsNative.statusOffline", "Offline", "오프라인"),
+    (
+        "settingsNative.githubRateLimited",
+        "GitHub is limiting update checks from this network. Try again after {{time}}.",
+        "GitHub이 이 네트워크의 업데이트 확인 요청을 제한하고 있어요. {{time}} 이후 다시 시도하세요.",
+    ),
 ];

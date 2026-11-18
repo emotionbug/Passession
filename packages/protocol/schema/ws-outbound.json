@@ -70279,13 +70279,16 @@
                     "restartGroup": {"enum":["none","daemon","gui"]},
                     "atomicGroups": {"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"array","maxItems":4,"uniqueItems":true,"items":{"enum":["app","daemon","tailnet","update-helper"]},"minItems":1}},
                     "supportError": { "type": ["string", "null"], "maxLength": 1024 },
-                    "checkError": { "type": ["string", "null"], "maxLength": 1024 }
+                    "checkError": { "type": ["string", "null"], "maxLength": 1024 },
+                    "checkErrorCode": { "const": "github_rate_limited" },
+                    "retryAt": { "type": "string", "format": "date-time" }
                   },
                   "if": { "properties": { "targetKind": { "const": "app" } }, "required": ["targetKind"] },
                   "then": {
                     "properties": {
                       "requestId": {}, "serverId": {}, "targetKind": {}, "latest": {},
                       "supported": {}, "updateAvailable": {}, "supportError": {}, "checkError": {},
+                      "checkErrorCode": {}, "retryAt": {},
                       "components": {}, "componentRequirements": {}, "availableComponents": {},
                       "restartGroup": {}, "atomicGroups": {},
                       "current": {

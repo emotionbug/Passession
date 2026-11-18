@@ -5,6 +5,7 @@
 ### Fixed
 
 - Publish current installers with every release that changes the app, daemon, Tailnet or update helper. A release only rebuilt the Windows installer, Linux deb and AppImage when the packaging files changed, so 0.13.41 published none and pointed new installs at 0.13.40's installers, which installed a daemon without the tray icon. An installer now gets rebuilt whenever a component inside it is rebuilt.
+- Stop update checks failing with "403 rate limit exceeded". GitHub allows 60 unauthenticated API requests per hour from one network, and every check by the daemon or the desktop app used 3 to 9 of them, repeated each time the Version page opened and again when an update started. Checks now download the latest release's inventory directly, which does not count against that limit, and remember a release once it has been verified: a repeat check of the same release makes no API requests, and a new release is verified once (3 to 8 requests). Beta checks still list releases through the API, one request per repeat check. If GitHub still limits the network, the Version page says so and shows the time to try again.
 
 ## 0.13.41 - 2026-11-18
 

@@ -94,6 +94,7 @@ async fn stage(
             UpdateSource::Release => {
                 let current = managed::inspect_current_runtime(&operation.launch_owner).await?;
                 super::super::updater::prepare_release(
+                    &operation.home,
                     &operation.launch_owner.executable,
                     &current,
                     &destination,

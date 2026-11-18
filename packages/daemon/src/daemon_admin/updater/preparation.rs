@@ -153,6 +153,7 @@ fn classify_source(source: &Path) -> Result<(PathBuf, Option<&'static str>)> {
 /// and strictly-newer semver rules are unchanged. The caller verifies the
 /// running standalone or independently installed bootstrap runtime.
 pub async fn prepare_release(
+    home: &Path,
     current_executable: &Path,
     current: &RuntimeIdentity,
     destination: &Path,
@@ -169,8 +170,7 @@ pub async fn prepare_release(
         "Verified current runtime does not match the executable"
     );
     let stage = Stage::begin(destination, &[current_root.as_path()])?;
-    let client = http()?;
-    let release = discover(&client).await?;
+    let release = discover_release(home).await?;
     if let Some(expected) = expected {
         release.require_identity(expected)?;
     }
@@ -180,7 +180,7 @@ pub async fn prepare_release(
     let directory = stage.directory.path().to_owned();
     ensure_space(&directory, release.size)?;
     let archive = directory.join(&release.name);
-    download(&client, &release, &archive).await?;
+    download(&http()?, &release, &archive).await?;
     let (runtime, format) = (stage.runtime.clone(), release.format.clone());
     tokio::task::spawn_blocking(move || {
         ensure_space(&directory, expanded_size(&archive, &format)?)?;

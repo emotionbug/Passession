@@ -3,19 +3,27 @@
 //! `preparation` stages complete local or official runtimes for the update engine.
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use futures_util::future::{BoxFuture, FutureExt, Shared, WeakShared};
 use paseo_protocol::components::{ComponentId, ComponentRef, ReleaseInventory, parse_inventory};
 use serde_json::Value;
+use serde_json::json;
 use sha2::{Digest, Sha256, Sha512};
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use url::Url;
 
+mod cache;
+#[cfg(test)]
+mod discovery_tests;
 mod preparation;
 pub use preparation::{
     input_digest, inspect_runtime, prepare_local_pinned, prepare_release, verify_runtime,
@@ -78,11 +86,135 @@ impl Release {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("GitHub is limiting update checks from this network. Retry after {retry_at}.")]
+pub(super) struct GitHubRateLimited {
+    pub retry_at: DateTime<Utc>,
+}
+
+impl GitHubRateLimited {
+    fn from_response(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        if !matches!(
+            status,
+            reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS
+        ) {
+            return None;
+        }
+        let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
+        let retry_after = header("retry-after");
+        let exhausted = header("x-ratelimit-remaining") == Some("0");
+        if !exhausted && retry_after.is_none() {
+            return None;
+        }
+        let delay = retry_after.and_then(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|seconds| *seconds >= 0)
+                .and_then(chrono::TimeDelta::try_seconds)
+                .and_then(|delay| now.checked_add_signed(delay))
+                .or_else(|| {
+                    DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .map(|date| date.with_timezone(&Utc))
+                })
+        });
+        let reset = exhausted
+            .then(|| header("x-ratelimit-reset")?.parse::<i64>().ok())
+            .flatten()
+            .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+        Some(Self {
+            retry_at: delay
+                .into_iter()
+                .chain(reset)
+                .max()
+                .unwrap_or(now + chrono::TimeDelta::minutes(1)),
+        })
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{0:#}")]
+pub(super) struct CheckError(Arc<anyhow::Error>);
+
+impl CheckError {
+    pub fn rate_limit(&self) -> Option<&GitHubRateLimited> {
+        self.0.downcast_ref()
+    }
+}
+
+impl From<anyhow::Error> for CheckError {
+    fn from(error: anyhow::Error) -> Self {
+        Self(Arc::new(error))
+    }
+}
+
+type CheckedRelease = std::result::Result<Arc<Release>, CheckError>;
+type CheckFuture = BoxFuture<'static, CheckedRelease>;
+
+#[derive(Default)]
+struct ReleaseChecks(Mutex<HashMap<PathBuf, WeakShared<CheckFuture>>>);
+
+impl ReleaseChecks {
+    fn flight(
+        &self,
+        home: &Path,
+        discover: impl FnOnce(PathBuf) -> CheckFuture,
+    ) -> Shared<CheckFuture> {
+        let mut flights = self.0.lock().expect("release check lock poisoned");
+        flights.retain(|_, weak| weak.upgrade().is_some_and(|flight| flight.peek().is_none()));
+        if let Some(flight) = flights.get(home).and_then(WeakShared::upgrade) {
+            return flight;
+        }
+        let flight = discover(home.to_owned()).shared();
+        flights.insert(
+            home.to_owned(),
+            flight
+                .downgrade()
+                .expect("new release check has a shared future"),
+        );
+        flight
+    }
+}
+
+static RELEASE_CHECKS: LazyLock<ReleaseChecks> = LazyLock::new(ReleaseChecks::default);
+
 /// Metadata/provenance only: no archive download, staging, or installation.
-pub async fn check_release() -> Result<Release> {
-    tokio::time::timeout(Duration::from_secs(20), async { discover(&http()?).await })
+pub(super) async fn check_release(home: &Path) -> CheckedRelease {
+    tokio::time::timeout(Duration::from_secs(20), discover_release(home))
         .await
         .context("Official release check timed out")?
+}
+
+async fn discover_release(home: &Path) -> CheckedRelease {
+    RELEASE_CHECKS
+        .flight(home, |home| {
+            async move {
+                let release = async {
+                    let (platform, arch) = platform()?;
+                    let client = http()?;
+                    discover(
+                        &client,
+                        &home,
+                        DiscoveryTarget {
+                            repository: repository()?,
+                            channel: channel()?,
+                            platform,
+                            arch,
+                        },
+                    )
+                    .await
+                }
+                .await;
+                release.map(Arc::new).map_err(CheckError::from)
+            }
+            .boxed()
+        })
+        .await
 }
 
 pub(crate) fn platform() -> Result<(&'static str, &'static str)> {
@@ -119,13 +251,11 @@ fn repository() -> Result<&'static str> {
     Ok(repository)
 }
 fn channel() -> Result<&'static str> {
-    let channel = option_env!("PASEO_RELEASE_CHANNEL").unwrap_or(
-        if crate::VERSION.contains('-') {
-            "beta"
-        } else {
-            "stable"
-        },
-    );
+    let channel = option_env!("PASEO_RELEASE_CHANNEL").unwrap_or(if crate::VERSION.contains('-') {
+        "beta"
+    } else {
+        "stable"
+    });
     if !matches!(channel, "stable" | "beta") {
         bail!("Invalid configured release channel")
     };
@@ -136,40 +266,221 @@ fn http() -> Result<reqwest::Client> {
         .user_agent(format!("paseo-native/{}", crate::VERSION))
         .timeout(Duration::from_secs(180))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let url = attempt.url();
-            let trusted = url.host_str().is_some_and(|h| {
-                matches!(
-                    h,
-                    "github.com"
-                        | "api.github.com"
-                        | "release-assets.githubusercontent.com"
-                        | "objects.githubusercontent.com"
-                )
-            });
-            if attempt.previous().len() > 5
-                || url.scheme() != "https"
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || !trusted
-            {
+            let trusted = trusted_update_host(attempt.url());
+            if attempt.previous().len() > 5 || !trusted {
                 attempt.error("Untrusted update redirect")
+            } else if attempt.previous().len() == 1
+                && attempt.previous()[0].host_str() == Some("github.com")
+                && attempt.previous()[0]
+                    .path()
+                    .contains("/releases/latest/download/")
+            {
+                // Preserve the alias's tag-bearing Location before the asset CDN
+                // replaces it with an opaque signed URL.
+                attempt.stop()
             } else {
                 attempt.follow()
             }
         }))
         .build()?)
 }
-async fn json_bytes(client: &reqwest::Client, url: Url) -> Result<Vec<u8>> {
-    let mut response = client.get(url).send().await?.error_for_status()?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > 4 * 1024 * 1024 {
-            bail!("Release metadata exceeds size limit")
-        };
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+
+fn trusted_update_host(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(
+            url.host_str(),
+            Some(
+                "github.com"
+                    | "api.github.com"
+                    | "release-assets.githubusercontent.com"
+                    | "objects.githubusercontent.com"
+            )
+        )
 }
+
+enum Metadata {
+    Bytes(Vec<u8>),
+    Redirect(Url),
+    NotFound,
+}
+
+trait MetadataSource {
+    async fn get_metadata(&self, url: &Url) -> Result<Metadata>;
+}
+
+impl MetadataSource for reqwest::Client {
+    async fn get_metadata(&self, url: &Url) -> Result<Metadata> {
+        let mut response = self.get(url.clone()).send().await?;
+        if let Some(error) =
+            GitHubRateLimited::from_response(response.status(), response.headers(), Utc::now())
+        {
+            return Err(error.into());
+        }
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Metadata::NotFound);
+        }
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("Missing release redirect location")?
+                .to_str()?;
+            let location = response.url().join(location)?;
+            anyhow::ensure!(trusted_update_host(&location), "Untrusted update redirect");
+            return Ok(Metadata::Redirect(location));
+        }
+        response.error_for_status_ref()?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                bytes.len() + chunk.len() <= 4 * 1024 * 1024,
+                "Release metadata exceeds size limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Metadata::Bytes(bytes))
+    }
+}
+
+async fn json_bytes(client: &impl MetadataSource, url: Url) -> Result<Vec<u8>> {
+    match client.get_metadata(&url).await? {
+        Metadata::Bytes(bytes) => Ok(bytes),
+        Metadata::NotFound => bail!("Release metadata not found at {url}"),
+        Metadata::Redirect(_) => bail!("Unexpected release metadata redirect at {url}"),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DiscoveryTarget<'a> {
+    repository: &'a str,
+    channel: &'a str,
+    platform: &'a str,
+    arch: &'a str,
+}
+
+fn has_daemon(inventory: &ReleaseInventory, target: &str) -> bool {
+    inventory
+        .targets
+        .get(target)
+        .is_some_and(|target| target.components.contains_key(&ComponentId::Daemon))
+}
+
+async fn published_release(
+    client: &impl MetadataSource,
+    repository: &str,
+    tag: &str,
+) -> Result<Value> {
+    let mut url = Url::parse(&format!(
+        "https://api.github.com/repos/{repository}/releases/tags/"
+    ))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Invalid release URL"))?
+        .pop_if_empty()
+        .push(tag);
+    let published: Value = serde_json::from_slice(&json_bytes(client, url).await?)?;
+    anyhow::ensure!(published["tag_name"] == tag, "GitHub release tag mismatch");
+    Ok(published)
+}
+
+async fn latest_inventory(
+    client: &impl MetadataSource,
+    repository: &str,
+    name: &str,
+) -> Result<Option<(Vec<u8>, Option<String>)>> {
+    let alias = Url::parse(&format!(
+        "https://github.com/{repository}/releases/latest/download/{name}"
+    ))?;
+    match client.get_metadata(&alias).await? {
+        Metadata::NotFound => Ok(None),
+        Metadata::Bytes(bytes) => Ok(Some((bytes, None))),
+        Metadata::Redirect(location) => {
+            let tag = match location.host_str() {
+                Some("github.com") => {
+                    let tag = location
+                        .path_segments()
+                        .and_then(|mut parts| parts.nth_back(1))
+                        .context("Missing latest release tag")?;
+                    let tag = percent_encoding::percent_decode_str(tag).decode_utf8()?;
+                    semver::Version::parse(tag.strip_prefix('v').unwrap_or(&tag))
+                        .context("Invalid latest release tag")?;
+                    asset_url(
+                        &json!({"browser_download_url": location.as_str()}),
+                        repository,
+                        &tag,
+                        name,
+                    )?;
+                    Some(tag.into_owned())
+                }
+                Some("release-assets.githubusercontent.com" | "objects.githubusercontent.com") => {
+                    None
+                }
+                _ => bail!("Unexpected latest release redirect host"),
+            };
+            match client.get_metadata(&location).await? {
+                Metadata::NotFound => Ok(None),
+                Metadata::Bytes(bytes) => Ok(Some((bytes, tag))),
+                Metadata::Redirect(_) => {
+                    bail!("Unexpected nested latest release metadata redirect")
+                }
+            }
+        }
+    }
+}
+
+async fn discover(
+    client: &impl MetadataSource,
+    home: &Path,
+    discovery: DiscoveryTarget<'_>,
+) -> Result<Release> {
+    let DiscoveryTarget {
+        repository,
+        channel,
+        platform,
+        arch,
+    } = discovery;
+    let target = format!("{platform}-{arch}");
+    let name = format!("components-{channel}.json");
+    if channel == "stable"
+        && let Some((bytes, redirected_tag)) = latest_inventory(client, repository, &name).await?
+    {
+        let inventory = parse_inventory(&bytes, repository)?;
+        let tag = redirected_tag.unwrap_or_else(|| format!("v{}", inventory.version));
+        anyhow::ensure!(
+            inventory.channel == channel
+                && (tag == inventory.version
+                    || tag.strip_prefix('v') == Some(inventory.version.as_str())),
+            "Latest component inventory collection identity mismatch"
+        );
+        if has_daemon(&inventory, &target) {
+            let key = cache::Key::new(repository, channel, &target, &tag, &bytes);
+            // The private entry attests to the exact freshly downloaded bytes.
+            // Rebuild the selection from those bytes, not from mutable cached URLs.
+            if cache::entries(home).await.contains(&key) {
+                return select_daemon(&inventory, platform, arch, &target, key.manifest_sha512);
+            }
+            let published = published_release(client, repository, &tag).await?;
+            let selected = validate_component_release(
+                &inventory,
+                &published,
+                repository,
+                channel,
+                platform,
+                arch,
+                key.manifest_sha512.clone(),
+            )?;
+            verify_release(
+                client, &selected, &inventory, &published, &bytes, repository, channel,
+            )
+            .await?;
+            cache::record(home, key).await;
+            return Ok(selected);
+        }
+    }
+    discover_from_list(client, home, discovery, &target, &name).await
+}
+
 fn asset_url(asset: &Value, repository: &str, tag: &str, name: &str) -> Result<Url> {
     let url = Url::parse(
         asset["browser_download_url"]
@@ -228,7 +539,9 @@ pub(super) fn validate_component_release(
     manifest_digest: String,
 ) -> Result<Release> {
     paseo_protocol::components::validate_inventory(inventory, repository)?;
-    let tag = published["tag_name"].as_str().context("Missing release tag")?;
+    let tag = published["tag_name"]
+        .as_str()
+        .context("Missing release tag")?;
     anyhow::ensure!(
         inventory.channel == channel
             && (tag == format!("v{}", inventory.version) || tag == inventory.version)
@@ -236,14 +549,41 @@ pub(super) fn validate_component_release(
             && (channel != "stable" || published["prerelease"] != true),
         "Component inventory collection identity mismatch"
     );
-    let target = format!("{platform}-{arch}");
-    let component = inventory.targets.get(&target)
-        .and_then(|target| target.components.get(&ComponentId::Daemon))
-        .context("Collection has no daemon component for this target")?.clone();
-    let format = if platform == "windows" { "zip" } else { "tar.gz" };
-    let origin = paseo_protocol::components::component_artifact_origin(
-        inventory.targets.get(&target).context("Missing daemon target")?, ComponentId::Daemon)?;
-    anyhow::ensure!(origin.package.is_none(), "Standalone daemon cannot activate a signed app container");
+    select_daemon(
+        inventory,
+        platform,
+        arch,
+        &format!("{platform}-{arch}"),
+        manifest_digest,
+    )
+}
+
+fn select_daemon(
+    inventory: &ReleaseInventory,
+    platform: &str,
+    arch: &str,
+    target: &str,
+    manifest_digest: String,
+) -> Result<Release> {
+    let target = inventory
+        .targets
+        .get(target)
+        .context("Missing daemon target")?;
+    let component = target
+        .components
+        .get(&ComponentId::Daemon)
+        .context("Collection has no daemon component for this target")?;
+    let format = if platform == "windows" {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    let origin =
+        paseo_protocol::components::component_artifact_origin(target, ComponentId::Daemon)?;
+    anyhow::ensure!(
+        origin.package.is_none(),
+        "Standalone daemon cannot activate a signed app container"
+    );
     anyhow::ensure!(
         component.identity.abi_version == ComponentId::Daemon.initial_abi_version()
             && component.artifact.format == format
@@ -253,9 +593,13 @@ pub(super) fn validate_component_release(
         "Daemon component ABI or runtime layout is unsupported"
     );
     let url = Url::parse(&component.artifact.url)?;
-    let name = url.path_segments().and_then(|mut segments| segments.next_back())
+    let name = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
         .context("Component artifact has no name")?;
-    let name = percent_encoding::percent_decode_str(name).decode_utf8()?.into_owned();
+    let name = percent_encoding::percent_decode_str(name)
+        .decode_utf8()?
+        .into_owned();
     // Bind origin separately below: a collection may reuse this exact older component.
     Ok(Release {
         version: component.identity.version.clone(),
@@ -270,7 +614,7 @@ pub(super) fn validate_component_release(
         digest: component.artifact.sha256.clone(),
         url,
         manifest_digest,
-        component,
+        component: component.clone(),
     })
 }
 
@@ -287,14 +631,18 @@ pub(super) fn require_origin_component(
             && (release.tag == format!("v{}", origin.version) || release.tag == origin.version)
             && origin.version == release.version
             && origin.source_sha == release.source_sha
-            && origin.targets.get(&release.component.target)
+            && origin
+                .targets
+                .get(&release.component.target)
                 .and_then(|target| target.components.get(&ComponentId::Daemon))
                 == Some(&release.component),
         "Reused daemon component does not match its original release inventory"
     );
     let asset = unique_asset(published, &release.name)?;
-    anyhow::ensure!(trusted_publisher(&asset["uploader"]["login"], repository),
-        "Original daemon artifact publisher is not trusted");
+    anyhow::ensure!(
+        trusted_publisher(&asset["uploader"]["login"], repository),
+        "Original daemon artifact publisher is not trusted"
+    );
     anyhow::ensure!(
         asset["size"].as_u64() == Some(release.size)
             && asset_url(asset, repository, &release.tag, &release.name)? == release.url,
@@ -304,8 +652,9 @@ pub(super) fn require_origin_component(
 }
 
 fn trusted_publisher(value: &Value, repository: &str) -> bool {
-    value.as_str().is_some_and(|login| login == "github-actions[bot]"
-        || Some(login) == repository.split('/').next())
+    value.as_str().is_some_and(|login| {
+        login == "github-actions[bot]" || Some(login) == repository.split('/').next()
+    })
 }
 
 pub(super) fn validate_publication(
@@ -336,18 +685,28 @@ pub(super) fn validate_publication(
             && provenance["inventory"]["sha256"] == format!("{:x}", Sha256::digest(bytes)),
         "Component inventory does not match its release provenance"
     );
-    provenance["runId"].as_u64()
-        .or_else(|| provenance["runId"].as_str().and_then(|value| value.parse().ok()))
-        .filter(|run| *run > 0).context("Missing component publication run identity")
+    provenance["runId"]
+        .as_u64()
+        .or_else(|| {
+            provenance["runId"]
+                .as_str()
+                .and_then(|value| value.parse().ok())
+        })
+        .filter(|run| *run > 0)
+        .context("Missing component publication run identity")
 }
 
 fn validate_metadata_asset(asset: &Value, bytes: &[u8], repository: &str) -> Result<()> {
-    anyhow::ensure!(trusted_publisher(&asset["uploader"]["login"], repository)
-        && asset["size"].as_u64() == Some(bytes.len() as u64),
-        "Release metadata asset publisher or size changed");
+    anyhow::ensure!(
+        trusted_publisher(&asset["uploader"]["login"], repository)
+            && asset["size"].as_u64() == Some(bytes.len() as u64),
+        "Release metadata asset publisher or size changed"
+    );
     if let Some(digest) = asset.get("digest").filter(|digest| !digest.is_null()) {
-        anyhow::ensure!(*digest == format!("sha256:{:x}", Sha256::digest(bytes)),
-            "Release metadata asset digest changed");
+        anyhow::ensure!(
+            *digest == format!("sha256:{:x}", Sha256::digest(bytes)),
+            "Release metadata asset digest changed"
+        );
     }
     Ok(())
 }
@@ -357,12 +716,25 @@ pub(super) fn validate_target_proof(
     release: &Release,
     proof: &Value,
 ) -> Result<u64> {
-    let target = inventory.targets.get(&release.component.target).context("Missing component target")?;
-    let source_tag = proof["sourceTag"].as_str().context("Missing target source tag")?;
+    let target = inventory
+        .targets
+        .get(&release.component.target)
+        .context("Missing component target")?;
+    let source_tag = proof["sourceTag"]
+        .as_str()
+        .context("Missing target source tag")?;
     let source_tag = source_tag.strip_prefix("refs/tags/").unwrap_or(source_tag);
-    let source_version = ["desktop-windows-v", "desktop-linux-v", "desktop-macos-v",
-        "desktop-v", "android-v", "app-v", "v"].into_iter()
-        .find_map(|prefix| source_tag.strip_prefix(prefix));
+    let source_version = [
+        "desktop-windows-v",
+        "desktop-linux-v",
+        "desktop-macos-v",
+        "desktop-v",
+        "android-v",
+        "app-v",
+        "v",
+    ]
+    .into_iter()
+    .find_map(|prefix| source_tag.strip_prefix(prefix));
     anyhow::ensure!(
         proof["schemaVersion"] == 2
             && proof["workflow"] == ".github/workflows/desktop-release.yml"
@@ -375,22 +747,42 @@ pub(super) fn validate_target_proof(
             && proof["packages"] == serde_json::to_value(&target.packages)?,
         "Original component target provenance does not match its inventory"
     );
-    let files = proof["files"].as_array().filter(|files| files.len() <= 256)
+    let files = proof["files"]
+        .as_array()
+        .filter(|files| files.len() <= 256)
         .context("Invalid target provenance file inventory")?;
     let mut matching = files.iter().filter(|file| file["name"] == release.name);
-    let file = matching.next().context("Original component archive has no target provenance")?;
-    anyhow::ensure!(matching.next().is_none()
-        && file["size"].as_u64() == Some(release.size)
-        && file["sha256"] == release.digest,
-        "Original component archive provenance changed");
-    proof["runId"].as_u64()
+    let file = matching
+        .next()
+        .context("Original component archive has no target provenance")?;
+    anyhow::ensure!(
+        matching.next().is_none()
+            && file["size"].as_u64() == Some(release.size)
+            && file["sha256"] == release.digest,
+        "Original component archive provenance changed"
+    );
+    proof["runId"]
+        .as_u64()
         .or_else(|| proof["runId"].as_str().and_then(|value| value.parse().ok()))
-        .filter(|run| *run > 0).context("Missing target publication run identity")
+        .filter(|run| *run > 0)
+        .context("Missing target publication run identity")
 }
 
-async fn verify_publication_run(client: &reqwest::Client, repository: &str, run: u64, require_success: bool) -> Result<()> {
-    let run: Value = serde_json::from_slice(&json_bytes(client,
-        Url::parse(&format!("https://api.github.com/repos/{repository}/actions/runs/{run}"))?).await?)?;
+async fn verify_publication_run(
+    client: &impl MetadataSource,
+    repository: &str,
+    run: u64,
+    require_success: bool,
+) -> Result<()> {
+    let run: Value = serde_json::from_slice(
+        &json_bytes(
+            client,
+            Url::parse(&format!(
+                "https://api.github.com/repos/{repository}/actions/runs/{run}"
+            ))?,
+        )
+        .await?,
+    )?;
     anyhow::ensure!(
         run["path"] == ".github/workflows/desktop-release.yml"
             && run["event"] == "workflow_dispatch"
@@ -403,24 +795,38 @@ async fn verify_publication_run(client: &reqwest::Client, repository: &str, run:
 }
 
 async fn verify_inventory_publication(
-    client: &reqwest::Client,
+    client: &impl MetadataSource,
     inventory: &ReleaseInventory,
     published: &Value,
     bytes: &[u8],
     repository: &str,
     original_component: Option<&Release>,
 ) -> Result<()> {
-    let tag = published["tag_name"].as_str().context("Missing release tag")?;
+    let tag = published["tag_name"]
+        .as_str()
+        .context("Missing release tag")?;
     let name = format!("components-{}.json", inventory.channel);
     let provenance_name = format!("provenance-components-{}.json", inventory.channel);
     let asset = unique_asset(published, &name)?;
+    asset_url(asset, repository, tag, &name)?;
     let provenance_asset = unique_asset(published, &provenance_name)?;
     validate_metadata_asset(asset, bytes, repository)?;
-    let provenance_bytes = json_bytes(client,
-        asset_url(provenance_asset, repository, tag, &provenance_name)?).await?;
+    let provenance_bytes = json_bytes(
+        client,
+        asset_url(provenance_asset, repository, tag, &provenance_name)?,
+    )
+    .await?;
     validate_metadata_asset(provenance_asset, &provenance_bytes, repository)?;
     let provenance: Value = serde_json::from_slice(&provenance_bytes)?;
-    let run = validate_publication(inventory, published, asset, provenance_asset, &provenance, bytes, repository)?;
+    let run = validate_publication(
+        inventory,
+        published,
+        asset,
+        provenance_asset,
+        &provenance,
+        bytes,
+        repository,
+    )?;
     verify_publication_run(client, repository, run, true).await?;
     if let Some(component) = original_component {
         let name = format!("provenance-{}.json", component.component.target);
@@ -428,7 +834,8 @@ async fn verify_inventory_publication(
         let bytes = json_bytes(client, asset_url(asset, repository, tag, &name)?).await?;
         validate_metadata_asset(asset, &bytes, repository)?;
         anyhow::ensure!(
-            provenance["targets"][&component.component.target] == format!("{:x}", Sha256::digest(&bytes)),
+            provenance["targets"][&component.component.target]
+                == format!("{:x}", Sha256::digest(&bytes)),
             "Original component target provenance digest changed"
         );
         let proof: Value = serde_json::from_slice(&bytes)?;
@@ -441,10 +848,19 @@ async fn verify_inventory_publication(
     }
     verify_source_commit(client, repository, tag, &inventory.source_sha).await
 }
-async fn discover(client: &reqwest::Client) -> Result<Release> {
-    let (repository, channel) = (repository()?, channel()?);
-    let (platform, arch) = platform()?;
-    let name = format!("components-{channel}.json");
+async fn discover_from_list(
+    client: &impl MetadataSource,
+    home: &Path,
+    discovery: DiscoveryTarget<'_>,
+    target: &str,
+    name: &str,
+) -> Result<Release> {
+    let DiscoveryTarget {
+        repository,
+        channel,
+        platform,
+        arch,
+    } = discovery;
     let mut newest: Option<(Release, ReleaseInventory, Value, Vec<u8>)> = None;
     for page in 1..=10 {
         let values: Value = serde_json::from_slice(
@@ -469,16 +885,15 @@ async fn discover(client: &reqwest::Client) -> Result<Release> {
             {
                 continue;
             }
-            let asset = unique_asset(release, &name)?;
+            let asset = unique_asset(release, name)?;
             let tag = release["tag_name"]
                 .as_str()
                 .context("Missing release tag")?;
-            let url = asset_url(asset, repository, tag, &name)?;
+            let url = asset_url(asset, repository, tag, name)?;
             let bytes = json_bytes(client, url).await?;
             let digest = STANDARD.encode(Sha512::digest(&bytes));
             let inventory = parse_inventory(&bytes, repository)?;
-            if !inventory.targets.get(&format!("{platform}-{arch}"))
-                .is_some_and(|target| target.components.contains_key(&ComponentId::Daemon)) {
+            if !has_daemon(&inventory, target) {
                 continue;
             }
             let candidate = validate_component_release(
@@ -496,29 +911,78 @@ async fn discover(client: &reqwest::Client) -> Result<Release> {
         }
     }
     let (selected, inventory, published, bytes) = newest.with_context(|| {
-        format!("No {channel} component inventory is published for {platform}/{arch} in {repository}")
+        format!(
+            "No {channel} component inventory is published for {platform}/{arch} in {repository}"
+        )
     })?;
-    let collection_tag = published["tag_name"].as_str().context("Missing release tag")?;
-    verify_inventory_publication(client, &inventory, &published, &bytes, repository,
-        (selected.tag == collection_tag).then_some(&selected)).await?;
-    if selected.tag == collection_tag {
-        require_origin_component(&selected, &inventory, &published, repository)?;
-    } else {
-        let mut url = Url::parse(&format!("https://api.github.com/repos/{repository}/releases/tags/"))?;
-        url.path_segments_mut().map_err(|_| anyhow::anyhow!("Invalid origin URL"))?
-            .pop_if_empty().push(&selected.tag);
-        let origin_release: Value = serde_json::from_slice(&json_bytes(client, url).await?)?;
-        let asset = unique_asset(&origin_release, &name)?;
-        let bytes = json_bytes(client, asset_url(asset, repository, &selected.tag, &name)?).await?;
-        let origin = parse_inventory(&bytes, repository)?;
-        anyhow::ensure!(origin.channel == channel, "Component origin channel changed");
-        require_origin_component(&selected, &origin, &origin_release, repository)?;
-        verify_inventory_publication(client, &origin, &origin_release, &bytes, repository, Some(&selected)).await?;
+    let tag = published["tag_name"]
+        .as_str()
+        .context("Missing release tag")?;
+    let key = cache::Key::with_digest(
+        repository,
+        channel,
+        target,
+        tag,
+        selected.manifest_digest.clone(),
+    );
+    if !cache::entries(home).await.contains(&key) {
+        verify_release(
+            client, &selected, &inventory, &published, &bytes, repository, channel,
+        )
+        .await?;
+        cache::record(home, key).await;
     }
     Ok(selected)
 }
+
+async fn verify_release(
+    client: &impl MetadataSource,
+    selected: &Release,
+    inventory: &ReleaseInventory,
+    published: &Value,
+    bytes: &[u8],
+    repository: &str,
+    channel: &str,
+) -> Result<()> {
+    let collection_tag = published["tag_name"]
+        .as_str()
+        .context("Missing release tag")?;
+    verify_inventory_publication(
+        client,
+        inventory,
+        published,
+        bytes,
+        repository,
+        (selected.tag == collection_tag).then_some(selected),
+    )
+    .await?;
+    if selected.tag == collection_tag {
+        require_origin_component(selected, inventory, published, repository)?;
+    } else {
+        let name = format!("components-{channel}.json");
+        let origin_release = published_release(client, repository, &selected.tag).await?;
+        let asset = unique_asset(&origin_release, &name)?;
+        let bytes = json_bytes(client, asset_url(asset, repository, &selected.tag, &name)?).await?;
+        let origin = parse_inventory(&bytes, repository)?;
+        anyhow::ensure!(
+            origin.channel == channel,
+            "Component origin channel changed"
+        );
+        require_origin_component(selected, &origin, &origin_release, repository)?;
+        verify_inventory_publication(
+            client,
+            &origin,
+            &origin_release,
+            &bytes,
+            repository,
+            Some(selected),
+        )
+        .await?;
+    }
+    Ok(())
+}
 async fn verify_source_commit(
-    client: &reqwest::Client,
+    client: &impl MetadataSource,
     repository: &str,
     tag: &str,
     source_sha: &str,

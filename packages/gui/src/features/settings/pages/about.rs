@@ -4,6 +4,7 @@
 use serde_json::{Value, json};
 
 use super::View;
+use super::host::release_check_error_text;
 use crate::features::settings::i18n::{t, ta};
 use crate::features::settings::json::str_of;
 use crate::features::settings::model::daemon_update::{self as du, normalize_version};
@@ -323,7 +324,7 @@ pub fn draw_about(ui: &mut Ui, s: &Settings, v: &View) {
             .clone()
             .or_else(|| state.check_error.clone())
             .or_else(|| state.error.clone())
-            .or_else(|| state.update["checkError"].as_str().map(String::from))
+            .or_else(|| release_check_error_text(&state.update))
             .or_else(|| state.update["supportError"].as_str().map(String::from))
             .or_else(|| state.operation["error"].as_str().map(String::from));
         let check_act =

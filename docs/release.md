@@ -123,6 +123,8 @@ macOS app/Tailnet delivery preserves an intact signed app bundle. A new signed c
 
 Settings → local host → Version checks the local app and the standalone daemon separately. The daemon uses its durable updater and may wait for running agent work. The app uses its local updater helper; unsaved documents can block its restart. Remote clients can update a supported daemon but cannot update a desktop app from another device.
 
+Stable update checks start with GitHub's direct release inventory download. The daemon and desktop app keep separate private verification caches in the daemon home and the app data directory. Once a release is verified, unchanged inventory bytes for that target require no GitHub REST calls on the stable download path. Beta checks and stable releases without the needed component still use the paginated releases API for discovery. If GitHub limits requests from the network, the Version page shows the local time to retry.
+
 ## Signing and mobile build numbers
 
 `xtask/src/common.rs` resolves the build number from `PASEO_BUILD_NUMBER`, then `ANDROID_VERSION_CODE`, then `packaging/android/version.properties`; empty variables count as unset. Android enforces a minimum of `13000`. Confirm the next build number against the actual store history; do not infer store acceptance from a local version string.

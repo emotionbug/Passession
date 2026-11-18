@@ -89,7 +89,20 @@ impl Default for Operations {
 
 pub async fn check_local(shared: &Arc<Shared>, args: &Value) -> Result<Value, PlatformError> {
     let channel = channel(shared, args).await;
-    let mut result = shared.desktop.updater.check_app_release(&channel).await?;
+    let mut result = match shared.desktop.updater.check_app_release(&channel).await {
+        Ok(result) => result,
+        Err(super::updater::DiscoveryError::RateLimited(retry_at)) => {
+            return Ok(json!({
+                "targetKind": "app",
+                "updateAvailable": false,
+                "latest": null,
+                "checkError": super::updater::RATE_LIMIT_MESSAGE,
+                "errorCode": super::updater::RATE_LIMIT_CODE,
+                "retryAt": retry_at.to_rfc3339(),
+            }));
+        }
+        Err(error) => return Err(error.into()),
+    };
     result["targetKind"] = "app".into();
     if result["supported"] == true {
         let actual = observed_components().await?;
@@ -563,7 +576,7 @@ pub(super) async fn private_dir(path: &Path) -> Result<(), PlatformError> {
     }
     Ok(())
 }
-async fn read_json(path: &Path) -> Result<Value, PlatformError> {
+pub(super) async fn read_json(path: &Path) -> Result<Value, PlatformError> {
     let meta = tokio::fs::symlink_metadata(path).await?;
     if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > LIMIT {
         return Err(error("Invalid APP update journal file."));

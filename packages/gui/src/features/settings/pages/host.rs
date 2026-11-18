@@ -807,6 +807,28 @@ fn update_error_text(code: &str, raw: &str) -> String {
     with_detail(&ut(key), raw)
 }
 
+pub(super) fn release_check_error_text(check: &Value) -> Option<String> {
+    let code = check["checkErrorCode"]
+        .as_str()
+        .or_else(|| check["errorCode"].as_str());
+    if code == Some("github_rate_limited")
+        && let Some(retry) = check["retryAt"]
+            .as_str()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    {
+        let time = retry
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        return Some(ta("settingsNative.githubRateLimited", &[("time", &time)]));
+    }
+    check["checkError"]
+        .as_str()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| update_error_text("", raw))
+}
+
 /// The daemon (`updater.rs`) and desktop updater report a release channel with
 /// no component inventory for this platform with this phrase; the check itself
 /// succeeded, there is simply nothing published yet.
@@ -1866,10 +1888,11 @@ fn draw_local_app_versions(ui: &mut Ui, app: &about::AboutState, daemon: &Update
         .unwrap_or_else(|| t("settingsNative.unknownVersion"));
     ui.row(row(ut("appLocal.current")).hint(current));
     ui.card_row_separator();
+    let release_error = release_check_error_text(&app.update);
     let check_error = app
         .check_error
         .as_deref()
-        .or_else(|| app.update["checkError"].as_str())
+        .or(release_error.as_deref())
         .filter(|error| !error.is_empty());
     let support_error = app.update["supportError"].as_str();
     let latest = app.update["latest"]["version"]
@@ -2006,7 +2029,9 @@ pub fn draw_version_page(ui: &mut Ui, s: &Settings, host: &HostView) {
     } else if !c.check_error.is_empty() {
         c.check_error.clone()
     } else {
-        update_error_text("", &raw_check_error)
+        checked
+            .and_then(release_check_error_text)
+            .unwrap_or_default()
     };
     let latest = checked
         .and_then(|v| v["latest"]["version"].as_str())
@@ -2547,6 +2572,29 @@ mod tests {
         for (phase, _, _) in cases {
             let key = format!("flutter.{}", host::update_operation_key(phase));
             assert!(persisted.get(&key).is_none(), "{key}");
+        }
+    }
+
+    #[test]
+    fn github_rate_limit_has_local_retry_time() {
+        let retry_at = "2026-11-18T16:37:00Z";
+        let local_time = chrono::DateTime::parse_from_rfc3339(retry_at)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        for code_key in ["checkErrorCode", "errorCode"] {
+            let mut check = json!({"retryAt":retry_at,"checkError":"raw rate limit"});
+            check[code_key] = json!("github_rate_limited");
+            assert_eq!(
+                release_check_error_text(&check).unwrap(),
+                ta("settingsNative.githubRateLimited", &[("time", &local_time)])
+            );
+            check["retryAt"] = json!("invalid");
+            assert_eq!(
+                release_check_error_text(&check).as_deref(),
+                Some("raw rate limit")
+            );
         }
     }
 
