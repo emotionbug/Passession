@@ -19,6 +19,41 @@ pub(super) struct DaemonRuntime {
 }
 
 impl DaemonRuntime {
+    #[cfg(target_os = "macos")]
+    async fn load_shell_path(&mut self, shell: &Path) -> anyhow::Result<()> {
+        if self.environment.contains_key("PATH") {
+            return Ok(());
+        }
+        // Finder supplies only the system PATH. Agent CLIs and their runtimes
+        // are installed through the user's interactive login shell.
+        let output = paseo_client::process::run(
+            paseo_client::process::CommandSpec {
+                program: shell.to_string_lossy().into_owned(),
+                args: vec![
+                    "-ilc".into(),
+                    "printf '\\0PASEO_PATH=%s\\0' \"$PATH\"".into(),
+                ],
+                cwd: None,
+                env: Default::default(),
+                clear_env: false,
+            },
+            64 * 1024,
+            Duration::from_secs(3),
+            Default::default(),
+        )
+        .await?;
+        anyhow::ensure!(output.status == 0, "Login shell PATH query failed");
+        let path = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .find_map(|field| field.strip_prefix(b"PASEO_PATH="))
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Login shell did not return PATH"))?;
+        self.environment
+            .insert("PATH".into(), String::from_utf8(path.to_vec())?);
+        Ok(())
+    }
+
     /// The selected bundled daemon component, an explicit development manifest,
     /// or the bundled desktop-runtime.json.
     fn locate() -> anyhow::Result<Self> {
@@ -163,10 +198,20 @@ async fn run(runtime: &DaemonRuntime, args: Vec<OsString>) -> Result<Value, Plat
 async fn runtime(cached: &OnceCell<DaemonRuntime>) -> Result<&DaemonRuntime, PlatformError> {
     cached
         .get_or_try_init(|| async {
-            tokio::task::spawn_blocking(DaemonRuntime::locate)
+            let runtime = tokio::task::spawn_blocking(DaemonRuntime::locate)
                 .await
                 .map_err(|e| PlatformError::native(e.to_string()))?
-                .map_err(|e| PlatformError::new("RUNTIME_MISSING", e.to_string()))
+                .map_err(|e| PlatformError::new("RUNTIME_MISSING", e.to_string()))?;
+            #[cfg(target_os = "macos")]
+            let runtime = {
+                let mut runtime = runtime;
+                let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+                if let Err(error) = runtime.load_shell_path(Path::new(&shell)).await {
+                    makepad_widgets::log!("Login shell PATH unavailable: {error}");
+                }
+                runtime
+            };
+            Ok(runtime)
         })
         .await
 }
@@ -268,6 +313,68 @@ async fn ensure_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn login_shell_path_reaches_daemon_and_agent_clis() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let tools = directory.path().join("agent tools");
+        std::fs::create_dir(&tools).unwrap();
+        let shell = tools.join("login shell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\n[ \"$1\" = '-ilc' ] || exit 7\nprintf 'shell startup banner\\n'\nprintf '\\0PASEO_PATH=%s\\0' \"${0%/*}\"\n",
+        ).unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for cli in ["codex", "claude"] {
+            let program = tools.join(cli);
+            std::fs::write(&program, "#!/bin/sh\nprintf 'agent-version\\n'\n").unwrap();
+            std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut runtime = DaemonRuntime {
+            executable: "/usr/bin/env".into(),
+            working_directory: directory.path().to_owned(),
+            environment: HashMap::new(),
+        };
+        runtime.load_shell_path(&shell).await.unwrap();
+        for cli in ["codex", "claude"] {
+            let output = daemon_command(&runtime, [cli.into(), "--version".into()])
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"agent-version\n");
+        }
+        runtime
+            .environment
+            .insert("PATH".into(), "/explicit/runtime/path".into());
+        runtime
+            .load_shell_path(Path::new("/missing/shell"))
+            .await
+            .unwrap();
+        assert_eq!(runtime.environment["PATH"], "/explicit/runtime/path");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn failed_shell_query_preserves_the_inherited_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut runtime = DaemonRuntime {
+            executable: "/usr/bin/env".into(),
+            working_directory: directory.path().to_owned(),
+            environment: HashMap::from([("EXPLICIT".into(), "preserved".into())]),
+        };
+        assert!(
+            runtime
+                .load_shell_path(Path::new("/usr/bin/false"))
+                .await
+                .is_err()
+        );
+        assert!(!runtime.environment.contains_key("PATH"));
+        assert_eq!(runtime.environment["EXPLICIT"], "preserved");
+    }
 
     #[tokio::test]
     async fn startup_only_ensures_stopped_or_legacy_daemons_when_enabled() {

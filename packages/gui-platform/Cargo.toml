@@ -63,6 +63,7 @@ block2 = "0.6"
 objc2 = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+paseo-client = { path = "../client" }
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
