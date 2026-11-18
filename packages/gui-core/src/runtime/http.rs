@@ -205,7 +205,7 @@ mod tests {
             let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     let mut events = Vec::new();
-                    core.queue.drain_into(&mut events, 100);
+                    while core.queue.stage(&mut events) {}
                     for event in events {
                         if let crate::CoreEvent::Response { result, .. } = event { return result.unwrap(); }
                     }

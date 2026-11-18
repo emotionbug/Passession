@@ -82,11 +82,12 @@ The daemon publishes an agent's state as soon as a displayed field changes; chan
 latest value. Directory followers skip agent and project upserts whose serialized form is
 unchanged.
 
-The app admits at most 64 queued core events in one dispatch, taking a finite queue snapshot
-under one lock. A nonempty batch arms a 1/60-second continuation timer; incoming signals cannot
-bypass that timer. This yields between batches even while a producer keeps refilling the queue,
-including when no window is drawing. It does not drop canonical events or impose a byte/time
-budget on an individual event.
+The core keeps only the latest undelivered `State`: it is a complete presentation
+snapshot, so older snapshots add no information. Connection, host, response and
+error events remain FIFO. Each wake handles small chunks for about 4 ms, including
+delivery to features and windows. If events remain, the app signals the next
+loop turn without a frame-rate timer, including when no window is drawing. The
+budget does not preempt a chunk or cap the bytes in the ordered queue.
 
 Timeline sessions apply matching events in order. Publish one projection per
 dirty session after the batch; an unrelated UI event does not visit retained histories.

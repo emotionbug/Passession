@@ -821,7 +821,7 @@ mod tests {
                 let mut responses = Vec::new();
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
-                        core.queue.drain_into(&mut responses, 100);
+                        while core.queue.stage(&mut responses) {}
                         if responses
                             .iter()
                             .filter(|event| matches!(event, crate::CoreEvent::Response { .. }))

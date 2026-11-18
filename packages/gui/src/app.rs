@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use makepad_widgets::*;
 use paseo_gui_core::{CoreConfig, CoreEvent, GuiCore};
@@ -82,8 +83,7 @@ fn core_config() -> CoreConfig {
 }
 
 // Leave event-loop turns between transcript batches for input and painting.
-const CORE_BATCH_LIMIT: usize = 64;
-const CORE_BATCH_INTERVAL: f64 = 1.0 / 60.0;
+const CORE_BATCH_BUDGET: Duration = Duration::from_millis(4);
 const LAYOUT_RETIREMENT_INTERVAL: f64 = 1.0 / 60.0;
 
 /// Everything that exists once startup succeeded.
@@ -102,7 +102,6 @@ struct Runtime {
     /// The embedded Tailscale presence last handed to the Android foreground service.
     #[cfg(target_os = "android")]
     tailnet_presence: Option<TailnetPresence>,
-    core_batch_timer: Timer,
     /// The core's last `State` publication: batch deltas compare publications, so a local
     /// optimistic write (`write_preference`) still reaches every window with its echo.
     published: Arc<paseo_gui_core::CoreState>,
@@ -184,7 +183,6 @@ impl App {
             menu_locale: "",
             #[cfg(target_os = "android")]
             tailnet_presence: None,
-            core_batch_timer: Timer::default(),
             published: Arc::new(paseo_gui_core::CoreState::default()),
         });
         self.ui
@@ -253,40 +251,38 @@ impl App {
         }
     }
 
-    /// Admits one bounded FIFO batch; a live producer cannot extend this dispatch.
-    fn drain_core(runtime: &mut Runtime) -> bool {
+    fn drain_core(runtime: &mut Runtime) -> (bool, bool) {
         let mut state_changed = false;
-        runtime
-            .core
-            .drain_events(&mut runtime.ui.events, CORE_BATCH_LIMIT);
-        for event in &runtime.ui.events {
-            if let Some(platform) = runtime.platform.as_mut() {
+        let remaining = runtime.core.stage_events(&mut runtime.ui.events);
+        let ui = &mut runtime.ui;
+        let platform = &mut runtime.platform;
+        let published = &mut runtime.published;
+        for event in &ui.events {
+            if let Some(platform) = platform.as_mut() {
                 platform.observe_core_event(event);
             }
-            if let CoreEvent::Response {
-                request_id, result, ..
-            } = event
-            {
-                runtime.ui.terminal_terminations.settle(request_id, result);
-            }
-            if let CoreEvent::State { state } = &event {
-                let delta = StateDelta::between(&runtime.published, state);
-                runtime.ui.state_delta.merge(delta);
-                runtime.published = state.clone();
-                runtime.ui.state = state.clone();
-                state_changed = true;
-            }
-            if let CoreEvent::Connected {
-                host_id,
-                server_info,
-            } = &event
-            {
-                let mut infos = (*runtime.ui.server_infos).clone();
-                infos.insert(host_id.clone(), server_info.clone());
-                runtime.ui.server_infos = std::rc::Rc::new(infos);
+            match event {
+                CoreEvent::Response {
+                    request_id, result, ..
+                } => ui.terminal_terminations.settle(request_id, result),
+                CoreEvent::State { state } => {
+                    let delta = StateDelta::between(published, state);
+                    ui.state_delta.merge(delta);
+                    *published = state.clone();
+                    ui.state = state.clone();
+                    state_changed = true;
+                }
+                CoreEvent::Connected {
+                    host_id,
+                    server_info,
+                } => {
+                    std::rc::Rc::make_mut(&mut ui.server_infos)
+                        .insert(host_id.clone(), server_info.clone());
+                }
+                _ => {}
             }
         }
-        state_changed
+        (state_changed, remaining)
     }
 
     fn open_window(&mut self, cx: &mut Cx, request: shell::WindowRequest) {
@@ -487,15 +483,37 @@ fn dispatch_window(
     }
 }
 
+/// Runs complete chunks (including feature and widget dispatch) while budget
+/// remains. A chunk cannot be preempted, and the first always makes progress.
+fn dispatch_core_turn(budget: Duration, mut dispatch_chunk: impl FnMut() -> bool) -> bool {
+    let started = Instant::now();
+    while dispatch_chunk() {
+        if started.elapsed() >= budget {
+            return true;
+        }
+    }
+    false
+}
+
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         common::transition::begin_event(event);
-        cx.with_timer_owner(common::APP_TIMERS, |cx| self.dispatch_event(cx, event));
+        cx.with_timer_owner(common::APP_TIMERS, |cx| {
+            if matches!(event, Event::Signal) {
+                if dispatch_core_turn(CORE_BATCH_BUDGET, || self.dispatch_event(cx, event)) {
+                    // Re-arm the worker wake for another loop turn, including
+                    // when windows are hidden and there are no animation frames.
+                    SignalToUI::set_ui_signal();
+                }
+            } else {
+                self.dispatch_event(cx, event);
+            }
+        });
     }
 }
 
 impl App {
-    fn dispatch_event(&mut self, cx: &mut Cx, event: &Event) {
+    fn dispatch_event(&mut self, cx: &mut Cx, event: &Event) -> bool {
         let timer = match event {
             Event::Timer(e) => cx.take_timer_owner(e.timer_id),
             _ => None,
@@ -526,7 +544,7 @@ impl App {
                     self.ui.handle_event(cx, event, &mut Scope::empty())
                 });
             }
-            return;
+            return false;
         };
         if !matches!(event, Event::Timer(_))
             && let Some(platform) = runtime.platform.as_mut()
@@ -552,19 +570,15 @@ impl App {
             runtime.theme_key.clear();
         }
         let mut appearance = refresh_appearance || matches!(event, Event::Startup);
-        let core_tick = runtime.core_batch_timer.is_event(event).is_some();
-        if core_tick {
-            runtime.core_batch_timer = Timer::default();
-        }
-        if core_tick || (matches!(event, Event::Signal) && runtime.core_batch_timer.is_empty()) {
-            appearance |= Self::drain_core(runtime);
-            if !runtime.ui.events.is_empty() {
-                // Poll once more even if the queue was empty after admission:
-                // arrivals during processing must not bypass the cadence. A timer
-                // also services hidden windows which have no animation frames.
-                runtime.core_batch_timer = cx.start_timeout(CORE_BATCH_INTERVAL);
-            }
-        }
+        let signal = matches!(event, Event::Signal);
+        let remaining = if signal {
+            cx.frame_trace_core_queue(|| runtime.core.event_backlog());
+            let (state_changed, remaining) = Self::drain_core(runtime);
+            appearance |= state_changed;
+            remaining
+        } else {
+            false
+        };
         if appearance {
             Self::appearance(runtime, cx);
             // After `appearance`: a language change relabels the presence.
@@ -587,16 +601,7 @@ impl App {
         if let Event::Signal = event {
             crate::features::composer::poll_background(cx);
         }
-        // The continuation timer belongs to the app, not every panel receiving
-        // the batch. Deliver the data as a worker wake, without the raw timer.
-        let widget_event = if core_tick && batch {
-            &Event::Signal
-        } else {
-            event
-        };
-        let widget_timer = if core_tick && batch { None } else { timer };
-        let signal = matches!(widget_event, Event::Signal);
-        let platform_completion = matches!(widget_event, Event::Actions(actions) if actions.iter().any(|action| {
+        let platform_completion = matches!(event, Event::Actions(actions) if actions.iter().any(|action| {
             matches!(action.downcast_ref::<paseo_gui_platform::PlatformAction>(),
                 Some(paseo_gui_platform::PlatformAction::Completed { .. }))
         }));
@@ -610,43 +615,31 @@ impl App {
                 Event::Foreground | Event::Resume | Event::Background | Event::Pause
             )
         {
-            crate::features::timeline::handle_event(cx, widget_event, &mut runtime.ui);
+            crate::features::timeline::handle_event(cx, event, &mut runtime.ui);
         }
         if batch || signal || platform_completion || group == Some(common::FILE_TIMERS.group) {
             let timer_session = timer
                 .filter(|owner| owner.group == common::FILE_TIMERS.group)
                 .map(|owner| owner.target);
-            crate::features::files::handle_event(cx, widget_event, &mut runtime.ui, timer_session);
+            crate::features::files::handle_event(cx, event, &mut runtime.ui, timer_session);
         }
         if batch || signal || group == Some(common::GIT_TIMERS.group) {
             crate::features::git::store::with_store(|store| {
-                store.handle_event(cx, widget_event, &mut runtime.ui)
+                store.handle_event(cx, event, &mut runtime.ui)
             });
         }
 
         // Main window first: the first dispatched shell consumes global effects.
-        dispatch_window(
-            cx,
-            widget_event,
-            &self.ui,
-            widget_timer,
-            &mut runtime.ui,
-            || {
-                self.ui
-                    .widget(id!(main_window.shell))
-                    .as_paseo_shell()
-                    .os_window()
-            },
-        );
+        dispatch_window(cx, event, &self.ui, timer, &mut runtime.ui, || {
+            self.ui
+                .widget(id!(main_window.shell))
+                .as_paseo_shell()
+                .os_window()
+        });
         for (_, window) in &runtime.windows {
-            dispatch_window(
-                cx,
-                widget_event,
-                window,
-                widget_timer,
-                &mut runtime.ui,
-                || window.widget(id!(shell)).as_paseo_shell().os_window(),
-            );
+            dispatch_window(cx, event, window, timer, &mut runtime.ui, || {
+                window.widget(id!(shell)).as_paseo_shell().os_window()
+            });
         }
         runtime.ui.timer_target = None;
         if matches!(event, Event::Draw(_)) {
@@ -689,12 +682,25 @@ impl App {
         }
         #[cfg(feature = "desktop-smoke")]
         self.smoke_event(cx, event);
+        remaining
     }
 }
 
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
+
+    #[test]
+    fn perf_core_turn_drains_past_the_old_limit_and_yields_on_budget() {
+        let mut remaining = 160_usize;
+        let mut dispatch_chunk = || {
+            remaining = remaining.saturating_sub(32);
+            remaining != 0
+        };
+        assert!(dispatch_core_turn(Duration::ZERO, &mut dispatch_chunk));
+        assert!(!dispatch_core_turn(Duration::MAX, &mut dispatch_chunk));
+        assert_eq!(remaining, 0);
+    }
 
     #[test]
     fn dispatch_timer_reaches_only_the_registered_owner() {

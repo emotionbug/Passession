@@ -15,7 +15,6 @@ use crate::common::paint::{Font, HitMap};
 use crate::common::{FileLinkIntent, PanelTarget, TabPlacement, UiContext, UiEffect};
 use crate::theme::{self, Palette, Typography, with_alpha};
 
-use super::editor::buffer::{find_matches, match_len};
 use super::editor::field::{FieldEvent, TextField};
 use super::editor::view::{EditorLook, SourceEditor};
 use super::handle::Snapshot;
@@ -456,6 +455,12 @@ impl FileView {
                 self.editor_session = Some(id);
             }
         }
+        if changed_text.is_some() {
+            self.match_index = 0;
+            if self.find_visible {
+                self.count_matches();
+            }
+        }
         let text = self
             .editor
             .as_ref()
@@ -711,11 +716,16 @@ impl FileView {
         self.with_model(cx, ui, move |m, io| m.edit(text, io));
         if self.find_visible {
             self.count_matches();
+        } else {
+            self.match_index = 0;
         }
     }
 
     fn open_find(&mut self, cx: &mut Cx) {
         self.find_visible = true;
+        if self.match_index == 0 {
+            self.count_matches();
+        }
         self.set_focus(cx, Focus::Find);
         cx.claim_text_selection(self.area);
         self.query.select_all();
@@ -727,19 +737,22 @@ impl FileView {
     }
 
     fn count_matches(&mut self) {
-        let Some(editor) = self.editor.as_ref() else {
-            return;
-        };
-        self.match_count = find_matches(editor.text(), self.query.text(), self.match_case).len();
-        self.match_index = 0;
-    }
-
-    fn find_next(&mut self, ui: &mut UiContext, previous: bool) {
         let Some(editor) = self.editor.as_mut() else {
             return;
         };
-        let needle = self.query.text().to_owned();
-        let matches = find_matches(editor.text(), &needle, self.match_case);
+        self.match_count = editor
+            .buffer
+            .matches(self.query.text(), self.match_case)
+            .len();
+        self.match_index = 0;
+    }
+
+    fn find_next(&mut self, previous: bool) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        let selection = editor.buffer.selection;
+        let matches = editor.buffer.matches(self.query.text(), self.match_case);
         self.match_count = matches.len();
         self.match_index = 0;
         if matches.is_empty() {
@@ -751,25 +764,18 @@ impl FileView {
                 session.view = TextView::Source;
             }
         });
-        let selection = editor.buffer.selection;
-        let next = if previous {
+        let index = if previous {
             matches
-                .iter()
-                .rev()
-                .find(|&&index| index < selection.start())
-                .copied()
-                .unwrap_or(*matches.last().unwrap())
+                .partition_point(|matched| matched.start < selection.start())
+                .checked_sub(1)
+                .unwrap_or(matches.len() - 1)
         } else {
-            matches
-                .iter()
-                .find(|&&index| index >= selection.end())
-                .copied()
-                .unwrap_or(matches[0])
+            let index = matches.partition_point(|matched| matched.start < selection.end());
+            if index == matches.len() { 0 } else { index }
         };
-        let len = match_len(editor.text(), next, &needle, self.match_case);
-        editor.select(next, next + len);
-        self.match_index = matches.iter().position(|&index| index == next).unwrap_or(0) + 1;
-        let _ = ui;
+        let matched = matches[index].clone();
+        editor.select(matched.start, matched.end);
+        self.match_index = index + 1;
     }
 
     fn replace_selection(&mut self, cx: &mut Cx, ui: &mut UiContext) {
@@ -779,64 +785,29 @@ impl FileView {
         if editor.read_only {
             return;
         }
-        let selection = editor.buffer.selection;
-        let selected = editor.buffer.selected_text().to_owned();
-        let needle = self.query.text().to_owned();
-        let same = if self.match_case {
-            selected == needle
-        } else {
-            selected.to_lowercase() == needle.to_lowercase()
-        };
-        if selection.is_empty() || !same {
-            self.find_next(ui, false);
-            return;
+        if editor
+            .buffer
+            .replace_match(self.query.text(), self.match_case, self.replacement.text())
+        {
+            self.edited(cx, ui);
         }
-        let replacement = self.replacement.text().to_owned();
-        editor.buffer.replace(
-            selection.start(),
-            selection.end(),
-            &replacement,
-            super::editor::buffer::EditKind::Other,
-        );
-        self.edited(cx, ui);
-        self.find_next(ui, false);
+        self.find_next(false);
     }
 
     fn replace_all(&mut self, cx: &mut Cx, ui: &mut UiContext) {
         let Some(editor) = self.editor.as_mut() else {
             return;
         };
-        let needle = self.query.text().to_owned();
-        if editor.read_only || needle.is_empty() {
+        if editor.read_only
+            || !editor.buffer.replace_all(
+                self.query.text(),
+                self.match_case,
+                self.replacement.text(),
+            )
+        {
             return;
         }
-        let replacement = self.replacement.text().to_owned();
-        let text = editor.text().to_owned();
-        let matches = find_matches(&text, &needle, self.match_case);
-        if matches.is_empty() {
-            return;
-        }
-        let mut out = String::with_capacity(text.len());
-        let mut last = 0;
-        for start in &matches {
-            out.push_str(&text[last..*start]);
-            out.push_str(&replacement);
-            last = start + match_len(&text, *start, &needle, self.match_case);
-        }
-        out.push_str(&text[last..]);
-        let head = editor.buffer.selection.head.min(out.len());
-        editor
-            .buffer
-            .replace(0, text.len(), &out, super::editor::buffer::EditKind::Other);
-        editor
-            .buffer
-            .set_selection(super::editor::buffer::Selection::caret(
-                super::editor::buffer::floor_boundary(&out, head),
-            ));
         self.edited(cx, ui);
-        if let Some(editor) = self.editor.as_ref() {
-            self.match_count = find_matches(editor.text(), &needle, self.match_case).len();
-        }
     }
 
     /// Flutter `_attach`: whole file or the selected lines.
@@ -1767,7 +1738,7 @@ impl FileView {
                 };
                 match field.handle_hit(cx, kit, hit) {
                     FieldEvent::Submitted { shift } if self.focus == Focus::Find => {
-                        self.find_next(ui, shift)
+                        self.find_next(shift)
                     }
                     FieldEvent::Changed if self.focus == Focus::Find => self.count_matches(),
                     _ => {}
@@ -1837,8 +1808,8 @@ impl FileView {
                 self.match_case = !self.match_case;
                 self.count_matches();
             }
-            Hot::FindPrev => self.find_next(ui, true),
-            Hot::FindNext => self.find_next(ui, false),
+            Hot::FindPrev => self.find_next(true),
+            Hot::FindNext => self.find_next(false),
             Hot::FindClose => self.close_find(cx),
             Hot::ReplaceOne => self.replace_selection(cx, ui),
             Hot::ReplaceAll => self.replace_all(cx, ui),
@@ -3199,5 +3170,43 @@ fn slot_state(slot: Option<ImageSlot>) -> ImageState {
         },
         Some(ImageSlot::Failed(error)) => ImageState::Failed(error),
         _ => ImageState::Loading,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_find_keeps_unicode_selection_and_navigation_after_replace() {
+        let mut view = FileView::new("find-test", WidgetUid(0));
+        view.editor = Some(SourceEditor::new(
+            "İ i\u{307} İ".into(),
+            "test.txt",
+            "find-test".into(),
+            false,
+        ));
+        view.query.set_text("i\u{307}");
+        view.count_matches();
+        assert_eq!((view.match_count, view.match_index), (3, 0));
+
+        view.find_next(false);
+        let editor = view.editor.as_mut().unwrap();
+        assert_eq!(editor.buffer.selection.end(), 2);
+        assert_eq!(editor.buffer.selected_text(), "İ");
+        assert!(editor.buffer.replace_match(view.query.text(), false, "한"));
+
+        view.count_matches();
+        view.find_next(false);
+        assert_eq!((view.match_count, view.match_index), (2, 1));
+        assert_eq!(
+            view.editor.as_ref().unwrap().buffer.selected_text(),
+            "i\u{307}",
+        );
+        view.find_next(true);
+        assert_eq!(view.match_index, 2);
+        assert_eq!(view.editor.as_ref().unwrap().buffer.selected_text(), "İ");
+        view.find_next(false);
+        assert_eq!(view.match_index, 1);
     }
 }

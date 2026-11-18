@@ -3,7 +3,7 @@
 //! [`GuiCore`] owns one dedicated core thread with a single-threaded Tokio runtime. Host
 //! connections (direct, relay, IPC, SSH and connected-host routes), directory hydration,
 //! persistence and request correlation run there; the GUI thread only enqueues commands through
-//! [`CoreHandle`] and drains bounded [`CoreEvent`] batches with [`GuiCore::drain_events`]. It ports the Flutter
+//! [`CoreHandle`] and stages [`CoreEvent`]s for budgeted GUI dispatch.
 //! `core/client.dart`, the host and persistence parts of `core/app_store.dart`, and
 //! `core/transport/connection_selection.dart`.
 mod connection;
@@ -491,11 +491,16 @@ impl GuiCore {
         self.handle.clone()
     }
 
-    /// Moves at most `limit` queued events into `output`, in arrival order.
-    /// After a nonempty batch, schedule another GUI turn: the queue only emits
-    /// an external wake when it transitions from empty to nonempty.
-    pub fn drain_events(&mut self, output: &mut Vec<CoreEvent>, limit: usize) -> usize {
-        self.queue.drain_into(output, limit)
+    /// Stages one FIFO chunk without holding the queue lock during dispatch.
+    /// Returns whether more events were queued; a later push to an empty
+    /// queue wakes the GUI independently.
+    pub fn stage_events(&mut self, output: &mut Vec<CoreEvent>) -> bool {
+        self.queue.stage(output)
+    }
+
+    /// Pending event count and age of the oldest event (`PASEO_FRAME_TRACE=1`).
+    pub fn event_backlog(&self) -> (usize, Duration) {
+        self.queue.backlog()
     }
 }
 

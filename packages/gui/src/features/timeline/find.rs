@@ -1,9 +1,9 @@
 //! Port of `chrome/chat_find.dart` ChatFindController (chat-find/model.ts):
 //! debounced host search (120ms) over the whole chat through
-//! `agent.timeline.search.request`, a position across every match, next /
-//! previous stepping through each message's rendered occurrences, older
-//! history loaded to reveal a hit, and named failures (connection, history
-//! changed, reveal). The controller is a state machine: it emits `Request`s
+//! `agent.timeline.search.request`, an early first hit while the total is
+//! still paging, next/previous stepping through each message's rendered
+//! occurrences, older history loaded to reveal a hit, and named failures
+//! (connection, history changed, reveal). The controller emits `Request`s
 //! the panel runs and consumes their outcomes.
 
 use super::json::*;
@@ -59,11 +59,16 @@ struct Target {
     before: i64,
 }
 
+impl Target {
+    fn covers_alias(self, seq: i64, role: &str, kept: &Location) -> bool {
+        seq != kept.seq && role == kept.role && seq > self.before && seq <= self.seq
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Pending {
     None,
     Debounce,
-    Search,
     /// Navigation: resolving `index` going `direction`, `remaining` tries left.
     Load {
         index: usize,
@@ -89,11 +94,16 @@ pub struct FindController {
     pub focus_requests: u64,
     locations: Vec<Location>,
     resolved: Vec<(i64, Target)>,
+    // Resolved row spans that extend beyond the latest search cursor.
+    covered: Vec<(Location, Target)>,
     result_epoch: Option<String>,
     current: Option<usize>,
     in_message: (usize, usize),
     highlighted: bool,
-    token: u64,
+    search_token: u64,
+    paging: bool,
+    cursor: Option<i64>,
+    navigation_token: u64,
     pending: Pending,
     pub requests: Vec<Request>,
 }
@@ -128,11 +138,15 @@ impl Default for FindController {
             focus_requests: 0,
             locations: Vec::new(),
             resolved: Vec::new(),
+            covered: Vec::new(),
             result_epoch: None,
             current: None,
             in_message: (0, 0),
             highlighted: false,
-            token: 0,
+            search_token: 0,
+            paging: false,
+            cursor: None,
+            navigation_token: 0,
             pending: Pending::None,
             requests: Vec::new(),
         }
@@ -148,7 +162,16 @@ impl FindController {
     }
 
     fn cancel(&mut self) {
-        self.token += 1;
+        self.search_token += 1;
+        self.paging = false;
+        self.cursor = None;
+        self.covered.clear();
+        self.cancel_navigation();
+        self.requests.clear();
+    }
+
+    fn cancel_navigation(&mut self) {
+        self.navigation_token += 1;
         self.pending = Pending::None;
         self.highlighted = false;
     }
@@ -200,14 +223,17 @@ impl FindController {
             return;
         }
         self.pending = Pending::Debounce;
-        self.requests.push(Request::Debounce { token: self.token });
+        self.requests.push(Request::Debounce {
+            token: self.search_token,
+        });
     }
 
     pub fn search_due(&mut self, token: u64) {
-        if token != self.token || !matches!(self.pending, Pending::Debounce) {
+        if token != self.search_token || !matches!(self.pending, Pending::Debounce) {
             return;
         }
-        self.pending = Pending::Search;
+        self.pending = Pending::None;
+        self.paging = true;
         self.requests.push(Request::Search {
             token,
             query: self.query.clone(),
@@ -229,43 +255,68 @@ impl FindController {
         result: Result<Value, String>,
         loaded_epoch: Option<&str>,
         rows: &[Rc<Value>],
-    ) {
-        if token != self.token || !matches!(self.pending, Pending::Search) {
-            return;
+    ) -> bool {
+        if token != self.search_token || !self.paging {
+            return false;
         }
         let Ok(page) = result else {
             self.fail(Failure::Connection);
-            return;
+            return true;
         };
-        let epoch = str_of(get(&page, "epoch")).to_owned();
+        let epoch = str_of(get(&page, "epoch"));
         if loaded_epoch.is_some_and(|e| e != epoch)
             || self.result_epoch.as_deref().is_some_and(|e| e != epoch)
         {
             self.fail(Failure::HistoryChanged);
-            return;
+            return true;
         }
-        self.result_epoch = Some(epoch);
+        if self.result_epoch.is_none() {
+            self.result_epoch = Some(epoch.to_owned());
+        }
+        let start = self.locations.len();
         for location in list(get(&page, "locations")) {
+            let seq = int_of(get(location, "seq"));
+            let role = str_or(get(location, "role"), "assistant");
+            if self
+                .covered
+                .iter()
+                .any(|(kept, target)| target.covers_alias(seq, role, kept))
+            {
+                continue;
+            }
+            // COMPAT(timelineSearchCount): hosts before v0.9.0 send no count.
+            let count = get(location, "count").as_u64().map_or(1, |c| c as usize);
+            self.count += count;
             self.locations.push(Location {
-                seq: int_of(get(location, "seq")),
-                role: str_or(get(location, "role"), "assistant").to_owned(),
-                // COMPAT(timelineSearchCount): hosts before v0.9.0 send no count.
-                count: get(location, "count")
-                    .as_u64()
-                    .map(|c| c as usize)
-                    .unwrap_or(1),
+                seq,
+                role: role.to_owned(),
+                count,
             });
         }
-        if let Some(cursor) = get(&page, "nextCursor").as_i64() {
+        let added = self.locations.len() - start;
+        let cursor = get(&page, "nextCursor").as_i64();
+        self.covered
+            .retain(|(_, target)| cursor.is_some_and(|cursor| target.seq > cursor));
+        self.cursor = cursor;
+        self.paging = cursor.is_some();
+        if self.current.is_none() {
+            // The first candidate may still be waiting on an older-history load.
+            // In that case extend its fallback to include the newly arrived rows.
+            match &mut self.pending {
+                Pending::Load { remaining, .. } | Pending::Wait { remaining, .. } => {
+                    *remaining += added;
+                }
+                _ => self.navigate(start, 1, added, loaded_epoch, rows),
+            }
+        }
+        if let Some(cursor) = cursor {
             self.requests.push(Request::Search {
                 token,
                 query: self.query.clone(),
                 cursor: Some(cursor),
             });
-            return;
         }
-        self.pending = Pending::None;
-        self.navigate(0, 1, self.locations.len(), loaded_epoch, rows);
+        true
     }
 
     /// model.ts updateHistory: the loaded timeline changed.
@@ -294,14 +345,14 @@ impl FindController {
     }
 
     pub fn wait_expired(&mut self, token: u64) {
-        if token == self.token && matches!(self.pending, Pending::Wait { .. }) {
+        if token == self.navigation_token && matches!(self.pending, Pending::Wait { .. }) {
             self.fail(Failure::Reveal);
         }
     }
 
     /// The older-history load for a location finished.
     pub fn on_load(&mut self, token: u64, ok: bool, epoch: Option<&str>, rows: &[Rc<Value>]) {
-        if token != self.token {
+        if token != self.navigation_token {
             return;
         }
         let Pending::Load {
@@ -345,7 +396,9 @@ impl FindController {
                 continue;
             }
             let kind = str_of(get(get(row, "item"), "type"));
-            if kind == format!("{}_message", location.role) && (!exact || start <= location.seq) {
+            if kind.strip_suffix("_message") == Some(location.role.as_str())
+                && (!exact || start <= location.seq)
+            {
                 return Some(Target {
                     id: start,
                     seq,
@@ -393,13 +446,14 @@ impl FindController {
                     Err(next) => index = next,
                 },
                 None => {
+                    self.navigation_token += 1;
                     self.pending = Pending::Load {
                         index,
                         direction,
                         remaining,
                     };
                     self.requests.push(Request::Load {
-                        token: self.token,
+                        token: self.navigation_token,
                         seq: location.seq,
                     });
                     return;
@@ -407,9 +461,12 @@ impl FindController {
             }
         }
         self.highlighted = false;
-        self.phase = Phase::Ready;
+        self.phase = if self.paging && self.current.is_none() {
+            Phase::Searching
+        } else {
+            Phase::Ready
+        };
         self.selected_row = None;
-        self.count = 0;
         self.occurrence = 0;
     }
 
@@ -428,27 +485,33 @@ impl FindController {
         self.resolved.push((location.seq, target));
         // Several host hits may belong to one displayed message.
         let keep_seq = location.seq;
-        let role = location.role.clone();
         self.locations.retain(|c| {
-            c.seq == keep_seq || c.role != role || !(c.seq > target.before && c.seq <= target.seq)
+            let keep = !target.covers_alias(c.seq, &c.role, &location);
+            if !keep {
+                self.count -= c.count;
+            }
+            keep
         });
+        if self.cursor.is_some_and(|cursor| target.seq > cursor)
+            && !self.covered.iter().any(|(kept, _)| kept.seq == keep_seq)
+        {
+            self.covered.push((location, target));
+        }
         let index = self
             .locations
             .iter()
             .position(|c| c.seq == keep_seq)
             .unwrap_or(0);
-        if self.selected_row != Some(target.id) {
-            self.highlighted = false;
-        }
-        self.selected_row = Some(target.id);
         let reveal = self.reveal(target.id, if direction == 1 { 0 } else { -1 }, rows);
         if reveal.1 > 0 {
+            self.selected_row = Some(target.id);
             self.current = Some(index);
             self.phase = Phase::Ready;
             self.position(index, reveal);
             return Ok(());
         }
-        self.locations.remove(index);
+        self.count -= self.locations.remove(index).count;
+        self.current = None;
         let next = if direction == -1 {
             index as i64 - 1
         } else {
@@ -464,11 +527,11 @@ impl FindController {
         let Some(entry) = rows.iter().find(|r| int_of(get(r, "seqStart")) == row) else {
             return (0, 0);
         };
-        self.requests.push(Request::ScrollTo { row });
         let count = row_match_count(entry, &self.query);
         if count == 0 {
             return (0, 0);
         }
+        self.requests.push(Request::ScrollTo { row });
         self.highlighted = true;
         let occurrence = if occurrence < 0 {
             count - 1
@@ -480,24 +543,21 @@ impl FindController {
 
     fn position(&mut self, index: usize, revealed: (usize, usize)) {
         self.in_message = revealed;
-        self.locations[index].count = revealed.1;
-        let mut before = 0;
-        let mut total = 0;
-        for (i, location) in self.locations.iter().enumerate() {
-            if i == index {
-                before = total;
-            }
-            total += location.count;
-        }
-        self.occurrence = before + revealed.0;
-        self.count = total;
+        let count = &mut self.locations[index].count;
+        self.count = self.count - *count + revealed.1;
+        *count = revealed.1;
+        self.occurrence = self.locations[..index]
+            .iter()
+            .map(|location| location.count)
+            .sum::<usize>()
+            + revealed.0;
     }
 
     fn step(&mut self, direction: i32, epoch: Option<&str>, rows: &[Rc<Value>]) {
         if self.phase != Phase::Ready || self.count == 0 {
             return;
         }
-        self.cancel();
+        self.cancel_navigation();
         let next = self.in_message.0 as i64 + direction as i64;
         if let Some(row) = self.selected_row
             && next >= 0
@@ -528,8 +588,163 @@ impl FindController {
     pub fn previous(&mut self, epoch: Option<&str>, rows: &[Rc<Value>]) {
         self.step(-1, epoch, rows);
     }
+}
 
-    pub fn token(&self) -> u64 {
-        self.token
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn start(find: &mut FindController, query: &str) -> u64 {
+        find.show();
+        find.set_query(query);
+        let [Request::Debounce { token }] = find.requests.as_slice() else {
+            panic!("expected one debounce request");
+        };
+        let token = *token;
+        find.requests.clear();
+        find.search_due(token);
+        assert_eq!(
+            std::mem::take(&mut find.requests),
+            [Request::Search {
+                token,
+                query: query.into(),
+                cursor: None,
+            }],
+        );
+        token
+    }
+
+    fn row(start: i64, end: i64, text: &str) -> Rc<Value> {
+        Rc::new(json!({
+            "seqStart": start, "seqEnd": end,
+            "item": {"type": "user_message", "text": text},
+        }))
+    }
+
+    fn page(epoch: &str, matches: &[(i64, usize)], cursor: Option<i64>) -> Result<Value, String> {
+        let locations: Vec<_> = matches
+            .iter()
+            .map(|(seq, count)| json!({"seq": seq, "count": count, "role": "user"}))
+            .collect();
+        Ok(json!({"epoch": epoch, "locations": locations, "nextCursor": cursor}))
+    }
+
+    #[test]
+    fn perf_chat_find_reveals_the_first_valid_hit_and_counts_later_pages() {
+        let mut find = FindController::default();
+        let token = start(&mut find, "needle");
+        let rows = [
+            row(1, 1, "not rendered"),
+            row(8, 10, "needle needle"),
+            row(11, 11, "needle"),
+            row(14, 14, "needle"),
+        ];
+        assert!(find.on_search(
+            token,
+            page("a", &[(1, 1), (8, 1)], Some(8)),
+            Some("a"),
+            &rows
+        ));
+        assert_eq!(find.phase, Phase::Ready);
+        assert_eq!(find.selected_row, Some(8));
+        assert_eq!((find.occurrence, find.count), (0, 2));
+        assert_eq!(
+            std::mem::take(&mut find.requests),
+            [
+                Request::ScrollTo { row: 8 },
+                Request::Search {
+                    token,
+                    query: "needle".into(),
+                    cursor: Some(8),
+                },
+            ],
+        );
+
+        find.next(Some("a"), &rows);
+        assert_eq!((find.occurrence, find.count), (1, 2));
+        find.requests.clear();
+        // Location 9 belongs to the row we already highlighted on page one.
+        assert!(find.on_search(
+            token,
+            page("a", &[(9, 1), (11, 1)], Some(11)),
+            Some("a"),
+            &rows
+        ));
+        assert_eq!(find.highlight(), Some(("needle".into(), 8, 1)));
+        assert_eq!((find.occurrence, find.count), (1, 3));
+        assert_eq!(
+            std::mem::take(&mut find.requests),
+            [Request::Search {
+                token,
+                query: "needle".into(),
+                cursor: Some(11),
+            }],
+        );
+        assert!(find.on_search(token, page("a", &[(14, 1)], None), Some("a"), &rows));
+        assert_eq!(find.highlight(), Some(("needle".into(), 8, 1)));
+        assert_eq!((find.occurrence, find.count), (1, 4));
+        assert!(find.requests.is_empty());
+        find.next(Some("a"), &rows);
+        assert_eq!(find.selected_row, Some(11));
+        assert_eq!((find.occurrence, find.count), (2, 4));
+    }
+
+    #[test]
+    fn perf_chat_find_counts_while_waiting_to_reveal_older_history() {
+        let mut find = FindController::default();
+        let token = start(&mut find, "needle");
+        let rows = [row(11, 11, "needle")];
+        find.on_search(token, page("a", &[(8, 1)], Some(8)), Some("a"), &rows);
+        let [
+            Request::Load {
+                token: load,
+                seq: 8,
+            },
+            Request::Search {
+                cursor: Some(8), ..
+            },
+        ] = find.requests.as_slice()
+        else {
+            panic!("reveal should start before the next page returns");
+        };
+        let load = *load;
+        find.requests.clear();
+        assert_eq!(find.phase, Phase::Loading);
+        find.on_search(token, page("a", &[(11, 1)], None), Some("a"), &rows);
+        assert_eq!(find.count, 2);
+        assert!(find.requests.is_empty());
+
+        let rows = [row(8, 8, "not rendered"), row(11, 11, "needle")];
+        find.on_load(load, true, Some("a"), &rows);
+        assert_eq!(find.phase, Phase::Ready);
+        assert_eq!(find.selected_row, Some(11));
+        assert_eq!(find.count, 1);
+    }
+
+    #[test]
+    fn perf_chat_find_query_and_epoch_changes_cancel_paging() {
+        let mut find = FindController::default();
+        let rows = [row(1, 1, "needle other")];
+        let original = start(&mut find, "needle");
+        find.on_search(original, page("a", &[(1, 1)], Some(1)), Some("a"), &rows);
+        let next = start(&mut find, "other");
+        assert!(!find.on_search(original, page("a", &[(2, 1)], Some(2)), Some("a"), &rows));
+        assert_eq!(find.phase, Phase::Searching);
+        assert!(find.requests.is_empty());
+
+        find.on_search(next, page("a", &[(1, 1)], Some(1)), Some("a"), &rows);
+        assert_eq!(find.selected_row, Some(1));
+        find.history_changed(Some("b"), &rows);
+        assert!(!find.on_search(next, page("a", &[(2, 1)], Some(2)), Some("b"), &rows));
+        assert_eq!(find.failure, Some(Failure::HistoryChanged));
+        assert!(find.selected_row.is_none());
+        assert!(find.requests.is_empty());
+
+        let fresh = start(&mut find, "needle");
+        find.on_search(fresh, page("a", &[(1, 1)], Some(1)), Some("b"), &rows);
+        assert_eq!(find.failure, Some(Failure::HistoryChanged));
+        assert!(find.selected_row.is_none());
+        assert!(find.requests.is_empty());
     }
 }

@@ -287,7 +287,7 @@ impl TerminalPanel {
                 } else {
                     view.blur(cx);
                 }
-                view.sync_size(&core, true);
+                output_changed |= view.sync_size(&core, true);
             }
             if let Some(session) = view.session.as_mut() {
                 let was_exited = session.exited;
@@ -307,7 +307,7 @@ impl TerminalPanel {
                 if output_pending || attached || exit_changed {
                     view.redraw(cx);
                 }
-                output_changed = output_pending || attached;
+                output_changed |= output_pending || attached;
                 presentation_changed |= changed || attached;
             }
         }
@@ -578,6 +578,9 @@ impl TerminalPanel {
             self.create_terminal(cx, ctx);
         }
         // Find: the toolbar toggle, Ctrl+Shift+F / Cmd+F in the terminal, and the card.
+        if output.reflowed(actions) {
+            self.find.output_changed(cx);
+        }
         let toggled = self.view.wa_button(id!(toggle_find)).clicked(actions);
         if toggled && self.find.open {
             self.find.close(cx);

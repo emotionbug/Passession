@@ -24,6 +24,8 @@ pub struct Screen {
     lines: HashMap<usize, Line>,
     title: String,
     revision: u64,
+    /// Raw row changes, including writes and reflow not yet published.
+    row_revision: u64,
     line_count: usize,
     has_dimensions: bool,
     /// Keep scroll geometry while a snapshot is in flight, so a paused viewport does not
@@ -49,6 +51,7 @@ impl Screen {
             lines: HashMap::new(),
             title: String::new(),
             revision: 0,
+            row_revision: 0,
             line_count: 0,
             has_dimensions: false,
             dormant_size: (DEFAULT_ROWS, DEFAULT_COLS),
@@ -63,6 +66,7 @@ impl Screen {
         };
         emulator.write(bytes);
         self.lines.clear();
+        self.row_revision = self.row_revision.wrapping_add(1);
     }
 
     /// Replaces the screen with a snapshot or restore rendering, at the snapshot's size or
@@ -95,6 +99,7 @@ impl Screen {
         }
         emulator.resize(rows, cols)?;
         self.lines.clear();
+        self.row_revision = self.row_revision.wrapping_add(1);
         Ok(true)
     }
 
@@ -168,6 +173,11 @@ impl Screen {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Rows can change before their searchable extent is counted at publication.
+    pub(super) fn row_revision(&self) -> u64 {
+        self.row_revision
     }
 
     /// Presented rows through the cursor and the last non-blank row (`_countLines`), as of

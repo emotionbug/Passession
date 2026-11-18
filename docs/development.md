@@ -154,6 +154,8 @@ rendering and presentation. Timer totals use the caller that started each timer.
 Layer entries are keyed by the `Layer::begin` call site and report repaint/replay
 counts. Redraw and next-frame entries report requests, which may coalesce into
 fewer actual draws or events. This is wall-clock timing, not a CPU profile.
+`core_queue_peak` and `core_queue_oldest_ms` are the highest pending event count
+and oldest-event age sampled before a core drain during the interval.
 Without the opt-in, no reporter starts and the hooks do not sample clocks or
 collect data.
 

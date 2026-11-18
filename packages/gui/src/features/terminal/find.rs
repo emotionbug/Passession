@@ -3,8 +3,8 @@
 //! across soft-wrapped rows is still found, the highlights a view paints, and the floating
 //! find card both panes show.
 //!
-//! Output keeps arriving while the card is open: the panel re-runs the search (debounced
-//! like typing) and the active match stays on the nearest match to where it was.
+//! Output keeps arriving while the card is open: the panel refreshes the search after a
+//! debounce and keeps the active match nearby. Navigation reuses the current matches.
 
 use makepad_widgets::*;
 
@@ -68,8 +68,8 @@ pub fn find_matches(stream: &Stream, query: &str) -> Vec<FindMatch> {
         return Vec::new();
     }
     let count = stream.line_count();
-    // The searchable text and, per char, its (row, char offset within the row).
-    let mut text: Vec<char> = Vec::new();
+    // Case folding preserves one searchable character per original coordinate.
+    let mut source = Vec::new();
     let mut offsets: Vec<(usize, usize)> = Vec::new();
     let mut previous_wraps = false;
     let mut start = 0;
@@ -81,27 +81,21 @@ pub fn find_matches(stream: &Stream, query: &str) -> Vec<FindMatch> {
         for (index, line) in chunk.iter().enumerate() {
             let row = start + index;
             if row > 0 && !previous_wraps {
-                text.push('\n');
+                source.push('\n');
                 offsets.push((row, 0));
             }
             for (offset, ch) in line.text.chars().enumerate() {
-                text.push(ch);
+                source.push(fold(ch));
                 offsets.push((row, offset));
             }
             previous_wraps = line.wraps_next;
         }
         start += chunk.len();
     }
-    // Fold case only when folding keeps offsets aligned (one char maps to one char).
-    let folded: Vec<char> = text.iter().map(|c| fold(*c)).collect();
+    // The panes always search case-insensitively with these single-char mappings.
     let needle: Vec<char> = query.chars().map(fold).collect();
-    let (source, needle) = if folded.len() == text.len() {
-        (folded, needle)
-    } else {
-        (text, query.chars().collect())
-    };
     let mut matches = Vec::new();
-    if needle.is_empty() || needle.len() > source.len() {
+    if needle.len() > source.len() {
         return matches;
     }
     let mut from = 0;
@@ -217,12 +211,16 @@ pub enum SearchMode {
 pub struct FindHits {
     pub matches: Vec<FindMatch>,
     pub active: Option<usize>,
-    /// The output revision the matches were found in.
-    pub revision: u64,
+    /// The screen generations and query for the cached positions.
+    revision: (u64, u64),
+    query: String,
+    #[cfg(test)]
+    scans: usize,
 }
 
 impl FindHits {
     pub fn clear(&mut self) {
+        self.query.clear();
         self.matches.clear();
         self.active = None;
     }
@@ -233,32 +231,41 @@ impl FindHits {
 
     /// Searches `stream` for `query`; returns the match to reveal.
     pub fn search(&mut self, stream: &Stream, query: &str, mode: SearchMode) -> Option<FindMatch> {
-        let revision = stream.revision();
+        let revision = (stream.revision(), stream.screen.row_revision());
+        let same_output = self.revision.0 == revision.0;
+        if query.is_empty() {
+            self.revision = revision;
+            self.clear();
+            return None;
+        }
         let anchor = self
             .active
             .and_then(|index| self.matches.get(index))
             .copied();
-        let same_output = self.revision == revision;
-        self.revision = revision;
-        if query.is_empty() {
-            self.clear();
-            return None;
+        if self.revision != revision || self.query != query {
+            self.matches = find_matches(stream, query);
+            self.revision = revision;
+            self.query.clear();
+            self.query.push_str(query);
+            #[cfg(test)]
+            {
+                self.scans += 1;
+            }
         }
-        let matches = find_matches(stream, query);
-        let nearest = || anchor.and_then(|anchor| nearest_index(&matches, anchor));
+        let total = self.matches.len();
+        let nearest = || anchor.and_then(|anchor| nearest_index(&self.matches, anchor));
         let active = match mode {
-            SearchMode::Reset { previous } => next_index(None, matches.len(), previous, true),
+            SearchMode::Reset { previous } => next_index(None, total, previous, true),
             SearchMode::Step { previous } => {
                 let base = if same_output {
-                    self.active.filter(|index| *index < matches.len())
+                    self.active.filter(|index| *index < total)
                 } else {
                     nearest()
                 };
-                next_index(base, matches.len(), previous, false)
+                next_index(base, total, previous, false)
             }
             SearchMode::Refresh => nearest(),
         };
-        self.matches = matches;
         self.active = active;
         match mode {
             SearchMode::Refresh => None,
@@ -552,6 +559,51 @@ mod tests {
         assert_eq!(hits.active, Some(1));
         let log = crate::features::logs::session::open("h", "t", 100).unwrap();
         assert!(find_matches(&log, "error").is_empty());
+    }
+
+    #[test]
+    fn find_cache_reuses_steps_and_refreshes_after_append_and_reflow() {
+        let mut terminal = stream("0123456needle!\r\nneEdle");
+        let mut hits = FindHits::default();
+        let reset = SearchMode::Reset { previous: false };
+        let next = SearchMode::Step { previous: false };
+        let previous = SearchMode::Step { previous: true };
+        let first = hits.search(&terminal, "needle", reset).unwrap();
+        let second = hits.search(&terminal, "needle", next).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(hits.search(&terminal, "needle", previous), Some(first));
+        assert_eq!(hits.scans, 1);
+
+        terminal.screen.write(b"\r\x1b[2Knot found");
+        assert_eq!(hits.search(&terminal, "needle", SearchMode::Refresh), None);
+        assert_eq!(hits.matches, vec![first]);
+        assert_eq!(hits.scans, 2);
+
+        terminal.screen.write(b"\r\nNEEDLE again");
+        terminal.publish();
+        assert_eq!(hits.search(&terminal, "needle", SearchMode::Refresh), None);
+        let before_reflow = find_matches(&terminal, "needle");
+        assert_eq!(hits.matches, before_reflow);
+        assert_eq!(hits.matches.len(), 2);
+        assert_eq!(hits.scans, 3);
+
+        assert!(terminal.screen.resize(24, 8).unwrap());
+        terminal.publish();
+        let after_reflow = find_matches(&terminal, "needle");
+        assert_ne!(before_reflow, after_reflow);
+        assert!(after_reflow.iter().any(|m| m.end_row > m.start_row));
+        assert_eq!(
+            hits.search(&terminal, "needle", reset),
+            after_reflow.first().copied(),
+        );
+        assert_eq!(hits.matches, after_reflow);
+        assert_eq!(hits.scans, 4);
+        hits.search(&terminal, "needle", next);
+        assert_eq!(hits.scans, 4);
+
+        hits.search(&terminal, "found", reset);
+        assert_eq!(hits.matches, find_matches(&terminal, "found"));
+        assert_eq!(hits.scans, 5);
     }
 
     #[test]

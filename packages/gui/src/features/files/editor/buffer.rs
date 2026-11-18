@@ -3,9 +3,13 @@
 //! navigation, grouped undo/redo and literal find/replace. All offsets are UTF-8 byte offsets on
 //! char boundaries.
 
+use std::ops::Range;
+
 use makepad_widgets::event::TextImeEvent;
 use makepad_widgets::text_input::{TextInputKeyCommand, TextInputMotion, text_input_word_boundary};
 use unicode_segmentation::UnicodeSegmentation;
+
+use super::geometry::Geometry;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Selection {
@@ -62,6 +66,8 @@ struct Group {
 pub struct TextBuffer {
     text: String,
     line_starts: Vec<usize>,
+    pub(super) geometry: Geometry,
+    find: FindCache,
     pub selection: Selection,
     undo: Vec<Group>,
     redo: Vec<Group>,
@@ -86,11 +92,13 @@ impl TextBuffer {
     fn index(&mut self) {
         self.line_starts.clear();
         self.line_starts.push(0);
-        for (index, byte) in self.text.bytes().enumerate() {
-            if byte == b'\n' {
-                self.line_starts.push(index + 1);
-            }
-        }
+        self.line_starts.extend(newline_starts(&self.text, 0));
+        self.geometry = Geometry::default();
+    }
+
+    pub(super) fn ensure_geometry(&mut self, cols: usize, font_size: f64) -> bool {
+        self.geometry
+            .update(&self.text, &self.line_starts, cols, font_size)
     }
 
     pub fn text(&self) -> &str {
@@ -228,10 +236,36 @@ impl TextBuffer {
         self.open_group = false;
     }
 
+    fn replace_text(&mut self, start: usize, end: usize, inserted: &str) {
+        let first = self.line_of(start);
+        let last = if start == end {
+            first
+        } else {
+            self.line_of(end)
+        };
+        // A start at `end` belongs to a newline consumed by the edit. Starts strictly
+        // after `end` survive, and only their absolute byte offsets change.
+        let following = &mut self.line_starts[last + 1..];
+        if inserted.len() != end - start {
+            for offset in following {
+                *offset = *offset - (end - start) + inserted.len();
+            }
+        }
+        let old_starts = first + 1..last + 1;
+        let mut new_starts = newline_starts(inserted, start).peekable();
+        let mut added = 0;
+        if !old_starts.is_empty() || new_starts.peek().is_some() {
+            // `splice` consumes the inserted starts without scanning any surviving text.
+            self.line_starts
+                .splice(old_starts, new_starts.inspect(|_| added += 1));
+        }
+        self.geometry.invalidate(first..last + 1, added + 1);
+        self.text.replace_range(start..end, inserted);
+    }
+
     fn apply(&mut self, start: usize, end: usize, inserted: &str) -> Edit {
         let removed = self.text[start..end].to_owned();
-        self.text.replace_range(start..end, inserted);
-        self.index();
+        self.replace_text(start, end, inserted);
         self.revision = self.revision.wrapping_add(1);
         Edit {
             start,
@@ -378,9 +412,8 @@ impl TextBuffer {
         };
         for edit in group.edits.iter().rev() {
             let end = edit.start + edit.inserted.len();
-            self.text.replace_range(edit.start..end, &edit.removed);
+            self.replace_text(edit.start, end, &edit.removed);
         }
-        self.index();
         self.revision = self.revision.wrapping_add(1);
         self.selection = group.before;
         self.redo.push(group);
@@ -394,9 +427,8 @@ impl TextBuffer {
         };
         for edit in &group.edits {
             let end = edit.start + edit.removed.len();
-            self.text.replace_range(edit.start..end, &edit.inserted);
+            self.replace_text(edit.start, end, &edit.inserted);
         }
-        self.index();
         self.revision = self.revision.wrapping_add(1);
         self.selection = group.after;
         self.undo.push(group);
@@ -440,68 +472,139 @@ impl TextBuffer {
         (self.line_start(line), end)
     }
 
-    /// Byte offsets of literal, non-overlapping matches (Flutter `_matches`).
-    pub fn matches(&self, needle: &str, match_case: bool) -> Vec<usize> {
-        find_matches(&self.text, needle, match_case)
+    /// Byte ranges of literal, non-overlapping matches (Flutter `_matches`).
+    pub fn matches(&mut self, needle: &str, match_case: bool) -> &[Range<usize>] {
+        self.find
+            .matches(&self.text, self.revision, needle, match_case)
+    }
+
+    pub fn replace_match(&mut self, needle: &str, match_case: bool, replacement: &str) -> bool {
+        let selection = self.selection;
+        if selection.is_empty() {
+            return false;
+        }
+        let selected = self.selected_text();
+        let same = if match_case {
+            selected == needle
+        } else {
+            selected.to_lowercase() == needle.to_lowercase()
+        };
+        if !same {
+            return false;
+        }
+        self.replace(
+            selection.start(),
+            selection.end(),
+            replacement,
+            EditKind::Other,
+        );
+        true
+    }
+
+    pub fn replace_all(&mut self, needle: &str, match_case: bool, replacement: &str) -> bool {
+        let matches = self
+            .find
+            .matches(&self.text, self.revision, needle, match_case);
+        if matches.is_empty() {
+            return false;
+        }
+        let mut out = String::with_capacity(self.text.len());
+        let mut last = 0;
+        for matched in matches {
+            out.push_str(&self.text[last..matched.start]);
+            out.push_str(replacement);
+            last = matched.end;
+        }
+        out.push_str(&self.text[last..]);
+        let head = floor_boundary(&out, self.selection.head);
+        self.replace(0, self.len(), &out, EditKind::Other);
+        self.set_selection(Selection::caret(head));
+        true
     }
 }
 
-/// Literal non-overlapping matches; case-insensitive matching compares lowercased chars and
-/// reports offsets in the original text.
-pub fn find_matches(text: &str, needle: &str, match_case: bool) -> Vec<usize> {
+fn newline_starts(text: &str, start: usize) -> impl Iterator<Item = usize> + '_ {
+    text.bytes()
+        .enumerate()
+        .filter(|&(_, byte)| byte == b'\n')
+        .map(move |(index, _)| start + index + 1)
+}
+
+#[derive(Default)]
+struct FindCache {
+    needle: String,
+    revision: u64,
+    match_case: bool,
+    matches: Vec<Range<usize>>,
+    #[cfg(test)]
+    scans: usize,
+}
+
+impl FindCache {
+    fn matches(
+        &mut self,
+        text: &str,
+        revision: u64,
+        needle: &str,
+        match_case: bool,
+    ) -> &[Range<usize>] {
+        if self.revision != revision || self.match_case != match_case || self.needle != needle {
+            self.revision = revision;
+            self.match_case = match_case;
+            self.needle.clear();
+            self.needle.push_str(needle);
+            self.matches = find_matches(text, needle, match_case);
+            #[cfg(test)]
+            {
+                self.scans += 1;
+            }
+        }
+        &self.matches
+    }
+}
+
+/// Match the complete lowercase expansion of each source character, without letting a
+/// match start or end inside an expansion. Record byte ranges in the original text.
+fn find_matches(text: &str, needle: &str, match_case: bool) -> Vec<Range<usize>> {
     if needle.is_empty() {
         return Vec::new();
     }
     if match_case {
-        return text.match_indices(needle).map(|(index, _)| index).collect();
+        return text
+            .match_indices(needle)
+            .map(|(index, matched)| index..index + matched.len())
+            .collect();
     }
     let needle: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let mut result = Vec::new();
-    let mut i = 0;
-    'outer: while i < chars.len() {
-        let mut j = 0;
-        let mut k = i;
-        while j < needle.len() {
-            let Some(&(_, c)) = chars.get(k) else {
-                break 'outer;
-            };
-            let mut lower = c.to_lowercase();
-            let mut matched = true;
-            for lc in lower.by_ref() {
-                if needle.get(j) != Some(&lc) {
-                    matched = false;
-                    break;
+    let (first, rest) = needle.split_first().unwrap();
+    let mut matches = Vec::new();
+    let mut candidates = text.char_indices();
+    'candidate: while let Some((start, ch)) = candidates.next() {
+        let mut lower = ch.to_lowercase();
+        if lower.next() != Some(*first) {
+            continue;
+        }
+        let mut tail = candidates.clone();
+        let mut expected = rest.iter().copied();
+        loop {
+            for lower in lower {
+                if expected.next() != Some(lower) {
+                    continue 'candidate;
                 }
-                j += 1;
             }
-            if !matched {
-                i += 1;
-                continue 'outer;
+            if expected.len() == 0 {
+                matches.push(start..tail.offset());
+                candidates = tail;
+                break;
             }
-            k += 1;
+            let Some((_, next)) = tail.next() else {
+                // No later start can have more lowercase characters left.
+                break 'candidate;
+            };
+            lower = next.to_lowercase();
         }
-        result.push(chars[i].0);
-        i = k.max(i + 1);
     }
-    result
-}
-
-/// The byte length of the match starting at `start` for `needle` (case-insensitive matches may
-/// differ in bytes from the needle).
-pub fn match_len(text: &str, start: usize, needle: &str, match_case: bool) -> usize {
-    if match_case {
-        return needle.len();
-    }
-    let count = needle.chars().flat_map(char::to_lowercase).count();
-    let mut lowered = 0;
-    for (index, c) in text[start..].char_indices() {
-        if lowered >= count {
-            return index;
-        }
-        lowered += c.to_lowercase().count();
-    }
-    text.len() - start
+    matches
 }
 
 pub fn floor_boundary(text: &str, mut index: usize) -> usize {
@@ -614,13 +717,13 @@ mod tests {
 
     #[test]
     fn android_ime_composition_is_one_undo_group_and_commit_is_not_duplicated() {
-        let mut buffer = TextBuffer::new("A😀Z".into());
+        let mut buffer = TextBuffer::new("A😀Z\nunchanged\n".into());
         buffer.set_selection(Selection::caret(5));
         for (text, composing) in [
-            ("A😀ㅎZ", true),
-            ("A😀하Z", true),
-            ("A😀한Z", true),
-            ("A😀한Z", false),
+            ("A😀ㅎZ\nunchanged\n", true),
+            ("A😀하Z\nunchanged\n", true),
+            ("A😀한Z\nunchanged\n", true),
+            ("A😀한Z\nunchanged\n", false),
         ] {
             buffer.apply_ime(
                 &TextImeEvent {
@@ -633,14 +736,17 @@ mod tests {
                 },
                 false,
             );
+            assert_full_line_index(&buffer);
         }
-        assert_eq!(buffer.text(), "A😀한Z");
+        assert_eq!(buffer.text(), "A😀한Z\nunchanged\n");
         assert_eq!(buffer.selection, Selection::caret(8));
         buffer.undo();
-        assert_eq!(buffer.text(), "A😀Z");
+        assert_eq!(buffer.text(), "A😀Z\nunchanged\n");
         assert_eq!(buffer.selection, Selection::caret(5));
+        assert_full_line_index(&buffer);
         buffer.redo();
-        assert_eq!(buffer.text(), "A😀한Z");
+        assert_eq!(buffer.text(), "A😀한Z\nunchanged\n");
+        assert_full_line_index(&buffer);
     }
 
     #[test]
@@ -702,12 +808,153 @@ mod tests {
         assert_eq!(buffer.text(), "abc");
     }
 
+    fn assert_full_line_index(buffer: &TextBuffer) {
+        let starts: Vec<_> = std::iter::once(0)
+            .chain(
+                buffer
+                    .text()
+                    .match_indices('\n')
+                    .map(|(index, _)| index + 1),
+            )
+            .collect();
+        assert_eq!(buffer.line_starts, starts);
+        for (line, text) in buffer.text().split('\n').enumerate() {
+            assert_eq!(buffer.line(line), text);
+        }
+    }
+
     #[test]
-    fn case_insensitive_matches_use_original_offsets() {
-        assert_eq!(find_matches("Foo foo FOO", "foo", false), vec![0, 4, 8]);
-        assert_eq!(find_matches("Foo foo", "foo", true), vec![4]);
-        assert_eq!(find_matches("aaaa", "aa", true), vec![0, 2]);
-        assert_eq!(match_len("ÉCOLE", 0, "éc", false), "ÉC".len());
+    fn incremental_line_index_matches_rebuild_through_edits_undo_and_redo() {
+        let mut buffer = TextBuffer::new("한글\n😀 row\n끝\n".into());
+        for (start, end, inserted) in [
+            (0, 0, "\nα\n"),
+            (0, "\nα\n".len(), ""),
+            ("한글".len(), "한글\n".len(), "-"),
+            ("한글-😀".len(), "한글-😀 row\n".len(), "\n\n"),
+            (0, usize::MAX, "one\n\n끝"),
+            (0, usize::MAX, ""),
+        ] {
+            let before = buffer.text().to_owned();
+            buffer.replace(start, end, inserted, EditKind::Other);
+            let after = buffer.text().to_owned();
+            assert_full_line_index(&buffer);
+            assert!(buffer.undo());
+            assert_eq!(buffer.text(), before);
+            assert_full_line_index(&buffer);
+            assert!(buffer.redo());
+            assert_eq!(buffer.text(), after);
+            assert_full_line_index(&buffer);
+        }
+        buffer.set_text("one\n두\n".into());
+        assert_full_line_index(&buffer);
+    }
+
+    // Reference: the previous eager char/offset-array search, including rejection
+    // of matches that would finish partway through a source character's lowercase.
+    fn legacy_matches(text: &str, needle: &str, match_case: bool) -> Vec<Range<usize>> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        if match_case {
+            return text
+                .match_indices(needle)
+                .map(|(start, _)| start..start + needle.len())
+                .collect();
+        }
+        let needle: Vec<_> = needle.chars().flat_map(char::to_lowercase).collect();
+        let chars: Vec<_> = text.char_indices().collect();
+        let mut result = Vec::new();
+        let mut i = 0;
+        'candidate: while i < chars.len() {
+            let mut j = 0;
+            let mut k = i;
+            while j < needle.len() {
+                let Some(&(_, ch)) = chars.get(k) else {
+                    break 'candidate;
+                };
+                for lower in ch.to_lowercase() {
+                    if needle.get(j) != Some(&lower) {
+                        i += 1;
+                        continue 'candidate;
+                    }
+                    j += 1;
+                }
+                k += 1;
+            }
+            result.push(chars[i].0..chars.get(k).map_or(text.len(), |&(offset, _)| offset));
+            i = k;
+        }
+        result
+    }
+
+    #[test]
+    fn direct_find_matches_legacy_unicode_and_overlap_rules() {
+        for text in [
+            "",
+            "Foo foo FOO\nFoo",
+            "aaaaaAbAaBa",
+            "한글한글 한글 a한글",
+            "İ i\u{307} I ı Iİİi\u{307}",
+            "ẞ ß ss SS Σ ς ΟΣ Οσ",
+            "ÉCOLE école K K 😺",
+        ] {
+            for query in [
+                "",
+                "foo",
+                "Foo\n",
+                "aa",
+                "aba",
+                "abaaa",
+                "a한",
+                "한글",
+                "한글",
+                "i",
+                "İ",
+                "i\u{307}",
+                "\u{307}",
+                "İi",
+                "ss",
+                "ß",
+                "ẞ",
+                "σ",
+                "ς",
+                "ΟΣ",
+                "éc",
+                "k",
+                "😺",
+            ] {
+                for match_case in [false, true] {
+                    assert_eq!(
+                        find_matches(text, query, match_case),
+                        legacy_matches(text, query, match_case),
+                        "{text:?}, {query:?}, {match_case}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_cache_reuses_matches_and_replace_all_preserves_utf8_caret() {
+        let mut buffer = TextBuffer::new("İ İ i".into());
+        assert_eq!(buffer.matches("i\u{307}", false), &[0..2, 3..5]);
+        assert_eq!(buffer.matches("i\u{307}", false).len(), 2);
+        assert_eq!(buffer.find.scans, 1);
+
+        buffer.set_selection(Selection::caret(2));
+        assert!(buffer.replace_all("i\u{307}", false, "한"));
+        assert_eq!(buffer.find.scans, 1);
+        assert_eq!(buffer.text(), "한 한 i");
+        assert_eq!(buffer.selection, Selection::caret(0));
+        assert!(buffer.matches("i\u{307}", false).is_empty());
+        assert_eq!(buffer.find.scans, 2);
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.selection, Selection::caret(2));
+        assert_eq!(buffer.matches("i\u{307}", false), &[0..2, 3..5]);
+        assert!(buffer.matches("i\u{307}", true).is_empty());
+        assert_eq!(buffer.matches("İ", true), &[0..2, 3..5]);
+        assert_eq!(buffer.find.scans, 5);
     }
 
     #[test]

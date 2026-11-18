@@ -50,6 +50,8 @@ pub enum WaTerminalViewAction {
     ModifiersConsumed,
     /// Ctrl+Shift+F / Cmd+F: open the pane's find card.
     FindRequested,
+    /// The local screen reflowed, invalidating displayed row/column coordinates.
+    Reflowed,
 }
 
 #[derive(Live, LiveHook, Widget)]
@@ -433,24 +435,29 @@ impl WaTerminalView {
     }
 
     /// Reflows the local screen to the fitted size and sends it to the daemon.
-    pub fn sync_size(&mut self, core: &CoreHandle, force: bool) {
+    pub fn sync_size(&mut self, core: &CoreHandle, force: bool) -> bool {
         let (Some((rows, cols)), Some(session)) = (self.fitted, self.session.as_mut()) else {
-            return;
+            return false;
         };
-        match session.screen.resize(rows, cols) {
-            Ok(true) => session.publish(),
-            Ok(false) => {}
-            Err(_) => return,
-        }
+        let reflowed = match session.screen.resize(rows, cols) {
+            Ok(true) => {
+                session.publish();
+                self.reveal = None;
+                true
+            }
+            Ok(false) => false,
+            Err(_) => return false,
+        };
         if !self.connected || !session.live(true) || !session.is_visible() {
-            return;
+            return reflowed;
         }
         let next = (rows, cols, self.claim);
         if !force && self.sent == Some(next) {
-            return;
+            return reflowed;
         }
         session.send_resize(core, rows, cols, self.claim);
         self.sent = Some(next);
+        reflowed
     }
 
     fn pos_to_cell(&mut self, cx: &Cx, abs: DVec2) -> Option<CellPos> {
@@ -635,7 +642,13 @@ impl Widget for WaTerminalView {
         if self.resize_timer.is_event(event).is_some() {
             self.resize_timer = Timer::default();
             if let Some(core) = core_of(scope) {
-                self.sync_size(&core, false);
+                if self.sync_size(&core, false) {
+                    cx.widget_action(
+                        self.widget_uid(),
+                        &scope.path,
+                        WaTerminalViewAction::Reflowed,
+                    );
+                }
                 self.redraw(cx);
             }
         }
@@ -1128,6 +1141,12 @@ impl WaTerminalViewRef {
         actions
             .filter_widget_actions(self.widget_uid())
             .any(|action| matches!(action.cast(), WaTerminalViewAction::FindRequested))
+    }
+
+    pub fn reflowed(&self, actions: &Actions) -> bool {
+        actions
+            .filter_widget_actions(self.widget_uid())
+            .any(|action| matches!(action.cast(), WaTerminalViewAction::Reflowed))
     }
 }
 

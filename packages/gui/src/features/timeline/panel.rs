@@ -2014,8 +2014,16 @@ impl ChatPanel {
         self.redraw_timeline(cx);
     }
 
-    /// Runs the find controller's requests.
+    /// Runs the find controller's requests and redraws the current highlight.
     fn pump_find(&mut self, cx: &mut Cx, ui: &mut UiContext) {
+        self.pump_find_requests(cx, ui);
+        if self.visible && self.find_open {
+            self.redraw_chrome_part(cx, FIND);
+            self.redraw_timeline(cx);
+        }
+    }
+
+    fn pump_find_requests(&mut self, cx: &mut Cx, ui: &mut UiContext) {
         let requests = std::mem::take(&mut self.find.requests);
         for request in requests {
             match request {
@@ -2059,11 +2067,7 @@ impl ChatPanel {
             }
         }
         if !self.find.requests.is_empty() {
-            self.pump_find(cx, ui);
-        }
-        if self.visible && self.find_open {
-            self.redraw_chrome_part(cx, FIND);
-            self.redraw_timeline(cx);
+            self.pump_find_requests(cx, ui);
         }
     }
 
@@ -2987,18 +2991,24 @@ impl ChatPanel {
                 Err(e) => self.show_failure(cx, e.message),
             },
             ActionKind::Search { token } => {
+                let selected = self.find.selected_row;
                 let (epoch, rows) = self
                     .snap
                     .as_ref()
-                    .map(|s| (s.epoch.clone(), s.timeline.clone()))
+                    .map(|s| (s.epoch.as_deref(), s.timeline.as_slice()))
                     .unwrap_or_default();
-                self.find.on_search(
-                    token,
-                    result.map_err(|e| e.message),
-                    epoch.as_deref(),
-                    &rows,
-                );
-                self.pump_find(cx, ui);
+                if self
+                    .find
+                    .on_search(token, result.map_err(|e| e.message), epoch, rows)
+                {
+                    self.pump_find_requests(cx, ui);
+                    if self.visible && self.find_open {
+                        self.redraw_chrome_part(cx, FIND);
+                        if selected != self.find.selected_row {
+                            self.redraw_timeline(cx);
+                        }
+                    }
+                }
             }
             ActionKind::ClearAttention => {}
             ActionKind::ArchiveSubagent { key } => {

@@ -1,8 +1,8 @@
 //! The native source editor (Flutter `FilePanel._source` TextField + `_SourceLineNumbers` +
 //! `SourceController`): monospace rows with an optional wrap, a line-number gutter, syntax
 //! colouring from the worker, selection, IME commits, clipboard, undo/redo and keyboard
-//! navigation. Only visible rows are laid out; row geometry is cached per text revision and
-//! row layouts only near the viewport.
+//! navigation. Widths and wrapped row starts are cached per source line; text layout is
+//! kept only near the viewport.
 //!
 //! The editor is not a widget: its owner forwards hits inside the editor rect and draws it into
 //! a rect, so one widget area serves the whole file view.
@@ -18,12 +18,10 @@ use crate::common::paint::Font;
 use crate::theme::{Palette, with_alpha};
 
 use super::buffer::{EditKind, Selection, TextBuffer};
+use super::geometry::char_cols;
 use crate::features::files::highlight::{self, Highlighted};
 use crate::features::files::kit::{Kit, RichFont, RichSpan, rect, spec};
 use makepad_widgets::makepad_draw::event::DigitId;
-
-/// Tab stops are this many columns apart, as in the shared text layout (`TAB_STOP_IN_SPACES`).
-const TAB_WIDTH: usize = 4;
 
 /// What drawing needs besides the text.
 #[derive(Clone)]
@@ -59,19 +57,6 @@ enum Reveal {
     CenterLine(usize),
 }
 
-#[derive(Default)]
-struct Geometry {
-    revision: u64,
-    cols: usize,
-    wrap: bool,
-    font_size: f64,
-    /// Cumulative visual rows before each line (len = lines + 1).
-    prefix: Vec<usize>,
-    max_cols: usize,
-    /// Row starts (byte offsets within the line) of wrapped lines, filled on demand.
-    starts: HashMap<usize, Vec<usize>>,
-}
-
 /// Source-to-display byte map of one laid-out row (empty without tabs).
 type TabMap = Rc<[(usize, usize)]>;
 
@@ -94,7 +79,6 @@ pub struct SourceEditor {
     viewport: Rect,
     char_width: f64,
     char_width_size: f64,
-    geometry: Geometry,
     /// Laid-out visual rows near the viewport, keyed by (line, row within line).
     layouts: HashMap<(usize, usize), RowLayout>,
     layouts_key: (u64, u64, u64, bool, usize, bool),
@@ -119,60 +103,6 @@ pub struct SourceEditor {
     /// The text revision the last highlight request was for.
     highlight_requested: u64,
     pub content_rect: Rect,
-}
-
-/// Columns `c` takes when it starts at `column` of its row: a tab reaches the next tab stop.
-fn char_cols(c: char, column: usize) -> usize {
-    let code = c as u32;
-    let wide = matches!(code,
-        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6 | 0x1F300..=0x1F64F | 0x1F900..=0x1F9FF | 0x20000..=0x3FFFD);
-    if c == '\t' {
-        TAB_WIDTH - column % TAB_WIDTH
-    } else if wide {
-        2
-    } else {
-        1
-    }
-}
-
-fn line_cols(line: &str) -> usize {
-    if line.is_ascii() && !line.contains('\t') {
-        return line.len();
-    }
-    line.chars()
-        .fold(0, |column, c| column + char_cols(c, column))
-}
-
-/// Row starts of `line` wrapped at `cols` columns, breaking after whitespace when possible.
-fn wrap_line(line: &str, cols: usize) -> Vec<usize> {
-    let mut starts = vec![0];
-    if cols == 0 {
-        return starts;
-    }
-    let mut row_cols = 0;
-    let mut last_break: Option<usize> = None;
-    let mut row_start = 0;
-    for (index, c) in line.char_indices() {
-        let mut width = char_cols(c, row_cols);
-        if row_cols + width > cols && index > row_start {
-            let start = match last_break {
-                Some(brk) if brk > row_start => brk,
-                _ => index,
-            };
-            starts.push(start);
-            row_start = start;
-            row_cols = line_cols(&line[start..index]);
-            last_break = None;
-            width = char_cols(c, row_cols);
-        }
-        row_cols += width;
-        if c == ' ' || c == '\t' {
-            last_break = Some(index + c.len_utf8());
-        }
-    }
-    starts
 }
 
 /// Display text of a row: each tab expanded to its tab stop. Returns the text and the byte
@@ -242,7 +172,6 @@ impl SourceEditor {
             viewport: Rect::default(),
             char_width: 0.0,
             char_width_size: 0.0,
-            geometry: Geometry::default(),
             layouts: HashMap::new(),
             layouts_key: (u64::MAX, 0, 0, false, 0, false),
             ime_area: Area::Empty,
@@ -403,61 +332,18 @@ impl SourceEditor {
         } else {
             0
         };
-        let g = &self.geometry;
-        if g.revision == self.buffer.revision
-            && g.cols == cols
-            && g.wrap == look.wrap
-            && g.font_size == look.font_size
-            && !g.prefix.is_empty()
-        {
-            return;
+        if self.buffer.ensure_geometry(cols, look.font_size) {
+            self.layouts.clear();
         }
-        let mut prefix = Vec::with_capacity(self.buffer.line_count() + 1);
-        let mut total = 0usize;
-        let mut max_cols = 0usize;
-        for line in 0..self.buffer.line_count() {
-            prefix.push(total);
-            let text = self.buffer.line(line);
-            let width = line_cols(text);
-            max_cols = max_cols.max(width);
-            total += if look.wrap && width > cols {
-                wrap_line(text, cols).len()
-            } else {
-                1
-            };
-        }
-        prefix.push(total);
-        self.geometry = Geometry {
-            revision: self.buffer.revision,
-            cols,
-            wrap: look.wrap,
-            font_size: look.font_size,
-            prefix,
-            max_cols,
-            starts: HashMap::new(),
-        };
     }
 
     fn total_rows(&self) -> usize {
-        *self.geometry.prefix.last().unwrap_or(&1)
-    }
-
-    fn row_starts(&mut self, line: usize) -> Vec<usize> {
-        let rows = self.geometry.prefix[line + 1] - self.geometry.prefix[line];
-        if rows <= 1 {
-            return vec![0];
-        }
-        if let Some(starts) = self.geometry.starts.get(&line) {
-            return starts.clone();
-        }
-        let starts = wrap_line(self.buffer.line(line), self.geometry.cols);
-        self.geometry.starts.insert(line, starts.clone());
-        starts
+        *self.buffer.geometry.prefix.last().unwrap_or(&1)
     }
 
     /// (line, row within line) of a visual row.
     fn row_to_line(&self, row: usize) -> (usize, usize) {
-        let prefix = &self.geometry.prefix;
+        let prefix = &self.buffer.geometry.prefix;
         let line = match prefix.binary_search(&row) {
             Ok(mut line) => {
                 // Skip lines with zero rows never happen (each line has ≥ 1 row).
@@ -473,8 +359,8 @@ impl SourceEditor {
     }
 
     /// Byte range (absolute) of a visual row.
-    fn row_range(&mut self, line: usize, row: usize) -> (usize, usize) {
-        let starts = self.row_starts(line);
+    fn row_range(&self, line: usize, row: usize) -> (usize, usize) {
+        let starts = self.buffer.geometry.row_starts(line);
         let base = self.buffer.line_start(line);
         let start = base + starts[row.min(starts.len() - 1)];
         let end = match starts.get(row + 1) {
@@ -485,17 +371,12 @@ impl SourceEditor {
     }
 
     /// The visual row of an absolute offset.
-    fn row_of(&mut self, offset: usize) -> usize {
+    fn row_of(&self, offset: usize) -> usize {
         let line = self.buffer.line_of(offset);
-        let starts = self.row_starts(line);
+        let starts = self.buffer.geometry.row_starts(line);
         let within = offset - self.buffer.line_start(line);
-        let mut row = 0;
-        for (index, start) in starts.iter().enumerate() {
-            if *start <= within {
-                row = index;
-            }
-        }
-        self.geometry.prefix[line] + row
+        let row = starts.partition_point(|start| *start <= within) - 1;
+        self.buffer.geometry.prefix[line] + row
     }
 
     fn layout_row(
@@ -603,6 +484,7 @@ impl SourceEditor {
         look: &EditorLook,
         abs: DVec2,
     ) -> usize {
+        self.ensure_geometry(look, self.content_rect.size.x);
         let line_height = self.line_height(look);
         let (_, top, _, _) = Self::padding(look);
         let rel_y = abs.y - self.content_rect.pos.y + self.scroll.y - top;
@@ -644,7 +526,7 @@ impl SourceEditor {
     fn scroll_bounds(&self, look: &EditorLook) -> DVec2 {
         let (_, top, _, bottom) = Self::padding(look);
         let content_h = top + self.total_rows() as f64 * self.line_height(look) + bottom;
-        let content_w = self.geometry.max_cols as f64 * self.char_width + 2.0;
+        let content_w = self.buffer.geometry.max_cols as f64 * self.char_width + 2.0;
         dvec2(
             if look.wrap {
                 0.0
@@ -727,7 +609,7 @@ impl SourceEditor {
             highlighted.as_ref().map(|h| h.revision).unwrap_or(u64::MAX),
             style_key,
             look.highlighting,
-            self.geometry.cols,
+            self.buffer.geometry.cols,
             look.wrap,
         );
         if key != self.layouts_key {
@@ -756,7 +638,7 @@ impl SourceEditor {
                 }
                 Reveal::CenterLine(line) => {
                     let line = line.min(self.buffer.line_count() - 1);
-                    let y = top + self.geometry.prefix[line] as f64 * line_height;
+                    let y = top + self.buffer.geometry.prefix[line] as f64 * line_height;
                     self.scroll.y = y + line_height / 2.0 - content.size.y / 2.0;
                 }
             }
@@ -771,7 +653,7 @@ impl SourceEditor {
         // Layouts stay for the visible rows, a screen above and below, and the caret row.
         let head_row = self.row_of(self.buffer.selection.head);
         let keep = first.saturating_sub(visible)..last + visible;
-        let prefix = &self.geometry.prefix;
+        let prefix = &self.buffer.geometry.prefix;
         self.layouts.retain(|&(line, row), _| {
             prefix
                 .get(line)
@@ -1335,6 +1217,7 @@ impl SourceEditor {
         rows: isize,
         extend: bool,
     ) {
+        self.ensure_geometry(look, self.content_rect.size.x);
         let head = self.buffer.selection.head;
         let point = self.caret_point(cx, kit, look, head);
         let x = *self.preferred_x.get_or_insert(point.x);
@@ -1471,7 +1354,9 @@ impl SourceEditor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::geometry::{line_cols, wrap_line};
     use super::*;
+
     #[test]
     fn source_touch_does_not_focus_or_move_selection_before_release() {
         use super::super::field::touch_tests::{cancel, down, moved_out, up};
@@ -1567,6 +1452,65 @@ mod tests {
         assert_eq!(wrap_line("abcdefghij", 4), vec![0, 4, 8]);
         assert_eq!(wrap_line("short", 10), vec![0]);
         assert_eq!(line_cols("한글"), 4);
+    }
+
+    fn assert_full_geometry(buffer: &TextBuffer, cols: usize) {
+        let geometry = &buffer.geometry;
+        let mut cumulative_rows = 0;
+        let mut max_width = 0;
+        for (line_number, line) in buffer.text().split('\n').enumerate() {
+            let width = line_cols(line);
+            max_width = max_width.max(width);
+            let expected = wrap_line(line, cols);
+            assert_eq!(geometry.row_starts(line_number), expected);
+            assert_eq!(geometry.prefix[line_number], cumulative_rows);
+            cumulative_rows += expected.len();
+        }
+        assert_eq!(geometry.prefix.len(), buffer.line_count() + 1);
+        assert_eq!(geometry.prefix.last(), Some(&cumulative_rows));
+        assert_eq!(geometry.max_cols, max_width);
+    }
+
+    #[test]
+    fn line_geometry_reuses_untouched_lines_and_matches_full_reflow() {
+        let mut buffer =
+            TextBuffer::new("hello world foo\n한글\ta\nlonger unchanged line\n\n".into());
+        assert!(buffer.ensure_geometry(8, 12.0));
+        assert_full_geometry(&buffer, 8);
+        let measured = buffer.line_count();
+        assert_eq!(buffer.geometry.measured_lines, measured);
+        assert!(!buffer.ensure_geometry(8, 12.0));
+
+        let middle = buffer.line_start(1);
+        buffer.replace(middle, middle + "한글".len(), "바", EditKind::Other);
+        assert!(buffer.ensure_geometry(8, 12.0));
+        assert_full_geometry(&buffer, 8);
+        assert_eq!(buffer.geometry.measured_lines, measured + 1);
+
+        // Change the longest line and split it, then remove a blank below it
+        // before the next draw. Unedited lines retain geometry through both shifts.
+        let start = buffer.line_start(2);
+        let end = buffer.line_end(2);
+        buffer.replace(start, end, "a\n b", EditKind::Other);
+        let blank = buffer.line_start(4);
+        buffer.replace(blank, blank + 1, "", EditKind::Other);
+        assert!(buffer.ensure_geometry(8, 12.0));
+        assert_full_geometry(&buffer, 8);
+        assert_eq!(buffer.geometry.measured_lines, measured + 4);
+
+        assert!(buffer.undo());
+        assert!(buffer.undo());
+        assert!(buffer.ensure_geometry(8, 12.0));
+        assert_full_geometry(&buffer, 8);
+        let measured = buffer.geometry.measured_lines;
+        for (i, (cols, size)) in [(3, 12.0), (3, 14.0), (0, 14.0)].into_iter().enumerate() {
+            assert!(buffer.ensure_geometry(cols, size));
+            assert_full_geometry(&buffer, cols);
+            assert_eq!(
+                buffer.geometry.measured_lines,
+                measured + buffer.line_count() * (i + 1),
+            );
+        }
     }
 
     #[test]

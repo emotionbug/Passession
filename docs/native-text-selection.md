@@ -6,6 +6,12 @@ Selection must remain usable while scrolling, changing pane width and opening/cl
 
 Keep selection offsets in source text, not in a previous frame's glyph rectangles. Chat paints selection after the current row layout so resizing follows reflow; the source editor keeps buffer selection separate from cached visible-row geometry. Preserve code whitespace and Unicode boundaries when mapping hits to source and copying. Scrolling a code block or detail body must not also scroll the outer timeline.
 
+The source editor shifts later line offsets after an edit and remeasures width
+and wrap only for changed lines. A change in wrap columns or font size rebuilds
+line geometry. File Find reuses byte ranges for the current buffer revision,
+query and case option, so navigation and replacement use the same original UTF-8
+boundaries.
+
 Desktop input fields and source editors share native editing commands rather than
 interpreting modifiers independently:
 

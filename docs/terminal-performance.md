@@ -14,6 +14,11 @@ Ghostty bounds scrollback in bytes and prunes whole pages. `paseo_terminal::Opti
 
 An interactive terminal sends input and its claimed size. A log observer sends neither and drops emulator replies; its local viewport size is not a PTY resize request. Restore authoritative dimensions and remap the observation slot before consuming binary frames after reconnect.
 
+Terminal and log Find reuse match positions when the query and screen generations
+are unchanged. Output, restored snapshots, and local reflow invalidate those
+positions; the open find card refreshes after its debounce without scrolling away
+from the reader.
+
 ## Boundaries to measure
 
 Measure process spawn/start, first output, keystroke-to-echo latency, sustained output, replay after reconnect, backpressure, memory under large scrollback, completion/error publication and cancellation. Separate server PTY cost, daemon screen-thread work, core delivery, client VT parsing and Makepad layout/draw work. An isolated parser benchmark does not prove end-to-end latency.

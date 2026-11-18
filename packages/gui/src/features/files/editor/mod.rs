@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod field;
+mod geometry;
 pub mod view;
 
 use std::time::Instant;

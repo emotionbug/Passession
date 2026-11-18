@@ -872,20 +872,28 @@ pub fn terminal_label(terminal: &Value) -> String {
     }
 }
 
+fn workspaces_by_project<'a>(
+    workspaces: impl IntoIterator<Item = &'a Value>,
+) -> HashMap<&'a str, Vec<&'a Value>> {
+    let mut projects: HashMap<&str, Vec<&Value>> = HashMap::new();
+    for workspace in workspaces {
+        projects
+            .entry(j::text(workspace, "projectId"))
+            .or_default()
+            .push(workspace);
+    }
+    projects
+}
+
 /// Live terminals of a project's shown workspaces in workspace order. Configured script and
 /// service terminals (the workspace's `scripts[].terminalId`) stay in their log surfaces.
-pub fn terminal_rows(
+fn terminal_rows<'a>(
     terminals: &TerminalDirectories,
-    host: &Host<'_>,
-    project_id: &str,
+    sid: &str,
+    workspaces: impl IntoIterator<Item = &'a Value>,
 ) -> Vec<TerminalRow> {
-    let sid = host.server_id();
     let mut out = Vec::new();
-    for workspace in host
-        .workspaces()
-        .iter()
-        .filter(|w| j::text(w, "projectId") == project_id)
-    {
+    for workspace in workspaces {
         let workspace_id = j::text(workspace, "id");
         let Some(dir) = terminals.get(&(sid.to_string(), workspace_id.to_string())) else {
             continue;
@@ -932,7 +940,12 @@ pub fn find_terminal(
         })?
         .0;
     let project_id = j::text(host.workspace(workspace_id)?, "projectId");
-    terminal_rows(terminals, &host, project_id)
+    let workspaces = host
+        .workspaces()
+        .iter()
+        .map(Arc::as_ref)
+        .filter(|workspace| j::text(workspace, "projectId") == project_id);
+    terminal_rows(terminals, sid, workspaces)
         .into_iter()
         .find(|row| row.id == terminal_id)
 }
@@ -1388,18 +1401,16 @@ fn draw_tree(
         let host_collapsed = host_group.collapsed;
         // Visible project blocks first (search may hide the host); live terminals follow the
         // directory's sessions and search matches their label.
+        let workspaces = workspaces_by_project(host.workspaces().iter().map(Arc::as_ref));
         let mut blocks: Vec<(&ProjectGroup, Vec<TerminalRow>)> = Vec::new();
         for project in &host_group.projects {
-            let terms: Vec<TerminalRow> =
-                terminal_rows(&terminals, host, j::text(&project.project, "projectId"))
-                    .into_iter()
-                    .filter(|row| {
-                        query.is_empty()
-                            || host_matches
-                            || project.matches
-                            || row.label.to_lowercase().contains(&query)
-                    })
-                    .collect();
+            let project_workspaces = workspaces
+                .get(j::text(&project.project, "projectId"))
+                .map_or(&[][..], Vec::as_slice);
+            let mut terms = terminal_rows(&terminals, sid, project_workspaces.iter().copied());
+            if !query.is_empty() && !host_matches && !project.matches {
+                terms.retain(|row| row.label.to_lowercase().contains(&query));
+            }
             if !query.is_empty()
                 && !host_matches
                 && !project.matches
@@ -2207,6 +2218,29 @@ mod tests {
             nav_order(&prefs),
             vec!["search", "new-workspace", "schedules"]
         );
+    }
+
+    #[test]
+    fn perf_workspace_buckets_match_the_old_project_filter() {
+        let workspaces = [
+            json!({"id": "p-local", "projectId": "p"}),
+            json!({"id": "q-remote", "projectId": "q"}),
+            json!({"id": "p-remote", "projectId": "p", "background": true}),
+            json!({"id": "unassigned"}),
+        ];
+        let mut visited = 0;
+        let buckets = workspaces_by_project(workspaces.iter().inspect(|_| visited += 1));
+        for project in ["p", "q", "", "empty"] {
+            let old: Vec<_> = workspaces
+                .iter()
+                .filter(|workspace| j::text(workspace, "projectId") == project)
+                .collect();
+            assert_eq!(
+                buckets.get(project).map_or(&[][..], Vec::as_slice),
+                old.as_slice()
+            );
+        }
+        assert_eq!(visited, workspaces.len());
     }
 
     #[test]

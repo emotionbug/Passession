@@ -45,6 +45,8 @@ struct Sample {
     render_time: Duration,
     texture_uploads: usize,
     texture_upload_bytes: u64,
+    core_queue_peak: usize,
+    core_queue_oldest: Duration,
     surface_presents: usize,
     surface_repair_pct_sum: f64,
     surface_reuse_waits: usize,
@@ -164,6 +166,16 @@ impl Cx {
             }
         }
     }
+
+    #[doc(hidden)]
+    pub fn frame_trace_core_queue(&self, backlog: impl FnOnce() -> (usize, Duration)) {
+        if let Some(trace) = &self.frame_trace {
+            let (count, oldest) = backlog();
+            let mut sample = trace.sample.lock().unwrap();
+            sample.core_queue_peak = sample.core_queue_peak.max(count);
+            sample.core_queue_oldest = sample.core_queue_oldest.max(oldest);
+        }
+    }
 }
 
 fn ms(time: Duration) -> f64 {
@@ -188,13 +200,14 @@ impl Sample {
         let draw_time = self.events.get("Draw").map_or(Duration::ZERO, |cost| cost.time);
         let all_event_time: Duration = self.events.values().map(|cost| cost.time).sum();
         eprintln!(
-            "PASEO_FRAME_TRACE t={:.3}s interval={:.3}s draw={} render_passes={} render_frames={} next_frame={} timer={} signal={} actions={}/{} event_ms={:.3} draw_ms={:.3} render_ms={:.3} texture_uploads={} texture_upload_bytes={} surface_presents={} surface_repair_pct={:.2} surface_reuse_waits={} surface_deferred={} surface_publish_ms={:.3} events=[{}] timers=[{}] next_frame_requests=[{}] layers=[{}] redraw=[{}]",
+            "PASEO_FRAME_TRACE t={:.3}s interval={:.3}s draw={} render_passes={} render_frames={} next_frame={} timer={} signal={} actions={}/{} event_ms={:.3} draw_ms={:.3} render_ms={:.3} texture_uploads={} texture_upload_bytes={} surface_presents={} surface_repair_pct={:.2} surface_reuse_waits={} surface_deferred={} surface_publish_ms={:.3} core_queue_peak={} core_queue_oldest_ms={:.3} events=[{}] timers=[{}] next_frame_requests=[{}] layers=[{}] redraw=[{}]",
             since_start.as_secs_f64(), interval.as_secs_f64(), event("Draw"), self.render_passes, self.render_frames,
             event("NextFrame"), event("Timer"), event("Signal"), event("Actions"), self.actions,
             ms(all_event_time - draw_time), ms(draw_time), ms(self.render_time),
             self.texture_uploads, self.texture_upload_bytes,
             self.surface_presents, self.surface_repair_pct_sum / self.surface_presents.max(1) as f64,
             self.surface_reuse_waits, self.surface_deferred, ms(self.surface_publish_time),
+            self.core_queue_peak, ms(self.core_queue_oldest),
             series(self.events.iter().map(|(name, cost)| format!("{name}={cost}"))),
             series(self.timers.iter().map(|(owner, cost)| {
                 owner.map_or_else(|| format!("unknown={cost}"), |owner| format!("{owner}={cost}"))

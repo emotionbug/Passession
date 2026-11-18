@@ -131,6 +131,9 @@ provider.
 For a saved tail page, the daemon reads the latest rows from the checkpoint and extends the
 window only when an earlier merged row overlaps it. Subscription recovery reads only the
 checkpoint epoch. Search pages seek beyond the previous sequence cursor and preserve display order.
+Chat find reveals the first valid hit without waiting for the rest of the pages.
+Later pages update the count without moving the selection; a changed query or
+history epoch invalidates the outstanding search.
 
 After a `saved` page, the client refreshes `after` its end cursor once per readiness transition.
 Replay normally changes the epoch, so that refresh resets to the new tail through the stale-cursor
