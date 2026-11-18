@@ -1,7 +1,7 @@
 //! The only place settings code touches `paseo-gui-platform` (platform-api.md).
 //! Calls are non-blocking `PlatformHandle` requests; their results arrive as
-//! `PlatformAction::Completed` in `Event::Actions`, which the panel routes back
-//! to the waiting continuation by request id.
+//! `PlatformAction::Completed` in `Event::Actions` and are delivered only to
+//! the settings instance with a pending continuation for that request id.
 
 use makepad_widgets::*;
 use paseo_gui_platform::{
@@ -9,6 +9,9 @@ use paseo_gui_platform::{
     PlatformRequestId, PlatformValue, platform,
 };
 use serde_json::{Map, Value};
+
+use super::rpc::{Env, ReqError};
+use super::state::Settings;
 
 pub const DESKTOP: bool = cfg!(any(
     target_os = "linux",
@@ -44,8 +47,6 @@ pub fn desktop_available() -> bool {
             .unwrap_or(false)
 }
 
-pub type Reply = (PlatformRequestId, Result<Value, String>);
-
 fn unavailable() -> String {
     super::i18n::t("settingsNative.desktopUnavailable")
 }
@@ -78,10 +79,10 @@ fn error_text(error: &PlatformError) -> String {
 }
 
 /// Issues platform requests and converts their completions. Requests that
-/// cannot start (no platform handle) complete on the next `collect`.
+/// cannot start (no platform handle) complete on the next event.
 #[derive(Default)]
 pub struct Bridge {
-    failed: Vec<Reply>,
+    failed: Vec<(PlatformRequestId, String)>,
     next_local: u64,
 }
 
@@ -90,7 +91,7 @@ impl Bridge {
         // Local ids live in the top half so they never collide with platform ids.
         self.next_local += 1;
         let id = u64::MAX - self.next_local;
-        self.failed.push((id, Err(message)));
+        self.failed.push((id, message));
         id
     }
 
@@ -181,19 +182,34 @@ impl Bridge {
             None => self.local_failure(unavailable()),
         }
     }
+}
 
-    /// Completions in this event (platform actions plus local failures).
-    pub fn collect(&mut self, event: &Event) -> Vec<Reply> {
-        let mut out: Vec<Reply> = std::mem::take(&mut self.failed);
-        if let Event::Actions(actions) = event {
-            for action in actions.iter() {
-                if let Some(PlatformAction::Completed { request, result }) =
-                    action.downcast_ref::<PlatformAction>()
-                {
-                    out.push((*request, result.as_ref().map(to_value).map_err(error_text)));
-                }
+/// Runs this instance's continuations and reports whether any reply was applied.
+pub(super) fn handle_event(s: &mut Settings, env: &mut Env, event: &Event) -> bool {
+    let mut applied = false;
+    // Detach this batch first: a continuation can queue another local failure.
+    for (request, message) in std::mem::take(&mut env.bridge.failed) {
+        if let Some(then) = s.take_bridge_job(request) {
+            then(s, env, Err(ReqError::msg(message)));
+            applied = true;
+        }
+    }
+    if s.has_bridge_jobs()
+        && let Event::Actions(actions) = event
+    {
+        for action in actions {
+            if let Some(PlatformAction::Completed { request, result }) =
+                action.downcast_ref::<PlatformAction>()
+                && let Some(then) = s.take_bridge_job(*request)
+            {
+                let result = result
+                    .as_ref()
+                    .map(to_value)
+                    .map_err(|error| ReqError::msg(error_text(error)));
+                then(s, env, result);
+                applied = true;
             }
         }
-        out
     }
+    applied
 }

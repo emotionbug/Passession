@@ -751,6 +751,7 @@ impl WaProjectSettingsView {
                 Err(error) => self.project_sheet.icon_error = Some(error.message.clone()),
             }
             self.presentation_dirty = true;
+            break;
         }
     }
 

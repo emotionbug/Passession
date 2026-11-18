@@ -230,10 +230,12 @@ impl Settings {
         self.bridge_pending.insert(token, Box::new(then));
     }
 
-    pub fn on_bridge(&mut self, env: &mut Env, token: u64, result: Result<Value, String>) {
-        if let Some(then) = self.bridge_pending.remove(&token) {
-            then(self, env, result.map_err(ReqError::msg));
-        }
+    pub(super) fn has_bridge_jobs(&self) -> bool {
+        !self.bridge_pending.is_empty()
+    }
+
+    pub(super) fn take_bridge_job(&mut self, token: u64) -> Option<Then> {
+        self.bridge_pending.remove(&token)
     }
 
     pub fn after(

@@ -16,7 +16,7 @@ use serde_json::Value;
 use super::host::{self, HostView, Status};
 use super::i18n::t;
 use super::pages::{self, View};
-use super::platform::{Bridge, DESKTOP};
+use super::platform::{self, Bridge, DESKTOP};
 use super::rpc::{Env, Handler, ReqError, handler};
 use super::state::{Settings, SheetKind, Tip};
 use super::ui::draw::{Draws, Font, Icon};
@@ -589,14 +589,7 @@ impl Widget for SettingsPanel {
             self.started = true;
             dirty |= self.handle_core(cx, ui);
         }
-        // Platform completions.
-        let replies = self.bridge.collect(event);
-        if !replies.is_empty() {
-            dirty = true;
-        }
-        for (token, result) in replies {
-            self.with_env(cx, ui, |s, env| s.on_bridge(env, token, result));
-        }
+        dirty |= self.with_env(cx, ui, |s, env| platform::handle_event(s, env, event));
         if matches!(
             event,
             Event::Foreground | Event::Resume | Event::AppGotFocus
@@ -1669,5 +1662,88 @@ impl SettingsPanelRef {
             SettingsPanelAction::EditorClosed { saved_on_host } => Some(saved_on_host),
             SettingsPanelAction::None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use paseo_gui_core::{CoreConfig, GuiCore};
+    use paseo_gui_platform::{PlatformAction, PlatformValue};
+    use std::sync::Arc;
+
+    #[test]
+    fn platform_completion_redraws_only_owning_settings_or_composer_editor() {
+        let dir = std::env::temp_dir().join(format!("paseo-platform-{}", uuid::Uuid::new_v4()));
+        let core = GuiCore::start(
+            CoreConfig {
+                state_dir: dir.clone(),
+                daemon_home: Some(dir.join("daemon")),
+                default_endpoint: None,
+                tailnet_key_store: None,
+            },
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut ui = UiContext::new(core.handle());
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        crate::app::App::register_main_module(&mut cx);
+        crate::app::live_design(&mut cx);
+        cx.live_expand();
+
+        let mut new_panel = |sheet_only, token| {
+            let mut panel = SettingsPanel::new(&mut cx);
+            panel.sheet_only = sheet_only;
+            panel.started = true;
+            let list = cx.draw_lists.alloc();
+            cx.draw_lists[list.id()].rect_areas.push(CxRectArea {
+                rect: Rect::default(),
+                draw_clip: (DVec2::default(), DVec2::default()),
+            });
+            panel.area = Area::Rect(RectArea {
+                draw_list_id: list.id(),
+                rect_id: 0,
+                redraw_id: cx.draw_lists[list.id()].redraw_id,
+            });
+            panel.st.bridge_job(token, |s, _, result| {
+                assert_eq!(result.unwrap(), Value::Bool(true));
+                s.scroll = 12.0;
+            });
+            (panel, list)
+        };
+        let (mut settings, settings_list) = new_panel(false, 1);
+        // The composer's profile editor is a retained sheet-only SettingsPanel.
+        let (mut editor, editor_list) = new_panel(true, 2);
+
+        let mut dispatch = |request, value, expected_lists: &[DrawListId]| {
+            cx.new_draw_event = DrawEvent::default();
+            let event = Event::Actions(vec![Box::new(PlatformAction::Completed {
+                request,
+                result: Ok(value),
+            })]);
+            let mut scope = Scope::with_data(&mut ui);
+            settings.handle_event(&mut cx, &event, &mut scope);
+            editor.handle_event(&mut cx, &event, &mut scope);
+            assert_eq!(cx.new_draw_event.draw_lists, expected_lists);
+            assert!(cx.new_draw_event.draw_lists_and_children.is_empty());
+            assert!(!cx.new_draw_event.redraw_all);
+            (settings.st.scroll, editor.st.scroll)
+        };
+        assert_eq!(
+            dispatch(3, PlatformValue::IdleMilliseconds(5_000), &[]),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            dispatch(1, PlatformValue::Bool(true), &[settings_list.id()]),
+            (12.0, 0.0)
+        );
+        assert_eq!(
+            dispatch(2, PlatformValue::Bool(true), &[editor_list.id()]),
+            (12.0, 12.0)
+        );
+        assert_eq!(dispatch(1, PlatformValue::Bool(false), &[]), (12.0, 12.0));
+
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

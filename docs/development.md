@@ -134,6 +134,11 @@ Completed discovery invalidates synchronous and asynchronous layouts, typography
 
 Use Rust instrumentation for daemon and client work. Browser/CDP and React profilers do not profile the native client. A development mock provider can test controlled UI states but is not evidence of real provider interoperability.
 
+Platform completions share Makepad's action batch with unsolicited events.
+This delivery is not a redraw signal: only the instance with a pending request
+for the completion's token may consume the reply and invalidate its UI. Match and
+remove that token before converting the payload, scheduling work, or redrawing.
+
 ## Scripts, logs, and diagnostics
 
 Workspace setup and services remain daemon-side shell/PTY operations. The client exposes start/stop and **read-only logs**; interactive shells are separate Terminal tabs ([terminal activity](terminal-activity.md)).
