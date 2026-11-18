@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.43 - 2026-11-19
+
 ### Fixed
 
 - Show updates received while the session list was open as soon as the conversation slides back into view, instead of briefly showing the old transcript.

@@ -1,0 +1,7 @@
+Fixed
+- Returning to a session shows the latest messages and resumes its timer and activity dots without scrolling.
+- The selected session keeps its chat icon.
+- Rows and sheets no longer inherit clipping from an earlier animation and lose visible or tappable content.
+- Android uses full redraws by default.
+
+Full notes: https://github.com/emotionbug/Passession/releases
