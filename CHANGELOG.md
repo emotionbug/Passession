@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.44 - 2026-11-19
+
 ### Added
 
 - Update a remote host's desktop app from Settings -> host -> Version, including from Android, while the app is running on that PC. When both the daemon and the app have updates, one approval updates the daemon first and then the app. The app restarts without asking on the PC, so save open files there first.
