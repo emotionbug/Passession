@@ -958,8 +958,16 @@ pub(crate) struct Installation {
 /// the kernel releases it on process death, which is how bootstrap recovery
 /// distinguishes an orphaned trial from one under active verification.
 pub(crate) struct InstallationLease {
-    _file: File,
+    file: File,
     root: PathBuf,
+}
+
+impl Drop for InstallationLease {
+    fn drop(&mut self) {
+        // A child forked by another thread shares this open file description until
+        // it execs, so closing alone can leave the lock held; unlock it explicitly.
+        let _ = self.file.unlock();
+    }
 }
 
 impl Installation {
@@ -1058,7 +1066,7 @@ impl Installation {
         };
         match file.try_lock() {
             Ok(()) => Ok(Some(InstallationLease {
-                _file: file,
+                file,
                 root: self.root.clone(),
             })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
