@@ -253,8 +253,12 @@ the window switches back to the full drawable path.
 For the timed runs, report per scenario `surface_presents`,
 `surface_repair_pct` (mean repaired pixel area), `surface_reuse_waits`,
 `surface_deferred`, `surface_publish_ms / surface_presents` (encode start to
-Core Animation commit, not scanout), `texture_upload_bytes`, and presentation
-rate. Compare actual input-to-display latency against stock with a high-speed
+Core Animation commit, not scanout), `texture_upload_bytes`, and
+`drawable_presents`. Compute the macOS presentation-submission rate as
+`(surface_presents + drawable_presents) / interval`. Live resize deliberately
+uses the drawable path, so `surface_presents` alone undercounts updates during
+resize. `render_frames` can include offscreen work; neither counter measures
+actual scanout. Compare actual input-to-display latency against stock with a high-speed
 camera or Instruments; record GPU time, memory and energy if available.
 The expected added latency is at most one refresh in steady state, with no
 intentional extra display tick; a saturated GPU/compositor can coalesce work.

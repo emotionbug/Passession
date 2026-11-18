@@ -286,6 +286,7 @@ impl Cx {
                             DrawPassMode::Drawable(drawable)
                         };
                         self.draw_pass(*pass_id, metal_cx, mode);
+                        if let Some(trace) = &self.frame_trace { trace.drawable_presented(); }
                         rendered += 1;
                     }
                 }
