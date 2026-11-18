@@ -210,13 +210,13 @@ resize, incompatible viewports, and unsupported or failed presenters. iOS
 continues to use its own `MTKView` path.
 
 The existing drawable layer leaves `colorspace` nil (no color matching).
-The plain CALayer's IOSurfaces instead carry `kIOSurfaceColorSpace` set to
-`CGColorSpaceCopyPropertyList` of the window's RGB backing color space (its
-screen's if no window profile is provided). This labels the same premultiplied
-SDR channel values in their destination space without forcing an sRGB/P3
-conversion or changing shaders. Color parity still needs Mac display testing,
-particularly for windows spanning displays. `contentsScale` is the native
-backing scale; the unflipped hosted view uses top-left gravity and unflipped
+The plain CALayer's IOSurfaces carry `kIOSurfaceColorSpace` set to the serialized
+device RGB color space, preserving the same unmanaged premultiplied SDR values.
+Labeling those values with the calibrated window/screen profile caused visible
+color changes on a P3 Mac display; leaving the IOSurface untagged did too. The
+native probe matched the nil-colorspace drawable with explicit device RGB.
+Windows spanning different displays still need native testing. `contentsScale`
+is the native backing scale; the unflipped hosted view uses top-left gravity and unflipped
 texture contents. Size, scale, display/profile changes, fullscreen and wake
 discard the ring; a new Metal device also gets new textures and clear state.
 

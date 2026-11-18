@@ -258,7 +258,7 @@ impl Cx {
                             let surface = metal_window.surface.as_mut().unwrap();
                             if let Some(viewport) = self.surface_viewport(*pass_id, key.size) {
                                 match surface.acquire(
-                                    key, metal_window.cocoa_window.window, display_tick, visible, self.frame_trace.as_deref(),
+                                    key, display_tick, visible, self.frame_trace.as_deref(),
                                 ) {
                                     Acquire::Deferred => continue,
                                     Acquire::Fallback(reason) => metal_window.disable_surface(reason),

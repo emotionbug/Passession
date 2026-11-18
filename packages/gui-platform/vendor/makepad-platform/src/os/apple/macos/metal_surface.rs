@@ -44,6 +44,7 @@ impl Drop for OwnedCf {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn CGColorSpaceCreateDeviceRGB() -> ObjcId;
     fn CGColorSpaceCopyPropertyList(space: ObjcId) -> ObjcId;
 }
 
@@ -204,7 +205,7 @@ impl SurfacePresenter {
     pub(crate) fn needs_display_tick(&self) -> bool { self.waiting_since.is_some() }
 
     pub(crate) fn acquire(
-        &mut self, key: SurfaceKey, window: ObjcId, display_tick: bool,
+        &mut self, key: SurfaceKey, display_tick: bool,
         visible: bool, trace: Option<&FrameTrace>,
     ) -> Acquire {
         if self.ring.as_ref().is_none_or(|ring| ring.key != key) {
@@ -213,8 +214,8 @@ impl SurfacePresenter {
                 // A hidden or not-yet-mapped window has no known backing profile.
                 return Acquire::Deferred;
             }
-            let Some(ring) = Ring::new(key, window) else {
-                return Acquire::Fallback("IOSurface allocation or backing profile unsupported");
+            let Some(ring) = Ring::new(key) else {
+                return Acquire::Fallback("IOSurface allocation or device RGB profile unsupported");
             };
             if !force_full_redraw() && self.clear.as_ref().is_none_or(|clear| clear.device != key.device) {
                 let Some(clear) = RepairClear::new(key.device) else {
@@ -359,18 +360,15 @@ pub(crate) fn transaction(update: impl FnOnce()) {
 }
 
 impl Ring {
-    fn new(key: SurfaceKey, window: ObjcId) -> Option<Self> {
+    fn new(key: SurfaceKey) -> Option<Self> {
         unsafe {
             let unified: BOOL = msg_send![key.device, hasUnifiedMemory];
             if unified != YES || key.size.iter().any(|&axis| !(1..=16384).contains(&axis)) { return None; }
-            // CAMetalLayer's nil colorspace means no matching. Label these same
-            // BGRA8Unorm values with the destination window's backing RGB profile
-            // (its screen's if AppKit did not supply one), not sRGB or linear RGB.
-            let mut space: ObjcId = msg_send![window, colorSpace];
-            if space == nil { space = msg_send![key.screen, colorSpace]; }
-            let cg_space: ObjcId = msg_send![space, CGColorSpace];
-            if cg_space == nil { return None; }
-            let profile = OwnedCf(NonNull::new(CGColorSpaceCopyPropertyList(cg_space))?);
+            // Match CAMetalLayer.colorspace == nil: the shader's SDR channel
+            // values are unmanaged device RGB. A calibrated window/screen profile
+            // reinterprets those values and visibly changes colors on a P3 screen.
+            let space = OwnedCf(NonNull::new(CGColorSpaceCreateDeviceRGB())?);
+            let profile = OwnedCf(NonNull::new(CGColorSpaceCopyPropertyList(space.as_id()))?);
             let descriptor = texture_descriptor(key.size, MTLPixelFormat::BGRA8Unorm, MTLStorageMode::Shared);
             let make = || Surface::new(key.device, key.size, profile.as_id(), descriptor);
             Some(Self {
@@ -378,6 +376,51 @@ impl Ring {
                 presented: 0, observed: 0, pending: None, depth_baseline: None,
                 completion: Arc::default(), oracle: None,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" {
+        fn IOSurfaceCopyValue(surface: ObjcId, key: ObjcId) -> ObjcId;
+        fn CGColorSpaceCreateWithPropertyList(profile: ObjcId) -> ObjcId;
+        fn CFEqual(left: ObjcId, right: ObjcId) -> u8;
+    }
+
+    #[test]
+    fn ring_surfaces_preserve_unmanaged_device_rgb() {
+        unsafe {
+            let _pool = RcObjcId::from_owned(
+                NonNull::new(msg_send![class!(NSAutoreleasePool), new]).unwrap(),
+            );
+            let device = RcObjcId::from_owned(
+                NonNull::new(MTLCreateSystemDefaultDevice()).expect("Native Metal device required"),
+            );
+            let ring = Ring::new(SurfaceKey {
+                device: device.as_id(), size: [4, 4], scale: 1.0, screen: nil,
+            }).expect("Create IOSurface ring");
+            let expected_space = OwnedCf(NonNull::new(CGColorSpaceCreateDeviceRGB()).unwrap());
+            let expected = OwnedCf(NonNull::new(CGColorSpaceCopyPropertyList(
+                expected_space.as_id(),
+            )).unwrap());
+            // Inspect the serialized metadata on every real IOSurface. Shader
+            // readback alone cannot detect a compositor color-space conversion.
+            for surface in &ring.surfaces {
+                let profile = OwnedCf(NonNull::new(IOSurfaceCopyValue(
+                    surface.io.as_id(), kIOSurfaceColorSpace,
+                )).expect("IOSurface color-space metadata"));
+                let _space = OwnedCf(NonNull::new(CGColorSpaceCreateWithPropertyList(
+                    profile.as_id(),
+                )).expect("Decode IOSurface color space"));
+                // CoreGraphics may canonicalize Device RGB when serializing it;
+                // the IOSurface contract is the serialized value, not CFEqual on
+                // the original and reconstructed CGColorSpace objects.
+                assert_ne!(CFEqual(profile.as_id(), expected.as_id()), 0,
+                    "The compositor must receive unmanaged device RGB, not a display profile");
+            }
         }
     }
 }
